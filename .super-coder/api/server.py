@@ -274,8 +274,7 @@ def require_current_schema(db_path=DB_PATH,
     A pre-fix updater can materialize the target engine and pin before its
     live-state refusal fires.  The newly installed server must therefore
     recognize that half-applied floor from the migration ledger before key
-    provisioning, Interface reconciliation, or request handling reaches a
-    column the old DB does not have.
+    provisioning or request handling reaches a column the old DB does not have.
     """
     expected = {path.name for path in migrations_dir.glob("*.sql")}
     con = db_driver.connect(db_path)
@@ -308,8 +307,8 @@ def require_current_schema(db_path=DB_PATH,
         "Refusing startup before first DB use; continuing would run new code "
         "against an old schema.\n"
         "Recovery: run `./sc rollback --engine-only` to restore the previous "
-        "engine/pin while preserving this unchanged DB, then drain/reconcile "
-        "live Interface state and retry `./sc update`.")
+        "engine/pin while preserving this unchanged DB, then retry "
+        "`./sc update`.")
 
 
 def rows(cur) -> list[dict]:

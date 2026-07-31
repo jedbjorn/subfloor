@@ -40,6 +40,35 @@ TOKEN = "test-token-deadbeef"
 PEER_TOKEN = "peer-token-cafebabe"   # second shell — cross-shell read coverage
 
 
+class MemMessageHelpContractTest(unittest.TestCase):
+    def test_authored_send_help_matches_parser_options(self):
+        parser = mem.build_parser()
+        message = next(
+            action for action in parser._actions
+            if isinstance(action, mem.argparse._SubParsersAction)
+        ).choices["message"]
+        send = next(
+            action for action in message._actions
+            if isinstance(action, mem.argparse._SubParsersAction)
+        ).choices["send"]
+        options = {
+            option
+            for action in send._actions
+            for option in action.option_strings
+        }
+        self.assertEqual(options, {"-h", "--help", "--kind"})
+
+        rendered = send.format_help()
+        synopsis = (
+            './sc mem message send <to-shortname> "<body>" '
+            '[--kind shell|task|result]'
+        )
+        self.assertIn(synopsis, mem.__doc__)
+        for retired in ("--assignment", "--result-kind", "--directive"):
+            self.assertNotIn(retired, mem.__doc__)
+            self.assertNotIn(retired, rendered)
+
+
 def build_engine_db(path: Path) -> None:
     """A throwaway file DB shaped like the shipped engine (schema + every
     migration), with one keyed shell that owns an active session archive."""

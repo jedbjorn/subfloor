@@ -73,6 +73,7 @@ import db_driver  # noqa: E402
 import engine_manifest  # noqa: E402
 import install as install_mod  # noqa: E402  (ensure_harnesses)
 import migrate as migrate_mod  # noqa: E402
+import ports  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402
 import seed_skills  # noqa: E402
 import shell_factory  # noqa: E402
@@ -673,6 +674,66 @@ def migrate_or_rebuild() -> None:
     migrate_mod.migrate(str(DB_PATH))
 
 
+def stop_pm2_review_server() -> tuple[str, str] | None:
+    """Stop this fork's running legacy PM2 review server, if it has one.
+
+    A stopped process stays registered in PM2, so starting the same name after
+    migration loads the newly materialized server code.  An absent PM2 binary
+    or an unregistered/stopped process means this install has no PM2 service to
+    cut over.
+    """
+    pm2_bin = shutil.which("pm2")
+    if pm2_bin is None:
+        return None
+    process = f"sc-{ports.resolve(persist=False).get('repo', REPO_ROOT.name)}"
+    probe = subprocess.run(
+        [pm2_bin, "pid", process], capture_output=True, text=True, check=False
+    )
+    if probe.returncode != 0:
+        sys.exit(
+            f"update: could not inspect PM2 process {process}:\n"
+            + (probe.stderr or probe.stdout).strip()
+        )
+    pids = [line.strip() for line in probe.stdout.splitlines()]
+    if not any(pid.isdigit() and int(pid) > 0 for pid in pids):
+        return None
+    stopped = subprocess.run(
+        [pm2_bin, "stop", process], capture_output=True, text=True, check=False
+    )
+    if stopped.returncode != 0:
+        sys.exit(
+            f"update: could not stop old PM2 server {process}; "
+            "refusing to migrate the live DB:\n"
+            + (stopped.stderr or stopped.stdout).strip()
+        )
+    print(f"→ stopped old PM2 server {process} before DB migration")
+    return pm2_bin, process
+
+
+def start_pm2_review_server(service: tuple[str, str] | None) -> None:
+    if service is None:
+        return
+    pm2_bin, process = service
+    started = subprocess.run(
+        [pm2_bin, "start", process], capture_output=True, text=True, check=False
+    )
+    if started.returncode != 0:
+        sys.exit(
+            f"update: DB migration succeeded but new PM2 server {process} "
+            "could not start:\n" + (started.stderr or started.stdout).strip()
+        )
+    print(f"→ started new PM2 server {process} after DB migration")
+
+
+def migrate_with_service_cutover() -> None:
+    service = stop_pm2_review_server()
+    migrate_or_rebuild()
+    # Deliberately not in finally: a failed destructive migration must leave
+    # the old server stopped instead of restarting code against a changed or
+    # incompatible floor.
+    start_pm2_review_server(service)
+
+
 def sync_skills() -> None:
     """Re-apply the engine skills seed against the live DB.
 
@@ -847,7 +908,7 @@ def main(argv: list[str]) -> int:
         print(f"→ expire the sandbox's baked harness CLIs (epoch {epoch})")
         print("  they reinstall on the next image build — normal `./sc restart` / `make dos-r`")
 
-    migrate_or_rebuild()
+    migrate_with_service_cutover()
 
     print("→ sync skills catalogue (id-stable)")
     sync_skills()
