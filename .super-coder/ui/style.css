@@ -349,11 +349,11 @@ body.interface-view main {
 }
 .review-summary {
   min-width: 0; padding: .55rem 1rem; border-bottom: 1px solid var(--line);
-  display: grid; grid-template-columns: minmax(220px, 1fr) auto auto auto;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center; gap: .8rem; background: var(--panel);
 }
 .review-workspace-shell .review-summary {
-  grid-template-columns: minmax(220px, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto;
 }
 .review-summary .k {
   display: block; margin: 0 0 .2rem; color: var(--dim); font-size: .63rem;
@@ -369,7 +369,10 @@ body.interface-view main {
 }
 .review-lifecycle-block { display: flex; flex-direction: column; gap: .18rem; }
 .review-status {
-  display: flex; align-items: center; justify-self: end; gap: .8rem;
+  display: flex; align-items: center; gap: .8rem;
+}
+.review-summary-actions {
+  min-width: 0; display: flex; align-items: center; justify-self: end; gap: .8rem;
 }
 .review-lifecycle {
   width: fit-content; border: 1px solid var(--line); border-radius: 99px;
@@ -387,7 +390,7 @@ body.interface-view main {
 .review-freshness .warning { color: var(--warn); }
 .review-refresh.act { margin: 0; padding: .34rem .7rem; font-size: .7rem; }
 .review-group-switch {
-  margin: 0 0 0 auto; flex: none; border-radius: 7px;
+  margin: 0; flex: none; border-radius: 7px;
 }
 .review-change-switch { margin: 0; flex: none; }
 .review-scope-switch button { padding-inline: 1rem; }
@@ -447,7 +450,8 @@ body.interface-view main {
 }
 .review-patch-head {
   flex: none; min-width: 0; min-height: 48px; padding: .4rem .75rem;
-  display: flex; align-items: center; gap: 1rem; border-bottom: 1px solid var(--line);
+  display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center; gap: 1rem; border-bottom: 1px solid var(--line);
   background: var(--panel); overflow: hidden;
 }
 .review-patch-title {
@@ -558,7 +562,8 @@ body.interface-view main {
   .review-summary, .review-workspace-shell .review-summary {
     grid-template-columns: minmax(0, 1fr); align-items: stretch;
   }
-  .review-status { justify-self: start; flex-wrap: wrap; }
+  .review-summary-actions { justify-self: start; flex-wrap: wrap; }
+  .review-status { flex-wrap: wrap; }
   .review-refresh.act { justify-self: start; }
   .review-body { grid-template-columns: minmax(0, 1fr); overflow-y: auto; }
   .review-navigator {

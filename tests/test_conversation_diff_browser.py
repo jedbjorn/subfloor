@@ -643,18 +643,36 @@ export { mode };"""
         assert page.get_by_text("ON DISK", exact=True).is_visible()
         assert page.get_by_text("7 dirty", exact=False).is_visible()
         assert page.locator(".review-summary > .review-change-switch").count() == 1
-        assert page.locator(".review-summary > .review-status").count() == 1
+        assert page.locator(".review-summary-actions > .review-status").count() == 1
         assert page.locator(".review-workspace > .review-group-switch").count() == 0
         assert page.locator(".review-patch-head > .review-group-switch").count() == 1
-        patch_header = page.locator(
-            ".review-patch-title, .review-patch-title span, .review-group-switch"
+        summary_alignment = page.locator(
+            ".review-summary, .review-summary > .review-change-switch"
         ).evaluate_all(
-            "nodes => ({titleRight: nodes[0].getBoundingClientRect().right, "
-            "subtitleOverflow: getComputedStyle(nodes[1]).textOverflow, "
-            "tabsLeft: nodes[2].getBoundingClientRect().left})"
+            "nodes => { const container = nodes[0].getBoundingClientRect(); "
+            "const tabs = nodes[1].getBoundingClientRect(); return "
+            "{containerCenter: container.left + container.width / 2, "
+            "tabsCenter: tabs.left + tabs.width / 2}; }"
+        )
+        assert abs(
+            summary_alignment["containerCenter"] - summary_alignment["tabsCenter"]
+        ) <= 1
+        patch_header = page.locator(
+            ".review-patch-head, .review-patch-title, "
+            ".review-patch-title span, .review-group-switch"
+        ).evaluate_all(
+            "nodes => { const header = nodes[0].getBoundingClientRect(); "
+            "const tabs = nodes[3].getBoundingClientRect(); return "
+            "{headerCenter: header.left + header.width / 2, "
+            "titleRight: nodes[1].getBoundingClientRect().right, "
+            "subtitleOverflow: getComputedStyle(nodes[2]).textOverflow, "
+            "tabsLeft: tabs.left, tabsCenter: tabs.left + tabs.width / 2}; }"
         )
         assert patch_header["tabsLeft"] - patch_header["titleRight"] >= 12
         assert patch_header["subtitleOverflow"] == "ellipsis"
+        assert abs(
+            patch_header["headerCenter"] - patch_header["tabsCenter"]
+        ) <= 1
         initial_observations = sum(
             method == "POST" and path.endswith("/review-observations")
             for method, path, _query in requests

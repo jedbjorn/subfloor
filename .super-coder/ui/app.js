@@ -3060,13 +3060,15 @@ function chatReviewWorkspace(host, conversation) {
           textContent: warning,
           hidden: !warning,
         })));
+    const summaryActions = el("div", { className: "review-summary-actions" },
+      summaryStatus,
+      refreshButton);
     const summary = el("div", { className: "review-summary" },
       el("div", { className: "review-target-control" },
         el("label", { className: "k" }, "Current worktree"),
         el("strong", {}, facts[0])),
       ...(sectionSwitch ? [sectionSwitch] : []),
-      summaryStatus,
-      refreshButton);
+      summaryActions);
     const groupSwitch = el("div", {
       className: "review-scope-switch review-group-switch",
       role: "tablist",
