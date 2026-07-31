@@ -658,21 +658,25 @@ export { mode };"""
             summary_alignment["containerCenter"] - summary_alignment["tabsCenter"]
         ) <= 1
         patch_header = page.locator(
-            ".review-patch-head, .review-patch-title, "
+            ".review-body, .review-patch-head, .review-patch-title, "
             ".review-patch-title span, .review-group-switch"
         ).evaluate_all(
-            "nodes => { const header = nodes[0].getBoundingClientRect(); "
-            "const tabs = nodes[3].getBoundingClientRect(); return "
-            "{headerCenter: header.left + header.width / 2, "
-            "titleRight: nodes[1].getBoundingClientRect().right, "
-            "subtitleOverflow: getComputedStyle(nodes[2]).textOverflow, "
-            "tabsLeft: tabs.left, tabsCenter: tabs.left + tabs.width / 2}; }"
+            "nodes => { const body = nodes[0].getBoundingClientRect(); "
+            "const header = nodes[1].getBoundingClientRect(); "
+            "const tabs = nodes[4].getBoundingClientRect(); return "
+            "{bodyCenter: body.left + body.width / 2, headerTop: header.top, "
+            "titleRight: nodes[2].getBoundingClientRect().right, "
+            "subtitleOverflow: getComputedStyle(nodes[3]).textOverflow, "
+            "tabsTop: tabs.top, tabsLeft: tabs.left, "
+            "tabsCenter: tabs.left + tabs.width / 2}; }"
         )
         assert patch_header["tabsLeft"] - patch_header["titleRight"] >= 12
         assert patch_header["subtitleOverflow"] == "ellipsis"
         assert abs(
-            patch_header["headerCenter"] - patch_header["tabsCenter"]
+            patch_header["bodyCenter"] - patch_header["tabsCenter"]
         ) <= 1
+        assert abs(summary_alignment["tabsCenter"] - patch_header["tabsCenter"]) <= 1
+        assert abs(patch_header["headerTop"] - patch_header["tabsTop"]) <= 1
         initial_observations = sum(
             method == "POST" and path.endswith("/review-observations")
             for method, path, _query in requests
