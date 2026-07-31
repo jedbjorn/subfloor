@@ -346,3 +346,116 @@ def attach_live_participations(con, shells: list[dict]) -> list[dict]:
     for shell in shells:
         shell["sprint"] = by_shell.get(int(shell["shell_id"]))
     return shells
+
+
+def planner_fallback_packet(con, participant_id: int, *, reason: str) -> dict[str, Any]:
+    """Build a bounded durable packet for one linked Planner replacement."""
+    reason = _nonblank(reason, "reason", maximum=2000)
+    row = con.execute(
+        "SELECT p.participant_id,p.sprint_id,p.role,p.disposition,"
+        "p.harness,p.model,p.effort,p.current_conversation_id,"
+        "sh.shell_id,sh.shortname,s.lifecycle,s.feature_id,r.title "
+        "FROM sprint_participants p "
+        "JOIN shells sh ON sh.shell_id=p.shell_id "
+        "JOIN sprints s ON s.sprint_id=p.sprint_id "
+        "JOIN roadmap r ON r.feature_id=s.feature_id "
+        "WHERE p.participant_id=?",
+        (participant_id,),
+    ).fetchone()
+    if row is None:
+        raise SprintConversationError("Sprint participant does not exist")
+    if row["role"] != "planner":
+        raise SprintConversationError("fallback route replacement is Planner-only")
+    if row["current_conversation_id"] is None:
+        raise SprintConversationError("Planner has no current Sprint conversation")
+    specs = [
+        {
+            "document_id": int(spec["document_id"]),
+            "revision_sha256": spec["bound_revision_sha256"],
+        }
+        for spec in con.execute(
+            "SELECT document_id,bound_revision_sha256 FROM sprint_specs "
+            "WHERE sprint_id=? ORDER BY document_id",
+            (row["sprint_id"],),
+        )
+    ]
+    units = [
+        {
+            "work_unit_id": int(unit["work_unit_id"]),
+            "title": unit["title"],
+            "disposition": unit["disposition"],
+        }
+        for unit in con.execute(
+            "SELECT work_unit_id,title,disposition FROM sprint_work_units "
+            "WHERE sprint_id=? AND disposition NOT IN ('completed','cancelled') "
+            "ORDER BY planned_wave,work_unit_id",
+            (row["sprint_id"],),
+        )
+    ]
+    return {
+        "packet_version": 1,
+        "reason": reason,
+        "sprint": {
+            "sprint_id": int(row["sprint_id"]),
+            "feature_id": int(row["feature_id"]),
+            "feature_title": row["title"],
+            "lifecycle": row["lifecycle"],
+        },
+        "participant": {
+            "participant_id": int(row["participant_id"]),
+            "shell_id": int(row["shell_id"]),
+            "shortname": row["shortname"],
+            "role": row["role"],
+            "disposition": row["disposition"],
+            "previous_route": {
+                "harness": row["harness"],
+                "model": row["model"],
+                "effort": row["effort"],
+            },
+            "previous_conversation_id": row["current_conversation_id"],
+        },
+        "bound_specs": specs,
+        "open_work_units": units,
+    }
+
+
+def create_planner_fallback(
+    con,
+    *,
+    participant_id: int,
+    reason: str,
+    harness: str,
+    model: str | None,
+    effort: str | None,
+    idempotency_key: str,
+) -> str:
+    """Create and select a linked fallback route inside the caller's txn."""
+    packet = planner_fallback_packet(con, participant_id, reason=reason)
+    participant = _participant(con, participant_id)
+    owner = con.execute(
+        "SELECT planner.user_id FROM sprints s "
+        "JOIN shells planner ON planner.shell_id=s.originating_planner_shell_id "
+        "WHERE s.sprint_id=?",
+        (participant["sprint_id"],),
+    ).fetchone()
+    if owner is None or owner["user_id"] is None:
+        raise SprintConversationError("originating Planner has no browser owner")
+    worktree = run_mod.shell_work_dir(participant["shortname"], participant["flavor"])
+    return create_and_select(
+        con,
+        participant_id=participant_id,
+        owner_user_id=int(owner["user_id"]),
+        purpose="fallback",
+        harness=harness,
+        provider=run_mod.session_provider(harness, model),
+        model=model,
+        effort=effort,
+        worktree=str(worktree.resolve(strict=False)),
+        title=(
+            f"Sprint {participant['sprint_id']} · Planner fallback · "
+            f"{participant['shortname']}"
+        ),
+        idempotency_key=idempotency_key,
+        parent_conversation_id=packet["participant"]["previous_conversation_id"],
+        context_packet=packet,
+    )

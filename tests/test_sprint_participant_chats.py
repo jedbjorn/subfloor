@@ -32,10 +32,21 @@ def substrate():
           flavor TEXT,
           user_id INTEGER REFERENCES users(user_id)
         );
+        CREATE TABLE roadmap (
+          feature_id INTEGER PRIMARY KEY,
+          title TEXT NOT NULL
+        );
         CREATE TABLE sprints (
           sprint_id INTEGER PRIMARY KEY,
+          feature_id INTEGER NOT NULL REFERENCES roadmap(feature_id),
           originating_planner_shell_id INTEGER NOT NULL REFERENCES shells(shell_id),
           lifecycle TEXT NOT NULL
+        );
+        CREATE TABLE sprint_specs (
+          sprint_id INTEGER NOT NULL REFERENCES sprints(sprint_id),
+          document_id INTEGER NOT NULL,
+          bound_revision_sha256 TEXT NOT NULL,
+          PRIMARY KEY(sprint_id,document_id)
         );
         CREATE TABLE conversations (
           conversation_id TEXT PRIMARY KEY,
@@ -88,15 +99,27 @@ def substrate():
         CREATE UNIQUE INDEX one_work_conversation
           ON sprint_participant_conversations(sprint_participant_id)
           WHERE purpose='work';
+        CREATE TABLE sprint_work_units (
+          work_unit_id INTEGER PRIMARY KEY,
+          sprint_id INTEGER NOT NULL REFERENCES sprints(sprint_id),
+          title TEXT NOT NULL,
+          disposition TEXT NOT NULL,
+          planned_wave INTEGER NOT NULL
+        );
         INSERT INTO users VALUES (1);
+        INSERT INTO roadmap VALUES (31,'Collaborative orchestration');
         INSERT INTO shells VALUES
           (10,'DEV1','dev',1),(20,'REV1','reviewer',1),(30,'PLN1','planner',1);
-        INSERT INTO sprints VALUES (7,30,'armed');
+        INSERT INTO sprints VALUES (7,31,30,'armed');
+        INSERT INTO sprint_specs VALUES (7,46,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
         INSERT INTO sprint_participants
           (participant_id,sprint_id,shell_id,role,harness,model,effort,disposition)
           VALUES (101,7,10,'developer','codex','gpt-test','high','active'),
                  (102,7,20,'reviewer','kimi','kimi-test','high','idle'),
                  (103,7,30,'planner','codex','planner-test','high','active');
+        INSERT INTO sprint_work_units VALUES
+          (700,7,'Participant chats','active',1),
+          (701,7,'Already shipped','completed',0);
         """
     )
     try:
@@ -341,6 +364,89 @@ def test_fallback_replacement_retains_packet_route_and_history() -> None:
             ).fetchone()[0]
             == fallback
         )
+
+
+def test_planner_fallback_generates_bounded_context_and_rejects_developer() -> None:
+    with substrate() as con:
+        provisioned = sprint_participant_chats.provision_at_arming(con, 7)
+
+        fallback = sprint_participant_chats.create_planner_fallback(
+            con,
+            participant_id=103,
+            reason="primary route quota exhausted",
+            harness="kimi",
+            model="kimi-fallback",
+            effort="high",
+            idempotency_key="s7:p103:fallback:quota-1",
+        )
+
+        row = con.execute(
+            "SELECT c.harness,c.provider,l.parent_conversation_id,l.context_packet "
+            "FROM conversations c JOIN sprint_participant_conversations l "
+            "ON l.conversation_id=c.conversation_id WHERE c.conversation_id=?",
+            (fallback,),
+        ).fetchone()
+        packet = json.loads(row["context_packet"])
+        assert tuple(row)[:3] == ("kimi", "kimi", provisioned[2])
+        assert packet == {
+            "packet_version": 1,
+            "reason": "primary route quota exhausted",
+            "sprint": {
+                "sprint_id": 7,
+                "feature_id": 31,
+                "feature_title": "Collaborative orchestration",
+                "lifecycle": "armed",
+            },
+            "participant": {
+                "participant_id": 103,
+                "shell_id": 30,
+                "shortname": "PLN1",
+                "role": "planner",
+                "disposition": "active",
+                "previous_route": {
+                    "harness": "codex",
+                    "model": "planner-test",
+                    "effort": "high",
+                },
+                "previous_conversation_id": provisioned[2],
+            },
+            "bound_specs": [
+                {
+                    "document_id": 46,
+                    "revision_sha256": "a" * 64,
+                }
+            ],
+            "open_work_units": [
+                {
+                    "work_unit_id": 700,
+                    "title": "Participant chats",
+                    "disposition": "active",
+                }
+            ],
+        }
+        assert (
+            con.execute(
+                "SELECT current_conversation_id FROM sprint_participants "
+                "WHERE participant_id=103"
+            ).fetchone()[0]
+            == fallback
+        )
+
+        before = con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+        with pytest.raises(
+            sprint_participant_chats.SprintConversationError,
+            match="Planner-only",
+        ):
+            sprint_participant_chats.create_planner_fallback(
+                con,
+                participant_id=101,
+                reason="not a planner",
+                harness="kimi",
+                model="kimi-fallback",
+                effort="high",
+                idempotency_key="s7:p101:fallback:invalid",
+            )
+        assert con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == before
 
 
 def test_live_pill_projection_follows_current_pointer_until_terminal() -> None:
