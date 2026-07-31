@@ -62,7 +62,6 @@ Run from the repo root, like every engine command:
     ./sc mem narrative "<line>"
     ./sc mem message check [N]                         # your unread inbox (read-only)
     ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
-                            [--assignment ID --result-kind KIND --directive ID]
     ./sc mem message sent                              # outbound view — verify delivery
     ./sc mem message mark-read <message_id>
 

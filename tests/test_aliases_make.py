@@ -49,6 +49,18 @@ COMMANDS_THAT_MUST_EXPLAIN_THEMSELVES = (
     "dos-verify",
 )
 
+RETIRED_INTERFACE_TARGETS = (
+    "dos-status",
+    "dos-start",
+    "dos-view",
+    "dos-attach",
+    "dos-take",
+    "dos-take-control",
+    "dos-stop",
+    "dos-reconcile",
+    "dos-recover",
+)
+
 
 def described_targets(help_text: str) -> dict[str, str]:
     """Map every target in `help_text` to its description, alias pairs split.
@@ -98,6 +110,17 @@ class MakeAliasContractTest(unittest.TestCase):
         self.assertNotIn("dos-token", make("dos-help").stdout)
         self.assertNotIn("dos-token", make("dos-h").stdout)
 
+    def test_retired_interface_aliases_stay_gone(self):
+        help_text = make("dos-help").stdout
+        for target in RETIRED_INTERFACE_TARGETS:
+            with self.subTest(target=target):
+                result = make("-n", target, "s=DEV1")
+                self.assertNotEqual(
+                    result.returncode, 0, f"{target} still resolves as a make target"
+                )
+                self.assertNotIn(target, help_text)
+        self.assertNotIn("INTERFACE", help_text)
+
     def test_documented_targets_delegate_exactly_to_sc(self):
         cases = [
             (("dos-enter",), "./sc enter"),
@@ -115,22 +138,6 @@ class MakeAliasContractTest(unittest.TestCase):
              "./sc test tests/test_aliases_make.py"),
             (("dos-t",), "./sc test"),
             (("dos-url",), "./sc url"),
-            (("dos-status", "s=DEV1", "ARGS=--json"),
-             "./sc interface status DEV1 --json"),
-            (("dos-start", "s=DEV1", "ARGS=--harness codex"),
-             "./sc interface start DEV1 --harness codex"),
-            (("dos-view", "s=DEV1"), "./sc interface view DEV1"),
-            (("dos-attach", "s=DEV1"), "./sc interface attach DEV1"),
-            (("dos-take", "s=DEV1"),
-             "./sc interface take-control DEV1"),
-            (("dos-take-control", "s=DEV1"),
-             "./sc interface take-control DEV1"),
-            (("dos-stop", "s=DEV1", "ARGS=--force"),
-             "./sc interface stop DEV1 --force"),
-            (("dos-reconcile", "s=DEV1", "ARGS=--close"),
-             "./sc interface reconcile DEV1 --close"),
-            (("dos-recover", "s=DEV1", "ARGS=--force --yes"),
-             "./sc interface recover DEV1 --force --yes"),
             (("dos-models", "ARGS=list codex"), "./sc models list codex"),
             (("dos-model-refresh",), "./sc models refresh"),
             (("dos-model-list", "h=codex"), "./sc models list codex"),
@@ -162,25 +169,6 @@ class MakeAliasContractTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
 
-    def test_shell_actions_fail_before_dispatch_when_s_is_missing(self):
-        for target in (
-            "dos-start",
-            "dos-view",
-            "dos-attach",
-            "dos-take",
-            "dos-take-control",
-            "dos-stop",
-            "dos-reconcile",
-            "dos-recover",
-        ):
-            with self.subTest(target=target):
-                result = make("-n", target)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(result.stdout, "")
-                self.assertIn(
-                    f"{target}: requires s=<shell-shortname>", result.stderr
-                )
-
     def test_model_resolve_requires_harness_and_model_before_dispatch(self):
         result = make("-n", "dos-model-resolve", "h=codex")
         self.assertNotEqual(result.returncode, 0)
@@ -195,17 +183,9 @@ class MakeAliasContractTest(unittest.TestCase):
         result = make("dos-help")
         self.assertEqual(result.returncode, 0, result.stderr)
         help_text = result.stdout
-        for heading in ("HOT", "INTERFACE", "MODELS + JOBS", "MAINTENANCE"):
+        for heading in ("HOT", "MODELS + JOBS", "MAINTENANCE"):
             self.assertIn(heading, help_text)
         for target in (
-            "dos-status",
-            "dos-start",
-            "dos-view",
-            "dos-attach",
-            "dos-take-control",
-            "dos-stop",
-            "dos-reconcile",
-            "dos-recover",
             "dos-models",
             "dos-model-refresh",
             "dos-model-list",

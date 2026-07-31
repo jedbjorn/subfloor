@@ -31,8 +31,7 @@
 #   make dos-h                   list the commands
 #   make dos-help                list + describe the commands
 #
-#   LONG-ONLY: Interface status/start/view/attach/take-control/stop/reconcile/
-#              recover; models/job; build/logs/serve/health/ports;
+#   LONG-ONLY: models/job; build/logs/serve/health/ports;
 #              verify/map/render/snapshot/deps/install/rollback/
 #              update-harnesses/harness-status/feature/eject/remove
 #              passthrough: make dos ARGS=health
@@ -41,15 +40,10 @@ SC := ./sc
 .PHONY: dos-e dos-enter dos-l dos-launch dos-r dos-restart dos-d dos-down dos-u dos-update \
         dos-t dos-test dos-h dos-help dos-url dos-build dos-logs dos-serve dos-health dos-ports \
         dos-verify dos-map dos-render dos-snapshot dos-deps dos-install dos-rollback \
-        dos-update-harnesses dos-harness-status dos-feat dos-feature dos-eject dos-remove dos-status \
-        dos-start dos-view dos-attach dos-take dos-take-control dos-stop \
-        dos-reconcile dos-recover dos-models dos-model-refresh dos-model-list \
+        dos-update-harnesses dos-harness-status dos-feat dos-feature dos-eject dos-remove \
+        dos-models dos-model-refresh dos-model-list \
         dos-model-resolve dos-job dos-setup dos
 
-# Interface actions other than enter/status require an exact shell. Fail in
-# Make before ./sc is invoked so a typo cannot silently widen an operation.
-require-shell = $(if $(strip $(s)),,$(error $@: requires s=<shell-shortname>))
-shell-arg = $(if $(strip $(s)),$(s))
 require-model-route = $(if $(and $(strip $(h)),$(strip $(m))),,$(error $@: requires h=<harness> m=<model> [s=<shell-shortname>]))
 model-shell-arg = $(if $(strip $(s)),--shell $(s))
 
@@ -69,18 +63,6 @@ dos-t: dos-test
 # The links an operator loses when the boot summary scrolls away — derived per
 # fork, never a fixed 8800 (decision #50).
 dos-url:              ; $(SC) url
-
-# Interface operator workflow. These are the accepted public API-backed verbs;
-# server-only primitives and direct DB operations intentionally stay out.
-dos-status:           ; $(SC) interface status $(shell-arg) $(ARGS)
-dos-start:            ; $(call require-shell)$(SC) interface start $(s) $(ARGS)
-dos-view:             ; $(call require-shell)$(SC) interface view $(s)
-dos-attach:           ; $(call require-shell)$(SC) interface attach $(s)
-dos-take:             ; $(call require-shell)$(SC) interface take-control $(s)
-dos-take-control:     ; $(call require-shell)$(SC) interface take-control $(s)
-dos-stop:             ; $(call require-shell)$(SC) interface stop $(s) $(ARGS)
-dos-reconcile:        ; $(call require-shell)$(SC) interface reconcile $(s) $(ARGS)
-dos-recover:          ; $(call require-shell)$(SC) interface recover $(s) $(ARGS)
 
 # Model catalogue and durable local jobs.
 dos-models:           ; $(SC) models $(ARGS)
@@ -151,17 +133,6 @@ dos-help:
 	@echo "    dos-u / dos-update          update and reconcile the engine (ARGS forwarded)"
 	@echo "    dos-t / dos-test            run backend + UI suites (ARGS forwarded)"
 	@echo "    dos-url                     print the review GUI + dev-server URLs for this fork"
-	@echo ""
-	@echo "  INTERFACE  (API-backed; actions marked s=x require a shell shortname)"
-	@echo "    dos-status [s=x]            rail status, optionally one shell"
-	@echo "    dos-start s=x               start a New chat"
-	@echo "    dos-view s=x                attach read-only"
-	@echo "    dos-attach s=x              attach as writer without takeover"
-	@echo "    dos-take s=x                explicitly transfer the writer role"
-	@echo "    dos-take-control s=x        descriptive alias of dos-take"
-	@echo "    dos-stop s=x                gracefully end; ARGS=--force after timeout"
-	@echo "    dos-reconcile s=x           revalidate; ARGS=--close after proved absence"
-	@echo "    dos-recover s=x             preview/recover; force/discard via explicit ARGS"
 	@echo ""
 	@echo "  MODELS + JOBS"
 	@echo "    dos-model-refresh           refresh the local model catalogue"
