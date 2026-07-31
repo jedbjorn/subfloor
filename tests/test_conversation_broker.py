@@ -1051,6 +1051,18 @@ class ServiceContractTest(ConversationBrokerCase):
             stream.write(
                 json.dumps(
                     {
+                        "type": "context.append_loop_event",
+                        "event": {
+                            "type": "step.end",
+                            "finishReason": "end_turn",
+                        },
+                    }
+                )
+                + "\n"
+            )
+            stream.write(
+                json.dumps(
+                    {
                         "type": "usage.record",
                         "usageScope": "turn",
                         "usage": {"inputOther": 4, "output": 2},
@@ -1089,7 +1101,10 @@ class ServiceContractTest(ConversationBrokerCase):
         self.assertEqual(
             json.loads(events[0]["payload"]),
             {
-                "detail": "Kimi exact run slice contains turn-scoped usage",
+                "detail": (
+                    "Kimi exact run slice contains end_turn and "
+                    "turn-scoped usage"
+                ),
                 "outcome": "succeeded",
                 "proven": True,
                 "reconciled": True,

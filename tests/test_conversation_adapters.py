@@ -34,6 +34,17 @@ from conversation_adapters import (  # noqa: E402
 KIMI_FIXTURES = ROOT / "tests" / "fixtures" / "conversations" / "kimi"
 
 
+def kimi_step_event(
+    event_type: str,
+    *,
+    finish_reason: str | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {"type": event_type}
+    if finish_reason is not None:
+        event["finishReason"] = finish_reason
+    return {"type": "context.append_loop_event", "event": event}
+
+
 class FakeOpenCode:
     def __init__(self) -> None:
         self.requests: list[tuple[str, str, dict, Any]] = []
@@ -1241,6 +1252,7 @@ class ConversationAdapterTest(unittest.TestCase):
                 *captured,
             ],
             after_prompt=[
+                kimi_step_event("step.end", finish_reason="end_turn"),
                 {
                     "type": "usage.record",
                     "usageScope": "turn",
@@ -1340,6 +1352,7 @@ class ConversationAdapterTest(unittest.TestCase):
                 {"role": "assistant", "content": "server started"},
             ],
             after_prompt=[
+                kimi_step_event("step.end", finish_reason="end_turn"),
                 {
                     "type": "usage.record",
                     "usageScope": "turn",
@@ -1365,6 +1378,107 @@ class ConversationAdapterTest(unittest.TestCase):
             ],
         )
         self.assertEqual(events[-1].native_type, "usage.record")
+
+    def test_kimi_tool_usage_does_not_complete_before_follow_up_answer(
+        self,
+    ) -> None:
+        adapter, runner = self.build("kimi")
+        runner.queue(
+            stdout_lines=[
+                {
+                    "role": "assistant",
+                    "content": "Running the repo-map queries now.",
+                    "tool_calls": [
+                        {
+                            "id": "tool-map",
+                            "function": {"name": "Bash"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "tool-map"},
+                {"role": "assistant", "content": "Map loaded."},
+            ],
+            after_prompt=[
+                kimi_step_event("step.end", finish_reason="tool_use"),
+                {
+                    "type": "usage.record",
+                    "usageScope": "turn",
+                    "usage": {"inputOther": 10, "output": 2},
+                },
+                kimi_step_event("step.begin"),
+            ],
+            block_after_stdout=True,
+        )
+
+        turn = adapter.start(self.context, "continue")
+        events: list[Any] = []
+        errors: list[BaseException] = []
+
+        def consume() -> None:
+            try:
+                events.extend(adapter.stream(turn))
+            except BaseException as exc:  # noqa: BLE001 - cross-thread test capture
+                errors.append(exc)
+
+        worker = threading.Thread(target=consume)
+        worker.start()
+        self.assertTrue(turn.opaque.stdout_blocked.wait(1.0))
+        self.assertFalse(
+            turn.opaque.stdout_released.wait(0.25),
+            "tool-use usage must not terminate the persistent Kimi child",
+        )
+        self.assertFalse(turn.opaque.terminated)
+        self.assertEqual(
+            adapter.inspect(turn.session_ref, self.context).state,
+            "unknown",
+        )
+
+        wire = Path(turn.metadata["wire_path"])
+        with wire.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(
+                kimi_step_event("step.end", finish_reason="end_turn")
+            ) + "\n")
+        self.assertFalse(
+            turn.opaque.stdout_released.wait(0.25),
+            "end_turn without its usage must not terminate Kimi",
+        )
+        with wire.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "type": "usage.record",
+                "usageScope": "turn",
+                "usage": {"inputOther": 5, "output": 3},
+            }) + "\n")
+
+        worker.join(2.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(turn.opaque.terminated)
+        self.assertEqual(
+            [event.type for event in events],
+            [
+                "session.started",
+                "run.started",
+                "assistant.delta",
+                "tool.started",
+                "tool.completed",
+                "assistant.delta",
+                "usage",
+                "run.completed",
+            ],
+        )
+        self.assertEqual(
+            next(event for event in events if event.type == "usage").payload,
+            {
+                "tokens": {
+                    "input_tokens": 15,
+                    "output_tokens": 5,
+                }
+            },
+        )
+        self.assertEqual(
+            adapter.inspect(turn.session_ref, self.context).state,
+            "idle",
+        )
 
     def test_kimi_default_runner_owns_and_cleans_up_process_group(self) -> None:
         adapter = KimiAdapter()
@@ -1419,6 +1533,7 @@ class ConversationAdapterTest(unittest.TestCase):
             "recovered",
             prompt_time=8000,
             after_prompt=[
+                kimi_step_event("step.end", finish_reason="end_turn"),
                 {
                     "type": "usage.record",
                     "usageScope": "turn",
@@ -1453,6 +1568,43 @@ class ConversationAdapterTest(unittest.TestCase):
             result.outcome,
             "cancelled",
             "a later turn.cancel must not terminate the recovered run",
+        )
+
+    def test_kimi_recovered_tool_step_is_not_terminal_completion(self) -> None:
+        adapter, runner = self.build("kimi")
+        session_ref = "session_abababab-abab-4bab-8bab-abababababab"
+        _session, _wire = runner.write_session(
+            runner.sessions_root,
+            session_ref,
+            self.root,
+            "recover tool step",
+            prompt_time=8050,
+            after_prompt=[
+                kimi_step_event("step.end", finish_reason="tool_use"),
+                {
+                    "type": "usage.record",
+                    "usageScope": "turn",
+                    "usage": {"inputOther": 4, "output": 2},
+                },
+                kimi_step_event("step.begin"),
+            ],
+            directory="wd_recovered_tool_step",
+        )
+        recovered = NativeTurn(
+            "kimi",
+            session_ref,
+            "kimi-8050-0",
+            self.root,
+            metadata={"recovered": True},
+        )
+
+        result = adapter.reconcile(recovered, self.context)
+
+        self.assertEqual(result.outcome, "unknown")
+        self.assertFalse(result.proven)
+        self.assertEqual(
+            adapter.inspect(session_ref, self.context).state,
+            "unknown",
         )
 
     def test_kimi_recovered_turn_rebuilds_exact_cancel_slice(self) -> None:
@@ -1518,6 +1670,7 @@ class ConversationAdapterTest(unittest.TestCase):
                     "input": [{"type": "text", "text": "later"}],
                     "time": 7001,
                 },
+                kimi_step_event("step.end", finish_reason="end_turn"),
                 {
                     "type": "usage.record",
                     "usageScope": "turn",

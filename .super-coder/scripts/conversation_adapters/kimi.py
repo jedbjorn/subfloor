@@ -363,7 +363,7 @@ class KimiAdapter(ConversationAdapter):
                 records = self._run_slice(turn)
             except (AdapterError, OSError):
                 continue
-            if not self._usage(records):
+            if not self._completion_proven(records):
                 continue
             # Give final stdout metadata already in flight (especially the
             # resume hint) a bounded window to reach the validator.
@@ -819,6 +819,42 @@ class KimiAdapter(ConversationAdapter):
                     totals[normalized] = totals.get(normalized, 0) + value
         return totals
 
+    @classmethod
+    def _completion_proven(
+        cls,
+        records: list[Mapping[str, Any]],
+    ) -> bool:
+        """Return whether Kimi durably ended the exact run.
+
+        Kimi writes turn-scoped usage after every model step.  A tool-calling
+        step therefore has usage even though the next model step is already
+        starting.  Only the final ``end_turn`` step plus its usage proves that
+        a persistent child may be cleaned up safely.
+        """
+        latest_step: str | None = None
+        completed = False
+        for raw in records:
+            if raw.get("type") == "usage.record":
+                if raw.get("usageScope") == "turn" and cls._usage([raw]):
+                    completed = latest_step == "end_turn"
+                continue
+            if raw.get("type") != "context.append_loop_event":
+                continue
+            event = raw.get("event")
+            if not isinstance(event, dict):
+                continue
+            event_type = event.get("type")
+            if event_type == "step.begin":
+                latest_step = None
+                completed = False
+            elif event_type == "step.end":
+                finish_reason = event.get("finishReason")
+                latest_step = (
+                    finish_reason if isinstance(finish_reason, str) else None
+                )
+                completed = False
+        return completed
+
     @staticmethod
     def _stderr(process: Any) -> str:
         captured = getattr(process, "_sc_conversation_stderr", None)
@@ -995,13 +1031,8 @@ class KimiAdapter(ConversationAdapter):
             elif latest_slice:
                 latest_slice.append(raw)
         terminal = any(
-            raw.get("type") == "turn.cancel"
-            or (
-                raw.get("type") == "usage.record"
-                and raw.get("usageScope") == "turn"
-            )
-            for raw in latest_slice
-        )
+            raw.get("type") == "turn.cancel" for raw in latest_slice
+        ) or self._completion_proven(latest_slice)
         return SessionInspection(
             session_ref,
             True,
@@ -1058,11 +1089,11 @@ class KimiAdapter(ConversationAdapter):
                 True,
                 "Kimi exact run slice contains turn.cancel",
             )
-        if self._usage(records):
+        if self._completion_proven(records):
             return ReconcileResult(
                 "succeeded",
                 True,
-                "Kimi exact run slice contains turn-scoped usage",
+                "Kimi exact run slice contains end_turn and turn-scoped usage",
             )
         return ReconcileResult(
             "unknown",
