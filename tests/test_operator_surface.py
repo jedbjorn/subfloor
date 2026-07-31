@@ -183,23 +183,30 @@ class HelpChartTest(unittest.TestCase):
         self.assertEqual(uncharted, [],
                          f"dispatchable but absent from ./sc help: {uncharted}")
 
-    def test_the_retired_watch_daemon_verbs_are_charted_as_retired(self):
-        """Retired but still dispatchable: they print the cutover notice, so
-        the chart has to say RETIRED rather than leave them looking live."""
+    def test_removed_sprint_verbs_are_unknown_and_absent_from_help(self):
         help_text = sc("help").stdout
-        for verb in ("watch-daemon-up", "watch-daemon-install"):
+        for verb in (
+            "sprint",
+            "directives",
+            "events",
+            "watch",
+            "watch-daemon-up",
+            "watch-daemon-down",
+            "watch-daemon-install",
+            "watch-daemon-uninstall",
+        ):
             with self.subTest(verb=verb):
-                line = next(l for l in help_text.splitlines()
-                            if re.search(rf"sc {verb}(?![\w-])", l))
-                self.assertIn("RETIRED", line)
-
-    def test_retired_start_verbs_refuse_instead_of_starting_anything(self):
-        up = sc("watch-daemon-up")
-        self.assertEqual(up.returncode, 0, up.stderr)
-        self.assertIn("RETIRED", up.stdout)
-        install = sc("watch-daemon-install")
-        self.assertEqual(install.returncode, 1)
-        self.assertIn("RETIRED", install.stderr)
+                out = sc(verb)
+                self.assertEqual(out.returncode, 2)
+                self.assertEqual(out.stdout, "")
+                self.assertEqual(
+                    out.stderr,
+                    f"sc: unknown command '{verb}' (try ./sc help)\n",
+                )
+                self.assertNotRegex(
+                    help_text,
+                    rf"(?<![\w-])(?:\./)?sc {re.escape(verb)}(?![\w-])",
+                )
 
 
 if __name__ == "__main__":

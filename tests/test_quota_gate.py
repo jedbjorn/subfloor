@@ -401,8 +401,12 @@ class NoInertAccountMachineryTest(unittest.TestCase):
         if path == "api/server.py":
             return text[text.index("def _quota_upsert"):text.index("# \u2500\u2500 Mutations")]
         if path == "ui/app.js":
-            return text[text.index("// \u2500\u2500 Provider Quota"):
-                        text.index("// \u2500\u2500 Active sprints")]
+            return text[
+                text.index("// \u2500\u2500 Provider Quota"):
+                text.index(
+                    "// \u2500\u2500 Interface / browser-native conversations"
+                )
+            ]
         if path == "ui/style.css":
             return text[text.index("/* \u2500\u2500 Provider Quota"):]
         return text
@@ -487,7 +491,10 @@ EL = APP[APP.index("const el ="):APP.index("const esc =")]
 HELPERS = APP[APP.index("const fmt = (n)"):APP.index("// On/off switch")]
 SHELL_STATE = APP[APP.index("let selectedShell ="):
                   APP.index("// Rough token estimator")]
-QUOTA = APP[APP.index("// ── Provider Quota"):APP.index("// ── Active sprints")]
+QUOTA = APP[
+    APP.index("// ── Provider Quota"):
+    APP.index("// ── Interface / browser-native conversations")
+]
 _ROUTER_AT = APP.index("function routeFromHash()")
 # U4's slice stops at the nav-button line; this one deliberately runs PAST it,
 # through `window.addEventListener("hashchange", routeFromHash)` — the wiring
@@ -549,12 +556,6 @@ let forkName = "";
 const STUB = new FakeElement("div");
 function $(sel) { return STUB; }
 function setStatus(s) {}
-let sprintsRefreshError = null;
-async function sprintsRefresh() {
-  if (sprintsRefreshError) throw sprintsRefreshError;
-}
-let sprintsPollStarted = 0;
-function sprintsStartPoll() { sprintsPollStarted += 1; }
 function all(root, pred, found = []) {
   if (pred(root)) found.push(root);
   for (const c of root.children || []) if (c && c.nodeType === 1) all(c, pred, found);
@@ -609,15 +610,11 @@ class DeepLinkSurvivesReloadTest(unittest.TestCase):
 
     def test_loading_the_page_on_the_quota_hash_lands_on_the_section(self):
         r = run_js("""
-          out({ view: anView, tab: shown[shown.length - 1], routed: shown.length,
-                sprintsPollStarted });
+          out({ view: anView, tab: shown[shown.length - 1], routed: shown.length });
         """, boot=True, hash="#analytics-quota")
         self.assertEqual("quota", r["view"])
         self.assertEqual("analytics", r["tab"])
         self.assertEqual(1, r["routed"], "the load routed more than once")
-        self.assertEqual(
-            1, r["sprintsPollStarted"],
-            "the boot IIFE did not start the document-wide sprint poll")
 
     def test_the_boot_route_runs_even_when_the_health_call_fails(self):
         """`routeFromHash()` sits outside the IIFE's try/catch on purpose: an
@@ -627,18 +624,6 @@ class DeepLinkSurvivesReloadTest(unittest.TestCase):
           apiFail = "offline";
           out({ view: anView, tab: shown[shown.length - 1] });
         """, boot=True, hash="#analytics-quota")
-        self.assertEqual("quota", r["view"])
-        self.assertEqual("analytics", r["tab"])
-
-    def test_the_boot_route_runs_even_when_sprints_refresh_throws(self):
-        r = run_js(
-            """
-              out({ view: anView, tab: shown[shown.length - 1] });
-            """,
-            boot=True,
-            hash="#analytics-quota",
-            preboot='sprintsRefreshError = new Error("offline");\n',
-        )
         self.assertEqual("quota", r["view"])
         self.assertEqual("analytics", r["tab"])
 

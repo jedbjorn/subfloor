@@ -32,7 +32,7 @@
 #   make dos-help                list + describe the commands
 #
 #   LONG-ONLY: Interface status/start/view/attach/take-control/stop/reconcile/
-#              recover; models; sprint/watch/job; build/logs/serve/health/ports;
+#              recover; models/job; build/logs/serve/health/ports;
 #              verify/map/render/snapshot/deps/install/rollback/
 #              update-harnesses/harness-status/feature/eject
 #              passthrough: make dos ARGS=health
@@ -44,7 +44,7 @@ SC := ./sc
         dos-update-harnesses dos-harness-status dos-feat dos-feature dos-eject dos-status \
         dos-start dos-view dos-attach dos-take dos-take-control dos-stop \
         dos-reconcile dos-recover dos-models dos-model-refresh dos-model-list \
-        dos-model-resolve dos-sprint dos-watch dos-job dos-setup dos
+        dos-model-resolve dos-job dos-setup dos
 
 # Interface actions other than enter/status require an exact shell. Fail in
 # Make before ./sc is invoked so a typo cannot silently widen an operation.
@@ -82,13 +82,11 @@ dos-stop:             ; $(call require-shell)$(SC) interface stop $(s) $(ARGS)
 dos-reconcile:        ; $(call require-shell)$(SC) interface reconcile $(s) $(ARGS)
 dos-recover:          ; $(call require-shell)$(SC) interface recover $(s) $(ARGS)
 
-# Model catalogue and durable sprint operator surfaces.
+# Model catalogue and durable local jobs.
 dos-models:           ; $(SC) models $(ARGS)
 dos-model-refresh:    ; $(SC) models refresh
 dos-model-list:       ; $(SC) models list $(h)
 dos-model-resolve:    ; $(call require-model-route)$(SC) models resolve $(h) $(m) $(model-shell-arg)
-dos-sprint:           ; $(SC) sprint $(ARGS)
-dos-watch:            ; $(SC) watch $(ARGS)
 dos-job:              ; $(SC) job $(ARGS)
 
 # Long-only commands.
@@ -163,13 +161,11 @@ dos-help:
 	@echo "    dos-reconcile s=x           revalidate; ARGS=--close after proved absence"
 	@echo "    dos-recover s=x             preview/recover; force/discard via explicit ARGS"
 	@echo ""
-	@echo "  MODELS + SPRINT"
+	@echo "  MODELS + JOBS"
 	@echo "    dos-model-refresh           refresh the local model catalogue"
 	@echo "    dos-model-list [h=x]        list all routes or one harness"
 	@echo "    dos-model-resolve h=x m=y   resolve an exact route; optional s=<shell>"
 	@echo "    dos-models ARGS='<cmd>'     generic model catalogue command"
-	@echo "    dos-sprint ARGS='<cmd>'      sprint action/status/alerts/retry"
-	@echo "    dos-watch ARGS='<cmd>'       PR watch register/list/reconcile/inbox"
 	@echo "    dos-job ARGS='<cmd>'         durable local job start/wait/list/status/tail/kill"
 	@echo ""
 	@echo "  MAINTENANCE"

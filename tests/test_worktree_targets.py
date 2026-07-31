@@ -386,12 +386,12 @@ class LiveSurfacesStillResolveTest(WorktreeFixture):
         launcher.rename(absent)
         try:
             self.assertFalse(launcher.exists())
-            sprint = run_bare_sc(self.wt, self.main, "sprint", "--help")
+            models = run_bare_sc(self.wt, self.main, "models", "--help")
             pin = run_bare_sc(self.wt, self.main, "engine-ref")
         finally:
             absent.rename(launcher)
-        self.assertEqual(sprint.returncode, 0, sprint.stderr)
-        self.assertIn("usage:", sprint.stdout)
+        self.assertEqual(models.returncode, 0, models.stderr)
+        self.assertIn("usage:", models.stdout)
         self.assertEqual(pin.returncode, 0, pin.stderr)
         self.assertEqual(pin.stdout, ENGINE_PIN + "\n")
 

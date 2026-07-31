@@ -136,8 +136,6 @@ class MakeAliasContractTest(unittest.TestCase):
             (("dos-model-list", "h=codex"), "./sc models list codex"),
             (("dos-model-resolve", "h=codex", "m=gpt-5.6-sol", "s=DEV1"),
              "./sc models resolve codex gpt-5.6-sol --shell DEV1"),
-            (("dos-sprint", "ARGS=status --all"), "./sc sprint status --all"),
-            (("dos-watch", "ARGS=list --all"), "./sc watch list --all"),
             (("dos-job", "ARGS=status 7"), "./sc job status 7"),
             (("dos-build",), "./sc build"),
             (("dos-logs",), "./sc logs"),
@@ -197,7 +195,7 @@ class MakeAliasContractTest(unittest.TestCase):
         result = make("dos-help")
         self.assertEqual(result.returncode, 0, result.stderr)
         help_text = result.stdout
-        for heading in ("HOT", "INTERFACE", "MODELS + SPRINT", "MAINTENANCE"):
+        for heading in ("HOT", "INTERFACE", "MODELS + JOBS", "MAINTENANCE"):
             self.assertIn(heading, help_text)
         for target in (
             "dos-status",
@@ -212,14 +210,14 @@ class MakeAliasContractTest(unittest.TestCase):
             "dos-model-refresh",
             "dos-model-list",
             "dos-model-resolve",
-            "dos-sprint",
-            "dos-watch",
             "dos-job",
             "dos-setup",
             "dos-url",
             "dos ARGS='<cmd>'",
         ):
             self.assertIn(target, help_text)
+        self.assertNotIn("dos-sprint", help_text)
+        self.assertNotIn("dos-watch", help_text)
 
     def test_full_help_describes_every_maintenance_command(self):
         """A name is not documentation. `make dos-help` must say what each
