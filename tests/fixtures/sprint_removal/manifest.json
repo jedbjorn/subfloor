@@ -401,6 +401,42 @@
     ],
     "task": 170
   },
+  "guidance_removal": {
+    "authored_scan_paths": [
+      "README.md",
+      "docs/README.md",
+      "docs/quick-start.md",
+      ".super-coder/Dockerfile",
+      ".super-coder/adapters/claude/README.md",
+      ".super-coder/adapters/codex/README.md",
+      ".super-coder/adapters/kimi/README.md",
+      ".super-coder/api/transport.py",
+      ".super-coder/assets/skills/engine_surgery/SKILL.md",
+      ".super-coder/assets/skills/memory/SKILL.md",
+      ".super-coder/assets/skills/messaging/SKILL.md",
+      ".super-coder/assets/skills/test_authoring/SKILL.md",
+      ".super-coder/migrations/0001_seed_skills.sql",
+      ".super-coder/migrations/0145_reseed_generic_guidance.sql",
+      ".super-coder/scripts/live_model/__init__.py",
+      ".super-coder/scripts/models.py",
+      ".super-coder/scripts/shell_liveness.py",
+      ".super-coder/ui/app.js",
+      ".super-coder/ui/index.html",
+      ".super-coder/ui/style.css",
+      "sc"
+    ],
+    "forbidden_pattern": "(?:\\bsprints?\\b|\\bconductor\\b|SC_SPRINT_|pr_event|watched_prs|watch-daemon|interface_(?:generations|sessions|writer_leases|input_state|idempotency_keys|recovery_observations)|planner_(?:wake_batches|wake_items|action_receipts|alerts))",
+    "removed_paths": [
+      "docs/images/analytics.png",
+      "docs/images/cover.png",
+      "docs/images/interface-tab.png",
+      "docs/u7-codex-readiness-findings.md",
+      "reviews/sprint14-conformance.md",
+      "tests/test_sprint_decoupling.py",
+      "tests/test_sprint_no_render_read.py"
+    ],
+    "task": 171
+  },
   "scan_roots": [
     "sc",
     ".super-coder",

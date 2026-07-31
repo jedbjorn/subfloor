@@ -2,7 +2,7 @@
 """Mutation proofs for L&S self-curation (migration 0100).
 
 This ships a GUARD, and a guard is only worth what it REFUSES. One of this
-repo's own L&S entries records `render-check` sitting inert for three sprints
+repo's own L&S entries records `render-check` sitting inert for three cycles
 while announcing success with a green checkmark — so nothing here asserts that
 a legal write works and calls the cap proven. Every cap is proven by writing
 OVER it and demanding the abort; every advisory is proven by driving the

@@ -67,11 +67,11 @@ trees afterwards.
 |---|---|---|
 | pull the main checkout | cheap, safe, no session impact | stale reads |
 | apply pending migrations | low; back up first | stale DB rows |
-| `./sc update` + restart | refuses on live Interface state; **restart kills live sessions** | stale running process |
+| `./sc update` + restart | **restart kills live sessions** | stale running process |
 
-Pull after every merge. Reconcile and restart at **sprint boundaries** — never
-mid-sprint, because a restart kills working devs and swapping the floor under an
-in-flight unit is its own hazard. The restart is the FnB's call.
+Pull after every merge. Reconcile and restart only at a coordinated idle
+boundary: a restart kills working shells, and swapping the floor under active
+work is its own hazard. The restart is the FnB's call.
 
 ## Migrating the live DB
 

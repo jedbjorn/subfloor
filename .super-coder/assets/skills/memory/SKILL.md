@@ -27,8 +27,8 @@ a decision's reasoning, a spec's gate, a flag's argument all pasted inline when
 each is a live row one query away. Name what is in flight and carry the id:
 
 ```
-Sprint 59 U0 gate — see doc #46, feature #29.
-Blocked on flag #200. Next: U3 shape once U0 answers.
+Feature #29 task #171 gate — see doc #44.
+Blocked on flag #200. Next: task #172 after the blocker clears.
 ```
 
 Not the argument, the ruling, or the rationale — those have rows, and a reader
@@ -58,7 +58,7 @@ sc mem retire <entry_id>   # curate out (frees a cap slot)
 
 Operating lessons, imperative voice. An entry is **the RULE** — **≤500 chars,
 hard**. The incident that taught it goes in the narrative, where you already
-wrote it; if the text opens with "Sprint 38:", it is a narrative entry.
+wrote it; if the text opens with an incident timestamp, it is a narrative entry.
 
 **Exactly one of `--supersedes` / `--new` is required.** Your active set is
 already rendered in your boot doc, so checking a new rule against it costs no

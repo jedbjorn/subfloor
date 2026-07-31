@@ -61,7 +61,7 @@ stands alone; do NOT hunt for one the fork doesn't ship.
    the worst possible correlation: the suite hangs or exhausts a pool
    only when it is catching bugs (a close-after-assert probe connection
    deadlocked three concurrent pytest runs of one file for four hours in
-   a dos-arch sprint). Open in a fixture (`yield` + teardown /
+   a release gate). Open in a fixture (`yield` + teardown /
    `addfinalizer`) or a `with` block; teardown must run on the red path.
    Audit pattern: AST-scan the suite for opens whose close sits after an
    `assert` in the same body.

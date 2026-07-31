@@ -1,4 +1,4 @@
-"""Mutation round trips for spec #48 / sprint 45 U11 — per-request /vendor
+"""Mutation round trips for spec #48 U11 — per-request /vendor
 resolution and the honest failure report.
 
 Acceptance evidence, committed rather than run once in a session that dies

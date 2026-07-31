@@ -1,4 +1,4 @@
--- 0096 — Account Analytics: harness quota registry + window snapshots (spec doc 49, feature 17, sprint doc 52).
+-- 0096 — Account Analytics: harness quota registry + window snapshots (spec doc 49, feature 17).
 --
 -- Feature #17's collector answers *what did we spend* by parsing what each
 -- harness writes to disk after the fact. It cannot answer *how much is left*:

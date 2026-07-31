@@ -1,6 +1,6 @@
 -- 0077 — reseed: docs skill — single-writer note.
 --
--- Sprint 25 ruling (decision #20) deferred SC-012/013/014: rendered artifacts
+-- Decision #20 deferred SC-012/013/014: rendered artifacts
 -- (content.sql + flat renders) are created only by manual admin-shell or GUI
 -- actions, so a single in-process API lock suffices and cross-process
 -- concurrency is out of scope for v1 (roadmap #21). The docs skill's Author

@@ -1,8 +1,8 @@
 """live_model — the model a session is using RIGHT NOW, read from its transcript.
 
-The launch route (`interface_sessions.model_route`) records what a session was
-STARTED with. An in-harness `/model` switch never reaches the engine, so the
-launch route silently goes stale (decision #55, superseding #53). Harness
+The launch metadata records what a session was STARTED with. An in-harness
+`/model` switch never reaches the engine, so launch metadata silently goes
+stale (decision #55, superseding #53). Harness
 transcripts, however, carry per-message model ids — so an explicit `last_model`
 derived from the last main-thread assistant message is truthful where the
 launch label and the analytics aggregate are not (flag #136: the

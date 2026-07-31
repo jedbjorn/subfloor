@@ -1685,11 +1685,11 @@ trees afterwards.
 |---|---|---|
 | pull the main checkout | cheap, safe, no session impact | stale reads |
 | apply pending migrations | low; back up first | stale DB rows |
-| `./sc update` + restart | refuses on live Interface state; **restart kills live sessions** | stale running process |
+| `./sc update` + restart | **restart kills live sessions** | stale running process |
 
-Pull after every merge. Reconcile and restart at **sprint boundaries** — never
-mid-sprint, because a restart kills working devs and swapping the floor under an
-in-flight unit is its own hazard. The restart is the FnB''s call.
+Pull after every merge. Reconcile and restart only at a coordinated idle
+boundary: a restart kills working shells, and swapping the floor under active
+work is its own hazard. The restart is the FnB''s call.
 
 ## Migrating the live DB
 
@@ -2556,8 +2556,8 @@ a decision''s reasoning, a spec''s gate, a flag''s argument all pasted inline wh
 each is a live row one query away. Name what is in flight and carry the id:
 
 ```
-Sprint 59 U0 gate — see doc #46, feature #29.
-Blocked on flag #200. Next: U3 shape once U0 answers.
+Feature #29 task #171 gate — see doc #44.
+Blocked on flag #200. Next: task #172 after the blocker clears.
 ```
 
 Not the argument, the ruling, or the rationale — those have rows, and a reader
@@ -2587,7 +2587,7 @@ sc mem retire <entry_id>   # curate out (frees a cap slot)
 
 Operating lessons, imperative voice. An entry is **the RULE** — **≤500 chars,
 hard**. The incident that taught it goes in the narrative, where you already
-wrote it; if the text opens with "Sprint 38:", it is a narrative entry.
+wrote it; if the text opens with an incident timestamp, it is a narrative entry.
 
 **Exactly one of `--supersedes` / `--new` is required.** Your active set is
 already rendered in your boot doc, so checking a new rule against it costs no
@@ -2638,7 +2638,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'messaging',
-  'Shell-to-shell inbox — send a markdown message to another shell (typed: shell/task/result; pr_event is daemon-emitted), check your unread inbox, verify delivery via the sent view, mark messages read. Driven by `sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.',
+  'Shell-to-shell inbox — send a markdown message to another shell (typed: shell/task/result), check your unread inbox, verify delivery via the sent view, mark messages read. Driven by `sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.',
   'substrate',
   'sc mem message',
   1,
@@ -2653,19 +2653,13 @@ Args: `check [N] | send <to-shortname> <body> [--kind k] | sent | mark-read <id>
 
 ## Message kinds
 
-Every message carries a `kind` — the trail stays filterable
-(`SELECT * FROM shell_messages WHERE kind != ''shell''` replays a sprint''s
-whole coordination history):
+Every message carries a `kind`, so ordinary mail, delegated tasks, and
+completion evidence remain independently filterable:
 
 - `shell` — ordinary shell-to-shell mail (the default; what `send` does
   unless told otherwise).
-- `task` — planner → worker instruction (a sprint kickoff / re-task).
+- `task` — a bounded instruction for another shell.
 - `result` — worker → planner completion or transition report.
-- `pr_event` — GitHub watcher daemon → shell PR transition (checks
-  green/red, review submitted, merged, closed). Daemon-emitted only:
-  `send` refuses it — a forged PR event would poison the wake loop''s
-  ground truth. Detail lives in `gh`; the row is the wake-up, not the
-  payload.
 
 ## check — your unread inbox
 
@@ -2685,7 +2679,7 @@ sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
 
 - Multi-word body = one quoted argument; markdown preserved verbatim.
 - Examples: `sc mem message send cartographer "map is stale — re-run sc map"`
-  · `sc mem message send plan1 "sprint 12: unit 3 merged (PR #41)" --kind result`
+  · `sc mem message send plan1 "feature 12 task 3 complete (PR #41)" --kind result`
 - `cartographer` is a **role alias**: when no shell has that literal
   shortname, it resolves to the fork''s cartographer shell whatever its
   shortname (e.g. `CART1`). Address the map-keeper as `cartographer` — no
@@ -3964,7 +3958,7 @@ stands alone; do NOT hunt for one the fork doesn''t ship.
    the worst possible correlation: the suite hangs or exhausts a pool
    only when it is catching bugs (a close-after-assert probe connection
    deadlocked three concurrent pytest runs of one file for four hours in
-   a dos-arch sprint). Open in a fixture (`yield` + teardown /
+   a release gate). Open in a fixture (`yield` + teardown /
    `addfinalizer`) or a `with` block; teardown must run on the red path.
    Audit pattern: AST-scan the suite for opens whose close sits after an
    `assert` in the same body.

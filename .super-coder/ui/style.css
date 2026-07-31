@@ -1046,119 +1046,6 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
   background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
   font: 12px/1.5 ui-monospace, monospace; color: var(--ink); user-select: all; }
 
-/* Sprint observation — Planner-armed, with operator messaging/Stop/Cancel. */
-#view-sprints, .sprint-board { min-width: 0; }
-#view-sprints { max-width: 1350px; }
-.sprint-board { overflow: hidden; }
-.sprint-group-title { margin: 1.2rem 0 .45rem; color: var(--dim);
-  font-size: .75rem; letter-spacing: .08em; text-transform: uppercase; }
-.sprint-board.sprint-closing { border-color: var(--warn); }
-.sprint-board.sprint-history { opacity: .82; }
-.sprint-header { display: flex; align-items: baseline; gap: .5rem; min-width: 0; }
-.sprint-header h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap; }
-.sprint-cancel { margin: 0 0 0 auto; color: #ef7d86; white-space: nowrap; }
-.sprint-meta { color: var(--dim); font-size: .78rem; margin-bottom: .7rem; }
-.sprint-state.state-cancelling, .sprint-state.state-closing {
-  color: var(--warn); }
-.sprint-state.state-closed { color: var(--ok); }
-.sprint-state.state-aborted { color: #ef7d86; }
-.sprint-cancellation-progress { flex-basis: 100%; color: var(--warn); }
-.sprint-flow { width: 100%; min-width: 0; overflow-x: auto; padding: .2rem 0 .35rem; }
-.sprint-flow-inner { position: relative; min-width: 850px; }
-.sprint-wires { position: absolute; inset: 0 auto auto 0; z-index: 0;
-  pointer-events: none; overflow: visible; }
-.sprint-cols { position: relative; z-index: 1; display: flex; gap: 35px;
-  align-items: flex-start; padding: 0 .15rem; }
-.sprint-col { flex: 1 1 0; min-width: 150px; display: flex;
-  flex-direction: column; gap: .65rem; }
-.sprint-col-head { display: flex; align-items: center; gap: .35rem;
-  min-height: 1.6rem; padding-bottom: .3rem; border-bottom: 1px solid var(--line-soft);
-  color: var(--dim); font-size: .7rem; font-weight: 650; letter-spacing: .08em;
-  text-transform: uppercase; }
-.sprint-col-head .count { min-width: 1.3rem; padding: 0 .32rem;
-  border: 1px solid var(--line); border-radius: 999px; color: var(--ink);
-  font-size: .65rem; line-height: 1.25rem; text-align: center; }
-.sprint-unit { width: 100%; min-width: 0; padding: .55rem .6rem; border: 1px solid var(--line);
-  border-left: 3px solid var(--line); border-radius: 9px; background: var(--panel2);
-  cursor: pointer; transition: opacity .12s, border-color .12s, box-shadow .12s; }
-.sprint-unit:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.sprint-unit.pending { border-left-color: var(--lock); }
-.sprint-unit.working { border-left-color: var(--task-open); }
-.sprint-unit.in_review { border-left-color: var(--accent); }
-.sprint-unit.blocked, .sprint-unit.unrecognized { border-left-color: var(--warn); }
-.sprint-unit.done { border-left-color: var(--ok); }
-.sprint-unit-title, .sprint-unit-overlap {
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.sprint-unit-title { font-size: .82rem; font-weight: 600; }
-.sprint-unit-title .idnum { color: var(--accent); }
-.sprint-unit-state { margin-top: .35rem; }
-.sprint-unit-state .pill.working { color: var(--task-open); }
-.sprint-unit-state .pill.in_review { color: var(--accent); }
-.sprint-unit-state .pill.blocked,
-.sprint-unit-state .pill.unrecognized { color: var(--warn); }
-.sprint-unit-state .pill.done { color: var(--ok); }
-.sprint-unit-roles { display: flex; flex-direction: column; gap: .05rem;
-  margin-top: .35rem; color: var(--dim); font-size: .72rem; }
-.sprint-role.active { color: var(--accent); font-weight: 650; }
-.sprint-role.warn { color: var(--warn); }
-.sprint-unit-deps, .sprint-unit-overlap, .sprint-unit-delivery {
-  margin-top: .35rem; color: var(--dim); font-size: .7rem;
-}
-.sprint-dep-warning { margin-left: .25rem; }
-.sprint-unit-details { min-width: 0; }
-.sprint-unit-delivery { display: flex; flex-direction: column; min-width: 0; }
-.sprint-unit-delivery > span { overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap; }
-/* Wires are ink-on-demand: invisible at rest (each card's Depends: line
-   carries the standing signal), revealed by the spotlight rules below when a
-   card is hovered or selected. */
-.sprint-wire { fill: none; stroke: transparent; stroke-width: 1.6px; }
-.sprint-flow.sprint-spotlight .sprint-unit { opacity: .38; }
-.sprint-flow.sprint-spotlight .sprint-unit.lit { opacity: 1; border-color: var(--accent);
-  box-shadow: 0 0 0 1px rgba(110,168,254,.35); }
-.sprint-flow.sprint-spotlight .sprint-unit.selected {
-  box-shadow: 0 0 0 2px rgba(110,168,254,.58); }
-.sprint-flow.sprint-spotlight .sprint-wire { stroke: rgba(110,168,254,.1); }
-.sprint-flow.sprint-spotlight .sprint-wire.lit { stroke: var(--accent); stroke-width: 2px; }
-.sprint-conductor { margin-top: .7rem; border-top: 1px solid var(--line);
-  padding-top: .55rem; color: var(--dim); font-size: .75rem; }
-.sprint-conductor summary { cursor: pointer; color: var(--ink); }
-.sprint-conductor-transcript { display: flex; flex-direction: column; gap: .35rem;
-  max-height: 18rem; overflow-y: auto; padding: .55rem 0; }
-.sprint-conductor-line { white-space: pre-wrap; overflow-wrap: anywhere;
-  color: var(--dim); }
-.sprint-conductor-line.assistant { color: var(--ink); }
-.sprint-conductor-line.activity { color: var(--warn); }
-.sprint-conductor-controls { display: grid; grid-template-columns: minmax(0, 1fr) auto;
-  gap: .45rem; align-items: stretch; }
-.sprint-conductor-composer { min-width: 0; resize: vertical; }
-.sprint-conductor-actions { display: flex; flex-direction: column; gap: .35rem; }
-.sprint-conductor-actions .act { min-width: 5rem; }
-.sprint-assignments { margin-top: .8rem; border-top: 1px solid var(--line);
-  padding-top: .6rem; }
-.sprint-assignments h3 { margin: 0 0 .45rem; color: var(--dim);
-  font-size: .72rem; letter-spacing: .08em; text-transform: uppercase; }
-.sprint-assignment-list { display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: .45rem; }
-.sprint-assignment { min-width: 0; padding: .5rem .55rem;
-  border: 1px solid var(--line); border-left: 3px solid var(--line);
-  border-radius: 8px; background: var(--panel2); font-size: .72rem; }
-.sprint-assignment.state-working, .sprint-assignment.state-queued {
-  border-left-color: var(--task-open); }
-.sprint-assignment.state-waiting { border-left-color: var(--warn); }
-.sprint-assignment.state-failed, .sprint-assignment.state-unknown {
-  border-left-color: #ef7d86; }
-.sprint-assignment.state-cancelled { border-left-color: var(--dim); }
-.sprint-assignment.state-closed { border-left-color: var(--ok); }
-.sprint-assignment-head { display: flex; justify-content: space-between;
-  gap: .5rem; align-items: baseline; }
-.sprint-assignment-result { margin-top: .3rem; color: var(--ok);
-  overflow-wrap: anywhere; }
-.sprint-assignment-error { margin-top: .3rem; color: #ef7d86;
-  white-space: pre-wrap; overflow-wrap: anywhere; }
-
 /* Roadmap Flow view — feature dependency graph: cards in stage columns with an
    SVG wire overlay (blocker → blocked). Replaces the old mermaid flowchart. */
 .view-toggle { margin-bottom: .6rem; }
@@ -1243,8 +1130,6 @@ textarea, input[type=text], select { transition: border-color .12s, outline-colo
 .sess-full-title { font-size: .85rem; margin-bottom: .3rem; }
 .sess-ref { display: block; color: var(--dim); font-size: .72rem; margin-top: .3rem;
   overflow-wrap: anywhere; }
-.an-sprint { border-left: 2px solid var(--accent); padding-left: .6rem; margin: .4rem 0; }
-.an-sprint-head { display: flex; gap: .5rem; align-items: center; font-size: .85rem; padding: .2rem 0; }
 .an-more { text-align: center; margin: .8rem 0; }
 
 /* ── Analytics: stat cards + spline graph + range chips ── */

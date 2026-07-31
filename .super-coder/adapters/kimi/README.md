@@ -22,7 +22,7 @@ catch-all; kimi is the native Moonshot path.
 | `headless.launch` | non-interactive base argv (`kimi`) |
 | `headless.prompt_flag` | `-p`; run.py emits it immediately before the prompt value |
 | `headless.model_flag` | `-m`; the selector must be an alias discovered from `~/.kimi-code/config.toml` |
-| `headless.effort.env` | `KIMI_MODEL_THINKING_EFFORT`; sprint headless boots set it to `high` |
+| `headless.effort.env` | `KIMI_MODEL_THINKING_EFFORT`; applies an explicitly requested headless effort level |
 | `sandbox.launch_flags` | flags appended ONLY inside the docker sandbox, interactive launches only (`--yolo`) |
 
 **`--yolo` (sandbox, interactive only):** auto-approves all actions inside the
@@ -38,7 +38,7 @@ per-action approval prompts.
 
 **No interactive `model` field:** Kimi's `-m` selects a user-local alias from
 `~/.kimi-code/config.toml`, not a portable provider id, so an interactive flavor
-default remains unsafe. Headless sprint boots are different: Refresh models
+default remains unsafe. Headless boots are different: Refresh models
 discovers the exact local aliases (for example `kimi-code/k3`), the resolver
 accepts only a locally available high-effort route, and the adapter emits
 `kimi -m <alias> -p <prompt>`. A requested selector that cannot be applied fails

@@ -11,7 +11,7 @@ STYLE = (ROOT / ".super-coder" / "ui" / "style.css").read_text()
 
 
 def test_interface_is_a_first_class_reload_safe_view():
-    assert 'data-tab="interface"' in INDEX
+    assert '<button data-tab="interface">Chats</button>' in INDEX
     assert 'id="view-interface"' in INDEX
     assert 'interface: ["#view-interface", renderInterface]' in APP
     assert 'raw === "interface" || raw.startsWith("interface/")' in APP
@@ -271,10 +271,7 @@ def test_shell_rail_hides_labels_but_retains_ordered_flavor_dividers():
     assert (
         '"cartographer", "admin", "planner", "dev", "reviewer", "devops"'
     ) in APP
-    assert (
-        'const shells = allShells.filter((item) => '
-        'item.flavor !== "conductor")'
-    ) in interface
+    assert "const shells = allShells;" in interface
     assert "const orderedShells = orderedFlavors.flatMap" in interface
     assert "for (const item of orderedShells)" in interface
     assert 'const flavor = item.flavor || "bespoke"' in interface
@@ -283,6 +280,7 @@ def test_shell_rail_hides_labels_but_retains_ordered_flavor_dividers():
     assert 'className: "chat-shell-group"' not in interface
     assert ".chat-shell-group" not in STYLE
     assert ".chat-shell-divider" in STYLE
+    assert ".sprint-board" not in STYLE
 
 
 def test_history_metadata_and_all_shell_accents_poll_without_repainting_interface():

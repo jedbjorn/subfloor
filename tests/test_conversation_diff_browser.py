@@ -411,8 +411,6 @@ export { mode };"""
             )
         if path == "/api/models":
             return fulfill(route, {"harnesses": {}})
-        if path == "/api/sprints":
-            return fulfill(route, {"items": []})
         if path == "/api/conversations":
             return fulfill(route, {"items": [current]})
         if path == f"/api/conversations/{CONVERSATION_ID}":
@@ -837,8 +835,6 @@ def test_chat_performance_uses_bounded_requests_and_keyed_frames(static_ui):
                     ]
                 },
             )
-        if parsed.path == "/api/sprints":
-            return fulfill(route, {"items": []})
         if parsed.path == "/api/models":
             return fulfill(route, {"harnesses": {}})
         if parsed.path == "/api/flavor-defaults":

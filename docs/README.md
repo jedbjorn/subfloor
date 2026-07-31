@@ -26,10 +26,10 @@ ships — nothing patched, nothing forked:
 | Property | Ours | Enters the harness via |
 |---|---|---|
 | **Boot context** | identity · memory · laws · current state | the boot doc it reads natively (`CLAUDE.md` / `AGENTS.md`) |
-| **Native tooling** | the `./sc` CLI — `mem` · jobs · watches · brokers | the shell it already executes commands in |
+| **Native tooling** | the `./sc` CLI — `mem` · jobs · models · brokers | the shell it already executes commands in |
 | **Skills** | DB-canonical catalogue, per-shell grants | the skill dirs it already discovers |
 | **Guardrails** | branch-guard · sandbox · worktrees | its own hook / plugin seams + the environment it boots into |
-| **Orchestration** | eventing · headless boots · sprints | its headless mode (`claude -p` · `codex exec` · `opencode run`) |
+| **Coordination** | messages · detached jobs · headless boots | its headless mode (`claude -p` · `codex exec` · `opencode run` · `kimi -p`) |
 
 The overlay makes the harness you rent behave like it has all of this built
 in — without touching its loop. Think **distro over kernel**: the kernel (the
@@ -51,7 +51,7 @@ value: 5
 label: Shell flavors
 description: planner · reviewer · dev · cartographer · admin
 :::class2
-value: 8
+value: 9
 label: Review-GUI tabs
 :::class2
 value: 88xx
@@ -320,7 +320,7 @@ it owns:
    re-pushes; the thread closes when it's clean.
    *(dev · `dev_kit`, `test_authoring`, `flags`, `git` · UI: Flags)*
 10. **Operator merges** — merging is the FnB's gate, never a shell's (the one
-    scoped exception is a declared sprint — see *Sprints*). On dev's next boot
+    exception requires separate explicit operator authority). On dev's next boot
     the launcher auto-syncs the base onto `origin/main` and prunes the merged
     branch. *(operator gate; no shell skill · UI: Worktrees)*
 11. **Freeze spec + write docs** — on ship, the spec freezes (`frozen=1`,
@@ -381,9 +381,8 @@ default per harness (the `flavor_defaults` table — the picker pre-selects it;
 
 ★ = the harness the picker pre-selects for that flavor.
 
-The logic — defaults are set from **sprint success telemetry** (which
-model/flavor pairings actually land reviewed, merged work across the fleet),
-re-fit as the telemetry moves, plus three standing rules:
+The logic — defaults are set from observed model/flavor outcomes across the
+fleet, re-fit as the evidence moves, plus three standing rules:
 
 - **Bookends premium.** Planner and reviewer are *low-volume, high-leverage
   reasoning* — one good plan or one sharp review pays for the premium model
@@ -407,31 +406,23 @@ re-fit as the telemetry moves, plus three standing rules:
 > [!class2]
 > **Vibe and Kimi Code sit outside this matrix.** Neither takes a model from the launch seam. Vibe selects its own via `active_model` in `~/.vibe/config.toml` (`vibe --setup`) or `VIBE_ACTIVE_MODEL`, and takes no headless boot. Kimi Code selects via `default_model` in `~/.kimi-code/config.toml` (its `-m` wants a user-local alias, not a portable model id) — it *does* boot headless (`kimi -p`), on that configured default (`./sc run` covers claude · codex · opencode · kimi).
 
-### The sprint interview — models per role, per sprint
+### Headless model routing
 
-`flavor_defaults` + the picker cover interactive boots. Sprints boot workers
-**headlessly** (`./sc run` — no picker), so the model seam moves to the sprint
-declaration: the planner asks the operator exactly **two questions** — which
-harness and model for **devs** (one answer, every dev runs it), and which for
-**reviewers** (one answer, every reviewer runs it). The answers land in the
-sprint doc's header —
+`flavor_defaults` and the picker cover interactive boots. Generic headless
+launches have no picker, so resolve the exact local route before automation:
 
+```bash
+./sc models refresh
+./sc models list <harness>
+./sc models resolve <harness> <selector> --shell <shortname>
+./sc run <shortname> --harness <harness> -m <selector> -p "<bounded task>"
 ```
-models: devs=<harness>/<model> · reviewers=<harness>/<model>
-```
 
-— and parameterize every `./sc run` the planner issues for that sprint. No
-answer → `flavor_defaults`, unchanged. One answer per flavor is deliberate:
-shells of a flavor are interchangeable workers, and reviewers stay a
-*different lineage* from the code they gate — the doctrine above, chosen per
-sprint instead of per boot.
-
-The planner itself is not interviewed — it is already booted. **Strong
-recommendation, not a gate: run the planner on Claude.** The planner is the
-low-volume, high-leverage reasoning seat, the one long-lived context in the
-loop, and the only role the inbox watcher (`./sc watch inbox`, claude-only)
-fully serves. Any harness *works* in the planner seat — wake latency and
-ergonomics degrade, correctness doesn't.
+Refresh reads each installed harness's local catalogue. Resolve refuses
+advisory-only models, unsupported headless adapters, and effort levels the
+adapter cannot apply exactly. A failed refresh retains the last known routes as
+stale evidence instead of silently erasing them. Route records are local
+machine/account state and are not serialized into content snapshots.
 
 ### Keeping harnesses (and therefore models) current
 
@@ -487,359 +478,104 @@ needed. They all work the same repo without clobbering each other:
   fork's dev port, routed by subdomain — `http://<shortname>.localhost:<port>/`
   — and the post-commit hook prints the shell's URL after each commit.
 
-## Interface
+## Browser conversations
 
 > [!class2]
-> **UI** Interface · **Shells** all flavors (sprint wake is planner-only)
+> **UI** Chats · **Modes** Chat and Diff · **Shells** any ordinary shell
 
-Every interactive session runs inside a **tmux pane the engine owns**, not in
-the terminal you started it from. `./sc enter` is a *client* of that pane — and
-so is the browser. The Review GUI's **Interface** tab is a real terminal: pick a
-shell in the rail, and you're looking at its live harness TUI, with the same
-keyboard, slash commands, permission prompts, and model routing you get in a
-terminal. Nothing is re-implemented; subfloor streams the pane.
+The **Chats** tab hosts durable normal conversations. Select an available shell,
+choose a supported harness and model, and create a chat without opening a
+terminal. Each accepted message is stored before dispatch, queued in order, and
+resumed against the exact harness-native session recorded for that conversation.
 
-![Review GUI, Interface tab — the shell rail with per-shell availability, the live harness TUI streamed into the browser, and the message composer](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/interface-tab.png)
+A shell has at most one open browser conversation. Browser and CLI ownership
+are mutually exclusive: a CLI launch refuses while browser chat is open, and a
+browser conversation refuses while a CLI session owns the shell. **Close** is
+the explicit browser-to-CLI handoff.
 
-What the tmux host buys you:
+### Chat lifecycle
 
-- **A session outlives its client.** Close the tab, drop the SSH link, kill the
-  terminal emulator — the harness keeps working. Reattach and the pane is still
-  there, mid-turn if that's where you left it.
-- **One live chat per shell, seen the same way everywhere.** Browser and CLI
-  attach to the *same* generation. There is no second process to reconcile, and
-  no provider-side "resume" — the tmux pane is the continuity.
-- **Reattach is a redraw, not a replay.** A headless xterm sidecar keeps each
-  generation's grid, so a fresh attach paints the current screen — alternate
-  screen, colors, cursor, modes intact — instead of dumping scrollback at you.
-- **Every writable byte is serialized.** An API-owned input broker orders and
-  acknowledges input from all sources before it reaches the pane, so a browser
-  keystroke, a CLI paste, and an automatic sprint wake can never interleave
-  into one garbled line.
+- **New chat** creates a distinct durable conversation and closes only an idle,
+  waiting, or failed prior chat for that shell.
+- Messages submitted during an active turn remain ordered in the queue; they do
+  not interrupt the running turn.
+- **Stop** interrupts only the active turn and preserves queued follow-ups.
+- **Close** cancels queued work, requests interruption when needed, waits for
+  terminal proof, and then releases the shell.
+- Closed conversations remain readable history. Stars pin important chats
+  without changing their lifecycle.
+- Browser refresh resumes from a bounded transcript snapshot plus the live event
+  cursor; the harness transcript is evidence, never the message queue.
 
-### The Interface tab
+The broker owns dispatch and crash recovery. It leases an outbox item, creates
+one run, starts or exactly resumes the harness session, stores normalized
+events, and commits the terminal result before releasing the lease. Startup and
+lease-expiry scans are bounded recovery, not scheduled work discovery.
 
-The left rail lists every shell with the state the API can *prove*, not a
-guess:
+### Chat and Diff
 
-| Rail state | Means |
+**Chat** renders user prompts, assistant output, durable activity, queue state,
+and recovery controls. Large histories load in bounded pages and transcript
+snapshots; omitted display history remains durable.
+
+**Diff** is a read-only projection of the same conversation's live worktree,
+branch, or pull request. Switching to Diff does not stop the run or open a
+second conversation. The view preserves review after local branch cleanup by
+using the stored Git target and canonical merged-PR patch when available.
+
+The browser receives normalized conversation and Git-review resources only. It
+never receives harness credentials or mutates a harness transcript directly.
+
+## Messages, jobs & headless launch
+
+> [!class2]
+> **UI** Shells · Scripts · **Shells** all flavors
+
+Three generic tools cover work that should not live in one interactive context.
+
+### Shell messages
+
+`./sc mem message` provides durable shell-to-shell mail:
+
+| Kind | Meaning |
 |---|---|
-| `available` | No live generation — the pane offers one **New chat** command (harness · model · effort, from the live model catalogue). |
-| `starting` | The reservation committed; the pane is spawning. Only **Cancel start** is offered — a reservation is not a terminal. |
-| `occupied` | One live API-managed generation owns the shell. The row shows harness and the model route it was *launched* with. |
-| `working` | A live harness process holds the shell with no Interface session of its own — typically a headless `./sc run` sprint worker, and the row names the sprint. Not startable, and *not* something to recover. |
-| `unreconciled` | A process holds the shell but every PID is orphaned (a closed terminal, a dead parent), or a spawn ended ambiguously. New chat stays blocked; recovery is offered. |
-| `lost` / `error` | The generation's diagnostics are preserved, with only the actions whose preconditions are actually satisfied. |
+| `shell` | ordinary coordination |
+| `task` | a bounded instruction for another shell |
+| `result` | completion evidence or a job outcome |
 
-Selecting an occupied shell attaches the terminal. The header carries the
-session's exact state — harness and launch route, archive age, whether you hold
-the **writer lease** or are read-only, whether the composer is clean, dirty, or
-unknown, and the sprint-wake state — behind **Details** and **Alerts**
-disclosures so the terminal keeps the viewport.
+`check` reads unread messages without acknowledging them; `mark-read` clears
+one only after it has been acted on. Sends carry a dedupe key, so a timed-out
+request can be verified with `sent` before any retry.
 
-Below it sits a **message composer**: type a line, hit **Send**, and it goes
-through the broker as ordered, acknowledged input — the convenient path when
-you just want to answer a shell rather than drive its TUI. **End chat** is the
-explicit, confirmed close; **certify clean** tells the broker the composer is
-empty (the one thing quiet time can never prove).
-
-**One writer at a time.** The first client to attach takes the writer lease;
-everyone else attaches read-only and can request an explicit **take-over**,
-which atomically revokes the old lease. Closing a viewer releases only that
-client's lease — never the chat.
-
-### From the CLI
-
-Same API, same state machine — the CLI never touches tmux or the DB behind the
-server's back:
+### Session-surviving jobs
 
 ```bash
-./sc enter                    # pick a shell → New chat or reattach, in one flow
-./sc interface status [shell] # the rail, as text (--json for scripts)
-./sc interface start <shell>  # scriptable New chat  [--harness H --model M --effort E]
-./sc interface view <shell>   # attach read-only — watch without taking the lease
-./sc interface attach <shell> # attach as writer (never steals an existing lease)
-./sc interface take-control <shell>   # explicit writer transfer
-./sc interface stop <shell>   # graceful end; --force only after a timeout, and it
-                              #   names the PID/generation it will end
-./sc interface reconcile <shell>      # revalidate tmux/process/lease state (--close)
-./sc interface recover <shell>        # preview + execute stranded-shell recovery
-./sc url                      # reprint the GUI URL the harness TUI overdrew
+./sc job start --label suite --timeout 1800 -- pytest
+./sc job list
+./sc job status <id>
+./sc job tail <id>
+./sc job wait <id>
+./sc job kill <id>
 ```
 
-`./sc boot` — the raw launch primitive — now **refuses** without an Interface
-reservation capability, so there is no side door that creates a second harness
-process outside the state machine.
+A job is a detached supervised one-shot. It outlives the shell session that
+started it, captures bounded output, group-kills on timeout, and posts a
+`result` message to the starting shell when it completes. Use it for suites,
+builds, and benchmarks that would otherwise die with the harness process.
 
-> [!class2]
-> **The GUI URL scrolls away now.** Because `./sc enter` hands the terminal to
-> the harness TUI inside the pane, the boot summary gets overdrawn. `./sc url`
-> (alias `make dos-url`) reprints this fork's Review GUI and dev-server URLs on
-> demand; `./sc launch` still prints them at start.
+### Generic headless launch
 
-### Signing in — and what that trusts
-
-Open the Interface tab and it works: no sign-in step, nothing to paste, no
-credential in the browser. A same-origin bootstrap mints an `HttpOnly`,
-`SameSite=Strict` session cookie plus an anti-forgery token held only in page
-memory; the mode-`0600` operator capability stays a CLI/server credential and
-never enters JavaScript. Streams additionally consume single-use tickets bound
-to session, generation, client, role, and expiry.
-
-That convenience is bought by a stated boundary: **subfloor is a
-personal-machine tool.** Other processes running as you are not treated as
-adversaries — they can already reach your repos, harness credentials, and
-terminal processes. What *is* defended, as release-critical controls: other web
-origins (exact `Origin` + `Sec-Fetch-Site`, CSRF on every mutation, CORS off),
-DNS rebinding (exact `Host` allowlist), and network exposure (loopback only —
-off-sandbox the server *exits* rather than bind wide; in the sandbox the fence
-is `./sc launch`'s `-p 127.0.0.1:PORT:PORT` mapping). Full threat model:
-[`.super-coder/docs/interface-trust-boundary.md`](../.super-coder/docs/interface-trust-boundary.md).
-
-> [!class4]
-> **If untrusted people use your machine, don't run subfloor on it.** That is
-> the boundary stated plainly, rather than a lock that implies a protection it
-> cannot deliver.
-
-### When a session strands
-
-A killed container, a crashed broker, or a harness that outlived its terminal
-leaves a shell that reads `unreconciled` — and a shell you cannot free is a
-shell you cannot use. **Recover** is evidence-fenced, not a big red button:
-preview first, and the API projects exactly what it observed (is the process in
-`/proc`, is the tmux pane present, is the worktree dirty), then offers only the
-actions that evidence makes legal. Proven-absent closes as bookkeeping;
-proven-live refuses; ambiguous stays ambiguous and says so. **Force recover**
-appears only after a graceful attempt has failed, and shows what it will end.
-`./sc interface recover <shell>` runs the identical preview/execute flow.
-
-### Waking a live planner
-
-During a sprint, events are durable rows (`task` / `result` / `pr_event`) — but
-a planner already sitting in a live pane needs to be *told*. Arming an `ACTIVE`
-sprint document to a planner generation lets the broker submit one fixed line:
-
-```
-Check your inbox and act on unread sprint events.
+```bash
+./sc models refresh
+./sc models resolve <harness> <selector> --shell <shortname>
+./sc run <shortname> --harness <harness> -m <selector> -p "<bounded task>"
 ```
 
-Message bodies never enter the terminal — the row is the work, the submission
-is only the doorbell. It fires only when every gate holds: a supported planner
-harness, lifecycle `idle`, composer **certified clean**, three seconds since
-the last accepted human input, and the broker owning the input queue. Any
-writable path that bypasses the broker makes input state unknown and disables
-automatic delivery; quiet time alone never turns dirty into clean. If the
-broker dies with a human frame reserved but unacknowledged, that frame parks as
-`delivery_unknown` and is **never** blind-replayed — the session disarms until
-you look at the pane and reconcile it.
-
-### Requirements
-
-Interface needs the Linux sandbox and a declared tmux — the image builds
-**tmux 3.5a from source** with a pinned checksum (the fence proofs are
-version-specific), and the runtime gates `tmux -V` ≥ 3.4 at startup. The
-browser terminal is vendored `@xterm/xterm`, with `@xterm/headless` as the
-redraw sidecar; nothing loads from a CDN. A non-Linux or no-sandbox server
-keeps the whole review UI and simply reports Interface unavailable — every
-other tab still works.
-
-## Sprints
-
-> [!class2]
-> **UI** Docs · **Shells** planner governs (`sprint_orchestration`) · devs build + reviewers gate (`sprint`)
-
-The everyday loop ships one feature through one dev, with the operator merging.
-A **sprint** is the multi-shell mode: a declared, planner-governed push where
-several shells build **dependent units** — B builds on A, C on B — and run the
-handoffs themselves. Every unit is built, reviewed, fixed, and **merged by the
-shells**: the loop is planner → devs → reviewers → devs → planner, self-running
-what the operator used to orchestrate by hand. You declare *that* a sprint
-happens; the planner makes it run.
-
-> [!class4]
-> **Prerequisite: a planned, spec'd feature.** A sprint doesn't start from an
-> idea — it starts from a thorough, multi-step feature already worked out with
-> the planner: recommendation, feature design, and the specs (usually more than
-> one) the units are cut from. Then start a **fresh session** and declare the
-> sprint — planning and sprinting don't share a chat.
-
-```linear
-Recommendation :::class3 -> Design feature + specs :::class3 -> New session :::class4 -> Sprint :::class1
-```
-
-```linear
-Declare :::class1 -> Kick off :::class1 -> Build :::class2 -> Review :::class3 -> Merge :::class2 -> Hand off :::class2 -> Close out :::class1
-```
-
-```mermaid
-graph TD
-  F[FnB directs a push]:::class4 --> D[Planner declares the sprint doc]:::class1
-  D --> K[Kickoff — scoped authority ON · task rows + headless worker boots]:::class1
-  K --> B[Dev builds its unit]:::class2
-  B --> P[PR open + watch registered → CI green]:::class2
-  P --> R[Sprint review]:::class3
-  R -->|Major / Medium findings| B
-  R -->|review-clean| M[Dev merges its own PR]:::class2
-  M -->|pr_event wakes planner → boots downstream dev| B
-  M --> C[all units merged]:::class1
-  C --> Q[Conformance pass — spec vs main]:::class3
-  Q -->|Major finding → fix unit| B
-  Q --> X[Close out — freeze the doc, authority OFF · watches self-retired · sprint report]:::class1
-```
-
-| Slot | Skill | Owns |
-|---|---|---|
-| **planner** | `sprint_orchestration` | decompose into units · sequence the chain · declare the board · kick off · monitor · unblock stalls · conformance pass + rulings · close out + synthesized report |
-| **dev** | `sprint` | build its unit · PR · babysit CI · fix review findings · merge on green+clean · file its unit report · hand off downstream |
-| **reviewer** | `sprint` | gate assigned units — Major/Medium block, Low goes to the report · declare `review-clean` |
-| **conformance** | `sprint` | judge the spec against `main` pre-freeze — four-way verdicts filed as a `CONFORMANCE:` doc · verdicts, never rulings |
-
-- **The sprint doc is the board — one writer.** The declaration is a
-  `documents` row (`SPRINT: <title>`, visible in the Docs tab): status line
-  (`ACTIVE | CLOSED`) plus one table row per unit — `seq · unit · shell ·
-  reviewer · depends on · branch · pr · status`. Unit status walks
-  `waiting → building → pr-open → in-review → fixing → merged`. The planner is
-  the doc's **only writer**; participants report transitions by message and the
-  planner folds them in. One writer, one board, no drift — the board is what
-  the operator and any rebooted shell reads to re-orient mid-sprint.
-- **Crew size is the planner's call, not a formula.** The planner weighs the
-  magnitude of the push against the capacity actually available — the shells
-  that exist, reviewer bandwidth, how wide the dependency graph genuinely
-  runs. More units than shells is fine (units queue behind the chain); more
-  shells than parallel work is waste. One reviewer may gate several units —
-  it just mustn't become the whole sprint's bottleneck.
-- **Scoped merge authority.** Merging stays the operator's gate everywhere —
-  a sprint grants the one narrow exception. A dev may merge **only** its
-  assigned unit's PR, **only** on all-green checks, **only** after its reviewer
-  declared review-clean (every Major/Medium fixed), **only** while the doc says
-  `ACTIVE` and isn't frozen. Anything outside those four conditions is the
-  default gate, unchanged — and the authority dies when the sprint closes.
-- **Events wake shells — nobody polls on a schedule.** A sprint is mostly
-  waiting for someone else's PR, and idle waiting used to cost a full-context
-  harness turn per poll, per shell. Now every instruction and result is a
-  typed `shell_messages` row: the planner sends `task` rows and boots workers
-  headless; a dev opens its PR and registers a watch for the planner; the
-  fork's ONE GitHub watcher daemon turns CI conclusions, reviews, and merges
-  into `pr_event` rows; the planner's zero-token inbox watcher wakes it the
-  moment any row lands. Waking is not knowing: on wake a shell re-reads the
-  board and its inbox — the event only says "look". The pieces and their
-  commands are *Under the hood — the event loop*, below.
-- **Models are declared per sprint.** Headless boots never pass the launch
-  picker, so the model seam moves to the declaration: the planner asks the
-  operator exactly two questions — which harness/model for **devs**, which
-  for **reviewers** — and the answers ride the sprint doc's `models:` line
-  into every `./sc run` of the sprint (see *Harnesses & models · The sprint
-  interview*). No answer → `flavor_defaults`, unchanged. Cross-provider is
-  first-class: devs on one harness, reviewers on another.
-- **Ambiguities are called, then reported.** A dev that hits a spec ambiguity
-  mid-unit makes the judgment call and keeps building — the chain doesn't wait
-  for a ruling — and reports the call to the planner in one line (what was
-  open, what it chose, why). The planner may overrule while the unit is
-  un-merged; silence ratifies. Every call lands in the sprint report.
-- **Review runs at sprint pace.** Same adversarial method as the everyday
-  loop, different gate: **Major/Medium findings block** the merge and loop the
-  dev through `fixing`; **Low findings inform** — one summary note to the
-  planner, landing in the sprint report as the post-sprint cleanup list.
-  Reviewers hand findings to the dev directly (scoped, like the merge
-  authority) instead of routing through the operator.
-- **Every merge closes with a unit report.** A dev's merged-notification is
-  a structured result row — `shipped / judgements / issues / deviations /
-  follow-ups` — filed at merge, while the unit's history is still in the
-  worker's context. `deviations` is the honesty field: declared here it's a
-  judgement to ratify; found later by the conformance pass it's a finding.
-- **A conformance pass gates the close.** "All units merged" and "the spec
-  shipped" are different claims — unit reviewers gate diffs, nobody else
-  reads the integrated whole. So after the last merge, **before** the freeze,
-  the planner boots review shell(s) to judge the spec against `main`: every
-  requirement gets one of four verdicts — `as-specced`,
-  `deviated-intentionally` (matches a ratified call), `deviated-silently`,
-  `unimplemented`. Major findings become fix units under still-active sprint
-  authority; Medium is a planner ruling; Low never holds the close. The
-  design is [`specs_sc/sprint-reporting.md`](../specs_sc/sprint-reporting.md).
-- **Close-out revokes everything, then reports.** Conformance rulings settled
-  → the planner sets `CLOSED`, freezes the doc (freezing **is** the
-  revocation — it's exactly what the `sprint` skill checks before any merge),
-  verifies every PR watch retired itself (`./sc watch list`), and
-  **synthesizes the sprint report** from the unit reports and the conformance
-  doc reconciled against each other — fixed skeleton: Verdict · Units
-  Shipped · Judgements Made · Spec Accuracy · Issues Encountered · Deferred &
-  Follow-ups · Spec Debt · Metrics — filed as a doc row and dropped as a copy
-  in the fork's `shared/` dir, with the `CONFORMANCE:` doc alongside as the
-  evidence trail.
-
-Enforcement is advisory in v1 — merge order and authority live in the skill
-text and the board, not in a pre-commit check. The planner absorbs mechanics
-(re-sequencing, stalls, severity disputes, booting workers — `./sc run` is
-the nudge that replaces "is it alive?"), and escalates judgment: scope cuts
-and interface changes stay the operator's calls. The daemon never boots
-anything — it only writes rows; only the planner (or the operator) starts a
-session.
-
-### Under the hood — the event loop
-
-Five pieces carry a sprint's coordination, one direction of flow. The frozen
-design is [`specs_sc/sprint-eventing.md`](../specs_sc/sprint-eventing.md).
-
-- **Typed messages.** Every `shell_messages` row carries a `kind`: `shell`
-  (ordinary shell-to-shell mail, the default), `task` (planner → worker
-  instruction), `result` (worker → planner completion report), `pr_event`
-  (daemon → shell GitHub transition). The sprint trail is one query, and a
-  rebooted planner — or the operator — can replay the whole coordination
-  history from the table alone.
-- **One watcher daemon per fork.** `./sc watch pr <owner/repo> <n>
-  --shell <shortname>` registers a PR in the `watched_prs` registry (the
-  `sprint` skill does it in the same step that opens the PR). The daemon —
-  supervised by `./sc launch` / `./sc down` like the brokers — covers every
-  live watch with one batched GraphQL poll and turns transitions (checks
-  concluded, review submitted, merged, closed) into one-line `pr_event`
-  rows: the message is the wake-up, not the payload. On merge/close a watch
-  retires itself (a merge whose checks are still pending keeps its watch until
-  they conclude); `./sc watch list` shows what's live. Each cycle the daemon
-  also beats a heartbeat row, so `list` / `pr` can say whether anybody is
-  actually polling — a watch can no longer report live with the daemon down.
-  The daemon only ever writes rows — it never boots shells and never touches
-  git.
-- **Headless workers.** `./sc run <shortname> [-p "<prompt>"]
-  [--harness <h>] [-m <model>]` boots a shell non-interactively: the same
-  render as `./sc enter`, then a per-harness adapter — `claude -p` ·
-  `codex exec` · `opencode run`. The default prompt is *"Check your inbox
-  and act on your unread messages."* Harness + model resolve explicit flags
-  → the sprint doc's `models:` line → `flavor_defaults`; a liveness guard
-  refuses a shell that already has a live session — and classifies sessions
-  that outlived their terminal as *orphaned*, so a dead boot is a labeled
-  fact, not a silent block. Workers become
-  ephemeral, per-task sessions — boot fresh, act, report a `result` row,
-  exit — so no worker context accretes across the sprint, while memory,
-  archives, and messages accrete in the DB exactly as in an interactive
-  session.
-- **A zero-token wake for the planner.** `./sc watch inbox` blocks until a
-  message row lands, then exits — armed as a background task, its exit
-  wakes the live planner session the moment anything arrives, at zero token
-  cost while idle. Claude-harness only; on other harnesses the planner
-  keeps the task-boundary inbox check, so correctness is identical and only
-  wake latency degrades. A planner sitting in a live Interface pane can also
-  be woken *at the terminal*: arm its generation to the `ACTIVE` sprint doc
-  and the input broker submits one fixed line, gated on idle + certified-clean
-  + quiet ([Interface → Waking a live planner](#interface)).
-- **Session-surviving jobs.** `./sc job start [--label <slug>] [--timeout <s>]
-  -- <cmd>` runs long local work — a suite, a bench, a build — as a detached,
-  supervised one-shot that **outlives the session that started it** (a harness
-  background task is session-scoped and dies with a headless boot, silently).
-  Completion lands as a `result` row in the starting shell's own inbox — the
-  same wake path PR events ride — and `--timeout` group-kills a wedged run
-  into a bounded failure *with* a wake-up, never a silent hole. `list` /
-  `status` / `tail` / `kill` complete the set; `./sc job wait <id>` is the
-  bounded foreground slice (≤ 550 s; exit 2 = still running — drain your inbox
-  between slices). Full doc: [`docs_sc/job-runner.md`](../docs_sc/job-runner.md).
-
-```linear
-Planner sends task row :::class1 -> sc run dev (headless) :::class2 -> Dev builds, opens PR + watch :::class2 -> CI concludes :::class3 -> Daemon writes pr_event :::class3 -> Watcher wakes planner :::class1 -> Planner boots next unit :::class1
-```
-
-The bar the feature shipped against: a unit goes task → build → PR → green →
-review → merge with **zero scheduled polling by any shell** — the planner is
-woken by rows, workers are booted per task, and the full history replays
-from `shell_messages`.
+`./sc run` renders the same shell identity and skills as an interactive boot,
+executes one non-interactive harness turn, records its archive, and exits.
+Model resolution is exact: unsupported aliases, headless adapters, or effort
+levels fail before launch. The caller owns the task contract and any follow-up
+message; the launcher does not invent workflow or merge authority.
 
 ## Update a fork
 
@@ -966,14 +702,10 @@ launch, enter, snapshot, render, and the GUI work unchanged.
 
 ```bash
 ./sc launch              # build + start the sandbox container (server + GUI), 127.0.0.1 only
-./sc enter               # attach a session: pick a shell, then New chat (harness picker) or reattach
-./sc enter-<shortname>   # attach + boot one shell directly, skip the shell picker
-./sc interface <verb>    # the same sessions, scriptable: status · start · view · attach ·
-                         #   take-control · stop · reconcile · recover  (see Interface)
+./sc enter               # boot a CLI session: pick a shell, harness, and model
+./sc enter-<shortname>   # boot one shell directly, skip the shell picker
 ./sc url                 # reprint this fork's Review GUI + dev-server URLs
-./sc run <shortname>     # headless boot: render + exec, drain the inbox, act, exit (sprint workers)
-./sc watch pr <o/r> <n>  # register a PR watch — the daemon turns its transitions into pr_event rows
-./sc watch inbox         # block until this shell has unread messages — the planner's zero-token wake
+./sc run <shortname>     # generic headless boot: render + exec one bounded task, then exit
 ./sc job start -- <cmd>  # run a long local command detached + supervised — survives the session,
                          #   completion lands in your inbox (wait/list/status/tail/kill complete the set)
 ./sc mem <cmd>           # a shell's own memory over the engine API (state · seed · lns · decision ·
@@ -1407,21 +1139,24 @@ plus the host steps it prints are the whole setup. Full design:
 [`.super-coder/docs/db-broker.md`](../.super-coder/docs/db-broker.md).
 
 > [!class2]
-> **Reboot-proof it all in one verb.** Every host-side daemon — the GitHub watch daemon and the four brokers — has a `-install` verb (a systemd `--user` unit). `./sc persist` runs them all in one pass: installs + enables every unit that applies to this fork (the watch daemon when `gh` is present; each broker when its block is linked), enables linger so they survive logout and reboot, and skips the rest with a reason. Idempotent — re-run any time.
+> **Reboot-proof it all in one verb.** Each host-side broker has a `-install`
+> verb (a systemd `--user` unit). `./sc persist` installs and enables every
+> broker linked to this fork, enables linger so they survive logout and reboot,
+> and skips the rest with a reason. Idempotent — re-run any time.
 
 ## Review GUI
 
 > [!class2]
-> **UI** this IS the GUI — Interface · Shells · Skills · Roadmap · Docs · Flags · Worktrees · Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)
+> **UI** this IS the GUI — Chats · Shells · Roadmap · Docs · Flags · Worktrees · Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)
 
-A zero-dependency localhost GUI to review the substrate — shells, roadmap,
-flags — and, since the Interface tab, to *drive* it. One stdlib Python server
-serves the JSON API, the static UI, and the terminal stream; no venv, no npm,
-no build step. Its ten tabs are the windows the workflow above refers to:
+A zero-dependency localhost GUI to review the substrate and hold normal browser
+conversations. One stdlib Python server serves the JSON API, static UI, and
+conversation event stream; no venv, no npm, no build step. Its nine tabs are
+the windows the workflow above refers to:
 
 | Tab | What it shows |
 |---|---|
-| **Interface** | The live terminals. Every shell in a rail with its proven availability; an available shell offers **New chat**, an occupied one streams its tmux-hosted harness TUI with a writer lease, composer, and recovery controls. The whole surface: [Interface](#interface). |
+| **Chats** | Durable normal conversations by shell: queued turns, streamed state, history, stars, Stop/Close recovery, and read-only Diff review. See [Browser conversations](#browser-conversations). |
 | **Shells** | Each shell's role, mandate, editable `current_state`, identity, decisions, and skill grants. The default landing tab. |
 | **Skills** | The skill catalogue (Repo · Substrate · Craft), with per-shell grant toggles and full content in a modal. |
 | **Roadmap** | Features in a planning funnel (Brainstorm → … → Shipped), each with its spec tasks, linked docs, and flag blockers. Two views — a **Board** for editing a feature inline, and a **Flow** that groups features by work-stream and wires their blocker dependencies (see below). |
@@ -1464,11 +1199,10 @@ The Roadmap tab renders the same feature rows two ways, toggled top-centre:
 
 The server runs **inside the sandbox container** as its foreground process, so
 `./sc launch` brings it up (printing its URL) and `./sc down` stops it;
-`./sc enter` then attaches you to a harness session hosted in that same
-container — a tmux pane the server owns, reached over the Interface API — so
-the shell and the GUI run side by side on one bind-mounted repo + creds, and
-the same session is attachable from the browser ([Interface](#interface)). The
-port publishes to `127.0.0.1` only.
+`./sc enter` starts a CLI-owned shell session, while the Chats tab starts a
+separate browser-owned conversation through the same harness adapters. The two
+surfaces never own one shell concurrently. The port publishes to `127.0.0.1`
+only.
 
 ```bash
 ./sc health    # curl /api/health
@@ -1530,10 +1264,8 @@ shortname names it) and archive time-window; anything ambiguous stays visibly
 **unattributed** rather than guessed. The Analytics tab reads it all back:
 per-class stat cards with harness/model filters, a local-day spend graph,
 usage panels (favorite model by flavor, peak day, features and specs shipped,
-docs outstanding), and a session history grouped by local day with sprint
-clusters and per-session token rollups.
-
-![Review GUI, Analytics tab — token-class stat cards with harness and model filters, the total-tokens spend graph, usage panels (favorite model by flavor, peak day, features and specs shipped, docs outstanding), and the day-grouped session history](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/analytics.png)
+docs outstanding), and a session history grouped by local day with per-session
+token rollups.
 
 The same reads are served as JSON at `/api/analytics/*` (session window +
 cursor, token totals and series, filters) for anything outside the GUI.

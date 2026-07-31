@@ -276,7 +276,7 @@ class ApiMemTest(unittest.TestCase):
         self.run_mem("flag", "close", str(fid),
                      "--notes", "REV1 verified at head f7f687c")
         with self.assertRaises(SystemExit):
-            self.run_mem("flag", "close", str(fid), "--notes", "closed per sprint")
+            self.run_mem("flag", "close", str(fid), "--notes", "closed without evidence")
         row = self.q("SELECT resolution_notes, resolved FROM flags WHERE flag_id=?",
                      fid)
         self.assertEqual(row["resolution_notes"], "REV1 verified at head f7f687c")

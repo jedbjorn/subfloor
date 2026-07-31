@@ -938,54 +938,6 @@ print('-> pg: added to $f')
 }
 
 
-# ── GitHub PR polling cutover (spec #20 task #85, decision #19) ──────────────
-# The supervised engine service is the fork's SOLE PR poller — it starts with
-# the sandbox (`launch`) and polls only watches armed to an ACTIVE sprint. The
-# legacy HOST watch daemon (a second, direct-DB writer) is RETIRED: `up` and
-# `install` refuse so no legacy supervision can be (re)created, while `down`
-# and `uninstall` stay fully functional — they ARE the cutover's stop+disable
-# for forks that still have the old nohup/systemd supervision lying around.
-WATCH_DAEMON_PID="$ENGINE/run/watch-daemon.pid"
-WATCH_DAEMON_UNIT="sc-watch-daemon-$(basename "$here").service"
-
-sc_watch_daemon_unit_active() {
-  command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet "$WATCH_DAEMON_UNIT" 2>/dev/null
-}
-sc_watch_daemon_alive() {
-  # pid exists AND is actually the daemon — a stale pidfile surviving a host
-  # reboot can point at a reused pid, and a bare kill -0 would false-report it.
-  [ -f "$WATCH_DAEMON_PID" ] || return 1
-  pid="$(cat "$WATCH_DAEMON_PID" 2>/dev/null)"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
-  ps -p "$pid" -o args= 2>/dev/null | grep -q "watch\.py daemon"
-}
-sc_watch_daemon_up() {
-  echo "→ watch-daemon: RETIRED (spec #20, decision #19) — the engine service is the sole PR poller; nothing started"
-  return 0
-}
-sc_watch_daemon_down() {
-  if sc_watch_daemon_alive; then
-    kill "$(cat "$WATCH_DAEMON_PID")" && echo "→ legacy watch-daemon stopped"
-  elif sc_watch_daemon_unit_active; then
-    echo "→ legacy watch-daemon is systemd-managed ($WATCH_DAEMON_UNIT) — leaving it; use watch-daemon-uninstall"
-  else
-    echo "→ watch-daemon not running"
-  fi
-  rm -f "$WATCH_DAEMON_PID"
-}
-sc_watch_daemon_install() {
-  echo "✗ watch-daemon-install: RETIRED (spec #20, decision #19) — the engine service is the sole PR poller." >&2
-  echo "  To remove a legacy unit: ./sc watch-daemon-uninstall" >&2
-  return 1
-}
-sc_watch_daemon_uninstall() {
-  command -v systemctl >/dev/null 2>&1 || { echo "✗ watch-daemon-uninstall: systemd not found" >&2; return 1; }
-  systemctl --user disable --now "$WATCH_DAEMON_UNIT" 2>/dev/null || true
-  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$WATCH_DAEMON_UNIT"
-  systemctl --user daemon-reload
-  echo "→ legacy watch-daemon systemd unit removed ($WATCH_DAEMON_UNIT)"
-}
-
 # ── persist: reboot-proof every applicable host-side daemon in one verb ───────
 # The #359 incident shape: a host reboot kills the nohup'd daemons while the
 # docker sandbox resurrects itself — the fork looks healthy with nobody
@@ -995,10 +947,6 @@ sc_watch_daemon_uninstall() {
 sc_persist() {
   command -v systemctl >/dev/null 2>&1 || {
     echo "✗ persist: systemd (systemctl) not found — nohup + \`./sc launch\` is the only supervision on this host" >&2; return 1; }
-  # The retired watch-daemon is not installed (the engine service is the sole
-  # PR poller — decision #19); a legacy unit, if one exists, is removed by
-  # ./sc watch-daemon-uninstall.
-  echo "→ persist: watch-daemon skipped (retired — the engine service polls)"
   if "$PY" "$S/vm.py" configured;  then sc_vm_broker_install;  else echo "→ persist: no VM linked — vm-broker skipped"; fi
   if "$PY" "$S/ts.py" configured;  then sc_ts_broker_install;  else echo "→ persist: no tailnet linked — ts-broker skipped"; fi
   if "$PY" "$S/pm2.py" configured; then sc_pm2_broker_install; else echo "→ persist: no pm2 stack linked — pm2-broker skipped"; fi
@@ -1129,15 +1077,6 @@ sc_restart_health_summary() {
     fi
   else
     echo "  postgres: skipped (unconfigured)"
-  fi
-  if sc_watch_daemon_unit_active; then
-    systemctl --user stop "$WATCH_DAEMON_UNIT" >/dev/null 2>&1 || true
-  fi
-  if sc_watch_daemon_alive || sc_watch_daemon_unit_active; then
-    echo "  legacy-watch-daemon: failed (retired service still running)"
-    SC_RESTART_FAILED=1
-  else
-    echo "  legacy-watch-daemon: skipped (retired; confirmed stopped)"
   fi
   [ "$SC_RESTART_FAILED" -eq 0 ]
 }
@@ -1456,8 +1395,6 @@ case "$cmd" in
     # Same for the read-only DB broker — it was previously omitted from the
     # sandbox lifecycle, so a restart could leave configured diagnostics down.
     sc_db_broker_up || true
-    # PR polling rides the engine service itself (spec #20, decision #19) —
-    # no host watch-daemon is started here anymore.
     # Start the PG sidecar when configured — self-skips otherwise.
     sc_pg_up || true ;;
   enter)        sc_urls || true; exec docker exec -it "$CNAME" ./sc boot "$@" ;;
@@ -1467,7 +1404,6 @@ case "$cmd" in
                 sc_ts_broker_down
                 sc_pm2_broker_down
                 sc_db_broker_down
-                sc_watch_daemon_down
                 sc_pg_down ;;
   # restart is a hard bounce — down runs `docker rm -f`, which SIGKILLs every
   # live session inside the sandbox along with whatever those sessions had not

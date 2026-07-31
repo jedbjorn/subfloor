@@ -50,8 +50,8 @@ a suite), so nothing here kills anything. The consumer (`sc run`'s guard, the
 operator) verifies idleness first: `ps -o etime=,stat= -p <pid>`, no child
 processes doing work, then `kill <pid>`.
 
-Launch claims (spec #76 H-25): lineage cannot answer for a headless sprint
-worker. It is detached from birth — no controlling TTY, launcher gone — so
+Launch claims (spec #76 H-25): lineage cannot answer for a generic headless
+shell. It is detached from birth — no controlling TTY, launcher gone — so
 'detached' describes how it was STARTED, not whether it is working, and between
 relaunches no process holds the worktree at all. `run.record_launch` therefore
 records the pid each headless boot is about to become (`shell_launch_records`),
@@ -335,8 +335,8 @@ def claim_live(claim: dict) -> bool:
     """Is the process a launch claim names still the one that was launched, and
     does it still hold that shell's worktree?
 
-    PARENTAGE IS NEVER ASKED — that is the whole of H-25. A headless sprint
-    worker is reparented to init the moment its launcher exits, so every
+    PARENTAGE IS NEVER ASKED — that is the whole of H-25. A headless shell is
+    reparented to init the moment its launcher exits, so every
     lineage-shaped question ('detached', 'a NORMAL headless session still has a
     live parent') answers about the launch style rather than about the work.
 
@@ -483,7 +483,7 @@ def orphan_split(shortname: str, snap: dict) -> "tuple[list[int], list[int]]":
     survivors of closed terminals / dead parents, not by a working session.
 
     A CLAIMED pid is never in the orphan half (H-25). The consumer of this list
-    is advice to kill, and a detached sprint worker is the one process that
+    is advice to kill, and a detached headless shell is the one process that
     reads as a remnant by lineage while being the healthiest thing on the box."""
     procs = [p for p in snap.get("processes", [])
              if (p.get("shortname") or "").lower() == shortname.lower()]
@@ -516,7 +516,7 @@ def record_state(shortname: str, snap: dict) -> "str | None":
                         out of the expected set stays visible.
     'expected_absent' — a launch claimed this shell and that process is gone.
                         The distinction the rail could not previously draw:
-                        between relaunches a sprint worker's shell held no
+                        between headless launches a shell held no
                         process at all and read as a bare 'available'.
     None              — no claim was ever made, or liveness is unsupported."""
     if not snap.get("supported"):
@@ -567,8 +567,8 @@ def _print_text(d: dict) -> None:
         print(f"\n⚠ {len(d['claimed_absent'])} shell(s) EXPECTED BUT ABSENT: "
               f"{', '.join(d['claimed_absent'])} — a headless launch claimed "
               f"each one and that process is gone. Not a remnant to kill; the "
-              f"opposite. Whether an absence is a FAULT is the sprint "
-              f"reconciler's call, never this scan's.")
+              f"opposite. Whether an absence is a fault belongs to the "
+              f"caller, never this scan.")
     print("\nVERDICT")
     if d["active_other_shells"]:
         print(f"  Live OTHER shells: {', '.join(d['active_other_shells'])}"

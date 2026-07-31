@@ -277,7 +277,7 @@ CREATE TABLE shell_messages (
     -- added by migration 0059. Kept out of this baseline CREATE on purpose:
     -- ADD COLUMN can't be IF NOT EXISTS and rebuild applies migrations after
     -- schema.sql, so inlining would double-define (the 0047 precedent). See
-    -- migrations/0059_sprint_eventing.sql.
+    -- migration 0059 (generic message-kind support).
     -- dedupe_key TEXT — idempotent send (#333), added by migration 0062
     -- (same migration-only precedent; unique partial index
     -- idx_shell_messages_dedupe rides in the migration).

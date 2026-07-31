@@ -1,4 +1,4 @@
-"""Mutation round trips for sprint 52 U4 — the Account Analytics UI.
+"""Mutation round trips for U4 — the Account Analytics UI.
 
 Acceptance evidence, committed rather than run once in a session that dies with
 it (the U1/U2/U3 convention). Each entry breaks ONE property in the real source,
@@ -10,7 +10,7 @@ pinned, whatever the suite's colour says.
 
 Asked per PROPERTY, not per test. Four of this unit's rules have TWO failure
 directions each, and a one-directional leg is satisfied by a fix that merely
-trades the bug for its mirror image — the shape U2's reviewer caught mid-sprint:
+trades the bug for its mirror image — the shape U2's reviewer caught mid-review:
 
   * n/a versus a measured zero: M9 draws a bar under an absent number (a meter
     reads as measured), M11 swallows a REAL 0% into n/a. Either alone blesses

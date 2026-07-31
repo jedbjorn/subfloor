@@ -1,6 +1,6 @@
 ---
 name: messaging
-description: Shell-to-shell inbox — send a markdown message to another shell (typed: shell/task/result; pr_event is daemon-emitted), check your unread inbox, verify delivery via the sent view, mark messages read. Driven by `sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.
+description: Shell-to-shell inbox — send a markdown message to another shell (typed: shell/task/result), check your unread inbox, verify delivery via the sent view, mark messages read. Driven by `sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.
 category: substrate
 command: sc mem message
 common: true
@@ -17,19 +17,13 @@ Args: `check [N] | send <to-shortname> <body> [--kind k] | sent | mark-read <id>
 
 ## Message kinds
 
-Every message carries a `kind` — the trail stays filterable
-(`SELECT * FROM shell_messages WHERE kind != 'shell'` replays a sprint's
-whole coordination history):
+Every message carries a `kind`, so ordinary mail, delegated tasks, and
+completion evidence remain independently filterable:
 
 - `shell` — ordinary shell-to-shell mail (the default; what `send` does
   unless told otherwise).
-- `task` — planner → worker instruction (a sprint kickoff / re-task).
+- `task` — a bounded instruction for another shell.
 - `result` — worker → planner completion or transition report.
-- `pr_event` — GitHub watcher daemon → shell PR transition (checks
-  green/red, review submitted, merged, closed). Daemon-emitted only:
-  `send` refuses it — a forged PR event would poison the wake loop's
-  ground truth. Detail lives in `gh`; the row is the wake-up, not the
-  payload.
 
 ## check — your unread inbox
 
@@ -49,7 +43,7 @@ sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
 
 - Multi-word body = one quoted argument; markdown preserved verbatim.
 - Examples: `sc mem message send cartographer "map is stale — re-run sc map"`
-  · `sc mem message send plan1 "sprint 12: unit 3 merged (PR #41)" --kind result`
+  · `sc mem message send plan1 "feature 12 task 3 complete (PR #41)" --kind result`
 - `cartographer` is a **role alias**: when no shell has that literal
   shortname, it resolves to the fork's cartographer shell whatever its
   shortname (e.g. `CART1`). Address the map-keeper as `cartographer` — no

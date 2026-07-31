@@ -23,8 +23,8 @@ the response body verbatim.
 | `moonshot_usages.json` | `GET` with the access token from `~/.kimi-code/credentials/kimi-code.json`, captured inside the **900-second** window after the operator booted Kimi. No refresh was performed to obtain it, and none may be: Kimi rotates its refresh token on every refresh, so a refresh by anything other than the Kimi CLI strands the CLI with an invalidated token and signs the operator out of the provider this panel monitors. To re-capture: ask the operator to boot Kimi, then capture within 15 minutes. |
 
 **They replaced transcriptions.** The previous fixtures were written from spec
-doc #49's observed-field tables rather than from the wire, because the sprint
-task scoped that unit to "capture fixtures from the spec's documented response
+doc #49's observed-field tables rather than from the wire, because the task
+scoped that unit to "capture fixtures from the spec's documented response
 shapes" rather than re-probe. Where those tables were wrong the probes were
 built wrong and every test agreed with them (flag #198). Six field-level
 defects — four in moonshot, one in openai, one in anthropic — were found only by
@@ -65,7 +65,7 @@ derivation under test — `used = limit - remaining` — lands on **zero**. Zero
 also what every *broken* derivation returns: a missing key coerces to `None` and
 then to 0, and a wrong nesting level finds nothing and yields 0. A test built
 only on the capture would therefore pass against a derivation that never works —
-this sprint's own vacuous-coverage shape, arriving in the fixture layer.
+the original gate's own vacuous-coverage shape, arriving in the fixture layer.
 
 So `test_limits_entry_unwraps_detail_and_derives_used` starts from the capture,
 holds its structure exactly, and moves only the numbers (`400`/`150` → `250`).

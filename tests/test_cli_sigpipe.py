@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SIGPIPE hygiene for the `sc` CLI surface (flag #384).
 
-`./sc sprint board | head -1` used to print the board and then a 12-line
+`./sc mem get roadmap | head -1` used to print one line and then a 12-line
 BrokenPipeError traceback: Python ignores SIGPIPE, so an early-closed reader
 surfaces as an exception out of whatever `print()` was running. Agent shells
 pipe `sc` output constantly, so that traceback lands in transcripts fleet-wide.
@@ -177,7 +177,7 @@ class EntrypointsTest(unittest.TestCase):
         self.assertIn("init_fork.py", self.blocks)
         self.assertGreaterEqual(len(self.blocks), 35,
                                 "scripts/ holds ~39 CLI entrypoints (the "
-                                "interface_* CLIs retired, conductor Step 1); "
+                                "retired CLI modules removed); "
                                 "a short scan means the finder broke, not "
                                 "that the tree shrank")
 

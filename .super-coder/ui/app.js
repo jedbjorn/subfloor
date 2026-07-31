@@ -4100,7 +4100,7 @@ async function renderInterface(root) {
   ]);
   if (generation !== chatRenderGeneration) return;
 
-  const shells = allShells.filter((item) => item.flavor !== "conductor");
+  const shells = allShells;
   if (!shells.length) {
     root.replaceChildren(el("div", { className: "card muted" }, "No shells."));
     return;

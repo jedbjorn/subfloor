@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""live_model probe — spec doc 44 (feature 17), sprint 45 unit 44-U1.
+"""live_model probe — spec doc 44 (feature 17), task 44-U1.
 
 Every fixture under tests/fixtures/live_model/ is a REAL transcript written by
 a REAL run of the harness it belongs to, captured deliberately for this unit
@@ -217,7 +217,7 @@ class SubagentNoise(ProbeCase):
 class SyntheticRecords(ProbeCase):
     """`<synthetic>` is a real claude model value — 50 records in the corpus.
 
-    PLN1 ruling (c), sprint 45: treat it (and any non-real id) as a
+    PLN1 ruling (c): treat it (and any non-real id) as a
     non-explicit record and keep walking back.
     """
 
@@ -237,7 +237,7 @@ class SyntheticRecords(ProbeCase):
         self.assertIn("claude-sonnet-5", models)
 
     def test_no_acceptance_fixture_rests_on_a_synthetic_transition(self):
-        """REV2's L1 on the 44-U0 scout (sprint 45): the scout's "60 mid-switch
+        """REV2's L1 on the 44-U0 scout: the scout's "60 mid-switch
         sessions" count only reaches 60 if `<synthetic>` is counted as a
         distinct model, so a switch fixture drawn from that pool could be a
         `<synthetic>` transition rather than a real operator switch — a test
@@ -678,7 +678,7 @@ class SilentTranscripts(ProbeCase):
     what these tests exist to stop. Read as "not mine", a silent CURRENT
     transcript hands the answer to the PREVIOUS session in the same project
     dir and the probe reports a dead session's model as `ok` — the one
-    falsehood this feature can state (sprint 45 L1). Read as "mine", a silent
+    falsehood this feature can state (review L1). Read as "mine", a silent
     file in a NEIGHBOUR's project dir blanks an answer that was perfectly good
     (L2). One fact decides both: `_encode` maps one character to one, so only
     a dir named EXACTLY this cwd's encoding can hold this cwd's sessions.
@@ -861,9 +861,8 @@ class Caching(ProbeCase):
 
 
 # The RouteProjection class was deleted here: it exercised
-# interface_routes._live_model, the Interface-session API projection of the
-# probe, which retired with the Interface stack (conductor Step 1). The probe
-# itself — the surviving surface — is covered by every class above.
+# the retired session-controller API projection of the probe. The probe itself
+# — the surviving surface — is covered by every class above.
 
 
 # ----------------------------------------------------------------- helpers
