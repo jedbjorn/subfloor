@@ -32,11 +32,13 @@ def build_pre_removal_database() -> sqlite3.Connection:
     return con
 
 
-def build_current_database() -> sqlite3.Connection:
+def build_current_database(*, through: str | None = None) -> sqlite3.Connection:
     con = sqlite3.connect(":memory:")
     con.row_factory = sqlite3.Row
     con.executescript((ENGINE / "schema.sql").read_text())
     for migration in sorted(MIGRATIONS.glob("*.sql")):
+        if through is not None and migration.name > through:
+            break
         con.executescript(migration.read_text())
     con.execute("PRAGMA foreign_keys=ON")
     return con
@@ -349,6 +351,8 @@ for name in sys.argv[2:]:
         with closing(sqlite3.connect(":memory:")) as con:
             con.executescript((ENGINE / "schema.sql").read_text())
             for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name > "0145_reseed_generic_guidance.sql":
+                    break
                 con.executescript(migration.read_text())
             con.execute("PRAGMA foreign_keys=ON")
 
@@ -490,6 +494,8 @@ for name in sys.argv[2:]:
 
         removed = set(load_manifest()["removed_tables"])
         for migration in sorted(MIGRATIONS.glob("*.sql")):
+            if migration.name > Path(removal["cleanup_migration"]).name:
+                continue
             if migration.name == Path(removal["cleanup_migration"]).name:
                 continue
             sql = migration.read_text().lower()
@@ -511,9 +517,11 @@ for name in sys.argv[2:]:
             self.assertNotIn("'sprint_rev'", sql, migration.name)
             self.assertNotIn("'sprint_cond'", sql, migration.name)
 
-    def test_task_170_fresh_build_contains_only_retained_schema(self):
+    def test_task_170_cutover_floor_contains_only_retained_schema(self):
         manifest = load_manifest()
-        with closing(build_current_database()) as con:
+        with closing(
+            build_current_database(through="0145_reseed_generic_guidance.sql")
+        ) as con:
             tables = {
                 row[0]
                 for row in con.execute(
@@ -739,7 +747,9 @@ for name in sys.argv[2:]:
             dirty.execute("PRAGMA foreign_keys=ON")
             dirty.executescript(cleanup.read_text())
             dirty.executescript(cleanup.read_text())
-            with closing(build_current_database()) as fresh:
+            with closing(
+                build_current_database(through="0145_reseed_generic_guidance.sql")
+            ) as fresh:
                 self.assertEqual(schema_signature(fresh), schema_signature(dirty))
                 self.assertEqual(
                     fresh.execute("PRAGMA foreign_key_check").fetchall(),

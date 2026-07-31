@@ -383,7 +383,7 @@ class ConversationBrokerCase(unittest.TestCase):
 
 
 class StoreContractTest(ConversationBrokerCase):
-    def test_normal_run_finishes_without_sprint_runtime_tables(self) -> None:
+    def test_normal_run_finishes_without_sprint_domain_writes(self) -> None:
         conversation_id = self.add_conversation()
         self.add_message(conversation_id)
         con = self.connect()
@@ -391,7 +391,6 @@ class StoreContractTest(ConversationBrokerCase):
             "sprint_assignment_results",
             "sprint_cancellations",
             "sprint_conversation_bindings",
-            "sprints",
         )
         present = {
             row[0]
@@ -400,6 +399,11 @@ class StoreContractTest(ConversationBrokerCase):
             ).fetchall()
         }
         self.assertTrue(set(absent_tables).isdisjoint(present))
+        self.assertTrue({"sprints", "sprint_events"}.issubset(present))
+        self.assertEqual(0, con.execute("SELECT COUNT(*) FROM sprints").fetchone()[0])
+        self.assertEqual(
+            0, con.execute("SELECT COUNT(*) FROM sprint_events").fetchone()[0]
+        )
         con.close()
 
         store = BrokerStore(self.db_path)
@@ -432,6 +436,13 @@ class StoreContractTest(ConversationBrokerCase):
                     (run.run_id,),
                 ).fetchone()[0],
                 "succeeded",
+            )
+            self.assertEqual(
+                (0, 0),
+                (
+                    con.execute("SELECT COUNT(*) FROM sprints").fetchone()[0],
+                    con.execute("SELECT COUNT(*) FROM sprint_events").fetchone()[0],
+                ),
             )
         finally:
             con.close()
