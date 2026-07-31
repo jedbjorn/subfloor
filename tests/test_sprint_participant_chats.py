@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,8 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 import sprint_participant_chats
 
 
-def substrate() -> sqlite3.Connection:
+@contextmanager
+def substrate():
     con = sqlite3.connect(":memory:")
     con.row_factory = sqlite3.Row
     con.executescript(
@@ -97,7 +99,10 @@ def substrate() -> sqlite3.Connection:
                  (103,7,30,'planner','codex','planner-test','high','active');
         """
     )
-    return con
+    try:
+        yield con
+    finally:
+        con.close()
 
 
 def create(
@@ -189,6 +194,29 @@ def test_replay_is_idempotent_and_conflicting_reuse_changes_nothing() -> None:
             == work
         )
         assert con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 1
+
+
+def test_caller_transaction_rolls_back_every_row_when_pointer_selection_fails() -> None:
+    with substrate() as con:
+        con.execute(
+            "CREATE TRIGGER reject_pointer BEFORE UPDATE OF current_conversation_id "
+            "ON sprint_participants BEGIN SELECT RAISE(ABORT,'pointer fault'); END"
+        )
+        con.commit()
+
+        with pytest.raises(sqlite3.IntegrityError, match="pointer fault"), con:
+            create(con, 101, "work", "s7:p101:work")
+
+        assert con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 0
+        assert (
+            con.execute("SELECT COUNT(*) FROM conversation_events").fetchone()[0] == 0
+        )
+        assert (
+            con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_conversations"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_fix_conversation_becomes_current_without_closing_persistent_work() -> None:
