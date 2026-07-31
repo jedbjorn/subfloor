@@ -366,12 +366,6 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
                 enter(mock.patch.object(server.backfill_shell_api_keys,
                                         "backfill"))
                 enter(mock.patch.object(server.mem_credentials, "provision"))
-                enter(mock.patch.object(server.pr_poller, "Poller"))
-                enter(mock.patch.object(
-                    server.conductor_runtime,
-                    "load_config",
-                    return_value=server.conductor_runtime.ConductorConfig(),
-                ))
                 broker_start = enter(mock.patch.object(
                     server.conversation_broker, "start_service"
                 ))
@@ -411,6 +405,19 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
             self._start("127.0.0.1"),
             (None, "127.0.0.1", True),
         )
+
+    def test_startup_imports_no_removed_scheduler(self):
+        for name in (
+            "pr_poller",
+            "conductor_runtime",
+            "conductor_routes",
+            "sprint_routes",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(
+                    hasattr(server, name),
+                    f"server startup still imports removed machinery: {name}",
+                )
 
     def test_startup_serves_the_wide_bind_in_the_sandbox(self):
         # The counterweight: over-refusing here would make `./sc launch`

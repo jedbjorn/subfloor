@@ -1209,16 +1209,6 @@ case "$cmd" in
                   exit 1
                 fi
                 printf '%s\n' "$sc_engine_ref" ;;
-  sprint)       exec "$PY" "$S/sprint.py" "$@" ;;
-  directives)   exec "$PY" "$S/conductor_contracts.py" directives "$@" ;;
-  events)       exec "$PY" "$S/conductor_contracts.py" events "$@" ;;
-  # ── sprint eventing: PR watches + inbox watcher (shell-side, API) and the
-  # GitHub watcher daemon (HOST-side foreground; -up/-down supervise it) ──
-  watch)             exec "$PY" "$S/watch.py" "$@" ;;
-  watch-daemon-up)   sc_watch_daemon_up ;;
-  watch-daemon-down) sc_watch_daemon_down ;;
-  watch-daemon-install)   sc_watch_daemon_install ;;
-  watch-daemon-uninstall) sc_watch_daemon_uninstall ;;
   # ── persist (HOST-side): reboot-proof all applicable daemons via systemd ──
   persist)           sc_persist ;;
   # ── session-surviving local jobs: detached supervised one-shots whose
@@ -1619,30 +1609,6 @@ super-coder — forkable shell substrate
                              own credential, so pasting a token by hand is no longer the everyday sign-in
   sc engine-ref            print the full engine pin from the canonical live checkout — safe from any shell
                              worktree; stdout is the 40-character SHA only
-  ./sc sprint unit <cmd>   the sprint board, as a record: add declares a unit (--sprint/--seq/--title, plus
-                             --dev/--reviewer/--depends-on/--overlap/--branch/--pr; an existing seq is a 409,
-                             never an upsert); set edits those fields but NOT state; state <s> moves one unit alone
-                             (pending|working|in_review|blocked|merged|cancelled) and restamps
-                             state_changed_at only when the state actually changes; list reads it.
-                             WRITES are planner-flavor only; every worker is refused 403 and reads freely.
-                             'none' clears a role or field (--pr -1)
-  ./sc sprint board        render the unit table from the record and print it (--sprint <doc-id>) — a VIEW,
-                             never written back into the document body; the doc keeps its prose
-                             Conductor slots boot explicitly with
-                             `./sc run <shortname> --slot <plan|dev|rev> --sprint <id> [--unit U]`;
-                             launch validates flavor and assignment, then embeds the exact sprint context.
-  ./sc directives <cmd>    Conductor directives: list/inspect read the durable queue; emit validates the
-                             authenticated shell's flavor against the data whitelist before inserting;
-                             act executes/refuses one pending row through the mechanical transition table
-  ./sc events <cmd>        sentinel observation log: list/inspect append-only evidence rows
-  ./sc watch pr <o/r> <n>  register a PR watch (--shell <name> subscribes another shell, e.g. the planner;
-                             --sprint <doc-id> arms it to an ACTIVE sprint); an immediate GitHub baseline
-                             is taken at registration, then the engine service poller turns transitions
-                             into pr_event inbox rows
-  ./sc watch list          live PR watches (--all includes retired)
-  ./sc watch reconcile     explicit one-shot poll of every armed watch (operator)
-  ./sc watch inbox         block until this shell has unread messages, then exit — the zero-token
-                             inbox watcher; arm as a background task and its exit is your wake-up
   ./sc job start -- <cmd>  run a long local command (suite/bench/build) detached + supervised — it
                              survives your session; completion lands in YOUR inbox as a result row
                              (--label <slug> names it, --timeout <s> kills the wedged process group)
@@ -1750,22 +1716,9 @@ super-coder — forkable shell substrate
   ./sc db-broker-install   supervise via a systemd --user unit (survives logout/reboot)
   ./sc db-broker-uninstall remove the systemd unit
 
-  GitHub PR polling (RETIRED host daemon — spec #20 task #85, decision #19):
-  the supervised engine service is now the fork's SOLE PR poller; it starts
-  with `launch` and polls only watches armed to an ACTIVE sprint. The legacy
-  direct-DB host daemon is retired — `sc watch daemon` prints the cutover
-  notice and exits clean. The start verbs are kept dispatchable for the same
-  reason, so old muscle memory gets the cutover notice instead of a bare
-  "unknown command"; the rest remain to REMOVE legacy supervision:
-  ./sc watch-daemon-up     RETIRED — prints the cutover notice, starts nothing (exit 0)
-  ./sc watch-daemon-install RETIRED — refuses on stderr, pointing at watch-daemon-uninstall (exit 1)
-  ./sc watch-daemon-down   stop a still-running legacy background daemon
-  ./sc watch-daemon-uninstall remove a legacy systemd --user unit
-
   Persist (HOST-side — reboot-proof the fork in one verb; #359): installs the
   systemd --user unit for every daemon that applies here (vm/ts/pm2/db brokers
-  when linked — the retired watch-daemon is no longer installed; the engine
-  service polls), enables linger, skips the rest with a reason. Idempotent:
+  when linked), enables linger, skips the rest with a reason. Idempotent:
   ./sc persist             install + enable --now every applicable unit
 
   Postgres sidecar (app-only; docker container on SC_NET, data in a named volume).

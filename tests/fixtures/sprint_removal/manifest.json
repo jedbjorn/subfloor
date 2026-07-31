@@ -3,6 +3,7 @@
     "tests/fixtures/sprint_removal/build_pre_removal_fixture.py",
     "tests/fixtures/sprint_removal/manifest.json",
     "tests/fixtures/sprint_removal/pre_removal.sql",
+    "tests/test_sprint_entrypoint_removal.py",
     "tests/test_sprint_removal_manifest.py"
   ],
   "baseline_migration_ledger": {

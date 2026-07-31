@@ -61,7 +61,6 @@ _LOG_LOCK = threading.Lock()
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
 import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
-import conductor_runtime  # noqa: E402  (Step 8 wake/config/doctor)
 import conversation_broker  # noqa: E402  (Feature #24 durable turn service)
 import conversation_launch  # noqa: E402  (canonical shell launch preparation)
 import db_driver  # noqa: E402
@@ -69,12 +68,9 @@ import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
 import sprint_lifecycle  # noqa: E402  (authoritative sprint state/ownership)
 sys.path.insert(0, str(ENGINE / "api"))
-import conductor_routes  # noqa: E402  (Step 4 directive/event contracts)
 import conversation_routes  # noqa: E402  (Feature #24 browser conversations)
 import review_routes  # noqa: E402  (Feature #26 browser Diff review)
-import sprint_routes  # noqa: E402  (sprint board API — /api/sprint-units)
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
-import pr_poller  # noqa: E402  (watched-PR polling — the service scheduler)
 import sprint_state  # noqa: E402  (the one structural sprint-liveness predicate)
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
@@ -576,21 +572,6 @@ def get_docs(con) -> dict:
         "d.frozen_date, r.title AS feature_title FROM documents d "
         "LEFT JOIN roadmap r ON r.feature_id = d.feature_id "
         "WHERE d.kind='doc' ORDER BY d.feature_id, d.seq"))}
-
-
-def get_active_sprints(con) -> dict:
-    """Project only authoritative ``state=active`` sprint records."""
-    ids = con.execute(
-        "SELECT sp.sprint_doc_id FROM sprints sp "
-        "JOIN documents d ON d.document_id=sp.sprint_doc_id "
-        "WHERE sp.state='active' AND d.frozen=0 "
-        "ORDER BY sp.handed_off_at,sp.sprint_doc_id"
-    ).fetchall()
-    sprints = [
-        sprint_routes._sprint_projection(con, row[0])  # one shared API shape
-        for row in ids
-    ]
-    return {"active_count": len(sprints), "sprints": sprints}
 
 
 _EMPTY_MAP = {"repo": None, "total_files": 0, "by_lang": [],
@@ -1163,24 +1144,6 @@ def patch_document(con, doc_id, body, commit=True):
     # and silently dropped it, and `doc add` always INSERTs a new row.
     return patch_columns(con, "documents", "document_id", doc_id, body,
                          {"body", "title", "render_path"}, commit=commit)
-
-
-def _link_watch_unit(con, watch_id: int, unit_id) -> bool:
-    """Point a live watch at a board unit (H-13). True when the row changed.
-
-    Called on the idempotent re-registration paths, where the watch already
-    exists: `sc watch pr … --unit U3` on an unlinked watch has to LINK it, not
-    report "already watched" and drop the flag. Re-pointing an already-linked
-    watch is allowed — a PR moving between units is a planner decision, and
-    the alternative is an operator with no way to correct a typo'd --unit.
-    Caller owns the commit.
-    """
-    if unit_id is None:
-        return False
-    return con.execute(
-        "UPDATE watched_prs SET unit_id=? "
-        "WHERE watch_id=? AND (unit_id IS NULL OR unit_id<>?)",
-        (unit_id, watch_id, unit_id)).rowcount > 0
 
 
 def _freeze_board_refusal(con, doc_id) -> "dict | None":
@@ -2933,230 +2896,6 @@ class Handler(BaseHTTPRequestHandler):
             con.close()
 
     # -- static + GET --
-    # -- /_sc/watches — the PR watch registry (sprint eventing) --
-    # Token-scoped like /_sc/mem/*: registration defaults to the calling shell;
-    # `shell` names another subscriber (the sprint skill registers the planner
-    # at PR open — the recipient-naming precedent of `message send`). The list
-    # is a shared read like /roadmap: single-operator fork, the planner needs
-    # the whole board. Since the polling cutover (spec #20 task #85, decision
-    # #19) the service's own scheduler is the sole poller and DB writer:
-    # registration takes an immediate GitHub baseline (no baseline, no armed
-    # watch), `--sprint` scopes a watch to a sprint document (validated as a
-    # sprint doc, not for liveness — the poller arms on liveness), and
-    # /_sc/watches/reconcile is the operator's explicit one-shot poll.
-
-    def _daemon_state(self, con) -> "dict | None":
-        """Poller + reconciler liveness (#359): heartbeat rows → age + verdict.
-        Stale = beat older than 3× the daemon's own interval (one slow gh
-        call + the sleep fit comfortably inside). None means neither daemon
-        has run (or a pre-0068 DB has no heartbeat table); a reconcile-only
-        result is truthy but has no top-level beat_at. Reconciliation stays
-        nested so older clients ignore it while their own beat_at guard still
-        renders a never-run poller."""
-        try:
-            rs = con.execute(
-                "SELECT name, beat_at, interval_s, CAST((julianday('now') - "
-                "julianday(beat_at)) * 86400 AS INTEGER) AS age_s "
-                "FROM daemon_heartbeats WHERE name IN ('watch','reconcile')").fetchall()
-        except Exception:
-            return None
-        states = {
-            r["name"]: {"beat_at": r["beat_at"], "interval_s": r["interval_s"],
-                        "age_s": r["age_s"],
-                        "stale": r["age_s"] > 3 * r["interval_s"]}
-            for r in rs
-        }
-        if not states:
-            return None
-        watch = states.get("watch", {})
-        watch["reconcile"] = states.get("reconcile")
-        return watch
-
-    def _watches_get(self):
-        sid = self._require_shell_auth()
-        if sid is None:
-            return
-        con = db()
-        try:
-            q = parse_qs(urlparse(self.path).query)
-            include_closed = q.get("all", ["0"])[0] in ("1", "true", "yes")
-            active = sprint_state.live_sprint_doc_ids(con)
-            sql = ("SELECT w.watch_id, w.repo, w.pr_number, w.shell_id, "
-                   "s.shortname, w.created_at, w.closed_at, w.sprint_doc_id, "
-                   "w.unit_id, u.seq AS unit_seq "
-                   "FROM watched_prs w "
-                   "JOIN shells s ON s.shell_id = w.shell_id "
-                   "LEFT JOIN sprint_units u ON u.unit_id = w.unit_id")
-            if not include_closed:
-                sql += " WHERE w.closed_at IS NULL"
-            sql += " ORDER BY w.repo, w.pr_number, w.watch_id"
-            ws = rows(con.execute(sql))
-            for w in ws:
-                w["armed"] = (w.get("closed_at") is None
-                              and w.get("sprint_doc_id") in active)
-            return self._send(200, {"watches": ws,
-                                    "daemon": self._daemon_state(con)})
-        except Exception as e:
-            return self._fail(e)
-        finally:
-            con.close()
-
-    def _watches_post(self, body: dict):
-        sid = self._require_shell_auth()
-        if sid is None:
-            return
-        con = db()
-        try:
-            repo = (body.get("repo") or "").strip().strip("/")
-            try:
-                pr = int(body.get("pr_number"))
-            except (TypeError, ValueError):
-                pr = None
-            if not repo or repo.count("/") != 1 or pr is None:
-                return self._send(400, {"error": "repo (owner/name) and pr_number (int) required"})
-            sprint_doc_id = body.get("sprint_doc_id")
-            if sprint_doc_id is None:
-                return self._send(400, {"error":
-                    "sprint_doc_id (int) required — unscoped watches are "
-                    "dormant and cannot be registered"})
-            try:
-                sprint_doc_id = int(sprint_doc_id)
-            except (TypeError, ValueError):
-                return self._send(400, {"error": "sprint_doc_id must be an int"})
-            # Registration validates SPRINT-DOC IDENTITY only, not liveness
-            # (H-2): a watch registered in the declaration window — board
-            # declared, units not yet — must be legal, and liveness is the
-            # poller's arming predicate, not the write boundary. A watch on a
-            # sprint that is not live is inert by construction: `armed_watches`
-            # scopes every poll to `sprint_state.live_sprint_doc_ids`.
-            if not sprint_state.is_sprint_doc(con, sprint_doc_id):
-                return self._send(409, {"error":
-                    f"document {sprint_doc_id} is not a SPRINT doc — a watch "
-                    "scopes to a sprint board, and one registered anywhere "
-                    "else is never polled; check the --sprint id"})
-            # H-13: the unit this PR belongs to, named the way every message
-            # names it ("U3") and resolved against THIS sprint's board. Two
-            # free integers that nothing joined is what made the reconciler
-            # regex message prose for the answer.
-            unit_id = None
-            if body.get("unit"):
-                seq = str(body["unit"]).strip()
-                r = con.execute(
-                    "SELECT unit_id FROM sprint_units "
-                    "WHERE sprint_doc_id=? AND seq=?",
-                    (sprint_doc_id, seq)).fetchone()
-                if r is None:
-                    return self._send(404, {"error":
-                        f"sprint {sprint_doc_id} has no unit '{seq}' — a watch "
-                        "links to a unit the board already declares; check "
-                        "`sc sprint board --sprint " f"{sprint_doc_id}`"})
-                unit_id = r["unit_id"]
-            target = sid
-            if body.get("shell"):
-                r = con.execute(
-                    "SELECT shell_id FROM shells WHERE LOWER(shortname)=LOWER(?) "
-                    "AND COALESCE(is_deleted,0)=0", (body["shell"],)).fetchone()
-                if r is None:
-                    return self._send(404, {"error": f"shell '{body['shell']}' unknown"})
-                target = r[0]
-            # Idempotent by (repo, pr, shell, scope): a live duplicate in the
-            # SAME scope returns the existing watch. A live UNSCOPED watch
-            # registered with --sprint is rebound (explicit re-arm — legacy
-            # dormant watches become polled only this way). A retired watch is
-            # NOT reopened: registration inserts a new row so closed history
-            # is retained (0080 cutover).
-            existing = con.execute(
-                "SELECT watch_id, sprint_doc_id FROM watched_prs "
-                "WHERE repo=? AND pr_number=? AND shell_id=? AND closed_at IS NULL "
-                "AND COALESCE(sprint_doc_id, 0) = COALESCE(?, 0)",
-                (repo, pr, target, sprint_doc_id)).fetchone()
-            daemon = self._daemon_state(con)
-            if existing is not None:
-                # A re-registration that NAMES a unit links the live watch even
-                # though the watch itself already existed. Returning "already
-                # watched" while silently dropping --unit would leave the
-                # operator believing a link they can see no trace of.
-                linked = _link_watch_unit(con, existing["watch_id"], unit_id)
-                con.commit()
-                return self._send(200, {"watch_id": existing["watch_id"],
-                                        "existing": True, "linked": linked,
-                                        "daemon": daemon})
-            # Registration baseline (spec: an immediate GitHub read, normalized
-            # and stored BEFORE arming; a failed baseline creates no armed
-            # watch and returns a retryable sanitized error). The gh call
-            # happens before the INSERT so a failure leaves no row at all.
-            fp, err = pr_poller.baseline_read(repo, pr)
-            if fp is None:
-                return self._send(502, {"error":
-                    f"baseline read failed (retryable): {err}",
-                    "retryable": True, "daemon": daemon})
-            # The baseline is an external read and cannot hold a DB writer
-            # reservation. Revalidate scope after it, under the same
-            # transaction that arms or rebinds the watch, so a doc that stops
-            # being a sprint board cannot land between the decision and its
-            # write.
-            con.execute("BEGIN IMMEDIATE")
-            if not sprint_state.is_sprint_doc(con, sprint_doc_id):
-                con.rollback()
-                return self._send(409, {"error":
-                    f"document {sprint_doc_id} is not a SPRINT doc — a watch "
-                    "scopes to a sprint board, and one registered anywhere "
-                    "else is never polled; check the --sprint id"})
-            existing = con.execute(
-                "SELECT watch_id FROM watched_prs "
-                "WHERE repo=? AND pr_number=? AND shell_id=? "
-                "AND closed_at IS NULL AND sprint_doc_id=?",
-                (repo, pr, target, sprint_doc_id)).fetchone()
-            if existing is not None:
-                linked = _link_watch_unit(con, existing["watch_id"], unit_id)
-                con.commit()
-                return self._send(200, {"watch_id": existing["watch_id"],
-                                        "existing": True, "linked": linked,
-                                        "daemon": daemon})
-            unscoped = con.execute(
-                "SELECT watch_id FROM watched_prs "
-                "WHERE repo=? AND pr_number=? AND shell_id=? "
-                "AND closed_at IS NULL AND sprint_doc_id IS NULL",
-                (repo, pr, target)).fetchone()
-            if unscoped is not None:
-                con.execute(
-                    "UPDATE watched_prs SET sprint_doc_id=?, last_seen=?, "
-                    "unit_id=COALESCE(?, unit_id) WHERE watch_id=?",
-                    (sprint_doc_id, json.dumps(fp), unit_id,
-                     unscoped["watch_id"]))
-                con.commit()
-                return self._send(200, {"watch_id": unscoped["watch_id"],
-                                        "rebound": True, "daemon": daemon})
-            cur = con.execute(
-                "INSERT INTO watched_prs (repo, pr_number, shell_id, last_seen, "
-                "sprint_doc_id, unit_id) VALUES (?, ?, ?, ?, ?, ?)",
-                (repo, pr, target, json.dumps(fp), sprint_doc_id, unit_id))
-            con.commit()
-            return self._send(201, {"watch_id": cur.lastrowid, "daemon": daemon})
-        except Exception as e:
-            return self._fail(e)
-        finally:
-            con.close()
-
-    def _watches_reconcile(self):
-        """Operator's explicit one-shot poll (spec: startup + explicit
-        reconciliation are the two non-interval triggers). Synchronous —
-        the response IS the cycle's summary."""
-        sid = self._require_shell_auth()
-        if sid is None:
-            return
-        con = db()
-        try:
-            summary = pr_poller.poll_cycle(
-                con,
-                source="reconcile",
-                system_signals=pr_poller.sentinel.load_config().enabled,
-            )
-            return self._send(200, summary)
-        except Exception as e:
-            return self._fail(e)
-        finally:
-            con.close()
 
     def _serve_vendor(self, path: str):
         """GET/HEAD a vendored asset, resolved against the tree as it is NOW.
@@ -3230,8 +2969,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, text, ctype, headers=headers)
         if path.startswith("/_sc/mem/"):
             return self._mem_get(path)
-        if path == "/_sc/watches":
-            return self._watches_get()
         if not path.startswith("/api/"):
             return self._send(404, {"error": "not found"})
         # git-hygiene is a live filesystem/git read — no DB, computed on demand
@@ -3284,38 +3021,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, tag_origin([dict(r)])[0])
             if path == "/api/roadmap":
                 return self._send(200, get_roadmap(con))
-            if path == "/api/sprints":
-                q = parse_qs(urlparse(self.path).query)
-                if q.get("view") == ["board"] and "status" not in q:
-                    try:
-                        recent = int(q.get("recent", ["5"])[0])
-                    except (TypeError, ValueError):
-                        return self._send(
-                            422,
-                            {"error": {
-                                "code": "validation",
-                                "message": (
-                                    "recent must be an integer from 0 through 20"
-                                ),
-                            }},
-                        )
-                    if recent < 0 or recent > 20:
-                        return self._send(
-                            422,
-                            {"error": {
-                                "code": "validation",
-                                "message": (
-                                    "recent must be an integer from 0 through 20"
-                                ),
-                            }},
-                        )
-                    return self._send(
-                        200, sprint_routes._sprint_overview(con, recent)
-                    )
-                if q.get("status") != ["active"]:
-                    return self._send(
-                        400, {"error": "status=active is required"})
-                return self._send(200, get_active_sprints(con))
             if path == "/api/docs":
                 return self._send(200, get_docs(con))
             if path == "/api/map":
@@ -3393,10 +3098,6 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path.startswith("/_sc/mem/"):
             return self._mem_post(path, self._body())
-        if path == "/_sc/watches":
-            return self._watches_post(self._body())
-        if path == "/_sc/watches/reconcile":
-            return self._watches_reconcile()
         con = db()
         try:
             if path == "/api/flags":
@@ -3696,13 +3397,9 @@ class _ShimHandler(Handler):
 def dispatch_http(method: str, path: str, headers_raw: str,
                   body: bytes) -> tuple:
     """The transport's HTTP entry: route one request, return
-    (status, [(header, value)], body bytes). Contract and sprint-board paths
-    go to their focused route modules; everything else runs through the
-    shimmed Handler."""
+    (status, [(header, value)], body bytes). Focused retained routes go to
+    their own modules; everything else runs through the shimmed Handler."""
     parsed = urlparse(path)
-    if parsed.path.startswith(("/api/directives",
-                               "/api/sentinel-events")):
-        return conductor_routes.handle(method, path, headers_raw, body)
     if (
         parsed.path.startswith("/api/review-targets/")
         or (
@@ -3713,12 +3410,6 @@ def dispatch_http(method: str, path: str, headers_raw: str,
         return review_routes.handle(method, path, headers_raw, body)
     if parsed.path.startswith("/api/conversations"):
         return conversation_routes.handle(method, path, headers_raw, body)
-    if parsed.path.startswith((
-        "/api/sprint-units",
-        "/api/spec-qaqc-reviews",
-        "/api/sprints",
-    )):
-        return sprint_routes.handle(method, path, headers_raw, body)
     handler = _ShimHandler(method, path, headers_raw, body)
     try:
         route = getattr(handler, f"do_{method}", None)
@@ -3864,24 +3555,6 @@ def main(argv):
     # api_key rotation is picked up here. Lives under the gitignored,
     # never-snapshotted .super-coder/run/.
     mem_credentials.provision(str(DB_PATH), f"http://127.0.0.1:{port}")
-    conductor_config = conductor_runtime.load_config()
-    if conductor_config.enabled:
-        con = db_driver.connect(str(DB_PATH))
-        try:
-            conductor_runtime.doctor(con, conductor_config)
-        except conductor_runtime.ConductorConfigError as exc:
-            sys.exit(f"server: conductor config invalid — {exc}")
-        finally:
-            con.close()
-    # Sole scheduler: watched-PR polling (spec #20 task #85, decision #19) plus
-    # the config-gated Conductor sentinel. The retired host `sc watch daemon`
-    # cannot form a second DB writer. GitHub reads stay watch-gated; sentinel
-    # reads stay live-sprint-gated and never boot a shell before Step 8.
-    pr_poller.Poller(
-        DB_PATH,
-        sentinel_config=pr_poller.sentinel.load_config(),
-        conductor_config=conductor_config,
-    ).start()
     # Bind 127.0.0.1 by default (the host stance: localhost-only, operator owns
     # network controls). In the container set SC_BIND=0.0.0.0 so docker can
     # publish the port — the jail is the `-p 127.0.0.1:PORT:PORT` mapping, which

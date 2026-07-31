@@ -35,10 +35,8 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
         'const CHAT_HARNESSES = ["opencode", "claude", "codex", "kimi"]'
         in interface
     )
-    assert (
-        'shell.flavor === "conductor"\n    ? ["opencode"] : CHAT_HARNESSES'
-        in interface
-    )
+    assert "const availableHarnesses = CHAT_HARNESSES;" in interface
+    assert 'shell.flavor === "conductor"' not in interface
     assert 'const CHAT_CONFIGURE_ROUTE = "configure"' in interface
     assert 'textContent: "＋ Chat"' in interface
     assert 'textContent: "Configure"' in interface
