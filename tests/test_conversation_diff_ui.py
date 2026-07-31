@@ -197,9 +197,12 @@ def test_diff_layout_is_full_width_bounded_and_responsive():
     assert "grid-column: 1 / -1; grid-row: 1" in STYLE
     assert "align-self: start; margin-top: -.4rem" in STYLE
     assert "--review-tab-cut: 10px" in STYLE
-    assert "--review-tab-radius: 3px" in STYLE
+    assert "--review-tab-radius: 6px" in STYLE
+    assert "border-radius: 4px 4px 0 4px" in STYLE
     assert STYLE.count("clip-path: shape(") == 1
+    assert ".review-group-switch button.active { z-index: 1; }" in STYLE
     assert ".review-group-switch button:first-child.active + button::before" in STYLE
+    assert ".review-group-switch button:first-child:not(.active)::after" in STYLE
     assert "height: calc(100% - var(--review-tab-cut) - var(--review-tab-radius))" in STYLE
     assert "flex: 1 1 auto" in STYLE
     assert "text-overflow: ellipsis" in STYLE
