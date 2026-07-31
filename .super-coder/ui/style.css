@@ -391,15 +391,11 @@ body.interface-view main {
 .review-refresh.act { margin: 0; padding: .34rem .7rem; font-size: .7rem; }
 .review-group-switch {
   --review-tab-cut: 10px;
+  --review-tab-radius: 3px;
+  --review-tab-radius-diagonal: 2px;
   margin: 0; flex: none; border-radius: 0;
-  clip-path: polygon(
-    0 0,
-    100% 0,
-    100% calc(100% - var(--review-tab-cut)),
-    calc(100% - var(--review-tab-cut)) 100%,
-    0 100%
-  );
 }
+.review-group-switch,
 .review-group-switch button:first-child.active {
   clip-path: polygon(
     0 0,
@@ -408,6 +404,28 @@ body.interface-view main {
     calc(100% - var(--review-tab-cut)) 100%,
     0 100%
   );
+  clip-path: shape(
+    from 0 0,
+    line to 100% 0,
+    line to 100% calc(100% - var(--review-tab-cut) - var(--review-tab-radius)),
+    curve to calc(100% - var(--review-tab-radius-diagonal))
+      calc(100% - var(--review-tab-cut) + var(--review-tab-radius-diagonal))
+      with 100% calc(100% - var(--review-tab-cut)),
+    line to calc(100% - var(--review-tab-cut) + var(--review-tab-radius-diagonal))
+      calc(100% - var(--review-tab-radius-diagonal)),
+    curve to calc(100% - var(--review-tab-cut) - var(--review-tab-radius)) 100%
+      with calc(100% - var(--review-tab-cut)) 100%,
+    line to 0 100%,
+    close
+  );
+}
+.review-group-switch button:first-child.active + button {
+  position: relative; border-left: 0;
+}
+.review-group-switch button:first-child.active + button::before {
+  content: ""; position: absolute; inset: 0 auto auto 0;
+  height: calc(100% - var(--review-tab-cut) - var(--review-tab-radius));
+  border-left: 1px solid var(--line); pointer-events: none;
 }
 .review-change-switch { margin: 0; flex: none; }
 .review-scope-switch button { padding-inline: 1rem; }
