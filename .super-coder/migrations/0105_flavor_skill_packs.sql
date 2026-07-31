@@ -60,7 +60,6 @@ WITH template_grants(flavor, skill_name) AS (
         ('dev', 'dev_kit'),
         ('dev', 'test_authoring'),
         ('dev', 'agents'),
-        ('dev', 'sprint_dev'),
         ('devops', 'git'),
         ('devops', 'flags'),
         ('devops', 'docs'),
@@ -72,9 +71,6 @@ WITH template_grants(flavor, skill_name) AS (
         ('planner', 'blueprint'),
         ('planner', 'api-design'),
         ('planner', 'onboard'),
-        ('planner', 'sprint_orchestration'),
-        ('planner', 'sprint_orchestration_recover'),
-        ('planner', 'sprint_orchestration_close'),
         ('reviewer', 'review'),
         ('reviewer', 'flags'),
         ('reviewer', 'git'),
@@ -82,8 +78,7 @@ WITH template_grants(flavor, skill_name) AS (
         ('reviewer', 'database-migrations'),
         ('reviewer', 'redline_review'),
         ('reviewer', 'test_authoring'),
-        ('reviewer', 'agents'),
-        ('reviewer', 'sprint_review')
+        ('reviewer', 'agents')
 )
 INSERT OR IGNORE INTO flavor_skills (flavor, skill_id)
 SELECT g.flavor, s.skill_id

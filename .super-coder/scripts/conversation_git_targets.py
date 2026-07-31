@@ -133,13 +133,11 @@ def persist_local_observation(
             "conversation.git_target.observe",
         ):
             current = con.execute(
-                "SELECT mode,worktree FROM conversations "
-                "WHERE conversation_id=?",
+                "SELECT worktree FROM conversations WHERE conversation_id=?",
                 (conversation_id,),
             ).fetchone()
             if (
                 current is None
-                or current["mode"] != "normal"
                 or current["worktree"] != expected_worktree
             ):
                 return None
@@ -201,7 +199,7 @@ def observe_and_persist(
     connect: Callable[[str | Path], Any] = db_driver.connect,
     now: datetime | None = None,
 ) -> bool:
-    """Observe and persist one normal conversation.
+    """Observe and persist one conversation.
 
     Lifecycle callers use ``safely_observe_and_persist`` so observation cannot
     affect their already-committed result.
@@ -209,11 +207,10 @@ def observe_and_persist(
     con = connect(db_path)
     try:
         row = con.execute(
-            "SELECT mode,worktree FROM conversations "
-            "WHERE conversation_id=?",
+            "SELECT worktree FROM conversations WHERE conversation_id=?",
             (conversation_id,),
         ).fetchone()
-        if row is None or row["mode"] != "normal":
+        if row is None:
             return False
         worktree = str(row["worktree"])
     finally:

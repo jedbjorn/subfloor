@@ -15,6 +15,7 @@ FIXTURE_DIR = ROOT / "tests" / "fixtures" / "sprint_removal"
 MANIFEST_PATH = FIXTURE_DIR / "manifest.json"
 DATABASE_FIXTURE = FIXTURE_DIR / "pre_removal.sql"
 ENGINE = ROOT / ".super-coder"
+MIGRATIONS = ENGINE / "migrations"
 
 
 def load_manifest() -> dict:
@@ -27,6 +28,28 @@ def build_pre_removal_database() -> sqlite3.Connection:
     con.executescript(DATABASE_FIXTURE.read_text())
     con.execute("PRAGMA foreign_keys=ON")
     return con
+
+
+def build_current_database() -> sqlite3.Connection:
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.executescript((ENGINE / "schema.sql").read_text())
+    for migration in sorted(MIGRATIONS.glob("*.sql")):
+        con.executescript(migration.read_text())
+    con.execute("PRAGMA foreign_keys=ON")
+    return con
+
+
+def schema_signature(con: sqlite3.Connection) -> set[tuple[str, str, str]]:
+    return {
+        tuple(row)
+        for row in con.execute(
+            "SELECT type,name,tbl_name FROM sqlite_master "
+            "WHERE type IN ('table','view','index','trigger') "
+            "AND name NOT LIKE 'sqlite_%' "
+            "AND name<>'schema_migrations'"
+        )
+    }
 
 
 def current_reference_files(manifest: dict) -> set[str]:
@@ -42,11 +65,11 @@ def current_reference_files(manifest: dict) -> set[str]:
     for relative in tracked:
         if relative in allowed:
             continue
-        if deny.search(relative):
-            hits.add(relative)
-            continue
         path = ROOT / relative
         if not path.exists():
+            continue
+        if deny.search(relative):
+            hits.add(relative)
             continue
         if path.stat().st_size > 2_000_000:
             continue
@@ -404,6 +427,300 @@ for name in sys.argv[2:]:
                 1,
             )
             self.assertEqual(con.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_task_170_historical_migrations_are_absent_and_mixed_inputs_are_clean(
+        self,
+    ):
+        removal = load_manifest()["schema_removal"]
+        self.assertEqual(
+            [],
+            [
+                name
+                for name in removal["historical_migrations_removed"]
+                if (MIGRATIONS / name).exists()
+            ],
+        )
+        for name in removal["mixed_migrations_retained"]:
+            self.assertTrue((MIGRATIONS / name).is_file(), name)
+
+        removed = set(load_manifest()["removed_tables"])
+        for migration in sorted(MIGRATIONS.glob("*.sql")):
+            if migration.name == Path(removal["cleanup_migration"]).name:
+                continue
+            sql = migration.read_text().lower()
+            for table in removed:
+                self.assertNotIn(
+                    f"create table {table}",
+                    sql,
+                    f"{migration.name} recreates {table}",
+                )
+                self.assertNotIn(
+                    f"create table if not exists {table}",
+                    sql,
+                    f"{migration.name} recreates {table}",
+                )
+            self.assertNotIn("add column sprint_doc_id", sql, migration.name)
+            self.assertNotIn("add column sprint_ref", sql, migration.name)
+            self.assertNotIn("'sprint_dev'", sql, migration.name)
+            self.assertNotIn("'sprint_pln'", sql, migration.name)
+            self.assertNotIn("'sprint_rev'", sql, migration.name)
+            self.assertNotIn("'sprint_cond'", sql, migration.name)
+
+    def test_task_170_fresh_build_contains_only_retained_schema(self):
+        manifest = load_manifest()
+        with closing(build_current_database()) as con:
+            tables = {
+                row[0]
+                for row in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            self.assertEqual(set(), set(manifest["removed_tables"]) & tables)
+            for table, retired in manifest["shared_table_cutover"].items():
+                columns = {
+                    row[1]
+                    for row in con.execute(f'PRAGMA table_info("{table}")')
+                }
+                self.assertEqual(
+                    set(),
+                    set(retired) & columns,
+                    f"{table} retained a removed field",
+                )
+            con.executemany(
+                "INSERT INTO shells (shell_id,display_name,system_prompt) "
+                "VALUES (?,?,'test')",
+                ((9001, "Sender"), (9002, "Recipient")),
+            )
+            con.executemany(
+                "INSERT INTO shell_messages "
+                "(from_shell_id,to_shell_id,body,kind) VALUES (9001,9002,?,?)",
+                (("shell", "shell"), ("task", "task"), ("result", "result")),
+            )
+            self.assertEqual(
+                ["shell", "task", "result"],
+                [
+                    row[0]
+                    for row in con.execute(
+                        "SELECT DISTINCT kind FROM shell_messages "
+                        "ORDER BY CASE kind "
+                        "WHEN 'shell' THEN 1 WHEN 'task' THEN 2 ELSE 3 END"
+                    )
+                ],
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute(
+                    "INSERT INTO shell_messages "
+                    "(from_shell_id,to_shell_id,body,kind) "
+                    "VALUES (9001,9002,'removed','pr_event')"
+                )
+            self.assertEqual(con.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_task_170_dirty_cutover_preserves_generic_data_and_discards_sprint(
+        self,
+    ):
+        cleanup = ROOT / load_manifest()["schema_removal"]["cleanup_migration"]
+        with closing(build_pre_removal_database()) as con:
+            con.executescript(cleanup.read_text())
+            con.executescript(cleanup.read_text())
+
+            self.assertEqual(
+                [
+                    (
+                        "cv_normal",
+                        1,
+                        "Retained normal conversation",
+                        0,
+                    )
+                ],
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT conversation_id,owner_user_id,title,starred "
+                        "FROM conversations ORDER BY conversation_id"
+                    )
+                ],
+            )
+            self.assertEqual(
+                [
+                    (200, "Retained normal prompt", "completed"),
+                ],
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT message_id,body,state "
+                        "FROM conversation_messages ORDER BY message_id"
+                    )
+                ],
+            )
+            self.assertEqual(
+                [(210, "succeeded", 42)],
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT run_id,state,archive_id "
+                        "FROM conversation_runs ORDER BY run_id"
+                    )
+                ],
+            )
+            self.assertEqual(
+                [(220, "assistant.delta")],
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT event_id,event_type "
+                        "FROM conversation_events ORDER BY event_id"
+                    )
+                ],
+            )
+            self.assertEqual(
+                [(230, "dispatched")],
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT outbox_id,state "
+                        "FROM conversation_outbox ORDER BY outbox_id"
+                    )
+                ],
+            )
+            self.assertEqual(
+                [("feat/retained-review", 900)],
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT branch_name,pr_number "
+                        "FROM conversation_git_targets"
+                    )
+                ],
+            )
+            self.assertEqual(
+                [
+                    (100, "shell", "generic-shell"),
+                    (101, "result", "generic-job-result"),
+                ],
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT message_id,kind,dedupe_key "
+                        "FROM shell_messages ORDER BY message_id"
+                    )
+                ],
+            )
+            self.assertEqual(
+                [
+                    (42, "normal-session", "codex", "openai", "gpt-fixture"),
+                    (
+                        43,
+                        "sprint-session",
+                        "claude",
+                        "anthropic",
+                        "conductor-fixture",
+                    ),
+                ],
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT archive_id,session_id,harness,provider,model "
+                        "FROM shell_memory_archives ORDER BY archive_id"
+                    )
+                ],
+            )
+            self.assertEqual(
+                [30, 32],
+                [
+                    row[0]
+                    for row in con.execute(
+                        "SELECT document_id FROM documents ORDER BY document_id"
+                    )
+                ],
+            )
+            self.assertEqual(
+                (1,),
+                tuple(
+                    con.execute(
+                        "SELECT is_deleted FROM shells WHERE shell_id=13"
+                    ).fetchone()
+                ),
+            )
+            self.assertEqual(
+                0,
+                con.execute(
+                    "SELECT COUNT(*) FROM skills WHERE lower(name) LIKE '%sprint%'"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                [("conversation-broker",)],
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT name FROM daemon_heartbeats ORDER BY name"
+                    )
+                ],
+            )
+            self.assertEqual(con.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_task_170_partial_fixture_and_fresh_build_converge(self):
+        manifest = load_manifest()
+        cleanup = ROOT / manifest["schema_removal"]["cleanup_migration"]
+        with closing(build_pre_removal_database()) as dirty:
+            dirty.execute("PRAGMA foreign_keys=OFF")
+            for table in (
+                "interface_recovery_observations",
+                "planner_alerts",
+                "sprint_cancellations",
+            ):
+                dirty.execute(f'DROP TABLE "{table}"')
+            dirty.execute("PRAGMA foreign_keys=ON")
+            dirty.executescript(cleanup.read_text())
+            dirty.executescript(cleanup.read_text())
+            with closing(build_current_database()) as fresh:
+                self.assertEqual(schema_signature(fresh), schema_signature(dirty))
+                self.assertEqual(
+                    fresh.execute("PRAGMA foreign_key_check").fetchall(),
+                    dirty.execute("PRAGMA foreign_key_check").fetchall(),
+                )
+
+    def test_task_170_cleanup_rolls_back_before_ledger_stamp_on_failure(self):
+        cleanup = ROOT / load_manifest()["schema_removal"]["cleanup_migration"]
+        scripts = ENGINE / "scripts"
+        sys.path.insert(0, str(scripts))
+        try:
+            import migrate
+        finally:
+            sys.path.pop(0)
+
+        with closing(build_pre_removal_database()) as con:
+            def deny_shell_message_drop(
+                action: int,
+                arg1: str | None,
+                _arg2: str | None,
+                _database: str | None,
+                _trigger: str | None,
+            ) -> int:
+                if action == sqlite3.SQLITE_DROP_TABLE and arg1 == "shell_messages":
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            con.set_authorizer(deny_shell_message_drop)
+            with self.assertRaises(sqlite3.DatabaseError):
+                migrate.apply(con, cleanup)
+            con.set_authorizer(None)
+
+            self.assertIsNotNone(
+                con.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='watched_prs'"
+                ).fetchone()
+            )
+            self.assertEqual(
+                4,
+                con.execute("SELECT COUNT(*) FROM shell_messages").fetchone()[0],
+            )
+            self.assertIsNone(
+                con.execute(
+                    "SELECT 1 FROM schema_migrations WHERE filename=?",
+                    (cleanup.name,),
+                ).fetchone()
+            )
 
 
 if __name__ == "__main__":

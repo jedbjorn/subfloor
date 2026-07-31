@@ -183,7 +183,10 @@ class LnsCurationTest(unittest.TestCase):
             c.executescript(SCHEMA.read_text())
             older = [p for p in sorted(MIGRATIONS.glob("*.sql"))
                      if p.name < "0100_"]
-            self.assertTrue(any(p.name.startswith("0099") for p in older))
+            self.assertIn(
+                "0097_quota_drop_account_identity.sql",
+                {p.name for p in older},
+            )
             for p in older:
                 c.executescript(p.read_text())
             c.execute("INSERT INTO users (user_id, username) VALUES (1, 'T')")

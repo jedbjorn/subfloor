@@ -136,7 +136,7 @@ def _etag_response(headers, etag_value: str, body: dict[str, Any]):
 def _conversation(con, conversation_id: str, owner_user_id: int):
     row = con.execute(
         "SELECT conversation_id,worktree FROM conversations "
-        "WHERE conversation_id=? AND mode='normal' AND owner_user_id=?",
+        "WHERE conversation_id=? AND owner_user_id=?",
         (conversation_id, owner_user_id),
     ).fetchone()
     if row is None:
@@ -148,7 +148,7 @@ def _target_select() -> str:
     return (
         "SELECT t.*,c.worktree FROM conversation_git_targets t "
         "JOIN conversations c ON c.conversation_id=t.conversation_id "
-        "WHERE t.target_id=? AND c.mode='normal' AND c.owner_user_id=?"
+        "WHERE t.target_id=? AND c.owner_user_id=?"
     )
 
 
@@ -288,7 +288,7 @@ def _persist_remote(
     try:
         current = con.execute(
             "SELECT worktree FROM conversations WHERE conversation_id=? "
-            "AND mode='normal' AND owner_user_id=?",
+            "AND owner_user_id=?",
             (conversation_id, owner_user_id),
         ).fetchone()
         if current is None or current["worktree"] != worktree:
@@ -321,7 +321,7 @@ def _persist_remote(
         with db_driver.write_transaction(con, "conversation.review_targets.refresh"):
             current = con.execute(
                 "SELECT worktree FROM conversations WHERE conversation_id=? "
-                "AND mode='normal' AND owner_user_id=?",
+                "AND owner_user_id=?",
                 (conversation_id, owner_user_id),
             ).fetchone()
             if current is None or current["worktree"] != worktree:

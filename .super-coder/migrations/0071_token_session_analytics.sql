@@ -7,7 +7,7 @@
 --
 -- Two parts:
 --   1. Session lifecycle columns on shell_memory_archives — written by
---      run.py open_session (started_at/harness/provider/model/sprint_ref);
+--      run.py open_session (started_at/harness/provider/model);
 --      ended_at is backfilled by the sweep (run.py execs the harness, so no
 --      code runs at exit). Historical rows stay NULL.
 --   2. session_token_usage — one row per (harness session × model), swept
@@ -28,7 +28,6 @@ ALTER TABLE shell_memory_archives ADD COLUMN ended_at   TEXT;   -- ISO UTC, swee
 ALTER TABLE shell_memory_archives ADD COLUMN harness    TEXT;   -- claude/opencode/codex/vibe/kimi
 ALTER TABLE shell_memory_archives ADD COLUMN provider   TEXT;   -- anthropic/openai/mistral/…
 ALTER TABLE shell_memory_archives ADD COLUMN model      TEXT;   -- resolved model id (NULL = harness default)
-ALTER TABLE shell_memory_archives ADD COLUMN sprint_ref TEXT;   -- SC_SPRINT_REF (tracker document_id)
 
 CREATE TABLE IF NOT EXISTS session_token_usage (
     usage_id            INTEGER PRIMARY KEY,

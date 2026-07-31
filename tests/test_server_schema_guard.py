@@ -17,7 +17,7 @@ from unittest import mock
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
-ACK_MIGRATION = "0083_planner_alert_acknowledgement.sql"
+ACK_MIGRATION = "0142_conversation_git_targets.sql"
 
 sys.path.insert(0, str(ENGINE / "api"))
 import server  # noqa: E402
@@ -49,10 +49,11 @@ class ServerSchemaGuardTest(unittest.TestCase):
             try:
                 with self.assertRaises(sqlite3.OperationalError) as raw:
                     con.execute(
-                        "SELECT acknowledged_at FROM planner_alerts").fetchall()
+                        "SELECT target_id FROM conversation_git_targets"
+                    ).fetchall()
             finally:
                 con.close()
-            self.assertIn("no such column", str(raw.exception))
+            self.assertIn("no such table", str(raw.exception))
 
             with mock.patch.object(
                 server, "DB_PATH", db_path
@@ -69,7 +70,7 @@ class ServerSchemaGuardTest(unittest.TestCase):
             self.assertIn("before first DB use", message)
             self.assertIn("`./sc rollback --engine-only`", message)
             self.assertIn("preserving this unchanged DB", message)
-            self.assertNotIn("no such column", message)
+            self.assertNotIn("no such table", message)
             backfill.assert_not_called()
 
     def test_current_migration_ledger_passes(self):

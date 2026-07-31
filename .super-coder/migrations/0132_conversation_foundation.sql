@@ -14,10 +14,7 @@ CREATE TABLE conversations (
     conversation_id         TEXT PRIMARY KEY
                             DEFAULT ('cv_' || lower(hex(randomblob(16)))),
     shell_id                INTEGER NOT NULL REFERENCES shells(shell_id),
-    mode                    TEXT NOT NULL DEFAULT 'normal'
-                            CHECK (mode IN ('normal','sprint')),
-    owner_user_id           INTEGER REFERENCES users(user_id),
-    sprint_doc_id           INTEGER REFERENCES documents(document_id),
+    owner_user_id           INTEGER NOT NULL REFERENCES users(user_id),
     harness                 TEXT NOT NULL CHECK (trim(harness) <> ''),
     provider                TEXT,
     model                   TEXT,
@@ -39,11 +36,6 @@ CREATE TABLE conversations (
     last_activity_at        TEXT NOT NULL DEFAULT (datetime('now')),
     closed_at               TEXT,
     version                 INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
-    CHECK (
-      (mode='normal' AND owner_user_id IS NOT NULL AND sprint_doc_id IS NULL)
-      OR
-      (mode='sprint' AND sprint_doc_id IS NOT NULL)
-    ),
     CHECK (
       (state='closed' AND closed_at IS NOT NULL)
       OR
@@ -205,17 +197,8 @@ CREATE TABLE conversation_outbox (
 
 -- Optimistic idempotency: the API compares the stored request hash when a key
 -- already exists. The unique key itself is the DB backstop against duplicates.
-CREATE UNIQUE INDEX idx_conversations_normal_idempotency
-    ON conversations(owner_user_id, creation_idempotency_key)
-    WHERE mode='normal';
-CREATE UNIQUE INDEX idx_conversations_sprint_idempotency
-    ON conversations(sprint_doc_id, creation_idempotency_key)
-    WHERE mode='sprint';
-
--- Reserved Sprint binding: at most one non-closed conversation per sprint.
-CREATE UNIQUE INDEX idx_conversations_live_sprint
-    ON conversations(sprint_doc_id)
-    WHERE mode='sprint' AND state<>'closed';
+CREATE UNIQUE INDEX idx_conversations_idempotency
+    ON conversations(owner_user_id, creation_idempotency_key);
 
 CREATE INDEX idx_conversations_shell_activity
     ON conversations(shell_id, last_activity_at, conversation_id);
@@ -241,7 +224,7 @@ CREATE INDEX idx_conversation_outbox_claim
 -- the explicitly mutable title, state, timestamps, version, and session ref.
 CREATE TRIGGER trg_conversations_identity_immutable
 BEFORE UPDATE OF
-    conversation_id, shell_id, mode, owner_user_id, sprint_doc_id,
+    conversation_id, shell_id, owner_user_id,
     harness, provider, model, effort, worktree,
     creation_idempotency_key, creation_request_hash, created_at
 ON conversations
@@ -253,7 +236,7 @@ CREATE TRIGGER trg_conversations_state
 BEFORE UPDATE OF state ON conversations
 WHEN NEW.state <> OLD.state AND NOT (
     (OLD.state='idle'    AND NEW.state IN ('queued','closed')) OR
-    (OLD.state='queued'  AND NEW.state='running') OR
+    (OLD.state='queued'  AND NEW.state IN ('idle','running')) OR
     (OLD.state='running' AND NEW.state IN
         ('idle','queued','waiting','error')) OR
     (OLD.state='waiting' AND NEW.state IN ('queued','closed')) OR

@@ -32,6 +32,7 @@ import db_driver  # noqa: E402
 # END;` stays intact when we strip the file's outer BEGIN/COMMIT.
 _TXN_BEGIN = re.compile(r"^\s*BEGIN(\s+TRANSACTION)?\s*;\s*$", re.IGNORECASE)
 _TXN_COMMIT = re.compile(r"^\s*(COMMIT|END\s+TRANSACTION)\s*;\s*$", re.IGNORECASE)
+_FOREIGN_KEYS_OFF = "-- migrate: foreign-keys-off"
 
 
 def applied_set(con) -> set[str]:
@@ -74,18 +75,25 @@ def apply(con, path: Path) -> None:
     (`duplicate column …`), wedging the chain. Wrapping body + stamp in one
     explicit transaction (with rollback on error) makes a partial failure revert
     whole, leaving the migration unstamped and cleanly re-runnable."""
+    sql = path.read_text()
+    foreign_keys_off = _FOREIGN_KEYS_OFF in sql
     stamp = path.name.replace("'", "''")
     script = (
         "BEGIN;\n"
-        f"{_strip_outer_txn(path.read_text()).strip()}\n"
+        f"{_strip_outer_txn(sql).strip()}\n"
         f"INSERT INTO schema_migrations (filename) VALUES ('{stamp}');\n"
         "COMMIT;"
     )
     try:
+        if foreign_keys_off:
+            con.execute("PRAGMA foreign_keys=OFF")
         con.executescript(script)
     except Exception:
         con.rollback()
         raise
+    finally:
+        if foreign_keys_off:
+            con.execute("PRAGMA foreign_keys=ON")
 
 
 def migrate(db_path: str) -> int:

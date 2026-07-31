@@ -112,6 +112,42 @@ class AtomicMigrateTests(unittest.TestCase):
             con.close()
         self.assertEqual(n, 1)  # trigger fired -> it was created intact
 
+    def test_foreign_keys_off_marker_allows_parent_swap_and_restores_enforcement(
+        self,
+    ):
+        con = db_driver.connect(self.db)
+        try:
+            con.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+            con.execute(
+                "CREATE TABLE child ("
+                "parent_id INTEGER NOT NULL REFERENCES parent(id))"
+            )
+            con.execute("INSERT INTO parent (id) VALUES (1)")
+            con.execute("INSERT INTO child (parent_id) VALUES (1)")
+            con.commit()
+        finally:
+            con.close()
+
+        self._write(
+            "0001_swap.sql",
+            "-- migrate: foreign-keys-off\n"
+            "BEGIN;\n"
+            "CREATE TABLE parent_new (id INTEGER PRIMARY KEY);\n"
+            "INSERT INTO parent_new SELECT * FROM parent;\n"
+            "DROP TABLE parent;\n"
+            "ALTER TABLE parent_new RENAME TO parent;\n"
+            "COMMIT;\n",
+        )
+        self._run()
+
+        con = db_driver.connect(self.db)
+        try:
+            self.assertEqual(con.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            self.assertEqual(con.execute("PRAGMA foreign_key_check").fetchall(), [])
+        finally:
+            con.close()
+        self.assertIn("0001_swap.sql", self._stamped())
+
 
 if __name__ == "__main__":
     unittest.main()

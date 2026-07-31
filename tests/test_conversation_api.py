@@ -154,10 +154,10 @@ class ConversationApiCase(unittest.TestCase):
         timestamp = activity or f"2026-07-30 12:{number % 60:02d}:00"
         con.execute(
             "INSERT INTO conversations "
-            "(conversation_id,shell_id,mode,owner_user_id,harness,effort,"
+            "(conversation_id,shell_id,owner_user_id,harness,effort,"
             "worktree,state,title,starred,creation_idempotency_key,"
             "creation_request_hash,created_at,last_activity_at,closed_at) "
-            "VALUES (?,?,'normal',?,'codex','high',?,?,?,?,?,?,?, ?,?)",
+            "VALUES (?,?,?,'codex','high',?,?,?,?,?,?,?, ?,?)",
             (
                 conversation_id,
                 shell_id,
@@ -1328,8 +1328,7 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
                 for row in con.execute(
                     "EXPLAIN QUERY PLAN "
                     "SELECT c.conversation_id FROM conversations c "
-                    "WHERE c.mode='normal' AND c.owner_user_id=? "
-                    "AND c.shell_id=? AND c.starred=? "
+                    "WHERE c.owner_user_id=? AND c.shell_id=? AND c.starred=? "
                     "ORDER BY c.last_activity_at DESC,c.conversation_id DESC "
                     "LIMIT ?",
                     (1, 1, 0, 21),
