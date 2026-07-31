@@ -37,7 +37,9 @@
     "tests/test_sprint_review_loop.py",
     "tests/test_sprint_close.py",
     "tests/test_sprint_cli.py",
-    "tests/test_sprint_skills.py"
+    "tests/test_sprint_skills.py",
+    "tests/test_sprint_live_proof.py",
+    "tests/fixtures/sprint_v2_acceptance.json"
   ],
   "baseline_migration_ledger": {
     "count": 142,
