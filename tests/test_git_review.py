@@ -85,6 +85,23 @@ class GitHubReaderTest(unittest.TestCase):
         self.assertEqual(calls[0][:4], ["gh", "pr", "view", "823"])
         self.assertEqual(calls[1], ["gh", "pr", "diff", "823", "--patch"])
 
+    def test_explicit_repository_scopes_every_read(self) -> None:
+        payload = json.dumps(MockGitHub().pr(821)).encode()
+        calls = []
+
+        def runner(args, **kwargs):
+            calls.append(args)
+            return SimpleNamespace(returncode=0, stdout=payload, stderr=b"")
+
+        reader = GitHubPullRequestReader(
+            "/tmp/repo", repository="acme/project", runner=runner
+        )
+        self.assertEqual(821, reader.get(821).number)
+        self.assertEqual(
+            ["gh", "pr", "view", "821", "--json"], calls[0][:5]
+        )
+        self.assertEqual(["--repo", "acme/project"], calls[0][-2:])
+
     def test_response_cap_fails_closed(self) -> None:
         def runner(args, **kwargs):
             return SimpleNamespace(returncode=0, stdout=b"x" * 11, stderr=b"")

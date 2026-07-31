@@ -7,6 +7,7 @@
     ".super-coder/scripts/sprint_message_delivery.py",
     ".super-coder/scripts/sprint_participant_chats.py",
     ".super-coder/scripts/sprint_runtime.py",
+    ".super-coder/scripts/sprint_pr_watcher.py",
     ".super-coder/migrations/0144_remove_sprint_v1.sql",
     "tests/fixtures/sprint_removal/build_pre_removal_fixture.py",
     "tests/fixtures/sprint_removal/manifest.json",
@@ -16,7 +17,8 @@
     "tests/test_sprint_v2_domain.py",
     "tests/test_sprint_message_delivery.py",
     "tests/test_sprint_participant_chats.py",
-    "tests/test_sprint_work_dispatch.py"
+    "tests/test_sprint_work_dispatch.py",
+    "tests/test_sprint_pr_watcher.py"
   ],
   "baseline_migration_ledger": {
     "count": 142,
