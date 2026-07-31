@@ -110,6 +110,26 @@ def test_workspace_has_current_changes_shell_files_and_manual_refresh():
     assert "innerHTML" not in patch_renderer
 
 
+def test_patch_change_arrows_scroll_between_adjacent_change_blocks():
+    renderer = APP[
+        APP.index("function reviewPatchRows"):
+        APP.index("function reviewFileTree")
+    ]
+
+    for text in (
+        'direction === "previous" ? "Previous change" : "Next change"',
+        'changeStep("previous", index - 1)',
+        'changeStep("next", index + 1)',
+        'target?.closest(".review-patch-wrap")',
+        "scroller.scrollTop",
+        "left: scroller.scrollLeft",
+        'behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches',
+    ):
+        assert text in renderer
+    assert ".review-change-step" in STYLE
+    assert ".review-change-step:disabled" in STYLE
+
+
 def test_diff_observes_once_then_only_refreshes_manually_single_flight():
     source = current_workspace_source()
 

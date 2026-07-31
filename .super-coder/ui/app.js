@@ -2762,6 +2762,7 @@ function reviewTypedState(title, detail = "", tone = "") {
 
 function reviewPatchRows(text) {
   const patch = el("div", { className: "review-patch" });
+  const rows = [];
   let oldLine = null;
   let newLine = null;
   for (const line of String(text || "").split("\n")) {
@@ -2799,7 +2800,52 @@ function reviewPatchRows(text) {
       el("span", { className: "review-line-code" }, line),
     );
     patch.append(row);
+    rows.push({ kind, row });
   }
+
+  const changeBlocks = [];
+  for (const entry of rows) {
+    if (entry.kind !== "add" && entry.kind !== "delete") continue;
+    const previous = changeBlocks.at(-1);
+    if (!previous || previous.last !== entry.row.previousElementSibling) {
+      changeBlocks.push({ first: entry.row, last: entry.row });
+    } else {
+      previous.last = entry.row;
+    }
+  }
+  const scrollToChange = (index) => {
+    const target = changeBlocks[index]?.first;
+    const scroller = target?.closest(".review-patch-wrap");
+    if (!target || !scroller) return;
+    const targetBox = target.getBoundingClientRect();
+    const scrollerBox = scroller.getBoundingClientRect();
+    const top = scroller.scrollTop + targetBox.top - scrollerBox.top
+      - (scroller.clientHeight - targetBox.height) / 2;
+    scroller.scrollTo({
+      top: Math.max(0, top),
+      left: scroller.scrollLeft,
+      behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches
+        ? "auto" : "smooth",
+    });
+  };
+  const changeStep = (direction, targetIndex) => {
+    const label = direction === "previous" ? "Previous change" : "Next change";
+    const button = el("button", {
+      type: "button",
+      className: `review-change-step review-change-step-${direction}`,
+      ariaLabel: label,
+      title: label,
+      disabled: targetIndex < 0 || targetIndex >= changeBlocks.length,
+    }, direction === "previous" ? "↑" : "↓");
+    button.onclick = () => scrollToChange(targetIndex);
+    return button;
+  };
+  changeBlocks.forEach((block, index) => {
+    block.first.classList.add("review-change-first");
+    block.last.classList.add("review-change-last");
+    block.first.append(changeStep("previous", index - 1));
+    block.last.append(changeStep("next", index + 1));
+  });
   return patch;
 }
 

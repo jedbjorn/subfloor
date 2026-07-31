@@ -358,6 +358,10 @@ const mode = 'chat';
 +const safe = document.createTextNode('patch with a deliberately long line for horizontal scroll position preservation across refresh');
 export { mode };"""
     patch += "\n" + "\n".join(
+        f"const contextLine{index} = 'change navigation spacing {index}';"
+        for index in range(40)
+    )
+    patch += "\n" + "\n".join(
         f"+const addedLine{index} = 'scroll proof {index}';"
         for index in range(80)
     )
@@ -644,6 +648,23 @@ export { mode };"""
         assert page.locator(".review-line-add").count() >= 82
         assert page.locator(".review-line-delete").count() == 1
         assert page.locator(".status-conflict").count() == 1
+        previous_changes = page.get_by_role("button", name="Previous change")
+        next_changes = page.get_by_role("button", name="Next change")
+        assert previous_changes.count() == next_changes.count() == 2
+        assert previous_changes.first.is_disabled()
+        assert next_changes.last.is_disabled()
+        next_changes.first.click()
+        page.wait_for_function(
+            "document.querySelector('.review-patch-wrap').scrollTop > 0"
+        )
+        navigated_top = page.locator(".review-patch-wrap").evaluate(
+            "node => node.scrollTop"
+        )
+        previous_changes.last.click()
+        page.wait_for_function(
+            "top => document.querySelector('.review-patch-wrap').scrollTop < top",
+            arg=navigated_top,
+        )
         page.get_by_title("assets/logo.bin").click()
         page.get_by_text("Binary file", exact=True).wait_for()
         page.get_by_title("large.txt").click()
