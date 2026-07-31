@@ -282,11 +282,12 @@ class AcceptanceAndDeclineTest(SprintMessageCase):
             declined,
         )
         self.assertEqual(
-            "planned",
+            "active",
             self.con.execute(
                 "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
                 (self.unit_id,),
             ).fetchone()[0],
+            "declining a duplicate assignment must not release an active lane",
         )
         planner_results = [
             tuple(row)
