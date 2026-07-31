@@ -659,7 +659,8 @@ export { mode };"""
         ) <= 1
         patch_header = page.locator(
             ".review-body, .review-patch-head, .review-patch-title, "
-            ".review-patch-title span, .review-group-switch"
+            ".review-patch-title span, .review-group-switch, "
+            ".review-group-switch button.active"
         ).evaluate_all(
             "nodes => { const body = nodes[0].getBoundingClientRect(); "
             "const header = nodes[1].getBoundingClientRect(); "
@@ -668,7 +669,10 @@ export { mode };"""
             "titleRight: nodes[2].getBoundingClientRect().right, "
             "subtitleOverflow: getComputedStyle(nodes[3]).textOverflow, "
             "tabsTop: tabs.top, tabsLeft: tabs.left, "
-            "tabsCenter: tabs.left + tabs.width / 2}; }"
+            "tabsCenter: tabs.left + tabs.width / 2, "
+            "tabsClip: getComputedStyle(nodes[4]).clipPath, "
+            "tabsRadius: getComputedStyle(nodes[4]).borderRadius, "
+            "activeClip: getComputedStyle(nodes[5]).clipPath}; }"
         )
         assert patch_header["tabsLeft"] - patch_header["titleRight"] >= 12
         assert patch_header["subtitleOverflow"] == "ellipsis"
@@ -677,6 +681,9 @@ export { mode };"""
         ) <= 1
         assert abs(summary_alignment["tabsCenter"] - patch_header["tabsCenter"]) <= 1
         assert abs(patch_header["headerTop"] - patch_header["tabsTop"]) <= 1
+        assert patch_header["tabsClip"].startswith("polygon(")
+        assert patch_header["activeClip"].startswith("polygon(")
+        assert patch_header["tabsRadius"] == "0px"
         initial_observations = sum(
             method == "POST" and path.endswith("/review-observations")
             for method, path, _query in requests
