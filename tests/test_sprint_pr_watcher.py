@@ -129,6 +129,43 @@ class RegistrationTest(SprintPRWatcherCase):
             ],
         )
 
+    def test_registration_rejects_multiple_work_units_without_side_effects(self):
+        other_unit = int(
+            self.con.execute(
+                "INSERT INTO sprint_work_units "
+                "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+                "expected_output,planned_wave) VALUES (?,1,2,'Other','No',2)",
+                (self.sprint_id,),
+            ).lastrowid
+        )
+        self.con.commit()
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "exactly one owning work unit",
+        ):
+            self.watcher.register(
+                self.sprint_id,
+                owner_shell_id=1,
+                repository="acme/repo",
+                pr_number=41,
+                work_unit_ids=(self.unit_id, other_unit),
+            )
+
+        self.assertEqual([], self.reader.get_calls)
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_registered_prs"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_pr_work_units"
+            ).fetchone()[0],
+        )
+
     def test_registration_rejects_non_owner_work_and_non_armed_sprint(self):
         other_unit = int(
             self.con.execute(

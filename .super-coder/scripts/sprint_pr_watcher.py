@@ -102,6 +102,10 @@ class SprintPRRegistrationStore:
         unit_ids = tuple(sorted({int(item) for item in work_unit_ids}))
         if not unit_ids or any(item < 1 for item in unit_ids):
             raise ValueError("registration requires positive work-unit IDs")
+        if len(unit_ids) != 1:
+            raise SprintInvariantError(
+                "registered PR requires exactly one owning work unit"
+            )
 
         with db_driver.write_transaction(self.con, "sprint.pr.register"):
             sprint = self.con.execute(
