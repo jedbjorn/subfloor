@@ -269,6 +269,53 @@ def select_work(con, participant_id: int) -> str:
     return conversation_id
 
 
+def create_review_outcome(
+    con,
+    *,
+    participant_id: int,
+    purpose: str,
+    idempotency_key: str,
+) -> str:
+    """Create and select a fresh Developer fix or merge conversation."""
+    if purpose not in {"fix", "merge"}:
+        raise SprintConversationError("review outcomes create fix or merge chats")
+    row = con.execute(
+        "SELECT p.sprint_id,p.role,p.harness,p.model,p.effort,"
+        "p.current_conversation_id,sh.shortname,sh.flavor,owner.user_id "
+        "FROM sprint_participants p "
+        "JOIN sprints s ON s.sprint_id=p.sprint_id "
+        "JOIN shells sh ON sh.shell_id=p.shell_id "
+        "JOIN shells owner ON owner.shell_id=s.originating_planner_shell_id "
+        "WHERE p.participant_id=?",
+        (participant_id,),
+    ).fetchone()
+    if row is None:
+        raise SprintConversationError("Sprint participant does not exist")
+    if row["role"] != "developer":
+        raise SprintConversationError("review outcomes target a Developer")
+    if row["current_conversation_id"] is None:
+        raise SprintConversationError("Developer has no current Sprint conversation")
+    if row["user_id"] is None:
+        raise SprintConversationError("originating Planner has no browser owner")
+    worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
+    return create_and_select(
+        con,
+        participant_id=participant_id,
+        owner_user_id=int(row["user_id"]),
+        purpose=purpose,
+        harness=row["harness"],
+        provider=run_mod.session_provider(row["harness"], row["model"]),
+        model=row["model"],
+        effort=row["effort"],
+        worktree=str(worktree.resolve(strict=False)),
+        title=(
+            f"Sprint {row['sprint_id']} · {purpose.title()} · {row['shortname']}"
+        ),
+        idempotency_key=idempotency_key,
+        parent_conversation_id=row["current_conversation_id"],
+    )
+
+
 def provision_at_arming(con, sprint_id: int) -> list[str]:
     """Create every participant's persistent conversation during arming.
 
