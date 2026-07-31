@@ -3189,8 +3189,8 @@ function chatReviewWorkspace(host, conversation) {
         patchBody = el("div", { className: "review-patch-wrap" });
         patchBody.append(reviewPatchRows(state.patch.patch || ""));
       }
-      workspace.append(el("div", { className: "review-body" }, navigator,
-        el("section", { className: "review-patch-pane" }, patchHead, patchBody)));
+      workspace.append(el("div", { className: "review-body" }, navigator, patchHead,
+        el("section", { className: "review-patch-pane" }, patchBody)));
     } else {
       const navigator = el("aside", { className: "review-navigator" });
       const list = el("div", { className: "review-file-tree review-shell-tree" });
@@ -3229,8 +3229,8 @@ function chatReviewWorkspace(host, conversation) {
         className: "review-shell-file review-patch-wrap",
         textContent: state.shellFile.body,
       });
-      workspace.append(el("div", { className: "review-body" }, navigator,
-        el("section", { className: "review-patch-pane" }, head, body)));
+      workspace.append(el("div", { className: "review-body" }, navigator, head,
+        el("section", { className: "review-patch-pane" }, body)));
     }
     host.replaceChildren(workspace);
   };

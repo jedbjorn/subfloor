@@ -194,6 +194,8 @@ def test_diff_layout_is_full_width_bounded_and_responsive():
     assert "grid-template-columns: minmax(220px, 300px) minmax(0, 1fr)" in STYLE
     assert STYLE.count("grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr)") >= 2
     assert "grid-template-rows: auto minmax(0, 1fr)" in STYLE
+    assert "grid-column: 1 / -1; grid-row: 1" in STYLE
+    assert "align-self: start; margin-top: -.4rem" in STYLE
     assert "flex: 1 1 auto" in STYLE
     assert "text-overflow: ellipsis" in STYLE
     source = current_workspace_source()
@@ -204,6 +206,8 @@ def test_diff_layout_is_full_width_bounded_and_responsive():
     assert "summaryStatus" in source
     assert "summaryActions" in summary
     assert "patchHeader(" in source
+    assert '}, navigator, patchHead,' in source
+    assert '}, navigator, head,' in source
     assert "}, summary);" in source
     assert 'el("span", { title: detail }, detail)' in source
     assert "@media (max-width: 900px)" in STYLE
