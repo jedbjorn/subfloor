@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import db_driver
+import sprint_liveness
 import sprint_participant_chats
 from github_pull_requests import GitHubPullRequestReader, PullRequest
 from sprint_domain import (
@@ -143,7 +144,7 @@ class SprintReviewLoopStore:
             self._require_armed(lane)
             if int(lane["reviewer_shell_id"]) != reviewer_shell_id:
                 raise SprintAuthorityError("only the assigned Reviewer owns the verdict")
-            requested_head = self._accepted_review_head(lane)
+            review_message_id, requested_head = self._accepted_review_request(lane)
             purpose = "fix" if verdict == "changes_requested" else "merge"
             disposition = "fixing" if verdict == "changes_requested" else "merge_ready"
             notification = (
@@ -167,48 +168,55 @@ class SprintReviewLoopStore:
             conversation_key = f"{idempotency_key}:conversation"
             if not receipt.created:
                 conversation_id = self._conversation_for_key(conversation_key)
-                return self._outcome_receipt(
+                outcome = self._outcome_receipt(
                     lane, conversation_id, receipt, disposition
                 )
-            if lane["disposition"] != "in_review":
-                raise SprintInvariantError(
-                    f"review verdict cannot start from {lane['disposition']}"
+            else:
+                if lane["disposition"] != "in_review":
+                    raise SprintInvariantError(
+                        f"review verdict cannot start from {lane['disposition']}"
+                    )
+                transition = self._latest_transition(registered_pr_id)
+                if transition["observed_head_sha"] != requested_head:
+                    raise SprintInvariantError("review request is stale for the PR head")
+                conversation_id = sprint_participant_chats.create_review_outcome(
+                    self.con,
+                    participant_id=int(lane["developer_participant_id"]),
+                    purpose=purpose,
+                    idempotency_key=conversation_key,
                 )
-            transition = self._latest_transition(registered_pr_id)
-            if transition["observed_head_sha"] != requested_head:
-                raise SprintInvariantError("review request is stale for the PR head")
-            conversation_id = sprint_participant_chats.create_review_outcome(
-                self.con,
-                participant_id=int(lane["developer_participant_id"]),
-                purpose=purpose,
-                idempotency_key=conversation_key,
-            )
-            self._record_judgment(
-                lane,
-                reviewer_shell_id,
-                "issue" if verdict == "changes_requested" else "decision",
-                body,
-            )
-            self.con.execute(
-                "UPDATE sprint_work_units SET disposition=?,"
-                "updated_at=datetime('now') WHERE work_unit_id=?",
-                (disposition, lane["work_unit_id"]),
-            )
-            self._event(
-                sprint_id,
-                f"review.{verdict}",
-                reviewer_shell_id,
-                {
-                    "conversation_id": conversation_id,
-                    "head_sha": requested_head,
-                    "message_id": receipt.message_id,
-                    "registered_pr_id": registered_pr_id,
-                    "work_unit_id": int(lane["work_unit_id"]),
-                },
-            )
-            return self._outcome_receipt(
-                lane, conversation_id, receipt, disposition
-            )
+                self._record_judgment(
+                    lane,
+                    reviewer_shell_id,
+                    "issue" if verdict == "changes_requested" else "decision",
+                    body,
+                )
+                self.con.execute(
+                    "UPDATE sprint_work_units SET disposition=?,"
+                    "updated_at=datetime('now') WHERE work_unit_id=?",
+                    (disposition, lane["work_unit_id"]),
+                )
+                self._event(
+                    sprint_id,
+                    f"review.{verdict}",
+                    reviewer_shell_id,
+                    {
+                        "conversation_id": conversation_id,
+                        "head_sha": requested_head,
+                        "message_id": receipt.message_id,
+                        "registered_pr_id": registered_pr_id,
+                        "work_unit_id": int(lane["work_unit_id"]),
+                    },
+                )
+                outcome = self._outcome_receipt(
+                    lane, conversation_id, receipt, disposition
+                )
+
+        sprint_liveness.SprintLivenessMonitor(self.con).resolve(
+            review_message_id,
+            f"review submitted: {verdict}",
+        )
+        return outcome
 
     def authorize_merge(
         self,
@@ -346,7 +354,7 @@ class SprintReviewLoopStore:
             raise SprintInvariantError("registered PR has no exact observed head")
         return row
 
-    def _accepted_review_head(self, lane: sqlite3.Row) -> str:
+    def _accepted_review_request(self, lane: sqlite3.Row) -> tuple[int, str]:
         latest = self.con.execute(
             "SELECT message_id,disposition FROM sprint_messages WHERE sprint_id=? "
             "AND work_unit_id=? AND to_participant_id=? "
@@ -372,7 +380,7 @@ class SprintReviewLoopStore:
         head_sha = json.loads(event["payload"]).get("head_sha")
         if not isinstance(head_sha, str) or not head_sha:
             raise SprintInvariantError("accepted review request has no exact head")
-        return head_sha
+        return int(latest["message_id"]), head_sha
 
     def _record_judgment(
         self,

@@ -227,6 +227,16 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
         ).fetchone()
         self.assertEqual(("fix", self.developer_conversation_id), tuple(fix_link))
         self.assertIsNone(self.messages.mark_read(changed.message_id, 1))
+        self.assertEqual(
+            ("review submitted: changes_requested", 0),
+            tuple(
+                self.con.execute(
+                    "SELECT resolution,next_evaluation_at IS NOT NULL "
+                    "FROM sprint_liveness_expectations WHERE message_id=?",
+                    (first.message_id,),
+                ).fetchone()
+            ),
+        )
 
         self.reader.current = pull_request(
             checks="FAILURE", checks_failed=True, head_sha="b" * 40
@@ -278,6 +288,16 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
                 "WHERE participant_id=?",
                 (self.developer_id,),
             ).fetchone()[0],
+        )
+        self.assertEqual(
+            ("review submitted: approved", 0),
+            tuple(
+                self.con.execute(
+                    "SELECT resolution,next_evaluation_at IS NOT NULL "
+                    "FROM sprint_liveness_expectations WHERE message_id=?",
+                    (second.message_id,),
+                ).fetchone()
+            ),
         )
         self.assertEqual(
             [("issue", "Medium: preserve the exact reviewed head."),
