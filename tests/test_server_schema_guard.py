@@ -373,6 +373,9 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
                 sprint_start = enter(mock.patch.object(
                     server.sprint_runtime, "start_service"
                 ))
+                watcher_start = enter(mock.patch.object(
+                    server.sprint_pr_watcher, "start_service"
+                ))
                 enter(mock.patch.object(transport, "serve", _fake_serve))
                 enter(contextlib.redirect_stdout(io.StringIO()))
                 enter(contextlib.redirect_stderr(io.StringIO()))
@@ -386,12 +389,19 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
             served[0] if served else None,
             broker_start.called,
             sprint_start.called,
+            watcher_start.called,
         )
 
     def test_startup_refuses_an_unsafe_bind_before_serving(self):
         for bind in ("0.0.0.0", "::", "192.168.1.10", "example.com"):
             with self.subTest(bind=bind):
-                refusal, served, broker_started, sprint_started = self._start(bind)
+                (
+                    refusal,
+                    served,
+                    broker_started,
+                    sprint_started,
+                    watcher_started,
+                ) = self._start(bind)
                 self.assertIsNotNone(
                     refusal, "main() accepted a non-loopback bind on a host")
                 self.assertIn("loopback", str(refusal))
@@ -408,11 +418,15 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
                     sprint_started,
                     "Sprint runtime started before bind refusal",
                 )
+                self.assertFalse(
+                    watcher_started,
+                    "Sprint PR watcher started before bind refusal",
+                )
 
     def test_startup_serves_a_loopback_bind(self):
         self.assertEqual(
             self._start("127.0.0.1"),
-            (None, "127.0.0.1", True, True),
+            (None, "127.0.0.1", True, True, True),
         )
 
     def test_startup_imports_no_removed_scheduler(self):
@@ -433,7 +447,7 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
         # unbootable, so the sandbox exception has to survive the wiring too.
         self.assertEqual(
             self._start("0.0.0.0", container=True),
-            (None, "0.0.0.0", True, True),
+            (None, "0.0.0.0", True, True, True),
         )
 
     def test_startup_binds_the_csp_to_the_served_port(self):

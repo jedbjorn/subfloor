@@ -84,7 +84,7 @@ class SprintMessageStore:
                 "only work assignments and review requests are actionable"
             )
         with db_driver.write_transaction(self.con, "sprint.message.send"):
-            return self._send(
+            return self.send_in_transaction(
                 sprint_id,
                 to_participant_id=to_participant_id,
                 message_kind=message_kind,
@@ -95,6 +95,49 @@ class SprintMessageStore:
                 actionable=actionable,
                 active=active,
             )
+
+    def send_in_transaction(
+        self,
+        sprint_id: int,
+        *,
+        to_participant_id: int,
+        message_kind: str,
+        body: str,
+        idempotency_key: str,
+        from_participant_id: int | None = None,
+        work_unit_id: int | None = None,
+        actionable: bool = False,
+        active: bool = True,
+    ) -> MessageReceipt:
+        """Commit through a caller-owned transaction.
+
+        Deterministic producers use this seam when their evidence row and the
+        resulting message+wake must either all commit or all roll back.  The
+        caller must already hold the short database-only transaction.
+        """
+        if not self.con.in_transaction:
+            raise RuntimeError("send_in_transaction requires an active transaction")
+        body = body.strip()
+        key = idempotency_key.strip()
+        if not body:
+            raise ValueError("Sprint message body is empty")
+        if not key:
+            raise ValueError("Sprint message idempotency key is empty")
+        if actionable and message_kind not in ACTIONABLE_KINDS:
+            raise SprintInvariantError(
+                "only work assignments and review requests are actionable"
+            )
+        return self._send(
+            sprint_id,
+            to_participant_id=to_participant_id,
+            message_kind=message_kind,
+            body=body,
+            idempotency_key=key,
+            from_participant_id=from_participant_id,
+            work_unit_id=work_unit_id,
+            actionable=actionable,
+            active=active,
+        )
 
     def inbox(self, sprint_id: int, shell_id: int) -> list[sqlite3.Row]:
         return self.con.execute(

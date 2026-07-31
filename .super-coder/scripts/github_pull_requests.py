@@ -228,14 +228,19 @@ class GitHubPullRequestReader:
         self,
         repo_root: str | Path,
         *,
+        repository: str | None = None,
         runner: Callable[..., Any] = _run_read_process,
         timeout: float = GITHUB_TIMEOUT_SECONDS,
         max_response_bytes: int = MAX_RESPONSE_BYTES,
     ) -> None:
         self.repo_root = Path(repo_root)
+        self.repository = repository.strip() if repository else None
         self.runner = runner
         self.timeout = timeout
         self.max_response_bytes = max_response_bytes
+
+    def _repo_args(self) -> list[str]:
+        return ["--repo", self.repository] if self.repository else []
 
     def _run(self, args: list[str]) -> str:
         try:
@@ -277,6 +282,7 @@ class GitHubPullRequestReader:
                 str(LIST_LIMIT),
                 "--json",
                 _FIELDS,
+                *self._repo_args(),
             ]
         )
         try:
@@ -292,7 +298,10 @@ class GitHubPullRequestReader:
     def get(self, number: int) -> PullRequest:
         if not isinstance(number, int) or number < 1:
             raise ValueError("PR number must be a positive integer")
-        raw = self._run(["gh", "pr", "view", str(number), "--json", _FIELDS])
+        raw = self._run(
+            ["gh", "pr", "view", str(number), "--json", _FIELDS,
+             *self._repo_args()]
+        )
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -304,4 +313,6 @@ class GitHubPullRequestReader:
     def patch(self, number: int) -> str:
         if not isinstance(number, int) or number < 1:
             raise ValueError("PR number must be a positive integer")
-        return self._run(["gh", "pr", "diff", str(number), "--patch"])
+        return self._run(
+            ["gh", "pr", "diff", str(number), "--patch", *self._repo_args()]
+        )

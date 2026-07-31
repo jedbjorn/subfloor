@@ -74,6 +74,7 @@ import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
 import sprint_participant_chats  # noqa: E402  (Sprints v2 participant chat topology)
+import sprint_pr_watcher  # noqa: E402  (Sprints v2 armed GitHub observation)
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
 import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
@@ -3227,12 +3228,13 @@ def require_loopback_bind(bind: str) -> None:
 
 
 def start_runtime_services() -> None:
-    """Start commit-woken conversations, then the armed Sprint pulse."""
+    """Start commit-woken conversations and the armed Sprint services."""
     conversation_broker.start_service(
         DB_PATH,
         launch_preparer=conversation_launch.ConversationLaunchPreparer(DB_PATH),
     )
     sprint_runtime.start_service(DB_PATH)
+    sprint_pr_watcher.start_service(DB_PATH, repo_root=REPO_ROOT)
 
 
 def main(argv):
@@ -3277,6 +3279,15 @@ def main(argv):
         # reconciliation. Task #94 calls notify_commit() after its transaction.
         # The callback runs after the TCP bind succeeds, so a losing duplicate
         # server process cannot dispatch a queued prompt before bind refusal.
+        def _start_runtime_services():
+            conversation_broker.start_service(
+                DB_PATH,
+                launch_preparer=conversation_launch.ConversationLaunchPreparer(
+                    DB_PATH
+                ),
+            )
+            sprint_pr_watcher.start_service(DB_PATH, repo_root=REPO_ROOT)
+
         await transport.serve(
             bind,
             port,
