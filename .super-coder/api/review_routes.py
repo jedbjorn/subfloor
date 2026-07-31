@@ -11,11 +11,16 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import stat
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -43,6 +48,12 @@ _CONVERSATION_TARGETS = re.compile(
 _TARGET_RESOURCE = re.compile(
     r"^/api/review-targets/(gt_[0-9a-f]{32})/(files|diff|commits)$"
 )
+_CONVERSATION_OBSERVATIONS = re.compile(
+    r"^/api/conversations/(cv_[0-9a-f]{32})/review-observations$"
+)
+_OBSERVATION_RESOURCE = re.compile(
+    r"^/api/review-observations/([0-9a-f]{64})/(patch|shell-file)$"
+)
 _REMOTE_ATTEMPTS: dict[str, float] = {}
 _REMOTE_RESULTS: dict[
     str,
@@ -51,6 +62,17 @@ _REMOTE_RESULTS: dict[
 _FILE_STATUSES = frozenset(
     ("added", "modified", "deleted", "renamed", "untracked", "conflict")
 )
+OBSERVATION_CACHE_LIMIT = 64
+OBSERVATION_KEY_CACHE_LIMIT = 512
+MAX_SHELL_FILES = 256
+MAX_SHELL_FILE_BYTES = 512 * 1024
+MAX_SHELL_TOTAL_BYTES = 2 * 1024 * 1024
+FETCHER = git_review.fetch_origin_main
+_OBSERVATION_LOCK = threading.Lock()
+_OBSERVATIONS: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_OBSERVATION_KEYS: OrderedDict[
+    tuple[int, str, str], dict[str, Any]
+] = OrderedDict()
 
 ApiError = conversation_routes.ApiError
 
@@ -135,7 +157,7 @@ def _etag_response(headers, etag_value: str, body: dict[str, Any]):
 
 def _conversation(con, conversation_id: str, owner_user_id: int):
     row = con.execute(
-        "SELECT conversation_id,worktree FROM conversations "
+        "SELECT conversation_id,shell_id,harness,worktree FROM conversations "
         "WHERE conversation_id=? AND owner_user_id=?",
         (conversation_id, owner_user_id),
     ).fetchone()
@@ -1000,6 +1022,464 @@ def _commits(
     return _etag_response(headers, response_etag, body)
 
 
+def _skill_names(con, shell_id: int) -> list[str]:
+    return [
+        str(row["name"])
+        for row in con.execute(
+            "SELECT sk.name FROM shell_skills ss "
+            "JOIN skills sk ON sk.skill_id=ss.skill_id "
+            "WHERE ss.shell_id=? AND sk.is_deleted=0 ORDER BY sk.name",
+            (shell_id,),
+        ).fetchall()
+    ]
+
+
+def _skill_roots(harness: str) -> list[str]:
+    adapter = Path(__file__).resolve().parents[1] / "adapters" / harness / "adapter.json"
+    roots = [".claude/skills"]
+    try:
+        payload = json.loads(adapter.read_text())
+    except (OSError, json.JSONDecodeError):
+        return roots
+    declared = payload.get("skill_dirs")
+    if isinstance(declared, list) and all(isinstance(item, str) for item in declared):
+        roots = declared
+    return list(dict.fromkeys(roots))
+
+
+def _shell_source(worktree: Path, relative_path: str) -> dict[str, Any]:
+    try:
+        safe_path = git_review.validate_review_path(relative_path)
+    except git_review.ReviewError:
+        return {"available": False, "error": "REVIEW_PATH_INVALID"}
+    candidate = worktree / safe_path
+    try:
+        direct = candidate.lstat()
+    except OSError:
+        return {"available": False, "error": "REVIEW_SHELL_FILE_UNAVAILABLE"}
+    if stat.S_ISLNK(direct.st_mode):
+        return {"available": False, "error": "REVIEW_SHELL_FILE_UNAVAILABLE"}
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(candidate, flags)
+    except OSError:
+        return {"available": False, "error": "REVIEW_SHELL_FILE_UNAVAILABLE"}
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            return {"available": False, "error": "REVIEW_SHELL_FILE_UNAVAILABLE"}
+        try:
+            opened = Path(os.readlink(f"/proc/self/fd/{descriptor}")).resolve(strict=True)
+            opened.relative_to(worktree)
+        except (OSError, RuntimeError, ValueError):
+            return {"available": False, "error": "REVIEW_SHELL_FILE_UNAVAILABLE"}
+        if info.st_size > MAX_SHELL_FILE_BYTES:
+            return {
+                "available": False,
+                "error": "REVIEW_SHELL_FILE_TOO_LARGE",
+                "bytes": info.st_size,
+            }
+        chunks: list[bytes] = []
+        remaining = MAX_SHELL_FILE_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    except OSError:
+        return {"available": False, "error": "REVIEW_SHELL_FILE_UNAVAILABLE"}
+    finally:
+        os.close(descriptor)
+    if len(raw) > MAX_SHELL_FILE_BYTES:
+        return {
+            "available": False,
+            "error": "REVIEW_SHELL_FILE_TOO_LARGE",
+            "bytes": len(raw),
+        }
+    try:
+        body = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return {"available": False, "error": "REVIEW_SHELL_FILE_NOT_TEXT"}
+    if "\0" in body:
+        return {"available": False, "error": "REVIEW_SHELL_FILE_NOT_TEXT"}
+    return {
+        "available": True,
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "body": body,
+    }
+
+
+def _shell_projection(
+    worktree_raw: str,
+    harness: str,
+    skill_names: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    try:
+        worktree = Path(worktree_raw).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise git_review.ReviewError(
+            "REVIEW_WORKTREE_MISSING",
+            "Conversation worktree is unavailable",
+        ) from exc
+    sources: list[dict[str, Any]] = []
+    for name in ("CLAUDE.md", "AGENTS.md"):
+        sources.append(
+            {
+                "kind": "boot",
+                "name": name,
+                "path": name,
+                **_shell_source(worktree, name),
+            }
+        )
+    skill_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+    roots = _skill_roots(harness)
+    for skill_name in skill_names:
+        if not skill_pattern.fullmatch(skill_name):
+            continue
+        for root in roots:
+            relative = f"{root}/{skill_name}/SKILL.md"
+            sources.append(
+                {
+                    "kind": "skill",
+                    "name": skill_name,
+                    "path": relative,
+                    **_shell_source(worktree, relative),
+                }
+            )
+    sources = sources[:MAX_SHELL_FILES]
+    total = 0
+    for source in sources:
+        if not source.get("available"):
+            continue
+        total += int(source["bytes"])
+        if total > MAX_SHELL_TOTAL_BYTES:
+            source.pop("body", None)
+            source.pop("sha256", None)
+            source["available"] = False
+            source["error"] = "REVIEW_SHELL_FILES_TOO_LARGE"
+
+    public: list[dict[str, Any]] = []
+    internal: list[dict[str, Any]] = []
+    for source in (item for item in sources if item["kind"] == "boot"):
+        descriptor = {
+            key: source.get(key)
+            for key in ("kind", "name", "available", "bytes", "sha256", "error")
+            if source.get(key) is not None
+        }
+        descriptor["paths"] = [source["path"]]
+        public.append(descriptor)
+        internal.append({**descriptor, "bodies": [source.get("body")]})
+
+    for skill_name in skill_names:
+        items = [
+            item for item in sources
+            if item["kind"] == "skill" and item["name"] == skill_name
+        ]
+        available = [item for item in items if item.get("available")]
+        digests = {item["sha256"] for item in available}
+        mismatch = len(digests) > 1
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for item in available:
+            groups.setdefault(item["sha256"], []).append(item)
+        for digest, group in groups.items():
+            descriptor = {
+                "kind": "skill",
+                "name": skill_name,
+                "available": True,
+                "bytes": group[0]["bytes"],
+                "sha256": digest,
+                "paths": [item["path"] for item in group],
+                "mismatch": mismatch,
+            }
+            public.append(descriptor)
+            internal.append(
+                {**descriptor, "bodies": [item["body"] for item in group]}
+            )
+        for item in (entry for entry in items if not entry.get("available")):
+            descriptor = {
+                "kind": "skill",
+                "name": skill_name,
+                "available": False,
+                "paths": [item["path"]],
+                "error": item.get("error", "REVIEW_SHELL_FILE_UNAVAILABLE"),
+                "mismatch": mismatch,
+            }
+            public.append(descriptor)
+            internal.append({**descriptor, "bodies": [None]})
+    return public, internal
+
+
+def _observation_fingerprint(
+    conversation_id: str,
+    projection: git_review.WorktreeProjection,
+    shell_files: list[dict[str, Any]],
+) -> str:
+    return git_review.fingerprint(
+        {
+            "conversation_id": conversation_id,
+            "projection": projection.fingerprint,
+            "shell_files": shell_files,
+        }
+    )
+
+
+def _file_descriptor(
+    fingerprint_value: str,
+    section: str,
+    item: git_review.FileProjection,
+) -> dict[str, Any]:
+    file_id = "rf_" + git_review.fingerprint(
+        {"fingerprint": fingerprint_value, "section": section, "path": item.path}
+    )[:32]
+    return {**asdict(item), "file_id": file_id}
+
+
+def _build_observation(
+    conversation: dict[str, Any],
+    owner_user_id: int,
+    *,
+    fetch: git_review.FetchProjection,
+) -> dict[str, Any]:
+    worktree = str(conversation["worktree"])
+    projection = git_review.project_current_worktree(worktree)
+    con = _db()
+    try:
+        skill_names = _skill_names(con, int(conversation["shell_id"]))
+    finally:
+        con.close()
+    shell_public, shell_internal = _shell_projection(
+        worktree,
+        str(conversation["harness"]),
+        skill_names,
+    )
+    digest = _observation_fingerprint(
+        str(conversation["conversation_id"]),
+        projection,
+        shell_public,
+    )
+    dirty = [_file_descriptor(digest, "dirty", item) for item in projection.dirty]
+    branch_files = [
+        _file_descriptor(digest, "branch", item) for item in projection.branch_files
+    ]
+    file_map = {
+        item["file_id"]: {"section": section, "path": item["path"]}
+        for section, items in (("dirty", dirty), ("branch", branch_files))
+        for item in items
+    }
+    shell_map: dict[str, dict[str, Any]] = {}
+    for index, (public, internal) in enumerate(zip(shell_public, shell_internal)):
+        shell_id = "sf_" + git_review.fingerprint(
+            {"fingerprint": digest, "index": index, "paths": public["paths"]}
+        )[:32]
+        public["file_id"] = shell_id
+        internal["file_id"] = shell_id
+        if public.get("available"):
+            shell_map[shell_id] = internal
+    observed_at = datetime.now(timezone.utc).isoformat()
+    body = {
+        "conversation_id": conversation["conversation_id"],
+        "fingerprint": digest,
+        "observed_at": observed_at,
+        "fetch": {
+            "fresh": fetch.fresh,
+            "error": fetch.error,
+            "base_stale": not fetch.fresh and projection.base_available,
+        },
+        "status": {
+            "branch": projection.branch,
+            "head_sha": projection.head_sha,
+            "base_sha": projection.base_sha,
+            "base_available": projection.base_available,
+            "dirty_count": len(dirty),
+            "ahead_count": projection.visible_ahead,
+            "behind": projection.behind,
+        },
+        "changes": {
+            "dirty": dirty,
+            "branch": branch_files,
+            "commits": [asdict(item) for item in projection.commits],
+            "files_truncated": projection.files_truncated,
+            "commits_truncated": projection.commits_truncated,
+        },
+        "shell_files": shell_public,
+        "no_code_changes": not dirty and not branch_files and not projection.commits,
+    }
+    return {
+        "conversation_id": conversation["conversation_id"],
+        "owner_user_id": owner_user_id,
+        "shell_id": int(conversation["shell_id"]),
+        "harness": str(conversation["harness"]),
+        "worktree": worktree,
+        "projection": projection,
+        "fingerprint": digest,
+        "file_map": file_map,
+        "shell_map": shell_map,
+        "body": body,
+    }
+
+
+def _remember_observation(snapshot: dict[str, Any]) -> None:
+    digest = snapshot["fingerprint"]
+    _OBSERVATIONS.setdefault(digest, snapshot)
+    _OBSERVATIONS.move_to_end(digest)
+    while len(_OBSERVATIONS) > OBSERVATION_CACHE_LIMIT:
+        old_digest, _old = _OBSERVATIONS.popitem(last=False)
+        for key, value in list(_OBSERVATION_KEYS.items()):
+            if value["fingerprint"] == old_digest:
+                _OBSERVATION_KEYS.pop(key, None)
+
+
+def _create_observation(
+    conversation_id: str,
+    owner_user_id: int,
+    idempotency_key: str,
+):
+    key = (owner_user_id, conversation_id, idempotency_key)
+    with _OBSERVATION_LOCK:
+        cached = _OBSERVATION_KEYS.get(key)
+        if cached is not None:
+            _OBSERVATION_KEYS.move_to_end(key)
+            return conversation_routes._json(200, cached["body"])
+        con = _db()
+        try:
+            row = _conversation(con, conversation_id, owner_user_id)
+            conversation = dict(row)
+        finally:
+            con.close()
+        fetch = FETCHER(str(conversation["worktree"]))
+        snapshot = _build_observation(conversation, owner_user_id, fetch=fetch)
+        _remember_observation(snapshot)
+        _OBSERVATION_KEYS[key] = {
+            "fingerprint": snapshot["fingerprint"],
+            "body": snapshot["body"],
+        }
+        _OBSERVATION_KEYS.move_to_end(key)
+        while len(_OBSERVATION_KEYS) > OBSERVATION_KEY_CACHE_LIMIT:
+            _OBSERVATION_KEYS.popitem(last=False)
+        return conversation_routes._json(201, snapshot["body"])
+
+
+def _observation(digest: str, owner_user_id: int) -> dict[str, Any]:
+    snapshot = _OBSERVATIONS.get(digest)
+    if snapshot is None or snapshot["owner_user_id"] != owner_user_id:
+        raise ApiError(
+            404,
+            "REVIEW_OBSERVATION_NOT_FOUND",
+            "review observation does not exist",
+        )
+    _OBSERVATIONS.move_to_end(digest)
+    return snapshot
+
+
+def _observation_source(snapshot: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    con = _db()
+    try:
+        row = _conversation(
+            con,
+            str(snapshot["conversation_id"]),
+            int(snapshot["owner_user_id"]),
+        )
+        conversation = dict(row)
+        skill_names = _skill_names(con, int(conversation["shell_id"]))
+    finally:
+        con.close()
+    if (
+        str(conversation["worktree"]) != snapshot["worktree"]
+        or int(conversation["shell_id"]) != snapshot["shell_id"]
+        or str(conversation["harness"]) != snapshot["harness"]
+    ):
+        raise ApiError(
+            409,
+            "REVIEW_SNAPSHOT_CHANGED",
+            "review source changed after the observation",
+        )
+    return conversation, skill_names
+
+
+def _ensure_observation_current(snapshot: dict[str, Any]) -> None:
+    _conversation_row, skill_names = _observation_source(snapshot)
+    projection = git_review.project_current_worktree(snapshot["worktree"])
+    shell_public, _internal = _shell_projection(
+        snapshot["worktree"],
+        snapshot["harness"],
+        skill_names,
+    )
+    current = _observation_fingerprint(
+        snapshot["conversation_id"],
+        projection,
+        shell_public,
+    )
+    if current != snapshot["fingerprint"]:
+        raise ApiError(
+            409,
+            "REVIEW_SNAPSHOT_CHANGED",
+            "worktree changed after the observation",
+        )
+
+
+def _observation_patch(snapshot: dict[str, Any], query: dict[str, str], headers):
+    file_id = query.get("file") or ""
+    selected = snapshot["file_map"].get(file_id)
+    if selected is None:
+        raise ApiError(422, "REVIEW_PATH_INVALID", "review file is not in the snapshot")
+    _ensure_observation_current(snapshot)
+    projection = snapshot["projection"]
+    if selected["section"] == "dirty":
+        patch = git_review.read_file_patch(
+            snapshot["worktree"],
+            projection.head_sha,
+            selected["path"],
+        )
+    else:
+        patch = git_review.read_file_patch(
+            snapshot["worktree"],
+            projection.merge_base_sha,
+            selected["path"],
+            new_ref=projection.head_sha,
+        )
+    _ensure_observation_current(snapshot)
+    body = {
+        "fingerprint": snapshot["fingerprint"],
+        "file_id": file_id,
+        "section": selected["section"],
+        "patch": patch.text,
+        "sha256": patch.sha256,
+        "truncated": patch.truncated,
+        "binary": patch.binary,
+        "unavailable_reason": patch.unavailable_reason,
+    }
+    return _etag_response(headers, patch.etag, body)
+
+
+def _observation_shell_file(snapshot: dict[str, Any], query: dict[str, str], headers):
+    file_id = query.get("file") or ""
+    selected = snapshot["shell_map"].get(file_id)
+    if selected is None:
+        raise ApiError(
+            422,
+            "REVIEW_PATH_INVALID",
+            "shell file is not in the snapshot",
+        )
+    _observation_source(snapshot)
+    bodies = selected["bodies"]
+    _observation_source(snapshot)
+    response_etag = git_review.etag(selected["sha256"])
+    return _etag_response(
+        headers,
+        response_etag,
+        {
+            "fingerprint": snapshot["fingerprint"],
+            "file_id": file_id,
+            "paths": selected["paths"],
+            "body": bodies[0],
+            "mismatch": selected.get("mismatch", False),
+        },
+    )
+
+
 _REVIEW_ERROR_STATUS = {
     "REVIEW_TARGET_NOT_FOUND": 404,
     "REVIEW_WORKTREE_MISSING": 409,
@@ -1010,25 +1490,41 @@ _REVIEW_ERROR_STATUS = {
     "REVIEW_DIFF_TOO_LARGE": 413,
     "REVIEW_TARGET_CHANGED": 409,
     "REVIEW_TARGET_UNAVAILABLE": 503,
+    "REVIEW_SNAPSHOT_CHANGED": 409,
+    "REVIEW_OBSERVATION_NOT_FOUND": 404,
+    "REVIEW_SHELL_FILE_TOO_LARGE": 413,
+    "REVIEW_SHELL_FILES_TOO_LARGE": 413,
+    "REVIEW_SHELL_FILE_NOT_TEXT": 415,
 }
 
 
 def handle(method: str, path: str, headers_raw: str, raw_body: bytes):
-    """Dispatch one authenticated review GET request."""
+    """Dispatch authenticated historical and current-worktree review reads."""
     headers = conversation_routes._parse_headers(headers_raw)
     if not conversation_routes._host_ok(headers):
         return conversation_routes._err(403, "HOST_FORBIDDEN", "Host is not allowed")
     parsed = urlparse(path)
     conversation_match = _CONVERSATION_TARGETS.fullmatch(parsed.path)
     target_match = _TARGET_RESOURCE.fullmatch(parsed.path)
-    if conversation_match is None and target_match is None:
+    observation_match = _CONVERSATION_OBSERVATIONS.fullmatch(parsed.path)
+    observation_resource_match = _OBSERVATION_RESOURCE.fullmatch(parsed.path)
+    if all(
+        match is None
+        for match in (
+            conversation_match,
+            target_match,
+            observation_match,
+            observation_resource_match,
+        )
+    ):
         return conversation_routes._err(404, "NOT_FOUND", "route does not exist")
-    if method != "GET":
+    expected_method = "POST" if observation_match is not None else "GET"
+    if method != expected_method:
         return conversation_routes._err(
             405,
             "METHOD_NOT_ALLOWED",
-            "review resources are read-only",
-            headers=[("Allow", "GET")],
+            "review method is not allowed",
+            headers=[("Allow", expected_method)],
         )
     if not conversation_routes._mutation_site_ok(headers):
         return conversation_routes._err(
@@ -1040,16 +1536,36 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes):
         con = _db()
         try:
             operator = conversation_routes._operator(con, headers)
-            if conversation_match is not None:
+            if conversation_match is not None or observation_match is not None:
+                matched_conversation = conversation_match or observation_match
                 _conversation(
                     con,
-                    conversation_match.group(1),
+                    matched_conversation.group(1),
                     operator["user_id"],
                 )
-            else:
+            elif target_match is not None:
                 row = _target(con, target_match.group(1), operator["user_id"])
         finally:
             con.close()
+        if observation_match is not None:
+            _query(parsed.query, set())
+            if raw_body:
+                raise ApiError(422, "VALIDATION_ERROR", "request body must be empty")
+            idempotency_key = conversation_routes._idempotency_key(headers)
+            return _create_observation(
+                observation_match.group(1),
+                operator["user_id"],
+                idempotency_key,
+            )
+        if observation_resource_match is not None:
+            snapshot = _observation(
+                observation_resource_match.group(1),
+                operator["user_id"],
+            )
+            query = _query(parsed.query, {"file"})
+            if observation_resource_match.group(2) == "patch":
+                return _observation_patch(snapshot, query, headers)
+            return _observation_shell_file(snapshot, query, headers)
         if conversation_match is not None:
             query = _query(parsed.query, {"refresh"})
             return _list_targets(

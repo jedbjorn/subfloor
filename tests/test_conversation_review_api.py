@@ -70,23 +70,25 @@ class ReviewDispatchTest(unittest.TestCase):
     def test_real_server_dispatches_both_review_resource_families(self) -> None:
         expected = (299, [("X-Review", "yes")], b"review")
         conversation_id = "cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        paths = (
-            f"/api/conversations/{conversation_id}/review-targets?refresh=remote",
-            "/api/review-targets/gt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/files",
+        routes = (
+            ("GET", f"/api/conversations/{conversation_id}/review-targets?refresh=remote"),
+            ("GET", "/api/review-targets/gt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/files"),
+            ("POST", f"/api/conversations/{conversation_id}/review-observations"),
+            ("GET", "/api/review-observations/" + "a" * 64 + "/patch?file=rf_a"),
         )
         with patch.object(server.review_routes, "handle", return_value=expected) as call:
-            for path in paths:
+            for method, path in routes:
                 with self.subTest(path=path):
                     self.assertEqual(
                         server.dispatch_http(
-                            "GET",
+                            method,
                             path,
                             "Host: 127.0.0.1\r\n\r\n",
                             b"",
                         ),
                         expected,
                     )
-            self.assertEqual(call.call_count, 2)
+            self.assertEqual(call.call_count, 4)
 
 
 class ConversationReviewApiTest(unittest.TestCase):
@@ -121,6 +123,7 @@ class ConversationReviewApiTest(unittest.TestCase):
         self.original_db_path = review_routes.DB_PATH
         self.original_reader = review_routes.READER_FACTORY
         self.original_cache = review_routes.CACHE_FACTORY
+        self.original_fetcher = review_routes.FETCHER
         review_routes.DB_PATH = self.db_path
         review_routes.READER_FACTORY = FakeReader
         review_routes.CACHE_FACTORY = partial(
@@ -129,6 +132,8 @@ class ConversationReviewApiTest(unittest.TestCase):
         )
         review_routes._REMOTE_ATTEMPTS.clear()
         review_routes._REMOTE_RESULTS.clear()
+        review_routes._OBSERVATIONS.clear()
+        review_routes._OBSERVATION_KEYS.clear()
         FakeReader.pull_requests = []
         FakeReader.available = True
         self.addCleanup(self._restore)
@@ -137,17 +142,27 @@ class ConversationReviewApiTest(unittest.TestCase):
         review_routes.DB_PATH = self.original_db_path
         review_routes.READER_FACTORY = self.original_reader
         review_routes.CACHE_FACTORY = self.original_cache
+        review_routes.FETCHER = self.original_fetcher
         review_routes._REMOTE_ATTEMPTS.clear()
         review_routes._REMOTE_RESULTS.clear()
+        review_routes._OBSERVATIONS.clear()
+        review_routes._OBSERVATION_KEYS.clear()
         FakeReader.pull_requests = []
         FakeReader.available = True
 
-    def request(self, path: str, *, headers: str | None = None):
+    def request(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        headers: str | None = None,
+        body: bytes = b"",
+    ):
         status, response_headers, body = review_routes.handle(
-            "GET",
+            method,
             path,
             headers or self.headers,
-            b"",
+            body,
         )
         value = json.loads(body) if body else None
         return status, dict(response_headers), value
@@ -161,6 +176,16 @@ class ConversationReviewApiTest(unittest.TestCase):
             item["target_id"]
             for item in body["items"]
             if item["kind"] == "workspace"
+        )
+
+    def observe(self, key: str = "observe-1"):
+        return self.request(
+            f"/api/conversations/{self.conversation_id}/review-observations",
+            method="POST",
+            headers=(
+                "Host: 127.0.0.1\r\n"
+                f"Idempotency-Key: {key}\r\n\r\n"
+            ),
         )
 
     def test_owned_targets_hide_worktree_and_expose_fresh_selection(self) -> None:
@@ -280,6 +305,227 @@ class ConversationReviewApiTest(unittest.TestCase):
         )
         self.assertEqual(not_modified, 304)
         self.assertIsNone(response_body)
+
+    def test_current_worktree_observation_is_retry_safe_and_fingerprinted(self) -> None:
+        calls = []
+        real_fetcher = review_routes.FETCHER
+
+        def fetcher(worktree):
+            calls.append(worktree)
+            return real_fetcher(worktree)
+
+        review_routes.FETCHER = fetcher
+        self.fixture.write("CLAUDE.md", "claude boot\n")
+        self.fixture.write("AGENTS.md", "agents boot\n")
+
+        status, _headers, observed = self.observe()
+        retry_status, _retry_headers, retried = self.observe()
+
+        self.assertEqual(status, 201, observed)
+        self.assertEqual(retry_status, 200, retried)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(retried, observed)
+        self.assertEqual(len(observed["fingerprint"]), 64)
+        self.assertEqual(observed["status"]["branch"], "feature/review-api")
+        self.assertEqual(observed["status"]["ahead_count"], 1)
+        self.assertEqual(observed["status"]["behind"], 0)
+        self.assertEqual(
+            {item["path"] for item in observed["changes"]["branch"]},
+            {"api.txt", "second.txt"},
+        )
+        self.assertEqual(
+            {item["name"] for item in observed["shell_files"][:2]},
+            {"CLAUDE.md", "AGENTS.md"},
+        )
+        self.assertNotIn(str(self.fixture.repo), json.dumps(observed))
+
+        review_routes.FETCHER = lambda _worktree: git_review.FetchProjection(
+            False,
+            "offline",
+        )
+        second_status, _second_headers, second = self.observe("observe-2")
+        retry_status, _retry_headers, retried_again = self.observe()
+        self.assertEqual(second_status, 201, second)
+        self.assertEqual(second["fingerprint"], observed["fingerprint"])
+        self.assertFalse(second["fetch"]["fresh"])
+        self.assertEqual(retry_status, 200, retried_again)
+        self.assertEqual(retried_again, observed)
+
+    def test_observation_patch_accepts_only_snapshot_files_and_detects_change(self) -> None:
+        status, _headers, observed = self.observe()
+        self.assertEqual(status, 201, observed)
+        api_file = next(
+            item for item in observed["changes"]["branch"]
+            if item["path"] == "api.txt"
+        )
+
+        status, _headers, patch_body = self.request(
+            f"/api/review-observations/{observed['fingerprint']}/patch"
+            f"?file={api_file['file_id']}"
+        )
+        self.assertEqual(status, 200, patch_body)
+        self.assertEqual(patch_body["section"], "branch")
+        self.assertIn("+review api", patch_body["patch"])
+
+        status, _headers, refused = self.request(
+            f"/api/review-observations/{observed['fingerprint']}/patch"
+            "?file=rf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+        self.assertEqual(status, 422, refused)
+        self.assertEqual(refused["error"]["code"], "REVIEW_PATH_INVALID")
+
+        self.fixture.write("api.txt", "changed after observation\n")
+        status, _headers, changed = self.request(
+            f"/api/review-observations/{observed['fingerprint']}/patch"
+            f"?file={api_file['file_id']}"
+        )
+        self.assertEqual(status, 409, changed)
+        self.assertEqual(changed["error"]["code"], "REVIEW_SNAPSHOT_CHANGED")
+
+    def test_fetch_failure_uses_stale_base_or_typed_unavailable_base(self) -> None:
+        review_routes.FETCHER = lambda _worktree: git_review.FetchProjection(
+            False,
+            "offline",
+        )
+
+        status, _headers, stale = self.observe("stale-base")
+        self.assertEqual(status, 201, stale)
+        self.assertFalse(stale["fetch"]["fresh"])
+        self.assertTrue(stale["fetch"]["base_stale"])
+        self.assertTrue(stale["status"]["base_available"])
+        self.assertEqual(stale["fetch"]["error"], "offline")
+
+        self.fixture.git("update-ref", "-d", "refs/remotes/origin/main")
+        self.fixture.write("dirty.txt", "dirty without base\n")
+        status, _headers, unavailable = self.observe("missing-base")
+        self.assertEqual(status, 201, unavailable)
+        self.assertFalse(unavailable["status"]["base_available"])
+        self.assertIsNone(unavailable["status"]["base_sha"])
+        self.assertEqual(unavailable["changes"]["branch"], [])
+        self.assertEqual(unavailable["changes"]["commits"], [])
+        self.assertIn(
+            "dirty.txt",
+            {item["path"] for item in unavailable["changes"]["dirty"]},
+        )
+
+    def test_shell_files_are_exact_deduplicated_and_mismatch_aware(self) -> None:
+        con = sqlite3.connect(self.db_path)
+        self.conversation_id = "cv_cccccccccccccccccccccccccccccccc"
+        con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (2,'OpenCode Dev','ocdev','dev','prompt',1)"
+        )
+        con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,worktree,"
+            "creation_idempotency_key,creation_request_hash) "
+            "VALUES (?,2,1,'opencode',?,'opencode-create','hash')",
+            (self.conversation_id, str(self.fixture.repo)),
+        )
+        con.execute(
+            "INSERT INTO skills (name,description,content) "
+            "VALUES ('sample','sample skill','body')"
+        )
+        skill_id = con.execute(
+            "SELECT skill_id FROM skills WHERE name='sample'"
+        ).fetchone()[0]
+        con.execute(
+            "INSERT INTO shell_skills (shell_id,skill_id) VALUES (2,?)",
+            (skill_id,),
+        )
+        con.commit()
+        con.close()
+        self.fixture.write("CLAUDE.md", "claude boot\n")
+        self.fixture.write("AGENTS.md", "agents boot\n")
+        mirrored = "---\nname: sample\n---\nexact body\n"
+        self.fixture.write(".claude/skills/sample/SKILL.md", mirrored)
+        self.fixture.write(".opencode/skills/sample/SKILL.md", mirrored)
+
+        status, _headers, observed = self.observe("shell-identical")
+        self.assertEqual(status, 201, observed)
+        skill_files = [
+            item for item in observed["shell_files"] if item["name"] == "sample"
+        ]
+        self.assertEqual(len(skill_files), 1)
+        self.assertEqual(
+            skill_files[0]["paths"],
+            [
+                ".claude/skills/sample/SKILL.md",
+                ".opencode/skills/sample/SKILL.md",
+            ],
+        )
+        self.assertFalse(skill_files[0]["mismatch"])
+
+        status, _headers, content = self.request(
+            f"/api/review-observations/{observed['fingerprint']}/shell-file"
+            f"?file={skill_files[0]['file_id']}"
+        )
+        self.assertEqual(status, 200, content)
+        self.assertEqual(content["body"], mirrored)
+        self.assertEqual(content["paths"], skill_files[0]["paths"])
+
+        self.fixture.write(
+            ".opencode/skills/sample/SKILL.md",
+            "---\nname: sample\n---\ndifferent mirror\n",
+        )
+        status, _headers, stable = self.request(
+            f"/api/review-observations/{observed['fingerprint']}/shell-file"
+            f"?file={skill_files[0]['file_id']}"
+        )
+        self.assertEqual(status, 200, stable)
+        self.assertEqual(stable["body"], mirrored)
+        status, _headers, mismatched = self.observe("shell-mismatch")
+        self.assertEqual(status, 201, mismatched)
+        skill_files = [
+            item for item in mismatched["shell_files"] if item["name"] == "sample"
+        ]
+        self.assertEqual(len(skill_files), 2)
+        self.assertTrue(all(item["mismatch"] for item in skill_files))
+
+    def test_shell_file_symlink_binary_and_size_limits_fail_closed(self) -> None:
+        con = sqlite3.connect(self.db_path)
+        con.execute(
+            "INSERT INTO skills (name,description,content) "
+            "VALUES ('sample','sample skill','body')"
+        )
+        skill_id = con.execute(
+            "SELECT skill_id FROM skills WHERE name='sample'"
+        ).fetchone()[0]
+        con.execute(
+            "INSERT INTO shell_skills (shell_id,skill_id) VALUES (1,?)",
+            (skill_id,),
+        )
+        con.commit()
+        con.close()
+        self.fixture.write("CLAUDE.md", b"binary\x00body")
+        self.fixture.write("AGENTS.md", "x" * (512 * 1024 + 1))
+        secret = self.fixture.root / "outside-secret.txt"
+        secret.write_text("must not escape\n")
+        skill_dir = self.fixture.repo / ".claude" / "skills" / "sample"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").symlink_to(secret)
+
+        status, _headers, observed = self.observe("unsafe-shell-files")
+
+        self.assertEqual(status, 201, observed)
+        by_name = {item["name"]: item for item in observed["shell_files"][:2]}
+        self.assertFalse(by_name["CLAUDE.md"]["available"])
+        self.assertEqual(
+            by_name["CLAUDE.md"]["error"],
+            "REVIEW_SHELL_FILE_NOT_TEXT",
+        )
+        self.assertFalse(by_name["AGENTS.md"]["available"])
+        self.assertEqual(
+            by_name["AGENTS.md"]["error"],
+            "REVIEW_SHELL_FILE_TOO_LARGE",
+        )
+        sample = next(
+            item for item in observed["shell_files"] if item["name"] == "sample"
+        )
+        self.assertFalse(sample["available"])
+        self.assertEqual(sample["error"], "REVIEW_SHELL_FILE_UNAVAILABLE")
+        self.assertNotIn("must not escape", json.dumps(observed))
 
     def test_target_ownership_and_operator_auth_do_not_leak(self) -> None:
         con = sqlite3.connect(self.db_path)

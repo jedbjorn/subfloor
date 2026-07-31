@@ -3098,9 +3098,10 @@ def dispatch_http(method: str, path: str, headers_raw: str,
     parsed = urlparse(path)
     if (
         parsed.path.startswith("/api/review-targets/")
+        or parsed.path.startswith("/api/review-observations/")
         or (
             parsed.path.startswith("/api/conversations/")
-            and parsed.path.endswith("/review-targets")
+            and parsed.path.endswith(("/review-targets", "/review-observations"))
         )
     ):
         return review_routes.handle(method, path, headers_raw, body)
