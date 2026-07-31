@@ -673,9 +673,14 @@ export { mode };"""
             "tabsTop: tabs.top, tabsLeft: tabs.left, "
             "tabsCenter: tabs.left + tabs.width / 2, "
             "tabsClip: getComputedStyle(nodes[4]).clipPath, "
-            "tabsRadius: getComputedStyle(nodes[4]).borderRadius, "
+            "tabsTopLeftRadius: getComputedStyle(nodes[4]).borderTopLeftRadius, "
+            "tabsTopRightRadius: getComputedStyle(nodes[4]).borderTopRightRadius, "
+            "tabsBottomRightRadius: getComputedStyle(nodes[4]).borderBottomRightRadius, "
+            "tabsBottomLeftRadius: getComputedStyle(nodes[4]).borderBottomLeftRadius, "
             "activeClip: getComputedStyle(nodes[5]).clipPath, "
             "activeHeight: active.height, "
+            "activeLayer: getComputedStyle(nodes[5]).zIndex, "
+            "inactiveLayer: getComputedStyle(nodes[6]).zIndex, "
             "dividerBorder: getComputedStyle(nodes[6], '::before').borderLeftWidth, "
             "dividerHeight: parseFloat(getComputedStyle(nodes[6], '::before').height), "
             "buttonBorder: getComputedStyle(nodes[6]).borderLeftWidth}; }"
@@ -689,11 +694,16 @@ export { mode };"""
         assert abs(patch_header["headerTop"] - patch_header["tabsTop"]) <= 1
         assert patch_header["tabsClip"].startswith("shape(")
         assert patch_header["activeClip"].startswith("shape(")
-        assert patch_header["tabsRadius"] == "0px"
+        assert patch_header["tabsTopLeftRadius"] == "4px"
+        assert patch_header["tabsTopRightRadius"] == "4px"
+        assert patch_header["tabsBottomRightRadius"] == "0px"
+        assert patch_header["tabsBottomLeftRadius"] == "4px"
+        assert patch_header["activeLayer"] == "1"
+        assert patch_header["inactiveLayer"] == "0"
         assert patch_header["dividerBorder"] == "1px"
         assert patch_header["buttonBorder"] == "0px"
         assert abs(
-            patch_header["activeHeight"] - patch_header["dividerHeight"] - 13
+            patch_header["activeHeight"] - patch_header["dividerHeight"] - 16
         ) <= 1
         initial_observations = sum(
             method == "POST" and path.endswith("/review-observations")
@@ -799,6 +809,18 @@ export { mode };"""
         page.get_by_role("tab", name="Commits").click()
         page.get_by_text("Build the current-worktree Diff", exact=True).wait_for()
         page.get_by_role("tab", name="Shell files").click()
+        shell_layers = page.locator(".review-group-switch button").evaluate_all(
+            "nodes => ({inactiveLayer: getComputedStyle(nodes[0]).zIndex, "
+            "activeLayer: getComputedStyle(nodes[1]).zIndex, "
+            "dividerBorder: getComputedStyle(nodes[0], '::after').borderRightWidth, "
+            "activeBorder: getComputedStyle(nodes[1]).borderLeftWidth})"
+        )
+        assert shell_layers == {
+            "inactiveLayer": "0",
+            "activeLayer": "1",
+            "dividerBorder": "1px",
+            "activeBorder": "0px",
+        }
         page.get_by_role("button", name="CLAUDE.md").click()
         page.locator(".review-shell-file").wait_for()
         assert "# Exact CLAUDE" in page.locator(".review-shell-file").text_content()
