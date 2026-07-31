@@ -1,13 +1,15 @@
 """Task #166 gates for the Sprint v1 removal manifest and cutover fixture."""
 from __future__ import annotations
 
+import io
 import json
 import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -742,6 +744,76 @@ for name in sys.argv[2:]:
                 self.assertEqual(
                     fresh.execute("PRAGMA foreign_key_check").fetchall(),
                     dirty.execute("PRAGMA foreign_key_check").fetchall(),
+                )
+
+    def test_task_172_dirty_upgrade_runner_stamps_once_and_retry_is_noop(self):
+        cleanup = ROOT / load_manifest()["schema_removal"]["cleanup_migration"]
+        scripts = ENGINE / "scripts"
+        sys.path.insert(0, str(scripts))
+        try:
+            import migrate
+        finally:
+            sys.path.pop(0)
+
+        with tempfile.TemporaryDirectory() as raw:
+            db_path = Path(raw) / "dirty-upgrade.db"
+            with closing(sqlite3.connect(db_path)) as seed:
+                seed.executescript(DATABASE_FIXTURE.read_text())
+                seed.execute("PRAGMA foreign_keys=ON")
+
+            first_output = io.StringIO()
+            with redirect_stdout(first_output):
+                self.assertEqual(0, migrate.migrate(str(db_path)))
+            retry_output = io.StringIO()
+            with redirect_stdout(retry_output):
+                self.assertEqual(0, migrate.migrate(str(db_path)))
+
+            self.assertIn(
+                f"migrate: applied {cleanup.name}",
+                first_output.getvalue(),
+            )
+            self.assertIn("migrate: nothing pending", retry_output.getvalue())
+            with closing(sqlite3.connect(db_path)) as con:
+                con.row_factory = sqlite3.Row
+                con.execute("PRAGMA foreign_keys=ON")
+                self.assertEqual(
+                    1,
+                    con.execute(
+                        "SELECT COUNT(*) FROM schema_migrations "
+                        "WHERE filename=?",
+                        (cleanup.name,),
+                    ).fetchone()[0],
+                )
+                self.assertEqual(
+                    [(220, "cv_normal", "assistant.delta")],
+                    [
+                        tuple(row)
+                        for row in con.execute(
+                            "SELECT event_id,conversation_id,event_type "
+                            "FROM conversation_events ORDER BY event_id"
+                        )
+                    ],
+                )
+                for statement in (
+                    "DELETE FROM conversation_events WHERE event_id=220",
+                    (
+                        "UPDATE conversation_events SET event_type='mutated' "
+                        "WHERE event_id=220"
+                    ),
+                ):
+                    with self.subTest(statement=statement), self.assertRaisesRegex(
+                        sqlite3.IntegrityError,
+                        "conversation events are append-only",
+                    ):
+                        con.execute(statement)
+                self.assertEqual(
+                    (220, "cv_normal", "assistant.delta"),
+                    tuple(
+                        con.execute(
+                            "SELECT event_id,conversation_id,event_type "
+                            "FROM conversation_events WHERE event_id=220"
+                        ).fetchone()
+                    ),
                 )
 
     def test_task_170_cleanup_rolls_back_before_ledger_stamp_on_failure(self):
