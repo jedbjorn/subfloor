@@ -286,7 +286,7 @@ class ShellFactoryTest(unittest.TestCase):
 
     def test_operational_shell_has_no_personal_identity_by_default(self) -> None:
         sid = shell_factory.create_shell(
-            self.con, flavor="conductor", name="Conductor"
+            self.con, flavor="dev", name="Developer"
         )
         row = self.con.execute(
             "SELECT lineage_seed, has_identity FROM shells WHERE shell_id=?",

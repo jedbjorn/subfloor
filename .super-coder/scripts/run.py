@@ -1645,8 +1645,7 @@ def _self_start_ticks() -> "int | None":
 
     comm (field 2) may contain spaces and parens, so the split starts after the
     final ')': rest[0] is state (field 3), rest[19] is starttime (field 22) —
-    the same indexing shell_liveness._stat_fields and activity_readers._stat
-    already use.
+    the same indexing shell_liveness._stat_fields already uses.
     """
     try:
         data = (PROC_SELF_STAT).read_text()

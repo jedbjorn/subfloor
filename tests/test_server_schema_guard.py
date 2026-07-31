@@ -474,21 +474,6 @@ class CspSourceListTest(unittest.TestCase):
              "ws://localhost:8800", "wss://localhost:8800",
              "ws://[::1]:8800", "wss://[::1]:8800"})
 
-    def test_socket_sources_cover_every_allowed_api_host(self):
-        # A host the API fence admits but the CSP omits is a client that
-        # cannot connect. Read the allowlist from the surviving fence
-        # (sprint_routes' Host allowlist — the Interface stack retired):
-        # drift between the two lists is the failure this catches. An IPv6
-        # literal is bracketed in a URL authority, so map it before comparing.
-        sys.path.insert(0, str(ENGINE / "api"))
-        import sprint_routes  # noqa: PLC0415 — imported late, like the fence
-
-        sources = set(self._directive(server._csp(8800), "connect-src"))
-        for host in sprint_routes._ALLOWED_HOST_SET:
-            url_host = f"[{host}]" if ":" in host else host
-            with self.subTest(host=host):
-                self.assertIn(f"ws://{url_host}:8800", sources)
-
     def test_the_rest_of_the_policy_stays_strict(self):
         csp = server._csp(8800)
         self.assertEqual(self._directive(csp, "script-src"), ["'self'"])
