@@ -16,10 +16,7 @@ WHERE name IN (
     'cartographer',
     'db_map',
     'dev_kit',
-    'dev_sprint',
-    'issue_reporting',
-    'plan_sprint',
-    'rev_sprint'
+    'issue_reporting'
 );
 
 UPDATE skills

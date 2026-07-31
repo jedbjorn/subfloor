@@ -9,13 +9,11 @@ SET state='closed',
     closed_at=COALESCE(closed_at, datetime('now')),
     last_activity_at=datetime('now'),
     version=version+1
-WHERE mode='normal'
-  AND state<>'closed'
+WHERE state<>'closed'
   AND EXISTS (
       SELECT 1
       FROM conversations AS newer
-      WHERE newer.mode='normal'
-        AND newer.state<>'closed'
+      WHERE newer.state<>'closed'
         AND newer.shell_id=older.shell_id
         AND (
             newer.last_activity_at > older.last_activity_at
@@ -26,8 +24,8 @@ WHERE mode='normal'
         )
   );
 
-CREATE UNIQUE INDEX idx_conversations_live_normal_shell
+CREATE UNIQUE INDEX idx_conversations_live_shell
     ON conversations(shell_id)
-    WHERE mode='normal' AND state<>'closed';
+    WHERE state<>'closed';
 
 COMMIT;

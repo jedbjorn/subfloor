@@ -32,76 +32,6 @@ def digest(path: Path) -> str:
 
 
 class RebuildIntegrityTest(unittest.TestCase):
-    def test_cleanup_migration_keeps_ended_alert_resolved_and_removes_orphans(self):
-        with tempfile.TemporaryDirectory() as raw_tmp:
-            db = Path(raw_tmp) / "shell_db.db"
-            apply_engine_schema(db)
-            con = sqlite3.connect(db)
-            con.execute(
-                "INSERT INTO users (user_id, username, is_active) "
-                "VALUES (1,'test',1)")
-            con.execute(
-                "INSERT INTO shells (shell_id, display_name, shortname, mandate, "
-                "system_prompt, user_id, is_shared, has_identity, bootstrapped) "
-                "VALUES (1,'S1','s1','test','sp',1,0,1,1)")
-            con.execute(
-                "INSERT INTO interface_generations "
-                "(shell_id, generation, ended_at) VALUES (1,1,datetime('now'))")
-            con.execute(
-                "INSERT INTO interface_sessions "
-                "(session_id, shell_id, generation, occupancy, lifecycle, ended_at) "
-                "VALUES (1,1,1,'ended','ended',datetime('now'))")
-            con.execute(
-                "INSERT INTO interface_input_state "
-                "(session_id, shell_id, generation, composer, pending_seq) "
-                "VALUES (1,1,1,'unknown',7)")
-            con.execute(
-                "INSERT INTO interface_writer_leases "
-                "(session_id, shell_id, generation, client_id, token_hash) "
-                "VALUES (1,1,1,'client','hash')")
-            con.execute(
-                "INSERT INTO planner_alerts "
-                "(alert_id, session_id, severity, reason, dedupe_key) "
-                "VALUES (42,1,'critical','crash_window_delivery_unknown',"
-                "'1|-|-|crash_window_delivery_unknown')")
-            con.execute(
-                "INSERT INTO planner_alerts "
-                "(alert_id, session_id, severity, reason, dedupe_key) "
-                "VALUES (41,999,'warning','legacy-orphan','orphan')")
-            con.commit()
-
-            migration = (
-                MIGRATIONS / "0084_interface_integrity_cleanup.sql").read_text()
-            con.executescript(migration)
-            first_alert = con.execute(
-                "SELECT alert_id, reason, resolved_at FROM planner_alerts "
-                "WHERE session_id=1").fetchone()
-            self.assertEqual(first_alert[:2], (
-                42, "crash_window_delivery_unknown"))
-            self.assertIsNotNone(first_alert[2])
-            con.executescript(migration)
-            self.assertEqual(con.execute(
-                "SELECT composer, delivery, pending_seq "
-                "FROM interface_input_state WHERE session_id=1"
-            ).fetchone(), ("unknown", "delivery_unknown", 7))
-            self.assertEqual(con.execute(
-                "SELECT alert_id, reason, resolved_at FROM planner_alerts "
-                "WHERE session_id=1"
-            ).fetchall(), [first_alert])
-            self.assertIsNone(con.execute(
-                "SELECT 1 FROM planner_alerts WHERE session_id=1 "
-                "AND resolved_at IS NULL"
-            ).fetchone())
-            revoked_at, reason = con.execute(
-                "SELECT revoked_at, revoke_reason FROM interface_writer_leases "
-                "WHERE session_id=1").fetchone()
-            self.assertIsNotNone(revoked_at)
-            self.assertEqual(reason, "session_end")
-            self.assertIsNone(con.execute(
-                "SELECT 1 FROM planner_alerts WHERE alert_id=41"
-            ).fetchone())
-            con.close()
-
     def test_valid_candidate_atomically_replaces_outgoing_db(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
@@ -165,9 +95,11 @@ class RebuildIntegrityTest(unittest.TestCase):
             apply_engine_schema(outgoing)
             con = sqlite3.connect(outgoing)
             con.execute(
-                "INSERT INTO planner_alerts "
-                "(alert_id, session_id, severity, reason, dedupe_key) "
-                "VALUES (41,999,'warning','legacy-orphan','orphan')")
+                "INSERT INTO conversation_messages "
+                "(message_id,conversation_id,sender_kind,sender_ref,"
+                "message_kind,body,idempotency_key,request_hash) "
+                "VALUES (41,'cv_missing','engine','rebuild','notice',"
+                "'orphan','orphan','orphan-hash')")
             con.commit()
             con.close()
             outgoing_before = digest(outgoing)
@@ -175,10 +107,12 @@ class RebuildIntegrityTest(unittest.TestCase):
             snapshot.write_text(
                 "PRAGMA foreign_keys=OFF;\n"
                 "BEGIN;\n"
-                "DELETE FROM planner_alerts;\n"
-                "INSERT INTO planner_alerts "
-                "(alert_id, session_id, severity, reason, dedupe_key) "
-                "VALUES (41,999,'warning','legacy-orphan','orphan');\n"
+                "DELETE FROM conversation_messages;\n"
+                "INSERT INTO conversation_messages "
+                "(message_id,conversation_id,sender_kind,sender_ref,"
+                "message_kind,body,idempotency_key,request_hash) "
+                "VALUES (41,'cv_missing','engine','rebuild','notice',"
+                "'orphan','orphan','orphan-hash');\n"
                 "COMMIT;\n"
                 "PRAGMA foreign_keys=ON;\n"
             )
@@ -197,7 +131,7 @@ class RebuildIntegrityTest(unittest.TestCase):
 
             message = str(ctx.exception)
             self.assertIn("foreign-key check failed", message)
-            self.assertIn("table planner_alerts row 41", message)
+            self.assertIn("table conversation_messages row 41", message)
             self.assertEqual(digest(outgoing), outgoing_before)
             self.assertFalse(Path(str(outgoing) + ".rebuild").exists())
 
@@ -206,11 +140,11 @@ class RebuildIntegrityTest(unittest.TestCase):
             backup = sqlite3.connect(backup_files[0])
             try:
                 row = backup.execute(
-                    "SELECT session_id, reason FROM planner_alerts "
-                    "WHERE alert_id=41").fetchone()
+                    "SELECT conversation_id, body FROM conversation_messages "
+                    "WHERE message_id=41").fetchone()
             finally:
                 backup.close()
-            self.assertEqual(row, (999, "legacy-orphan"))
+            self.assertEqual(row, ("cv_missing", "orphan"))
 
 
 if __name__ == "__main__":

@@ -111,9 +111,9 @@ class ConversationReviewApiTest(unittest.TestCase):
         )
         con.execute(
             "INSERT INTO conversations "
-            "(conversation_id,shell_id,mode,owner_user_id,harness,worktree,"
+            "(conversation_id,shell_id,owner_user_id,harness,worktree,"
             "creation_idempotency_key,creation_request_hash) "
-            "VALUES (?,1,'normal',1,'codex',?,'create','hash')",
+            "VALUES (?,1,1,'codex',?,'create','hash')",
             (self.conversation_id, str(self.fixture.repo)),
         )
         con.commit()
@@ -291,9 +291,9 @@ class ConversationReviewApiTest(unittest.TestCase):
         )
         con.execute(
             "INSERT INTO conversations "
-            "(conversation_id,shell_id,mode,owner_user_id,harness,worktree,"
+            "(conversation_id,shell_id,owner_user_id,harness,worktree,"
             "creation_idempotency_key,creation_request_hash) "
-            "VALUES ('cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',2,'normal',2,"
+            "VALUES ('cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',2,2,"
             "'codex',?,'other-create','other-hash')",
             (str(self.fixture.repo),),
         )

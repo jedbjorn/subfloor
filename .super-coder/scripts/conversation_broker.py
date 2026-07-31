@@ -81,7 +81,7 @@ class BrokerRun:
     interrupt_requested: bool = False
 
     def context(self) -> ConversationContext:
-        # Normal-mode browser conversations run with worktree command access.
+        # Browser conversations run with worktree command access.
         # Each adapter chooses its native mechanism; there is no shared
         # requirement for a literal --sandbox flag.
         return ConversationContext(
@@ -240,7 +240,6 @@ class BrokerStore:
                     " ON c.conversation_id=o.conversation_id "
                     "JOIN conversation_messages m ON m.message_id=o.message_id "
                     "WHERE o.state='pending' AND c.state='queued' "
-                    "AND c.mode='normal' "
                     "AND NOT EXISTS ("
                     " SELECT 1 FROM conversation_events closing "
                     " WHERE closing.conversation_id=c.conversation_id "
@@ -368,8 +367,7 @@ class BrokerStore:
             with db_driver.write_transaction(con, "conversation.broker.adopt"):
                 selected = con.execute(
                     self._run_select()
-                    + "WHERE c.mode='normal' "
-                    "AND r.state IN ('leased','starting','running') "
+                    + "WHERE r.state IN ('leased','starting','running') "
                     "AND r.lease_expires_at<=? ORDER BY r.run_id LIMIT ?",
                     (now, limit),
                 ).fetchall()

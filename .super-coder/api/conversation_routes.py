@@ -1,6 +1,6 @@
-"""Browser-native normal conversation HTTP resources (Feature #24).
+"""Browser-native conversation HTTP resources (Feature #24).
 
-The localhost operator is the only actor for normal-mode conversations.
+The localhost operator is the only actor for conversations.
 Browser mutations additionally prove same-origin.  Native harness session and
 run references remain server-side; projections and SSE expose normalized
 conversation data only.
@@ -198,7 +198,7 @@ def _operator(con, headers) -> dict:
         raise ApiError(
             403,
             "OPERATOR_REQUIRED",
-            "normal conversations are owned by the browser operator",
+            "conversations are owned by the browser operator",
         )
     row = con.execute(
         "SELECT user_id,username FROM users WHERE is_active=1 ORDER BY user_id LIMIT 1"
@@ -381,7 +381,7 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
         " AND active.state IN ('leased','starting','running') "
         " ORDER BY active.run_id DESC LIMIT 1) AS active_run_id "
         "FROM conversations c JOIN shells s ON s.shell_id=c.shell_id "
-        "WHERE c.conversation_id=? AND c.mode='normal' AND c.owner_user_id=?",
+        "WHERE c.conversation_id=? AND c.owner_user_id=?",
         (conversation_id, owner_user_id),
     ).fetchone()
 
@@ -595,7 +595,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     # write reservation. The transaction repeats every authoritative DB read.
     existing = con.execute(
         "SELECT conversation_id,creation_request_hash FROM conversations "
-        "WHERE mode='normal' AND owner_user_id=? "
+        "WHERE owner_user_id=? "
         "AND creation_idempotency_key=?",
         (operator["user_id"], key),
     ).fetchone()
@@ -629,7 +629,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         )
     open_conversations = con.execute(
         "SELECT conversation_id,state FROM conversations "
-        "WHERE mode='normal' AND shell_id=? AND state!='closed'",
+        "WHERE shell_id=? AND state!='closed'",
         (shell_id,),
     ).fetchall()
     if not open_conversations:
@@ -694,7 +694,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     with db_driver.write_transaction(con, "conversation.create"):
         existing = con.execute(
             "SELECT conversation_id,creation_request_hash FROM conversations "
-            "WHERE mode='normal' AND owner_user_id=? "
+            "WHERE owner_user_id=? "
             "AND creation_idempotency_key=?",
             (operator["user_id"], key),
         ).fetchone()
@@ -739,7 +739,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
 
         open_conversations = con.execute(
             "SELECT conversation_id,state FROM conversations "
-            "WHERE mode='normal' AND shell_id=? AND state!='closed'",
+            "WHERE shell_id=? AND state!='closed'",
             (shell_id,),
         ).fetchall()
         if not open_conversations:
@@ -780,9 +780,9 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             auto_closed.append(row["conversation_id"])
         con.execute(
             "INSERT INTO conversations "
-            "(conversation_id,shell_id,mode,owner_user_id,harness,provider,model,"
+            "(conversation_id,shell_id,owner_user_id,harness,provider,model,"
             "effort,worktree,title,creation_idempotency_key,"
-            "creation_request_hash) VALUES (?,?,'normal',?,?,?,?,?,?,?,?,?)",
+            "creation_request_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
                 conversation_id,
                 shell_id,
@@ -828,7 +828,7 @@ def _list_conversations(con, operator: dict, query):
     if "mode" in query:
         raise ApiError(422, "VALIDATION_ERROR", "unknown query field: mode")
     limit = _limit(query, maximum=100)
-    clauses = ["c.mode='normal'", "c.owner_user_id=?"]
+    clauses = ["c.owner_user_id=?"]
     params: list = [operator["user_id"]]
     shell = query.get("shell_id", [None])[0]
     shell_id = None

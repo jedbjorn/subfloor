@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Conversation state-machine vocabulary mirrored by migrations 0132 and 0135.
+"""Conversation state-machine vocabulary mirrored by migration 0132.
 
 The database triggers are the final backstop. API and broker code import these
 maps to reject a bad edge with a useful typed error before SQLite reduces it to
@@ -46,18 +46,11 @@ OUTBOX_TRANSITIONS = {
     "cancelled": frozenset(),
 }
 
-SPRINT_BINDING_TRANSITIONS = {
-    "pending": frozenset({"active", "terminal"}),
-    "active": frozenset({"terminal"}),
-    "terminal": frozenset(),
-}
-
 MACHINES = {
     "conversation": CONVERSATION_TRANSITIONS,
     "message": MESSAGE_TRANSITIONS,
     "run": RUN_TRANSITIONS,
     "outbox": OUTBOX_TRANSITIONS,
-    "sprint_binding": SPRINT_BINDING_TRANSITIONS,
 }
 
 INITIAL_STATES = {
@@ -65,7 +58,6 @@ INITIAL_STATES = {
     "message": "accepted",
     "run": "leased",
     "outbox": "pending",
-    "sprint_binding": "pending",
 }
 
 

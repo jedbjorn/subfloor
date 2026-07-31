@@ -44,9 +44,9 @@ class ConversationGitTargetsTest(unittest.TestCase):
         )
         con.execute(
             "INSERT INTO conversations "
-            "(conversation_id,shell_id,mode,owner_user_id,harness,worktree,"
+            "(conversation_id,shell_id,owner_user_id,harness,worktree,"
             "creation_idempotency_key,creation_request_hash) "
-            "VALUES ('cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'normal',1,"
+            "VALUES ('cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,1,"
             "'codex',?,'create','hash')",
             (str(self.fixture.repo),),
         )
@@ -220,9 +220,9 @@ class ConversationGitTargetsTest(unittest.TestCase):
         )
         target.execute(
             "INSERT INTO conversations "
-            "(conversation_id,shell_id,mode,owner_user_id,harness,worktree,"
+            "(conversation_id,shell_id,owner_user_id,harness,worktree,"
             "creation_idempotency_key,creation_request_hash) "
-            "VALUES ('cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,'normal',1,"
+            "VALUES ('cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,1,"
             "'codex','/missing/after-cleanup','create','hash')"
         )
         target.executescript(

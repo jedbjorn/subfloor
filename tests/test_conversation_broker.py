@@ -241,7 +241,7 @@ class ConversationBrokerCase(unittest.TestCase):
     def allow_legacy_duplicate_open_chats(self) -> None:
         """Exercise the broker's independent lock against pre-migration data."""
         con = self.connect()
-        con.execute("DROP INDEX idx_conversations_live_normal_shell")
+        con.execute("DROP INDEX idx_conversations_live_shell")
         con.commit()
         con.close()
 
@@ -387,15 +387,19 @@ class StoreContractTest(ConversationBrokerCase):
         conversation_id = self.add_conversation()
         self.add_message(conversation_id)
         con = self.connect()
-        con.execute("PRAGMA foreign_keys=OFF")
-        for table in (
+        absent_tables = (
             "sprint_assignment_results",
             "sprint_cancellations",
             "sprint_conversation_bindings",
             "sprints",
-        ):
-            con.execute(f"DROP TABLE {table}")
-        con.commit()
+        )
+        present = {
+            row[0]
+            for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        self.assertTrue(set(absent_tables).isdisjoint(present))
         con.close()
 
         store = BrokerStore(self.db_path)
