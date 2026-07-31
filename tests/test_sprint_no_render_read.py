@@ -44,7 +44,6 @@ AUDITED_REFERENCES = {
     "api/db_broker.py": "docstring spec citation",
     "scripts/dbq.py": "docstring spec citation",
     "scripts/job.py": "docstring spec citation",
-    "scripts/run.py": "docstring spec citation",
     "scripts/watch.py": "docstring spec citation",
     "scripts/seed_dogfood.py": "stores render_path as a WRITE destination",
     "scripts/install.py": "adds generated mirror paths to the ignore policy",

@@ -815,23 +815,6 @@ class BoardRecordTest(_BoardCase):
 
     # -- the board survives a rebuild ----------------------------------------
 
-    def test_the_board_is_snapshot_content_not_a_rebuildable_cache(self):
-        """Nothing re-derives a sprint board. Left out of the snapshot
-        allowlist, a mid-sprint rebuild drops every unit and the reconciler
-        has nothing left to compare belief against."""
-        import snapshot
-        self.assertIn("sprint_units", snapshot.PER_INSTANCE_TABLES)
-        self.assertGreater(
-            snapshot.PER_INSTANCE_TABLES.index("sprint_units"),
-            snapshot.PER_INSTANCE_TABLES.index("documents"),
-            "sprint_units must load after its FK target `documents`")
-        self.assertGreater(
-            snapshot.PER_INSTANCE_TABLES.index("sprint_units"),
-            snapshot.PER_INSTANCE_TABLES.index("shells"),
-            "sprint_units must load after its FK target `shells`")
-
-    # -- malformed input is refused at the edge -------------------------------
-
     def test_a_field_of_the_wrong_type_is_refused_not_stored(self):
         """The board is a record of what a planner DECLARED, and the reconciler
         acts on what it is handed. A field holding something no planner could

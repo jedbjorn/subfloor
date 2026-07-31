@@ -228,7 +228,6 @@ class SourceSyncWiringCase(unittest.TestCase):
         reconciling a tree deliberately. Positive control: the test above shows
         this same harness DOES reach the sync without the flag."""
         with mock.patch.object(update, "is_source_repo", return_value=True), \
-                mock.patch.object(update, "warn_live_state"), \
                 mock.patch.object(update, "ensure_workflows", side_effect=Stop), \
                 mock.patch.object(update, "sync_repo_checkout") as sync, \
                 contextlib.redirect_stdout(io.StringIO()):

@@ -105,89 +105,6 @@ class ShellStatusTest(unittest.TestCase):
                 run._shell_status(browser_shell, self.snap),
             )
 
-    def test_sprint_reservation_replaces_only_available(self) -> None:
-        sprint_shell = {
-            **self.shell,
-            "current_state": "working notes\nSPRINT doc=21 unit=4 status=waiting",
-            "sprint_reserved": True,
-        }
-        with mock.patch.object(style, "ON", True), mock.patch.object(
-                run.shell_liveness, "session_state", return_value=None):
-            self.assertEqual("\x1b[38;5;214mSprint\x1b[0m      ",
-                             run._shell_status(sprint_shell, self.snap))
-
-        for state, expected in (("busy", "Busy"), ("orphan", "Orphaned")):
-            with self.subTest(state=state), mock.patch.object(
-                    run.shell_liveness, "session_state", return_value=state):
-                self.assertEqual(expected,
-                                 run._shell_status(sprint_shell, self.snap).strip())
-
-        partial = {**self.snap, "indeterminate": 1}
-        with mock.patch.object(run.shell_liveness, "session_state", return_value=None):
-            self.assertEqual("Unknown",
-                             run._shell_status(sprint_shell, partial).strip())
-
-    def _sprint_db(self):
-        con = sqlite3.connect(":memory:")
-        self.addCleanup(con.close)
-        con.row_factory = sqlite3.Row
-        con.executescript("""
-            CREATE TABLE shells (
-                shell_id INTEGER PRIMARY KEY,
-                display_name TEXT,
-                shortname TEXT,
-                mandate TEXT,
-                is_shared INTEGER NOT NULL DEFAULT 0,
-                flavor TEXT,
-                current_state TEXT,
-                user_id INTEGER,
-                is_deleted INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE documents (
-                document_id INTEGER PRIMARY KEY,
-                kind TEXT NOT NULL,
-                frozen INTEGER NOT NULL DEFAULT 0,
-                body TEXT
-            );
-            INSERT INTO documents VALUES
-                (21, 'doc', 0, '# SPRINT: active\nstatus: ACTIVE'),
-                (22, 'doc', 0, '# SPRINT: closed\nstatus: CLOSED'),
-                (23, 'doc', 1, '# SPRINT: frozen\nstatus: ACTIVE'),
-                (24, 'doc', 0, '# SPRINT: malformed\nstatus:');
-            INSERT INTO shells VALUES
-                (1, 'Active', 'DEV1', '', 0, 'dev', 'SPRINT doc=21 unit=1', 1, 0),
-                (2, 'Closed', 'DEV2', '', 0, 'dev', 'SPRINT doc=22 unit=2', 1, 0),
-                (3, 'Frozen', 'REV1', '', 0, 'reviewer', 'SPRINT doc=23 reviewing=2', 1, 0),
-                (4, 'Missing', 'DEV3', '', 0, 'dev', 'SPRINT doc=999 unit=3', 1, 0),
-                (5, 'Bad marker', 'DEV4', '', 0, 'dev', 'SPRINT doc=oops unit=4', 1, 0),
-                (6, 'Bad tracker', 'DEV5', '', 0, 'dev', 'SPRINT doc=24 unit=5', 1, 0);
-        """)
-        return con
-
-    def test_only_active_unfrozen_sprint_docs_reserve_shells(self) -> None:
-        con = self._sprint_db()
-
-        shells = {shell["shortname"]: shell
-                  for shell in run.list_shells(con, user_id=1)}
-
-        self.assertEqual(
-            {"DEV1": True, "DEV2": False, "REV1": False,
-             "DEV3": False, "DEV4": False, "DEV5": False},
-            {name: shell["sprint_reserved"] for name, shell in shells.items()},
-        )
-        with mock.patch.object(
-                run.shell_liveness, "session_state", return_value=None):
-            self.assertEqual(
-                "Sprint", run._shell_status(shells["DEV1"], self.snap).strip())
-            self.assertEqual(
-                "Available", run._shell_status(shells["DEV2"], self.snap).strip())
-
-    def test_sprint_annotation_never_blocks_boot(self) -> None:
-        sprint_shell = {**self.shell, "sprint_reserved": True}
-        with mock.patch.object(
-                run.shell_liveness, "session_state", return_value=None):
-            self.assertTrue(run.confirm_live(sprint_shell, self.snap))
-
     def test_picker_has_a_dedicated_status_column(self) -> None:
         shell = {**self.shell, "display_name": "Dev One"}
         stdout = _Stdout(tty=False)
@@ -201,90 +118,6 @@ class ShellStatusTest(unittest.TestCase):
         self.assertIs(shell, chosen)
         self.assertIn("Shortname     Status      Default", stdout.getvalue())
         self.assertIn("DEV1          Available", stdout.getvalue())
-
-
-class SprintRefTest(unittest.TestCase):
-    """Archive sprint scope comes only from explicit launch context."""
-
-    def _db(self):
-        con = sqlite3.connect(":memory:")
-        self.addCleanup(con.close)
-        return con
-
-    def test_explicit_env_is_the_scope(self) -> None:
-        con = self._db()
-        with mock.patch.dict(run.os.environ, {"SC_SPRINT_REF": "40"},
-                             clear=True):
-            self.assertEqual("40", run.resolve_sprint_ref(con))
-
-    def test_explicitly_empty_env_declares_a_non_sprint_boot(self) -> None:
-        con = self._db()
-        for blank in ("", "   "):
-            with self.subTest(blank=blank), mock.patch.dict(
-                run.os.environ,
-                {"SC_SPRINT_REF": blank},
-                clear=True,
-            ):
-                self.assertIsNone(run.resolve_sprint_ref(con))
-
-    def test_absent_env_never_guesses_from_the_database(self) -> None:
-        con = self._db()
-        con.executescript("""
-            CREATE TABLE sprint_planner_bindings (
-                binding_id INTEGER PRIMARY KEY,
-                sprint_doc_id INTEGER,
-                released_at TEXT);
-            INSERT INTO sprint_planner_bindings VALUES (1, 38, NULL);
-        """)
-        with mock.patch.dict(run.os.environ, {}, clear=True):
-            self.assertIsNone(run.resolve_sprint_ref(con))
-
-    def test_current_state_prose_is_never_a_source(self) -> None:
-        """The ruling's whole point: a shell whose current_state names an
-        ACTIVE sprint doc still stamps nothing without a binding or the env.
-        Deriving hard state from prose is the defect class this unit fixes."""
-        con = self._db()
-        con.executescript("""
-            CREATE TABLE shells (
-                shell_id INTEGER PRIMARY KEY, display_name TEXT,
-                shortname TEXT, mandate TEXT,
-                is_shared INTEGER NOT NULL DEFAULT 0, flavor TEXT,
-                current_state TEXT, user_id INTEGER,
-                is_deleted INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE documents (
-                document_id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
-                frozen INTEGER NOT NULL DEFAULT 0, body TEXT);
-            INSERT INTO documents VALUES (38,'doc',0,'# SPRINT\nstatus: ACTIVE');
-            INSERT INTO shells VALUES
-                (1,'Dev','DEV6','',0,'dev','SPRINT doc=38 unit=4',1,0);
-        """)
-        with mock.patch.dict(run.os.environ, {}, clear=True):
-            self.assertIsNone(run.resolve_sprint_ref(con))
-
-    def test_headless_boot_writes_the_resolved_ref_onto_the_archive(self) -> None:
-        """End to end through open_session: explicit launch scope is stored."""
-        con = self._db()
-        con.executescript("""
-            CREATE TABLE shells (
-                shell_id INTEGER PRIMARY KEY, active_archive_id INTEGER);
-            CREATE TABLE shell_memory_archives (
-                archive_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                shell_id INTEGER NOT NULL, session_id TEXT NOT NULL,
-                date TEXT NOT NULL, full_narrative TEXT NOT NULL,
-                started_at TEXT, harness TEXT, provider TEXT, model TEXT,
-                sprint_ref TEXT, UNIQUE (shell_id, session_id));
-            CREATE TABLE session_token_usage (archive_id INTEGER);
-            INSERT INTO shells VALUES (1, NULL);
-        """)
-        with mock.patch.dict(run.os.environ, {"SC_SPRINT_REF": "38"},
-                             clear=True):
-            run.open_session(con, 1, lifecycle={
-                "harness": "claude", "provider": "anthropic", "model": "opus",
-                "sprint_ref": run.resolve_sprint_ref(con)})
-        self.assertEqual(
-            ("38",),
-            tuple(con.execute(
-                "SELECT sprint_ref FROM shell_memory_archives").fetchone()))
 
 
 class SpinnerTest(unittest.TestCase):
@@ -392,7 +225,6 @@ class BootPhaseLabelTest(unittest.TestCase):
         full = {"shell_id": 1, "display_name": "Dev One", "api_key": None}
         con = mock.Mock()
         con.execute.return_value.fetchone.return_value = full
-        # No armed sprint binding — resolve_sprint_ref stamps nothing.
         con.execute.return_value.fetchall.return_value = []
         labels: list[str] = []
 
@@ -401,8 +233,7 @@ class BootPhaseLabelTest(unittest.TestCase):
             self.assertTrue(enabled)
             yield _LabelRecorder(labels, label)
 
-        # SC_RAW_BOOT: main()'s interactive entry refuses without the Interface
-        # reservation capability (spec #20); these unit tests drive the raw
+        # SC_RAW_BOOT: these unit tests drive the raw
         # boot pipeline itself, so they hold the tooling escape hatch.
         env = {"SC_RAW_BOOT": "1"}
         if no_prune:

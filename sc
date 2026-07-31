@@ -53,8 +53,8 @@ MAPDB="$("$PY" "$S/artifact_policy.py" path map-db)"
 # whole fix — `./sc migrate` from a worktree used to maintain the main
 # checkout's live DB and say nothing about which DB it meant.
 #
-# `-h`/`--help` is not an action and must work from any checkout (sprint ruling
-# R1): parse first, refuse second, act third. Only the commands whose target
+# `-h`/`--help` is not an action and must work from any checkout:
+# parse first, refuse second, act third. Only the commands whose target
 # actually implements help consult sc_help_form; for the rest every form is an
 # action form and refuses.
 sc_help_form() {
@@ -1315,9 +1315,8 @@ case "$cmd" in
   pg-down)      sc_pg_down ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
-  # Headless boot (sprint eventing): same render-then-exec path as boot, minus
-  # the picker and the TTY. In-container primitive like boot — the planner
-  # calls it to stand up an ephemeral worker; also the no-docker host path.
+  # Headless boot: same render-then-exec path as boot, minus the picker and
+  # the TTY. Also used by the no-docker host path.
   run)          exec "$PY" "$S/run.py" --headless "$@" ;;
   deps)         sc_deps "$@" ;;
   test)         sc_test "$@" ;;
@@ -1409,7 +1408,7 @@ case "$cmd" in
     docker rm -f "$CNAME" >/dev/null 2>&1 || true
     # Docker's init shim is PID 1 so orphaned harness/worker subprocesses are
     # reaped. Without it the Python API server becomes PID 1, never wait()s on
-    # reparented children, and a long-running multi-shell sprint exhausts the
+    # reparented children, and long-running multi-shell work exhausts the
     # container's PID limit with zombies (flag #323).
     docker run -d --name "$CNAME" --restart unless-stopped --init \
       --network "$SC_NET" \
@@ -1582,7 +1581,6 @@ super-coder — forkable shell substrate
   ./sc ensure-harness      install claude + opencode + codex + vibe + kimi if missing (official native installers, no npm)
   ./sc doctor              sandbox readiness: docker (rootless/rootful) + harness login
   ./sc update              fetch + materialize the engine (gitignored dep) + reconcile IN PLACE (migrate, sync skills, map);
-                             ACTIVE sprints warn and continue; their rows and board state are preserved
                              --no-fetch skips the fetch · --ref <tag|sha> pins a version · blocks on local engine edits (--force discards them)
                              first runs git pull --ff-only for any tracked checkout; source repos then reconcile FROM that tree.
                              Advisory, never blocking: an unsafe/offline pull WARNS and engine update continues from the current
@@ -1623,7 +1621,7 @@ super-coder — forkable shell substrate
                              (drain your inbox between slices); list/status/tail/kill complete the set
   ./sc models refresh      refresh local model routes (same action as Shells → Refresh models)
   ./sc models resolve <h> <model> [--shell <shortname>]
-                             print one exact, locally runnable high-effort sprint call; list [harness] shows routes
+                             print one exact, locally runnable high-effort call; list [harness] shows routes
   ./sc visual-qa <mode>    viewport screenshot QA: ci boots/captures · run captures a local app · init scaffolds config
   sc sql "<query>"         read-only passthrough to the engine DB (schema/skills/flags) — absolute path, cwd-independent (no `cd` to root)
   sc map-sql "<query>"     read-only passthrough to the repo-map DB (dr_* catalogue) — absolute path, cwd-independent
@@ -1653,10 +1651,9 @@ super-coder — forkable shell substrate
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)
   make dos-help            supported operator aliases for lifecycle, models,
-                             sprint/watch/job, maintenance, browser token, and generic ./sc forwarding
+                             job, maintenance, browser token, and generic ./sc forwarding
   ./sc run <shortname>     headless boot: render + exec the harness NON-interactively (claude · codex ·
                              opencode · kimi); -p "<prompt>" · --harness <h> · -m <model> · --effort;
-                             Conductor workers add --slot <plan|dev|rev> --sprint <id> [--unit U];
                              refuses a shell that already has a live session
   ./sc down                stop + remove the sandbox container
   ./sc restart             confirm + WAL-safe backup, fully bounce, then health-check managed services

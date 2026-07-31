@@ -20,7 +20,6 @@ TEMPLATE_PATH = ENGINE / "templates" / "boot.md"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import conductor_runtime  # noqa: E402
-from sprint_units import TERMINAL_UNIT_STATES  # noqa: E402
 
 # Rendered into ORIENTATION for every shell EXCEPT the cartographer (who owns the
 # map and heals discrepancies directly — telling it to report them to itself is
@@ -78,10 +77,9 @@ PROJECT_VS_ENGINE_SOURCE = (
     "2. **Verify claims about engine code against the remote, not your tree** —\n"
     "   `git show origin/main:<path>` — because a stale checkout answers\n"
     "   confidently and a command that reads it inherits the staleness.\n"
-    "3. **Pull after every merge; reconcile and restart at sprint boundaries.**\n"
-    "   Pulling is cheap and safe. `./sc update` refuses on live Interface state\n"
-    "   by design and a restart kills live sessions — never mid-sprint, and the\n"
-    "   restart is the FnB's.\n"
+    "3. **Pull after every merge; reconcile before restarting.** Pulling is\n"
+    "   cheap and safe. A restart kills live sessions, so the FnB owns that\n"
+    "   boundary.\n"
     "4. **The live DB is the one you are migrating.** Back it up before applying\n"
     "   anything, and name the DB path explicitly rather than trusting whichever\n"
     "   one the dispatcher resolves.\n"
@@ -92,228 +90,6 @@ PROJECT_VS_ENGINE_SOURCE = (
 )
 # The repo catalogue (dr_*) lives in its OWN db, separate from shell_db.db.
 MAP_DB_PATH = ENGINE.parent / ".sc-state" / "map.db"
-
-# ── The sprint directive (spec doc 58, unit U9) ──────────────────────────────
-# A shell holding sprint work is told so BY THE BOOT RENDER, resolved from the
-# record. The directive used to live in a task row the planner hand-wrote; an
-# audit found it in every kickoff row (written from a template) and absent from
-# all six improvised afterwards. A worker booted without it behaved exactly as a
-# shell should in a normal interactive session — it finished a full review pass,
-# filed its flags, then ended its turn on a question. Nothing reads a headless
-# run's stdout, so the planner read the silence as death and re-booted it over
-# eleven minutes of completed work.
-#
-# So the remedy is not a better sentence. The boot doc is the one artifact the
-# harness is guaranteed to read, and this section is a function of `sprint_units`
-# alone: a task row cannot grant it, and a missing task row cannot withhold it.
-# The planner and the retired Interface binding are removed from the path.
-# Stated inline rather than referenced, because the failure mode is precisely a
-# skill body that never loads. This renders as prose in a document every harness
-# reads, so it survives a harness with no skill mechanism at all.
-PARTICIPANT_RULES = (
-    "A headless turn communicates through durable artifacts:\n"
-    "\n"
-    "1. File findings, flags, verdicts, reports, PRs, and commits within your "
-    "assigned authority.\n"
-    "2. Send rulings and transitions to the planner as a scoped row: "
-    "`sc mem message send <planner> \"…\" --kind result --sprint <doc-id>`.\n"
-    "3. When work remains, send a partial naming completed work, evidence, and "
-    "the next uncompleted action before ending the turn.\n"
-    "4. Nothing found is a result. Send it."
-)
-
-
-def resolve_sprint_roles(con, shell_id: int) -> list:
-    """Every sprint role `shell_id` holds right now, read fresh from the record
-    — never cached, so a role changed since the last boot resolves correctly.
-
-    Returns a list of `{doc_id, doc_title, role, units}` for dev/reviewer
-    assignments in `unit_id` order. Empty means no section renders. A shell
-    with roles in two sprints gets an entry per (sprint, role) — every one is
-    named, because silently choosing one is the failure this unit removes.
-
-    Planner identity is deliberately absent during Conductor decoupling. It
-    used to come from `sprint_planner_bindings`, an Interface wake table that
-    is no longer runtime truth. Step 7's explicit `--slot plan --sprint …`
-    launch makes planner context deterministic without resurrecting a binding.
-
-    LIVENESS IS STRUCTURED, NEVER THE BODY'S PROSE — `documents.frozen` plus
-    `sprint_units` rows, never the `status: ACTIVE` line. Regex-matching
-    liveness out of prose is part of the structural gap this feature exists to
-    close (flag_id 213 removed exactly that from the reconciler's trigger), and
-    reintroducing it here would have the boot render and the reconciler
-    disagreeing the moment someone reformats a line.
-
-    A dev/reviewer role is `frozen = 0` plus a non-terminal row of its own.
-    The same pair drives the worker reconciler, so boot and monitoring cannot
-    disagree about whether an assignment is live.
-
-    Returns `[]` when `sprint_units` DOES NOT EXIST — a floor that has not
-    applied migration 0098 has no such table, which was the state of this
-    repo's own running floor as U9 was written, and compose reads the live db at
-    every boot of every shell. That degrade is gated on the table's ACTUAL
-    ABSENCE and nothing else (flag_id 233): the missing table is temporary, a
-    bare `except OperationalError` would be permanent, and once 0098 is applied
-    the only thing such a catch could still swallow is a genuine fault — a
-    renamed column, a typo — silently reverting the whole fleet to pre-U9
-    behaviour on a section the render itself labels MANDATORY. Faults raise.
-    """
-    entries = []
-    tables = {
-        row[0]
-        for row in con.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name IN ('sprint_units','sprints')"
-        )
-    }
-    if tables != {"sprint_units", "sprints"}:
-        return []
-    placeholders = ",".join("?" * len(TERMINAL_UNIT_STATES))
-    rows = con.execute(
-        "SELECT u.sprint_doc_id, d.title, u.seq, u.unit_title, "
-        "       u.dev_shell_id, u.reviewer_shell_id "
-        "FROM sprint_units u "
-        "JOIN documents d ON d.document_id = u.sprint_doc_id "
-        "JOIN sprints sp ON sp.sprint_doc_id = u.sprint_doc_id "
-        "WHERE (u.dev_shell_id = ? OR u.reviewer_shell_id = ?) "
-        f"  AND u.state NOT IN ({placeholders}) "
-        "  AND sp.state='active' AND d.frozen = 0 "
-        "ORDER BY u.sprint_doc_id, u.unit_id",
-        (shell_id, shell_id, *TERMINAL_UNIT_STATES)).fetchall()
-
-    # (doc, role) -> entry, so a shell holding four review units in one sprint
-    # gets one line naming all four rather than four sections.
-    by_role = {}
-    for doc_id, title, seq, unit_title, dev_id, reviewer_id in rows:
-        for role, holder in (("dev", dev_id), ("reviewer", reviewer_id)):
-            if holder != shell_id:
-                continue
-            entry = by_role.get((doc_id, role))
-            if entry is None:
-                entry = {"doc_id": doc_id, "doc_title": title, "role": role,
-                         "units": []}
-                by_role[(doc_id, role)] = entry
-                entries.append(entry)
-            entry["units"].append((seq, unit_title))
-    return entries
-
-
-def render_sprint_directive(con, shell_id: int) -> str:
-    """The `## SPRINT DIRECTIVE` body, or "" when this shell holds no sprint
-    role — no ceremony for a shell with no sprint work."""
-    entries = resolve_sprint_roles(con, shell_id)
-    if not entries:
-        return ""
-    lines = [
-        "You hold sprint work. This section is resolved from the RECORD at "
-        "every boot — the board's `sprint_units` rows define the standing "
-        "worker role independently of message wording.",
-        "",
-    ]
-    for e in entries:
-        sprint = f"**Sprint doc {e['doc_id']}**"
-        if e["doc_title"]:
-            sprint += f" — {e['doc_title']}"
-        units = ", ".join(f"`{seq}` ({title})" for seq, title in e["units"])
-        slot = "dev" if e["role"] == "dev" else "reviewer"
-        skill = "sprint_dev" if e["role"] == "dev" else "sprint_rev"
-        lines.append(f"- {sprint}: you are the **{slot.upper()}** for {units}. "
-                     f"Invoke the `{skill}` skill.")
-    if len(entries) > 1:
-        lines.append("")
-        lines.append("**Act on every role listed above.**")
-    return "\n".join(lines + ["", PARTICIPANT_RULES])
-
-
-def render_slot_directive(context: "dict | None") -> str:
-    """Render one launcher-validated slot plus its complete role skill."""
-    if context is None:
-        return ""
-    title = context.get("sprint_title") or "(untitled sprint)"
-    browser_binding = context.get("binding_id") is not None
-    lines = [
-        (
-            "This browser-launched session has one validated Sprint binding. "
-            "Execute only this assignment and return the required typed result."
-            if browser_binding
-            else
-            "This ephemeral session has one launcher-validated role. Execute "
-            "only this slot and finish by emitting the directive required by "
-            "its loaded skill."
-        ),
-        "",
-        f"- **Slot:** `{context['slot']}`",
-        f"- **Sprint:** document `{context['sprint_doc_id']}` — {title}",
-        f"- **Loaded skill:** `{context['skill_name']}`",
-    ]
-    if context.get("role"):
-        lines.append(f"- **Role:** `{context['role']}`")
-    if context.get("lifecycle"):
-        lines.append(f"- **Lifecycle:** `{context['lifecycle']}`")
-    if context.get("binding_id") is not None:
-        lines.append(f"- **Assignment:** `{context['binding_id']}`")
-    if context.get("spec_doc_id") is not None:
-        spec_title = context.get("spec_title") or "(untitled spec)"
-        lines.append(
-            f"- **Governing spec:** document `{context['spec_doc_id']}` — "
-            f"{spec_title}"
-        )
-    if context.get("source_directive_id") is not None:
-        lines.append(
-            f"- **Source directive:** `{context['source_directive_id']}`"
-        )
-    if context.get("source_message_id") is not None:
-        lines.append(f"- **Source message:** `{context['source_message_id']}`")
-    if context.get("required_result_kind"):
-        lines.append(
-            f"- **Required result:** `{context['required_result_kind']}`"
-        )
-        result_target = context.get("conductor_slot") or context["slot"]
-        directive_arg = (
-            ""
-            if context["required_result_kind"] == "abort-report"
-            else " --directive <directive-id>"
-        )
-        lines.extend([
-            "",
-            "Return the durable result before this one-shot exits:",
-            "",
-            "```bash",
-            (
-                f"sc mem message send {result_target} \"<bounded evidence>\" "
-                f"--kind result --sprint {context['sprint_doc_id']} "
-                f"--assignment {context['binding_id']} "
-                f"--result-kind {context['required_result_kind']}"
-                f"{directive_arg}"
-            ),
-            "```",
-        ])
-    lines.extend(["", "### Kickoff context", ""])
-    units = context.get("units") or []
-    for unit in units:
-        detail = (
-            f"`{unit['seq']}` (unit id `{unit['unit_id']}`) — "
-            f"{unit['unit_title']} · state `{unit['state']}`"
-        )
-        if unit.get("depends_on"):
-            detail += f" · depends on {unit['depends_on']}"
-        if unit.get("branch"):
-            detail += f" · branch `{unit['branch']}`"
-        if unit.get("pr_number"):
-            detail += f" · PR #{unit['pr_number']}"
-        lines.append(f"- {detail}")
-        if unit.get("overlap"):
-            lines.append(f"  - overlap: {unit['overlap']}")
-    if not units:
-        lines.append("- Sprint-wide assignment; no unit is bound.")
-    lines.extend([
-        "",
-        f"### Loaded skill — {context['skill_name']}",
-        "",
-        context["skill_body"].strip(),
-    ])
-    return "\n".join(lines)
-
 
 def open_map_ro() -> "sqlite3.Connection | None":
     """Read-only handle to the map DB, or None if the repo isn't mapped yet
@@ -540,8 +316,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                  floor_note: "str | None" = None,
                  api_key: "str | None" = None,
                  api_port: "int | None" = None,
-                 source_mode: bool = False,
-                 slot_context: "dict | None" = None) -> str:
+                 source_mode: bool = False) -> str:
     """Assemble the full boot markdown for `shell`, driven by `user`.
 
     work_dir, when set, is the shell's effective working directory (dev-shell
@@ -559,11 +334,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     stays a pure render, no git).
     """
     if shell["flavor"] == "conductor":
-        return conductor_runtime.render_boot(
-            con,
-            shell,
-            slot_context=slot_context,
-        )
+        return conductor_runtime.render_boot(con, shell)
 
     template = TEMPLATE_PATH.read_text().rstrip()
     template = template.replace(
@@ -658,28 +429,12 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     if floor_note:
         active_session.append(f"- floor: {floor_note}")
 
-    # Directly after ACTIVE SESSION and ahead of everything else the render
-    # appends: it is this session's standing orders, and the whole unit exists
-    # because a worker missed the context it was operating in. Empty for a
-    # shell with no sprint role — the section is mandatory, never unconditional.
-    slot_directive = render_slot_directive(slot_context)
-    sprint_directive = (
-        "" if slot_directive else render_sprint_directive(con, shell_id)
-    )
-    sprint_block = (
-        ["## SLOT DIRECTIVE — MANDATORY", "", slot_directive, "", "---", ""]
-        if slot_directive
-        else (["## SPRINT DIRECTIVE — MANDATORY", "", sprint_directive,
-               "", "---", ""] if sprint_directive else [])
-    )
-
     parts = [
         template,
         "",
         "## ACTIVE SESSION", "",
         *active_session,
         "", "---", "",
-        *sprint_block,
         *first_run,
         "## OPERATOR", "", render_operator(user),
         "", "---", "",

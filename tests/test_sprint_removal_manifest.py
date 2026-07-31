@@ -44,6 +44,8 @@ def current_reference_files(manifest: dict) -> set[str]:
             hits.add(relative)
             continue
         path = ROOT / relative
+        if not path.exists():
+            continue
         if path.stat().st_size > 2_000_000:
             continue
         try:

@@ -362,7 +362,7 @@ def _append_event(
 
 def _conversation_row(con, conversation_id: str, owner_user_id: int):
     return con.execute(
-        "SELECT c.conversation_id,c.shell_id,c.mode,c.owner_user_id,c.harness,"
+        "SELECT c.conversation_id,c.shell_id,c.owner_user_id,c.harness,"
         "c.provider,c.model,c.effort,c.state,c.title,c.starred,c.created_at,"
         "c.last_activity_at,c.closed_at,c.version,c.harness_session_ref,"
         "s.display_name,s.shortname,"
@@ -394,7 +394,6 @@ def _conversation_projection(row) -> dict:
             "display_name": row["display_name"],
             "shortname": row["shortname"],
         },
-        "mode": row["mode"],
         "route": {
             "harness": row["harness"],
             "provider": row["provider"],
@@ -628,14 +627,6 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             "SHELL_NOT_LAUNCHABLE",
             "shell is unknown, deleted, or unavailable to this operator",
         )
-    if shell["flavor"] == "conductor":
-        raise ApiError(
-            422,
-            "SPRINT_OWNED_SHELL",
-            "Conductor is owned by armed Sprints and cannot open an ordinary "
-            "browser conversation",
-        )
-
     open_conversations = con.execute(
         "SELECT conversation_id,state FROM conversations "
         "WHERE mode='normal' AND shell_id=? AND state!='closed'",
@@ -667,11 +658,6 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             "HARNESS_CONVERSATION_UNSUPPORTED",
             f"harness {harness!r} has no browser conversation adapter",
         )
-    try:
-        run_mod.conductor_policy.require_harness(shell["flavor"], harness)
-    except ValueError as exc:
-        raise ApiError(422, "HARNESS_ROUTE_INVALID", str(exc)) from exc
-
     model = body.get("model")
     if model is None and defaults:
         model = defaults["models"].get(harness)
@@ -839,6 +825,8 @@ def _create_conversation(con, operator: dict, headers, body: dict):
 
 
 def _list_conversations(con, operator: dict, query):
+    if "mode" in query:
+        raise ApiError(422, "VALIDATION_ERROR", "unknown query field: mode")
     limit = _limit(query, maximum=100)
     clauses = ["c.mode='normal'", "c.owner_user_id=?"]
     params: list = [operator["user_id"]]
@@ -868,20 +856,12 @@ def _list_conversations(con, operator: dict, query):
                 "open and state filters cannot both be true",
             )
         clauses.append("c.state!='closed'" if open_only else "c.state='closed'")
-    mode = query.get("mode", [None])[0]
-    if mode and mode != "normal":
-        raise ApiError(
-            422,
-            "VALIDATION_ERROR",
-            "this endpoint exposes normal conversations only",
-        )
     scope = {
         "owner_user_id": int(operator["user_id"]),
         "shell_id": shell_id,
         "starred": starred,
         "open": open_only,
         "state": state or None,
-        "mode": "normal",
     }
     cursor = query.get("cursor", [None])[0]
     if cursor:
@@ -901,7 +881,7 @@ def _list_conversations(con, operator: dict, query):
         )
         params.extend((decoded["a"], decoded["a"], decoded["id"]))
     rows = con.execute(
-        "SELECT c.conversation_id,c.shell_id,c.mode,c.owner_user_id,c.harness,"
+        "SELECT c.conversation_id,c.shell_id,c.owner_user_id,c.harness,"
         "c.provider,c.model,c.effort,c.state,c.title,c.starred,c.created_at,"
         "c.last_activity_at,c.closed_at,c.version,s.display_name,s.shortname,"
         "CASE WHEN c.state!='closed' THEN ("

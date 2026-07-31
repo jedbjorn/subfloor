@@ -565,228 +565,6 @@ class ApiTest(unittest.TestCase):
         rows = self.q("SELECT kind FROM shell_messages WHERE body='plain mail'")
         self.assertEqual(rows[0]["kind"], "shell")
 
-    def test_cli_refuses_pr_event_kind(self):
-        with self.assertRaises(SystemExit):   # argparse: not in choices
-            mem.main(["message", "send", "dev1", "forged", "--kind", "pr_event"])
-
-    def test_api_refuses_pr_event_from_a_shell_token(self):
-        """H-3 — kind parity. The CLI's argparse `choices` was the ONLY fence:
-        any holder of any shell key could POST kind='pr_event' straight past it
-        and mint a PR transition GitHub never reported, waking a planner on
-        forged ground truth. The refusal belongs at shell-token ingress, which
-        is what this route is."""
-        before = self.q("SELECT COUNT(*) c FROM shell_messages "
-                        "WHERE kind='pr_event'")[0]["c"]
-        with self.assertRaises(SystemExit) as denied:
-            mem._api("POST", "/_sc/mem/messages",
-                     {"to": "plan1", "body": "own/repo#9 merged (forged)",
-                      "kind": "pr_event", "sprint_doc_id": 100})
-        self.assertIn("HTTP 403", str(denied.exception))
-        self.assertEqual(
-            self.q("SELECT COUNT(*) c FROM shell_messages "
-                   "WHERE kind='pr_event'")[0]["c"], before,
-            "the refused send must leave no row")
-
-    def test_the_poller_still_emits_pr_event_through_its_own_path(self):
-        """The other half of H-3, and the reason it is a 403 and not a schema
-        change: the poller writes `pr_event` by direct DB insert, so the API
-        refusal cannot reach it. If this ever goes red, the poller has been
-        moved onto the API and needs a system credential — not a carve-out in
-        the ingress check.
-
-        Its own DB, not the class fixture: poll_cycle sweeps EVERY armed watch,
-        so the sibling tests' registrations would share the batched read.
-        """
-        con = build_db()
-        try:
-            seed_shells(con)
-            seed_sprint_doc(con)
-            con.execute(
-                "INSERT INTO watched_prs (repo, pr_number, shell_id, "
-                "sprint_doc_id, last_seen) VALUES ('own/repo', 77, 1, 100, ?)",
-                (json.dumps({"state": "OPEN", "sha": "aaa", "checks": "PENDING",
-                             "reviews": 0, "review_state": None}),))
-            con.commit()
-            pr_poller.poll_cycle(con, fetch=lambda q: pr_poller.GhResult(
-                data={"r0": {"pullRequest": {
-                    "state": "MERGED", "headRefOid": "bbb",
-                    "reviews": {"totalCount": 0, "nodes": []},
-                    "commits": {"nodes": [{"commit": {"statusCheckRollup":
-                                                      {"state": "SUCCESS"}}}]},
-                }}}))
-            emitted = con.execute(
-                "SELECT body FROM shell_messages WHERE kind='pr_event'"
-            ).fetchall()
-        finally:
-            con.close()
-        self.assertTrue(emitted, "the poller's own path is unaffected")
-
-    def test_message_scope_must_name_a_sprint_doc(self):
-        """H-2 — validate sprint scope at the write boundary. This route took
-        ANY integer, so a typo'd --sprint produced a message scoped to nothing:
-        never woke, never filtered with the sprint's traffic, reported success.
-        """
-        spec_id = 100 - 1
-        con = sqlite3.connect(self.db)
-        con.execute(
-            "INSERT INTO documents (document_id, kind, title, body) "
-            "VALUES (?, 'spec', 'Sprint flow hardening', 'x')", (spec_id,))
-        con.commit()
-        con.close()
-        for scope in (spec_id, 99999):
-            with self.subTest(scope=scope):
-                with self.assertRaises(SystemExit) as denied:
-                    mem._api("POST", "/_sc/mem/messages",
-                             {"to": "dev1", "body": "scoped wrong",
-                              "kind": "task", "sprint_doc_id": scope})
-                self.assertIn("HTTP 422", str(denied.exception))
-        self.assertEqual(
-            self.q("SELECT COUNT(*) c FROM shell_messages "
-                   "WHERE body='scoped wrong'")[0]["c"], 0)
-
-    def test_message_scope_accepts_a_sprint_doc_at_any_liveness(self):
-        """The deliberately distinct half of H-2: tagging validates IDENTITY,
-        never liveness. A coordination message in the declaration window (board
-        declared, units not yet) and a result row sent after close are both
-        legal traffic — gating them on liveness would make the sprint's own
-        open and close unreportable."""
-        con = sqlite3.connect(self.db)
-        seed_sprint_doc(con, 121, units=0)            # declaration window
-        seed_sprint_doc(con, 122)
-        con.execute("UPDATE documents SET frozen=1 WHERE document_id=122")
-        con.commit()
-        con.close()
-        for scope in (121, 122):
-            with self.subTest(scope=scope):
-                out = mem._api("POST", "/_sc/mem/messages",
-                               {"to": "dev1", "body": f"legal {scope}",
-                                "kind": "result", "sprint_doc_id": scope})
-                self.assertIn("message_id", out)
-                self.assertEqual(
-                    self.q("SELECT sprint_doc_id s FROM shell_messages "
-                           "WHERE message_id=?", out["message_id"])[0]["s"],
-                    scope)
-
-    def test_typed_assignment_result_records_exact_binding_and_directive(self):
-        con = sqlite3.connect(self.db)
-        con.row_factory = sqlite3.Row
-        try:
-            con.execute("UPDATE shells SET flavor='planner' WHERE shell_id=1")
-            con.execute(
-                "INSERT OR IGNORE INTO shells "
-                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
-                "VALUES (3,'Conductor','CON1','conductor','x',1)"
-            )
-            seed_sprint_doc(con, 180, units=0)
-            con.execute("UPDATE sprints SET state='active' WHERE sprint_doc_id=180")
-            source_id = con.execute(
-                "INSERT INTO directives "
-                "(issuer_flavor,kind,target,sprint_doc_id) "
-                "VALUES ('system','stall','conductor',180)"
-            ).lastrowid
-            con.execute(
-                "INSERT INTO conversations "
-                "(conversation_id,shell_id,mode,sprint_doc_id,harness,worktree,"
-                "state,creation_idempotency_key,creation_request_hash) "
-                "VALUES ('cv_result_planner',1,'sprint',180,'claude','/tmp',"
-                "'running','result-planner','result-planner-hash')"
-            )
-            binding_id = con.execute(
-                "INSERT INTO sprint_conversation_bindings "
-                "(conversation_id,sprint_doc_id,role,lifecycle,slot,"
-                "source_directive_id,required_result_kind,state,started_at) "
-                "VALUES ('cv_result_planner',180,'planner','one_shot','plan1',"
-                "?,'planner-directive','active',datetime('now'))",
-                (source_id,),
-            ).lastrowid
-            directive_id = con.execute(
-                "INSERT INTO directives "
-                "(issuer_shell_id,issuer_flavor,kind,payload,target,"
-                "sprint_doc_id) "
-                "VALUES (1,'planner','hold','{\"reason\":\"gate\"}',"
-                "'conductor',180)"
-            ).lastrowid
-            con.commit()
-        finally:
-            con.close()
-
-        result = mem._api(
-            "POST",
-            "/_sc/mem/messages",
-            {
-                "to": "CON1",
-                "body": "Planner ruling evidence",
-                "kind": "result",
-                "sprint_doc_id": 180,
-                "sprint_assignment_id": binding_id,
-                "sprint_result_kind": "planner-directive",
-                "sprint_directive_id": directive_id,
-                "dedupe_key": "typed-result-180",
-            },
-        )
-
-        row = self.q(
-            "SELECT binding_id,message_id,result_kind,directive_id "
-            "FROM sprint_assignment_results WHERE binding_id=?",
-            binding_id,
-        )[0]
-        self.assertEqual(
-            tuple(row),
-            (binding_id, result["message_id"], "planner-directive", directive_id),
-        )
-        con = sqlite3.connect(self.db)
-        try:
-            con.execute(
-                "UPDATE conversations SET state='idle' "
-                "WHERE conversation_id='cv_result_planner'"
-            )
-            con.execute(
-                "UPDATE conversations SET state='closed',"
-                "closed_at=datetime('now') "
-                "WHERE conversation_id='cv_result_planner'"
-            )
-            con.execute(
-                "UPDATE sprint_conversation_bindings SET state='terminal',"
-                "outcome='succeeded',result_message_id=?,"
-                "completed_at=datetime('now') "
-                "WHERE binding_id=?",
-                (result["message_id"], binding_id),
-            )
-            con.commit()
-        finally:
-            con.close()
-        replay = mem._api(
-            "POST",
-            "/_sc/mem/messages",
-            {
-                "to": "CON1",
-                "body": "Planner ruling evidence",
-                "kind": "result",
-                "sprint_doc_id": 180,
-                "sprint_assignment_id": binding_id,
-                "sprint_result_kind": "planner-directive",
-                "sprint_directive_id": directive_id,
-                "dedupe_key": "typed-result-180",
-            },
-        )
-        self.assertTrue(replay["duplicate"])
-        self.assertEqual(replay["message_id"], result["message_id"])
-        with self.assertRaises(SystemExit):
-            mem._api(
-                "POST",
-                "/_sc/mem/messages",
-                {
-                    "to": "CON1",
-                    "body": "different evidence",
-                    "kind": "result",
-                    "sprint_doc_id": 180,
-                    "sprint_assignment_id": binding_id,
-                    "sprint_result_kind": "planner-directive",
-                    "sprint_directive_id": directive_id,
-                    "dedupe_key": "typed-result-180",
-                },
-            )
-
     def test_messages_read_returns_kind(self):
         mem.main(["message", "send", "plan1", "report done", "--kind", "result"])
         data = mem._api("GET", "/_sc/mem/messages")
@@ -797,6 +575,27 @@ class ApiTest(unittest.TestCase):
         with self.assertRaises(SystemExit):   # _api dies on HTTP 400
             mem._api("POST", "/_sc/mem/messages",
                      {"to": "dev1", "body": "x", "kind": "gossip"})
+
+    def test_server_rejects_removed_message_correlation_fields(self):
+        before = self.q("SELECT COUNT(*) AS n FROM shell_messages")[0]["n"]
+        with self.assertRaises(SystemExit):
+            mem._api(
+                "POST",
+                "/_sc/mem/messages",
+                {
+                    "to": "dev1",
+                    "body": "must not land",
+                    "kind": "result",
+                    "sprint_doc_id": 100,
+                    "sprint_assignment_id": 1,
+                },
+            )
+        after = self.q("SELECT COUNT(*) AS n FROM shell_messages")[0]["n"]
+        self.assertEqual(before, after)
+        self.assertEqual(
+            [],
+            self.q("SELECT body FROM shell_messages WHERE body='must not land'"),
+        )
 
 
 # ── headless boot: resolution order + argv shape ─────────────────────────────

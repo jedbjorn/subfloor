@@ -1365,8 +1365,6 @@ class SnapshotPolicyTest(ConversationDbCase):
     TABLES = (
         "conversations",
         "conversation_git_targets",
-        "sprint_conversation_bindings",
-        "sprint_cancellations",
         "conversation_messages",
         "conversation_runs",
         "conversation_events",
@@ -1379,50 +1377,6 @@ class SnapshotPolicyTest(ConversationDbCase):
             for table in self.TABLES
         ]
         self.assertEqual(positions, sorted(positions))
-
-    def test_snapshot_round_trip_preserves_sprint_binding(self) -> None:
-        self.add_sprint()
-        conversation = self.add_conversation(shell_id=4, mode="sprint")
-        self.add_binding(conversation, slot="con1")
-
-        body = ["PRAGMA foreign_keys=OFF;", "BEGIN;"]
-        for table in ("conversations", "sprint_conversation_bindings"):
-            body.extend(snapshot.dump_table(self.con, table))
-        body.extend(["COMMIT;", "PRAGMA foreign_keys=ON;"])
-
-        target = sqlite3.connect(":memory:")
-        apply_schema(target)
-        target.execute(
-            "INSERT INTO users (user_id,username) VALUES (1,'operator')"
-        )
-        target.execute(
-            "INSERT INTO shells "
-            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
-            "VALUES (4,'Conductor','con1','conductor','prompt',1)"
-        )
-        target.execute(
-            "INSERT INTO documents "
-            "(document_id,kind,title,body) "
-            "VALUES (24,'doc','SPRINT: conversation test','x')"
-        )
-        target.execute(
-            "INSERT INTO sprints "
-            "(sprint_doc_id,state,legacy) VALUES (24,'declared',1)"
-        )
-        target.executescript("\n".join(body))
-
-        self.assertEqual(
-            target.execute(
-                "SELECT conversation_id,sprint_doc_id,role,lifecycle,slot,"
-                "state FROM sprint_conversation_bindings"
-            ).fetchone(),
-            (conversation, 24, "conductor", "persistent", "con1", "pending"),
-        )
-        self.assertEqual(
-            target.execute("PRAGMA foreign_key_check").fetchall(),
-            [],
-        )
-        target.close()
 
     def test_snapshot_round_trip_preserves_queue_and_recovery_evidence(
             self) -> None:

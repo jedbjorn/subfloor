@@ -102,8 +102,6 @@ def armed(stack: ExitStack, tmp: Path, **overrides):
         rebuild.db_backup_mod, "select_backup_dir",
         tripwire("db_backup.select_backup_dir")))
     stack.enter_context(mock.patch.object(
-        rebuild, "active_sprint_ids", tripwire("active_sprint_ids")))
-    stack.enter_context(mock.patch.object(
         rebuild.migrate_mod, "migrate", tripwire("migrate")))
     stack.enter_context(mock.patch.object(
         rebuild.map_repo, "main", tripwire("map_repo.main")))
@@ -253,8 +251,6 @@ class RebuildActionFormTest(unittest.TestCase):
                         stack, tmp,
                         read_existing_keys=lambda *a, **k: {},
                     )
-                    stack.enter_context(mock.patch.object(
-                        rebuild, "active_sprint_ids", return_value=set()))
                     with self.assertRaises(Tripwire) as ctx:
                         rebuild.main(argv)
                 self.assertEqual(str(ctx.exception), expected)

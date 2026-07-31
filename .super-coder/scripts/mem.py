@@ -61,10 +61,10 @@ Run from the repo root, like every engine command:
     ./sc mem doc qaqc <spec_document_id> --verdict approved|changes_requested [--findings-doc ID]
     ./sc mem narrative "<line>"
     ./sc mem message check [N]                         # your unread inbox (read-only)
-    ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result] [--sprint DOC_ID]
+    ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
                             [--assignment ID --result-kind KIND --directive ID]
     ./sc mem message sent                              # outbound view — verify delivery
-    ./sc mem message mark-read <message_id>            # (pr_event rows are daemon-emitted)
+    ./sc mem message mark-read <message_id>
 
 Writes retry on engine-DB contention (#331): the server answers 503 when the
 shared DB is busy (nothing committed) and every method retries it; ambiguous
@@ -856,8 +856,7 @@ def cmd_narrative(args) -> int:
 
 
 def _kind_tag(m: dict) -> str:
-    """' task' / ' result' / ' pr_event' label; blank for ordinary mail (and
-    for rows from a pre-0059 server that returns no kind)."""
+    """' task' / ' result' label; blank for ordinary mail."""
     kind = m.get("kind") or "shell"
     return f" {kind}" if kind != "shell" else ""
 
@@ -893,46 +892,11 @@ def cmd_message(args) -> int:
     if args.message_cmd == "send":
         if not args.body.strip():
             die("body is empty")
-        sprint_doc_id = args.sprint
-        assignment_id = args.assignment
-        result_kind = args.result_kind
-        directive_id = args.directive
-        if args.kind == "result":
-            if assignment_id is None and os.environ.get(
-                "SC_SPRINT_ASSIGNMENT_ID"
-            ):
-                assignment_id = int(os.environ["SC_SPRINT_ASSIGNMENT_ID"])
-            if result_kind is None:
-                result_kind = os.environ.get("SC_SPRINT_REQUIRED_RESULT_KIND")
-            if sprint_doc_id is None and os.environ.get("SC_SPRINT_REF"):
-                sprint_doc_id = int(os.environ["SC_SPRINT_REF"])
-            if assignment_id is not None:
-                if not result_kind:
-                    die(
-                        "a Sprint assignment result needs --result-kind "
-                        "(browser one-shots receive it automatically)"
-                    )
-                if directive_id is None and result_kind != "abort-report":
-                    die(
-                        "a Sprint assignment result needs --directive <id>; "
-                        "final assistant text is evidence, not a board transition"
-                    )
-        elif any(
-            value is not None
-            for value in (assignment_id, result_kind, directive_id)
-        ):
-            die(
-                "--assignment/--result-kind/--directive require --kind result"
-            )
         # dedupe_key makes the send idempotent (#333): the server returns the
         # original row for a repeat key, so _api may safely retry an ambiguous
         # timeout — the failure mode that used to duplicate messages fleet-wide.
         r = _api("POST", "/_sc/mem/messages",
                  {"to": args.to, "body": args.body, "kind": args.kind,
-                  "sprint_doc_id": sprint_doc_id,
-                  "sprint_assignment_id": assignment_id,
-                  "sprint_result_kind": result_kind,
-                  "sprint_directive_id": directive_id,
                   "dedupe_key": uuid.uuid4().hex},
                  idempotent=True)
         tag = f" ({args.kind})" if args.kind != "shell" else ""
@@ -1133,38 +1097,8 @@ def build_parser() -> argparse.ArgumentParser:
     ms = msub.add_parser("send")
     ms.add_argument("to")
     ms.add_argument("body")
-    # 'pr_event' is deliberately not offered — it is the poller's kind; a shell
-    # forging PR transitions would poison the wake loop's ground truth. The API
-    # refuses it at shell-token ingress too (H-3), so this is a friendly early
-    # refusal rather than the only fence.
     ms.add_argument("--kind", default="shell", choices=["shell", "task", "result"],
                     help="message kind: shell (default) | task (planner→worker) | result (worker→planner)")
-    ms.add_argument("--sprint", type=int, default=None, metavar="DOC_ID",
-                    help="scope a task/result event to a sprint doc (validated "
-                         "server-side) — wake-eligible when the sprint is live "
-                         "and the recipient is its bound planner")
-    ms.add_argument(
-        "--assignment",
-        type=int,
-        default=None,
-        metavar="ID",
-        help="correlate a typed result to a browser one-shot assignment "
-             "(defaults from SC_SPRINT_ASSIGNMENT_ID)",
-    )
-    ms.add_argument(
-        "--result-kind",
-        default=None,
-        metavar="KIND",
-        help="typed assignment result "
-             "(defaults from SC_SPRINT_REQUIRED_RESULT_KIND)",
-    )
-    ms.add_argument(
-        "--directive",
-        type=int,
-        default=None,
-        metavar="ID",
-        help="exact Sprint directive returned by this assignment",
-    )
     mm = msub.add_parser("mark-read")
     mm.add_argument("message_id", type=int)
     sp.set_defaults(fn=cmd_message)

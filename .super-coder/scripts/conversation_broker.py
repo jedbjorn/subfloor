@@ -29,7 +29,6 @@ from typing import Any
 import conversation_events
 import conversation_git_targets
 import db_driver
-import sprint_conversations
 from conversation_adapters import (
     ConversationAdapter,
     ConversationContext,
@@ -185,158 +184,6 @@ class BrokerStore:
         return int(sequence)
 
     @staticmethod
-    def _bridge_sprint_assignment(
-        con,
-        *,
-        binding,
-        run_id: int,
-        run_outcome: str,
-        error_code: str | None,
-        error_detail: str | None,
-        now: str,
-    ) -> str | None:
-        """Terminalize one one-shot and queue its proven result or failure."""
-        result = con.execute(
-            "SELECT ar.message_id,ar.result_kind,ar.directive_id,m.body "
-            "FROM sprint_assignment_results ar "
-            "JOIN shell_messages m ON m.message_id=ar.message_id "
-            "WHERE ar.binding_id=?",
-            (binding["binding_id"],),
-        ).fetchone()
-        missing_result = run_outcome == "succeeded" and result is None
-        assignment_outcome = (
-            "failed" if missing_result else run_outcome
-        )
-        result_message_id = (
-            int(result["message_id"])
-            if assignment_outcome == "succeeded" and result is not None
-            else None
-        )
-        con.execute(
-            "UPDATE sprint_conversation_bindings SET state='terminal',"
-            "outcome=?,result_message_id=?,completed_at=? "
-            "WHERE binding_id=? AND state<>'terminal'",
-            (
-                assignment_outcome,
-                result_message_id,
-                now,
-                binding["binding_id"],
-            ),
-        )
-        sprint_conversations.append_event(
-            con,
-            binding["conversation_id"],
-            "sprint.assignment.completed",
-            {
-                "binding_id": int(binding["binding_id"]),
-                "role": binding["role"],
-                "outcome": assignment_outcome,
-                "result_message_id": result_message_id,
-                "run_id": run_id,
-            },
-            run_id=run_id,
-        )
-
-        if assignment_outcome == "succeeded":
-            if result["result_kind"] == "abort-report":
-                return None
-            evidence = {
-                "binding_id": int(binding["binding_id"]),
-                "conversation_id": binding["conversation_id"],
-                "role": binding["role"],
-                "slot": binding["slot"],
-                "unit_id": binding["unit_id"],
-                "result_kind": result["result_kind"],
-                "result_message_id": int(result["message_id"]),
-                "result_body": str(result["body"])[:32768],
-                "run_id": run_id,
-            }
-            return sprint_conversations.enqueue_conductor_directive(
-                con,
-                sprint_doc_id=int(binding["sprint_doc_id"]),
-                directive_id=int(result["directive_id"]),
-                source_kind="worker-result",
-                evidence=evidence,
-                idempotency_key=(
-                    f"sprint:{binding['sprint_doc_id']}:assignment-result:"
-                    f"{binding['binding_id']}"
-                ),
-            )
-
-        if assignment_outcome not in {"failed", "unknown"}:
-            return None
-        cancellation = con.execute(
-            "SELECT 1 FROM sprint_cancellations WHERE sprint_doc_id=?",
-            (binding["sprint_doc_id"],),
-        ).fetchone()
-        if cancellation is not None:
-            return None
-        failure_code = (
-            "SPRINT_REQUIRED_RESULT_MISSING"
-            if missing_result
-            else error_code or "SPRINT_WORKER_RUN_FAILED"
-        )
-        evidence = {
-            "binding_id": int(binding["binding_id"]),
-            "conversation_id": binding["conversation_id"],
-            "role": binding["role"],
-            "slot": binding["slot"],
-            "unit_id": binding["unit_id"],
-            "required_result_kind": binding["required_result_kind"],
-            "run_id": run_id,
-            "run_outcome": run_outcome,
-            "assignment_outcome": assignment_outcome,
-            "error_code": failure_code,
-            "error_detail": (error_detail or "")[:16384] or None,
-            "dedupe_key": f"worker-failed|{binding['binding_id']}|{run_id}",
-        }
-        prior = con.execute(
-            "SELECT directive_id FROM sentinel_events "
-            "WHERE event_kind='worker-failed' "
-            "AND json_extract(evidence,'$.dedupe_key')=?",
-            (evidence["dedupe_key"],),
-        ).fetchone()
-        if prior is None:
-            directive_id = int(
-                con.execute(
-                    "INSERT INTO directives "
-                    "(issuer_shell_id,issuer_flavor,kind,payload,target,"
-                    "sprint_doc_id,unit_id) "
-                    "VALUES (NULL,'system','worker-failed',?,'conductor',?,?)",
-                    (
-                        BrokerStore._payload(evidence),
-                        binding["sprint_doc_id"],
-                        binding["unit_id"],
-                    ),
-                ).lastrowid
-            )
-            con.execute(
-                "INSERT INTO sentinel_events "
-                "(event_kind,shell_id,sprint_doc_id,unit_id,directive_id,"
-                "evidence) VALUES ('worker-failed',?,?,?,?,?)",
-                (
-                    binding["shell_id"],
-                    binding["sprint_doc_id"],
-                    binding["unit_id"],
-                    directive_id,
-                    BrokerStore._payload(evidence),
-                ),
-            )
-        else:
-            directive_id = int(prior["directive_id"])
-        return sprint_conversations.enqueue_conductor_directive(
-            con,
-            sprint_doc_id=int(binding["sprint_doc_id"]),
-            directive_id=directive_id,
-            source_kind="worker-failed",
-            evidence=evidence,
-            idempotency_key=(
-                f"sprint:{binding['sprint_doc_id']}:worker-failed:"
-                f"{binding['binding_id']}:{run_id}"
-            ),
-        )
-
-    @staticmethod
     def _run_from_row(row) -> BrokerRun:
         return BrokerRun(
             run_id=int(row["run_id"]),
@@ -393,20 +240,13 @@ class BrokerStore:
                     " ON c.conversation_id=o.conversation_id "
                     "JOIN conversation_messages m ON m.message_id=o.message_id "
                     "WHERE o.state='pending' AND c.state='queued' "
+                    "AND c.mode='normal' "
                     "AND NOT EXISTS ("
                     " SELECT 1 FROM conversation_events closing "
                     " WHERE closing.conversation_id=c.conversation_id "
                     " AND closing.event_type='conversation.close.requested'"
                     ") "
                     "AND m.state IN ('accepted','queued') "
-                    "AND (c.mode='normal' OR NOT EXISTS ("
-                    " SELECT 1 FROM sprint_cancellations cancelled "
-                    " WHERE cancelled.sprint_doc_id=c.sprint_doc_id"
-                    ") OR EXISTS ("
-                    " SELECT 1 FROM sprint_conversation_bindings closeout "
-                    " WHERE closeout.conversation_id=c.conversation_id "
-                    " AND closeout.role='planner'"
-                    ")) "
                     "AND NOT EXISTS ("
                     " SELECT 1 FROM conversation_messages earlier "
                     " WHERE earlier.conversation_id=m.conversation_id "
@@ -462,22 +302,6 @@ class BrokerStore:
                     ),
                 )
                 run_id = int(cur.lastrowid)
-                binding_started = con.execute(
-                    "UPDATE sprint_conversation_bindings "
-                    "SET state='active',started_at=? "
-                    "WHERE conversation_id=? AND lifecycle='one_shot' "
-                    "AND state='pending'",
-                    (now, row["conversation_id"]),
-                ).rowcount
-                if binding_started:
-                    self._append_event(
-                        con,
-                        conversation_id=row["conversation_id"],
-                        event_type="sprint.assignment.started",
-                        payload={"run_id": run_id},
-                        message_id=row["message_id"],
-                        run_id=run_id,
-                    )
                 require_transition("outbox", "claimed", "dispatched")
                 con.execute(
                     "UPDATE conversation_outbox SET state='dispatched',run_id=?,"
@@ -544,7 +368,8 @@ class BrokerStore:
             with db_driver.write_transaction(con, "conversation.broker.adopt"):
                 selected = con.execute(
                     self._run_select()
-                    + "WHERE r.state IN ('leased','starting','running') "
+                    + "WHERE c.mode='normal' "
+                    "AND r.state IN ('leased','starting','running') "
                     "AND r.lease_expires_at<=? ORDER BY r.run_id LIMIT ?",
                     (now, limit),
                 ).fetchall()
@@ -795,19 +620,12 @@ class BrokerStore:
                 row = con.execute(
                     "SELECT r.state,r.conversation_id,r.trigger_message_id,"
                     "c.state AS conversation_state,c.shell_id,"
-                    "b.binding_id,b.sprint_doc_id,b.role,b.lifecycle,b.slot,"
-                    "b.unit_id,b.required_result_kind,"
-                    "sp.state AS sprint_state,"
                     "EXISTS(SELECT 1 FROM conversation_events closing "
                     " WHERE closing.conversation_id=r.conversation_id "
                     " AND closing.event_type='conversation.close.requested') "
                     "AS close_requested "
                     "FROM conversation_runs r JOIN conversations c "
                     "ON c.conversation_id=r.conversation_id "
-                    "LEFT JOIN sprint_conversation_bindings b "
-                    "ON b.conversation_id=c.conversation_id "
-                    "LEFT JOIN sprints sp "
-                    "ON sp.sprint_doc_id=b.sprint_doc_id "
                     "WHERE r.run_id=?",
                     (run_id,),
                 ).fetchone()
@@ -827,12 +645,7 @@ class BrokerStore:
                     (row["trigger_message_id"],),
                 ).fetchone()[0]
                 require_transition("message", message_current, message_state)
-                close_after = bool(row["close_requested"]) or (
-                    row["lifecycle"] == "one_shot"
-                ) or (
-                    row["role"] == "conductor"
-                    and row["sprint_state"] in {"closed", "aborted"}
-                )
+                close_after = bool(row["close_requested"])
                 if close_after:
                     queued_ids = [
                         int(item["message_id"])
@@ -934,29 +747,6 @@ class BrokerStore:
                         run_id=run_id,
                     )
                 notify_ids.add(str(row["conversation_id"]))
-                if row["lifecycle"] == "one_shot":
-                    conductor_id = self._bridge_sprint_assignment(
-                        con,
-                        binding=row,
-                        run_id=run_id,
-                        run_outcome=outcome,
-                        error_code=error_code,
-                        error_detail=error_detail,
-                        now=now,
-                    )
-                    if conductor_id is not None:
-                        notify_ids.add(conductor_id)
-                elif (
-                    row["role"] == "conductor"
-                    and close_after
-                    and row["binding_id"] is not None
-                ):
-                    con.execute(
-                        "UPDATE sprint_conversation_bindings "
-                        "SET state='terminal',outcome='closed',completed_at=? "
-                        "WHERE binding_id=? AND state<>'terminal'",
-                        (now, row["binding_id"]),
-                    )
                 conversation_id = row["conversation_id"]
         finally:
             con.close()

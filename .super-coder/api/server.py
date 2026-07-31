@@ -4,8 +4,7 @@
 One process serves the JSON API and the static review UI on a single per-fork
 port (see scripts/ports.py + api/transport.py). The review layer stays
 zero-dependency stdlib; the transport pins `websockets` for its one-port
-multiplex (WS upgrades answer unavailable — the Interface stream stack was
-retired on the conductor branch, Step 1). Single-user, localhost — network
+multiplex (WS upgrades answer unavailable). Single-user, localhost — network
 controls are the operator's, exactly like superCC's API surface.
 
 It is a REVIEW layer over the live `shell_db.db`. The law-curated fields (seed,
@@ -66,20 +65,16 @@ import conversation_launch  # noqa: E402  (canonical shell launch preparation)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
-import sprint_lifecycle  # noqa: E402  (authoritative sprint state/ownership)
 sys.path.insert(0, str(ENGINE / "api"))
 import conversation_routes  # noqa: E402  (Feature #24 browser conversations)
 import review_routes  # noqa: E402  (Feature #26 browser Diff review)
 import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
-import sprint_state  # noqa: E402  (the one structural sprint-liveness predicate)
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
 import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
-from sprint_units import UNIT_COLUMNS as _SPRINT_UNIT_COLUMNS  # noqa: E402
-from sprint_units import TERMINAL_UNIT_STATES  # noqa: E402
 from quota_probes import dispatch as quota_dispatch  # noqa: E402  (account quota probes — doc #49)
 import vm as vm_mod  # noqa: E402  (Windows Test VM — config + live checks)
 import ts as ts_mod  # noqa: E402  (tailnet — config + live checks)
@@ -154,9 +149,7 @@ def _resolve_vendor(rel: str) -> tuple:
         return None, "unresolvable path"
     return candidate, ctype
 
-# The localhost authorities, for the socket sources in the CSP below — the
-# same set the sprint board API fences to. The app shell carries the policy
-# itself either way.
+# The localhost authorities for the socket sources in the CSP below.
 _CSP_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 
 
@@ -262,12 +255,8 @@ FLAG_EDITABLE = {"resolved", "resolution_notes", "description", "display_name",
                  "feature_id", "priority"}
 ROADMAP_EDITABLE = {"title", "roadmap_status", "summary", "sort_order", "project_id"}
 
-# Typed traffic on the shell_messages bus (migration 0059). Shells send the
-# first three via `sc mem message send --kind`; 'pr_event' belongs to the PR
-# poller, which writes the DB directly. It stays in this vocabulary because
-# reads and filters use it, but shell-token ingress REFUSES it (H-3) — see the
-# POST /_sc/mem/messages handler.
-MESSAGE_KINDS = {"shell", "task", "result", "pr_event"}
+# Typed traffic on the generic shell_messages bus.
+MESSAGE_KINDS = {"shell", "task", "result"}
 # spec_tasks lifecycle — 'cancelled' (#342) closes a task whose work moved in
 # a feature split/re-scope without lying that it was built. Validated here so
 # a typo'd status is a 400, not a raw CHECK-constraint 500.
@@ -625,7 +614,7 @@ def get_flags(con) -> dict:
 # — FnB stance 2026-07-19), so /sessions returns a flat window + cursor, not
 # server-grouped days. A "session card" is the usage rows grouped by
 # (harness, harness_session_ref) — one harness session, possibly several
-# models — enriched with shell/sprint via the attributed archive.
+# models — enriched with shell identity via the attributed archive.
 
 # Every usage row is datable through this (captured_at is always set), so
 # windowing can never orphan a row with missing harness timestamps.
@@ -688,7 +677,7 @@ def get_analytics_sessions(con, q) -> dict:
     if aids:
         marks = ",".join("?" for _ in aids)
         arch = {a["archive_id"]: dict(a) for a in con.execute(
-            f"SELECT a.archive_id, a.session_id, a.sprint_ref, s.shortname, "
+            f"SELECT a.archive_id, a.session_id, s.shortname, "
             f"s.display_name, s.flavor FROM shell_memory_archives a "
             f"JOIN shells s ON s.shell_id=a.shell_id WHERE a.archive_id IN ({marks})",
             aids)}
@@ -696,7 +685,6 @@ def get_analytics_sessions(con, q) -> dict:
         a = arch.get(c["archive_id"]) or {}
         c["shell"] = a.get("shortname")
         c["shell_session"] = a.get("session_id")
-        c["sprint_ref"] = a.get("sprint_ref")
         c["status"] = _card_status(c.pop("statuses"), c["archive_id"])
         c["unattributed"] = c["archive_id"] is None
     older = con.execute(
@@ -781,14 +769,9 @@ def get_analytics_usage(con, q) -> dict:
         "WHERE r.roadmap_status='shipped' AND NOT EXISTS "
         "(SELECT 1 FROM documents d WHERE d.feature_id=r.feature_id AND d.kind='doc') "
         "ORDER BY r.updated_at DESC"))
-    # sprint_ref → tracker-doc title, for the session list's sprint clusters
-    sprint_titles = {r["sprint_ref"]: r["title"] for r in con.execute(
-        "SELECT DISTINCT a.sprint_ref, d.title FROM shell_memory_archives a "
-        "LEFT JOIN documents d ON CAST(d.document_id AS TEXT) = a.sprint_ref "
-        "WHERE a.sprint_ref IS NOT NULL")}
     return {"favorite_models": sorted(fav.values(), key=lambda f: f["flavor"]),
             "features_shipped": features_shipped, "specs_shipped": specs_shipped,
-            "docs_outstanding": docs_outstanding, "sprint_titles": sprint_titles}
+            "docs_outstanding": docs_outstanding}
 
 
 def get_analytics_filters(con) -> dict:
@@ -1115,110 +1098,17 @@ def patch_shell(con, shell_id, body):
 
 
 def patch_document(con, doc_id, body, commit=True):
-    r = con.execute("SELECT frozen, title FROM documents WHERE document_id=?",
+    r = con.execute("SELECT frozen FROM documents WHERE document_id=?",
                     (doc_id,)).fetchone()
     if r is None:
         return False, "no such document"
     if r["frozen"]:
         return False, "document is frozen — open the next spec, don't edit this one"
-    # The title is part of the liveness predicate (H-1), so it stops being a
-    # mutable prose surface for as long as the doc holds a board: a mid-sprint
-    # retitle would silently drop the sprint out of `SPRINT:%` and turn every
-    # participant deaf, which is the exact defect class the structural
-    # predicate exists to close, moved one field over. Freezing the doc — i.e.
-    # closing the sprint — lifts nothing here: a frozen doc refuses all edits
-    # one branch above.
-    # Compared RAW, exactly as `patch_columns` would write it — a normalized
-    # comparison would wave through the whitespace and NULL forms that break
-    # `LIKE 'SPRINT:%'` just as thoroughly as a rename.
-    if "title" in body and body["title"] != r["title"]:
-        if sprint_state.has_units(con, doc_id):
-            return False, (
-                f"document {doc_id} is the board of sprint {r['title']!r} "
-                f"and its title is load-bearing — a live sprint is identified "
-                f"by 'SPRINT:%', so retitling it would silently disarm the "
-                f"wake path and every watch. Close the sprint (freeze the "
-                f"doc) before any retitle.")
     # render_path is editable (#312): a doc authored without one could never
     # be made publishable — `doc edit --render-path` advertised the option
     # and silently dropped it, and `doc add` always INSERTs a new row.
     return patch_columns(con, "documents", "document_id", doc_id, body,
                          {"body", "title", "render_path"}, commit=commit)
-
-
-def _freeze_board_refusal(con, doc_id) -> "dict | None":
-    """Refuse to freeze a sprint whose own board says it is not finished
-    (spec #76 H-12, H-14). Returns an error body, or None to let the freeze
-    proceed.
-
-    Two conditions, reported TOGETHER rather than one per attempt: a planner
-    fixing a freeze wants the whole list, and refusing serially would make it
-    re-run the close to discover the second reason.
-
-    - every unit terminal (merged or cancelled). A non-terminal unit under a
-      frozen doc is a worker directive with nothing left to move it.
-    - every MERGED unit carries a review_head. Cancelled units are exempt by
-      construction: they never had a clean review, so requiring a head for one
-      would ask the planner to invent a SHA.
-
-    PRESENCE, not correctness — nothing here judges whether the SHA is the one
-    the reviewer read (decision #76). A board with no units at all freezes
-    freely; that is a sprint declared and abandoned before any unit existed,
-    and it has no worker to strand.
-    """
-    marks = ",".join("?" for _ in TERMINAL_UNIT_STATES)
-    live = [
-        (r["seq"], r["state"]) for r in con.execute(
-            "SELECT seq, state FROM sprint_units WHERE sprint_doc_id=? "
-            f"AND state NOT IN ({marks}) ORDER BY LENGTH(seq), seq",
-            (doc_id, *TERMINAL_UNIT_STATES)).fetchall()]
-    headless = [
-        r["seq"] for r in con.execute(
-            "SELECT seq FROM sprint_units WHERE sprint_doc_id=? "
-            "AND state='merged' AND (review_head IS NULL OR "
-            "TRIM(review_head)='') ORDER BY LENGTH(seq), seq",
-            (doc_id,)).fetchall()]
-    if not live and not headless:
-        return None
-    parts = []
-    if live:
-        parts.append("non-terminal: "
-                     + ", ".join(f"{seq} ({state})" for seq, state in live))
-    if headless:
-        parts.append("merged with no review_head: " + ", ".join(headless))
-    return {
-        "error": f"sprint {doc_id} is not finished — {'; '.join(parts)}. "
-                 "Freeze records that the sprint is over; move each unit to "
-                 "merged or cancelled first, and set --review-head on every "
-                 "merged unit from its reviewer's review-clean verdict.",
-        "code": "sprint_not_finished",
-        "non_terminal_units": [seq for seq, _ in live],
-        "units_without_review_head": headless,
-    }
-
-
-def _close_sprint_wake(con, doc_id) -> dict:
-    """Sprint close integration (spec #20 Sprint Scope, sprint 25 seq 10;
-    spec #76 H-12; H-1): closing a sprint IS freezing its doc, and the freeze
-    retires the sprint's live PR watches in the SAME transaction. Sentinel
-    observations are append-only evidence and are never "resolved" on close.
-    Messages stay unread.
-
-    The Interface wake machine's close hooks (binding release, held wake-item
-    cancellation) died with the Interface stack (conductor Step 1); the legacy
-    binding/wake tables themselves are drained and dropped by the Step 4
-    migration. The response keeps their keys at zero until then so close
-    callers keep parsing.
-
-    Returns the counts, because a cleanup nobody can see is indistinguishable
-    from one that did not run — the close response reports what it retired.
-    """
-    retired = con.execute(
-        "UPDATE watched_prs SET closed_at=datetime('now') "
-        "WHERE sprint_doc_id=? AND closed_at IS NULL", (doc_id,)).rowcount
-    return {"released_bindings": 0, "retired_watches": retired,
-            "resolved_watch_alerts": 0,
-            "cancelled_held_items": 0}
 
 
 def create_flag(con, body):
@@ -1860,7 +1750,7 @@ class Handler(BaseHTTPRequestHandler):
         `{"error": "'feature_id'"}`, no stack, status 400). Log the full
         traceback to stderr and return 500 so it reads as a server fault."""
         # Write contention on the shared engine DB is not a fault of either
-        # side — it's a retryable condition (#331: multi-shell sprint load
+        # side — it's a retryable condition (#331: concurrent shell load
         # exhausts busy_timeout and SQLite raises 'database is locked').
         # Nothing was committed (the con rolls back on close), so tell the
         # client to retry instead of leaking the raw sqlite error as a 500.
@@ -2093,11 +1983,13 @@ class Handler(BaseHTTPRequestHandler):
                         "m.created_at, m.read_at FROM shell_messages m "
                         "JOIN shells s ON s.shell_id = m.to_shell_id "
                         "WHERE m.from_shell_id=? "
+                        "AND m.kind IN ('shell','task','result') "
                         "ORDER BY m.created_at DESC LIMIT 50", (sid,)))
                     return self._send(200, {"messages": msgs, "direction": "sent"})
                 msgs = rows(con.execute(
                     "SELECT message_id, from_shell_id, kind, body, created_at, read_at "
                     "FROM shell_messages WHERE to_shell_id=? "
+                    "AND kind IN ('shell','task','result') "
                     "ORDER BY read_at IS NOT NULL, created_at DESC LIMIT 50",
                     (sid,)))
                 return self._send(200, {"messages": msgs})
@@ -2415,47 +2307,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True})
 
             if path == "/_sc/mem/messages":
+                unknown = sorted(
+                    set(body)
+                    - {"to", "to_shell_id", "body", "kind", "dedupe_key"}
+                )
+                if unknown:
+                    return self._send(400, {
+                        "error": "unknown message field(s): " + ", ".join(unknown)
+                    })
                 msg = (body.get("body") or "").strip()
                 kind = (body.get("kind") or "shell").strip()
                 if kind not in MESSAGE_KINDS:
                     return self._send(400, {"error": f"kind must be one of {', '.join(sorted(MESSAGE_KINDS))}"})
-                if kind == "pr_event":
-                    # Kind parity with the CLI (H-3), which has refused
-                    # `--kind pr_event` since 0059. This whole surface is
-                    # shell-token ingress (`_require_shell_auth`), and a shell
-                    # that can mint a PR event can wake a planner with a
-                    # transition GitHub never reported — the wake loop's ground
-                    # truth, forgeable by any holder of any shell key.
-                    #
-                    # The poller is unaffected BECAUSE it emits by direct DB
-                    # insert rather than through this route. That is contract,
-                    # not accident: if the poller is ever moved onto the API it
-                    # needs a system credential, not a carve-out here.
-                    return self._send(403, {"error":
-                        "kind 'pr_event' is emitted by the PR poller, which "
-                        "writes the DB directly — a shell may not mint one. "
-                        "Send --kind result to report a PR transition."})
-                sprint_doc_id = body.get("sprint_doc_id")
-                if sprint_doc_id is not None:
-                    # Scope validation at the write boundary (H-2). This route
-                    # took any integer, so a typo'd --sprint produced a message
-                    # scoped to nothing: it never woke, never filtered with the
-                    # sprint's traffic, and reported success.
-                    #
-                    # SPRINT-DOC IDENTITY ONLY, deliberately — not liveness.
-                    # Declaration-window coordination (board declared, units
-                    # not yet) and post-close result rows are both legal
-                    # traffic; liveness never gates acceptance of the message
-                    # itself.
-                    if isinstance(sprint_doc_id, bool) or not isinstance(sprint_doc_id, int):
-                        return self._send(400, {"error":
-                            "sprint_doc_id must be an int (a sprint document id)"})
-                    if not sprint_state.is_sprint_doc(con, sprint_doc_id):
-                        return self._send(422, {"error":
-                            f"document {sprint_doc_id} is not a SPRINT doc — "
-                            "a scoped message tagged to anything else is "
-                            "invisible to the sprint and never wakes its "
-                            "planner; check the --sprint id"})
                 to_sid = body.get("to_shell_id")
                 if to_sid is None and body.get("to"):
                     r = con.execute(
@@ -2480,103 +2343,7 @@ class Handler(BaseHTTPRequestHandler):
                     to_sid = r[0]
                 if to_sid is None or not msg:
                     return self._send(400, {"error": "to (shortname) or to_shell_id, and body, required"})
-                assignment_id = body.get("sprint_assignment_id")
-                result_kind = body.get("sprint_result_kind")
-                directive_id = body.get("sprint_directive_id")
-                assignment_result = assignment_id is not None
-                # Resolve the idempotency key before assignment liveness. An
-                # accepted result can terminalize its one-shot while the HTTP
-                # response is in flight; the exact retry must still return the
-                # committed row instead of failing the now-terminal binding.
                 dk = (body.get("dedupe_key") or "").strip() or None
-                if assignment_result:
-                    if kind != "result":
-                        return self._send(400, {"error":
-                            "sprint_assignment_id requires kind='result'"})
-                    if (
-                        isinstance(assignment_id, bool)
-                        or not isinstance(assignment_id, int)
-                    ):
-                        return self._send(400, {"error":
-                            "sprint_assignment_id must be an int"})
-                    if not isinstance(result_kind, str) or not result_kind.strip():
-                        return self._send(400, {"error":
-                            "sprint_result_kind must be a nonblank string"})
-                    result_kind = result_kind.strip()
-                    if result_kind == "abort-report":
-                        if directive_id is not None:
-                            return self._send(422, {"error":
-                                "abort-report results do not name a directive"})
-                    elif (
-                        isinstance(directive_id, bool)
-                        or not isinstance(directive_id, int)
-                    ):
-                        return self._send(400, {"error":
-                            "Sprint assignment result requires an integer "
-                            "sprint_directive_id"})
-                    if dk is not None:
-                        prior = con.execute(
-                            "SELECT m.message_id,m.to_shell_id,m.body,m.kind,"
-                            "m.sprint_doc_id,ar.binding_id,ar.result_kind,"
-                            "ar.directive_id FROM shell_messages m "
-                            "LEFT JOIN sprint_assignment_results ar "
-                            "ON ar.message_id=m.message_id "
-                            "WHERE m.from_shell_id=? AND m.dedupe_key=?",
-                            (sid, dk),
-                        ).fetchone()
-                        if prior is not None:
-                            exact = (
-                                prior["to_shell_id"] == int(to_sid)
-                                and prior["body"] == msg
-                                and prior["kind"] == kind
-                                and prior["sprint_doc_id"] == sprint_doc_id
-                                and prior["binding_id"] == assignment_id
-                                and prior["result_kind"] == result_kind
-                                and prior["directive_id"] == directive_id
-                            )
-                            if exact:
-                                return self._send(
-                                    200,
-                                    {
-                                        "message_id": prior["message_id"],
-                                        "duplicate": True,
-                                    },
-                                )
-                            return self._send(409, {"error":
-                                "Sprint result dedupe_key was reused with "
-                                "different assignment evidence"})
-                    binding = con.execute(
-                        "SELECT b.binding_id,b.sprint_doc_id,b.role,b.unit_id,"
-                        "b.required_result_kind,b.state,c.shell_id "
-                        "FROM sprint_conversation_bindings b "
-                        "JOIN conversations c "
-                        "ON c.conversation_id=b.conversation_id "
-                        "WHERE b.binding_id=? AND b.lifecycle='one_shot'",
-                        (assignment_id,),
-                    ).fetchone()
-                    if binding is None:
-                        return self._send(404, {"error":
-                            f"no one-shot Sprint assignment {assignment_id}"})
-                    if binding["state"] != "active":
-                        return self._send(409, {"error":
-                            f"Sprint assignment {assignment_id} is "
-                            f"{binding['state']}, not active"})
-                    if binding["shell_id"] != sid:
-                        return self._send(403, {"error":
-                            f"Sprint assignment {assignment_id} belongs to "
-                            "another shell"})
-                    if sprint_doc_id != binding["sprint_doc_id"]:
-                        return self._send(422, {"error":
-                            "Sprint assignment result has the wrong "
-                            "sprint_doc_id"})
-                    if result_kind != binding["required_result_kind"]:
-                        return self._send(422, {"error":
-                            f"Sprint assignment {assignment_id} requires "
-                            f"result kind {binding['required_result_kind']!r}"})
-                elif result_kind is not None or directive_id is not None:
-                    return self._send(400, {"error":
-                        "Sprint result metadata requires "
-                        "sprint_assignment_id"})
                 # Idempotent send (#333): a client timeout after the server-side
                 # write left the sender unable to tell delivered from lost, and
                 # blind resends duplicated fleet-wide. The client stamps each
@@ -2592,55 +2359,14 @@ class Handler(BaseHTTPRequestHandler):
                         return self._send(200, {"message_id": r[0], "duplicate": True})
                 try:
                     cur = con.execute(
-                        "INSERT INTO shell_messages (from_shell_id, to_shell_id, body, kind, sprint_doc_id, dedupe_key) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (sid, int(to_sid), msg, kind, sprint_doc_id, dk))
+                        "INSERT INTO shell_messages "
+                        "(from_shell_id,to_shell_id,body,kind,dedupe_key) "
+                        "VALUES (?,?,?,?,?)",
+                        (sid, int(to_sid), msg, kind, dk))
                     message_id = cur.lastrowid
-                    if assignment_result:
-                        con.execute(
-                            "INSERT INTO sprint_assignment_results "
-                            "(binding_id,message_id,result_kind,directive_id) "
-                            "VALUES (?,?,?,?)",
-                            (
-                                assignment_id,
-                                message_id,
-                                result_kind,
-                                directive_id,
-                            ),
-                        )
                     con.commit()
-                except db_driver.IntegrityError as exc:
+                except db_driver.IntegrityError:
                     con.rollback()
-                    if assignment_result:
-                        r = con.execute(
-                            "SELECT m.message_id,m.to_shell_id,m.body,m.kind,"
-                            "m.sprint_doc_id,ar.binding_id,ar.result_kind,"
-                            "ar.directive_id FROM shell_messages m "
-                            "LEFT JOIN sprint_assignment_results ar "
-                            "ON ar.message_id=m.message_id "
-                            "WHERE m.from_shell_id=? AND m.dedupe_key=?",
-                            (sid, dk),
-                        ).fetchone()
-                        exact = r is not None and (
-                            r["to_shell_id"] == int(to_sid)
-                            and r["body"] == msg
-                            and r["kind"] == kind
-                            and r["sprint_doc_id"] == sprint_doc_id
-                            and r["binding_id"] == assignment_id
-                            and r["result_kind"] == result_kind
-                            and r["directive_id"] == directive_id
-                        )
-                        if exact:
-                            return self._send(
-                                200,
-                                {
-                                    "message_id": r["message_id"],
-                                    "duplicate": True,
-                                },
-                            )
-                        return self._send(409, {"error":
-                            "Sprint assignment result conflicts with durable "
-                            f"assignment evidence: {exc}"})
                     r = con.execute(
                         "SELECT message_id FROM shell_messages "
                         "WHERE from_shell_id=? AND dedupe_key=?", (sid, dk)).fetchone()
@@ -2817,35 +2543,14 @@ class Handler(BaseHTTPRequestHandler):
                     # heals any drift a lost post-freeze serialize left behind.
                     return self._send(200, {"ok": True, "already_frozen": True,
                                             "serialize": serialize_doc_write()})
-                # H-12/H-14: the close skill already REQUIRES every unit
-                # terminal and every merged unit review-clean at a known head.
-                # Until now that was procedure only — a freeze went through on
-                # a board still showing `working` units, and the record then
-                # said the sprint was over while its own units said otherwise.
-                refusal = _freeze_board_refusal(con, did)
-                if refusal is not None:
-                    return self._send(409, refusal)
                 con.execute(
                     "UPDATE documents SET frozen=1, frozen_date=date('now') WHERE document_id=?",
                     (did,))
-                sprint = sprint_lifecycle.sprint_row(con, did)
-                if sprint is not None:
-                    if sprint["state"] == "active":
-                        sprint_lifecycle.transition(con, did, "closing")
-                        sprint_lifecycle.transition(con, did, "closed")
-                    elif sprint["state"] == "closing":
-                        sprint_lifecycle.transition(con, did, "closed")
-                    elif sprint["state"] == "declared":
-                        sprint_lifecycle.transition(con, did, "aborted")
-                    elif sprint["state"] == "needs_owner":
-                        sprint_lifecycle.transition(con, did, "closed")
-                # Sprint close integration (seq 10): freezing the board
-                # releases its wake bindings + cancels queued wake work, and
-                # retires the sprint's watches + watch-scoped alerts (H-12).
-                closed = _close_sprint_wake(con, did)
                 con.commit()
-                return self._send(200, {"ok": True, **closed,
-                                        "serialize": serialize_doc_write()})
+                return self._send(200, {
+                    "ok": True,
+                    "serialize": serialize_doc_write(),
+                })
 
             # PATCH /_sc/mem/docs/{id}
             if len(parts) == 4 and parts[2] == "docs":
@@ -2854,31 +2559,22 @@ class Handler(BaseHTTPRequestHandler):
                         "SELECT 1 FROM documents WHERE document_id=?",
                         (did,)).fetchone():
                     return self._send(404, {"error": "no such document"})
-                # NO sprint-close trigger here (H-1). A body edit used to
-                # release bindings when it happened to leave a `status: CLOSED`
-                # line, which made a prose line executable and made the close
-                # depend on formatting. Closing a sprint IS freezing its doc —
-                # the freeze route above owns the release, atomically. The
-                # `status:` line the close skill still writes is display prose
-                # for the human reader and nothing reads it back.
                 ok, err = patch_document(con, did, body, commit=False)
                 if not ok:
                     return self._send(400, {"ok": ok, "error": err})
                 con.commit()
-                # Zeros, not an absent key: the counts stay in the response
-                # shape the freeze route reports (U3), so a reader parsing a
-                # doc write never has to branch on which route answered.
-                return self._send(200, {"ok": ok,
-                                        "released_bindings": 0,
-                                        "retired_watches": 0,
-                                        "resolved_watch_alerts": 0,
-                                        "serialize": serialize_doc_write()})
+                return self._send(200, {
+                    "ok": ok,
+                    "serialize": serialize_doc_write(),
+                })
 
             # PATCH /_sc/mem/messages/{id}/read
             if len(parts) == 5 and parts[2] == "messages" and parts[4] == "read":
                 mid = int(parts[3])
                 if not con.execute(
-                        "SELECT 1 FROM shell_messages WHERE message_id=? AND to_shell_id=?",
+                        "SELECT 1 FROM shell_messages WHERE message_id=? "
+                        "AND to_shell_id=? "
+                        "AND kind IN ('shell','task','result')",
                         (mid, sid)).fetchone():
                     return self._send(404, {"error": "no such message"})
                 con.execute(
@@ -3347,7 +3043,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ---------------------------------------------------------------------------
-# asyncio transport integration (sprint 25 seq 5, spec #20)
+# asyncio transport integration
 #
 # The stdlib ThreadingHTTPServer loop is replaced by api/transport.py's
 # one-port HTTP+WS multiplex. Every existing route below is UNTOUCHED: the

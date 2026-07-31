@@ -23,7 +23,6 @@ class FreshInstallShellContractTest(unittest.TestCase):
         rendered = compose.render_api(8837, "configured")
         self.assertIn("`sc mem`", rendered)
         self.assertNotIn("`./sc mem`", rendered)
-        self.assertNotIn("./sc", compose.PARTICIPANT_RULES)
         boot = (
             ROOT / ".super-coder" / "templates" / "boot.md"
         ).read_text()

@@ -863,43 +863,5 @@ class SprintDeclarationContractTest(unittest.TestCase):
             "completed",
         )
 
-    def test_cancel_records_interrupt_for_a_run_that_crossed_dispatch(self):
-        sprint = self.staged_sprint(key="cancel-running")
-        sprint_id = sprint["sprint_doc_id"]
-        self.call(
-            "PATCH",
-            f"/api/sprints/{sprint_id}",
-            {"state": "active"},
-            key="arm-running",
-        )
-        store = sprint_routes.conversation_broker.BrokerStore(self.db_path)
-        run = store.claim_next("test-broker")
-        self.assertIsNotNone(run)
-
-        with mock.patch.object(
-            sprint_routes.conversation_broker,
-            "interrupt_run",
-            side_effect=sprint_routes.conversation_broker.BrokerError(
-                "CONVERSATION_BROKER_UNAVAILABLE", "offline"
-            ),
-        ) as interrupt:
-            self.call(
-                "POST",
-                f"/api/sprints/{sprint_id}/cancellations",
-                {"reason": "stop running work"},
-                token=None,
-                key="cancel-running",
-            )
-        interrupt.assert_called_once_with(run.run_id)
-        self.assertEqual(
-            self.con.execute(
-                "SELECT COUNT(*) FROM conversation_events "
-                "WHERE run_id=? AND event_type='run.interrupt.requested'",
-                (run.run_id,),
-            ).fetchone()[0],
-            1,
-        )
-
-
 if __name__ == "__main__":
     unittest.main(verbosity=2)

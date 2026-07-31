@@ -31,7 +31,6 @@ import db_driver  # noqa: E402
 import map_repo  # noqa: E402
 import migrate as migrate_mod  # noqa: E402
 import seed_skills  # noqa: E402  (re-assert the fork retire list post-seed)
-import sprint_state  # noqa: E402
 
 # Compatibility/readability constant: the historical preferred location.
 # Writes resolve dynamically through backup_dir() so a restricted host seat can
@@ -198,7 +197,7 @@ def parse_args(argv: list[str]) -> bool:
     """Return no_backup, print help, or reject — touching NO state.
 
     Spec #67: rebuild used to interpret arguments only after it had read the
-    schema, carried the outgoing keys, probed live sprint state and taken a
+    schema, carried the outgoing keys and taken a
     backup, so `./sc rebuild --help` and every typo ran a real rebuild. The
     whole argument contract lives here, ahead of all of it, and this function
     opens no database and touches no path.
@@ -218,22 +217,6 @@ def parse_args(argv: list[str]) -> bool:
     return "--no-backup" in argv
 
 
-def active_sprint_ids(db_path: Path | None = None) -> set[int]:
-    """Read the centralized ACTIVE-sprint predicate from the outgoing DB."""
-    db_path = db_path or DB_PATH
-    if not db_path.exists():
-        return set()
-    con = db_driver.connect(db_path)
-    try:
-        return sprint_state.live_sprint_doc_ids(con)
-    except db_driver.OperationalError as exc:
-        if "no such table" in str(exc).lower():
-            return set()
-        raise
-    finally:
-        con.close()
-
-
 def main(argv: list[str]) -> int:
     no_backup = parse_args(argv)
 
@@ -242,12 +225,6 @@ def main(argv: list[str]) -> int:
         sys.exit(f"rebuild: missing {schema}")
 
     keys = read_existing_keys()
-    active = active_sprint_ids()
-    if active:
-        ids = ", ".join(str(doc_id) for doc_id in sorted(active))
-        sys.exit(
-            "rebuild: refusing — ACTIVE sprint(s) exist: "
-            f"{ids}. Close or freeze every sprint before rebuilding.")
     if not no_backup:
         backup_existing()
 

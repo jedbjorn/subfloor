@@ -102,44 +102,6 @@ class RebuildIntegrityTest(unittest.TestCase):
             ).fetchone())
             con.close()
 
-    def test_active_sprint_refuses_before_rebuild_mutation(self):
-        with tempfile.TemporaryDirectory() as raw_tmp:
-            tmp = Path(raw_tmp)
-            outgoing = tmp / "shell_db.db"
-            apply_engine_schema(outgoing)
-            con = sqlite3.connect(outgoing)
-            con.execute(
-                "INSERT INTO users (user_id, username, is_active) "
-                "VALUES (1,'before',1)")
-            con.execute(
-                "INSERT INTO shells (shell_id, display_name, shortname, mandate, "
-                "system_prompt, user_id, is_shared, has_identity, bootstrapped) "
-                "VALUES (1,'Before','s1','test','sp',1,0,1,1)")
-            con.execute(
-                "INSERT INTO documents "
-                "(document_id, kind, title, frozen) "
-                "VALUES (59,'doc','SPRINT: rebuild guard',0)")
-            con.execute(
-                "INSERT INTO sprint_units "
-                "(sprint_doc_id, seq, unit_title, state) "
-                "VALUES (59,'U1','guard proof','working')")
-            con.execute(
-                "INSERT INTO sprints (sprint_doc_id, state, legacy) "
-                "VALUES (59,'active',1)")
-            con.commit()
-            con.close()
-            before = digest(outgoing)
-
-            with mock.patch.multiple(
-                rebuild, DB_PATH=outgoing, REPO_ROOT=tmp
-            ), self.assertRaises(SystemExit) as ctx:
-                rebuild.main(["--no-backup"])
-
-            self.assertIn("ACTIVE sprint", str(ctx.exception))
-            self.assertIn("59", str(ctx.exception))
-            self.assertEqual(before, digest(outgoing))
-            self.assertFalse(Path(str(outgoing) + ".rebuild").exists())
-
     def test_valid_candidate_atomically_replaces_outgoing_db(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
