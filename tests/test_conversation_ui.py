@@ -28,6 +28,35 @@ def test_open_chat_restore_matches_the_flat_shell_projection():
     )
 
 
+def test_sprint_pill_enters_the_current_conversation_without_a_wake():
+    interface = APP[APP.index("async function renderInterface"):
+                    APP.index("// ── Tabs + boot")]
+    pill = interface[interface.index('className: "chat-sprint-pill"'):
+                     interface.index("shellRow.append(pill)")]
+    assert "sprint.current_conversation_id" in pill
+    assert "location.hash = chatHash(" in pill
+    assert "chatApi(" not in pill
+    assert "Sprint ${sprint.sprint_id}" in pill
+    assert "${sprint.role} · ${sprint.disposition}" in pill
+    assert ".chat-sprint-pill" in STYLE
+    assert "color: var(--warn)" in STYLE[
+        STYLE.index(".chat-sprint-pill"):STYLE.index(".chat-sprint-meta")
+    ]
+
+
+def test_sprint_conversations_are_not_closed_by_normal_chat_controls():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    close_for_switch = interface[
+        interface.index("async function chatCloseForSwitch"):
+        interface.index("function chatBubble")
+    ]
+    assert 'if (conversation.scope === "sprint") return true' in close_for_switch
+    assert 'const sprintManaged = conversation.scope === "sprint"' in interface
+    assert "close.hidden = sprintManaged" in interface
+    assert 'hidden: conversation.scope === "sprint"' in interface
+
+
 def test_start_chat_has_default_and_configured_paths_without_terminal_controls():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
@@ -210,7 +239,7 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert "{ version: latest.version, state: \"closed\" }" in close_handler
     assert 'close.textContent = "Closing…"' in close_handler
     assert "const closing = !closed && Boolean(conversation.close_requested_at)" in interface
-    assert "close.disabled = closed || closing" in interface
+    assert "close.disabled = sprintManaged || closed || closing" in interface
     assert 'close.textContent = closing ? "Closing…" : "Close"' in interface
     assert '"conversation.close.requested"' in interface
     assert "chatCloseForSwitch(selectedConversation)" in interface
@@ -218,7 +247,7 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert 'item.state !== "closed"' in interface
     shell_switch = interface[
         interface.index('button.onclick = () => {', interface.index("chat-shell-name")):
-        interface.index("rail.append(button);", interface.index("chat-shell-name"))
+        interface.index("rail.append(shellRow);", interface.index("chat-shell-name"))
     ]
     assert "chatCloseForSwitch" not in shell_switch
 

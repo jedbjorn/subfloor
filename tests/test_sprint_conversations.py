@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / ".super-coder" / "api"))
+sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 
 import sprint_conversations
 
@@ -26,11 +26,13 @@ def substrate() -> sqlite3.Connection:
         );
         CREATE TABLE shells (
           shell_id INTEGER PRIMARY KEY,
-          shortname TEXT NOT NULL
+          shortname TEXT NOT NULL,
+          flavor TEXT,
+          user_id INTEGER REFERENCES users(user_id)
         );
         CREATE TABLE sprints (
           sprint_id INTEGER PRIMARY KEY,
-          owner_user_id INTEGER NOT NULL REFERENCES users(user_id),
+          originating_planner_shell_id INTEGER NOT NULL REFERENCES shells(shell_id),
           lifecycle TEXT NOT NULL
         );
         CREATE TABLE conversations (
@@ -62,8 +64,13 @@ def substrate() -> sqlite3.Connection:
           sprint_id INTEGER NOT NULL REFERENCES sprints(sprint_id),
           shell_id INTEGER NOT NULL REFERENCES shells(shell_id),
           role TEXT NOT NULL,
+          harness TEXT NOT NULL,
+          model TEXT,
+          effort TEXT,
           disposition TEXT NOT NULL,
-          current_conversation_id TEXT REFERENCES conversations(conversation_id)
+          persistent_conversation_id TEXT REFERENCES conversations(conversation_id),
+          current_conversation_id TEXT REFERENCES conversations(conversation_id),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE TABLE sprint_participant_conversations (
           participant_conversation_id INTEGER PRIMARY KEY,
@@ -80,12 +87,14 @@ def substrate() -> sqlite3.Connection:
           ON sprint_participant_conversations(sprint_participant_id)
           WHERE purpose='work';
         INSERT INTO users VALUES (1);
-        INSERT INTO shells VALUES (10,'DEV1'),(20,'REV1');
-        INSERT INTO sprints VALUES (7,1,'armed');
+        INSERT INTO shells VALUES
+          (10,'DEV1','dev',1),(20,'REV1','reviewer',1),(30,'PLN1','planner',1);
+        INSERT INTO sprints VALUES (7,30,'armed');
         INSERT INTO sprint_participants
-          (participant_id,sprint_id,shell_id,role,disposition)
-          VALUES (101,7,10,'developer','working'),
-                 (102,7,20,'reviewer','waiting');
+          (participant_id,sprint_id,shell_id,role,harness,model,effort,disposition)
+          VALUES (101,7,10,'developer','codex','gpt-test','high','active'),
+                 (102,7,20,'reviewer','kimi','kimi-test','high','idle'),
+                 (103,7,30,'planner','codex','planner-test','high','active');
         """
     )
     return con
@@ -116,30 +125,34 @@ def create(
 
 def test_arming_provisions_every_participant_without_a_wake() -> None:
     with substrate() as con:
-        developer = create(con, 101, "work", "s7:p101:work")
-        reviewer = create(con, 102, "work", "s7:p102:work")
+        provisioned = sprint_conversations.provision_at_arming(con, 7)
+        assert len(provisioned) == 3
 
         conversations = con.execute(
-            "SELECT conversation_id,shell_id,conversation_scope,state "
+            "SELECT shell_id,conversation_scope,state "
             "FROM conversations ORDER BY shell_id"
         ).fetchall()
         assert [tuple(row) for row in conversations] == [
-            (developer, 10, "sprint", "idle"),
-            (reviewer, 20, "sprint", "idle"),
+            (10, "sprint", "idle"),
+            (20, "sprint", "idle"),
+            (30, "sprint", "idle"),
         ]
         pointers = con.execute(
-            "SELECT participant_id,current_conversation_id "
+            "SELECT participant_id,persistent_conversation_id,"
+            "current_conversation_id "
             "FROM sprint_participants ORDER BY participant_id"
         ).fetchall()
-        assert [tuple(row) for row in pointers] == [
-            (101, developer),
-            (102, reviewer),
-        ]
+        assert [row["participant_id"] for row in pointers] == [101, 102, 103]
+        assert all(
+            row["persistent_conversation_id"] == row["current_conversation_id"]
+            for row in pointers
+        )
+        assert {row["current_conversation_id"] for row in pointers} == set(provisioned)
         events = con.execute(
             "SELECT conversation_id,event_type,payload "
             "FROM conversation_events ORDER BY conversation_id"
         ).fetchall()
-        assert len(events) == 2
+        assert len(events) == 3
         assert {json.loads(row["payload"])["purpose"] for row in events} == {"work"}
         assert all(row["event_type"] == "conversation.created" for row in events)
 
@@ -300,3 +313,46 @@ def test_fallback_replacement_retains_packet_route_and_history() -> None:
             ).fetchone()[0]
             == fallback
         )
+
+
+def test_live_pill_projection_follows_current_pointer_until_terminal() -> None:
+    with substrate() as con:
+        provisioned = sprint_conversations.provision_at_arming(con, 7)
+        work = con.execute(
+            "SELECT persistent_conversation_id FROM sprint_participants "
+            "WHERE participant_id=101"
+        ).fetchone()[0]
+        fix = create(
+            con,
+            101,
+            "fix",
+            "s7:p101:review:55:fix",
+            parent_conversation_id=work,
+        )
+        shells = [{"shell_id": 10}, {"shell_id": 20}, {"shell_id": 30}]
+
+        projected = sprint_conversations.attach_live_participations(con, shells)
+
+        assert projected[0]["sprint"] == {
+            "sprint_id": 7,
+            "lifecycle": "armed",
+            "role": "developer",
+            "disposition": "active",
+            "current_conversation_id": fix,
+        }
+        assert projected[1]["sprint"] == {
+            "sprint_id": 7,
+            "lifecycle": "armed",
+            "role": "reviewer",
+            "disposition": "idle",
+            "current_conversation_id": provisioned[1],
+        }
+
+        con.execute("UPDATE sprints SET lifecycle='completed' WHERE sprint_id=7")
+        terminal = sprint_conversations.attach_live_participations(
+            con, [{"shell_id": 10}, {"shell_id": 20}]
+        )
+        assert terminal == [
+            {"shell_id": 10, "sprint": None},
+            {"shell_id": 20, "sprint": None},
+        ]

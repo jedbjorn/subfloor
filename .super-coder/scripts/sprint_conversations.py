@@ -14,6 +14,8 @@ import json
 import uuid
 from typing import Any
 
+import run as run_mod
+
 _PURPOSES = {"work", "fix", "merge", "fallback"}
 
 
@@ -40,8 +42,9 @@ def _nonblank(value: str | None, field: str, *, maximum: int) -> str:
 
 def _participant(con, participant_id: int):
     row = con.execute(
-        "SELECT p.participant_id,p.sprint_id,p.shell_id,p.current_conversation_id,"
-        "s.shortname FROM sprint_participants p "
+        "SELECT p.participant_id,p.sprint_id,p.shell_id,"
+        "p.persistent_conversation_id,p.current_conversation_id,"
+        "s.shortname,s.flavor FROM sprint_participants p "
         "JOIN shells s ON s.shell_id=p.shell_id "
         "WHERE p.participant_id=?",
         (participant_id,),
@@ -230,11 +233,19 @@ def create_and_select(
             packet_json,
         ),
     )
-    updated = con.execute(
-        "UPDATE sprint_participants SET current_conversation_id=? "
-        "WHERE participant_id=?",
-        (conversation_id, participant_id),
-    ).rowcount
+    if purpose == "work":
+        updated = con.execute(
+            "UPDATE sprint_participants SET persistent_conversation_id=?,"
+            "current_conversation_id=?,updated_at=datetime('now') "
+            "WHERE participant_id=?",
+            (conversation_id, conversation_id, participant_id),
+        ).rowcount
+    else:
+        updated = con.execute(
+            "UPDATE sprint_participants SET current_conversation_id=?,"
+            "updated_at=datetime('now') WHERE participant_id=?",
+            (conversation_id, participant_id),
+        ).rowcount
     if updated != 1:
         raise SprintConversationError("Sprint participant disappeared during creation")
     return conversation_id
@@ -242,19 +253,96 @@ def create_and_select(
 
 def select_work(con, participant_id: int) -> str:
     """Return the participant pointer to its persistent work conversation."""
-    _participant(con, participant_id)
-    row = con.execute(
-        "SELECT conversation_id FROM sprint_participant_conversations "
-        "WHERE sprint_participant_id=? AND purpose='work'",
-        (participant_id,),
-    ).fetchone()
-    if row is None:
+    participant = _participant(con, participant_id)
+    conversation_id = participant["persistent_conversation_id"]
+    if conversation_id is None or not _linked_to_participant(
+        con, participant_id, conversation_id
+    ):
         raise SprintConversationError(
             "Sprint participant has no persistent work conversation"
         )
     con.execute(
-        "UPDATE sprint_participants SET current_conversation_id=? "
-        "WHERE participant_id=?",
-        (row["conversation_id"], participant_id),
+        "UPDATE sprint_participants SET current_conversation_id=?,"
+        "updated_at=datetime('now') WHERE participant_id=?",
+        (conversation_id, participant_id),
     )
-    return row["conversation_id"]
+    return conversation_id
+
+
+def provision_at_arming(con, sprint_id: int) -> list[str]:
+    """Create every participant's persistent conversation during arming.
+
+    The caller's arming transaction owns the commit.  This function performs
+    no harness or Git operation and emits no wake, so even later-wave
+    participants can receive durable placeholders without consuming usage.
+    """
+    rows = con.execute(
+        "SELECT p.participant_id,p.role,p.harness,p.model,p.effort,"
+        "s.originating_planner_shell_id,sh.shortname,sh.flavor,owner.user_id "
+        "FROM sprint_participants p "
+        "JOIN sprints s ON s.sprint_id=p.sprint_id "
+        "JOIN shells sh ON sh.shell_id=p.shell_id "
+        "JOIN shells owner ON owner.shell_id=s.originating_planner_shell_id "
+        "WHERE p.sprint_id=? ORDER BY p.participant_id",
+        (sprint_id,),
+    ).fetchall()
+    if not rows:
+        raise SprintConversationError("arming requires Sprint participants")
+    conversation_ids = []
+    for row in rows:
+        if row["user_id"] is None:
+            raise SprintConversationError(
+                "originating Planner has no browser operator owner"
+            )
+        worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
+        conversation_ids.append(
+            create_and_select(
+                con,
+                participant_id=int(row["participant_id"]),
+                owner_user_id=int(row["user_id"]),
+                purpose="work",
+                harness=row["harness"],
+                provider=run_mod.session_provider(row["harness"], row["model"]),
+                model=row["model"],
+                effort=row["effort"],
+                worktree=str(worktree.resolve(strict=False)),
+                title=f"Sprint {sprint_id} · {row['role']} · {row['shortname']}",
+                idempotency_key=(
+                    f"sprint:{sprint_id}:participant:{row['participant_id']}:work"
+                ),
+            )
+        )
+    return conversation_ids
+
+
+def attach_live_participations(con, shells: list[dict]) -> list[dict]:
+    """Attach the one live/paused Sprint pill projection to shell rows."""
+    rows = con.execute(
+        "SELECT p.shell_id,p.role,p.disposition,p.current_conversation_id,"
+        "s.sprint_id,s.lifecycle "
+        "FROM sprint_participants p "
+        "JOIN sprints s ON s.sprint_id=p.sprint_id "
+        "WHERE s.lifecycle IN ('armed','paused') "
+        "ORDER BY s.lifecycle='armed' DESC,s.sprint_id DESC"
+    ).fetchall()
+    by_shell: dict[int, dict] = {}
+    for row in rows:
+        shell_id = int(row["shell_id"])
+        if shell_id in by_shell:
+            raise SprintConversationError(
+                "shell participates in more than one live or paused Sprint"
+            )
+        if row["current_conversation_id"] is None:
+            raise SprintConversationError(
+                "live Sprint participant has no current conversation"
+            )
+        by_shell[shell_id] = {
+            "sprint_id": int(row["sprint_id"]),
+            "lifecycle": row["lifecycle"],
+            "role": row["role"],
+            "disposition": row["disposition"],
+            "current_conversation_id": row["current_conversation_id"],
+        }
+    for shell in shells:
+        shell["sprint"] = by_shell.get(int(shell["shell_id"]))
+    return shells

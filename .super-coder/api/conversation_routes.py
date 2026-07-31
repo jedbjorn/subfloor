@@ -363,7 +363,8 @@ def _append_event(
 def _conversation_row(con, conversation_id: str, owner_user_id: int):
     return con.execute(
         "SELECT c.conversation_id,c.shell_id,c.owner_user_id,c.harness,"
-        "c.provider,c.model,c.effort,c.state,c.title,c.starred,c.created_at,"
+        "c.provider,c.model,c.effort,c.state,c.title,c.starred,"
+        "c.conversation_scope,c.created_at,"
         "c.last_activity_at,c.closed_at,c.version,c.harness_session_ref,"
         "s.display_name,s.shortname,"
         "CASE WHEN c.state!='closed' THEN ("
@@ -400,6 +401,7 @@ def _conversation_projection(row) -> dict:
             "model": row["model"],
             "effort": row["effort"],
         },
+        "scope": row["conversation_scope"],
         "state": row["state"],
         "title": row["title"],
         "starred": bool(row["starred"]),
@@ -629,7 +631,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         )
     open_conversations = con.execute(
         "SELECT conversation_id,state FROM conversations "
-        "WHERE shell_id=? AND state!='closed'",
+        "WHERE shell_id=? AND state!='closed' AND conversation_scope='normal'",
         (shell_id,),
     ).fetchall()
     if not open_conversations:
@@ -739,7 +741,8 @@ def _create_conversation(con, operator: dict, headers, body: dict):
 
         open_conversations = con.execute(
             "SELECT conversation_id,state FROM conversations "
-            "WHERE shell_id=? AND state!='closed'",
+            "WHERE shell_id=? AND state!='closed' "
+            "AND conversation_scope='normal'",
             (shell_id,),
         ).fetchall()
         if not open_conversations:
@@ -882,7 +885,8 @@ def _list_conversations(con, operator: dict, query):
         params.extend((decoded["a"], decoded["a"], decoded["id"]))
     rows = con.execute(
         "SELECT c.conversation_id,c.shell_id,c.owner_user_id,c.harness,"
-        "c.provider,c.model,c.effort,c.state,c.title,c.starred,c.created_at,"
+        "c.provider,c.model,c.effort,c.state,c.title,c.starred,"
+        "c.conversation_scope,c.created_at,"
         "c.last_activity_at,c.closed_at,c.version,s.display_name,s.shortname,"
         "CASE WHEN c.state!='closed' THEN ("
         " SELECT requested.created_at FROM conversation_events requested "
@@ -948,6 +952,12 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
                 {"expected": int(row["version"]), "received": version},
             )
         closing = body.get("state") == "closed"
+        if closing and row["conversation_scope"] == "sprint":
+            raise ApiError(
+                409,
+                "SPRINT_CONVERSATION_MANAGED",
+                "Sprint conversations close only with Sprint lifecycle cleanup",
+            )
         if row["state"] == "closed" and {"title", "state"}.intersection(body):
             raise ApiError(
                 409,
