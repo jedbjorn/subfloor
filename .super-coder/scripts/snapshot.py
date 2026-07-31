@@ -69,47 +69,17 @@ PER_INSTANCE_TABLES = [
     # cache. Loads after `shells` (its FK target). read_at is preserved, so an
     # unread message stays unread across a rebuild.
     "shell_messages",
-    # watched_prs is per-instance eventing state (this fork's live PR
-    # subscriptions + the daemon's diff fingerprints), so a mid-sprint rebuild
-    # doesn't drop the planner's watches. Loads after `shells` (its FK target).
-    "watched_prs",
     # flavor_defaults is operator-tuned launch config (the Default Models GUI:
     # model per harness + starred default harness, per flavor). Migrations seed
     # the engine's baseline; content.sql loads AFTER migrations on rebuild, so
     # the fork's edits win — without this the GUI's changes vanish on rebuild.
     "flavor_defaults",
-    # Retired Interface state and its dependent wake-machine audit remain in
-    # live installed DBs until Step 4 drains them, but are no longer part of a
-    # rebuilt instance. Serializing the dependents without their Interface FK
-    # parents would create an invalid candidate.
-    "pr_poll_observations",
-    # sprint_units (0098) is the planner's AUTHORED board — the declared belief
-    # about who should be doing what — not a derived cache: nothing re-derives
-    # it, so a mid-sprint rebuild without it drops the whole sprint's state and
-    # leaves the reconciler with nothing to compare against. Same class as
-    # watched_prs/flags, and unlike the quota tables (0096) which a probe
-    # rebuilds. Loads after `shells` and `documents`, both its FK targets. No
-    # row filter: every unit row is durable planner content, terminal or not.
-    "sprint_units",
-    # Reviewed-spec evidence and executable sprint declarations are durable
-    # instance truth. Reviews load after their document/shell parents; sprints
-    # then load after documents, shells, and reviews.
-    "spec_qaqc_reviews",
-    "sprints",
-    # Conductor contract rows are durable orchestration truth. Whitelist and
-    # expectation defaults are migration-owned system data; the live queue,
-    # evidence trail, and one-time legacy-drain audit are instance state.
-    "directives",
-    "sentinel_events",
-    "wake_machine_retirements",
-    # Browser-native conversations are durable instance truth: Sprint bindings,
-    # exact harness refs, message queues, recovery evidence, replay events, and
-    # pending outbox work must all survive update/rebuild. Parents precede
+    # Browser-native conversations are durable instance truth: exact harness
+    # refs, message queues, recovery evidence, replay events, and pending
+    # outbox work must all survive update/rebuild. Parents precede
     # children so a snapshot stays readable and foreign-key-valid when loaded.
     "conversations",
     "conversation_git_targets",
-    "sprint_conversation_bindings",
-    "sprint_cancellations",
     "conversation_messages",
     "conversation_runs",
     "conversation_events",
@@ -119,12 +89,7 @@ PER_INSTANCE_TABLES = [
     # .sc-state/local/map/content.sql by snapshot_map() below, not here.
 ]
 
-SNAPSHOT_ROW_FILTERS = {
-    "pr_poll_observations":
-        "WHERE (transition IS NOT NULL OR blind_window <> 0) "
-        "AND EXISTS (SELECT 1 FROM watched_prs w "
-        "WHERE w.watch_id=pr_poll_observations.watch_id)",
-}
+SNAPSHOT_ROW_FILTERS = {}
 
 
 def quote(v) -> str:

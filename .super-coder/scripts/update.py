@@ -18,8 +18,8 @@ makes `./sc rollback` sound (DB + engine restored together).
 
 Flow:
     1. attempt to fast-forward the current checkout with `git pull --ff-only`,
-       then fetch upstream engine objects. Checkout sync failures and active
-       sprints warn but never prevent an engine update.
+       then fetch upstream engine objects. Checkout sync failures warn but
+       never prevent an engine update.
     2. capture the restore point: the current `engine.ref` → `engine.ref.prev`.
     3. materialize the engine paths at the new ref into the
        gitignored `.super-coder/` dir; write the new `engine.ref`. Per-instance
@@ -77,7 +77,6 @@ import migrate as migrate_mod  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402
 import seed_skills  # noqa: E402
 import shell_factory  # noqa: E402
-import sprint_state  # noqa: E402
 
 EJECTED_MARKER = STATE_DIR / "ejected"
 
@@ -607,33 +606,6 @@ def fetch_and_materialize(branch: str, ref: str | None = None,
     materialize_fetched_engine(sha, force=force)
 
 
-def active_sprint_ids(db_path: Path | None = None) -> set[int]:
-    """Read the centralized ACTIVE-sprint predicate from the live engine DB."""
-    db_path = db_path or DB_PATH
-    if not db_path.exists():
-        return set()
-    con = db_driver.connect(db_path)
-    try:
-        return sprint_state.live_sprint_doc_ids(con)
-    except db_driver.OperationalError as exc:
-        if "no such table" in str(exc).lower():
-            return set()
-        raise
-    finally:
-        con.close()
-
-
-def warn_live_state() -> None:
-    """Surface active sprints without withholding the update recovery path."""
-    active = active_sprint_ids()
-    if not active:
-        return
-    ids = ", ".join(str(doc_id) for doc_id in sorted(active))
-    print(
-        "! update: ACTIVE sprint(s) exist: "
-        f"{ids} — continuing; sprint rows and board state will be preserved.")
-
-
 def migrate_engine_untrack() -> None:
     """One-time B7 migration for a fork that predates the gitignore model: stop
     tracking `.super-coder/` and ensure .gitignore keeps it out. Idempotent — a
@@ -692,15 +664,11 @@ def migrate_generated_artifacts_local() -> None:
     )
 
 
-def migrate_or_rebuild(*, live_warning_done: bool = False) -> None:
+def migrate_or_rebuild() -> None:
     if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
         print("→ no live DB (fresh fork) — building from text")
         rebuild_mod.main([])
         return
-    # Direct callers still surface the warning. update.main passes the explicit
-    # receipt so the same active sprint is not announced twice.
-    if not live_warning_done:
-        warn_live_state()
     rebuild_mod.backup_existing()  # restore point before any structural change
     print("→ migrate in place (pending migrations → the live DB; data preserved)")
     migrate_mod.migrate(str(DB_PATH))
@@ -848,8 +816,6 @@ def main(argv: list[str]) -> int:
     target_sha = None
     if not source and not no_fetch:
         target_sha = fetch_update_ref(branch, ref=ref)
-    warn_live_state()
-
     if source:
         # The source repo IS the engine — it has no upstream to materialize from
         # and must keep tracking .super-coder/. Reconcile its own tree only.
@@ -900,7 +866,7 @@ def main(argv: list[str]) -> int:
         print(f"→ expire the sandbox's baked harness CLIs (epoch {epoch})")
         print("  they reinstall on the next image build — normal `./sc restart` / `make dos-r`")
 
-    migrate_or_rebuild(live_warning_done=True)
+    migrate_or_rebuild()
 
     print("→ sync skills catalogue (id-stable)")
     sync_skills()

@@ -18,7 +18,6 @@ STEP4 = MIGRATIONS / "0119_conductor_contracts.sql"
 
 sys.path.insert(0, str(ENGINE / "api"))
 import conductor_routes  # noqa: E402
-import snapshot as snapshot_mod  # noqa: E402
 sys.path.insert(0, str(ENGINE / "scripts"))
 import conductor_contracts as conductor_cli  # noqa: E402
 
@@ -300,14 +299,6 @@ class ConductorContractTests(unittest.TestCase):
         terminal = {r["unit_state"]: r for r in rows}
         self.assertEqual(terminal["merged"]["enabled"], 0)
         self.assertIsNone(terminal["cancelled"]["max_dwell_seconds"])
-
-    def test_instance_contract_trail_is_rebuild_persistent(self):
-        for table in (
-                "directives", "sentinel_events", "wake_machine_retirements"):
-            self.assertIn(table, snapshot_mod.PER_INSTANCE_TABLES)
-        self.assertNotIn("unit_expectations", snapshot_mod.PER_INSTANCE_TABLES)
-        self.assertNotIn("directive_kinds", snapshot_mod.PER_INSTANCE_TABLES)
-
 
 class WakeDrainMigrationTests(unittest.TestCase):
     def test_live_legacy_rows_are_closed_with_audit(self):

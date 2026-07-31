@@ -260,6 +260,23 @@
     "shell_launch_records": "generic headless shell liveness",
     "shell_messages": "generic shell/task/result and job delivery"
   },
+  "retained_shared_system_files": [
+    "sc",
+    ".super-coder/api/server.py",
+    ".super-coder/api/conversation_routes.py",
+    ".super-coder/scripts/conversation_broker.py",
+    ".super-coder/scripts/conversation_launch.py",
+    ".super-coder/scripts/run.py",
+    ".super-coder/scripts/mem.py",
+    ".super-coder/scripts/job.py",
+    ".super-coder/scripts/analytics.py",
+    ".super-coder/scripts/snapshot.py",
+    ".super-coder/scripts/rebuild.py",
+    ".super-coder/scripts/update.py",
+    ".super-coder/scripts/install.py",
+    ".super-coder/render/compose.py",
+    ".super-coder/render/flat.py"
+  ],
   "scan_roots": [
     "sc",
     ".super-coder",

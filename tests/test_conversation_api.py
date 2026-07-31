@@ -743,37 +743,13 @@ class ConversationResourceTest(ConversationApiCase):
             ("kimi", "kimi", None, "high"),
         )
 
-    def test_conductor_shell_rejects_ordinary_browser_chat(self) -> None:
-        con = self.connect()
-        try:
-            con.execute("UPDATE shells SET flavor='conductor' WHERE shell_id=1")
-            con.commit()
-        finally:
-            con.close()
-        status, _, error = self.request(
-            "POST",
-            "/api/conversations",
-            body={"shell_id": 1, "harness": "kimi"},
-            key="conductor-kimi",
-        )
-        self.assertEqual(status, 422)
-        self.assertEqual(error["error"]["code"], "SPRINT_OWNED_SHELL")
-        self.assertIn("armed sprints", error["error"]["message"].lower())
-        con = self.connect()
-        try:
-            count = con.execute(
-                "SELECT COUNT(*) FROM conversations"
-            ).fetchone()[0]
-        finally:
-            con.close()
-        self.assertEqual(count, 0)
-
     def test_create_is_idempotent_and_never_exposes_native_identity(self) -> None:
         first = self.create(title="API")
         second = self.create(title="API")
         self.assertEqual(first, second)
         self.assertNotIn("worktree", first)
         self.assertNotIn("harness_session_ref", json.dumps(first))
+        self.assertNotIn("mode", first)
         self.assertEqual(first["route"]["harness"], "codex")
 
         status, _, error = self.request(
@@ -1304,6 +1280,7 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
             "starred=true&starred=false",
             "open=yes",
             "open=true&open=true",
+            "mode=normal",
         ):
             with self.subTest(query=query):
                 status, _, error = self.request(

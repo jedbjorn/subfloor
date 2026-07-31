@@ -20,14 +20,11 @@ Interactive and headless launches share this direct boot path. `./sc enter`
 dispatches here for a human session; `./sc run` supplies `--headless`.
 
 Headless (`./sc run <shortname> [-p "<prompt>"] [--harness <h>] [-m <model>]
-[--effort <level>] [--slot <plan|dev|rev> --sprint <id> [--unit U]]`):
+[--effort <level>]`):
 the same render-then-exec path minus the picker and the TTY. The harness runs
 non-interactively via its adapter's `headless` block (claude -p · codex exec ·
-opencode run), streams a final message, and exits — the ephemeral-worker
-primitive of sprint eventing (`specs_sc/sprint-eventing.md`). A slot launch
-validates the shell flavor, live sprint, and assigned unit before opening a
-session, then embeds the exact board context plus the full slot skill in the
-boot artifact. Plain headless launches keep the inbox-drain default. A liveness
+opencode run), streams a final message, and exits. Headless launches keep the
+inbox-drain default. A liveness
 guard refuses a shell whose worktree already hosts a live session (one shell,
 one session). Harness + model resolve: explicit flags → the shell's
 flavor_defaults.
@@ -55,7 +52,6 @@ import flat  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
-import conductor_policy  # noqa: E402
 import db_driver  # noqa: E402
 import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
@@ -63,8 +59,6 @@ import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
 import style  # noqa: E402  — launcher ANSI; degrades to plain text off-TTY
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
 import shell_liveness  # noqa: E402  — headless boot's one-shell-one-session guard
-import sprint_lifecycle  # noqa: E402  — authoritative sprint owner/state/routes
-from sprint_units import TERMINAL_UNIT_STATES  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "api"))
 import model_catalog  # noqa: E402  — HARNESS_PROVIDER: one source for harness → provider
@@ -73,14 +67,7 @@ ADAPTERS = ENGINE / "adapters"
 PROC_SELF_STAT = Path("/proc/self/stat")   # H-25: our own start ticks, pre-exec
 
 DEFAULT_HEADLESS_PROMPT = "Check your inbox and act on your unread messages."
-SLOT_SKILLS = {
-    "plan": ("planner", "sprint_pln"),
-    "dev": ("dev", "sprint_dev"),
-    "rev": ("reviewer", "sprint_rev"),
-}
 SESSION_OPEN_RETRY_DELAYS_S = (0.1, 0.3)
-SPRINT_ACTIVATION_WAIT_SECONDS = 30.0
-SPRINT_ACTIVATION_POLL_SECONDS = 0.05
 
 
 def resolve_headless_model(flag_model: "str | None", fdef: "dict | None",
@@ -669,20 +656,7 @@ def list_shells(con, user_id: int) -> list:
         (user_id,),
     ).fetchall()]
     browser_shell_ids = browser_conversation_shell_ids(con)
-    refs_by_shell = [_sprint_doc_refs(shell) for shell in shells]
-    referenced = set().union(*refs_by_shell)
-    active = set()
-    if referenced:
-        placeholders = ",".join("?" for _ in referenced)
-        docs = con.execute(
-            f"SELECT document_id, frozen, body FROM documents "
-            f"WHERE kind='doc' AND document_id IN ({placeholders})",
-            tuple(sorted(referenced)),
-        ).fetchall()
-        active = {doc["document_id"] for doc in docs
-                  if _sprint_doc_is_active(doc)}
-    for shell, refs in zip(shells, refs_by_shell):
-        shell["sprint_reserved"] = bool(refs & active)
+    for shell in shells:
         shell["browser_active"] = shell["shell_id"] in browser_shell_ids
     return shells
 
@@ -719,229 +693,8 @@ def _default_label(defaults: dict, flavor: str | None) -> str:
     return harness + (f" · {model.split('/')[-1]}" if model else "")
 
 
-def _sprint_doc_refs(shell) -> set[int]:
-    """Tracker document ids named by current_state's sprint marker lines."""
-    current_state = dict(shell).get("current_state") or ""
-    refs = set()
-    prefix = "SPRINT doc="
-    for line in current_state.splitlines():
-        marker = line.strip()
-        if not marker.startswith(prefix):
-            continue
-        value = marker[len(prefix):].split(maxsplit=1)[0]
-        if value.isdigit():
-            refs.add(int(value))
-    return refs
-
-
-def _sprint_doc_is_active(doc) -> bool:
-    """The tracker contract says ACTIVE, and freeze has not revoked authority."""
-    if doc["frozen"]:
-        return False
-    for line in (doc["body"] or "").splitlines():
-        field, separator, value = line.strip().partition(":")
-        if field == "status" and separator:
-            status = value.strip().split(maxsplit=1)
-            return bool(status) and status[0] == "ACTIVE"
-    return False
-
-
-def _is_sprint_reserved(shell) -> bool:
-    """Picker-only annotation computed by list_shells; never a boot gate."""
-    return bool(dict(shell).get("sprint_reserved"))
-
-
-def resolve_sprint_ref(con) -> "str | None":
-    """The tracker doc id stamped on a headless boot's archive.
-
-    Only the explicit launch context is truth. The old armed-binding fallback
-    guessed that every boot during a live sprint belonged to that sprint and
-    depended on the retired Interface wake table. Slot launches pass the
-    validated `--sprint` value directly; compatibility callers may still set
-    ``SC_SPRINT_REF``. Set-but-empty explicitly means non-sprint.
-    """
-    return os.environ.get("SC_SPRINT_REF", "").strip() or None
-
-
-class SlotRequestError(ValueError):
-    """A slot launch that cannot resolve one unambiguous sprint assignment."""
-
-
-def await_sprint_active(
-    con,
-    sprint_ref: int,
-    *,
-    timeout_seconds: float = SPRINT_ACTIVATION_WAIT_SECONDS,
-) -> bool:
-    """Wait for a Conductor handoff transaction to become visible.
-
-    Conductor validates the board, activates the sprint, and releases its
-    ready units in one transaction. Slot children start before that transaction
-    commits so launch failures can still roll it back. A child launched through
-    that boundary must therefore wait on a fresh read instead of rejecting the
-    still-visible ``declared`` state.
-
-    Return False on timeout or when the sprint is absent/in another state;
-    ``resolve_slot_context`` then emits the ordinary fail-closed diagnosis.
-    """
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        row = con.execute(
-            "SELECT state FROM sprints WHERE sprint_doc_id=?",
-            (sprint_ref,),
-        ).fetchone()
-        state = row["state"] if row is not None else None
-        if state == "active":
-            return True
-        if state != "declared" or time.monotonic() >= deadline:
-            return False
-        # End any read transaction before polling so a separate SQLite
-        # connection's activation commit becomes visible.
-        con.rollback()
-        time.sleep(SPRINT_ACTIVATION_POLL_SECONDS)
-
-
-def resolve_slot_context(con, shell, slot: str, sprint_ref: int,
-                         unit_ref: "str | None" = None) -> dict:
-    """Validate and load the deterministic context for one ephemeral slot.
-
-    This runs before session/worktree creation. A slot therefore cannot start
-    with the wrong flavor, a closed sprint, an unassigned unit, or a missing
-    role skill.
-    """
-    route = SLOT_SKILLS.get(slot)
-    if route is None:
-        raise SlotRequestError(
-            f"--slot must be one of {', '.join(SLOT_SKILLS)}")
-    required_flavor, skill_name = route
-    if shell["flavor"] != required_flavor:
-        raise SlotRequestError(
-            f"--slot {slot} requires a {required_flavor} shell; "
-            f"'{shell['shortname']}' is {shell['flavor'] or 'bespoke'}")
-
-    doc = con.execute(
-        "SELECT d.document_id,d.title,d.frozen,sp.state,"
-        "sp.planner_shell_id,sp.planner_route,sp.dev_route,sp.reviewer_route "
-        "FROM documents d LEFT JOIN sprints sp "
-        "ON sp.sprint_doc_id=d.document_id WHERE d.document_id=?",
-        (sprint_ref,),
-    ).fetchone()
-    if doc is None:
-        raise SlotRequestError(f"sprint document {sprint_ref} does not exist")
-    if doc["state"] != "active" or doc["frozen"]:
-        state = "frozen" if doc["frozen"] else (doc["state"] or "undeclared")
-        raise SlotRequestError(
-            f"sprint document {sprint_ref} is {state}, not active")
-    if slot == "plan" and doc["planner_shell_id"] != shell["shell_id"]:
-        raise SlotRequestError(
-            f"shell '{shell['shortname']}' is not sprint {sprint_ref}'s "
-            "originating Planner"
-        )
-    route_column = {
-        "plan": "planner_route",
-        "dev": "dev_route",
-        "rev": "reviewer_route",
-    }[slot]
-    try:
-        harness, model = sprint_lifecycle.split_route(doc[route_column])
-    except sprint_lifecycle.SprintLifecycleError as exc:
-        raise SlotRequestError(str(exc)) from exc
-
-    skill = con.execute(
-        "SELECT name,content FROM skills "
-        "WHERE name=? AND COALESCE(is_deleted,0)=0",
-        (skill_name,),
-    ).fetchone()
-    if skill is None:
-        raise SlotRequestError(
-            f"slot skill '{skill_name}' is unavailable; run ./sc seed-skills")
-
-    params: list = [sprint_ref]
-    where = ["sprint_doc_id=?"]
-    live_assignment = slot == "dev" or (slot == "rev" and unit_ref is not None)
-    if live_assignment:
-        placeholders = ",".join("?" * len(TERMINAL_UNIT_STATES))
-        where.append(f"state NOT IN ({placeholders})")
-        params.extend(TERMINAL_UNIT_STATES)
-    if unit_ref is not None:
-        where.append("seq=?")
-        params.append(unit_ref)
-    if slot == "dev":
-        where.append("dev_shell_id=?")
-        params.append(shell["shell_id"])
-    elif slot == "rev" and unit_ref is not None:
-        where.append("reviewer_shell_id=?")
-        params.append(shell["shell_id"])
-
-    units = con.execute(
-        "SELECT unit_id,seq,unit_title,state,depends_on,overlap,branch,"
-        "pr_number,dev_shell_id,reviewer_shell_id FROM sprint_units WHERE "
-        + " AND ".join(where)
-        + " ORDER BY unit_id",
-        tuple(params),
-    ).fetchall()
-    if not units:
-        focus = f" unit {unit_ref}" if unit_ref is not None else ""
-        if slot == "plan" or (slot == "rev" and unit_ref is None):
-            raise SlotRequestError(
-                f"sprint document {sprint_ref}{focus} has no unit")
-        raise SlotRequestError(
-            f"shell '{shell['shortname']}' has no live {slot} assignment in "
-            f"sprint document {sprint_ref}{focus}")
-
-    return {
-        "slot": slot,
-        "skill_name": skill["name"],
-        "skill_body": skill["content"],
-        "sprint_doc_id": doc["document_id"],
-        "sprint_title": doc["title"],
-        "harness": harness,
-        "model": model,
-        "units": [dict(row) for row in units],
-    }
-
-
-def slot_default_prompt(context: dict) -> str:
-    """The prompt used when the Conductor supplies no narrower relay payload."""
-    units = ", ".join(row["seq"] for row in context["units"])
-    return (
-        f"Execute the loaded {context['skill_name']} slot for sprint "
-        f"{context['sprint_doc_id']} ({units}); emit the required directive."
-    )
-
-
-def sprint_launch_env(context: "dict | None") -> dict[str, str]:
-    """Serialize one validated Sprint binding into the launched process env."""
-    if context is None:
-        return {}
-    env = {
-        "SC_SPRINT_REF": str(context["sprint_doc_id"]),
-        "SC_SPRINT_ROLE": str(context["role"]),
-        "SC_SPRINT_SLOT": str(context["slot"]),
-        "SC_SPRINT_ASSIGNMENT_ID": str(context["binding_id"]),
-        "SC_SPRINT_LIFECYCLE": str(context["lifecycle"]),
-        "SC_SPRINT_RESULT_TARGET": str(context["result_target_slot"]),
-    }
-    optional = {
-        "SC_SPRINT_SPEC_DOC_ID": context.get("spec_doc_id"),
-        "SC_SPRINT_SOURCE_DIRECTIVE_ID": context.get("source_directive_id"),
-        "SC_SPRINT_SOURCE_MESSAGE_ID": context.get("source_message_id"),
-        "SC_SPRINT_REQUIRED_RESULT_KIND": context.get("required_result_kind"),
-    }
-    env.update(
-        {name: str(value) for name, value in optional.items() if value is not None}
-    )
-    units = context.get("units") or []
-    if units:
-        env["SC_SPRINT_UNITS"] = ",".join(str(row["seq"]) for row in units)
-        if len(units) == 1:
-            env["SC_SPRINT_UNIT_ID"] = str(units[0]["unit_id"])
-            env["SC_SPRINT_UNIT"] = str(units[0]["seq"])
-    return env
-
-
 def _shell_status(shell, snap: "dict | None") -> str:
-    """Styled picker status derived from liveness plus sprint reservation."""
+    """Styled picker status derived from liveness."""
     if shell["flavor"] == "admin":
         label, paint = "Exempt", style.dim
     elif dict(shell).get("browser_active"):
@@ -956,8 +709,6 @@ def _shell_status(shell, snap: "dict | None") -> str:
             label, paint = "Orphaned", style.red
         elif snap.get("indeterminate"):
             label, paint = "Unknown", style.dim
-        elif _is_sprint_reserved(shell):
-            label, paint = "Sprint", style.amber
         else:
             label, paint = "Available", style.green
     return f"{paint(label)}{' ' * (12 - len(label))}"
@@ -1121,7 +872,7 @@ def open_session(con, shell_id: int,
     """Atomically open a lifecycle archive, with bounded lock retries.
 
     `lifecycle` carries the launch telemetry persisted onto the archive row
-    (started_at/harness/provider/model/sprint_ref — migration 0071). ended_at is
+    (started_at/harness/provider/model). ended_at is
     NOT written here: run.py execs the harness, so no code runs at exit; the
     analytics sweep backfills it from harness session data.
 
@@ -1133,7 +884,7 @@ def open_session(con, shell_id: int,
     """
     life = {"started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             **(lifecycle or {})}
-    life_cols = ["started_at", "harness", "provider", "model", "sprint_ref"]
+    life_cols = ["started_at", "harness", "provider", "model"]
     delays = SESSION_OPEN_RETRY_DELAYS_S if not con.in_transaction else ()
     attempts = len(delays) + 1
 
@@ -1214,12 +965,11 @@ def _cli_version(binary: str) -> "str | None":
 
 def prepare_launch(*, shell_id: int, harness: "str | None" = None,
                    model: "str | None" = None, effort: "str | None" = None,
-                   headless_prompt: "str | None" = None,
-                   slot_context: "dict | None" = None) -> LaunchPlan:
+                   headless_prompt: "str | None" = None) -> LaunchPlan:
     """Prepare a launch exactly as main() would, without any TTY.
 
-    Spec #20 (sprint 25 seq 5): starting an Interface chat uses the NORMAL
-    harness, model, effort, permission, worktree, render, boot, and archive
+    A browser chat uses the normal harness, model, effort, permission,
+    worktree, render, boot, and archive
     paths. This is that path as a library call: it runs main()'s boot
     pipeline step-for-step — authenticate, session archive, worktree
     ensure/sync, boot-doc + skill render, adapter emit + config merges,
@@ -1235,8 +985,6 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     this seam (open_db, authenticate, ensure_worktree) still sys.exit, so
     callers must also treat SystemExit as a refusal."""
     headless = headless_prompt is not None
-    if slot_context is not None and not headless:
-        raise LaunchError("Sprint launch context requires a headless prompt")
     con = open_db()
     # Same best-effort skill heal as main() — compose's SKILLS block reads
     # what this repairs. RENDER_ONLY never mutates, here as there.
@@ -1274,11 +1022,6 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     ensure_harness_path()
     harness = (harness or (fdef["default_harness"] if fdef else None)
                or _configured_harness() or "claude")
-    try:
-        conductor_policy.require_harness(chosen["flavor"], harness)
-    except ValueError as exc:
-        con.close()
-        raise LaunchError(str(exc)) from exc
     adapter = load_adapter(harness)
 
     # Model route: an explicit model wins; else the (flavor, harness) cell,
@@ -1313,11 +1056,6 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
             "harness": harness,
             "provider": session_provider(harness, session_model),
             "model": session_model,
-            "sprint_ref": (
-                str(slot_context["sprint_doc_id"])
-                if slot_context is not None
-                else (os.environ.get("SC_SPRINT_REF") or None)
-            ),
         })
     except SessionOpenError as exc:
         con.close()
@@ -1350,8 +1088,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
                            floor_note=floor_note,
                            source_mode=install.is_source_repo(),
                            api_key=full["api_key"],
-                           api_port=api_port,
-                           slot_context=slot_context)
+                           api_port=api_port)
     render_harness_skills(
         con, full["shell_id"], work_dir, adapter
     )
@@ -1420,7 +1157,6 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     env["SC_SHELL_WORKTREE"] = str(work_dir)
     env["SC_ROOT"] = str(REPO_ROOT)
     env["PATH"] = os.pathsep.join([str(REPO_ROOT), env.get("PATH", "")])
-    env.update(sprint_launch_env(slot_context))
 
     return LaunchPlan(argv=argv, env=env, cwd=str(work_dir),
                       session_id=session_id, archive_id=archive_id,
@@ -1463,16 +1199,11 @@ def main() -> None:
     flag_model = None
     flag_effort = None
     prompt = None
-    slot = None
-    slot_sprint = None
-    slot_unit = None
-    await_active = False
     positional = []
     i = 0
     while i < len(args):
         a = args[i]
-        if a == "--await-sprint-active":
-            await_active = True
+        if a in ("--first", "--headless"):
             i += 1
             continue
         if a == "--harness":
@@ -1491,18 +1222,6 @@ def main() -> None:
             prompt = args[i + 1] if i + 1 < len(args) else None
             i += 2
             continue
-        if a == "--slot":
-            slot = args[i + 1] if i + 1 < len(args) else ""
-            i += 2
-            continue
-        if a == "--sprint":
-            slot_sprint = args[i + 1] if i + 1 < len(args) else ""
-            i += 2
-            continue
-        if a == "--unit":
-            slot_unit = args[i + 1] if i + 1 < len(args) else ""
-            i += 2
-            continue
         if a.startswith("--harness="):
             flag_harness = a.split("=", 1)[1]
         elif a.startswith("--model="):
@@ -1511,46 +1230,21 @@ def main() -> None:
             flag_effort = a.split("=", 1)[1]
         elif a.startswith("--prompt="):
             prompt = a.split("=", 1)[1]
-        elif a.startswith("--slot="):
-            slot = a.split("=", 1)[1]
-        elif a.startswith("--sprint="):
-            slot_sprint = a.split("=", 1)[1]
-        elif a.startswith("--unit="):
-            slot_unit = a.split("=", 1)[1]
+        elif a.startswith("-"):
+            sys.exit(f"session launch: unknown option {a!r}")
         elif not a.startswith("-"):
             positional.append(a)
         i += 1
     requested = positional[0] if positional else None
     if headless and not requested:
         sys.exit('usage: ./sc run <shortname> [-p "<prompt>"] [--harness <h>] '
-                 '[-m <model>] [--effort <level>] '
-                 '[--slot <plan|dev|rev> --sprint <id> [--unit U]]')
-    slot_flags = (slot is not None, slot_sprint is not None, slot_unit is not None)
-    if any(slot_flags) and not headless:
-        sys.exit("session launch: --slot/--sprint/--unit require ./sc run")
-    if any(slot_flags) and (not slot or not slot_sprint):
-        sys.exit("sc run: --slot and --sprint are required together")
-    if slot_unit == "":
-        sys.exit("sc run: --unit requires a value")
-    if slot_sprint is not None:
-        try:
-            slot_sprint = int(slot_sprint)
-        except (TypeError, ValueError):
-            sys.exit("sc run: --sprint must be a positive integer")
-        if slot_sprint <= 0:
-            sys.exit("sc run: --sprint must be a positive integer")
-    if await_active and (not headless or slot is None or slot_sprint is None):
-        sys.exit(
-            "sc run: --await-sprint-active requires a headless sprint slot"
-        )
+                 '[-m <model>] [--effort <level>]')
 
     # Wordmark banner — interactive boots only; headless/verify logs stay clean.
     if not headless and not os.environ.get("RENDER_ONLY") and sys.stdin.isatty():
         print(style.banner(REPO_ROOT.name))
 
     con = open_db()
-    if await_active:
-        await_sprint_active(con, slot_sprint)
     # Self-heal stale engine skills before anything this boot reads them
     # (compose's SKILLS block, render_skill_md). A DB stranded by an in-place
     # `0001` regen repairs itself from assets/skills/ instead of needing a manual
@@ -1573,29 +1267,13 @@ def main() -> None:
     user = authenticate(con, interactive=not headless)
     fdefaults = flavor_defaults(con)
     # Liveness snapshot for the interactive picker: one /proc pass (ms) so the
-    # boot list can show shell status — BROWSER / Busy / Orphaned / Sprint /
+    # boot list can show shell status — BROWSER / Busy / Orphaned /
     # Available / Exempt — and
     # confirm before booting into a live worktree. Headless keeps its own lazy
     # compute below; non-TTY boots (--first, piped) can't confirm, so no snap.
     snap = (shell_liveness.compute()
             if not headless and sys.stdin.isatty() else None)
     launchable = list_shells(con, user["user_id"])
-    if not os.environ.get("SC_CONDUCTOR_INTERNAL"):
-        if requested and any(
-            shell["shortname"].lower() == requested.lower()
-            and shell["flavor"] == "conductor"
-            for shell in launchable
-        ):
-            con.close()
-            sys.exit(
-                "sc run: Conductor is Sprint-owned and cannot be launched "
-                "as an ordinary shell; the originating Planner starts it "
-                "with `sc sprint arm --sprint <id>`"
-            )
-        launchable = [
-            shell for shell in launchable
-            if shell["flavor"] != "conductor"
-        ]
     chosen = pick_shell(launchable, requested, first, fdefaults, snap)
     if browser_conversation_active(con, chosen["shell_id"]):
         con.close()
@@ -1603,14 +1281,6 @@ def main() -> None:
             f"shell '{chosen['shortname']}': Browser chat is open. "
             "Close it in Interface before starting a CLI session."
         )
-    slot_context = None
-    if slot is not None:
-        try:
-            slot_context = resolve_slot_context(
-                con, chosen, slot, slot_sprint, slot_unit)
-        except SlotRequestError as exc:
-            con.close()
-            sys.exit(f"sc run: {exc}")
     # Direct interactive boots (`./sc enter dev3`) skip the picker and its
     # confirm — run the same guard here. Picker path already confirmed.
     if requested and not headless and not confirm_live(chosen, snap):
@@ -1660,16 +1330,10 @@ def main() -> None:
     harness = (flag_harness or os.environ.get("HARNESS")
                or pick_harness(detect_harnesses(), default_harness, first or headless)
                or default_harness)
-    try:
-        conductor_policy.require_harness(chosen["flavor"], harness)
-    except ValueError as exc:
-        con.close()
-        sys.exit(f"sc run: {exc}")
 
     # Resolve + validate the complete headless route before opening a session.
-    # `sc run` is the sprint-worker primitive, so high effort is the default
-    # where the harness exposes an effort seam. OpenCode exposes none and keeps
-    # the model's own default.
+    # High effort is the default where the harness exposes an effort seam.
+    # OpenCode exposes none and keeps the model's own default.
     flavor_model = fdef["models"].get(harness) if fdef else None
     adapter = load_adapter(harness)
     session_model = (resolve_headless_model(flag_model, fdef, harness)
@@ -1715,16 +1379,10 @@ def main() -> None:
         # flavor default; interactive routes the flavor default). None = the harness
         # picks its own — recorded as NULL, honest about what we know at boot.
         try:
-            launch_sprint_ref = (
-                str(slot_context["sprint_doc_id"])
-                if slot_context is not None
-                else resolve_sprint_ref(con)
-            )
             session_id, archive_id = open_session(con, chosen["shell_id"], lifecycle={
                 "harness": harness,
                 "provider": session_provider(harness, session_model),
                 "model": session_model,
-                "sprint_ref": launch_sprint_ref,
             })
         except SessionOpenError as exc:
             con.close()
@@ -1781,8 +1439,7 @@ def main() -> None:
                                floor_note=floor_note,
                                source_mode=install.is_source_repo(),
                                api_key=full["api_key"],
-                               api_port=api_port,
-                               slot_context=slot_context)
+                               api_port=api_port)
 
         # Render this shell's granted skills to every directory declared by the
         # selected harness — gitignored and rebuilt per boot.
@@ -1892,11 +1549,7 @@ def main() -> None:
     headless_cmd = None
     if headless:
         hmodel = session_model  # resolved up front (persisted on the archive row)
-        effective_prompt = (
-            prompt
-            or (slot_default_prompt(slot_context)
-                if slot_context is not None else DEFAULT_HEADLESS_PROMPT)
-        )
+        effective_prompt = prompt or DEFAULT_HEADLESS_PROMPT
         headless_cmd = headless_command(
             adapter, effective_prompt, hmodel, sandbox_flags,
             session_effort)
@@ -1907,12 +1560,6 @@ def main() -> None:
             src = "explicit -m" if flag_model else f"flavor default for {chosen['flavor']}"
             print(f"→ model: {hmodel} ({src})")
         print(f"→ effort: {session_effort}")
-        if slot_context is not None:
-            print(
-                f"→ slot: {slot_context['slot']} · "
-                f"sprint {slot_context['sprint_doc_id']} · "
-                f"skill {slot_context['skill_name']}"
-            )
         print(f"→ headless prompt: {effective_prompt[:120]}")
 
     # Close the boot summary with the review GUI — the link lives in a different
@@ -1945,11 +1592,6 @@ def main() -> None:
     env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
     env["SC_API_TOKEN"] = full["api_key"] or ""
     env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""
-    if slot_context is not None:
-        env["SC_SPRINT_REF"] = str(slot_context["sprint_doc_id"])
-        env["SC_SPRINT_SLOT"] = slot_context["slot"]
-        env["SC_SPRINT_UNITS"] = ",".join(
-            row["seq"] for row in slot_context["units"])
     # Optional fast-path for the branch-guard hooks: the absolute engine path, so
     # they skip the `git rev-parse --git-common-dir` walk. NOT load-bearing — the
     # hooks resolve the engine env-independently (a fork gitignores .super-coder/,
@@ -2022,8 +1664,9 @@ def record_launch(shell_id: int, work_dir: Path, harness: "str | None",
     """Record the harness pid this launch is about to become (spec #76 H-25).
 
     HEADLESS ONLY, deliberately — hence the parameter rather than a caller-side
-    `if`: the rule is the requirement, so it is stated and tested here. A sprint
-    worker runs detached — no controlling TTY, launcher gone, ppid==1 — so the
+    `if`: the rule is the requirement, so it is stated and tested here. A
+    headless worker runs detached — no controlling TTY, launcher gone,
+    ppid==1 — so the
     lineage scan can only ever call it 'detached' and project 'unreconciled';
     between relaunches nothing holds the worktree at all and the same shell
     projects 'available'. The record is what replaces that inference. An
