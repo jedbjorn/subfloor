@@ -53,6 +53,23 @@ CREATE UNIQUE INDEX idx_sprints_single_armed
     ON sprints((1)) WHERE lifecycle='armed';
 CREATE INDEX idx_sprints_feature ON sprints(feature_id, sprint_id);
 
+-- Every Sprint must pass through the authoritative prepared -> armed path.
+-- Once that path commits the merge grant, later lifecycle states retain it.
+CREATE TRIGGER trg_sprints_insert_prepared_only
+BEFORE INSERT ON sprints
+WHEN NEW.lifecycle<>'prepared'
+BEGIN
+  SELECT RAISE(ABORT, 'Sprint inserts must start prepared');
+END;
+
+CREATE TRIGGER trg_sprints_merge_grant_immutable_after_arm
+BEFORE UPDATE OF merge_grant_enabled ON sprints
+WHEN NEW.merge_grant_enabled<>OLD.merge_grant_enabled
+  AND OLD.lifecycle<>'prepared'
+BEGIN
+  SELECT RAISE(ABORT, 'Sprint merge grant is immutable after arming');
+END;
+
 CREATE TRIGGER trg_sprints_lifecycle
 BEFORE UPDATE OF lifecycle ON sprints
 WHEN NEW.lifecycle <> OLD.lifecycle AND NOT (

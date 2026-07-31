@@ -169,6 +169,56 @@ class MigrationAndShapeTest(SprintDomainCase):
 
 
 class LifecycleTest(SprintDomainCase):
+    def test_sprint_insert_must_start_prepared(self) -> None:
+        sprint_id, _ = self.create_sprint()
+        feature_id = self.con.execute(
+            "SELECT feature_id FROM sprints WHERE sprint_id=?", (sprint_id,)
+        ).fetchone()[0]
+
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError, "Sprint inserts must start prepared"
+        ):
+            self.con.execute(
+                "INSERT INTO sprints "
+                "(feature_id,originating_planner_shell_id,lifecycle,"
+                "merge_grant_enabled) VALUES (?,3,'armed',1)",
+                (feature_id,),
+            )
+
+        self.assertEqual(
+            [(sprint_id, "prepared")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT sprint_id,lifecycle FROM sprints ORDER BY sprint_id"
+                )
+            ],
+        )
+
+    def test_armed_sprint_merge_grant_is_immutable(self) -> None:
+        sprint_id, _ = self.create_sprint()
+        self.store.arm(sprint_id, 3)
+
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "Sprint merge grant is immutable after arming",
+        ):
+            self.con.execute(
+                "UPDATE sprints SET merge_grant_enabled=0 WHERE sprint_id=?",
+                (sprint_id,),
+            )
+
+        self.assertEqual(
+            ("armed", 1),
+            tuple(
+                self.con.execute(
+                    "SELECT lifecycle,merge_grant_enabled FROM sprints "
+                    "WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone()
+            ),
+        )
+
     def test_arm_atomically_releases_only_dependency_free_work(self) -> None:
         sprint_id, first_unit = self.create_sprint()
         blocked_unit = self.con.execute(
