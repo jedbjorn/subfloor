@@ -2828,23 +2828,30 @@ function reviewPatchRows(text) {
         ? "auto" : "smooth",
     });
   };
-  const changeStep = (direction, targetIndex) => {
-    const label = direction === "previous" ? "Previous change" : "Next change";
+  const changeStep = (direction, targetIndex, customLabel = "") => {
+    const label = customLabel
+      || (direction === "previous" ? "Previous change" : "Next change");
     const button = el("button", {
       type: "button",
       className: `review-change-step review-change-step-${direction}`,
       ariaLabel: label,
       title: label,
-      disabled: targetIndex < 0 || targetIndex >= changeBlocks.length,
-    }, direction === "previous" ? "↑" : "↓");
+    });
     button.onclick = () => scrollToChange(targetIndex);
     return button;
   };
+  if (changeBlocks.length && changeBlocks[0].first !== rows[0]?.row) {
+    const firstChange = changeStep("next", 0, "Jump to first change");
+    firstChange.classList.add("review-change-step-first");
+    rows[0].row.append(firstChange);
+  }
   changeBlocks.forEach((block, index) => {
     block.first.classList.add("review-change-first");
     block.last.classList.add("review-change-last");
-    block.first.append(changeStep("previous", index - 1));
-    block.last.append(changeStep("next", index + 1));
+    if (index > 0) block.first.append(changeStep("previous", index - 1));
+    if (index < changeBlocks.length - 1) {
+      block.last.append(changeStep("next", index + 1));
+    }
   });
   return patch;
 }
