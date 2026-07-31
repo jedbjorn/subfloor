@@ -390,7 +390,24 @@ body.interface-view main {
 .review-freshness .warning { color: var(--warn); }
 .review-refresh.act { margin: 0; padding: .34rem .7rem; font-size: .7rem; }
 .review-group-switch {
-  margin: 0; flex: none; border-radius: 7px;
+  --review-tab-cut: 10px;
+  margin: 0; flex: none; border-radius: 0;
+  clip-path: polygon(
+    0 0,
+    100% 0,
+    100% calc(100% - var(--review-tab-cut)),
+    calc(100% - var(--review-tab-cut)) 100%,
+    0 100%
+  );
+}
+.review-group-switch button:first-child.active {
+  clip-path: polygon(
+    0 0,
+    100% 0,
+    100% calc(100% - var(--review-tab-cut)),
+    calc(100% - var(--review-tab-cut)) 100%,
+    0 100%
+  );
 }
 .review-change-switch { margin: 0; flex: none; }
 .review-scope-switch button { padding-inline: 1rem; }

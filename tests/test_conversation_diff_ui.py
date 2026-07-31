@@ -196,6 +196,8 @@ def test_diff_layout_is_full_width_bounded_and_responsive():
     assert "grid-template-rows: auto minmax(0, 1fr)" in STYLE
     assert "grid-column: 1 / -1; grid-row: 1" in STYLE
     assert "align-self: start; margin-top: -.4rem" in STYLE
+    assert "--review-tab-cut: 10px" in STYLE
+    assert STYLE.count("calc(100% - var(--review-tab-cut))") == 4
     assert "flex: 1 1 auto" in STYLE
     assert "text-overflow: ellipsis" in STYLE
     source = current_workspace_source()
