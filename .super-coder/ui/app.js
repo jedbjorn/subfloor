@@ -3095,14 +3095,22 @@ function chatReviewWorkspace(host, conversation) {
       paint();
       loadSelected();
     }));
+    const patchHeader = (title, detail, extraClass = "") => el("div", {
+      className: `review-patch-head${extraClass ? ` ${extraClass}` : ""}`,
+    },
+    el("div", { className: "review-patch-title" },
+      el("strong", {}, title),
+      el("span", { title: detail }, detail)),
+    groupSwitch);
     const workspace = el("div", {
       className: `review-workspace review-workspace-${state.group}`,
-    }, summary, groupSwitch);
+    }, summary);
 
     if (state.group === "changes") {
       if (state.section === "commits") {
         const commits = snapshot.changes.commits || [];
-        const body = el("div", { className: "review-commits-pane" });
+        const body = el("div", { className: "review-commits-pane" },
+          patchHeader("Commits", "Ahead commits relative to origin/main", "review-commits-head"));
         if (!commits.length) body.append(reviewTypedState("No visible ahead commits."));
         else {
           const list = el("div", { className: "review-commit-list" });
@@ -3158,11 +3166,12 @@ function chatReviewWorkspace(host, conversation) {
         (file) => selectItem(file),
       ));
       const selected = selectedItem();
-      const patchHead = el("div", { className: "review-patch-head" },
-        el("strong", {}, selected?.path || "Patch"),
-        el("span", {}, state.section === "dirty"
+      const patchHead = patchHeader(
+        selected?.path || "Patch",
+        state.section === "dirty"
           ? "staged, unstaged, conflicted, or untracked relative to HEAD"
-          : "merge-base(origin/main, HEAD) through HEAD"));
+          : "merge-base(origin/main, HEAD) through HEAD",
+      );
       let patchBody;
       if (state.contentError) patchBody = typedError(state.contentError);
       else if (state.contentLoading) patchBody = reviewTypedState("Loading patch…");
@@ -3205,9 +3214,10 @@ function chatReviewWorkspace(host, conversation) {
       }
       navigator.append(list);
       const selected = selectedItem();
-      const head = el("div", { className: "review-patch-head" },
-        el("strong", {}, selected?.name || "Shell file"),
-        el("span", {}, selected ? (selected.paths || []).join(" · ") : "Read-only exact text"));
+      const head = patchHeader(
+        selected?.name || "Shell file",
+        selected ? (selected.paths || []).join(" · ") : "Read-only exact text",
+      );
       let body;
       if (state.contentError) body = typedError(state.contentError);
       else if (state.contentLoading) body = reviewTypedState("Loading shell file…");
