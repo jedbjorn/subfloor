@@ -241,7 +241,7 @@ class ConversationBrokerCase(unittest.TestCase):
     def allow_legacy_duplicate_open_chats(self) -> None:
         """Exercise the broker's independent lock against pre-migration data."""
         con = self.connect()
-        con.execute("DROP INDEX idx_conversations_live_shell")
+        con.execute("DROP INDEX idx_conversations_live_normal_shell")
         con.commit()
         con.close()
 
