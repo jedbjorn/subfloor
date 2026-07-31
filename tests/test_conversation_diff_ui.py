@@ -155,6 +155,9 @@ def test_diff_layout_is_full_width_bounded_and_responsive():
         ".chat-review-host",
         ".review-workspace",
         ".review-summary",
+        ".review-status",
+        ".review-group-switch",
+        ".review-change-switch",
         ".review-body",
         ".review-file-tree",
         ".review-patch",
@@ -165,6 +168,14 @@ def test_diff_layout_is_full_width_bounded_and_responsive():
     ):
         assert selector in STYLE
     assert "grid-template-columns: minmax(220px, 300px) minmax(0, 1fr)" in STYLE
+    assert "grid-template-rows: auto auto minmax(0, 1fr)" in STYLE
+    assert "border-radius: 0 0 7px 7px" in STYLE
+    source = current_workspace_source()
+    summary = source[source.index('const summary = el("div"'):source.index(
+        'const groupSwitch = el("div"'
+    )]
+    assert "...(sectionSwitch ? [sectionSwitch] : [])" in summary
+    assert "summaryStatus" in summary
     assert "@media (max-width: 900px)" in STYLE
     responsive = STYLE[STYLE.index("@media (max-width: 900px)"):]
     assert "grid-template-columns: minmax(0, 1fr)" in responsive

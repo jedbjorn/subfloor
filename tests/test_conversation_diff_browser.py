@@ -632,6 +632,16 @@ export { mode };"""
         assert page.locator(".chat-stop-header").is_enabled()
         assert page.get_by_text("ON DISK", exact=True).is_visible()
         assert page.get_by_text("7 dirty", exact=False).is_visible()
+        assert page.locator(".review-summary > .review-change-switch").count() == 1
+        assert page.locator(".review-summary > .review-status").count() == 1
+        header_edges = page.locator(".review-summary, .review-group-switch").evaluate_all(
+            "nodes => ({summaryTop: nodes[0].getBoundingClientRect().top, "
+            "summaryBottom: nodes[0].getBoundingClientRect().bottom, "
+            "tabsTop: nodes[1].getBoundingClientRect().top, "
+            "tabsBottom: nodes[1].getBoundingClientRect().bottom})"
+        )
+        assert abs(header_edges["summaryBottom"] - header_edges["tabsTop"]) <= 1
+        assert header_edges["tabsBottom"] - header_edges["summaryTop"] <= 90
         initial_observations = sum(
             method == "POST" and path.endswith("/review-observations")
             for method, path, _query in requests

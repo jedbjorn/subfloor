@@ -2977,10 +2977,26 @@ function chatReviewWorkspace(host, conversation) {
       disabled: state.refreshInFlight,
     });
     refreshButton.onclick = () => observe(true);
-    const summary = el("div", { className: "review-summary" },
-      el("div", { className: "review-target-control" },
-        el("label", { className: "k" }, "Current worktree"),
-        el("strong", {}, facts[0])),
+    let sectionSwitch = null;
+    if (state.group === "changes") {
+      sectionSwitch = el("div", {
+        className: "review-scope-switch review-change-switch",
+        role: "tablist",
+        ariaLabel: "Changes view",
+      });
+      for (const [value, label] of [
+        ["dirty", "Dirty"], ["branch", "Branch"], ["commits", "Commits"],
+      ]) sectionSwitch.append(tabButton(value, label, state.section, () => {
+        if (state.section === value) return;
+        state.section = value;
+        state.selectedPath = value === "commits" ? "" : sectionFiles()[0]?.path || "";
+        state.patch = null;
+        state.contentError = null;
+        paint();
+        loadSelected();
+      }));
+    }
+    const summaryStatus = el("div", { className: "review-status" },
       el("div", { className: "review-lifecycle-block" },
         el("span", { className: "review-lifecycle lifecycle-local" }, "ON DISK"),
         el("span", { className: "review-facts" }, facts.slice(1).join(" · "))),
@@ -2990,7 +3006,13 @@ function chatReviewWorkspace(host, conversation) {
           className: "warning review-refresh-warning",
           textContent: warning,
           hidden: !warning,
-        })),
+        })));
+    const summary = el("div", { className: "review-summary" },
+      el("div", { className: "review-target-control" },
+        el("label", { className: "k" }, "Current worktree"),
+        el("strong", {}, facts[0])),
+      ...(sectionSwitch ? [sectionSwitch] : []),
+      summaryStatus,
       refreshButton);
     const groupSwitch = el("div", {
       className: "review-scope-switch review-group-switch",
@@ -3025,23 +3047,6 @@ function chatReviewWorkspace(host, conversation) {
     }, summary, groupSwitch);
 
     if (state.group === "changes") {
-      const sectionSwitch = el("div", {
-        className: "review-scope-switch review-change-switch",
-        role: "tablist",
-        ariaLabel: "Changes view",
-      });
-      for (const [value, label] of [
-        ["dirty", "Dirty"], ["branch", "Branch"], ["commits", "Commits"],
-      ]) sectionSwitch.append(tabButton(value, label, state.section, () => {
-        if (state.section === value) return;
-        state.section = value;
-        state.selectedPath = value === "commits" ? "" : sectionFiles()[0]?.path || "";
-        state.patch = null;
-        state.contentError = null;
-        paint();
-        loadSelected();
-      }));
-      workspace.append(sectionSwitch);
       if (state.section === "commits") {
         const commits = snapshot.changes.commits || [];
         const body = el("div", { className: "review-commits-pane" });
