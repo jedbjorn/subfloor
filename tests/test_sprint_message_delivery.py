@@ -43,17 +43,6 @@ class SprintMessageCase(unittest.TestCase):
                 (3, "Planner", "PLN1", "planner", "prompt"),
             ),
         )
-        self.con.executemany(
-            "INSERT INTO conversations "
-            "(conversation_id,shell_id,owner_user_id,harness,worktree,"
-            "creation_idempotency_key,creation_request_hash) "
-            "VALUES (?,?,1,'codex',?,?,?)",
-            (
-                ("cv_dev", 1, "/tmp/dev", "conversation-dev", "hash-dev"),
-                ("cv_review", 2, "/tmp/review", "conversation-review", "hash-review"),
-                ("cv_plan", 3, "/tmp/plan", "conversation-plan", "hash-plan"),
-            ),
-        )
         feature_id = self.con.execute(
             "INSERT INTO roadmap (title,roadmap_status) "
             "VALUES ('Feature','in_progress')"
@@ -87,12 +76,11 @@ class SprintMessageCase(unittest.TestCase):
         )
         self.con.executemany(
             "INSERT INTO sprint_participants "
-            "(sprint_id,shell_id,role,harness,current_conversation_id) "
-            "VALUES (?,?,?,?,?)",
+            "(sprint_id,shell_id,role,harness) VALUES (?,?,?,?)",
             (
-                (self.sprint_id, 3, "planner", "codex", "cv_plan"),
-                (self.sprint_id, 1, "developer", "codex", "cv_dev"),
-                (self.sprint_id, 2, "reviewer", "codex", "cv_review"),
+                (self.sprint_id, 3, "planner", "codex"),
+                (self.sprint_id, 1, "developer", "codex"),
+                (self.sprint_id, 2, "reviewer", "codex"),
             ),
         )
         participants = {
@@ -117,6 +105,11 @@ class SprintMessageCase(unittest.TestCase):
         self.con.commit()
         self.lifecycle = sprint_domain.SprintLifecycleStore(self.con)
         initial_wake = self.lifecycle.arm(self.sprint_id, 3)[0]
+        self.developer_conversation_id = self.con.execute(
+            "SELECT current_conversation_id FROM sprint_participants "
+            "WHERE participant_id=?",
+            (self.developer_id,),
+        ).fetchone()[0]
         initial_message = self.con.execute(
             "SELECT message_id FROM sprint_wake_messages WHERE wake_id=?",
             (initial_wake,),
@@ -376,7 +369,13 @@ class WakeDeliveryTest(SprintMessageCase):
         )
 
         self.assertEqual(
-            [("cv_dev", delivery.FIXED_WAKE_PROMPT, self._wake_key(sent.wake_id))],
+            [
+                (
+                    self.developer_conversation_id,
+                    delivery.FIXED_WAKE_PROMPT,
+                    self._wake_key(sent.wake_id),
+                )
+            ],
             observed,
         )
         self.assertEqual(
@@ -388,7 +387,10 @@ class WakeDeliveryTest(SprintMessageCase):
             "FROM sprint_wake_attempts WHERE wake_id=?",
             (sent.wake_id,),
         ).fetchone()
-        self.assertEqual((1, "cv_dev", "native-run-7", "delivered"), tuple(attempt))
+        self.assertEqual(
+            (1, self.developer_conversation_id, "native-run-7", "delivered"),
+            tuple(attempt),
+        )
 
     def test_messages_behind_delivering_wake_coalesce_once(self) -> None:
         first = self.send("first")

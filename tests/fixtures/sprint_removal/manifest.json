@@ -1,9 +1,11 @@
 {
   "allowed_reference_files": [
     ".super-coder/migrations/0146_sprint_v2_domain.sql",
+    ".super-coder/migrations/0147_sprint_participant_conversations.sql",
     ".super-coder/migrations/0148_sprint_message_delivery.sql",
     ".super-coder/scripts/sprint_domain.py",
     ".super-coder/scripts/sprint_message_delivery.py",
+    ".super-coder/scripts/sprint_participant_chats.py",
     ".super-coder/migrations/0144_remove_sprint_v1.sql",
     "tests/fixtures/sprint_removal/build_pre_removal_fixture.py",
     "tests/fixtures/sprint_removal/manifest.json",
@@ -11,7 +13,8 @@
     "tests/test_sprint_entrypoint_removal.py",
     "tests/test_sprint_removal_manifest.py",
     "tests/test_sprint_v2_domain.py",
-    "tests/test_sprint_message_delivery.py"
+    "tests/test_sprint_message_delivery.py",
+    "tests/test_sprint_participant_chats.py"
   ],
   "baseline_migration_ledger": {
     "count": 142,
@@ -431,6 +434,28 @@
       ".super-coder/ui/style.css",
       "sc"
     ],
+    "allowed_v2_authored_lines": {
+      ".super-coder/ui/app.js": [
+        "if (conversation.scope === \"sprint\") return true;",
+        "const sprintManaged = conversation.scope === \"sprint\";",
+        "if (item.sprint) {",
+        "const sprint = item.sprint;",
+        "className: \"chat-sprint-pill\",",
+        "title: `Sprint ${sprint.sprint_id} · ${sprint.role} · ${sprint.disposition}`,",
+        "ariaLabel: `Enter Sprint ${sprint.sprint_id} ${sprint.role} conversation`,",
+        "el(\"span\", {}, `Sprint ${sprint.sprint_id}`),",
+        "el(\"span\", { className: \"chat-sprint-meta\" },",
+        "`${sprint.role} · ${sprint.disposition}`));",
+        "sprint.current_conversation_id,",
+        "disabled: conversation.scope === \"sprint\" || conversation.state === \"closed\",",
+        "hidden: conversation.scope === \"sprint\","
+      ],
+      ".super-coder/ui/style.css": [
+        ".chat-sprint-pill {",
+        ".chat-sprint-pill:hover {",
+        ".chat-sprint-meta {"
+      ]
+    },
     "forbidden_pattern": "(?:\\bsprints?\\b|\\bconductor\\b|SC_SPRINT_|pr_event|watched_prs|watch-daemon|interface_(?:generations|sessions|writer_leases|input_state|idempotency_keys|recovery_observations)|planner_(?:wake_batches|wake_items|action_receipts|alerts))",
     "removed_paths": [
       "docs/images/analytics.png",

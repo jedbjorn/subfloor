@@ -72,6 +72,7 @@ import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
+import sprint_participant_chats  # noqa: E402  (Sprints v2 participant chat topology)
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
 import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
@@ -328,9 +329,10 @@ def _json_default(o):
 # ── Data assembly ─────────────────────────────────────────────────────────────
 
 def get_shells(con) -> list[dict]:
-    return rows(con.execute(
+    shells = rows(con.execute(
         "SELECT shell_id, display_name, shortname, role, flavor, mandate, is_shared "
         "FROM shells WHERE COALESCE(is_deleted,0)=0 ORDER BY shell_id"))
+    return sprint_participant_chats.attach_live_participations(con, shells)
 
 
 def get_shell(con, sid: int) -> dict | None:

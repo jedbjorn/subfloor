@@ -2607,6 +2607,7 @@ function chatConversationName(conversation) {
 
 async function chatCloseForSwitch(conversation) {
   if (!conversation) return true;
+  if (conversation.scope === "sprint") return true;
   try {
     const latest = await chatApi(
       `/conversations/${conversation.conversation_id}`,
@@ -3839,6 +3840,7 @@ async function chatRenderOpen(host, initialConversation, initialSnapshot) {
     updateStreamStatus();
     const closed = conversation.state === "closed";
     const closing = !closed && Boolean(conversation.close_requested_at);
+    const sprintManaged = conversation.scope === "sprint";
     composer.disabled = closed || closing;
     send.disabled = closed || closing;
     stop.disabled = conversation.state !== "running" || closing || Boolean(stopRequest);
@@ -3846,7 +3848,8 @@ async function chatRenderOpen(host, initialConversation, initialSnapshot) {
     headerStop.disabled = stop.disabled;
     headerStop.textContent = stop.textContent;
     headerStop.hidden = currentMode !== "diff";
-    close.disabled = closed || closing;
+    close.hidden = sprintManaged;
+    close.disabled = sprintManaged || closed || closing;
     close.textContent = closing ? "Closing…" : "Close";
     composer.placeholder = closed
       ? "This conversation is closed."
@@ -4257,7 +4260,27 @@ async function renderInterface(root) {
       if (item.shell_id === shell.shell_id) return;
       location.hash = chatHash(item.shortname);
     };
-    rail.append(button);
+    const shellRow = el("div", { className: "chat-shell-row" }, button);
+    if (item.sprint) {
+      const sprint = item.sprint;
+      const pill = el("button", {
+        className: "chat-sprint-pill",
+        type: "button",
+        title: `Sprint ${sprint.sprint_id} · ${sprint.role} · ${sprint.disposition}`,
+        ariaLabel: `Enter Sprint ${sprint.sprint_id} ${sprint.role} conversation`,
+      },
+      el("span", {}, `Sprint ${sprint.sprint_id}`),
+      el("span", { className: "chat-sprint-meta" },
+        `${sprint.role} · ${sprint.disposition}`));
+      pill.onclick = () => {
+        location.hash = chatHash(
+          item.shortname,
+          sprint.current_conversation_id,
+        );
+      };
+      shellRow.append(pill);
+    }
+    rail.append(shellRow);
   }
 
   const side = el("aside", { className: "chat-history" });
@@ -4625,7 +4648,8 @@ async function renderInterface(root) {
         className: "act danger",
         type: "button",
         textContent: "Close",
-        disabled: conversation.state === "closed",
+        disabled: conversation.scope === "sprint" || conversation.state === "closed",
+        hidden: conversation.scope === "sprint",
       });
       close.onclick = async () => {
         close.disabled = true;
