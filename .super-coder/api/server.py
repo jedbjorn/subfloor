@@ -65,6 +65,7 @@ import conversation_launch  # noqa: E402  (canonical shell launch preparation)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
+import sprint_runtime  # noqa: E402  (armed-only Sprint dispatch + wake delivery)
 sys.path.insert(0, str(ENGINE / "api"))
 import conversation_routes  # noqa: E402  (Feature #24 browser conversations)
 import review_routes  # noqa: E402  (Feature #26 browser Diff review)
@@ -3225,6 +3226,15 @@ def require_loopback_bind(bind: str) -> None:
     )
 
 
+def start_runtime_services() -> None:
+    """Start commit-woken conversations, then the armed Sprint pulse."""
+    conversation_broker.start_service(
+        DB_PATH,
+        launch_preparer=conversation_launch.ConversationLaunchPreparer(DB_PATH),
+    )
+    sprint_runtime.start_service(DB_PATH)
+
+
 def main(argv):
     port = None
     if "--port" in argv:
@@ -3272,12 +3282,7 @@ def main(argv):
             port,
             dispatch_http,
             _ws_unavailable,
-            on_started=lambda: conversation_broker.start_service(
-                DB_PATH,
-                launch_preparer=conversation_launch.ConversationLaunchPreparer(
-                    DB_PATH
-                ),
-            ),
+            on_started=start_runtime_services,
             stream_handler=conversation_routes.stream_events,
         )
 

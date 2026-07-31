@@ -151,7 +151,8 @@ class MigrationAndShapeTest(SprintDomainCase):
         sprint_id, _ = self.create_sprint()
         self.store.arm(sprint_id, 3)
         event = self.con.execute(
-            "SELECT event_id,event_type FROM sprint_events WHERE sprint_id=?",
+            "SELECT event_id,event_type FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='lifecycle.armed'",
             (sprint_id,),
         ).fetchone()
         self.assertEqual("lifecycle.armed", event["event_type"])
@@ -433,7 +434,7 @@ class LifecycleTest(SprintDomainCase):
             ).fetchone()[0],
         )
 
-    def test_arm_coalesces_ready_messages_for_the_same_participant(self) -> None:
+    def test_arm_releases_only_one_ready_unit_per_participant(self) -> None:
         sprint_id, first_unit = self.create_sprint()
         second_unit = self.con.execute(
             "INSERT INTO sprint_work_units "
@@ -447,7 +448,7 @@ class LifecycleTest(SprintDomainCase):
 
         self.assertEqual(1, len(wake_ids))
         self.assertEqual(
-            [(first_unit,), (second_unit,)],
+            [(first_unit,)],
             [
                 tuple(row)
                 for row in self.con.execute(
@@ -455,6 +456,17 @@ class LifecycleTest(SprintDomainCase):
                     "JOIN sprint_messages m USING (message_id) "
                     "WHERE wm.wake_id=? ORDER BY m.message_id",
                     (wake_ids[0],),
+                )
+            ],
+        )
+        self.assertEqual(
+            [(first_unit, "ready"), (second_unit, "planned")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT work_unit_id,disposition FROM sprint_work_units "
+                    "WHERE sprint_id=? ORDER BY work_unit_id",
+                    (sprint_id,),
                 )
             ],
         )

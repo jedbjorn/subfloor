@@ -8,14 +8,14 @@ external harness enqueue outside the database transaction.
 """
 from __future__ import annotations
 
+import json
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import sqlite3
 
 import db_driver
 from sprint_domain import SprintInvariantError, SprintLifecycleStore
-
 
 FIXED_WAKE_PROMPT = (
     "Check your inbox. If you accept the task(s), mark the message as read "
@@ -110,6 +110,7 @@ class SprintMessageStore:
         """Read one message; actionable reads atomically accept it."""
         with db_driver.write_transaction(self.con, "sprint.message.read"):
             message = self._recipient_message(message_id, shell_id)
+            accepted_now = False
             if message["actionable"]:
                 if message["disposition"] == "declined":
                     return "declined"
@@ -119,6 +120,7 @@ class SprintMessageStore:
                         "read_at=datetime('now') WHERE message_id=?",
                         (message_id,),
                     )
+                    accepted_now = True
                 disposition = "accepted"
             else:
                 self.con.execute(
@@ -127,6 +129,42 @@ class SprintMessageStore:
                     (message_id,),
                 )
                 disposition = None
+            if (
+                accepted_now
+                and message["message_kind"] == "work_assignment"
+                and message["work_unit_id"] is not None
+            ):
+                changed = self.con.execute(
+                    "UPDATE sprint_work_units SET disposition='active',"
+                    "updated_at=datetime('now') WHERE sprint_id=? "
+                    "AND work_unit_id=? AND assigned_shell_id=? "
+                    "AND disposition='ready'",
+                    (
+                        message["sprint_id"],
+                        message["work_unit_id"],
+                        shell_id,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise SprintInvariantError(
+                        "work assignment no longer owns a ready editing lane"
+                    )
+                self.con.execute(
+                    "INSERT INTO sprint_events "
+                    "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+                    "VALUES (?,'work_unit.accepted','participant',?,?)",
+                    (
+                        message["sprint_id"],
+                        shell_id,
+                        json.dumps(
+                            {
+                                "message_id": message_id,
+                                "work_unit_id": int(message["work_unit_id"]),
+                            },
+                            sort_keys=True,
+                        ),
+                    ),
+                )
             self._cancel_resolved_wakes(message_id)
             return disposition
 
@@ -152,7 +190,8 @@ class SprintMessageStore:
                 ] is not None:
                     self.con.execute(
                         "UPDATE sprint_work_units SET disposition='planned',"
-                        "updated_at=datetime('now') WHERE work_unit_id=?",
+                        "updated_at=datetime('now') WHERE work_unit_id=? "
+                        "AND disposition='ready'",
                         (message["work_unit_id"],),
                     )
             elif message["decline_reason"] != reason:

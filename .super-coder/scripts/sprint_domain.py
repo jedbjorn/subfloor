@@ -7,15 +7,14 @@ registered poll/dispatch callbacks from running outside an armed Sprint.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
 import hashlib
 import json
 import sqlite3
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 import db_driver
 import sprint_participant_chats
-
 
 SPRINT_TRANSITIONS = {
     "prepared": frozenset({"armed", "aborted"}),
@@ -24,6 +23,10 @@ SPRINT_TRANSITIONS = {
     "completed": frozenset(),
     "aborted": frozenset(),
 }
+
+EDITING_UNIT_DISPOSITIONS = frozenset(
+    {"active", "in_review", "fixing", "merge_ready"}
+)
 
 
 class SprintLifecycleError(ValueError):
@@ -384,66 +387,10 @@ class SprintLifecycleStore:
         *,
         planner_participant_id: int,
     ) -> list[int]:
-        units = self.con.execute(
-            "SELECT u.work_unit_id,u.assigned_shell_id,u.title,u.expected_output,"
-            "p.participant_id FROM sprint_work_units u "
-            "JOIN sprint_participants p ON p.sprint_id=u.sprint_id "
-            "AND p.shell_id=u.assigned_shell_id AND p.role='developer' "
-            "WHERE u.sprint_id=? AND u.disposition='planned' "
-            "AND NOT EXISTS (SELECT 1 FROM sprint_work_unit_dependencies d "
-            "WHERE d.work_unit_id=u.work_unit_id) "
-            "ORDER BY u.planned_wave,u.work_unit_id",
-            (sprint_id,),
-        ).fetchall()
-        wake_ids: list[int] = []
-        for unit in units:
-            unit_id = int(unit["work_unit_id"])
-            key = f"sprint:{sprint_id}:work-unit:{unit_id}:assignment"
-            message_id = self.con.execute(
-                "INSERT INTO sprint_messages "
-                "(sprint_id,from_participant_id,to_participant_id,work_unit_id,"
-                "message_kind,body,actionable,disposition,idempotency_key) "
-                "VALUES (?,?,?,?,?,?,1,'pending',?)",
-                (
-                    sprint_id,
-                    planner_participant_id,
-                    unit["participant_id"],
-                    unit_id,
-                    "work_assignment",
-                    f"{unit['title']}\n\n{unit['expected_output']}",
-                    key,
-                ),
-            ).lastrowid
-            pending_wake = self.con.execute(
-                "SELECT wake_id FROM sprint_wake_outbox "
-                "WHERE sprint_id=? AND participant_id=? AND state='pending'",
-                (sprint_id, unit["participant_id"]),
-            ).fetchone()
-            wake_id = (
-                int(pending_wake["wake_id"])
-                if pending_wake is not None
-                else int(
-                    self.con.execute(
-                        "INSERT INTO sprint_wake_outbox "
-                        "(sprint_id,participant_id,idempotency_key) "
-                        "VALUES (?,?,?)",
-                        (sprint_id, unit["participant_id"], f"wake:{key}"),
-                    ).lastrowid
-                )
-            )
-            self.con.execute(
-                "INSERT INTO sprint_wake_messages "
-                "(sprint_id,wake_id,message_id) VALUES (?,?,?)",
-                (sprint_id, wake_id, message_id),
-            )
-            self.con.execute(
-                "UPDATE sprint_work_units SET disposition='ready',"
-                "updated_at=datetime('now') WHERE work_unit_id=?",
-                (unit_id,),
-            )
-            if wake_id not in wake_ids:
-                wake_ids.append(wake_id)
-        return wake_ids
+        return SprintWorkUnitStore(self.con)._dispatch_ready_locked(
+            sprint_id,
+            planner_participant_id=planner_participant_id,
+        )
 
     def _update_lifecycle(
         self,
@@ -484,6 +431,496 @@ class SprintLifecycleStore:
                 event_type,
                 actor.kind,
                 actor.shell_id,
+                json.dumps(payload, sort_keys=True),
+            ),
+        )
+
+
+class SprintWorkUnitStore:
+    """Planner-owned work-unit planning and dependency-aware dispatch."""
+
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+        self.con.row_factory = sqlite3.Row
+
+    def create(
+        self,
+        sprint_id: int,
+        planner_shell_id: int,
+        *,
+        assigned_shell_id: int,
+        reviewer_shell_id: int,
+        title: str,
+        expected_output: str,
+        task_ids: Iterable[int],
+        planned_wave: int = 0,
+        dependency_ids: Iterable[int] = (),
+    ) -> int:
+        """Create one planned editing lane from existing governing-spec tasks."""
+        title = title.strip()
+        expected_output = expected_output.strip()
+        tasks = tuple(dict.fromkeys(int(task_id) for task_id in task_ids))
+        dependencies = tuple(
+            dict.fromkeys(int(unit_id) for unit_id in dependency_ids)
+        )
+        if not title or not expected_output:
+            raise ValueError("work unit title and expected output are required")
+        if not tasks:
+            raise SprintInvariantError("work units require at least one spec task")
+        if planned_wave < 0:
+            raise ValueError("planned wave must be non-negative")
+
+        with db_driver.write_transaction(self.con, "sprint.work_unit.create"):
+            lifecycle, _ = self._require_planner(sprint_id, planner_shell_id)
+            if lifecycle in {"completed", "aborted"}:
+                raise SprintInvariantError("terminal Sprints reject new work units")
+            self._require_participant(sprint_id, assigned_shell_id, "developer")
+            self._require_participant(sprint_id, reviewer_shell_id, "reviewer")
+            self._require_tasks(sprint_id, tasks)
+            unit_id = int(
+                self.con.execute(
+                    "INSERT INTO sprint_work_units "
+                    "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+                    "expected_output,planned_wave) VALUES (?,?,?,?,?,?)",
+                    (
+                        sprint_id,
+                        assigned_shell_id,
+                        reviewer_shell_id,
+                        title,
+                        expected_output,
+                        planned_wave,
+                    ),
+                ).lastrowid
+            )
+            self.con.executemany(
+                "INSERT INTO sprint_work_unit_tasks "
+                "(sprint_id,work_unit_id,task_id) VALUES (?,?,?)",
+                ((sprint_id, unit_id, task_id) for task_id in tasks),
+            )
+            self._replace_dependencies(sprint_id, unit_id, dependencies)
+            self._event(
+                sprint_id,
+                "work_unit.created",
+                planner_shell_id,
+                {
+                    "work_unit_id": unit_id,
+                    "assigned_shell_id": assigned_shell_id,
+                    "reviewer_shell_id": reviewer_shell_id,
+                    "planned_wave": planned_wave,
+                    "task_ids": list(tasks),
+                    "dependency_ids": list(dependencies),
+                },
+            )
+        return unit_id
+
+    def replan(
+        self,
+        sprint_id: int,
+        work_unit_id: int,
+        planner_shell_id: int,
+        *,
+        assigned_shell_id: int,
+        reviewer_shell_id: int,
+        planned_wave: int,
+        dependency_ids: Iterable[int],
+    ) -> bool:
+        """Replace the editable plan projection and append its before/after fact."""
+        if planned_wave < 0:
+            raise ValueError("planned wave must be non-negative")
+        dependencies = tuple(
+            dict.fromkeys(int(unit_id) for unit_id in dependency_ids)
+        )
+        with db_driver.write_transaction(self.con, "sprint.work_unit.replan"):
+            self._require_planner(sprint_id, planner_shell_id)
+            unit = self._unit(sprint_id, work_unit_id)
+            if unit["disposition"] != "planned":
+                raise SprintInvariantError(
+                    "only planned work units may be replanned; return assigned "
+                    "work to the ready pool first"
+                )
+            self._require_participant(sprint_id, assigned_shell_id, "developer")
+            self._require_participant(sprint_id, reviewer_shell_id, "reviewer")
+            before = self._plan_projection(unit)
+            after = {
+                "assigned_shell_id": assigned_shell_id,
+                "reviewer_shell_id": reviewer_shell_id,
+                "planned_wave": planned_wave,
+                "dependency_ids": sorted(dependencies),
+            }
+            if before == after:
+                return False
+            self.con.execute(
+                "UPDATE sprint_work_units SET assigned_shell_id=?,"
+                "reviewer_shell_id=?,planned_wave=?,updated_at=datetime('now') "
+                "WHERE work_unit_id=?",
+                (
+                    assigned_shell_id,
+                    reviewer_shell_id,
+                    planned_wave,
+                    work_unit_id,
+                ),
+            )
+            self._replace_dependencies(sprint_id, work_unit_id, dependencies)
+            self._event(
+                sprint_id,
+                "work_unit.replanned",
+                planner_shell_id,
+                {
+                    "work_unit_id": work_unit_id,
+                    "before": before,
+                    "after": after,
+                },
+            )
+        return True
+
+    def dispatch_ready(self, sprint_id: int) -> list[int]:
+        """Release every dependency-ready unit that has shell capacity."""
+        with db_driver.write_transaction(self.con, "sprint.work_unit.dispatch"):
+            sprint = self.con.execute(
+                "SELECT lifecycle,originating_planner_shell_id FROM sprints "
+                "WHERE sprint_id=?",
+                (sprint_id,),
+            ).fetchone()
+            if sprint is None:
+                raise KeyError(f"unknown Sprint: {sprint_id}")
+            if sprint["lifecycle"] != "armed":
+                return []
+            planner = self._require_participant(
+                sprint_id,
+                int(sprint["originating_planner_shell_id"]),
+                "planner",
+            )
+            return self._dispatch_ready_locked(
+                sprint_id,
+                planner_participant_id=planner,
+            )
+
+    def complete(
+        self,
+        sprint_id: int,
+        work_unit_id: int,
+        shell_id: int,
+    ) -> list[int]:
+        """Record Developer completion and release newly unblocked work."""
+        with db_driver.write_transaction(self.con, "sprint.work_unit.complete"):
+            unit = self._unit(sprint_id, work_unit_id)
+            if int(unit["assigned_shell_id"]) != shell_id:
+                raise SprintAuthorityError("only the assigned Developer owns completion")
+            if unit["disposition"] == "completed":
+                return []
+            if unit["disposition"] not in EDITING_UNIT_DISPOSITIONS:
+                raise SprintInvariantError(
+                    f"cannot complete work unit from {unit['disposition']}"
+                )
+            self.con.execute(
+                "UPDATE sprint_work_units SET disposition='completed',"
+                "completed_at=datetime('now'),updated_at=datetime('now') "
+                "WHERE work_unit_id=?",
+                (work_unit_id,),
+            )
+            self._event(
+                sprint_id,
+                "work_unit.completed",
+                shell_id,
+                {"work_unit_id": work_unit_id},
+                actor_kind="participant",
+            )
+            sprint = self.con.execute(
+                "SELECT lifecycle,originating_planner_shell_id FROM sprints "
+                "WHERE sprint_id=?",
+                (sprint_id,),
+            ).fetchone()
+            if sprint["lifecycle"] != "armed":
+                return []
+            planner = self._require_participant(
+                sprint_id,
+                int(sprint["originating_planner_shell_id"]),
+                "planner",
+            )
+            return self._dispatch_ready_locked(
+                sprint_id,
+                planner_participant_id=planner,
+            )
+
+    def _dispatch_ready_locked(
+        self,
+        sprint_id: int,
+        *,
+        planner_participant_id: int,
+    ) -> list[int]:
+        occupied = {
+            int(row[0])
+            for row in self.con.execute(
+                "SELECT assigned_shell_id FROM sprint_work_units "
+                "WHERE sprint_id=? AND disposition IN "
+                "('ready','active','in_review','fixing','merge_ready')",
+                (sprint_id,),
+            )
+        }
+        candidates = self.con.execute(
+            "SELECT u.*,p.participant_id FROM sprint_work_units u "
+            "JOIN sprint_participants p ON p.sprint_id=u.sprint_id "
+            "AND p.shell_id=u.assigned_shell_id AND p.role='developer' "
+            "WHERE u.sprint_id=? AND u.disposition='planned' "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM sprint_work_unit_dependencies d "
+            "JOIN sprint_work_units upstream "
+            "ON upstream.sprint_id=d.sprint_id "
+            "AND upstream.work_unit_id=d.depends_on_work_unit_id "
+            "WHERE d.sprint_id=u.sprint_id AND d.work_unit_id=u.work_unit_id "
+            "AND upstream.disposition<>'completed') "
+            "ORDER BY u.planned_wave,u.work_unit_id",
+            (sprint_id,),
+        ).fetchall()
+        wake_ids: list[int] = []
+        for unit in candidates:
+            shell_id = int(unit["assigned_shell_id"])
+            if shell_id in occupied:
+                continue
+            wake_id = self._queue_assignment(
+                sprint_id,
+                planner_participant_id=planner_participant_id,
+                unit=unit,
+            )
+            occupied.add(shell_id)
+            if wake_id not in wake_ids:
+                wake_ids.append(wake_id)
+        return wake_ids
+
+    def _queue_assignment(
+        self,
+        sprint_id: int,
+        *,
+        planner_participant_id: int,
+        unit: sqlite3.Row,
+    ) -> int:
+        unit_id = int(unit["work_unit_id"])
+        generation = int(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_messages "
+                "WHERE work_unit_id=? AND message_kind='work_assignment'",
+                (unit_id,),
+            ).fetchone()[0]
+        ) + 1
+        key = (
+            f"sprint:{sprint_id}:work-unit:{unit_id}:assignment:{generation}"
+        )
+        message_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_messages "
+                "(sprint_id,from_participant_id,to_participant_id,work_unit_id,"
+                "message_kind,body,actionable,disposition,idempotency_key) "
+                "VALUES (?,?,?,?,?,?,1,'pending',?)",
+                (
+                    sprint_id,
+                    planner_participant_id,
+                    unit["participant_id"],
+                    unit_id,
+                    "work_assignment",
+                    f"{unit['title']}\n\n{unit['expected_output']}",
+                    key,
+                ),
+            ).lastrowid
+        )
+        pending = self.con.execute(
+            "SELECT wake_id FROM sprint_wake_outbox "
+            "WHERE sprint_id=? AND participant_id=? AND state='pending'",
+            (sprint_id, unit["participant_id"]),
+        ).fetchone()
+        wake_id = (
+            int(pending["wake_id"])
+            if pending is not None
+            else int(
+                self.con.execute(
+                    "INSERT INTO sprint_wake_outbox "
+                    "(sprint_id,participant_id,idempotency_key) VALUES (?,?,?)",
+                    (sprint_id, unit["participant_id"], f"wake:{key}"),
+                ).lastrowid
+            )
+        )
+        self.con.execute(
+            "INSERT INTO sprint_wake_messages "
+            "(sprint_id,wake_id,message_id) VALUES (?,?,?)",
+            (sprint_id, wake_id, message_id),
+        )
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='ready',"
+            "updated_at=datetime('now') WHERE work_unit_id=?",
+            (unit_id,),
+        )
+        self._event(
+            sprint_id,
+            "work_unit.ready",
+            None,
+            {
+                "work_unit_id": unit_id,
+                "message_id": message_id,
+                "wake_id": wake_id,
+            },
+            actor_kind="system",
+        )
+        return wake_id
+
+    def _replace_dependencies(
+        self,
+        sprint_id: int,
+        work_unit_id: int,
+        dependency_ids: tuple[int, ...],
+    ) -> None:
+        if work_unit_id in dependency_ids:
+            raise SprintInvariantError("work units cannot depend on themselves")
+        if dependency_ids:
+            placeholders = ",".join("?" for _ in dependency_ids)
+            found = {
+                int(row[0])
+                for row in self.con.execute(
+                    "SELECT work_unit_id FROM sprint_work_units "
+                    f"WHERE sprint_id=? AND work_unit_id IN ({placeholders})",
+                    (sprint_id, *dependency_ids),
+                )
+            }
+            if found != set(dependency_ids):
+                raise SprintInvariantError(
+                    "dependencies must name work units in the same Sprint"
+                )
+        self.con.execute(
+            "DELETE FROM sprint_work_unit_dependencies "
+            "WHERE sprint_id=? AND work_unit_id=?",
+            (sprint_id, work_unit_id),
+        )
+        self.con.executemany(
+            "INSERT INTO sprint_work_unit_dependencies "
+            "(sprint_id,work_unit_id,depends_on_work_unit_id) VALUES (?,?,?)",
+            (
+                (sprint_id, work_unit_id, dependency_id)
+                for dependency_id in dependency_ids
+            ),
+        )
+        self._require_acyclic(sprint_id)
+
+    def _require_acyclic(self, sprint_id: int) -> None:
+        graph: dict[int, set[int]] = {}
+        for row in self.con.execute(
+            "SELECT work_unit_id,depends_on_work_unit_id "
+            "FROM sprint_work_unit_dependencies WHERE sprint_id=?",
+            (sprint_id,),
+        ):
+            graph.setdefault(int(row[0]), set()).add(int(row[1]))
+
+        visiting: set[int] = set()
+        visited: set[int] = set()
+
+        def visit(unit_id: int) -> None:
+            if unit_id in visiting:
+                raise SprintInvariantError("work-unit dependencies must be acyclic")
+            if unit_id in visited:
+                return
+            visiting.add(unit_id)
+            for dependency_id in graph.get(unit_id, ()):
+                visit(dependency_id)
+            visiting.remove(unit_id)
+            visited.add(unit_id)
+
+        for unit_id in graph:
+            visit(unit_id)
+
+    def _require_tasks(self, sprint_id: int, task_ids: tuple[int, ...]) -> None:
+        placeholders = ",".join("?" for _ in task_ids)
+        found = {
+            int(row[0])
+            for row in self.con.execute(
+                "SELECT t.task_id FROM spec_tasks t "
+                "JOIN sprint_specs ss ON ss.document_id=t.document_id "
+                f"WHERE ss.sprint_id=? AND t.task_id IN ({placeholders})",
+                (sprint_id, *task_ids),
+            )
+        }
+        if found != set(task_ids):
+            raise SprintInvariantError(
+                "work-unit tasks must belong to a governing Sprint spec"
+            )
+
+    def _require_planner(
+        self,
+        sprint_id: int,
+        planner_shell_id: int,
+    ) -> tuple[str, int]:
+        sprint = self.con.execute(
+            "SELECT lifecycle,originating_planner_shell_id FROM sprints "
+            "WHERE sprint_id=?",
+            (sprint_id,),
+        ).fetchone()
+        if sprint is None:
+            raise KeyError(f"unknown Sprint: {sprint_id}")
+        if int(sprint["originating_planner_shell_id"]) != planner_shell_id:
+            raise SprintAuthorityError("only the originating Planner owns replanning")
+        participant = self._require_participant(
+            sprint_id, planner_shell_id, "planner"
+        )
+        return str(sprint["lifecycle"]), participant
+
+    def _require_participant(
+        self,
+        sprint_id: int,
+        shell_id: int,
+        role: str,
+    ) -> int:
+        row = self.con.execute(
+            "SELECT participant_id FROM sprint_participants "
+            "WHERE sprint_id=? AND shell_id=? AND role=?",
+            (sprint_id, shell_id, role),
+        ).fetchone()
+        if row is None:
+            raise SprintInvariantError(
+                f"shell {shell_id} is not this Sprint's assigned {role}"
+            )
+        return int(row[0])
+
+    def _unit(self, sprint_id: int, work_unit_id: int) -> sqlite3.Row:
+        row = self.con.execute(
+            "SELECT * FROM sprint_work_units WHERE sprint_id=? AND work_unit_id=?",
+            (sprint_id, work_unit_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown Sprint work unit: {work_unit_id}")
+        return row
+
+    def _plan_projection(self, unit: sqlite3.Row) -> dict:
+        dependencies = [
+            int(row[0])
+            for row in self.con.execute(
+                "SELECT depends_on_work_unit_id "
+                "FROM sprint_work_unit_dependencies "
+                "WHERE sprint_id=? AND work_unit_id=? "
+                "ORDER BY depends_on_work_unit_id",
+                (unit["sprint_id"], unit["work_unit_id"]),
+            )
+        ]
+        return {
+            "assigned_shell_id": int(unit["assigned_shell_id"]),
+            "reviewer_shell_id": int(unit["reviewer_shell_id"]),
+            "planned_wave": int(unit["planned_wave"]),
+            "dependency_ids": dependencies,
+        }
+
+    def _event(
+        self,
+        sprint_id: int,
+        event_type: str,
+        actor_shell_id: int | None,
+        payload: dict,
+        *,
+        actor_kind: str = "planner",
+    ) -> None:
+        self.con.execute(
+            "INSERT INTO sprint_events "
+            "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+            "VALUES (?,?,?,?,?)",
+            (
+                sprint_id,
+                event_type,
+                actor_kind,
+                actor_shell_id,
                 json.dumps(payload, sort_keys=True),
             ),
         )
