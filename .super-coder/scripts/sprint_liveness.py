@@ -8,6 +8,7 @@ minutes.  External delivery remains the wake outbox's responsibility.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections.abc import Callable
@@ -35,9 +36,7 @@ _NATIVE_EVIDENCE_EVENTS = (
     "input.requested",
     "usage",
     "run.completed",
-    "run.failed",
     "run.interrupted",
-    "run.unknown",
 )
 _PROVIDER_ALIASES = {"kimi": "moonshot", "kimi-for-coding": "moonshot"}
 
@@ -130,6 +129,9 @@ class SprintEvidenceCollector:
         failures = list(self._terminal_failures(participant_id, accepted_at))
         supporting: list[Evidence] = []
         unreadable: list[str] = []
+        unknown_outcome = self._latest_unknown_outcome(participant_id, accepted_at)
+        if unknown_outcome is not None:
+            unreadable.append(unknown_outcome)
 
         participant = self.con.execute(
             "SELECT p.*,sh.shortname FROM sprint_participants p "
@@ -367,25 +369,6 @@ class SprintEvidenceCollector:
                 )
             )
 
-        row = self.con.execute(
-            "SELECT target_id,latest_head_sha,last_seen_at "
-            "FROM conversation_git_targets target "
-            "JOIN sprint_participant_conversations pc "
-            "ON pc.conversation_id=target.conversation_id "
-            "WHERE pc.sprint_participant_id=? AND target.last_seen_at>=? "
-            "ORDER BY target.last_seen_at DESC,target.target_id LIMIT 1",
-            (participant_id, threshold),
-        ).fetchone()
-        if row is not None:
-            candidates.append(
-                Evidence(
-                    f"git.head:{row['target_id']}:{row['latest_head_sha']}",
-                    "git.head",
-                    _parse(row["last_seen_at"]),
-                    "strong",
-                    "durable local Git head observation",
-                )
-            )
         return max(candidates, key=lambda item: (item.observed_at, item.key), default=None)
 
     def _terminal_failures(
@@ -395,7 +378,7 @@ class SprintEvidenceCollector:
             "SELECT r.run_id,r.state,r.ended_at,COALESCE(r.error_code,'') error_code "
             "FROM conversation_runs r JOIN sprint_participant_conversations pc "
             "ON pc.conversation_id=r.conversation_id "
-            "WHERE pc.sprint_participant_id=? AND r.state IN ('failed','unknown') "
+            "WHERE pc.sprint_participant_id=? AND r.state='failed' "
             "AND r.ended_at>=? ORDER BY r.ended_at DESC,r.run_id DESC LIMIT 1",
             (participant_id, _stamp(accepted_at)),
         ).fetchone()
@@ -410,6 +393,24 @@ class SprintEvidenceCollector:
                 f"proven terminal native run {row['state']} {row['error_code']}".strip(),
             ),
         )
+
+    def _latest_unknown_outcome(
+        self, participant_id: int, accepted_at: datetime
+    ) -> str | None:
+        row = self.con.execute(
+            "SELECT r.run_id,COALESCE(r.error_code,'') error_code "
+            "FROM conversation_runs r JOIN sprint_participant_conversations pc "
+            "ON pc.conversation_id=r.conversation_id "
+            "WHERE pc.sprint_participant_id=? AND r.state='unknown' "
+            "AND r.ended_at>=? ORDER BY r.ended_at DESC,r.run_id DESC LIMIT 1",
+            (participant_id, _stamp(accepted_at)),
+        ).fetchone()
+        if row is None:
+            return None
+        detail = f"native run {row['run_id']} outcome is unknown"
+        if row["error_code"]:
+            detail += f" ({row['error_code']})"
+        return detail
 
     def _git_support(
         self, participant_id: int, accepted_at: datetime, now: datetime
@@ -484,30 +485,48 @@ class PlannerEscalationRouter:
         self,
         sprint_id: int,
         *,
-        expectation_message_id: int,
-        silence_episode: int,
         now: datetime,
         reason: str,
     ) -> tuple[int, str]:
         planner = self.con.execute(
-            "SELECT p.participant_id,p.harness,p.model,p.effort,sh.flavor,"
-            "c.harness current_harness,c.provider current_provider "
+            "SELECT p.participant_id,p.harness,p.model,p.effort,sh.flavor "
             "FROM sprint_participants p JOIN shells sh ON sh.shell_id=p.shell_id "
-            "LEFT JOIN conversations c ON c.conversation_id=p.current_conversation_id "
             "WHERE p.sprint_id=? AND p.role='planner'",
             (sprint_id,),
         ).fetchone()
         if planner is None:
             raise RuntimeError("armed Sprint has no Planner participant")
         participant_id = int(planner["participant_id"])
-        primary = self.collector.quota_state(_provider(planner["current_provider"]), now)
+        primary_provider = _provider(
+            run_mod.session_provider(planner["harness"], planner["model"])
+        )
+        primary = self.collector.quota_state(primary_provider, now)
         if not primary.exhausted:
             return participant_id, "primary"
+
+        incident_source = primary.key or primary.provider or "unknown"
+        incident = hashlib.sha256(incident_source.encode()).hexdigest()[:16]
+        fallback_key = f"sprint:{sprint_id}:liveness:planner-fallback:{incident}"
+        existing = self.con.execute(
+            "SELECT c.conversation_id,c.harness "
+            "FROM sprint_participant_conversations link "
+            "JOIN conversations c ON c.conversation_id=link.conversation_id "
+            "WHERE link.sprint_participant_id=? AND link.purpose='fallback' "
+            "AND c.creation_idempotency_key=?",
+            (participant_id, fallback_key),
+        ).fetchone()
+        if existing is not None:
+            self.con.execute(
+                "UPDATE sprint_participants SET current_conversation_id=? "
+                "WHERE participant_id=?",
+                (existing["conversation_id"], participant_id),
+            )
+            return participant_id, f"fallback:{existing['harness']}"
 
         candidates = self.con.execute(
             "SELECT harness,model FROM flavor_defaults WHERE flavor=? "
             "AND harness<>? ORDER BY is_default DESC,harness",
-            (planner["flavor"], planner["current_harness"] or planner["harness"]),
+            (planner["flavor"], planner["harness"]),
         ).fetchall()
         for candidate in candidates:
             candidate_provider = _provider(
@@ -524,10 +543,7 @@ class PlannerEscalationRouter:
                 harness=candidate["harness"],
                 model=candidate["model"],
                 effort=planner["effort"],
-                idempotency_key=(
-                    f"sprint:{sprint_id}:liveness:{expectation_message_id}:"
-                    f"episode:{silence_episode}:planner-fallback"
-                ),
+                idempotency_key=fallback_key,
             )
             return participant_id, f"fallback:{candidate['harness']}"
         return participant_id, "unavailable"
@@ -627,9 +643,21 @@ class SprintLivenessMonitor:
             if failure is not None and (
                 failure.observed_at >= last_strong_at
                 or failure.kind in {"quota.exhausted", "process.missing"}
+            ) and (
+                    row["escalated_at"] is None
+                    or failure.key != row["last_failure_key"]
             ):
-                if row["escalated_at"] is None:
-                    return self._escalate(row, episode, snapshot, now, failure=failure)
+                return self._escalate(row, episode, snapshot, now, failure=failure)
+
+            if row["escalated_at"] is not None:
+                self._update_observation(
+                    message_id,
+                    now,
+                    snapshot,
+                    failure_key=row["last_failure_key"],
+                )
+                action = "supporting-evidence" if snapshot.supporting else "observed"
+                return EvaluationOutcome(message_id, action, episode)
 
             accepted_silence = now - last_strong_at
             if row["nudge_at"] is None and accepted_silence >= GRACE_WINDOW:
@@ -695,8 +723,6 @@ class SprintLivenessMonitor:
         reason = failure.detail if failure else "continued silence after one nudge"
         planner_id, route = self.router.prepare(
             int(row["sprint_id"]),
-            expectation_message_id=int(row["message_id"]),
-            silence_episode=episode,
             now=now,
             reason=f"Liveness escalation delivery: {reason}",
         )
@@ -717,13 +743,18 @@ class SprintLivenessMonitor:
                 "pause_option": route == "unavailable",
             }
         )
+        escalation_key = "silence"
+        if failure is not None:
+            digest = hashlib.sha256(failure.key.encode()).hexdigest()[:16]
+            escalation_key = f"failure:{digest}"
         receipt = self.messages.send_in_transaction(
             int(row["sprint_id"]),
             to_participant_id=planner_id,
             message_kind="escalation",
             body=body,
             idempotency_key=(
-                f"liveness:{row['message_id']}:episode:{episode}:planner-escalation"
+                f"liveness:{row['message_id']}:episode:{episode}:"
+                f"planner-escalation:{escalation_key}"
             ),
             actionable=False,
             active=route != "unavailable",

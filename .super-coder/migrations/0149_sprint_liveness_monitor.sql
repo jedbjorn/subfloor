@@ -58,11 +58,18 @@ INSERT INTO sprint_liveness_expectations (
     last_strong_at,last_strong_key,next_evaluation_at
 )
 SELECT
-    message_id,sprint_id,to_participant_id,read_at,
-    read_at,'message.accepted:' || message_id,
-    datetime(read_at,'+5 minutes')
-FROM sprint_messages
-WHERE actionable=1 AND disposition='accepted' AND read_at IS NOT NULL;
+    m.message_id,m.sprint_id,m.to_participant_id,m.read_at,
+    m.read_at,'message.accepted:' || m.message_id,
+    datetime(m.read_at,'+5 minutes')
+FROM sprint_messages m
+JOIN sprints s ON s.sprint_id=m.sprint_id
+LEFT JOIN sprint_work_units unit
+  ON unit.sprint_id=m.sprint_id AND unit.work_unit_id=m.work_unit_id
+WHERE m.actionable=1
+  AND m.disposition='accepted'
+  AND m.read_at IS NOT NULL
+  AND s.lifecycle='armed'
+  AND (m.work_unit_id IS NULL OR unit.disposition NOT IN ('completed','cancelled'));
 
 CREATE TRIGGER trg_sprint_liveness_acceptance
 AFTER UPDATE OF disposition,read_at ON sprint_messages
