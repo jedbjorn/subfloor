@@ -88,6 +88,10 @@ DELETE FROM conversation_outbox
 WHERE conversation_id IN (
     SELECT conversation_id FROM _sprint_v1_conversations
 );
+-- Conversation events remain append-only for every retained runtime path. Lift
+-- only the delete guard, inside this transaction, for the destructive Sprint
+-- cutover; the retained trigger is recreated below after the parent swap.
+DROP TRIGGER IF EXISTS trg_conversation_events_append_only_delete;
 DELETE FROM conversation_events
 WHERE conversation_id IN (
     SELECT conversation_id FROM _sprint_v1_conversations
