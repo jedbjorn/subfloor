@@ -353,6 +353,12 @@ index 1111111..2222222 100644
 +++ b/src/app.js
 @@ -1,3 +1,4 @@
 const mode = 'chat';
+"""
+    patch += "\n" + "\n".join(
+        f"const openingContext{index} = 'first change navigation spacing {index}';"
+        for index in range(30)
+    )
+    patch += """
 -const oldValue = false;
 +const reviewOnly = true;
 +const safe = document.createTextNode('patch with a deliberately long line for horizontal scroll position preservation across refresh');
@@ -658,25 +664,43 @@ export { mode };"""
         assert page.locator(".review-line-add").count() >= 82
         assert page.locator(".review-line-delete").count() == 1
         assert page.locator(".status-conflict").count() == 1
+        first_change = page.get_by_role("button", name="Jump to first change")
         previous_changes = page.get_by_role("button", name="Previous change")
         next_changes = page.get_by_role("button", name="Next change")
-        assert previous_changes.count() == next_changes.count() == 2
-        assert previous_changes.first.is_disabled()
-        assert next_changes.last.is_disabled()
-        next_changes.first.click()
-        page.wait_for_function(
-            "document.querySelector('.review-patch-wrap').scrollTop > 0"
+        assert first_change.count() == 1
+        assert previous_changes.count() == next_changes.count() == 1
+        assert page.locator(".review-change-step:disabled").count() == 0
+
+        def wait_for_change(index):
+            page.wait_for_function(
+                "index => { const target = document.querySelectorAll("
+                "'.review-change-first')[index]; const scroller = target?.closest("
+                "'.review-patch-wrap'); if (!target || !scroller) return false; "
+                "const targetBox = target.getBoundingClientRect(); const scrollerBox = "
+                "scroller.getBoundingClientRect(); return Math.abs(targetBox.top + "
+                "targetBox.height / 2 - scrollerBox.top - scroller.clientHeight / 2) < 3; }",
+                arg=index,
+            )
+
+        first_change.click()
+        wait_for_change(0)
+        first_top = page.locator(".review-patch-wrap").evaluate(
+            "node => node.scrollTop"
         )
+        next_changes.first.click()
+        wait_for_change(1)
         navigated_top = page.locator(".review-patch-wrap").evaluate(
             "node => node.scrollTop"
         )
-        previous_changes.last.click()
-        page.wait_for_function(
-            "top => document.querySelector('.review-patch-wrap').scrollTop < top",
-            arg=navigated_top,
-        )
+        assert navigated_top > first_top
+        previous_changes.first.click()
+        wait_for_change(0)
+        assert page.locator(".review-patch-wrap").evaluate(
+            "node => node.scrollTop"
+        ) < navigated_top
         page.get_by_title("assets/logo.bin").click()
         page.get_by_text("Binary file", exact=True).wait_for()
+        assert page.locator(".review-change-step").count() == 0
         page.get_by_title("large.txt").click()
         page.get_by_text("Patch exceeds review limits", exact=True).wait_for()
         page.get_by_title("src/old.js → src/renamed.js").click()

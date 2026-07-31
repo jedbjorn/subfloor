@@ -110,24 +110,26 @@ def test_workspace_has_current_changes_shell_files_and_manual_refresh():
     assert "innerHTML" not in patch_renderer
 
 
-def test_patch_change_arrows_scroll_between_adjacent_change_blocks():
+def test_patch_chevrons_only_render_for_real_change_targets():
     renderer = APP[
         APP.index("function reviewPatchRows"):
         APP.index("function reviewFileTree")
     ]
 
     for text in (
-        'direction === "previous" ? "Previous change" : "Next change"',
-        'changeStep("previous", index - 1)',
-        'changeStep("next", index + 1)',
+        'changeStep("next", 0, "Jump to first change")',
+        "if (index > 0)",
+        "if (index < changeBlocks.length - 1)",
         'target?.closest(".review-patch-wrap")',
         "scroller.scrollTop",
         "left: scroller.scrollLeft",
         'behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches',
     ):
         assert text in renderer
+    assert "disabled:" not in renderer
     assert ".review-change-step" in STYLE
-    assert ".review-change-step:disabled" in STYLE
+    assert ".review-change-step::before" in STYLE
+    assert ".review-change-step:disabled" not in STYLE
 
 
 def test_diff_observes_once_then_only_refreshes_manually_single_flight():
