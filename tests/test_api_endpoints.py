@@ -107,10 +107,13 @@ class AssemblerSmokeTest(unittest.TestCase):
         )
         sprint_id = self.con.execute(
             "INSERT INTO sprints "
-            "(feature_id,originating_planner_shell_id,lifecycle,"
-            "merge_grant_enabled) VALUES (?,?,'armed',1)",
+            "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+            "VALUES (?,?,1)",
             (self.ids["feature_id"], shell_id),
         ).lastrowid
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?", (sprint_id,)
+        )
         participant_id = self.con.execute(
             "INSERT INTO sprint_participants "
             "(sprint_id,shell_id,role,harness,disposition) "

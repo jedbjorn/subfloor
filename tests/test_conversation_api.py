@@ -148,9 +148,10 @@ class ConversationApiCase(unittest.TestCase):
             )
             con.execute(
                 "INSERT INTO sprints "
-                "(sprint_id,feature_id,originating_planner_shell_id,lifecycle,"
-                "merge_grant_enabled) VALUES (7,31,1,'armed',1)"
+                "(sprint_id,feature_id,originating_planner_shell_id,"
+                "merge_grant_enabled) VALUES (7,31,1,1)"
             )
+            con.execute("UPDATE sprints SET lifecycle='armed' WHERE sprint_id=7")
             participant_id = con.execute(
                 "INSERT INTO sprint_participants "
                 "(sprint_id,shell_id,role,harness,model,effort,disposition) "
