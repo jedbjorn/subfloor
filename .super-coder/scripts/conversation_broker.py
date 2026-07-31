@@ -810,44 +810,59 @@ class BrokerStore:
                 con,
                 "conversation.broker.request_interrupt",
             ):
-                row = con.execute(
-                    "SELECT conversation_id,trigger_message_id,state "
-                    "FROM conversation_runs WHERE run_id=?",
-                    (run_id,),
-                ).fetchone()
-                if row is None:
-                    raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
-                if row["state"] not in LIVE_RUN_STATES:
-                    raise BrokerError(
-                        "CONVERSATION_RUN_NOT_ACTIVE",
-                        f"run {run_id} is {row['state']}",
-                    )
-                exists = con.execute(
-                    "SELECT 1 FROM conversation_events "
-                    "WHERE run_id=? AND event_type='run.interrupt.requested'",
-                    (run_id,),
-                ).fetchone()
-                if exists is None:
-                    self._append_event(
-                        con,
-                        conversation_id=row["conversation_id"],
-                        event_type="run.interrupt.requested",
-                        payload={"requested_at": now},
-                        message_id=row["trigger_message_id"],
-                        run_id=run_id,
-                    )
-                    con.execute(
-                        "UPDATE conversations SET last_activity_at=?,"
-                        "version=version+1 WHERE conversation_id=?",
-                        (now, row["conversation_id"]),
-                    )
-                conversation_id = row["conversation_id"]
-                created = exists is None
+                created, conversation_id = self.request_interrupt_in_transaction(
+                    con,
+                    run_id,
+                    requested_at=now,
+                )
         finally:
             con.close()
         if created:
             conversation_events.notify(conversation_id)
         return created
+
+    @staticmethod
+    def request_interrupt_in_transaction(
+        con,
+        run_id: int,
+        *,
+        requested_at: str,
+    ) -> tuple[bool, str]:
+        """Persist one interrupt intent inside an existing owner transaction."""
+        if not con.in_transaction:
+            raise RuntimeError("interrupt intent requires an active transaction")
+        row = con.execute(
+            "SELECT conversation_id,trigger_message_id,state "
+            "FROM conversation_runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise BrokerError("CONVERSATION_RUN_NOT_FOUND", str(run_id))
+        if row["state"] not in LIVE_RUN_STATES:
+            raise BrokerError(
+                "CONVERSATION_RUN_NOT_ACTIVE",
+                f"run {run_id} is {row['state']}",
+            )
+        exists = con.execute(
+            "SELECT 1 FROM conversation_events "
+            "WHERE run_id=? AND event_type='run.interrupt.requested'",
+            (run_id,),
+        ).fetchone()
+        if exists is None:
+            BrokerStore._append_event(
+                con,
+                conversation_id=row["conversation_id"],
+                event_type="run.interrupt.requested",
+                payload={"requested_at": requested_at},
+                message_id=row["trigger_message_id"],
+                run_id=run_id,
+            )
+            con.execute(
+                "UPDATE conversations SET last_activity_at=?,"
+                "version=version+1 WHERE conversation_id=?",
+                (requested_at, row["conversation_id"]),
+            )
+        return exists is None, str(row["conversation_id"])
 
     def heartbeat_service(self, interval_seconds: int) -> None:
         con = self.connect()

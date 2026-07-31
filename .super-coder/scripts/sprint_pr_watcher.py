@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import db_driver
+import sprint_liveness
 from github_pull_requests import (
     GitHubPullRequestReader,
     GitHubReadError,
@@ -50,6 +51,7 @@ class TransitionReceipt:
     transition_id: int
     normalized_state: str
     transition_key: str
+    resolved_review_message_ids: tuple[int, ...] = ()
 
 
 @dataclass
@@ -225,6 +227,7 @@ class SprintPRWatcher:
         self.monotonic = monotonic
         self.registration = SprintPRRegistrationStore(con)
         self.messages = SprintMessageStore(con)
+        self.liveness = sprint_liveness.SprintLivenessMonitor(con)
         self.review_loop = SprintReviewLoopStore(
             con,
             repo_root=self.repo_root,
@@ -334,7 +337,6 @@ class SprintPRWatcher:
         pull_request: PullRequest,
         trigger: str,
     ) -> TransitionReceipt | None:
-        registered_pr_id = int(registered["registered_pr_id"])
         if pull_request.number != int(registered["pr_number"]):
             self._poll_failed(
                 registered,
@@ -342,6 +344,37 @@ class SprintPRWatcher:
                 GitHubReadError("GitHub returned a different PR identity"),
             )
             return None
+        with db_driver.write_transaction(self.con, "sprint.pr.observe"):
+            receipt = self.observe_in_transaction(
+                int(registered["registered_pr_id"]),
+                pull_request,
+                trigger=trigger,
+            )
+        if receipt is not None:
+            self._backoff.pop(int(registered["registered_pr_id"]), None)
+        return receipt
+
+    def observe_in_transaction(
+        self,
+        registered_pr_id: int,
+        pull_request: PullRequest,
+        *,
+        trigger: str,
+        dispatch: bool = True,
+    ) -> TransitionReceipt | None:
+        """Apply a pre-read observation inside an owner reconciliation commit."""
+        if not self.con.in_transaction:
+            raise RuntimeError("PR observation requires an active transaction")
+        registered = self.con.execute(
+            "SELECT registered_pr_id,sprint_id,repository,pr_number "
+            "FROM sprint_registered_prs WHERE registered_pr_id=?",
+            (registered_pr_id,),
+        ).fetchone()
+        if registered is None:
+            raise KeyError(f"unknown registered PR: {registered_pr_id}")
+        registered_pr_id = int(registered["registered_pr_id"])
+        if pull_request.number != int(registered["pr_number"]):
+            raise GitHubReadError("GitHub returned a different PR identity")
         state = normalize_state(pull_request)
         evidence = {
             "base_ref": pull_request.base_ref,
@@ -355,66 +388,75 @@ class SprintPRWatcher:
             "trigger": trigger,
             "url": pull_request.url,
         }
-        with db_driver.write_transaction(self.con, "sprint.pr.observe"):
-            current = self.con.execute(
-                "SELECT p.*,s.lifecycle FROM sprint_registered_prs p "
-                "JOIN sprints s USING (sprint_id) "
-                "WHERE p.registered_pr_id=?",
-                (registered_pr_id,),
-            ).fetchone()
-            if current is None or current["lifecycle"] != "armed":
-                return None
-            latest = self.con.execute(
-                "SELECT transition_key,normalized_state "
-                "FROM sprint_pr_transitions WHERE registered_pr_id=? "
-                "ORDER BY transition_id DESC LIMIT 1",
-                (registered_pr_id,),
-            ).fetchone()
-            if latest is not None and latest["normalized_state"] == state:
-                self._backoff.pop(registered_pr_id, None)
-                return None
-            parent_key = latest["transition_key"] if latest is not None else "root"
-            transition_key = hashlib.sha256(
-                f"{registered_pr_id}:{parent_key}:{state}".encode()
-            ).hexdigest()
-            transition_id = int(
-                self.con.execute(
-                    "INSERT INTO sprint_pr_transitions "
-                    "(registered_pr_id,normalized_state,transition_key,"
-                    "observed_head_sha,evidence) VALUES (?,?,?,?,?)",
-                    (
-                        registered_pr_id,
-                        state,
-                        transition_key,
-                        pull_request.head_sha,
-                        json.dumps(evidence, sort_keys=True),
-                    ),
-                ).lastrowid
-            )
-            self._route_transition(current, transition_key, state, pull_request)
-            if state == "merged":
-                self.review_loop.observe_merge_in_transaction(
-                    registered_pr_id,
-                    transition_key=transition_key,
-                )
+        current = self.con.execute(
+            "SELECT p.*,s.lifecycle FROM sprint_registered_prs p "
+            "JOIN sprints s USING (sprint_id) "
+            "WHERE p.registered_pr_id=?",
+            (registered_pr_id,),
+        ).fetchone()
+        if current is None or current["lifecycle"] != "armed":
+            return None
+        latest = self.con.execute(
+            "SELECT transition_key,normalized_state "
+            "FROM sprint_pr_transitions WHERE registered_pr_id=? "
+            "ORDER BY transition_id DESC LIMIT 1",
+            (registered_pr_id,),
+        ).fetchone()
+        if latest is not None and latest["normalized_state"] == state:
+            self._backoff.pop(registered_pr_id, None)
+            return None
+        parent_key = latest["transition_key"] if latest is not None else "root"
+        transition_key = hashlib.sha256(
+            f"{registered_pr_id}:{parent_key}:{state}".encode()
+        ).hexdigest()
+        transition_id = int(
             self.con.execute(
-                "INSERT INTO sprint_events "
-                "(sprint_id,event_type,actor_kind,payload) "
-                "VALUES (?,'pr.transition','system',?)",
+                "INSERT INTO sprint_pr_transitions "
+                "(registered_pr_id,normalized_state,transition_key,"
+                "observed_head_sha,evidence) VALUES (?,?,?,?,?)",
                 (
-                    current["sprint_id"],
-                    json.dumps(
-                        {
-                            "normalized_state": state,
-                            "registered_pr_id": registered_pr_id,
-                            "transition_id": transition_id,
-                        },
-                        sort_keys=True,
-                    ),
+                    registered_pr_id,
+                    state,
+                    transition_key,
+                    pull_request.head_sha,
+                    json.dumps(evidence, sort_keys=True),
                 ),
+            ).lastrowid
+        )
+        resolved_review_message_ids = self._route_transition(
+            current,
+            transition_key,
+            state,
+            pull_request,
+        )
+        if state == "merged":
+            self.review_loop.observe_merge_in_transaction(
+                registered_pr_id,
+                transition_key=transition_key,
+                dispatch=dispatch,
             )
-        self._backoff.pop(registered_pr_id, None)
-        return TransitionReceipt(transition_id, state, transition_key)
+        self.con.execute(
+            "INSERT INTO sprint_events "
+            "(sprint_id,event_type,actor_kind,payload) "
+            "VALUES (?,'pr.transition','system',?)",
+            (
+                current["sprint_id"],
+                json.dumps(
+                    {
+                        "normalized_state": state,
+                        "registered_pr_id": registered_pr_id,
+                        "transition_id": transition_id,
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        )
+        return TransitionReceipt(
+            transition_id,
+            state,
+            transition_key,
+            resolved_review_message_ids,
+        )
 
     def _route_transition(
         self,
@@ -422,7 +464,7 @@ class SprintPRWatcher:
         transition_key: str,
         state: str,
         pull_request: PullRequest,
-    ) -> None:
+    ) -> tuple[int, ...]:
         sprint_id = int(registered["sprint_id"])
         registered_pr_id = int(registered["registered_pr_id"])
         unit_rows = self.con.execute(
@@ -435,6 +477,14 @@ class SprintPRWatcher:
         work_unit_id = (
             int(unit_rows[0]["work_unit_id"]) if len(unit_rows) == 1 else None
         )
+        resolved_review_message_ids: tuple[int, ...] = ()
+        if state == "closed" and work_unit_id is not None:
+            resolved_review_message_ids = (
+                self.liveness.resolve_review_requests_for_work_unit_in_transaction(
+                    work_unit_id,
+                    "registered_pr.closed_without_merge",
+                )
+            )
         recipients: dict[int, bool] = {
             int(registered["owner_participant_id"]): state in {"red", "green"}
         }
@@ -478,6 +528,7 @@ class SprintPRWatcher:
                     f"pr-transition:{transition_key}:participant:{participant_id}"
                 ),
             )
+        return resolved_review_message_ids
 
     def _poll_failed(
         self,

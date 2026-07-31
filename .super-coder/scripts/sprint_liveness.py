@@ -599,6 +599,36 @@ class SprintLivenessMonitor:
             ).rowcount
         return changed == 1
 
+    def resolve_review_requests_for_work_unit_in_transaction(
+        self,
+        work_unit_id: int,
+        resolution: str,
+    ) -> tuple[int, ...]:
+        """Resolve every live review expectation owned by one editing lane."""
+        if not self.con.in_transaction:
+            raise RuntimeError("liveness resolution requires an active transaction")
+        resolution = resolution.strip()
+        if not resolution:
+            raise ValueError("liveness expectation resolution is empty")
+        rows = self.con.execute(
+            "SELECT e.message_id FROM sprint_liveness_expectations e "
+            "JOIN sprint_messages m ON m.message_id=e.message_id "
+            "WHERE m.work_unit_id=? AND m.message_kind='review_request' "
+            "AND e.resolved_at IS NULL ORDER BY e.message_id",
+            (work_unit_id,),
+        ).fetchall()
+        message_ids = tuple(int(row[0]) for row in rows)
+        if not message_ids:
+            return ()
+        marks = ",".join("?" for _ in message_ids)
+        self.con.execute(
+            "UPDATE sprint_liveness_expectations SET resolved_at=?,resolution=?,"
+            "next_evaluation_at=NULL "
+            f"WHERE message_id IN ({marks}) AND resolved_at IS NULL",
+            (_stamp(self.now()), resolution, *message_ids),
+        )
+        return message_ids
+
     def _apply(
         self, message_id: int, snapshot: EvidenceSnapshot, now: datetime
     ) -> EvaluationOutcome | None:

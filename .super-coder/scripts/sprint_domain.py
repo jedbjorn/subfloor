@@ -13,6 +13,8 @@ import sqlite3
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
+import conversation_broker
+import conversation_events
 import db_driver
 import sprint_participant_chats
 
@@ -57,6 +59,32 @@ class LifecycleActor:
             raise ValueError(f"{self.kind} actor requires shell_id")
 
 
+@dataclass(frozen=True)
+class PauseReceipt:
+    changed: bool
+    report_id: int | None
+    interrupt_run_ids: tuple[int, ...]
+    notification_conversation_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ResumeReceipt:
+    changed: bool
+    dispatched_wake_ids: tuple[int, ...]
+    projected_work_unit_ids: tuple[int, ...]
+    resolved_review_message_ids: tuple[int, ...]
+    spec_drift_document_ids: tuple[int, ...]
+    anomalies: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AbortReceipt:
+    changed: bool
+    report_id: int | None
+    interrupt_run_ids: tuple[int, ...]
+    notification_conversation_ids: tuple[str, ...]
+
+
 def transition_allowed(current: str, target: str) -> bool:
     return (
         current in SPRINT_TRANSITIONS
@@ -68,9 +96,17 @@ def transition_allowed(current: str, target: str) -> bool:
 class SprintLifecycleStore:
     """Transactional lifecycle operations over one engine DB connection."""
 
-    def __init__(self, con: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        con: sqlite3.Connection,
+        *,
+        interrupt_run: Callable[[int], bool] | None = None,
+        notify_commit: Callable[[], bool] | None = None,
+    ) -> None:
         self.con = con
         self.con.row_factory = sqlite3.Row
+        self.interrupt_run = interrupt_run or conversation_broker.interrupt_run
+        self.notify_commit = notify_commit or conversation_broker.notify_commit
 
     def armed_sprint_id(self) -> int | None:
         row = self.con.execute(
@@ -129,6 +165,17 @@ class SprintLifecycleStore:
         terminal_outcome: str | None = None,
     ) -> bool:
         """Apply one authorized edge; same-state requests are idempotent."""
+        if target == "paused":
+            return self.pause(sprint_id, actor, reason=reason or "unspecified").changed
+        if target == "armed":
+            return self.resume(sprint_id, actor, reason=reason).changed
+        if target == "aborted":
+            return self.abort(
+                sprint_id,
+                actor,
+                reason=reason or terminal_outcome or "aborted",
+                terminal_outcome=terminal_outcome,
+            ).changed
         with db_driver.write_transaction(self.con, "sprint.transition"):
             sprint = self._sprint(sprint_id)
             current = str(sprint["lifecycle"])
@@ -158,6 +205,203 @@ class SprintLifecycleStore:
             )
         return True
 
+    def pause(
+        self,
+        sprint_id: int,
+        actor: LifecycleActor,
+        *,
+        reason: str,
+        detail: dict | None = None,
+    ) -> PauseReceipt:
+        """Atomically pause, persist intent/report/reason, and notify Planner."""
+        reason = self._required_text(reason, "pause reason", 1000)
+        with db_driver.write_transaction(self.con, "sprint.pause"):
+            sprint = self._sprint(sprint_id)
+            current = str(sprint["lifecycle"])
+            if current == "paused":
+                return PauseReceipt(False, None, (), ())
+            self._require_edge(current, "paused")
+            self._authorize(sprint, "paused", actor)
+            receipt = self._pause_in_transaction(
+                sprint,
+                actor,
+                reason=reason,
+                detail=detail or {},
+            )
+        self._signal_interrupts_and_notifications(receipt)
+        return receipt
+
+    def resume(
+        self,
+        sprint_id: int,
+        actor: LifecycleActor,
+        *,
+        reason: str | None = None,
+        reconcile_in_transaction: Callable[[sqlite3.Connection], None] | None = None,
+        external_anomalies: Iterable[str] = (),
+    ) -> ResumeReceipt:
+        """Reconcile durable and supplied evidence before publishing re-arming."""
+        anomalies = tuple(
+            self._required_text(item, "reconciliation anomaly", 2000)
+            for item in external_anomalies
+        )
+        all_anomalies = anomalies
+        notice_conversations: tuple[str, ...] = ()
+        with db_driver.write_transaction(self.con, "sprint.resume"):
+            sprint = self._sprint(sprint_id)
+            current = str(sprint["lifecycle"])
+            if current == "armed":
+                return ResumeReceipt(False, (), (), (), (), anomalies)
+            if current == "prepared":
+                raise SprintInvariantError(
+                    "prepared Sprints must use arm() so plan release is atomic"
+                )
+            self._require_edge(current, "armed")
+            self._authorize(sprint, "armed", actor)
+
+            # Armed is not externally visible until this transaction commits.
+            # That permits active reconciliation notifications to be created
+            # before dispatch without exposing a half-reconciled Sprint.
+            self._update_lifecycle(
+                sprint_id,
+                current=current,
+                target="armed",
+                outcome=None,
+            )
+            if reconcile_in_transaction is not None:
+                reconcile_in_transaction(self.con)
+            projected, resolved = self._reconcile_registered_prs_in_transaction(
+                sprint_id
+            )
+            drift = self._spec_drift(sprint_id)
+            all_anomalies = tuple(
+                dict.fromkeys((*anomalies, *self._local_reconciliation_anomalies(sprint_id)))
+            )
+            evidence = self._reconciliation_evidence(
+                sprint_id,
+                trigger="resume",
+                projected_work_unit_ids=projected,
+                resolved_review_message_ids=resolved,
+                spec_drift=drift,
+                anomalies=all_anomalies,
+            )
+            self._event(
+                sprint_id,
+                "lifecycle.reconciled",
+                actor,
+                evidence,
+            )
+            if drift or all_anomalies:
+                _, notice_conversations = self._queue_planner_notice(
+                    sprint_id,
+                    body=(
+                        f"Sprint {sprint_id} resumed with reconciliation evidence: "
+                        f"{len(drift)} spec drift item(s), "
+                        f"{len(all_anomalies)} anomaly item(s)."
+                    ),
+                    idempotency_key=(
+                        f"sprint-resume:{sprint_id}:v{int(sprint['version']) + 1}"
+                    ),
+                )
+            planner = self._planner_participant_id(sprint_id)
+            dispatched = tuple(
+                SprintWorkUnitStore(self.con)._dispatch_ready_locked(
+                    sprint_id,
+                    planner_participant_id=planner,
+                )
+            )
+            self._event(
+                sprint_id,
+                "lifecycle.armed",
+                actor,
+                {
+                    "from": current,
+                    "reason": reason,
+                    "reconciled": True,
+                    "dispatched_wake_ids": list(dispatched),
+                },
+            )
+        self._signal_notifications(notice_conversations)
+        return ResumeReceipt(
+            True,
+            dispatched,
+            tuple(projected),
+            tuple(resolved),
+            tuple(sorted(drift)),
+            all_anomalies,
+        )
+
+    def abort(
+        self,
+        sprint_id: int,
+        actor: LifecycleActor,
+        *,
+        reason: str,
+        terminal_outcome: str | None,
+    ) -> AbortReceipt:
+        """Abort from prepared/armed/paused without deleting Sprint history."""
+        reason = self._required_text(reason, "abort reason", 2000)
+        outcome = self._required_text(
+            terminal_outcome or "aborted",
+            "abort outcome",
+            500,
+        )
+        with db_driver.write_transaction(self.con, "sprint.abort"):
+            sprint = self._sprint(sprint_id)
+            current = str(sprint["lifecycle"])
+            if current == "aborted":
+                return AbortReceipt(False, None, (), ())
+            self._require_edge(current, "aborted")
+            self._authorize(sprint, "aborted", actor)
+            run_ids, run_conversations = self._persist_interrupt_intents(sprint_id)
+            self._update_lifecycle(
+                sprint_id,
+                current=current,
+                target="aborted",
+                outcome=outcome,
+            )
+            report_id = int(
+                self.con.execute(
+                    "INSERT INTO sprint_reports "
+                    "(sprint_id,report_kind,author_shell_id,body) "
+                    "VALUES (?,'abort',?,?)",
+                    (
+                        sprint_id,
+                        actor.shell_id,
+                        json.dumps(
+                            self._abort_report(sprint_id, current, reason, outcome),
+                            sort_keys=True,
+                        ),
+                    ),
+                ).lastrowid
+            )
+            _, notice_conversations = self._queue_planner_notice(
+                sprint_id,
+                body=f"Sprint {sprint_id} aborted: {reason}",
+                idempotency_key=(
+                    f"sprint-abort:{sprint_id}:v{int(sprint['version']) + 1}"
+                ),
+            )
+            self._event(
+                sprint_id,
+                "lifecycle.aborted",
+                actor,
+                {
+                    "from": current,
+                    "reason": reason,
+                    "report_id": report_id,
+                    "interrupt_run_ids": list(run_ids),
+                },
+            )
+            receipt = AbortReceipt(
+                True,
+                report_id,
+                run_ids,
+                tuple(sorted(set(run_conversations) | set(notice_conversations))),
+            )
+        self._signal_interrupts_and_notifications(receipt)
+        return receipt
+
     def record_wake_failure(
         self,
         wake_id: int,
@@ -171,6 +415,7 @@ class SprintLifecycleStore:
         if not error:
             raise ValueError("wake failure requires an error")
         error = error[:16384]
+        pause_receipt: PauseReceipt | None = None
         with db_driver.write_transaction(self.con, "sprint.wake_failure"):
             row = self.con.execute(
                 "SELECT wake_id,sprint_id,state,attempt_count,claim_owner "
@@ -214,36 +459,590 @@ class SprintLifecycleStore:
             if terminal:
                 sprint = self._sprint(int(row["sprint_id"]))
                 if sprint["lifecycle"] == "armed":
-                    self._update_lifecycle(
-                        int(row["sprint_id"]),
-                        current="armed",
-                        target="paused",
-                        outcome=None,
-                    )
-                    body = json.dumps(
-                        {
-                            "reason": "wake_delivery_exhausted",
+                    pause_receipt = self._pause_in_transaction(
+                        sprint,
+                        LifecycleActor("system"),
+                        reason="wake_delivery_exhausted",
+                        detail={
                             "wake_id": wake_id,
                             "attempts": 3,
                             "last_error": error,
                         },
-                        sort_keys=True,
                     )
-                    self.con.execute(
-                        "INSERT INTO sprint_reports "
-                        "(sprint_id,report_kind,body) VALUES (?,'pause',?)",
-                        (int(row["sprint_id"]), body),
-                    )
-                    self._event(
-                        int(row["sprint_id"]),
-                        "lifecycle.paused",
-                        LifecycleActor("system"),
-                        {
-                            "reason": "wake_delivery_exhausted",
-                            "wake_id": wake_id,
-                        },
-                    )
+        if pause_receipt is not None:
+            self._signal_interrupts_and_notifications(pause_receipt)
         return attempt
+
+    def recover_on_startup(
+        self, sprint_id: int | None = None
+    ) -> tuple[tuple[int, str], ...]:
+        """Reassert durable non-terminal recovery facts without changing state."""
+        sql = (
+            "SELECT sprint_id,lifecycle FROM sprints "
+            "WHERE lifecycle IN ('prepared','armed','paused')"
+        )
+        params: tuple[int, ...] = ()
+        if sprint_id is not None:
+            sql += " AND sprint_id=?"
+            params = (sprint_id,)
+        rows = self.con.execute(sql + " ORDER BY sprint_id", params).fetchall()
+        recovered: list[tuple[int, str]] = []
+        for row in rows:
+            sprint_id = int(row["sprint_id"])
+            lifecycle = str(row["lifecycle"])
+            run_ids: tuple[int, ...] = ()
+            conversations: tuple[str, ...] = ()
+            if lifecycle in {"armed", "paused"}:
+                with db_driver.write_transaction(
+                    self.con, "sprint.recover.startup"
+                ):
+                    if lifecycle == "paused":
+                        run_ids, conversations = self._persist_interrupt_intents(
+                            sprint_id
+                        )
+                    else:
+                        self._reconcile_registered_prs_in_transaction(sprint_id)
+            if run_ids or conversations:
+                self._signal_interrupts_and_notifications(
+                    PauseReceipt(True, None, run_ids, conversations)
+                )
+            recovered.append((sprint_id, lifecycle))
+        return tuple(recovered)
+
+    def _pause_in_transaction(
+        self,
+        sprint: sqlite3.Row,
+        actor: LifecycleActor,
+        *,
+        reason: str,
+        detail: dict,
+    ) -> PauseReceipt:
+        if not self.con.in_transaction:
+            raise RuntimeError("pause requires an active transaction")
+        sprint_id = int(sprint["sprint_id"])
+        current = str(sprint["lifecycle"])
+        self._require_edge(current, "paused")
+        self._authorize(sprint, "paused", actor)
+        run_ids, run_conversations = self._persist_interrupt_intents(sprint_id)
+        template = self._pause_report(sprint_id, current, reason, actor, detail)
+        self._update_lifecycle(
+            sprint_id,
+            current=current,
+            target="paused",
+            outcome=None,
+        )
+        report_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_reports "
+                "(sprint_id,report_kind,author_shell_id,body) "
+                "VALUES (?,'pause',?,?)",
+                (sprint_id, actor.shell_id, json.dumps(template, sort_keys=True)),
+            ).lastrowid
+        )
+        _, notice_conversations = self._queue_planner_notice(
+            sprint_id,
+            body=f"Sprint {sprint_id} paused: {reason}",
+            idempotency_key=(
+                f"sprint-pause:{sprint_id}:v{int(sprint['version']) + 1}"
+            ),
+        )
+        self._event(
+            sprint_id,
+            "lifecycle.paused",
+            actor,
+            {
+                "from": current,
+                "reason": reason,
+                "report_id": report_id,
+                "interrupt_run_ids": list(run_ids),
+                **detail,
+            },
+        )
+        return PauseReceipt(
+            True,
+            report_id,
+            run_ids,
+            tuple(sorted(set(run_conversations) | set(notice_conversations))),
+        )
+
+    def _persist_interrupt_intents(
+        self, sprint_id: int
+    ) -> tuple[tuple[int, ...], tuple[str, ...]]:
+        if not self.con.in_transaction:
+            raise RuntimeError("interrupt persistence requires an active transaction")
+        rows = self.con.execute(
+            "SELECT DISTINCT r.run_id FROM conversation_runs r "
+            "JOIN sprint_participant_conversations pc "
+            "ON pc.conversation_id=r.conversation_id "
+            "JOIN sprint_participants p "
+            "ON p.participant_id=pc.sprint_participant_id "
+            "WHERE p.sprint_id=? AND r.state IN ('leased','starting','running') "
+            "ORDER BY r.run_id",
+            (sprint_id,),
+        ).fetchall()
+        now = str(self.con.execute("SELECT datetime('now')").fetchone()[0])
+        run_ids: list[int] = []
+        conversations: list[str] = []
+        for row in rows:
+            run_id = int(row["run_id"])
+            _, conversation_id = (
+                conversation_broker.BrokerStore.request_interrupt_in_transaction(
+                    self.con,
+                    run_id,
+                    requested_at=now,
+                )
+            )
+            run_ids.append(run_id)
+            conversations.append(conversation_id)
+        return tuple(run_ids), tuple(sorted(set(conversations)))
+
+    def _pause_report(
+        self,
+        sprint_id: int,
+        lifecycle_before: str,
+        reason: str,
+        actor: LifecycleActor,
+        detail: dict,
+    ) -> dict:
+        active_turns = [
+            dict(row)
+            for row in self.con.execute(
+                "SELECT r.run_id,r.conversation_id,r.state,r.lease_owner,"
+                "r.heartbeat_at,r.lease_expires_at FROM conversation_runs r "
+                "JOIN sprint_participant_conversations pc "
+                "ON pc.conversation_id=r.conversation_id "
+                "JOIN sprint_participants p "
+                "ON p.participant_id=pc.sprint_participant_id "
+                "WHERE p.sprint_id=? AND r.state IN ('leased','starting','running') "
+                "ORDER BY r.run_id",
+                (sprint_id,),
+            )
+        ]
+        work_units = [
+            dict(row)
+            for row in self.con.execute(
+                "SELECT work_unit_id,assigned_shell_id,reviewer_shell_id,title,"
+                "planned_wave,disposition FROM sprint_work_units "
+                "WHERE sprint_id=? ORDER BY work_unit_id",
+                (sprint_id,),
+            )
+        ]
+        prs = [
+            dict(row)
+            for row in self.con.execute(
+                "SELECT pr.registered_pr_id,pr.repository,pr.pr_number,"
+                "t.normalized_state,t.observed_head_sha,t.observed_at "
+                "FROM sprint_registered_prs pr LEFT JOIN sprint_pr_transitions t "
+                "ON t.transition_id=(SELECT MAX(latest.transition_id) "
+                "FROM sprint_pr_transitions latest "
+                "WHERE latest.registered_pr_id=pr.registered_pr_id) "
+                "WHERE pr.sprint_id=? ORDER BY pr.registered_pr_id",
+                (sprint_id,),
+            )
+        ]
+        anomalies = [
+            {"event_type": row["event_type"], "payload": json.loads(row["payload"])}
+            for row in self.con.execute(
+                "SELECT event_type,payload FROM sprint_events WHERE sprint_id=? "
+                "AND (event_type LIKE '%failed%' OR event_type LIKE '%error%' "
+                "OR event_type LIKE '%unknown%' OR event_type LIKE '%escalat%') "
+                "ORDER BY event_id DESC LIMIT 20",
+                (sprint_id,),
+            )
+        ]
+        return {
+            "reason": reason,
+            "actor": {"kind": actor.kind, "shell_id": actor.shell_id},
+            "lifecycle_before": lifecycle_before,
+            "detail": detail,
+            "deterministic": {
+                "active_turns": active_turns,
+                "work_units": work_units,
+                "registered_prs": prs,
+                "recent_anomalies": anomalies,
+            },
+            "integrity_threat": "",
+            "judgment": "",
+            "recommendation": "",
+        }
+
+    def _abort_report(
+        self,
+        sprint_id: int,
+        lifecycle_before: str,
+        reason: str,
+        outcome: str,
+    ) -> dict:
+        rows = self.con.execute(
+            "SELECT work_unit_id,title,disposition FROM sprint_work_units "
+            "WHERE sprint_id=? ORDER BY work_unit_id",
+            (sprint_id,),
+        ).fetchall()
+        completed = [dict(row) for row in rows if row["disposition"] == "completed"]
+        outstanding = [
+            dict(row) for row in rows if row["disposition"] != "completed"
+        ]
+        return {
+            "reason": reason,
+            "terminal_outcome": outcome,
+            "lifecycle_before": lifecycle_before,
+            "completed_work": completed,
+            "outstanding_work": outstanding,
+            "recovery_disposition": "",
+        }
+
+    def _reconcile_registered_prs_in_transaction(
+        self, sprint_id: int
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        if not self.con.in_transaction:
+            raise RuntimeError("PR reconciliation requires an active transaction")
+        rows = self.con.execute(
+            "SELECT pr.registered_pr_id,t.transition_key,t.normalized_state "
+            "FROM sprint_registered_prs pr JOIN sprint_pr_transitions t "
+            "ON t.transition_id=(SELECT MAX(latest.transition_id) "
+            "FROM sprint_pr_transitions latest "
+            "WHERE latest.registered_pr_id=pr.registered_pr_id) "
+            "WHERE pr.sprint_id=? ORDER BY pr.registered_pr_id",
+            (sprint_id,),
+        ).fetchall()
+        projected: list[int] = []
+        resolved: list[int] = []
+        units = SprintWorkUnitStore(self.con)
+        for row in rows:
+            registered_pr_id = int(row["registered_pr_id"])
+            unit_ids = tuple(
+                int(item[0])
+                for item in self.con.execute(
+                    "SELECT work_unit_id FROM sprint_pr_work_units "
+                    "WHERE registered_pr_id=? ORDER BY work_unit_id",
+                    (registered_pr_id,),
+                )
+            )
+            if row["normalized_state"] == "merged":
+                incomplete = tuple(
+                    int(item[0])
+                    for item in self.con.execute(
+                        "SELECT work_unit_id FROM sprint_work_units "
+                        "WHERE work_unit_id IN ("
+                        + ",".join("?" for _ in unit_ids)
+                        + ") AND disposition<>'completed' ORDER BY work_unit_id",
+                        unit_ids,
+                    )
+                ) if unit_ids else ()
+                if incomplete:
+                    units.complete_from_merge_in_transaction(
+                        sprint_id,
+                        unit_ids,
+                        transition_key=str(row["transition_key"]),
+                        dispatch=False,
+                    )
+                    projected.extend(incomplete)
+            elif row["normalized_state"] == "closed":
+                for unit_id in unit_ids:
+                    resolved.extend(
+                        self._resolve_review_expectations_in_transaction(
+                            unit_id,
+                            "registered_pr.closed_without_merge",
+                        )
+                    )
+        return tuple(sorted(set(projected))), tuple(sorted(set(resolved)))
+
+    def _resolve_review_expectations_in_transaction(
+        self, work_unit_id: int, resolution: str
+    ) -> tuple[int, ...]:
+        rows = self.con.execute(
+            "SELECT e.message_id FROM sprint_liveness_expectations e "
+            "JOIN sprint_messages m ON m.message_id=e.message_id "
+            "WHERE m.work_unit_id=? AND m.message_kind='review_request' "
+            "AND e.resolved_at IS NULL ORDER BY e.message_id",
+            (work_unit_id,),
+        ).fetchall()
+        message_ids = tuple(int(row[0]) for row in rows)
+        if message_ids:
+            marks = ",".join("?" for _ in message_ids)
+            self.con.execute(
+                "UPDATE sprint_liveness_expectations SET resolved_at=datetime('now'),"
+                "resolution=?,next_evaluation_at=NULL "
+                f"WHERE message_id IN ({marks}) AND resolved_at IS NULL",
+                (resolution, *message_ids),
+            )
+        return message_ids
+
+    def _spec_drift(self, sprint_id: int) -> dict[int, dict[str, str]]:
+        drift: dict[int, dict[str, str]] = {}
+        rows = self.con.execute(
+            "SELECT ss.document_id,ss.bound_revision_sha256,d.body "
+            "FROM sprint_specs ss JOIN documents d USING (document_id) "
+            "WHERE ss.sprint_id=? ORDER BY ss.document_id",
+            (sprint_id,),
+        ).fetchall()
+        for row in rows:
+            current = hashlib.sha256((row["body"] or "").encode()).hexdigest()
+            if current != row["bound_revision_sha256"]:
+                drift[int(row["document_id"])] = {
+                    "bound_revision_sha256": str(row["bound_revision_sha256"]),
+                    "current_revision_sha256": current,
+                }
+        return drift
+
+    def _local_reconciliation_anomalies(self, sprint_id: int) -> tuple[str, ...]:
+        anomalies = [
+            f"participant {row['participant_id']} ({row['role']}) has no usable capacity"
+            for row in self.con.execute(
+                "SELECT p.participant_id,p.role FROM sprint_participants p "
+                "JOIN shells sh USING (shell_id) WHERE p.sprint_id=? "
+                "AND (sh.is_deleted<>0 OR p.current_conversation_id IS NULL) "
+                "ORDER BY p.participant_id",
+                (sprint_id,),
+            )
+        ]
+        anomalies.extend(
+            f"wake {row['wake_id']} targets a participant without a current conversation"
+            for row in self.con.execute(
+                "SELECT w.wake_id FROM sprint_wake_outbox w "
+                "JOIN sprint_participants p ON p.participant_id=w.participant_id "
+                "WHERE w.sprint_id=? AND w.state IN ('pending','delivering') "
+                "AND p.current_conversation_id IS NULL ORDER BY w.wake_id",
+                (sprint_id,),
+            )
+        )
+        return tuple(anomalies)
+
+    def _reconciliation_evidence(
+        self,
+        sprint_id: int,
+        *,
+        trigger: str,
+        projected_work_unit_ids: Iterable[int],
+        resolved_review_message_ids: Iterable[int],
+        spec_drift: dict[int, dict[str, str]],
+        anomalies: Iterable[str],
+    ) -> dict:
+        return {
+            "trigger": trigger,
+            "native_runs": [
+                dict(row)
+                for row in self.con.execute(
+                    "SELECT r.run_id,r.state,r.heartbeat_at,r.lease_expires_at,"
+                    "EXISTS(SELECT 1 FROM conversation_events e "
+                    "WHERE e.run_id=r.run_id "
+                    "AND e.event_type='run.interrupt.requested') interrupt_requested "
+                    "FROM conversation_runs r "
+                    "JOIN sprint_participant_conversations pc "
+                    "ON pc.conversation_id=r.conversation_id "
+                    "JOIN sprint_participants p "
+                    "ON p.participant_id=pc.sprint_participant_id "
+                    "WHERE p.sprint_id=? ORDER BY r.run_id",
+                    (sprint_id,),
+                )
+            ],
+            "unread_message_ids": [
+                int(row[0])
+                for row in self.con.execute(
+                    "SELECT message_id FROM sprint_messages WHERE sprint_id=? "
+                    "AND read_at IS NULL ORDER BY message_id",
+                    (sprint_id,),
+                )
+            ],
+            "pending_wakes": [
+                dict(row)
+                for row in self.con.execute(
+                    "SELECT wake_id,participant_id,state,attempt_count,available_at,"
+                    "lease_expires_at FROM sprint_wake_outbox WHERE sprint_id=? "
+                    "AND state IN ('pending','delivering') ORDER BY wake_id",
+                    (sprint_id,),
+                )
+            ],
+            "work_units": [
+                dict(row)
+                for row in self.con.execute(
+                    "SELECT work_unit_id,assigned_shell_id,disposition "
+                    "FROM sprint_work_units WHERE sprint_id=? ORDER BY work_unit_id",
+                    (sprint_id,),
+                )
+            ],
+            "registered_prs": [
+                dict(row)
+                for row in self.con.execute(
+                    "SELECT pr.registered_pr_id,pr.repository,pr.pr_number,"
+                    "t.normalized_state,t.observed_head_sha "
+                    "FROM sprint_registered_prs pr LEFT JOIN sprint_pr_transitions t "
+                    "ON t.transition_id=(SELECT MAX(latest.transition_id) "
+                    "FROM sprint_pr_transitions latest "
+                    "WHERE latest.registered_pr_id=pr.registered_pr_id) "
+                    "WHERE pr.sprint_id=? ORDER BY pr.registered_pr_id",
+                    (sprint_id,),
+                )
+            ],
+            "participant_capacity": [
+                dict(row)
+                for row in self.con.execute(
+                    "SELECT p.participant_id,p.shell_id,p.role,p.disposition,"
+                    "CASE WHEN sh.is_deleted=0 AND p.current_conversation_id IS NOT NULL "
+                    "THEN 1 ELSE 0 END available "
+                    "FROM sprint_participants p JOIN shells sh USING (shell_id) "
+                    "WHERE p.sprint_id=? ORDER BY p.participant_id",
+                    (sprint_id,),
+                )
+            ],
+            "projected_work_unit_ids": list(projected_work_unit_ids),
+            "resolved_review_message_ids": list(resolved_review_message_ids),
+            "spec_drift": {str(key): value for key, value in spec_drift.items()},
+            "anomalies": list(anomalies),
+        }
+
+    def _planner_participant_id(self, sprint_id: int) -> int:
+        row = self.con.execute(
+            "SELECT participant_id FROM sprint_participants "
+            "WHERE sprint_id=? AND role='planner'",
+            (sprint_id,),
+        ).fetchone()
+        if row is None:
+            raise SprintInvariantError("Sprint has no Planner participant")
+        return int(row[0])
+
+    def _queue_planner_notice(
+        self,
+        sprint_id: int,
+        *,
+        body: str,
+        idempotency_key: str,
+    ) -> tuple[int, tuple[str, ...]]:
+        participant_id = self._planner_participant_id(sprint_id)
+        participant = self.con.execute(
+            "SELECT current_conversation_id FROM sprint_participants "
+            "WHERE participant_id=?",
+            (participant_id,),
+        ).fetchone()
+        existing = self.con.execute(
+            "SELECT message_id FROM sprint_messages WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if existing is None:
+            message_id = int(
+                self.con.execute(
+                    "INSERT INTO sprint_messages "
+                    "(sprint_id,to_participant_id,message_kind,body,actionable,"
+                    "idempotency_key) VALUES (?,?,'notification',?,0,?)",
+                    (sprint_id, participant_id, body, idempotency_key),
+                ).lastrowid
+            )
+        else:
+            message_id = int(existing[0])
+        conversation_id = participant["current_conversation_id"]
+        if conversation_id is None:
+            return message_id, ()
+        conversation = self.con.execute(
+            "SELECT state FROM conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        if conversation is None or conversation["state"] == "closed":
+            return message_id, ()
+        prompt = f"{body}\n\nCheck the Sprint inbox and recovery evidence."
+        prompt_key = f"{idempotency_key}:planner-conversation"
+        queued = self.con.execute(
+            "SELECT message_id FROM conversation_messages "
+            "WHERE conversation_id=? AND idempotency_key=?",
+            (conversation_id, prompt_key),
+        ).fetchone()
+        if queued is None:
+            conversation_message_id = int(
+                self.con.execute(
+                    "INSERT INTO conversation_messages "
+                    "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                    "idempotency_key,request_hash,state) "
+                    "VALUES (?,'engine','sprint-recovery','prompt',?,?,?,'queued')",
+                    (
+                        conversation_id,
+                        prompt,
+                        prompt_key,
+                        hashlib.sha256(prompt.encode()).hexdigest(),
+                    ),
+                ).lastrowid
+            )
+            self.con.execute(
+                "INSERT INTO conversation_outbox (conversation_id,message_id) "
+                "VALUES (?,?)",
+                (conversation_id, conversation_message_id),
+            )
+            sequence = int(
+                self.con.execute(
+                    "SELECT COALESCE(MAX(sequence),0)+1 "
+                    "FROM conversation_events WHERE conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()[0]
+            )
+            self.con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,message_id) "
+                "VALUES (?,?,'message.accepted',?,?)",
+                (
+                    conversation_id,
+                    sequence,
+                    json.dumps(
+                        {
+                            "message_id": conversation_message_id,
+                            "queue_state": "queued",
+                            "source": "sprint_recovery",
+                        },
+                        sort_keys=True,
+                    ),
+                    conversation_message_id,
+                ),
+            )
+            target_state = (
+                conversation["state"]
+                if conversation["state"] in {"queued", "running"}
+                else "queued"
+            )
+            self.con.execute(
+                "UPDATE conversations SET state=?,last_activity_at=datetime('now'),"
+                "version=version+1 WHERE conversation_id=?",
+                (target_state, conversation_id),
+            )
+        return message_id, (str(conversation_id),)
+
+    def _signal_interrupts_and_notifications(
+        self, receipt: PauseReceipt | AbortReceipt
+    ) -> None:
+        self._signal_notifications(receipt.notification_conversation_ids)
+        for run_id in receipt.interrupt_run_ids:
+            try:
+                self.interrupt_run(run_id)
+            except Exception as exc:  # noqa: BLE001 - intent remains retryable
+                with db_driver.write_transaction(
+                    self.con, "sprint.pause.interrupt_delivery"
+                ):
+                    sprint_id = self.con.execute(
+                        "SELECT p.sprint_id FROM conversation_runs r "
+                        "JOIN sprint_participant_conversations pc "
+                        "ON pc.conversation_id=r.conversation_id "
+                        "JOIN sprint_participants p "
+                        "ON p.participant_id=pc.sprint_participant_id "
+                        "WHERE r.run_id=?",
+                        (run_id,),
+                    ).fetchone()[0]
+                    self._event(
+                        int(sprint_id),
+                        "pause.interrupt_delivery_failed",
+                        LifecycleActor("system"),
+                        {"run_id": run_id, "error": str(exc)[:2000]},
+                    )
+
+    def _signal_notifications(self, conversation_ids: Iterable[str]) -> None:
+        for conversation_id in sorted(set(conversation_ids)):
+            conversation_events.notify(conversation_id)
+        if tuple(conversation_ids):
+            self.notify_commit()
+
+    @staticmethod
+    def _required_text(value: str, label: str, limit: int) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError(f"{label} is empty")
+        if len(value) > limit:
+            raise ValueError(f"{label} exceeds {limit} characters")
+        return value
 
     def _sprint(self, sprint_id: int) -> sqlite3.Row:
         row = self.con.execute(
@@ -648,6 +1447,7 @@ class SprintWorkUnitStore:
         work_unit_ids: Iterable[int],
         *,
         transition_key: str,
+        dispatch: bool = True,
     ) -> list[int]:
         """Project an observed merge, then release newly ready work atomically."""
         if not self.con.in_transaction:
@@ -662,7 +1462,7 @@ class SprintWorkUnitStore:
         ).fetchone()
         if sprint is None:
             raise KeyError(f"unknown Sprint: {sprint_id}")
-        if sprint["lifecycle"] != "armed":
+        if sprint["lifecycle"] not in {"armed", "paused"}:
             return []
         placeholders = ",".join("?" for _ in unit_ids)
         units = self.con.execute(
@@ -709,7 +1509,7 @@ class SprintWorkUnitStore:
                 },
                 actor_kind="system",
             )
-        if not changed:
+        if not changed or not dispatch or sprint["lifecycle"] != "armed":
             return []
         planner = self._require_participant(
             sprint_id,
@@ -1026,6 +1826,7 @@ class ArmedServiceSwitch:
         self.callbacks = tuple(callbacks)
 
     def recover_on_startup(self) -> bool:
+        self.store.recover_on_startup()
         return self._run("startup")
 
     def tick(self) -> bool:
