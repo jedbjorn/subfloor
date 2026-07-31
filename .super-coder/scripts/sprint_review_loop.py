@@ -272,6 +272,7 @@ class SprintReviewLoopStore:
         registered_pr_id: int,
         *,
         transition_key: str,
+        dispatch: bool = True,
     ) -> list[int]:
         if not self.con.in_transaction:
             raise RuntimeError("merge observation requires an active transaction")
@@ -293,6 +294,7 @@ class SprintReviewLoopStore:
             int(row["sprint_id"]),
             unit_ids,
             transition_key=transition_key,
+            dispatch=dispatch,
         )
 
     def _lane(self, sprint_id: int, registered_pr_id: int) -> sqlite3.Row:
