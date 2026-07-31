@@ -12,14 +12,10 @@ Nothing here touches the harness; nothing here writes the DB.
 from __future__ import annotations
 
 import sqlite3
-import sys
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 TEMPLATE_PATH = ENGINE / "templates" / "boot.md"
-
-sys.path.insert(0, str(ENGINE / "scripts"))
-import conductor_runtime  # noqa: E402
 
 # Rendered into ORIENTATION for every shell EXCEPT the cartographer (who owns the
 # map and heals discrepancies directly — telling it to report them to itself is
@@ -333,9 +329,6 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     source-repo variant (caller decides via install.is_source_repo() — compose
     stays a pure render, no git).
     """
-    if shell["flavor"] == "conductor":
-        return conductor_runtime.render_boot(con, shell)
-
     template = TEMPLATE_PATH.read_text().rstrip()
     template = template.replace(
         "{{project_vs_engine}}",

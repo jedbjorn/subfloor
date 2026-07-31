@@ -7,8 +7,8 @@ the system, never super-coder's memory or roadmap. So a just-installed fork has
 no users and no shells, and `./sc launch` has nothing to authenticate or boot.
 This provisions the local user, then seeds the starting team via the shared
 shell factory: two `planner`, four `dev`, two `reviewer` shells, an `admin`, the
-singleton `cartographer`, and the operational `conductor` — an eleven-shell
-roster out of the box. One planner is your primary by default.
+singleton `cartographer` — a ten-shell roster out of the box. One planner is
+your primary by default.
 
 Run ONCE, right after `./sc rebuild`, on a fresh fork. Refuses if a shell already
 exists. After it runs: `SC_ADMIN=1 ./sc snapshot`, then `./sc launch`. More shells (or
@@ -52,7 +52,7 @@ TEAM_ROSTER = [
     ("reviewer", "Rev-02", "REV2"),
 ]
 
-from shell_factory import create_shell, flavors, reconcile_conductor  # noqa: E402
+from shell_factory import create_shell, flavors  # noqa: E402
 
 
 def already_seeded(con) -> bool:
@@ -165,9 +165,6 @@ def main(argv: list[str]) -> int:
                 con, flavor="cartographer", name="Cartographer",
                 shortname="CART1" if a.shortname is None else None,
                 partner=a.partner or username, repo=repo)
-        conductor_id, _ = reconcile_conductor(
-            con, partner=a.partner or username, repo=repo
-        )
         con.commit()
 
         def _sn(sid):
@@ -184,11 +181,7 @@ def main(argv: list[str]) -> int:
         if cart_id:
             print(f"init_fork: created '{_sn(cart_id)}' (cartographer, shell_id={cart_id}) "
                   "— owns the repo map.")
-        print(
-            f"init_fork: created '{_sn(conductor_id)}' "
-            f"(conductor, shell_id={conductor_id}) — role-only sprint relay."
-        )
-        total = 2 + len(team) + (1 if cart_id else 0)
+        total = 1 + len(team) + (1 if cart_id else 0)
         print(f"init_fork: seeded a {total}-shell team. "
               "next -> `SC_ADMIN=1 ./sc snapshot` (serialize), then `./sc launch`.")
     finally:

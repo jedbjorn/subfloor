@@ -69,7 +69,6 @@ PY = sys.executable
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
-import conductor_runtime  # noqa: E402
 import db_driver  # noqa: E402
 import engine_manifest  # noqa: E402
 import install as install_mod  # noqa: E402  (ensure_harnesses)
@@ -738,24 +737,6 @@ def regrant() -> int:
         con.close()
 
 
-def reconcile_conductor() -> bool:
-    """Provision/update the singleton operational Conductor in the live DB."""
-    con = db_driver.connect(DB_PATH)
-    try:
-        user = con.execute(
-            "SELECT username FROM users WHERE user_id=1"
-        ).fetchone()
-        _, created = shell_factory.reconcile_conductor(
-            con,
-            partner=user[0] if user is not None else None,
-            repo=REPO_ROOT.name,
-        )
-        con.commit()
-        return created
-    finally:
-        con.close()
-
-
 def expire_sandbox_harnesses() -> str | None:
     """Expire the harness CLIs baked into the sandbox image; return the epoch.
 
@@ -872,14 +853,6 @@ def main(argv: list[str]) -> int:
     sync_skills()
     print("→ re-grant catalogue skills to all shells")
     print(f"  {regrant()} grant change(s)")
-    print("→ reconcile singleton Conductor")
-    print("  created CON1" if reconcile_conductor() else "  CON1 current")
-    print("→ reconcile Conductor config")
-    print(
-        "  enabled CON1 automatic wakes"
-        if conductor_runtime.reconcile_config()
-        else "  Conductor config current"
-    )
     print("→ wire map automation + map the repo")
     run_script("map_setup.py")
     print("→ snapshot the live state")

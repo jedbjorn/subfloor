@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import subprocess
+import sys
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -13,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DIR = ROOT / "tests" / "fixtures" / "sprint_removal"
 MANIFEST_PATH = FIXTURE_DIR / "manifest.json"
 DATABASE_FIXTURE = FIXTURE_DIR / "pre_removal.sql"
+ENGINE = ROOT / ".super-coder"
 
 
 def load_manifest() -> dict:
@@ -206,6 +208,202 @@ class SprintRemovalManifestTest(unittest.TestCase):
                 [],
                 "fixture relationships must be valid before the cleanup runs",
             )
+
+    def test_task_169_runtime_modules_and_role_assets_are_deleted(self):
+        removal = load_manifest()["runtime_removal"]
+        removed = (
+            removal["modules"]
+            + removal["role_assets"]
+            + removal["focused_tests"]
+        )
+        self.assertEqual(
+            [],
+            [relative for relative in removed if (ROOT / relative).exists()],
+        )
+
+    def test_task_169_runtime_modules_cannot_import_from_engine_paths(self):
+        removal = load_manifest()["runtime_removal"]
+        names = [Path(relative).stem for relative in removal["modules"]]
+        probe = r"""
+import importlib
+import sys
+import sysconfig
+from pathlib import Path
+
+root = Path(sys.argv[1])
+stdlib = Path(sysconfig.get_paths()["stdlib"])
+sys.path[:] = [
+    str(root / ".super-coder" / "api"),
+    str(root / ".super-coder" / "scripts"),
+    str(stdlib),
+    str(stdlib / "lib-dynload"),
+]
+for name in sys.argv[2:]:
+    try:
+        importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        if exc.name != name:
+            raise
+    else:
+        raise SystemExit(f"removed module still imports: {name}")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(ROOT), *names],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            result.stdout + result.stderr,
+        )
+
+    def test_task_169_conductor_flavor_and_sprint_skills_cannot_regenerate(self):
+        removal = load_manifest()["runtime_removal"]
+        skills = set(removal["skill_names"])
+        templates = ENGINE / "templates" / "shells"
+        flavors = {
+            path.stem: json.loads(path.read_text())
+            for path in templates.glob("*.json")
+        }
+        self.assertNotIn("conductor", flavors)
+        for flavor, template in flavors.items():
+            with self.subTest(flavor=flavor):
+                self.assertEqual(
+                    set(),
+                    skills & set(template.get("skills", ())),
+                )
+
+        seed = (ENGINE / "migrations" / "0001_seed_skills.sql").read_text()
+        for skill in skills:
+            with self.subTest(skill=skill):
+                self.assertNotIn(f"'{skill}'", seed)
+
+        retained_hooks = (
+            ENGINE / "scripts" / "install.py",
+            ENGINE / "scripts" / "update.py",
+            ENGINE / "scripts" / "init_fork.py",
+            ENGINE / "scripts" / "shell_factory.py",
+            ENGINE / "render" / "compose.py",
+        )
+        source = "\n".join(path.read_text() for path in retained_hooks)
+        for marker in (
+            "conductor_runtime",
+            "conductor_policy",
+            "reconcile_conductor",
+            "CON1",
+        ):
+            with self.subTest(marker=marker):
+                self.assertNotIn(marker, source)
+
+    def test_task_169_role_cleanup_converges_on_dirty_installed_state(self):
+        removal = load_manifest()["runtime_removal"]
+        cleanup = ROOT / removal["role_cleanup_migration"]
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                con.executescript(migration.read_text())
+            con.execute("PRAGMA foreign_keys=ON")
+
+            skills = tuple(removal["skill_names"])
+            placeholders = ",".join("?" for _ in skills)
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM skills "
+                    f"WHERE name IN ({placeholders}) AND is_deleted=0",
+                    skills,
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM flavor_defaults "
+                    "WHERE flavor='conductor'"
+                ).fetchone()[0],
+                0,
+            )
+
+            con.execute(
+                "UPDATE skills SET is_deleted=0 "
+                f"WHERE name IN ({placeholders})",
+                skills,
+            )
+            for flavor, skill in (
+                ("conductor", "sprint_cond"),
+                ("dev", "sprint_dev"),
+                ("planner", "sprint_onboarding"),
+                ("planner", "sprint_pln"),
+                ("reviewer", "sprint_rev"),
+            ):
+                con.execute(
+                    "INSERT INTO flavor_skills (flavor,skill_id) "
+                    "SELECT ?,skill_id FROM skills WHERE name=?",
+                    (flavor, skill),
+                )
+            con.execute(
+                "INSERT INTO flavor_defaults "
+                "(flavor,harness,model,is_default) "
+                "VALUES ('conductor','opencode','removed-model',1)"
+            )
+            conductor_id = con.execute(
+                "INSERT INTO shells "
+                "(display_name,shortname,system_prompt,flavor) "
+                "VALUES ('Removed Conductor','CON1','removed','conductor') "
+                "RETURNING shell_id"
+            ).fetchone()[0]
+            con.execute(
+                "INSERT INTO shell_skills (shell_id,skill_id) "
+                "SELECT ?,skill_id FROM skills WHERE name='sprint_cond'",
+                (conductor_id,),
+            )
+
+            con.executescript(cleanup.read_text())
+            con.executescript(cleanup.read_text())
+
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM skills "
+                    f"WHERE name IN ({placeholders}) AND is_deleted=0",
+                    skills,
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM flavor_skills fs "
+                    "JOIN skills s USING(skill_id) "
+                    f"WHERE fs.flavor='conductor' "
+                    f"OR s.name IN ({placeholders})",
+                    skills,
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM shell_skills ss "
+                    "JOIN skills s USING(skill_id) "
+                    f"WHERE s.name IN ({placeholders})",
+                    skills,
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM flavor_defaults "
+                    "WHERE flavor='conductor'"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                con.execute(
+                    "SELECT is_deleted FROM shells WHERE shell_id=?",
+                    (conductor_id,),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(con.execute("PRAGMA foreign_key_check").fetchall(), [])
 
 
 if __name__ == "__main__":

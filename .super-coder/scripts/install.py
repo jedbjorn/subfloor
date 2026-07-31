@@ -50,7 +50,6 @@ PY = sys.executable
 IS_MAC = platform.system() == "Darwin"  # guidance arms differ (colima/brew vs systemd/apt)
 
 sys.path.insert(0, str(ENGINE / "scripts"))
-import conductor_policy  # noqa: E402
 import engine_manifest  # noqa: E402
 import ports as ports_mod  # noqa: E402
 
@@ -840,11 +839,6 @@ def main(argv: list[str]) -> int:
     cfg = ports_mod.resolve(persist=False)
     cfg["harness"] = harness
     cfg["installed_at"] = datetime.now(timezone.utc).date().isoformat()
-    cfg["conductor"] = {
-        "enabled": True,
-        "shell": "CON1",
-        "model": conductor_policy.DEFAULT_CONDUCTOR_MODEL,
-    }
     ports_mod.CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
 
     # 9. Done -----------------------------------------------------------------

@@ -137,7 +137,7 @@ class VisualQaSeedTest(unittest.TestCase):
                 "WHERE sh.flavor IS NULL;"
             )
 
-        next_shell_id = iter(range(1, 12))
+        next_shell_id = iter(range(1, 11))
         identity_flags = []
 
         def create_shell(con, *, flavor, **kwargs):
@@ -150,11 +150,6 @@ class VisualQaSeedTest(unittest.TestCase):
             )
             return shell_id
 
-        def reconcile_conductor(con, **kwargs):
-            return create_shell(
-                con, flavor="conductor", partner=kwargs.get("partner")
-            ), True
-
         seeded = [Path(".github/workflows/subfloor-visual-qa.yml")]
         with (
             mock.patch.object(init_fork, "DB_PATH", database),
@@ -162,15 +157,10 @@ class VisualQaSeedTest(unittest.TestCase):
             mock.patch.object(init_fork, "create_shell", side_effect=create_shell),
             mock.patch.object(
                 init_fork,
-                "reconcile_conductor",
-                side_effect=reconcile_conductor,
-            ),
-            mock.patch.object(
-                init_fork,
                 "flavors",
                 return_value=[{"flavor": name} for name in
                               ("admin", "planner", "dev", "reviewer",
-                               "cartographer", "conductor")],
+                               "cartographer")],
             ),
         ):
             self.assertEqual(init_fork.main(["--username", "Jed"]), 0)
@@ -194,11 +184,11 @@ class VisualQaSeedTest(unittest.TestCase):
                     ("reviewer",),
                     ("reviewer",),
                     ("cartographer",),
-                    ("conductor",),
                 ],
             )
             self.assertNotIn(("devops",), flavors)
-        self.assertEqual(identity_flags, [True] + [False] * 10)
+            self.assertNotIn(("conductor",), flavors)
+        self.assertEqual(identity_flags, [True] + [False] * 9)
 
 
 class VisualQaUpdateTest(unittest.TestCase):

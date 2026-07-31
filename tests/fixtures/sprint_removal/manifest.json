@@ -1,5 +1,6 @@
 {
   "allowed_reference_files": [
+    ".super-coder/migrations/0143_remove_sprint_runtime_roles.sql",
     "tests/fixtures/sprint_removal/build_pre_removal_fixture.py",
     "tests/fixtures/sprint_removal/manifest.json",
     "tests/fixtures/sprint_removal/pre_removal.sql",
@@ -277,6 +278,57 @@
     ".super-coder/render/compose.py",
     ".super-coder/render/flat.py"
   ],
+  "runtime_removal": {
+    "focused_tests": [
+      "tests/run_conductor_real_matrix.py",
+      "tests/test_activity_readers.py",
+      "tests/test_conductor_contracts.py",
+      "tests/test_conductor_reconciliation.py",
+      "tests/test_conductor_runtime.py",
+      "tests/test_conductor_slot_skills.py",
+      "tests/test_pr_poller.py",
+      "tests/test_reconciler_delivery.py",
+      "tests/test_reconciler_tick.py",
+      "tests/test_sentinel.py",
+      "tests/test_sprint_assignment_notice.py",
+      "tests/test_sprint_board_record.py",
+      "tests/test_sprint_declarations.py",
+      "tests/test_sprint_eventing.py"
+    ],
+    "modules": [
+      ".super-coder/api/conductor_routes.py",
+      ".super-coder/api/sprint_routes.py",
+      ".super-coder/scripts/activity_readers.py",
+      ".super-coder/scripts/conductor_contracts.py",
+      ".super-coder/scripts/conductor_policy.py",
+      ".super-coder/scripts/conductor_runtime.py",
+      ".super-coder/scripts/pr_poller.py",
+      ".super-coder/scripts/sentinel.py",
+      ".super-coder/scripts/sprint.py",
+      ".super-coder/scripts/sprint_conversations.py",
+      ".super-coder/scripts/sprint_lifecycle.py",
+      ".super-coder/scripts/sprint_state.py",
+      ".super-coder/scripts/sprint_units.py",
+      ".super-coder/scripts/watch.py"
+    ],
+    "role_assets": [
+      ".super-coder/assets/skills/sprint_cond/SKILL.md",
+      ".super-coder/assets/skills/sprint_dev/SKILL.md",
+      ".super-coder/assets/skills/sprint_onboarding/SKILL.md",
+      ".super-coder/assets/skills/sprint_pln/SKILL.md",
+      ".super-coder/assets/skills/sprint_rev/SKILL.md",
+      ".super-coder/templates/shells/conductor.json"
+    ],
+    "role_cleanup_migration": ".super-coder/migrations/0143_remove_sprint_runtime_roles.sql",
+    "skill_names": [
+      "sprint_cond",
+      "sprint_dev",
+      "sprint_onboarding",
+      "sprint_pln",
+      "sprint_rev"
+    ],
+    "task": 169
+  },
   "scan_roots": [
     "sc",
     ".super-coder",

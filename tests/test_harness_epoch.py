@@ -201,8 +201,7 @@ class ScFixture:
         shutil.copy2(ROOT / "sc", self.root / "sc")
         # cli_entry.py is not optional in a synthetic fork: every entrypoint
         # imports it from its __main__ block (SIGPIPE hygiene, #384).
-        for script in ("install.py", "conductor_policy.py",
-                       "engine_manifest.py", "ports.py",
+        for script in ("install.py", "engine_manifest.py", "ports.py",
                        "artifact_policy.py", "harness_versions.py",
                        "cli_entry.py"):
             shutil.copy2(ENGINE / "scripts" / script, self.scripts / script)
