@@ -311,6 +311,32 @@ class LifecycleTest(SprintDomainCase):
             ).fetchone()[0],
         )
 
+    def test_arm_coalesces_ready_messages_for_the_same_participant(self) -> None:
+        sprint_id, first_unit = self.create_sprint()
+        second_unit = self.con.execute(
+            "INSERT INTO sprint_work_units "
+            "(sprint_id,assigned_shell_id,reviewer_shell_id,title,expected_output) "
+            "VALUES (?,1,2,'Second','Ship second')",
+            (sprint_id,),
+        ).lastrowid
+        self.con.commit()
+
+        wake_ids = self.store.arm(sprint_id, 3)
+
+        self.assertEqual(1, len(wake_ids))
+        self.assertEqual(
+            [(first_unit,), (second_unit,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT m.work_unit_id FROM sprint_wake_messages wm "
+                    "JOIN sprint_messages m USING (message_id) "
+                    "WHERE wm.wake_id=? ORDER BY m.message_id",
+                    (wake_ids[0],),
+                )
+            ],
+        )
+
     def test_arm_rejects_wrong_planner_and_unapproved_spec_without_effect(self) -> None:
         sprint_id, unit_id = self.create_sprint(approval_verdict="fail")
         with self.assertRaises(sprint_domain.SprintAuthorityError):

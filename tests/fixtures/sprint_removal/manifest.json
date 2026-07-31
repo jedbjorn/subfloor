@@ -1,14 +1,17 @@
 {
   "allowed_reference_files": [
     ".super-coder/migrations/0146_sprint_v2_domain.sql",
+    ".super-coder/migrations/0148_sprint_message_delivery.sql",
     ".super-coder/scripts/sprint_domain.py",
+    ".super-coder/scripts/sprint_message_delivery.py",
     ".super-coder/migrations/0144_remove_sprint_v1.sql",
     "tests/fixtures/sprint_removal/build_pre_removal_fixture.py",
     "tests/fixtures/sprint_removal/manifest.json",
     "tests/fixtures/sprint_removal/pre_removal.sql",
     "tests/test_sprint_entrypoint_removal.py",
     "tests/test_sprint_removal_manifest.py",
-    "tests/test_sprint_v2_domain.py"
+    "tests/test_sprint_v2_domain.py",
+    "tests/test_sprint_message_delivery.py"
   ],
   "baseline_migration_ledger": {
     "count": 142,

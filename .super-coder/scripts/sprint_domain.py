@@ -148,13 +148,22 @@ class SprintLifecycleStore:
             )
         return True
 
-    def record_wake_failure(self, wake_id: int, error: str) -> int:
+    def record_wake_failure(
+        self,
+        wake_id: int,
+        error: str,
+        *,
+        target_conversation_id: str | None = None,
+        expected_claim_owner: str | None = None,
+    ) -> int:
         """Record one failed attempt; attempt three atomically auto-pauses."""
-        if not error.strip():
+        error = error.strip()
+        if not error:
             raise ValueError("wake failure requires an error")
+        error = error[:16384]
         with db_driver.write_transaction(self.con, "sprint.wake_failure"):
             row = self.con.execute(
-                "SELECT wake_id,sprint_id,state,attempt_count "
+                "SELECT wake_id,sprint_id,state,attempt_count,claim_owner "
                 "FROM sprint_wake_outbox WHERE wake_id=?",
                 (wake_id,),
             ).fetchone()
@@ -164,20 +173,26 @@ class SprintLifecycleStore:
                 raise SprintInvariantError(
                     f"wake {wake_id} is terminal ({row['state']})"
                 )
+            if expected_claim_owner is not None and (
+                row["state"] != "delivering"
+                or row["claim_owner"] != expected_claim_owner
+            ):
+                raise SprintInvariantError("wake delivery claim is not owned")
             attempt = int(row["attempt_count"]) + 1
             if attempt > 3:
                 raise SprintInvariantError(f"wake {wake_id} exhausted attempts")
             self.con.execute(
                 "INSERT INTO sprint_wake_attempts "
-                "(wake_id,attempt_number,outcome,error_detail) "
-                "VALUES (?,?,'failed',?)",
-                (wake_id, attempt, error),
+                "(wake_id,attempt_number,target_conversation_id,outcome,error_detail) "
+                "VALUES (?,?,?,'failed',?)",
+                (wake_id, attempt, target_conversation_id, error),
             )
             terminal = attempt == 3
             self.con.execute(
                 "UPDATE sprint_wake_outbox SET attempt_count=?,state=?,"
                 "last_error=?,failed_at=CASE WHEN ? THEN datetime('now') "
-                "ELSE NULL END WHERE wake_id=?",
+                "ELSE NULL END,claim_owner=NULL,claimed_at=NULL,"
+                "lease_expires_at=NULL WHERE wake_id=?",
                 (
                     attempt,
                     "failed" if terminal else "pending",
@@ -392,11 +407,23 @@ class SprintLifecycleStore:
                     key,
                 ),
             ).lastrowid
-            wake_id = self.con.execute(
-                "INSERT INTO sprint_wake_outbox "
-                "(sprint_id,participant_id,idempotency_key) VALUES (?,?,?)",
-                (sprint_id, unit["participant_id"], f"wake:{key}"),
-            ).lastrowid
+            pending_wake = self.con.execute(
+                "SELECT wake_id FROM sprint_wake_outbox "
+                "WHERE sprint_id=? AND participant_id=? AND state='pending'",
+                (sprint_id, unit["participant_id"]),
+            ).fetchone()
+            wake_id = (
+                int(pending_wake["wake_id"])
+                if pending_wake is not None
+                else int(
+                    self.con.execute(
+                        "INSERT INTO sprint_wake_outbox "
+                        "(sprint_id,participant_id,idempotency_key) "
+                        "VALUES (?,?,?)",
+                        (sprint_id, unit["participant_id"], f"wake:{key}"),
+                    ).lastrowid
+                )
+            )
             self.con.execute(
                 "INSERT INTO sprint_wake_messages "
                 "(sprint_id,wake_id,message_id) VALUES (?,?,?)",
@@ -407,7 +434,8 @@ class SprintLifecycleStore:
                 "updated_at=datetime('now') WHERE work_unit_id=?",
                 (unit_id,),
             )
-            wake_ids.append(int(wake_id))
+            if wake_id not in wake_ids:
+                wake_ids.append(wake_id)
         return wake_ids
 
     def _update_lifecycle(
