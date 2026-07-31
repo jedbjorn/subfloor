@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Vendored assets resolve against the tree as it is NOW — spec #48
-(sprint 45, unit 11).
+"""Vendored assets resolve against the tree as it is NOW — spec #48,
+unit 11.
 
 The defect these pin is a rate mismatch, not a wrong line: the route table was
 built once at import while file BODIES were read per request, so pulling the

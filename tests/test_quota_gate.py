@@ -397,7 +397,7 @@ class NoInertAccountMachineryTest(unittest.TestCase):
 
     def quota_region(self, text: str, path: str) -> str:
         """Only the quota code — these names are common words elsewhere in the
-        engine (watched_prs has its own last_seen, and every tab has a plan)."""
+        engine (other resources have their own last_seen, and every tab has a plan)."""
         if path == "api/server.py":
             return text[text.index("def _quota_upsert"):text.index("# \u2500\u2500 Mutations")]
         if path == "ui/app.js":

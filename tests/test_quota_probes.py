@@ -537,7 +537,7 @@ class OpenAIProbeTest(ProbeCase):
         self.assertEqual(ep.calls, [])
 
     def test_a_failed_probe_claims_no_account(self):
-        """INVERTED FROM SPRINT 52, and flag #196 is why.
+        """INVERTED FROM THE ORIGINAL RELEASE GATE, and flag #196 is why.
 
         This used to assert the opposite — that the file's account_id keeps an
         unauth card keyed. But the file's id is a GUESS at who the endpoint

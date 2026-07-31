@@ -1,8 +1,8 @@
 # live_model fixtures — provenance
 
 Every file here is a **real transcript written by a real run of the harness it
-belongs to**, captured on 2026-07-25 for spec doc 44 (feature 17), sprint 45
-unit 44-U1. Nothing is hand-authored, trimmed, or reshaped: what a harness
+belongs to**, captured on 2026-07-25 for spec doc 44 (feature 17), task 44-U1.
+Nothing is hand-authored, trimmed, or reshaped: what a harness
 wrote is what is committed.
 
 That is a requirement, not a preference. Decision #55 and spec doc 44's
@@ -102,7 +102,7 @@ they contain the one shape a capture run cannot be made to produce on demand:
 an assistant record whose `message.model` is the literal `<synthetic>`. Claude
 writes it on locally-generated records ("No response requested.", API-error
 stubs); there are 50 in the scout's corpus and a naive last-record probe
-reports it as the live model. PLN1 ruling (c) of sprint 45 put them in scope
+reports it as the live model. PLN1 ruling (c) put them in scope
 and pointed at these specimens.
 
 - `ea436171` — real `claude-sonnet-5` records, then `<synthetic>` **last**: the

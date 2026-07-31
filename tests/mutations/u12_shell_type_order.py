@@ -1,4 +1,4 @@
-"""Mutation round trips for sprint 45 U12 — shell lists grouped by type.
+"""Mutation round trips for U12 — shell lists grouped by type.
 
 Acceptance evidence, committed rather than run once in a session that dies with
 it (the U5/U7/U11 convention). Each entry breaks ONE property in the real

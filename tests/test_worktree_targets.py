@@ -215,7 +215,7 @@ class LinkedWorktreeRefusalTest(WorktreeFixture):
 
 
 class HelpSurvivesTheRefusalTest(WorktreeFixture):
-    """Sprint ruling R1: -h/--help answers from ANY checkout — parse first,
+    """Ruling R1: -h/--help answers from ANY checkout — parse first,
     refuse second, act third. Only an ACTION form is refused."""
 
     def test_help_forms_exit_zero_with_usage_from_the_linked_worktree(self):

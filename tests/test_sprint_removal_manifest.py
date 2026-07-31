@@ -428,6 +428,29 @@ for name in sys.argv[2:]:
             )
             self.assertEqual(con.execute("PRAGMA foreign_key_check").fetchall(), [])
 
+    def test_task_171_current_guidance_and_assets_are_clean(self):
+        removal = load_manifest()["guidance_removal"]
+        forbidden = re.compile(removal["forbidden_pattern"], re.IGNORECASE)
+
+        self.assertEqual(
+            [],
+            [relative for relative in removal["removed_paths"]
+             if (ROOT / relative).exists()],
+        )
+
+        for relative in removal["authored_scan_paths"]:
+            with self.subTest(relative=relative):
+                path = ROOT / relative
+                self.assertTrue(path.is_file())
+                self.assertIsNone(forbidden.search(relative))
+                self.assertIsNone(forbidden.search(path.read_text()))
+
+        html = (ENGINE / "ui" / "index.html").read_text()
+        style = (ENGINE / "ui" / "style.css").read_text()
+        self.assertIn('<button data-tab="interface">Chats</button>', html)
+        self.assertNotIn(".sprint-board", style)
+        self.assertNotIn(".an-sprint", style)
+
     def test_task_170_historical_migrations_are_absent_and_mixed_inputs_are_clean(
         self,
     ):

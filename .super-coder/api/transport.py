@@ -1,4 +1,4 @@
-"""One-port asyncio HTTP + WebSocket transport (spec #20, sprint 25 seq 5).
+"""One-port asyncio HTTP + WebSocket transport (spec #20, sequence 5).
 
 Replaces the stdlib ThreadingHTTPServer request loop with the spike-proven
 multiplex (spikes/interface-stream/DESIGN.md): plain HTTP and WebSocket

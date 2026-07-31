@@ -1,6 +1,6 @@
 -- 0062 — idempotent message send: dedupe_key on shell_messages (#333).
 --
--- Under multi-shell sprint load (#331 contention), a client timeout on
+-- Under concurrent multi-shell load (#331 contention), a client timeout on
 -- POST /_sc/mem/messages sometimes fired AFTER the server-side write —
 -- the sender couldn't tell delivered from lost, and blind resends
 -- duplicated messages fleet-wide. The client now stamps every send
@@ -15,7 +15,7 @@
 --
 -- The unique index backstops the server's check-then-insert against a
 -- concurrent retry; partial (NOT NULL only) so keyless writers — the
--- watcher daemon's pr_event INSERTs, older clients — are untouched.
+-- older clients are untouched.
 
 BEGIN;
 

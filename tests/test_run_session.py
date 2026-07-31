@@ -35,7 +35,6 @@ CREATE TABLE shell_memory_archives (
     harness TEXT,
     provider TEXT,
     model TEXT,
-    sprint_ref TEXT,
     UNIQUE (shell_id, session_id)
 );
 CREATE TABLE session_token_usage (

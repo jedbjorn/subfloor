@@ -2,9 +2,9 @@
 """Inspect and resolve locally callable model routes.
 
 `sc models refresh` is the CLI twin of Shells → Default Models → Refresh.
-`sc models resolve <harness> <selector>` is the sprint skill's lazy-load seam:
-it returns one exact, high-effort `sc run` call or fails with the reason that
-route cannot be honored on this machine.
+`sc models resolve <harness> <selector>` is the generic headless-launch seam:
+it returns one exact `sc run` call or fails with the reason that route cannot
+be honored on this machine.
 """
 from __future__ import annotations
 

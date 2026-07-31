@@ -136,11 +136,11 @@ class HardCutoverMigrationTest(unittest.TestCase):
         body = (
             "<!-- sc-root-only: operator runs this from the main checkout -->\n"
             "./sc update\n"
-            "./sc sprint board --sprint 1\n"
+            "./sc mem get roadmap\n"
         )
         self.assertEqual(
             unexplained_relative_sc(body),
-            [(3, "./sc sprint board --sprint 1")],
+            [(3, "./sc mem get roadmap")],
         )
 
     def test_flavored_rows_are_discarded_bespoke_rows_survive(self) -> None:

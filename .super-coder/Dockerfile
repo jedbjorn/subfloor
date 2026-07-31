@@ -37,8 +37,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # websockets 16.1.1 (BSD-3-Clause) — the sans-io WS layer for the one-port
-# HTTP+WS transport (api/transport.py; WS upgrades answer unavailable since
-# the Interface retired, conductor Step 1). Baked into the IMAGE python
+# HTTP+WS transport (api/transport.py; WS upgrades currently answer
+# unavailable). Baked into the IMAGE python
 # because the engine server runs on the image's interpreter, not the fork's
 # .venv.
 RUN pip install --no-cache-dir "websockets==16.1.1"

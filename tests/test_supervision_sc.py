@@ -406,10 +406,7 @@ class RestrictedLaunchTests(unittest.TestCase):
         self.assertIn("  pm2-broker: restarted (systemd)", result.stdout)
         self.assertIn("  db-broker: restarted (systemd)", result.stdout)
         self.assertIn("  postgres: skipped (unconfigured)", result.stdout)
-        self.assertIn(
-            "  legacy-watch-daemon: skipped (retired; confirmed stopped)",
-            result.stdout,
-        )
+        self.assertNotIn("watch-daemon", result.stdout)
 
     def test_restart_aggregates_health_failure_and_returns_nonzero(self):
         self.fx.env["SC_TEST_CONFIGURED"] = "vm"
