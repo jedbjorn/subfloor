@@ -65,6 +65,10 @@ import conversation_launch  # noqa: E402  (canonical shell launch preparation)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
+import sprint_close  # noqa: E402  (Sprints v2 conformance + report evidence)
+import sprint_domain  # noqa: E402  (Sprints v2 work dispatch authority)
+import sprint_liveness  # noqa: E402  (Sprints v2 one-shot monitor surface)
+import sprint_review_loop  # noqa: E402  (Sprints v2 Dev/Review command surface)
 import sprint_runtime  # noqa: E402  (armed-only Sprint dispatch + wake delivery)
 sys.path.insert(0, str(ENGINE / "api"))
 import conversation_routes  # noqa: E402  (Feature #24 browser conversations)
@@ -1818,6 +1822,174 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return shell_id
 
+    # -- /sprint/* token-scoped collaboration endpoints --
+
+    @staticmethod
+    def _sprint_integer(body: dict, name: str) -> int:
+        value = body.get(name)
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a positive integer")
+        try:
+            value = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a positive integer") from exc
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        return value
+
+    def _sprint_error(self, exc: Exception):
+        if isinstance(exc, sprint_domain.SprintAuthorityError):
+            return self._send(403, {"error": str(exc)})
+        if isinstance(exc, sprint_domain.SprintInvariantError):
+            return self._send(409, {"error": str(exc)})
+        if isinstance(exc, KeyError):
+            return self._send(404, {"error": str(exc).strip("'")})
+        if isinstance(exc, (ValueError, TypeError)):
+            return self._send(400, {"error": str(exc)})
+        return self._fail(exc)
+
+    @staticmethod
+    def _require_sprint_planner(con, sprint_id: int, shell_id: int) -> None:
+        sprint = con.execute(
+            "SELECT originating_planner_shell_id FROM sprints WHERE sprint_id=?",
+            (sprint_id,),
+        ).fetchone()
+        if sprint is None:
+            raise KeyError(f"unknown Sprint: {sprint_id}")
+        if int(sprint["originating_planner_shell_id"]) != shell_id:
+            raise sprint_domain.SprintAuthorityError(
+                "only the owning Planner may trigger Sprint dispatch or monitoring"
+            )
+
+    def _sprint_get(self, path: str):
+        shell_id = self._require_shell_auth()
+        if shell_id is None:
+            return
+        parts = path.strip("/").split("/")
+        con = db()
+        try:
+            if len(parts) != 4:
+                return self._send(404, {"error": "not found"})
+            sprint_id = int(parts[2])
+            store = sprint_close.SprintCloseStore(con)
+            if parts[3] == "report":
+                query = parse_qs(urlparse(self.path).query)
+                limit = int(
+                    query.get(
+                        "limit", [str(sprint_close.DEFAULT_SECTION_LIMIT)]
+                    )[0]
+                )
+                packet = store.compile_evidence_packet(
+                    sprint_id, shell_id, section_limit=limit
+                )
+                return self._send(200, {"evidence_packet": packet})
+            if parts[3] == "timeline":
+                return self._send(200, store.timeline(sprint_id, shell_id))
+            return self._send(404, {"error": "not found"})
+        except Exception as exc:
+            return self._sprint_error(exc)
+        finally:
+            con.close()
+
+    def _sprint_post(self, path: str, body: dict):
+        shell_id = self._require_shell_auth()
+        if shell_id is None:
+            return
+        con = db()
+        try:
+            sprint_id = self._sprint_integer(body, "sprint_id")
+            if path == "/_sc/sprint/review-request":
+                receipt = sprint_review_loop.SprintReviewLoopStore(
+                    con, repo_root=REPO_ROOT
+                ).request_review(
+                    sprint_id,
+                    self._sprint_integer(body, "registered_pr_id"),
+                    shell_id,
+                    readiness=body.get("readiness") or "",
+                    idempotency_key=body.get("idempotency_key") or "",
+                )
+                return self._send(201 if receipt.created else 200, {
+                    "work_unit_id": receipt.work_unit_id,
+                    "message_id": receipt.message_id,
+                    "wake_id": receipt.wake_id,
+                    "created": receipt.created,
+                })
+            if path == "/_sc/sprint/review-record":
+                receipt = sprint_review_loop.SprintReviewLoopStore(
+                    con, repo_root=REPO_ROOT
+                ).record_review(
+                    sprint_id,
+                    self._sprint_integer(body, "registered_pr_id"),
+                    shell_id,
+                    verdict=body.get("verdict") or "",
+                    body=body.get("body") or "",
+                    idempotency_key=body.get("idempotency_key") or "",
+                )
+                return self._send(201 if receipt.created else 200, {
+                    "work_unit_id": receipt.work_unit_id,
+                    "conversation_id": receipt.conversation_id,
+                    "message_id": receipt.message_id,
+                    "wake_id": receipt.wake_id,
+                    "disposition": receipt.disposition,
+                    "created": receipt.created,
+                })
+            if path == "/_sc/sprint/merge-authorize":
+                authorization = sprint_review_loop.SprintReviewLoopStore(
+                    con, repo_root=REPO_ROOT
+                ).authorize_merge(
+                    sprint_id,
+                    self._sprint_integer(body, "registered_pr_id"),
+                    shell_id,
+                )
+                return self._send(200, {
+                    "registered_pr_id": authorization.registered_pr_id,
+                    "repository": authorization.repository,
+                    "pr_number": authorization.pr_number,
+                    "head_sha": authorization.head_sha,
+                })
+            if path == "/_sc/sprint/dispatch":
+                self._require_sprint_planner(con, sprint_id, shell_id)
+                released = sprint_domain.SprintWorkUnitStore(con).dispatch_ready(
+                    sprint_id
+                )
+                return self._send(200, {"wake_ids": released})
+            if path == "/_sc/sprint/monitor":
+                self._require_sprint_planner(con, sprint_id, shell_id)
+                outcomes = sprint_liveness.SprintLivenessMonitor(con).evaluate(
+                    sprint_id
+                )
+                return self._send(200, {
+                    "outcomes": [
+                        {
+                            "message_id": outcome.message_id,
+                            "action": outcome.action,
+                            "silence_episode": outcome.silence_episode,
+                        }
+                        for outcome in outcomes
+                    ]
+                })
+            if path == "/_sc/sprint/conformance":
+                findings = body.get("findings")
+                if not isinstance(findings, list):
+                    raise ValueError("findings must be a JSON array")
+                receipt = sprint_close.SprintCloseStore(con).record_conformance(
+                    sprint_id,
+                    shell_id,
+                    body=body.get("body") or "",
+                    findings=findings,
+                    idempotency_key=body.get("idempotency_key") or "",
+                )
+                return self._send(201 if receipt.created else 200, {
+                    "report_id": receipt.report_id,
+                    "followup_ids": list(receipt.followup_ids),
+                    "created": receipt.created,
+                })
+            return self._send(404, {"error": "not found"})
+        except Exception as exc:
+            return self._sprint_error(exc)
+        finally:
+            con.close()
+
     # -- /mem/* token-scoped shell memory endpoints --
 
     def _mem_get(self, path: str):
@@ -2668,6 +2840,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, text, ctype, headers=headers)
         if path.startswith("/_sc/mem/"):
             return self._mem_get(path)
+        if path.startswith("/_sc/sprint/"):
+            return self._sprint_get(path)
         if not path.startswith("/api/"):
             return self._send(404, {"error": "not found"})
         # git-hygiene is a live filesystem/git read — no DB, computed on demand
@@ -2797,6 +2971,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path.startswith("/_sc/mem/"):
             return self._mem_post(path, self._body())
+        if path.startswith("/_sc/sprint/"):
+            return self._sprint_post(path, self._body())
         con = db()
         try:
             if path == "/api/flags":

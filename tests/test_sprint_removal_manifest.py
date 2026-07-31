@@ -514,6 +514,9 @@ for name in sys.argv[2:]:
             self.assertTrue((MIGRATIONS / name).is_file(), name)
 
         removed = set(load_manifest()["removed_tables"])
+        retired_role_skills = set(
+            load_manifest()["runtime_removal"]["skill_names"]
+        )
         for migration in sorted(MIGRATIONS.glob("*.sql")):
             if migration.name > Path(removal["cleanup_migration"]).name:
                 continue
@@ -533,10 +536,8 @@ for name in sys.argv[2:]:
                 )
             self.assertNotIn("add column sprint_doc_id", sql, migration.name)
             self.assertNotIn("add column sprint_ref", sql, migration.name)
-            self.assertNotIn("'sprint_dev'", sql, migration.name)
-            self.assertNotIn("'sprint_pln'", sql, migration.name)
-            self.assertNotIn("'sprint_rev'", sql, migration.name)
-            self.assertNotIn("'sprint_cond'", sql, migration.name)
+            for skill in retired_role_skills:
+                self.assertNotIn(f"'{skill}'", sql, migration.name)
 
     def test_task_170_cutover_floor_contains_only_retained_schema(self):
         manifest = load_manifest()

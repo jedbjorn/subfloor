@@ -4,6 +4,15 @@
     ".super-coder/migrations/0147_sprint_participant_conversations.sql",
     ".super-coder/migrations/0148_sprint_message_delivery.sql",
     ".super-coder/migrations/0149_sprint_liveness_monitor.sql",
+    ".super-coder/migrations/0150_sprint_close_reports.sql",
+    ".super-coder/migrations/0151_seed_sprint_v2_skills.sql",
+    ".super-coder/assets/skills/sprint_prep/SKILL.md",
+    ".super-coder/assets/skills/sprint_pln/SKILL.md",
+    ".super-coder/assets/skills/sprint_dev/SKILL.md",
+    ".super-coder/assets/skills/sprint_rev/SKILL.md",
+    ".super-coder/assets/skills/sprint_close/SKILL.md",
+    ".super-coder/scripts/sprint_close.py",
+    ".super-coder/scripts/sprint_cli.py",
     ".super-coder/scripts/sprint_domain.py",
     ".super-coder/scripts/sprint_liveness.py",
     ".super-coder/scripts/sprint_message_delivery.py",
@@ -25,7 +34,10 @@
     "tests/test_sprint_work_dispatch.py",
     "tests/test_sprint_pr_watcher.py",
     "tests/test_sprint_recovery.py",
-    "tests/test_sprint_review_loop.py"
+    "tests/test_sprint_review_loop.py",
+    "tests/test_sprint_close.py",
+    "tests/test_sprint_cli.py",
+    "tests/test_sprint_skills.py"
   ],
   "baseline_migration_ledger": {
     "count": 142,
@@ -333,19 +345,13 @@
     ],
     "role_assets": [
       ".super-coder/assets/skills/sprint_cond/SKILL.md",
-      ".super-coder/assets/skills/sprint_dev/SKILL.md",
       ".super-coder/assets/skills/sprint_onboarding/SKILL.md",
-      ".super-coder/assets/skills/sprint_pln/SKILL.md",
-      ".super-coder/assets/skills/sprint_rev/SKILL.md",
       ".super-coder/templates/shells/conductor.json"
     ],
     "role_cleanup_migration": ".super-coder/migrations/0144_remove_sprint_v1.sql",
     "skill_names": [
       "sprint_cond",
-      "sprint_dev",
-      "sprint_onboarding",
-      "sprint_pln",
-      "sprint_rev"
+      "sprint_onboarding"
     ],
     "task": 169
   },
@@ -435,7 +441,6 @@
       ".super-coder/assets/skills/memory/SKILL.md",
       ".super-coder/assets/skills/messaging/SKILL.md",
       ".super-coder/assets/skills/test_authoring/SKILL.md",
-      ".super-coder/migrations/0001_seed_skills.sql",
       ".super-coder/migrations/0145_reseed_generic_guidance.sql",
       ".super-coder/scripts/live_model/__init__.py",
       ".super-coder/scripts/models.py",
@@ -465,6 +470,10 @@
         ".chat-sprint-pill {",
         ".chat-sprint-pill:hover {",
         ".chat-sprint-meta {"
+      ],
+      "sc": [
+        "sprint)       exec \"$PY\" \"$S/sprint_cli.py\" \"$@\" ;;",
+        "./sc sprint <cmd>        authenticated Sprints v2 actions: request-review · record-review · authorize-merge · dispatch · monitor · record-conformance · compile-report"
       ]
     },
     "forbidden_pattern": "(?:\\bsprints?\\b|\\bconductor\\b|SC_SPRINT_|pr_event|watched_prs|watch-daemon|interface_(?:generations|sessions|writer_leases|input_state|idempotency_keys|recovery_observations)|planner_(?:wake_batches|wake_items|action_receipts|alerts))",
