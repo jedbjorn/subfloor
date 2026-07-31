@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import sys
 import tempfile
@@ -191,6 +192,127 @@ class LifecycleTest(SprintDomainCase):
                 tuple(row)
                 for row in self.con.execute(
                     "SELECT sprint_id,lifecycle FROM sprints ORDER BY sprint_id"
+                )
+            ],
+        )
+
+    def test_arm_atomically_provisions_every_participant_conversation(self) -> None:
+        sprint_id, _ = self.create_sprint()
+
+        self.store.arm(sprint_id, 3)
+
+        participants = self.con.execute(
+            "SELECT participant_id,persistent_conversation_id,"
+            "current_conversation_id FROM sprint_participants "
+            "WHERE sprint_id=? ORDER BY participant_id",
+            (sprint_id,),
+        ).fetchall()
+        self.assertEqual(3, len(participants))
+        self.assertTrue(
+            all(
+                row["persistent_conversation_id"] == row["current_conversation_id"]
+                for row in participants
+            )
+        )
+        conversation_ids = {row["current_conversation_id"] for row in participants}
+        self.assertEqual(
+            [("sprint", "idle", 3)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT conversation_scope,state,COUNT(*) "
+                    "FROM conversations WHERE conversation_id IN (?,?,?) "
+                    "GROUP BY conversation_scope,state",
+                    tuple(sorted(conversation_ids)),
+                )
+            ],
+        )
+        self.assertEqual(
+            [("work", 3)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT purpose,COUNT(*) FROM sprint_participant_conversations "
+                    "GROUP BY purpose"
+                )
+            ],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute("SELECT COUNT(*) FROM conversation_outbox").fetchone()[0],
+            "creating placeholders must not launch or wake a harness",
+        )
+        event = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='lifecycle.armed'",
+            (sprint_id,),
+        ).fetchone()
+        self.assertEqual(
+            conversation_ids,
+            set(json.loads(event["payload"])["initial_conversation_ids"]),
+        )
+
+        self.con.execute(
+            "INSERT INTO conversations "
+            "(shell_id,owner_user_id,harness,worktree,title,"
+            "creation_idempotency_key,creation_request_hash) "
+            "VALUES (1,1,'codex','/normal','Normal chat','normal-1','hash')"
+        )
+        self.assertEqual(
+            [("normal", 1), ("sprint", 3)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT conversation_scope,COUNT(*) FROM conversations "
+                    "GROUP BY conversation_scope ORDER BY conversation_scope"
+                )
+            ],
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.con.execute(
+                "INSERT INTO conversations "
+                "(shell_id,owner_user_id,harness,worktree,title,"
+                "creation_idempotency_key,creation_request_hash) "
+                "VALUES (1,1,'codex','/normal-2','Other normal chat',"
+                "'normal-2','hash')"
+            )
+
+    def test_arm_rolls_back_conversations_when_initial_release_fails(self) -> None:
+        sprint_id, _ = self.create_sprint()
+        self.con.execute(
+            "CREATE TRIGGER reject_initial_message BEFORE INSERT ON sprint_messages "
+            "BEGIN SELECT RAISE(ABORT,'release fault'); END"
+        )
+        self.con.commit()
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "release fault"):
+            self.store.arm(sprint_id, 3)
+
+        self.assertEqual(
+            "prepared",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?", (sprint_id,)
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_conversations"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            [(None, None), (None, None), (None, None)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT persistent_conversation_id,current_conversation_id "
+                    "FROM sprint_participants WHERE sprint_id=? "
+                    "ORDER BY participant_id",
+                    (sprint_id,),
                 )
             ],
         )

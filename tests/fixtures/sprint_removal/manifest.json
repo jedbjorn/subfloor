@@ -434,6 +434,28 @@
       ".super-coder/ui/style.css",
       "sc"
     ],
+    "allowed_v2_authored_lines": {
+      ".super-coder/ui/app.js": [
+        "if (conversation.scope === \"sprint\") return true;",
+        "const sprintManaged = conversation.scope === \"sprint\";",
+        "if (item.sprint) {",
+        "const sprint = item.sprint;",
+        "className: \"chat-sprint-pill\",",
+        "title: `Sprint ${sprint.sprint_id} · ${sprint.role} · ${sprint.disposition}`,",
+        "ariaLabel: `Enter Sprint ${sprint.sprint_id} ${sprint.role} conversation`,",
+        "el(\"span\", {}, `Sprint ${sprint.sprint_id}`),",
+        "el(\"span\", { className: \"chat-sprint-meta\" },",
+        "`${sprint.role} · ${sprint.disposition}`));",
+        "sprint.current_conversation_id,",
+        "disabled: conversation.scope === \"sprint\" || conversation.state === \"closed\",",
+        "hidden: conversation.scope === \"sprint\","
+      ],
+      ".super-coder/ui/style.css": [
+        ".chat-sprint-pill {",
+        ".chat-sprint-pill:hover {",
+        ".chat-sprint-meta {"
+      ]
+    },
     "forbidden_pattern": "(?:\\bsprints?\\b|\\bconductor\\b|SC_SPRINT_|pr_event|watched_prs|watch-daemon|interface_(?:generations|sessions|writer_leases|input_state|idempotency_keys|recovery_observations)|planner_(?:wake_batches|wake_items|action_receipts|alerts))",
     "removed_paths": [
       "docs/images/analytics.png",

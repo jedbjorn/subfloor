@@ -14,6 +14,7 @@ import sqlite3
 from dataclasses import dataclass
 
 import db_driver
+import sprint_participant_chats
 
 
 SPRINT_TRANSITIONS = {
@@ -97,6 +98,9 @@ class SprintLifecycleStore:
                 target="armed",
                 outcome=None,
             )
+            conversation_ids = sprint_participant_chats.provision_at_arming(
+                self.con, sprint_id
+            )
             wake_ids = self._release_initial_work(
                 sprint_id,
                 planner_participant_id=planner_participant,
@@ -105,7 +109,10 @@ class SprintLifecycleStore:
                 sprint_id,
                 "lifecycle.armed",
                 actor,
-                {"initial_wake_ids": wake_ids},
+                {
+                    "initial_conversation_ids": conversation_ids,
+                    "initial_wake_ids": wake_ids,
+                },
             )
         return wake_ids
 

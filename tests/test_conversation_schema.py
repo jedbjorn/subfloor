@@ -655,7 +655,7 @@ class TransitionMatrixTest(ConversationDbCase):
 
 class FenceAndEventTest(ConversationDbCase):
     def test_open_chat_migration_closes_older_legacy_rows(self) -> None:
-        self.con.execute("DROP INDEX idx_conversations_live_shell")
+        self.con.execute("DROP INDEX idx_conversations_live_normal_shell")
         older = self.add_conversation(shell_id=1)
         self.con.execute(
             "UPDATE conversations SET last_activity_at='2026-01-01 00:00:00' "

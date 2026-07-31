@@ -97,6 +97,62 @@ class AssemblerSmokeTest(unittest.TestCase):
         out = server.get_shells(self.con)
         self.assertTrue(any(s["shell_id"] == self.ids["shell_id"] for s in out))
 
+    def test_get_shells_projects_only_live_current_sprint_conversation(self) -> None:
+        shell_id = self.ids["shell_id"]
+        self.con.execute(
+            "INSERT INTO users (user_id,username) VALUES (1,'operator')"
+        )
+        self.con.execute(
+            "UPDATE shells SET user_id=1 WHERE shell_id=?", (shell_id,)
+        )
+        sprint_id = self.con.execute(
+            "INSERT INTO sprints "
+            "(feature_id,originating_planner_shell_id,lifecycle,"
+            "merge_grant_enabled) VALUES (?,?,'armed',1)",
+            (self.ids["feature_id"], shell_id),
+        ).lastrowid
+        participant_id = self.con.execute(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness,disposition) "
+            "VALUES (?,?,'developer','codex','active')",
+            (sprint_id, shell_id),
+        ).lastrowid
+        conversation_id = server.sprint_participant_chats.create_and_select(
+            self.con,
+            participant_id=int(participant_id),
+            owner_user_id=1,
+            purpose="work",
+            harness="codex",
+            provider="openai",
+            model=None,
+            effort="high",
+            worktree="/fixture/dev",
+            title="Sprint participant",
+            idempotency_key="fixture:sprint:participant:work",
+        )
+        self.con.commit()
+
+        by_id = {row["shell_id"]: row for row in server.get_shells(self.con)}
+        self.assertEqual(
+            {
+                "sprint_id": int(sprint_id),
+                "lifecycle": "armed",
+                "role": "developer",
+                "disposition": "active",
+                "current_conversation_id": conversation_id,
+            },
+            by_id[shell_id]["sprint"],
+        )
+
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='completed',terminal_outcome='shipped' "
+            "WHERE sprint_id=?",
+            (sprint_id,),
+        )
+        self.con.commit()
+        by_id = {row["shell_id"]: row for row in server.get_shells(self.con)}
+        self.assertIsNone(by_id[shell_id]["sprint"])
+
     def test_get_shell(self) -> None:
         out = server.get_shell(self.con, self.ids["shell_id"])
         self.assertIsNotNone(out)

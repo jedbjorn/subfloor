@@ -457,6 +457,12 @@ for name in sys.argv[2:]:
     def test_task_171_current_guidance_and_assets_are_clean(self):
         removal = load_manifest()["guidance_removal"]
         forbidden = re.compile(removal["forbidden_pattern"], re.IGNORECASE)
+        allowed_v2 = {
+            relative: set(lines)
+            for relative, lines in removal.get(
+                "allowed_v2_authored_lines", {}
+            ).items()
+        }
 
         self.assertEqual(
             [],
@@ -469,7 +475,22 @@ for name in sys.argv[2:]:
                 path = ROOT / relative
                 self.assertTrue(path.is_file())
                 self.assertIsNone(forbidden.search(relative))
-                self.assertIsNone(forbidden.search(path.read_text()))
+                source_lines = path.read_text().splitlines()
+                allowed_lines = allowed_v2.get(relative, set())
+                self.assertEqual(
+                    set(),
+                    allowed_lines - {line.strip() for line in source_lines},
+                    "every v2 exception must bind to an exact current source line",
+                )
+                self.assertEqual(
+                    [],
+                    [
+                        line
+                        for line in source_lines
+                        if forbidden.search(line) and line.strip() not in allowed_lines
+                    ],
+                    "only exact declared v2 lines may use retired-v1 vocabulary",
+                )
 
         html = (ENGINE / "ui" / "index.html").read_text()
         style = (ENGINE / "ui" / "style.css").read_text()

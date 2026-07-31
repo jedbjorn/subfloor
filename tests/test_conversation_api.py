@@ -20,6 +20,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import conversation_broker
 import conversation_events
 import conversation_routes
+import sprint_participant_chats
 
 
 def apply_schema(con: sqlite3.Connection) -> None:
@@ -138,6 +139,36 @@ class ConversationApiCase(unittest.TestCase):
         status, _, obj = self.request("POST", "/api/conversations", body=body, key=key)
         self.assertEqual(status, 201, obj)
         return obj
+
+    def seed_sprint_conversation(self) -> str:
+        with self.connect() as con:
+            con.execute(
+                "INSERT INTO roadmap (feature_id,title,roadmap_status) "
+                "VALUES (31,'Collaborative orchestration','in_progress')"
+            )
+            con.execute(
+                "INSERT INTO sprints "
+                "(sprint_id,feature_id,originating_planner_shell_id,lifecycle,"
+                "merge_grant_enabled) VALUES (7,31,1,'armed',1)"
+            )
+            participant_id = con.execute(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness,model,effort,disposition) "
+                "VALUES (7,1,'developer','codex','gpt-test','high','active')"
+            ).lastrowid
+            return sprint_participant_chats.create_and_select(
+                con,
+                participant_id=int(participant_id),
+                owner_user_id=1,
+                purpose="work",
+                harness="codex",
+                provider="openai",
+                model="gpt-test",
+                effort="high",
+                worktree=str(self.root / ".sc-worktrees" / "dev"),
+                title="Sprint 7 developer",
+                idempotency_key="sprint:7:participant:1:work",
+            )
 
     def seed_conversation(
         self,
@@ -769,6 +800,85 @@ class ConversationResourceTest(ConversationApiCase):
         con.close()
         self.assertEqual(count, 1)
         self.assertEqual(tuple(event), (1, "conversation.created"))
+
+    def test_sprint_entry_is_read_only_and_normal_close_cannot_break_pointer(
+        self,
+    ) -> None:
+        conversation_id = self.seed_sprint_conversation()
+        con = self.connect()
+        try:
+            before = tuple(
+                con.execute(
+                    "SELECT state,last_activity_at,version FROM conversations "
+                    "WHERE conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()
+            )
+            wake_count = con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_outbox"
+            ).fetchone()[0]
+            generic_outbox_count = con.execute(
+                "SELECT COUNT(*) FROM conversation_outbox"
+            ).fetchone()[0]
+        finally:
+            con.close()
+
+        status, _, viewed = self.request(
+            "GET", f"/api/conversations/{conversation_id}"
+        )
+
+        self.assertEqual(status, 200, viewed)
+        self.assertEqual(viewed["scope"], "sprint")
+        con = self.connect()
+        try:
+            self.assertEqual(
+                before,
+                tuple(
+                    con.execute(
+                        "SELECT state,last_activity_at,version FROM conversations "
+                        "WHERE conversation_id=?",
+                        (conversation_id,),
+                    ).fetchone()
+                ),
+            )
+            self.assertEqual(
+                wake_count,
+                con.execute(
+                    "SELECT COUNT(*) FROM sprint_wake_outbox"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                generic_outbox_count,
+                con.execute(
+                    "SELECT COUNT(*) FROM conversation_outbox"
+                ).fetchone()[0],
+            )
+        finally:
+            con.close()
+
+        status, _, error = self.request(
+            "PATCH",
+            f"/api/conversations/{conversation_id}",
+            body={"version": viewed["version"], "state": "closed"},
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(error["error"]["code"], "SPRINT_CONVERSATION_MANAGED")
+        con = self.connect()
+        try:
+            self.assertEqual(
+                ("idle", conversation_id),
+                tuple(
+                    con.execute(
+                        "SELECT c.state,p.current_conversation_id "
+                        "FROM conversations c JOIN sprint_participants p "
+                        "ON p.current_conversation_id=c.conversation_id "
+                        "WHERE c.conversation_id=?",
+                        (conversation_id,),
+                    ).fetchone()
+                ),
+            )
+        finally:
+            con.close()
 
     def test_operator_boundary_rejects_tokens_and_cross_site_mutations(self) -> None:
         status, _, obj = self.request(
