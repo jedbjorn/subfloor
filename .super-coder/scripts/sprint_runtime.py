@@ -20,6 +20,7 @@ from sprint_domain import (
     SprintWorkUnitStore,
 )
 from sprint_message_delivery import SprintWakeDeliveryService
+from sprint_liveness import SprintLivenessMonitor
 
 DEFAULT_PULSE_SECONDS = 5.0
 
@@ -191,6 +192,7 @@ class SprintRuntimeService(threading.Thread):
     def _switch(self, con: sqlite3.Connection) -> ArmedServiceSwitch:
         units = SprintWorkUnitStore(con)
         wakes = SprintWakeDeliveryService(con)
+        liveness = SprintLivenessMonitor(con)
 
         def dispatch(sprint_id: int, _trigger: str) -> None:
             units.dispatch_ready(sprint_id)
@@ -201,9 +203,12 @@ class SprintRuntimeService(threading.Thread):
                 if outcome is None or outcome.state != "delivered":
                     return
 
+        def evaluate_liveness(sprint_id: int, _trigger: str) -> None:
+            liveness.evaluate(sprint_id)
+
         return ArmedServiceSwitch(
             SprintLifecycleStore(con),
-            (dispatch, deliver),
+            (dispatch, evaluate_liveness, deliver),
         )
 
     def run(self) -> None:  # pragma: no cover - loop tested through pulse_once
