@@ -180,6 +180,7 @@ def test_diff_layout_is_full_width_bounded_and_responsive():
         ".review-status",
         ".review-group-switch",
         ".review-change-switch",
+        ".review-patch-title",
         ".review-body",
         ".review-file-tree",
         ".review-patch",
@@ -190,14 +191,18 @@ def test_diff_layout_is_full_width_bounded_and_responsive():
     ):
         assert selector in STYLE
     assert "grid-template-columns: minmax(220px, 300px) minmax(0, 1fr)" in STYLE
-    assert "grid-template-rows: auto auto minmax(0, 1fr)" in STYLE
-    assert "border-radius: 0 0 7px 7px" in STYLE
+    assert "grid-template-rows: auto minmax(0, 1fr)" in STYLE
+    assert "flex: 1 1 auto" in STYLE
+    assert "text-overflow: ellipsis" in STYLE
     source = current_workspace_source()
     summary = source[source.index('const summary = el("div"'):source.index(
         'const groupSwitch = el("div"'
     )]
     assert "...(sectionSwitch ? [sectionSwitch] : [])" in summary
     assert "summaryStatus" in summary
+    assert "patchHeader(" in source
+    assert "}, summary);" in source
+    assert 'el("span", { title: detail }, detail)' in source
     assert "@media (max-width: 900px)" in STYLE
     responsive = STYLE[STYLE.index("@media (max-width: 900px)"):]
     assert "grid-template-columns: minmax(0, 1fr)" in responsive

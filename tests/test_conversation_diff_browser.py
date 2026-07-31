@@ -644,14 +644,17 @@ export { mode };"""
         assert page.get_by_text("7 dirty", exact=False).is_visible()
         assert page.locator(".review-summary > .review-change-switch").count() == 1
         assert page.locator(".review-summary > .review-status").count() == 1
-        header_edges = page.locator(".review-summary, .review-group-switch").evaluate_all(
-            "nodes => ({summaryTop: nodes[0].getBoundingClientRect().top, "
-            "summaryBottom: nodes[0].getBoundingClientRect().bottom, "
-            "tabsTop: nodes[1].getBoundingClientRect().top, "
-            "tabsBottom: nodes[1].getBoundingClientRect().bottom})"
+        assert page.locator(".review-workspace > .review-group-switch").count() == 0
+        assert page.locator(".review-patch-head > .review-group-switch").count() == 1
+        patch_header = page.locator(
+            ".review-patch-title, .review-patch-title span, .review-group-switch"
+        ).evaluate_all(
+            "nodes => ({titleRight: nodes[0].getBoundingClientRect().right, "
+            "subtitleOverflow: getComputedStyle(nodes[1]).textOverflow, "
+            "tabsLeft: nodes[2].getBoundingClientRect().left})"
         )
-        assert abs(header_edges["summaryBottom"] - header_edges["tabsTop"]) <= 1
-        assert header_edges["tabsBottom"] - header_edges["summaryTop"] <= 90
+        assert patch_header["tabsLeft"] - patch_header["titleRight"] >= 12
+        assert patch_header["subtitleOverflow"] == "ellipsis"
         initial_observations = sum(
             method == "POST" and path.endswith("/review-observations")
             for method, path, _query in requests

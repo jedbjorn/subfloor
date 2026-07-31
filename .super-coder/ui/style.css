@@ -345,7 +345,7 @@ body.interface-view main {
 }
 .review-workspace {
   min-width: 0; min-height: 0; height: 100%; display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr); overflow: hidden;
+  grid-template-rows: auto minmax(0, 1fr); overflow: hidden;
 }
 .review-summary {
   min-width: 0; padding: .55rem 1rem; border-bottom: 1px solid var(--line);
@@ -387,7 +387,7 @@ body.interface-view main {
 .review-freshness .warning { color: var(--warn); }
 .review-refresh.act { margin: 0; padding: .34rem .7rem; font-size: .7rem; }
 .review-group-switch {
-  margin: 0 auto; flex: none; border-top: 0; border-radius: 0 0 7px 7px;
+  margin: 0 0 0 auto; flex: none; border-radius: 7px;
 }
 .review-change-switch { margin: 0; flex: none; }
 .review-scope-switch button { padding-inline: 1rem; }
@@ -446,15 +446,20 @@ body.interface-view main {
   min-width: 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column;
 }
 .review-patch-head {
-  flex: none; min-width: 0; min-height: 40px; padding: .55rem .75rem;
-  display: flex; align-items: baseline; gap: .7rem; border-bottom: 1px solid var(--line);
+  flex: none; min-width: 0; min-height: 48px; padding: .4rem .75rem;
+  display: flex; align-items: center; gap: 1rem; border-bottom: 1px solid var(--line);
   background: var(--panel); overflow: hidden;
 }
+.review-patch-title {
+  min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column;
+  gap: .05rem; overflow: hidden;
+}
 .review-patch-head strong {
-  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font: .74rem ui-monospace, monospace;
 }
 .review-patch-head span {
+  display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis;
   color: var(--dim); font-size: .64rem; white-space: nowrap;
 }
 .review-file-steps { display: flex; gap: .25rem; margin-left: auto; }
