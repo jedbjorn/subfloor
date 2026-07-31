@@ -27,6 +27,7 @@ from conversation_adapters import (  # noqa: E402
     ConversationContext,
     KimiAdapter,
     NativeTurn,
+    NormalizedEvent,
     OpenCodeAdapter,
     adapter_for,
 )
@@ -724,6 +725,24 @@ class ConversationAdapterTest(unittest.TestCase):
             / "-home-j3d1-Repos-dos-app--sc-worktrees-pln1"
             / "b6321ad5-9363-4529-980d-93a959000968.jsonl",
         )
+
+    def test_claude_success_result_prose_cannot_assert_interruption(self) -> None:
+        adapter, _runner = self.build("claude")
+
+        events = adapter._normalize(
+            {
+                "type": "result",
+                "subtype": "success",
+                "result": "I was mid-orientation when you first interrupted.",
+            }
+        )
+
+        self.assertEqual(events[-1].type, "run.completed")
+        self.assertEqual(events[-1].payload["status"], "completed")
+
+    def test_interrupted_events_require_structured_evidence(self) -> None:
+        with self.assertRaisesRegex(ValueError, "structured native or operator"):
+            NormalizedEvent("run.interrupted", {"status": "interrupted"})
 
     def test_identical_contract_start_stream_interrupt_resume_reconcile(
         self,

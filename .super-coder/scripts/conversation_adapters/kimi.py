@@ -937,6 +937,7 @@ class KimiAdapter(ConversationAdapter):
                 "run.interrupted",
                 {"status": "interrupted"},
                 "turn.cancel" if cancelled else "process.exit",
+                "native" if cancelled else "operator",
             )
             turn.metadata["terminal"] = event.type
             yield event

@@ -553,6 +553,7 @@ class OpenCodeAdapter(ConversationAdapter):
                     "run.interrupted" if interrupted else "run.failed",
                     {"error": name},
                     native_type,
+                    "native" if interrupted else None,
                 )
             ]
         if native_type == "message.part.delta":
@@ -681,6 +682,7 @@ class OpenCodeAdapter(ConversationAdapter):
                 "run.interrupted",
                 {"status": "cancelled"},
                 "operator.interrupt",
+                "operator",
             )
             return
         self._prompt(turn.session_ref, context, message)
@@ -703,6 +705,7 @@ class OpenCodeAdapter(ConversationAdapter):
                                 "run.interrupted",
                                 {"status": "cancelled"},
                                 event.native_type,
+                                "operator",
                             )
                 if event.type in {
                     "run.started",

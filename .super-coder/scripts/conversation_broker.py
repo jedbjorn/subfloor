@@ -23,6 +23,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,9 @@ DEFAULT_HEARTBEAT_SECONDS = 10
 DEFAULT_RECOVERY_SECONDS = 5
 DEFAULT_RECONCILE_ATTEMPTS = 3
 DEFAULT_MAX_WORKERS = 8
+DEFAULT_EVENT_BATCH_SIZE = 64
+DEFAULT_EVENT_BACKLOG_SIZE = 1024
+DEFAULT_EVENT_FLUSH_SECONDS = 0.1
 
 
 class BrokerError(RuntimeError):
@@ -544,17 +548,28 @@ class BrokerStore:
         run_id: int,
         event: NormalizedEvent,
     ) -> int:
-        if event.type in TERMINAL_EVENTS:
-            raise BrokerError(
-                "CONVERSATION_TERMINAL_EVENT_REQUIRES_FINISH",
-                event.type,
-            )
+        return self.append_events(run_id, [event])[0]
+
+    def append_events(
+        self,
+        run_id: int,
+        events: list[NormalizedEvent],
+    ) -> list[int]:
+        """Commit one ordered batch of non-terminal native events."""
+        if not events:
+            return []
+        for event in events:
+            if event.type in TERMINAL_EVENTS:
+                raise BrokerError(
+                    "CONVERSATION_TERMINAL_EVENT_REQUIRES_FINISH",
+                    event.type,
+                )
         con = self.connect()
         now, _ = self._times()
         try:
             with db_driver.write_transaction(
                 con,
-                "conversation.broker.append_event",
+                "conversation.broker.append_events",
             ):
                 row = con.execute(
                     "SELECT conversation_id,trigger_message_id,state "
@@ -568,17 +583,23 @@ class BrokerStore:
                         "CONVERSATION_RUN_TERMINAL",
                         f"run {run_id} is already {row['state']}",
                     )
-                payload = dict(event.payload)
-                if event.native_type:
-                    payload["native_type"] = event.native_type
-                sequence = self._append_event(
-                    con,
-                    conversation_id=row["conversation_id"],
-                    event_type=event.type,
-                    payload=payload,
-                    message_id=row["trigger_message_id"],
-                    run_id=run_id,
-                )
+                sequences = []
+                for event in events:
+                    payload = dict(event.payload)
+                    if event.native_type:
+                        payload["native_type"] = event.native_type
+                    if event.interrupt_evidence:
+                        payload["interrupt_evidence"] = event.interrupt_evidence
+                    sequences.append(
+                        self._append_event(
+                            con,
+                            conversation_id=row["conversation_id"],
+                            event_type=event.type,
+                            payload=payload,
+                            message_id=row["trigger_message_id"],
+                            run_id=run_id,
+                        )
+                    )
                 con.execute(
                     "UPDATE conversations SET last_activity_at=?,"
                     "version=version+1 WHERE conversation_id=?",
@@ -588,7 +609,7 @@ class BrokerStore:
         finally:
             con.close()
         conversation_events.notify(conversation_id)
-        return sequence
+        return sequences
 
     def finish_run(
         self,
@@ -884,6 +905,9 @@ class ConversationBroker(threading.Thread):
         heartbeat_seconds: int = DEFAULT_HEARTBEAT_SECONDS,
         recovery_seconds: int = DEFAULT_RECOVERY_SECONDS,
         reconcile_attempts: int = DEFAULT_RECONCILE_ATTEMPTS,
+        event_batch_size: int = DEFAULT_EVENT_BATCH_SIZE,
+        event_backlog_size: int = DEFAULT_EVENT_BACKLOG_SIZE,
+        event_flush_seconds: float = DEFAULT_EVENT_FLUSH_SECONDS,
     ) -> None:
         super().__init__(name="conversation-broker", daemon=True)
         self.store = store or BrokerStore(db_path)
@@ -896,6 +920,9 @@ class ConversationBroker(threading.Thread):
         self.heartbeat_seconds = heartbeat_seconds
         self.recovery_seconds = recovery_seconds
         self.reconcile_attempts = reconcile_attempts
+        self.event_batch_size = event_batch_size
+        self.event_backlog_size = event_backlog_size
+        self.event_flush_seconds = event_flush_seconds
         self._wake = threading.Event()
         self._stop_event = threading.Event()
         self._active: dict[int, _ActiveRun] = {}
@@ -1024,26 +1051,87 @@ class ConversationBroker(threading.Thread):
             "unknown": "run.unknown",
         }[outcome]
 
-    def _finish_adapter_event(
+    def _retry_busy(
+        self,
+        action: Callable[[], Any],
+        *,
+        wait: bool,
+    ) -> tuple[bool, Any]:
+        """Retry only exhausted SQLite writer acquisition, never native work."""
+        while not self._stop_event.is_set():
+            try:
+                return True, action()
+            except Exception as exc:
+                if not db_driver.is_busy_error(exc):
+                    raise
+                if not wait:
+                    return False, None
+                self._stop_event.wait(min(1.0, self.recovery_seconds))
+        return False, None
+
+    def _flush_events(
         self,
         run_id: int,
+        pending: list[NormalizedEvent],
+        *,
+        wait: bool,
+    ) -> bool:
+        if not pending:
+            return True
+        batch = list(pending)
+        persisted, _result = self._retry_busy(
+            partial(self.store.append_events, run_id, batch),
+            wait=wait,
+        )
+        if persisted:
+            del pending[: len(batch)]
+        return persisted
+
+    def _finish_adapter_event(
+        self,
+        active: _ActiveRun,
         event: NormalizedEvent,
-    ) -> None:
+    ) -> bool:
+        if event.type == "run.failed" and active.interrupt_requested:
+            event = NormalizedEvent(
+                "run.interrupted",
+                {
+                    **dict(event.payload),
+                    "status": "cancelled",
+                    "adapter_terminal": "run.failed",
+                },
+                event.native_type,
+                "operator",
+            )
         outcome = terminal_outcome(event.type)
         error = event.payload.get("error")
         exit_code = event.payload.get("exit_code")
-        self.store.finish_run(
-            run_id,
-            outcome,
-            event_type=event.type,
-            payload={
-                **dict(event.payload),
-                **({"native_type": event.native_type} if event.native_type else {}),
-            },
-            error_code=str(error)[:255] if error else None,
-            error_detail=str(error) if error else None,
-            exit_code=exit_code if isinstance(exit_code, int) else None,
+        persisted, _result = self._retry_busy(
+            partial(
+                self.store.finish_run,
+                active.run.run_id,
+                outcome,
+                event_type=event.type,
+                payload={
+                    **dict(event.payload),
+                    **(
+                        {"native_type": event.native_type}
+                        if event.native_type
+                        else {}
+                    ),
+                    **(
+                        {"interrupt_evidence": event.interrupt_evidence}
+                        if event.interrupt_evidence
+                        else {}
+                    ),
+                },
+                error_code=str(error)[:255] if error else None,
+                error_detail=str(error) if error else None,
+                exit_code=exit_code if isinstance(exit_code, int) else None,
+            ),
+            wait=True,
         )
+        return persisted
 
     def _finish_error(
         self,
@@ -1055,13 +1143,17 @@ class ConversationBroker(threading.Thread):
         code = getattr(exc, "code", "BROKER_RUN_ERROR")
         detail = getattr(exc, "detail", str(exc))
         outcome = "failed" if proven else "unknown"
-        self.store.finish_run(
-            run_id,
-            outcome,
-            event_type=self._terminal_event(outcome),
-            payload={"error": str(code), "detail": str(detail)},
-            error_code=str(code)[:255],
-            error_detail=str(detail),
+        self._retry_busy(
+            partial(
+                self.store.finish_run,
+                run_id,
+                outcome,
+                event_type=self._terminal_event(outcome),
+                payload={"error": str(code), "detail": str(detail)},
+                error_code=str(code)[:255],
+                error_detail=str(detail),
+            ),
+            wait=True,
         )
 
     def _reconcile_loop(
@@ -1090,10 +1182,15 @@ class ConversationBroker(threading.Thread):
                 result = adapter.reconcile(turn, context)
             except Exception as exc:
                 failures += 1
-                self.store.note_reconcile_error(
-                    active.run.run_id,
-                    self.owner,
-                    f"reconcile attempt {failures}: {exc}",
+                reconcile_detail = f"reconcile attempt {failures}: {exc}"
+                self._retry_busy(
+                    partial(
+                        self.store.note_reconcile_error,
+                        active.run.run_id,
+                        self.owner,
+                        reconcile_detail,
+                    ),
+                    wait=True,
                 )
                 if failures >= self.reconcile_attempts:
                     self._finish_error(active.run.run_id, exc, proven=False)
@@ -1103,25 +1200,39 @@ class ConversationBroker(threading.Thread):
 
             if result.outcome == "running" and result.proven:
                 failures = 0
-                self.store.renew_runs(self.owner, [active.run.run_id])
+                self._retry_busy(
+                    partial(
+                        self.store.renew_runs,
+                        self.owner,
+                        [active.run.run_id],
+                    ),
+                    wait=True,
+                )
                 self._stop_event.wait(self.recovery_seconds)
                 continue
             outcome = result.outcome if result.proven else "unknown"
-            self.store.finish_run(
-                active.run.run_id,
-                outcome,
-                event_type=self._terminal_event(outcome),
-                payload={
-                    "reconciled": True,
-                    "proven": result.proven,
-                    "detail": result.detail,
-                },
-                error_code=(
-                    "HARNESS_OUTCOME_UNKNOWN" if outcome == "unknown" else None
+            terminal_payload = {
+                "reconciled": True,
+                "proven": result.proven,
+                "detail": result.detail,
+            }
+            error_code = (
+                "HARNESS_OUTCOME_UNKNOWN" if outcome == "unknown" else None
+            )
+            error_detail = (
+                result.detail if outcome in {"failed", "unknown"} else None
+            )
+            self._retry_busy(
+                partial(
+                    self.store.finish_run,
+                    active.run.run_id,
+                    outcome,
+                    event_type=self._terminal_event(outcome),
+                    payload=terminal_payload,
+                    error_code=error_code,
+                    error_detail=error_detail,
                 ),
-                error_detail=result.detail
-                if outcome in {"failed", "unknown"}
-                else None,
+                wait=True,
             )
             return
 
@@ -1164,18 +1275,54 @@ class ConversationBroker(threading.Thread):
                 self._deliver_interrupt(active)
 
                 terminal = False
+                pending: list[NormalizedEvent] = []
+                last_flush = time.monotonic()
+                retry_after = 0.0
                 try:
                     for event in adapter.stream(turn):
                         if event.type in TERMINAL_EVENTS:
-                            self._finish_adapter_event(run.run_id, event)
-                            terminal = True
+                            if not self._flush_events(
+                                run.run_id,
+                                pending,
+                                wait=True,
+                            ):
+                                return
+                            terminal = self._finish_adapter_event(active, event)
                             break
-                        self.store.append_event(run.run_id, event)
+                        pending.append(event)
+                        now = time.monotonic()
+                        should_flush = (
+                            event.type != "assistant.delta"
+                            or len(pending) >= self.event_batch_size
+                            or now - last_flush >= self.event_flush_seconds
+                        )
+                        force_backpressure = (
+                            len(pending) >= self.event_backlog_size
+                        )
+                        if not should_flush and not force_backpressure:
+                            continue
+                        if now < retry_after and not force_backpressure:
+                            continue
+                        if self._flush_events(
+                            run.run_id,
+                            pending,
+                            wait=force_backpressure,
+                        ):
+                            last_flush = time.monotonic()
+                            retry_after = 0.0
+                        else:
+                            retry_after = now + self.recovery_seconds
                 except Exception:
                     # Exact identities are durable; inspect them rather than
                     # replaying a message after a broken stream.
                     pass
                 if terminal:
+                    return
+                if not self._flush_events(
+                    run.run_id,
+                    pending,
+                    wait=True,
+                ):
                     return
                 self._reconcile_loop(active, context)
                 return
