@@ -72,10 +72,10 @@ def launch_case():
         )
         con.execute(
             "INSERT INTO conversations "
-            "(conversation_id,shell_id,mode,owner_user_id,harness,provider,"
-            "model,effort,worktree,state,creation_idempotency_key,"
+            "(conversation_id,shell_id,owner_user_id,harness,provider,model,"
+            "effort,worktree,state,creation_idempotency_key,"
             "creation_request_hash) "
-            "VALUES (?,1,'normal',1,'codex','openai','gpt-test','high',"
+            "VALUES (?,1,1,'codex','openai','gpt-test','high',"
             "?,'idle','normal-create','normal-hash')",
             ("cv_" + "a" * 32, str(root / ".sc-worktrees" / "dev")),
         )
