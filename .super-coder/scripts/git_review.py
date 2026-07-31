@@ -39,6 +39,10 @@ _READ_ONLY_ENV = {
     "GIT_PAGER": "cat",
     "GIT_TERMINAL_PROMPT": "0",
 }
+_FETCH_ENV = {
+    **_READ_ONLY_ENV,
+    "GIT_OPTIONAL_LOCKS": "1",
+}
 _HEX = frozenset("0123456789abcdef")
 
 
@@ -127,6 +131,30 @@ class CommitSetProjection:
 
 
 @dataclass(frozen=True)
+class WorktreeProjection:
+    branch: str | None
+    head_sha: str
+    base_sha: str | None
+    merge_base_sha: str | None
+    dirty: tuple[FileProjection, ...]
+    branch_files: tuple[FileProjection, ...]
+    commits: tuple[CommitProjection, ...]
+    files_truncated: bool
+    commits_truncated: bool
+    visible_ahead: int
+    behind: int | None
+    base_available: bool
+    fingerprint: str
+    etag: str
+
+
+@dataclass(frozen=True)
+class FetchProjection:
+    fresh: bool
+    error: str | None
+
+
+@dataclass(frozen=True)
 class PatchProjection:
     text: str | None
     sha256: str | None
@@ -210,12 +238,13 @@ def _run_read_process(
     check: bool,
     env: dict[str, str],
     start_new_session: bool,
+    input: bytes | None = None,
 ) -> subprocess.CompletedProcess:
     """Run one Git read in its own group and reap the group on timeout."""
     process = subprocess.Popen(
         args,
         cwd=cwd,
-        stdin=stdin,
+        stdin=subprocess.PIPE if input is not None else stdin,
         stdout=stdout,
         stderr=stderr,
         text=text,
@@ -223,7 +252,10 @@ def _run_read_process(
         start_new_session=start_new_session,
     )
     try:
-        result_stdout, result_stderr = process.communicate(timeout=timeout)
+        result_stdout, result_stderr = process.communicate(
+            input=input,
+            timeout=timeout,
+        )
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -260,28 +292,32 @@ def _run_git(
     timeout: float = GIT_TIMEOUT_SECONDS,
     output_limit: int = _STATUS_OUTPUT_LIMIT,
     allow_truncate: bool = False,
+    ok_returncodes: tuple[int, ...] = (0,),
+    input_bytes: bytes | None = None,
 ) -> tuple[bytes, bool]:
     command = ["git", "-C", str(worktree), "--no-pager", *args]
     try:
-        result = runner(
-            command,
-            cwd=str(worktree),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-            timeout=timeout,
-            check=False,
-            env=_READ_ONLY_ENV,
-            start_new_session=True,
-        )
+        kwargs = {
+            "cwd": str(worktree),
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": False,
+            "timeout": timeout,
+            "check": False,
+            "env": _READ_ONLY_ENV,
+            "start_new_session": True,
+        }
+        if input_bytes is not None:
+            kwargs["input"] = input_bytes
+        result = runner(command, **kwargs)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise GitReadError(
             "REVIEW_TARGET_UNAVAILABLE",
             f"Git read failed: {exc}",
         ) from exc
     stdout = _completed_bytes(result.stdout)
-    if result.returncode != 0:
+    if result.returncode not in ok_returncodes:
         stderr = _completed_bytes(result.stderr).decode("utf-8", errors="replace")
         detail = stderr.strip().splitlines()
         raise GitReadError(
@@ -580,6 +616,53 @@ def _merge_stats(
 def _batches(values: Sequence[str], size: int = 100) -> Iterable[Sequence[str]]:
     for index in range(0, len(values), size):
         yield values[index : index + size]
+
+
+def _ignored_paths(
+    worktree: Path,
+    paths: Sequence[str],
+    *,
+    limits: ReviewLimits,
+    runner: Callable[..., Any],
+) -> set[str]:
+    """Resolve the worktree's effective ignore rules, including tracked paths."""
+    ignored: set[str] = set()
+    candidates = sorted(set(filter(None, paths)))
+    for batch in _batches(candidates):
+        encoded = b"\0".join(
+            path.encode("utf-8", errors="surrogateescape") for path in batch
+        ) + b"\0"
+        payload, _ = _run_git(
+            worktree,
+            ("check-ignore", "--no-index", "-z", "--stdin"),
+            runner=runner,
+            ok_returncodes=(0, 1),
+            input_bytes=encoded,
+        )
+        ignored.update(
+            _decode_path(raw, limits)
+            for raw in payload.split(b"\0")
+            if raw
+        )
+    return ignored
+
+
+def _visible_files(
+    worktree: Path,
+    files: Sequence[FileProjection],
+    *,
+    limits: ReviewLimits,
+    runner: Callable[..., Any],
+) -> list[FileProjection]:
+    candidates = [item.path for item in files]
+    candidates.extend(item.old_path for item in files if item.old_path)
+    ignored = _ignored_paths(worktree, candidates, limits=limits, runner=runner)
+    return [
+        item
+        for item in files
+        if item.path not in ignored
+        and (item.old_path is None or item.old_path not in ignored)
+    ]
 
 
 def _generated_paths(
@@ -932,6 +1015,259 @@ def review_commits(
         commits_truncated=truncated,
         fingerprint=digest,
         etag=etag(digest),
+    )
+
+
+def _commit_paths(
+    worktree: Path,
+    commit_sha: str,
+    *,
+    limits: ReviewLimits,
+    runner: Callable[..., Any],
+) -> tuple[str, ...]:
+    payload, _ = _run_git(
+        worktree,
+        (
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            commit_sha,
+            "--",
+        ),
+        runner=runner,
+    )
+    return tuple(
+        _decode_path(raw, limits) for raw in payload.split(b"\0") if raw
+    )
+
+
+def _path_states(
+    worktree: Path,
+    files: Sequence[FileProjection],
+    *,
+    limits: ReviewLimits,
+    runner: Callable[..., Any],
+) -> list[dict[str, Any]]:
+    """Fingerprint bounded on-disk and index state without exposing contents."""
+    paths = sorted({item.path for item in files})
+    index_payload = b""
+    if paths:
+        index_payload, _ = _run_git(
+            worktree,
+            ("ls-files", "--stage", "-z", "--", *paths),
+            runner=runner,
+        )
+    index_rows: dict[str, list[str]] = {path: [] for path in paths}
+    for raw in index_payload.split(b"\0"):
+        metadata, separator, path_raw = raw.partition(b"\t")
+        if not separator:
+            continue
+        path = _decode_path(path_raw, limits)
+        index_rows.setdefault(path, []).append(
+            metadata.decode("ascii", errors="replace")
+        )
+    states: list[dict[str, Any]] = []
+    for path in paths:
+        candidate = worktree / path
+        try:
+            info = candidate.lstat()
+        except OSError:
+            states.append(
+                {"path": path, "worktree": "missing", "index": index_rows[path]}
+            )
+            continue
+        state: dict[str, Any] = {
+            "path": path,
+            "mode": stat.S_IFMT(info.st_mode),
+            "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns,
+            "index": index_rows[path],
+        }
+        if stat.S_ISLNK(info.st_mode):
+            try:
+                state["link"] = os.readlink(candidate)
+            except OSError:
+                state["link"] = "unavailable"
+        elif stat.S_ISREG(info.st_mode) and info.st_size <= limits.max_patch_bytes:
+            digest = hashlib.sha256()
+            try:
+                with candidate.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(64 * 1024), b""):
+                        digest.update(chunk)
+                state["sha256"] = digest.hexdigest()
+            except OSError:
+                state["sha256"] = "unavailable"
+        states.append(state)
+    return states
+
+
+def project_current_worktree(
+    worktree: str | Path,
+    *,
+    base_ref: str = "refs/remotes/origin/main",
+    limits: ReviewLimits = DEFAULT_LIMITS,
+    runner: Callable[..., Any] = _run_read_process,
+) -> WorktreeProjection:
+    """Project only visible current-worktree changes against remote main."""
+    resolved = _resolve_worktree(worktree)
+    workspace = collect_workspace(resolved, limits=limits, runner=runner)
+    dirty = _visible_files(
+        resolved,
+        workspace.files,
+        limits=limits,
+        runner=runner,
+    )
+    base_sha = _optional_sha(resolved, base_ref, runner=runner)
+    branch_files: list[FileProjection] = []
+    commits: list[CommitProjection] = []
+    merge_base: str | None = None
+    behind: int | None = None
+    files_truncated = workspace.files_truncated
+    commits_truncated = False
+    if base_sha is not None:
+        merge_raw, _ = _run_git(
+            resolved,
+            ("merge-base", base_sha, workspace.head_sha),
+            runner=runner,
+            output_limit=128,
+        )
+        merge_base = merge_raw.decode("ascii", errors="replace").strip().lower()
+        branch_projection = _file_set(
+            resolved,
+            base_sha=base_sha,
+            head_sha=workspace.head_sha,
+            merge_base_sha=merge_base,
+            diff_args=(merge_base, workspace.head_sha),
+            include_untracked=False,
+            limits=limits,
+            runner=runner,
+        )
+        branch_files = _visible_files(
+            resolved,
+            branch_projection.files,
+            limits=limits,
+            runner=runner,
+        )
+        files_truncated = files_truncated or branch_projection.files_truncated
+        all_commits = review_commits(
+            resolved,
+            base_sha,
+            head_ref=workspace.head_sha,
+            limits=limits,
+            runner=runner,
+        )
+        commit_paths = {
+            commit.sha: _commit_paths(
+                resolved,
+                commit.sha,
+                limits=limits,
+                runner=runner,
+            )
+            for commit in all_commits.commits
+        }
+        ignored = _ignored_paths(
+            resolved,
+            [path for paths in commit_paths.values() for path in paths],
+            limits=limits,
+            runner=runner,
+        )
+        commits = [
+            commit
+            for commit in all_commits.commits
+            if any(path not in ignored for path in commit_paths[commit.sha])
+        ]
+        commits_truncated = all_commits.commits_truncated
+        counts_raw, _ = _run_git(
+            resolved,
+            ("rev-list", "--left-right", "--count", f"{workspace.head_sha}...{base_sha}"),
+            runner=runner,
+            output_limit=128,
+        )
+        count_fields = counts_raw.decode("ascii", errors="replace").split()
+        if len(count_fields) == 2:
+            behind = int(count_fields[1])
+    dirty = sorted(dirty, key=lambda item: item.path)[: limits.max_files]
+    branch_files = sorted(branch_files, key=lambda item: item.path)[: limits.max_files]
+    core = {
+        "branch": workspace.branch,
+        "head_sha": workspace.head_sha,
+        "base_sha": base_sha,
+        "merge_base_sha": merge_base,
+        "dirty": [asdict(item) for item in dirty],
+        "branch_files": [asdict(item) for item in branch_files],
+        "commits": [asdict(item) for item in commits],
+        "files_truncated": files_truncated,
+        "commits_truncated": commits_truncated,
+        "behind": behind,
+        "path_states": _path_states(
+            resolved,
+            [*dirty, *branch_files],
+            limits=limits,
+            runner=runner,
+        ),
+    }
+    digest = fingerprint(core)
+    return WorktreeProjection(
+        branch=workspace.branch,
+        head_sha=workspace.head_sha,
+        base_sha=base_sha,
+        merge_base_sha=merge_base,
+        dirty=tuple(dirty),
+        branch_files=tuple(branch_files),
+        commits=tuple(commits),
+        files_truncated=files_truncated,
+        commits_truncated=commits_truncated,
+        visible_ahead=len(commits),
+        behind=behind,
+        base_available=base_sha is not None,
+        fingerprint=digest,
+        etag=etag(digest),
+    )
+
+
+def fetch_origin_main(
+    worktree: str | Path,
+    *,
+    runner: Callable[..., Any] = _run_read_process,
+    timeout: float = 20.0,
+) -> FetchProjection:
+    """Advance only the fixed origin/main tracking ref with a bounded fetch."""
+    resolved = _resolve_worktree(worktree)
+    command = [
+        "git",
+        "-C",
+        str(resolved),
+        "--no-pager",
+        "fetch",
+        "--no-tags",
+        "origin",
+        "+refs/heads/main:refs/remotes/origin/main",
+    ]
+    try:
+        result = runner(
+            command,
+            cwd=str(resolved),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            timeout=timeout,
+            check=False,
+            env=_FETCH_ENV,
+            start_new_session=True,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return FetchProjection(False, f"origin/main fetch failed: {exc}"[:240])
+    if result.returncode == 0:
+        return FetchProjection(True, None)
+    stderr = _completed_bytes(result.stderr).decode("utf-8", errors="replace")
+    detail = stderr.strip().splitlines()
+    return FetchProjection(
+        False,
+        (detail[0][:240] if detail else "origin/main fetch failed"),
     )
 
 

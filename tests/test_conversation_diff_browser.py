@@ -203,6 +203,85 @@ def file_items() -> list[dict]:
     ]
 
 
+def observation_page(*, fresh: bool = True, fingerprint: str = "a" * 64) -> dict:
+    files = file_items()
+    return {
+        "conversation_id": CONVERSATION_ID,
+        "fingerprint": fingerprint,
+        "observed_at": "2026-07-31T12:00:00+00:00",
+        "fetch": {
+            "fresh": fresh,
+            "error": None if fresh else "fixture origin is offline",
+            "base_stale": not fresh,
+        },
+        "status": {
+            "branch": "feat/current-worktree-diff",
+            "head_sha": "b" * 40,
+            "base_sha": "c" * 40,
+            "base_available": True,
+            "dirty_count": len(files),
+            "ahead_count": 1,
+            "behind": 3,
+        },
+        "changes": {
+            "dirty": files,
+            "branch": [files[0], files[1]],
+            "commits": [
+                {
+                    "sha": "d" * 40,
+                    "short_sha": "ddddddd",
+                    "author": "CC",
+                    "authored_at": "2026-07-30T20:30:00Z",
+                    "subject": "Build the current-worktree Diff",
+                }
+            ],
+            "files_truncated": False,
+            "commits_truncated": False,
+        },
+        "shell_files": [
+            {
+                "file_id": "sf_claude",
+                "kind": "boot",
+                "name": "CLAUDE.md",
+                "available": True,
+                "bytes": 24,
+                "sha256": "e" * 64,
+                "paths": ["CLAUDE.md"],
+            },
+            {
+                "file_id": "sf_agents",
+                "kind": "boot",
+                "name": "AGENTS.md",
+                "available": True,
+                "bytes": 22,
+                "sha256": "f" * 64,
+                "paths": ["AGENTS.md"],
+            },
+            {
+                "file_id": "sf_skill_a",
+                "kind": "skill",
+                "name": "git",
+                "available": True,
+                "bytes": 18,
+                "sha256": "1" * 64,
+                "paths": [".claude/skills/git/SKILL.md"],
+                "mismatch": True,
+            },
+            {
+                "file_id": "sf_skill_b",
+                "kind": "skill",
+                "name": "git",
+                "available": True,
+                "bytes": 20,
+                "sha256": "2" * 64,
+                "paths": [".opencode/skills/git/SKILL.md"],
+                "mismatch": True,
+            },
+        ],
+        "no_code_changes": False,
+    }
+
+
 def test_diff_workspace_preserves_live_chat_and_uses_get_only(
     static_ui,
     tmp_path,
@@ -210,7 +289,11 @@ def test_diff_workspace_preserves_live_chat_and_uses_get_only(
     requests: list[tuple[str, str, str]] = []
     conditional_requests: list[str] = []
     browser_errors: list[str] = []
-    remote_state = {"available": True}
+    observation_state = {
+        "fresh": True,
+        "fingerprint": "a" * 64,
+        "remove_path": None,
+    }
     current = conversation()
     messages = [
         {
@@ -221,17 +304,63 @@ def test_diff_workspace_preserves_live_chat_and_uses_get_only(
         }
         for index in range(1, 22)
     ]
+    transcript_page = {
+        "conversation_id": CONVERSATION_ID,
+        "projection_version": 1,
+        "through_sequence": 22,
+        "controls": {
+            "conversation_version": 4,
+            "conversation_state": "running",
+            "queued_count": 0,
+            "active_run_id": 77,
+            "close_requested_at": None,
+        },
+        "items": [
+            {
+                "item_id": f"message:{item['message_id']}",
+                "kind": "user",
+                "order_sequence": item["message_id"],
+                "message_id": item["message_id"],
+                "run_id": None,
+                "created_at": "2026-07-30 20:00:00",
+                "text": item["body"],
+                "state": "completed",
+                "completed_at": "2026-07-30 20:00:01",
+                "text_truncated": False,
+            }
+            for item in messages
+        ] + [
+            {
+                "item_id": "run:77:assistant",
+                "kind": "assistant",
+                "order_sequence": 22,
+                "message_id": 1,
+                "run_id": 77,
+                "created_at": "2026-07-30 20:00:02",
+                "text": "initial",
+                "outcome": None,
+                "first_sequence": 22,
+                "last_sequence": 22,
+                "text_truncated": False,
+            }
+        ],
+        "truncation": None,
+    }
     files = file_items()
     patch = """diff --git a/src/app.js b/src/app.js
 index 1111111..2222222 100644
 --- a/src/app.js
 +++ b/src/app.js
 @@ -1,3 +1,4 @@
- const mode = 'chat';
+const mode = 'chat';
 -const oldValue = false;
 +const reviewOnly = true;
-+const safe = document.createTextNode('patch');
- export { mode };"""
++const safe = document.createTextNode('patch with a deliberately long line for horizontal scroll position preservation across refresh');
+export { mode };"""
+    patch += "\n" + "\n".join(
+        f"+const addedLine{index} = 'scroll proof {index}';"
+        for index in range(80)
+    )
 
     def fulfill(route, payload, *, status=200, headers=None):
         route.fulfill(
@@ -290,6 +419,66 @@ index 1111111..2222222 100644
             return fulfill(route, current)
         if path == f"/api/conversations/{CONVERSATION_ID}/messages":
             return fulfill(route, {"items": messages})
+        if path == f"/api/conversations/{CONVERSATION_ID}/transcript":
+            return fulfill(route, transcript_page)
+        if path == f"/api/conversations/{CONVERSATION_ID}/review-observations":
+            assert request.method == "POST"
+            assert request.headers.get("idempotency-key")
+            observed = observation_page(
+                fresh=observation_state["fresh"],
+                fingerprint=observation_state["fingerprint"],
+            )
+            remove_path = observation_state["remove_path"]
+            if remove_path:
+                for section in ("dirty", "branch"):
+                    observed["changes"][section] = [
+                        item for item in observed["changes"][section]
+                        if item["path"] != remove_path
+                    ]
+                observed["status"]["dirty_count"] = len(
+                    observed["changes"]["dirty"]
+                )
+            return fulfill(route, observed, status=201)
+        if path.endswith("/patch") and "/api/review-observations/" in path:
+            selected_id = query.get("file", [""])[0]
+            selected = next(
+                item for item in file_items() if item["file_id"] == selected_id
+            )
+            binary = selected["binary"]
+            oversized = selected["oversized"]
+            return fulfill(
+                route,
+                {
+                    "fingerprint": observation_state["fingerprint"],
+                    "file_id": selected_id,
+                    "section": "dirty",
+                    "patch": None if binary or oversized else patch,
+                    "sha256": "c" * 64,
+                    "truncated": oversized,
+                    "binary": binary,
+                    "unavailable_reason": "binary" if binary
+                    else "oversized" if oversized
+                    else None,
+                },
+            )
+        if path.endswith("/shell-file") and "/api/review-observations/" in path:
+            selected_id = query.get("file", [""])[0]
+            bodies = {
+                "sf_claude": "# Exact CLAUDE\nplain text\n",
+                "sf_agents": "# Exact AGENTS\nplain text\n",
+                "sf_skill_a": "# Claude git skill\n",
+                "sf_skill_b": "# OpenCode git skill\n",
+            }
+            return fulfill(
+                route,
+                {
+                    "fingerprint": observation_state["fingerprint"],
+                    "file_id": selected_id,
+                    "paths": [selected_id],
+                    "body": bodies[selected_id],
+                    "mismatch": selected_id.startswith("sf_skill"),
+                },
+            )
         if path == f"/api/conversations/{CONVERSATION_ID}/review-targets":
             if (
                 request.headers.get("if-none-match") == '"targets-1"'
@@ -301,7 +490,7 @@ index 1111111..2222222 100644
                     body="",
                 )
             body = target_page()
-            if not remote_state["available"]:
+            if not observation_state["fresh"]:
                 body["freshness"] = {
                     "local": "fresh",
                     "remote": "unavailable",
@@ -422,6 +611,11 @@ index 1111111..2222222 100644
             wait_until="networkidle",
         )
         composer = page.locator(".chat-composer-input")
+        page.wait_for_timeout(500)
+        assert composer.count() == 1, json.dumps(
+            {"requests": requests, "browser_errors": browser_errors},
+            indent=2,
+        )
         composer.fill("unsent draft survives mode changes")
         transcript = page.locator(".chat-transcript")
         page.wait_for_timeout(100)
@@ -438,23 +632,66 @@ index 1111111..2222222 100644
         assert composer.input_value() == "unsent draft survives mode changes"
         assert page.locator(".chat-stop-header").is_visible()
         assert page.locator(".chat-stop-header").is_enabled()
-        assert page.get_by_text("LOCAL BRANCH", exact=True).is_visible()
-        assert page.get_by_text("7 files", exact=False).is_visible()
-        assert page.locator(".review-line-add").count() == 2
+        assert page.get_by_text("ON DISK", exact=True).is_visible()
+        assert page.get_by_text("7 dirty", exact=False).is_visible()
+        initial_observations = sum(
+            method == "POST" and path.endswith("/review-observations")
+            for method, path, _query in requests
+        )
+        page.wait_for_timeout(2200)
+        assert sum(
+            method == "POST" and path.endswith("/review-observations")
+            for method, path, _query in requests
+        ) == initial_observations == 1
+        assert page.locator(".review-line-add").count() >= 82
         assert page.locator(".review-line-delete").count() == 1
         assert page.locator(".status-conflict").count() == 1
         page.get_by_title("assets/logo.bin").click()
         page.get_by_text("Binary file", exact=True).wait_for()
         page.get_by_title("large.txt").click()
-        page.get_by_text("Patch too large", exact=True).wait_for()
+        page.get_by_text("Patch exceeds review limits", exact=True).wait_for()
         page.get_by_title("src/old.js → src/renamed.js").click()
-        page.get_by_text("renamed from src/old.js", exact=True).wait_for()
+        page.get_by_text("src/renamed.js", exact=True).wait_for()
+        page.get_by_title("src/app.js").click()
+        page.locator(".review-patch-wrap").wait_for()
+        scroll_proof = page.locator(".review-patch-wrap").evaluate(
+            "node => { node.scrollTop = 240; node.scrollLeft = 120; "
+            "return {top: node.scrollTop, left: node.scrollLeft}; }"
+        )
+        page.evaluate(
+            "window.__unchangedWorkspace = document.querySelector('.review-workspace')"
+        )
+        before_refresh_observations = sum(
+            method == "POST" and path.endswith("/review-observations")
+            for method, path, _query in requests
+        )
+        page.get_by_role("button", name="Refresh Diff").click()
+        page.wait_for_timeout(150)
+        assert sum(
+            method == "POST" and path.endswith("/review-observations")
+            for method, path, _query in requests
+        ) == before_refresh_observations + 1
+        assert page.evaluate(
+            "window.__unchangedWorkspace === "
+            "document.querySelector('.review-workspace')"
+        )
+        assert page.locator(".review-patch-wrap").evaluate(
+            "node => ({top: node.scrollTop, left: node.scrollLeft})"
+        ) == scroll_proof
+
+        observation_state["fingerprint"] = "b" * 64
+        observation_state["remove_path"] = "src/app.js"
+        page.get_by_role("button", name="Refresh Diff").click()
+        page.get_by_text("src/renamed.js", exact=True).wait_for()
+        assert page.locator(".review-patch-wrap").evaluate(
+            "node => node.scrollTop"
+        ) == 0
         page.screenshot(path=tmp_path / "diff-desktop.png", full_page=True)
 
         page.evaluate(
             """
             window.__fakeEventSources[0].emit('assistant.delta', {
-              sequence: 9001,
+              sequence: 23,
               event_type: 'assistant.delta',
               message_id: 1,
               run_id: 77,
@@ -464,29 +701,25 @@ index 1111111..2222222 100644
             """
         )
         page.get_by_role("tab", name="Commits").click()
-        page.get_by_text("Build the Diff workspace", exact=True).wait_for()
-        page.get_by_role("tab", name="Local only").click()
-        page.locator(".review-file-row").first.wait_for()
-        page.get_by_role("button", name="Hide binary").click()
-        page.locator(".review-target-select").select_option(
-            "gt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-        )
-        page.get_by_text("PR MERGED", exact=True).wait_for()
-        assert page.get_by_text("cleanup pending", exact=False).is_visible()
-        assert page.get_by_text("40 behind base", exact=False).is_visible()
-        page.locator(".review-target-select").select_option(TARGET_ID)
-        remote_state["available"] = False
-        page.get_by_role("button", name="Refresh remote").click()
-        page.get_by_text("Remote unavailable", exact=False).wait_for()
+        page.get_by_text("Build the current-worktree Diff", exact=True).wait_for()
+        page.get_by_role("tab", name="Shell files").click()
+        page.get_by_role("button", name="CLAUDE.md").click()
+        page.locator(".review-shell-file").wait_for()
+        assert "# Exact CLAUDE" in page.locator(".review-shell-file").text_content()
+        assert page.get_by_text("mirror mismatch", exact=True).count() == 2
+
+        observation_state["fresh"] = False
+        page.get_by_role("button", name="Refresh Diff").click()
+        page.get_by_text("Refresh failed: fixture origin is offline", exact=True).wait_for()
+        assert "# Exact CLAUDE" in page.locator(".review-shell-file").text_content()
 
         page.go_back()
         transcript.wait_for()
         page.wait_for_timeout(100)
         assert composer.input_value() == "unsent draft survives mode changes"
-        assert page.get_by_text(
-            "background completion arrived",
-            exact=True,
-        ).is_visible()
+        assert "background completion arrived" in (
+            page.locator(".chat-assistant-body").last.text_content() or ""
+        )
         assert abs(transcript.evaluate("node => node.scrollTop") - scroll_before) <= 1
         assert page.evaluate("window.__fakeEventSources.length") == 1
 
@@ -496,18 +729,18 @@ index 1111111..2222222 100644
         page.screenshot(path=tmp_path / "diff-mobile.png", full_page=True)
 
         current["state"] = "closed"
+        transcript_page["controls"]["conversation_state"] = "closed"
+        transcript_page["controls"]["active_run_id"] = None
         page.reload(wait_until="networkidle")
         page.locator(".review-workspace").wait_for()
         assert page.get_by_role("button", name="Close").is_disabled()
-        assert page.get_by_text("LOCAL BRANCH", exact=True).is_visible()
+        assert page.get_by_text("ON DISK", exact=True).is_visible()
         browser.close()
 
-    review_requests = [
-        item for item in requests if "/review-targets" in item[1]
-    ]
+    review_requests = [item for item in requests if "/review-observations" in item[1]]
     assert review_requests
-    assert {method for method, _path, _query in review_requests} == {"GET"}
-    assert any(path.endswith("/files") for path in conditional_requests)
+    assert {method for method, _path, _query in review_requests} == {"GET", "POST"}
+    assert not conditional_requests
     assert not browser_errors
     assert (tmp_path / "diff-desktop.png").stat().st_size > 10_000
     assert (tmp_path / "diff-mobile.png").stat().st_size > 10_000
@@ -644,6 +877,25 @@ def test_chat_performance_uses_bounded_requests_and_keyed_frames(static_ui):
                             "state": "completed",
                         }
                     ]
+                },
+            )
+        if parsed.path == f"/api/conversations/{CONVERSATION_ID}/review-observations":
+            return fulfill(route, observation_page(), status=201)
+        if (
+            parsed.path.endswith("/patch")
+            and "/api/review-observations/" in parsed.path
+        ):
+            return fulfill(
+                route,
+                {
+                    "fingerprint": "a" * 64,
+                    "file_id": "rf_1",
+                    "section": "dirty",
+                    "patch": "diff --git a/src/app.js b/src/app.js\n+proof\n",
+                    "sha256": "c" * 64,
+                    "truncated": False,
+                    "binary": False,
+                    "unavailable_reason": None,
                 },
             )
         if parsed.path == f"/api/conversations/{CONVERSATION_ID}/review-targets":

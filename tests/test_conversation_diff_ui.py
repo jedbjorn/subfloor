@@ -11,15 +11,21 @@ STYLE = (ROOT / ".super-coder" / "ui" / "style.css").read_text()
 
 def diff_source() -> str:
     return APP[
-        APP.index("const CHAT_REVIEW_POLL_MS"):
+        APP.index("const CHAT_MODES"):
         APP.index("async function renderInterface")
+    ]
+
+
+def current_workspace_source() -> str:
+    return APP[
+        APP.index("function chatReviewWorkspace"):
+        APP.index("async function chatRenderNew")
     ]
 
 
 def test_diff_is_a_deep_linked_coequal_mode_without_rebuilding_chat():
     source = diff_source()
 
-    assert "const CHAT_REVIEW_POLL_MS = 2000" in source
     assert 'const CHAT_MODES = ["chat", "diff"]' in source
     assert "function chatModeHash(" in source
     assert 'mode === "diff" ? "/diff" : ""' in source
@@ -54,79 +60,94 @@ def test_diff_keeps_truthful_header_controls_and_chat_state_alive():
     ]
 
 
-def test_review_client_is_get_only_and_uses_server_issued_identities():
-    source = diff_source()
-    client = source[
-        source.index("async function reviewApi"):
-        source.index("function reviewLifecycleLabel")
-    ]
+def test_review_client_posts_observations_and_reads_only_server_issued_files():
+    source = current_workspace_source()
 
-    assert 'method: "GET"' in client
-    assert '"If-None-Match"' in client
-    assert "response.status === 304" in client
-    assert "Cache-Control" not in client
-    for verb in ("POST", "PATCH", "PUT", "DELETE"):
-        assert f'"{verb}"' not in client
-    assert "/review-targets/${" in source
-    assert "encodeURIComponent(file.path)" in source
+    assert "/review-observations`" in source
+    assert '{ method: "POST", key: requestKey() }' in source
+    assert "selected.file_id" in source
+    assert "encodeURIComponent(selected.file_id)" in source
+    assert "/review-targets/${" not in source
+    assert "encodeURIComponent(file.path)" not in source
     assert "cwd=" not in source
     assert "ref=" not in source
 
 
-def test_workspace_has_targets_scopes_filters_tree_patch_and_commits():
-    source = diff_source()
+def test_workspace_has_current_changes_shell_files_and_manual_refresh():
+    source = current_workspace_source()
 
     for text in (
-        "Review changes",
-        "Local only",
+        "Changes",
+        "Shell files",
+        "Dirty",
+        "Branch",
         "Commits",
         "Filter paths",
-        "Hide viewed",
-        "Hide generated",
-        "Hide binary",
-        "Hide deleted",
-        "Refresh remote",
-        "No review targets yet.",
-        "No files match this scope and filter.",
-        "No commits in this change set.",
+        "Refresh Diff",
+        "No code changes",
+        "No visible ahead commits.",
+        "Remote main unavailable",
+        "mirror mismatch",
     ):
         assert text in source
     for class_name in (
         "review-summary",
-        "review-target-select",
         "review-scope-switch",
         "review-file-tree",
         "review-file-row",
         "review-patch",
         "review-commit-list",
-        "review-typed-state",
     ):
         assert class_name in source
-    assert "function reviewPatchRows" in source
+    assert "reviewTypedState(" in source
+    assert "reviewPatchRows(" in source
+    assert "function reviewPatchRows" in APP
     assert 'document.createTextNode' in APP
-    assert "innerHTML" not in source[source.index("function reviewPatchRows"):]
+    patch_renderer = APP[
+        APP.index("function reviewPatchRows"):
+        APP.index("function reviewFileTree")
+    ]
+    assert "innerHTML" not in patch_renderer
 
 
-def test_viewed_state_is_ephemeral_and_scoped_to_target_fingerprint():
-    source = diff_source()
+def test_diff_observes_once_then_only_refreshes_manually_single_flight():
+    source = current_workspace_source()
 
-    assert "const chatReviewViewed = new Map()" in source
-    assert "function reviewViewedKey(targetId, fingerprint)" in source
-    assert "reviewViewedKey(state.targetId, state.fileFingerprint)" in source
-    assert "viewedFiles().add(file.path)" in source
-    assert "chatReviewViewed.get(key)" in source
+    assert 'mode === "diff" && !state.loaded && !state.loading' in source
+    assert "if (state.refreshInFlight) return" in source
+    assert "state.refreshInFlight = true" in source
+    assert "state.refreshInFlight = false" in source
+    assert "setInterval(" not in source
+    assert "visibilitychange" not in source
+    assert "poll" not in source.lower()
 
 
-def test_local_polling_is_visible_single_flight_and_stops_in_chat():
-    source = diff_source()
+def test_refresh_reconciliation_preserves_selection_and_both_scroll_axes():
+    source = current_workspace_source()
 
-    assert "document.hidden || state.mode !== \"diff\" || state.pollInFlight" in source
-    assert "state.pollInFlight = true" in source
-    assert "finally { state.pollInFlight = false; }" in source
-    assert "setInterval(pollReview, CHAT_REVIEW_POLL_MS)" in source
-    assert "clearInterval(state.pollTimer)" in source
-    assert 'document.addEventListener("visibilitychange", visibilityRefresh)' in source
-    assert 'document.removeEventListener("visibilitychange", visibilityRefresh)' in source
+    for text in (
+        "navigator.scrollTop",
+        "navigator.scrollLeft",
+        "patch.scrollTop",
+        "patch.scrollLeft",
+        "oldSnapshot.fingerprint === next.fingerprint",
+        "stillPresent || nearest",
+        "preservePatch: Boolean(stillPresent)",
+    ):
+        assert text in source
+    unchanged = source[
+        source.index("oldSnapshot.fingerprint === next.fingerprint") - 40:
+        source.index("oldSnapshot.fingerprint === next.fingerprint") + 100
+    ]
+    assert "paint()" not in unchanged
+
+
+def test_shell_file_body_is_exact_text_not_markdown():
+    source = current_workspace_source()
+
+    assert 'textContent: state.shellFile.body' in source
+    assert 'className: "review-shell-file review-patch-wrap"' in source
+    assert "marked.parse" not in source
 
 
 def test_diff_layout_is_full_width_bounded_and_responsive():

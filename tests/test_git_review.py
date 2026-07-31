@@ -120,6 +120,131 @@ class LocalReviewProjectionTest(unittest.TestCase):
         )
         self.assertEqual(projection.etag, f'"{projection.fingerprint}"')
 
+    def test_current_worktree_projection_separates_dirty_branch_and_commits(self) -> None:
+        self.fixture.write("tracked-ignored.txt", "tracked base\n")
+        self.fixture.write("tracked-visible.txt", "visible base\n")
+        self.fixture.commit("tracked ignored base")
+        self.fixture.git("push", "origin", "main")
+        self.fixture.branch("feature/current-worktree")
+        self.fixture.write(
+            ".gitignore",
+            "ignored-untracked.txt\ntracked-ignored.txt\nignored-commit.txt\n",
+        )
+        self.fixture.commit("add current ignore rules")
+        self.fixture.write("ignored-commit.txt", "hidden commit\n")
+        self.fixture.git("add", "-f", "ignored-commit.txt")
+        hidden_sha = self.fixture.commit("ignored only commit")
+        self.fixture.write("visible-commit.txt", "visible commit\n")
+        visible_sha = self.fixture.commit("visible commit")
+        self.fixture.write("tracked-ignored.txt", "hidden dirty\n")
+        self.fixture.write("tracked-visible.txt", "visible unstaged\n")
+        self.fixture.write("ignored-untracked.txt", "hidden untracked\n")
+        self.fixture.write("dirty-staged.txt", "staged\n")
+        self.fixture.git("add", "dirty-staged.txt")
+        self.fixture.write("dirty-untracked.txt", "untracked\n")
+
+        projection = git_review.project_current_worktree(self.fixture.repo)
+
+        self.assertEqual(
+            {item.path for item in projection.dirty},
+            {"dirty-staged.txt", "dirty-untracked.txt", "tracked-visible.txt"},
+        )
+        self.assertEqual(
+            {item.path for item in projection.branch_files},
+            {".gitignore", "visible-commit.txt"},
+        )
+        self.assertEqual(
+            [item.sha for item in projection.commits],
+            [visible_sha, self.fixture.git("rev-parse", "HEAD~2")],
+        )
+        self.assertNotIn(hidden_sha, {item.sha for item in projection.commits})
+        self.assertEqual(projection.visible_ahead, 2)
+        self.assertEqual(projection.behind, 0)
+        self.assertTrue(projection.base_available)
+
+    def test_current_worktree_projection_keeps_conflicted_paths_dirty(self) -> None:
+        self.fixture.build_conflict_case()
+
+        projection = git_review.project_current_worktree(self.fixture.repo)
+        conflict = next(
+            item for item in projection.dirty if item.path == "conflict.txt"
+        )
+
+        self.assertEqual(conflict.status, "conflict")
+        self.assertTrue(conflict.staged)
+        self.assertTrue(conflict.unstaged)
+        self.assertTrue(conflict.conflict)
+
+    def test_ignored_only_commit_and_dirty_state_are_no_code_changes(self) -> None:
+        self.fixture.write("tracked.txt", "base\n")
+        self.fixture.commit("tracked base")
+        self.fixture.write(".gitignore", "tracked.txt\nhidden.txt\n")
+        self.fixture.commit("ignore policy")
+        self.fixture.git("push", "origin", "main")
+        self.fixture.branch("feature/ignored-only")
+        self.fixture.write("hidden.txt", "committed but hidden\n")
+        self.fixture.git("add", "-f", "hidden.txt")
+        self.fixture.commit("hidden commit")
+        self.fixture.write("tracked.txt", "dirty but hidden\n")
+
+        projection = git_review.project_current_worktree(self.fixture.repo)
+
+        self.assertEqual(projection.dirty, ())
+        self.assertEqual(projection.branch_files, ())
+        self.assertEqual(projection.commits, ())
+        self.assertEqual(projection.visible_ahead, 0)
+        self.assertEqual(projection.behind, 0)
+
+    def test_projection_uses_merge_base_for_diverged_and_detached_heads(self) -> None:
+        self.fixture.branch("feature/diverged")
+        self.fixture.write("topic.txt", "topic\n")
+        topic_sha = self.fixture.commit("topic")
+        self.fixture.checkout("main")
+        self.fixture.write("remote-main.txt", "remote\n")
+        self.fixture.commit("advance remote main")
+        self.fixture.git("push", "origin", "main")
+        self.fixture.checkout("feature/diverged")
+        self.fixture.git("fetch", "origin", "main")
+        self.fixture.git("checkout", "--detach", topic_sha)
+
+        projection = git_review.project_current_worktree(self.fixture.repo)
+
+        self.assertIsNone(projection.branch)
+        self.assertEqual(projection.behind, 1)
+        self.assertEqual(projection.visible_ahead, 1)
+        self.assertEqual(
+            {item.path for item in projection.branch_files},
+            {"topic.txt"},
+        )
+        self.assertNotIn(
+            "remote-main.txt",
+            {item.path for item in projection.branch_files},
+        )
+
+    def test_origin_main_fetch_is_fixed_bounded_and_failure_tolerant(self) -> None:
+        calls = []
+
+        def runner(args, **kwargs):
+            calls.append((args, kwargs))
+            return subprocess.CompletedProcess(args, 1, b"", b"offline\n")
+
+        result = git_review.fetch_origin_main(self.fixture.repo, runner=runner)
+
+        self.assertFalse(result.fresh)
+        self.assertEqual(result.error, "offline")
+        self.assertEqual(
+            calls[0][0][-4:],
+            [
+                "fetch",
+                "--no-tags",
+                "origin",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ],
+        )
+        self.assertEqual(calls[0][1]["timeout"], 20.0)
+        self.assertEqual(calls[0][1]["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(calls[0][1]["env"]["GIT_OPTIONAL_LOCKS"], "1")
+
     def test_workspace_projects_all_bounded_file_states(self) -> None:
         self.fixture.build_file_state_case()
 

@@ -2441,7 +2441,6 @@ const CHAT_FLAVOR_ORDER = [
 ];
 const CHAT_CONFIGURE_ROUTE = "configure";
 const CHAT_HISTORY_POLL_MS = 2000;
-const CHAT_REVIEW_POLL_MS = 2000;
 const CHAT_MODES = ["chat", "diff"];
 let chatRouteShell = "";
 let chatRouteConversation = "";
@@ -2454,7 +2453,6 @@ let chatModeController = null;
 let chatReviewCleanup = null;
 let chatConfiguration = null;
 let chatConfigurationPromise = null;
-const chatReviewViewed = new Map();
 
 function chatLoadConfiguration() {
   if (chatConfiguration) return Promise.resolve(chatConfiguration);
@@ -2723,23 +2721,16 @@ function chatCreateConversation(shell, fields = {}) {
   );
 }
 
-async function reviewApi(path, etagValue = "") {
-  const headers = etagValue ? { "If-None-Match": etagValue } : {};
+async function reviewObservationApi(path, { method = "GET", key = "" } = {}) {
+  const headers = key ? { "Idempotency-Key": key } : {};
   let response;
   try {
-    response = await fetch("/api" + path, { method: "GET", headers });
+    response = await fetch("/api" + path, { method, headers });
   } catch (cause) {
-    const error = new Error("Review data could not be reached.");
-    error.code = "REVIEW_REMOTE_UNAVAILABLE";
+    const error = new Error("Diff observation could not be reached.");
+    error.code = "REVIEW_TARGET_UNAVAILABLE";
     error.cause = cause;
     throw error;
-  }
-  if (response.status === 304) {
-    return {
-      notModified: true,
-      etag: response.headers.get("ETag") || etagValue,
-      data: null,
-    };
   }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -2750,34 +2741,7 @@ async function reviewApi(path, etagValue = "") {
     error.status = response.status;
     throw error;
   }
-  return {
-    notModified: false,
-    etag: response.headers.get("ETag") || "",
-    data,
-  };
-}
-
-function reviewLifecycleLabel(lifecycle) {
-  return {
-    local: "LOCAL BRANCH",
-    local_branch: "LOCAL BRANCH",
-    pushed: "PUSHED",
-    pr_open: "PR OPEN",
-    checks_failed: "CHECKS FAILED",
-    pr_merged: "PR MERGED",
-    pr_closed: "PR CLOSED",
-    remote_unknown: "REMOTE UNKNOWN",
-  }[lifecycle] || String(lifecycle || "LOCAL BRANCH").replaceAll("_", " ").toUpperCase();
-}
-
-function reviewTargetLabel(target) {
-  if (target.pr_number)
-    return `PR #${target.pr_number} · ${target.branch || "branch unavailable"} · `
-      + reviewLifecycleLabel(target.lifecycle).toLowerCase();
-  if (target.kind === "workspace")
-    return `Live workspace · ${target.branch || "detached HEAD"}`;
-  return `Branch ${target.branch || "detached HEAD"} · `
-    + reviewLifecycleLabel(target.lifecycle).toLowerCase();
+  return data;
 }
 
 function reviewObservedLabel(value) {
@@ -2786,10 +2750,6 @@ function reviewObservedLabel(value) {
   return Number.isNaN(parsed.getTime())
     ? `observed ${value}`
     : `observed ${parsed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
-}
-
-function reviewViewedKey(targetId, fingerprint) {
-  return `${targetId}:${fingerprint || "unknown"}`;
 }
 
 function reviewTypedState(title, detail = "", tone = "") {
@@ -2903,577 +2863,426 @@ function reviewFileTree(files, selectedPath, viewed, onSelect) {
 function chatReviewWorkspace(host, conversation) {
   const state = {
     mode: "chat",
+    snapshot: null,
     loaded: false,
-    loadingTargets: false,
-    loadingContent: false,
-    pollInFlight: false,
-    pollTimer: null,
+    loading: false,
+    refreshInFlight: false,
     requestGeneration: 0,
-    responseCache: new Map(),
-    targetsEtag: "",
-    gitFingerprint: "",
-    targets: [],
-    targetId: "",
-    targetFingerprint: "",
-    freshness: null,
-    scope: "review",
-    files: [],
-    fileFingerprint: "",
-    filesTruncated: false,
+    group: "changes",
+    section: "dirty",
     selectedPath: "",
-    patch: null,
-    patchError: null,
-    patchLoading: false,
-    commits: [],
-    commitsTruncated: false,
     pathFilter: "",
     statusFilter: "",
-    hideViewed: false,
-    hideGenerated: false,
-    hideBinary: false,
-    hideDeleted: false,
+    patch: null,
+    shellFile: null,
+    contentLoading: false,
+    contentError: null,
     error: null,
+    refreshWarning: "",
   };
+  let refreshButton = null;
 
-  const selectedTarget = () =>
-    state.targets.find((target) => target.target_id === state.targetId) || null;
-  const selectedFile = () =>
-    state.files.find((file) => file.path === state.selectedPath) || null;
-  const viewedFiles = () => {
-    const key = reviewViewedKey(state.targetId, state.fileFingerprint);
-    if (!chatReviewViewed.has(key)) chatReviewViewed.set(key, new Set());
-    return chatReviewViewed.get(key);
+  const sectionFiles = (snapshot = state.snapshot) => {
+    if (!snapshot || state.group !== "changes") return [];
+    if (state.section === "dirty") return snapshot.changes.dirty || [];
+    if (state.section === "branch") return snapshot.changes.branch || [];
+    return [];
   };
-
-  const targetFacts = (target) => {
-    if (!target) return [];
-    const facts = [];
-    if (target.facts?.dirty) facts.push("dirty workspace");
-    if (target.facts?.ahead) facts.push(`${target.facts.ahead} unpushed commit${target.facts.ahead === 1 ? "" : "s"}`);
-    if (target.facts?.behind) facts.push(`${target.facts.behind} behind base`);
-    if (target.facts?.cleanup_pending) facts.push("cleanup pending");
-    if (target.facts?.pushed === false && target.kind !== "pull_request")
-      facts.push("not pushed");
-    if (target.freshness?.remote === "cached") facts.push("cached remote");
-    return facts;
+  const shellFiles = (snapshot = state.snapshot) => snapshot?.shell_files || [];
+  const itemPath = (item) => state.group === "shell"
+    ? (item.paths || []).join("\n")
+    : item.path;
+  const selectedItem = () => {
+    const items = state.group === "shell" ? shellFiles() : sectionFiles();
+    return items.find((item) => itemPath(item) === state.selectedPath) || null;
   };
-
-  const patchBody = () => {
-    const file = selectedFile();
-    if (!file) return reviewTypedState(
-      "Select a file",
-      "Choose a path from the navigator to read its bounded patch.",
-    );
-    if (state.patchLoading) return reviewTypedState("Loading patch…", file.path);
-    if (state.patchError) {
-      const code = state.patchError.code || "REVIEW_TARGET_UNAVAILABLE";
-      return reviewTypedState(code, state.patchError.message, "error");
-    }
-    if (!state.patch) return reviewTypedState("Patch unavailable", file.path);
-    if (state.patch.binary || file.binary)
-      return reviewTypedState("Binary file", "Raw binary bytes are never transported.");
-    if (!state.patch.patch) {
-      const reason = state.patch.unavailable_reason || "unavailable";
-      return reviewTypedState(
-        reason === "oversized" ? "Patch too large" : "Patch unavailable",
-        reason === "oversized"
-          ? "The file remains listed, but its patch exceeds the review limit."
-          : `No textual patch is available (${reason}).`,
-      );
-    }
-    const wrapper = el("div", { className: "review-patch-wrap" });
-    if (state.patch.truncated)
-      wrapper.append(reviewTypedState(
-        "Patch truncated",
-        "Showing the bounded portion returned by the server.",
-        "warning",
-      ));
-    wrapper.append(reviewPatchRows(state.patch.patch));
-    return wrapper;
-  };
-
-  const commitBody = () => {
-    if (state.error)
-      return reviewTypedState(
-        state.error.code || "REVIEW_TARGET_UNAVAILABLE",
-        state.error.message,
-        "error",
-      );
-    if (state.loadingContent)
-      return reviewTypedState("Loading commits…", "Reading the bounded change history.");
-    if (!state.commits.length)
-      return reviewTypedState("No commits in this change set.");
-    const list = el("div", { className: "review-commit-list" });
-    for (const commit of state.commits) {
-      list.append(el("article", { className: "review-commit" },
-        el("code", {}, commit.short_sha),
-        el("div", { className: "review-commit-main" },
-          el("strong", {}, commit.subject),
-          el("span", {}, `${commit.author} · ${commit.authored_at}`))));
-    }
-    if (state.commitsTruncated)
-      list.append(reviewTypedState(
-        "Commit list truncated",
-        "The server returned its bounded commit projection.",
-        "warning",
-      ));
-    return list;
-  };
-
-  const filteredFiles = () => {
-    const needle = state.pathFilter.trim().toLowerCase();
-    const viewed = viewedFiles();
-    return state.files.filter((file) =>
-      (!needle || file.path.toLowerCase().includes(needle))
-      && (!state.statusFilter || file.status === state.statusFilter)
-      && (!state.hideViewed || !viewed.has(file.path))
-      && (!state.hideGenerated || !file.generated)
-      && (!state.hideBinary || !file.binary)
-      && (!state.hideDeleted || file.status !== "deleted"));
-  };
-
-  const toggleFilter = (label, key) => {
-    const button = el("button", {
-      className: `review-filter-toggle${state[key] ? " active" : ""}`,
-      type: "button",
-      textContent: label,
-      ariaPressed: String(state[key]),
-    });
-    button.onclick = () => {
-      state[key] = !state[key];
-      paint();
+  const visibleFiles = () => sectionFiles().filter((file) => {
+    if (state.pathFilter
+      && !file.path.toLowerCase().includes(state.pathFilter.toLowerCase())) return false;
+    if (state.statusFilter && file.status !== state.statusFilter) return false;
+    return true;
+  });
+  const capturePosition = () => {
+    const navigator = $(".review-file-tree", host);
+    const patch = $(".review-patch-wrap", host);
+    return {
+      navigatorTop: navigator?.scrollTop || 0,
+      navigatorLeft: navigator?.scrollLeft || 0,
+      patchTop: patch?.scrollTop || 0,
+      patchLeft: patch?.scrollLeft || 0,
     };
+  };
+  const restorePosition = (position, preservePatch) => queueMicrotask(() => {
+    const navigator = $(".review-file-tree", host);
+    if (navigator) {
+      navigator.scrollTop = position?.navigatorTop || 0;
+      navigator.scrollLeft = position?.navigatorLeft || 0;
+    }
+    const patch = $(".review-patch-wrap", host);
+    if (patch && preservePatch) {
+      patch.scrollTop = position?.patchTop || 0;
+      patch.scrollLeft = position?.patchLeft || 0;
+    }
+  });
+  const typedError = (error) => reviewTypedState(
+    error?.code || "REVIEW_TARGET_UNAVAILABLE",
+    error?.message || "Diff is unavailable.",
+    "error",
+  );
+  const tabButton = (value, label, active, onclick) => {
+    const button = el("button", {
+      type: "button",
+      role: "tab",
+      className: active === value ? "active" : "",
+      ariaSelected: String(active === value),
+      textContent: label,
+    });
+    button.onclick = onclick;
     return button;
   };
 
-  const selectReviewFile = (file) => {
-    if (!file) return;
-    state.selectedPath = file.path;
-    viewedFiles().add(file.path);
-    loadPatch(file);
-    paint();
-  };
-
   const paint = () => {
-    if (state.mode !== "diff") return;
-    if (state.loadingTargets && !state.loaded) {
+    if (!state.loaded && state.loading) {
       host.replaceChildren(reviewTypedState(
-        "Loading review workspace…",
-        "Reading local Git state and cached pull-request evidence.",
+        "Observing current worktree…",
+        "Fetching origin/main once and reading the selected shell.",
       ));
       return;
     }
-    if (state.error && !state.targets.length) {
-      const retry = el("button", {
-        className: "act",
-        type: "button",
-        textContent: "Retry",
-      });
-      retry.onclick = () => loadTargets();
-      host.replaceChildren(reviewTypedState(
-        state.error.code || "REVIEW_TARGET_UNAVAILABLE",
-        state.error.message,
-        "error",
-      ), retry);
+    if (!state.snapshot) {
+      host.replaceChildren(state.error ? typedError(state.error) : reviewTypedState(
+        "Diff unavailable",
+        "Select Refresh Diff to try the current shell again.",
+      ));
       return;
     }
-    if (!state.targets.length) {
-      const refresh = el("button", {
-        className: "act",
-        type: "button",
-        textContent: "Refresh remote",
-      });
-      refresh.onclick = () => loadTargets({ remote: true });
-      host.replaceChildren(reviewTypedState(
-        "No review targets yet.",
-        "The selected conversation has no observed branch, workspace change, or pull request.",
-      ), refresh);
-      return;
-    }
-
-    const target = selectedTarget();
-    const targetSelect = el("select", {
-      className: "review-target-select",
-      ariaLabel: "Review target",
-    });
-    for (const item of state.targets)
-      targetSelect.append(el("option", {
-        value: item.target_id,
-        selected: item.target_id === state.targetId,
-        textContent: reviewTargetLabel(item),
-      }));
-    targetSelect.onchange = () => {
-      state.targetId = targetSelect.value;
-      state.targetFingerprint = selectedTarget()?.fingerprint || "";
-      state.scope = "review";
-      state.selectedPath = "";
-      state.patch = null;
-      state.commits = [];
-      loadContent();
-    };
-    const status = el("span", {
-      className: `review-lifecycle lifecycle-${target?.lifecycle || "local"}`,
-    }, reviewLifecycleLabel(target?.lifecycle));
-    const refresh = el("button", {
-      className: "act review-refresh",
+    const snapshot = state.snapshot;
+    const status = snapshot.status || {};
+    const facts = [
+      status.branch || `detached ${String(status.head_sha || "").slice(0, 8)}`,
+      `${status.dirty_count || 0} dirty`,
+      `${status.ahead_count || 0} ahead`,
+    ];
+    if (status.behind) facts.push(`${status.behind} behind origin/main`);
+    const warning = state.refreshWarning
+      || (!snapshot.fetch?.fresh && snapshot.fetch?.base_stale
+        ? "Fetch failed; this observation uses stale origin/main."
+        : !status.base_available
+          ? "Remote main unavailable; only Dirty can be inspected."
+          : "");
+    refreshButton = el("button", {
       type: "button",
-      textContent: state.loadingTargets ? "Refreshing…" : "Refresh remote",
-      disabled: state.loadingTargets,
+      className: "act review-refresh",
+      textContent: state.refreshInFlight ? "Refreshing…" : "Refresh Diff",
+      disabled: state.refreshInFlight,
     });
-    refresh.onclick = () => loadTargets({ remote: true });
-    const facts = targetFacts(target);
-    if (state.scope !== "commits" && !state.loadingContent) {
-      const additions = state.files.reduce(
-        (total, file) => total + (file.additions || 0), 0);
-      const deletions = state.files.reduce(
-        (total, file) => total + (file.deletions || 0), 0);
-      facts.push(`${state.files.length} file${state.files.length === 1 ? "" : "s"}`);
-      if (additions || deletions) facts.push(`+${additions} −${deletions}`);
-    }
-    const remoteWarning = state.freshness?.remote === "unavailable"
-      ? `Remote unavailable${state.freshness.remote_error
-        ? ` — ${state.freshness.remote_error}` : ""}. Local and cached evidence remain readable.`
-      : "";
+    refreshButton.onclick = () => observe(true);
     const summary = el("div", { className: "review-summary" },
       el("div", { className: "review-target-control" },
-        el("label", { className: "k" }, "Change set"),
-        targetSelect),
+        el("label", { className: "k" }, "Current worktree"),
+        el("strong", {}, facts[0])),
       el("div", { className: "review-lifecycle-block" },
-        status,
-        el("span", { className: "review-facts" }, facts.join(" · ") || "clean local state")),
+        el("span", { className: "review-lifecycle lifecycle-local" }, "ON DISK"),
+        el("span", { className: "review-facts" }, facts.slice(1).join(" · "))),
       el("div", { className: "review-freshness" },
-        el("span", {}, reviewObservedLabel(target?.last_seen_at)),
-        remoteWarning ? el("span", { className: "warning" }, remoteWarning) : null),
-      refresh);
-
-    const scopeSwitch = el("div", {
-      className: "review-scope-switch",
+        el("span", {}, reviewObservedLabel(snapshot.observed_at)),
+        el("span", {
+          className: "warning review-refresh-warning",
+          textContent: warning,
+          hidden: !warning,
+        })),
+      refreshButton);
+    const groupSwitch = el("div", {
+      className: "review-scope-switch review-group-switch",
       role: "tablist",
-      ariaLabel: "Comparison scope",
-    });
-    for (const [value, label] of [
-      ["review", "Review changes"],
-      ["local", "Local only"],
-      ["commits", "Commits"],
-    ]) {
-      const button = el("button", {
-        className: value === state.scope ? "active" : "",
-        type: "button",
-        role: "tab",
-        ariaSelected: String(value === state.scope),
-        textContent: label,
-      });
-      button.onclick = () => {
-        if (state.scope === value) return;
-        state.scope = value;
-        state.selectedPath = "";
-        state.patch = null;
-        state.error = null;
-        loadContent();
-      };
-      scopeSwitch.append(button);
-    }
-
-    const workspace = el("div", { className: "review-workspace" }, summary, scopeSwitch);
-    if (state.scope === "commits") {
-      workspace.append(el("div", { className: "review-commits-pane" }, commitBody()));
-      host.replaceChildren(workspace);
-      return;
-    }
-
-    const pathInput = el("input", {
-      type: "search",
-      className: "review-path-filter",
-      placeholder: "Filter paths",
-      value: state.pathFilter,
-    });
-    pathInput.oninput = () => {
-      const start = pathInput.selectionStart;
-      state.pathFilter = pathInput.value;
+      ariaLabel: "Diff section",
+    },
+    tabButton("changes", "Changes", state.group, () => {
+      if (state.group === "changes") return;
+      state.group = "changes";
+      state.section = "dirty";
+      state.selectedPath = sectionFiles()[0]?.path || "";
+      state.patch = null;
+      state.shellFile = null;
+      state.contentError = null;
       paint();
-      const next = $(".review-path-filter", host);
-      next?.focus();
-      next?.setSelectionRange(start, start);
-    };
-    const statuses = [...new Set(state.files.map((file) => file.status))].sort();
-    const statusSelect = el("select", {
-      className: "review-status-filter",
-      ariaLabel: "File status",
-    }, el("option", { value: "", textContent: "All statuses" }));
-    for (const value of statuses)
-      statusSelect.append(el("option", {
+      loadSelected();
+    }),
+    tabButton("shell", "Shell files", state.group, () => {
+      if (state.group === "shell") return;
+      state.group = "shell";
+      state.selectedPath = itemPath(
+        shellFiles().find((file) => file.available) || {},
+      );
+      state.patch = null;
+      state.shellFile = null;
+      state.contentError = null;
+      paint();
+      loadSelected();
+    }));
+    const workspace = el("div", {
+      className: `review-workspace review-workspace-${state.group}`,
+    }, summary, groupSwitch);
+
+    if (state.group === "changes") {
+      const sectionSwitch = el("div", {
+        className: "review-scope-switch review-change-switch",
+        role: "tablist",
+        ariaLabel: "Changes view",
+      });
+      for (const [value, label] of [
+        ["dirty", "Dirty"], ["branch", "Branch"], ["commits", "Commits"],
+      ]) sectionSwitch.append(tabButton(value, label, state.section, () => {
+        if (state.section === value) return;
+        state.section = value;
+        state.selectedPath = value === "commits" ? "" : sectionFiles()[0]?.path || "";
+        state.patch = null;
+        state.contentError = null;
+        paint();
+        loadSelected();
+      }));
+      workspace.append(sectionSwitch);
+      if (state.section === "commits") {
+        const commits = snapshot.changes.commits || [];
+        const body = el("div", { className: "review-commits-pane" });
+        if (!commits.length) body.append(reviewTypedState("No visible ahead commits."));
+        else {
+          const list = el("div", { className: "review-commit-list" });
+          for (const commit of commits) list.append(el("article", { className: "review-commit" },
+            el("code", {}, commit.short_sha),
+            el("div", { className: "review-commit-main" },
+              el("strong", {}, commit.subject),
+              el("span", {}, `${commit.author} · ${reviewObservedLabel(commit.authored_at)}`))));
+          body.append(list);
+        }
+        workspace.append(body);
+        host.replaceChildren(workspace);
+        return;
+      }
+      const pathInput = el("input", {
+        type: "search",
+        className: "review-path-filter",
+        placeholder: "Filter paths",
+        value: state.pathFilter,
+      });
+      pathInput.oninput = () => {
+        const start = pathInput.selectionStart;
+        state.pathFilter = pathInput.value;
+        paint();
+        const next = $(".review-path-filter", host);
+        next?.focus();
+        next?.setSelectionRange(start, start);
+      };
+      const statuses = [...new Set(sectionFiles().map((file) => file.status))].sort();
+      const statusSelect = el("select", {
+        className: "review-status-filter",
+        ariaLabel: "File status",
+      }, el("option", { value: "", textContent: "All statuses" }));
+      for (const value of statuses) statusSelect.append(el("option", {
         value,
         selected: value === state.statusFilter,
         textContent: value,
       }));
-    statusSelect.onchange = () => {
-      state.statusFilter = statusSelect.value;
-      paint();
-    };
-    const filters = el("div", { className: "review-filters" },
-      pathInput,
-      statusSelect,
-      toggleFilter("Hide viewed", "hideViewed"),
-      toggleFilter("Hide generated", "hideGenerated"),
-      toggleFilter("Hide binary", "hideBinary"),
-      toggleFilter("Hide deleted", "hideDeleted"));
-    const visibleFiles = filteredFiles();
-    const viewed = viewedFiles();
-    const navigator = el("aside", { className: "review-navigator" }, filters);
-    if (state.error) {
-      navigator.append(reviewTypedState(
-        state.error.code || "REVIEW_TARGET_UNAVAILABLE",
-        state.error.message,
-        "error",
+      statusSelect.onchange = () => {
+        state.statusFilter = statusSelect.value;
+        paint();
+      };
+      const navigator = el("aside", { className: "review-navigator" },
+        el("div", { className: "review-filters" }, pathInput, statusSelect));
+      const files = visibleFiles();
+      if (!files.length) navigator.append(reviewTypedState(
+        snapshot.no_code_changes ? "No code changes" : `No ${state.section} changes.`,
       ));
-    } else if (state.loadingContent) {
-      navigator.append(reviewTypedState("Loading files…"));
-    } else if (!visibleFiles.length) {
-      navigator.append(reviewTypedState("No files match this scope and filter."));
-    } else {
-      navigator.append(reviewFileTree(
-        visibleFiles,
+      else navigator.append(reviewFileTree(
+        files,
         state.selectedPath,
-        viewed,
-        selectReviewFile,
+        new Set(),
+        (file) => selectItem(file),
       ));
-    }
-    if (state.filesTruncated)
-      navigator.append(reviewTypedState(
-        "File list truncated",
-        "The server returned its bounded file projection.",
+      const selected = selectedItem();
+      const patchHead = el("div", { className: "review-patch-head" },
+        el("strong", {}, selected?.path || "Patch"),
+        el("span", {}, state.section === "dirty"
+          ? "staged, unstaged, conflicted, or untracked relative to HEAD"
+          : "merge-base(origin/main, HEAD) through HEAD"));
+      let patchBody;
+      if (state.contentError) patchBody = typedError(state.contentError);
+      else if (state.contentLoading) patchBody = reviewTypedState("Loading patch…");
+      else if (!selected) patchBody = reviewTypedState("Select a changed file.");
+      else if (!state.patch) patchBody = reviewTypedState("Patch unavailable.");
+      else if (state.patch.binary) patchBody = reviewTypedState("Binary file", "Binary bytes are never transported.");
+      else if (state.patch.truncated) patchBody = reviewTypedState(
+        "Patch exceeds review limits",
+        state.patch.unavailable_reason || "The bounded patch cannot be displayed.",
         "warning",
-      ));
-    const selected = selectedFile();
-    const selectedIndex = visibleFiles.findIndex(
-      (file) => file.path === state.selectedPath);
-    const previousFile = selectedIndex > 0 ? visibleFiles[selectedIndex - 1] : null;
-    const nextFile = selectedIndex >= 0 && selectedIndex < visibleFiles.length - 1
-      ? visibleFiles[selectedIndex + 1] : null;
-    const previous = el("button", {
-      type: "button",
-      className: "review-file-step",
-      textContent: "↑",
-      title: "Previous file",
-      ariaLabel: "Previous file",
-      disabled: !previousFile,
-    });
-    previous.onclick = () => selectReviewFile(previousFile);
-    const next = el("button", {
-      type: "button",
-      className: "review-file-step",
-      textContent: "↓",
-      title: "Next file",
-      ariaLabel: "Next file",
-      disabled: !nextFile,
-    });
-    next.onclick = () => selectReviewFile(nextFile);
-    const patchHead = el("div", { className: "review-patch-head" },
-      el("strong", {}, selected?.path || "Patch"),
-      selected?.old_path
-        ? el("span", {}, `renamed from ${selected.old_path}`)
-        : el("span", {}, state.scope === "local"
-          ? "local changes absent from selected head"
-          : "merge-base / canonical review patch"),
-      el("div", { className: "review-file-steps" }, previous, next));
-    const patchPane = el("section", { className: "review-patch-pane" },
-      patchHead, patchBody());
-    workspace.append(el("div", { className: "review-body" }, navigator, patchPane));
+      );
+      else {
+        patchBody = el("div", { className: "review-patch-wrap" });
+        patchBody.append(reviewPatchRows(state.patch.patch || ""));
+      }
+      workspace.append(el("div", { className: "review-body" }, navigator,
+        el("section", { className: "review-patch-pane" }, patchHead, patchBody)));
+    } else {
+      const navigator = el("aside", { className: "review-navigator" });
+      const list = el("div", { className: "review-file-tree review-shell-tree" });
+      for (const file of shellFiles()) {
+        const key = itemPath(file);
+        const row = el("button", {
+          type: "button",
+          className: `review-file-row${key === state.selectedPath ? " selected" : ""}`,
+          disabled: !file.available,
+          title: (file.paths || []).join("\n"),
+        },
+        el("span", { className: "review-file-status" }, file.available ? "R" : "!"),
+        el("span", { className: "review-file-path" }, file.name),
+        el("span", { className: "review-file-counts" },
+          file.mismatch ? "mirror mismatch" : (file.paths || []).join(" · ")));
+        row.onclick = () => selectItem(file);
+        list.append(row);
+        if (!file.available) list.append(reviewTypedState(
+          file.error || "Unavailable",
+          (file.paths || []).join(" · "),
+          "warning",
+        ));
+      }
+      navigator.append(list);
+      const selected = selectedItem();
+      const head = el("div", { className: "review-patch-head" },
+        el("strong", {}, selected?.name || "Shell file"),
+        el("span", {}, selected ? (selected.paths || []).join(" · ") : "Read-only exact text"));
+      let body;
+      if (state.contentError) body = typedError(state.contentError);
+      else if (state.contentLoading) body = reviewTypedState("Loading shell file…");
+      else if (!selected) body = reviewTypedState("Select an available Shell file.");
+      else if (!state.shellFile) body = reviewTypedState("Shell file unavailable.");
+      else body = el("pre", {
+        className: "review-shell-file review-patch-wrap",
+        textContent: state.shellFile.body,
+      });
+      workspace.append(el("div", { className: "review-body" }, navigator,
+        el("section", { className: "review-patch-pane" }, head, body)));
+    }
     host.replaceChildren(workspace);
   };
 
-  const readReviewResource = async (path) => {
-    const cached = state.responseCache.get(path);
-    const result = await reviewApi(path, cached?.etag || "");
-    if (result.notModified) {
-      if (!cached) {
-        const error = new Error("Review cache entry is unavailable.");
-        error.code = "REVIEW_TARGET_UNAVAILABLE";
-        throw error;
-      }
-      return cached.data;
+  const loadSelected = async ({ position = null, preservePatch = false } = {}) => {
+    const selected = selectedItem();
+    if (!selected || (state.group === "changes" && state.section === "commits")) {
+      paint();
+      restorePosition(position, false);
+      return;
     }
-    state.responseCache.set(path, { etag: result.etag, data: result.data });
-    return result.data;
-  };
-
-  const loadPatch = async (file) => {
-    if (!file || state.scope === "commits") return;
     const request = ++state.requestGeneration;
-    state.patchLoading = true;
-    state.patchError = null;
+    state.contentLoading = true;
+    state.contentError = null;
+    state.patch = null;
+    state.shellFile = null;
     paint();
     try {
-      const data = await readReviewResource(
-        `/review-targets/${encodeURIComponent(state.targetId)}/diff`
-        + `?scope=${encodeURIComponent(state.scope)}`
-        + `&path=${encodeURIComponent(file.path)}`,
+      const resource = state.group === "shell" ? "shell-file" : "patch";
+      const data = await reviewObservationApi(
+        `/review-observations/${state.snapshot.fingerprint}/${resource}`
+        + `?file=${encodeURIComponent(selected.file_id)}`,
       );
       if (request !== state.requestGeneration) return;
-      state.patch = data;
+      if (state.group === "shell") state.shellFile = data;
+      else state.patch = data;
     } catch (error) {
       if (request !== state.requestGeneration) return;
-      state.patchError = error;
-      if (error.code === "REVIEW_TARGET_CHANGED") loadTargets();
+      state.contentError = error;
     } finally {
       if (request === state.requestGeneration) {
-        state.patchLoading = false;
+        state.contentLoading = false;
         paint();
+        restorePosition(position, preservePatch && !state.contentError);
       }
     }
   };
 
-  const loadFiles = async () => {
-    const request = ++state.requestGeneration;
-    state.loadingContent = true;
+  const selectItem = (item) => {
+    const nextPath = itemPath(item);
+    if (!nextPath || nextPath === state.selectedPath) return;
+    state.selectedPath = nextPath;
+    state.contentError = null;
+    loadSelected();
+  };
+
+  const observe = async (manual = false) => {
+    if (state.refreshInFlight) return;
+    state.refreshInFlight = true;
+    state.loading = !state.snapshot;
     state.error = null;
-    paint();
-    try {
-      const items = [];
-      let cursor = "";
-      let page;
-      do {
-        const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
-        page = await readReviewResource(
-          `/review-targets/${encodeURIComponent(state.targetId)}/files`
-          + `?scope=${encodeURIComponent(state.scope)}&limit=200${suffix}`,
-        );
-        items.push(...page.items);
-        cursor = page.next_cursor || "";
-      } while (cursor && items.length < 2000);
-      if (request !== state.requestGeneration) return;
-      const fingerprintChanged = state.fileFingerprint
-        && state.fileFingerprint !== page.fingerprint;
-      state.files = items;
-      state.fileFingerprint = page.fingerprint;
-      state.filesTruncated = Boolean(page.files_truncated || cursor);
-      if (fingerprintChanged || !items.some((file) => file.path === state.selectedPath))
-        state.selectedPath = items[0]?.path || "";
-      state.patch = null;
-      state.patchError = null;
-      state.loadingContent = false;
-      paint();
-      const file = selectedFile();
-      if (file) {
-        viewedFiles().add(file.path);
-        await loadPatch(file);
-      }
-    } catch (error) {
-      if (request !== state.requestGeneration) return;
-      state.loadingContent = false;
-      state.error = error;
-      state.files = [];
-      state.patch = null;
-      paint();
+    const position = capturePosition();
+    const oldSnapshot = state.snapshot;
+    const oldItems = state.group === "shell"
+      ? shellFiles(oldSnapshot).filter((file) => file.available)
+      : sectionFiles(oldSnapshot);
+    const oldIndex = oldItems.findIndex((item) => itemPath(item) === state.selectedPath);
+    const oldPath = state.selectedPath;
+    if (!oldSnapshot) paint();
+    if (refreshButton) {
+      refreshButton.disabled = true;
+      refreshButton.textContent = "Refreshing…";
     }
-  };
-
-  const loadCommits = async () => {
-    const request = ++state.requestGeneration;
-    state.loadingContent = true;
-    state.error = null;
-    paint();
     try {
-      const items = [];
-      let cursor = "";
-      let page;
-      do {
-        const suffix = cursor ? `?limit=200&cursor=${encodeURIComponent(cursor)}` : "?limit=200";
-        page = await readReviewResource(
-          `/review-targets/${encodeURIComponent(state.targetId)}/commits${suffix}`,
-        );
-        items.push(...page.items);
-        cursor = page.next_cursor || "";
-      } while (cursor && items.length < 500);
-      if (request !== state.requestGeneration) return;
-      state.commits = items;
-      state.commitsTruncated = Boolean(page.commits_truncated || cursor);
-    } catch (error) {
-      if (request !== state.requestGeneration) return;
-      state.error = error;
-      state.commits = [];
-    } finally {
-      if (request === state.requestGeneration) {
-        state.loadingContent = false;
-        paint();
-      }
-    }
-  };
-
-  const loadContent = () =>
-    state.scope === "commits" ? loadCommits() : loadFiles();
-
-  const loadTargets = async ({ remote = false, polling = false } = {}) => {
-    if (state.loadingTargets) return;
-    state.loadingTargets = true;
-    if (!polling) paint();
-    const oldTargetId = state.targetId;
-    const oldTargetFingerprint = selectedTarget()?.fingerprint || "";
-    try {
-      const query = remote ? "?refresh=remote" : "";
-      const result = await reviewApi(
-        `/conversations/${conversation.conversation_id}/review-targets${query}`,
-        polling && !remote ? state.targetsEtag : "",
+      const next = await reviewObservationApi(
+        `/conversations/${conversation.conversation_id}/review-observations`,
+        { method: "POST", key: requestKey() },
       );
-      if (result.notModified) return;
-      const page = result.data;
-      state.targetsEtag = result.etag;
-      state.gitFingerprint = page.git_fingerprint;
-      state.targets = page.items;
-      state.freshness = page.freshness;
       state.loaded = true;
-      state.error = null;
-      if (!state.targets.some((target) => target.target_id === state.targetId))
-        state.targetId = page.selected_target_id || state.targets[0]?.target_id || "";
-      const nextTargetFingerprint = selectedTarget()?.fingerprint || "";
-      state.targetFingerprint = nextTargetFingerprint;
-      if (state.targetId && (
-        state.targetId !== oldTargetId
-        || nextTargetFingerprint !== oldTargetFingerprint
-        || (!state.files.length && !state.commits.length)
-      )) {
-        await loadContent();
-      } else {
-        paint();
+      if (manual && oldSnapshot && !next.fetch?.fresh) {
+        state.refreshWarning = next.fetch?.error
+          ? `Refresh failed: ${next.fetch.error}`
+          : "Refresh failed; the current observation is retained.";
+        const warning = $(".review-refresh-warning", host);
+        if (warning) {
+          warning.hidden = false;
+          warning.textContent = state.refreshWarning;
+        }
+        return;
       }
+      state.refreshWarning = "";
+      if (oldSnapshot && oldSnapshot.fingerprint === next.fingerprint) return;
+      state.snapshot = next;
+      const nextItems = state.group === "shell"
+        ? shellFiles(next).filter((file) => file.available)
+        : sectionFiles(next);
+      const stillPresent = nextItems.find((item) => itemPath(item) === oldPath);
+      const nearest = nextItems[Math.min(Math.max(oldIndex, 0), nextItems.length - 1)];
+      state.selectedPath = itemPath(stillPresent || nearest || {});
+      state.patch = null;
+      state.shellFile = null;
+      state.contentError = null;
+      paint();
+      await loadSelected({ position, preservePatch: Boolean(stillPresent) });
     } catch (error) {
       state.error = error;
       state.loaded = true;
-      paint();
+      if (!oldSnapshot) paint();
+      else {
+        state.refreshWarning = error.message || "Refresh failed.";
+        const warning = $(".review-refresh-warning", host);
+        if (warning) {
+          warning.hidden = false;
+          warning.textContent = state.refreshWarning;
+        }
+      }
     } finally {
-      state.loadingTargets = false;
-      paint();
+      state.loading = false;
+      state.refreshInFlight = false;
+      if (refreshButton) {
+        refreshButton.disabled = false;
+        refreshButton.textContent = "Refresh Diff";
+      }
     }
   };
-
-  const pollReview = async () => {
-    if (document.hidden || state.mode !== "diff" || state.pollInFlight) return;
-    state.pollInFlight = true;
-    try { await loadTargets({ polling: true }); }
-    finally { state.pollInFlight = false; }
-  };
-  const visibilityRefresh = () => {
-    if (!document.hidden && state.mode === "diff") pollReview();
-  };
-  document.addEventListener("visibilitychange", visibilityRefresh);
 
   const setMode = (mode) => {
     state.mode = mode;
-    if (mode === "diff") {
-      if (!state.loaded) loadTargets();
-      if (state.pollTimer === null)
-        state.pollTimer = setInterval(pollReview, CHAT_REVIEW_POLL_MS);
-      paint();
-    } else if (state.pollTimer !== null) {
-      clearInterval(state.pollTimer);
-      state.pollTimer = null;
-    }
+    if (mode === "diff" && !state.loaded && !state.loading) observe(false);
   };
   const cleanup = () => {
     state.requestGeneration += 1;
-    if (state.pollTimer !== null) clearInterval(state.pollTimer);
-    state.pollTimer = null;
-    document.removeEventListener("visibilitychange", visibilityRefresh);
   };
   chatReviewCleanup = cleanup;
   return { setMode, cleanup };
