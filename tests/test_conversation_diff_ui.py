@@ -177,6 +177,7 @@ def test_diff_layout_is_full_width_bounded_and_responsive():
         ".chat-review-host",
         ".review-workspace",
         ".review-summary",
+        ".review-summary-actions",
         ".review-status",
         ".review-group-switch",
         ".review-change-switch",
@@ -191,6 +192,7 @@ def test_diff_layout_is_full_width_bounded_and_responsive():
     ):
         assert selector in STYLE
     assert "grid-template-columns: minmax(220px, 300px) minmax(0, 1fr)" in STYLE
+    assert STYLE.count("grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr)") >= 2
     assert "grid-template-rows: auto minmax(0, 1fr)" in STYLE
     assert "flex: 1 1 auto" in STYLE
     assert "text-overflow: ellipsis" in STYLE
@@ -199,7 +201,8 @@ def test_diff_layout_is_full_width_bounded_and_responsive():
         'const groupSwitch = el("div"'
     )]
     assert "...(sectionSwitch ? [sectionSwitch] : [])" in summary
-    assert "summaryStatus" in summary
+    assert "summaryStatus" in source
+    assert "summaryActions" in summary
     assert "patchHeader(" in source
     assert "}, summary);" in source
     assert 'el("span", { title: detail }, detail)' in source
