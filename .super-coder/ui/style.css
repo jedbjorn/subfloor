@@ -464,13 +464,26 @@ body.interface-view main {
 }
 .review-line {
   display: grid; grid-template-columns: 3.7rem 3.7rem minmax(max-content, 1fr);
-  min-height: 1.55em; white-space: pre;
+  position: relative; min-height: 1.55em; white-space: pre;
 }
 .review-line-number {
   padding: 0 .45rem; color: rgba(255,255,255,.28); text-align: right;
   user-select: none; border-right: 1px solid var(--line-soft);
 }
 .review-line-code { padding: 0 .7rem; }
+.review-change-step {
+  position: absolute; left: .25rem; z-index: 1; width: 1.1rem; height: 1.1rem;
+  padding: 0; display: grid; place-items: center; border: 1px solid var(--line);
+  border-radius: 50%; background: var(--panel); color: var(--dim); cursor: pointer;
+  font: 700 .72rem/1 ui-monospace, monospace;
+}
+.review-change-step-previous { top: 0; transform: translateY(-55%); }
+.review-change-step-next { bottom: 0; transform: translateY(55%); }
+.review-change-step:hover:not(:disabled) {
+  color: var(--ink); border-color: var(--accent); background: var(--panel2);
+}
+.review-change-step:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.review-change-step:disabled { opacity: .28; cursor: default; }
 .review-line-add { background: rgba(76,175,125,.12); }
 .review-line-add .review-line-code { color: #a9dfbd; }
 .review-line-delete { background: rgba(239,125,134,.10); }
