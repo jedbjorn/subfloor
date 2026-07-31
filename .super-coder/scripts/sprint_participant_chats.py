@@ -1,4 +1,4 @@
-"""Sprint-scoped reuse of durable browser conversations.
+"""Sprint participant reuse of durable browser conversations.
 
 This module owns no transaction boundary.  Arming and later Sprint transition
 services call it inside their existing write transaction so conversation

@@ -12,7 +12,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 
-import sprint_conversations
+import sprint_participant_chats
 
 
 def substrate() -> sqlite3.Connection:
@@ -120,12 +120,12 @@ def create(
         "idempotency_key": key,
     }
     values.update(changes)
-    return sprint_conversations.create_and_select(con, **values)
+    return sprint_participant_chats.create_and_select(con, **values)
 
 
 def test_arming_provisions_every_participant_without_a_wake() -> None:
     with substrate() as con:
-        provisioned = sprint_conversations.provision_at_arming(con, 7)
+        provisioned = sprint_participant_chats.provision_at_arming(con, 7)
         assert len(provisioned) == 3
 
         conversations = con.execute(
@@ -171,7 +171,7 @@ def test_replay_is_idempotent_and_conflicting_reuse_changes_nothing() -> None:
         )
 
         with pytest.raises(
-            sprint_conversations.SprintConversationError,
+            sprint_participant_chats.SprintConversationError,
             match="different request",
         ):
             create(
@@ -219,7 +219,7 @@ def test_fix_conversation_becomes_current_without_closing_persistent_work() -> N
             == fix
         )
 
-        selected = sprint_conversations.select_work(con, 101)
+        selected = sprint_participant_chats.select_work(con, 101)
         assert selected == work
         assert (
             con.execute(
@@ -236,7 +236,7 @@ def test_cross_participant_parent_is_rejected_without_partial_rows() -> None:
         reviewer = create(con, 102, "work", "s7:p102:work")
 
         with pytest.raises(
-            sprint_conversations.SprintConversationError,
+            sprint_participant_chats.SprintConversationError,
             match="does not belong",
         ):
             create(
@@ -317,7 +317,7 @@ def test_fallback_replacement_retains_packet_route_and_history() -> None:
 
 def test_live_pill_projection_follows_current_pointer_until_terminal() -> None:
     with substrate() as con:
-        provisioned = sprint_conversations.provision_at_arming(con, 7)
+        provisioned = sprint_participant_chats.provision_at_arming(con, 7)
         work = con.execute(
             "SELECT persistent_conversation_id FROM sprint_participants "
             "WHERE participant_id=101"
@@ -331,7 +331,7 @@ def test_live_pill_projection_follows_current_pointer_until_terminal() -> None:
         )
         shells = [{"shell_id": 10}, {"shell_id": 20}, {"shell_id": 30}]
 
-        projected = sprint_conversations.attach_live_participations(con, shells)
+        projected = sprint_participant_chats.attach_live_participations(con, shells)
 
         assert projected[0]["sprint"] == {
             "sprint_id": 7,
@@ -349,7 +349,7 @@ def test_live_pill_projection_follows_current_pointer_until_terminal() -> None:
         }
 
         con.execute("UPDATE sprints SET lifecycle='completed' WHERE sprint_id=7")
-        terminal = sprint_conversations.attach_live_participations(
+        terminal = sprint_participant_chats.attach_live_participations(
             con, [{"shell_id": 10}, {"shell_id": 20}]
         )
         assert terminal == [
