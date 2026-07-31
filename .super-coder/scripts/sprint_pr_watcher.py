@@ -31,6 +31,7 @@ from sprint_domain import (
     SprintLifecycleStore,
 )
 from sprint_message_delivery import SprintMessageStore
+from sprint_review_loop import SprintReviewLoopStore
 
 PULSE_SECONDS = 5.0
 MAX_BACKOFF_SECONDS = 300.0
@@ -91,6 +92,7 @@ class SprintPRRegistrationStore:
         repository: str,
         pr_number: int,
         work_unit_ids: Iterable[int],
+        notify_service: bool = True,
     ) -> RegistrationReceipt:
         repository = repository.strip().lower()
         if not _REPOSITORY.fullmatch(repository):
@@ -100,6 +102,10 @@ class SprintPRRegistrationStore:
         unit_ids = tuple(sorted({int(item) for item in work_unit_ids}))
         if not unit_ids or any(item < 1 for item in unit_ids):
             raise ValueError("registration requires positive work-unit IDs")
+        if len(unit_ids) != 1:
+            raise SprintInvariantError(
+                "registered PR requires exactly one owning work unit"
+            )
 
         with db_driver.write_transaction(self.con, "sprint.pr.register"):
             sprint = self.con.execute(
@@ -192,6 +198,8 @@ class SprintPRRegistrationStore:
                     ),
                 ),
             )
+        if notify_service:
+            notify_commit()
         return RegistrationReceipt(registered_pr_id, True)
 
 
@@ -217,6 +225,11 @@ class SprintPRWatcher:
         self.monotonic = monotonic
         self.registration = SprintPRRegistrationStore(con)
         self.messages = SprintMessageStore(con)
+        self.review_loop = SprintReviewLoopStore(
+            con,
+            repo_root=self.repo_root,
+            reader_factory=self.reader_factory,
+        )
         self._backoff: dict[int, _FailureBackoff] = {}
         self._trigger = "pulse"
         self._switch = ArmedServiceSwitch(
@@ -239,6 +252,7 @@ class SprintPRWatcher:
             repository=repository,
             pr_number=pr_number,
             work_unit_ids=work_unit_ids,
+            notify_service=False,
         )
         row = self._registered_row(receipt.registered_pr_id, sprint_id)
         if receipt.created and row is not None:
@@ -378,6 +392,11 @@ class SprintPRWatcher:
                 ).lastrowid
             )
             self._route_transition(current, transition_key, state, pull_request)
+            if state == "merged":
+                self.review_loop.observe_merge_in_transaction(
+                    registered_pr_id,
+                    transition_key=transition_key,
+                )
             self.con.execute(
                 "INSERT INTO sprint_events "
                 "(sprint_id,event_type,actor_kind,payload) "

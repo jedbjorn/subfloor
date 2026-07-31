@@ -642,6 +642,85 @@ class SprintWorkUnitStore:
                 planner_participant_id=planner,
             )
 
+    def complete_from_merge_in_transaction(
+        self,
+        sprint_id: int,
+        work_unit_ids: Iterable[int],
+        *,
+        transition_key: str,
+    ) -> list[int]:
+        """Project an observed merge, then release newly ready work atomically."""
+        if not self.con.in_transaction:
+            raise RuntimeError("merge observation requires an active transaction")
+        unit_ids = tuple(sorted({int(unit_id) for unit_id in work_unit_ids}))
+        if not unit_ids:
+            raise SprintInvariantError("merged PR has no linked work units")
+        sprint = self.con.execute(
+            "SELECT lifecycle,originating_planner_shell_id FROM sprints "
+            "WHERE sprint_id=?",
+            (sprint_id,),
+        ).fetchone()
+        if sprint is None:
+            raise KeyError(f"unknown Sprint: {sprint_id}")
+        if sprint["lifecycle"] != "armed":
+            return []
+        placeholders = ",".join("?" for _ in unit_ids)
+        units = self.con.execute(
+            "SELECT work_unit_id,assigned_shell_id,disposition "
+            "FROM sprint_work_units "
+            f"WHERE sprint_id=? AND work_unit_id IN ({placeholders}) "
+            "ORDER BY work_unit_id",
+            (sprint_id, *unit_ids),
+        ).fetchall()
+        if {int(unit["work_unit_id"]) for unit in units} != set(unit_ids):
+            raise SprintInvariantError("merged PR links unknown Sprint work units")
+
+        changed = False
+        for unit in units:
+            if unit["disposition"] == "completed":
+                continue
+            changed = True
+            if unit["disposition"] != "merge_ready":
+                self._event(
+                    sprint_id,
+                    "merge.grant_bypassed",
+                    None,
+                    {
+                        "before": unit["disposition"],
+                        "transition_key": transition_key,
+                        "work_unit_id": int(unit["work_unit_id"]),
+                    },
+                    actor_kind="system",
+                )
+            self.con.execute(
+                "UPDATE sprint_work_units SET disposition='completed',"
+                "completed_at=datetime('now'),updated_at=datetime('now') "
+                "WHERE work_unit_id=?",
+                (unit["work_unit_id"],),
+            )
+            self._event(
+                sprint_id,
+                "work_unit.completed",
+                None,
+                {
+                    "source": "pr.merge_observed",
+                    "transition_key": transition_key,
+                    "work_unit_id": int(unit["work_unit_id"]),
+                },
+                actor_kind="system",
+            )
+        if not changed:
+            return []
+        planner = self._require_participant(
+            sprint_id,
+            int(sprint["originating_planner_shell_id"]),
+            "planner",
+        )
+        return self._dispatch_ready_locked(
+            sprint_id,
+            planner_participant_id=planner,
+        )
+
     def _dispatch_ready_locked(
         self,
         sprint_id: int,
@@ -695,6 +774,9 @@ class SprintWorkUnitStore:
         unit: sqlite3.Row,
     ) -> int:
         unit_id = int(unit["work_unit_id"])
+        sprint_participant_chats.select_work(
+            self.con, int(unit["participant_id"])
+        )
         generation = int(
             self.con.execute(
                 "SELECT COUNT(*) FROM sprint_messages "
