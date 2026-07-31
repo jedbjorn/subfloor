@@ -273,7 +273,9 @@ def build_database() -> sqlite3.Connection:
              message_id, run_id)
         VALUES
             (220, 'cv_normal', 1, 'assistant.delta',
-             '{"text":"retained event"}', 200, 210);
+             '{"text":"retained event"}', 200, 210),
+            (221, 'cv_sprint_dev', 1, 'assignment.notice',
+             '{"text":"disposable Sprint event"}', 201, NULL);
 
         INSERT INTO conversation_outbox
             (outbox_id, conversation_id, message_id, state, claim_owner,

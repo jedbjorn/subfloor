@@ -29,6 +29,7 @@ CREATE TABLE conversation_events (
     UNIQUE (conversation_id, sequence)
 );
 INSERT INTO "conversation_events" VALUES(220,'cv_normal',1,'assistant.delta',1,'{"text":"retained event"}',200,210,'2026-07-31 00:00:00');
+INSERT INTO "conversation_events" VALUES(221,'cv_sprint_dev',1,'assignment.notice',1,'{"text":"disposable Sprint event"}',201,NULL,'2026-07-31 00:00:00');
 CREATE TABLE conversation_git_targets (
     target_id              TEXT PRIMARY KEY
                            DEFAULT ('gt_' || lower(hex(randomblob(16))))

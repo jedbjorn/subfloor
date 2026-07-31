@@ -152,6 +152,26 @@ class SprintRemovalManifestTest(unittest.TestCase):
             self.assertEqual(expected_ledger["count"], len(migration_ledger))
             self.assertEqual(expected_ledger["first"], migration_ledger[0])
             self.assertEqual(expected_ledger["last"], migration_ledger[-1])
+            self.assertEqual(
+                [
+                    (220, "cv_normal", "assistant.delta"),
+                    (221, "cv_sprint_dev", "assignment.notice"),
+                ],
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT event_id,conversation_id,event_type "
+                        "FROM conversation_events ORDER BY event_id"
+                    )
+                ],
+            )
+            self.assertIsNotNone(
+                con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                    "AND name='trg_conversation_events_append_only_delete'"
+                ).fetchone(),
+                "dirty fixture must install the retained append-only guard",
+            )
 
     def test_frozen_fixture_pins_retained_data_and_sprint_negative_space(self):
         with closing(build_pre_removal_database()) as con:
@@ -595,6 +615,28 @@ for name in sys.argv[2:]:
                     )
                 ],
             )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "conversation events are append-only",
+            ):
+                con.execute("DELETE FROM conversation_events WHERE event_id=220")
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "conversation events are append-only",
+            ):
+                con.execute(
+                    "UPDATE conversation_events SET event_type='mutated' "
+                    "WHERE event_id=220"
+                )
+            self.assertEqual(
+                (220, "cv_normal", "assistant.delta"),
+                tuple(
+                    con.execute(
+                        "SELECT event_id,conversation_id,event_type "
+                        "FROM conversation_events WHERE event_id=220"
+                    ).fetchone()
+                ),
+            )
             self.assertEqual(
                 [(230, "dispatched")],
                 [
@@ -738,6 +780,21 @@ for name in sys.argv[2:]:
                 4,
                 con.execute("SELECT COUNT(*) FROM shell_messages").fetchone()[0],
             )
+            self.assertEqual(
+                [(220, "cv_normal"), (221, "cv_sprint_dev")],
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT event_id,conversation_id "
+                        "FROM conversation_events ORDER BY event_id"
+                    )
+                ],
+            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "conversation events are append-only",
+            ):
+                con.execute("DELETE FROM conversation_events WHERE event_id=221")
             self.assertIsNone(
                 con.execute(
                     "SELECT 1 FROM schema_migrations WHERE filename=?",
