@@ -181,10 +181,9 @@ class HelpChartTest(unittest.TestCase):
         self.assertEqual(uncharted, [],
                          f"dispatchable but absent from ./sc help: {uncharted}")
 
-    def test_removed_sprint_verbs_are_unknown_and_absent_from_help(self):
+    def test_removed_v1_sprint_verbs_are_unknown_and_absent_from_help(self):
         help_text = sc("help").stdout
         for verb in (
-            "sprint",
             "directives",
             "events",
             "watch",
