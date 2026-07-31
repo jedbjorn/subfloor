@@ -1175,6 +1175,11 @@ case "$cmd" in
   feature)      exec "$PY" "$S/feature.py" "$@" ;;
   artifact-mode) exec "$PY" "$S/artifact_policy.py" "$@" ;;
   eject)        exec "$PY" "$S/eject.py" "$@" ;;
+  remove)       if sc_help_form "$@"; then
+                  exec "$PY" "$CALLER_ENGINE/scripts/remove.py" "$@"
+                fi
+                sc_refuse_linked remove "$ROOT"
+                exec "$PY" "$S/remove.py" "$@" ;;
   init)         exec "$PY" "$S/init_fork.py" "$@" ;;
   # rebuild/migrate: the script owns the whole argument contract (help, unknown
   # tokens), so the dispatcher forwards VERBATIM and only inserts the refusal —
@@ -1592,6 +1597,8 @@ super-coder — forkable shell substrate
   ./sc feature             list the opt-in features (pg · windows · tailnet · pm2 · app-deploy) and the state of both halves (config block + skill grants)
   ./sc feature enable <f>  enable one: grant its skills to the owning flavors + create/point-at its instance.json block (disable reverses)
   ./sc eject               ONE-WAY: stop tracking upstream and own the engine — un-gitignore + stage .super-coder/ as fork source (confirm-gated)
+  ./sc remove              safely uninstall subfloor from this repo after a verified DB backup
+                             --dry-run previews; --yes skips confirmation, never safety gates
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db
   ./sc snapshot            dump per-instance tables to gitignored .sc-state/local/

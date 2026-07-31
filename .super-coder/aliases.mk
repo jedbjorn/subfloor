@@ -34,14 +34,14 @@
 #   LONG-ONLY: Interface status/start/view/attach/take-control/stop/reconcile/
 #              recover; models/job; build/logs/serve/health/ports;
 #              verify/map/render/snapshot/deps/install/rollback/
-#              update-harnesses/harness-status/feature/eject
+#              update-harnesses/harness-status/feature/eject/remove
 #              passthrough: make dos ARGS=health
 #
 SC := ./sc
 .PHONY: dos-e dos-enter dos-l dos-launch dos-r dos-restart dos-d dos-down dos-u dos-update \
         dos-t dos-test dos-h dos-help dos-url dos-build dos-logs dos-serve dos-health dos-ports \
         dos-verify dos-map dos-render dos-snapshot dos-deps dos-install dos-rollback \
-        dos-update-harnesses dos-harness-status dos-feat dos-feature dos-eject dos-status \
+        dos-update-harnesses dos-harness-status dos-feat dos-feature dos-eject dos-remove dos-status \
         dos-start dos-view dos-attach dos-take dos-take-control dos-stop \
         dos-reconcile dos-recover dos-models dos-model-refresh dos-model-list \
         dos-model-resolve dos-job dos-setup dos
@@ -114,6 +114,8 @@ dos-feature:          ; $(SC) feature $(ARGS)
 dos-feat: dos-feature
 # One-way divergence — interactive warning + typed confirmation in ./sc eject.
 dos-eject:            ; $(SC) eject
+# One-way uninstall — ./sc remove owns confirmation, backup, and safety gates.
+dos-remove:           ; $(SC) remove $(ARGS)
 
 # Passthrough: run any ./sc subcommand — make dos ARGS=health
 dos:                  ; $(SC) $(ARGS)
@@ -190,6 +192,8 @@ dos-help:
 	@echo "    dos-harness-status          harness CLI versions in the sandbox + is a harness rebuild owed"
 	@echo "    dos-feat / dos-feature      list/enable/disable opt-in features"
 	@echo "    dos-eject                   ONE-WAY: own the engine"
+	@echo "    dos-remove                  ONE-WAY: verified DB backup, then remove subfloor from this repo"
+	@echo "                                (ARGS='--dry-run' previews; ARGS='--yes' skips only confirmation)"
 	@echo ""
 	@echo "    dos ARGS='<cmd>'            generic ./sc passthrough"
 	@echo ""

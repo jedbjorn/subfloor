@@ -57,6 +57,18 @@ import ports as ports_mod  # noqa: E402
 
 # --- make-alias wiring (shared by install + update) -------------------------
 ALIASES_INCLUDE = "-include .super-coder/aliases.mk"
+INSTALLER_MAKEFILE = (
+    "# Fork Makefile — super-coder convenience aliases (make dos-e / dos-enter).\n"
+    "# Every target is dos--prefixed; add your own targets below the include.\n"
+    f"{ALIASES_INCLUDE}\n"
+)
+APPENDED_ALIASES_BLOCK = (
+    "\n# super-coder convenience aliases (designs-OS 'dos-' command standard).\n"
+    "# Appended by ./sc; every target is dos--prefixed so it can't collide with\n"
+    "# this Makefile's own targets. Delete this line to opt out — `./sc <cmd>`\n"
+    "# stays equivalent.\n"
+    f"{ALIASES_INCLUDE}\n"
+)
 # Matches an existing include of the alias file in any form: hard `include` or
 # soft `-include`, with arbitrary surrounding whitespace.
 _ALIASES_RE = re.compile(r"^\s*-?include\s+\.super-coder/aliases\.mk\s*$", re.M)
@@ -81,23 +93,14 @@ def wire_make_aliases(repo_root: Path | None = None) -> str:
     """
     mk = (repo_root or REPO_ROOT) / "Makefile"
     if not mk.exists():
-        mk.write_text(
-            "# Fork Makefile — super-coder convenience aliases (make dos-e / dos-enter).\n"
-            "# Every target is dos--prefixed; add your own targets below the include.\n"
-            f"{ALIASES_INCLUDE}\n"
-        )
+        mk.write_text(INSTALLER_MAKEFILE)
         return "wrote Makefile (-include .super-coder/aliases.mk) → `make dos-e` works"
     text = mk.read_text()
     if _ALIASES_RE.search(text):
         return "Makefile already wired (-include .super-coder/aliases.mk) — left as-is"
     sep = "" if text.endswith("\n") else "\n"
     mk.write_text(
-        text + sep
-        + "\n# super-coder convenience aliases (designs-OS 'dos-' command standard).\n"
-        + "# Appended by ./sc; every target is dos--prefixed so it can't collide with\n"
-        + "# this Makefile's own targets. Delete this line to opt out — `./sc <cmd>`\n"
-        + "# stays equivalent.\n"
-        + f"{ALIASES_INCLUDE}\n"
+        text + sep + APPENDED_ALIASES_BLOCK
     )
     return "appended -include .super-coder/aliases.mk to existing Makefile → `make dos-e` works"
 
@@ -126,6 +129,23 @@ VISUAL_QA_TEMPLATE_TARGETS = {
     "subfloor-visual-qa.yml": Path(".github/workflows/subfloor-visual-qa.yml"),
     "visual-qa.example.json": Path(".sc-state/visual-qa.example.json"),
 }
+
+# Repo-local surfaces emitted or wholly owned by an installed engine.  Teardown
+# imports this inventory so install and remove cannot quietly disagree about
+# which generated paths belong to subfloor.  Mixed host files (Makefile,
+# .gitignore, shared/) are handled surgically instead.
+GENERATED_INSTALL_PATHS = (
+    Path("CLAUDE.md"),
+    Path("AGENTS.md"),
+    Path("opencode.json"),
+    Path(".claude/settings.local.json"),
+    Path(".codex/hooks.json"),
+    Path(".claude/skills"),
+    Path("roadmap_sc.md"),
+    Path("docs_sc"),
+    Path("specs_sc"),
+    Path("skills_sc"),
+)
 
 
 def origin_basename() -> str | None:
