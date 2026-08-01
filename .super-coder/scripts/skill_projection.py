@@ -88,13 +88,6 @@ def _skill_body(row) -> str:
     )
 
 
-def _remove_tree(path: Path) -> None:
-    if path.is_symlink():
-        path.unlink()
-        return
-    shutil.rmtree(path)
-
-
 def _banner_owned_skill_directory(path: Path) -> bool:
     """Return whether a real directory carries a managed SKILL.md banner."""
     if path.is_symlink() or not path.is_dir():
@@ -111,6 +104,17 @@ def _banner_owned_skill_directory(path: Path) -> bool:
 def _upstream_skill_slugs() -> set[str]:
     names = (*seed_skills.seeded_skill_names(), *seed_skills.tombstoned_skill_names())
     return {name.strip().lower().replace(" ", "-") for name in names}
+
+
+def _remove_managed_tree(path: Path, managed_names: set[str]) -> bool:
+    """Remove a proven engine-managed directory without following symlinks."""
+    if path.name not in managed_names and not _banner_owned_skill_directory(path):
+        return False
+    if path.is_symlink():
+        path.unlink()
+    else:
+        shutil.rmtree(path)
+    return True
 
 
 def reconcile_root(
@@ -134,7 +138,7 @@ def reconcile_root(
     written: list[Path] = []
     skipped: list[Path] = []
     deleted: list[Path] = []
-    root_sweep_names = _upstream_skill_slugs() if shell_id is None else set()
+    managed_names = _upstream_skill_slugs()
 
     if root.exists():
         for child in root.iterdir():
@@ -144,15 +148,9 @@ def reconcile_root(
                         f"granted skill directory is a symlink: {child}"
                     )
                 continue
-            if (
-                shell_id is None
-                and child.name not in root_sweep_names
-                and not _banner_owned_skill_directory(child)
+            if (child.is_dir() or child.is_symlink()) and _remove_managed_tree(
+                child, managed_names
             ):
-                continue
-            if child.is_dir() or child.is_symlink():
-                _remove_tree(child)
-                written.append(child)
                 deleted.append(child)
 
     for row in rows:
