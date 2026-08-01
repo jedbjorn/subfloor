@@ -45,6 +45,23 @@ def test_global_header_leads_with_chats_sprints_shells_and_keeps_remaining_order
     assert INDEX.count('id="view-sprints"') == 1
 
 
+def test_sprint_modals_follow_action_and_viewer_footer_contracts():
+    action = SPRINT_BLOCK[
+        SPRINT_BLOCK.index("function openSprintActionModal"):
+        SPRINT_BLOCK.index("function sprintActionButtons")
+    ]
+    detail = SPRINT_BLOCK[
+        SPRINT_BLOCK.index("function openSprintUnitModal"):
+        SPRINT_BLOCK.index("function sprintWorkUnitCard")
+    ]
+    assert "openActionModal" in action
+    assert "dismissNode: cancel" in action
+    assert "actionNode: confirmButton" in action
+    assert "footerStart:" in detail
+    assert "footerEnd: closeButton" in detail
+    assert "footNodes" not in action + detail
+
+
 def test_priority_selection_is_armed_then_latest_paused_then_prepared_then_terminal():
     script = SPRINT_BLOCK + r"""
 const base = [

@@ -540,7 +540,7 @@
         "el(\"span\", {}, `Sprint ${sprint.sprint_id}`),",
         "else if (activeTab === \"sprints\") load(\"sprints\");",
         "feature: board.sprint.feature,",
-        "footNodes: [el(\"span\", { className: \"muted\" }, `Sprint ${snapshot.sprint.sprint_id}`), closeButton],",
+        "footerStart: el(\"span\", { className: \"muted\" }, `Sprint ${snapshot.sprint.sprint_id}`),",
         "for (const [kind, label] of [[\"events\", \"Sprint events\"], [\"summaries\", \"Sprint summaries\"]]) {",
         "for (const path of svg.querySelectorAll(\".sprint-wire\")) {",
         "function openSprintActionModal(sprint, target, label) {",

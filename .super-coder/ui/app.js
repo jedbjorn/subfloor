@@ -194,25 +194,52 @@ function glassDropdown({ items, value, onChange }) {
 }
 
 // Modal base (dos-arch dialog): overlay click or Esc closes; header carries
-// the title + an optional readout; footer nodes sit space-between. Returns
-// the close function.
-function openModal({ title, headExtra, bodyNode, footNodes, width = 650, height = 700 }) {
+// the title + an optional readout; footer content uses explicit physical
+// start/end slots. Returns the close function.
+let modalSequence = 0;
+function openModal({
+  title, headExtra, bodyNode, footerStart, footerEnd, width = 650, height = 700,
+}) {
+  const priorFocus = document.activeElement;
   const overlay = el("div", { className: "modal-overlay" });
-  const close = () => overlay.remove();
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    overlay.remove();
+    if (priorFocus?.isConnected && typeof priorFocus.focus === "function") priorFocus.focus();
+  };
+  overlay.closeModal = close;
   overlay.onmousedown = (e) => { if (e.target === overlay) close(); };
   const dlg = el("div", { className: "modal" });
+  const titleId = `modal-title-${++modalSequence}`;
+  dlg.setAttribute("role", "dialog");
+  dlg.setAttribute("aria-modal", "true");
+  dlg.setAttribute("aria-labelledby", titleId);
   dlg.style.width = width + "px";
   dlg.style.height = height + "px";
-  const head = el("div", { className: "modal-head" }, el("div", { className: "modal-title" }, title));
+  const head = el("div", { className: "modal-head" },
+    el("div", { className: "modal-title", id: titleId }, title));
   if (headExtra) head.append(headExtra);
   dlg.append(head, el("div", { className: "modal-body" }, bodyNode));
-  if (footNodes?.length) dlg.append(el("div", { className: "modal-foot" }, ...footNodes));
+  if (footerStart || footerEnd) {
+    const foot = el("div", { className: "modal-foot" });
+    if (footerStart) foot.append(el("div", { className: "modal-foot-start" }, footerStart));
+    if (footerEnd) foot.append(el("div", { className: "modal-foot-end" }, footerEnd));
+    dlg.append(foot);
+  }
   overlay.append(dlg);
   document.body.append(overlay);
   return close;
 }
 
-// Unified edit modal — 650×700, Save bottom-LEFT / Cancel bottom-RIGHT,
+// Action dialogs name intent instead of physical position. Dismissal is always
+// first/left and the primary or destructive action is always last/right.
+function openActionModal({ dismissNode, actionNode, ...modal }) {
+  return openModal({ ...modal, footerStart: dismissNode, footerEnd: actionNode });
+}
+
+// Unified edit modal — 650×700, Cancel bottom-left / Save bottom-right,
 // live ~tokens / chars readout in the header.
 function openEditModal({ title, value, onSave }) {
   const counter = el("div", { className: "modal-count" });
@@ -221,7 +248,9 @@ function openEditModal({ title, value, onSave }) {
   ta.oninput = upd; upd();
   const save = el("button", { className: "act primary", type: "button", textContent: "Save" });
   const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
-  const close = openModal({ title, headExtra: counter, bodyNode: ta, footNodes: [save, cancel] });
+  const close = openActionModal({
+    title, headExtra: counter, bodyNode: ta, dismissNode: cancel, actionNode: save,
+  });
   save.onclick = async () => {
     save.disabled = true; save.textContent = "Saving…";
     try { await onSave(ta.value); close(); }
@@ -251,7 +280,7 @@ async function openSkillContentModal(skill) {
     const closeBtn = el("button", { className: "act", type: "button", textContent: "Close" });
     const close = openModal({
       title: skill.name, headExtra: counter, bodyNode: body,
-      footNodes: [rawBtn, closeBtn],
+      footerStart: rawBtn, footerEnd: closeBtn,
       width: 800, height: 650,
     });
     closeBtn.onclick = close;
@@ -273,8 +302,8 @@ function openNewShellModal(templates, root) {
   const form = el("div", { className: "modal-form" },
     el("span", { className: "k" }, "shell type"), fl,
     el("span", { className: "k" }, "name"), nm);
-  const close = openModal({ title: "New shell", bodyNode: form,
-    footNodes: [cancel, create], width: 600, height: 300 });
+  const close = openActionModal({ title: "New shell", bodyNode: form,
+    dismissNode: cancel, actionNode: create, width: 600, height: 300 });
   create.onclick = async () => {
     if (!nm.value.trim()) return toast("name required");
     create.disabled = true; create.textContent = "Creating…";
@@ -1229,14 +1258,14 @@ function featureForm(f, candidates = [], projects = []) {
 
 // Click-to-open edit modal — the same editor as the Board card's inline expand,
 // reachable from any card (small Flow cards, shipped cards, and the Board card's
-// ⤢ button). Save bottom-left / Cancel bottom-right; reloads the roadmap on save.
+// ⤢ button). Cancel bottom-left / Save bottom-right; reloads the roadmap on save.
 function openFeatureModal(f, candidates = [], projects = []) {
   const { node, save } = featureForm(f, candidates, projects);
   const saveBtn = el("button", { className: "act primary", type: "button", textContent: "Save" });
   const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
-  const close = openModal({
+  const close = openActionModal({
     title: (f.title || "(untitled)") + "  #" + f.feature_id,
-    bodyNode: node, footNodes: [saveBtn, cancel],
+    bodyNode: node, dismissNode: cancel, actionNode: saveBtn,
     width: 680, height: 720,
   });
   saveBtn.onclick = async () => {
@@ -1372,32 +1401,59 @@ async function renderDocs(root) {
 let flagFilter = "open";   // open | resolved | all — persists across re-renders
 let flagQuery = "";        // flags search; persists across re-renders
 
-// New-flag form in a 600×400 modal — Create bottom-left, Cancel bottom-right.
-function openNewFlagModal(features) {
-  const name = el("input", { type: "text", placeholder: "display name (e.g. SC-001)" });
-  const desc = el("textarea", { rows: 4, placeholder: "[Area] description | Blocker for: …" });
+// Shared create/edit flag form — roomy description, dismissal left, action right.
+function openFlagModal(features, flag = null) {
+  const editing = Boolean(flag);
+  const name = el("input", {
+    type: "text", placeholder: "display name (e.g. SC-001)", value: flag?.display_name || "",
+  });
+  const desc = el("textarea", {
+    rows: 8, placeholder: "[Area] description | Blocker for: …", value: flag?.description || "",
+  });
   const feat = el("select", {});
-  feat.append(el("option", { value: "", textContent: "— no feature —" }));
-  for (const f of features) feat.append(el("option", { value: f.feature_id, textContent: `#${f.feature_id} ${f.title}` }));
+  feat.append(el("option", {
+    value: "", selected: flag?.feature_id == null, textContent: "— no feature —",
+  }));
+  for (const f of features) feat.append(el("option", {
+    value: f.feature_id,
+    selected: String(f.feature_id) === String(flag?.feature_id),
+    textContent: `#${f.feature_id} ${f.title}`,
+  }));
   const prio = el("select", {});
-  for (const p of ["High", "Medium", "Low"]) prio.append(el("option", { value: p, selected: p === "Medium", textContent: p }));
-  const create = el("button", { className: "act primary", type: "button", textContent: "Create" });
+  for (const p of ["High", "Medium", "Low"]) prio.append(el("option", {
+    value: p, selected: p === (flag?.priority || "Medium"), textContent: p,
+  }));
+  const actionLabel = editing ? "Save" : "Create";
+  const action = el("button", {
+    className: "act primary", type: "button", textContent: actionLabel,
+  });
   const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
   const form = el("div", { className: "modal-form" },
     el("span", { className: "k" }, "name"), name,
     el("span", { className: "k" }, "description"), desc,
     el("span", { className: "k" }, "feature"), feat,
     el("span", { className: "k" }, "priority"), prio);
-  const close = openModal({ title: "New flag", bodyNode: form,
-    footNodes: [create, cancel], width: 600, height: 400 });
-  create.onclick = async () => {
+  const close = openActionModal({
+    title: editing ? `Edit flag #${flag.flag_id}` : "New flag",
+    bodyNode: form, dismissNode: cancel, actionNode: action,
+    width: 600, height: 520,
+  });
+  action.onclick = async () => {
     if (!desc.value) return toast("description required");
-    create.disabled = true; create.textContent = "Creating…";
+    action.disabled = true; action.textContent = editing ? "Saving…" : "Creating…";
+    const payload = {
+      display_name: name.value || null,
+      description: desc.value,
+      feature_id: feat.value || null,
+      priority: prio.value,
+    };
     try {
-      await api("/flags", "POST", { display_name: name.value || null, description: desc.value,
-        feature_id: feat.value || null, priority: prio.value });
-      close(); setStatus("flag created"); load("flags");
-    } catch (e) { toast("error: " + e.message); create.disabled = false; create.textContent = "Create"; }
+      await api(editing ? "/flags/" + flag.flag_id : "/flags", editing ? "PATCH" : "POST", payload);
+      close(); setStatus(editing ? "flag saved" : "flag created"); load("flags");
+    } catch (e) {
+      toast("error: " + e.message);
+      action.disabled = false; action.textContent = actionLabel;
+    }
   };
   cancel.onclick = close;
   desc.focus();
@@ -1420,7 +1476,7 @@ async function renderFlags(root) {
     bar.append(chip);
   }
   const newBtn = el("button", { className: "act newflag", type: "button", textContent: "＋ New flag" });
-  newBtn.onclick = () => openNewFlagModal(features);
+  newBtn.onclick = () => openFlagModal(features);
   root.append(el("div", { className: "flagbar" }, bar, newBtn));
 
   // results repaint in place: filter by the toggle, then narrow by the query
@@ -1447,14 +1503,14 @@ async function renderFlags(root) {
     for (const [title, list] of unlinkedLast(Object.entries(byFeat))) {
       const c = el("div", { className: "card" });
       c.append(el("h2", {}, title));
-      for (const f of list) c.append(flagRow(f));
+      for (const f of list) c.append(flagRow(f, features));
       results.append(c);
     }
   }
   draw();
 }
 
-function flagRow(f) {
+function flagRow(f, features) {
   // Expandable: collapsed row shows the priority badge + title + #id;
   // expanding reveals the full description, linked items as cards, and the
   // resolution note (resolved) or the resolve action (open).
@@ -1483,18 +1539,26 @@ function flagRow(f) {
     body.append(lc);
   }
 
+  const actions = el("div", { className: "flag-actions" });
   if (f.resolved) {
     body.append(el("div", { className: "tag" }, `resolved ${f.resolved_date || ""} — ${f.resolution_notes || ""}`));
   } else {
-    const btn = el("button", { className: "act", textContent: "resolve" });
+    const btn = el("button", { className: "act", type: "button", textContent: "resolve" });
     btn.onclick = async () => {
       const notes = prompt("Resolution notes:");
       if (notes === null) return;
       try { await api("/flags/" + f.flag_id, "PATCH", { resolved: 1, resolution_notes: notes }); setStatus("flag resolved"); load("flags"); }
       catch (e) { toast("error: " + e.message); }
     };
-    body.append(btn);
+    actions.append(btn);
   }
+  const edit = el("button", { className: "act flag-edit", type: "button", textContent: "edit" });
+  edit.onclick = (e) => {
+    e.preventDefault(); e.stopPropagation();
+    openFlagModal(features, f);
+  };
+  actions.append(edit);
+  body.append(actions);
   row.append(body);
   return row;
 }
@@ -1627,10 +1691,10 @@ async function openWinVmModal() {
 
   const save = el("button", { className: "act primary", textContent: "save" });
   const cancel = el("button", { className: "act", textContent: "close" });
-  const close = openModal({
+  const close = openActionModal({
     title: "Windows Test VM", width: 680, height: 760,
     bodyNode: el("div", {}, form, el("div", { className: "modal-form-foot" }, runAll), note, results),
-    footNodes: [save, cancel],
+    dismissNode: cancel, actionNode: save,
   });
   save.onclick = async () => {
     save.disabled = true; setStatus("saving VM config…");
@@ -4993,10 +5057,11 @@ function openSprintActionModal(sprint, target, label) {
     target === "aborted" ? el("div", { className: "sprint-abort-note" },
       "Abort stops active work but retains the complete Sprint history and the Planner's durable abort-report request.") : "",
     el("label", { className: "k" }, "Reason"), reason);
-  const close = openModal({
+  const close = openActionModal({
     title: `${label} · Sprint ${sprint.sprint_id}`,
     bodyNode: body,
-    footNodes: [confirmButton, cancel],
+    dismissNode: cancel,
+    actionNode: confirmButton,
     width: 560,
     height: 360,
   });
@@ -5090,7 +5155,8 @@ function openSprintUnitModal(unit, snapshot) {
   const close = openModal({
     title: `U${unit.work_unit_id} · ${unit.title}`,
     bodyNode: body,
-    footNodes: [el("span", { className: "muted" }, `Sprint ${snapshot.sprint.sprint_id}`), closeButton],
+    footerStart: el("span", { className: "muted" }, `Sprint ${snapshot.sprint.sprint_id}`),
+    footerEnd: closeButton,
     width: 840,
     height: 760,
   });
@@ -5436,7 +5502,8 @@ document.addEventListener("mousedown", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     const overlays = document.querySelectorAll(".modal-overlay");
-    overlays[overlays.length - 1]?.remove();
+    const overlay = overlays[overlays.length - 1];
+    if (overlay?.closeModal) overlay.closeModal();
   }
 });
 $("#snapshot").onclick = async () => {
