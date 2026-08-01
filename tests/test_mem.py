@@ -38,6 +38,7 @@ import server  # noqa: E402
 
 TOKEN = "test-token-deadbeef"
 PEER_TOKEN = "peer-token-cafebabe"   # second shell — cross-shell read coverage
+REVIEW_TOKEN = "review-token-012345"
 
 
 class MemMessageHelpContractTest(unittest.TestCase):
@@ -85,6 +86,13 @@ def build_engine_db(path: Path) -> None:
         "INSERT INTO shells (shell_id, display_name, shortname, mandate, system_prompt, "
         "user_id, is_shared, has_identity, bootstrapped, api_key) "
         "VALUES (2, 'Peer', 'peer', 'test', 'sp', 1, 0, 1, 0, ?)", (PEER_TOKEN,))
+    con.execute(
+        "INSERT INTO shells (shell_id, display_name, shortname, flavor, mandate, "
+        "system_prompt, user_id, is_shared, has_identity, bootstrapped, api_key) "
+        "VALUES (3, 'Reviewer', 'rev1', 'reviewer', 'test', 'sp', "
+        "1, 0, 1, 0, ?)",
+        (REVIEW_TOKEN,),
+    )
     con.execute(
         "INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date) "
         "VALUES (1, 1, '0001', '2026-01-01')")
@@ -488,6 +496,42 @@ class ApiMemTest(unittest.TestCase):
         tid = self.q("SELECT task_id FROM spec_tasks WHERE title='task C'")[0]
         self.run_mem("task", "done", str(tid))
         self.assertEqual(self.q("SELECT status FROM spec_tasks WHERE task_id=?", tid)[0], "done")
+
+    def test_legacy_mem_qaqc_command_uses_the_sprint_approval_surface(self):
+        self.run_mem("roadmap", "add", "feat QAQC")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat QAQC'")[0]
+        body = self.tmp / "qaqc.md"
+        body.write_text("# exact QAQC body\n")
+        self.run_mem(
+            "doc",
+            "add",
+            "spec QAQC",
+            "--body-file",
+            str(body),
+            "--feature",
+            str(fid),
+        )
+        did = self.q("SELECT document_id FROM documents WHERE title='spec QAQC'")[0]
+        original_token = mem.SC_API_TOKEN
+        mem.SC_API_TOKEN = REVIEW_TOKEN
+        try:
+            self.assertEqual(
+                0,
+                self.run_mem(
+                    "doc", "qaqc", str(did), "--verdict", "approved"
+                ),
+            )
+        finally:
+            mem.SC_API_TOKEN = original_token
+
+        approval = self.q(
+            "SELECT reviewer_shell_id,verdict,revision_sha256 "
+            "FROM sprint_spec_approvals WHERE document_id=?",
+            did,
+        )
+        self.assertEqual((3, "pass"), tuple(approval[:2]))
+        self.assertEqual(64, len(approval["revision_sha256"]))
+        self.assertEqual(0, self.run_mem("get", "qaqc", "--doc", str(did)))
 
     # ── doc writes serialize headlessly (subfloor#434) ───────────────────────
     def test_doc_write_serializes(self):

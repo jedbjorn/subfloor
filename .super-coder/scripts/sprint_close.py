@@ -25,6 +25,12 @@ class ConformanceReceipt:
     created: bool
 
 
+@dataclass(frozen=True)
+class FinalReportReceipt:
+    report_id: int
+    created: bool
+
+
 class SprintCloseStore:
     """Record close-out findings and compile deterministic evidence packets."""
 
@@ -106,6 +112,130 @@ class SprintCloseStore:
             )
         return ConformanceReceipt(report_id, tuple(followup_ids), True)
 
+    def record_final_report(
+        self,
+        sprint_id: int,
+        caller_shell_id: int,
+        *,
+        body: str,
+        idempotency_key: str,
+    ) -> FinalReportReceipt:
+        """Commit the optional final synthesis before lifecycle completion."""
+        body = self._required(body, "final report body")
+        idempotency_key = self._required(
+            idempotency_key, "idempotency key", maximum=220
+        )
+        with db_driver.write_transaction(self.con, "sprint.close.final_report"):
+            sprint = self._require_close_authority(sprint_id, caller_shell_id)
+            existing = self.con.execute(
+                "SELECT report_id,body,idempotency_key FROM sprint_reports "
+                "WHERE sprint_id=? AND report_kind='final' ORDER BY report_id LIMIT 1",
+                (sprint_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["body"] != body
+                    or existing["idempotency_key"] != idempotency_key
+                ):
+                    raise SprintInvariantError(
+                        "Sprint already has a different final report"
+                    )
+                return FinalReportReceipt(int(existing["report_id"]), False)
+            if sprint["lifecycle"] != "armed":
+                raise SprintInvariantError(
+                    f"final report requires an armed Sprint, not {sprint['lifecycle']}"
+                )
+            report_id = int(
+                self.con.execute(
+                    "INSERT INTO sprint_reports "
+                    "(sprint_id,report_kind,author_shell_id,body,idempotency_key) "
+                    "VALUES (?,'final',?,?,?)",
+                    (sprint_id, caller_shell_id, body, idempotency_key),
+                ).lastrowid
+            )
+            actor_kind = "fnb" if sprint["caller_flavor"] == "admin" else "planner"
+            self._event(
+                sprint_id,
+                "final_report.recorded",
+                caller_shell_id,
+                {"report_id": report_id},
+                actor_kind=actor_kind,
+            )
+        return FinalReportReceipt(report_id, True)
+
+    def disposition_followup(
+        self,
+        sprint_id: int,
+        followup_id: int,
+        caller_shell_id: int,
+        *,
+        disposition: str,
+        resolution: str | None = None,
+    ) -> bool:
+        """Record the FnB's terminal disposition of one conformance follow-up."""
+        if disposition not in {"accepted", "resolved", "dismissed"}:
+            raise ValueError(
+                "follow-up disposition must be accepted, resolved, or dismissed"
+            )
+        normalized_resolution = (resolution or "").strip()
+        if disposition == "accepted" and normalized_resolution:
+            raise ValueError("accepted follow-ups do not take a resolution")
+        if disposition in {"resolved", "dismissed"} and not normalized_resolution:
+            raise ValueError(f"{disposition} follow-ups require a resolution")
+        if len(normalized_resolution) > 8000:
+            raise ValueError("follow-up resolution exceeds 8000 characters")
+        with db_driver.write_transaction(self.con, "sprint.followup.disposition"):
+            caller = self.con.execute(
+                "SELECT flavor FROM shells WHERE shell_id=? "
+                "AND COALESCE(is_deleted,0)=0",
+                (caller_shell_id,),
+            ).fetchone()
+            if caller is None or caller["flavor"] != "admin":
+                raise SprintAuthorityError("only FnB may disposition Sprint follow-ups")
+            followup = self.con.execute(
+                "SELECT sprint_id,disposition,resolution FROM sprint_followups "
+                "WHERE sprint_id=? AND followup_id=?",
+                (sprint_id, followup_id),
+            ).fetchone()
+            if followup is None:
+                raise KeyError(
+                    f"unknown Sprint follow-up {followup_id} for Sprint {sprint_id}"
+                )
+            if followup["disposition"] != "pending":
+                existing_resolution = (followup["resolution"] or "").strip()
+                if (
+                    followup["disposition"] == disposition
+                    and existing_resolution == normalized_resolution
+                ):
+                    return False
+                raise SprintInvariantError(
+                    "Sprint follow-up already has a terminal disposition"
+                )
+            if disposition == "accepted":
+                self.con.execute(
+                    "UPDATE sprint_followups SET disposition='accepted' "
+                    "WHERE followup_id=?",
+                    (followup_id,),
+                )
+            else:
+                self.con.execute(
+                    "UPDATE sprint_followups SET disposition=?,resolution=?,"
+                    "resolved_at=datetime('now') WHERE followup_id=?",
+                    (disposition, normalized_resolution, followup_id),
+                )
+            self._event(
+                int(followup["sprint_id"]),
+                "followup.dispositioned",
+                caller_shell_id,
+                {
+                    "followup_id": followup_id,
+                    "disposition": disposition,
+                    "resolution": normalized_resolution or None,
+                },
+                actor_kind="fnb",
+            )
+        return True
+
     def compile_evidence_packet(
         self,
         sprint_id: int,
@@ -168,7 +298,7 @@ class SprintCloseStore:
         pending_followups = self._rows(
             "SELECT followup_id,severity,title,spec_document_id,work_unit_id,"
             "disposition,created_at FROM sprint_followups WHERE sprint_id=? "
-            "AND disposition IN ('pending','accepted') ORDER BY followup_id",
+            "AND disposition='pending' ORDER BY followup_id",
             (sprint_id,),
         )
         conformance_reports = self._rows(
@@ -183,6 +313,13 @@ class SprintCloseStore:
             "spec_document_id,work_unit_id,disposition,resolution,created_at,"
             "resolved_at FROM sprint_followups WHERE sprint_id=? "
             "ORDER BY followup_id",
+            (sprint_id,),
+        )
+        final_reports = self._rows(
+            "SELECT r.report_id,r.author_shell_id,s.shortname,r.body,r.created_at "
+            "FROM sprint_reports r LEFT JOIN shells s "
+            "ON s.shell_id=r.author_shell_id WHERE r.sprint_id=? "
+            "AND r.report_kind='final' ORDER BY r.report_id",
             (sprint_id,),
         )
         spec_events = [
@@ -221,6 +358,9 @@ class SprintCloseStore:
             "conformance": {
                 "reports": self._bounded(conformance_reports, section_limit),
                 "followups": self._bounded(conformance_followups, section_limit),
+                "final_reports": self._bounded(final_reports, section_limit),
+                "missing_conformance": not conformance_reports,
+                "missing_final_report": not final_reports,
             },
             "unresolved_work": {
                 "work_units": self._bounded(unresolved_units, section_limit),
@@ -255,8 +395,9 @@ class SprintCloseStore:
     def _planned_vs_actual(self, sprint_id: int) -> list[dict[str, Any]]:
         units = self._rows(
             "SELECT work_unit_id,assigned_shell_id,reviewer_shell_id,title,"
-            "expected_output,planned_wave,disposition,created_at,updated_at,"
-            "completed_at FROM sprint_work_units WHERE sprint_id=? "
+            "expected_output,output_kind,completion_result,planned_wave,"
+            "disposition,created_at,updated_at,completed_at "
+            "FROM sprint_work_units WHERE sprint_id=? "
             "ORDER BY planned_wave,work_unit_id",
             (sprint_id,),
         )
@@ -573,14 +714,17 @@ class SprintCloseStore:
         event_type: str,
         shell_id: int,
         payload: dict[str, Any],
+        *,
+        actor_kind: str = "participant",
     ) -> None:
         self.con.execute(
             "INSERT INTO sprint_events "
             "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
-            "VALUES (?,?,'participant',?,?)",
+            "VALUES (?,?,?,?,?)",
             (
                 sprint_id,
                 event_type,
+                actor_kind,
                 shell_id,
                 json.dumps(payload, separators=(",", ":"), sort_keys=True),
             ),

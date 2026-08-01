@@ -478,7 +478,7 @@ def _render_get(surface: str, data: dict) -> int:
                 print("  ⤷ " + t["resolution_notes"])
         return 0
     if surface == "qaqc":
-        reviews = data.get("reviews", [])
+        reviews = data.get("approvals", [])
         if not reviews:
             print("mem: no QAQC reviews")
             return 0
@@ -488,9 +488,9 @@ def _render_get(surface: str, data: dict) -> int:
                 or f"shell #{review['reviewer_shell_id']}"
             )
             print(
-                f"#{review['review_id']} [{review['verdict']}] "
-                f"spec #{review['spec_doc_id']} · {reviewer} · "
-                f"{review['body_sha256']} · {review['completed_at']}"
+                f"#{review['approval_id']} [{review['verdict']}] "
+                f"spec #{review['document_id']} · {reviewer} · "
+                f"{review['revision_sha256']} · {review['reviewed_at']}"
             )
         return 0
     if surface == "messages":
@@ -533,7 +533,7 @@ def cmd_get(args) -> int:
     elif surface == "qaqc":
         if args.doc is None:
             die("get qaqc needs --doc <spec_document_id>")
-        path = f"/api/spec-qaqc-reviews?spec_doc_id={args.doc}"
+        path = f"/_sc/sprint/approvals/{args.doc}"
     data = _api("GET", path)
     if args.json:
         print(json.dumps(data, indent=2, default=str))
@@ -780,21 +780,23 @@ def cmd_oriented(args) -> int:
 def cmd_doc(args) -> int:
     if args.doc_cmd == "qaqc":
         payload = {
-            "spec_doc_id": args.document_id,
-            "verdict": args.verdict,
+            "document_id": args.document_id,
+            "verdict": (
+                "pass" if args.verdict == "approved" else "fail"
+            ),
         }
         if args.findings_doc is not None:
-            payload["findings_doc_id"] = args.findings_doc
+            payload["findings_document_id"] = args.findings_doc
         review = _api(
             "POST",
-            "/api/spec-qaqc-reviews",
+            "/_sc/sprint/qaqc",
             payload,
             idempotent=True,
             idem_key=f"qaqc|{args.document_id}|{uuid.uuid4()}",
         )
         return _finish_api(
-            f"mem: QAQC review #{review['review_id']} → {review['verdict']} "
-            f"for spec #{args.document_id} at {review['body_sha256']}"
+            f"mem: QAQC approval #{review['approval_id']} → {review['verdict']} "
+            f"for spec #{args.document_id} at {review['revision_sha256']}"
         )
     if args.doc_cmd == "freeze":
         r = _api("PATCH", f"/_sc/mem/docs/{args.document_id}/freeze",

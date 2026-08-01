@@ -1543,7 +1543,7 @@ super-coder — forkable shell substrate
                              source-pure one: it verifies the CALLER's engine sources and local artifacts, and names the checkout it read.
   ./sc mem <cmd> [args]    a shell's own memory, over the engine API (get/state/seed/lns/decision/flag/roadmap/doc/narrative);
                              already wired to this launched shell, identity resolved by the engine — no DB path, no direct-DB fallback. `./sc mem which` to orient
-  ./sc sprint <cmd>        authenticated Sprints v2 actions: request-review · record-review · authorize-merge · dispatch · monitor · record-conformance · compile-report
+  ./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)
                              caller identity is resolved by the engine; report and review bodies use files, and mutating retries carry stable keys where required
   ./sc token               print the browser sign-in operator token (an operator capability: the Admin runtime
                              credential from the owner-only artifact .super-coder/run/mem/<shortname>.json, mode 0600)

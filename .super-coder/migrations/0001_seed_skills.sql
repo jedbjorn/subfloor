@@ -3729,9 +3729,11 @@ been chosen. Close-out supplies meaning; the compiler supplies facts.
 
 Before conformance, re-read work units, dependencies, registered PRs, checks,
 merge observations, task membership, pending actionable messages, and active
-native runs. Every planned unit must be completed/cancelled with an explicit
-disposition, and code units must have their real PR outcome. Do not infer task
-completion from PR state alone.
+native runs. Normally every planned unit is completed/cancelled with an
+explicit disposition, and code units have their real PR outcome. Close-out is
+advisory: the packet surfaces gaps but never prevents the owning Planner or FnB
+from making and reporting a completion judgment. Do not infer code completion
+from PR state alone.
 
 Boot an independent Reviewer into `sprint_rev` conformance mode with the bound
 spec revision hashes, integrated main SHA, and ratified judgment list. Do not
@@ -3748,6 +3750,16 @@ evidence rather than a silently reopened editing lane.
 
 Verify report id, follow-up ids, author identity, and idempotent replay before
 synthesis.
+
+FnB records one terminal disposition per follow-up. `accepted` acknowledges
+ship-as-is; `resolved` and `dismissed` require a resolution file.
+
+```text
+sc sprint disposition-followup --sprint <id> --followup <id> \
+  --disposition accepted
+sc sprint disposition-followup --sprint <id> --followup <id> \
+  --disposition resolved --resolution-file <path>
+```
 
 ## Compile bounded evidence
 
@@ -3808,14 +3820,16 @@ nothing.
 
 ## Terminal handoff
 
-Commit the final or abort report before the lifecycle transition. Complete only
-after conformance evidence and synthesis are durable; abort only under Planner
-or FnB authority. Terminal state stops Sprint services and removes live pills
-while retaining conversations, messages, events, PR evidence, reports, and
-follow-ups.
+Pass the final synthesis to `complete`; the surface commits the append-only
+`final` report before attempting the lifecycle transition. Omitting the report
+is permitted under advisory close-out, but the evidence packet records the gap.
+Abort only under Planner or FnB authority. Terminal state stops Sprint services
+and removes live pills while retaining conversations, messages, events, PR
+evidence, reports, and follow-ups.
 
 ```text
-sc sprint complete --sprint <id> --reason <summary> --outcome <outcome>
+sc sprint complete --sprint <id> --reason <summary> --outcome <outcome> \
+  --report-file <path> --key <stable-key>
 sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
 ```
 
@@ -3840,6 +3854,12 @@ Use for an actionable work-unit assignment in an armed Sprint. Marking that
 Sprint message read is acceptance and starts work immediately. If you cannot
 accept, decline with a concrete reason; never leave it unread and waking.
 
+```text
+sc sprint inbox --sprint <id>
+sc sprint accept --sprint <id> --message <message-id>
+sc sprint decline --sprint <id> --message <message-id> --reason <reason>
+```
+
 ## Orient and bound the lane
 
 Read the assignment, expected output, bound spec revision, dependencies,
@@ -3862,6 +3882,15 @@ Verification must exercise the unit''s independent stage gate and realistic
 failure paths. A local exploratory number is not merge evidence. Record real CI
 failures, anomalous infrastructure failures, retries, review friction, and
 known departures for the final report.
+
+An explicitly planned report-only or no-code lane completes with its durable
+result instead of a PR. Code lanes cannot use this path; they complete only
+after merge authorization and observation.
+
+```text
+sc sprint complete-unit --sprint <id> --work-unit <id> \
+  --result-file <path>
+```
 
 Register the PR through the authoritative Sprint surface and retain ownership
 until it is green. The watcher supplies red/green facts; do not write PR state
@@ -3944,6 +3973,11 @@ participant routes, active conversations, registered PRs, unresolved
 expectations, and recent anomalies. Viewing a participant conversation is
 observation, not activity; never manufacture progress from browser presence.
 
+```text
+sc sprint inbox --sprint <id>
+sc sprint accept --sprint <id> --message <message-id>
+```
+
 Release every dependency-ready lane through the production surface:
 
 ```text
@@ -3977,6 +4011,17 @@ sc sprint monitor --sprint <id>
 
 Do not poll this command on a schedule. It evaluates only due accepted
 expectations and its nudge/escalation identities are durable.
+
+Revise only a still-planned lane; name its complete new projection so the
+before/after event is reviewable. Cancel only an unreleased lane, with the
+reason retained as its terminal result:
+
+```text
+sc sprint replan-unit --sprint <id> --work-unit <id> \
+  --developer-shell <id> --reviewer-shell <id> --wave <n> \
+  [--depends-on <work-unit-id>] [--output-kind code|report-only|no-code]
+sc sprint cancel-unit --sprint <id> --work-unit <id> --reason <reason>
+```
 
 ## Escalation judgment
 
@@ -4059,6 +4104,17 @@ Read the feature, selected spec bodies, task ledgers, QAQC records, shell roster
 model routes, quota state, repository access, and worktree availability. Record
 the exact revision hash you inspected; a title or document id is not a revision.
 
+The Review shell records its verdict against the current exact body through the
+authenticated Sprint surface:
+
+```text
+sc sprint record-qaqc --document <spec-document-id> --verdict pass \
+  [--findings-document <document-id>]
+```
+
+Use `fail` until every blocking finding is resolved. A body edit changes the
+revision hash and therefore needs a fresh signed record.
+
 Refuse arming when any of these is true:
 
 - a selected current revision lacks Review-shell QAQC approval;
@@ -4098,7 +4154,8 @@ sc sprint declare --feature <feature-id> \
 sc sprint plan-unit --sprint <id> \
   --developer-shell <id> --reviewer-shell <id> --title <title> \
   --expected-output-file <path> --task <task-id> \
-  [--task <task-id>] [--wave <n>] [--depends-on <work-unit-id>]
+  [--task <task-id>] [--wave <n>] [--depends-on <work-unit-id>] \
+  [--output-kind code|report-only|no-code]
 ```
 
 The participant file contains `shell_id`, `role`, and `harness`, with optional
@@ -4145,6 +4202,16 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 
 Use in one of two modes: a work-unit PR review during the loop, or the final
 whole-Sprint conformance pass. The evidence differs; independence does not.
+
+Read and accept the actionable request before beginning. During preparation,
+sign the exact current spec revision through the same authenticated surface:
+
+```text
+sc sprint inbox --sprint <id>
+sc sprint accept --sprint <id> --message <message-id>
+sc sprint record-qaqc --document <spec-document-id> \
+  --verdict pass [--findings-document <document-id>]
+```
 
 ## Severity rubric
 

@@ -149,10 +149,16 @@ class SprintMessageStore:
             (sprint_id, shell_id),
         ).fetchall()
 
-    def mark_read(self, message_id: int, shell_id: int) -> str | None:
+    def mark_read(
+        self,
+        message_id: int,
+        shell_id: int,
+        *,
+        sprint_id: int | None = None,
+    ) -> str | None:
         """Read one message; actionable reads atomically accept it."""
         with db_driver.write_transaction(self.con, "sprint.message.read"):
-            message = self._recipient_message(message_id, shell_id)
+            message = self._recipient_message(message_id, shell_id, sprint_id)
             accepted_now = False
             if message["actionable"]:
                 if message["disposition"] == "declined":
@@ -211,13 +217,20 @@ class SprintMessageStore:
             self._cancel_resolved_wakes(message_id)
             return disposition
 
-    def decline(self, message_id: int, shell_id: int, reason: str) -> int:
+    def decline(
+        self,
+        message_id: int,
+        shell_id: int,
+        reason: str,
+        *,
+        sprint_id: int | None = None,
+    ) -> int:
         """Resolve an actionable message and actively route the result to Planner."""
         reason = reason.strip()
         if not reason:
             raise ValueError("decline requires a reason")
         with db_driver.write_transaction(self.con, "sprint.message.decline"):
-            message = self._recipient_message(message_id, shell_id)
+            message = self._recipient_message(message_id, shell_id, sprint_id)
             if not message["actionable"]:
                 raise SprintInvariantError("informational messages cannot be declined")
             if message["disposition"] == "accepted":
@@ -396,13 +409,24 @@ class SprintMessageStore:
         )
         return wake_id
 
-    def _recipient_message(self, message_id: int, shell_id: int) -> sqlite3.Row:
+    def _recipient_message(
+        self,
+        message_id: int,
+        shell_id: int,
+        sprint_id: int | None,
+    ) -> sqlite3.Row:
+        scope = " AND m.sprint_id=?" if sprint_id is not None else ""
+        params = (
+            (message_id, shell_id, sprint_id)
+            if sprint_id is not None
+            else (message_id, shell_id)
+        )
         row = self.con.execute(
             "SELECT m.* FROM sprint_messages m "
             "JOIN sprint_participants p "
             "ON p.sprint_id=m.sprint_id AND p.participant_id=m.to_participant_id "
-            "WHERE m.message_id=? AND p.shell_id=?",
-            (message_id, shell_id),
+            "WHERE m.message_id=? AND p.shell_id=?" + scope,
+            params,
         ).fetchone()
         if row is None:
             raise KeyError(f"Sprint message {message_id} is not addressed to shell")

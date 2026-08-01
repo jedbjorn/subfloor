@@ -69,6 +69,7 @@ import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, sp
 import sprint_close  # noqa: E402  (Sprints v2 conformance + report evidence)
 import sprint_domain  # noqa: E402  (Sprints v2 work dispatch authority)
 import sprint_liveness  # noqa: E402  (Sprints v2 one-shot monitor surface)
+import sprint_message_delivery  # noqa: E402  (Sprints v2 inbox acceptance)
 import sprint_recovery  # noqa: E402  (Sprints v2 pause/resume reconciliation)
 import sprint_review_loop  # noqa: E402  (Sprints v2 Dev/Review command surface)
 import sprint_runtime  # noqa: E402  (armed-only Sprint dispatch + wake delivery)
@@ -2000,8 +2001,11 @@ class Handler(BaseHTTPRequestHandler):
             for approval_id in approval_ids:
                 approval = con.execute(
                     "SELECT a.document_id,a.revision_sha256,a.verdict,d.feature_id,"
-                    "d.kind,d.body FROM sprint_spec_approvals a "
+                    "d.kind,d.body,reviewer.flavor AS reviewer_flavor,"
+                    "COALESCE(reviewer.is_deleted,0) AS reviewer_deleted "
+                    "FROM sprint_spec_approvals a "
                     "JOIN documents d ON d.document_id=a.document_id "
+                    "JOIN shells reviewer ON reviewer.shell_id=a.reviewer_shell_id "
                     "WHERE a.approval_id=?",
                     (approval_id,),
                 ).fetchone()
@@ -2015,6 +2019,8 @@ class Handler(BaseHTTPRequestHandler):
                     or approval["kind"] != "spec"
                     or int(approval["feature_id"]) != feature_id
                     or approval["revision_sha256"] != current_revision
+                    or approval["reviewer_flavor"] != "reviewer"
+                    or approval["reviewer_deleted"]
                 ):
                     raise sprint_domain.SprintInvariantError(
                         "declaration requires current passing approvals for its feature"
@@ -2111,7 +2117,20 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if len(parts) != 4:
                 return self._send(404, {"error": "not found"})
+            if parts[2] == "approvals":
+                approvals = sprint_domain.SprintSpecApprovalStore(
+                    con
+                ).for_document(int(parts[3]))
+                return self._send(200, {"approvals": approvals})
             sprint_id = int(parts[2])
+            if parts[3] == "inbox":
+                messages = sprint_message_delivery.SprintMessageStore(con).inbox(
+                    sprint_id, shell_id
+                )
+                return self._send(
+                    200,
+                    {"sprint_id": sprint_id, "messages": [dict(row) for row in messages]},
+                )
             store = sprint_close.SprintCloseStore(con)
             if parts[3] == "report":
                 query = parse_qs(urlparse(self.path).query)
@@ -2138,6 +2157,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         con = db()
         try:
+            if path == "/_sc/sprint/qaqc":
+                receipt = sprint_domain.SprintSpecApprovalStore(con).record(
+                    self._sprint_integer(body, "document_id"),
+                    shell_id,
+                    verdict=body.get("verdict") or "",
+                    findings_document_id=(
+                        self._sprint_integer(body, "findings_document_id")
+                        if body.get("findings_document_id") is not None
+                        else None
+                    ),
+                )
+                return self._send(201 if receipt.created else 200, {
+                    "approval_id": receipt.approval_id,
+                    "revision_sha256": receipt.revision_sha256,
+                    "verdict": receipt.verdict,
+                    "created": receipt.created,
+                })
             if path == "/_sc/sprint/declare":
                 sprint_id = self._declare_sprint(con, shell_id, body)
                 return self._send(201, {"sprint_id": sprint_id})
@@ -2164,6 +2200,7 @@ class Handler(BaseHTTPRequestHandler):
                         if body.get("dependency_ids")
                         else ()
                     ),
+                    output_kind=body.get("output_kind") or "code",
                 )
                 return self._send(201, {"work_unit_id": unit_id})
             if path == "/_sc/sprint/arm":
@@ -2181,6 +2218,65 @@ class Handler(BaseHTTPRequestHandler):
                         "another Sprint is already armed"
                     ) from exc
                 return self._send(200, {"wake_ids": wake_ids})
+            if path == "/_sc/sprint/replan-unit":
+                planner_shell_id = self._sprint_planner_proxy(
+                    con, sprint_id, shell_id
+                )
+                changed = sprint_domain.SprintWorkUnitStore(con).replan(
+                    sprint_id,
+                    self._sprint_integer(body, "work_unit_id"),
+                    planner_shell_id,
+                    assigned_shell_id=self._sprint_integer(
+                        body, "assigned_shell_id"
+                    ),
+                    reviewer_shell_id=self._sprint_integer(
+                        body, "reviewer_shell_id"
+                    ),
+                    planned_wave=int(body.get("planned_wave", 0)),
+                    dependency_ids=(
+                        self._sprint_integer_list(body, "dependency_ids")
+                        if body.get("dependency_ids")
+                        else ()
+                    ),
+                    output_kind=body.get("output_kind"),
+                )
+                return self._send(200, {"changed": changed})
+            if path == "/_sc/sprint/complete-unit":
+                wake_ids = sprint_domain.SprintWorkUnitStore(con).complete(
+                    sprint_id,
+                    self._sprint_integer(body, "work_unit_id"),
+                    shell_id,
+                    result=body.get("result") or "",
+                )
+                return self._send(200, {"wake_ids": wake_ids})
+            if path == "/_sc/sprint/cancel-unit":
+                planner_shell_id = self._sprint_planner_proxy(
+                    con, sprint_id, shell_id
+                )
+                changed = sprint_domain.SprintWorkUnitStore(con).cancel(
+                    sprint_id,
+                    self._sprint_integer(body, "work_unit_id"),
+                    planner_shell_id,
+                    reason=body.get("reason") or "",
+                )
+                return self._send(200, {"changed": changed})
+            if path == "/_sc/sprint/inbox-read":
+                disposition = sprint_message_delivery.SprintMessageStore(
+                    con
+                ).mark_read(
+                    self._sprint_integer(body, "message_id"),
+                    shell_id,
+                    sprint_id=sprint_id,
+                )
+                return self._send(200, {"disposition": disposition})
+            if path == "/_sc/sprint/inbox-decline":
+                message_id = sprint_message_delivery.SprintMessageStore(con).decline(
+                    self._sprint_integer(body, "message_id"),
+                    shell_id,
+                    body.get("reason") or "",
+                    sprint_id=sprint_id,
+                )
+                return self._send(200, {"result_message_id": message_id})
             if path == "/_sc/sprint/register-pr":
                 receipt = sprint_pr_watcher.SprintPRWatcher(
                     con, repo_root=REPO_ROOT
@@ -2236,6 +2332,20 @@ class Handler(BaseHTTPRequestHandler):
                     "anomalies": list(receipt.anomalies),
                 })
             if path == "/_sc/sprint/complete":
+                report_body = body.get("final_report")
+                report_key = body.get("idempotency_key")
+                if (report_body is None) != (report_key is None):
+                    raise ValueError(
+                        "final_report and idempotency_key must be provided together"
+                    )
+                report = None
+                if report_body is not None:
+                    report = sprint_close.SprintCloseStore(con).record_final_report(
+                        sprint_id,
+                        shell_id,
+                        body=report_body,
+                        idempotency_key=report_key,
+                    )
                 changed = sprint_domain.SprintLifecycleStore(con).transition(
                     sprint_id,
                     "completed",
@@ -2243,7 +2353,11 @@ class Handler(BaseHTTPRequestHandler):
                     reason=body.get("reason"),
                     terminal_outcome=body.get("terminal_outcome"),
                 )
-                return self._send(200, {"changed": changed})
+                return self._send(200, {
+                    "changed": changed,
+                    "report_id": report.report_id if report else None,
+                    "report_created": report.created if report else False,
+                })
             if path == "/_sc/sprint/abort":
                 receipt = sprint_recovery.SprintRecoveryCoordinator(
                     con, repo_root=REPO_ROOT
@@ -2347,6 +2461,15 @@ class Handler(BaseHTTPRequestHandler):
                     "followup_ids": list(receipt.followup_ids),
                     "created": receipt.created,
                 })
+            if path == "/_sc/sprint/followup-disposition":
+                changed = sprint_close.SprintCloseStore(con).disposition_followup(
+                    sprint_id,
+                    self._sprint_integer(body, "followup_id"),
+                    shell_id,
+                    disposition=body.get("disposition") or "",
+                    resolution=body.get("resolution"),
+                )
+                return self._send(200, {"changed": changed})
             return self._send(404, {"error": "not found"})
         except Exception as exc:
             return self._sprint_error(exc)

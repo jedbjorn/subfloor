@@ -170,6 +170,114 @@ class MigrationAndShapeTest(SprintDomainCase):
         )
 
 
+class SpecApprovalTest(SprintDomainCase):
+    def test_review_shell_records_exact_revision_and_retry_is_idempotent(self) -> None:
+        feature_id = int(
+            self.con.execute(
+                "INSERT INTO roadmap (title) VALUES ('QAQC feature')"
+            ).lastrowid
+        )
+        document_id = int(
+            self.con.execute(
+                "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                "VALUES (?,'spec',1,'QAQC spec','exact body')",
+                (feature_id,),
+            ).lastrowid
+        )
+        findings_id = int(
+            self.con.execute(
+                "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                "VALUES (?,'doc',1,'Findings','none')",
+                (feature_id,),
+            ).lastrowid
+        )
+        self.con.commit()
+        approvals = sprint_domain.SprintSpecApprovalStore(self.con)
+
+        first = approvals.record(
+            document_id,
+            2,
+            verdict="pass",
+            findings_document_id=findings_id,
+        )
+        replay = approvals.record(
+            document_id,
+            2,
+            verdict="pass",
+            findings_document_id=findings_id,
+        )
+
+        self.assertTrue(first.created)
+        self.assertFalse(replay.created)
+        self.assertEqual(first.approval_id, replay.approval_id)
+        self.assertEqual(hashlib.sha256(b"exact body").hexdigest(), first.revision_sha256)
+        self.assertEqual(
+            (
+                document_id,
+                2,
+                "pass",
+                findings_id,
+            ),
+            tuple(
+                self.con.execute(
+                    "SELECT document_id,reviewer_shell_id,verdict,"
+                    "findings_document_id FROM sprint_spec_approvals "
+                    "WHERE approval_id=?",
+                    (first.approval_id,),
+                ).fetchone()
+            ),
+        )
+        listed = approvals.for_document(document_id)
+        self.assertEqual(1, len(listed))
+        self.assertEqual("REV1", listed[0]["reviewer_shortname"])
+
+    def test_non_reviewer_cannot_record_or_arm_hand_seeded_approval(self) -> None:
+        feature_id = int(
+            self.con.execute(
+                "INSERT INTO roadmap (title) VALUES ('Bad signer feature')"
+            ).lastrowid
+        )
+        document_id = int(
+            self.con.execute(
+                "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                "VALUES (?,'spec',1,'Bad signer','body')",
+                (feature_id,),
+            ).lastrowid
+        )
+        self.con.commit()
+        approvals = sprint_domain.SprintSpecApprovalStore(self.con)
+        with self.assertRaisesRegex(
+            sprint_domain.SprintAuthorityError, "Review shell"
+        ):
+            approvals.record(document_id, 1, verdict="pass")
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_spec_approvals WHERE document_id=?",
+                (document_id,),
+            ).fetchone()[0],
+        )
+
+        sprint_id, _ = self.create_sprint()
+        self.con.execute(
+            "UPDATE sprint_spec_approvals SET reviewer_shell_id=1 "
+            "WHERE approval_id=(SELECT approval_id FROM sprint_specs "
+            "WHERE sprint_id=?)",
+            (sprint_id,),
+        )
+        self.con.commit()
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "passing spec approval"
+        ):
+            self.store.arm(sprint_id, 3)
+        self.assertEqual(
+            "prepared",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?", (sprint_id,)
+            ).fetchone()[0],
+        )
+
+
 class LifecycleTest(SprintDomainCase):
     def test_sprint_insert_must_start_prepared(self) -> None:
         sprint_id, _ = self.create_sprint()
