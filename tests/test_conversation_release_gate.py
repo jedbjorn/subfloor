@@ -496,7 +496,7 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
 
     @pytest.mark.xfail(
         strict=True,
-        reason="Sprint 63 unit 4 removes this cross-harness gate marker",
+        reason="unit 4 removes this cross-harness gate marker",
     )
     @unittest.expectedFailure
     def test_same_adapter_conversations_keep_segment_ids_run_scoped(self) -> None:
