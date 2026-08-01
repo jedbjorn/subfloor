@@ -4633,6 +4633,7 @@ async function renderInterface(root) {
     historyPollInFlight = true;
     try {
       let cursor = null;
+      let selectedSeen = false;
       const nextOpenByShell = new Map();
       do {
         const suffix = cursor
@@ -4652,11 +4653,24 @@ async function renderInterface(root) {
             chatPaintHistoryItem(item, accepted);
           }
           if (conversation.conversation_id
-              === selectedConversation?.conversation_id)
+              === selectedConversation?.conversation_id) {
+            selectedSeen = true;
             selectedConversation = acceptSummary(conversation);
+          }
         }
         cursor = page.next_cursor;
       } while (cursor);
+      if (selectedConversation
+          && selectedConversation.state !== "closed"
+          && !selectedSeen) {
+        const conversation = await chatApi(
+          `/conversations/${selectedConversation.conversation_id}`,
+        );
+        const accepted = acceptSummary(conversation);
+        const item = historyItems.get(conversation.conversation_id);
+        if (item) chatPaintHistoryItem(item, accepted);
+        selectedConversation = accepted;
+      }
       if (generation !== chatRenderGeneration || !chatHistoryPollTimer) return;
       for (const [shellId, button] of shellItems)
         chatPaintShellState(button, nextOpenByShell.get(shellId));
@@ -4827,11 +4841,15 @@ function sprintPageShell(list, selectedId) {
     className: "sprint-selector",
     title: "Select Sprint",
   });
-  for (const item of list) selector.append(el("option", {
-    value: String(item.sprint_id),
-    selected: item.sprint_id === selectedId,
-    textContent: `Sprint ${item.sprint_id} · ${item.lifecycle} · ${item.feature.title}`,
-  }));
+  for (const item of list) {
+    const label = `Sprint ${item.sprint_id} · ${item.lifecycle} · ${item.feature.title}`;
+    selector.append(el("option", {
+      title: label,
+      value: String(item.sprint_id),
+      selected: item.sprint_id === selectedId,
+      textContent: label.length > 50 ? `${label.slice(0, 49)}…` : label,
+    }));
+  }
   selector.onchange = () => sprintRoute(Number(selector.value));
   const content = el("div", { className: "sprint-content" });
   return {

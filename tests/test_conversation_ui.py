@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -10,6 +13,20 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 INDEX = (ROOT / ".super-coder" / "ui" / "index.html").read_text()
 STYLE = (ROOT / ".super-coder" / "ui" / "style.css").read_text()
+POLL_BLOCK = APP[
+    APP.index("  let historyPollInFlight = false;"):
+    APP.index(
+        "  chatHistoryPollTimer = setInterval(pollHistory, CHAT_HISTORY_POLL_MS);"
+    ) + len("  chatHistoryPollTimer = setInterval(pollHistory, CHAT_HISTORY_POLL_MS);")
+]
+
+
+def run_js(script: str) -> dict:
+    proc = subprocess.run(
+        ["node", "-e", script], text=True, capture_output=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
 def test_interface_is_a_first_class_reload_safe_view():
@@ -424,6 +441,69 @@ def test_history_poll_only_reconciles_open_pages_without_advancing_history():
     assert "renderInterface(" not in poll
     assert "historyItems.get(conversation.conversation_id)" in poll
     assert "chatPaintShellState(button, nextOpenByShell.get(shellId))" in poll
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_history_poll_reconciles_selected_conversation_after_it_closes():
+    script = r"""
+globalThis.document = {hidden: false};
+let scheduled = null;
+globalThis.setInterval = (callback) => { scheduled = callback; return 1; };
+const calls = [];
+const painted = [];
+let openPoll = 0;
+async function chatApi(path) {
+  calls.push(path);
+  if (path === "/conversations?open=true&limit=100") {
+    openPoll += 1;
+    return openPoll === 1
+      ? {items: [{conversation_id: "cv1", state: "running", version: 2,
+          shell: {shell_id: 7}}], next_cursor: null}
+      : {items: [], next_cursor: null};
+  }
+  if (path === "/conversations/cv1")
+    return {conversation_id: "cv1", state: "closed", version: 3,
+      shell: {shell_id: 7}};
+  throw new Error(`unexpected request: ${path}`);
+}
+const historyItems = new Map([["cv1", {id: "selected"}]]);
+const shellItems = new Map([[7, {}]]);
+const acceptSummary = (conversation) => conversation;
+const chatPaintHistoryItem = (item, conversation) => {
+  painted.push([item.id, conversation.state, conversation.version]);
+};
+const chatPaintShellState = () => {};
+let selectedConversation = {
+  conversation_id: "cv1", state: "idle", version: 1, shell: {shell_id: 7},
+};
+const generation = 4;
+let chatRenderGeneration = 4;
+let chatHistoryPollTimer = 1;
+const CHAT_HISTORY_POLL_MS = 2000;
+""" + POLL_BLOCK + r"""
+(async () => {
+  await scheduled();
+  await scheduled();
+  await scheduled();
+  console.log(JSON.stringify({calls, painted, selected: selectedConversation}));
+})().catch((error) => {
+  console.error(error.stack || error);
+  process.exit(1);
+});
+"""
+    result = run_js(script)
+    assert result["calls"] == [
+        "/conversations?open=true&limit=100",
+        "/conversations?open=true&limit=100",
+        "/conversations/cv1",
+        "/conversations?open=true&limit=100",
+    ]
+    assert result["painted"] == [
+        ["selected", "running", 2],
+        ["selected", "closed", 3],
+    ]
+    assert result["selected"]["state"] == "closed"
+    assert result["selected"]["version"] == 3
 
 
 def test_history_card_has_independent_durable_star_button():
