@@ -40,6 +40,35 @@ OUT_PATH = artifact_policy.content_path()
 # copy, remove it once we write the new one so it can't shadow or drift.
 LEGACY_PATH = ENGINE / "snapshot" / "content.sql"
 
+# Every durable Sprints v2 table.  Keep this as the one snapshot authority for
+# the domain: tests compare it to the migrated schema so a future sprint_*
+# table cannot silently fall out of rebuilds.  Generic conversations are
+# listed before this group in PER_INSTANCE_TABLES because participant links,
+# pointers, and wake attempts reference them.
+SPRINT_INSTANCE_TABLES = [
+    "sprint_spec_approvals",
+    "sprints",
+    "sprint_specs",
+    "sprint_participants",
+    "sprint_participant_conversations",
+    "sprint_work_units",
+    "sprint_work_unit_tasks",
+    "sprint_work_unit_dependencies",
+    "sprint_messages",
+    "sprint_wake_outbox",
+    "sprint_wake_messages",
+    "sprint_wake_attempts",
+    "sprint_liveness_expectations",
+    "sprint_registered_prs",
+    "sprint_pr_work_units",
+    "sprint_pr_transitions",
+    "sprint_judgments",
+    "sprint_reports",
+    "sprint_followups",
+    "sprint_events",
+]
+
+
 # Per-instance tables, parents-before-children for readability.
 # `schema_migrations` is excluded. Engine-authored skills are system content
 # seeded from migrations; project-local skills are serialized by the special
@@ -84,6 +113,11 @@ PER_INSTANCE_TABLES = [
     "conversation_runs",
     "conversation_events",
     "conversation_outbox",
+    # Sprints are durable orchestration truth, not a derived runtime cache.
+    # This includes terminal rows and append-only evidence: numeric allocators,
+    # exact approvals, active routes, retries, reports, and history must all
+    # survive update/rebuild together.
+    *SPRINT_INSTANCE_TABLES,
     # NOTE: dr_section is authored navigation but lives in the MAP DB now
     # (.sc-state/map.db), not shell_db.db — it is serialized separately to
     # .sc-state/local/map/content.sql by snapshot_map() below, not here.
@@ -225,6 +259,222 @@ SENSITIVE_COLUMNS = {
 }
 
 
+def _table_columns(con, table: str) -> list[str]:
+    return [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+
+
+def _insert_line(table: str, cols: list[str], row) -> str:
+    vals = ", ".join(quote(v) for v in row)
+    return f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({vals});"
+
+
+def _dependency_ordered_rows(
+    rows,
+    cols: list[str],
+    *,
+    table: str,
+    identity: str,
+    parent: str,
+    scope: tuple[str, ...],
+):
+    """Order immutable self-references parent-first for trigger-safe replay."""
+    identity_index = cols.index(identity)
+    parent_index = cols.index(parent)
+    scope_indexes = tuple(cols.index(column) for column in scope)
+
+    def row_key(row) -> tuple:
+        return tuple(row[index] for index in scope_indexes) + (row[identity_index],)
+
+    by_key = {row_key(row): row for row in rows}
+    if len(by_key) != len(rows):
+        raise RuntimeError(f"snapshot: duplicate dependency identity in {table}")
+
+    keys = [row_key(row) for row in rows]
+    children: dict[tuple, list[tuple]] = {key: [] for key in keys}
+    indegree = {key: 0 for key in keys}
+    for key, row in zip(keys, rows):
+        parent_identity = row[parent_index]
+        if parent_identity is not None:
+            parent_key = tuple(row[index] for index in scope_indexes) + (
+                parent_identity,
+            )
+            if parent_key not in by_key:
+                raise RuntimeError(
+                    f"snapshot: missing dependency in {table}: {parent_key!r}"
+                )
+            children[parent_key].append(key)
+            indegree[key] += 1
+
+    ready = [key for key in keys if indegree[key] == 0]
+    ordered = []
+    cursor = 0
+    while cursor < len(ready):
+        key = ready[cursor]
+        cursor += 1
+        ordered.append(by_key[key])
+        for child_key in children[key]:
+            indegree[child_key] -= 1
+            if indegree[child_key] == 0:
+                ready.append(child_key)
+    if len(ordered) != len(rows):
+        raise RuntimeError(f"snapshot: dependency cycle in {table}")
+    return ordered
+
+
+def dump_dependency_ordered_table(
+    con,
+    table: str,
+    *,
+    identity: str,
+    parent: str,
+    scope: tuple[str, ...],
+) -> list[str]:
+    """Dump a self-referential table in legal immutable-insert order."""
+    cols = _table_columns(con, table)
+    rows = con.execute(
+        f"SELECT {', '.join(cols)} FROM {table} ORDER BY rowid"
+    ).fetchall()
+    ordered = _dependency_ordered_rows(
+        rows,
+        cols,
+        table=table,
+        identity=identity,
+        parent=parent,
+        scope=scope,
+    )
+    lines = [f"DELETE FROM {table};"]
+    lines.extend(_insert_line(table, cols, row) for row in ordered)
+    lines.append("")
+    return lines
+
+
+def dump_sprints(con) -> list[str]:
+    """Serialize lifecycle rows through their legal transition path.
+
+    The schema correctly refuses inserting an armed/terminal Sprint directly.
+    A rebuild therefore inserts the exact row as prepared (with no terminal
+    outcome), then replays only the lifecycle edges needed to restore its
+    projection.  All timestamps, generation identity, version, and plan fields
+    are inserted at their original values and remain byte-for-byte unchanged.
+    """
+    table = "sprints"
+    cols = _table_columns(con, table)
+    rows = con.execute(
+        f"SELECT {', '.join(cols)} FROM {table} ORDER BY rowid"
+    ).fetchall()
+    lifecycle_index = cols.index("lifecycle")
+    outcome_index = cols.index("terminal_outcome")
+    lines = [f"DELETE FROM {table};"]
+    restores: list[tuple[str, list[str]]] = []
+    for original in rows:
+        row = list(original)
+        lifecycle = str(row[lifecycle_index])
+        outcome = row[outcome_index]
+        sprint_id = row[cols.index("sprint_id")]
+        if lifecycle != "prepared":
+            row[lifecycle_index] = "prepared"
+            row[outcome_index] = None
+        lines.append(_insert_line(table, cols, row))
+        transitions: list[str] = []
+        if lifecycle in {"armed", "paused", "completed"}:
+            transitions.append(
+                f"UPDATE sprints SET lifecycle='armed' WHERE sprint_id={quote(sprint_id)};"
+            )
+        if lifecycle == "paused":
+            transitions.append(
+                f"UPDATE sprints SET lifecycle='paused' WHERE sprint_id={quote(sprint_id)};"
+            )
+        elif lifecycle == "completed":
+            transitions.append(
+                "UPDATE sprints SET lifecycle='completed', terminal_outcome="
+                f"{quote(outcome)} WHERE sprint_id={quote(sprint_id)};"
+            )
+        elif lifecycle == "aborted":
+            transitions.append(
+                "UPDATE sprints SET lifecycle='aborted', terminal_outcome="
+                f"{quote(outcome)} WHERE sprint_id={quote(sprint_id)};"
+            )
+        restores.append((lifecycle, transitions))
+    # The unique partial index permits only one armed Sprint.  Restore every
+    # row that finishes non-armed first, then the current armed row.  This is
+    # independent of creation order (an older paused Sprint can be resumed
+    # after a newer Sprint is paused).
+    for lifecycle, transitions in restores:
+        if lifecycle != "armed":
+            lines.extend(transitions)
+    for lifecycle, transitions in restores:
+        if lifecycle == "armed":
+            lines.extend(transitions)
+    lines.append("")
+    return lines
+
+
+def dump_sprint_participants(con) -> list[str]:
+    """Insert participants before immutable links, with pointers deferred."""
+    table = "sprint_participants"
+    cols = _table_columns(con, table)
+    rows = con.execute(
+        f"SELECT {', '.join(cols)} FROM {table} ORDER BY rowid"
+    ).fetchall()
+    pointer_indexes = (
+        cols.index("persistent_conversation_id"),
+        cols.index("current_conversation_id"),
+    )
+    lines = [f"DELETE FROM {table};"]
+    for original in rows:
+        row = list(original)
+        for index in pointer_indexes:
+            row[index] = None
+        lines.append(_insert_line(table, cols, row))
+    lines.append("")
+    return lines
+
+
+def dump_sprint_participant_conversations(con) -> list[str]:
+    """Restore immutable links, then select the participants' exact pointers."""
+    lines = dump_dependency_ordered_table(
+        con,
+        "sprint_participant_conversations",
+        identity="conversation_id",
+        parent="parent_conversation_id",
+        scope=("sprint_participant_id",),
+    )
+    pointers = con.execute(
+        "SELECT participant_id,persistent_conversation_id,current_conversation_id "
+        "FROM sprint_participants "
+        "WHERE persistent_conversation_id IS NOT NULL "
+        "OR current_conversation_id IS NOT NULL ORDER BY participant_id"
+    ).fetchall()
+    if pointers:
+        lines.pop()  # keep pointer selection in the same readable table block
+    for participant_id, persistent, current in pointers:
+        lines.append(
+            "UPDATE sprint_participants SET persistent_conversation_id="
+            f"{quote(persistent)}, current_conversation_id={quote(current)} "
+            f"WHERE participant_id={quote(participant_id)};"
+        )
+    if pointers:
+        lines.append("")
+    return lines
+
+
+def dump_plain_table(con, table: str) -> list[str]:
+    cols = _table_columns(con, table)
+    cols = [c for c in cols if c not in SENSITIVE_COLUMNS.get(table, ())]
+    if not cols:
+        return []
+    collist = ", ".join(cols)
+    where = SNAPSHOT_ROW_FILTERS.get(table, "")
+    rows = con.execute(
+        f"SELECT {collist} FROM {table} {where} ORDER BY rowid"
+    ).fetchall()
+    lines = [f"DELETE FROM {table};"]
+    for row in rows:
+        lines.append(_insert_line(table, cols, row))
+    lines.append("")
+    return lines
+
+
 def dump_table(con, table: str) -> list[str]:
     if table == "skills":
         return dump_local_skills(con)
@@ -232,21 +482,21 @@ def dump_table(con, table: str) -> list[str]:
         return dump_flavor_skills(con)
     if table == "shell_skills":
         return dump_shell_skills(con)
-    cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
-    cols = [c for c in cols if c not in SENSITIVE_COLUMNS.get(table, ())]
-    if not cols:
-        return []
-    collist = ", ".join(cols)
-    where = SNAPSHOT_ROW_FILTERS.get(table, "")
-    rows = con.execute(
-        f"SELECT {collist} FROM {table} "
-        f"{where} ORDER BY rowid").fetchall()
-    lines = [f"DELETE FROM {table};"]
-    for row in rows:
-        vals = ", ".join(quote(v) for v in row)
-        lines.append(f"INSERT INTO {table} ({collist}) VALUES ({vals});")
-    lines.append("")
-    return lines
+    if table == "conversation_messages":
+        return dump_dependency_ordered_table(
+            con,
+            table,
+            identity="message_id",
+            parent="caused_by_message_id",
+            scope=("conversation_id",),
+        )
+    if table == "sprints":
+        return dump_sprints(con)
+    if table == "sprint_participants":
+        return dump_sprint_participants(con)
+    if table == "sprint_participant_conversations":
+        return dump_sprint_participant_conversations(con)
+    return dump_plain_table(con, table)
 
 
 def snapshot_map() -> None:
@@ -283,16 +533,10 @@ def snapshot_map() -> None:
         con.close()
 
 
-def main() -> int:
-    require_admin("snapshot")
-    copied = artifact_policy.prepare_local_state()
-    if copied:
-        print(f"snapshot: localized {len(copied)} existing artifact(s)")
-    if not DB_PATH.exists():
-        raise SystemExit(f"snapshot: no live DB at {DB_PATH} — run `./sc rebuild` first.")
-    con = db_driver.connect(DB_PATH)
+def serialize_instance(con) -> str:
+    """Render one coherent read view of every per-instance table."""
+    con.execute("BEGIN")
     try:
-        reconciled = seed_skills.reconcile_tombstoned_skills(con)
         out = [
             "-- super-coder per-instance snapshot — GENERATED by scripts/snapshot.py.",
             "-- Idempotent: DELETE-then-INSERT per table, PK order. Loaded by rebuild.py.",
@@ -308,7 +552,24 @@ def main() -> int:
             if table_exists(con, table):
                 out.extend(dump_table(con, table))
         out.extend(["COMMIT;", "PRAGMA foreign_keys=ON;"])
-        artifact_policy.atomic_write_text(OUT_PATH, "\n".join(out) + "\n")
+        return "\n".join(out) + "\n"
+    finally:
+        # End the fixed read view without taking ownership of any live writes.
+        con.rollback()
+
+
+def main() -> int:
+    require_admin("snapshot")
+    copied = artifact_policy.prepare_local_state()
+    if copied:
+        print(f"snapshot: localized {len(copied)} existing artifact(s)")
+    if not DB_PATH.exists():
+        raise SystemExit(f"snapshot: no live DB at {DB_PATH} — run `./sc rebuild` first.")
+    con = db_driver.connect(DB_PATH)
+    try:
+        reconciled = seed_skills.reconcile_tombstoned_skills(con)
+        content = serialize_instance(con)
+        artifact_policy.atomic_write_text(OUT_PATH, content)
     finally:
         con.close()
     if reconciled.changed_names:

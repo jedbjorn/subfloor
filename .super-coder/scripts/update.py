@@ -843,7 +843,10 @@ def migrate_or_rebuild() -> None:
         print("→ no live DB (fresh fork) — building from text")
         rebuild_mod.main([])
         return
-    rebuild_mod.backup_existing()  # restore point before any structural change
+    # This restore point pairs with engine.ref.prev.  Keep it distinct from a
+    # later verify/rebuild diagnostic backup so rollback cannot combine a
+    # current-schema DB with the previous engine.
+    rebuild_mod.backup_existing(prefix="preupdate")
     print("→ migrate in place (pending migrations → the live DB; data preserved)")
     migrate_mod.migrate(str(DB_PATH))
 
