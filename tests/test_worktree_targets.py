@@ -54,6 +54,7 @@ IGNORE = shutil.ignore_patterns(
 # source independently. Generated mirrors are local-only and need not exist.
 SENTINEL_MIGRATION = "9999_worktree_sentinel.sql"
 SENTINEL_SKILL = "wt-sentinel-skill"
+SEED_SENTINEL_SKILL = "wt_seed_sentinel"
 ENGINE_PIN = "1234567890abcdef1234567890abcdef12345678"
 SENTINEL_SQL = (
     "INSERT INTO skills (name, description, content, common, is_deleted) "
@@ -404,6 +405,76 @@ class RenderCheckRunsCallerSourceTest(WorktreeFixture):
         self.assertIn(str(self.wt / ".super-coder"), done.stderr)
         self.assertIn("does not", done.stderr)
         self.assertEqual(done.stdout, "")
+
+
+class SeedSkillsRunsCallerSourceTest(WorktreeFixture):
+    """Seed generation authors the invoking checkout, never shared source."""
+
+    def setUp(self):
+        super().setUp()
+        git = ["git", "-C", str(self.main)]
+        subprocess.run(
+            [
+                *git,
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/jedbjorn/subfloor.git",
+            ],
+            check=True,
+        )
+        self.addCleanup(
+            subprocess.run, [*git, "remote", "remove", "origin"], check=True
+        )
+        self.asset_dir = (
+            self.wt / ".super-coder" / "assets" / "skills" / SEED_SENTINEL_SKILL
+        )
+        self.asset_dir.mkdir()
+        self.asset_dir.joinpath("SKILL.md").write_text(
+            "---\n"
+            f"name: {SEED_SENTINEL_SKILL}\n"
+            "description: present only in the linked source worktree\n"
+            "common: false\n"
+            "---\n\n"
+            "# Linked source sentinel\n"
+        )
+        self.addCleanup(shutil.rmtree, self.asset_dir)
+        self.seed = self.wt / ".super-coder" / "migrations" / "0001_seed_skills.sql"
+        seed_before = self.seed.read_bytes()
+        self.addCleanup(self.seed.write_bytes, seed_before)
+
+    def test_seed_generation_uses_caller_assets_without_touching_live_state(self):
+        live_before = state_digest(self.main)
+        main_seed = self.main / ".super-coder" / "migrations" / "0001_seed_skills.sql"
+        main_seed_before = main_seed.read_bytes()
+
+        done = run_sc(self.wt, "seed-skills")
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn(
+            "seed_skills: wrote .super-coder/migrations/0001_seed_skills.sql",
+            done.stdout,
+        )
+        self.assertIn(f"'{SEED_SENTINEL_SKILL}'", self.seed.read_text())
+        self.assertEqual(main_seed.read_bytes(), main_seed_before)
+        self.assertEqual(state_digest(self.main), live_before)
+        self.assertFalse((self.wt / ".super-coder" / "shell_db.db").exists())
+
+    def test_missing_caller_seed_script_fails_instead_of_falling_back(self):
+        script = self.wt / ".super-coder" / "scripts" / "seed_skills.py"
+        parked = script.with_suffix(".py.parked")
+        live_before = state_digest(self.main)
+        script.rename(parked)
+        try:
+            done = run_sc(self.wt, "seed-skills")
+        finally:
+            parked.rename(script)
+
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(done.stdout, "")
+        self.assertIn(str(self.wt / ".super-coder"), done.stderr)
+        self.assertIn("does not", done.stderr)
+        self.assertEqual(state_digest(self.main), live_before)
 
 
 class LiveSurfacesStillResolveTest(WorktreeFixture):
