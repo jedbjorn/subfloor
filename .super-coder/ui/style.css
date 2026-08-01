@@ -874,6 +874,8 @@ details.feature.shipped-bar { border-left-color: var(--lock); }
 .flag-body { padding: 0 .4rem .7rem 1.8rem; }
 .flag-desc { white-space: pre-wrap; font-size: .85rem; line-height: 1.55; margin-bottom: .6rem; }
 .flag-links { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .6rem; }
+.flag-actions { display: flex; align-items: center; gap: .6rem; margin-top: .7rem; }
+.flag-actions .flag-edit { margin-left: auto; }
 .link-card {
   display: inline-flex; flex-direction: column; gap: .1rem;
   background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
@@ -1123,7 +1125,9 @@ button.gmenu-name:hover { color: #fff; }
 /* feature editor in a modal: scroll the form, don't stretch a lone textarea */
 .modal-body > .feature-body { flex: 1; min-height: 0; overflow: auto; padding: .2rem .2rem 0; }
 .modal-body > .feature-body textarea { flex: none; resize: vertical; font: inherit; width: 100%; }
-.modal-foot { display: flex; justify-content: space-between; padding: .6rem 1.2rem 1rem; }
+.modal-foot { display: flex; align-items: center; padding: .6rem 1.2rem 1rem; }
+.modal-foot-start, .modal-foot-end { display: flex; align-items: center; gap: .6rem; }
+.modal-foot-end { margin-left: auto; }
 .modal-foot .act { margin-top: 0; }
 
 /* ── Markdown surfaces (vendored marked + DOMPurify; dos-arch ramp on flat
