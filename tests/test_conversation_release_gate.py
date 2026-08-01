@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from collections.abc import Iterator
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -28,7 +29,9 @@ from conversation_adapters import (
     ReconcileResult,
 )
 
-REQUIRED_HARNESSES = ("opencode", "claude", "codex")
+REQUIRED_HARNESSES = ("claude", "codex", "kimi", "opencode")
+ACTIONABLE_BOUNDARY_HARNESSES = {"codex", "opencode"}
+TERMINAL_RUN_STATES = {"succeeded", "failed", "cancelled", "unknown"}
 
 
 def apply_schema(con: sqlite3.Connection) -> None:
@@ -54,6 +57,7 @@ class NativeHarnessState:
         self.reconciled: list[tuple[str, str]] = []
         self.run_serial = 0
         self.segmented_trace = False
+        self.actionable_boundaries = False
         self.stream_barrier: threading.Barrier | None = None
         self.stream_lock = threading.Lock()
         self.active_streams = 0
@@ -133,6 +137,23 @@ class ReleaseGateAdapter:
                     "assistant.delta",
                     {"text": f"{self.harness} after tool"},
                 )
+                if self.state.actionable_boundaries:
+                    yield NormalizedEvent(
+                        "permission.requested",
+                        {"detail": "approve release-gate write"},
+                    )
+                    yield NormalizedEvent(
+                        "assistant.delta",
+                        {"text": f"{self.harness} after permission"},
+                    )
+                    yield NormalizedEvent(
+                        "input.requested",
+                        {"detail": "choose release-gate target"},
+                    )
+                    yield NormalizedEvent(
+                        "assistant.delta",
+                        {"text": f"{self.harness} after input"},
+                    )
             else:
                 yield NormalizedEvent(
                     "assistant.delta",
@@ -296,12 +317,9 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
                 "FROM conversation_runs ORDER BY run_id"
             ).fetchall()
             con.close()
-            if len(rows) >= count and rows[-1]["state"] in {
-                "succeeded",
-                "failed",
-                "cancelled",
-                "unknown",
-            }:
+            if len(rows) >= count and all(
+                row["state"] in TERMINAL_RUN_STATES for row in rows[:count]
+            ):
                 return rows
             time.sleep(0.01)
         self.fail(f"{count} conversation run(s) did not become terminal")
@@ -327,6 +345,8 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
     def assert_release_journey(self, harness: str) -> None:
         self.assertIn(harness, REQUIRED_HARNESSES)
         state = NativeHarnessState(harness)
+        state.segmented_trace = True
+        state.actionable_boundaries = harness in ACTIONABLE_BOUNDARY_HARNESSES
         first_broker = self.start_broker(state)
         create_body = {"shell_id": 1, "harness": harness}
         if harness == "opencode":
@@ -404,6 +424,11 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
         self.assertNotEqual(
             first_rows[0]["runner_ref"],
             second_rows[1]["runner_ref"],
+        )
+        self.assert_segmented_transcript(
+            conversation_id,
+            harness,
+            [int(row["run_id"]) for row in second_rows],
         )
 
         status, _, duplicate = self.request(
@@ -483,6 +508,110 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
         )
         self.stop_broker(running_recovery)
 
+    def assert_segmented_transcript(
+        self,
+        conversation_id: str,
+        harness: str,
+        run_ids: list[int],
+    ) -> None:
+        with closing(self.connect()) as con:
+            boundary_sequences = {
+                (int(row["run_id"]), row["event_type"]): int(row["sequence"])
+                for row in con.execute(
+                    "SELECT run_id,event_type,sequence FROM conversation_events "
+                    "WHERE conversation_id=? AND run_id IS NOT NULL AND "
+                    "event_type IN ('tool.completed','permission.requested',"
+                    "'input.requested')",
+                    (conversation_id,),
+                )
+            }
+
+        expected = []
+        for run_id in run_ids:
+            expected_boundary_types = {"tool.completed"}
+            if harness in ACTIONABLE_BOUNDARY_HARNESSES:
+                expected_boundary_types.update({
+                    "permission.requested",
+                    "input.requested",
+                })
+            self.assertEqual(
+                {
+                    event_type
+                    for event_run_id, event_type in boundary_sequences
+                    if event_run_id == run_id
+                },
+                expected_boundary_types,
+            )
+            tool_sequence = boundary_sequences[(run_id, "tool.completed")]
+            expected.extend([
+                (
+                    f"run:{run_id}:assistant:0",
+                    "assistant",
+                    f"{harness} before tool",
+                ),
+                (
+                    f"run:{run_id}:assistant:{tool_sequence}",
+                    "assistant",
+                    f"{harness} after tool",
+                ),
+            ])
+            if harness not in ACTIONABLE_BOUNDARY_HARNESSES:
+                continue
+            permission_sequence = boundary_sequences[
+                (run_id, "permission.requested")
+            ]
+            input_sequence = boundary_sequences[(run_id, "input.requested")]
+            expected.extend([
+                (
+                    f"event:{permission_sequence}",
+                    "permission.requested",
+                    "Waiting for permission",
+                ),
+                (
+                    f"run:{run_id}:assistant:{permission_sequence}",
+                    "assistant",
+                    f"{harness} after permission",
+                ),
+                (
+                    f"event:{input_sequence}",
+                    "input.requested",
+                    "Waiting for input",
+                ),
+                (
+                    f"run:{run_id}:assistant:{input_sequence}",
+                    "assistant",
+                    f"{harness} after input",
+                ),
+            ])
+
+        status, _, transcript = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/transcript",
+        )
+        self.assertEqual(status, 200, transcript)
+        self.assertEqual(transcript["projection_version"], 2)
+        self.assertIsNone(transcript["truncation"])
+        projected = []
+        for item in transcript["items"]:
+            if item["kind"] == "user":
+                continue
+            projected.append((
+                item["item_id"],
+                (
+                    item["activity_type"]
+                    if item["kind"] == "activity"
+                    else item["kind"]
+                ),
+                item.get("label", item.get("text")),
+            ))
+        self.assertEqual(projected, expected)
+        item_ids = [item["item_id"] for item in transcript["items"]]
+        self.assertEqual(len(item_ids), len(expected) + len(run_ids))
+        self.assertEqual(len(item_ids), len(set(item_ids)))
+        encoded = json.dumps(transcript)
+        self.assertNotIn("tool.started", encoded)
+        self.assertNotIn("tool.completed", encoded)
+
     def test_opencode_release_journey_and_crash_windows(self) -> None:
         self.assert_release_journey("opencode")
 
@@ -491,6 +620,9 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
 
     def test_codex_release_journey_and_crash_windows(self) -> None:
         self.assert_release_journey("codex")
+
+    def test_kimi_release_journey_and_crash_windows(self) -> None:
+        self.assert_release_journey("kimi")
 
     def test_same_adapter_conversations_keep_segment_ids_run_scoped(self) -> None:
         state = NativeHarnessState("codex")

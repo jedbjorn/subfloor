@@ -1237,6 +1237,27 @@ def test_segmented_live_trace_refresh_replay_and_node_identity(static_ui):
             return fulfill(route, selected)
         if parsed.path == f"/api/conversations/{CONVERSATION_ID}/transcript":
             return fulfill(route, snapshot)
+        if parsed.path == f"/api/conversations/{CONVERSATION_ID}/review-targets":
+            return fulfill(route, target_page())
+        if parsed.path == f"/api/conversations/{CONVERSATION_ID}/review-observations":
+            return fulfill(route, observation_page())
+        if (
+            parsed.path.endswith("/patch")
+            and "/api/review-observations/" in parsed.path
+        ):
+            return fulfill(
+                route,
+                {
+                    "fingerprint": "a" * 64,
+                    "file_id": "rf_1",
+                    "section": "dirty",
+                    "patch": "diff --git a/src/app.js b/src/app.js\n+proof\n",
+                    "sha256": "c" * 64,
+                    "truncated": False,
+                    "binary": False,
+                    "unavailable_reason": None,
+                },
+            )
         return fulfill(
             route,
             {"error": {"code": "UNMOCKED", "message": parsed.path}},
@@ -1324,6 +1345,8 @@ def test_segmented_live_trace_refresh_replay_and_node_identity(static_ui):
         }
         page.reload(wait_until="networkidle")
         page.locator(".chat-transcript").wait_for()
+        composer = page.locator(".chat-composer-input")
+        composer.fill("draft survives pending-boundary refresh")
         page.evaluate(
             """
             window.__firstSegmentNode =
@@ -1337,18 +1360,18 @@ def test_segmented_live_trace_refresh_replay_and_node_identity(static_ui):
             """
         )
 
+        page.get_by_role("tab", name="Diff").click()
+        page.locator(".review-workspace").wait_for()
+        assert page.url.endswith(f"/{CONVERSATION_ID}/diff")
+        assert composer.input_value() == "draft survives pending-boundary refresh"
+        assert page.locator(".chat-stop-header").is_visible()
+        assert page.locator(".chat-stop-header").is_enabled()
+
         delta = LIVE_SEGMENT_EVENTS[2]
         page.evaluate(
             "([type, payload]) => "
             "window.__fakeEventSources[0].emit(type, payload)",
             [delta["event_type"], delta],
-        )
-        page.get_by_text("after tool", exact=True).wait_for()
-        page.evaluate(
-            """
-            window.__secondSegmentNode =
-              document.querySelectorAll('.chat-bubble.chat-assistant')[1];
-            """
         )
 
         replayed_boundary = LIVE_SEGMENT_EVENTS[0]
@@ -1363,7 +1386,22 @@ def test_segmented_live_trace_refresh_replay_and_node_identity(static_ui):
                 "window.__fakeEventSources[0].emit(type, payload)",
                 [event["event_type"], event],
             )
+        page.wait_for_timeout(100)
+        hidden_counts = page.evaluate("window.__chatPerf")
+        assert hidden_counts["transcriptReplacements"] == 0
+        assert hidden_counts["assistantReplacements"] == 0
+
+        page.get_by_role("tab", name="Chat").click()
         page.get_by_text("after tool continued", exact=True).wait_for()
+        assert composer.input_value() == "draft survives pending-boundary refresh"
+        assert page.locator(".chat-stop").is_visible()
+        assert page.locator(".chat-stop").is_enabled()
+        page.evaluate(
+            """
+            window.__secondSegmentNode =
+              document.querySelectorAll('.chat-bubble.chat-assistant')[1];
+            """
+        )
 
         assert page.locator(".chat-assistant-body").evaluate_all(
             "nodes => nodes.map((node) => node.textContent.trim())"
