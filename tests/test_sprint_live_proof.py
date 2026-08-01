@@ -2,29 +2,46 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import sqlite3
 import sys
 import tempfile
 import threading
 import unittest
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 ACCEPTANCE = ROOT / "tests" / "fixtures" / "sprint_v2_acceptance.json"
-sys.path[:0] = [str(ENGINE / "scripts"), str(ROOT / "tests")]
+sys.path[:0] = [
+    str(ENGINE / "scripts"),
+    str(ENGINE / "api"),
+    str(ROOT / "tests"),
+]
 
 import db_driver
-import sprint_close
+import mem
+import server
+import sprint_cli
 import sprint_domain
 import sprint_message_delivery
 import sprint_pr_watcher
-import sprint_review_loop
 import sprint_runtime
 from github_pull_requests import PullRequest
 from test_sprint_v2_domain import apply_schema
+
+TOKENS = {
+    1: "live-dev-1",
+    2: "live-review-1",
+    3: "live-planner",
+    4: "live-dev-2",
+    5: "live-review-2",
+}
 
 
 class ScenarioGitHub:
@@ -47,7 +64,7 @@ class ScenarioGitHub:
         pull_request = PullRequest(
             number=number,
             head_ref=f"live-proof/pr-{number}",
-            base_ref="main",
+            base_ref="live-proof/base",
             head_sha=head,
             state=state,
             merged_at="2026-08-01T00:00:00Z" if state == "MERGED" else None,
@@ -71,6 +88,18 @@ class ScenarioGitHub:
 
 
 class SprintLiveProof(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        mem.SC_API_BASE = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
@@ -85,19 +114,51 @@ class SprintLiveProof(unittest.TestCase):
         self.con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
         self.con.executemany(
             "INSERT INTO shells "
-            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
-            "VALUES (?,?,?,?,?,1)",
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id,api_key) "
+            "VALUES (?,?,?,?,?,1,?)",
             (
-                (1, "Developer one", "DEV1", "dev", "prompt"),
-                (2, "Reviewer one", "REV1", "reviewer", "prompt"),
-                (3, "Planner", "PLN1", "planner", "prompt"),
-                (4, "Developer two", "DEV2", "dev", "prompt"),
-                (5, "Reviewer two", "REV2", "reviewer", "prompt"),
+                (1, "Developer one", "DEV1", "dev", "prompt", TOKENS[1]),
+                (2, "Reviewer one", "REV1", "reviewer", "prompt", TOKENS[2]),
+                (3, "Planner", "PLN1", "planner", "prompt", TOKENS[3]),
+                (4, "Developer two", "DEV2", "dev", "prompt", TOKENS[4]),
+                (5, "Reviewer two", "REV2", "reviewer", "prompt", TOKENS[5]),
             ),
         )
         self.con.commit()
+        server.DB_PATH = self.db_path
         self.github = ScenarioGitHub()
         self.reader_factory = lambda _repository: self.github
+        self.input_counter = 0
+
+    def write_input(self, body: str) -> str:
+        path = Path(self.temp_dir.name) / f"input-{self.input_counter}.txt"
+        self.input_counter += 1
+        path.write_text(body)
+        return str(path)
+
+    def run_cli(self, shell_id: int, *argv: str) -> dict:
+        mem.SC_API_TOKEN = TOKENS[shell_id]
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                server.sprint_pr_watcher,
+                "GitHubPullRequestReader",
+                return_value=self.github,
+            ),
+            mock.patch.object(
+                server.sprint_review_loop,
+                "GitHubPullRequestReader",
+                return_value=self.github,
+            ),
+            mock.patch.object(
+                server.sprint_recovery,
+                "GitHubPullRequestReader",
+                return_value=self.github,
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(0, sprint_cli.main(list(argv)))
+        return json.loads(output.getvalue())
 
     def prepare(
         self,
@@ -127,31 +188,6 @@ class SprintLiveProof(unittest.TestCase):
                 (document_id, revision),
             ).lastrowid
         )
-        sprint_id = int(
-            self.con.execute(
-                "INSERT INTO sprints "
-                "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
-                "VALUES (?,3,1)",
-                (feature_id,),
-            ).lastrowid
-        )
-        self.con.execute(
-            "INSERT INTO sprint_specs "
-            "(sprint_id,document_id,bound_revision_sha256,approval_id) "
-            "VALUES (?,?,?,?)",
-            (sprint_id, document_id, revision, approval_id),
-        )
-        self.con.executemany(
-            "INSERT INTO sprint_participants "
-            "(sprint_id,shell_id,role,harness,model,effort) VALUES (?,?,?,?,?,?)",
-            (
-                (sprint_id, 3, "planner", "codex", "planner-model", "high"),
-                (sprint_id, 1, "developer", "codex", "dev-model", "high"),
-                (sprint_id, 2, "reviewer", "kimi", "review-model", "high"),
-                (sprint_id, 4, "developer", "codex", "dev-model", "high"),
-                (sprint_id, 5, "reviewer", "kimi", "review-model", "high"),
-            ),
-        )
         task_ids = [
             int(
                 self.con.execute(
@@ -163,23 +199,80 @@ class SprintLiveProof(unittest.TestCase):
             for index in range(len(lanes))
         ]
         self.con.commit()
-
-        units = sprint_domain.SprintWorkUnitStore(self.con)
+        declaration = self.run_cli(
+            3,
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec-approval",
+            str(approval_id),
+            "--participants-file",
+            self.write_input(
+                json.dumps(
+                    [
+                        {
+                            "shell_id": 3,
+                            "role": "planner",
+                            "harness": "codex",
+                            "model": "planner-model",
+                            "effort": "high",
+                        },
+                        {
+                            "shell_id": 1,
+                            "role": "developer",
+                            "harness": "codex",
+                            "model": "dev-model",
+                            "effort": "high",
+                        },
+                        {
+                            "shell_id": 2,
+                            "role": "reviewer",
+                            "harness": "kimi",
+                            "model": "review-model",
+                            "effort": "high",
+                        },
+                        {
+                            "shell_id": 4,
+                            "role": "developer",
+                            "harness": "codex",
+                            "model": "dev-model",
+                            "effort": "high",
+                        },
+                        {
+                            "shell_id": 5,
+                            "role": "reviewer",
+                            "harness": "kimi",
+                            "model": "review-model",
+                            "effort": "high",
+                        },
+                    ]
+                )
+            ),
+            "--merge-grant",
+        )
+        sprint_id = declaration["sprint_id"]
         unit_ids: list[int] = []
         for index, (developer, reviewer, dependency_indexes) in enumerate(lanes):
-            unit_ids.append(
-                units.create(
-                    sprint_id,
-                    3,
-                    assigned_shell_id=developer,
-                    reviewer_shell_id=reviewer,
-                    title=f"Live lane {index + 1}",
-                    expected_output=f"Merged live lane {index + 1}",
-                    task_ids=(task_ids[index],),
-                    planned_wave=0,
-                    dependency_ids=tuple(unit_ids[item] for item in dependency_indexes),
-                )
-            )
+            argv = [
+                "plan-unit",
+                "--sprint",
+                str(sprint_id),
+                "--developer-shell",
+                str(developer),
+                "--reviewer-shell",
+                str(reviewer),
+                "--title",
+                f"Live lane {index + 1}",
+                "--expected-output-file",
+                self.write_input(f"Merged live lane {index + 1}"),
+                "--task",
+                str(task_ids[index]),
+                "--wave",
+                "0",
+            ]
+            for dependency_index in dependency_indexes:
+                argv.extend(("--depends-on", str(unit_ids[dependency_index])))
+            unit_ids.append(self.run_cli(3, *argv)["work_unit_id"])
         return sprint_id, document_id, unit_ids
 
     def watcher(self) -> sprint_pr_watcher.SprintPRWatcher:
@@ -234,66 +327,95 @@ class SprintLiveProof(unittest.TestCase):
         request_changes: bool = False,
     ) -> int:
         self.github.set(pr_number, "OPEN")
-        registration = watcher.register(
-            sprint_id,
-            owner_shell_id=developer,
-            repository="acme/live-proof",
-            pr_number=pr_number,
-            work_unit_ids=(unit_id,),
-        )
-        loop = sprint_review_loop.SprintReviewLoopStore(
-            self.con,
-            repo_root=ROOT,
-            reader_factory=self.reader_factory,
+        registration = self.run_cli(
+            developer,
+            "register-pr",
+            "--sprint",
+            str(sprint_id),
+            "--repository",
+            "acme/live-proof",
+            "--pr",
+            str(pr_number),
+            "--work-unit",
+            str(unit_id),
         )
         messages = sprint_message_delivery.SprintMessageStore(self.con)
 
-        handoff = loop.request_review(
-            sprint_id,
-            registration.registered_pr_id,
+        handoff = self.run_cli(
             developer,
-            readiness=f"PR {pr_number} is green and ready.",
-            idempotency_key=f"proof:{pr_number}:review:1",
+            "request-review",
+            "--sprint",
+            str(sprint_id),
+            "--registered-pr",
+            str(registration["registered_pr_id"]),
+            "--readiness-file",
+            self.write_input(f"PR {pr_number} is green and ready."),
+            "--key",
+            f"proof:{pr_number}:review:1",
         )
-        self.assertEqual("accepted", messages.mark_read(handoff.message_id, reviewer))
+        self.assertEqual(
+            "accepted", messages.mark_read(handoff["message_id"], reviewer)
+        )
         if request_changes:
-            outcome = loop.record_review(
-                sprint_id,
-                registration.registered_pr_id,
+            outcome = self.run_cli(
                 reviewer,
-                verdict="changes_requested",
-                body="Exercise the correction loop before approval.",
-                idempotency_key=f"proof:{pr_number}:changes",
+                "record-review",
+                "--sprint",
+                str(sprint_id),
+                "--registered-pr",
+                str(registration["registered_pr_id"]),
+                "--verdict",
+                "changes_requested",
+                "--body-file",
+                self.write_input("Exercise the correction loop before approval."),
+                "--key",
+                f"proof:{pr_number}:changes",
             )
-            self.assertEqual("fixing", outcome.disposition)
+            self.assertEqual("fixing", outcome["disposition"])
             self.github.set(pr_number, "OPEN", checks="FAILURE")
             self.assertTrue(watcher.poll_once())
             self.github.set(pr_number, "OPEN")
             self.assertTrue(watcher.poll_once())
-            handoff = loop.request_review(
-                sprint_id,
-                registration.registered_pr_id,
+            handoff = self.run_cli(
                 developer,
-                readiness=f"PR {pr_number} correction is green.",
-                idempotency_key=f"proof:{pr_number}:review:2",
+                "request-review",
+                "--sprint",
+                str(sprint_id),
+                "--registered-pr",
+                str(registration["registered_pr_id"]),
+                "--readiness-file",
+                self.write_input(f"PR {pr_number} correction is green."),
+                "--key",
+                f"proof:{pr_number}:review:2",
             )
             self.assertEqual(
-                "accepted", messages.mark_read(handoff.message_id, reviewer)
+                "accepted", messages.mark_read(handoff["message_id"], reviewer)
             )
 
-        approval = loop.record_review(
-            sprint_id,
-            registration.registered_pr_id,
+        approval = self.run_cli(
             reviewer,
-            verdict="approved",
-            body="No Medium-or-higher findings remain.",
-            idempotency_key=f"proof:{pr_number}:approved",
+            "record-review",
+            "--sprint",
+            str(sprint_id),
+            "--registered-pr",
+            str(registration["registered_pr_id"]),
+            "--verdict",
+            "approved",
+            "--body-file",
+            self.write_input("No Medium-or-higher findings remain."),
+            "--key",
+            f"proof:{pr_number}:approved",
         )
-        self.assertEqual("merge_ready", approval.disposition)
-        authorization = loop.authorize_merge(
-            sprint_id, registration.registered_pr_id, developer
+        self.assertEqual("merge_ready", approval["disposition"])
+        authorization = self.run_cli(
+            developer,
+            "authorize-merge",
+            "--sprint",
+            str(sprint_id),
+            "--registered-pr",
+            str(registration["registered_pr_id"]),
         )
-        self.assertEqual(f"{pr_number:040x}", authorization.head_sha)
+        self.assertEqual(f"{pr_number:040x}", authorization["head_sha"])
         self.github.set(pr_number, "MERGED")
         self.assertTrue(watcher.poll_once())
         self.assertEqual(
@@ -303,28 +425,41 @@ class SprintLiveProof(unittest.TestCase):
                 (unit_id,),
             ).fetchone()[0],
         )
-        return registration.registered_pr_id
+        return registration["registered_pr_id"]
 
     def close(self, sprint_id: int, document_id: int) -> dict:
-        close = sprint_close.SprintCloseStore(self.con)
-        receipt = close.record_conformance(
-            sprint_id,
+        receipt = self.run_cli(
             2,
-            body="Integrated live proof matches its bound contract.",
-            findings=(),
-            idempotency_key=f"proof:{sprint_id}:conformance",
+            "record-conformance",
+            "--sprint",
+            str(sprint_id),
+            "--body-file",
+            self.write_input("Integrated live proof matches its bound contract."),
+            "--findings-file",
+            self.write_input("[]"),
+            "--key",
+            f"proof:{sprint_id}:conformance",
         )
-        self.assertEqual((), receipt.followup_ids)
-        self.assertTrue(
-            sprint_domain.SprintLifecycleStore(self.con).transition(
-                sprint_id,
-                "completed",
-                sprint_domain.LifecycleActor("planner", 3),
-                reason="delivery and conformance complete",
-                terminal_outcome="accepted",
-            )
+        self.assertEqual([], receipt["followup_ids"])
+        completed = self.run_cli(
+            3,
+            "complete",
+            "--sprint",
+            str(sprint_id),
+            "--reason",
+            "delivery and conformance complete",
+            "--outcome",
+            "accepted",
         )
-        packet = close.compile_evidence_packet(sprint_id, 3)
+        self.assertTrue(completed["changed"])
+        packet = self.run_cli(
+            3,
+            "compile-report",
+            "--sprint",
+            str(sprint_id),
+            "--limit",
+            "50",
+        )
         self.assertEqual("completed", packet["scope"]["lifecycle"])
         self.assertEqual(
             document_id, packet["spec_revisions"]["bound"][0]["document_id"]
@@ -335,7 +470,7 @@ class SprintLiveProof(unittest.TestCase):
 
     def test_serial_sprint_runs_correction_merge_dispatch_and_close(self) -> None:
         sprint_id, document_id, units = self.prepare(((1, 2, ()), (1, 2, (0,))))
-        initial_wakes = sprint_domain.SprintLifecycleStore(self.con).arm(sprint_id, 3)
+        initial_wakes = self.run_cli(3, "arm", "--sprint", str(sprint_id))["wake_ids"]
         self.assertEqual(1, len(initial_wakes))
         self.assertEqual(
             [(units[0], "ready"), (units[1], "planned")],
@@ -409,7 +544,7 @@ class SprintLiveProof(unittest.TestCase):
 
     def test_parallel_sprint_completes_out_of_order_without_lane_overlap(self) -> None:
         sprint_id, document_id, units = self.prepare(((1, 2, ()), (4, 5, ())))
-        initial_wakes = sprint_domain.SprintLifecycleStore(self.con).arm(sprint_id, 3)
+        initial_wakes = self.run_cli(3, "arm", "--sprint", str(sprint_id))["wake_ids"]
         self.assertEqual(2, len(initial_wakes))
         self.deliver_browser_turns()
         self.accept_assignment(units[0], 1)

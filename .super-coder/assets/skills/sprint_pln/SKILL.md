@@ -74,6 +74,11 @@ messages, pending wakes, work units, registered PRs, capacity, and spec drift.
 Drift informs; it never silently blocks resume. Record the exact revision facts
 and choose continue, re-plan, or abort.
 
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
+sc sprint resume --sprint <id> [--reason <reconciliation-judgment>]
+```
+
 Abort only when continuing would be dishonest or unsafe. It is terminal and
 deletes nothing.
 

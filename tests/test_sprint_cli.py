@@ -1,4 +1,5 @@
 """Authenticated end-to-end gates for the shell-facing Sprint commands."""
+
 from __future__ import annotations
 
 import contextlib
@@ -27,6 +28,7 @@ from github_pull_requests import PullRequest  # noqa: E402
 from test_sprint_v2_domain import apply_schema  # noqa: E402
 
 TOKENS = {
+    "admin": "admin-token",
     "developer": "dev-token",
     "reviewer": "review-token",
     "planner": "planner-token",
@@ -69,6 +71,7 @@ class SprintCliApiTest(unittest.TestCase):
                 (2, "Reviewer", "REV1", "reviewer", "prompt", TOKENS["reviewer"]),
                 (3, "Planner", "PLN1", "planner", "prompt", TOKENS["planner"]),
                 (4, "Developer 2", "DEV2", "dev", "prompt", "dev2-token"),
+                (5, "FnB", "FNB", "admin", "prompt", TOKENS["admin"]),
             ),
         )
         feature_id = int(
@@ -135,9 +138,7 @@ class SprintCliApiTest(unittest.TestCase):
             ).lastrowid
         )
         con.commit()
-        initial_wake = sprint_domain.SprintLifecycleStore(con).arm(
-            cls.sprint_id, 3
-        )[0]
+        initial_wake = sprint_domain.SprintLifecycleStore(con).arm(cls.sprint_id, 3)[0]
         initial_message = int(
             con.execute(
                 "SELECT message_id FROM sprint_wake_messages WHERE wake_id=?",
@@ -201,6 +202,400 @@ class SprintCliApiTest(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             self.assertEqual(0, sprint_cli.main(list(argv)))
         return json.loads(output.getvalue())
+
+    def seed_declaration(self, suffix: str) -> tuple[int, int, int]:
+        con = sqlite3.connect(self.db)
+        try:
+            feature_id = int(
+                con.execute(
+                    "INSERT INTO roadmap (title,roadmap_status) VALUES (?,?)",
+                    (f"Declared feature {suffix}", "in_progress"),
+                ).lastrowid
+            )
+            body = f"declared spec {suffix}"
+            document_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',1,?,?)",
+                    (feature_id, f"Spec {suffix}", body),
+                ).lastrowid
+            )
+            approval_id = int(
+                con.execute(
+                    "INSERT INTO sprint_spec_approvals "
+                    "(document_id,revision_sha256,reviewer_shell_id,verdict) "
+                    "VALUES (?,?,2,'pass')",
+                    (document_id, hashlib.sha256(body.encode()).hexdigest()),
+                ).lastrowid
+            )
+            task_id = int(
+                con.execute(
+                    "INSERT INTO spec_tasks (feature_id,document_id,seq,title) "
+                    "VALUES (?,?,0,?)",
+                    (feature_id, document_id, f"Task {suffix}"),
+                ).lastrowid
+            )
+            con.commit()
+            return feature_id, approval_id, task_id
+        finally:
+            con.close()
+
+    def participants_file(self) -> str:
+        return self.write(
+            json.dumps(
+                [
+                    {"shell_id": 3, "role": "planner", "harness": "codex"},
+                    {"shell_id": 1, "role": "developer", "harness": "codex"},
+                    {"shell_id": 2, "role": "reviewer", "harness": "kimi"},
+                ]
+            )
+        )
+
+    def use_isolated_db(self) -> None:
+        original_db = self.db
+        original_server_db = server.DB_PATH
+        with tempfile.NamedTemporaryFile(
+            dir=self.tmp, suffix=".db", delete=False
+        ) as handle:
+            isolated = Path(handle.name)
+        con = sqlite3.connect(isolated)
+        try:
+            apply_schema(con)
+            con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
+            con.executemany(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id,api_key) "
+                "VALUES (?,?,?,?,?,1,?)",
+                (
+                    (1, "Developer", "DEV1", "dev", "prompt", TOKENS["developer"]),
+                    (2, "Reviewer", "REV1", "reviewer", "prompt", TOKENS["reviewer"]),
+                    (3, "Planner", "PLN1", "planner", "prompt", TOKENS["planner"]),
+                    (5, "FnB", "FNB", "admin", "prompt", TOKENS["admin"]),
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+        self.db = isolated
+        server.DB_PATH = isolated
+        self.addCleanup(setattr, self, "db", original_db)
+        self.addCleanup(setattr, server, "DB_PATH", original_server_db)
+
+    def test_declare_plan_lifecycle_and_registration_surfaces(self):
+        self.use_isolated_db()
+        feature_id, approval_id, task_id = self.seed_declaration("lifecycle")
+        declaration = self.run_cli(
+            TOKENS["planner"],
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec-approval",
+            str(approval_id),
+            "--participants-file",
+            self.participants_file(),
+            "--merge-grant",
+        )
+        sprint_id = declaration["sprint_id"]
+        unit = self.run_cli(
+            TOKENS["planner"],
+            "plan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--developer-shell",
+            "1",
+            "--reviewer-shell",
+            "2",
+            "--title",
+            "Shell-driven lane",
+            "--expected-output-file",
+            self.write("One merged fixture PR."),
+            "--task",
+            str(task_id),
+        )
+        armed = self.run_cli(TOKENS["planner"], "arm", "--sprint", str(sprint_id))
+        self.assertEqual(1, len(armed["wake_ids"]))
+
+        with mock.patch.object(
+            server.sprint_pr_watcher,
+            "GitHubPullRequestReader",
+            return_value=Reader(),
+        ):
+            registration = self.run_cli(
+                TOKENS["developer"],
+                "register-pr",
+                "--sprint",
+                str(sprint_id),
+                "--repository",
+                "acme/repo",
+                "--pr",
+                "84",
+                "--work-unit",
+                str(unit["work_unit_id"]),
+            )
+        self.assertTrue(registration["created"])
+
+        paused = self.run_cli(
+            TOKENS["developer"],
+            "pause",
+            "--sprint",
+            str(sprint_id),
+            "--reason",
+            "exercise participant pause",
+        )
+        self.assertTrue(paused["changed"])
+        self.assertIsInstance(paused["report_id"], int)
+        with mock.patch.object(
+            server.sprint_recovery,
+            "GitHubPullRequestReader",
+            return_value=Reader(),
+        ):
+            resumed = self.run_cli(
+                TOKENS["planner"],
+                "resume",
+                "--sprint",
+                str(sprint_id),
+                "--reason",
+                "fixture is healthy",
+            )
+        self.assertTrue(resumed["changed"])
+        completed = self.run_cli(
+            TOKENS["planner"],
+            "complete",
+            "--sprint",
+            str(sprint_id),
+            "--reason",
+            "proof complete",
+            "--outcome",
+            "accepted",
+        )
+        self.assertTrue(completed["changed"])
+
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                ("completed", "accepted"),
+                con.execute(
+                    "SELECT lifecycle,terminal_outcome FROM sprints WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone(),
+            )
+            self.assertEqual(
+                [("sprint.declared",), ("work_unit.created",)],
+                con.execute(
+                    "SELECT event_type FROM sprint_events WHERE sprint_id=? "
+                    "ORDER BY event_id LIMIT 2",
+                    (sprint_id,),
+                ).fetchall(),
+            )
+        finally:
+            con.close()
+
+    def test_admin_declares_for_planner_and_aborts_without_deleting_history(self):
+        self.use_isolated_db()
+        feature_id, approval_id, task_id = self.seed_declaration("abort")
+        declaration = self.run_cli(
+            TOKENS["admin"],
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--planner-shell",
+            "3",
+            "--spec-approval",
+            str(approval_id),
+            "--participants-file",
+            self.participants_file(),
+            "--merge-grant",
+        )
+        sprint_id = declaration["sprint_id"]
+        unit_id = self.run_cli(
+            TOKENS["admin"],
+            "plan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--developer-shell",
+            "1",
+            "--reviewer-shell",
+            "2",
+            "--title",
+            "FnB-planned lane",
+            "--expected-output-file",
+            self.write("History survives armed abort."),
+            "--task",
+            str(task_id),
+        )["work_unit_id"]
+        armed = self.run_cli(TOKENS["admin"], "arm", "--sprint", str(sprint_id))
+        self.assertEqual(1, len(armed["wake_ids"]))
+        aborted = self.run_cli(
+            TOKENS["admin"],
+            "abort",
+            "--sprint",
+            str(sprint_id),
+            "--reason",
+            "fixture cancellation",
+        )
+        self.assertTrue(aborted["changed"])
+        self.assertIsInstance(aborted["report_id"], int)
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                ("aborted", "aborted"),
+                con.execute(
+                    "SELECT lifecycle,terminal_outcome FROM sprints WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone(),
+            )
+            self.assertEqual(
+                (3, "ready"),
+                con.execute(
+                    "SELECT COUNT(*),u.disposition FROM sprint_participants p "
+                    "JOIN sprint_work_units u ON u.sprint_id=p.sprint_id "
+                    "WHERE p.sprint_id=? AND u.work_unit_id=?",
+                    (sprint_id, unit_id),
+                ).fetchone(),
+            )
+        finally:
+            con.close()
+
+    def test_arm_reports_single_armed_conflict_and_rolls_back_release(self):
+        feature_id, approval_id, task_id = self.seed_declaration("single-armed")
+        sprint_id = self.run_cli(
+            TOKENS["planner"],
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec-approval",
+            str(approval_id),
+            "--participants-file",
+            self.participants_file(),
+            "--merge-grant",
+        )["sprint_id"]
+        unit_id = self.run_cli(
+            TOKENS["planner"],
+            "plan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--developer-shell",
+            "1",
+            "--reviewer-shell",
+            "2",
+            "--title",
+            "Blocked second Sprint",
+            "--expected-output-file",
+            self.write("No assignment may escape."),
+            "--task",
+            str(task_id),
+        )["work_unit_id"]
+        with self.assertRaisesRegex(SystemExit, "HTTP 409.*already armed"):
+            self.run_cli(TOKENS["planner"], "arm", "--sprint", str(sprint_id))
+
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                ("prepared", "planned", 0),
+                con.execute(
+                    "SELECT s.lifecycle,u.disposition,"
+                    "(SELECT COUNT(*) FROM sprint_messages WHERE sprint_id=s.sprint_id) "
+                    "FROM sprints s JOIN sprint_work_units u USING(sprint_id) "
+                    "WHERE s.sprint_id=? AND u.work_unit_id=?",
+                    (sprint_id, unit_id),
+                ).fetchone(),
+            )
+        finally:
+            con.close()
+
+    def test_new_surface_rejects_cross_role_without_side_effects(self):
+        self.use_isolated_db()
+        feature_id, approval_id, task_id = self.seed_declaration("authority")
+        declare_argv = (
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec-approval",
+            str(approval_id),
+            "--participants-file",
+            self.participants_file(),
+            "--merge-grant",
+        )
+        with self.assertRaisesRegex(SystemExit, "HTTP 403.*originating Planner"):
+            self.run_cli(TOKENS["developer"], *declare_argv)
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                0, con.execute("SELECT COUNT(*) FROM sprints").fetchone()[0]
+            )
+        finally:
+            con.close()
+
+        sprint_id = self.run_cli(TOKENS["planner"], *declare_argv)["sprint_id"]
+        plan_argv = (
+            "plan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--developer-shell",
+            "1",
+            "--reviewer-shell",
+            "2",
+            "--title",
+            "Authority lane",
+            "--expected-output-file",
+            self.write("No unauthorized writes."),
+            "--task",
+            str(task_id),
+        )
+        with self.assertRaisesRegex(SystemExit, "HTTP 403.*owning Planner"):
+            self.run_cli(TOKENS["developer"], *plan_argv)
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                0,
+                con.execute(
+                    "SELECT COUNT(*) FROM sprint_work_units WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone()[0],
+            )
+        finally:
+            con.close()
+
+        unit_id = self.run_cli(TOKENS["planner"], *plan_argv)["work_unit_id"]
+        with self.assertRaisesRegex(SystemExit, "HTTP 403.*owning Planner"):
+            self.run_cli(TOKENS["reviewer"], "arm", "--sprint", str(sprint_id))
+        self.run_cli(TOKENS["planner"], "arm", "--sprint", str(sprint_id))
+        with self.assertRaisesRegex(SystemExit, "HTTP 409.*Developer participant"):
+            self.run_cli(
+                TOKENS["reviewer"],
+                "register-pr",
+                "--sprint",
+                str(sprint_id),
+                "--repository",
+                "acme/repo",
+                "--pr",
+                "85",
+                "--work-unit",
+                str(unit_id),
+            )
+        with self.assertRaisesRegex(SystemExit, "HTTP 403.*cannot transition"):
+            self.run_cli(
+                TOKENS["reviewer"],
+                "complete",
+                "--sprint",
+                str(sprint_id),
+                "--reason",
+                "unauthorized",
+                "--outcome",
+                "accepted",
+            )
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                ("armed", 0),
+                con.execute(
+                    "SELECT lifecycle,(SELECT COUNT(*) FROM sprint_registered_prs) "
+                    "FROM sprints WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone(),
+            )
+        finally:
+            con.close()
 
     def test_real_review_merge_dispatch_monitor_and_close_surfaces(self):
         request = self.run_cli(
@@ -269,8 +664,7 @@ class SprintCliApiTest(unittest.TestCase):
             self.assertEqual(
                 "ready",
                 con.execute(
-                    "SELECT disposition FROM sprint_work_units "
-                    "WHERE work_unit_id=?",
+                    "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
                     (self.dispatch_unit_id,),
                 ).fetchone()[0],
             )

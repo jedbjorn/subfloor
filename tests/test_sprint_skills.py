@@ -1,4 +1,5 @@
 """Stage 9 gates for the five Sprints v2 engine skills."""
+
 from __future__ import annotations
 
 import sqlite3
@@ -80,6 +81,14 @@ class SprintSkillTest(unittest.TestCase):
 
     def test_skills_use_only_the_shipped_shell_command_surface(self):
         expected = {
+            "declare",
+            "plan-unit",
+            "arm",
+            "register-pr",
+            "pause",
+            "resume",
+            "complete",
+            "abort",
             "request-review",
             "record-review",
             "authorize-merge",
