@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -33,6 +34,22 @@ TOKENS = {
     "reviewer": "review-token",
     "planner": "planner-token",
 }
+
+
+class SprintCliDispatcherTest(unittest.TestCase):
+    def test_sc_sprint_help_dispatches_to_shipped_cli(self):
+        completed = subprocess.run(
+            [str(ROOT / "sc"), "sprint", "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertIn("Authenticated Sprints v2 actions", completed.stdout)
+        self.assertIn("record-qaqc", completed.stdout)
+        self.assertIn("compile-report", completed.stdout)
 
 
 class Reader:
