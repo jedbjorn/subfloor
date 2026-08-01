@@ -37,6 +37,7 @@ class SupervisionFixture:
         # imports it from its __main__ block (SIGPIPE hygiene, #384).
         for script in (
             "artifact_policy.py",
+            "callable_floor.py",
             "db_backup.py",
             "cli_entry.py",
             "engine_manifest.py",

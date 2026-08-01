@@ -1220,7 +1220,24 @@ def review_gui_panel(api_port: int, has_key: bool) -> str:
 
 def main() -> None:
     source_repo = install.is_source_repo()
-    owns_engine = source_repo or (REPO_ROOT / ".sc-state" / "ejected").is_file()
+    tracked_engine = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(REPO_ROOT),
+            "ls-files",
+            "--error-unmatch",
+            ".super-coder/scripts/run.py",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+    owns_engine = (
+        source_repo
+        or tracked_engine
+        or (REPO_ROOT / ".sc-state" / "ejected").is_file()
+    )
     callable_floor.require_callable_floor(
         REPO_ROOT,
         expected_ref=(

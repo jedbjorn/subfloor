@@ -28,9 +28,13 @@ class VerifyCleanCloneTest(unittest.TestCase):
             subprocess.run(
                 ["git", "checkout", "--quiet", sha], cwd=checkout, check=True,
             )
-            # Include a locally edited dispatcher when this regression test is
-            # run before its fix has been committed.
+            # Include locally edited launch-floor files when this regression
+            # test is run before their fixes have been committed.
             shutil.copy2(ROOT / "sc", checkout / "sc")
+            shutil.copy2(
+                ROOT / ".super-coder" / "scripts" / "run.py",
+                checkout / ".super-coder" / "scripts" / "run.py",
+            )
             env = os.environ.copy()
             env.pop("SC_ARTIFACT_MODE", None)
             result = subprocess.run(
