@@ -8,9 +8,11 @@ so a fresh clone needs this run once to point git at them. In an external-work
 install, the hooks always remain on this HOME clone; only the map scan moves to
 the declared project. This:
 
-    1. points `core.hooksPath` at .super-coder/hooks/   (idempotent)
-    2. ensures the hook scripts are executable
-    3. runs an initial map
+    1. completes any one-time legacy update bridge materialized by an older
+       updater process
+    2. points `core.hooksPath` at .super-coder/hooks/   (idempotent)
+    3. ensures the hook scripts are executable
+    4. runs an initial map
 
 Run by `./sc install` and `./sc update` (so every fork is wired), and by the
 cartographer shell on first boot / when healing. Re-running is safe.
@@ -43,6 +45,24 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import map_repo  # noqa: E402
 
 
+def run_update_compat() -> None:
+    """Run the newly materialized update bridge before map setup.
+
+    A fork updates by executing its currently installed ``update.py`` and then
+    replacing the engine files beneath that process. The parent Python module
+    therefore cannot execute update logic introduced by the release it just
+    materialized. Legacy updaters already launch ``map_setup.py`` as a fresh
+    process near the end of every update, making this the compatibility seam
+    where newly materialized code can finish that first adoption run.
+    """
+    script = ENGINE / "scripts" / "update_compat.py"
+    if not script.is_file():
+        return
+    result = subprocess.run([sys.executable, str(script)], check=False)
+    if result.returncode != 0:
+        raise SystemExit("map-setup: legacy update compatibility phase failed")
+
+
 def _is_git_repo() -> bool:
     return subprocess.run(
         ["git", "-C", str(HOME_ROOT), "rev-parse", "--is-inside-work-tree"],
@@ -72,6 +92,7 @@ def wire_hooks() -> bool:
 
 
 def main() -> int:
+    run_update_compat()
     wire_hooks()
     print("map-setup: mapping the repo")
     return map_repo.main()

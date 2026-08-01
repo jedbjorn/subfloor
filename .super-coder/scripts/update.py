@@ -111,6 +111,22 @@ def run_script(name: str) -> None:
         sys.exit(f"update: {name} failed.")
 
 
+def run_update_compat() -> None:
+    """Finish a partially adopted legacy update before reconciliation.
+
+    The first old-updater adoption reaches this script through the freshly
+    materialized map-setup process. This early call covers recovery when that
+    legacy run materialized the new floor but stopped before map setup: the next
+    invocation completes the bridge before doing any other update work.
+    """
+    script = ENGINE / "scripts" / "update_compat.py"
+    if not script.is_file():
+        return
+    result = subprocess.run([PY, str(script)], check=False)
+    if result.returncode != 0:
+        sys.exit("update: legacy compatibility phase failed")
+
+
 def repair_git_worktrees() -> tuple[Path, ...]:
     """Repair every shell worktree on every update, healthy or relocated.
 
@@ -909,6 +925,7 @@ def expire_sandbox_harnesses() -> str | None:
 
 
 def main(argv: list[str]) -> int:
+    run_update_compat()
     no_fetch = "--no-fetch" in argv
     force = "--force" in argv
     branch = "main"
