@@ -30,9 +30,12 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
@@ -59,15 +62,62 @@ SENTINEL_SQL = (
 )
 
 
-def run_sc(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+def run_sc(cwd: Path, *args: str,
+           env_overrides: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """`./sc <args>` from `cwd`, with the dispatcher's own `sc` — the one under
     test — resolved relative to that checkout."""
     env = dict(os.environ)
-    env.pop("SC_PYTHON", None)
+    for name in ("SC_PYTHON", "SC_API_TOKEN", "SC_API_BASE"):
+        env.pop(name, None)
+    env.update(env_overrides or {})
     return subprocess.run(
         [str(cwd / "sc"), *args],
         cwd=str(cwd), capture_output=True, text=True, timeout=600,
         check=False, env=env)
+
+
+class _CatalogApiHandler(BaseHTTPRequestHandler):
+    """Tiny authenticated peer for proving the subprocess chooses HTTP."""
+
+    route = {
+        "harness": "codex", "selector": "wt-live-model", "source": "live-api",
+        "availability": "available", "stale": 0, "headless_supported": 1,
+        "high_effort_supported": 1, "cli_version": "test",
+        "supported_efforts": '["high"]',
+    }
+    skill = {
+        "skill_id": 999, "name": "wt-live-skill", "common": 0,
+        "is_deleted": 0, "grant_scopes": ["flavor:dev"],
+    }
+
+    def do_GET(self):
+        if self.headers.get("Authorization") != "Bearer shell-token":
+            return self._json(401, {"error": "unauthorized"})
+        path = urlparse(self.path).path
+        if path == "/_sc/model-routes":
+            return self._json(200, {"routes": [self.route]})
+        if path == "/_sc/skills":
+            return self._json(200, {"skills": [self.skill]})
+        return self._json(404, {"error": "not found"})
+
+    def _json(self, status: int, payload: dict):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args):
+        pass
+
+
+def start_catalog_api() -> tuple[ThreadingHTTPServer, threading.Thread, str]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CatalogApiHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    return server, thread, base
 
 
 def run_bare_sc(cwd: Path, live_root: Path,
@@ -400,7 +450,7 @@ class LiveSurfacesStillResolveTest(WorktreeFixture):
         self.addCleanup(engine.chmod, engine_mode)
         self.addCleanup(self.live_db.chmod, db_mode)
 
-    def test_model_list_and_resolve_read_the_read_only_live_database(self):
+    def test_model_list_and_resolve_use_current_api_when_live_db_is_unwritable(self):
         # The shell worktree may lag the installed floor.  Sabotage its tracked
         # model script so success also proves the dispatcher reaches the
         # canonical live-instance script and DB, not the stale caller copy.
@@ -409,61 +459,48 @@ class LiveSurfacesStillResolveTest(WorktreeFixture):
         stale_script.write_text("raise SystemExit('STALE-WORKTREE-MODELS')\n")
         self.addCleanup(stale_script.write_bytes, stale_source)
 
-        con = sqlite3.connect(self.live_db)
-        self.assertEqual(
-            con.execute("PRAGMA journal_mode=WAL").fetchone()[0],
-            "wal",
-        )
-        con.executescript(
-            (self.main / ".super-coder" / "migrations" /
-             "0075_model_routes.sql").read_text()
-        )
-        con.execute(
-            "INSERT INTO model_routes (harness, selector, source, availability, "
-            "headless_supported, high_effort_supported, supported_efforts, "
-            "last_seen_at) VALUES ('codex', 'wt-live-model', 'live-marker', "
-            "'available', 1, 1, '[\"high\"]', datetime('now'))"
-        )
-        con.commit()
-        con.close()
-        self.assertFalse(Path(f"{self.live_db}-wal").exists())
-        self.assertFalse(Path(f"{self.live_db}-shm").exists())
         before = state_digest(self.main)
         self._make_live_engine_read_only()
-
-        listed = run_sc(self.wt, "models", "list", "codex")
-        resolved = run_sc(
-            self.wt, "models", "resolve", "codex", "wt-live-model", "--json"
-        )
+        api, thread, base = start_catalog_api()
+        env = {"SC_API_TOKEN": "shell-token", "SC_API_BASE": base}
+        try:
+            listed = run_sc(
+                self.wt, "models", "list", "codex", env_overrides=env
+            )
+            resolved = run_sc(
+                self.wt, "models", "resolve", "codex", "wt-live-model", "--json",
+                env_overrides=env,
+            )
+        finally:
+            api.shutdown()
+            api.server_close()
+            thread.join(2)
 
         self.assertEqual(listed.returncode, 0, listed.stderr)
         self.assertNotIn("STALE-WORKTREE-MODELS", listed.stdout + listed.stderr)
         self.assertIn("codex/wt-live-model", listed.stdout)
-        self.assertIn("live-marker", listed.stdout)
+        self.assertIn("live-api", listed.stdout)
         self.assertEqual(resolved.returncode, 0, resolved.stderr)
         self.assertNotIn("STALE-WORKTREE-MODELS", resolved.stdout + resolved.stderr)
         self.assertEqual(json.loads(resolved.stdout)["selector"], "wt-live-model")
         self.assertEqual(state_digest(self.main), before)
         self.assertFalse((self.wt / ".super-coder" / "shell_db.db").exists())
 
-    def test_skill_list_reads_the_read_only_live_database(self):
-        con = sqlite3.connect(self.live_db)
-        self.assertEqual(
-            con.execute("PRAGMA journal_mode=WAL").fetchone()[0],
-            "wal",
-        )
-        con.execute(
-            "INSERT INTO skills (name, description, content, common, is_deleted) "
-            "VALUES ('wt-live-skill', 'live marker', 'body', 0, 0)"
-        )
-        con.commit()
-        con.close()
-        self.assertFalse(Path(f"{self.live_db}-wal").exists())
-        self.assertFalse(Path(f"{self.live_db}-shm").exists())
+    def test_skill_list_uses_current_api_when_live_db_is_unwritable(self):
         before = state_digest(self.main)
         self._make_live_engine_read_only()
-
-        listed = run_sc(self.wt, "skill", "list")
+        api, thread, base = start_catalog_api()
+        try:
+            listed = run_sc(
+                self.wt, "skill", "list",
+                env_overrides={
+                    "SC_API_TOKEN": "shell-token", "SC_API_BASE": base,
+                },
+            )
+        finally:
+            api.shutdown()
+            api.server_close()
+            thread.join(2)
 
         self.assertEqual(listed.returncode, 0, listed.stderr)
         self.assertIn("wt-live-skill", listed.stdout)

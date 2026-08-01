@@ -196,14 +196,31 @@ class RetireTest(unittest.TestCase):
 
 
 class SkillCliConnectionTest(unittest.TestCase):
-    def test_exact_list_uses_read_only_connection(self):
+    def test_exact_list_uses_shell_api_without_opening_database(self):
+        payload = {"skills": [{
+            "skill_id": 1, "name": "api_skill", "common": 0,
+            "is_deleted": 0, "grant_scopes": ["flavor:dev"],
+        }]}
+        with (
+            mock.patch.object(skill_cli.mem, "SC_API_TOKEN", "shell-token"),
+            mock.patch.object(skill_cli.mem, "SC_API_BASE", "http://engine"),
+            mock.patch.object(skill_cli.mem, "_api", return_value=payload) as api,
+            mock.patch.object(
+                skill_cli, "connect", side_effect=AssertionError("opened DB")
+            ),
+        ):
+            self.assertEqual(skill_cli.main(["list"]), 0)
+        api.assert_called_once_with("GET", "/_sc/skills")
+
+    def test_no_token_root_list_keeps_normal_database_connection(self):
         con = mock.Mock()
         with (
+            mock.patch.object(skill_cli.mem, "SC_API_TOKEN", ""),
             mock.patch.object(skill_cli, "connect", return_value=con) as opened,
             mock.patch.object(skill_cli, "cmd_list", return_value=0),
         ):
             self.assertEqual(skill_cli.main(["list"]), 0)
-        opened.assert_called_once_with(read_only=True)
+        opened.assert_called_once_with()
 
     def test_mutation_keeps_the_wal_enabled_write_connection(self):
         con = mock.Mock()
@@ -212,7 +229,7 @@ class SkillCliConnectionTest(unittest.TestCase):
             mock.patch.object(skill_cli, "cmd_grant", return_value=0),
         ):
             self.assertEqual(skill_cli.main(["grant", "review", "DEV1"]), 0)
-        opened.assert_called_once_with(read_only=False)
+        opened.assert_called_once_with()
 
 
 if __name__ == "__main__":

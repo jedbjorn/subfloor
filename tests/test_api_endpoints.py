@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -609,6 +610,89 @@ class PatchShellTest(unittest.TestCase):
         ok, err = server.patch_shell(self.con, sid, {"system_prompt": "hijack"})
         self.assertFalse(ok)
         self.assertEqual(self._shell(sid)["system_prompt"], "x")
+
+
+class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "engine.db"
+        source = build_db()
+        ids = seed(source)
+        source.execute(
+            "UPDATE shells SET api_key='shell-token' WHERE shell_id=?",
+            (ids["shell_id"],),
+        )
+        source.execute(
+            "INSERT INTO model_routes (harness,selector,source,availability,"
+            "headless_supported,high_effort_supported,supported_efforts,"
+            "last_seen_at) VALUES "
+            "('codex','api-model','api-source-v1','available',1,1,'[\"high\"]',"
+            "datetime('now'))"
+        )
+        source.commit()
+        target = sqlite3.connect(self.path)
+        source.backup(target)
+        target.close()
+        source.close()
+
+    def connect(self) -> sqlite3.Connection:
+        con = sqlite3.connect(self.path)
+        con.row_factory = sqlite3.Row
+        return con
+
+    def request(self, path: str, token: str | None = "shell-token"):
+        headers = "Host: 127.0.0.1"
+        if token is not None:
+            headers += f"\r\nAuthorization: Bearer {token}"
+        with mock.patch.object(server, "db", side_effect=self.connect):
+            status, _headers, body = server.dispatch_http("GET", path, headers, b"")
+        return status, json.loads(body)
+
+    def test_model_routes_require_shell_auth_and_apply_exact_filters(self) -> None:
+        self.assertEqual(self.request("/_sc/model-routes", None)[0], 401)
+        self.assertEqual(self.request("/_sc/model-routes", "wrong")[0], 401)
+
+        status, body = self.request(
+            "/_sc/model-routes?harness=codex&selector=api-model"
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(len(body["routes"]), 1)
+        self.assertEqual(body["routes"][0]["source"], "api-source-v1")
+
+        con = self.connect()
+        con.execute(
+            "UPDATE model_routes SET source='api-source-v2' "
+            "WHERE harness='codex' AND selector='api-model'"
+        )
+        con.commit()
+        con.close()
+        status, current = self.request(
+            "/_sc/model-routes?harness=codex&selector=api-model"
+        )
+        self.assertEqual(status, 200, current)
+        self.assertEqual(current["routes"][0]["source"], "api-source-v2")
+
+    def test_skill_catalogue_requires_auth_and_includes_grant_scopes(self) -> None:
+        self.assertEqual(self.request("/_sc/skills", None)[0], 401)
+        status, body = self.request("/_sc/skills")
+        self.assertEqual(status, 200, body)
+        skill = next(
+            row for row in body["skills"] if row["name"] == "local_only_skill"
+        )
+        self.assertEqual(
+            skill["grant_scopes"], ["flavor:dev", "shell:custom"]
+        )
+
+    def test_catalogue_filters_reject_unknown_or_repeated_input(self) -> None:
+        self.assertEqual(
+            self.request("/_sc/model-routes?sort=source")[0], 400
+        )
+        self.assertEqual(
+            self.request("/_sc/model-routes?harness=codex&harness=kimi")[0],
+            400,
+        )
+        self.assertEqual(self.request("/_sc/skills?harness=codex")[0], 400)
 
 
 if __name__ == "__main__":

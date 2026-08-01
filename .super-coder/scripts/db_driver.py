@@ -11,7 +11,6 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 import logging
-from pathlib import Path
 import random
 import sqlite3
 import time
@@ -135,68 +134,6 @@ def connect(path):
     except BaseException:
         con.close()
         raise
-
-
-def connect_readonly(path):
-    """Open an existing engine DB without requiring a writable DB directory.
-
-    Read surfaces used from linked shell worktrees deliberately target the
-    canonical main checkout's live database.  That checkout can be outside the
-    worktree's writable seat, so the normal connector cannot be used: enabling
-    WAL is itself a write and may need to create SQLite sidecars.
-
-    A cleanly closed WAL database has no ``-wal``/``-shm`` files, but its main
-    header still names WAL.  Plain ``mode=ro`` then tries to recreate the
-    sidecars and fails on a read-only directory.  ``immutable=1`` is safe for
-    that sidecar-free shape because the final WAL owner checkpointed everything
-    into the main file.  It is NOT safe while sidecars exist (SQLite would
-    ignore uncheckpointed WAL rows), so a live WAL database keeps plain
-    ``mode=ro``.  The post-open recheck closes the small race where a writer
-    appeared while the immutable snapshot was opening.
-
-    URI read-only mode is the hard write boundary; ``query_only`` is a second
-    guard against accidental mutation by a caller that receives this connection.
-    """
-    resolved = Path(path).resolve()
-
-    def sidecars_exist() -> bool:
-        return any(Path(f"{resolved}{suffix}").exists() for suffix in ("-wal", "-shm"))
-
-    def open_uri(*, immutable: bool) -> sqlite3.Connection:
-        uri = resolved.as_uri() + "?mode=ro" + ("&immutable=1" if immutable else "")
-        con = sqlite3.connect(
-            uri,
-            uri=True,
-            timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000,
-        )
-        try:
-            con.row_factory = sqlite3.Row
-            con.execute("PRAGMA foreign_keys=ON")
-            con.execute("PRAGMA query_only=ON")
-            con.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
-            # Force the pager to inspect the journal now, inside the retry
-            # boundary.  sqlite3.connect() itself is lazy enough that a WAL
-            # sidecar race can otherwise fail only on the caller's first query.
-            con.execute("PRAGMA schema_version").fetchone()
-            return con
-        except BaseException:
-            con.close()
-            raise
-
-    immutable = not sidecars_exist()
-    try:
-        con = open_uri(immutable=immutable)
-    except sqlite3.OperationalError:
-        # A live owner can close and remove both sidecars between the first
-        # probe and SQLite's open.  Only that now-sidecar-free transition is
-        # safe to retry as immutable; never hide another open failure.
-        if immutable or sidecars_exist():
-            raise
-        return open_uri(immutable=True)
-    if immutable and sidecars_exist():
-        con.close()
-        return open_uri(immutable=False)
-    return con
 
 
 @contextmanager

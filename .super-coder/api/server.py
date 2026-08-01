@@ -419,6 +419,50 @@ def get_skills(con) -> dict:
     return {"skills": skills, "shells": get_shells(con), "flavors": flavors}
 
 
+def get_cli_skills(con) -> dict:
+    """Exact read projection used by authenticated ``sc skill list`` calls."""
+    skills = rows(con.execute(
+        "SELECT skill_id, name, common, is_deleted FROM skills "
+        "ORDER BY is_deleted, name"
+    ))
+    scopes: dict[int, list[str]] = {}
+    for row in rows(con.execute(
+        "SELECT skill_id, 'flavor:' || flavor AS scope FROM flavor_skills "
+        "UNION ALL "
+        "SELECT ss.skill_id, 'shell:' || "
+        "COALESCE(sh.shortname, sh.display_name, sh.shell_id) AS scope "
+        "FROM shell_skills ss JOIN shells sh ON sh.shell_id=ss.shell_id "
+        "WHERE sh.flavor IS NULL AND COALESCE(sh.is_deleted,0)=0 "
+        "ORDER BY scope"
+    )):
+        scopes.setdefault(row["skill_id"], []).append(row["scope"])
+    for skill in skills:
+        skill["grant_scopes"] = scopes.get(skill["skill_id"], [])
+    return {"skills": skills}
+
+
+def get_model_routes(con, *, harness: str | None = None,
+                     selector: str | None = None) -> dict:
+    """Small exact-route projection for authenticated shell CLI reads."""
+    sql = (
+        "SELECT harness, selector, source, availability, stale, "
+        "headless_supported, high_effort_supported, cli_version, "
+        "supported_efforts FROM model_routes"
+    )
+    clauses = []
+    params = []
+    if harness is not None:
+        clauses.append("harness=?")
+        params.append(harness)
+    if selector is not None:
+        clauses.append("selector=?")
+        params.append(selector)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY harness, availability='available' DESC, selector"
+    return {"routes": rows(con.execute(sql, tuple(params)))}
+
+
 def known_harnesses() -> list[str]:
     """The harness set = the shipped adapters (claude/codex/kimi/opencode/vibe)."""
     d = ENGINE / "adapters"
@@ -2584,6 +2628,39 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             con.close()
 
+    # -- authenticated shell CLI catalogue reads --
+
+    def _shell_catalog_get(self, path: str):
+        if self._require_shell_auth() is None:
+            return
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        con = db()
+        try:
+            if path == "/_sc/skills":
+                if query:
+                    return self._send(400, {"error": "skills takes no filters"})
+                return self._send(200, get_cli_skills(con))
+            if path == "/_sc/model-routes":
+                unknown = set(query) - {"harness", "selector"}
+                repeated = [name for name, values in query.items() if len(values) != 1]
+                empty = [name for name, values in query.items() if not values[0]]
+                if unknown or repeated or empty:
+                    return self._send(400, {
+                        "error": "model route filters must be one non-empty "
+                                 "harness and/or selector",
+                    })
+                return self._send(200, get_model_routes(
+                    con,
+                    harness=(query.get("harness") or [None])[0],
+                    selector=(query.get("selector") or [None])[0],
+                ))
+            return self._send(404, {"error": "not found"})
+        except Exception as exc:
+            return self._fail(exc)
+        finally:
+            con.close()
+
     # -- /mem/* token-scoped shell memory endpoints --
 
     def _mem_get(self, path: str):
@@ -3432,6 +3509,8 @@ class Handler(BaseHTTPRequestHandler):
             if self._if_none_match(headers["ETag"]):
                 return self._not_modified(headers)
             return self._send(200, text, ctype, headers=headers)
+        if path in ("/_sc/model-routes", "/_sc/skills"):
+            return self._shell_catalog_get(path)
         if path.startswith("/_sc/mem/"):
             return self._mem_get(path)
         if path.startswith("/_sc/sprint/"):

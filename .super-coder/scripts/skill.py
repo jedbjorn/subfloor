@@ -56,17 +56,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import db_driver  # noqa: E402
 import artifact_policy  # noqa: E402
+import mem  # noqa: E402
 import seed_skills  # noqa: E402 — seeded_skill_names is the engine/local line
 
 ENGINE = Path(__file__).resolve().parents[1]
 DB_PATH = ENGINE / "shell_db.db"
 
 
-def connect(*, read_only: bool = False):
+def connect():
     if not DB_PATH.exists() or not DB_PATH.stat().st_size:
         sys.exit("sc skill: no live DB — run `./sc rebuild` (or `./sc launch`) first.")
-    connector = db_driver.connect_readonly if read_only else db_driver.connect
-    return connector(DB_PATH)
+    return db_driver.connect(DB_PATH)
+
+
+def _shell_api_enabled() -> bool:
+    if not mem.SC_API_TOKEN:
+        return False
+    mem._PROG = "skill"
+    mem._require_api()
+    return True
 
 
 def resolve_shell(con, ref: str) -> tuple[int, str]:
@@ -160,23 +168,36 @@ def persist_note() -> None:
     print(f"→ persist: ./sc snapshot   (serializes to {target}{suffix})")
 
 
-def cmd_list(con) -> int:
+def print_catalogue(rows: list[dict]) -> int:
     engine = set(seed_skills.seeded_skill_names())
     retired = set(seed_skills.retired_skill_names())
-    rows = con.execute(
-        "SELECT s.skill_id, s.name, s.common, s.is_deleted "
-        "FROM skills s ORDER BY s.is_deleted, s.name").fetchall()
     if not rows:
         print("(no skills)")
         return 0
-    w = max(len(r[1]) for r in rows)
-    for skill_id, name, common, deleted in rows:
+    w = max(len(row["name"]) for row in rows)
+    for row in rows:
+        name = row["name"]
+        common = row["common"]
+        deleted = row["is_deleted"]
         origin = "engine" if name in engine else "local "
         tag = "common" if common else "opt-in"
         dead = ("  [retired]" if name in retired else "  [deleted]") if deleted else ""
-        scopes = ", ".join(grant_scopes(con, skill_id)) or "(ungranted)"
+        scopes = ", ".join(row.get("grant_scopes") or []) or "(ungranted)"
         print(f"{name:<{w}}  {origin}  {tag}  → {scopes}{dead}")
     return 0
+
+
+def cmd_list(con) -> int:
+    rows = [dict(row) for row in con.execute(
+        "SELECT s.skill_id, s.name, s.common, s.is_deleted "
+        "FROM skills s ORDER BY s.is_deleted, s.name").fetchall()]
+    for row in rows:
+        row["grant_scopes"] = grant_scopes(con, row["skill_id"])
+    return print_catalogue(rows)
+
+
+def cmd_list_api() -> int:
+    return print_catalogue(mem._api("GET", "/_sc/skills").get("skills") or [])
 
 
 def resolve_author(con, ref: "str | None") -> tuple[int, str]:
@@ -382,10 +403,9 @@ def main(argv: list[str]) -> int:
         print(usage)
         return 0
     cmd, args = argv[0], argv[1:]
-    # Catalogue inspection is valid from linked shell worktrees, where the
-    # canonical live DB can be outside the writable seat.  Every mutation keeps
-    # the standard WAL-enabled connection.
-    con = connect(read_only=cmd == "list" and not args)
+    if cmd == "list" and not args and _shell_api_enabled():
+        return cmd_list_api()
+    con = connect()
     try:
         if cmd == "list" and not args:
             return cmd_list(con)

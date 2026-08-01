@@ -12,6 +12,7 @@ import json
 import shlex
 import sys
 from pathlib import Path
+from urllib.parse import urlencode
 
 ENGINE = Path(__file__).resolve().parents[1]
 DB_PATH = ENGINE / "shell_db.db"
@@ -20,13 +21,33 @@ sys.path.insert(0, str(ENGINE / "api"))
 sys.path.insert(0, str(ENGINE / "scripts"))
 import model_catalog  # noqa: E402
 import db_driver  # noqa: E402
+import mem  # noqa: E402
 
 
-def _open_db(*, read_only: bool = False):
+def _open_db():
     if not DB_PATH.exists():
         raise SystemExit(f"models: no DB at {DB_PATH} — run `sc rebuild`")
-    connector = db_driver.connect_readonly if read_only else db_driver.connect
-    return connector(DB_PATH)
+    return db_driver.connect(DB_PATH)
+
+
+def _shell_api_enabled() -> bool:
+    """A launched shell reads the live server; no token means root DB mode."""
+    if not mem.SC_API_TOKEN:
+        return False
+    mem._PROG = "models"
+    mem._require_api()
+    return True
+
+
+def _api_routes(*, harness: str | None = None,
+                selector: str | None = None) -> list[dict]:
+    query = urlencode({
+        name: value for name, value in (
+            ("harness", harness), ("selector", selector)
+        ) if value is not None
+    })
+    path = "/_sc/model-routes" + (f"?{query}" if query else "")
+    return mem._api("GET", path).get("routes") or []
 
 
 def _route(con, harness: str, selector: str):
@@ -36,6 +57,11 @@ def _route(con, harness: str, selector: str):
             (harness, selector)).fetchone()
     except db_driver.OperationalError:
         raise SystemExit("models: model_routes unavailable — run `sc rebuild` to migrate")
+    if row is None:
+        model_catalog.catalog(con=con)
+        row = con.execute(
+            "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+            (harness, selector)).fetchone()
     return dict(row) if row else None
 
 
@@ -47,6 +73,11 @@ def _command(harness: str, selector: str, shell: str, effort: str) -> list[str]:
 def resolve(con, harness: str, selector: str, *, shell: str = "<shell>",
             effort: str = "high") -> dict:
     row = _route(con, harness, selector)
+    return resolve_row(row, harness, selector, shell=shell, effort=effort)
+
+
+def resolve_row(row: dict | None, harness: str, selector: str, *,
+                shell: str = "<shell>", effort: str = "high") -> dict:
     if row is None:
         return {"ok": False, "error": f"no route for {harness}/{selector}; refresh models"}
     failures = []
@@ -76,18 +107,7 @@ def _print_resolved(data: dict, as_json: bool) -> int:
     return 0 if data["ok"] else 2
 
 
-def _list(con, harness: str | None) -> int:
-    sql = ("SELECT harness, selector, source, availability, stale, "
-           "headless_supported, high_effort_supported FROM model_routes")
-    params: tuple = ()
-    if harness:
-        sql += " WHERE harness=?"
-        params = (harness,)
-    sql += " ORDER BY harness, availability='available' DESC, selector"
-    try:
-        rows = con.execute(sql, params).fetchall()
-    except db_driver.OperationalError:
-        raise SystemExit("models: model_routes unavailable — run `sc rebuild` to migrate")
+def _print_routes(rows) -> int:
     if not rows:
         print("models: no routes — run `sc models refresh`", file=sys.stderr)
         return 2
@@ -101,18 +121,50 @@ def _list(con, harness: str | None) -> int:
     return 0
 
 
+def _list(con, harness: str | None) -> int:
+    sql = ("SELECT harness, selector, source, availability, stale, "
+           "headless_supported, high_effort_supported FROM model_routes")
+    params: tuple = ()
+    if harness:
+        sql += " WHERE harness=?"
+        params = (harness,)
+    sql += " ORDER BY harness, availability='available' DESC, selector"
+    try:
+        rows = con.execute(sql, params).fetchall()
+    except db_driver.OperationalError:
+        raise SystemExit("models: model_routes unavailable — run `sc rebuild` to migrate")
+    if not rows:
+        model_catalog.catalog(con=con)
+        rows = con.execute(sql, params).fetchall()
+    return _print_routes(rows)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(argv if argv is not None else sys.argv[1:])
     if not args or args[0] in ("-h", "--help"):
         print("usage: sc models refresh | list [harness] | "
               "resolve <harness> <selector> [--shell <shortname>] [--json]")
         return 0
-    # list/resolve are inspection surfaces and must stay callable from a linked
-    # shell worktree whose canonical live DB is outside its writable seat.
-    # refresh remains the one explicit route mutation and keeps the normal WAL
-    # connector.
-    read_only = args[0] in ("list", "resolve")
-    con = _open_db(read_only=read_only)
+    command = args[0]
+    if command == "list" and _shell_api_enabled():
+        return _print_routes(_api_routes(
+            harness=args[1] if len(args) > 1 else None
+        ))
+    if command == "resolve" and len(args) >= 3 and _shell_api_enabled():
+        shell = "<shell>"
+        if "--shell" in args:
+            i = args.index("--shell")
+            shell = args[i + 1] if i + 1 < len(args) else ""
+            if not shell:
+                raise SystemExit("models: --shell requires a shortname")
+        routes = _api_routes(harness=args[1], selector=args[2])
+        data = resolve_row(
+            routes[0] if routes else None,
+            args[1], args[2], shell=shell,
+        )
+        return _print_resolved(data, "--json" in args)
+
+    con = _open_db()
     try:
         if args[0] == "refresh":
             payload = model_catalog.catalog(refresh=True, con=con)

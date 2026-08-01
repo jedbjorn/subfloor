@@ -267,25 +267,45 @@ class RoutePersistenceTest(unittest.TestCase):
 
 
 class RouteCliConnectionTest(unittest.TestCase):
-    def test_list_and_resolve_open_the_hard_read_only_lane(self):
-        con = mock.Mock()
-        with mock.patch.object(routes_cli, "_open_db", return_value=con) as opened:
-            with mock.patch.object(routes_cli, "_list", return_value=0):
-                self.assertEqual(routes_cli.main(["list"]), 0)
-            opened.assert_called_once_with(read_only=True)
+    ROUTE = {
+        "harness": "codex", "selector": "api-model", "source": "live-api",
+        "availability": "available", "stale": 0, "headless_supported": 1,
+        "high_effort_supported": 1, "cli_version": "1",
+        "supported_efforts": '["high"]',
+    }
 
-        opened.reset_mock()
-        with mock.patch.object(routes_cli, "_open_db", return_value=con) as opened:
-            with mock.patch.object(
-                routes_cli,
-                "resolve",
-                return_value={"ok": False, "error": "missing"},
-            ):
-                self.assertEqual(
-                    routes_cli.main(["resolve", "codex", "missing"]),
-                    2,
-                )
-            opened.assert_called_once_with(read_only=True)
+    def test_list_and_resolve_use_shell_api_without_opening_database(self):
+        with (
+            mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+            mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+            mock.patch.object(
+                routes_cli.mem, "_api", return_value={"routes": [self.ROUTE]}
+            ) as api,
+            mock.patch.object(
+                routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+            ),
+        ):
+            self.assertEqual(routes_cli.main(["list", "codex"]), 0)
+            self.assertEqual(
+                routes_cli.main(["resolve", "codex", "api-model", "--json"]),
+                0,
+            )
+        self.assertEqual(api.call_args_list, [
+            mock.call("GET", "/_sc/model-routes?harness=codex"),
+            mock.call(
+                "GET", "/_sc/model-routes?harness=codex&selector=api-model"
+            ),
+        ])
+
+    def test_no_token_root_list_keeps_normal_database_connection(self):
+        con = mock.Mock()
+        with (
+            mock.patch.object(routes_cli.mem, "SC_API_TOKEN", ""),
+            mock.patch.object(routes_cli, "_open_db", return_value=con) as opened,
+            mock.patch.object(routes_cli, "_list", return_value=0),
+        ):
+            self.assertEqual(routes_cli.main(["list"]), 0)
+        opened.assert_called_once_with()
 
     def test_refresh_keeps_the_wal_enabled_write_lane(self):
         con = mock.Mock()
@@ -295,7 +315,7 @@ class RouteCliConnectionTest(unittest.TestCase):
             mock.patch.object(routes_cli.model_catalog, "catalog", return_value=payload),
         ):
             self.assertEqual(routes_cli.main(["refresh"]), 0)
-        opened.assert_called_once_with(read_only=False)
+        opened.assert_called_once_with()
 
 
 class CatalogCacheTest(NoCLI):
