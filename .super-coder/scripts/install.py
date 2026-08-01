@@ -142,6 +142,7 @@ GENERATED_INSTALL_PATHS = (
     Path(".codex/hooks.json"),
     Path(".claude/skills"),
     Path(".agents/skills"),
+    Path(".opencode/skills"),
     Path("roadmap_sc.md"),
     Path("docs_sc"),
     Path("specs_sc"),
@@ -546,6 +547,7 @@ _GITIGNORE_BLOCK = f"""
 /opencode.json
 /.claude/skills/
 /.agents/skills/
+/.opencode/skills/
 # Engine-managed harness config re-emitted each launch (per-harness branch-guard
 # hook); kept apart from a fork's own tracked config (claude settings.json /
 # codex config.toml).

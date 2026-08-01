@@ -60,6 +60,7 @@ import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
 import style  # noqa: E402  — launcher ANSI; degrades to plain text off-TTY
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
 import shell_liveness  # noqa: E402  — headless boot's one-shell-one-session guard
+import skill_projection  # noqa: E402  — exact bounded harness skill mirrors
 
 sys.path.insert(0, str(ENGINE / "api"))
 import model_catalog  # noqa: E402  — HARNESS_PROVIDER: one source for harness → provider
@@ -173,24 +174,14 @@ def render_harness_skills(con: sqlite3.Connection, shell_id: int,
     selected harness. Adapters default to the Claude-compatible path and may
     add a native path where compatibility discovery is incomplete."""
     skill_dirs = adapter.get("skill_dirs") or [".claude/skills"]
-    written: list[Path] = []
-    skipped: list[Path] = []
-    for raw_dir in skill_dirs:
-        skills_dir = Path(raw_dir)
-        if skills_dir.is_absolute() or ".." in skills_dir.parts:
-            raise LaunchError(
-                f"adapter skill_dirs entry must stay inside the worktree: {raw_dir}"
-            )
-        summary = flat.render_skill_md(
-            con, shell_id, work_dir, skills_dir=skills_dir
+    try:
+        summary = skill_projection.reconcile_shell(
+            con, shell_id, work_dir, ensure_dirs=skill_dirs
         )
-        written.extend(summary["written"])
-        skipped.extend(summary["skipped"])
-    return {
-        "written": written,
-        "skipped": skipped,
-        "dirs": list(skill_dirs),
-    }
+    except skill_projection.ProjectionError as exc:
+        raise LaunchError(str(exc)) from exc
+    summary["dirs"] = list(skill_dirs)
+    return summary
 
 
 def resolve_opencode_plugins(work_dir: Path) -> None:
@@ -1532,7 +1523,8 @@ def main() -> None:
     print(f"→ wrote {work_dir / 'AGENTS.md'}")
     if headless and api_port and full["api_key"]:
         print(f"→ api: http://127.0.0.1:{api_port} (SC_API_TOKEN set)")
-    print(f"→ skills: {len(skills['written'])} written, "
+    print(f"→ skills: {len(skills['written'])} changed "
+          f"({len(skills['deleted'])} deleted), "
           f"{len(skills['skipped'])} unchanged → "
           f"{', '.join(skills['dirs'])}")
 

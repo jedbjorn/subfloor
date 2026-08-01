@@ -72,11 +72,20 @@ class RetireTest(unittest.TestCase):
         self._orig = (seed_skills.RETIRED_FILE, seed_skills.OUT)
         seed_skills.RETIRED_FILE = root / ".sc-state" / "skills_retired.json"
         seed_skills.OUT = seed
+        self.projection = mock.patch.object(
+            skill_cli.skill_projection,
+            "reconcile_existing_checkouts",
+            return_value={
+                "written": [], "skipped": [], "deleted": [], "checkouts": []
+            },
+        )
+        self.reconcile_existing = self.projection.start()
         self.con = make_db()
 
     def tearDown(self):
         seed_skills.RETIRED_FILE, seed_skills.OUT = self._orig
         self.con.close()
+        self.projection.stop()
         self.tmp.cleanup()
 
     def _retire_file(self, names) -> None:
@@ -170,6 +179,7 @@ class RetireTest(unittest.TestCase):
         self.assertEqual(json.loads(seed_skills.RETIRED_FILE.read_text()),
                          ["test_authoring"])
         self.assertEqual(self._deleted("test_authoring"), 1)
+        self.reconcile_existing.assert_called_once_with(self.con)
 
     def test_cmd_retire_refuses_local_skill(self):
         with self.assertRaises(SystemExit):

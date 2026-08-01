@@ -48,6 +48,7 @@ PY = sys.executable
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
 import artifact_policy  # noqa: E402
+import skill_projection  # noqa: E402
 
 # The registry. `block` is the instance.json key (None = procedure-only, no
 # infrastructure half); `block_auto` says whether enable may create it (only
@@ -216,6 +217,15 @@ def cmd_enable(name: str) -> int:
             note = f"  (no live {'/'.join(missing)} shell yet — create one and re-run)" if missing else ""
             print(f"  skill {skill} → {state}{note}")
         con.commit()
+        try:
+            skill_projection.reconcile_flavors(
+                con,
+                (flavor for flavors in f["grants"].values() for flavor in flavors),
+            )
+        except skill_projection.ProjectionError as exc:
+            sys.exit(skill_projection.partial_failure_message(
+                f"feature enable {name}", exc
+            ))
     finally:
         con.close()
 
@@ -257,6 +267,15 @@ def cmd_disable(name: str) -> int:
                 print(f"  skill {skill}: revoked {n} grant(s) "
                       f"(flavors: {', '.join(flavors)}; other shells untouched)")
             con.commit()
+            try:
+                skill_projection.reconcile_flavors(
+                    con,
+                    (flavor for flavors in f["grants"].values() for flavor in flavors),
+                )
+            except skill_projection.ProjectionError as exc:
+                sys.exit(skill_projection.partial_failure_message(
+                    f"feature disable {name}", exc
+                ))
         finally:
             con.close()
         if revoked:

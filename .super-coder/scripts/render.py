@@ -23,6 +23,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
 import db_driver  # noqa: E402
 import flat  # noqa: E402
+import skill_projection  # noqa: E402
 from _serialize_guard import require_admin  # noqa: E402
 from seed_skills import sync_engine_skills  # noqa: E402
 
@@ -33,14 +34,15 @@ def _open():
     return db_driver.connect(DB_PATH)
 
 
-def _resolve_shell(con, shortname: str) -> int:
+def _resolve_shell(con, shortname: str):
     row = con.execute(
-        "SELECT shell_id FROM shells WHERE shortname=? AND COALESCE(is_deleted,0)=0",
+        "SELECT shell_id, shortname, flavor FROM shells "
+        "WHERE shortname=? AND COALESCE(is_deleted,0)=0",
         (shortname,),
     ).fetchone()
     if row is None:
         sys.exit(f"render: no shell '{shortname}'")
-    return row["shell_id"]
+    return row
 
 
 def _heal_fresh(con) -> None:
@@ -84,8 +86,22 @@ def main(argv: list[str]) -> int:
                 _heal_fresh(con)
                 artifact_policy.prepare_local_state()
                 _report("flat", flat.render_visibility(con))
-            shell_id = _resolve_shell(con, argv[1])
-            _report(f"skills[{argv[1]}]", flat.render_skill_md(con, shell_id))
+            shell = _resolve_shell(con, argv[1])
+            checkout = skill_projection.shell_checkout(
+                shell["shortname"], shell["flavor"]
+            )
+            if not checkout.is_dir():
+                sys.exit(
+                    f"render: shell checkout {checkout} does not exist — launch "
+                    f"{shell['shortname']} once before rendering its skills"
+                )
+            summary = skill_projection.reconcile_shell(
+                con,
+                shell["shell_id"],
+                checkout,
+                ensure_dirs=skill_projection.managed_skill_dirs(),
+            )
+            _report(f"skills[{argv[1]}]", summary)
         else:
             sys.exit(f"render: unknown mode '{mode}' (flat | skills <shell> | all <shell>)")
     finally:
