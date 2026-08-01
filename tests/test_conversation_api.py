@@ -1850,10 +1850,22 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
             con.execute(
                 "INSERT INTO conversation_events "
                 "(conversation_id,sequence,event_type,payload,message_id,run_id) "
-                "VALUES (?,?,'message.accepted',?,?,NULL)",
+                "VALUES (?,?,'run.failed',?,?,?)",
                 (
                     conversation_id,
                     sequence + 1,
+                    json.dumps({"error_code": "FIXTURE_TERMINAL_FAILURE"}),
+                    message_id,
+                    terminal_run_id,
+                ),
+            )
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+                "VALUES (?,?,'message.accepted',?,?,NULL)",
+                (
+                    conversation_id,
+                    sequence + 2,
                     json.dumps({"text": "trace prompt", "attempt": 2}),
                     message_id,
                 ),
@@ -1862,7 +1874,7 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
                 "INSERT INTO conversation_events "
                 "(conversation_id,sequence,event_type,payload,message_id,run_id) "
                 "VALUES (?,?,'run.started','{}',?,?)",
-                (conversation_id, sequence + 2, message_id, active_run_id),
+                (conversation_id, sequence + 3, message_id, active_run_id),
             )
             con.execute(
                 "INSERT INTO conversation_events "
@@ -1870,7 +1882,7 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
                 "VALUES (?,?,'assistant.delta',?,?,?)",
                 (
                     conversation_id,
-                    sequence + 3,
+                    sequence + 4,
                     json.dumps({"text": "active suffix"}),
                     message_id,
                     active_run_id,
