@@ -23,7 +23,7 @@ _USABLE_WAKE_STATES = {"idle", "queued", "running", "waiting"}
 _WAKE_ROLES = {
     "developer": ("Developer", "sprint_dev"),
     "reviewer": ("Reviewer", "sprint_rev"),
-    "planner": ("originating Planner", "sprint_pln"),
+    "planner": ("Originating Planner", "sprint_pln"),
 }
 
 
@@ -485,11 +485,29 @@ def ensure_wake_conversation(
             parent_id = str(candidate)
             break
     purpose = "fallback" if parent_id is not None else "work"
-    existing = con.execute(
-        "SELECT conversation_id FROM conversations "
-        "WHERE owner_user_id=? AND creation_idempotency_key=?",
-        (row["user_id"], idempotency_key),
-    ).fetchone()
+    prior_routes = con.execute(
+        "SELECT conversation_id,state,creation_idempotency_key "
+        "FROM conversations WHERE owner_user_id=? "
+        "AND (creation_idempotency_key=? "
+        "OR creation_idempotency_key LIKE ?) ORDER BY rowid",
+        (row["user_id"], idempotency_key, f"{idempotency_key}:reroute:%"),
+    ).fetchall()
+    for prior in reversed(prior_routes):
+        if (
+            prior["state"] in _USABLE_WAKE_STATES
+            and _linked_to_participant(con, participant_id, prior["conversation_id"])
+        ):
+            con.execute(
+                "UPDATE sprint_participants SET current_conversation_id=?,"
+                "updated_at=datetime('now') WHERE participant_id=?",
+                (prior["conversation_id"], participant_id),
+            )
+            return WakeConversationRoute(str(prior["conversation_id"]), False)
+    route_key = (
+        idempotency_key
+        if not prior_routes
+        else f"{idempotency_key}:reroute:{len(prior_routes)}"
+    )
     worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
     conversation_id = create_and_select(
         con,
@@ -504,7 +522,7 @@ def ensure_wake_conversation(
         title=(
             f"Sprint {row['sprint_id']} · Wake route · {row['shortname']}"
         ),
-        idempotency_key=idempotency_key,
+        idempotency_key=route_key,
         parent_conversation_id=parent_id,
         context_packet=(
             {
@@ -517,7 +535,7 @@ def ensure_wake_conversation(
             else None
         ),
     )
-    return WakeConversationRoute(conversation_id, existing is None)
+    return WakeConversationRoute(conversation_id, True)
 
 
 def create_review_outcome(

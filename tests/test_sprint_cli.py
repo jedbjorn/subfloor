@@ -401,6 +401,8 @@ class SprintCliApiTest(unittest.TestCase):
             "PLN1",
             "--body-file",
             self.write("Please confirm the downstream handoff."),
+            "--key",
+            "cli-participant-send-retry",
         )
 
         self.assertEqual(
@@ -439,6 +441,39 @@ class SprintCliApiTest(unittest.TestCase):
                 "WHERE participant_id=1",
             ).fetchone()
             self.assertEqual((response["conversation_id"],), current)
+
+        replay = self.run_cli(
+            TOKENS["developer"],
+            "send",
+            "--sprint",
+            str(self.sprint_id),
+            "--to",
+            "PLN1",
+            "--body-file",
+            self.write("Please confirm the downstream handoff."),
+            "--key",
+            "cli-participant-send-retry",
+        )
+        self.assertEqual(response["message_id"], replay["message_id"])
+        self.assertEqual(response["wake_id"], replay["wake_id"])
+        self.assertFalse(replay["message_created"])
+
+    def test_participant_send_rejects_non_string_body_and_key_as_bad_requests(self):
+        mem.SC_API_TOKEN = TOKENS["developer"]
+        for field, value, message in (
+            ("body", ["not", "text"], "message body must be a string"),
+            ("idempotency_key", ["not", "text"], "idempotency key must be a string"),
+        ):
+            with self.subTest(field=field):
+                payload = {
+                    "sprint_id": self.sprint_id,
+                    "to": "PLN1",
+                    "body": "valid body",
+                    "idempotency_key": "valid-key",
+                }
+                payload[field] = value
+                with self.assertRaisesRegex(SystemExit, f"HTTP 400.*{message}"):
+                    mem._api("POST", "/_sc/sprint/send", payload)
 
     def test_remediation_surfaces_are_authenticated_and_durable(self):
         self.use_isolated_db()

@@ -28,14 +28,19 @@ Put a concrete question, answer, blocker, or context request in a short body
 file, then send it to the conformance Reviewer or participant who owns the fact:
 
 ```text
-sc sprint send --sprint <id> --to <shortname> --body-file <path>
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --key <stable-key>
 ```
 
 Answer incoming questions through `send`, confirm that write, then mark the
-handled question read with `accept`. For a blocker, send the evidence, impact,
-and exact action needed to FnB and every directly affected participant. Continue
-safe synthesis, but stop at a decision boundary when the answer is required. Do
-not send duplicate reminders; unread recovery owns re-waking.
+handled question read with `accept`. For a blocker, relay the evidence, impact,
+and exact action needed to every directly affected Sprint participant, and
+surface the exceptional recovery need separately to FnB. Continue safe
+synthesis, but stop at a decision boundary when the answer is required. Do not
+send duplicate reminders; unread recovery owns re-waking.
+
+Choose one stable key for the intended recipient and exact body. Reuse it only
+when retrying that same write; use a new key when the recipient or body changes.
 
 Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
 characters is the hard maximum. Before submitting, run `wc -m < <path>` and

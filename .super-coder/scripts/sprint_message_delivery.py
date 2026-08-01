@@ -114,8 +114,15 @@ class SprintMessageStore:
         body: str,
         idempotency_key: str,
     ) -> ParticipantRelayReceipt:
+        if not isinstance(body, str):
+            raise ValueError("Sprint message body must be a string")
+        if not isinstance(to_shortname, str):
+            raise ValueError("Sprint recipient shortname must be a string")
+        if not isinstance(idempotency_key, str):
+            raise ValueError("Sprint message idempotency key must be a string")
         body = body.strip()
         to_shortname = to_shortname.strip()
+        idempotency_key = idempotency_key.strip()
         if not body:
             raise ValueError("Sprint message body is empty")
         if len(body) > 8000:
@@ -124,6 +131,8 @@ class SprintMessageStore:
             )
         if not to_shortname:
             raise ValueError("Sprint recipient shortname is empty")
+        if not idempotency_key:
+            raise ValueError("Sprint message idempotency key is empty")
         with db_driver.write_transaction(self.con, "sprint.message.relay"):
             sender = self.con.execute(
                 "SELECT participant_id FROM sprint_participants "

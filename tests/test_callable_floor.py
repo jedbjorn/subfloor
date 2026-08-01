@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 import callable_floor  # noqa: E402
+import install  # noqa: E402
 
 
 def _git(root: Path, *args: str) -> str:
@@ -133,6 +135,13 @@ class CallableFloorTest(unittest.TestCase):
         (state / "engine.ref").write_text("not-a-sha\n")
 
         self.assertIsNone(callable_floor.read_engine_ref(self.root))
+
+    def test_install_verifies_callable_floor_before_publishing_pin(self) -> None:
+        source = inspect.getsource(install.main)
+        self.assertLess(
+            source.index("callable_floor.require_callable_floor"),
+            source.index("write_engine_ref(pinned)"),
+        )
 
 
 if __name__ == "__main__":

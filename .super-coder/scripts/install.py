@@ -635,12 +635,8 @@ def untrack_engine() -> bool:
     return True
 
 
-def pin_engine() -> str | None:
-    """Record the upstream SHA the engine was materialized at → .sc-state/engine.ref
-    (the fork's version record + the engine half of a sound rollback). Best-effort:
-    if the remote ref can't be resolved, `./sc update` will pin it later."""
-    state = REPO_ROOT / ".sc-state"
-    state.mkdir(parents=True, exist_ok=True)
+def resolve_engine_ref() -> str | None:
+    """Resolve the materialized upstream SHA without publishing a pin."""
     remote = sc_remote()
     if not remote:
         return None
@@ -650,8 +646,14 @@ def pin_engine() -> str | None:
     sha = r.stdout.strip()
     if r.returncode != 0 or len(sha) != 40 or not all(c in "0123456789abcdef" for c in sha):
         return None
-    (state / "engine.ref").write_text(sha + "\n")
     return sha
+
+
+def write_engine_ref(sha: str) -> None:
+    """Publish a callable engine SHA as the fork's rollback/version pin."""
+    state = REPO_ROOT / ".sc-state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "engine.ref").write_text(sha + "\n")
 
 
 def step(msg: str) -> None:
@@ -758,20 +760,23 @@ def main(argv: list[str]) -> int:
     step("Making the engine a dependency (untrack + pin)")
     print("  git rm -r --cached .super-coder (files kept on disk)" if untrack_engine()
           else "  (engine already untracked)")
-    pinned = pin_engine()
-    print(f"  pinned engine.ref at {pinned[:12]}" if pinned
-          else "  (could not resolve upstream ref — `./sc update` will pin it)")
-    # First engine hash manifest: the checkout just brought the engine in, so
-    # disk == upstream right now. From here, `./sc update` detects (and refuses
-    # to silently overwrite) any local edit to an engine file.
-    n = engine_manifest.write_manifest(engine_manifest.ENGINE_PATHS)
-    print(f"  engine manifest written ({n} files) — local engine edits now detected on update")
+    pinned = resolve_engine_ref()
     callable_floor.require_callable_floor(
         REPO_ROOT,
         expected_ref=pinned,
         allow_unpinned=pinned is None,
         context="install",
     )
+    if pinned is not None:
+        write_engine_ref(pinned)
+        print(f"  pinned engine.ref at {pinned[:12]}")
+    else:
+        print("  (could not resolve upstream ref — `./sc update` will pin it)")
+    # First engine hash manifest: the checkout just brought the engine in, so
+    # disk == upstream right now. From here, `./sc update` detects (and refuses
+    # to silently overwrite) any local edit to an engine file.
+    n = engine_manifest.write_manifest(engine_manifest.ENGINE_PATHS)
+    print(f"  engine manifest written ({n} files) — local engine edits now detected on update")
 
     # 3.6 Create the shared scratch / handoff dir -----------------------------
     # A host-repo dir for screenshots, drafts, quick handoffs. The CONNECTIONS

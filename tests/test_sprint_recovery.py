@@ -568,6 +568,110 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             ],
         )
 
+    def test_error_conversation_queued_turn_does_not_suppress_recovery(self):
+        message = self.send("pickup-error-conversation")
+        old_wake = int(message.wake_id)
+        self.deliver_wake_with_turn(old_wake, terminal=False)
+        self.con.execute(
+            "UPDATE conversations SET state='running' WHERE conversation_id=?",
+            (self.developer_conversation_id,),
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='error' WHERE conversation_id=?",
+            (self.developer_conversation_id,),
+        )
+        self.con.commit()
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="queued turn cannot run from an error conversation",
+        )
+
+        receipt = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+
+        self.assertEqual(1, len(receipt.requeued_wake_ids))
+        replacement = receipt.requeued_wake_ids[0]
+        self.assertNotEqual(old_wake, replacement)
+        self.assertEqual(
+            (replacement, "pending"),
+            tuple(
+                self.con.execute(
+                    "SELECT wm.wake_id,w.state FROM sprint_wake_messages wm "
+                    "JOIN sprint_wake_outbox w USING (wake_id) "
+                    "WHERE wm.message_id=?",
+                    (message.message_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_resume_attaches_wakeless_unread_planner_notice_once(self):
+        assignment = self.send(
+            "paused-decline-recovery",
+            kind="work_assignment",
+            actionable=True,
+        )
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="decline while paused",
+        )
+        result_id = self.messages.decline(
+            assignment.message_id,
+            1,
+            "cannot safely continue",
+        )
+        self.con.execute(
+            "UPDATE conversation_messages SET state='running' "
+            "WHERE conversation_id IN (SELECT conversation_id "
+            "FROM sprint_participant_conversations "
+            "WHERE sprint_participant_id=?) AND state='queued'",
+            (self.planner_id,),
+        )
+        self.con.execute(
+            "UPDATE conversation_messages SET state='completed',"
+            "completed_at=datetime('now') WHERE conversation_id IN ("
+            "SELECT conversation_id FROM sprint_participant_conversations "
+            "WHERE sprint_participant_id=?) AND state='running'",
+            (self.planner_id,),
+        )
+        self.con.commit()
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_messages WHERE message_id=?",
+                (result_id,),
+            ).fetchone()[0],
+        )
+
+        first = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+        self.assertEqual(1, len(first.requeued_wake_ids))
+        wake_id = first.requeued_wake_ids[0]
+        self.assertEqual(
+            [(wake_id, result_id, "pending")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT wm.wake_id,wm.message_id,w.state "
+                    "FROM sprint_wake_messages wm JOIN sprint_wake_outbox w "
+                    "USING (wake_id) WHERE wm.message_id=?",
+                    (result_id,),
+                )
+            ],
+        )
+        self.assertEqual(
+            (),
+            self.lifecycle.reconcile_unread_pickup(
+                self.sprint_id,
+                trigger="monitor",
+            ),
+        )
+
     def test_startup_reconciliation_repairs_once_across_repeated_passes(self):
         message = self.send("pickup-startup")
         old_wake = int(message.wake_id)

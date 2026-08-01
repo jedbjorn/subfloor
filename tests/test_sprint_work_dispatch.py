@@ -342,6 +342,49 @@ class DispatchGateTest(SprintWorkDispatchCase):
             ),
         )
 
+    def test_cancellation_reason_accepts_8000_and_rejects_8001_with_counts(self):
+        rejected = self.create_unit(developer=1, title="Rejected cancellation")
+        with self.assertRaisesRegex(
+            ValueError,
+            "work-unit cancellation reason is 8001 characters; maximum is 8000",
+        ):
+            self.units.cancel(
+                self.sprint_id,
+                rejected,
+                3,
+                reason="x" * 8001,
+            )
+        self.assertEqual(
+            ("planned", None),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,completion_result FROM sprint_work_units "
+                    "WHERE work_unit_id=?",
+                    (rejected,),
+                ).fetchone()
+            ),
+        )
+
+        accepted = self.create_unit(developer=1, title="Accepted cancellation")
+        self.assertTrue(
+            self.units.cancel(
+                self.sprint_id,
+                accepted,
+                3,
+                reason="x" * 8000,
+            )
+        )
+        self.assertEqual(
+            ("cancelled", 8000),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,length(completion_result) "
+                    "FROM sprint_work_units WHERE work_unit_id=?",
+                    (accepted,),
+                ).fetchone()
+            ),
+        )
+
     def test_planner_cancels_only_unreleased_lane_with_reason(self) -> None:
         cancelled = self.create_unit(developer=1, title="Cancelled")
         self.assertTrue(

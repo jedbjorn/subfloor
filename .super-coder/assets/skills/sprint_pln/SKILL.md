@@ -70,7 +70,8 @@ Put a concrete question, answer, decision, blocker, or useful context in a short
 body file and address the participant who owns the needed fact or action:
 
 ```text
-sc sprint send --sprint <id> --to <shortname> --body-file <path>
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --key <stable-key>
 ```
 
 Answer incoming questions through `send` so the answer is durable and wakes the
@@ -79,6 +80,9 @@ For a cross-unit blocker, send evidence, impact, and the exact action needed to
 every directly affected participant. Continue safe independent governance, but
 stop at a decision boundary when an answer is required. Do not spam duplicates
 when no response is immediate; unread recovery owns re-waking.
+
+Choose one stable key for the intended recipient and exact body. Reuse it only
+when retrying that same write; use a new key when the recipient or body changes.
 
 Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
 characters is the hard maximum. Before submitting, run `wc -m < <path>` and

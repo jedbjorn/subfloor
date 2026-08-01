@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import uuid
 from pathlib import Path
 
 import mem
@@ -129,7 +128,7 @@ def cmd_send(args: argparse.Namespace) -> int:
             "sprint_id": args.sprint,
             "to": args.to,
             "body": _text(args.body_file, "message body"),
-            "idempotency_key": "participant-send:" + uuid.uuid4().hex,
+            "idempotency_key": args.key,
         },
         idempotent=True,
     )
@@ -435,6 +434,11 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--sprint", type=int, required=True)
     send.add_argument("--to", required=True, help="recipient shell shortname")
     send.add_argument("--body-file", required=True, help=PAYLOAD_FILE_HELP)
+    send.add_argument(
+        "--key",
+        required=True,
+        help="stable retry key; reuse it only for the same recipient and body",
+    )
     send.set_defaults(fn=cmd_send)
 
     accept = sub.add_parser(

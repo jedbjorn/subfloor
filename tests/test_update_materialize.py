@@ -146,6 +146,16 @@ class EnginePathsAtRefTest(unittest.TestCase):
             "ENGINE_PATHS = " + repr(paths) + "\n"
         )
 
+    def write_hash_baseline(self, paths: list[str]) -> None:
+        engine = self.root / ".super-coder"
+        with mock.patch.multiple(
+            update.engine_manifest,
+            REPO_ROOT=self.root,
+            ENGINE=engine,
+            MANIFEST=engine / "engine.manifest",
+        ):
+            update.engine_manifest.write_manifest(paths)
+
     def test_added_path_resolves_from_target_ref_and_materializes(self):
         installed = ["sc", ".super-coder/scripts"]
         (self.root / "sc").write_text("old dispatcher\n")
@@ -321,6 +331,103 @@ class EnginePathsAtRefTest(unittest.TestCase):
         self.assertIn("sc", recorded)
         self.assertIn(".super-coder/scripts/sprint_cli.py", recorded)
         self.assertNotIn(".super-coder/scripts/sprint.py", recorded)
+
+    def test_half_laid_target_bypasses_only_matching_manifest_drift_on_retry(self):
+        installed = ["sc", ".super-coder/scripts"]
+        (self.root / "sc").write_text(
+            "#!/bin/sh\nexec \"$PY\" \"$S/sprint.py\" \"$@\"\n"
+        )
+        (self.root / "sc").chmod(0o755)
+        self.write_manifest(installed)
+        (self.scripts / "sprint.py").write_text("print('old')\n")
+        old_sha = self.commit("old callable floor")
+
+        (self.root / "sc").write_text(
+            "#!/bin/sh\nexec \"$PY\" \"$S/sprint_cli.py\" \"$@\"\n"
+        )
+        (self.scripts / "sprint.py").unlink()
+        (self.scripts / "sprint_cli.py").write_text("print('new')\n")
+        target_sha = self.commit("new callable floor")
+        _git(self.root, "checkout", old_sha)
+        self.write_hash_baseline(installed)
+
+        state = self.root / ".sc-state"
+        state.mkdir()
+        (state / "engine.ref").write_text(old_sha + "\n")
+        engine = self.root / ".super-coder"
+        manifest = engine / "engine.manifest"
+        with mock.patch.multiple(
+            update,
+            REPO_ROOT=self.root,
+            ENGINE=engine,
+            STATE_DIR=state,
+            ENGINE_REF=state / "engine.ref",
+            ENGINE_REF_PREV=state / "engine.ref.prev",
+            ENGINE_PATHS=installed,
+        ), mock.patch.multiple(
+            update.engine_manifest,
+            REPO_ROOT=self.root,
+            ENGINE=engine,
+            MANIFEST=manifest,
+        ):
+            update.materialize_engine(target_sha, engine_paths=installed)
+            self.assertFalse(update.repair_callable_dispatcher(old_sha))
+            self.assertIn("sprint_cli.py", (self.root / "sc").read_text())
+
+            update.materialize_fetched_engine(target_sha)
+
+        self.assertEqual(target_sha + "\n", (state / "engine.ref").read_text())
+        self.assertIn("sprint_cli.py", (self.root / "sc").read_text())
+        self.assertNotIn(
+            ".super-coder/scripts/sprint.py",
+            json.loads(manifest.read_text()),
+            "a retired script may linger on disk but must leave engine authority",
+        )
+
+    def test_compat_repair_preserves_deliberate_dispatcher_edit_and_manifest(self):
+        installed = ["sc", ".super-coder/scripts"]
+        (self.root / "sc").write_text("#!/bin/sh\necho old\n")
+        (self.root / "sc").chmod(0o755)
+        self.write_manifest(installed)
+        (self.scripts / "floor.py").write_text("print('old')\n")
+        old_sha = self.commit("old floor")
+
+        (self.root / "sc").write_text("#!/bin/sh\necho new upstream\n")
+        (self.scripts / "floor.py").write_text("print('new')\n")
+        target_sha = self.commit("target floor")
+        _git(self.root, "checkout", old_sha)
+        self.write_hash_baseline(installed)
+        manifest = self.root / ".super-coder" / "engine.manifest"
+        baseline = manifest.read_text()
+        (self.root / "sc").write_text("#!/bin/sh\necho deliberate fork patch\n")
+
+        engine = self.root / ".super-coder"
+        state = self.root / ".sc-state"
+        with mock.patch.multiple(
+            update,
+            REPO_ROOT=self.root,
+            ENGINE=engine,
+            STATE_DIR=state,
+            ENGINE_REF=state / "engine.ref",
+            ENGINE_REF_PREV=state / "engine.ref.prev",
+            ENGINE_PATHS=installed,
+        ), mock.patch.multiple(
+            update.engine_manifest,
+            REPO_ROOT=self.root,
+            ENGINE=engine,
+            MANIFEST=manifest,
+        ):
+            self.assertFalse(update.repair_callable_dispatcher(old_sha))
+            with self.assertRaisesRegex(
+                SystemExit, "refusing to overwrite local engine edits"
+            ):
+                update.materialize_fetched_engine(target_sha)
+
+        self.assertEqual(
+            "#!/bin/sh\necho deliberate fork patch\n",
+            (self.root / "sc").read_text(),
+        )
+        self.assertEqual(baseline, manifest.read_text())
 
     def test_retired_path_is_not_materialized_and_is_reported(self):
         base = ["sc", ".super-coder/scripts"]

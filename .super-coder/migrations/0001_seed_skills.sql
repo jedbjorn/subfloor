@@ -3743,14 +3743,19 @@ Put a concrete question, answer, blocker, or context request in a short body
 file, then send it to the conformance Reviewer or participant who owns the fact:
 
 ```text
-sc sprint send --sprint <id> --to <shortname> --body-file <path>
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --key <stable-key>
 ```
 
 Answer incoming questions through `send`, confirm that write, then mark the
-handled question read with `accept`. For a blocker, send the evidence, impact,
-and exact action needed to FnB and every directly affected participant. Continue
-safe synthesis, but stop at a decision boundary when the answer is required. Do
-not send duplicate reminders; unread recovery owns re-waking.
+handled question read with `accept`. For a blocker, relay the evidence, impact,
+and exact action needed to every directly affected Sprint participant, and
+surface the exceptional recovery need separately to FnB. Continue safe
+synthesis, but stop at a decision boundary when the answer is required. Do not
+send duplicate reminders; unread recovery owns re-waking.
+
+Choose one stable key for the intended recipient and exact body. Reuse it only
+when retrying that same write; use a new key when the recipient or body changes.
 
 Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
 characters is the hard maximum. Before submitting, run `wc -m < <path>` and
@@ -3942,7 +3947,8 @@ Write a concrete question, answer, blocker, or useful context to a short body
 file, then send it durably to the participant who can act:
 
 ```text
-sc sprint send --sprint <id> --to <shortname> --body-file <path>
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --key <stable-key>
 ```
 
 Ask the Planner about scope, priority, or cross-unit decisions; ask the assigned
@@ -3953,6 +3959,9 @@ impact, the exact action needed, and your recommendation. Continue safe
 independent work, but stop at a decision boundary when the answer is required.
 No immediate response is not a reason to send duplicates: the durable message
 and recovery reconciler own re-waking.
+
+Choose one stable key for the intended recipient and exact body. Reuse it only
+when retrying that same write; use a new key when the recipient or body changes.
 
 Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
 characters is the hard maximum. Before submitting, run `wc -m < <path>` and
@@ -4126,7 +4135,8 @@ Put a concrete question, answer, decision, blocker, or useful context in a short
 body file and address the participant who owns the needed fact or action:
 
 ```text
-sc sprint send --sprint <id> --to <shortname> --body-file <path>
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --key <stable-key>
 ```
 
 Answer incoming questions through `send` so the answer is durable and wakes the
@@ -4135,6 +4145,9 @@ For a cross-unit blocker, send evidence, impact, and the exact action needed to
 every directly affected participant. Continue safe independent governance, but
 stop at a decision boundary when an answer is required. Do not spam duplicates
 when no response is immediate; unread recovery owns re-waking.
+
+Choose one stable key for the intended recipient and exact body. Reuse it only
+when retrying that same write; use a new key when the recipient or body changes.
 
 Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
 characters is the hard maximum. Before submitting, run `wc -m < <path>` and
@@ -4379,7 +4392,8 @@ and send it to the participant who can act. Ask the Developer for missing PR
 evidence and the Planner for scope or severity decisions:
 
 ```text
-sc sprint send --sprint <id> --to <shortname> --body-file <path>
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --key <stable-key>
 ```
 
 Answer incoming questions through `send` so the answer is durable and wakes the
@@ -4388,6 +4402,9 @@ blocker or integrity concern goes to the Planner with concise evidence, impact,
 the exact action needed, and your recommendation. Continue independent safe
 review, but stop at a decision boundary when the answer is required. Do not send
 duplicate reminders; unread recovery owns re-waking.
+
+Choose one stable key for the intended recipient and exact body. Reuse it only
+when retrying that same write; use a new key when the recipient or body changes.
 
 Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
 characters is the hard maximum. Before submitting, run `wc -m < <path>` and
@@ -4497,11 +4514,11 @@ Surface immediate safety risk to the FnB, but preserve the close-out rule.
 
 ## Stop
 
-For unit review, stop after the durable verdict is recorded. For conformance,
-re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and stop
-after marking every handled informational message read with `accept` and after
-the report and all findings replay idempotently and give the Planner their
-report/follow-up ids.',
+For either mode, re-run `sc sprint inbox --sprint <id>` and act on newly arrived
+messages before stopping. For unit review, stop after the durable verdict is
+recorded and every handled informational message is marked read with `accept`.
+For conformance, also require the report and all findings to replay
+idempotently and give the Planner their report/follow-up ids.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET

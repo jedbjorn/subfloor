@@ -42,7 +42,8 @@ Write a concrete question, answer, blocker, or useful context to a short body
 file, then send it durably to the participant who can act:
 
 ```text
-sc sprint send --sprint <id> --to <shortname> --body-file <path>
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --key <stable-key>
 ```
 
 Ask the Planner about scope, priority, or cross-unit decisions; ask the assigned
@@ -53,6 +54,9 @@ impact, the exact action needed, and your recommendation. Continue safe
 independent work, but stop at a decision boundary when the answer is required.
 No immediate response is not a reason to send duplicates: the durable message
 and recovery reconciler own re-waking.
+
+Choose one stable key for the intended recipient and exact body. Reuse it only
+when retrying that same write; use a new key when the recipient or body changes.
 
 Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
 characters is the hard maximum. Before submitting, run `wc -m < <path>` and

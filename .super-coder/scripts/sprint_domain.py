@@ -1015,6 +1015,70 @@ class SprintLifecycleStore:
                 },
             )
             replacements.append(new_wake_id)
+
+        unwoken = self.con.execute(
+            "SELECT m.message_id,m.to_participant_id FROM sprint_messages m "
+            "WHERE m.sprint_id=? AND m.read_at IS NULL "
+            "AND m.idempotency_key LIKE 'decline-result:%' "
+            "AND m.to_participant_id IS NOT NULL AND NOT EXISTS ("
+            "SELECT 1 FROM sprint_wake_messages wm "
+            "WHERE wm.message_id=m.message_id) ORDER BY m.message_id",
+            (sprint_id,),
+        ).fetchall()
+        for message in unwoken:
+            participant_id = int(message["to_participant_id"])
+            if self._participant_has_pickup_turn(participant_id):
+                continue
+            deliverable = self.con.execute(
+                "SELECT wake_id FROM sprint_wake_outbox WHERE sprint_id=? "
+                "AND participant_id=? AND state IN ('pending','delivering') "
+                "ORDER BY wake_id LIMIT 1",
+                (sprint_id, participant_id),
+            ).fetchone()
+            created = deliverable is None
+            if created:
+                new_wake_id = int(
+                    self.con.execute(
+                        "INSERT INTO sprint_wake_outbox "
+                        "(sprint_id,participant_id,idempotency_key) VALUES (?,?,?)",
+                        (
+                            sprint_id,
+                            participant_id,
+                            f"sprint-recovery:{sprint_id}:unwoken:"
+                            f"{int(message['message_id'])}",
+                        ),
+                    ).lastrowid
+                )
+            else:
+                new_wake_id = int(deliverable["wake_id"])
+            self.con.execute(
+                "INSERT INTO sprint_wake_messages "
+                "(sprint_id,wake_id,message_id) VALUES (?,?,?)",
+                (sprint_id, new_wake_id, int(message["message_id"])),
+            )
+            route = sprint_participant_chats.ensure_wake_conversation(
+                self.con,
+                participant_id,
+                idempotency_key=(
+                    f"sprint:{sprint_id}:wake:{new_wake_id}:conversation"
+                ),
+            )
+            self._event(
+                sprint_id,
+                "wake.requeued",
+                LifecycleActor("system"),
+                {
+                    "trigger": trigger,
+                    "prior_wake_id": None,
+                    "prior_wake_state": "absent",
+                    "prior_turn_state": {},
+                    "message_id": int(message["message_id"]),
+                    "replacement_wake_id": new_wake_id,
+                    "replacement_created": created,
+                    "replacement_conversation_id": route.conversation_id,
+                },
+            )
+            replacements.append(new_wake_id)
         return tuple(sorted(set(replacements)))
 
     def _participant_has_pickup_turn(self, participant_id: int) -> bool:
@@ -1022,7 +1086,9 @@ class SprintLifecycleStore:
             "SELECT 1 FROM sprint_participant_conversations pc "
             "JOIN conversation_messages m "
             "ON m.conversation_id=pc.conversation_id "
+            "JOIN conversations c ON c.conversation_id=m.conversation_id "
             "WHERE pc.sprint_participant_id=? "
+            "AND c.state IN ('idle','queued','running','waiting') "
             "AND (m.state='queued' OR (m.state='running' AND EXISTS ("
             "SELECT 1 FROM conversation_runs r WHERE r.trigger_message_id=m.message_id "
             "AND r.state IN ('leased','starting','running') AND NOT EXISTS ("
@@ -1835,7 +1901,10 @@ class SprintWorkUnitStore:
         if not reason:
             raise ValueError("work-unit cancellation reason is required")
         if len(reason) > 8000:
-            raise ValueError("work-unit cancellation reason exceeds 8000 characters")
+            raise ValueError(
+                f"work-unit cancellation reason is {len(reason)} characters; "
+                "maximum is 8000"
+            )
         with db_driver.write_transaction(self.con, "sprint.work_unit.cancel"):
             self._require_planner(sprint_id, planner_shell_id)
             unit = self._unit(sprint_id, work_unit_id)

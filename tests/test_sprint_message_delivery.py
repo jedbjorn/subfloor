@@ -408,7 +408,7 @@ class WakeDeliveryTest(SprintMessageCase):
                 "sprint_dev",
             ),
             "reviewer": (self.reviewer_id, "Reviewer", "sprint_rev"),
-            "planner": (self.planner_id, "originating Planner", "sprint_pln"),
+            "planner": (self.planner_id, "Originating Planner", "sprint_pln"),
         }
         observed: dict[str, str] = {}
         service = delivery.SprintWakeDeliveryService(self.con)
@@ -706,6 +706,60 @@ class ParticipantRelayTest(SprintMessageCase):
         self.assertEqual(old_conversation, packet["previous_conversation_id"])
         self.assertEqual(
             receipt.conversation_id,
+            self.con.execute(
+                "SELECT current_conversation_id FROM sprint_participants "
+                "WHERE participant_id=?",
+                (self.planner_id,),
+            ).fetchone()[0],
+        )
+
+    def test_delivery_reroutes_when_the_created_wake_chat_closes(self) -> None:
+        old_conversation = self.con.execute(
+            "SELECT current_conversation_id FROM sprint_participants "
+            "WHERE participant_id=?",
+            (self.planner_id,),
+        ).fetchone()[0]
+        self.con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+            "WHERE conversation_id=?",
+            (old_conversation,),
+        )
+        self.con.commit()
+        receipt = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="PLN1",
+            body="Route this wake after a closed fallback.",
+            idempotency_key="participant-send:closed-fallback-route",
+        )
+        first_route = receipt.conversation_id
+        self.con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+            "WHERE conversation_id=?",
+            (first_route,),
+        )
+        self.con.commit()
+
+        lease = delivery.SprintWakeDeliveryService(self.con).claim_next(
+            "closed-route-retry"
+        )
+
+        self.assertIsNotNone(lease)
+        self.assertEqual(receipt.wake_id, lease.wake_id)
+        self.assertNotEqual(first_route, lease.target_conversation_id)
+        self.assertEqual(
+            ("idle", "fallback", first_route),
+            tuple(
+                self.con.execute(
+                    "SELECT c.state,pc.purpose,pc.parent_conversation_id "
+                    "FROM conversations c JOIN sprint_participant_conversations pc "
+                    "USING (conversation_id) WHERE c.conversation_id=?",
+                    (lease.target_conversation_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            lease.target_conversation_id,
             self.con.execute(
                 "SELECT current_conversation_id FROM sprint_participants "
                 "WHERE participant_id=?",

@@ -68,6 +68,35 @@ class SprintSkillTest(unittest.TestCase):
                 ]
                 self.assertEqual([flavor], grants)
 
+    def test_handoff_migration_converges_a_drifted_existing_skill_body(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0153_harden_sprint_handoff_skills.sql":
+                    break
+                con.executescript(migration.read_text())
+            con.execute(
+                "UPDATE skills SET content='fork-local drift' WHERE name='sprint_dev'"
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0153_harden_sprint_handoff_skills.sql"
+            ).read_text()
+            con.executescript(migration)
+
+            expected = seed_skills.parse_skill(
+                ASSETS / "sprint_dev" / "SKILL.md"
+            )["content"]
+            self.assertEqual(
+                expected,
+                con.execute(
+                    "SELECT content FROM skills WHERE name='sprint_dev'"
+                ).fetchone()[0],
+            )
+        finally:
+            con.close()
+
     def test_reviewer_skill_owns_severity_and_conformance_never_fixes(self):
         reviewer = (ASSETS / "sprint_rev" / "SKILL.md").read_text()
         self.assertIn("## Severity rubric", reviewer)
@@ -130,7 +159,7 @@ class SprintSkillTest(unittest.TestCase):
                     "sc sprint inbox --sprint <id>",
                     "sc sprint accept --sprint <id> --message <message-id>",
                     "sc sprint decline --sprint <id> --message <message-id>",
-                    "sc sprint send --sprint <id> --to <shortname> --body-file <path>",
+                    "sc sprint send --sprint <id> --to <shortname> --body-file <path> \\",
                 ):
                     self.assertIn(command, body)
                 normalized = " ".join(body.lower().split())
@@ -155,9 +184,11 @@ class SprintSkillTest(unittest.TestCase):
                     1,
                     body.count(
                         "sc sprint send --sprint <id> --to <shortname> "
-                        "--body-file <path>"
+                        "--body-file <path> \\\n  --key <stable-key>"
                     ),
                 )
+                self.assertIn("reuse it only", normalized)
+                self.assertIn("recipient or body changes", normalized)
                 for invented in ("ASK:", "ANSWER:", "BLOCKED:"):
                     self.assertNotIn(invented, body)
 
@@ -203,7 +234,10 @@ class SprintSkillTest(unittest.TestCase):
             "complete": ("--report-file",),
         }.items():
             with self.subTest(command=command):
-                help_text = commands[command].format_help()
                 for argument in arguments:
-                    self.assertIn(argument, help_text)
-                self.assertIn("8,000 characters", help_text)
+                    action = next(
+                        action
+                        for action in commands[command]._actions
+                        if argument in action.option_strings
+                    )
+                    self.assertIn("8,000 characters", action.help)

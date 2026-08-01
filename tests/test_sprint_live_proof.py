@@ -727,13 +727,19 @@ class SprintLiveProof(unittest.TestCase):
         sprint_id, _document_id, units = self.prepare(((1, 2, ()),))
         self.run_cli(3, "arm", "--sprint", str(sprint_id))
         self.deliver_browser_turns()
+        assignment_id = self.assignment_message(units[0])
+        developer_start = self.run_cli(1, "inbox", "--sprint", str(sprint_id))
+        self.assertIn(
+            assignment_id,
+            [message["message_id"] for message in developer_start["messages"]],
+        )
         self.run_cli(
             1,
             "accept",
             "--sprint",
             str(sprint_id),
             "--message",
-            str(self.assignment_message(units[0])),
+            str(assignment_id),
         )
 
         planner_conversation = str(
@@ -754,6 +760,8 @@ class SprintLiveProof(unittest.TestCase):
             "PLN1",
             "--body-file",
             self.write_input(question),
+            "--key",
+            "proof:68:question",
         )
         self.assertTrue(question_receipt["message_created"])
         self.assertEqual("pending", question_receipt["wake_state"])
@@ -774,6 +782,14 @@ class SprintLiveProof(unittest.TestCase):
             ),
         )
         self.deliver_browser_turns()
+        planner_inbox = self.run_cli(3, "inbox", "--sprint", str(sprint_id))
+        self.assertIn(
+            (question_receipt["message_id"], question),
+            [
+                (message["message_id"], message["body"])
+                for message in planner_inbox["messages"]
+            ],
+        )
         self.assertEqual(
             sprint_message_delivery.wake_prompt(sprint_id, "planner"),
             self.con.execute(
@@ -803,8 +819,15 @@ class SprintLiveProof(unittest.TestCase):
             self.write_input(
                 "Use the legacy update fixture with its pre-existing linked worktree."
             ),
+            "--key",
+            "proof:68:answer",
         )
         self.deliver_browser_turns()
+        developer_answer = self.run_cli(1, "inbox", "--sprint", str(sprint_id))
+        self.assertIn(
+            answer_receipt["message_id"],
+            [message["message_id"] for message in developer_answer["messages"]],
+        )
         self.run_cli(
             1,
             "accept",
@@ -872,6 +895,11 @@ class SprintLiveProof(unittest.TestCase):
             ),
         )
         self.deliver_browser_turns()
+        reviewer_inbox = self.run_cli(2, "inbox", "--sprint", str(sprint_id))
+        self.assertIn(
+            review_request["message_id"],
+            [message["message_id"] for message in reviewer_inbox["messages"]],
+        )
         self.run_cli(
             2,
             "accept",
@@ -895,10 +923,37 @@ class SprintLiveProof(unittest.TestCase):
             "--key",
             "proof:68:review-to-dev",
         )
-        terminal_conversation, terminal_prompt = self.deliver_terminal_turn(
-            outcome["wake_id"]
+        self.deliver_browser_turns()
+        developer_outcome = self.run_cli(1, "inbox", "--sprint", str(sprint_id))
+        self.assertIn(
+            outcome["message_id"],
+            [message["message_id"] for message in developer_outcome["messages"]],
         )
-        self.assertEqual(outcome["conversation_id"], terminal_conversation)
+        self.run_cli(
+            1,
+            "accept",
+            "--sprint",
+            str(sprint_id),
+            "--message",
+            str(outcome["message_id"]),
+        )
+
+        recovery_message = self.run_cli(
+            3,
+            "send",
+            "--sprint",
+            str(sprint_id),
+            "--to",
+            "DEV1",
+            "--body-file",
+            self.write_input("Preserve this separate delivered-unread recovery proof."),
+            "--key",
+            "proof:68:delivered-unread",
+        )
+        terminal_conversation, terminal_prompt = self.deliver_terminal_turn(
+            recovery_message["wake_id"]
+        )
+        self.assertEqual(recovery_message["conversation_id"], terminal_conversation)
         self.assertEqual(
             sprint_message_delivery.wake_prompt(sprint_id, "developer"),
             terminal_prompt,
@@ -906,7 +961,7 @@ class SprintLiveProof(unittest.TestCase):
         self.assertIsNone(
             self.con.execute(
                 "SELECT read_at FROM sprint_messages WHERE message_id=?",
-                (outcome["message_id"],),
+                (recovery_message["message_id"],),
             ).fetchone()[0]
         )
         prior_pickup_turns = [
@@ -951,15 +1006,20 @@ class SprintLiveProof(unittest.TestCase):
         )
         self.assertEqual(1, len(resumed["requeued_wake_ids"]))
         replacement = resumed["requeued_wake_ids"][0]
-        self.assertNotEqual(outcome["wake_id"], replacement)
+        self.assertNotEqual(recovery_message["wake_id"], replacement)
         self.deliver_browser_turns()
+        recovered_inbox = self.run_cli(1, "inbox", "--sprint", str(sprint_id))
+        self.assertIn(
+            recovery_message["message_id"],
+            [message["message_id"] for message in recovered_inbox["messages"]],
+        )
         self.run_cli(
             1,
             "accept",
             "--sprint",
             str(sprint_id),
             "--message",
-            str(outcome["message_id"]),
+            str(recovery_message["message_id"]),
         )
         evidence = json.loads(
             self.con.execute(
@@ -971,7 +1031,7 @@ class SprintLiveProof(unittest.TestCase):
         self.assertEqual("delivered", evidence["prior_wake_state"])
         self.assertEqual("completed", evidence["prior_turn_state"]["message_state"])
         self.assertEqual("succeeded", evidence["prior_turn_state"]["run_state"])
-        self.assertEqual(outcome["wake_id"], evidence["prior_wake_id"])
+        self.assertEqual(recovery_message["wake_id"], evidence["prior_wake_id"])
         self.assertEqual(replacement, evidence["replacement_wake_id"])
         self.assertEqual(
             ("fixing", "armed", "delivered"),
