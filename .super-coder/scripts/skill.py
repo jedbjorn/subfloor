@@ -218,6 +218,10 @@ def cmd_add(con, argv: list[str]) -> int:
         sys.exit(f"sc skill add: '{name}' is an ENGINE skill — the seed owns that "
                  "name and upserts it on every update. Pick a different one "
                  f"(e.g. {author}_{name}).")
+    if name in set(seed_skills.tombstoned_skill_names()):
+        sys.exit(f"sc skill add: '{name}' is a retired ENGINE skill — its name "
+                 "is permanently reserved by the upstream tombstone registry. "
+                 "Pick a different namespaced name.")
     # Guard 2 — namespace by shortname. A future upstream release claiming a
     # bare name would clobber this shell's content on the next sync; a
     # shortname prefix is a name upstream will never mint.

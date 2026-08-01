@@ -36,8 +36,10 @@ Usage:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import artifact_policy
@@ -47,6 +49,142 @@ SKILLS_DIR = ENGINE / "assets" / "skills"
 OUT = ENGINE / "migrations" / "0001_seed_skills.sql"
 DB_PATH = ENGINE / "shell_db.db"
 RETIRED_FILE = artifact_policy.retired_skills_path()
+TOMBSTONES_FILE = ENGINE / "assets" / "skill_tombstones.json"
+SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# These three legacy names remain in the generated seed until the catalogue
+# source-removal change lands. Until then, only their seed-owned assets may
+# overlap the registry; intersecting this tolerance with seeded_skill_names()
+# makes the exception disappear on that regeneration.
+LEGACY_SEED_TOMBSTONE_TOLERANCE = frozenset({
+    "engine_surgery",
+    "test_authoring_pg",
+    "test_authoring_sqlite",
+})
+
+
+@dataclass(frozen=True)
+class TombstoneReconciliation:
+    """The authority removed by one tombstone reconciliation pass."""
+
+    changed_names: tuple[str, ...]
+    grant_count: int
+
+
+def tombstoned_skill_names() -> list[str]:
+    """Load the permanent upstream skill-name reservations.
+
+    The registry is authored source, not best-effort configuration. Refuse a
+    malformed registry before any catalogue write can partially apply.
+    """
+    try:
+        names = json.loads(TOMBSTONES_FILE.read_text())
+    except FileNotFoundError as e:
+        raise ValueError(f"skill tombstone registry missing: {TOMBSTONES_FILE}") from e
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"skill tombstone registry {TOMBSTONES_FILE} is not valid JSON: {e}"
+        ) from e
+    if not isinstance(names, list):
+        raise TypeError(
+            f"skill tombstone registry {TOMBSTONES_FILE} must be a JSON array"
+        )
+    if not names:
+        raise ValueError(f"skill tombstone registry {TOMBSTONES_FILE} is empty")
+
+    seen: set[str] = set()
+    validated: list[str] = []
+    for index, name in enumerate(names):
+        if not isinstance(name, str):
+            raise TypeError(
+                f"skill tombstone registry entry {index} must be a string"
+            )
+        if not SKILL_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"skill tombstone registry entry {index} has malformed name {name!r}"
+            )
+        if name in seen:
+            raise ValueError(
+                f"skill tombstone registry contains duplicate name {name!r}"
+            )
+        seen.add(name)
+        validated.append(name)
+    return validated
+
+
+def validate_upstream_skill_namespace(active_names: list[str]) -> list[str]:
+    """Prove that active upstream names and permanent tombstones are disjoint."""
+    tombstones = tombstoned_skill_names()
+    overlap = sorted(set(active_names) & set(tombstones))
+    if overlap:
+        raise ValueError(
+            "active and tombstoned upstream skill names overlap: "
+            + ", ".join(overlap)
+        )
+    return tombstones
+
+
+def _validate_skill_specs_claimable(specs: list[dict]) -> None:
+    """Reject a fork-local asset that claims a reserved upstream name.
+
+    Three legacy skills remain in the active seed until the catalogue-removal
+    unit regenerates it. Those seed-owned rows are the only temporary overlap;
+    a name absent from the seed is a new fork-local claim and is refused now.
+    """
+    tombstones = set(tombstoned_skill_names())
+    tolerated = (
+        LEGACY_SEED_TOMBSTONE_TOLERANCE
+        & tombstones
+        & set(seeded_skill_names())
+    )
+    claimed = sorted(
+        spec["name"] for spec in specs
+        if spec["name"] in tombstones and spec["name"] not in tolerated
+    )
+    if claimed:
+        raise ValueError(
+            "skill asset claims tombstoned upstream name(s): " + ", ".join(claimed)
+        )
+
+
+def reconcile_tombstoned_skills(con) -> TombstoneReconciliation:
+    """Hard-delete tombstoned skills and both kinds of child grant.
+
+    A savepoint makes the operation atomic both as a standalone lifecycle step
+    and inside a caller-owned transaction. Releasing an outermost savepoint
+    commits; nested callers keep ownership of their surrounding transaction.
+    """
+    tombstones = tombstoned_skill_names()
+    placeholders = ",".join("?" for _ in tombstones)
+    rows = con.execute(
+        f"SELECT skill_id, name FROM skills WHERE name IN ({placeholders}) "
+        "ORDER BY name",
+        tombstones,
+    ).fetchall()
+    if not rows:
+        return TombstoneReconciliation((), 0)
+
+    skill_ids = [row[0] for row in rows]
+    id_placeholders = ",".join("?" for _ in skill_ids)
+    con.execute("SAVEPOINT reconcile_skill_tombstones")
+    try:
+        grant_count = con.execute(
+            f"DELETE FROM shell_skills WHERE skill_id IN ({id_placeholders})",
+            skill_ids,
+        ).rowcount
+        grant_count += con.execute(
+            f"DELETE FROM flavor_skills WHERE skill_id IN ({id_placeholders})",
+            skill_ids,
+        ).rowcount
+        con.execute(
+            f"DELETE FROM skills WHERE skill_id IN ({id_placeholders})",
+            skill_ids,
+        )
+    except Exception:
+        con.execute("ROLLBACK TO reconcile_skill_tombstones")
+        con.execute("RELEASE reconcile_skill_tombstones")
+        raise
+    con.execute("RELEASE reconcile_skill_tombstones")
+    return TombstoneReconciliation(tuple(row[1] for row in rows), grant_count)
 
 
 def sql_str(v) -> str:
@@ -236,6 +374,7 @@ def sync_engine_skills(con, specs: list[dict] | None = None) -> list[str]:
     transaction boundary intent; we commit our own writes."""
     if specs is None:
         specs = _engine_specs()
+    _validate_skill_specs_claimable(specs)
     stale = stale_engine_skills(con, specs)
     by_name = {s["name"]: s for s in specs}
     for name in stale:                       # stale ⊆ spec names, so always hits
