@@ -20,6 +20,7 @@ class Stop(Exception):
 class UpdateServiceCutoverTest(unittest.TestCase):
     def test_main_routes_migration_through_the_service_cutover(self):
         with mock.patch.object(update, "is_source_repo", return_value=True), \
+                mock.patch.object(update, "repair_git_worktrees") as repair, \
                 mock.patch.object(update, "ensure_workflows", return_value=("source", [])), \
                 mock.patch.object(update.install_mod, "ensure_harnesses"), \
                 mock.patch.object(update, "expire_sandbox_harnesses", return_value=None), \
@@ -31,6 +32,7 @@ class UpdateServiceCutoverTest(unittest.TestCase):
                 ), contextlib.redirect_stdout(io.StringIO()), \
                 self.assertRaises(Stop):
             update.main(["--no-fetch"])
+        repair.assert_called_once_with()
         cutover.assert_called_once_with()
 
     def test_running_pm2_server_stops_before_migration_and_starts_after(self):
