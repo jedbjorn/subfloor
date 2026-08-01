@@ -338,6 +338,10 @@ class ClaudeAdapter(ConversationAdapter):
                 if event.type in TERMINAL_EVENTS:
                     terminal = True
                     turn.metadata["terminal"] = event.type
+                    if event.interrupt_evidence:
+                        turn.metadata["interrupt_evidence"] = (
+                            event.interrupt_evidence
+                        )
                 yield event
         returncode = process.wait()
         turn.metadata["returncode"] = returncode
@@ -440,10 +444,16 @@ class ClaudeAdapter(ConversationAdapter):
     ) -> ReconcileResult:
         terminal = turn.metadata.get("terminal")
         if terminal in TERMINAL_EVENTS:
+            outcome = terminal_outcome(terminal)
             return ReconcileResult(
-                terminal_outcome(terminal),
+                outcome,
                 True,
                 f"terminal {terminal} was observed on Claude stdout",
+                (
+                    turn.metadata.get("interrupt_evidence")
+                    if outcome == "cancelled"
+                    else None
+                ),
             )
         process = turn.opaque
         if process is not None and process.poll() is None:
@@ -455,10 +465,12 @@ class ClaudeAdapter(ConversationAdapter):
         inspection = self.inspect(turn.session_ref, context)
         transcript_terminal = inspection.metadata.get("terminal")
         if transcript_terminal in TERMINAL_EVENTS:
+            outcome = terminal_outcome(str(transcript_terminal))
             return ReconcileResult(
-                terminal_outcome(str(transcript_terminal)),
+                outcome,
                 True,
                 "Claude transcript contains a terminal result",
+                "native" if outcome == "cancelled" else None,
             )
         return ReconcileResult(
             "unknown",

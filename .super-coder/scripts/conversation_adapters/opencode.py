@@ -674,6 +674,7 @@ class OpenCodeAdapter(ConversationAdapter):
             if turn.metadata.get("interrupt_requested"):
                 turn.metadata["dispatch_pending"] = False
                 turn.metadata["terminal"] = "run.interrupted"
+                turn.metadata["interrupt_evidence"] = "operator"
                 interrupted_before_dispatch = True
             else:
                 turn.metadata["dispatch_pending"] = False
@@ -718,6 +719,10 @@ class OpenCodeAdapter(ConversationAdapter):
                     observed_activity = True
                 if event.type in TERMINAL_EVENTS:
                     turn.metadata["terminal"] = event.type
+                    if event.interrupt_evidence:
+                        turn.metadata["interrupt_evidence"] = (
+                            event.interrupt_evidence
+                        )
                 yield event
                 if event.type in TERMINAL_EVENTS:
                     return
@@ -782,10 +787,16 @@ class OpenCodeAdapter(ConversationAdapter):
     ) -> ReconcileResult:
         terminal = turn.metadata.get("terminal")
         if terminal in TERMINAL_EVENTS:
+            outcome = terminal_outcome(terminal)
             return ReconcileResult(
-                terminal_outcome(terminal),
+                outcome,
                 True,
                 f"terminal {terminal} was observed on the native stream",
+                (
+                    turn.metadata.get("interrupt_evidence")
+                    if outcome == "cancelled"
+                    else None
+                ),
             )
         inspection = self.inspect(turn.session_ref, context)
         if not inspection.exists:

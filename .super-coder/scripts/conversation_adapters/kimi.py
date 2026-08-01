@@ -940,6 +940,7 @@ class KimiAdapter(ConversationAdapter):
                 "native" if cancelled else "operator",
             )
             turn.metadata["terminal"] = event.type
+            turn.metadata["interrupt_evidence"] = event.interrupt_evidence
             yield event
             return
         if native_completed.is_set() or returncode == 0:
@@ -1057,10 +1058,16 @@ class KimiAdapter(ConversationAdapter):
     ) -> ReconcileResult:
         terminal = turn.metadata.get("terminal")
         if terminal in TERMINAL_EVENTS:
+            outcome = terminal_outcome(str(terminal))
             return ReconcileResult(
-                terminal_outcome(str(terminal)),
+                outcome,
                 True,
                 f"terminal {terminal} was observed on Kimi stdout",
+                (
+                    turn.metadata.get("interrupt_evidence")
+                    if outcome == "cancelled"
+                    else None
+                ),
             )
         if turn.metadata.get("identity_mismatch"):
             return ReconcileResult(
@@ -1089,6 +1096,7 @@ class KimiAdapter(ConversationAdapter):
                 "cancelled",
                 True,
                 "Kimi exact run slice contains turn.cancel",
+                "native",
             )
         if self._completion_proven(records):
             return ReconcileResult(

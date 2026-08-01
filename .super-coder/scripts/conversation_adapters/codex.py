@@ -545,6 +545,10 @@ class CodexAdapter(ConversationAdapter):
                     ensure_exact_session(turn.session_ref, session)
                 if event.type in TERMINAL_EVENTS:
                     turn.metadata["terminal"] = event.type
+                    if event.interrupt_evidence:
+                        turn.metadata["interrupt_evidence"] = (
+                            event.interrupt_evidence
+                        )
                 yield event
                 if event.type in TERMINAL_EVENTS:
                     return
@@ -605,10 +609,16 @@ class CodexAdapter(ConversationAdapter):
     ) -> ReconcileResult:
         terminal = turn.metadata.get("terminal")
         if terminal in TERMINAL_EVENTS:
+            outcome = terminal_outcome(terminal)
             return ReconcileResult(
-                terminal_outcome(terminal),
+                outcome,
                 True,
                 f"terminal {terminal} was observed from app-server",
+                (
+                    turn.metadata.get("interrupt_evidence")
+                    if outcome == "cancelled"
+                    else None
+                ),
             )
         inspection = self.inspect(turn.session_ref, context)
         if not inspection.exists:
@@ -641,6 +651,7 @@ class CodexAdapter(ConversationAdapter):
                         outcome,
                         True,
                         f"Codex thread/read reports {status}",
+                        "native" if outcome == "cancelled" else None,
                     )
         return ReconcileResult(
             "unknown",

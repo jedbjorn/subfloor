@@ -181,12 +181,23 @@ class ReconcileResult:
     outcome: str
     proven: bool
     detail: str
+    interrupt_evidence: str | None = None
 
     def __post_init__(self) -> None:
         if self.outcome not in RECONCILE_OUTCOMES:
             raise ValueError(f"unknown reconciliation outcome: {self.outcome}")
         if self.outcome == "unknown" and self.proven:
             raise ValueError("an unknown adapter outcome cannot be proven")
+        if self.outcome == "cancelled":
+            if self.interrupt_evidence not in INTERRUPT_EVIDENCE:
+                raise ValueError(
+                    "cancelled reconciliation requires structured native or "
+                    "operator evidence"
+                )
+        elif self.interrupt_evidence is not None:
+            raise ValueError(
+                "interrupt evidence is valid only for cancelled reconciliation"
+            )
 
 
 class ConversationAdapter(abc.ABC):

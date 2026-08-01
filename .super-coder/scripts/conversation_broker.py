@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import socket
 import threading
 import time
@@ -50,6 +51,8 @@ DEFAULT_MAX_WORKERS = 8
 DEFAULT_EVENT_BATCH_SIZE = 64
 DEFAULT_EVENT_BACKLOG_SIZE = 1024
 DEFAULT_EVENT_FLUSH_SECONDS = 0.1
+DEFAULT_BUSY_RETRY_ATTEMPTS = 6
+_STREAM_END = object()
 
 
 class BrokerError(RuntimeError):
@@ -923,6 +926,7 @@ class ConversationBroker(threading.Thread):
         event_batch_size: int = DEFAULT_EVENT_BATCH_SIZE,
         event_backlog_size: int = DEFAULT_EVENT_BACKLOG_SIZE,
         event_flush_seconds: float = DEFAULT_EVENT_FLUSH_SECONDS,
+        busy_retry_attempts: int = DEFAULT_BUSY_RETRY_ATTEMPTS,
     ) -> None:
         super().__init__(name="conversation-broker", daemon=True)
         self.store = store or BrokerStore(db_path)
@@ -935,9 +939,18 @@ class ConversationBroker(threading.Thread):
         self.heartbeat_seconds = heartbeat_seconds
         self.recovery_seconds = recovery_seconds
         self.reconcile_attempts = reconcile_attempts
+        if event_batch_size <= 0:
+            raise ValueError("event_batch_size must be positive")
+        if event_backlog_size <= 0:
+            raise ValueError("event_backlog_size must be positive")
+        if event_flush_seconds <= 0:
+            raise ValueError("event_flush_seconds must be positive")
+        if busy_retry_attempts <= 0:
+            raise ValueError("busy_retry_attempts must be positive")
         self.event_batch_size = event_batch_size
         self.event_backlog_size = event_backlog_size
         self.event_flush_seconds = event_flush_seconds
+        self.busy_retry_attempts = busy_retry_attempts
         self._wake = threading.Event()
         self._stop_event = threading.Event()
         self._active: dict[int, _ActiveRun] = {}
@@ -1073,13 +1086,15 @@ class ConversationBroker(threading.Thread):
         wait: bool,
     ) -> tuple[bool, Any]:
         """Retry only exhausted SQLite writer acquisition, never native work."""
+        attempts = 0
         while not self._stop_event.is_set():
+            attempts += 1
             try:
                 return True, action()
             except Exception as exc:
                 if not db_driver.is_busy_error(exc):
                     raise
-                if not wait:
+                if not wait or attempts >= self.busy_retry_attempts:
                     return False, None
                 self._stop_event.wait(min(1.0, self.recovery_seconds))
         return False, None
@@ -1093,7 +1108,7 @@ class ConversationBroker(threading.Thread):
     ) -> bool:
         if not pending:
             return True
-        batch = list(pending)
+        batch = list(pending[: self.event_batch_size])
         persisted, _result = self._retry_busy(
             partial(self.store.append_events, run_id, batch),
             wait=wait,
@@ -1101,6 +1116,141 @@ class ConversationBroker(threading.Thread):
         if persisted:
             del pending[: len(batch)]
         return persisted
+
+    @staticmethod
+    def _produce_stream(
+        adapter: ConversationAdapter,
+        turn: NativeTurn,
+        items: queue.Queue[object],
+        stopped: threading.Event,
+    ) -> None:
+        """Drain one native stream into its bounded per-run queue."""
+        try:
+            for event in adapter.stream(turn):
+                while not stopped.is_set():
+                    try:
+                        items.put(event, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+                if stopped.is_set() or event.type in TERMINAL_EVENTS:
+                    break
+        except Exception as exc:
+            while not stopped.is_set():
+                try:
+                    items.put(exc, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+        finally:
+            while not stopped.is_set():
+                try:
+                    items.put(_STREAM_END, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    def _consume_stream(
+        self,
+        active: _ActiveRun,
+        adapter: ConversationAdapter,
+        turn: NativeTurn,
+    ) -> bool:
+        """Persist one stream with real flush deadlines and bounded batches."""
+        items: queue.Queue[object] = queue.Queue(
+            maxsize=self.event_backlog_size
+        )
+        stopped = threading.Event()
+        threading.Thread(
+            target=self._produce_stream,
+            args=(adapter, turn, items, stopped),
+            name=f"conversation-stream-{active.run.run_id}",
+            daemon=True,
+        ).start()
+        pending: list[NormalizedEvent] = []
+        pending_since: float | None = None
+        retry_after = 0.0
+        try:
+            while not self._stop_event.is_set():
+                now = time.monotonic()
+                flush_at = None
+                if pending_since is not None:
+                    flush_at = max(
+                        pending_since + self.event_flush_seconds,
+                        retry_after,
+                    )
+                timeout = 0.1
+                if flush_at is not None:
+                    timeout = min(timeout, max(0.0, flush_at - now))
+                if (
+                    len(pending) >= self.event_batch_size
+                    and now >= retry_after
+                ):
+                    timeout = 0.0
+                try:
+                    item = items.get(timeout=timeout)
+                except queue.Empty:
+                    item = None
+
+                if isinstance(item, NormalizedEvent):
+                    if item.type in TERMINAL_EVENTS:
+                        while pending:
+                            if not self._flush_events(
+                                active.run.run_id,
+                                pending,
+                                wait=True,
+                            ):
+                                return False
+                        return self._finish_adapter_event(active, item)
+                    if not pending:
+                        pending_since = time.monotonic()
+                    pending.append(item)
+                elif item is _STREAM_END or isinstance(item, Exception):
+                    break
+
+                now = time.monotonic()
+                deadline_reached = (
+                    pending_since is not None
+                    and now >= pending_since + self.event_flush_seconds
+                )
+                meaningful_event = (
+                    isinstance(item, NormalizedEvent)
+                    and item.type != "assistant.delta"
+                )
+                batch_ready = len(pending) >= self.event_batch_size
+                force_backpressure = (
+                    len(pending) >= self.event_backlog_size
+                )
+                should_flush = (
+                    meaningful_event
+                    or batch_ready
+                    or deadline_reached
+                    or force_backpressure
+                )
+                if not should_flush:
+                    continue
+                if now < retry_after and not force_backpressure:
+                    continue
+                if self._flush_events(
+                    active.run.run_id,
+                    pending,
+                    wait=force_backpressure,
+                ):
+                    pending_since = time.monotonic() if pending else None
+                    retry_after = 0.0
+                else:
+                    retry_after = now + self.recovery_seconds
+
+            while pending:
+                if not self._flush_events(
+                    active.run.run_id,
+                    pending,
+                    wait=True,
+                ):
+                    return False
+            return False
+        finally:
+            stopped.set()
 
     def _finish_adapter_event(
         self,
@@ -1198,7 +1348,7 @@ class ConversationBroker(threading.Thread):
             except Exception as exc:
                 failures += 1
                 reconcile_detail = f"reconcile attempt {failures}: {exc}"
-                self._retry_busy(
+                persisted, _result = self._retry_busy(
                     partial(
                         self.store.note_reconcile_error,
                         active.run.run_id,
@@ -1207,6 +1357,8 @@ class ConversationBroker(threading.Thread):
                     ),
                     wait=True,
                 )
+                if not persisted:
+                    return
                 if failures >= self.reconcile_attempts:
                     self._finish_error(active.run.run_id, exc, proven=False)
                     return
@@ -1215,7 +1367,7 @@ class ConversationBroker(threading.Thread):
 
             if result.outcome == "running" and result.proven:
                 failures = 0
-                self._retry_busy(
+                persisted, _result = self._retry_busy(
                     partial(
                         self.store.renew_runs,
                         self.owner,
@@ -1223,6 +1375,8 @@ class ConversationBroker(threading.Thread):
                     ),
                     wait=True,
                 )
+                if not persisted:
+                    return
                 self._stop_event.wait(self.recovery_seconds)
                 continue
             outcome = result.outcome if result.proven else "unknown"
@@ -1230,6 +1384,11 @@ class ConversationBroker(threading.Thread):
                 "reconciled": True,
                 "proven": result.proven,
                 "detail": result.detail,
+                **(
+                    {"interrupt_evidence": result.interrupt_evidence}
+                    if result.interrupt_evidence
+                    else {}
+                ),
             }
             error_code = (
                 "HARNESS_OUTCOME_UNKNOWN" if outcome == "unknown" else None
@@ -1289,55 +1448,7 @@ class ConversationBroker(threading.Thread):
                 self.store.mark_native_started(run.run_id, self.owner, turn)
                 self._deliver_interrupt(active)
 
-                terminal = False
-                pending: list[NormalizedEvent] = []
-                last_flush = time.monotonic()
-                retry_after = 0.0
-                try:
-                    for event in adapter.stream(turn):
-                        if event.type in TERMINAL_EVENTS:
-                            if not self._flush_events(
-                                run.run_id,
-                                pending,
-                                wait=True,
-                            ):
-                                return
-                            terminal = self._finish_adapter_event(active, event)
-                            break
-                        pending.append(event)
-                        now = time.monotonic()
-                        should_flush = (
-                            event.type != "assistant.delta"
-                            or len(pending) >= self.event_batch_size
-                            or now - last_flush >= self.event_flush_seconds
-                        )
-                        force_backpressure = (
-                            len(pending) >= self.event_backlog_size
-                        )
-                        if not should_flush and not force_backpressure:
-                            continue
-                        if now < retry_after and not force_backpressure:
-                            continue
-                        if self._flush_events(
-                            run.run_id,
-                            pending,
-                            wait=force_backpressure,
-                        ):
-                            last_flush = time.monotonic()
-                            retry_after = 0.0
-                        else:
-                            retry_after = now + self.recovery_seconds
-                except Exception:
-                    # Exact identities are durable; inspect them rather than
-                    # replaying a message after a broken stream.
-                    pass
-                if terminal:
-                    return
-                if not self._flush_events(
-                    run.run_id,
-                    pending,
-                    wait=True,
-                ):
+                if self._consume_stream(active, adapter, turn):
                     return
                 self._reconcile_loop(active, context)
                 return
