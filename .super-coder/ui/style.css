@@ -691,6 +691,7 @@ body.interface-view main {
 .pill.ok { color: var(--ok); }
 .pill.retired { color: var(--dim); opacity: .6; text-decoration: line-through; }
 .pill.warn { color: var(--warn); border-color: var(--warn); }
+.pill.info { color: var(--dim); border-color: var(--line); cursor: help; }
 .grid2 { display: grid; grid-template-columns: 180px 1fr; gap: .4rem 1rem; align-items: start; }
 .grid2 > .k { color: var(--dim); }
 label.k { color: var(--dim); display: block; margin: .6rem 0 .2rem; font-size: .85rem; }

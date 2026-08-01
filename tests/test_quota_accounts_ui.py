@@ -484,6 +484,31 @@ def test_a_degraded_probe_keeps_its_figures_and_stamps_them_with_their_age():
     assert "token not usable" in r["body"]          # the probe's state, not the operator's
 
 
+def test_an_unusable_token_is_neutral_and_explains_its_refresh_on_hover():
+    """A lapsed harness token is routine lifecycle information, not a warning.
+
+    Keep the badge short and neutral; the explanation belongs in its hover so
+    it is available without stretching the provider heading across the card.
+    A real probe failure remains visually distinct as a warning."""
+    r = run_js("""
+      const r0 = root(); anDrawQuota(r0, PAYLOAD);
+      const info = byClass(r0, "info")[0];
+      const warning = byClass(r0, "warn")[0];
+      out({ info: { text: info.textContent, title: info.title, classes: cls(info) },
+            warning: { text: warning.textContent, classes: cls(warning) } });
+    """, payload([
+        provider("moonshot", status="unauth", detail="HTTP 401", windows=[]),
+        provider("openai", status="error", detail="probe timed out", windows=[]),
+    ]))
+    assert r["info"]["text"] == "token not usable"
+    assert r["info"]["title"] == (
+        "Refreshes automatically the next time you use Kimi. Last probe: HTTP 401"
+    )
+    assert "warn" not in r["info"]["classes"]
+    assert r["warning"]["text"] == "probe failed · probe timed out"
+    assert "warn" in r["warning"]["classes"]
+
+
 def test_the_age_is_never_omitted_when_there_is_a_reading():
     """The age is the only thing keeping a stale card honest, so its presence is
     pinned for a FRESH card too — a section that rendered the age only when it
@@ -640,6 +665,14 @@ def test_threshold_classes_have_distinct_styling():
     for sel in (".an-win-pct.amber", ".an-win-pct.red",
                 ".an-meter-fill.amber", ".an-meter-fill.red"):
         assert sel in CSS, f"{sel} is not styled"
+
+
+def test_information_badge_has_an_explicit_neutral_style():
+    assert ".pill.info" in CSS
+    rule = CSS.split(".pill.info", 1)[1].split("}", 1)[0]
+    assert "var(--dim)" in rule
+    assert "var(--line)" in rule
+    assert "var(--warn)" not in rule
 
 
 def test_the_muted_card_style_is_gone_not_merely_unused():
