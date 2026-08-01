@@ -42,6 +42,7 @@ import db_driver  # noqa: E402
 import artifact_policy  # noqa: E402
 import mem  # noqa: E402
 import seed_skills  # noqa: E402 — seeded_skill_names is the engine/local line
+import skill_projection  # noqa: E402
 
 ENGINE = Path(__file__).resolve().parents[1]
 DB_PATH = ENGINE / "shell_db.db"
@@ -152,6 +153,20 @@ def persist_note() -> None:
     print(f"→ persist: ./sc snapshot   (serializes to {target}{suffix})")
 
 
+def _reconcile_targets(con, shell_ids: list[int], action: str) -> None:
+    try:
+        skill_projection.reconcile_assignment_targets(con, shell_ids)
+    except skill_projection.ProjectionError as exc:
+        sys.exit(skill_projection.partial_failure_message(action, exc))
+
+
+def _reconcile_all(con, action: str) -> None:
+    try:
+        skill_projection.reconcile_existing_checkouts(con)
+    except skill_projection.ProjectionError as exc:
+        sys.exit(skill_projection.partial_failure_message(action, exc))
+
+
 def print_catalogue(rows: list[dict]) -> int:
     engine = set(seed_skills.seeded_skill_names())
     retired = set(seed_skills.retired_skill_names())
@@ -186,24 +201,30 @@ def cmd_list_api() -> int:
 
 def cmd_grant(con, name: str, shell_refs: list[str]) -> int:
     skill_id = resolve_skill(con, name)
+    targets: list[int] = []
     for ref in shell_refs:
         shell_id, label = resolve_shell(con, ref)
+        targets.append(shell_id)
         changed, scope = set_target_grant(con, shell_id, label, skill_id, True)
         print(f"grant: {name} → {scope}"
               + ("" if changed else "  (already granted)"))
     con.commit()
+    _reconcile_targets(con, targets, f"grant {name}")
     persist_note()
     return 0
 
 
 def cmd_revoke(con, name: str, shell_refs: list[str]) -> int:
     skill_id = resolve_skill(con, name)
+    targets: list[int] = []
     for ref in shell_refs:
         shell_id, label = resolve_shell(con, ref)
+        targets.append(shell_id)
         changed, scope = set_target_grant(con, shell_id, label, skill_id, False)
         print(f"revoke: {name} ⇸ {scope}"
               + ("" if changed else "  (was not granted)"))
     con.commit()
+    _reconcile_targets(con, targets, f"revoke {name}")
     persist_note()
     return 0
 
@@ -235,6 +256,7 @@ def cmd_retire(con, name: str) -> int:
     if not already:
         _write_retire_list(names + [name])
     seed_skills.apply_retired(con)
+    _reconcile_all(con, f"retire {name}")
     dormant = grant_count(
         con, con.execute(
             "SELECT skill_id FROM skills WHERE name=?", (name,)).fetchone()[0])
@@ -254,6 +276,7 @@ def cmd_unretire(con, name: str) -> int:
                  f"({seed_skills.RETIRED_FILE}).")
     _write_retire_list([n for n in names if n != name])
     seed_skills.apply_retired(con)
+    _reconcile_all(con, f"unretire {name}")
     grants = grant_count(
         con, con.execute(
             "SELECT skill_id FROM skills WHERE name=?", (name,)).fetchone()[0])
@@ -275,6 +298,7 @@ def cmd_rm(con, name: str) -> int:
     n += con.execute("DELETE FROM shell_skills WHERE skill_id=?", (skill_id,)).rowcount
     con.execute("UPDATE skills SET is_deleted=1 WHERE skill_id=?", (skill_id,))
     con.commit()
+    _reconcile_all(con, f"rm {name}")
     print(f"rm: {name} soft-deleted, {n} grant(s) revoked.")
     asset = ENGINE / "assets" / "skills" / name
     if asset.exists():

@@ -143,7 +143,7 @@ class SourceCleanlinessTest(unittest.TestCase):
                 ".sc-state/content.sql", ".sc-state/map.config.json",
                 ".sc-state/map_content.sql", "roadmap_sc.md",
                 "docs_sc", "specs_sc", "skills_sc", "AGENTS.md", "CLAUDE.md",
-                ".claude/skills", ".agents/skills",
+                ".claude/skills", ".agents/skills", ".opencode/skills",
             ],
             capture_output=True,
             text=True,

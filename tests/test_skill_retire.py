@@ -51,8 +51,11 @@ def make_db() -> sqlite3.Connection:
         "CREATE TABLE flavor_skills (flavor TEXT, skill_id INTEGER, "
         "UNIQUE(flavor, skill_id))")
     con.execute(
-        "CREATE TABLE shells (shell_id INTEGER PRIMARY KEY, flavor TEXT)")
-    con.execute("INSERT INTO shells (shell_id, flavor) VALUES (1, NULL)")
+        "CREATE TABLE shells (shell_id INTEGER PRIMARY KEY, flavor TEXT, "
+        "shortname TEXT, display_name TEXT, is_deleted INTEGER DEFAULT 0)")
+    con.execute(
+        "INSERT INTO shells (shell_id, flavor, shortname, display_name) "
+        "VALUES (1, NULL, 'BSP1', 'Bespoke')")
     con.executescript(SEED_SQL)
     con.execute("INSERT INTO skills (name, description, content) "
                 "VALUES ('test_authoring_dosarch', 'fork skill', 'body')")
@@ -72,11 +75,29 @@ class RetireTest(unittest.TestCase):
         self._orig = (seed_skills.RETIRED_FILE, seed_skills.OUT)
         seed_skills.RETIRED_FILE = root / ".sc-state" / "skills_retired.json"
         seed_skills.OUT = seed
+        self.projection = mock.patch.object(
+            skill_cli.skill_projection,
+            "reconcile_existing_checkouts",
+            return_value={
+                "written": [], "skipped": [], "deleted": [], "checkouts": []
+            },
+        )
+        self.reconcile_existing = self.projection.start()
+        self.target_projection = mock.patch.object(
+            skill_cli.skill_projection,
+            "reconcile_assignment_targets",
+            return_value={
+                "written": [], "skipped": [], "deleted": [], "checkouts": []
+            },
+        )
+        self.reconcile_targets = self.target_projection.start()
         self.con = make_db()
 
     def tearDown(self):
         seed_skills.RETIRED_FILE, seed_skills.OUT = self._orig
         self.con.close()
+        self.target_projection.stop()
+        self.projection.stop()
         self.tmp.cleanup()
 
     def _retire_file(self, names) -> None:
@@ -170,6 +191,7 @@ class RetireTest(unittest.TestCase):
         self.assertEqual(json.loads(seed_skills.RETIRED_FILE.read_text()),
                          ["test_authoring"])
         self.assertEqual(self._deleted("test_authoring"), 1)
+        self.reconcile_existing.assert_called_once_with(self.con)
 
     def test_cmd_retire_refuses_local_skill(self):
         with self.assertRaises(SystemExit):
@@ -181,9 +203,45 @@ class RetireTest(unittest.TestCase):
 
     def test_cmd_unretire_restores(self):
         skill_cli.cmd_retire(self.con, "test_authoring")
+        self.reconcile_existing.reset_mock()
         skill_cli.cmd_unretire(self.con, "test_authoring")
         self.assertEqual(json.loads(seed_skills.RETIRED_FILE.read_text()), [])
         self.assertEqual(self._deleted("test_authoring"), 0)
+        self.reconcile_existing.assert_called_once_with(self.con)
+
+    def test_cmd_grant_reconciles_the_target_shell(self):
+        skill_cli.cmd_grant(self.con, "review", ["BSP1"])
+        self.reconcile_targets.assert_called_once_with(self.con, [1])
+
+    def test_cmd_revoke_reconciles_the_target_shell(self):
+        skill_cli.cmd_grant(self.con, "review", ["BSP1"])
+        self.reconcile_targets.reset_mock()
+        skill_cli.cmd_revoke(self.con, "review", ["BSP1"])
+        self.reconcile_targets.assert_called_once_with(self.con, [1])
+
+    def test_cmd_rm_reconciles_every_existing_checkout(self):
+        skill_cli.cmd_rm(self.con, "test_authoring_dosarch")
+        self.reconcile_existing.assert_called_once_with(self.con)
+        self.assertEqual(self._deleted("test_authoring_dosarch"), 1)
+
+    def test_projection_failure_reports_committed_grant(self):
+        self.reconcile_targets.side_effect = (
+            skill_cli.skill_projection.ProjectionError("managed root is a symlink")
+        )
+        with self.assertRaisesRegex(
+            SystemExit,
+            "grant review committed in the DB, but skill projection failed: "
+            "managed root is a symlink",
+        ):
+            skill_cli.cmd_grant(self.con, "review", ["BSP1"])
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM shell_skills ss "
+                "JOIN skills s ON s.skill_id=ss.skill_id "
+                "WHERE ss.shell_id=1 AND s.name='review'"
+            ).fetchone()[0],
+            1,
+        )
 
     def test_cmd_unretire_unlisted_is_loud(self):
         with self.assertRaises(SystemExit):

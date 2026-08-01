@@ -16,10 +16,11 @@
 
 # Per-shell skill renders — rebuilt at boot for whichever shell launches
 # (harness-consumed caches, like the boot artifact). `.claude/skills` is the
-# stable mirror; `.agents/skills` is Codex-native. Only render output is ignored;
-# a fork's other .claude/.agents configuration stays tracked.
+# stable mirror; `.agents/skills` is Codex-native and `.opencode/skills` is
+# OpenCode-native. Only render output is ignored; other harness config stays tracked.
 /.claude/skills/
 /.agents/skills/
+/.opencode/skills/
 
 # Engine-managed harness config, re-emitted each launch (the branch-guard hook
 # per harness). Kept separate from the fork's own tracked config: claude's

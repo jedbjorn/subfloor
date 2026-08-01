@@ -35,6 +35,10 @@ class VerifyCleanCloneTest(unittest.TestCase):
                 ROOT / ".super-coder" / "scripts" / "run.py",
                 checkout / ".super-coder" / "scripts" / "run.py",
             )
+            shutil.copy2(
+                ROOT / ".super-coder" / "scripts" / "skill_projection.py",
+                checkout / ".super-coder" / "scripts" / "skill_projection.py",
+            )
             env = os.environ.copy()
             env.pop("SC_ARTIFACT_MODE", None)
             result = subprocess.run(

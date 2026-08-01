@@ -35,6 +35,7 @@ ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
+import skill_projection  # noqa: E402
 
 # The do-not-edit banner (spec §Content & Render). No timestamp — render must be
 # deterministic so unchanged DB → unchanged file → clean diff.
@@ -268,39 +269,10 @@ def render_skill_md(con: sqlite3.Connection, shell_id: int,
 
     work_dir overrides the write root (used for dev-shell worktrees).
     skills_dir is relative to that root."""
-    rows = con.execute(
-        "SELECT s.name, s.description, s.content FROM skills s "
-        "JOIN resolved_shell_skills ss ON ss.skill_id = s.skill_id "
-        "WHERE ss.shell_id=? AND s.is_deleted=0 ORDER BY s.name",
-        (shell_id,),
-    ).fetchall()
-    skills_root = (work_dir or REPO_ROOT) / (
-        skills_dir or Path(".claude/skills")
+    return skill_projection.reconcile_root(
+        con,
+        shell_id,
+        work_dir or REPO_ROOT,
+        skills_dir or Path(".claude/skills"),
+        create=True,
     )
-    written: list[Path] = []
-    skipped: list[Path] = []
-    current = {_skill_slug(r["name"]) for r in rows}
-
-    # Prune folders that no longer correspond to a current grant.
-    if skills_root.exists():
-        for child in skills_root.iterdir():
-            if child.is_dir() and child.name not in current:
-                for f in child.rglob("*"):
-                    if f.is_file():
-                        f.unlink()
-                child.rmdir()
-
-    for r in rows:
-        desc = (r["description"] or "").strip().replace("\n", " ")
-        body = "\n".join([
-            "---", f"name: {r['name']}", f"description: {desc}", "---", "",
-            (r["content"] or "").strip(), "",
-        ])
-        path = skills_root / _skill_slug(r["name"]) / "SKILL.md"
-        if path.exists() and path.read_text() == body:
-            skipped.append(path)
-            continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(body)
-        written.append(path)
-    return {"written": written, "skipped": skipped}

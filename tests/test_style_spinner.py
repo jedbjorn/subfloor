@@ -278,7 +278,13 @@ class BootPhaseLabelTest(unittest.TestCase):
                 run.git_prune, "status_line", return_value=None))
             stack.enter_context(mock.patch.object(run, "compose_boot", return_value="boot"))
             stack.enter_context(mock.patch.object(
-                run.flat, "render_skill_md", return_value={"written": [], "skipped": []}))
+                run,
+                "render_harness_skills",
+                return_value={
+                    "written": [], "skipped": [], "deleted": [],
+                    "dirs": [".claude/skills"],
+                },
+            ))
             stack.enter_context(mock.patch.object(run, "atomic_write"))
             stack.enter_context(mock.patch.object(run, "load_adapter", return_value=adapter))
             stack.enter_context(mock.patch.object(run, "emit_adapter", return_value=[]))

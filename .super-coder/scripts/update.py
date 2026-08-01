@@ -78,6 +78,9 @@ import ports  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402
 import seed_skills  # noqa: E402
 import shell_factory  # noqa: E402
+import skill_projection  # noqa: E402
+sys.path.insert(0, str(ENGINE / "render"))
+import flat  # noqa: E402
 
 EJECTED_MARKER = STATE_DIR / "ejected"
 
@@ -984,6 +987,24 @@ def regrant() -> int:
         con.close()
 
 
+def reconcile_skill_projections() -> dict:
+    """Sweep existing checkouts and the active catalogue render after DB sync."""
+    con = db_driver.connect(DB_PATH)
+    try:
+        try:
+            summary = skill_projection.reconcile_existing_checkouts(con)
+        except skill_projection.ProjectionError as exc:
+            sys.exit(skill_projection.partial_failure_message(
+                "update catalogue reconciliation", exc
+            ))
+        catalogue = flat.render_visibility(con)
+    finally:
+        con.close()
+    summary["written"].extend(catalogue["written"])
+    summary["skipped"].extend(catalogue["skipped"])
+    return summary
+
+
 def expire_sandbox_harnesses() -> str | None:
     """Expire the harness CLIs baked into the sandbox image; return the epoch.
 
@@ -1111,6 +1132,17 @@ def main(argv: list[str]) -> int:
     sync_skills()
     print("→ re-grant catalogue skills to all shells")
     print(f"  {regrant()} grant change(s)")
+    print("→ reconcile managed skill projections")
+    projections = reconcile_skill_projections()
+    print(
+        f"  {len(projections['written'])} changed, "
+        f"{len(projections['skipped'])} unchanged across "
+        f"{len(projections['checkouts'])} existing checkout(s)"
+    )
+    print(
+        "  note: DB and disk are current; already-running harness sessions may "
+        "retain previously loaded skill text until reboot"
+    )
     print("→ wire map automation + map the repo")
     run_script("map_setup.py")
     print("→ snapshot the live state")

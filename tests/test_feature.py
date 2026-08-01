@@ -17,6 +17,7 @@ import sqlite3
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
@@ -131,6 +132,38 @@ class GrantRevokeTest(unittest.TestCase):
         rows = {r[0] for r in con.execute("SELECT flavor FROM flavor_skills")}
         self.assertEqual(rows, {"planner"}, "revoke must not touch packs outside "
                                            "the feature's flavors")
+
+
+class ProjectionTriggerTest(unittest.TestCase):
+    def _run(self, command) -> list[tuple[sqlite3.Connection, list[str]]]:
+        con = _mini_db()
+        calls: list[tuple[sqlite3.Connection, list[str]]] = []
+
+        def capture(target_con, flavors) -> dict:
+            calls.append((target_con, list(flavors)))
+            return {"written": [], "skipped": [], "deleted": [], "checkouts": []}
+
+        with (
+            mock.patch.object(feature, "DB_PATH", ROOT / "sc"),
+            mock.patch.object(feature.db_driver, "connect", return_value=con),
+            mock.patch.object(feature.skill_projection, "reconcile_flavors",
+                              side_effect=capture),
+            mock.patch.object(feature, "_instance", return_value={"pg": {}}),
+            mock.patch.object(feature, "_write_instance"),
+            mock.patch.object(feature, "_snapshot"),
+        ):
+            self.assertEqual(command("pg"), 0)
+        return calls
+
+    def test_enable_reconciles_every_granted_flavor(self):
+        calls = self._run(feature.cmd_enable)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], ["dev", "reviewer", "planner"])
+
+    def test_disable_reconciles_every_revoked_flavor(self):
+        calls = self._run(feature.cmd_disable)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], ["dev", "reviewer", "planner"])
 
 
 if __name__ == "__main__":

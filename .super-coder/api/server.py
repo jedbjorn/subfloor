@@ -74,6 +74,7 @@ import sprint_recovery  # noqa: E402  (Sprints v2 pause/resume reconciliation)
 import sprint_review_loop  # noqa: E402  (Sprints v2 Dev/Review command surface)
 import sprint_runtime  # noqa: E402  (armed-only Sprint dispatch + wake delivery)
 import sprint_board  # noqa: E402  (read-only Sprints v2 FnB board projections)
+import skill_projection  # noqa: E402  (exact bounded grant mirrors)
 sys.path.insert(0, str(ENGINE / "api"))
 import conversation_routes  # noqa: E402  (Feature #24 browser conversations)
 import review_routes  # noqa: E402  (Feature #26 browser Diff review)
@@ -3965,12 +3966,35 @@ class Handler(BaseHTTPRequestHandler):
                 ok, err = set_flavor_grant(
                     con, parts[2], int(parts[4]),
                     bool(self._body().get("granted")))
+                if ok:
+                    try:
+                        skill_projection.reconcile_flavors(con, [parts[2]])
+                    except skill_projection.ProjectionError as exc:
+                        error = skill_projection.partial_failure_message(
+                            f"flavor {parts[2]} skill toggle", exc
+                        )
+                        return self._send(500, {
+                            "ok": False, "committed": True, "error": error,
+                        })
                 return self._send(200 if ok else 404,
                                   {"ok": ok, "error": err})
             if len(parts) == 5 and parts[1] == "shells" and parts[3] == "skills":
+                shell_id = int(parts[2])
                 ok, err = set_grant(
-                    con, int(parts[2]), int(parts[4]),
+                    con, shell_id, int(parts[4]),
                     bool(self._body().get("granted")))
+                if ok:
+                    try:
+                        skill_projection.reconcile_assignment_targets(
+                            con, [shell_id]
+                        )
+                    except skill_projection.ProjectionError as exc:
+                        error = skill_projection.partial_failure_message(
+                            f"shell {shell_id} skill toggle", exc
+                        )
+                        return self._send(500, {
+                            "ok": False, "committed": True, "error": error,
+                        })
                 status = 200 if ok else (
                     409 if err and "edit the flavor pack" in err else 404)
                 return self._send(status, {"ok": ok, "error": err})
