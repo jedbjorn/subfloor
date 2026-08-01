@@ -13,6 +13,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 sys.path.insert(0, str(ENGINE / "api"))
@@ -53,6 +55,11 @@ class NativeHarnessState:
         self.resumed: list[str] = []
         self.reconciled: list[tuple[str, str]] = []
         self.run_serial = 0
+        self.segmented_trace = False
+        self.stream_barrier: threading.Barrier | None = None
+        self.stream_lock = threading.Lock()
+        self.active_streams = 0
+        self.max_active_streams = 0
 
     def next_run(self, prefix: str) -> str:
         self.run_serial += 1
@@ -103,16 +110,40 @@ class ReleaseGateAdapter:
         )
 
     def stream(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
-        yield NormalizedEvent(
-            "session.started",
-            {"session_ref": turn.session_ref},
-        )
-        yield NormalizedEvent("run.started", {"status": "running"})
-        yield NormalizedEvent(
-            "assistant.delta",
-            {"text": f"{self.harness} completed the turn"},
-        )
-        yield NormalizedEvent("run.completed", {"status": "succeeded"})
+        with self.state.stream_lock:
+            self.state.active_streams += 1
+            self.state.max_active_streams = max(
+                self.state.max_active_streams,
+                self.state.active_streams,
+            )
+        try:
+            if self.state.stream_barrier is not None:
+                self.state.stream_barrier.wait(timeout=3)
+            yield NormalizedEvent(
+                "session.started",
+                {"session_ref": turn.session_ref},
+            )
+            yield NormalizedEvent("run.started", {"status": "running"})
+            if self.state.segmented_trace:
+                yield NormalizedEvent(
+                    "assistant.delta",
+                    {"text": f"{self.harness} before tool"},
+                )
+                yield NormalizedEvent("tool.started", {"name": "write"})
+                yield NormalizedEvent("tool.completed", {"name": "write"})
+                yield NormalizedEvent(
+                    "assistant.delta",
+                    {"text": f"{self.harness} after tool"},
+                )
+            else:
+                yield NormalizedEvent(
+                    "assistant.delta",
+                    {"text": f"{self.harness} completed the turn"},
+                )
+            yield NormalizedEvent("run.completed", {"status": "succeeded"})
+        finally:
+            with self.state.stream_lock:
+                self.state.active_streams -= 1
 
     def interrupt(self, turn: NativeTurn) -> InterruptResult:
         self.interrupted.set()
@@ -155,11 +186,13 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
         con.execute(
             "INSERT INTO shells "
             "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
-            "VALUES (1,'Developer','dev','dev','prompt',1)"
+            "VALUES (1,'Developer','dev','dev','prompt',1),"
+            "(2,'Developer 2','dev2','dev','prompt',1)"
         )
         con.commit()
         con.close()
         (self.root / ".sc-worktrees" / "dev").mkdir(parents=True)
+        (self.root / ".sc-worktrees" / "dev2").mkdir(parents=True)
 
         self.active_broker: conversation_broker.ConversationBroker | None = None
         self.brokers: list[conversation_broker.ConversationBroker] = []
@@ -460,6 +493,60 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
 
     def test_codex_release_journey_and_crash_windows(self) -> None:
         self.assert_release_journey("codex")
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Sprint 63 unit 4 removes this cross-harness gate marker",
+    )
+    @unittest.expectedFailure
+    def test_same_adapter_conversations_keep_segment_ids_run_scoped(self) -> None:
+        state = NativeHarnessState("codex")
+        state.segmented_trace = True
+        state.stream_barrier = threading.Barrier(2)
+        conversation_ids = []
+        for number in range(2):
+            status, _, created = self.request(
+                "POST",
+                "/api/conversations",
+                body={"shell_id": number + 1, "harness": "codex"},
+                key=f"segmented-create-{number}",
+            )
+            self.assertEqual(status, 201, created)
+            conversation_id = created["conversation_id"]
+            conversation_ids.append(conversation_id)
+            status, _, accepted = self.request(
+                "POST",
+                f"/api/conversations/{conversation_id}/messages",
+                body={"text": f"segmented response {number}"},
+                key=f"segmented-message-{number}",
+            )
+            self.assertEqual(status, 202, accepted)
+
+        first_broker = self.start_broker(state)
+        second_broker = self.start_broker(state)
+        rows = self.wait_for_run_count(2)
+        self.stop_broker(first_broker)
+        self.stop_broker(second_broker)
+        self.assertEqual(state.max_active_streams, 2)
+        self.assertEqual([row["state"] for row in rows], ["succeeded", "succeeded"])
+
+        for conversation_id, row in zip(conversation_ids, rows, strict=True):
+            status, _, transcript = self.request(
+                "GET",
+                f"/api/conversations/{conversation_id}/transcript",
+            )
+            self.assertEqual(status, 200, transcript)
+            run_id = int(row["run_id"])
+            assistant = [
+                item for item in transcript["items"] if item["kind"] == "assistant"
+            ]
+            self.assertEqual(
+                [(item["item_id"], item["text"]) for item in assistant],
+                [
+                    (f"run:{run_id}:assistant:0", "codex before tool"),
+                    (f"run:{run_id}:assistant:6", "codex after tool"),
+                ],
+            )
 
 
 if __name__ == "__main__":
