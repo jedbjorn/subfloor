@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import uuid
 from pathlib import Path
 
 import mem
@@ -112,6 +113,21 @@ def cmd_replan_unit(args: argparse.Namespace) -> int:
 
 def cmd_inbox(args: argparse.Namespace) -> int:
     result = mem._api("GET", f"/_sc/sprint/{args.sprint}/inbox")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/send",
+        {
+            "sprint_id": args.sprint,
+            "to": args.to,
+            "body": _text(args.body_file, "message body"),
+            "idempotency_key": "participant-send:" + uuid.uuid4().hex,
+        },
+        idempotent=True,
+    )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
@@ -407,6 +423,14 @@ def build_parser() -> argparse.ArgumentParser:
     inbox = sub.add_parser("inbox", help="Read unread messages addressed to this shell")
     inbox.add_argument("--sprint", type=int, required=True)
     inbox.set_defaults(fn=cmd_inbox)
+
+    send = sub.add_parser(
+        "send", help="Send one freeform message to another Sprint participant"
+    )
+    send.add_argument("--sprint", type=int, required=True)
+    send.add_argument("--to", required=True, help="recipient shell shortname")
+    send.add_argument("--body-file", required=True)
+    send.set_defaults(fn=cmd_send)
 
     accept = sub.add_parser(
         "accept", help="Mark one Sprint message read and accept actionable work"

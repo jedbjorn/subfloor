@@ -561,7 +561,15 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             "WHERE conversation_id=? AND idempotency_key=?",
             (conversation_id, wake_key),
         ).fetchone()
-        self.assertEqual(delivery.FIXED_WAKE_PROMPT, native["body"])
+        expected_prompt = (
+            f"Sprint {self.sprint_id} handoff for your Developer role. Load "
+            "`sprint_dev`. Run `sc sprint inbox --sprint "
+            f"{self.sprint_id}` now and act on the Sprint message(s) using "
+            "`sprint_dev`. Confirm every Sprint write succeeds before stopping. "
+            "If the handoff is not complete, load `sprint_dev` again and run `sc "
+            f"sprint inbox --sprint {self.sprint_id}` again."
+        )
+        self.assertEqual(expected_prompt, native["body"])
         self.assertEqual(wake_key, native["idempotency_key"])
         self.assertEqual("queued", native["state"])
         self.assertEqual(
@@ -588,7 +596,7 @@ class ProductionPulseTest(SprintWorkDispatchCase):
         replay_ref = sprint_runtime.enqueue_conversation_turn(
             self.db_path,
             conversation_id,
-            delivery.FIXED_WAKE_PROMPT,
+            expected_prompt,
             wake_key,
         )
         attempt_ref = self.con.execute(

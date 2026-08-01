@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import sys
 import unittest
@@ -357,7 +358,7 @@ class AcceptanceAndDeclineTest(SprintMessageCase):
 
 
 class WakeDeliveryTest(SprintMessageCase):
-    def test_fixed_prompt_and_target_are_durable_delivery_evidence(self) -> None:
+    def test_role_aware_prompt_and_target_are_durable_delivery_evidence(self) -> None:
         sent = self.send("deliver")
         observed: list[tuple[str, str, str]] = []
         service = delivery.SprintWakeDeliveryService(self.con)
@@ -373,7 +374,13 @@ class WakeDeliveryTest(SprintMessageCase):
             [
                 (
                     self.developer_conversation_id,
-                    delivery.FIXED_WAKE_PROMPT,
+                    f"Sprint {self.sprint_id} handoff for your Developer role. "
+                    "Load `sprint_dev`. Run `sc sprint inbox --sprint "
+                    f"{self.sprint_id}` now and act on the Sprint message(s) using "
+                    "`sprint_dev`. Confirm every Sprint write succeeds before "
+                    "stopping. If the handoff is not complete, load `sprint_dev` "
+                    "again and run `sc sprint inbox --sprint "
+                    f"{self.sprint_id}` again.",
                     self._wake_key(sent.wake_id),
                 )
             ],
@@ -392,6 +399,50 @@ class WakeDeliveryTest(SprintMessageCase):
             (1, self.developer_conversation_id, "native-run-7", "delivered"),
             tuple(attempt),
         )
+
+    def test_every_participant_role_receives_the_exact_general_template(self) -> None:
+        expected = {
+            "developer": (
+                self.developer_id,
+                "Developer",
+                "sprint_dev",
+            ),
+            "reviewer": (self.reviewer_id, "Reviewer", "sprint_rev"),
+            "planner": (self.planner_id, "originating Planner", "sprint_pln"),
+        }
+        observed: dict[str, str] = {}
+        service = delivery.SprintWakeDeliveryService(self.con)
+        for role, (participant_id, label, skill) in expected.items():
+            self.messages.send(
+                self.sprint_id,
+                to_participant_id=participant_id,
+                from_participant_id=(
+                    self.developer_id if role != "developer" else self.planner_id
+                ),
+                message_kind="notification",
+                body="PR #321, message 987, work unit 654, sha deadbeef",
+                idempotency_key=f"role-prompt:{role}",
+            )
+            outcome = service.deliver_once(
+                "role-worker",
+                lambda _conversation, prompt, _key, role=role: (
+                    observed.__setitem__(role, prompt) or f"run-{role}"
+                ),
+            )
+            self.assertEqual("delivered", outcome.state)
+            self.assertEqual(
+                observed[role],
+                f"Sprint {self.sprint_id} handoff for your {label} role. "
+                f"Load `{skill}`. Run `sc sprint inbox --sprint {self.sprint_id}` "
+                f"now and act on the Sprint message(s) using `{skill}`. Confirm "
+                "every Sprint write succeeds before stopping. If the handoff is "
+                f"not complete, load `{skill}` again and run `sc sprint inbox "
+                f"--sprint {self.sprint_id}` again.",
+            )
+            self.assertNotIn("PR #321", observed[role])
+            self.assertNotIn("message 987", observed[role])
+            self.assertNotIn("work unit 654", observed[role])
+            self.assertNotIn("deadbeef", observed[role])
 
     def test_messages_behind_delivering_wake_coalesce_once(self) -> None:
         first = self.send("first")
@@ -523,6 +574,260 @@ class WakeDeliveryTest(SprintMessageCase):
             "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
             (wake_id,),
         ).fetchone()[0]
+
+
+class ParticipantRelayTest(SprintMessageCase):
+    def test_relay_is_freeform_communication_without_workflow_mutation(self) -> None:
+        before = tuple(
+            self.con.execute(
+                "SELECT s.lifecycle,u.disposition FROM sprints s "
+                "JOIN sprint_work_units u USING (sprint_id) "
+                "WHERE s.sprint_id=? AND u.work_unit_id=?",
+                (self.sprint_id, self.unit_id),
+            ).fetchone()
+        )
+
+        receipt = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="pln1",
+            body="Which acceptance criterion owns the empty-input case?",
+            idempotency_key="participant-send:question-1",
+        )
+
+        message = self.con.execute(
+            "SELECT m.from_participant_id,m.to_participant_id,m.work_unit_id,"
+            "m.message_kind,m.body,m.actionable,m.disposition,m.read_at "
+            "FROM sprint_messages m WHERE m.message_id=?",
+            (receipt.message_id,),
+        ).fetchone()
+        self.assertEqual(
+            (
+                self.developer_id,
+                self.planner_id,
+                None,
+                "notification",
+                "Which acceptance criterion owns the empty-input case?",
+                0,
+                None,
+                None,
+            ),
+            tuple(message),
+        )
+        self.assertEqual("pending", receipt.wake_state)
+        self.assertTrue(receipt.message_created)
+        self.assertEqual(
+            [(receipt.wake_id, receipt.message_id)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT wake_id,message_id FROM sprint_wake_messages "
+                    "WHERE message_id=?",
+                    (receipt.message_id,),
+                )
+            ],
+        )
+        after = tuple(
+            self.con.execute(
+                "SELECT s.lifecycle,u.disposition FROM sprints s "
+                "JOIN sprint_work_units u USING (sprint_id) "
+                "WHERE s.sprint_id=? AND u.work_unit_id=?",
+                (self.sprint_id, self.unit_id),
+            ).fetchone()
+        )
+        self.assertEqual(before, after)
+
+    def test_relay_reuses_a_usable_current_conversation(self) -> None:
+        current = self.con.execute(
+            "SELECT current_conversation_id FROM sprint_participants "
+            "WHERE participant_id=?",
+            (self.planner_id,),
+        ).fetchone()[0]
+        before = int(
+            self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+        )
+
+        receipt = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="PLN1",
+            body="A durable answer is needed.",
+            idempotency_key="participant-send:reuse-chat",
+        )
+
+        self.assertEqual(current, receipt.conversation_id)
+        self.assertEqual(
+            before,
+            int(self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]),
+        )
+
+    def test_relay_creates_and_selects_a_linked_chat_when_current_is_closed(self) -> None:
+        old_conversation = self.con.execute(
+            "SELECT current_conversation_id FROM sprint_participants "
+            "WHERE participant_id=?",
+            (self.planner_id,),
+        ).fetchone()[0]
+        self.con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+            "WHERE conversation_id=?",
+            (old_conversation,),
+        )
+        self.con.commit()
+        before = int(
+            self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+        )
+
+        receipt = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="PLN1",
+            body="Please answer from a fresh route.",
+            idempotency_key="participant-send:new-chat",
+        )
+
+        route = self.con.execute(
+            "SELECT c.shell_id,c.state,c.conversation_scope,pc.purpose,"
+            "pc.parent_conversation_id,pc.context_packet "
+            "FROM conversations c JOIN sprint_participant_conversations pc "
+            "USING (conversation_id) WHERE c.conversation_id=?",
+            (receipt.conversation_id,),
+        ).fetchone()
+        self.assertNotEqual(old_conversation, receipt.conversation_id)
+        self.assertEqual(before + 1, self.con.execute(
+            "SELECT COUNT(*) FROM conversations"
+        ).fetchone()[0])
+        self.assertEqual(
+            (3, "idle", "sprint", "fallback", old_conversation),
+            tuple(route)[:5],
+        )
+        packet = json.loads(route["context_packet"])
+        self.assertEqual(self.sprint_id, packet["sprint_id"])
+        self.assertEqual(self.planner_id, packet["participant_id"])
+        self.assertEqual(old_conversation, packet["previous_conversation_id"])
+        self.assertEqual(
+            receipt.conversation_id,
+            self.con.execute(
+                "SELECT current_conversation_id FROM sprint_participants "
+                "WHERE participant_id=?",
+                (self.planner_id,),
+            ).fetchone()[0],
+        )
+
+    def test_relay_replay_returns_one_message_and_one_wake(self) -> None:
+        first = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="PLN1",
+            body="Idempotent question",
+            idempotency_key="participant-send:replay",
+        )
+        replay = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="PLN1",
+            body="Idempotent question",
+            idempotency_key="participant-send:replay",
+        )
+
+        self.assertEqual(first.message_id, replay.message_id)
+        self.assertEqual(first.wake_id, replay.wake_id)
+        self.assertFalse(replay.message_created)
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_messages WHERE idempotency_key=?",
+                ("participant-send:replay",),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_messages WHERE message_id=?",
+                (first.message_id,),
+            ).fetchone()[0],
+        )
+
+    def test_relay_rejects_nonparticipant_sender_without_any_write(self) -> None:
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (4,'Outside','OUT1','dev','prompt',1)"
+        )
+        self.con.commit()
+        before = tuple(
+            self.con.execute(
+                "SELECT (SELECT COUNT(*) FROM sprint_messages),"
+                "(SELECT COUNT(*) FROM sprint_wake_outbox),"
+                "(SELECT COUNT(*) FROM conversations)"
+            ).fetchone()
+        )
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "sender is not a Sprint participant",
+        ):
+            self.messages.relay(
+                self.sprint_id,
+                from_shell_id=4,
+                to_shortname="PLN1",
+                body="should not land",
+                idempotency_key="participant-send:outsider",
+            )
+
+        self.assertEqual(
+            before,
+            tuple(
+                self.con.execute(
+                    "SELECT (SELECT COUNT(*) FROM sprint_messages),"
+                    "(SELECT COUNT(*) FROM sprint_wake_outbox),"
+                    "(SELECT COUNT(*) FROM conversations)"
+                ).fetchone()
+            ),
+        )
+
+    def test_relay_rejects_nonparticipant_recipient_without_any_write(self) -> None:
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (4,'Outside','OUT1','dev','prompt',1)"
+        )
+        self.con.commit()
+        before = self.con.execute("SELECT COUNT(*) FROM sprint_messages").fetchone()[0]
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "recipient is not a Sprint participant",
+        ):
+            self.messages.relay(
+                self.sprint_id,
+                from_shell_id=1,
+                to_shortname="OUT1",
+                body="should not land",
+                idempotency_key="participant-send:bad-recipient",
+            )
+
+        self.assertEqual(
+            before,
+            self.con.execute("SELECT COUNT(*) FROM sprint_messages").fetchone()[0],
+        )
+
+    def test_relay_rejects_oversize_body_with_actual_and_maximum_counts(self) -> None:
+        before = self.con.execute("SELECT COUNT(*) FROM sprint_messages").fetchone()[0]
+        with self.assertRaisesRegex(
+            ValueError,
+            "Sprint message body is 8001 characters; maximum is 8000",
+        ):
+            self.messages.relay(
+                self.sprint_id,
+                from_shell_id=1,
+                to_shortname="PLN1",
+                body="x" * 8001,
+                idempotency_key="participant-send:oversize",
+            )
+        self.assertEqual(
+            before,
+            self.con.execute("SELECT COUNT(*) FROM sprint_messages").fetchone()[0],
+        )
 
 
 if __name__ == "__main__":

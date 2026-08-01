@@ -391,6 +391,55 @@ class SprintCliApiTest(unittest.TestCase):
         finally:
             con.close()
 
+    def test_participant_send_confirms_durable_message_wake_and_route(self):
+        response = self.run_cli(
+            TOKENS["developer"],
+            "send",
+            "--sprint",
+            str(self.sprint_id),
+            "--to",
+            "PLN1",
+            "--body-file",
+            self.write("Please confirm the downstream handoff."),
+        )
+
+        self.assertEqual(
+            {
+                "conversation_id",
+                "message_created",
+                "message_id",
+                "wake_id",
+                "wake_state",
+            },
+            set(response),
+        )
+        self.assertTrue(response["message_created"])
+        self.assertEqual("pending", response["wake_state"])
+
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            message = con.execute(
+                "SELECT from_participant_id,to_participant_id,"
+                "message_kind,body,actionable,work_unit_id,disposition "
+                "FROM sprint_messages WHERE message_id=?",
+                (response["message_id"],),
+            ).fetchone()
+            self.assertEqual(
+                (2, 1, "notification", "Please confirm the downstream handoff.", 0, None, None),
+                message,
+            )
+            wake = con.execute(
+                "SELECT wm.message_id,w.state FROM sprint_wake_outbox w "
+                "JOIN sprint_wake_messages wm ON wm.wake_id=w.wake_id "
+                "WHERE w.wake_id=?",
+                (response["wake_id"],),
+            ).fetchone()
+            self.assertEqual((response["message_id"], "pending"), wake)
+            current = con.execute(
+                "SELECT current_conversation_id FROM sprint_participants "
+                "WHERE participant_id=1",
+            ).fetchone()
+            self.assertEqual((response["conversation_id"],), current)
+
     def test_remediation_surfaces_are_authenticated_and_durable(self):
         self.use_isolated_db()
         con = sqlite3.connect(self.db)

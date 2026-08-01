@@ -626,7 +626,7 @@ class SprintLiveProof(unittest.TestCase):
                 sprint_runtime.enqueue_conversation_turn(
                     self.db_path,
                     conversation_id,
-                    sprint_message_delivery.FIXED_WAKE_PROMPT,
+                    "concurrent Sprint turn",
                     "live-proof:concurrent-conversation",
                 )
             except BaseException as exc:  # noqa: BLE001 - asserted below
