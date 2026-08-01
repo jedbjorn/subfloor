@@ -2320,6 +2320,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {
                     "changed": receipt.changed,
                     "dispatched_wake_ids": list(receipt.dispatched_wake_ids),
+                    "requeued_wake_ids": list(receipt.requeued_wake_ids),
                     "projected_work_unit_ids": list(
                         receipt.projected_work_unit_ids
                     ),

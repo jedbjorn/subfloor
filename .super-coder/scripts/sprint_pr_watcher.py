@@ -397,17 +397,21 @@ class SprintPRWatcher:
         if current is None or current["lifecycle"] != "armed":
             return None
         latest = self.con.execute(
-            "SELECT transition_key,normalized_state "
+            "SELECT transition_key,normalized_state,observed_head_sha "
             "FROM sprint_pr_transitions WHERE registered_pr_id=? "
             "ORDER BY transition_id DESC LIMIT 1",
             (registered_pr_id,),
         ).fetchone()
-        if latest is not None and latest["normalized_state"] == state:
+        if (
+            latest is not None
+            and latest["normalized_state"] == state
+            and latest["observed_head_sha"] == pull_request.head_sha
+        ):
             self._backoff.pop(registered_pr_id, None)
             return None
         parent_key = latest["transition_key"] if latest is not None else "root"
         transition_key = hashlib.sha256(
-            f"{registered_pr_id}:{parent_key}:{state}".encode()
+            f"{registered_pr_id}:{parent_key}:{state}:{pull_request.head_sha}".encode()
         ).hexdigest()
         transition_id = int(
             self.con.execute(
@@ -428,6 +432,11 @@ class SprintPRWatcher:
             transition_key,
             state,
             pull_request,
+            previous_head_sha=(
+                str(latest["observed_head_sha"])
+                if latest is not None and latest["observed_head_sha"] is not None
+                else None
+            ),
         )
         if state == "merged":
             self.review_loop.observe_merge_in_transaction(
@@ -464,11 +473,12 @@ class SprintPRWatcher:
         transition_key: str,
         state: str,
         pull_request: PullRequest,
+        previous_head_sha: str | None,
     ) -> tuple[int, ...]:
         sprint_id = int(registered["sprint_id"])
         registered_pr_id = int(registered["registered_pr_id"])
         unit_rows = self.con.execute(
-            "SELECT l.work_unit_id,u.reviewer_shell_id "
+            "SELECT l.work_unit_id,u.reviewer_shell_id,u.disposition "
             "FROM sprint_pr_work_units l JOIN sprint_work_units u "
             "ON u.sprint_id=l.sprint_id AND u.work_unit_id=l.work_unit_id "
             "WHERE l.registered_pr_id=? ORDER BY l.work_unit_id",
@@ -511,6 +521,89 @@ class SprintPRWatcher:
             reviewer_id = int(reviewer["participant_id"])
             recipients.setdefault(reviewer_id, False)
 
+        head_changed = (
+            previous_head_sha is not None
+            and previous_head_sha != pull_request.head_sha
+        )
+        if (
+            head_changed
+            and len(unit_rows) == 1
+            and unit_rows[0]["disposition"] == "merge_ready"
+        ):
+            reviewer = self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=? AND role='reviewer'",
+                (sprint_id, int(unit_rows[0]["reviewer_shell_id"])),
+            ).fetchone()
+            if reviewer is None:
+                raise SprintInvariantError(
+                    "registered PR work unit has no Reviewer participant"
+                )
+            reviewer_id = int(reviewer["participant_id"])
+            work_unit_id = int(unit_rows[0]["work_unit_id"])
+            invalidated_message_id = self._invalidate_stale_approval(
+                sprint_id,
+                work_unit_id,
+            )
+            self.con.execute(
+                "UPDATE sprint_work_units SET disposition='in_review',"
+                "updated_at=datetime('now') WHERE work_unit_id=? "
+                "AND disposition='merge_ready'",
+                (work_unit_id,),
+            )
+            self.con.execute(
+                "INSERT INTO sprint_events "
+                "(sprint_id,event_type,actor_kind,payload) "
+                "VALUES (?,'review.approval_invalidated','system',?)",
+                (
+                    sprint_id,
+                    json.dumps(
+                        {
+                            "head_sha": pull_request.head_sha,
+                            "invalidated_message_id": invalidated_message_id,
+                            "previous_head_sha": previous_head_sha,
+                            "registered_pr_id": registered_pr_id,
+                            "transition_key": transition_key,
+                            "work_unit_id": work_unit_id,
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            review_request = self.messages.send_in_transaction(
+                sprint_id,
+                to_participant_id=reviewer_id,
+                work_unit_id=work_unit_id,
+                message_kind="review_request",
+                body=(
+                    f"PR #{registered['pr_number']} moved from {previous_head_sha} "
+                    f"to {pull_request.head_sha} after approval. Perform a delta "
+                    "review against the new head."
+                ),
+                actionable=True,
+                active=True,
+                idempotency_key=f"pr-head-change:{transition_key}:delta-review",
+            )
+            self.con.execute(
+                "INSERT INTO sprint_events "
+                "(sprint_id,event_type,actor_kind,payload) "
+                "VALUES (?,'review.requested','system',?)",
+                (
+                    sprint_id,
+                    json.dumps(
+                        {
+                            "head_sha": pull_request.head_sha,
+                            "message_id": review_request.message_id,
+                            "previous_head_sha": previous_head_sha,
+                            "registered_pr_id": registered_pr_id,
+                            "source": "watcher.head_changed",
+                            "work_unit_id": work_unit_id,
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+
         head = pull_request.head_sha or "unknown head"
         body = (
             f"GitHub observed {registered['repository']} PR "
@@ -529,6 +622,52 @@ class SprintPRWatcher:
                 ),
             )
         return resolved_review_message_ids
+
+    def _invalidate_stale_approval(
+        self,
+        sprint_id: int,
+        work_unit_id: int,
+    ) -> int | None:
+        approval = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='review.approved' "
+            "AND json_extract(payload,'$.work_unit_id')=? "
+            "ORDER BY event_id DESC LIMIT 1",
+            (sprint_id, work_unit_id),
+        ).fetchone()
+        if approval is None:
+            return None
+        message_id = json.loads(approval["payload"]).get("message_id")
+        if not isinstance(message_id, int):
+            return None
+        self.con.execute(
+            "UPDATE sprint_messages SET read_at=COALESCE(read_at,datetime('now')) "
+            "WHERE sprint_id=? AND message_id=?",
+            (sprint_id, message_id),
+        )
+        wake_ids = [
+            int(row[0])
+            for row in self.con.execute(
+                "SELECT wake_id FROM sprint_wake_messages "
+                "WHERE sprint_id=? AND message_id=?",
+                (sprint_id, message_id),
+            )
+        ]
+        for wake_id in wake_ids:
+            unread = self.con.execute(
+                "SELECT 1 FROM sprint_wake_messages wm JOIN sprint_messages m "
+                "ON m.sprint_id=wm.sprint_id AND m.message_id=wm.message_id "
+                "WHERE wm.sprint_id=? AND wm.wake_id=? AND m.read_at IS NULL LIMIT 1",
+                (sprint_id, wake_id),
+            ).fetchone()
+            if unread is None:
+                self.con.execute(
+                    "UPDATE sprint_wake_outbox SET state='cancelled',"
+                    "claim_owner=NULL,claimed_at=NULL,lease_expires_at=NULL "
+                    "WHERE sprint_id=? AND wake_id=? AND state='pending'",
+                    (sprint_id, wake_id),
+                )
+        return message_id
 
     def _poll_failed(
         self,

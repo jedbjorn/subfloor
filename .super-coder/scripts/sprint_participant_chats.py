@@ -14,6 +14,7 @@ import json
 import uuid
 from typing import Any
 
+import conversation_broker
 import run as run_mod
 
 _PURPOSES = {"work", "fix", "merge", "fallback"}
@@ -89,6 +90,152 @@ def _append_created_event(
             ),
         ),
     )
+
+
+def _append_event(
+    con,
+    conversation_id: str,
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    run_id: int | None = None,
+) -> None:
+    sequence = int(
+        con.execute(
+            "SELECT COALESCE(MAX(sequence),0)+1 FROM conversation_events "
+            "WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()[0]
+    )
+    con.execute(
+        "INSERT INTO conversation_events "
+        "(conversation_id,sequence,event_type,payload,run_id) VALUES (?,?,?,?,?)",
+        (
+            conversation_id,
+            sequence,
+            event_type,
+            _canonical_json(payload),
+            run_id,
+        ),
+    )
+
+
+def _cancel_queued_turns(con, conversation_id: str) -> int:
+    message_ids = [
+        int(row[0])
+        for row in con.execute(
+            "SELECT DISTINCT message_id FROM conversation_outbox "
+            "WHERE conversation_id=? AND state IN ('pending','claimed')",
+            (conversation_id,),
+        )
+    ]
+    if not message_ids:
+        return 0
+    marks = ",".join("?" for _ in message_ids)
+    cancelled = con.execute(
+        "UPDATE conversation_messages SET state='cancelled',"
+        "completed_at=datetime('now') "
+        f"WHERE message_id IN ({marks}) "
+        "AND state IN ('accepted','queued','running')",
+        message_ids,
+    ).rowcount
+    con.execute(
+        "UPDATE conversation_outbox SET state='cancelled',claim_owner=NULL,"
+        "claimed_at=NULL,lease_expires_at=NULL "
+        f"WHERE message_id IN ({marks}) AND state IN ('pending','claimed')",
+        message_ids,
+    )
+    return int(cancelled)
+
+
+def close_for_terminal_lifecycle(
+    con,
+    sprint_id: int,
+    *,
+    lifecycle: str,
+) -> tuple[tuple[int, ...], tuple[str, ...]]:
+    """Close linked conversations or persist close intent for live runs."""
+    if not con.in_transaction:
+        raise RuntimeError("Sprint conversation cleanup requires a transaction")
+    if lifecycle not in {"completed", "aborted"}:
+        raise ValueError("Sprint conversation cleanup requires a terminal lifecycle")
+    rows = con.execute(
+        "SELECT DISTINCT c.conversation_id,c.state "
+        "FROM sprint_participant_conversations pc "
+        "JOIN sprint_participants p "
+        "ON p.participant_id=pc.sprint_participant_id "
+        "JOIN conversations c ON c.conversation_id=pc.conversation_id "
+        "WHERE p.sprint_id=? ORDER BY c.conversation_id",
+        (sprint_id,),
+    ).fetchall()
+    run_ids: list[int] = []
+    conversation_ids: list[str] = []
+    now = str(con.execute("SELECT datetime('now')").fetchone()[0])
+    for row in rows:
+        conversation_id = str(row["conversation_id"])
+        if row["state"] == "closed":
+            continue
+        conversation_ids.append(conversation_id)
+        cancelled = _cancel_queued_turns(con, conversation_id)
+        active = con.execute(
+            "SELECT run_id FROM conversation_runs WHERE conversation_id=? "
+            "AND state IN ('leased','starting','running') "
+            "ORDER BY run_id DESC LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+        if active is not None:
+            run_id = int(active["run_id"])
+            run_ids.append(run_id)
+            close_requested = con.execute(
+                "SELECT 1 FROM conversation_events WHERE conversation_id=? "
+                "AND event_type='conversation.close.requested' LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+            if close_requested is None:
+                _append_event(
+                    con,
+                    conversation_id,
+                    "conversation.close.requested",
+                    {
+                        "cancelled_queued_turns": cancelled,
+                        "reason": f"sprint.lifecycle.{lifecycle}",
+                        "sprint_id": sprint_id,
+                    },
+                    run_id=run_id,
+                )
+            conversation_broker.BrokerStore.request_interrupt_in_transaction(
+                con,
+                run_id,
+                requested_at=now,
+            )
+            continue
+        if row["state"] == "queued":
+            con.execute(
+                "UPDATE conversations SET state='idle' WHERE conversation_id=?",
+                (conversation_id,),
+            )
+        elif row["state"] == "running":
+            con.execute(
+                "UPDATE conversations SET state='error' WHERE conversation_id=?",
+                (conversation_id,),
+            )
+        con.execute(
+            "UPDATE conversations SET state='closed',closed_at=?,"
+            "last_activity_at=?,version=version+1 WHERE conversation_id=?",
+            (now, now, conversation_id),
+        )
+        _append_event(
+            con,
+            conversation_id,
+            "conversation.closed",
+            {
+                "cancelled_queued_turns": cancelled,
+                "reason": f"sprint.lifecycle.{lifecycle}",
+                "sprint_id": sprint_id,
+                "state": "closed",
+            },
+        )
+    return tuple(run_ids), tuple(conversation_ids)
 
 
 def create_and_select(
