@@ -923,10 +923,15 @@ def sync_skills() -> None:
     if not seed.exists():
         print("  (no skills seed to sync)")
         return
+    seed_skills.validate_upstream_skill_namespace(
+        seed_skills.seeded_skill_names(),
+        allow_legacy_seed_overlap=True,
+    )
     con = db_driver.connect(DB_PATH)
     try:
         con.executescript(seed.read_text())
         con.commit()
+        reconciled = seed_skills.reconcile_tombstoned_skills(con)
         # The seed just reset every engine row to is_deleted=0 — re-assert the
         # fork retire list (.sc-state/skills_retired.json) before regrant()
         # hands the common catalogue back to every flavor/Bespoke pack.
@@ -934,6 +939,12 @@ def sync_skills() -> None:
     finally:
         con.close()
     print(f"  synced catalogue from {seed.name}")
+    if reconciled.changed_names:
+        print(
+            "  removed tombstoned skills: "
+            f"{', '.join(reconciled.changed_names)} "
+            f"({reconciled.grant_count} grant(s))"
+        )
     if flipped:
         print(f"  fork retire list re-applied: {', '.join(flipped)}")
 

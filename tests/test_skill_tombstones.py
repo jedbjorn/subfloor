@@ -234,6 +234,26 @@ class ReservedAssetTest(unittest.TestCase):
             seed_skills.sync_engine_skills(self.con, specs=[spec])
         self.assertEqual(self.con.execute("SELECT * FROM skills").fetchall(), [])
 
+    def test_seed_regeneration_validates_before_replacing_0001(self):
+        skills_dir = Path(self.tmp.name) / "assets" / "skills"
+        asset = skills_dir / "retired_name" / "SKILL.md"
+        asset.parent.mkdir(parents=True)
+        asset.write_text(
+            "---\nname: retired_name\ndescription: must not seed\n---\nbody\n"
+        )
+        before = seed_skills.OUT.read_text()
+        saved_skills_dir = seed_skills.SKILLS_DIR
+        saved_fork_mode = seed_skills._fork_mode
+        seed_skills.SKILLS_DIR = skills_dir
+        seed_skills._fork_mode = lambda: False
+        try:
+            with self.assertRaisesRegex(ValueError, "retired_name"):
+                seed_skills.main()
+        finally:
+            seed_skills.SKILLS_DIR = saved_skills_dir
+            seed_skills._fork_mode = saved_fork_mode
+        self.assertEqual(seed_skills.OUT.read_text(), before)
+
     def test_legacy_tolerance_dies_when_regenerated_seed_drops_overlap(self):
         seed_skills.TOMBSTONES_FILE.write_text('["engine_surgery"]\n')
         seed_skills.OUT.write_text(
@@ -248,11 +268,10 @@ class ReservedAssetTest(unittest.TestCase):
             "common": 0,
             "content": "legacy upstream body",
         }
-        self.assertEqual(
-            seed_skills.sync_engine_skills(self.con, specs=[spec]), ["engine_surgery"]
-        )
-        self.con.execute("DELETE FROM skills WHERE name='engine_surgery'")
-        self.con.commit()
+        # The temporary tolerance permits the still-authored upstream asset to
+        # pass validation, but the live reconciler never restores its authority.
+        self.assertEqual(seed_skills.sync_engine_skills(self.con, specs=[spec]), [])
+        self.assertEqual(self.con.execute("SELECT * FROM skills").fetchall(), [])
 
         seed_skills.OUT.write_text(
             "INSERT INTO skills (name) VALUES ('active_name') "

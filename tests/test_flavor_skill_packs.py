@@ -149,7 +149,7 @@ class HardCutoverMigrationTest(unittest.TestCase):
         dev1 = add_shell(con, "dev1", "dev")
         dev2 = add_shell(con, "dev2", "dev")
         bespoke = add_shell(con, "custom", None)
-        kid = skill_id(con, "engine_surgery")
+        kid = skill_id(con, "query_authoring_pg")
         con.executemany(
             "INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
             [(dev1, kid), (bespoke, kid)],
@@ -166,19 +166,19 @@ class HardCutoverMigrationTest(unittest.TestCase):
             ).fetchone()[0],
             0,
         )
-        self.assertNotIn("engine_surgery", resolved_names(con, dev1))
+        self.assertNotIn("query_authoring_pg", resolved_names(con, dev1))
         self.assertEqual(resolved_names(con, dev1), resolved_names(con, dev2))
-        self.assertIn("engine_surgery", resolved_names(con, bespoke))
+        self.assertIn("query_authoring_pg", resolved_names(con, bespoke))
 
     def test_stale_flavored_shell_row_is_never_effective(self) -> None:
         con = build_db()
         dev = add_shell(con, "dev", "dev")
-        kid = skill_id(con, "engine_surgery")
+        kid = skill_id(con, "query_authoring_pg")
         con.execute(
             "INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
             (dev, kid),
         )
-        self.assertNotIn("engine_surgery", resolved_names(con, dev))
+        self.assertNotIn("query_authoring_pg", resolved_names(con, dev))
 
 
 class GrantApiTest(unittest.TestCase):
@@ -188,7 +188,7 @@ class GrantApiTest(unittest.TestCase):
         self.dev2 = add_shell(self.con, "dev2", "dev")
         self.custom1 = add_shell(self.con, "custom1", None)
         self.custom2 = add_shell(self.con, "custom2", None)
-        self.kid = skill_id(self.con, "engine_surgery")
+        self.kid = skill_id(self.con, "query_authoring_pg")
 
     def tearDown(self) -> None:
         self.con.close()
@@ -198,19 +198,19 @@ class GrantApiTest(unittest.TestCase):
             self.con, "dev", self.kid, True
         )
         self.assertTrue(ok, err)
-        self.assertIn("engine_surgery", resolved_names(self.con, self.dev1))
-        self.assertIn("engine_surgery", resolved_names(self.con, self.dev2))
+        self.assertIn("query_authoring_pg", resolved_names(self.con, self.dev1))
+        self.assertIn("query_authoring_pg", resolved_names(self.con, self.dev2))
 
         ok, err = server.set_grant(self.con, self.dev1, self.kid, False)
         self.assertFalse(ok)
         self.assertIn("edit the flavor pack", err)
-        self.assertIn("engine_surgery", resolved_names(self.con, self.dev2))
+        self.assertIn("query_authoring_pg", resolved_names(self.con, self.dev2))
 
     def test_bespoke_writes_can_diverge(self) -> None:
         ok, err = server.set_grant(self.con, self.custom1, self.kid, True)
         self.assertTrue(ok, err)
-        self.assertIn("engine_surgery", resolved_names(self.con, self.custom1))
-        self.assertNotIn("engine_surgery", resolved_names(self.con, self.custom2))
+        self.assertIn("query_authoring_pg", resolved_names(self.con, self.custom1))
+        self.assertNotIn("query_authoring_pg", resolved_names(self.con, self.custom2))
 
     def test_unknown_targets_do_not_write(self) -> None:
         self.assertFalse(
@@ -328,7 +328,7 @@ class RenderAndSnapshotTest(unittest.TestCase):
         self.con = build_db()
         self.dev = add_shell(self.con, "dev", "dev")
         self.custom = add_shell(self.con, "custom", None)
-        self.kid = skill_id(self.con, "engine_surgery")
+        self.kid = skill_id(self.con, "query_authoring_pg")
 
     def tearDown(self) -> None:
         self.con.close()
@@ -342,10 +342,10 @@ class RenderAndSnapshotTest(unittest.TestCase):
             "INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
             (self.custom, self.kid),
         )
-        self.assertNotIn("engine_surgery", compose.render_skills(
+        self.assertNotIn("query_authoring_pg", compose.render_skills(
             self.con, self.dev
         ))
-        self.assertIn("engine_surgery", compose.render_skills(
+        self.assertIn("query_authoring_pg", compose.render_skills(
             self.con, self.custom
         ))
         with tempfile.TemporaryDirectory() as tmp:
@@ -357,11 +357,11 @@ class RenderAndSnapshotTest(unittest.TestCase):
             )
             self.assertFalse(
                 (Path(tmp) / "dev" / ".claude" / "skills"
-                 / "engine_surgery").exists()
+                 / "query_authoring_pg").exists()
             )
             self.assertTrue(
                 (Path(tmp) / "custom" / ".claude" / "skills"
-                 / "engine_surgery" / "SKILL.md").exists()
+                 / "query_authoring_pg" / "SKILL.md").exists()
             )
 
     def test_skill_render_supports_a_harness_native_directory(self) -> None:
@@ -379,7 +379,7 @@ class RenderAndSnapshotTest(unittest.TestCase):
 
             self.assertTrue(
                 (Path(tmp) / ".opencode" / "skills"
-                 / "engine_surgery" / "SKILL.md").exists()
+                 / "query_authoring_pg" / "SKILL.md").exists()
             )
 
     def test_codex_adapter_renders_and_prunes_native_skill_mirror(self) -> None:
@@ -405,10 +405,10 @@ class RenderAndSnapshotTest(unittest.TestCase):
             )
             for skill_root in (".claude", ".agents"):
                 rendered = (
-                    root / skill_root / "skills" / "engine_surgery" / "SKILL.md"
+                    root / skill_root / "skills" / "query_authoring_pg" / "SKILL.md"
                 )
                 self.assertTrue(rendered.exists())
-                self.assertIn("name: engine_surgery", rendered.read_text())
+                self.assertIn("name: query_authoring_pg", rendered.read_text())
 
             self.con.execute(
                 "DELETE FROM shell_skills WHERE shell_id=? AND skill_id=?",
@@ -417,7 +417,7 @@ class RenderAndSnapshotTest(unittest.TestCase):
             run.render_harness_skills(self.con, self.custom, root, adapter)
             for skill_root in (".claude", ".agents"):
                 self.assertFalse(
-                    (root / skill_root / "skills" / "engine_surgery").exists()
+                    (root / skill_root / "skills" / "query_authoring_pg").exists()
                 )
 
     def test_snapshot_serializes_pack_grants_by_skill_name(self) -> None:
@@ -437,12 +437,12 @@ class RenderAndSnapshotTest(unittest.TestCase):
         self.assertIn(
             f"INSERT INTO shell_skills (shell_id, skill_id) "
             f"SELECT {self.custom}, skill_id FROM skills "
-            "WHERE name='engine_surgery';",
+            "WHERE name='query_authoring_pg';",
             shell_dump,
         )
         self.assertNotIn(
             f"SELECT {self.dev}, skill_id FROM skills "
-            "WHERE name='engine_surgery';",
+            "WHERE name='query_authoring_pg';",
             shell_dump,
         )
 
