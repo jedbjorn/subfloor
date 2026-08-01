@@ -242,7 +242,7 @@ class EnginePathsAtRefTest(unittest.TestCase):
         self.assertFalse((state / "engine.ref").exists())
         self.assertEqual((self.root / "sc").read_text().splitlines()[0], "#!/bin/sh")
 
-    def test_materialized_alias_keeps_stale_worktree_and_repairs_main(self):
+    def test_legacy_bridge_repairs_stale_dispatcher_and_rebaselines_manifest(self):
         installed = ["sc", ".super-coder/scripts"]
         (self.root / "sc").write_text(
             "#!/bin/sh\n"
