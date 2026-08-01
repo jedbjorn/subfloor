@@ -339,6 +339,90 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
     def test_armed_in_flight_sprint_roundtrips_every_v2_table_exactly(self) -> None:
         self.assert_roundtrip(armed=True)
 
+    def test_causal_message_parent_with_higher_id_roundtrips_exactly(self) -> None:
+        con = sqlite3.connect(self.db)
+        try:
+            seed_prepared(con)
+            con.execute(
+                "INSERT INTO conversations "
+                "(conversation_id,shell_id,owner_user_id,harness,provider,model,"
+                "effort,worktree,title,creation_idempotency_key,"
+                "creation_request_hash) VALUES "
+                "('cv_causal',1,1,'codex','test','model','high','/worktree',"
+                "'Causal order','causal-conversation','causal-request')"
+            )
+            con.execute(
+                "INSERT INTO conversation_messages "
+                "(message_id,conversation_id,sender_kind,sender_ref,message_kind,"
+                "body,idempotency_key,request_hash) VALUES "
+                "(100,'cv_causal','user','operator','prompt','parent',"
+                "'causal-parent','parent-hash')"
+            )
+            con.execute(
+                "INSERT INTO conversation_messages "
+                "(message_id,conversation_id,sender_kind,sender_ref,message_kind,"
+                "body,idempotency_key,request_hash,caused_by_message_id) VALUES "
+                "(1,'cv_causal','engine','runtime','result','child',"
+                "'causal-child','child-hash',100)"
+            )
+            con.commit()
+        finally:
+            con.close()
+        compared = ["conversations", "conversation_messages"]
+        before = rows_by_table(self.db, compared)
+
+        self.snapshot_and_rebuild()
+
+        self.assertEqual(before, rows_by_table(self.db, compared))
+
+    def test_participant_link_parent_with_higher_id_restores_before_pointers(
+        self,
+    ) -> None:
+        con = sqlite3.connect(self.db)
+        try:
+            seed_prepared(con)
+            con.executemany(
+                "INSERT INTO conversations "
+                "(conversation_id,shell_id,owner_user_id,harness,provider,model,"
+                "effort,worktree,title,creation_idempotency_key,"
+                "creation_request_hash,conversation_scope) VALUES "
+                "(?,1,1,'codex','test','model','high','/worktree','Sprint link',"
+                "?,?,'sprint')",
+                (
+                    ("cv_parent", "link-parent", "link-parent-hash"),
+                    ("cv_child", "link-child", "link-child-hash"),
+                ),
+            )
+            con.execute(
+                "INSERT INTO sprint_participant_conversations "
+                "(participant_conversation_id,sprint_participant_id,"
+                "conversation_id,purpose) VALUES (100,2,'cv_parent','work')"
+            )
+            con.execute(
+                "INSERT INTO sprint_participant_conversations "
+                "(participant_conversation_id,sprint_participant_id,"
+                "conversation_id,purpose,parent_conversation_id) "
+                "VALUES (1,2,'cv_child','fix','cv_parent')"
+            )
+            con.execute(
+                "UPDATE sprint_participants SET persistent_conversation_id="
+                "'cv_parent', current_conversation_id='cv_child' "
+                "WHERE participant_id=2"
+            )
+            con.commit()
+        finally:
+            con.close()
+        compared = [
+            "conversations",
+            "sprint_participants",
+            "sprint_participant_conversations",
+        ]
+        before = rows_by_table(self.db, compared)
+
+        self.snapshot_and_rebuild()
+
+        self.assertEqual(before, rows_by_table(self.db, compared))
+
     def test_paused_and_terminal_lifecycle_rows_replay_exactly(self) -> None:
         con = sqlite3.connect(self.db)
         try:

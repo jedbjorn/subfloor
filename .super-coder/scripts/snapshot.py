@@ -268,6 +268,86 @@ def _insert_line(table: str, cols: list[str], row) -> str:
     return f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({vals});"
 
 
+def _dependency_ordered_rows(
+    rows,
+    cols: list[str],
+    *,
+    table: str,
+    identity: str,
+    parent: str,
+    scope: tuple[str, ...],
+):
+    """Order immutable self-references parent-first for trigger-safe replay."""
+    identity_index = cols.index(identity)
+    parent_index = cols.index(parent)
+    scope_indexes = tuple(cols.index(column) for column in scope)
+
+    def row_key(row) -> tuple:
+        return tuple(row[index] for index in scope_indexes) + (row[identity_index],)
+
+    by_key = {row_key(row): row for row in rows}
+    if len(by_key) != len(rows):
+        raise RuntimeError(f"snapshot: duplicate dependency identity in {table}")
+
+    keys = [row_key(row) for row in rows]
+    children: dict[tuple, list[tuple]] = {key: [] for key in keys}
+    indegree = {key: 0 for key in keys}
+    for key, row in zip(keys, rows):
+        parent_identity = row[parent_index]
+        if parent_identity is not None:
+            parent_key = tuple(row[index] for index in scope_indexes) + (
+                parent_identity,
+            )
+            if parent_key not in by_key:
+                raise RuntimeError(
+                    f"snapshot: missing dependency in {table}: {parent_key!r}"
+                )
+            children[parent_key].append(key)
+            indegree[key] += 1
+
+    ready = [key for key in keys if indegree[key] == 0]
+    ordered = []
+    cursor = 0
+    while cursor < len(ready):
+        key = ready[cursor]
+        cursor += 1
+        ordered.append(by_key[key])
+        for child_key in children[key]:
+            indegree[child_key] -= 1
+            if indegree[child_key] == 0:
+                ready.append(child_key)
+    if len(ordered) != len(rows):
+        raise RuntimeError(f"snapshot: dependency cycle in {table}")
+    return ordered
+
+
+def dump_dependency_ordered_table(
+    con,
+    table: str,
+    *,
+    identity: str,
+    parent: str,
+    scope: tuple[str, ...],
+) -> list[str]:
+    """Dump a self-referential table in legal immutable-insert order."""
+    cols = _table_columns(con, table)
+    rows = con.execute(
+        f"SELECT {', '.join(cols)} FROM {table} ORDER BY rowid"
+    ).fetchall()
+    ordered = _dependency_ordered_rows(
+        rows,
+        cols,
+        table=table,
+        identity=identity,
+        parent=parent,
+        scope=scope,
+    )
+    lines = [f"DELETE FROM {table};"]
+    lines.extend(_insert_line(table, cols, row) for row in ordered)
+    lines.append("")
+    return lines
+
+
 def dump_sprints(con) -> list[str]:
     """Serialize lifecycle rows through their legal transition path.
 
@@ -352,7 +432,13 @@ def dump_sprint_participants(con) -> list[str]:
 
 def dump_sprint_participant_conversations(con) -> list[str]:
     """Restore immutable links, then select the participants' exact pointers."""
-    lines = dump_plain_table(con, "sprint_participant_conversations")
+    lines = dump_dependency_ordered_table(
+        con,
+        "sprint_participant_conversations",
+        identity="conversation_id",
+        parent="parent_conversation_id",
+        scope=("sprint_participant_id",),
+    )
     pointers = con.execute(
         "SELECT participant_id,persistent_conversation_id,current_conversation_id "
         "FROM sprint_participants "
@@ -396,6 +482,14 @@ def dump_table(con, table: str) -> list[str]:
         return dump_flavor_skills(con)
     if table == "shell_skills":
         return dump_shell_skills(con)
+    if table == "conversation_messages":
+        return dump_dependency_ordered_table(
+            con,
+            table,
+            identity="message_id",
+            parent="caused_by_message_id",
+            scope=("conversation_id",),
+        )
     if table == "sprints":
         return dump_sprints(con)
     if table == "sprint_participants":
