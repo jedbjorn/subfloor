@@ -18,26 +18,9 @@ import db_driver
 import sprint_participant_chats
 from sprint_domain import SprintInvariantError, SprintLifecycleStore
 
+wake_prompt = sprint_participant_chats.wake_prompt
+
 ACTIONABLE_KINDS = frozenset({"work_assignment", "review_request"})
-_WAKE_ROLES = {
-    "developer": ("Developer", "sprint_dev"),
-    "reviewer": ("Reviewer", "sprint_rev"),
-    "planner": ("originating Planner", "sprint_pln"),
-}
-
-
-def wake_prompt(sprint_id: int, role: str) -> str:
-    try:
-        label, skill = _WAKE_ROLES[role]
-    except KeyError as exc:
-        raise SprintInvariantError(f"unsupported Sprint participant role: {role}") from exc
-    return (
-        f"Sprint {sprint_id} handoff for your {label} role. Load `{skill}`. "
-        f"Run `sc sprint inbox --sprint {sprint_id}` now and act on the Sprint "
-        f"message(s) using `{skill}`. Confirm every Sprint write succeeds before "
-        f"stopping. If the handoff is not complete, load `{skill}` again and run "
-        f"`sc sprint inbox --sprint {sprint_id}` again."
-    )
 
 
 @dataclass(frozen=True)

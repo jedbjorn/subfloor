@@ -2536,6 +2536,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"wake_ids": released})
             if path == "/_sc/sprint/monitor":
                 self._require_sprint_planner(con, sprint_id, shell_id)
+                sprint_domain.SprintLifecycleStore(con).reconcile_unread_pickup(
+                    sprint_id,
+                    trigger="monitor",
+                )
                 outcomes = sprint_liveness.SprintLivenessMonitor(con).evaluate(
                     sprint_id
                 )

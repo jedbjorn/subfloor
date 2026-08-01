@@ -190,9 +190,13 @@ class SprintRuntimeService(threading.Thread):
             con.close()
 
     def _switch(self, con: sqlite3.Connection) -> ArmedServiceSwitch:
+        lifecycle = SprintLifecycleStore(con)
         units = SprintWorkUnitStore(con)
         wakes = SprintWakeDeliveryService(con)
         liveness = SprintLivenessMonitor(con)
+
+        def recover_pickup(sprint_id: int, trigger: str) -> None:
+            lifecycle.reconcile_unread_pickup(sprint_id, trigger=trigger)
 
         def dispatch(sprint_id: int, _trigger: str) -> None:
             units.dispatch_ready(sprint_id)
@@ -207,8 +211,8 @@ class SprintRuntimeService(threading.Thread):
             liveness.evaluate(sprint_id)
 
         return ArmedServiceSwitch(
-            SprintLifecycleStore(con),
-            (dispatch, evaluate_liveness, deliver),
+            lifecycle,
+            (recover_pickup, dispatch, evaluate_liveness, deliver),
         )
 
     def run(self) -> None:  # pragma: no cover - loop tested through pulse_once

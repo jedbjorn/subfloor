@@ -20,6 +20,11 @@ import run as run_mod
 
 _PURPOSES = {"work", "fix", "merge", "fallback"}
 _USABLE_WAKE_STATES = {"idle", "queued", "running", "waiting"}
+_WAKE_ROLES = {
+    "developer": ("Developer", "sprint_dev"),
+    "reviewer": ("Reviewer", "sprint_rev"),
+    "planner": ("originating Planner", "sprint_pln"),
+}
 
 
 class SprintConversationError(ValueError):
@@ -30,6 +35,22 @@ class SprintConversationError(ValueError):
 class WakeConversationRoute:
     conversation_id: str
     created: bool
+
+
+def wake_prompt(sprint_id: int, role: str) -> str:
+    try:
+        label, skill = _WAKE_ROLES[role]
+    except KeyError as exc:
+        raise SprintConversationError(
+            f"unsupported Sprint participant role: {role}"
+        ) from exc
+    return (
+        f"Sprint {sprint_id} handoff for your {label} role. Load `{skill}`. "
+        f"Run `sc sprint inbox --sprint {sprint_id}` now and act on the Sprint "
+        f"message(s) using `{skill}`. Confirm every Sprint write succeeds before "
+        f"stopping. If the handoff is not complete, load `{skill}` again and run "
+        f"`sc sprint inbox --sprint {sprint_id}` again."
+    )
 
 
 def _canonical_json(value: Any) -> str:
