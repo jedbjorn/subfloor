@@ -218,3 +218,105 @@ function all(root, predicate, found = []) {
         assert view["rendered"] == view["key"]
     assert result["views"][2]["paneClass"] == "shell-pane skill-assignments"
     assert result["views"][0]["paneClass"] == "shell-pane"
+
+
+def test_overlapping_shell_renders_discard_the_stale_response():
+    script = r"""
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag;
+    this.nodeType = 1;
+    this.children = [];
+    this.className = "";
+    this._text = "";
+    this.classList = {
+      add: (name) => {
+        const names = new Set(this.className.split(" ").filter(Boolean));
+        names.add(name);
+        this.className = [...names].join(" ");
+      },
+    };
+  }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = [...nodes]; this._text = ""; }
+  set textContent(value) { this._text = String(value ?? ""); this.children = []; }
+  get textContent() {
+    return this._text + this.children.map(
+      (child) => typeof child === "string" ? child : child.textContent
+    ).join("");
+  }
+}
+globalThis.document = {
+  createElement: (tag) => new FakeElement(tag),
+  createTextNode: (text) => ({ nodeType: 3, textContent: String(text ?? "") }),
+};
+const el = (tag, props = {}, ...kids) => {
+  const node = Object.assign(new FakeElement(tag), props);
+  for (const kid of kids)
+    node.append(kid?.nodeType ? kid : document.createTextNode(kid ?? ""));
+  return node;
+};
+""" + SHELL_STATE + r"""
+const shells = [
+  {
+    shell_id: 3, shortname: "DEV3", display_name: "Code-01",
+    flavor: "dev", role: "first role", mandate: "first mandate", skills: [],
+  },
+  {
+    shell_id: 4, shortname: "DEV4", display_name: "Code-02",
+    flavor: "dev", role: "second role", mandate: "second mandate", skills: [],
+  },
+];
+const detailRequests = [];
+async function api(path) {
+  if (path === "/shells") return { shells };
+  if (path === "/shell-templates") return { templates: [] };
+  if (path.startsWith("/shells/")) return new Promise((resolve) => {
+    detailRequests.push({ path, resolve });
+  });
+  throw new Error("unexpected API call: " + path);
+}
+const microlabel = (text) => el("span", {}, text);
+function glassDropdown({ items, value }) {
+  return el("button", {}, items.find((item) => item.value === value).label);
+}
+function openNewShellModal() {}
+function setStatus() {}
+function toast() {}
+function renderHarness() {}
+function renderSkillViewer() {}
+function renderSkillAssignments() {}
+function renderDefaultModels() {}
+""" + SHELL_RENDER + r"""
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+(async () => {
+  const root = new FakeElement("div");
+  selectedShell = 3;
+  const stale = renderShells(root);
+  while (detailRequests.length < 1) await tick();
+
+  selectedShell = 4;
+  const current = renderShells(root);
+  while (detailRequests.length < 2) await tick();
+
+  detailRequests.find((request) => request.path === "/shells/4").resolve(shells[1]);
+  await current;
+  detailRequests.find((request) => request.path === "/shells/3").resolve(shells[0]);
+  await stale;
+
+  console.log(JSON.stringify({
+    text: root.textContent,
+    subbars: root.children.filter((child) => child.className === "subbar").length,
+  }));
+})().catch((error) => {
+  console.error(error.stack || error);
+  process.exit(1);
+});
+"""
+    result = run_js(script)
+    assert result["subbars"] == 1
+    assert "Code-02" in result["text"]
+    assert "second role" in result["text"]
+    assert "Code-01" not in result["text"]
+    assert "first role" not in result["text"]
