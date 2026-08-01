@@ -46,6 +46,8 @@ class RemoveFixture(unittest.TestCase):
         (self.repo / "sc").write_text("#!/bin/sh\nexit 0\n")
         (self.repo / "README.md").write_text("# keep me\n")
         (self.repo / "CLAUDE.md").write_text("generated\n")
+        (self.repo / ".agents/skills/sample").mkdir(parents=True)
+        (self.repo / ".agents/skills/sample/SKILL.md").write_text("generated\n")
         (self.repo / "docs_sc").mkdir()
         (self.repo / "docs_sc" / "generated.md").write_text("generated\n")
         (self.repo / "shared").mkdir()
@@ -145,6 +147,7 @@ class EndToEndRemoveTest(RemoveFixture):
         self.assertFalse(self.engine.exists())
         self.assertFalse((self.repo / "sc").exists())
         self.assertFalse((self.repo / "CLAUDE.md").exists())
+        self.assertFalse((self.repo / ".agents/skills").exists())
         self.assertFalse((self.repo / "docs_sc").exists())
         self.assertFalse(
             (self.repo / ".github/workflows/subfloor-visual-qa.yml").exists()

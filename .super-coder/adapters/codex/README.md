@@ -1,8 +1,10 @@
 # adapters/codex — OpenAI Codex CLI
 
 Codex reads the boot artifact (`AGENTS.md`) and project `AGENTS.md` conventions
-natively — already emitted by the render chain — so the adapter only carries the
-launch command plus how it takes a model and a sandbox flag.
+natively. The render chain also emits each shell's exact grants to Codex's
+native `.agents/skills/<name>/SKILL.md` tree while retaining the cross-harness
+`.claude/skills/<name>/SKILL.md` mirror. The adapter carries those skill targets,
+the launch command, and how Codex takes a model and sandbox flag.
 
 **Why it exists:** the *subscription* path for OpenAI models. Signing into Codex
 with a ChatGPT plan bills against that plan (flat, capped) instead of per-token
@@ -18,6 +20,7 @@ billing. opencode stays as the universal metered catch-all.
 | `launch` | argv exec'd to start the harness (`codex --dangerously-bypass-hook-trust`) |
 | `boot_artifact` | the context file this harness reads (`AGENTS.md`, informational) |
 | `emit` | files copied to the repo root at launch (`.codex/hooks.json` — the branch-guard hook) |
+| `skill_dirs` | exact shell grants rendered to `.claude/skills` and Codex-native `.agents/skills` |
 | `env` | extra env merged into the launch environment |
 | `model` | `{ "flag": "--model" }` — run.py appends `--model <id>` for the flavor's codex model |
 | `headless.effort` | maps requested effort to `-c model_reasoning_effort="<level>"` |

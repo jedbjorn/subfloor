@@ -21,6 +21,7 @@ import install  # noqa: E402
 
 MAP_DB = "/.sc-state/map.db"
 DB_BACKUPS = "/.sc-state/db_backups/"
+CODEX_SKILLS = "/.agents/skills/"
 
 
 class EnsureGitignoreTest(unittest.TestCase):
@@ -59,6 +60,17 @@ class EnsureGitignoreTest(unittest.TestCase):
         # existing lines are not duplicated
         self.assertEqual(text.count("/.super-coder/"), 1)
         # and a second run is a no-op
+        self.assertFalse(install.ensure_gitignore(self.root))
+
+    def test_tops_up_codex_native_skill_render_on_existing_fork(self):
+        old = "\n".join(
+            ln for ln in install._GITIGNORE_BLOCK.splitlines()
+            if ln != CODEX_SKILLS
+        )
+        self.gi.write_text(old + "\n")
+
+        self.assertTrue(install.ensure_gitignore(self.root))
+        self.assertIn(CODEX_SKILLS, self.gi.read_text())
         self.assertFalse(install.ensure_gitignore(self.root))
 
     def test_no_marker_unrelated_content_appends_once(self):
