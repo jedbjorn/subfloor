@@ -111,6 +111,107 @@ def run_script(name: str) -> None:
         sys.exit(f"update: {name} failed.")
 
 
+def run_update_compat() -> None:
+    """Finish a partially adopted legacy update before reconciliation.
+
+    The first old-updater adoption reaches this script through the freshly
+    materialized map-setup process. This early call covers recovery when that
+    legacy run materialized the new floor but stopped before map setup: the next
+    invocation completes the bridge before doing any other update work.
+    """
+    script = ENGINE / "scripts" / "update_compat.py"
+    if not script.is_file():
+        return
+    result = subprocess.run([PY, str(script)], check=False)
+    if result.returncode != 0:
+        sys.exit("update: legacy compatibility phase failed")
+
+
+def repair_git_worktrees() -> tuple[Path, ...]:
+    """Repair every shell worktree on every update, healthy or relocated.
+
+    Linked-worktree metadata contains absolute paths in both the main repo and
+    each worktree's ``.git`` file. All super-coder shell worktrees live below
+    ``.sc-worktrees`` and move with the fork, so their current directories are
+    the authoritative repair targets even when Git still lists the old paths.
+    The unconditional call is intentional: update is the fleet-wide healing
+    seam and ``git worktree repair`` is idempotent on healthy links.
+    """
+    root = REPO_ROOT / ".sc-worktrees"
+    if root.is_dir():
+        candidates = tuple(
+            sorted(
+                (
+                    path
+                    for path in root.iterdir()
+                    if path.is_dir() and (path / ".git").exists()
+                ),
+                key=lambda path: path.name,
+            )
+        )
+    else:
+        candidates = ()
+    result = git(
+        "worktree",
+        "repair",
+        *(str(path) for path in candidates),
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.exit(
+            "update: could not repair linked worktrees:\n"
+            f"{result.stderr.strip()}"
+        )
+    for path in candidates:
+        probe = git(
+            "rev-parse",
+            "--show-toplevel",
+            check=False,
+            repo_root=path,
+        )
+        if probe.returncode != 0:
+            sys.exit(
+                f"update: shell worktree remains unusable after repair: {path}\n"
+                f"{probe.stderr.strip()}"
+            )
+    print(f"→ repair git worktrees ({len(candidates)} shell worktree(s) checked)")
+    return candidates
+
+
+def refresh_installed_brokers() -> tuple[str, ...]:
+    """Rewrite and restart broker units that already belong to this fork.
+
+    The unit files embed absolute engine paths. A whole-repo move therefore
+    leaves an enabled service executing the old checkout even after the engine
+    update itself succeeds. Never opt a fork into a new broker here: only an
+    already-present unit is refreshed, through the same public install command
+    the operator originally used.
+    """
+    if os.environ.get("SC_SANDBOX") or shutil.which("systemctl") is None:
+        return ()
+    config_home = Path(
+        os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    )
+    unit_dir = config_home / "systemd" / "user"
+    refreshed: list[str] = []
+    repo_name = REPO_ROOT.name
+    for kind in ("vm", "ts", "pm2", "db"):
+        unit = unit_dir / f"sc-{kind}-broker-{repo_name}.service"
+        if not unit.is_file():
+            continue
+        command = f"{kind}-broker-install"
+        print(f"→ refresh installed {kind}-broker service (repo path may have moved)")
+        result = subprocess.run([str(REPO_ROOT / "sc"), command], cwd=REPO_ROOT)
+        if result.returncode != 0:
+            print(
+                f"  WARNING: {command} failed; unit remains at {unit}. "
+                f"Re-run `./sc {command}` after fixing systemd access."
+            )
+            continue
+        refreshed.append(kind)
+    return tuple(refreshed)
+
+
 def is_source_repo() -> bool:
     """The SOURCE repo (origin basename in install.SOURCE_REPO_NAMES — both
     names valid across the super-coder → subfloor rename) tracks the engine as
@@ -824,6 +925,7 @@ def expire_sandbox_harnesses() -> str | None:
 
 
 def main(argv: list[str]) -> int:
+    run_update_compat()
     no_fetch = "--no-fetch" in argv
     force = "--force" in argv
     branch = "main"
@@ -847,6 +949,11 @@ def main(argv: list[str]) -> int:
                  "upstream to update from; edit .super-coder/ directly and commit "
                  "like any other code. (To re-adopt upstream, that's a manual "
                  "re-fork — see README → 'Customize a fork vs diverge from it'.)")
+
+    # Reconcile every shell worktree before any pull or engine materialization.
+    # A whole fork move preserves the directories but invalidates Git's absolute
+    # links; update is the one command that must heal the entire set every time.
+    repair_git_worktrees()
 
     # Keep the app/source checkout current before reconciling its engine. This
     # is deliberately advisory: dirty, detached, offline, or diverged checkouts
@@ -909,6 +1016,11 @@ def main(argv: list[str]) -> int:
         print("  they reinstall on the next image build — normal `./sc restart` / `make dos-r`")
 
     migrate_with_service_cutover()
+
+    # Broker systemd units contain absolute ExecStart paths. Refresh only the
+    # services this fork had already installed so a moved repo does not keep
+    # running the pre-move engine after an otherwise successful update.
+    refresh_installed_brokers()
 
     print("→ sync skills catalogue (id-stable)")
     sync_skills()

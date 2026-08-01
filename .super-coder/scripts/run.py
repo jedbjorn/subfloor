@@ -294,11 +294,40 @@ def shell_work_dir(shortname: "str | None", flavor: "str | None") -> Path:
 def ensure_worktree(work_dir: Path, shortname: str) -> None:
     """Create a git worktree for a shell at work_dir on branch shell/<shortname>.
 
-    Idempotent: if work_dir already exists, assumes the worktree is intact and
-    returns immediately. Creates the branch from HEAD if it doesn't exist yet;
-    checks it out if it does. Exits with a clear message on git failure.
+    An existing directory is repaired before reuse. Git stores absolute paths
+    on both sides of a linked-worktree relationship, so moving a whole fork
+    leaves the directory present but its ``.git`` file and the main repo's
+    ``worktrees/<name>/gitdir`` pointing at the old location. ``git worktree
+    repair`` is lossless: it rewrites those links without touching the branch,
+    index, or working tree. Creates the branch from HEAD if it doesn't exist
+    yet; checks it out if it does. Exits with a clear message on git failure.
     """
     if work_dir.exists():
+        repair = subprocess.run(
+            [
+                "git", "-C", str(REPO_ROOT), "worktree", "repair",
+                str(work_dir),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if repair.returncode != 0:
+            sys.exit(
+                f"FATAL: could not repair existing worktree at {work_dir}:\n"
+                f"{repair.stderr.strip()}"
+            )
+        probe = subprocess.run(
+            ["git", "-C", str(work_dir), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode != 0:
+            sys.exit(
+                f"FATAL: existing shell worktree at {work_dir} is not usable "
+                f"after repair:\n{probe.stderr.strip()}"
+            )
+        if repair.stdout.strip() or repair.stderr.strip():
+            print(f"→ worktree: repaired Git links for {shortname} at {work_dir}")
         return
     work_dir.parent.mkdir(parents=True, exist_ok=True)
     branch = f"shell/{shortname.lower()}"
