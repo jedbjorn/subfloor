@@ -92,10 +92,29 @@ No `gh` / no network from your seat -> save the identical body as a fork flag:
 `sc mem flag open "[Engine] <symptom> | Blocker for: <x>" --name UP-###`, then
 message the **admin** shell to relay it upstream (see `messaging`).
 
+## Authorized curation recommendation
+
+The `curate` skill has one FnB-authorized exception to the normal enhancement
+gate below. When a recurring L&S cluster may warrant a reusable upstream skill,
+the curating shell may search and file the recommendation directly without
+asking the FnB first.
+
+Search all upstream issues before opening anything. Add evidence to a matching
+recommendation, or open one titled `skills: recommend <topic>` containing the
+trigger, repeated incidents, proposed ownership boundary, expected users, why
+existing skills do not cover it, and a compact candidate procedure.
+
+This route recommends; it never creates or promotes a skill. Keep one compressed
+L&S entry until a reviewed upstream skill ships and is granted. If issue search
+or creation is unavailable, surface the failure to the FnB, keep the L&S, and
+create no local skill or asset. Deliberate fork-specific authoring remains the
+administrator-owned workflow in `local_skill_management`.
+
 ## Rules
 
 - One defect per issue. Batch nothing.
 - Observed failure = the bar for filing unasked; enhancement ideas ("the
-  engine should…") go to your FnB first.
+  engine should…") go to your FnB first, except the authorized curation
+  recommendation route above.
 - Filing ≠ unblocked: defect blocks work -> also open a fork flag linking the
   issue URL.

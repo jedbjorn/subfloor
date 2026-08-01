@@ -322,98 +322,86 @@ class LnsCurationTest(unittest.TestCase):
         self.assertIn("chars", compose.render_lns_status(self.counts()))
 
 
-class SkillAddTest(unittest.TestCase):
-    """`sc skill add` — the promote pass's landing place. Each guard is proven
-    by trying the thing it forbids."""
+class CurationGovernanceTest(unittest.TestCase):
+    """Curation recommends upstream; only admins author durable fork skills."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-        self.db = self.tmp / "shell_db.db"
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self.tmp.name) / "shell_db.db"
         build_engine_db(self.db)
+        self.saved_db = skill_cmd.DB_PATH
         skill_cmd.DB_PATH = self.db
-        self.body = self.tmp / "proc.md"
-        self.body.write_text("# a procedure\n\nsteps.\n")
 
-    def add(self, *argv) -> str:
-        """Run `skill add`; return stdout on success or the refusal text."""
-        out, err = io.StringIO(), io.StringIO()
-        con = skill_cmd.connect()
+    def tearDown(self):
+        skill_cmd.DB_PATH = self.saved_db
+        self.tmp.cleanup()
+
+    def test_skill_help_and_execution_have_no_add_surface(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(skill_cmd.main(["--help"]), 0)
+        self.assertNotIn(" add ", f" {out.getvalue()} ")
+
+        with self.assertRaisesRegex(SystemExit, "usage: ./sc skill list"):
+            skill_cmd.main(["add", "tc_sweep", "--file", "candidate.md"])
+        con = sqlite3.connect(self.db)
         try:
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                try:
-                    skill_cmd.cmd_add(con, list(argv))
-                except SystemExit as e:
-                    return str(e or "")
+            self.assertIsNone(
+                con.execute("SELECT 1 FROM skills WHERE name='tc_sweep'").fetchone()
+            )
         finally:
             con.close()
-        return out.getvalue()
 
-    def q(self, sql, *params):
-        c = sqlite3.connect(self.db)
-        c.row_factory = sqlite3.Row
+    def test_curate_recommends_and_retains_lns_until_delivery(self):
+        text = (ENGINE / "assets" / "skills" / "curate" / "SKILL.md").read_text()
+        self.assertIn("gh issue list --repo jedbjorn/subfloor --state all", text)
+        self.assertIn("skills: recommend <topic>", text)
+        self.assertIn("trigger that makes the procedure useful", text)
+        self.assertIn("proposed ownership boundary", text)
+        self.assertIn("why existing skills do not cover it", text)
+        self.assertIn("until a reviewed upstream\nskill ships **and is granted**", text)
+        self.assertIn("create no local skill or asset", text)
+        self.assertNotIn("sc skill add", text)
+
+    def test_boot_and_issue_reporting_publish_the_authorized_exception(self):
+        boot = (ENGINE / "templates" / "boot.md").read_text()
+        reporting = (
+            ENGINE / "assets" / "skills" / "issue_reporting" / "SKILL.md"
+        ).read_text()
+        for text in (boot, reporting):
+            self.assertIn("skills: recommend <topic>", text)
+            self.assertIn("keep the l&s", text.lower())
+            self.assertIn("create no local skill or asset", text)
+        self.assertIn("FnB-authorized exception", reporting)
+        self.assertIn("administrator-owned", reporting)
+
+    def test_admin_asset_seed_snapshot_workflow_remains_explicit(self):
+        text = (
+            ENGINE / "assets" / "skills" / "local_skill_management" / "SKILL.md"
+        ).read_text()
+        self.assertIn("file -> seed -> grant -> local snapshot", text)
+        self.assertIn("SC_ADMIN=1 sc snapshot", text)
+
+    def test_trailing_migration_matches_changed_skill_assets_exactly(self):
+        con = sqlite3.connect(self.db)
+        con.row_factory = sqlite3.Row
         try:
-            return c.execute(sql, params).fetchone()
+            for name in ("curate", "issue_reporting"):
+                expected = skill_cmd.seed_skills.parse_skill(
+                    ENGINE / "assets" / "skills" / name / "SKILL.md"
+                )
+                actual = con.execute(
+                    "SELECT description, category, command, common, content "
+                    "FROM skills WHERE name=?",
+                    (name,),
+                ).fetchone()
+                self.assertIsNotNone(actual)
+                self.assertEqual(dict(actual), {
+                    key: expected[key]
+                    for key in ("description", "category", "command", "common", "content")
+                })
         finally:
-            c.close()
-
-    def test_adds_a_namespaced_local_skill_and_grants_it_to_the_author(self):
-        out = self.add("tc_sweep", "--file", str(self.body),
-                       "--desc", "one line", "--for", "tc")
-        self.assertIn("granted to Bespoke tc", out)
-        row = self.q("SELECT skill_id, description, content, is_deleted "
-                     "FROM skills WHERE name='tc_sweep'")
-        self.assertIsNotNone(row)
-        self.assertEqual(row["description"], "one line")
-        self.assertIn("a procedure", row["content"])
-        self.assertIsNotNone(self.q(
-            "SELECT 1 FROM shell_skills WHERE shell_id=1 AND skill_id=?",
-            row["skill_id"]))
-
-    def test_writes_no_asset_file(self):
-        """DB-only is load-bearing: `./sc seed-skills` upserts every asset, so
-        a file would put a local skill back on the seed path."""
-        self.add("tc_sweep", "--file", str(self.body), "--for", "tc")
-        self.assertFalse((ENGINE / "assets" / "skills" / "tc_sweep").exists())
-
-    def test_refuses_an_engine_name(self):
-        msg = self.add("memory", "--file", str(self.body), "--for", "tc")
-        self.assertIn("ENGINE skill", msg)
-        self.assertIsNone(self.q("SELECT 1 FROM skills WHERE name='memory' "
-                                 "AND content LIKE '%a procedure%'"))
-
-    def test_refuses_a_bare_unnamespaced_name(self):
-        msg = self.add("sweep", "--file", str(self.body), "--for", "tc")
-        self.assertIn("namespaced", msg)
-        self.assertIsNone(self.q("SELECT 1 FROM skills WHERE name='sweep'"))
-
-    def test_refuses_a_name_on_the_fork_retire_list(self):
-        real = skill_cmd.seed_skills.retired_skill_names
-        skill_cmd.seed_skills.retired_skill_names = lambda: ["tc_sweep"]
-        try:
-            msg = self.add("tc_sweep", "--file", str(self.body), "--for", "tc")
-        finally:
-            skill_cmd.seed_skills.retired_skill_names = real
-        self.assertIn("retire list", msg)
-        self.assertIsNone(self.q("SELECT 1 FROM skills WHERE name='tc_sweep'"))
-
-    def test_refuses_an_empty_or_missing_body(self):
-        self.assertIn("no such file", self.add(
-            "tc_sweep", "--file", str(self.tmp / "nope.md"), "--for", "tc"))
-        blank = self.tmp / "blank.md"
-        blank.write_text("   \n")
-        self.assertIn("empty", self.add(
-            "tc_sweep", "--file", str(blank), "--for", "tc"))
-
-    def test_unknown_author_refuses_rather_than_orphaning_the_skill(self):
-        import os
-        saved = os.environ.pop("SC_API_TOKEN", None)
-        try:
-            msg = self.add("tc_sweep", "--file", str(self.body))
-        finally:
-            if saved is not None:
-                os.environ["SC_API_TOKEN"] = saved
-        self.assertIn("--for", msg)
-        self.assertIsNone(self.q("SELECT 1 FROM skills WHERE name='tc_sweep'"))
+            con.close()
 
 
 if __name__ == "__main__":

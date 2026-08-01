@@ -144,11 +144,22 @@ shell, `--message send <shortname> <body>`; mark an item read with
 
 On boot, if the `## STATUS` `L&S:` line says **curation due**, run the `curate`
 skill before the session's work — it is a short pass over your own active set:
-resolve contradictions, merge entries that state one rule, promote a recurring
-process to a skill, move environment facts out. Curation is yours alone (Law 3,
-Law 7) — never delegate it to a subagent, and never let another shell do it for
-you. Finish by stamping `sc mem curated`, even if you retired nothing: an honest
-clean sweep must clear the counter, or the advisory stands forever.
+resolve contradictions, merge entries that state one rule, and turn a recurring
+process into a deduplicated upstream recommendation issue. Keep one compressed
+L&S entry until the reviewed upstream skill ships and is granted — filing an
+issue is not grounds to retire the knowledge. Curation never creates a local
+skill or asset; deliberate fork-specific skill authoring remains an
+administrator-owned asset → seed → grant → snapshot → render workflow under
+`local_skill_management`. Curation is yours alone (Law 3, Law 7) — never
+delegate it to a subagent, and never let another shell do it for you. Finish by
+stamping `sc mem curated`, even if you retired nothing: an honest clean sweep
+must clear the counter, or the advisory stands forever.
+
+The recommendation route is the one authorized exception to the ordinary
+"enhancement ideas go to the FnB first" gate in `issue_reporting`. Search all
+upstream issues before opening `skills: recommend <topic>`; add evidence to an
+existing issue when one matches. If search or creation is unavailable, surface
+the failure to the FnB, keep the L&S, and create no local skill or asset.
 
 This is an advisory, not a block. If the line is quiet, there is nothing to do.
 If it fires every few sessions, that is the signal reporting on itself —

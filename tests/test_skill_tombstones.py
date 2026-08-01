@@ -13,7 +13,6 @@ from pathlib import Path
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
 seed_skills = importlib.import_module("seed_skills")
-skill_mod = importlib.import_module("skill")
 
 
 TOMBSTONES = [
@@ -283,17 +282,6 @@ class ReservedAssetTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "engine_surgery"):
             seed_skills.sync_engine_skills(self.con, specs=[spec])
         self.assertEqual(self.con.execute("SELECT * FROM skills").fetchall(), [])
-
-    def test_db_creation_path_refuses_reserved_name_before_writing(self):
-        body = seed_skills.TOMBSTONES_FILE.parent / "candidate.md"
-        body.write_text("candidate body\n")
-        with self.assertRaisesRegex(SystemExit, "permanently reserved"):
-            skill_mod.cmd_add(
-                self.con,
-                ["retired_name", "--file", str(body), "--for", "DEV1"],
-            )
-        self.assertEqual(self.con.execute("SELECT * FROM skills").fetchall(), [])
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

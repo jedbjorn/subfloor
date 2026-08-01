@@ -957,7 +957,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'curate',
-  'The periodic L&S sweep. Run when the STATUS L&S line says "curation due" — resolve contradictions, merge entries stating one rule, promote a recurring process to a skill, move environment facts out, then stamp `sc mem curated`. Yours alone; never delegate it.',
+  'The periodic L&S sweep. Run when the STATUS L&S line says "curation due" — resolve contradictions, merge entries stating one rule, recommend recurring processes upstream, move environment facts out, then stamp `sc mem curated`. Yours alone; never delegate it.',
   'substrate',
   NULL,
   1,
@@ -967,7 +967,7 @@ Write-time triage (`--supersedes` / `--new`) catches contradiction and
 restatement pairwise, at the moment of writing. It **cannot** catch the
 emergent cluster: five entries can each be a valid distinct rule and only in
 aggregate be five instances of one principle. That is this pass''s job, along
-with promotion, category drift, and size drift.
+with recommendation, category drift, and size drift.
 
 **Yours alone.** Law 3 and Law 7 reserve curation to the shell. Never hand this
 to a subagent, never let another shell run it for you, never accept a proposed
@@ -1012,28 +1012,52 @@ The incidents behind the entries are already in the narrative. They do not need
 a second home, and the merged rule must not try to carry them: an entry is the
 rule, ≤500 chars, hard-enforced.
 
-## Pass 3 — Promote
+## Pass 3 — Recommend
 
 A cluster of three or more that keeps **recurring across sessions** is a
-*process*, not a lesson. Author it as a skill and keep one L&S rule pointing at
-it:
+candidate reusable process. Curation never creates or promotes a skill
+directly. Deduplicate against all upstream issues first:
 
-```
-sc skill add <you>_<topic> --file <path.md> --desc "<one line>"
+```bash
+gh issue list --repo jedbjorn/subfloor --state all --search "skills: recommend <topic>"
 ```
 
-Local skills are DB-only and namespaced by your shortname — the command
-enforces both. This is the pressure valve that makes a hard budget survivable:
-knowledge relocates to a lazy surface instead of being deleted.
+An existing recommendation gets the new evidence in a comment. Otherwise open
+one issue titled `skills: recommend <topic>` containing:
+
+- the trigger that makes the procedure useful;
+- the repeated incidents that exposed the need;
+- the proposed ownership boundary;
+- the expected users;
+- why existing skills do not cover it; and
+- a compact candidate procedure.
+
+```bash
+gh issue comment <number> --repo jedbjorn/subfloor --body "<new evidence>"
+gh issue create --repo jedbjorn/subfloor \
+  --title "skills: recommend <topic>" \
+  --body "<trigger, incidents, ownership, users, coverage gap, procedure>"
+```
+
+Keep one compressed L&S entry carrying the knowledge until a reviewed upstream
+skill ships **and is granted**. Filing or updating an issue is not grounds to
+retire it. If issue search or creation is unavailable, surface the failure to
+the FnB, keep the L&S, and create no local skill or asset.
+
+Deliberate fork-specific skill authoring is separate from curation and remains
+administrator-owned. The admin follows `local_skill_management`: authored
+asset → explicit seed → grant → snapshot → render.
 
 ## Pass 4 — Category
 
 An entry that is an **environment fact** (a routing quirk, a term to avoid, a
-path) is not an operating principle. It belongs in a skill, not in L&S. Retire
-it and put the fact where it is looked up.
+path) is not an operating principle. Move it into an existing authoritative
+skill when one owns that fact. Otherwise keep one compressed entry and include
+the missing ownership in a recommendation; do not invent a local skill during
+curation.
 
 ```
-sc mem retire <entry_id>
+sc mem retire <entry_id>  # only after the authoritative replacement is live
 ```
 
 ## Stamp
@@ -1049,7 +1073,8 @@ you would learn to ignore it. The stamp says "I looked," not "I cut."
 ## Stance
 
 Curate the set toward ~12–14 entries, not toward the cap. Cap 20 is a ceiling
-never to reach — if you ever hit it, this sweep is not running.
+never to reach — if you ever hit it, this sweep is not running. Recommendation
+issues do not bypass the cap by deleting knowledge before its replacement ships.
 
 The trigger firing often does not mean the threshold is wrong; it means entries
 are being written faster than they are reconciled. Fix that at write time, with
@@ -2213,11 +2238,30 @@ No `gh` / no network from your seat -> save the identical body as a fork flag:
 `sc mem flag open "[Engine] <symptom> | Blocker for: <x>" --name UP-###`, then
 message the **admin** shell to relay it upstream (see `messaging`).
 
+## Authorized curation recommendation
+
+The `curate` skill has one FnB-authorized exception to the normal enhancement
+gate below. When a recurring L&S cluster may warrant a reusable upstream skill,
+the curating shell may search and file the recommendation directly without
+asking the FnB first.
+
+Search all upstream issues before opening anything. Add evidence to a matching
+recommendation, or open one titled `skills: recommend <topic>` containing the
+trigger, repeated incidents, proposed ownership boundary, expected users, why
+existing skills do not cover it, and a compact candidate procedure.
+
+This route recommends; it never creates or promotes a skill. Keep one compressed
+L&S entry until a reviewed upstream skill ships and is granted. If issue search
+or creation is unavailable, surface the failure to the FnB, keep the L&S, and
+create no local skill or asset. Deliberate fork-specific authoring remains the
+administrator-owned workflow in `local_skill_management`.
+
 ## Rules
 
 - One defect per issue. Batch nothing.
 - Observed failure = the bar for filing unasked; enhancement ideas ("the
-  engine should…") go to your FnB first.
+  engine should…") go to your FnB first, except the authorized curation
+  recommendation route above.
 - Filing ≠ unblocked: defect blocks work -> also open a fork flag linking the
   issue URL.',
   0
