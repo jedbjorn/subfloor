@@ -44,6 +44,7 @@ NORMALIZED_EVENTS = frozenset(
 TERMINAL_EVENTS = frozenset(
     {"run.completed", "run.failed", "run.interrupted"}
 )
+INTERRUPT_EVIDENCE = frozenset({"native", "operator"})
 RECONCILE_OUTCOMES = frozenset(
     {"running", "succeeded", "failed", "cancelled", "unknown"}
 )
@@ -143,10 +144,21 @@ class NormalizedEvent:
     type: str
     payload: Mapping[str, Any] = field(default_factory=dict)
     native_type: str | None = None
+    interrupt_evidence: str | None = None
 
     def __post_init__(self) -> None:
         if self.type not in NORMALIZED_EVENTS:
             raise ValueError(f"unknown normalized conversation event: {self.type}")
+        if self.type == "run.interrupted":
+            if self.interrupt_evidence not in INTERRUPT_EVIDENCE:
+                raise ValueError(
+                    "run.interrupted requires structured native or operator "
+                    "evidence"
+                )
+        elif self.interrupt_evidence is not None:
+            raise ValueError(
+                "interrupt evidence is valid only for run.interrupted"
+            )
 
 
 @dataclass(frozen=True)

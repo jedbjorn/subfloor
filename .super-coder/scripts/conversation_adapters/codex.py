@@ -515,6 +515,7 @@ class CodexAdapter(ConversationAdapter):
                     event_type,
                     {"status": status or "failed", "error": error},
                     method,
+                    "native" if event_type == "run.interrupted" else None,
                 )
             ]
         return []

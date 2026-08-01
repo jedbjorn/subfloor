@@ -57,6 +57,7 @@ class FakeAdapter:
         harness: str = "codex",
         native_session_ref: str = "native-session",
         native_run_ref: str | None = None,
+        interrupt_terminal: str = "run.interrupted",
     ) -> None:
         self.harness = harness
         self.terminal = terminal
@@ -66,6 +67,7 @@ class FakeAdapter:
         self.block = block
         self.native_session_ref = native_session_ref
         self.native_run_ref = native_run_ref
+        self.interrupt_terminal = interrupt_terminal
         self.interrupted = threading.Event()
         self.started = 0
         self.resumed = 0
@@ -105,8 +107,18 @@ class FakeAdapter:
         yield NormalizedEvent("assistant.delta", {"text": "hello"})
         if self.block:
             self.interrupted.wait(5)
-        event_type = "run.interrupted" if self.interrupted.is_set() else self.terminal
-        yield NormalizedEvent(event_type, {"status": event_type.split(".")[1]})
+        event_type = (
+            self.interrupt_terminal
+            if self.interrupted.is_set()
+            else self.terminal
+        )
+        yield NormalizedEvent(
+            event_type,
+            {"status": event_type.split(".")[1]},
+            interrupt_evidence=(
+                "operator" if event_type == "run.interrupted" else None
+            ),
+        )
 
     def interrupt(self, turn: NativeTurn) -> InterruptResult:
         self.interrupted.set()
@@ -122,6 +134,48 @@ class FakeAdapter:
 
     def close(self) -> None:
         self.closed += 1
+
+
+class BarrierAdapter(FakeAdapter):
+    """Prove separate instances of one harness can stream concurrently."""
+
+    def __init__(self, barrier: threading.Barrier, serial: int) -> None:
+        super().__init__(native_session_ref=f"native-session-{serial}")
+        self.barrier = barrier
+        self.crossed = False
+
+    def stream(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
+        yield NormalizedEvent("session.started", {"session_ref": turn.session_ref})
+        yield NormalizedEvent("run.started", {"status": "running"})
+        self.barrier.wait(2)
+        self.crossed = True
+        yield NormalizedEvent("assistant.delta", {"text": "hello"})
+        yield NormalizedEvent("run.completed", {"status": "completed"})
+
+
+class ReconcileSequenceAdapter(FakeAdapter):
+    """End the stream uncertain, then prove running and terminal states."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.results = iter(
+            [
+                ReconcileResult("running", True, "native run is live"),
+                ReconcileResult("succeeded", True, "native run completed"),
+            ]
+        )
+
+    def stream(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
+        yield NormalizedEvent("session.started", {"session_ref": turn.session_ref})
+        yield NormalizedEvent("assistant.delta", {"text": "before recovery"})
+
+    def reconcile(
+        self,
+        turn: NativeTurn,
+        context: ConversationContext,
+    ) -> ReconcileResult:
+        self.reconciled += 1
+        return next(self.results)
 
 
 class BlockingOpenCodeTransport:
@@ -522,6 +576,45 @@ class StoreContractTest(ConversationBrokerCase):
         self.assertEqual(first_state, "completed")
         self.assertEqual(sequences, [1, 2])
 
+    def test_noisy_events_are_appended_in_one_ordered_batch(self) -> None:
+        conversation_id = self.add_conversation()
+        self.add_message(conversation_id)
+        store = BrokerStore(self.db_path)
+        run = store.claim_next("broker")
+        store.mark_starting(run.run_id, "broker")
+        store.mark_native_started(
+            run.run_id,
+            "broker",
+            NativeTurn("codex", "session", "runner", self.worktree),
+        )
+
+        sequences = store.append_events(
+            run.run_id,
+            [
+                NormalizedEvent("run.started", {"status": "running"}),
+                NormalizedEvent("assistant.delta", {"text": "one"}),
+                NormalizedEvent("assistant.delta", {"text": "two"}),
+            ],
+        )
+
+        self.assertEqual(sequences, [1, 2, 3])
+        con = self.connect()
+        rows = con.execute(
+            "SELECT sequence,event_type,payload FROM conversation_events "
+            "WHERE run_id=? ORDER BY sequence",
+            (run.run_id,),
+        ).fetchall()
+        con.close()
+        self.assertEqual(
+            [(row["sequence"], row["event_type"]) for row in rows],
+            [
+                (1, "run.started"),
+                (2, "assistant.delta"),
+                (3, "assistant.delta"),
+            ],
+        )
+        self.assertEqual(json.loads(rows[-1]["payload"])["text"], "two")
+
     def test_terminal_observation_is_post_commit_and_cannot_fail_run(self) -> None:
         conversation_id = self.add_conversation()
         self.add_message(conversation_id)
@@ -800,6 +893,158 @@ class ServiceContractTest(ConversationBrokerCase):
         self.assertEqual(len(adapters), 1)
         self.assertEqual(adapters[0].started, 1)
 
+    def test_transient_event_write_contention_does_not_abandon_stream(
+        self,
+    ) -> None:
+        adapter = FakeAdapter()
+        broker = self.start_broker(
+            lambda _harness: adapter,
+            recovery_seconds=0.01,
+        )
+        append_events = broker.store.append_events
+        attempts = 0
+
+        def contend_once(run_id, events):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return append_events(run_id, events)
+
+        broker.store.append_events = contend_once
+        conversation_id = self.add_conversation()
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+
+        deadline = time.monotonic() + 3
+        row = None
+        while time.monotonic() < deadline:
+            con = self.connect()
+            row = con.execute(
+                "SELECT run_id,state FROM conversation_runs "
+                "WHERE trigger_message_id=?",
+                (message_id,),
+            ).fetchone()
+            con.close()
+            if row is not None and row["state"] == "succeeded":
+                break
+            time.sleep(0.01)
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row["state"], "succeeded")
+        self.assertGreaterEqual(attempts, 2)
+        con = self.connect()
+        event_types = [
+            item[0]
+            for item in con.execute(
+                "SELECT event_type FROM conversation_events "
+                "WHERE run_id=? ORDER BY sequence",
+                (row["run_id"],),
+            )
+        ]
+        con.close()
+        self.assertEqual(
+            event_types,
+            [
+                "session.started",
+                "run.started",
+                "assistant.delta",
+                "run.completed",
+            ],
+        )
+        self.assertEqual(adapter.reconciled, 0)
+
+    def test_same_harness_runs_stream_concurrently_on_different_shells(
+        self,
+    ) -> None:
+        barrier = threading.Barrier(2)
+        adapters: list[BarrierAdapter] = []
+
+        def factory(_harness: str) -> BarrierAdapter:
+            adapter = BarrierAdapter(barrier, len(adapters) + 1)
+            adapters.append(adapter)
+            return adapter
+
+        broker = self.start_broker(factory)
+        first = self.add_conversation(shell_id=1, harness="codex")
+        second = self.add_conversation(shell_id=2, harness="codex")
+        first_message = self.add_message(first)
+        second_message = self.add_message(second)
+        broker.notify()
+
+        deadline = time.monotonic() + 3
+        states: dict[int, str] = {}
+        while time.monotonic() < deadline:
+            con = self.connect()
+            states = {
+                int(row["trigger_message_id"]): row["state"]
+                for row in con.execute(
+                    "SELECT trigger_message_id,state FROM conversation_runs "
+                    "WHERE trigger_message_id IN (?,?)",
+                    (first_message, second_message),
+                )
+            }
+            con.close()
+            if states == {
+                first_message: "succeeded",
+                second_message: "succeeded",
+            }:
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(
+            states,
+            {
+                first_message: "succeeded",
+                second_message: "succeeded",
+            },
+        )
+        self.assertEqual(len(adapters), 2)
+        self.assertTrue(all(adapter.started == 1 for adapter in adapters))
+        self.assertTrue(all(adapter.crossed for adapter in adapters))
+
+    def test_transient_lease_renewal_contention_stays_recoverable(
+        self,
+    ) -> None:
+        adapter = ReconcileSequenceAdapter()
+        broker = self.start_broker(
+            lambda _harness: adapter,
+            recovery_seconds=0.01,
+        )
+        renew_runs = broker.store.renew_runs
+        attempts = 0
+
+        def contend_once(owner, run_ids):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return renew_runs(owner, run_ids)
+
+        broker.store.renew_runs = contend_once
+        conversation_id = self.add_conversation()
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+
+        deadline = time.monotonic() + 3
+        row = None
+        while time.monotonic() < deadline:
+            con = self.connect()
+            row = con.execute(
+                "SELECT run_id,state FROM conversation_runs "
+                "WHERE trigger_message_id=?",
+                (message_id,),
+            ).fetchone()
+            con.close()
+            if row is not None and row["state"] == "succeeded":
+                break
+            time.sleep(0.01)
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row["state"], "succeeded")
+        self.assertGreaterEqual(attempts, 2)
+        self.assertEqual(adapter.reconciled, 2)
+
     def test_kimi_native_identities_are_persisted_before_first_event(
         self,
     ) -> None:
@@ -817,18 +1062,18 @@ class ServiceContractTest(ConversationBrokerCase):
         ))
         order: list[tuple[str, str, str | None]] = []
         mark_native_started = broker.store.mark_native_started
-        append_event = broker.store.append_event
+        append_events = broker.store.append_events
 
         def record_native(run_id, owner, turn):
             order.append(("native", turn.session_ref, turn.run_ref))
             return mark_native_started(run_id, owner, turn)
 
-        def record_event(run_id, event):
-            order.append(("event", event.type, None))
-            return append_event(run_id, event)
+        def record_events(run_id, events):
+            order.extend(("event", event.type, None) for event in events)
+            return append_events(run_id, events)
 
         broker.store.mark_native_started = record_native
-        broker.store.append_event = record_event
+        broker.store.append_events = record_events
         conversation_id = self.add_conversation(harness="kimi")
         message_id = self.add_message(conversation_id)
         broker.notify()
@@ -897,6 +1142,43 @@ class ServiceContractTest(ConversationBrokerCase):
             events.index("run.interrupt.requested"),
             events.index("run.interrupted"),
         )
+
+    def test_interrupt_intent_normalizes_adapter_failure_to_cancelled(
+        self,
+    ) -> None:
+        adapter = FakeAdapter(
+            block=True,
+            interrupt_terminal="run.failed",
+        )
+        broker = self.start_broker(lambda _harness: adapter)
+        conversation_id = self.add_conversation()
+        self.add_message(conversation_id)
+        broker.notify()
+
+        deadline = time.monotonic() + 3
+        run_id = None
+        while time.monotonic() < deadline:
+            active = broker.active_run_ids()
+            if active:
+                run_id = active[0]
+                break
+            time.sleep(0.01)
+        self.assertIsNotNone(run_id)
+
+        self.assertTrue(broker.interrupt(run_id))
+        self.wait_run_state(run_id, "cancelled")
+        con = self.connect()
+        terminal = con.execute(
+            "SELECT event_type,payload FROM conversation_events "
+            "WHERE run_id=? AND event_type LIKE 'run.%' "
+            "ORDER BY sequence DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        con.close()
+        self.assertEqual(terminal["event_type"], "run.interrupted")
+        payload = json.loads(terminal["payload"])
+        self.assertEqual(payload["adapter_terminal"], "run.failed")
+        self.assertEqual(payload["interrupt_evidence"], "operator")
 
     def test_opencode_blocking_message_is_interruptible_after_identity(
         self,
@@ -1051,6 +1333,18 @@ class ServiceContractTest(ConversationBrokerCase):
             stream.write(
                 json.dumps(
                     {
+                        "type": "context.append_loop_event",
+                        "event": {
+                            "type": "step.end",
+                            "finishReason": "end_turn",
+                        },
+                    }
+                )
+                + "\n"
+            )
+            stream.write(
+                json.dumps(
+                    {
                         "type": "usage.record",
                         "usageScope": "turn",
                         "usage": {"inputOther": 4, "output": 2},
@@ -1089,7 +1383,10 @@ class ServiceContractTest(ConversationBrokerCase):
         self.assertEqual(
             json.loads(events[0]["payload"]),
             {
-                "detail": "Kimi exact run slice contains turn-scoped usage",
+                "detail": (
+                    "Kimi exact run slice contains end_turn and "
+                    "turn-scoped usage"
+                ),
                 "outcome": "succeeded",
                 "proven": True,
                 "reconciled": True,

@@ -267,7 +267,7 @@ class ClaudeAdapter(ConversationAdapter):
             subtype = str(raw.get("subtype") or "")
             detail = str(raw.get("result") or raw.get("error") or "")
             interrupted = any(
-                token in f"{subtype} {detail}".lower()
+                token in subtype.lower()
                 for token in ("interrupt", "aborted")
             )
             failed = bool(raw.get("is_error")) or subtype.startswith("error")
@@ -298,6 +298,7 @@ class ClaudeAdapter(ConversationAdapter):
                         "result": detail if detail else None,
                     },
                     "result",
+                    "native" if interrupted else None,
                 )
             )
             return events
