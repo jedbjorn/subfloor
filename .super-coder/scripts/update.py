@@ -69,6 +69,7 @@ PY = sys.executable
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
+import callable_floor  # noqa: E402
 import db_driver  # noqa: E402
 import engine_manifest  # noqa: E402
 import install as install_mod  # noqa: E402  (ensure_harnesses)
@@ -687,6 +688,11 @@ def materialize_fetched_engine(sha: str, *, force: bool = False) -> None:
         resolved_paths + materializable_delta,
         REPO_ROOT,
     )
+    callable_floor.require_callable_floor(
+        REPO_ROOT,
+        expected_ref=sha,
+        context="update",
+    )
     ENGINE_REF.write_text(sha + "\n")
     n = engine_manifest.write_manifest(
         materialized_paths,
@@ -697,6 +703,34 @@ def materialize_fetched_engine(sha: str, *, force: bool = False) -> None:
         ),
     )
     print(f"  engine pinned at {sha[:12]} (.sc-state/engine.ref) · manifest over {n} files")
+
+
+def repair_callable_dispatcher(sha: str) -> bool:
+    """Heal a dispatcher missed by the already-running legacy updater."""
+    issues = callable_floor.inspect_callable_floor(
+        REPO_ROOT,
+        expected_ref=sha,
+    )
+    if not issues:
+        return False
+
+    materialize_engine(sha, engine_paths=["sc"])
+    callable_floor.require_callable_floor(
+        REPO_ROOT,
+        expected_ref=sha,
+        context="update compatibility repair",
+    )
+    materialized_paths = _materialized_engine_paths(REPO_ROOT)
+    engine_manifest.write_manifest(
+        materialized_paths,
+        files=_engine_files_at(
+            sha,
+            repo_root=REPO_ROOT,
+            engine_paths=materialized_paths,
+        ),
+    )
+    print(f"→ legacy update bridge: repaired callable dispatcher at {sha[:12]}")
+    return True
 
 
 def fetch_and_materialize(branch: str, ref: str | None = None,

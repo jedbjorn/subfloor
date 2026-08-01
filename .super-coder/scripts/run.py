@@ -52,6 +52,7 @@ import flat  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
+import callable_floor  # noqa: E402
 import db_driver  # noqa: E402
 import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
@@ -1218,6 +1219,16 @@ def review_gui_panel(api_port: int, has_key: bool) -> str:
 
 
 def main() -> None:
+    source_repo = install.is_source_repo()
+    owns_engine = source_repo or (REPO_ROOT / ".sc-state" / "ejected").is_file()
+    callable_floor.require_callable_floor(
+        REPO_ROOT,
+        expected_ref=(
+            None if owns_engine else callable_floor.read_engine_ref(REPO_ROOT)
+        ),
+        allow_unpinned=owns_engine,
+        context="session launch",
+    )
     args = sys.argv[1:]
     first = "--first" in args
     headless = "--headless" in args

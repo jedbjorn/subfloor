@@ -50,6 +50,7 @@ PY = sys.executable
 IS_MAC = platform.system() == "Darwin"  # guidance arms differ (colima/brew vs systemd/apt)
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import callable_floor  # noqa: E402
 import engine_manifest  # noqa: E402
 import ports as ports_mod  # noqa: E402
 
@@ -765,6 +766,12 @@ def main(argv: list[str]) -> int:
     # to silently overwrite) any local edit to an engine file.
     n = engine_manifest.write_manifest(engine_manifest.ENGINE_PATHS)
     print(f"  engine manifest written ({n} files) — local engine edits now detected on update")
+    callable_floor.require_callable_floor(
+        REPO_ROOT,
+        expected_ref=pinned,
+        allow_unpinned=pinned is None,
+        context="install",
+    )
 
     # 3.6 Create the shared scratch / handoff dir -----------------------------
     # A host-repo dir for screenshots, drafts, quick handoffs. The CONNECTIONS

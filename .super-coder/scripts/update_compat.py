@@ -60,14 +60,18 @@ def needs_legacy_bridge() -> tuple[bool, str | None]:
 
 
 def main() -> int:
+    current = _read_ref(ENGINE_REF)
+    if current is not None:
+        # Unlike the path-repair migration below, dispatcher coherence is a
+        # standing invariant. Existing forks may already carry the v1 marker
+        # while their tracked bootstrap still routes to a retired script.
+        import update
+
+        update.repair_callable_dispatcher(current)
+
     needed, current = needs_legacy_bridge()
     if not needed:
         return 0
-
-    # Import lazily: this process starts after materialization, so ``update`` is
-    # the new module on disk rather than the legacy module still loaded by the
-    # parent updater.
-    import update
 
     print("→ legacy update bridge: finish relocated-fork path repair")
     update.repair_git_worktrees()
