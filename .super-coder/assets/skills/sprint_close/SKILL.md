@@ -17,6 +17,11 @@ sc sprint accept --sprint <id> --message <message-id>
 sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 ```
 
+Use `accept` or `decline` for actionable work. After acting on an informational
+question, answer, blocker, or context message, run `accept` for that message.
+For informational messages it only marks the message read; it does not change
+Sprint or work-unit state.
+
 ## Questions, answers, blockers, and failures
 
 Put a concrete question, answer, blocker, or context request in a short body
@@ -26,11 +31,11 @@ file, then send it to the conformance Reviewer or participant who owns the fact:
 sc sprint send --sprint <id> --to <shortname> --body-file <path>
 ```
 
-Answer incoming questions through `send`. For a blocker, send the evidence,
-impact, and exact action needed to the originating Planner/FnB and every directly
-affected participant. Continue safe synthesis, but stop at a decision boundary
-when the answer is required. Do not send duplicate reminders; unread recovery
-owns re-waking.
+Answer incoming questions through `send`, confirm that write, then mark the
+handled question read with `accept`. For a blocker, send the evidence, impact,
+and exact action needed to FnB and every directly affected participant. Continue
+safe synthesis, but stop at a decision boundary when the answer is required. Do
+not send duplicate reminders; unread recovery owns re-waking.
 
 Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
 characters is the hard maximum. Before submitting, run `wc -m < <path>` and
@@ -38,14 +43,20 @@ condense if needed. The handoff is complete only when the Sprint command exits
 successfully and confirms the durable write and wake where applicable.
 
 If a Sprint command is rejected or transport fails, the write or handoff is
-incomplete. Correct and retry when safe; relay the exact failure if it cannot
-complete. For an integrity threat, pause first, confirm it, then send evidence:
+incomplete. Correct and retry when safe. If the relay itself fails, surface the
+attempted command and durable evidence to FnB; do not invent an alternate
+delivery protocol. This skill is Planner-owned: the Planner or FnB decides
+whether an integrity threat warrants pause. Send any needed participant context
+before pausing; an active relay is not available after the lifecycle becomes
+paused.
+
+Treat an exhausted recovery wake as bounded manual-recovery evidence for FnB;
+preserve the unread message and failed wake, and do not create recursive
+fallbacks.
 
 ```text
 sc sprint pause --sprint <id> --reason <integrity-threat>
 ```
-
-After the pause succeeds, use the `send` command above for the evidence.
 
 ## Delivery-complete gate
 
@@ -164,4 +175,5 @@ sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
 
 Hand the FnB the final report id, follow-up list, integrated SHA, and evidence
 links. Re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message,
-and stop after the terminal transition; Sprint-scoped authority is over.
+mark every handled informational message read with `accept`, and stop after the
+terminal transition; Sprint-scoped authority is over.

@@ -3732,6 +3732,11 @@ sc sprint accept --sprint <id> --message <message-id>
 sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 ```
 
+Use `accept` or `decline` for actionable work. After acting on an informational
+question, answer, blocker, or context message, run `accept` for that message.
+For informational messages it only marks the message read; it does not change
+Sprint or work-unit state.
+
 ## Questions, answers, blockers, and failures
 
 Put a concrete question, answer, blocker, or context request in a short body
@@ -3741,11 +3746,11 @@ file, then send it to the conformance Reviewer or participant who owns the fact:
 sc sprint send --sprint <id> --to <shortname> --body-file <path>
 ```
 
-Answer incoming questions through `send`. For a blocker, send the evidence,
-impact, and exact action needed to the originating Planner/FnB and every directly
-affected participant. Continue safe synthesis, but stop at a decision boundary
-when the answer is required. Do not send duplicate reminders; unread recovery
-owns re-waking.
+Answer incoming questions through `send`, confirm that write, then mark the
+handled question read with `accept`. For a blocker, send the evidence, impact,
+and exact action needed to FnB and every directly affected participant. Continue
+safe synthesis, but stop at a decision boundary when the answer is required. Do
+not send duplicate reminders; unread recovery owns re-waking.
 
 Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
 characters is the hard maximum. Before submitting, run `wc -m < <path>` and
@@ -3753,14 +3758,20 @@ condense if needed. The handoff is complete only when the Sprint command exits
 successfully and confirms the durable write and wake where applicable.
 
 If a Sprint command is rejected or transport fails, the write or handoff is
-incomplete. Correct and retry when safe; relay the exact failure if it cannot
-complete. For an integrity threat, pause first, confirm it, then send evidence:
+incomplete. Correct and retry when safe. If the relay itself fails, surface the
+attempted command and durable evidence to FnB; do not invent an alternate
+delivery protocol. This skill is Planner-owned: the Planner or FnB decides
+whether an integrity threat warrants pause. Send any needed participant context
+before pausing; an active relay is not available after the lifecycle becomes
+paused.
+
+Treat an exhausted recovery wake as bounded manual-recovery evidence for FnB;
+preserve the unread message and failed wake, and do not create recursive
+fallbacks.
 
 ```text
 sc sprint pause --sprint <id> --reason <integrity-threat>
 ```
-
-After the pause succeeds, use the `send` command above for the evidence.
 
 ## Delivery-complete gate
 
@@ -3879,7 +3890,8 @@ sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
 
 Hand the FnB the final report id, follow-up list, integrated SHA, and evidence
 links. Re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message,
-and stop after the terminal transition; Sprint-scoped authority is over.',
+mark every handled informational message read with `accept`, and stop after the
+terminal transition; Sprint-scoped authority is over.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -3907,6 +3919,11 @@ sc sprint accept --sprint <id> --message <message-id>
 sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 ```
 
+Use `accept` or `decline` for actionable work. After acting on an informational
+question, answer, blocker, or context message, run `accept` for that message.
+For informational messages it only marks the message read; it does not change
+Sprint or work-unit state.
+
 ## Orient and bound the lane
 
 Read the assignment, expected output, bound spec revision, dependencies,
@@ -3930,8 +3947,9 @@ sc sprint send --sprint <id> --to <shortname> --body-file <path>
 
 Ask the Planner about scope, priority, or cross-unit decisions; ask the assigned
 Reviewer about review evidence. Answer an incoming question through `send` so it
-wakes the asker. For a blocker, send evidence, impact, and the exact action
-needed to the Planner and any directly affected participant. Continue safe
+wakes the asker, confirm that write, then mark the handled question read with
+`accept`. For a blocker or integrity concern, send the Planner concise evidence,
+impact, the exact action needed, and your recommendation. Continue safe
 independent work, but stop at a decision boundary when the answer is required.
 No immediate response is not a reason to send duplicates: the durable message
 and recovery reconciler own re-waking.
@@ -3942,15 +3960,11 @@ condense if needed. The handoff is complete only when the Sprint command exits
 successfully and confirms the durable write and wake where applicable.
 
 If a Sprint command is rejected or transport fails, the write or handoff is
-incomplete. Correct and retry when safe; if it still cannot complete, relay the
-problem to the Planner. For an integrity threat, pause first, confirm the pause,
-then send the evidence needed to resolve it:
-
-```text
-sc sprint pause --sprint <id> --reason <integrity-threat>
-```
-
-After the pause succeeds, use the `send` command above for the evidence.
+incomplete. Correct and retry when safe. If the relay itself fails, surface the
+attempted command, evidence, impact, and recommendation to FnB; do not invent an
+alternate delivery protocol. A Developer does not pause the Sprint. The Planner
+decides whether the reported condition warrants continuing, re-planning, or
+pausing.
 
 ## Build and verify
 
@@ -4022,21 +4036,18 @@ command refuses, do not work around it; wait for the watcher or return to the
 appropriate loop. After merge, clean the worktree, submit the unit result and
 judgments, and let automatic merge observation advance dependencies.
 
-## Pause and stop
+## Report and stop
 
-Pause immediately when integrity is threatened: broken base, destructive
-ambiguity, unavailable GitHub, untrustworthy runners, provider exhaustion, or
-an unrecoverable environment. State the short reason first; detailed judgment
-can follow after pause is durable.
+Report broken bases, destructive ambiguity, unavailable GitHub, untrustworthy
+runners, provider exhaustion, or an unrecoverable environment to the Planner
+with evidence, impact, and a recommendation. Stop at the unsafe boundary while
+the Planner decides whether to continue, re-plan, or pause.
 
-```text
-sc sprint pause --sprint <id> --reason <integrity-threat>
-```
-
-Stop when the unit is merged and reported, declined, paused awaiting recovery,
-or returned to review. Before stopping, re-run `sc sprint inbox --sprint <id>`,
-act on any newly arrived message, and confirm the final typed handoff succeeded.
-Ask the Planner for later work only after the current editing lane is terminal.',
+Stop when the unit is merged and reported, declined, awaiting Planner/FnB
+recovery, or returned to review. Before stopping, re-run `sc sprint inbox
+--sprint <id>`, act on newly arrived messages, mark every handled informational
+message read with `accept`, and confirm the final typed handoff succeeded. Ask
+the Planner for later work only after the current editing lane is terminal.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -4080,9 +4091,10 @@ The returned ids are wake identities. Work-unit disposition and messages are
 the authoritative release facts. Dispatch is safe to repeat: occupied Developer
 lanes and stable assignment generations prevent double booking.
 
-Accept or decline only when the inbox item is actionable. Informational
-questions, answers, blockers, and evidence remain unread until you inspect them;
-reading them does not invent a work-unit transition.
+Accept or decline only when the inbox item is actionable. After acting on an
+informational question, answer, blocker, or evidence message, run `accept` for
+that message. For informational messages it only marks the message read; it does
+not change Sprint or work-unit state.
 
 ## Running loop
 
@@ -4118,10 +4130,11 @@ sc sprint send --sprint <id> --to <shortname> --body-file <path>
 ```
 
 Answer incoming questions through `send` so the answer is durable and wakes the
-asker. For a cross-unit blocker, send evidence, impact, and the exact action
-needed to every directly affected participant. Continue safe independent
-governance, but stop at a decision boundary when an answer is required. Do not
-spam duplicates when no response is immediate; unread recovery owns re-waking.
+asker, confirm that write, then mark the handled question read with `accept`.
+For a cross-unit blocker, send evidence, impact, and the exact action needed to
+every directly affected participant. Continue safe independent governance, but
+stop at a decision boundary when an answer is required. Do not spam duplicates
+when no response is immediate; unread recovery owns re-waking.
 
 Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
 characters is the hard maximum. Before submitting, run `wc -m < <path>` and
@@ -4129,15 +4142,16 @@ condense if needed. The handoff is complete only when the Sprint command exits
 successfully and confirms the durable write and wake where applicable.
 
 If a Sprint command is rejected or transport fails, the write or handoff is
-incomplete. Correct and retry when safe; if it cannot complete, send the exact
-failure to an eligible participant or surface it to FnB. For an integrity
-threat, pause first, confirm the pause, then relay the evidence:
+incomplete. Correct and retry when safe. If the relay itself fails, surface the
+attempted command and durable evidence to FnB; do not invent an alternate
+delivery protocol. When a Developer or Reviewer reports an integrity concern,
+evaluate its evidence, impact, and recommendation. Decide whether to continue,
+re-plan, or pause. Send any needed participant context before pausing; an active
+relay is not available after the lifecycle becomes paused.
 
 ```text
 sc sprint pause --sprint <id> --reason <integrity-threat>
 ```
-
-After the pause succeeds, use the `send` command above for the evidence.
 
 Revise only a still-planned lane; name its complete new projection so the
 before/after event is reviewable. Cancel only an unreleased lane, with the
@@ -4163,13 +4177,16 @@ Never edit the declined message into a different instruction.
 
 ## Pause and resume
 
-Any participant may pause immediately for an integrity threat. Effective pause
-comes first: transition durably, stop external Sprint services, persist
-interrupt intent, preserve every partial artifact, and notify Planner/FnB. Add
-judgment to the generated pause report after the boundary is safe.
+Developer and Reviewer participants report integrity concerns; the Planner or
+FnB decides whether to pause. When pause is warranted, transition durably, stop
+external Sprint services, persist interrupt intent, preserve every partial
+artifact, and retain the judgment and evidence for FnB recovery.
 
 Only Planner or FnB resumes. Review reconciliation for native runs, unread
 messages, pending wakes, work units, registered PRs, capacity, and spec drift.
+An exhausted recovery wake is one bounded fallback, not a retry loop. Preserve
+the unread message and failed wake as evidence, involve FnB for manual recovery,
+and do not create recursive fallbacks.
 Drift informs; it never silently blocks resume. Record the exact revision facts
 and choose continue, re-plan, or abort.
 
@@ -4189,8 +4206,9 @@ the next work assignment returns it to the persistent lane.
 
 When all planned delivery work is terminal and merged or explicitly no-code,
 re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message, confirm
-the final typed transition succeeded, stop dispatching, and invoke
-`sprint_close`. Do not fix close-out conformance findings inside this Sprint.',
+every handled informational message is marked read with `accept`, confirm the
+final typed transition succeeded, stop dispatching, and invoke `sprint_close`.
+Do not fix close-out conformance findings inside this Sprint.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -4349,6 +4367,11 @@ Decline an actionable request you cannot take, with a concrete reason:
 sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 ```
 
+Use `accept` or `decline` for actionable work. After acting on an informational
+question, answer, blocker, or context message, run `accept` for that message.
+For informational messages it only marks the message read; it does not change
+Sprint or work-unit state.
+
 ## Questions, answers, blockers, and failures
 
 Put a concrete question, answer, blocker, or useful context in a short body file
@@ -4360,8 +4383,9 @@ sc sprint send --sprint <id> --to <shortname> --body-file <path>
 ```
 
 Answer incoming questions through `send` so the answer is durable and wakes the
-asker. A blocker names evidence, impact, and the exact action needed, and goes to
-the Planner plus any directly affected Developer. Continue independent safe
+asker, confirm that write, then mark the handled question read with `accept`. A
+blocker or integrity concern goes to the Planner with concise evidence, impact,
+the exact action needed, and your recommendation. Continue independent safe
 review, but stop at a decision boundary when the answer is required. Do not send
 duplicate reminders; unread recovery owns re-waking.
 
@@ -4371,15 +4395,11 @@ condense if needed. The handoff is complete only when the Sprint command exits
 successfully and confirms the durable write and wake where applicable.
 
 If a Sprint command is rejected or transport fails, the verdict or handoff is
-incomplete. Correct and retry when safe; if it cannot complete, relay the exact
-failure to the Planner. For an integrity threat, pause first, confirm it, and
-then relay the evidence:
-
-```text
-sc sprint pause --sprint <id> --reason <integrity-threat>
-```
-
-After the pause succeeds, use the `send` command above for the evidence.
+incomplete. Correct and retry when safe. If the relay itself fails, surface the
+attempted command, evidence, impact, and recommendation to FnB; do not invent an
+alternate delivery protocol. A Reviewer does not pause the Sprint. The Planner
+decides whether the reported condition warrants continuing, re-planning, or
+pausing.
 
 ## Severity rubric
 
@@ -4479,7 +4499,8 @@ Surface immediate safety risk to the FnB, but preserve the close-out rule.
 
 For unit review, stop after the durable verdict is recorded. For conformance,
 re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and stop
-after the report and all findings replay idempotently and give the Planner their
+after marking every handled informational message read with `accept` and after
+the report and all findings replay idempotently and give the Planner their
 report/follow-up ids.',
   0
 )

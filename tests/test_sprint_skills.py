@@ -131,7 +131,6 @@ class SprintSkillTest(unittest.TestCase):
                     "sc sprint accept --sprint <id> --message <message-id>",
                     "sc sprint decline --sprint <id> --message <message-id>",
                     "sc sprint send --sprint <id> --to <shortname> --body-file <path>",
-                    "sc sprint pause --sprint <id> --reason <integrity-threat>",
                 ):
                     self.assertIn(command, body)
                 normalized = " ".join(body.lower().split())
@@ -146,6 +145,9 @@ class SprintSkillTest(unittest.TestCase):
                     "8,000",
                     "wc -m < <path>",
                     "command exits successfully",
+                    "informational message",
+                    "marks the message read",
+                    "does not change sprint or work-unit state",
                     "re-run `sc sprint inbox --sprint <id>`",
                 ):
                     self.assertIn(guidance, normalized)
@@ -158,6 +160,31 @@ class SprintSkillTest(unittest.TestCase):
                 )
                 for invented in ("ASK:", "ANSWER:", "BLOCKED:"):
                     self.assertNotIn(invented, body)
+
+    def test_pause_guidance_is_planner_owned_and_workers_report_before_stopping(self):
+        pause = "sc sprint pause --sprint <id> --reason <integrity-threat>"
+        for name in ("sprint_dev", "sprint_rev"):
+            with self.subTest(worker=name):
+                body = (ASSETS / name / "SKILL.md").read_text()
+                normalized = " ".join(body.lower().split())
+                self.assertNotIn(pause, body)
+                self.assertIn("evidence, impact", normalized)
+                self.assertIn("recommendation", normalized)
+                self.assertIn("does not pause the sprint", normalized)
+                self.assertIn("planner decides", normalized)
+                self.assertIn("relay itself fails", normalized)
+                self.assertIn("fnb", normalized)
+
+        for name in ("sprint_pln", "sprint_close"):
+            with self.subTest(planner=name):
+                body = (ASSETS / name / "SKILL.md").read_text()
+                normalized = " ".join(body.lower().split())
+                self.assertIn(pause, body)
+                self.assertIn("planner or fnb decides", normalized)
+                self.assertIn("relay itself fails", normalized)
+                self.assertIn("active relay is not available after", normalized)
+                self.assertIn("exhausted recovery wake", normalized)
+                self.assertIn("do not create recursive", normalized)
 
     def test_every_affected_file_argument_names_the_hard_ceiling(self):
         parser = sprint_cli.build_parser()

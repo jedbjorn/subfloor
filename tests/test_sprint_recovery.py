@@ -331,6 +331,58 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         self.assertEqual(replacement, lease.wake_id)
         self.assertEqual(1, lease.attempt_number)
 
+    def test_failed_recovery_wake_is_bounded_and_leaves_manual_evidence(self):
+        message = self.send("bounded-recovery-wake")
+        original = int(message.wake_id)
+        store = sprint_domain.SprintLifecycleStore(
+            self.con,
+            interrupt_run=lambda _run_id: True,
+            notify_commit=lambda: True,
+        )
+        coordinator = self.coordinator()
+
+        for error in ("original one", "original two", "original three"):
+            store.record_wake_failure(original, error)
+        first = coordinator.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="attempt one bounded recovery wake",
+        )
+        self.assertEqual(1, len(first.requeued_wake_ids))
+        replacement = first.requeued_wake_ids[0]
+
+        for error in ("fallback one", "fallback two", "fallback three"):
+            store.record_wake_failure(replacement, error)
+        second = coordinator.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="hand the durable failure evidence to FnB",
+        )
+
+        self.assertEqual((), second.requeued_wake_ids)
+        self.assertEqual(
+            (None, replacement, "failed", 3),
+            tuple(
+                self.con.execute(
+                    "SELECT m.read_at,wm.wake_id,w.state,w.attempt_count "
+                    "FROM sprint_messages m JOIN sprint_wake_messages wm "
+                    "USING (message_id) JOIN sprint_wake_outbox w USING (wake_id) "
+                    "WHERE m.message_id=?",
+                    (message.message_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_outbox WHERE sprint_id=? "
+                "AND (idempotency_key LIKE 'sprint-recovery:%' "
+                "OR idempotency_key LIKE '%:failed-wake:%')",
+                (self.sprint_id,),
+            ).fetchone()[0],
+            "the bounded fallback does not become a recursive recovery loop",
+        )
+
     def test_resume_repairs_delivered_unread_assignment_once(self):
         assignment = self.send(
             "pickup-assignment",
