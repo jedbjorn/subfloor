@@ -1,5 +1,6 @@
 {
   "allowed_reference_files": [
+    ".super-coder/assets/skill_tombstones.json",
     ".super-coder/migrations/0146_sprint_v2_domain.sql",
     ".super-coder/migrations/0147_sprint_participant_conversations.sql",
     ".super-coder/migrations/0148_sprint_message_delivery.sql",
@@ -46,6 +47,7 @@
     "tests/test_sprint_live_proof.py",
     "tests/test_sprint_board_api.py",
     "tests/test_sprint_board_ui.py",
+    "tests/test_skill_tombstones.py",
     "tests/fixtures/sprint_v2_acceptance.json",
     "tests/fixtures/sprint_handoff_hardening_acceptance.json",
     "tests/test_callable_floor.py",
