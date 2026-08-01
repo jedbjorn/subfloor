@@ -1,0 +1,2 @@
+Disposable collaboration proof fixture: parallel lane.
+Target is an isolated throwaway branch, never the default branch.
