@@ -608,7 +608,11 @@ UNIT
   loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
   # A pidfile-managed broker would hold the socket; stop it so systemd owns it.
   sc_vm_broker_down >/dev/null 2>&1 || true
-  systemctl --user enable --now "$VM_BROKER_UNIT"
+  # `enable --now` does not restart an already-active unit after ExecStart was
+  # rewritten (notably when the fork moved). Enable, then restart explicitly so
+  # the live process always executes the path in the freshly written unit.
+  systemctl --user enable "$VM_BROKER_UNIT"
+  systemctl --user restart "$VM_BROKER_UNIT"
   echo "→ vm-broker installed as systemd --user unit: $VM_BROKER_UNIT (enabled, started, linger on)"
   echo "  status: systemctl --user status $VM_BROKER_UNIT   ·   logs: journalctl --user -u $VM_BROKER_UNIT"
 }
@@ -679,7 +683,8 @@ UNIT
   loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
   # A pidfile-managed broker would hold the socket; stop it so systemd owns it.
   sc_ts_broker_down >/dev/null 2>&1 || true
-  systemctl --user enable --now "$TS_BROKER_UNIT"
+  systemctl --user enable "$TS_BROKER_UNIT"
+  systemctl --user restart "$TS_BROKER_UNIT"
   echo "→ ts-broker installed as systemd --user unit: $TS_BROKER_UNIT (enabled, started, linger on)"
   echo "  status: systemctl --user status $TS_BROKER_UNIT   ·   logs: journalctl --user -u $TS_BROKER_UNIT"
 }
@@ -751,7 +756,8 @@ UNIT
   loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
   # A pidfile-managed broker would hold the socket; stop it so systemd owns it.
   sc_pm2_broker_down >/dev/null 2>&1 || true
-  systemctl --user enable --now "$PM2_BROKER_UNIT"
+  systemctl --user enable "$PM2_BROKER_UNIT"
+  systemctl --user restart "$PM2_BROKER_UNIT"
   echo "→ pm2-broker installed as systemd --user unit: $PM2_BROKER_UNIT (enabled, started, linger on)"
   echo "  status: systemctl --user status $PM2_BROKER_UNIT   ·   logs: journalctl --user -u $PM2_BROKER_UNIT"
 }
@@ -825,7 +831,8 @@ UNIT
   systemctl --user daemon-reload
   loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
   sc_db_broker_down >/dev/null 2>&1 || true
-  systemctl --user enable --now "$DB_BROKER_UNIT"
+  systemctl --user enable "$DB_BROKER_UNIT"
+  systemctl --user restart "$DB_BROKER_UNIT"
   echo "→ db-broker installed as systemd --user unit: $DB_BROKER_UNIT (enabled, started, linger on)"
   echo "  DSN env-file: $envfile (create it host-side with: SC_RO_DSN=postgresql://…)"
   echo "  status: systemctl --user status $DB_BROKER_UNIT   ·   logs: journalctl --user -u $DB_BROKER_UNIT"

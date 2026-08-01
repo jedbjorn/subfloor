@@ -111,6 +111,40 @@ def run_script(name: str) -> None:
         sys.exit(f"update: {name} failed.")
 
 
+def refresh_installed_brokers() -> tuple[str, ...]:
+    """Rewrite and restart broker units that already belong to this fork.
+
+    The unit files embed absolute engine paths. A whole-repo move therefore
+    leaves an enabled service executing the old checkout even after the engine
+    update itself succeeds. Never opt a fork into a new broker here: only an
+    already-present unit is refreshed, through the same public install command
+    the operator originally used.
+    """
+    if os.environ.get("SC_SANDBOX") or shutil.which("systemctl") is None:
+        return ()
+    config_home = Path(
+        os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    )
+    unit_dir = config_home / "systemd" / "user"
+    refreshed: list[str] = []
+    repo_name = REPO_ROOT.name
+    for kind in ("vm", "ts", "pm2", "db"):
+        unit = unit_dir / f"sc-{kind}-broker-{repo_name}.service"
+        if not unit.is_file():
+            continue
+        command = f"{kind}-broker-install"
+        print(f"→ refresh installed {kind}-broker service (repo path may have moved)")
+        result = subprocess.run([str(REPO_ROOT / "sc"), command], cwd=REPO_ROOT)
+        if result.returncode != 0:
+            print(
+                f"  WARNING: {command} failed; unit remains at {unit}. "
+                f"Re-run `./sc {command}` after fixing systemd access."
+            )
+            continue
+        refreshed.append(kind)
+    return tuple(refreshed)
+
+
 def is_source_repo() -> bool:
     """The SOURCE repo (origin basename in install.SOURCE_REPO_NAMES — both
     names valid across the super-coder → subfloor rename) tracks the engine as
@@ -909,6 +943,11 @@ def main(argv: list[str]) -> int:
         print("  they reinstall on the next image build — normal `./sc restart` / `make dos-r`")
 
     migrate_with_service_cutover()
+
+    # Broker systemd units contain absolute ExecStart paths. Refresh only the
+    # services this fork had already installed so a moved repo does not keep
+    # running the pre-move engine after an otherwise successful update.
+    refresh_installed_brokers()
 
     print("→ sync skills catalogue (id-stable)")
     sync_skills()

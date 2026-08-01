@@ -184,6 +184,25 @@ class EnsureWorktreeTest(unittest.TestCase):
         self.assertEqual(git(wt, "symbolic-ref", "--short", "HEAD"),
                          "shell/pln1")
 
+    def test_repairs_existing_worktree_after_repo_relocation(self) -> None:
+        wt = self.repo / ".sc-worktrees" / "pln1"
+        with mock.patch.object(run_mod, "REPO_ROOT", self.repo):
+            ensure_worktree(wt, "PLN1")
+
+        moved = Path(self.tmp.name) / "Repos" / "fork"
+        moved.parent.mkdir()
+        self.repo.rename(moved)
+        moved_wt = moved / ".sc-worktrees" / "pln1"
+
+        with mock.patch.object(run_mod, "REPO_ROOT", moved):
+            ensure_worktree(moved_wt, "PLN1")
+
+        self.assertEqual(
+            Path(git(moved_wt, "rev-parse", "--show-toplevel")),
+            moved_wt,
+        )
+        self.assertIn(str(moved_wt), git(moved, "worktree", "list"))
+
 
 if __name__ == "__main__":
     unittest.main()
