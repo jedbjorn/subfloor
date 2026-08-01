@@ -1701,22 +1701,24 @@ def _transcript_projection(
 
         items = []
         retained_messages = set()
+        retained_runs = set()
         for message in message_rows:
             message_id = int(message["message_id"])
             order_sequence = accepted_sequence.get(message_id)
             message_runs = run_by_message.get(message_id, [])
-            loaded_complete = all(
-                evidence_count_by_run.get(int(run["run_id"]), 0)
-                == int(run["segmentation_evidence_count"])
+            projected_runs = [
+                run
                 for run in message_runs
-            )
-            non_terminal = any(
-                run["state"] in ("leased", "starting", "running")
-                for run in message_runs
-            )
-            if order_sequence is None or (not loaded_complete and not non_terminal):
+                if (
+                    evidence_count_by_run.get(int(run["run_id"]), 0)
+                    == int(run["segmentation_evidence_count"])
+                    or run["state"] in ("leased", "starting", "running")
+                )
+            ]
+            if order_sequence is None or (message_runs and not projected_runs):
                 continue
             retained_messages.add(message_id)
+            retained_runs.update(int(run["run_id"]) for run in projected_runs)
             items.append({
                 "item_id": f"message:{message_id}",
                 "kind": "user",
@@ -1729,7 +1731,7 @@ def _transcript_projection(
                 "completed_at": message["completed_at"],
                 "text_truncated": False,
             })
-            for run in message_runs:
+            for run in projected_runs:
                 run_id = int(run["run_id"])
                 segments = segments_by_run.get(run_id, {})
                 for anchor, deltas in sorted(
@@ -1761,15 +1763,16 @@ def _transcript_projection(
             )
             if message_id is not None and message_id not in retained_messages:
                 continue
+            run_id = event["run_id"]
+            if run_id is not None and int(run_id) not in retained_runs:
+                continue
             items.append({
                 "item_id": f"event:{event['sequence']}",
                 "kind": "activity",
                 "order_sequence": event["sequence"],
                 "message_id": message_id,
                 "run_id": (
-                    int(event["run_id"])
-                    if event["run_id"] is not None
-                    else None
+                    int(run_id) if run_id is not None else None
                 ),
                 "created_at": event["created_at"],
                 "activity_type": event["event_type"],

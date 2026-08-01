@@ -1819,6 +1819,116 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
         self.assertEqual(transcript["truncation"]["reason"], "source_event_limit")
         self.assertEqual(retained_source_rows, source_rows)
 
+    def test_segmented_terminal_suffix_is_omitted_with_active_sibling(
+        self,
+    ) -> None:
+        trace = next(
+            item
+            for item in HISTORICAL_SEGMENT_TRACES
+            if item["name"] == "prose_tool_prose"
+        )
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=715,
+                state="running",
+            )
+            message_id, terminal_run_id, sequence = self.seed_segmented_trace(
+                con,
+                conversation_id=conversation_id,
+                events=trace["events"],
+            )
+            active_run = con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,attempt,lease_owner,"
+                "lease_expires_at,state,started_at) "
+                "VALUES (?,1,?,2,'fixture','2026-07-30 13:00:00','running',"
+                "'2026-07-30 12:02:00')",
+                (conversation_id, message_id),
+            )
+            active_run_id = int(active_run.lastrowid)
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+                "VALUES (?,?,'run.failed',?,?,?)",
+                (
+                    conversation_id,
+                    sequence + 1,
+                    json.dumps({"error_code": "FIXTURE_TERMINAL_FAILURE"}),
+                    message_id,
+                    terminal_run_id,
+                ),
+            )
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+                "VALUES (?,?,'message.accepted',?,?,NULL)",
+                (
+                    conversation_id,
+                    sequence + 2,
+                    json.dumps({"text": "trace prompt", "attempt": 2}),
+                    message_id,
+                ),
+            )
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+                "VALUES (?,?,'run.started','{}',?,?)",
+                (conversation_id, sequence + 3, message_id, active_run_id),
+            )
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+                "VALUES (?,?,'assistant.delta',?,?,?)",
+                (
+                    conversation_id,
+                    sequence + 4,
+                    json.dumps({"text": "active suffix"}),
+                    message_id,
+                    active_run_id,
+                ),
+            )
+            con.execute(
+                "UPDATE conversations SET state='running' WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            con.commit()
+            transcript = conversation_routes._transcript_projection(
+                con,
+                conversation_id,
+                owner_user_id=1,
+                limits=conversation_routes.TranscriptLimits(
+                    max_turns=200,
+                    max_source_events=5,
+                    max_source_bytes=1_000_000,
+                    max_response_bytes=1_000_000,
+                ),
+            )
+
+        self.assertEqual(
+            [
+                (item["item_id"], item["kind"], item.get("text"))
+                for item in transcript["items"]
+            ],
+            [
+                (f"message:{message_id}", "user", "trace prompt"),
+                (
+                    f"run:{active_run_id}:assistant:0",
+                    "assistant",
+                    "active suffix",
+                ),
+            ],
+        )
+        self.assertFalse(any(
+            item.get("run_id") == terminal_run_id
+            for item in transcript["items"]
+        ))
+        self.assertEqual(transcript["truncation"]["reason"], "source_event_limit")
+        self.assertEqual(transcript["assistant_cursor"], {
+            "run_id": active_run_id,
+            "segment_anchor_sequence": 0,
+        })
+
     def test_transcript_caps_are_injected_explicit_and_never_mutate_sources(
         self,
     ) -> None:
