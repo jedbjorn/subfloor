@@ -401,7 +401,19 @@ class LiveSurfacesStillResolveTest(WorktreeFixture):
         self.addCleanup(self.live_db.chmod, db_mode)
 
     def test_model_list_and_resolve_read_the_read_only_live_database(self):
+        # The shell worktree may lag the installed floor.  Sabotage its tracked
+        # model script so success also proves the dispatcher reaches the
+        # canonical live-instance script and DB, not the stale caller copy.
+        stale_script = self.wt / ".super-coder" / "scripts" / "models.py"
+        stale_source = stale_script.read_bytes()
+        stale_script.write_text("raise SystemExit('STALE-WORKTREE-MODELS')\n")
+        self.addCleanup(stale_script.write_bytes, stale_source)
+
         con = sqlite3.connect(self.live_db)
+        self.assertEqual(
+            con.execute("PRAGMA journal_mode=WAL").fetchone()[0],
+            "wal",
+        )
         con.executescript(
             (self.main / ".super-coder" / "migrations" /
              "0075_model_routes.sql").read_text()
@@ -414,6 +426,8 @@ class LiveSurfacesStillResolveTest(WorktreeFixture):
         )
         con.commit()
         con.close()
+        self.assertFalse(Path(f"{self.live_db}-wal").exists())
+        self.assertFalse(Path(f"{self.live_db}-shm").exists())
         before = state_digest(self.main)
         self._make_live_engine_read_only()
 
@@ -423,21 +437,29 @@ class LiveSurfacesStillResolveTest(WorktreeFixture):
         )
 
         self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertNotIn("STALE-WORKTREE-MODELS", listed.stdout + listed.stderr)
         self.assertIn("codex/wt-live-model", listed.stdout)
         self.assertIn("live-marker", listed.stdout)
         self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.assertNotIn("STALE-WORKTREE-MODELS", resolved.stdout + resolved.stderr)
         self.assertEqual(json.loads(resolved.stdout)["selector"], "wt-live-model")
         self.assertEqual(state_digest(self.main), before)
         self.assertFalse((self.wt / ".super-coder" / "shell_db.db").exists())
 
     def test_skill_list_reads_the_read_only_live_database(self):
         con = sqlite3.connect(self.live_db)
+        self.assertEqual(
+            con.execute("PRAGMA journal_mode=WAL").fetchone()[0],
+            "wal",
+        )
         con.execute(
             "INSERT INTO skills (name, description, content, common, is_deleted) "
             "VALUES ('wt-live-skill', 'live marker', 'body', 0, 0)"
         )
         con.commit()
         con.close()
+        self.assertFalse(Path(f"{self.live_db}-wal").exists())
+        self.assertFalse(Path(f"{self.live_db}-shm").exists())
         before = state_digest(self.main)
         self._make_live_engine_read_only()
 

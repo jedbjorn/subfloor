@@ -115,10 +115,18 @@ class WriteTransactionTest(unittest.TestCase):
 
     def test_readonly_connection_skips_wal_and_enforces_query_only(self) -> None:
         con = db_driver.connect(self.path)
+        self.assertEqual(con.execute("PRAGMA journal_mode").fetchone()[0], "wal")
         con.execute("CREATE TABLE readable (value TEXT NOT NULL)")
         con.execute("INSERT INTO readable VALUES ('yes')")
         con.commit()
         con.close()
+        self.assertFalse(Path(f"{self.path}-wal").exists())
+        self.assertFalse(Path(f"{self.path}-shm").exists())
+        parent = self.path.parent
+        self.path.chmod(0o444)
+        parent.chmod(0o555)
+        self.addCleanup(parent.chmod, 0o755)
+        self.addCleanup(self.path.chmod, 0o644)
 
         with mock.patch.object(
             db_driver,
@@ -142,6 +150,43 @@ class WriteTransactionTest(unittest.TestCase):
         with self.assertRaises(sqlite3.OperationalError):
             db_driver.connect_readonly(missing)
         self.assertFalse(missing.exists())
+
+    def test_readonly_connection_keeps_uncheckpointed_live_wal_visible(self) -> None:
+        writer = db_driver.connect(self.path)
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE live_wal (value TEXT NOT NULL)")
+        writer.commit()
+        writer.execute("INSERT INTO live_wal VALUES ('current')")
+        writer.commit()
+        paths = [
+            self.path,
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+        ]
+        self.assertTrue(all(path.exists() for path in paths))
+        # WAL readers coordinate through the transient SHM index.  The hard
+        # read-only guarantee is that neither durable database content nor the
+        # WAL is changed by inspection.
+        durable = paths[:2]
+        before = {path: path.read_bytes() for path in durable}
+        try:
+            for path in paths:
+                path.chmod(0o444)
+            self.path.parent.chmod(0o555)
+            reader = db_driver.connect_readonly(self.path)
+            try:
+                self.assertEqual(
+                    reader.execute("SELECT value FROM live_wal").fetchone()[0],
+                    "current",
+                )
+            finally:
+                reader.close()
+            self.assertEqual({path: path.read_bytes() for path in durable}, before)
+        finally:
+            self.path.parent.chmod(0o755)
+            for path in paths:
+                path.chmod(0o644)
+            writer.close()
 
     def test_rolls_back_the_whole_body_on_failure(self) -> None:
         timings: list[db_driver.WriteTransactionTiming] = []
