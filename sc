@@ -1210,7 +1210,16 @@ case "$cmd" in
   # THIS repo into session_token_usage (incremental, idempotent; doc #11).
   analytics)    exec "$PY" "$S/analytics.py" "$@" ;;
   models)       exec "$PY" "$S/models.py" "$@" ;;
-  seed-skills)  exec "$PY" "$S/seed_skills.py" ;;
+  # Like render-check, seed generation authors the CALLER's tracked engine
+  # source. A linked source worktree must never regenerate the main checkout's
+  # 0001 from a different branch's assets or upsert that shared live DB.
+  seed-skills)  if [ ! -f "$CALLER_ENGINE/scripts/seed_skills.py" ]; then
+                  echo "✗ ./sc seed-skills: no engine source at $CALLER_ENGINE" >&2
+                  echo "  seed-skills authors THIS checkout's tracked catalogue; it does not" >&2
+                  echo "  fall back to the live instance at $LIVE_ROOT." >&2
+                  exit 1
+                fi
+                exec "$PY" "$CALLER_ENGINE/scripts/seed_skills.py" ;;
   # Skill catalogue write surface — grants/retirement by name, loud on a miss
   # (the raw-SQL grant's silent no-op class). Snapshot is still the persist step.
   skill)        exec "$PY" "$S/skill.py" "$@" ;;
