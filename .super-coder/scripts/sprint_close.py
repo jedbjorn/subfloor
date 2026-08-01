@@ -183,7 +183,10 @@ class SprintCloseStore:
         if disposition in {"resolved", "dismissed"} and not normalized_resolution:
             raise ValueError(f"{disposition} follow-ups require a resolution")
         if len(normalized_resolution) > 8000:
-            raise ValueError("follow-up resolution exceeds 8000 characters")
+            raise ValueError(
+                f"follow-up resolution is {len(normalized_resolution)} characters; "
+                "maximum is 8000"
+            )
         with db_driver.write_transaction(self.con, "sprint.followup.disposition"):
             caller = self.con.execute(
                 "SELECT flavor FROM shells WHERE shell_id=? "
@@ -694,7 +697,9 @@ class SprintCloseStore:
         if not value:
             raise ValueError(f"{name} is required")
         if len(value) > maximum:
-            raise ValueError(f"{name} exceeds {maximum} characters")
+            raise ValueError(
+                f"{name} is {len(value)} characters; maximum is {maximum}"
+            )
         return value
 
     @staticmethod

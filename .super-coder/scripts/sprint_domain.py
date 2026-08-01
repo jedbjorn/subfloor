@@ -1765,7 +1765,10 @@ class SprintWorkUnitStore:
         if not result:
             raise ValueError("work-unit completion result is required")
         if len(result) > 8000:
-            raise ValueError("work-unit completion result exceeds 8000 characters")
+            raise ValueError(
+                f"work-unit completion result is {len(result)} characters; "
+                "maximum is 8000"
+            )
         with db_driver.write_transaction(self.con, "sprint.work_unit.complete"):
             unit = self._unit(sprint_id, work_unit_id)
             if int(unit["assigned_shell_id"]) != shell_id:

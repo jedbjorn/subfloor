@@ -9,6 +9,8 @@ common: false
 
 Use as the originating Planner after `sprint_prep` arms the Sprint. The system
 captures deterministic facts; you decide scope, sequencing, and recovery.
+On every wake or re-entry, load `sprint_pln`, run the exact inbox command below,
+and inspect the durable message before deciding what to do.
 
 ## Start from durable state
 
@@ -20,6 +22,7 @@ observation, not activity; never manufacture progress from browser presence.
 ```text
 sc sprint inbox --sprint <id>
 sc sprint accept --sprint <id> --message <message-id>
+sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 ```
 
 Release every dependency-ready lane through the production surface:
@@ -31,6 +34,10 @@ sc sprint dispatch --sprint <id>
 The returned ids are wake identities. Work-unit disposition and messages are
 the authoritative release facts. Dispatch is safe to repeat: occupied Developer
 lanes and stable assignment generations prevent double booking.
+
+Accept or decline only when the inbox item is actionable. Informational
+questions, answers, blockers, and evidence remain unread until you inspect them;
+reading them does not invent a work-unit transition.
 
 ## Running loop
 
@@ -55,6 +62,37 @@ sc sprint monitor --sprint <id>
 
 Do not poll this command on a schedule. It evaluates only due accepted
 expectations and its nudge/escalation identities are durable.
+
+## Questions, answers, blockers, and failures
+
+Put a concrete question, answer, decision, blocker, or useful context in a short
+body file and address the participant who owns the needed fact or action:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path>
+```
+
+Answer incoming questions through `send` so the answer is durable and wakes the
+asker. For a cross-unit blocker, send evidence, impact, and the exact action
+needed to every directly affected participant. Continue safe independent
+governance, but stop at a decision boundary when an answer is required. Do not
+spam duplicates when no response is immediate; unread recovery owns re-waking.
+
+Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
+characters is the hard maximum. Before submitting, run `wc -m < <path>` and
+condense if needed. The handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake where applicable.
+
+If a Sprint command is rejected or transport fails, the write or handoff is
+incomplete. Correct and retry when safe; if it cannot complete, send the exact
+failure to an eligible participant or surface it to FnB. For an integrity
+threat, pause first, confirm the pause, then relay the evidence:
+
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
+```
+
+After the pause succeeds, use the `send` command above for the evidence.
 
 Revise only a still-planned lane; name its complete new projection so the
 before/after event is reviewable. Cancel only an unreleased lane, with the
@@ -105,5 +143,6 @@ outcomes move the Developer to fresh fix/merge conversations automatically;
 the next work assignment returns it to the persistent lane.
 
 When all planned delivery work is terminal and merged or explicitly no-code,
-stop dispatching and invoke `sprint_close`. Do not fix close-out conformance
-findings inside this Sprint.
+re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message, confirm
+the final typed transition succeeded, stop dispatching, and invoke
+`sprint_close`. Do not fix close-out conformance findings inside this Sprint.

@@ -165,6 +165,111 @@ class SprintCloseMigrationTest(unittest.TestCase):
 
 
 class ConformanceFollowupTest(SprintCloseCase):
+    def test_close_payloads_accept_8000_and_reject_8001_without_partial_writes(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "conformance body is 8001 characters; maximum is 8000",
+        ):
+            self.close.record_conformance(
+                self.sprint_id,
+                2,
+                body="x" * 8001,
+                findings=[],
+                idempotency_key="oversize-conformance",
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            "finding body is 8001 characters; maximum is 8000",
+        ):
+            self.close.record_conformance(
+                self.sprint_id,
+                2,
+                body="bounded",
+                findings=[self.finding(body="x" * 8001)],
+                idempotency_key="oversize-finding",
+            )
+        self.assertEqual(
+            (0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT (SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=?),"
+                    "(SELECT COUNT(*) FROM sprint_followups WHERE sprint_id=?)",
+                    (self.sprint_id, self.sprint_id),
+                ).fetchone()
+            ),
+        )
+
+        conformance = self.close.record_conformance(
+            self.sprint_id,
+            2,
+            body="x" * 8000,
+            findings=[self.finding(body="x" * 8000)],
+            idempotency_key="bounded-conformance",
+        )
+        self.assertTrue(conformance.created)
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (5,'FnB','FNB','admin','prompt',1)"
+        )
+        self.con.commit()
+        with self.assertRaisesRegex(
+            ValueError,
+            "follow-up resolution is 8001 characters; maximum is 8000",
+        ):
+            self.close.disposition_followup(
+                self.sprint_id,
+                conformance.followup_ids[0],
+                5,
+                disposition="resolved",
+                resolution="x" * 8001,
+            )
+        self.assertEqual(
+            ("pending", None),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,resolution FROM sprint_followups "
+                    "WHERE followup_id=?",
+                    (conformance.followup_ids[0],),
+                ).fetchone()
+            ),
+        )
+        self.assertTrue(
+            self.close.disposition_followup(
+                self.sprint_id,
+                conformance.followup_ids[0],
+                5,
+                disposition="resolved",
+                resolution="x" * 8000,
+            )
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "final report body is 8001 characters; maximum is 8000",
+        ):
+            self.close.record_final_report(
+                self.sprint_id,
+                3,
+                body="x" * 8001,
+                idempotency_key="oversize-final",
+            )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=? "
+                "AND report_kind='final'",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+        final = self.close.record_final_report(
+            self.sprint_id,
+            3,
+            body="x" * 8000,
+            idempotency_key="bounded-final",
+        )
+        self.assertTrue(final.created)
+
     def test_database_rejects_cross_sprint_report_and_spec_links(self):
         other_sprint_id, _ = self.create_sprint()
         other_report_id = int(

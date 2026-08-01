@@ -9,6 +9,43 @@ common: false
 
 Use as the owning Planner when delivery work is terminal, or when abort has
 been chosen. Close-out supplies meaning; the compiler supplies facts.
+On entry or any wake, load `sprint_close`, run `sc sprint inbox --sprint <id>`,
+inspect the durable message, and accept or decline it only when actionable.
+
+```text
+sc sprint accept --sprint <id> --message <message-id>
+sc sprint decline --sprint <id> --message <message-id> --reason <reason>
+```
+
+## Questions, answers, blockers, and failures
+
+Put a concrete question, answer, blocker, or context request in a short body
+file, then send it to the conformance Reviewer or participant who owns the fact:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path>
+```
+
+Answer incoming questions through `send`. For a blocker, send the evidence,
+impact, and exact action needed to the originating Planner/FnB and every directly
+affected participant. Continue safe synthesis, but stop at a decision boundary
+when the answer is required. Do not send duplicate reminders; unread recovery
+owns re-waking.
+
+Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
+characters is the hard maximum. Before submitting, run `wc -m < <path>` and
+condense if needed. The handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake where applicable.
+
+If a Sprint command is rejected or transport fails, the write or handoff is
+incomplete. Correct and retry when safe; relay the exact failure if it cannot
+complete. For an integrity threat, pause first, confirm it, then send evidence:
+
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
+```
+
+After the pause succeeds, use the `send` command above for the evidence.
 
 ## Delivery-complete gate
 
@@ -38,6 +75,9 @@ synthesis.
 
 FnB records one terminal disposition per follow-up. `accepted` acknowledges
 ship-as-is; `resolved` and `dismissed` require a resolution file.
+
+Keep a resolution at about 6,000 characters or fewer; 8,000 is the hard
+maximum. Run `wc -m < <path>` and require a successful durable disposition.
 
 ```text
 sc sprint disposition-followup --sprint <id> --followup <id> \
@@ -112,6 +152,10 @@ Abort only under Planner or FnB authority. Terminal state stops Sprint services
 and removes live pills while retaining conversations, messages, events, PR
 evidence, reports, and follow-ups.
 
+Keep the final report at about 6,000 characters or fewer; 8,000 is the hard
+maximum. Run `wc -m < <path>` before the typed terminal handoff, then require
+the successful report receipt and lifecycle transition.
+
 ```text
 sc sprint complete --sprint <id> --reason <summary> --outcome <outcome> \
   --report-file <path> --key <stable-key>
@@ -119,4 +163,5 @@ sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
 ```
 
 Hand the FnB the final report id, follow-up list, integrated SHA, and evidence
-links. Stop after the terminal transition; Sprint-scoped authority is over.
+links. Re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message,
+and stop after the terminal transition; Sprint-scoped authority is over.

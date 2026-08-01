@@ -87,6 +87,7 @@ class SprintSkillTest(unittest.TestCase):
             "replan-unit",
             "arm",
             "inbox",
+            "send",
             "accept",
             "decline",
             "complete-unit",
@@ -119,3 +120,63 @@ class SprintSkillTest(unittest.TestCase):
             if isinstance(action, sprint_cli.argparse._SubParsersAction)
         ).choices
         self.assertEqual(expected, set(commands))
+
+    def test_role_skills_cover_every_handoff_contingency_with_real_commands(self):
+        role_skills = {"sprint_pln", "sprint_dev", "sprint_rev", "sprint_close"}
+        for name in role_skills:
+            with self.subTest(name=name):
+                body = (ASSETS / name / "SKILL.md").read_text()
+                for command in (
+                    "sc sprint inbox --sprint <id>",
+                    "sc sprint accept --sprint <id> --message <message-id>",
+                    "sc sprint decline --sprint <id> --message <message-id>",
+                    "sc sprint send --sprint <id> --to <shortname> --body-file <path>",
+                    "sc sprint pause --sprint <id> --reason <integrity-threat>",
+                ):
+                    self.assertIn(command, body)
+                normalized = " ".join(body.lower().split())
+                for guidance in (
+                    "on every wake" if name != "sprint_close" else "on entry or any wake",
+                    "incoming question",
+                    "blocker",
+                    "decision boundary",
+                    "duplicate",
+                    "command is rejected or transport fails",
+                    "6,000 characters",
+                    "8,000",
+                    "wc -m < <path>",
+                    "command exits successfully",
+                    "re-run `sc sprint inbox --sprint <id>`",
+                ):
+                    self.assertIn(guidance, normalized)
+                self.assertEqual(
+                    1,
+                    body.count(
+                        "sc sprint send --sprint <id> --to <shortname> "
+                        "--body-file <path>"
+                    ),
+                )
+                for invented in ("ASK:", "ANSWER:", "BLOCKED:"):
+                    self.assertNotIn(invented, body)
+
+    def test_every_affected_file_argument_names_the_hard_ceiling(self):
+        parser = sprint_cli.build_parser()
+        commands = next(
+            action
+            for action in parser._actions
+            if isinstance(action, sprint_cli.argparse._SubParsersAction)
+        ).choices
+        for command, arguments in {
+            "send": ("--body-file",),
+            "complete-unit": ("--result-file",),
+            "request-review": ("--readiness-file",),
+            "record-review": ("--body-file",),
+            "record-conformance": ("--body-file", "--findings-file"),
+            "disposition-followup": ("--resolution-file",),
+            "complete": ("--report-file",),
+        }.items():
+            with self.subTest(command=command):
+                help_text = commands[command].format_help()
+                for argument in arguments:
+                    self.assertIn(argument, help_text)
+                self.assertIn("8,000 characters", help_text)

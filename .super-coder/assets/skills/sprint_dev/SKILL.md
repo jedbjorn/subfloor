@@ -10,6 +10,8 @@ common: false
 Use for an actionable work-unit assignment in an armed Sprint. Marking that
 Sprint message read is acceptance and starts work immediately. If you cannot
 accept, decline with a concrete reason; never leave it unread and waking.
+On every wake or re-entry, load `sprint_dev`, run the exact inbox command below,
+and inspect the durable message before deciding what to do.
 
 ```text
 sc sprint inbox --sprint <id>
@@ -29,6 +31,39 @@ unit's scope, record the choice and rationale, and continue. Escalate changes to
 the unit boundary, interfaces another unit consumes, deliverable cuts, or scope
 growth to the Planner.
 
+## Questions, answers, blockers, and failures
+
+Write a concrete question, answer, blocker, or useful context to a short body
+file, then send it durably to the participant who can act:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path>
+```
+
+Ask the Planner about scope, priority, or cross-unit decisions; ask the assigned
+Reviewer about review evidence. Answer an incoming question through `send` so it
+wakes the asker. For a blocker, send evidence, impact, and the exact action
+needed to the Planner and any directly affected participant. Continue safe
+independent work, but stop at a decision boundary when the answer is required.
+No immediate response is not a reason to send duplicates: the durable message
+and recovery reconciler own re-waking.
+
+Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
+characters is the hard maximum. Before submitting, run `wc -m < <path>` and
+condense if needed. The handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake where applicable.
+
+If a Sprint command is rejected or transport fails, the write or handoff is
+incomplete. Correct and retry when safe; if it still cannot complete, relay the
+problem to the Planner. For an integrity threat, pause first, confirm the pause,
+then send the evidence needed to resolve it:
+
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
+```
+
+After the pause succeeds, use the `send` command above for the evidence.
+
 ## Build and verify
 
 Sync the assigned repository, work on a feature branch, match the surrounding
@@ -43,6 +78,10 @@ known departures for the final report.
 An explicitly planned report-only or no-code lane completes with its durable
 result instead of a PR. Code lanes cannot use this path; they complete only
 after merge authorization and observation.
+
+Keep the result at about 6,000 characters or fewer; 8,000 is the hard maximum.
+Run `wc -m < <path>` before submitting, then require a successful command and
+durable completion receipt.
 
 ```text
 sc sprint complete-unit --sprint <id> --work-unit <id> \
@@ -62,6 +101,10 @@ sc sprint register-pr --sprint <id> --repository <owner/name> \
 ## Review handoff
 
 Put the readiness claim in a file, then use one stable retry key:
+
+Keep the readiness claim at about 6,000 characters or fewer; 8,000 is the hard
+maximum. Run `wc -m < <path>` and condense before the typed handoff. The handoff
+exists only after the command succeeds and confirms its durable write and wake.
 
 ```text
 sc sprint request-review \
@@ -103,5 +146,6 @@ sc sprint pause --sprint <id> --reason <integrity-threat>
 ```
 
 Stop when the unit is merged and reported, declined, paused awaiting recovery,
-or returned to review. Ask the Planner for later work only after the current
-editing lane is terminal.
+or returned to review. Before stopping, re-run `sc sprint inbox --sprint <id>`,
+act on any newly arrived message, and confirm the final typed handoff succeeded.
+Ask the Planner for later work only after the current editing lane is terminal.

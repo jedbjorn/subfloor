@@ -3724,6 +3724,43 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 
 Use as the owning Planner when delivery work is terminal, or when abort has
 been chosen. Close-out supplies meaning; the compiler supplies facts.
+On entry or any wake, load `sprint_close`, run `sc sprint inbox --sprint <id>`,
+inspect the durable message, and accept or decline it only when actionable.
+
+```text
+sc sprint accept --sprint <id> --message <message-id>
+sc sprint decline --sprint <id> --message <message-id> --reason <reason>
+```
+
+## Questions, answers, blockers, and failures
+
+Put a concrete question, answer, blocker, or context request in a short body
+file, then send it to the conformance Reviewer or participant who owns the fact:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path>
+```
+
+Answer incoming questions through `send`. For a blocker, send the evidence,
+impact, and exact action needed to the originating Planner/FnB and every directly
+affected participant. Continue safe synthesis, but stop at a decision boundary
+when the answer is required. Do not send duplicate reminders; unread recovery
+owns re-waking.
+
+Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
+characters is the hard maximum. Before submitting, run `wc -m < <path>` and
+condense if needed. The handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake where applicable.
+
+If a Sprint command is rejected or transport fails, the write or handoff is
+incomplete. Correct and retry when safe; relay the exact failure if it cannot
+complete. For an integrity threat, pause first, confirm it, then send evidence:
+
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
+```
+
+After the pause succeeds, use the `send` command above for the evidence.
 
 ## Delivery-complete gate
 
@@ -3753,6 +3790,9 @@ synthesis.
 
 FnB records one terminal disposition per follow-up. `accepted` acknowledges
 ship-as-is; `resolved` and `dismissed` require a resolution file.
+
+Keep a resolution at about 6,000 characters or fewer; 8,000 is the hard
+maximum. Run `wc -m < <path>` and require a successful durable disposition.
 
 ```text
 sc sprint disposition-followup --sprint <id> --followup <id> \
@@ -3827,6 +3867,10 @@ Abort only under Planner or FnB authority. Terminal state stops Sprint services
 and removes live pills while retaining conversations, messages, events, PR
 evidence, reports, and follow-ups.
 
+Keep the final report at about 6,000 characters or fewer; 8,000 is the hard
+maximum. Run `wc -m < <path>` before the typed terminal handoff, then require
+the successful report receipt and lifecycle transition.
+
 ```text
 sc sprint complete --sprint <id> --reason <summary> --outcome <outcome> \
   --report-file <path> --key <stable-key>
@@ -3834,7 +3878,8 @@ sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
 ```
 
 Hand the FnB the final report id, follow-up list, integrated SHA, and evidence
-links. Stop after the terminal transition; Sprint-scoped authority is over.',
+links. Re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message,
+and stop after the terminal transition; Sprint-scoped authority is over.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -3853,6 +3898,8 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 Use for an actionable work-unit assignment in an armed Sprint. Marking that
 Sprint message read is acceptance and starts work immediately. If you cannot
 accept, decline with a concrete reason; never leave it unread and waking.
+On every wake or re-entry, load `sprint_dev`, run the exact inbox command below,
+and inspect the durable message before deciding what to do.
 
 ```text
 sc sprint inbox --sprint <id>
@@ -3872,6 +3919,39 @@ unit''s scope, record the choice and rationale, and continue. Escalate changes t
 the unit boundary, interfaces another unit consumes, deliverable cuts, or scope
 growth to the Planner.
 
+## Questions, answers, blockers, and failures
+
+Write a concrete question, answer, blocker, or useful context to a short body
+file, then send it durably to the participant who can act:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path>
+```
+
+Ask the Planner about scope, priority, or cross-unit decisions; ask the assigned
+Reviewer about review evidence. Answer an incoming question through `send` so it
+wakes the asker. For a blocker, send evidence, impact, and the exact action
+needed to the Planner and any directly affected participant. Continue safe
+independent work, but stop at a decision boundary when the answer is required.
+No immediate response is not a reason to send duplicates: the durable message
+and recovery reconciler own re-waking.
+
+Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
+characters is the hard maximum. Before submitting, run `wc -m < <path>` and
+condense if needed. The handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake where applicable.
+
+If a Sprint command is rejected or transport fails, the write or handoff is
+incomplete. Correct and retry when safe; if it still cannot complete, relay the
+problem to the Planner. For an integrity threat, pause first, confirm the pause,
+then send the evidence needed to resolve it:
+
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
+```
+
+After the pause succeeds, use the `send` command above for the evidence.
+
 ## Build and verify
 
 Sync the assigned repository, work on a feature branch, match the surrounding
@@ -3886,6 +3966,10 @@ known departures for the final report.
 An explicitly planned report-only or no-code lane completes with its durable
 result instead of a PR. Code lanes cannot use this path; they complete only
 after merge authorization and observation.
+
+Keep the result at about 6,000 characters or fewer; 8,000 is the hard maximum.
+Run `wc -m < <path>` before submitting, then require a successful command and
+durable completion receipt.
 
 ```text
 sc sprint complete-unit --sprint <id> --work-unit <id> \
@@ -3905,6 +3989,10 @@ sc sprint register-pr --sprint <id> --repository <owner/name> \
 ## Review handoff
 
 Put the readiness claim in a file, then use one stable retry key:
+
+Keep the readiness claim at about 6,000 characters or fewer; 8,000 is the hard
+maximum. Run `wc -m < <path>` and condense before the typed handoff. The handoff
+exists only after the command succeeds and confirms its durable write and wake.
 
 ```text
 sc sprint request-review \
@@ -3946,8 +4034,9 @@ sc sprint pause --sprint <id> --reason <integrity-threat>
 ```
 
 Stop when the unit is merged and reported, declined, paused awaiting recovery,
-or returned to review. Ask the Planner for later work only after the current
-editing lane is terminal.',
+or returned to review. Before stopping, re-run `sc sprint inbox --sprint <id>`,
+act on any newly arrived message, and confirm the final typed handoff succeeded.
+Ask the Planner for later work only after the current editing lane is terminal.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -3965,6 +4054,8 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 
 Use as the originating Planner after `sprint_prep` arms the Sprint. The system
 captures deterministic facts; you decide scope, sequencing, and recovery.
+On every wake or re-entry, load `sprint_pln`, run the exact inbox command below,
+and inspect the durable message before deciding what to do.
 
 ## Start from durable state
 
@@ -3976,6 +4067,7 @@ observation, not activity; never manufacture progress from browser presence.
 ```text
 sc sprint inbox --sprint <id>
 sc sprint accept --sprint <id> --message <message-id>
+sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 ```
 
 Release every dependency-ready lane through the production surface:
@@ -3987,6 +4079,10 @@ sc sprint dispatch --sprint <id>
 The returned ids are wake identities. Work-unit disposition and messages are
 the authoritative release facts. Dispatch is safe to repeat: occupied Developer
 lanes and stable assignment generations prevent double booking.
+
+Accept or decline only when the inbox item is actionable. Informational
+questions, answers, blockers, and evidence remain unread until you inspect them;
+reading them does not invent a work-unit transition.
 
 ## Running loop
 
@@ -4011,6 +4107,37 @@ sc sprint monitor --sprint <id>
 
 Do not poll this command on a schedule. It evaluates only due accepted
 expectations and its nudge/escalation identities are durable.
+
+## Questions, answers, blockers, and failures
+
+Put a concrete question, answer, decision, blocker, or useful context in a short
+body file and address the participant who owns the needed fact or action:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path>
+```
+
+Answer incoming questions through `send` so the answer is durable and wakes the
+asker. For a cross-unit blocker, send evidence, impact, and the exact action
+needed to every directly affected participant. Continue safe independent
+governance, but stop at a decision boundary when an answer is required. Do not
+spam duplicates when no response is immediate; unread recovery owns re-waking.
+
+Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
+characters is the hard maximum. Before submitting, run `wc -m < <path>` and
+condense if needed. The handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake where applicable.
+
+If a Sprint command is rejected or transport fails, the write or handoff is
+incomplete. Correct and retry when safe; if it cannot complete, send the exact
+failure to an eligible participant or surface it to FnB. For an integrity
+threat, pause first, confirm the pause, then relay the evidence:
+
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
+```
+
+After the pause succeeds, use the `send` command above for the evidence.
 
 Revise only a still-planned lane; name its complete new projection so the
 before/after event is reviewable. Cancel only an unreleased lane, with the
@@ -4061,8 +4188,9 @@ outcomes move the Developer to fresh fix/merge conversations automatically;
 the next work assignment returns it to the persistent lane.
 
 When all planned delivery work is terminal and merged or explicitly no-code,
-stop dispatching and invoke `sprint_close`. Do not fix close-out conformance
-findings inside this Sprint.',
+re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message, confirm
+the final typed transition succeeded, stop dispatching, and invoke
+`sprint_close`. Do not fix close-out conformance findings inside this Sprint.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -4202,6 +4330,8 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 
 Use in one of two modes: a work-unit PR review during the loop, or the final
 whole-Sprint conformance pass. The evidence differs; independence does not.
+On every wake or re-entry, load `sprint_rev`, run the exact inbox command below,
+and inspect the durable message before deciding what to do.
 
 Read and accept the actionable request before beginning. During preparation,
 sign the exact current spec revision through the same authenticated surface:
@@ -4212,6 +4342,44 @@ sc sprint accept --sprint <id> --message <message-id>
 sc sprint record-qaqc --document <spec-document-id> \
   --verdict pass [--findings-document <document-id>]
 ```
+
+Decline an actionable request you cannot take, with a concrete reason:
+
+```text
+sc sprint decline --sprint <id> --message <message-id> --reason <reason>
+```
+
+## Questions, answers, blockers, and failures
+
+Put a concrete question, answer, blocker, or useful context in a short body file
+and send it to the participant who can act. Ask the Developer for missing PR
+evidence and the Planner for scope or severity decisions:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path>
+```
+
+Answer incoming questions through `send` so the answer is durable and wakes the
+asker. A blocker names evidence, impact, and the exact action needed, and goes to
+the Planner plus any directly affected Developer. Continue independent safe
+review, but stop at a decision boundary when the answer is required. Do not send
+duplicate reminders; unread recovery owns re-waking.
+
+Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
+characters is the hard maximum. Before submitting, run `wc -m < <path>` and
+condense if needed. The handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake where applicable.
+
+If a Sprint command is rejected or transport fails, the verdict or handoff is
+incomplete. Correct and retry when safe; if it cannot complete, relay the exact
+failure to the Planner. For an integrity threat, pause first, confirm it, and
+then relay the evidence:
+
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
+```
+
+After the pause succeeds, use the `send` command above for the evidence.
 
 ## Severity rubric
 
@@ -4246,6 +4414,10 @@ Findings must state:
 - the fix boundary, without prescribing unnecessary architecture.
 
 Put the verdict body in a file and record it through the authenticated surface:
+
+Keep the verdict at about 6,000 characters or fewer; 8,000 is the hard maximum.
+Run `wc -m < <path>` before submission. The typed review handoff exists only
+after the command succeeds and confirms its durable write and Developer wake.
 
 ```text
 sc sprint record-review \
@@ -4287,6 +4459,11 @@ Write the narrative report and a JSON findings array:
 
 Then record both atomically:
 
+Keep the conformance report and each finding body at about 6,000 characters or
+fewer; 8,000 is the hard maximum for each. Run `wc -m < <report>` and length-check
+each finding body before submission. Require the successful report and
+follow-up receipt before stopping.
+
 ```text
 sc sprint record-conformance \
   --sprint <id> --body-file <report> --findings-file <json> \
@@ -4301,8 +4478,9 @@ Surface immediate safety risk to the FnB, but preserve the close-out rule.
 ## Stop
 
 For unit review, stop after the durable verdict is recorded. For conformance,
-stop after the report and all findings replay idempotently and give the Planner
-their report/follow-up ids.',
+re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and stop
+after the report and all findings replay idempotently and give the Planner their
+report/follow-up ids.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET

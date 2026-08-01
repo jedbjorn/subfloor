@@ -302,6 +302,46 @@ class DispatchGateTest(SprintWorkDispatchCase):
             "Published conformance report #77", json.loads(event[0])["result"]
         )
 
+    def test_non_code_result_accepts_8000_and_rejects_8001_without_state_change(self):
+        report = self.create_unit(
+            developer=1,
+            title="Bounded report",
+            output_kind="report_only",
+        )
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.messages.mark_read(self.assignment_message(report), 1)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "work-unit completion result is 8001 characters; maximum is 8000",
+        ):
+            self.units.complete(self.sprint_id, report, 1, result="x" * 8001)
+        self.assertEqual(
+            ("active", None),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,completion_result FROM sprint_work_units "
+                    "WHERE work_unit_id=?",
+                    (report,),
+                ).fetchone()
+            ),
+        )
+
+        self.assertEqual(
+            [],
+            self.units.complete(self.sprint_id, report, 1, result="x" * 8000),
+        )
+        self.assertEqual(
+            ("completed", 8000),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,length(completion_result) "
+                    "FROM sprint_work_units WHERE work_unit_id=?",
+                    (report,),
+                ).fetchone()
+            ),
+        )
+
     def test_planner_cancels_only_unreleased_lane_with_reason(self) -> None:
         cancelled = self.create_unit(developer=1, title="Cancelled")
         self.assertTrue(
