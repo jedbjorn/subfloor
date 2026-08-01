@@ -44,7 +44,7 @@ def _mini_db() -> sqlite3.Connection:
                     [(1, "dev", 0), (2, "dev", 0), (3, "reviewer", 0),
                      (4, "admin", 0), (5, "dev", 1),      # deleted — never granted
                      (6, "planner", 0)])
-    con.execute("INSERT INTO skills (skill_id, name) VALUES (10, 'test_authoring_pg')")
+    con.execute("INSERT INTO skills (skill_id, name) VALUES (10, 'query_authoring_pg')")
     return con
 
 
@@ -96,19 +96,25 @@ class RegistryIntegrityTest(unittest.TestCase):
         self.assertIn("d['pg']={}", sc.replace(" ", ""),
                       "sc pg-init no longer writes the `pg` key feature.py expects")
 
+    def test_pg_grants_only_diagnostic_sql(self):
+        self.assertEqual(
+            feature.FEATURES["pg"]["grants"],
+            {"query_authoring_pg": ["dev", "reviewer", "planner"]},
+        )
+
 
 class GrantRevokeTest(unittest.TestCase):
     def test_grant_targets_each_named_flavor_once(self):
         con = _mini_db()
-        n = feature.grant(con, "test_authoring_pg", ["dev", "reviewer"])
+        n = feature.grant(con, "query_authoring_pg", ["dev", "reviewer"])
         self.assertEqual(n, 2)
         rows = {r[0] for r in con.execute("SELECT flavor FROM flavor_skills")}
         self.assertEqual(rows, {"dev", "reviewer"})
 
     def test_grant_is_idempotent(self):
         con = _mini_db()
-        feature.grant(con, "test_authoring_pg", ["dev"])
-        n = feature.grant(con, "test_authoring_pg", ["dev"])
+        feature.grant(con, "query_authoring_pg", ["dev"])
+        n = feature.grant(con, "query_authoring_pg", ["dev"])
         self.assertEqual(n, 0)
 
     def test_grant_unknown_skill_grants_nothing(self):
@@ -117,10 +123,10 @@ class GrantRevokeTest(unittest.TestCase):
 
     def test_revoke_leaves_other_flavors_grants(self):
         con = _mini_db()
-        feature.grant(con, "test_authoring_pg", ["dev", "reviewer"])
+        feature.grant(con, "query_authoring_pg", ["dev", "reviewer"])
         # A manual planner-pack grant — outside the feature's flavors.
         con.execute("INSERT INTO flavor_skills VALUES ('planner', 10)")
-        n = feature.revoke(con, "test_authoring_pg", ["dev", "reviewer"])
+        n = feature.revoke(con, "query_authoring_pg", ["dev", "reviewer"])
         self.assertEqual(n, 2)
         rows = {r[0] for r in con.execute("SELECT flavor FROM flavor_skills")}
         self.assertEqual(rows, {"planner"}, "revoke must not touch packs outside "

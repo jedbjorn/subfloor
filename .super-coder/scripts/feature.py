@@ -59,8 +59,7 @@ FEATURES: dict[str, dict] = {
         "title": "Postgres sidecar (app-only)",
         "block": "pg",
         "block_auto": True,
-        "grants": {"test_authoring_pg": ["dev", "reviewer"],
-                   "query_authoring_pg": ["dev", "reviewer", "planner"]},
+        "grants": {"query_authoring_pg": ["dev", "reviewer", "planner"]},
         "next": ["./sc launch   # starts the sidecar + forwards DATABASE_URL "
                  "(or: ./sc pg-up)"],
     },

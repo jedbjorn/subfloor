@@ -1618,170 +1618,6 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'engine_surgery',
-  'Procedure for changing the engine you are running — pull/reconcile/restart cadence and their costs, three-artifact engine-skill commits with a hermetic mirror render, migrating the live DB safely, and verifying claims about engine code against the remote rather than a possibly-stale checkout. SOURCE-REPO ONLY; a fork consumes the engine as a pinned dependency and never edits it. Load before touching .super-coder/ in the repo that owns it.',
-  'craft',
-  NULL,
-  0,
-  '# engine_surgery — changing the engine you are running
-
-This repo IS the engine. Every shell here runs on the code it edits, reads a DB
-it migrates, and is served by a process started from the tree it commits to.
-That is surgery on a moving car, and it has one characteristic failure mode:
-**a command answers confidently from a target you did not mean.**
-
-**Fork shells never load this.** A fork consumes `.super-coder/` as a gitignored
-dependency pinned by `engine.ref` and updates it with `./sc update`; it never
-authors engine changes. Granted only in the source repo.
-
-## The four trees, and which one bites
-
-| tree | what it is | who keeps it current |
-|---|---|---|
-| your worktree | `.sc-worktrees/<shortname>` — your cwd, your branch | you; boot reports it as `sync:` |
-| the main checkout | resolves your `./sc`, hosts the live DB, runs the server | admin / the FnB; boot reports it as `floor:` |
-| the running process | code already imported — changes only on restart | the FnB |
-| `origin/main` | the truth | whoever merged last |
-
-`sc:11-21` derives the engine root from git''s **common dir**, so `./sc` from any
-worktree reads the MAIN CHECKOUT. Being current in your own tree tells you
-nothing about it. Read the `floor:` line in ACTIVE SESSION.
-
-**Verify any claim about engine code against the remote:**
-
-```
-git show origin/main:<path>     # correct
-./sc help | grep <thing>        # answers from the main checkout — may be stale
-```
-
-Three wrong answers in one session came from skipping that: a help query, a
-pending-migration check that came back empty because it globbed a stale
-migrations dir and nearly made a reconcile a silent no-op, and dormant PR
-watches against a stale running floor.
-
-## EDIT IN YOUR WORKTREE — scripted writes bypass the branch guard
-
-`branch-guard.sh` blocks harness file-edit tools from writing to a
-default-branch checkout. **It does not see writes made by a script.** A
-`cd /home/j3d1/super-coder && python3 -c "...patch..."` lands on `main`,
-uncommitted, with no warning — and your worktree stays clean, so `git status`
-there reassures you nothing happened.
-
-Recovery, if you find edits on the wrong tree:
-
-```
-git -C <main-checkout> diff > /tmp/x.patch
-git apply /tmp/x.patch                                  # in your worktree
-git -C <main-checkout> checkout -- <files>
-```
-
-Prefer the harness edit tools, which are guarded. If you script an edit, `cd` to
-your worktree or use absolute worktree paths, and check `git status` in **both**
-trees afterwards.
-
-## Cadence — pull often, restart rarely
-
-| action | cost | fixes |
-|---|---|---|
-| pull the main checkout | cheap, safe, no session impact | stale reads |
-| apply pending migrations | low; back up first | stale DB rows |
-| `./sc update` + restart | **restart kills live sessions** | stale running process |
-
-Pull after every merge. Reconcile and restart only at a coordinated idle
-boundary: a restart kills working shells, and swapping the floor under active
-work is its own hazard. The restart is the FnB''s call.
-
-## Migrating the live DB
-
-The DB you migrate is the one every shell is using and the server has open.
-
-1. **Fast-forward the main checkout first.** Pending-migration checks glob its
-   `migrations/` dir, so a stale tree reports nothing pending and the reconcile
-   silently does nothing.
-2. **Name the DB path explicitly.** `./sc migrate` from a worktree resolves to
-   the main checkout''s DB and says so nowhere (issue #569). Prefer
-   `python3 .super-coder/scripts/migrate.py <explicit-path>`.
-3. **Back up first**, WAL-safe, via SQLite''s online backup rather than a file
-   copy:
-
-   ```python
-   src = sqlite3.connect(LIVE); dst = sqlite3.connect(BACKUP)
-   with dst: src.backup(dst)
-   ```
-
-4. **Data-only migrations are safe under a running server** (row updates, no
-   DDL). Schema changes want the restart window.
-5. **Verify by read-back**, not by the migrate command''s own output.
-
-## Engine skill edits are a three-artifact commit
-
-All three, or CI goes red even when tests pass:
-
-1. the source asset at `.super-coder/assets/skills/<name>/SKILL.md`;
-2. a **trailing reseed migration** so existing installations converge — full-body
-   upsert, `INSERT … ON CONFLICT(name) DO UPDATE SET`, patterned on the most
-   recent `*_reseed_*.sql`. Generate it FROM the asset rather than hand-writing
-   it, and store the body exactly as the guards read it
-   (`split("---", 2)[2].strip()`) — an unstripped body fails three freshness
-   guards;
-3. the re-rendered mirror.
-
-**Render the mirror through the guard''s own hermetic path**, never from the live
-DB, so it cannot drift from what CI rebuilds:
-
-```python
-import render_check as rc, flat
-rc._build_tracked_db(db)                  # schema → migrations → content.sql
-flat.render_visibility(con, root=rc.ACTIVE_ROOT)
-```
-
-In **local artifact mode** the mirror lives under the ignored `.sc-state/local/`
-and is not in the diff — the commit is then two artifacts, and `render-check`
-still proves the migration.
-
-Run the guard **from your own worktree** — `./sc render-check` resolves to the
-main checkout and will judge code you are not committing (flag #47):
-
-```
-python3 .super-coder/scripts/render_check.py
-```
-
-## Adding a source-repo-only skill
-
-Seeds carry **skills, not grants**: `0001` inserts catalogue rows. Standard
-shells resolve one shared `flavor_skills` pack; Bespoke shells resolve their own
-`shell_skills` rows. Newly-added common skills join every flavor/Bespoke pack
-on update. Opt-ins remain ungranted until assigned.
-
-A skill with **`common: false`** seeds into a fork''s catalogue without entering
-any pack. Grant it here by naming one shell:
-
-```
-./sc skill grant <name> <shell> [<shell>…]
-```
-
-Naming a standard shell changes its whole flavor pack. Naming a Bespoke shell
-changes only that shell.
-
-## Stance
-
-- A command reporting success against a target you did not intend is the house
-  defect. Name the target; verify the effect.
-- Never `SC_ADMIN=1` past a gate to save a step — the publish path is gated on
-  purpose.
-- Never auto-sync the main checkout from a shell. `sync_worktree` may
-  `reset --hard` a shell base; the main checkout is the running server''s tree and
-  a reset discards whatever the operator has in flight.
-- Assert before you replace; read back after you write. A non-matching string
-  replace does nothing and reports success.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'flag_sweep',
   'Admin''s every-session flag reconciliation — auto-close flags whose gating work is provably done, open ship flags for implemented-but-unshipped specs and docs-pending flags for shipped features that lack a doc (message the planner), surface judgment calls to the FnB. Step 1 of the admin standing pass; run before git_cleanup.',
   'substrate',
@@ -2980,10 +2816,10 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# query_authoring_pg — diagnostic SQL against the app''s Postgres
 
-The pg kit''s query half: `dev_kit` = the sidecar, `test_authoring_pg` = the
-test infra, this = ad-hoc SQL against the fork''s app DB. Use when diagnosing
-data issues, verifying a migration''s effect, or checking an invariant by
-query.
+The PG feature provides the Postgres sidecar through `dev_kit` and this
+diagnostic-SQL procedure. Test fixtures and database setup remain owned by the
+downstream repository. Use this skill when diagnosing data issues, verifying a
+migration''s effect, or checking an invariant by query.
 
 ## Know which DB you''re pointed at
 
@@ -4710,7 +4546,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'test_authoring',
-  'Principles for stringent pytest tests — tests a realistic bug turns red. Pair with a granted stack-infra testing skill (test_authoring_sqlite / test_authoring_pg / a fork-local one) if the shell has one.',
+  'Principles for stringent pytest tests — tests a realistic bug turns red. The downstream repository owns stack-specific fixtures and database setup.',
   'craft',
   NULL,
   0,
@@ -4720,10 +4556,10 @@ Apply when writing a test or reviewing a diff that touches `tests/`.
 Pass condition for any test: a realistic bug turns it red. A test no bug
 can fail reads as coverage while guarding nothing — sharpen or cut it.
 
-Stack infra (fixture setup, callers, DB access pattern) lives in the granted
-stack skill — `test_authoring_sqlite` / `test_authoring_pg` / a fork-local
-skill that supersedes this one. Load it alongside. None granted -> this skill
-stands alone; do NOT hunt for one the fork doesn''t ship.
+Stack infrastructure—fixture setup, callers, and database access patterns—lives
+in the downstream repository. Load its fork-local testing skill alongside this
+one when granted. None granted means this skill stands alone; infer setup from
+the repository''s existing tests and development tooling.
 
 ## Rules (the floor)
 
@@ -4804,178 +4640,6 @@ this skill.
 - Let a count or status code stand in for "the right thing happened."
 - Test only the happy path of code that has error branches.
 - Ship a test whose assertions no realistic bug could violate.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'test_authoring_pg',
-  'Postgres test infrastructure for postgres-backed forks — throwaway DB, Alice/Bob tenants, psycopg 3 direct assertions. Read alongside test_authoring for the rules.',
-  'craft',
-  NULL,
-  0,
-  '# test_authoring_pg — Postgres test infra
-
-Rules live in `test_authoring` — read it alongside. This skill = the test
-infrastructure PATTERN for Postgres-backed forks.
-
-**Your fork''s `tests/conftest.py` is the source of truth** for the throwaway
-DB''s naming, what schema artifact seeds it (a live `schema.sql`, a squash, a
-migration replay), and the fixture roster — read it before writing a test.
-Everything below is the typical shape, not a contract; where your conftest
-differs, the conftest wins. A fork may also ship its own superseding
-test-authoring skill — if one is granted, prefer it.
-
-## Foundation (typical shape)
-
-`tests/conftest.py` creates a throwaway Postgres DB at session start, applies
-the fork''s schema artifact, seeds two tenants (Alice / Bob) + a shared system
-shell, and drives the real app through `TestClient` with real auth.
-
-**Key identities (an example roster — confirm against your conftest):**
-
-| Name | Kind | ID |
-|---|---|---|
-| `USER_ADMIN` | admin user | 1 |
-| `USER_A` / Alice | tenant user | 10 |
-| `USER_B` / Bob | tenant user | 20 |
-| `SHELL_SHARED` | shared system shell | 100 |
-| `SHELL_A` / `SHELL_B` | per-tenant shells | 101 / 102 |
-| `PROJ_A` / `PROJ_B` | per-tenant projects | 500 / 501 |
-| `KEY_A` / `KEY_B` | shell bearer keys | `"ALICEKEY"` / `"BOBKEY"` |
-
-**Throwaway DB setup:**
-- An admin connection (`psycopg.connect(DATABASE_URL_ADMIN, autocommit=True)`)
-  creates a uniquely-named `<fork>_test_<unique>` database at session start
-  and drops it at session teardown — the naming scheme is the conftest''s.
-- `DATABASE_URL` injected via `os.environ["DATABASE_URL"]` BEFORE importing
-  the app — the app''s DB layer reads it at import time.
-- The fork''s schema artifact applied on the throwaway connection — which
-  artifact (postgres `schema.sql`, a schema squash, a migration replay) is a
-  per-fork choice; read the conftest, don''t assume.
-- Some forks isolate egress/spend rows in a second throwaway DB/schema —
-  only if your conftest declares one.
-
-**Callers** — same `Caller` pattern as the SQLite variant; identity carried
-via cookie or `Authorization: Bearer` header:
-```python
-alice   # session-cookie caller, USER_A identity
-bob     # session-cookie caller, USER_B identity
-admin   # session-cookie caller, USER_ADMIN identity
-anon    # no auth
-shell_a # bearer-key caller, KEY_A
-shell_b # bearer-key caller, KEY_B
-```
-
-**TestClient:**
-- Create WITHOUT a `with` block -> skips startup hooks (catalogue / model
-  sync) that would hit the network.
-- `scope="session"` -> one DB shared across the whole run. A test needing
-  isolation seeds its own fixture rows + cleans up explicitly.
-
-**Direct DB assertions:**
-```python
-import os, psycopg
-from psycopg.rows import dict_row
-con = psycopg.connect(os.environ["DATABASE_URL"], autocommit=True, row_factory=dict_row)
-cur = con.cursor()
-cur.execute("SELECT * FROM table WHERE ...")
-rows = cur.fetchall()
-```
-Assert against real rows, not the response payload.
-
-**Mocking boundary:** mock only true external egress — outbound HTTP, broker
-calls, third-party APIs. NEVER mock the router, the DB layer, or the
-function under test.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'test_authoring_sqlite',
-  'SQLite test infrastructure for super-coder-style forks — throwaway DB, Alice/Bob tenants, Caller/TestClient. Read alongside test_authoring for the rules.',
-  'craft',
-  NULL,
-  0,
-  '# test_authoring_sqlite — SQLite test infra
-
-Rules live in `test_authoring` — read it alongside. This skill = the test
-infrastructure PATTERN for SQLite-backed forks.
-
-**Your fork''s `tests/conftest.py` is the source of truth** for how the
-throwaway DB is built and what fixtures exist — read it before writing a
-test. Everything below is the typical shape, not a contract; where your
-conftest differs, the conftest wins. A fork may also ship its own superseding
-test-authoring skill — if one is granted, prefer it.
-
-## Foundation (typical shape)
-
-`tests/conftest.py` builds a throwaway SQLite DB from the fork''s schema
-artifact (schema.sql + a migration replay, or a squash), seeds two tenants
-(Alice / Bob) + a shared system shell, and drives the real app through
-`TestClient` with real auth.
-
-**Key identities (an example roster — confirm against your conftest):**
-
-| Name | Kind | ID |
-|---|---|---|
-| `USER_ADMIN` | admin user | 1 |
-| `USER_A` / Alice | tenant user | 10 |
-| `USER_B` / Bob | tenant user | 20 |
-| `SHELL_SHARED` | shared system shell | 100 |
-| `SHELL_A` / `SHELL_B` | per-tenant shells | 101 / 102 |
-| `PROJ_A` / `PROJ_B` | per-tenant projects | 500 / 501 |
-| `KEY_A` / `KEY_B` | shell bearer keys | `"ALICEKEY"` / `"BOBKEY"` |
-
-**Throwaway DB setup:**
-- `tempfile.NamedTemporaryFile(suffix=".db")` -> path injected via
-  `os.environ["SHELL_DB_PATH"]` BEFORE importing the app — the auth
-  middleware calls `db()` directly; a `Depends` override alone misses it.
-- The conftest''s schema builder (e.g. `apply_schema_and_migrations(con)`)
-  builds the throwaway DB — single source shared by all test harnesses;
-  NEVER copy-paste it.
-- Some forks isolate egress/spend rows in a second throwaway DB — only if
-  your conftest declares one.
-- `os.environ.setdefault("AUTH_COOKIE_SECURE", "")` -> plain `dsess` cookie,
-  no `__Host-` prefix in tests.
-
-**Callers** — all pytest fixtures:
-```python
-alice   # session-cookie caller, USER_A identity
-bob     # session-cookie caller, USER_B identity
-admin   # session-cookie caller, USER_ADMIN identity
-anon    # no auth
-shell_a # bearer-key caller, KEY_A
-shell_b # bearer-key caller, KEY_B
-```
-`shell_a` / `shell_b` send `Authorization: Bearer`.
-
-**TestClient:**
-- Create WITHOUT a `with` block -> skips startup hooks (catalogue / model
-  sync) that would hit the network.
-- `scope="session"` -> one DB shared across the whole run. Never depend on a
-  clean DB; a test needing isolation seeds its own via
-  `build_substrate_db()` (in-memory, returns a `sqlite3.Connection`).
-
-**Direct DB assertions:**
-```python
-import sqlite3, os
-con = sqlite3.connect(os.environ["SHELL_DB_PATH"])
-con.row_factory = sqlite3.Row
-rows = con.execute("SELECT * FROM table WHERE ...").fetchall()
-```
-Assert against real rows, not the response payload. The throwaway path is
-stable for the lifetime of the test session.
-
-**Mocking boundary:** mock only true external egress — outbound IMAP, HTTP,
-broker calls. NEVER mock the router, the DB layer, or the function under
-test.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
