@@ -389,7 +389,10 @@ class SprintLifecycleStore:
             )
             if reconcile_in_transaction is not None:
                 reconcile_in_transaction(self.con)
-            requeued = self._requeue_failed_wakes_in_transaction(sprint_id)
+            requeued = self._reconcile_unread_wakes_in_transaction(
+                sprint_id,
+                trigger="resume",
+            )
             projected, resolved = self._reconcile_registered_prs_in_transaction(
                 sprint_id
             )
@@ -417,7 +420,7 @@ class SprintLifecycleStore:
                     sprint_id,
                     body=(
                         f"Sprint {sprint_id} resumed with reconciliation evidence: "
-                        f"{len(requeued)} failed wake(s) re-queued, "
+                        f"{len(requeued)} unread wake(s) repaired, "
                         f"{len(drift)} spec drift item(s), "
                         f"{len(all_anomalies)} anomaly item(s)."
                     ),
@@ -641,6 +644,10 @@ class SprintLifecycleStore:
                             sprint_id
                         )
                     else:
+                        self._reconcile_unread_wakes_in_transaction(
+                            sprint_id,
+                            trigger="startup",
+                        )
                         self._reconcile_registered_prs_in_transaction(sprint_id)
             if run_ids or conversations:
                 self._signal_interrupts_and_notifications(
@@ -648,6 +655,23 @@ class SprintLifecycleStore:
                 )
             recovered.append((sprint_id, lifecycle))
         return tuple(recovered)
+
+    def reconcile_unread_pickup(
+        self,
+        sprint_id: int,
+        *,
+        trigger: str = "pulse",
+    ) -> tuple[int, ...]:
+        """Repair terminal wake delivery that left relevant messages unread."""
+        trigger = self._required_text(trigger, "pickup recovery trigger", 64)
+        with db_driver.write_transaction(self.con, "sprint.wake.pickup_recover"):
+            sprint = self._sprint(sprint_id)
+            if sprint["lifecycle"] != "armed":
+                return ()
+            return self._reconcile_unread_wakes_in_transaction(
+                sprint_id,
+                trigger=trigger,
+            )
 
     def _pause_in_transaction(
         self,
@@ -898,15 +922,22 @@ class SprintLifecycleStore:
                     )
         return tuple(sorted(set(projected))), tuple(sorted(set(resolved)))
 
-    def _requeue_failed_wakes_in_transaction(self, sprint_id: int) -> tuple[int, ...]:
+    def _reconcile_unread_wakes_in_transaction(
+        self,
+        sprint_id: int,
+        *,
+        trigger: str,
+    ) -> tuple[int, ...]:
         if not self.con.in_transaction:
             raise RuntimeError("wake reconciliation requires an active transaction")
         rows = self.con.execute(
-            "SELECT DISTINCT w.wake_id,w.participant_id FROM sprint_wake_outbox w "
+            "SELECT DISTINCT w.wake_id,w.participant_id,w.state,w.idempotency_key "
+            "FROM sprint_wake_outbox w "
             "JOIN sprint_wake_messages wm ON wm.sprint_id=w.sprint_id "
             "AND wm.wake_id=w.wake_id JOIN sprint_messages m "
             "ON m.sprint_id=wm.sprint_id AND m.message_id=wm.message_id "
-            "WHERE w.sprint_id=? AND w.state='failed' AND m.read_at IS NULL "
+            "WHERE w.sprint_id=? AND w.state IN ('failed','delivered') "
+            "AND m.read_at IS NULL "
             "ORDER BY w.wake_id",
             (sprint_id,),
         ).fetchall()
@@ -914,12 +945,98 @@ class SprintLifecycleStore:
         for row in rows:
             old_wake_id = int(row["wake_id"])
             participant_id = int(row["participant_id"])
-            pending = self.con.execute(
+            wake_key = str(row["idempotency_key"])
+            if wake_key.startswith("sprint-recovery:") or ":failed-wake:" in wake_key:
+                continue
+            turn = self._wake_turn_evidence(old_wake_id)
+            if self._participant_has_pickup_turn(participant_id):
+                continue
+            deliverable = self.con.execute(
                 "SELECT wake_id FROM sprint_wake_outbox WHERE sprint_id=? "
-                "AND participant_id=? AND state='pending'",
+                "AND participant_id=? AND state IN ('pending','delivering') "
+                "ORDER BY wake_id LIMIT 1",
                 (sprint_id, participant_id),
             ).fetchone()
-            if pending is None:
+            recovery_key = (
+                f"sprint-resume:{sprint_id}:failed-wake:{old_wake_id}"
+                if row["state"] == "failed"
+                else f"sprint-recovery:{sprint_id}:delivered-unread:{old_wake_id}"
+            )
+            if deliverable is None:
+                prior_recovery = self.con.execute(
+                    "SELECT wake_id,state FROM sprint_wake_outbox "
+                    "WHERE idempotency_key=?",
+                    (recovery_key,),
+                ).fetchone()
+                if prior_recovery is not None:
+                    if prior_recovery["state"] not in {"pending", "delivering"}:
+                        continue
+                    deliverable = prior_recovery
+            created = deliverable is None
+            if created:
+                new_wake_id = int(
+                    self.con.execute(
+                        "INSERT INTO sprint_wake_outbox "
+                        "(sprint_id,participant_id,idempotency_key) VALUES (?,?,?)",
+                        (sprint_id, participant_id, recovery_key),
+                    ).lastrowid
+                )
+            else:
+                new_wake_id = int(deliverable["wake_id"])
+            self.con.execute(
+                "UPDATE sprint_wake_messages SET wake_id=? "
+                "WHERE sprint_id=? AND wake_id=?",
+                (new_wake_id, sprint_id, old_wake_id),
+            )
+            route = sprint_participant_chats.ensure_wake_conversation(
+                self.con,
+                participant_id,
+                idempotency_key=(
+                    f"sprint:{sprint_id}:wake:{new_wake_id}:conversation"
+                ),
+            )
+            self._event(
+                sprint_id,
+                "wake.requeued",
+                LifecycleActor("system"),
+                {
+                    "trigger": trigger,
+                    "prior_wake_id": old_wake_id,
+                    "prior_wake_state": str(row["state"]),
+                    "prior_turn_state": turn,
+                    "replacement_wake_id": new_wake_id,
+                    "replacement_created": created,
+                    "replacement_conversation_id": route.conversation_id,
+                    **(
+                        {"failed_wake_id": old_wake_id}
+                        if row["state"] == "failed"
+                        else {}
+                    ),
+                },
+            )
+            replacements.append(new_wake_id)
+
+        unwoken = self.con.execute(
+            "SELECT m.message_id,m.to_participant_id FROM sprint_messages m "
+            "WHERE m.sprint_id=? AND m.read_at IS NULL "
+            "AND m.idempotency_key LIKE 'decline-result:%' "
+            "AND m.to_participant_id IS NOT NULL AND NOT EXISTS ("
+            "SELECT 1 FROM sprint_wake_messages wm "
+            "WHERE wm.message_id=m.message_id) ORDER BY m.message_id",
+            (sprint_id,),
+        ).fetchall()
+        for message in unwoken:
+            participant_id = int(message["to_participant_id"])
+            if self._participant_has_pickup_turn(participant_id):
+                continue
+            deliverable = self.con.execute(
+                "SELECT wake_id FROM sprint_wake_outbox WHERE sprint_id=? "
+                "AND participant_id=? AND state IN ('pending','delivering') "
+                "ORDER BY wake_id LIMIT 1",
+                (sprint_id, participant_id),
+            ).fetchone()
+            created = deliverable is None
+            if created:
                 new_wake_id = int(
                     self.con.execute(
                         "INSERT INTO sprint_wake_outbox "
@@ -927,28 +1044,100 @@ class SprintLifecycleStore:
                         (
                             sprint_id,
                             participant_id,
-                            f"sprint-resume:{sprint_id}:failed-wake:{old_wake_id}",
+                            f"sprint-recovery:{sprint_id}:unwoken:"
+                            f"{int(message['message_id'])}",
                         ),
                     ).lastrowid
                 )
             else:
-                new_wake_id = int(pending["wake_id"])
+                new_wake_id = int(deliverable["wake_id"])
             self.con.execute(
-                "UPDATE sprint_wake_messages SET wake_id=? "
-                "WHERE sprint_id=? AND wake_id=?",
-                (new_wake_id, sprint_id, old_wake_id),
+                "INSERT INTO sprint_wake_messages "
+                "(sprint_id,wake_id,message_id) VALUES (?,?,?)",
+                (sprint_id, new_wake_id, int(message["message_id"])),
+            )
+            route = sprint_participant_chats.ensure_wake_conversation(
+                self.con,
+                participant_id,
+                idempotency_key=(
+                    f"sprint:{sprint_id}:wake:{new_wake_id}:conversation"
+                ),
             )
             self._event(
                 sprint_id,
                 "wake.requeued",
                 LifecycleActor("system"),
                 {
-                    "failed_wake_id": old_wake_id,
+                    "trigger": trigger,
+                    "prior_wake_id": None,
+                    "prior_wake_state": "absent",
+                    "prior_turn_state": {},
+                    "message_id": int(message["message_id"]),
                     "replacement_wake_id": new_wake_id,
+                    "replacement_created": created,
+                    "replacement_conversation_id": route.conversation_id,
                 },
             )
             replacements.append(new_wake_id)
         return tuple(sorted(set(replacements)))
+
+    def _participant_has_pickup_turn(self, participant_id: int) -> bool:
+        return self.con.execute(
+            "SELECT 1 FROM sprint_participant_conversations pc "
+            "JOIN conversation_messages m "
+            "ON m.conversation_id=pc.conversation_id "
+            "JOIN conversations c ON c.conversation_id=m.conversation_id "
+            "WHERE pc.sprint_participant_id=? "
+            "AND c.state IN ('idle','queued','running','waiting') "
+            "AND (m.state='queued' OR (m.state='running' AND EXISTS ("
+            "SELECT 1 FROM conversation_runs r WHERE r.trigger_message_id=m.message_id "
+            "AND r.state IN ('leased','starting','running') AND NOT EXISTS ("
+            "SELECT 1 FROM conversation_events e WHERE e.run_id=r.run_id "
+            "AND e.event_type='run.interrupt.requested')))) LIMIT 1",
+            (participant_id,),
+        ).fetchone() is not None
+
+    def _wake_turn_evidence(self, wake_id: int) -> dict[str, str | int | None]:
+        wake = self.con.execute(
+            "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
+            (wake_id,),
+        ).fetchone()
+        attempt = self.con.execute(
+            "SELECT attempt_number,target_conversation_id,native_run_ref,outcome "
+            "FROM sprint_wake_attempts WHERE wake_id=? "
+            "ORDER BY attempt_number DESC LIMIT 1",
+            (wake_id,),
+        ).fetchone()
+        if wake is None or attempt is None:
+            return {
+                "attempt_number": None,
+                "target_conversation_id": None,
+                "native_run_ref": None,
+                "attempt_outcome": None,
+                "message_state": None,
+                "run_state": None,
+            }
+        message = self.con.execute(
+            "SELECT message_id,state FROM conversation_messages "
+            "WHERE conversation_id=? AND idempotency_key=?",
+            (attempt["target_conversation_id"], wake["idempotency_key"]),
+        ).fetchone()
+        run_state = None
+        if message is not None:
+            run = self.con.execute(
+                "SELECT state FROM conversation_runs WHERE trigger_message_id=? "
+                "ORDER BY attempt DESC LIMIT 1",
+                (message["message_id"],),
+            ).fetchone()
+            run_state = str(run["state"]) if run is not None else None
+        return {
+            "attempt_number": int(attempt["attempt_number"]),
+            "target_conversation_id": attempt["target_conversation_id"],
+            "native_run_ref": attempt["native_run_ref"],
+            "attempt_outcome": str(attempt["outcome"]),
+            "message_state": str(message["state"]) if message is not None else None,
+            "run_state": run_state,
+        }
 
     def _resolve_review_expectations_in_transaction(
         self, work_unit_id: int, resolution: str
@@ -1143,7 +1332,7 @@ class SprintLifecycleStore:
         ).fetchone()
         if conversation is None or conversation["state"] == "closed":
             return message_id, ()
-        prompt = f"{body}\n\nCheck the Sprint inbox and recovery evidence."
+        prompt = sprint_participant_chats.wake_prompt(sprint_id, "planner")
         prompt_key = f"{idempotency_key}:planner-conversation"
         queued = self.con.execute(
             "SELECT message_id FROM conversation_messages "
@@ -1642,7 +1831,10 @@ class SprintWorkUnitStore:
         if not result:
             raise ValueError("work-unit completion result is required")
         if len(result) > 8000:
-            raise ValueError("work-unit completion result exceeds 8000 characters")
+            raise ValueError(
+                f"work-unit completion result is {len(result)} characters; "
+                "maximum is 8000"
+            )
         with db_driver.write_transaction(self.con, "sprint.work_unit.complete"):
             unit = self._unit(sprint_id, work_unit_id)
             if int(unit["assigned_shell_id"]) != shell_id:
@@ -1709,7 +1901,10 @@ class SprintWorkUnitStore:
         if not reason:
             raise ValueError("work-unit cancellation reason is required")
         if len(reason) > 8000:
-            raise ValueError("work-unit cancellation reason exceeds 8000 characters")
+            raise ValueError(
+                f"work-unit cancellation reason is {len(reason)} characters; "
+                "maximum is 8000"
+            )
         with db_driver.write_transaction(self.con, "sprint.work_unit.cancel"):
             self._require_planner(sprint_id, planner_shell_id)
             unit = self._unit(sprint_id, work_unit_id)

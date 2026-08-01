@@ -69,6 +69,7 @@ PY = sys.executable
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
+import callable_floor  # noqa: E402
 import db_driver  # noqa: E402
 import engine_manifest  # noqa: E402
 import install as install_mod  # noqa: E402  (ensure_harnesses)
@@ -564,11 +565,37 @@ def materialize_engine(
         sys.exit("update: extracting the engine archive failed.")
 
 
-def check_local_edits(force: bool) -> None:
+def _path_matches_ref(rel: str, ref: str) -> bool:
+    """Whether one materialized path already has the exact target bytes."""
+    shown = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "show", f"{ref}:{rel}"],
+        capture_output=True,
+        check=False,
+    )
+    path = REPO_ROOT / rel
+    if shown.returncode != 0:
+        return not path.exists()
+    return path.is_file() and path.read_bytes() == shown.stdout
+
+
+def check_local_edits(force: bool, *, target_ref: str | None = None) -> None:
     """Block the materialize when engine files were edited locally since the
     last one — a wholesale overwrite would discard those edits silently. The
     operator's real options are stated; --force is the explicit discard."""
     edits = engine_manifest.local_edits()
+    if target_ref is not None and edits:
+        already_target = {
+            rel for rel in edits if _path_matches_ref(rel, target_ref)
+        }
+        if already_target:
+            edits = {
+                rel: kind for rel, kind in edits.items() if rel not in already_target
+            }
+            print(
+                "→ update retry: "
+                f"{len(already_target)} manifest mismatch(es) already match "
+                f"target {target_ref[:12]}"
+            )
     if not edits:
         return
     print(f"✗ {len(edits)} engine file(s) locally modified since the last materialize:")
@@ -654,7 +681,7 @@ def fetch_update_ref(branch: str, ref: str | None = None) -> str:
 def materialize_fetched_engine(sha: str, *, force: bool = False) -> None:
     """Lay an already-fetched ref onto the installed floor."""
 
-    check_local_edits(force)
+    check_local_edits(force, target_ref=sha)
 
     # Restore point (engine half): remember where we were before overwriting.
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -687,6 +714,11 @@ def materialize_fetched_engine(sha: str, *, force: bool = False) -> None:
         resolved_paths + materializable_delta,
         REPO_ROOT,
     )
+    callable_floor.require_callable_floor(
+        REPO_ROOT,
+        expected_ref=sha,
+        context="update",
+    )
     ENGINE_REF.write_text(sha + "\n")
     n = engine_manifest.write_manifest(
         materialized_paths,
@@ -697,6 +729,47 @@ def materialize_fetched_engine(sha: str, *, force: bool = False) -> None:
         ),
     )
     print(f"  engine pinned at {sha[:12]} (.sc-state/engine.ref) · manifest over {n} files")
+
+
+def repair_callable_dispatcher(sha: str) -> bool:
+    """Heal a dispatcher missed by the already-running legacy updater."""
+    issues = callable_floor.inspect_callable_floor(
+        REPO_ROOT,
+        expected_ref=sha,
+    )
+    if not issues:
+        return False
+
+    edits = engine_manifest.local_edits()
+    unsafe = {
+        rel: kind
+        for rel, kind in edits.items()
+        if rel == "sc" or not _path_matches_ref(rel, sha)
+    }
+    if unsafe:
+        print(
+            "→ legacy update bridge: dispatcher repair deferred to the update "
+            "local-edit guard"
+        )
+        return False
+
+    materialize_engine(sha, engine_paths=["sc"])
+    callable_floor.require_callable_floor(
+        REPO_ROOT,
+        expected_ref=sha,
+        context="update compatibility repair",
+    )
+    materialized_paths = _materialized_engine_paths(REPO_ROOT)
+    engine_manifest.write_manifest(
+        materialized_paths,
+        files=_engine_files_at(
+            sha,
+            repo_root=REPO_ROOT,
+            engine_paths=materialized_paths,
+        ),
+    )
+    print(f"→ legacy update bridge: repaired callable dispatcher at {sha[:12]}")
+    return True
 
 
 def fetch_and_materialize(branch: str, ref: str | None = None,

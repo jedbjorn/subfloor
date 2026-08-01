@@ -39,6 +39,7 @@ ENGINE_REF_PREV = STATE_DIR / "engine.ref.prev"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_backup as db_backup_mod  # noqa: E402
+import callable_floor  # noqa: E402
 import engine_manifest  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402  (BACKUP_DIR, backup_db, prune_backups, KEEP_BACKUPS)
 import update as update_mod    # noqa: E402  (materialize_engine, super_coder_remote, git)
@@ -147,6 +148,11 @@ def restore_engine(prev_sha: str) -> None:
             prev_sha,
             engine_paths=previous_materialize_paths,
         )
+    callable_floor.require_callable_floor(
+        REPO_ROOT,
+        expected_ref=prev_sha,
+        context="rollback",
+    )
     ENGINE_REF.write_text(prev_sha + "\n")
     # Re-baseline the hash manifest at the restored engine — without this, the
     # next update would read every rolled-back file as a "local edit" and block.

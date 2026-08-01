@@ -331,7 +331,9 @@ class SprintReviewLoopStore:
         if not value:
             raise ValueError(f"{name} is empty")
         if len(value) > maximum:
-            raise ValueError(f"{name} exceeds {maximum} characters")
+            raise ValueError(
+                f"{name} is {len(value)} characters; maximum is {maximum}"
+            )
         return value
 
     @staticmethod

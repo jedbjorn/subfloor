@@ -272,7 +272,10 @@ class HalfFloorRollbackTest(unittest.TestCase):
             ), mock.patch.object(
                 rollback.engine_manifest,
                 "write_manifest",
-            ):
+            ), mock.patch.object(
+                rollback.callable_floor,
+                "require_callable_floor",
+            ) as require_floor:
                 rollback.restore_engine(old_sha)
 
             self.assertEqual(
@@ -287,6 +290,11 @@ class HalfFloorRollbackTest(unittest.TestCase):
                 "addition in the rollback deletion candidate set",
             )
             self.assertEqual(engine_ref.read_text(), old_sha + "\n")
+            require_floor.assert_called_once_with(
+                root,
+                expected_ref=old_sha,
+                context="rollback",
+            )
 
     def test_engine_only_refuses_previous_floor_with_unrelated_extra(self):
         with tempfile.TemporaryDirectory() as raw_tmp:

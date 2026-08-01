@@ -10,6 +10,11 @@ from pathlib import Path
 
 import mem
 
+PAYLOAD_FILE_HELP = "text file; hard maximum 8,000 characters"
+FINDINGS_FILE_HELP = (
+    "JSON array; each finding body has a hard maximum of 8,000 characters"
+)
+
 
 def _text(path: str, name: str) -> str:
     if path == "-":
@@ -112,6 +117,21 @@ def cmd_replan_unit(args: argparse.Namespace) -> int:
 
 def cmd_inbox(args: argparse.Namespace) -> int:
     result = mem._api("GET", f"/_sc/sprint/{args.sprint}/inbox")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/send",
+        {
+            "sprint_id": args.sprint,
+            "to": args.to,
+            "body": _text(args.body_file, "message body"),
+            "idempotency_key": args.key,
+        },
+        idempotent=True,
+    )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
@@ -408,6 +428,19 @@ def build_parser() -> argparse.ArgumentParser:
     inbox.add_argument("--sprint", type=int, required=True)
     inbox.set_defaults(fn=cmd_inbox)
 
+    send = sub.add_parser(
+        "send", help="Send one freeform message to another Sprint participant"
+    )
+    send.add_argument("--sprint", type=int, required=True)
+    send.add_argument("--to", required=True, help="recipient shell shortname")
+    send.add_argument("--body-file", required=True, help=PAYLOAD_FILE_HELP)
+    send.add_argument(
+        "--key",
+        required=True,
+        help="stable retry key; reuse it only for the same recipient and body",
+    )
+    send.set_defaults(fn=cmd_send)
+
     accept = sub.add_parser(
         "accept", help="Mark one Sprint message read and accept actionable work"
     )
@@ -428,7 +461,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     complete_unit.add_argument("--sprint", type=int, required=True)
     complete_unit.add_argument("--work-unit", type=int, required=True)
-    complete_unit.add_argument("--result-file", required=True)
+    complete_unit.add_argument(
+        "--result-file", required=True, help=PAYLOAD_FILE_HELP
+    )
     complete_unit.set_defaults(fn=cmd_complete_unit)
 
     cancel_unit = sub.add_parser(
@@ -462,7 +497,7 @@ def build_parser() -> argparse.ArgumentParser:
     complete.add_argument("--sprint", type=int, required=True)
     complete.add_argument("--reason", required=True)
     complete.add_argument("--outcome", required=True)
-    complete.add_argument("--report-file")
+    complete.add_argument("--report-file", help=PAYLOAD_FILE_HELP)
     complete.add_argument("--key", help="stable final-report retry identity")
     complete.set_defaults(fn=cmd_complete)
 
@@ -479,7 +514,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     request.add_argument("--sprint", type=int, required=True)
     request.add_argument("--registered-pr", type=int, required=True)
-    request.add_argument("--readiness-file", required=True)
+    request.add_argument(
+        "--readiness-file", required=True, help=PAYLOAD_FILE_HELP
+    )
     request.add_argument("--key", required=True, help="stable retry identity")
     request.set_defaults(fn=cmd_request_review)
 
@@ -489,7 +526,7 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument(
         "--verdict", required=True, choices=("changes_requested", "approved")
     )
-    record.add_argument("--body-file", required=True)
+    record.add_argument("--body-file", required=True, help=PAYLOAD_FILE_HELP)
     record.add_argument("--key", required=True, help="stable retry identity")
     record.set_defaults(fn=cmd_record_review)
 
@@ -512,8 +549,12 @@ def build_parser() -> argparse.ArgumentParser:
         "record-conformance", help="Reviewer records a report and follow-ups"
     )
     conformance.add_argument("--sprint", type=int, required=True)
-    conformance.add_argument("--body-file", required=True)
-    conformance.add_argument("--findings-file", required=True)
+    conformance.add_argument(
+        "--body-file", required=True, help=PAYLOAD_FILE_HELP
+    )
+    conformance.add_argument(
+        "--findings-file", required=True, help=FINDINGS_FILE_HELP
+    )
     conformance.add_argument("--key", required=True, help="stable retry identity")
     conformance.set_defaults(fn=cmd_record_conformance)
 
@@ -527,7 +568,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("accepted", "resolved", "dismissed"),
         required=True,
     )
-    followup.add_argument("--resolution-file")
+    followup.add_argument("--resolution-file", help=PAYLOAD_FILE_HELP)
     followup.set_defaults(fn=cmd_disposition_followup)
 
     report = sub.add_parser(

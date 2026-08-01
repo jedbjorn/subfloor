@@ -302,6 +302,89 @@ class DispatchGateTest(SprintWorkDispatchCase):
             "Published conformance report #77", json.loads(event[0])["result"]
         )
 
+    def test_non_code_result_accepts_8000_and_rejects_8001_without_state_change(self):
+        report = self.create_unit(
+            developer=1,
+            title="Bounded report",
+            output_kind="report_only",
+        )
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.messages.mark_read(self.assignment_message(report), 1)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "work-unit completion result is 8001 characters; maximum is 8000",
+        ):
+            self.units.complete(self.sprint_id, report, 1, result="x" * 8001)
+        self.assertEqual(
+            ("active", None),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,completion_result FROM sprint_work_units "
+                    "WHERE work_unit_id=?",
+                    (report,),
+                ).fetchone()
+            ),
+        )
+
+        self.assertEqual(
+            [],
+            self.units.complete(self.sprint_id, report, 1, result="x" * 8000),
+        )
+        self.assertEqual(
+            ("completed", 8000),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,length(completion_result) "
+                    "FROM sprint_work_units WHERE work_unit_id=?",
+                    (report,),
+                ).fetchone()
+            ),
+        )
+
+    def test_cancellation_reason_accepts_8000_and_rejects_8001_with_counts(self):
+        rejected = self.create_unit(developer=1, title="Rejected cancellation")
+        with self.assertRaisesRegex(
+            ValueError,
+            "work-unit cancellation reason is 8001 characters; maximum is 8000",
+        ):
+            self.units.cancel(
+                self.sprint_id,
+                rejected,
+                3,
+                reason="x" * 8001,
+            )
+        self.assertEqual(
+            ("planned", None),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,completion_result FROM sprint_work_units "
+                    "WHERE work_unit_id=?",
+                    (rejected,),
+                ).fetchone()
+            ),
+        )
+
+        accepted = self.create_unit(developer=1, title="Accepted cancellation")
+        self.assertTrue(
+            self.units.cancel(
+                self.sprint_id,
+                accepted,
+                3,
+                reason="x" * 8000,
+            )
+        )
+        self.assertEqual(
+            ("cancelled", 8000),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,length(completion_result) "
+                    "FROM sprint_work_units WHERE work_unit_id=?",
+                    (accepted,),
+                ).fetchone()
+            ),
+        )
+
     def test_planner_cancels_only_unreleased_lane_with_reason(self) -> None:
         cancelled = self.create_unit(developer=1, title="Cancelled")
         self.assertTrue(
@@ -561,7 +644,15 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             "WHERE conversation_id=? AND idempotency_key=?",
             (conversation_id, wake_key),
         ).fetchone()
-        self.assertEqual(delivery.FIXED_WAKE_PROMPT, native["body"])
+        expected_prompt = (
+            f"Sprint {self.sprint_id} handoff for your Developer role. Load "
+            "`sprint_dev`. Run `sc sprint inbox --sprint "
+            f"{self.sprint_id}` now and act on the Sprint message(s) using "
+            "`sprint_dev`. Confirm every Sprint write succeeds before stopping. "
+            "If the handoff is not complete, load `sprint_dev` again and run `sc "
+            f"sprint inbox --sprint {self.sprint_id}` again."
+        )
+        self.assertEqual(expected_prompt, native["body"])
         self.assertEqual(wake_key, native["idempotency_key"])
         self.assertEqual("queued", native["state"])
         self.assertEqual(
@@ -588,7 +679,7 @@ class ProductionPulseTest(SprintWorkDispatchCase):
         replay_ref = sprint_runtime.enqueue_conversation_turn(
             self.db_path,
             conversation_id,
-            delivery.FIXED_WAKE_PROMPT,
+            expected_prompt,
             wake_key,
         )
         attempt_ref = self.con.execute(

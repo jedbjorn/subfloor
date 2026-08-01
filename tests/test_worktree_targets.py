@@ -81,6 +81,15 @@ def run_bare_sc(cwd: Path, live_root: Path,
         check=False, env=env)
 
 
+def git_status(cwd: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(cwd), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
 def state_digest(root: Path) -> dict[str, str]:
     """The live-state artifacts of an instance, by content: the DB, its WAL/SHM
     sidecars, and every backup. A replaced DB shows as a changed digest, a new
@@ -394,6 +403,20 @@ class LiveSurfacesStillResolveTest(WorktreeFixture):
         self.assertIn("usage:", models.stdout)
         self.assertEqual(pin.returncode, 0, pin.stderr)
         self.assertEqual(pin.stdout, ENGINE_PIN + "\n")
+
+    def test_bare_sprint_help_uses_canonical_dispatcher_without_dirtying_worktree(self):
+        before = git_status(self.wt)
+
+        sprint = run_bare_sc(self.wt, self.main, "sprint", "-h")
+        inbox = run_bare_sc(self.wt, self.main, "sprint", "inbox", "-h")
+
+        self.assertEqual(sprint.returncode, 0, sprint.stderr)
+        self.assertIn("usage: sc sprint", sprint.stdout)
+        self.assertNotIn("scripts/sprint.py", sprint.stderr)
+        self.assertEqual(inbox.returncode, 0, inbox.stderr)
+        self.assertIn("usage: sc sprint inbox", inbox.stdout)
+        self.assertNotIn("scripts/sprint.py", inbox.stderr)
+        self.assertEqual(git_status(self.wt), before)
 
     def test_engine_ref_refuses_a_missing_or_malformed_live_pin(self):
         path = self.main / ".sc-state" / "engine.ref"

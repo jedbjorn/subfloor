@@ -2365,6 +2365,21 @@ class Handler(BaseHTTPRequestHandler):
                     sprint_id=sprint_id,
                 )
                 return self._send(200, {"result_message_id": message_id})
+            if path == "/_sc/sprint/send":
+                receipt = sprint_message_delivery.SprintMessageStore(con).relay(
+                    sprint_id,
+                    from_shell_id=shell_id,
+                    to_shortname=body.get("to") or "",
+                    body=body.get("body") or "",
+                    idempotency_key=body.get("idempotency_key") or "",
+                )
+                return self._send(201 if receipt.message_created else 200, {
+                    "message_id": receipt.message_id,
+                    "wake_id": receipt.wake_id,
+                    "message_created": receipt.message_created,
+                    "wake_state": receipt.wake_state,
+                    "conversation_id": receipt.conversation_id,
+                })
             if path == "/_sc/sprint/register-pr":
                 receipt = sprint_pr_watcher.SprintPRWatcher(
                     con, repo_root=REPO_ROOT
@@ -2521,6 +2536,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"wake_ids": released})
             if path == "/_sc/sprint/monitor":
                 self._require_sprint_planner(con, sprint_id, shell_id)
+                sprint_domain.SprintLifecycleStore(con).reconcile_unread_pickup(
+                    sprint_id,
+                    trigger="monitor",
+                )
                 outcomes = sprint_liveness.SprintLivenessMonitor(con).evaluate(
                     sprint_id
                 )

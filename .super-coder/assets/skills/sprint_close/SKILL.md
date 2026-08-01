@@ -9,6 +9,59 @@ common: false
 
 Use as the owning Planner when delivery work is terminal, or when abort has
 been chosen. Close-out supplies meaning; the compiler supplies facts.
+On entry or any wake, load `sprint_close`, run `sc sprint inbox --sprint <id>`,
+inspect the durable message, and accept or decline it only when actionable.
+
+```text
+sc sprint accept --sprint <id> --message <message-id>
+sc sprint decline --sprint <id> --message <message-id> --reason <reason>
+```
+
+Use `accept` or `decline` for actionable work. After acting on an informational
+question, answer, blocker, or context message, run `accept` for that message.
+For informational messages it only marks the message read; it does not change
+Sprint or work-unit state.
+
+## Questions, answers, blockers, and failures
+
+Put a concrete question, answer, blocker, or context request in a short body
+file, then send it to the conformance Reviewer or participant who owns the fact:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --key <stable-key>
+```
+
+Answer incoming questions through `send`, confirm that write, then mark the
+handled question read with `accept`. For a blocker, relay the evidence, impact,
+and exact action needed to every directly affected Sprint participant, and
+surface the exceptional recovery need separately to FnB. Continue safe
+synthesis, but stop at a decision boundary when the answer is required. Do not
+send duplicate reminders; unread recovery owns re-waking.
+
+Choose one stable key for the intended recipient and exact body. Reuse it only
+when retrying that same write; use a new key when the recipient or body changes.
+
+Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
+characters is the hard maximum. Before submitting, run `wc -m < <path>` and
+condense if needed. The handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake where applicable.
+
+If a Sprint command is rejected or transport fails, the write or handoff is
+incomplete. Correct and retry when safe. If the relay itself fails, surface the
+attempted command and durable evidence to FnB; do not invent an alternate
+delivery protocol. This skill is Planner-owned: the Planner or FnB decides
+whether an integrity threat warrants pause. Send any needed participant context
+before pausing; an active relay is not available after the lifecycle becomes
+paused.
+
+Treat an exhausted recovery wake as bounded manual-recovery evidence for FnB;
+preserve the unread message and failed wake, and do not create recursive
+fallbacks.
+
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
+```
 
 ## Delivery-complete gate
 
@@ -38,6 +91,9 @@ synthesis.
 
 FnB records one terminal disposition per follow-up. `accepted` acknowledges
 ship-as-is; `resolved` and `dismissed` require a resolution file.
+
+Keep a resolution at about 6,000 characters or fewer; 8,000 is the hard
+maximum. Run `wc -m < <path>` and require a successful durable disposition.
 
 ```text
 sc sprint disposition-followup --sprint <id> --followup <id> \
@@ -112,6 +168,10 @@ Abort only under Planner or FnB authority. Terminal state stops Sprint services
 and removes live pills while retaining conversations, messages, events, PR
 evidence, reports, and follow-ups.
 
+Keep the final report at about 6,000 characters or fewer; 8,000 is the hard
+maximum. Run `wc -m < <path>` before the typed terminal handoff, then require
+the successful report receipt and lifecycle transition.
+
 ```text
 sc sprint complete --sprint <id> --reason <summary> --outcome <outcome> \
   --report-file <path> --key <stable-key>
@@ -119,4 +179,6 @@ sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
 ```
 
 Hand the FnB the final report id, follow-up list, integrated SHA, and evidence
-links. Stop after the terminal transition; Sprint-scoped authority is over.
+links. Re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message,
+mark every handled informational message read with `accept`, and stop after the
+terminal transition; Sprint-scoped authority is over.

@@ -7,6 +7,7 @@
     ".super-coder/migrations/0150_sprint_close_reports.sql",
     ".super-coder/migrations/0151_seed_sprint_v2_skills.sql",
     ".super-coder/migrations/0152_sprint_surface_completion.sql",
+    ".super-coder/migrations/0153_harden_sprint_handoff_skills.sql",
     ".super-coder/assets/skills/sprint_prep/SKILL.md",
     ".super-coder/assets/skills/sprint_pln/SKILL.md",
     ".super-coder/assets/skills/sprint_dev/SKILL.md",
@@ -43,7 +44,10 @@
     "tests/test_sprint_live_proof.py",
     "tests/test_sprint_board_api.py",
     "tests/test_sprint_board_ui.py",
-    "tests/fixtures/sprint_v2_acceptance.json"
+    "tests/fixtures/sprint_v2_acceptance.json",
+    "tests/fixtures/sprint_handoff_hardening_acceptance.json",
+    "tests/test_callable_floor.py",
+    "tests/test_update_materialize.py"
   ],
   "baseline_migration_ledger": {
     "count": 142,

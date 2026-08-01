@@ -15,12 +15,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import db_driver
+import sprint_participant_chats
 from sprint_domain import SprintInvariantError, SprintLifecycleStore
 
-FIXED_WAKE_PROMPT = (
-    "Check your inbox. If you accept the task(s), mark the message as read "
-    "and act on the message using your assigned sprint skill."
-)
+wake_prompt = sprint_participant_chats.wake_prompt
+
 ACTIONABLE_KINDS = frozenset({"work_assignment", "review_request"})
 
 
@@ -32,10 +31,20 @@ class MessageReceipt:
 
 
 @dataclass(frozen=True)
+class ParticipantRelayReceipt:
+    message_id: int
+    wake_id: int
+    message_created: bool
+    wake_state: str
+    conversation_id: str
+
+
+@dataclass(frozen=True)
 class WakeLease:
     wake_id: int
     sprint_id: int
     participant_id: int
+    participant_role: str
     target_conversation_id: str | None
     idempotency_key: str
     attempt_number: int
@@ -94,6 +103,82 @@ class SprintMessageStore:
                 work_unit_id=work_unit_id,
                 actionable=actionable,
                 active=active,
+            )
+
+    def relay(
+        self,
+        sprint_id: int,
+        *,
+        from_shell_id: int,
+        to_shortname: str,
+        body: str,
+        idempotency_key: str,
+    ) -> ParticipantRelayReceipt:
+        if not isinstance(body, str):
+            raise ValueError("Sprint message body must be a string")
+        if not isinstance(to_shortname, str):
+            raise ValueError("Sprint recipient shortname must be a string")
+        if not isinstance(idempotency_key, str):
+            raise ValueError("Sprint message idempotency key must be a string")
+        body = body.strip()
+        to_shortname = to_shortname.strip()
+        idempotency_key = idempotency_key.strip()
+        if not body:
+            raise ValueError("Sprint message body is empty")
+        if len(body) > 8000:
+            raise ValueError(
+                f"Sprint message body is {len(body)} characters; maximum is 8000"
+            )
+        if not to_shortname:
+            raise ValueError("Sprint recipient shortname is empty")
+        if not idempotency_key:
+            raise ValueError("Sprint message idempotency key is empty")
+        with db_driver.write_transaction(self.con, "sprint.message.relay"):
+            sender = self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=?",
+                (sprint_id, from_shell_id),
+            ).fetchone()
+            if sender is None:
+                raise SprintInvariantError("sender is not a Sprint participant")
+            recipient = self.con.execute(
+                "SELECT p.participant_id FROM sprint_participants p "
+                "JOIN shells sh ON sh.shell_id=p.shell_id "
+                "WHERE p.sprint_id=? AND lower(sh.shortname)=lower(?)",
+                (sprint_id, to_shortname),
+            ).fetchone()
+            if recipient is None:
+                raise SprintInvariantError("recipient is not a Sprint participant")
+            if int(recipient["participant_id"]) == int(sender["participant_id"]):
+                raise SprintInvariantError("Sprint participants cannot relay to self")
+            receipt = self._send(
+                sprint_id,
+                to_participant_id=int(recipient["participant_id"]),
+                message_kind="notification",
+                body=body,
+                idempotency_key=idempotency_key,
+                from_participant_id=int(sender["participant_id"]),
+                work_unit_id=None,
+                actionable=False,
+                active=True,
+            )
+            wake = self.con.execute(
+                "SELECT state FROM sprint_wake_outbox WHERE wake_id=?",
+                (receipt.wake_id,),
+            ).fetchone()
+            route = self.con.execute(
+                "SELECT current_conversation_id FROM sprint_participants "
+                "WHERE participant_id=?",
+                (recipient["participant_id"],),
+            ).fetchone()
+            if wake is None or route is None or route["current_conversation_id"] is None:
+                raise SprintInvariantError("Sprint relay did not produce a deliverable wake")
+            return ParticipantRelayReceipt(
+                message_id=receipt.message_id,
+                wake_id=int(receipt.wake_id),
+                message_created=receipt.created,
+                wake_state=str(wake["state"]),
+                conversation_id=str(route["current_conversation_id"]),
             )
 
     def send_in_transaction(
@@ -407,6 +492,11 @@ class SprintMessageStore:
             "VALUES (?,?,?)",
             (sprint_id, wake_id, message_id),
         )
+        sprint_participant_chats.ensure_wake_conversation(
+            self.con,
+            participant_id,
+            idempotency_key=f"sprint:{sprint_id}:wake:{wake_id}:conversation",
+        )
         return wake_id
 
     def _recipient_message(
@@ -503,7 +593,7 @@ class SprintWakeDeliveryService:
                 (now,),
             )
             row = self.con.execute(
-                "SELECT w.*,p.current_conversation_id "
+                "SELECT w.*,p.current_conversation_id,p.role "
                 "FROM sprint_wake_outbox w "
                 "JOIN sprints s USING (sprint_id) "
                 "JOIN sprint_participants p "
@@ -535,11 +625,19 @@ class SprintWakeDeliveryService:
                 )
             if result.rowcount != 1:
                 return None
+            route = sprint_participant_chats.ensure_wake_conversation(
+                self.con,
+                int(row["participant_id"]),
+                idempotency_key=(
+                    f"sprint:{row['sprint_id']}:wake:{row['wake_id']}:conversation"
+                ),
+            )
             return WakeLease(
                 wake_id=int(row["wake_id"]),
                 sprint_id=int(row["sprint_id"]),
                 participant_id=int(row["participant_id"]),
-                target_conversation_id=row["current_conversation_id"],
+                participant_role=str(row["role"]),
+                target_conversation_id=route.conversation_id,
                 idempotency_key=str(row["idempotency_key"]),
                 attempt_number=int(row["attempt_count"]) + 1,
                 claim_owner=owner,
@@ -558,7 +656,7 @@ class SprintWakeDeliveryService:
                 raise RuntimeError("participant has no current Sprint conversation")
             native_run_ref = deliver(
                 lease.target_conversation_id,
-                FIXED_WAKE_PROMPT,
+                wake_prompt(lease.sprint_id, lease.participant_role),
                 lease.idempotency_key,
             )
         except Exception as exc:  # external delivery faults become durable evidence

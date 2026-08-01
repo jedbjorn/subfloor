@@ -9,6 +9,8 @@ common: false
 
 Use in one of two modes: a work-unit PR review during the loop, or the final
 whole-Sprint conformance pass. The evidence differs; independence does not.
+On every wake or re-entry, load `sprint_rev`, run the exact inbox command below,
+and inspect the durable message before deciding what to do.
 
 Read and accept the actionable request before beginning. During preparation,
 sign the exact current spec revision through the same authenticated surface:
@@ -19,6 +21,50 @@ sc sprint accept --sprint <id> --message <message-id>
 sc sprint record-qaqc --document <spec-document-id> \
   --verdict pass [--findings-document <document-id>]
 ```
+
+Decline an actionable request you cannot take, with a concrete reason:
+
+```text
+sc sprint decline --sprint <id> --message <message-id> --reason <reason>
+```
+
+Use `accept` or `decline` for actionable work. After acting on an informational
+question, answer, blocker, or context message, run `accept` for that message.
+For informational messages it only marks the message read; it does not change
+Sprint or work-unit state.
+
+## Questions, answers, blockers, and failures
+
+Put a concrete question, answer, blocker, or useful context in a short body file
+and send it to the participant who can act. Ask the Developer for missing PR
+evidence and the Planner for scope or severity decisions:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --key <stable-key>
+```
+
+Answer incoming questions through `send` so the answer is durable and wakes the
+asker, confirm that write, then mark the handled question read with `accept`. A
+blocker or integrity concern goes to the Planner with concise evidence, impact,
+the exact action needed, and your recommendation. Continue independent safe
+review, but stop at a decision boundary when the answer is required. Do not send
+duplicate reminders; unread recovery owns re-waking.
+
+Choose one stable key for the intended recipient and exact body. Reuse it only
+when retrying that same write; use a new key when the recipient or body changes.
+
+Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
+characters is the hard maximum. Before submitting, run `wc -m < <path>` and
+condense if needed. The handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake where applicable.
+
+If a Sprint command is rejected or transport fails, the verdict or handoff is
+incomplete. Correct and retry when safe. If the relay itself fails, surface the
+attempted command, evidence, impact, and recommendation to FnB; do not invent an
+alternate delivery protocol. A Reviewer does not pause the Sprint. The Planner
+decides whether the reported condition warrants continuing, re-planning, or
+pausing.
 
 ## Severity rubric
 
@@ -53,6 +99,10 @@ Findings must state:
 - the fix boundary, without prescribing unnecessary architecture.
 
 Put the verdict body in a file and record it through the authenticated surface:
+
+Keep the verdict at about 6,000 characters or fewer; 8,000 is the hard maximum.
+Run `wc -m < <path>` before submission. The typed review handoff exists only
+after the command succeeds and confirms its durable write and Developer wake.
 
 ```text
 sc sprint record-review \
@@ -94,6 +144,11 @@ Write the narrative report and a JSON findings array:
 
 Then record both atomically:
 
+Keep the conformance report and each finding body at about 6,000 characters or
+fewer; 8,000 is the hard maximum for each. Run `wc -m < <report>` and length-check
+each finding body before submission. Require the successful report and
+follow-up receipt before stopping.
+
 ```text
 sc sprint record-conformance \
   --sprint <id> --body-file <report> --findings-file <json> \
@@ -107,6 +162,8 @@ Surface immediate safety risk to the FnB, but preserve the close-out rule.
 
 ## Stop
 
-For unit review, stop after the durable verdict is recorded. For conformance,
-stop after the report and all findings replay idempotently and give the Planner
-their report/follow-up ids.
+For either mode, re-run `sc sprint inbox --sprint <id>` and act on newly arrived
+messages before stopping. For unit review, stop after the durable verdict is
+recorded and every handled informational message is marked read with `accept`.
+For conformance, also require the report and all findings to replay
+idempotently and give the Planner their report/follow-up ids.

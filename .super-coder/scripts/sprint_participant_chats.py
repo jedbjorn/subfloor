@@ -12,16 +12,45 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 import conversation_broker
 import run as run_mod
 
 _PURPOSES = {"work", "fix", "merge", "fallback"}
+_USABLE_WAKE_STATES = {"idle", "queued", "running", "waiting"}
+_WAKE_ROLES = {
+    "developer": ("Developer", "sprint_dev"),
+    "reviewer": ("Reviewer", "sprint_rev"),
+    "planner": ("Originating Planner", "sprint_pln"),
+}
 
 
 class SprintConversationError(ValueError):
     """The requested Sprint conversation transition violates its contract."""
+
+
+@dataclass(frozen=True)
+class WakeConversationRoute:
+    conversation_id: str
+    created: bool
+
+
+def wake_prompt(sprint_id: int, role: str) -> str:
+    try:
+        label, skill = _WAKE_ROLES[role]
+    except KeyError as exc:
+        raise SprintConversationError(
+            f"unsupported Sprint participant role: {role}"
+        ) from exc
+    return (
+        f"Sprint {sprint_id} handoff for your {label} role. Load `{skill}`. "
+        f"Run `sc sprint inbox --sprint {sprint_id}` now and act on the Sprint "
+        f"message(s) using `{skill}`. Confirm every Sprint write succeeds before "
+        f"stopping. If the handoff is not complete, load `{skill}` again and run "
+        f"`sc sprint inbox --sprint {sprint_id}` again."
+    )
 
 
 def _canonical_json(value: Any) -> str:
@@ -414,6 +443,99 @@ def select_work(con, participant_id: int) -> str:
         (conversation_id, participant_id),
     )
     return conversation_id
+
+
+def ensure_wake_conversation(
+    con,
+    participant_id: int,
+    *,
+    idempotency_key: str,
+) -> WakeConversationRoute:
+    """Return a usable current chat, creating one linked route when absent."""
+    row = con.execute(
+        "SELECT p.participant_id,p.sprint_id,p.harness,p.model,p.effort,"
+        "p.persistent_conversation_id,p.current_conversation_id,"
+        "sh.shortname,sh.flavor,owner.user_id,c.state AS current_state "
+        "FROM sprint_participants p "
+        "JOIN sprints s ON s.sprint_id=p.sprint_id "
+        "JOIN shells sh ON sh.shell_id=p.shell_id "
+        "JOIN shells owner ON owner.shell_id=s.originating_planner_shell_id "
+        "LEFT JOIN conversations c "
+        "ON c.conversation_id=p.current_conversation_id "
+        "WHERE p.participant_id=?",
+        (participant_id,),
+    ).fetchone()
+    if row is None:
+        raise SprintConversationError("Sprint participant does not exist")
+    current_id = row["current_conversation_id"]
+    if (
+        current_id is not None
+        and row["current_state"] in _USABLE_WAKE_STATES
+        and _linked_to_participant(con, participant_id, current_id)
+    ):
+        return WakeConversationRoute(str(current_id), False)
+    if row["user_id"] is None:
+        raise SprintConversationError("originating Planner has no browser owner")
+
+    parent_id = None
+    for candidate in (current_id, row["persistent_conversation_id"]):
+        if candidate is not None and _linked_to_participant(
+            con, participant_id, candidate
+        ):
+            parent_id = str(candidate)
+            break
+    purpose = "fallback" if parent_id is not None else "work"
+    prior_routes = con.execute(
+        "SELECT conversation_id,state,creation_idempotency_key "
+        "FROM conversations WHERE owner_user_id=? "
+        "AND (creation_idempotency_key=? "
+        "OR creation_idempotency_key LIKE ?) ORDER BY rowid",
+        (row["user_id"], idempotency_key, f"{idempotency_key}:reroute:%"),
+    ).fetchall()
+    for prior in reversed(prior_routes):
+        if (
+            prior["state"] in _USABLE_WAKE_STATES
+            and _linked_to_participant(con, participant_id, prior["conversation_id"])
+        ):
+            con.execute(
+                "UPDATE sprint_participants SET current_conversation_id=?,"
+                "updated_at=datetime('now') WHERE participant_id=?",
+                (prior["conversation_id"], participant_id),
+            )
+            return WakeConversationRoute(str(prior["conversation_id"]), False)
+    route_key = (
+        idempotency_key
+        if not prior_routes
+        else f"{idempotency_key}:reroute:{len(prior_routes)}"
+    )
+    worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
+    conversation_id = create_and_select(
+        con,
+        participant_id=participant_id,
+        owner_user_id=int(row["user_id"]),
+        purpose=purpose,
+        harness=row["harness"],
+        provider=run_mod.session_provider(row["harness"], row["model"]),
+        model=row["model"],
+        effort=row["effort"],
+        worktree=str(worktree.resolve(strict=False)),
+        title=(
+            f"Sprint {row['sprint_id']} · Wake route · {row['shortname']}"
+        ),
+        idempotency_key=route_key,
+        parent_conversation_id=parent_id,
+        context_packet=(
+            {
+                "reason": "sprint wake requires a usable current conversation",
+                "sprint_id": int(row["sprint_id"]),
+                "participant_id": participant_id,
+                "previous_conversation_id": parent_id,
+            }
+            if parent_id is not None
+            else None
+        ),
+    )
+    return WakeConversationRoute(conversation_id, True)
 
 
 def create_review_outcome(

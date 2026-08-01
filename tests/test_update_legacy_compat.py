@@ -80,6 +80,8 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 ENGINE_REF_PREV=engine_ref_prev,
                 MARKER=marker,
             ), mock.patch.object(
+                update, "repair_callable_dispatcher"
+            ) as repair_dispatcher, mock.patch.object(
                 update, "repair_git_worktrees"
             ) as repair, mock.patch.object(
                 update, "refresh_installed_brokers"
@@ -87,6 +89,10 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 self.assertEqual(0, update_compat.main())
                 self.assertEqual(0, update_compat.main())
 
+            self.assertEqual(
+                repair_dispatcher.call_args_list,
+                [mock.call(new_ref), mock.call(new_ref)],
+            )
             repair.assert_called_once_with()
             refresh.assert_called_once_with()
             self.assertEqual(new_ref + "\n", marker.read_text())
@@ -130,12 +136,15 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 ENGINE_REF_PREV=engine_ref_prev,
                 MARKER=marker,
             ), mock.patch.object(
+                update, "repair_callable_dispatcher"
+            ) as repair_dispatcher, mock.patch.object(
                 update, "repair_git_worktrees"
             ) as repair, mock.patch.object(
                 update, "refresh_installed_brokers"
             ) as refresh:
                 self.assertEqual(0, update_compat.main())
 
+            repair_dispatcher.assert_called_once_with(current_ref)
             repair.assert_not_called()
             refresh.assert_not_called()
             self.assertFalse(marker.exists())
@@ -163,6 +172,7 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 "    path.write_text(old + value + '\\n')\n"
                 "def repair_git_worktrees(): _record('repair')\n"
                 "def refresh_installed_brokers(): _record('brokers')\n"
+                "def repair_callable_dispatcher(ref): _record('dispatcher')\n"
             )
             (scripts / "map_repo.py").write_text(
                 "def main(): return 0\n"
@@ -188,7 +198,7 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             )
 
             self.assertEqual(0, completed.returncode, completed.stderr)
-            self.assertEqual("repair\nbrokers\n", log.read_text())
+            self.assertEqual("dispatcher\nrepair\nbrokers\n", log.read_text())
             self.assertEqual(
                 current_ref + "\n",
                 (state / "local" / "update-compat-v1.done").read_text(),

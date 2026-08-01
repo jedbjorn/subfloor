@@ -64,6 +64,74 @@ class SprintReviewLoopCase(SprintPRWatcherCase):
 
 
 class ReviewHandoffTest(SprintReviewLoopCase):
+    def test_review_payloads_accept_8000_and_reject_8001_without_state_change(self):
+        before_messages = self.con.execute(
+            "SELECT COUNT(*) FROM sprint_messages"
+        ).fetchone()[0]
+        with self.assertRaisesRegex(
+            ValueError,
+            "readiness judgment is 8001 characters; maximum is 8000",
+        ):
+            self.loop.request_review(
+                self.sprint_id,
+                self.registered_pr_id,
+                1,
+                readiness="x" * 8001,
+                idempotency_key="oversize-readiness",
+            )
+        self.assertEqual(
+            ("active", before_messages),
+            tuple(
+                self.con.execute(
+                    "SELECT u.disposition,(SELECT COUNT(*) FROM sprint_messages) "
+                    "FROM sprint_work_units u WHERE u.work_unit_id=?",
+                    (self.unit_id,),
+                ).fetchone()
+            ),
+        )
+
+        handoff = self.loop.request_review(
+            self.sprint_id,
+            self.registered_pr_id,
+            1,
+            readiness="x" * 8000,
+            idempotency_key="bounded-readiness",
+        )
+        self.accept_review(handoff.message_id)
+        before_judgments = self.con.execute(
+            "SELECT COUNT(*) FROM sprint_judgments WHERE sprint_id=?",
+            (self.sprint_id,),
+        ).fetchone()[0]
+        with self.assertRaisesRegex(
+            ValueError,
+            "review body is 8001 characters; maximum is 8000",
+        ):
+            self.loop.record_review(
+                self.sprint_id,
+                self.registered_pr_id,
+                2,
+                verdict="approved",
+                body="x" * 8001,
+                idempotency_key="oversize-review",
+            )
+        self.assertEqual(
+            before_judgments,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_judgments WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+
+        outcome = self.loop.record_review(
+            self.sprint_id,
+            self.registered_pr_id,
+            2,
+            verdict="approved",
+            body="x" * 8000,
+            idempotency_key="bounded-review",
+        )
+        self.assertTrue(outcome.created)
+
     def test_green_readiness_commits_judgment_and_active_reviewer_request(self):
         handoff = self.request_review()
 
