@@ -495,6 +495,17 @@ class SprintPRWatcher:
                     "registered_pr.closed_without_merge",
                 )
             )
+        elif (
+            state == "merged"
+            and work_unit_id is not None
+            and unit_rows[0]["disposition"] != "merge_ready"
+        ):
+            resolved_review_message_ids = (
+                self.liveness.resolve_review_requests_for_work_unit_in_transaction(
+                    work_unit_id,
+                    "registered_pr.merged_grant_bypassed",
+                )
+            )
         recipients: dict[int, bool] = {
             int(registered["owner_participant_id"]): state in {"red", "green"}
         }
@@ -527,6 +538,7 @@ class SprintPRWatcher:
         )
         if (
             head_changed
+            and state not in {"merged", "closed"}
             and len(unit_rows) == 1
             and unit_rows[0]["disposition"] == "merge_ready"
         ):

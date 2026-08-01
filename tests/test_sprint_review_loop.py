@@ -555,6 +555,74 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             ).head_sha,
         )
 
+    def test_merged_head_move_completes_without_requesting_dead_delta_review(self):
+        self.approve()
+        self.reader.current = pull_request(
+            state="MERGED",
+            checks="SUCCESS",
+            checks_failed=False,
+            head_sha="b" * 40,
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(
+            "completed",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            (0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='review.approval_invalidated'),"
+                    "(SELECT COUNT(*) FROM sprint_messages "
+                    "WHERE idempotency_key LIKE 'pr-head-change:%:delta-review'),"
+                    "(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='merge.grant_bypassed')"
+                ).fetchone()
+            ),
+        )
+
+    def test_closed_head_move_does_not_create_orphaned_delta_review(self):
+        self.approve()
+        self.reader.current = pull_request(
+            state="CLOSED",
+            checks=None,
+            checks_failed=False,
+            head_sha="b" * 40,
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(
+            "merge_ready",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            (0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='review.approval_invalidated'),"
+                    "(SELECT COUNT(*) FROM sprint_messages "
+                    "WHERE idempotency_key LIKE 'pr-head-change:%:delta-review'),"
+                    "(SELECT COUNT(*) FROM sprint_liveness_expectations e "
+                    "JOIN sprint_messages m USING (message_id) "
+                    "WHERE m.message_kind='review_request' "
+                    "AND e.resolved_at IS NULL)"
+                ).fetchone()
+            ),
+        )
+
     def test_grant_bypassed_merge_notifies_planner_without_completing_unit(self):
         self.reader.current = pull_request(
             state="MERGED", checks="SUCCESS", checks_failed=False
@@ -614,6 +682,40 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
                     "WHERE idempotency_key LIKE 'merge-grant-bypassed:%')"
                 ).fetchone()
             ),
+        )
+
+    def test_grant_bypassed_merge_resolves_accepted_review_expectation(self):
+        handoff = self.request_review()
+        self.accept_review(handoff.message_id)
+        self.reader.current = pull_request(
+            state="MERGED", checks="SUCCESS", checks_failed=False
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        expectation = self.con.execute(
+            "SELECT resolved_at,resolution,next_evaluation_at "
+            "FROM sprint_liveness_expectations WHERE message_id=?",
+            (handoff.message_id,),
+        ).fetchone()
+        self.assertIsNotNone(expectation["resolved_at"])
+        self.assertEqual(
+            ("registered_pr.merged_grant_bypassed", None),
+            (expectation["resolution"], expectation["next_evaluation_at"]),
+        )
+        self.assertEqual(
+            "in_review",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type='merge.grant_bypassed'"
+            ).fetchone()[0],
         )
 
     def test_observed_merge_completes_board_and_assigns_next_in_persistent_lane(self):
