@@ -242,11 +242,15 @@ class EnginePathsAtRefTest(unittest.TestCase):
         self.assertFalse((state / "engine.ref").exists())
         self.assertEqual((self.root / "sc").read_text().splitlines()[0], "#!/bin/sh")
 
-    def test_legacy_bridge_repairs_stale_dispatcher_and_rebaselines_manifest(self):
+    def test_materialized_alias_keeps_stale_worktree_and_repairs_main(self):
         installed = ["sc", ".super-coder/scripts"]
         (self.root / "sc").write_text(
             "#!/bin/sh\n"
-            "S=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)/.super-coder/scripts\"\n"
+            "here=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"\n"
+            "live=\"$(cd \"$here\" && cd \"$(git rev-parse --git-common-dir)/..\" && pwd -P)\"\n"
+            "S=\"$live/.super-coder/scripts\"\n"
+            "cmd=\"${1:-}\"\n"
+            "[ \"$cmd\" = sprint ] && shift\n"
             'exec "${PY:-python3}" "$S/sprint.py" "$@"\n'
         )
         (self.root / "sc").chmod(0o755)
@@ -263,15 +267,27 @@ class EnginePathsAtRefTest(unittest.TestCase):
             "[ \"$cmd\" = sprint ] && shift\n"
             'exec "${PY:-python3}" "$S/sprint_cli.py" "$@"\n'
         )
-        (self.scripts / "sprint.py").unlink()
+        (self.scripts / "sprint.py").write_text(
+            (ROOT / ".super-coder" / "scripts" / "sprint.py").read_text()
+        )
         (self.scripts / "sprint_cli.py").write_text(
             "import sys\n"
-            "if sys.argv[1:] == ['-h']:\n"
-            "    print('usage: sc sprint [-h]')\n"
-            "elif sys.argv[1:] == ['inbox', '-h']:\n"
-            "    print('usage: sc sprint inbox [-h] --sprint SPRINT')\n"
-            "else:\n"
-            "    raise SystemExit(2)\n"
+            "def main(argv=None):\n"
+            "    argv = sys.argv[1:] if argv is None else argv\n"
+            "    if argv == ['-h']:\n"
+            "        print('usage: sc sprint [-h]')\n"
+            "    elif argv == ['inbox', '-h']:\n"
+            "        print('usage: sc sprint inbox [-h] --sprint SPRINT')\n"
+            "    else:\n"
+            "        raise SystemExit(2)\n"
+            "    return 0\n"
+            "if __name__ == '__main__':\n"
+            "    from cli_entry import run_cli\n"
+            "    raise SystemExit(run_cli(main))\n"
+        )
+        (self.scripts / "cli_entry.py").write_text(
+            "def run_cli(fn, *args, **kwargs):\n"
+            "    return fn(*args, **kwargs)\n"
         )
         self.write_manifest(installed)
         target_sha = self.commit("current callable floor")
@@ -294,6 +310,13 @@ class EnginePathsAtRefTest(unittest.TestCase):
             update.materialize_engine(
                 target_sha,
                 engine_paths=[".super-coder/scripts"],
+            )
+            stale_worktree_help = subprocess.run(
+                [str(worktree / "sc"), "sprint", "-h"],
+                cwd=worktree,
+                capture_output=True,
+                text=True,
+                check=False,
             )
             repaired = update.repair_callable_dispatcher(target_sha)
 
@@ -319,6 +342,8 @@ class EnginePathsAtRefTest(unittest.TestCase):
         self.assertIn("sprint_cli.py", (self.root / "sc").read_text())
         self.assertNotIn("sprint.py", (self.root / "sc").read_text())
         self.assertIn("legacy update bridge: repaired callable dispatcher", output.getvalue())
+        self.assertEqual(0, stale_worktree_help.returncode, stale_worktree_help.stderr)
+        self.assertEqual(stale_worktree_help.stdout, "usage: sc sprint [-h]\n")
         self.assertEqual(main_help.returncode, 0, main_help.stderr)
         self.assertEqual(main_help.stdout, "usage: sc sprint [-h]\n")
         self.assertEqual(worktree_help.returncode, 0, worktree_help.stderr)
@@ -329,8 +354,8 @@ class EnginePathsAtRefTest(unittest.TestCase):
         self.assertEqual(_git(worktree, "status", "--porcelain"), worktree_before)
         recorded = json.loads(manifest.read_text())
         self.assertIn("sc", recorded)
+        self.assertIn(".super-coder/scripts/sprint.py", recorded)
         self.assertIn(".super-coder/scripts/sprint_cli.py", recorded)
-        self.assertNotIn(".super-coder/scripts/sprint.py", recorded)
 
     def test_half_laid_target_bypasses_only_matching_manifest_drift_on_retry(self):
         installed = ["sc", ".super-coder/scripts"]
