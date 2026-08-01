@@ -101,9 +101,15 @@ def _banner_owned_skill_directory(path: Path) -> bool:
         return False
 
 
-def _upstream_skill_slugs() -> set[str]:
+def _managed_skill_slugs(con) -> set[str]:
+    """Return every upstream-reserved or DB-known managed directory name."""
     names = (*seed_skills.seeded_skill_names(), *seed_skills.tombstoned_skill_names())
-    return {name.strip().lower().replace(" ", "-") for name in names}
+    upstream = {name.strip().lower().replace(" ", "-") for name in names}
+    database = {
+        row[0].strip().lower().replace(" ", "-")
+        for row in con.execute("SELECT name FROM skills ORDER BY name")
+    }
+    return upstream | database
 
 
 def _remove_managed_tree(path: Path, managed_names: set[str]) -> bool:
@@ -138,7 +144,7 @@ def reconcile_root(
     written: list[Path] = []
     skipped: list[Path] = []
     deleted: list[Path] = []
-    managed_names = _upstream_skill_slugs()
+    managed_names = _managed_skill_slugs(con)
 
     if root.exists():
         for child in root.iterdir():

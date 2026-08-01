@@ -122,6 +122,54 @@ class SkillProjectionTest(unittest.TestCase):
                 self.assertIn(removed, summary["deleted"])
             self.assertFalse(checkout.joinpath(".opencode/skills").exists())
 
+    def test_revocation_deletes_fork_local_skill_from_managed_roots(self) -> None:
+        shell_id = add_shell(self.con, "custom", None)
+        local_name = "fork_local_probe"
+        self.con.execute(
+            "INSERT INTO skills (name, description, content, common) "
+            "VALUES (?, 'Fork-local probe', 'local body', 0)",
+            (local_name,),
+        )
+        grant(self.con, shell_id, local_name)
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp)
+            skill_projection.reconcile_shell(
+                self.con,
+                shell_id,
+                checkout,
+                ensure_dirs=(".claude/skills", ".agents/skills"),
+            )
+            rendered = [
+                checkout / relative / local_name / "SKILL.md"
+                for relative in (".claude/skills", ".agents/skills")
+            ]
+            self.assertEqual(
+                [path.read_text() for path in rendered],
+                [
+                    (
+                        "---\nname: fork_local_probe\n"
+                        "description: Fork-local probe\n---\n\nlocal body\n"
+                    )
+                ]
+                * 2,
+            )
+
+            self.con.execute("DELETE FROM shell_skills WHERE shell_id=?", (shell_id,))
+            summary = skill_projection.reconcile_shell(self.con, shell_id, checkout)
+
+            removed = [path.parent for path in rendered]
+            self.assertEqual(summary["deleted"], removed)
+            self.assertEqual([path.exists() for path in removed], [False, False])
+            self.assertEqual(
+                tuple(
+                    self.con.execute(
+                        "SELECT name, content, is_deleted FROM skills WHERE name=?",
+                        (local_name,),
+                    ).fetchone()
+                ),
+                (local_name, "local body", 0),
+            )
+
     def test_symlink_root_is_refused_without_touching_target(self) -> None:
         shell_id = add_shell(self.con, "custom", None)
         grant(self.con, shell_id, "query_authoring_pg")
