@@ -1,6 +1,7 @@
 """Stage 6 gates for the Sprints v2 Developer and Reviewer loop."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from unittest import mock
@@ -471,6 +472,249 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             self.con.execute(
                 "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
                 (approved.work_unit_id,),
+            ).fetchone()[0],
+        )
+
+    def test_same_state_head_move_invalidates_approval_and_requests_delta_review(self):
+        approved = self.approve()
+        self.reader.current = pull_request(
+            checks="SUCCESS", checks_failed=False, head_sha="b" * 40
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(
+            [("green", "a" * 40), ("green", "b" * 40)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT normalized_state,observed_head_sha "
+                    "FROM sprint_pr_transitions ORDER BY transition_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            "in_review",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+        delta = self.con.execute(
+            "SELECT message_id,to_participant_id,actionable,disposition,body "
+            "FROM sprint_messages WHERE idempotency_key LIKE "
+            "'pr-head-change:%:delta-review'"
+        ).fetchone()
+        self.assertEqual(
+            (self.reviewer_id, 1, "pending"),
+            (int(delta["to_participant_id"]), delta["actionable"], delta["disposition"]),
+        )
+        self.assertIn("Perform a delta review", delta["body"])
+        self.assertEqual(
+            [(self.reviewer_id, "pending")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT w.participant_id,w.state FROM sprint_wake_outbox w "
+                    "JOIN sprint_wake_messages wm USING (wake_id) "
+                    "WHERE wm.message_id=?",
+                    (delta["message_id"],),
+                )
+            ],
+        )
+        invalidated = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events "
+                "WHERE event_type='review.approval_invalidated'"
+            ).fetchone()[0]
+        )
+        self.assertEqual("a" * 40, invalidated["previous_head_sha"])
+        self.assertEqual("b" * 40, invalidated["head_sha"])
+        self.assertEqual(approved.message_id, invalidated["invalidated_message_id"])
+        self.assertIsNotNone(
+            self.con.execute(
+                "SELECT read_at FROM sprint_messages WHERE message_id=?",
+                (approved.message_id,),
+            ).fetchone()[0]
+        )
+
+        self.accept_review(int(delta["message_id"]))
+        outcome = self.loop.record_review(
+            self.sprint_id,
+            self.registered_pr_id,
+            2,
+            verdict="approved",
+            body="Delta review is clean on the replacement head.",
+            idempotency_key="approved-after-head-move",
+        )
+        self.assertEqual("merge_ready", outcome.disposition)
+        self.assertEqual(
+            "b" * 40,
+            self.loop.authorize_merge(
+                self.sprint_id, self.registered_pr_id, 1
+            ).head_sha,
+        )
+
+    def test_merged_head_move_completes_without_requesting_dead_delta_review(self):
+        self.approve()
+        self.reader.current = pull_request(
+            state="MERGED",
+            checks="SUCCESS",
+            checks_failed=False,
+            head_sha="b" * 40,
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(
+            "completed",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            (0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='review.approval_invalidated'),"
+                    "(SELECT COUNT(*) FROM sprint_messages "
+                    "WHERE idempotency_key LIKE 'pr-head-change:%:delta-review'),"
+                    "(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='merge.grant_bypassed')"
+                ).fetchone()
+            ),
+        )
+
+    def test_closed_head_move_does_not_create_orphaned_delta_review(self):
+        self.approve()
+        self.reader.current = pull_request(
+            state="CLOSED",
+            checks=None,
+            checks_failed=False,
+            head_sha="b" * 40,
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(
+            "merge_ready",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            (0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='review.approval_invalidated'),"
+                    "(SELECT COUNT(*) FROM sprint_messages "
+                    "WHERE idempotency_key LIKE 'pr-head-change:%:delta-review'),"
+                    "(SELECT COUNT(*) FROM sprint_liveness_expectations e "
+                    "JOIN sprint_messages m USING (message_id) "
+                    "WHERE m.message_kind='review_request' "
+                    "AND e.resolved_at IS NULL)"
+                ).fetchone()
+            ),
+        )
+
+    def test_grant_bypassed_merge_notifies_planner_without_completing_unit(self):
+        self.reader.current = pull_request(
+            state="MERGED", checks="SUCCESS", checks_failed=False
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(
+            "active",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+        bypass = self.con.execute(
+            "SELECT payload FROM sprint_events "
+            "WHERE event_type='merge.grant_bypassed'"
+        ).fetchone()
+        self.assertEqual("active", json.loads(bypass["payload"])["before"])
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type='work_unit.completed'"
+            ).fetchone()[0],
+        )
+        notice = self.con.execute(
+            "SELECT m.to_participant_id,m.work_unit_id,m.body,w.state "
+            "FROM sprint_messages m JOIN sprint_wake_messages wm USING (message_id) "
+            "JOIN sprint_wake_outbox w USING (wake_id) "
+            "WHERE m.idempotency_key LIKE 'merge-grant-bypassed:%'"
+        ).fetchone()
+        self.assertEqual(
+            (self.planner_id, self.unit_id, "pending"),
+            (int(notice[0]), int(notice[1]), notice[3]),
+        )
+        self.assertIn("remains incomplete", notice["body"])
+
+        lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+        lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="inspect the bypass",
+        )
+        lifecycle.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+        self.assertEqual(
+            (1, 1),
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='merge.grant_bypassed'),"
+                    "(SELECT COUNT(*) FROM sprint_messages "
+                    "WHERE idempotency_key LIKE 'merge-grant-bypassed:%')"
+                ).fetchone()
+            ),
+        )
+
+    def test_grant_bypassed_merge_resolves_accepted_review_expectation(self):
+        handoff = self.request_review()
+        self.accept_review(handoff.message_id)
+        self.reader.current = pull_request(
+            state="MERGED", checks="SUCCESS", checks_failed=False
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+
+        expectation = self.con.execute(
+            "SELECT resolved_at,resolution,next_evaluation_at "
+            "FROM sprint_liveness_expectations WHERE message_id=?",
+            (handoff.message_id,),
+        ).fetchone()
+        self.assertIsNotNone(expectation["resolved_at"])
+        self.assertEqual(
+            ("registered_pr.merged_grant_bypassed", None),
+            (expectation["resolution"], expectation["next_evaluation_at"]),
+        )
+        self.assertEqual(
+            "in_review",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type='merge.grant_bypassed'"
             ).fetchone()[0],
         )
 

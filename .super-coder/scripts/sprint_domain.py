@@ -72,6 +72,7 @@ class PauseReceipt:
 class ResumeReceipt:
     changed: bool
     dispatched_wake_ids: tuple[int, ...]
+    requeued_wake_ids: tuple[int, ...]
     projected_work_unit_ids: tuple[int, ...]
     resolved_review_message_ids: tuple[int, ...]
     spec_drift_document_ids: tuple[int, ...]
@@ -280,6 +281,8 @@ class SprintLifecycleStore:
                 reason=reason or terminal_outcome or "aborted",
                 terminal_outcome=terminal_outcome,
             ).changed
+        cleanup_run_ids: tuple[int, ...] = ()
+        cleanup_conversations: tuple[str, ...] = ()
         with db_driver.write_transaction(self.con, "sprint.transition"):
             sprint = self._sprint(sprint_id)
             current = str(sprint["lifecycle"])
@@ -301,12 +304,24 @@ class SprintLifecycleStore:
                 target=target,
                 outcome=terminal_outcome,
             )
+            if target == "completed":
+                cleanup_run_ids, cleanup_conversations = (
+                    sprint_participant_chats.close_for_terminal_lifecycle(
+                        self.con,
+                        sprint_id,
+                        lifecycle=target,
+                    )
+                )
             self._event(
                 sprint_id,
                 f"lifecycle.{target}",
                 actor,
                 {"from": current, "reason": reason},
             )
+        self._signal_terminal_conversation_cleanup(
+            cleanup_run_ids,
+            cleanup_conversations,
+        )
         return True
 
     def pause(
@@ -355,7 +370,7 @@ class SprintLifecycleStore:
             sprint = self._sprint(sprint_id)
             current = str(sprint["lifecycle"])
             if current == "armed":
-                return ResumeReceipt(False, (), (), (), (), anomalies)
+                return ResumeReceipt(False, (), (), (), (), (), anomalies)
             if current == "prepared":
                 raise SprintInvariantError(
                     "prepared Sprints must use arm() so plan release is atomic"
@@ -374,6 +389,7 @@ class SprintLifecycleStore:
             )
             if reconcile_in_transaction is not None:
                 reconcile_in_transaction(self.con)
+            requeued = self._requeue_failed_wakes_in_transaction(sprint_id)
             projected, resolved = self._reconcile_registered_prs_in_transaction(
                 sprint_id
             )
@@ -384,6 +400,7 @@ class SprintLifecycleStore:
             evidence = self._reconciliation_evidence(
                 sprint_id,
                 trigger="resume",
+                requeued_wake_ids=requeued,
                 projected_work_unit_ids=projected,
                 resolved_review_message_ids=resolved,
                 spec_drift=drift,
@@ -395,11 +412,12 @@ class SprintLifecycleStore:
                 actor,
                 evidence,
             )
-            if drift or all_anomalies:
+            if drift or all_anomalies or requeued:
                 _, notice_conversations = self._queue_planner_notice(
                     sprint_id,
                     body=(
                         f"Sprint {sprint_id} resumed with reconciliation evidence: "
+                        f"{len(requeued)} failed wake(s) re-queued, "
                         f"{len(drift)} spec drift item(s), "
                         f"{len(all_anomalies)} anomaly item(s)."
                     ),
@@ -429,6 +447,7 @@ class SprintLifecycleStore:
         return ResumeReceipt(
             True,
             dispatched,
+            requeued,
             tuple(projected),
             tuple(resolved),
             tuple(sorted(drift)),
@@ -497,11 +516,28 @@ class SprintLifecycleStore:
                     "interrupt_run_ids": list(run_ids),
                 },
             )
+            cleanup_run_ids, cleanup_conversations = (
+                sprint_participant_chats.close_for_terminal_lifecycle(
+                    self.con,
+                    sprint_id,
+                    lifecycle="aborted",
+                )
+            )
+            if set(cleanup_run_ids) != set(run_ids):
+                raise SprintInvariantError(
+                    "terminal conversation cleanup found an untracked active run"
+                )
             receipt = AbortReceipt(
                 True,
                 report_id,
                 run_ids,
-                tuple(sorted(set(run_conversations) | set(notice_conversations))),
+                tuple(
+                    sorted(
+                        set(run_conversations)
+                        | set(notice_conversations)
+                        | set(cleanup_conversations)
+                    )
+                ),
             )
         self._signal_interrupts_and_notifications(receipt)
         return receipt
@@ -834,13 +870,24 @@ class SprintLifecycleStore:
                     )
                 ) if unit_ids else ()
                 if incomplete:
+                    merge_ready = tuple(
+                        int(item[0])
+                        for item in self.con.execute(
+                            "SELECT work_unit_id FROM sprint_work_units "
+                            "WHERE work_unit_id IN ("
+                            + ",".join("?" for _ in unit_ids)
+                            + ") AND disposition='merge_ready' "
+                            "ORDER BY work_unit_id",
+                            unit_ids,
+                        )
+                    )
                     units.complete_from_merge_in_transaction(
                         sprint_id,
                         unit_ids,
                         transition_key=str(row["transition_key"]),
                         dispatch=False,
                     )
-                    projected.extend(incomplete)
+                    projected.extend(merge_ready)
             elif row["normalized_state"] == "closed":
                 for unit_id in unit_ids:
                     resolved.extend(
@@ -850,6 +897,58 @@ class SprintLifecycleStore:
                         )
                     )
         return tuple(sorted(set(projected))), tuple(sorted(set(resolved)))
+
+    def _requeue_failed_wakes_in_transaction(self, sprint_id: int) -> tuple[int, ...]:
+        if not self.con.in_transaction:
+            raise RuntimeError("wake reconciliation requires an active transaction")
+        rows = self.con.execute(
+            "SELECT DISTINCT w.wake_id,w.participant_id FROM sprint_wake_outbox w "
+            "JOIN sprint_wake_messages wm ON wm.sprint_id=w.sprint_id "
+            "AND wm.wake_id=w.wake_id JOIN sprint_messages m "
+            "ON m.sprint_id=wm.sprint_id AND m.message_id=wm.message_id "
+            "WHERE w.sprint_id=? AND w.state='failed' AND m.read_at IS NULL "
+            "ORDER BY w.wake_id",
+            (sprint_id,),
+        ).fetchall()
+        replacements: list[int] = []
+        for row in rows:
+            old_wake_id = int(row["wake_id"])
+            participant_id = int(row["participant_id"])
+            pending = self.con.execute(
+                "SELECT wake_id FROM sprint_wake_outbox WHERE sprint_id=? "
+                "AND participant_id=? AND state='pending'",
+                (sprint_id, participant_id),
+            ).fetchone()
+            if pending is None:
+                new_wake_id = int(
+                    self.con.execute(
+                        "INSERT INTO sprint_wake_outbox "
+                        "(sprint_id,participant_id,idempotency_key) VALUES (?,?,?)",
+                        (
+                            sprint_id,
+                            participant_id,
+                            f"sprint-resume:{sprint_id}:failed-wake:{old_wake_id}",
+                        ),
+                    ).lastrowid
+                )
+            else:
+                new_wake_id = int(pending["wake_id"])
+            self.con.execute(
+                "UPDATE sprint_wake_messages SET wake_id=? "
+                "WHERE sprint_id=? AND wake_id=?",
+                (new_wake_id, sprint_id, old_wake_id),
+            )
+            self._event(
+                sprint_id,
+                "wake.requeued",
+                LifecycleActor("system"),
+                {
+                    "failed_wake_id": old_wake_id,
+                    "replacement_wake_id": new_wake_id,
+                },
+            )
+            replacements.append(new_wake_id)
+        return tuple(sorted(set(replacements)))
 
     def _resolve_review_expectations_in_transaction(
         self, work_unit_id: int, resolution: str
@@ -917,6 +1016,7 @@ class SprintLifecycleStore:
         sprint_id: int,
         *,
         trigger: str,
+        requeued_wake_ids: Iterable[int],
         projected_work_unit_ids: Iterable[int],
         resolved_review_message_ids: Iterable[int],
         spec_drift: dict[int, dict[str, str]],
@@ -957,6 +1057,7 @@ class SprintLifecycleStore:
                     (sprint_id,),
                 )
             ],
+            "requeued_wake_ids": list(requeued_wake_ids),
             "work_units": [
                 dict(row)
                 for row in self.con.execute(
@@ -1138,6 +1239,18 @@ class SprintLifecycleStore:
             conversation_events.notify(conversation_id)
         if tuple(conversation_ids):
             self.notify_commit()
+
+    def _signal_terminal_conversation_cleanup(
+        self,
+        run_ids: Iterable[int],
+        conversation_ids: Iterable[str],
+    ) -> None:
+        self._signal_notifications(conversation_ids)
+        for run_id in run_ids:
+            try:
+                self.interrupt_run(run_id)
+            except Exception:  # noqa: BLE001 - durable intent is already committed
+                self.notify_commit()
 
     @staticmethod
     def _required_text(value: str, label: str, limit: int) -> str:
@@ -1660,19 +1773,34 @@ class SprintWorkUnitStore:
         for unit in units:
             if unit["disposition"] == "completed":
                 continue
-            changed = True
             if unit["disposition"] != "merge_ready":
-                self._event(
+                existing_bypass = self.con.execute(
+                    "SELECT 1 FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='merge.grant_bypassed' "
+                    "AND json_extract(payload,'$.transition_key')=? "
+                    "AND json_extract(payload,'$.work_unit_id')=?",
+                    (sprint_id, transition_key, int(unit["work_unit_id"])),
+                ).fetchone()
+                if existing_bypass is None:
+                    self._event(
+                        sprint_id,
+                        "merge.grant_bypassed",
+                        None,
+                        {
+                            "before": unit["disposition"],
+                            "transition_key": transition_key,
+                            "work_unit_id": int(unit["work_unit_id"]),
+                        },
+                        actor_kind="system",
+                    )
+                self._queue_planner_merge_bypass(
                     sprint_id,
-                    "merge.grant_bypassed",
-                    None,
-                    {
-                        "before": unit["disposition"],
-                        "transition_key": transition_key,
-                        "work_unit_id": int(unit["work_unit_id"]),
-                    },
-                    actor_kind="system",
+                    work_unit_id=int(unit["work_unit_id"]),
+                    transition_key=transition_key,
+                    before=str(unit["disposition"]),
                 )
+                continue
+            changed = True
             self.con.execute(
                 "UPDATE sprint_work_units SET disposition='completed',"
                 "completed_at=datetime('now'),updated_at=datetime('now') "
@@ -1701,6 +1829,70 @@ class SprintWorkUnitStore:
             sprint_id,
             planner_participant_id=planner,
         )
+
+    def _queue_planner_merge_bypass(
+        self,
+        sprint_id: int,
+        *,
+        work_unit_id: int,
+        transition_key: str,
+        before: str,
+    ) -> int:
+        planner = self.con.execute(
+            "SELECT participant_id FROM sprint_participants "
+            "WHERE sprint_id=? AND role='planner'",
+            (sprint_id,),
+        ).fetchone()
+        if planner is None:
+            raise SprintInvariantError("Sprint has no Planner participant")
+        planner_id = int(planner["participant_id"])
+        key = f"merge-grant-bypassed:{transition_key}:unit:{work_unit_id}"
+        existing = self.con.execute(
+            "SELECT message_id FROM sprint_messages WHERE idempotency_key=?",
+            (key,),
+        ).fetchone()
+        if existing is not None:
+            return int(existing["message_id"])
+        message_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_messages "
+                "(sprint_id,to_participant_id,work_unit_id,message_kind,body,"
+                "actionable,idempotency_key) VALUES (?,?,?,'notification',?,0,?)",
+                (
+                    sprint_id,
+                    planner_id,
+                    work_unit_id,
+                    (
+                        f"Merged PR bypassed the Sprint merge grant for work unit "
+                        f"{work_unit_id} from {before}; the unit remains incomplete "
+                        "and requires Planner disposition."
+                    ),
+                    key,
+                ),
+            ).lastrowid
+        )
+        pending = self.con.execute(
+            "SELECT wake_id FROM sprint_wake_outbox WHERE sprint_id=? "
+            "AND participant_id=? AND state='pending'",
+            (sprint_id, planner_id),
+        ).fetchone()
+        wake_id = (
+            int(pending["wake_id"])
+            if pending is not None
+            else int(
+                self.con.execute(
+                    "INSERT INTO sprint_wake_outbox "
+                    "(sprint_id,participant_id,idempotency_key) VALUES (?,?,?)",
+                    (sprint_id, planner_id, f"wake:{key}"),
+                ).lastrowid
+            )
+        )
+        self.con.execute(
+            "INSERT INTO sprint_wake_messages "
+            "(sprint_id,wake_id,message_id) VALUES (?,?,?)",
+            (sprint_id, wake_id, message_id),
+        )
+        return message_id
 
     def _dispatch_ready_locked(
         self,

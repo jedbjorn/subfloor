@@ -10,6 +10,8 @@ SCRIPTS = ROOT / ".super-coder" / "scripts"
 sys.path[:0] = [str(SCRIPTS), str(ROOT / "tests")]
 
 import sprint_domain
+import sprint_message_delivery
+import sprint_participant_chats
 import sprint_recovery
 from github_pull_requests import GitHubReadError
 from test_sprint_pr_watcher import SprintPRWatcherCase, pull_request
@@ -208,6 +210,54 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         )
         self.assertEqual([run_id], [row["run_id"] for row in report["deterministic"]["active_turns"]])
 
+        receipt = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="retry the stranded assignment",
+        )
+        self.assertEqual(1, len(receipt.requeued_wake_ids))
+        replacement = receipt.requeued_wake_ids[0]
+        self.assertNotEqual(wake_id, replacement)
+        self.assertEqual(
+            [(wake_id, "failed", 3), (replacement, "pending", 0)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT wake_id,state,attempt_count FROM sprint_wake_outbox "
+                    "WHERE wake_id IN (?,?) ORDER BY wake_id",
+                    (wake_id, replacement),
+                )
+            ],
+        )
+        self.assertEqual(
+            [(replacement,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT wake_id FROM sprint_wake_messages WHERE sprint_id=?",
+                    (self.sprint_id,),
+                )
+                if row[0] == replacement
+            ],
+        )
+        evidence = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='lifecycle.reconciled' ORDER BY event_id DESC LIMIT 1",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual([replacement], evidence["requeued_wake_ids"])
+        self.assertIn(
+            replacement,
+            [wake["wake_id"] for wake in evidence["pending_wakes"]],
+        )
+        lease = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con
+        ).claim_next("requeued-wake")
+        self.assertEqual(replacement, lease.wake_id)
+        self.assertEqual(1, lease.attempt_number)
+
     def test_resume_projects_observed_merge_before_releasing_downstream(self):
         registered = self.register()
         self.con.execute(
@@ -243,7 +293,12 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             (registered.registered_pr_id, "b" * 40),
         )
         self.con.commit()
-        self.reader.current = pull_request(state="MERGED", checks="SUCCESS", checks_failed=False)
+        self.reader.current = pull_request(
+            state="MERGED",
+            checks="SUCCESS",
+            checks_failed=False,
+            head_sha="b" * 40,
+        )
 
         receipt = coordinator.resume(
             self.sprint_id,
@@ -485,6 +540,73 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
                 "SELECT COUNT(*) FROM sprint_work_units WHERE work_unit_id=?",
                 (unit_id,),
             ).fetchone()[0],
+        )
+
+    def test_terminal_lifecycle_closes_every_sprint_conversation(self):
+        terminal_sprints = []
+        for target in ("completed", "aborted"):
+            sprint_id, _ = self.create_sprint()
+            self.store.arm(sprint_id, 3)
+            conversation_ids = [
+                str(row[0])
+                for row in self.con.execute(
+                    "SELECT pc.conversation_id "
+                    "FROM sprint_participant_conversations pc "
+                    "JOIN sprint_participants p "
+                    "ON p.participant_id=pc.sprint_participant_id "
+                    "WHERE p.sprint_id=? ORDER BY pc.conversation_id",
+                    (sprint_id,),
+                )
+            ]
+            self.assertEqual(3, len(conversation_ids))
+
+            self.store.transition(
+                sprint_id,
+                target,
+                sprint_domain.LifecycleActor("planner", 3),
+                reason=f"finish as {target}",
+                terminal_outcome=f"terminal {target}",
+            )
+
+            marks = ",".join("?" for _ in conversation_ids)
+            self.assertEqual(
+                [("closed", 1)] * 3,
+                [
+                    tuple(row)
+                    for row in self.con.execute(
+                        "SELECT state,closed_at IS NOT NULL FROM conversations "
+                        f"WHERE conversation_id IN ({marks}) ORDER BY conversation_id",
+                        conversation_ids,
+                    )
+                ],
+            )
+            self.assertEqual(
+                3,
+                self.con.execute(
+                    "SELECT COUNT(*) FROM conversation_events "
+                    f"WHERE conversation_id IN ({marks}) "
+                    "AND event_type='conversation.closed'",
+                    conversation_ids,
+                ).fetchone()[0],
+            )
+            terminal_sprints.append(sprint_id)
+
+        self.assertEqual(
+            [{"shell_id": 1, "sprint": None}, {"shell_id": 2, "sprint": None}],
+            sprint_participant_chats.attach_live_participations(
+                self.con,
+                [{"shell_id": 1}, {"shell_id": 2}],
+            ),
+        )
+        self.assertEqual(
+            ["completed", "aborted"],
+            [
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone()[0]
+                for sprint_id in terminal_sprints
+            ],
         )
 
     def test_restart_recovers_prepared_armed_and_paused_without_state_drift(self):
