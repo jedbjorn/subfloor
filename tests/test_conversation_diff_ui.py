@@ -196,14 +196,17 @@ def test_diff_layout_is_full_width_bounded_and_responsive():
     assert "grid-template-rows: auto minmax(0, 1fr)" in STYLE
     assert "grid-column: 1 / -1; grid-row: 1" in STYLE
     assert "align-self: start; margin-top: -.4rem" in STYLE
-    assert "--review-tab-cut: 10px" in STYLE
-    assert "--review-tab-radius: 6px" in STYLE
-    assert "border-radius: 4px 4px 0 4px" in STYLE
+    assert "--review-tab-cut: 16.97px" in STYLE
+    assert "--review-tab-radius: 8px" in STYLE
+    assert "--review-tab-radius-diagonal: 5.66px" in STYLE
+    assert "margin: 0; flex: none; border-radius: 0" in STYLE
     assert STYLE.count("clip-path: shape(") == 1
+    assert "line to calc(var(--review-tab-cut) + var(--review-tab-radius)) 100%" in STYLE
+    assert "curve to 0 calc(100% - var(--review-tab-cut) - var(--review-tab-radius))" in STYLE
+    assert "display: flex; align-items: center; justify-content: center" in STYLE
     assert ".review-group-switch button.active { z-index: 1; }" in STYLE
-    assert ".review-group-switch button:first-child.active + button::before" in STYLE
-    assert ".review-group-switch button:first-child:not(.active)::after" in STYLE
-    assert "height: calc(100% - var(--review-tab-cut) - var(--review-tab-radius))" in STYLE
+    assert ".review-group-switch button:first-child.active" not in STYLE
+    assert ".review-group-switch button:first-child:not(.active)" not in STYLE
     assert "flex: 1 1 auto" in STYLE
     assert "text-overflow: ellipsis" in STYLE
     source = current_workspace_source()
