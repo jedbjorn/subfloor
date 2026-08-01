@@ -149,6 +149,7 @@ class ProjectionTriggerTest(unittest.TestCase):
             mock.patch.object(feature.skill_projection, "reconcile_flavors",
                               side_effect=capture),
             mock.patch.object(feature, "_instance", return_value={"pg": {}}),
+            mock.patch.object(feature, "_write_instance"),
             mock.patch.object(feature, "_snapshot"),
         ):
             self.assertEqual(command("pg"), 0)
