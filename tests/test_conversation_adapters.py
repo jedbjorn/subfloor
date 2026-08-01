@@ -29,6 +29,7 @@ from conversation_adapters import (  # noqa: E402
     NativeTurn,
     NormalizedEvent,
     OpenCodeAdapter,
+    ReconcileResult,
     adapter_for,
 )
 
@@ -743,6 +744,18 @@ class ConversationAdapterTest(unittest.TestCase):
     def test_interrupted_events_require_structured_evidence(self) -> None:
         with self.assertRaisesRegex(ValueError, "structured native or operator"):
             NormalizedEvent("run.interrupted", {"status": "interrupted"})
+
+    def test_cancelled_reconciliation_requires_structured_evidence(self) -> None:
+        with self.assertRaisesRegex(ValueError, "structured native or operator"):
+            ReconcileResult("cancelled", True, "cancelled without provenance")
+
+        result = ReconcileResult(
+            "cancelled",
+            True,
+            "operator interrupt was durably recorded",
+            "operator",
+        )
+        self.assertEqual(result.interrupt_evidence, "operator")
 
     def test_identical_contract_start_stream_interrupt_resume_reconcile(
         self,

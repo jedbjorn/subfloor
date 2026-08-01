@@ -153,6 +153,23 @@ class BarrierAdapter(FakeAdapter):
         yield NormalizedEvent("run.completed", {"status": "completed"})
 
 
+class SparseDeltaAdapter(FakeAdapter):
+    """Pause after one delta so the broker must flush on its own deadline."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.delta_yielded = threading.Event()
+        self.release = threading.Event()
+
+    def stream(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
+        yield NormalizedEvent("session.started", {"session_ref": turn.session_ref})
+        yield NormalizedEvent("run.started", {"status": "running"})
+        yield NormalizedEvent("assistant.delta", {"text": "visible promptly"})
+        self.delta_yielded.set()
+        self.release.wait(2)
+        yield NormalizedEvent("run.completed", {"status": "completed"})
+
+
 class ReconcileSequenceAdapter(FakeAdapter):
     """End the stream uncertain, then prove running and terminal states."""
 
@@ -408,6 +425,7 @@ class ConversationBrokerCase(unittest.TestCase):
         *,
         heartbeat_seconds: int = 60,
         recovery_seconds: int = 60,
+        **kwargs,
     ) -> ConversationBroker:
         broker = ConversationBroker(
             self.db_path,
@@ -415,6 +433,7 @@ class ConversationBrokerCase(unittest.TestCase):
             owner=f"test-broker-{len(self.brokers) + 1}",
             heartbeat_seconds=heartbeat_seconds,
             recovery_seconds=recovery_seconds,
+            **kwargs,
         )
         self.brokers.append(broker)
         broker.start()
@@ -953,6 +972,113 @@ class ServiceContractTest(ConversationBrokerCase):
             ],
         )
         self.assertEqual(adapter.reconciled, 0)
+
+    def test_sparse_delta_flushes_without_waiting_for_the_next_native_event(
+        self,
+    ) -> None:
+        adapter = SparseDeltaAdapter()
+        self.addCleanup(adapter.release.set)
+        broker = self.start_broker(
+            lambda _harness: adapter,
+            event_flush_seconds=0.02,
+        )
+        conversation_id = self.add_conversation()
+        self.add_message(conversation_id)
+        broker.notify()
+        self.assertTrue(adapter.delta_yielded.wait(1))
+
+        deadline = time.monotonic() + 0.5
+        delta_rows = []
+        while time.monotonic() < deadline:
+            with self.connect() as con:
+                delta_rows = con.execute(
+                    "SELECT event_type,payload FROM conversation_events "
+                    "WHERE conversation_id=? AND event_type='assistant.delta'",
+                    (conversation_id,),
+                ).fetchall()
+            if delta_rows:
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(len(delta_rows), 1)
+        self.assertEqual(
+            json.loads(delta_rows[0]["payload"])["text"],
+            "visible promptly",
+        )
+        adapter.release.set()
+
+    def test_event_flush_writes_at_most_the_configured_batch_size(self) -> None:
+        store = mock.Mock()
+        store.append_events.side_effect = lambda _run_id, events: list(
+            range(1, len(events) + 1)
+        )
+        broker = ConversationBroker(
+            self.db_path,
+            store=store,
+            event_batch_size=2,
+        )
+        pending = [
+            NormalizedEvent("assistant.delta", {"text": str(index)})
+            for index in range(5)
+        ]
+
+        self.assertTrue(broker._flush_events(7, pending, wait=False))
+
+        written = store.append_events.call_args.args[1]
+        self.assertEqual([event.payload["text"] for event in written], ["0", "1"])
+        self.assertEqual(
+            [event.payload["text"] for event in pending],
+            ["2", "3", "4"],
+        )
+
+    def test_busy_retry_stops_at_the_configured_attempt_budget(self) -> None:
+        broker = ConversationBroker(
+            self.db_path,
+            recovery_seconds=0.001,
+            busy_retry_attempts=3,
+        )
+        attempts = 0
+
+        def always_busy() -> None:
+            nonlocal attempts
+            attempts += 1
+            raise sqlite3.OperationalError("database is locked")
+
+        persisted, result = broker._retry_busy(always_busy, wait=True)
+
+        self.assertFalse(persisted)
+        self.assertIsNone(result)
+        self.assertEqual(attempts, 3)
+
+    def test_reconciled_cancellation_persists_native_evidence(self) -> None:
+        _conversation, _message, run_id = self.add_live_run(
+            state="running",
+            session_after="native-session",
+            runner_ref="native-run-cancelled",
+        )
+        adapter = FakeAdapter(
+            reconcile=ReconcileResult(
+                "cancelled",
+                True,
+                "native transcript proves cancellation",
+                "native",
+            )
+        )
+        broker = self.start_broker(lambda _harness: adapter)
+
+        self.wait_run_state(run_id, "cancelled")
+        self.assertTrue(broker.wait_idle())
+        with self.connect() as con:
+            terminal = con.execute(
+                "SELECT event_type,payload FROM conversation_events "
+                "WHERE run_id=? ORDER BY sequence DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+
+        self.assertEqual(terminal["event_type"], "run.interrupted")
+        payload = json.loads(terminal["payload"])
+        self.assertEqual(payload["interrupt_evidence"], "native")
+        self.assertTrue(payload["reconciled"])
 
     def test_same_harness_runs_stream_concurrently_on_different_shells(
         self,
