@@ -99,5 +99,10 @@ or FnB authority. Terminal state stops Sprint services and removes live pills
 while retaining conversations, messages, events, PR evidence, reports, and
 follow-ups.
 
+```text
+sc sprint complete --sprint <id> --reason <summary> --outcome <outcome>
+sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
+```
+
 Hand the FnB the final report id, follow-up list, integrated SHA, and evidence
 links. Stop after the terminal transition; Sprint-scoped authority is over.

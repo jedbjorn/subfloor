@@ -1,0 +1,127 @@
+{
+  "spec_document_id": 46,
+  "scenarios": [
+    {
+      "scenario": "Crash after message commit but before wake dispatch",
+      "file": "tests/test_sprint_message_delivery.py",
+      "test": "test_message_and_active_wake_commit_or_roll_back_together"
+    },
+    {
+      "scenario": "Duplicate wake delivery and messages coalescing behind an active turn",
+      "file": "tests/test_sprint_message_delivery.py",
+      "test": "test_messages_behind_delivering_wake_coalesce_once"
+    },
+    {
+      "scenario": "Three failed wake attempts cause automatic pause",
+      "file": "tests/test_sprint_message_delivery.py",
+      "test": "test_third_delivery_failure_auto_pauses_and_stops_claiming"
+    },
+    {
+      "scenario": "Browser messaging during an active participant turn queues without interruption",
+      "file": "tests/test_conversation_api.py",
+      "test": "test_message_stacked_during_run_queues_without_interrupting"
+    },
+    {
+      "scenario": "GitHub outage, rate pressure, unchanged polls, and recovery stay durable",
+      "file": "tests/test_sprint_pr_watcher.py",
+      "test": "test_failure_is_durable_backs_off_and_never_invents_state"
+    },
+    {
+      "scenario": "First red and later green occurrences wake the Developer exactly once",
+      "file": "tests/test_sprint_pr_watcher.py",
+      "test": "test_red_green_red_occurrences_wake_once_each_and_coalesce"
+    },
+    {
+      "scenario": "PR change while paused is reconciled once after resume",
+      "file": "tests/test_sprint_pr_watcher.py",
+      "test": "test_paused_change_is_observed_once_after_resume"
+    },
+    {
+      "scenario": "Quota exhaustion after acceptance escalates immediately",
+      "file": "tests/test_sprint_liveness.py",
+      "test": "test_fresh_exhausted_worker_quota_escalates_on_first_evaluation"
+    },
+    {
+      "scenario": "Healthy long-running process permits one nudge without escalation",
+      "file": "tests/test_sprint_liveness.py",
+      "test": "test_supporting_process_health_allows_one_nudge_but_defers_escalation"
+    },
+    {
+      "scenario": "Continued silence after a nudge emits exactly one Planner escalation",
+      "file": "tests/test_sprint_liveness.py",
+      "test": "test_grace_nudge_escalation_and_restart_dedup"
+    },
+    {
+      "scenario": "Missing process or expired lease escalates as proven failure",
+      "file": "tests/test_sprint_liveness.py",
+      "test": "test_proven_failure_escalates_immediately_without_nudging_worker"
+    },
+    {
+      "scenario": "Pause during an active Developer turn persists interrupt intent",
+      "file": "tests/test_sprint_recovery.py",
+      "test": "test_participant_pause_atomically_persists_report_interrupt_and_notice"
+    },
+    {
+      "scenario": "Parallel Developers may finish out of planned order",
+      "file": "tests/test_sprint_live_proof.py",
+      "test": "test_parallel_sprint_completes_out_of_order_without_lane_overlap"
+    },
+    {
+      "scenario": "Review rejection, fresh correction conversation, approval, and merge",
+      "file": "tests/test_sprint_live_proof.py",
+      "test": "test_serial_sprint_runs_correction_merge_dispatch_and_close"
+    },
+    {
+      "scenario": "Mid-Sprint spec edit is surfaced during resume",
+      "file": "tests/test_sprint_recovery.py",
+      "test": "test_resume_records_drift_and_github_failure_without_blocking"
+    },
+    {
+      "scenario": "FnB authority can compile evidence when the Planner is unavailable",
+      "file": "tests/test_sprint_close.py",
+      "test": "test_only_planner_or_admin_compiles_and_participants_read_timeline"
+    },
+    {
+      "scenario": "Restart preserves every non-terminal lifecycle state",
+      "file": "tests/test_sprint_recovery.py",
+      "test": "test_restart_recovers_prepared_armed_and_paused_without_state_drift"
+    },
+    {
+      "scenario": "Conversation and watcher writes share SQLite without lock loss",
+      "file": "tests/test_sprint_live_proof.py",
+      "test": "test_conversation_and_watcher_writes_share_wal_without_lock_loss"
+    }
+  ],
+  "invariant_sweep": [
+    {
+      "invariant": "single armed Sprint",
+      "file": "tests/test_sprint_v2_domain.py",
+      "test": "test_single_armed_invariant_rolls_back_second_release"
+    },
+    {
+      "invariant": "one editing lane per Developer",
+      "file": "tests/test_sprint_work_dispatch.py",
+      "test": "test_dependencies_block_and_each_developer_gets_one_editing_lane"
+    },
+    {
+      "invariant": "one owning work unit per registered PR",
+      "file": "tests/test_sprint_pr_watcher.py",
+      "test": "test_registration_rejects_multiple_work_units_without_side_effects"
+    },
+    {
+      "invariant": "role and merge authority gates leave no side effects",
+      "file": "tests/test_sprint_review_loop.py",
+      "test": "test_non_green_and_wrong_developer_leave_no_review_evidence"
+    },
+    {
+      "invariant": "pause reconciliation projects merge before downstream release",
+      "file": "tests/test_sprint_recovery.py",
+      "test": "test_resume_projects_observed_merge_before_releasing_downstream"
+    },
+    {
+      "invariant": "closed without merge resolves review liveness",
+      "file": "tests/test_sprint_recovery.py",
+      "test": "test_closed_without_merge_resolves_every_review_expectation"
+    }
+  ]
+}

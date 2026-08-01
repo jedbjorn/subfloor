@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Authenticated shell-facing commands for the Sprints v2 loop."""
+
 from __future__ import annotations
 
 import argparse
@@ -34,8 +35,109 @@ def _json_array(path: str) -> list[dict]:
     return value
 
 
+def _integer_list(values: list[int] | None) -> list[int]:
+    return list(dict.fromkeys(values or ()))
+
+
 def _post(path: str, payload: dict, *, idempotent: bool = False) -> dict:
     return mem._api("POST", path, payload, idempotent=idempotent)
+
+
+def cmd_declare(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/declare",
+        {
+            "feature_id": args.feature,
+            "planner_shell_id": args.planner_shell,
+            "spec_approval_ids": _integer_list(args.spec_approval),
+            "participants": _json_array(args.participants_file),
+            "merge_grant_enabled": args.merge_grant,
+        },
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_plan_unit(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/plan-unit",
+        {
+            "sprint_id": args.sprint,
+            "assigned_shell_id": args.developer_shell,
+            "reviewer_shell_id": args.reviewer_shell,
+            "title": args.title,
+            "expected_output": _text(args.expected_output_file, "expected output"),
+            "task_ids": _integer_list(args.task),
+            "planned_wave": args.wave,
+            "dependency_ids": _integer_list(args.depends_on),
+        },
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_arm(args: argparse.Namespace) -> int:
+    result = _post("/_sc/sprint/arm", {"sprint_id": args.sprint})
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_register_pr(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/register-pr",
+        {
+            "sprint_id": args.sprint,
+            "repository": args.repository,
+            "pr_number": args.pr,
+            "work_unit_ids": [args.work_unit],
+        },
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_pause(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/pause",
+        {"sprint_id": args.sprint, "reason": args.reason},
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/resume",
+        {"sprint_id": args.sprint, "reason": args.reason},
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_complete(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/complete",
+        {
+            "sprint_id": args.sprint,
+            "reason": args.reason,
+            "terminal_outcome": args.outcome,
+        },
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_abort(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/abort",
+        {
+            "sprint_id": args.sprint,
+            "reason": args.reason,
+            "terminal_outcome": args.outcome,
+        },
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
 
 
 def cmd_request_review(args: argparse.Namespace) -> int:
@@ -114,9 +216,7 @@ def cmd_record_conformance(args: argparse.Namespace) -> int:
 
 
 def cmd_compile_report(args: argparse.Namespace) -> int:
-    result = mem._api(
-        "GET", f"/_sc/sprint/{args.sprint}/report?limit={args.limit}"
-    )
+    result = mem._api("GET", f"/_sc/sprint/{args.sprint}/report?limit={args.limit}")
     print(json.dumps(result["evidence_packet"], indent=2, sort_keys=True))
     return 0
 
@@ -131,7 +231,73 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    request = sub.add_parser("request-review", help="Developer hands a green PR to Review")
+    declare = sub.add_parser(
+        "declare", help="Planner creates one editable prepared Sprint envelope"
+    )
+    declare.add_argument("--feature", type=int, required=True)
+    declare.add_argument(
+        "--planner-shell",
+        type=int,
+        help="originating Planner; defaults to the authenticated caller",
+    )
+    declare.add_argument("--spec-approval", type=int, action="append", required=True)
+    declare.add_argument("--participants-file", required=True)
+    declare.add_argument("--merge-grant", action="store_true", required=True)
+    declare.set_defaults(fn=cmd_declare)
+
+    plan = sub.add_parser(
+        "plan-unit", help="Planner groups existing spec tasks into one editing lane"
+    )
+    plan.add_argument("--sprint", type=int, required=True)
+    plan.add_argument("--developer-shell", type=int, required=True)
+    plan.add_argument("--reviewer-shell", type=int, required=True)
+    plan.add_argument("--title", required=True)
+    plan.add_argument("--expected-output-file", required=True)
+    plan.add_argument("--task", type=int, action="append", required=True)
+    plan.add_argument("--wave", type=int, default=0)
+    plan.add_argument("--depends-on", type=int, action="append")
+    plan.set_defaults(fn=cmd_plan_unit)
+
+    arm = sub.add_parser("arm", help="Planner atomically arms an eligible plan")
+    arm.add_argument("--sprint", type=int, required=True)
+    arm.set_defaults(fn=cmd_arm)
+
+    register = sub.add_parser(
+        "register-pr", help="Developer registers one PR to its owning work unit"
+    )
+    register.add_argument("--sprint", type=int, required=True)
+    register.add_argument("--repository", required=True)
+    register.add_argument("--pr", type=int, required=True)
+    register.add_argument("--work-unit", type=int, required=True)
+    register.set_defaults(fn=cmd_register_pr)
+
+    pause = sub.add_parser("pause", help="Participant or FnB pauses for integrity")
+    pause.add_argument("--sprint", type=int, required=True)
+    pause.add_argument("--reason", required=True)
+    pause.set_defaults(fn=cmd_pause)
+
+    resume = sub.add_parser("resume", help="Planner or FnB reconciles and re-arms")
+    resume.add_argument("--sprint", type=int, required=True)
+    resume.add_argument("--reason")
+    resume.set_defaults(fn=cmd_resume)
+
+    complete = sub.add_parser("complete", help="Planner or FnB closes successfully")
+    complete.add_argument("--sprint", type=int, required=True)
+    complete.add_argument("--reason", required=True)
+    complete.add_argument("--outcome", required=True)
+    complete.set_defaults(fn=cmd_complete)
+
+    abort = sub.add_parser(
+        "abort", help="Planner or FnB stops without deleting history"
+    )
+    abort.add_argument("--sprint", type=int, required=True)
+    abort.add_argument("--reason", required=True)
+    abort.add_argument("--outcome", default="aborted")
+    abort.set_defaults(fn=cmd_abort)
+
+    request = sub.add_parser(
+        "request-review", help="Developer hands a green PR to Review"
+    )
     request.add_argument("--sprint", type=int, required=True)
     request.add_argument("--registered-pr", type=int, required=True)
     request.add_argument("--readiness-file", required=True)

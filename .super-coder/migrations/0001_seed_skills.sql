@@ -3814,6 +3814,11 @@ or FnB authority. Terminal state stops Sprint services and removes live pills
 while retaining conversations, messages, events, PR evidence, reports, and
 follow-ups.
 
+```text
+sc sprint complete --sprint <id> --reason <summary> --outcome <outcome>
+sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
+```
+
 Hand the FnB the final report id, follow-up list, integrated SHA, and evidence
 links. Stop after the terminal transition; Sprint-scoped authority is over.',
   0
@@ -3863,6 +3868,11 @@ until it is green. The watcher supplies red/green facts; do not write PR state
 yourself. On red, diagnose and fix the PR. On green, judge readiness rather
 than forwarding mechanically.
 
+```text
+sc sprint register-pr --sprint <id> --repository <owner/name> \
+  --pr <number> --work-unit <id>
+```
+
 ## Review handoff
 
 Put the readiness claim in a file, then use one stable retry key:
@@ -3901,6 +3911,10 @@ Pause immediately when integrity is threatened: broken base, destructive
 ambiguity, unavailable GitHub, untrustworthy runners, provider exhaustion, or
 an unrecoverable environment. State the short reason first; detailed judgment
 can follow after pause is durable.
+
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
+```
 
 Stop when the unit is merged and reported, declined, paused awaiting recovery,
 or returned to review. Ask the Planner for later work only after the current
@@ -3987,6 +4001,11 @@ messages, pending wakes, work units, registered PRs, capacity, and spec drift.
 Drift informs; it never silently blocks resume. Record the exact revision facts
 and choose continue, re-plan, or abort.
 
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
+sc sprint resume --sprint <id> [--reason <reconciliation-judgment>]
+```
+
 Abort only when continuing would be dishonest or unsafe. It is terminal and
 deletes nothing.
 
@@ -4070,6 +4089,22 @@ For every participant, record role, route, model, effective effort, persistent
 conversation ownership, and fallback facts the plan actually depends on. Never
 pretend a native session can resume across harnesses.
 
+Declare the prepared envelope from a JSON array of participant objects, then
+add each editing lane from existing spec tasks:
+
+```text
+sc sprint declare --feature <feature-id> \
+  --spec-approval <approval-id> --participants-file <path> --merge-grant
+sc sprint plan-unit --sprint <id> \
+  --developer-shell <id> --reviewer-shell <id> --title <title> \
+  --expected-output-file <path> --task <task-id> \
+  [--task <task-id>] [--wave <n>] [--depends-on <work-unit-id>]
+```
+
+The participant file contains `shell_id`, `role`, and `harness`, with optional
+`model`, `effort`, and `route`. FnB may add `--planner-shell <id>` when declaring
+for the originating Planner. Keep the Sprint prepared while shaping the plan.
+
 ## Final arming check
 
 Immediately before arming, re-read the spec revision hashes, QAQC records,
@@ -4080,6 +4115,10 @@ arming transaction; external harness and GitHub work occurs after it commits.
 Arming succeeds only when the first assignments and wake intents are durable.
 A process crash after commit is outbox recovery; a crash before commit exposes
 no partial Sprint.
+
+```text
+sc sprint arm --sprint <id>
+```
 
 ## Handoff
 

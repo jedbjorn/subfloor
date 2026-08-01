@@ -28,6 +28,7 @@ import io
 import ipaddress
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -68,6 +69,7 @@ import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, sp
 import sprint_close  # noqa: E402  (Sprints v2 conformance + report evidence)
 import sprint_domain  # noqa: E402  (Sprints v2 work dispatch authority)
 import sprint_liveness  # noqa: E402  (Sprints v2 one-shot monitor surface)
+import sprint_recovery  # noqa: E402  (Sprints v2 pause/resume reconciliation)
 import sprint_review_loop  # noqa: E402  (Sprints v2 Dev/Review command surface)
 import sprint_runtime  # noqa: E402  (armed-only Sprint dispatch + wake delivery)
 sys.path.insert(0, str(ENGINE / "api"))
@@ -1837,6 +1839,17 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError(f"{name} must be a positive integer")
         return value
 
+    @classmethod
+    def _sprint_integer_list(cls, body: dict, name: str) -> list[int]:
+        values = body.get(name)
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"{name} must be a non-empty array")
+        return list(
+            dict.fromkeys(
+                cls._sprint_integer({name: item}, name) for item in values
+            )
+        )
+
     def _sprint_error(self, exc: Exception):
         if isinstance(exc, sprint_domain.SprintAuthorityError):
             return self._send(403, {"error": str(exc)})
@@ -1860,6 +1873,234 @@ class Handler(BaseHTTPRequestHandler):
             raise sprint_domain.SprintAuthorityError(
                 "only the owning Planner may trigger Sprint dispatch or monitoring"
             )
+
+    @staticmethod
+    def _sprint_planner_proxy(con, sprint_id: int, shell_id: int) -> int:
+        row = con.execute(
+            "SELECT sp.originating_planner_shell_id,caller.flavor "
+            "FROM sprints sp JOIN shells caller ON caller.shell_id=? "
+            "WHERE sp.sprint_id=?",
+            (shell_id, sprint_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown Sprint: {sprint_id}")
+        planner_shell_id = int(row["originating_planner_shell_id"])
+        if shell_id != planner_shell_id and row["flavor"] != "admin":
+            raise sprint_domain.SprintAuthorityError(
+                "only the owning Planner or FnB may change the Sprint plan"
+            )
+        return planner_shell_id
+
+    @staticmethod
+    def _sprint_actor(
+        con, sprint_id: int, shell_id: int
+    ) -> sprint_domain.LifecycleActor:
+        row = con.execute(
+            "SELECT caller.flavor,sp.originating_planner_shell_id,"
+            "EXISTS(SELECT 1 FROM sprint_participants p "
+            "WHERE p.sprint_id=sp.sprint_id "
+            "AND p.shell_id=caller.shell_id) participates "
+            "FROM sprints sp JOIN shells caller ON caller.shell_id=? "
+            "WHERE sp.sprint_id=?",
+            (shell_id, sprint_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown Sprint: {sprint_id}")
+        if row["flavor"] == "admin":
+            return sprint_domain.LifecycleActor("fnb", shell_id)
+        if int(row["originating_planner_shell_id"]) == shell_id:
+            return sprint_domain.LifecycleActor("planner", shell_id)
+        if row["participates"]:
+            return sprint_domain.LifecycleActor("participant", shell_id)
+        raise sprint_domain.SprintAuthorityError(
+            "only a Sprint participant or FnB may change lifecycle"
+        )
+
+    def _declare_sprint(self, con, shell_id: int, body: dict) -> int:
+        feature_id = self._sprint_integer(body, "feature_id")
+        approval_ids = self._sprint_integer_list(body, "spec_approval_ids")
+        participants = body.get("participants")
+        if not isinstance(participants, list) or not participants:
+            raise ValueError("participants must be a non-empty array")
+        if body.get("merge_grant_enabled") is not True:
+            raise sprint_domain.SprintInvariantError(
+                "declaration requires an explicit Sprint merge grant"
+            )
+
+        caller = con.execute(
+            "SELECT flavor FROM shells WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
+            (shell_id,),
+        ).fetchone()
+        requested_planner = body.get("planner_shell_id")
+        planner_shell_id = (
+            shell_id
+            if requested_planner is None
+            else self._sprint_integer(body, "planner_shell_id")
+        )
+        if caller is None or (
+            caller["flavor"] != "admin"
+            and (caller["flavor"] != "planner" or planner_shell_id != shell_id)
+        ):
+            raise sprint_domain.SprintAuthorityError(
+                "only the originating Planner or FnB may declare a Sprint"
+            )
+        planner = con.execute(
+            "SELECT 1 FROM shells WHERE shell_id=? AND flavor='planner' "
+            "AND COALESCE(is_deleted,0)=0",
+            (planner_shell_id,),
+        ).fetchone()
+        if planner is None:
+            raise sprint_domain.SprintInvariantError(
+                "originating Planner must be an active Planner shell"
+            )
+
+        normalized: list[dict] = []
+        seen_shells: set[int] = set()
+        for participant in participants:
+            if not isinstance(participant, dict):
+                raise ValueError("each participant must be an object")
+            participant_shell_id = self._sprint_integer(
+                participant, "shell_id"
+            )
+            role = participant.get("role")
+            harness = participant.get("harness")
+            if role not in {"planner", "developer", "reviewer"}:
+                raise ValueError(
+                    "participant role must be planner, developer, or reviewer"
+                )
+            if not isinstance(harness, str) or not harness.strip():
+                raise ValueError("participant harness is required")
+            if participant_shell_id in seen_shells:
+                raise ValueError("participant shells must be unique")
+            seen_shells.add(participant_shell_id)
+            normalized.append(
+                {
+                    "shell_id": participant_shell_id,
+                    "role": role,
+                    "harness": harness.strip(),
+                    "model": participant.get("model"),
+                    "effort": participant.get("effort"),
+                    "route": participant.get("route"),
+                }
+            )
+        if not any(
+            item["shell_id"] == planner_shell_id and item["role"] == "planner"
+            for item in normalized
+        ):
+            raise sprint_domain.SprintInvariantError(
+                "originating Planner must be a Planner participant"
+            )
+
+        with db_driver.write_transaction(con, "sprint.declare"):
+            if con.execute(
+                "SELECT 1 FROM roadmap WHERE feature_id=?", (feature_id,)
+            ).fetchone() is None:
+                raise KeyError(f"unknown feature: {feature_id}")
+            approval_rows = []
+            for approval_id in approval_ids:
+                approval = con.execute(
+                    "SELECT a.document_id,a.revision_sha256,a.verdict,d.feature_id,"
+                    "d.kind,d.body FROM sprint_spec_approvals a "
+                    "JOIN documents d ON d.document_id=a.document_id "
+                    "WHERE a.approval_id=?",
+                    (approval_id,),
+                ).fetchone()
+                if approval is None:
+                    raise KeyError(f"unknown Sprint spec approval: {approval_id}")
+                current_revision = hashlib.sha256(
+                    approval["body"].encode()
+                ).hexdigest()
+                if (
+                    approval["verdict"] != "pass"
+                    or approval["kind"] != "spec"
+                    or int(approval["feature_id"]) != feature_id
+                    or approval["revision_sha256"] != current_revision
+                ):
+                    raise sprint_domain.SprintInvariantError(
+                        "declaration requires current passing approvals for its feature"
+                    )
+                approval_rows.append((approval_id, approval))
+            active_shells = {
+                int(row["shell_id"]): str(row["flavor"])
+                for row in con.execute(
+                    "SELECT shell_id,flavor FROM shells "
+                    "WHERE COALESCE(is_deleted,0)=0"
+                )
+            }
+            if not seen_shells.issubset(active_shells.keys()):
+                raise sprint_domain.SprintInvariantError(
+                    "Sprint participants must be active shells"
+                )
+            expected_flavors = {
+                "planner": "planner",
+                "developer": "dev",
+                "reviewer": "reviewer",
+            }
+            if any(
+                active_shells[item["shell_id"]] != expected_flavors[item["role"]]
+                for item in normalized
+            ):
+                raise sprint_domain.SprintInvariantError(
+                    "Sprint participant roles must match their shell flavors"
+                )
+            sprint_id = int(
+                con.execute(
+                    "INSERT INTO sprints "
+                    "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+                    "VALUES (?,?,1)",
+                    (feature_id, planner_shell_id),
+                ).lastrowid
+            )
+            con.executemany(
+                "INSERT INTO sprint_specs "
+                "(sprint_id,document_id,bound_revision_sha256,approval_id) "
+                "VALUES (?,?,?,?)",
+                (
+                    (
+                        sprint_id,
+                        approval["document_id"],
+                        approval["revision_sha256"],
+                        approval_id,
+                    )
+                    for approval_id, approval in approval_rows
+                ),
+            )
+            con.executemany(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness,model,effort,route) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (
+                    (
+                        sprint_id,
+                        item["shell_id"],
+                        item["role"],
+                        item["harness"],
+                        item["model"],
+                        item["effort"],
+                        item["route"],
+                    )
+                    for item in normalized
+                ),
+            )
+            con.execute(
+                "INSERT INTO sprint_events "
+                "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+                "VALUES (?,'sprint.declared',?,?,?)",
+                (
+                    sprint_id,
+                    "fnb" if caller["flavor"] == "admin" else "planner",
+                    shell_id,
+                    json.dumps(
+                        {
+                            "feature_id": feature_id,
+                            "spec_approval_ids": approval_ids,
+                            "participant_shell_ids": sorted(seen_shells),
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+        return sprint_id
 
     def _sprint_get(self, path: str):
         shell_id = self._require_shell_auth()
@@ -1897,7 +2138,129 @@ class Handler(BaseHTTPRequestHandler):
             return
         con = db()
         try:
+            if path == "/_sc/sprint/declare":
+                sprint_id = self._declare_sprint(con, shell_id, body)
+                return self._send(201, {"sprint_id": sprint_id})
             sprint_id = self._sprint_integer(body, "sprint_id")
+            if path == "/_sc/sprint/plan-unit":
+                planner_shell_id = self._sprint_planner_proxy(
+                    con, sprint_id, shell_id
+                )
+                unit_id = sprint_domain.SprintWorkUnitStore(con).create(
+                    sprint_id,
+                    planner_shell_id,
+                    assigned_shell_id=self._sprint_integer(
+                        body, "assigned_shell_id"
+                    ),
+                    reviewer_shell_id=self._sprint_integer(
+                        body, "reviewer_shell_id"
+                    ),
+                    title=body.get("title") or "",
+                    expected_output=body.get("expected_output") or "",
+                    task_ids=self._sprint_integer_list(body, "task_ids"),
+                    planned_wave=int(body.get("planned_wave", 0)),
+                    dependency_ids=(
+                        self._sprint_integer_list(body, "dependency_ids")
+                        if body.get("dependency_ids")
+                        else ()
+                    ),
+                )
+                return self._send(201, {"work_unit_id": unit_id})
+            if path == "/_sc/sprint/arm":
+                planner_shell_id = self._sprint_planner_proxy(
+                    con, sprint_id, shell_id
+                )
+                try:
+                    wake_ids = sprint_domain.SprintLifecycleStore(con).arm(
+                        sprint_id, planner_shell_id
+                    )
+                except sqlite3.IntegrityError as exc:
+                    if "idx_sprints_single_armed" not in str(exc):
+                        raise
+                    raise sprint_domain.SprintInvariantError(
+                        "another Sprint is already armed"
+                    ) from exc
+                return self._send(200, {"wake_ids": wake_ids})
+            if path == "/_sc/sprint/register-pr":
+                receipt = sprint_pr_watcher.SprintPRWatcher(
+                    con, repo_root=REPO_ROOT
+                ).register(
+                    sprint_id,
+                    owner_shell_id=shell_id,
+                    repository=body.get("repository") or "",
+                    pr_number=self._sprint_integer(body, "pr_number"),
+                    work_unit_ids=self._sprint_integer_list(
+                        body, "work_unit_ids"
+                    ),
+                )
+                return self._send(201 if receipt.created else 200, {
+                    "registered_pr_id": receipt.registered_pr_id,
+                    "created": receipt.created,
+                })
+            if path == "/_sc/sprint/pause":
+                receipt = sprint_recovery.SprintRecoveryCoordinator(
+                    con, repo_root=REPO_ROOT
+                ).pause(
+                    sprint_id,
+                    self._sprint_actor(con, sprint_id, shell_id),
+                    reason=body.get("reason") or "",
+                )
+                return self._send(200, {
+                    "changed": receipt.changed,
+                    "report_id": receipt.report_id,
+                    "interrupt_run_ids": list(receipt.interrupt_run_ids),
+                    "notification_conversation_ids": list(
+                        receipt.notification_conversation_ids
+                    ),
+                })
+            if path == "/_sc/sprint/resume":
+                receipt = sprint_recovery.SprintRecoveryCoordinator(
+                    con, repo_root=REPO_ROOT
+                ).resume(
+                    sprint_id,
+                    self._sprint_actor(con, sprint_id, shell_id),
+                    reason=body.get("reason"),
+                )
+                return self._send(200, {
+                    "changed": receipt.changed,
+                    "dispatched_wake_ids": list(receipt.dispatched_wake_ids),
+                    "projected_work_unit_ids": list(
+                        receipt.projected_work_unit_ids
+                    ),
+                    "resolved_review_message_ids": list(
+                        receipt.resolved_review_message_ids
+                    ),
+                    "spec_drift_document_ids": list(
+                        receipt.spec_drift_document_ids
+                    ),
+                    "anomalies": list(receipt.anomalies),
+                })
+            if path == "/_sc/sprint/complete":
+                changed = sprint_domain.SprintLifecycleStore(con).transition(
+                    sprint_id,
+                    "completed",
+                    self._sprint_actor(con, sprint_id, shell_id),
+                    reason=body.get("reason"),
+                    terminal_outcome=body.get("terminal_outcome"),
+                )
+                return self._send(200, {"changed": changed})
+            if path == "/_sc/sprint/abort":
+                receipt = sprint_recovery.SprintRecoveryCoordinator(
+                    con, repo_root=REPO_ROOT
+                ).abort(
+                    sprint_id,
+                    self._sprint_actor(con, sprint_id, shell_id),
+                    reason=body.get("reason") or "",
+                    terminal_outcome=body.get("terminal_outcome") or "aborted",
+                )
+                return self._send(200, {
+                    "changed": receipt.changed,
+                    "report_id": receipt.report_id,
+                    "interrupt_run_ids": list(receipt.interrupt_run_ids),
+                    "notification_conversation_ids": list(
+                        receipt.notification_conversation_ids
+                    ),
+                })
             if path == "/_sc/sprint/review-request":
                 receipt = sprint_review_loop.SprintReviewLoopStore(
                     con, repo_root=REPO_ROOT

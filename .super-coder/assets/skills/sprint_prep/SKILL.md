@@ -63,6 +63,22 @@ For every participant, record role, route, model, effective effort, persistent
 conversation ownership, and fallback facts the plan actually depends on. Never
 pretend a native session can resume across harnesses.
 
+Declare the prepared envelope from a JSON array of participant objects, then
+add each editing lane from existing spec tasks:
+
+```text
+sc sprint declare --feature <feature-id> \
+  --spec-approval <approval-id> --participants-file <path> --merge-grant
+sc sprint plan-unit --sprint <id> \
+  --developer-shell <id> --reviewer-shell <id> --title <title> \
+  --expected-output-file <path> --task <task-id> \
+  [--task <task-id>] [--wave <n>] [--depends-on <work-unit-id>]
+```
+
+The participant file contains `shell_id`, `role`, and `harness`, with optional
+`model`, `effort`, and `route`. FnB may add `--planner-shell <id>` when declaring
+for the originating Planner. Keep the Sprint prepared while shaping the plan.
+
 ## Final arming check
 
 Immediately before arming, re-read the spec revision hashes, QAQC records,
@@ -73,6 +89,10 @@ arming transaction; external harness and GitHub work occurs after it commits.
 Arming succeeds only when the first assignments and wake intents are durable.
 A process crash after commit is outbox recovery; a crash before commit exposes
 no partial Sprint.
+
+```text
+sc sprint arm --sprint <id>
+```
 
 ## Handoff
 

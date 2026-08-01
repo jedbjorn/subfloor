@@ -39,6 +39,11 @@ until it is green. The watcher supplies red/green facts; do not write PR state
 yourself. On red, diagnose and fix the PR. On green, judge readiness rather
 than forwarding mechanically.
 
+```text
+sc sprint register-pr --sprint <id> --repository <owner/name> \
+  --pr <number> --work-unit <id>
+```
+
 ## Review handoff
 
 Put the readiness claim in a file, then use one stable retry key:
@@ -77,6 +82,10 @@ Pause immediately when integrity is threatened: broken base, destructive
 ambiguity, unavailable GitHub, untrustworthy runners, provider exhaustion, or
 an unrecoverable environment. State the short reason first; detailed judgment
 can follow after pause is durable.
+
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
+```
 
 Stop when the unit is merged and reported, declined, paused awaiting recovery,
 or returned to review. Ask the Planner for later work only after the current
