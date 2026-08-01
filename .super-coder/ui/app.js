@@ -821,6 +821,7 @@ const SLABEL = { brainstorm: "Brainstorm", in_progress: "In Progress", next: "Ne
 const FLOW_STAGES = ["in_progress", "next", "near_term", "long_term", "shipped"];
 let roadmapFilter = null;            // null = show all (default); single-select
 let roadmapView = "board";           // "board" | "flow"
+let roadmapFeatureId = null;          // exact #roadmap-feature-<id> modal route
 let roadmapQuery = "";               // board search; persists across re-renders
 const roadmapCollapsed = new Set();  // statuses whose section is collapsed
 
@@ -906,6 +907,14 @@ async function renderRoadmap(root) {
     }
   }
   drawBoard();
+  if (roadmapFeatureId !== null) {
+    const requested = roadmapFeatureId;
+    roadmapFeatureId = null;
+    const feature = buckets.flatMap((bucket) => bucket.features)
+      .find((item) => item.feature_id === requested);
+    if (feature) openFeatureModal(feature, candidates, projects);
+    else toast(`feature #${requested} not found`);
+  }
 }
 
 // Flow view: one section per work-stream (project). Inside a section the
@@ -4694,10 +4703,624 @@ async function renderInterface(root) {
   await loadTranscript();
 }
 
+// ── Sprints v2 FnB board ────────────────────────────────────────────────────
+const SPRINTS_REFRESH_MS = 5000;
+let sprintRouteId = null;      // null = priority selection; NaN = invalid exact route
+let sprintSelectedId = null;
+let sprintRenderGeneration = 0;
+let sprintPollTimer = null;
+let activeTab = "shells";
+let sprintOpenUnitId = null;
+let sprintLastGoodId = null;
+let sprintFeedSprintId = null;
+let sprintFeedState = {
+  events: { open: false, openRows: new Set(), items: [], cursor: null, loading: false },
+  summaries: { open: false, openRows: new Set(), items: [], cursor: null, loading: false },
+};
+const sprintFeedRefs = {};
+
+const SPRINT_COLUMNS = [
+  ["done", "Done"],
+  ["review", "Review"],
+  ["dev", "Dev"],
+  ["waiting", "Waiting"],
+  ["blocked", "Blocked"],
+];
+
+function sprintStopPolling() {
+  if (sprintPollTimer !== null) clearTimeout(sprintPollTimer);
+  sprintPollTimer = null;
+}
+
+function sprintPriority(items) {
+  const newest = (rows, field) => rows.slice().sort((a, b) =>
+    String(b[field] || "").localeCompare(String(a[field] || ""))
+    || b.sprint_id - a.sprint_id)[0];
+  return items.find((item) => item.lifecycle === "armed")
+    || newest(items.filter((item) => item.lifecycle === "paused"), "paused_at")
+    || newest(items.filter((item) => item.lifecycle === "prepared"), "created_at")
+    || newest(items.filter((item) => ["completed", "aborted"].includes(item.lifecycle)), "created_at")
+    || null;
+}
+
+function sprintScheduleRefresh(root, generation) {
+  sprintStopPolling();
+  if (activeTab !== "sprints" || document.hidden) return;
+  sprintPollTimer = setTimeout(() => {
+    if (generation !== sprintRenderGeneration || activeTab !== "sprints" || document.hidden) return;
+    renderSprints(root, { refresh: true });
+  }, SPRINTS_REFRESH_MS);
+}
+
+function sprintRoute(sprintId) {
+  sprintRouteId = sprintId;
+  sprintSelectedId = sprintId;
+  location.hash = `sprints/${sprintId}`;
+}
+
+function sprintPageShell(list, selectedId) {
+  const selector = el("select", {
+    className: "sprint-selector",
+    title: "Select Sprint",
+  });
+  for (const item of list) selector.append(el("option", {
+    value: String(item.sprint_id),
+    selected: item.sprint_id === selectedId,
+    textContent: `Sprint ${item.sprint_id} · ${item.lifecycle} · ${item.feature.title}`,
+  }));
+  selector.onchange = () => sprintRoute(Number(selector.value));
+  const content = el("div", { className: "sprint-content" });
+  return {
+    node: el("div", { className: "sprint-page" },
+      el("div", { className: "sprint-toolbar" }, selector), content),
+    content,
+  };
+}
+
+function renderSprintRouteState(root, title, detail, retry = null) {
+  const card = el("div", { className: "card sprint-route-state" },
+    el("h2", {}, title), el("div", { className: "muted" }, detail));
+  if (retry) {
+    const button = el("button", { className: "act", type: "button", textContent: "Retry" });
+    button.onclick = retry;
+    card.append(button);
+  }
+  root.replaceChildren(card);
+}
+
+function sprintKeepLastGood(root, generation, error) {
+  if (sprintLastGoodId === null || sprintLastGoodId !== sprintSelectedId || !root.firstChild)
+    return false;
+  root.querySelector?.(".sprint-stale-notice")?.remove();
+  const retry = el("button", { className: "act", type: "button", textContent: "Retry now" });
+  retry.onclick = () => renderSprints(root, { refresh: true });
+  const notice = el("div", { className: "sprint-stale-notice", role: "status" },
+    el("span", {}, `Showing the last good Sprint snapshot — refresh failed: ${error.message}`),
+    retry);
+  root.prepend(notice);
+  sprintScheduleRefresh(root, generation);
+  return true;
+}
+
+function sprintTimestamp(value) {
+  if (!value) return null;
+  const parsed = new Date(value.replace(" ", "T") + (value.includes("Z") ? "" : "Z"));
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+}
+
+function sprintElapsed(sprint) {
+  const start = new Date((sprint.armed_at || sprint.created_at).replace(" ", "T") + "Z");
+  const endValue = sprint.completed_at || sprint.aborted_at;
+  const end = endValue ? new Date(endValue.replace(" ", "T") + "Z") : new Date();
+  const seconds = Math.max(0, Math.floor((end - start) / 1000));
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return [days ? `${days}d` : "", hours ? `${hours}h` : "", `${minutes}m`]
+    .filter(Boolean).join(" ");
+}
+
+function sprintParticipantLink(person) {
+  if (!person?.current_conversation_id) return el("span", {}, person?.shortname || "—");
+  return el("a", {
+    href: `#interface/${encodeURIComponent(person.shortname)}/${encodeURIComponent(person.current_conversation_id)}/chat`,
+    textContent: person.shortname,
+  });
+}
+
+function sprintAuditSection(title, rows, renderRow) {
+  const section = el("div", { className: "sprint-audit-section" }, el("h3", {}, title));
+  if (!rows.length) section.append(el("div", { className: "muted" }, "None"));
+  else for (const row of rows) section.append(renderRow(row));
+  return section;
+}
+
+function sprintFeedIdentity(kind, item) {
+  return kind === "events" ? `event:${item.event_id}` : `${item.source}:${item.id}`;
+}
+
+function sprintFeedRow(kind, item, state) {
+  const identity = sprintFeedIdentity(kind, item);
+  const detail = el("details", {
+    className: "sprint-feed-row",
+    open: state.openRows.has(identity),
+  });
+  detail.ontoggle = () => {
+    if (detail.open) state.openRows.add(identity);
+    else state.openRows.delete(identity);
+  };
+  const label = kind === "events"
+    ? `${item.actor.shortname || item.actor.kind} · ${item.type}`
+    : `${item.author.shortname || "system"} · ${item.kind}`;
+  detail.append(el("summary", {},
+    el("span", {}, label),
+    el("span", { className: "muted" }, sprintTimestamp(item.created_at))));
+  if (kind === "events") {
+    const keys = Object.keys(item.details || {});
+    detail.append(keys.length
+      ? el("pre", { className: "sprint-feed-detail" }, JSON.stringify(item.details, null, 2))
+      : el("div", { className: "muted sprint-feed-detail" }, "No display details."));
+  } else {
+    detail.append(el("div", { className: "sprint-feed-detail" },
+      item.work_unit_id ? el("div", { className: "muted" }, `Work unit U${item.work_unit_id}`) : "",
+      el("div", { className: "sprint-long-text" }, item.body)));
+  }
+  return detail;
+}
+
+function sprintPaintFeed(kind) {
+  const refs = sprintFeedRefs[kind];
+  if (!refs) return;
+  const state = sprintFeedState[kind];
+  refs.list.replaceChildren();
+  if (!state.items.length) refs.list.append(
+    el("div", { className: "muted sprint-feed-empty" }, state.loading ? "Loading…" : "No entries."));
+  else for (const item of state.items) refs.list.append(sprintFeedRow(kind, item, state));
+  refs.more.hidden = !state.cursor;
+  refs.more.disabled = state.loading;
+  refs.more.textContent = state.loading ? "Loading…" : "Load more";
+}
+
+async function sprintLoadFeed(kind, { more = false, refresh = false } = {}) {
+  const state = sprintFeedState[kind];
+  if (state.loading || sprintFeedSprintId === null) return;
+  const requestedSprintId = sprintFeedSprintId;
+  state.loading = true;
+  sprintPaintFeed(kind);
+  try {
+    const cursor = more ? state.cursor : null;
+    const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
+    const page = await api(`/sprints/${requestedSprintId}/${kind}?limit=50${suffix}`);
+    if (
+      requestedSprintId !== sprintFeedSprintId
+      || requestedSprintId !== sprintSelectedId
+      || state !== sprintFeedState[kind]
+    ) return;
+    if (!state.items.length || more) {
+      state.items = more ? [...state.items, ...page.items] : page.items;
+      state.cursor = page.next_cursor;
+    } else if (refresh) {
+      const seen = new Set(state.items.map((item) => sprintFeedIdentity(kind, item)));
+      state.items = [
+        ...page.items.filter((item) => !seen.has(sprintFeedIdentity(kind, item))),
+        ...state.items,
+      ];
+    }
+    const unique = new Set();
+    state.items = state.items.filter((item) => {
+      const identity = sprintFeedIdentity(kind, item);
+      if (unique.has(identity)) return false;
+      unique.add(identity);
+      return true;
+    });
+  } catch (error) {
+    toast(`${kind} unavailable: ${error.message}`);
+  } finally {
+    state.loading = false;
+    if (state === sprintFeedState[kind]) sprintPaintFeed(kind);
+  }
+}
+
+function sprintFeedsNode(sprintId) {
+  if (sprintFeedSprintId !== sprintId) {
+    sprintFeedSprintId = sprintId;
+    sprintFeedState = {
+      events: { open: false, openRows: new Set(), items: [], cursor: null, loading: false },
+      summaries: { open: false, openRows: new Set(), items: [], cursor: null, loading: false },
+    };
+  }
+  const wrap = el("div", { className: "sprint-feeds" });
+  for (const [kind, label] of [["events", "Sprint events"], ["summaries", "Sprint summaries"]]) {
+    const state = sprintFeedState[kind];
+    const list = el("div", { className: "sprint-feed-list" });
+    const more = el("button", { className: "act", type: "button", textContent: "Load more" });
+    more.onclick = () => sprintLoadFeed(kind, { more: true });
+    const detail = el("details", { className: "card sprint-feed", open: state.open },
+      el("summary", {}, `${label} (${kind === "events" ? "timeline" : "judgments and reports"})`),
+      list, more);
+    detail.ontoggle = () => {
+      state.open = detail.open;
+      if (detail.open && !state.items.length) sprintLoadFeed(kind);
+    };
+    sprintFeedRefs[kind] = { detail, list, more };
+    sprintPaintFeed(kind);
+    wrap.append(detail);
+  }
+  return wrap;
+}
+
+function sprintScopedFeed(sprintId, workUnitId, kind, label) {
+  const detail = el("details", { className: "sprint-audit-section sprint-scoped-feed" },
+    el("summary", {}, label));
+  const list = el("div", { className: "sprint-feed-list" });
+  const more = el("button", { className: "act", type: "button", textContent: "Load more", hidden: true });
+  let cursor = null;
+  let items = [];
+  let loading = false;
+  const paint = () => {
+    list.replaceChildren(...items.map((item) => sprintFeedRow(kind, item)));
+    if (!items.length) list.append(el("div", { className: "muted" }, loading ? "Loading…" : "No entries."));
+    more.hidden = !cursor;
+    more.disabled = loading;
+  };
+  const loadPage = async () => {
+    if (loading) return;
+    loading = true; paint();
+    try {
+      const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
+      const page = await api(
+        `/sprints/${sprintId}/${kind}?limit=50&work_unit_id=${workUnitId}${suffix}`);
+      items = [...items, ...page.items];
+      cursor = page.next_cursor;
+    } catch (error) { toast(`${label} unavailable: ${error.message}`); }
+    finally { loading = false; paint(); }
+  };
+  detail.ontoggle = () => { if (detail.open && !items.length) loadPage(); };
+  more.onclick = loadPage;
+  detail.append(list, more);
+  return detail;
+}
+
+function openSprintActionModal(sprint, target, label) {
+  const reason = el("textarea", {
+    rows: 5,
+    maxlength: 2000,
+    placeholder: `Reason for ${label.toLowerCase()} (required)`,
+  });
+  const confirmButton = el("button", { className: "act danger", type: "button", textContent: label });
+  const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+  const body = el("div", { className: "sprint-action-form" },
+    target === "aborted" ? el("div", { className: "sprint-abort-note" },
+      "Abort stops active work but retains the complete Sprint history and the Planner's durable abort-report request.") : "",
+    el("label", { className: "k" }, "Reason"), reason);
+  const close = openModal({
+    title: `${label} · Sprint ${sprint.sprint_id}`,
+    bodyNode: body,
+    footNodes: [confirmButton, cancel],
+    width: 560,
+    height: 360,
+  });
+  confirmButton.onclick = async () => {
+    const value = reason.value.trim();
+    if (!value) return toast("reason required");
+    confirmButton.disabled = true;
+    try {
+      const result = await api(`/sprints/${sprint.sprint_id}`, "PATCH", {
+        lifecycle: target,
+        reason: value,
+      });
+      close();
+      setStatus(result.changed ? `Sprint ${sprint.sprint_id} ${target}` : `Sprint already ${target}`);
+      await renderSprints($("#view-sprints"), { refresh: true });
+    } catch (error) {
+      toast(`action failed: ${error.message}`);
+      confirmButton.disabled = false;
+    }
+  };
+  cancel.onclick = close;
+  reason.focus();
+}
+
+function sprintActionButtons(sprint) {
+  const actions = [];
+  if (sprint.lifecycle === "armed") actions.push(["paused", "Pause Sprint"]);
+  if (sprint.lifecycle === "paused") actions.push(["armed", "Resume Sprint"]);
+  if (["prepared", "armed", "paused"].includes(sprint.lifecycle))
+    actions.push(["aborted", "Abort Sprint"]);
+  const row = el("div", { className: "sprint-actions" });
+  for (const [target, label] of actions) {
+    const button = el("button", {
+      className: `act ${target === "aborted" ? "danger" : ""}`,
+      type: "button",
+      textContent: label,
+    });
+    button.onclick = () => openSprintActionModal(sprint, target, label);
+    row.append(button);
+  }
+  return row;
+}
+
+function openSprintUnitModal(unit, snapshot) {
+  sprintOpenUnitId = unit.work_unit_id;
+  const body = el("div", { className: "sprint-unit-detail" });
+  const facts = el("div", { className: "grid2 sprint-unit-facts" },
+    el("span", { className: "k" }, "disposition"), el("span", {}, unit.disposition),
+    el("span", { className: "k" }, "wave"), el("span", {}, String(unit.planned_wave)),
+    el("span", { className: "k" }, "output kind"), el("span", {}, unit.output_kind),
+    el("span", { className: "k" }, "developer"), sprintParticipantLink(unit.developer),
+    el("span", { className: "k" }, "reviewer"), sprintParticipantLink(unit.reviewer),
+    el("span", { className: "k" }, "prerequisites"),
+    el("span", {}, unit.prerequisite_ids.length ? unit.prerequisite_ids.map((id) => `U${id}`).join(", ") : "None"),
+    el("span", { className: "k" }, "dependents"),
+    el("span", {}, unit.dependent_ids.length ? unit.dependent_ids.map((id) => `U${id}`).join(", ") : "None"));
+  body.append(facts,
+    el("h3", {}, "Expected output"), el("div", { className: "sprint-long-text" }, unit.expected_output));
+  if (unit.completion_result) body.append(
+    el("h3", {}, unit.disposition === "cancelled" ? "Cancellation result" : "Completion result"),
+    el("div", { className: "sprint-long-text" }, unit.completion_result));
+
+  body.append(sprintAuditSection("Included tasks", unit.tasks, (task) =>
+    el("div", { className: "sprint-audit-row" },
+      el("a", {
+        href: `/api/documents/${task.document_id}/open`, target: "_blank", rel: "noopener",
+        textContent: `#${task.task_id} ${task.title}`,
+      }), el("span", { className: "pill" }, task.status))));
+  body.append(sprintAuditSection("Pull requests", unit.pull_requests, (pr) => {
+    const label = `${pr.repository}#${pr.pr_number}`;
+    const link = pr.url ? el("a", {
+      href: pr.url, target: "_blank", rel: "noopener", textContent: label,
+    }) : el("span", {}, label);
+    return el("div", { className: "sprint-audit-row" }, link,
+      el("span", { className: "pill" }, pr.normalized_state || "registered"),
+      el("span", { className: "muted" }, pr.observed_head_sha || "no head observed",
+        pr.observed_at ? ` · ${sprintTimestamp(pr.observed_at)}` : ""));
+  }));
+  body.append(sprintAuditSection("Participant messages", unit.messages, (message) =>
+    el("div", { className: "sprint-message-audit" },
+      el("div", { className: "sprint-audit-row" },
+        el("span", {}, `${message.sender?.shortname || "system"} → ${message.recipient.shortname}`),
+        el("span", { className: "pill" }, message.kind),
+        el("span", { className: "muted" }, sprintTimestamp(message.created_at))),
+      el("div", { className: "sprint-long-text" }, message.body))));
+  body.append(
+    sprintScopedFeed(snapshot.sprint.sprint_id, unit.work_unit_id, "events", "Scoped events"),
+    sprintScopedFeed(snapshot.sprint.sprint_id, unit.work_unit_id, "summaries", "Scoped judgments and reports"));
+
+  const closeButton = el("button", { className: "act", type: "button", textContent: "Close" });
+  const close = openModal({
+    title: `U${unit.work_unit_id} · ${unit.title}`,
+    bodyNode: body,
+    footNodes: [el("span", { className: "muted" }, `Sprint ${snapshot.sprint.sprint_id}`), closeButton],
+    width: 840,
+    height: 760,
+  });
+  closeButton.onclick = () => { sprintOpenUnitId = null; close(); };
+}
+
+function sprintWorkUnitCard(unit, snapshot) {
+  const card = el("button", {
+    className: `sprint-unit sprint-unit-${unit.disposition}`,
+    type: "button",
+    title: `U${unit.work_unit_id} ${unit.title}`,
+  });
+  card.dataset.unitId = String(unit.work_unit_id);
+  const pr = unit.pull_requests[0];
+  card.append(
+    el("div", { className: "sprint-unit-title" },
+      el("span", { className: "sprint-unit-id" }, `U${unit.work_unit_id}`),
+      el("span", {}, unit.title)),
+    el("div", { className: "sprint-unit-meta" },
+      el("span", { className: "pill" }, unit.disposition),
+      el("span", { className: "muted" }, `wave ${unit.planned_wave}`)),
+    el("div", { className: "sprint-unit-people" },
+      `Dev: ${unit.developer.shortname} · Review: ${unit.reviewer.shortname}`),
+    el("div", { className: "sprint-unit-deps" },
+      unit.prerequisite_ids.length
+        ? `Depends: ${unit.prerequisite_ids.map((id) => `U${id}`).join(", ")}`
+        : "Depends: none"),
+    el("div", { className: "sprint-unit-foot" },
+      el("span", {}, unit.output_kind.replaceAll("_", " ")),
+      el("span", {}, pr ? `PR #${pr.pr_number} · ${pr.normalized_state || "registered"}` : "No PR")));
+  if (unit.disposition === "cancelled") card.append(
+    el("div", { className: "sprint-cancelled-note" }, "Cancelled — not completed"));
+  card.onclick = () => openSprintUnitModal(unit, snapshot);
+  return card;
+}
+
+function sprintWireGraph(wrap, canvas, svg, cardById, dependencies) {
+  const draw = () => {
+    if (!canvas.isConnected) return;
+    const base = canvas.getBoundingClientRect();
+    const width = canvas.scrollWidth;
+    const height = canvas.scrollHeight;
+    svg.setAttribute("width", width);
+    svg.setAttribute("height", height);
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.replaceChildren();
+    for (const edge of dependencies) {
+      const source = cardById[edge.depends_on_work_unit_id];
+      const target = cardById[edge.work_unit_id];
+      if (!source || !target) continue;
+      const a = source.getBoundingClientRect();
+      const b = target.getBoundingClientRect();
+      const x1 = a.right - base.left;
+      const y1 = a.top - base.top + a.height / 2;
+      const x2 = b.left - base.left;
+      const y2 = b.top - base.top + b.height / 2;
+      const bend = Math.max(36, Math.abs(x2 - x1) * .4);
+      const path = document.createElementNS(SVGNS, "path");
+      path.setAttribute("d", `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`);
+      path.setAttribute("class", "sprint-wire");
+      path.dataset.from = String(edge.depends_on_work_unit_id);
+      path.dataset.to = String(edge.work_unit_id);
+      svg.append(path);
+    }
+  };
+  requestAnimationFrame(draw);
+  const onResize = () => canvas.isConnected ? draw() : window.removeEventListener("resize", onResize);
+  window.addEventListener("resize", onResize);
+
+  const highlight = (unitId, on) => {
+    const direct = new Set([String(unitId)]);
+    for (const path of svg.querySelectorAll(".sprint-wire")) {
+      const lit = path.dataset.from === String(unitId) || path.dataset.to === String(unitId);
+      path.classList.toggle("lit", on && lit);
+      if (lit) { direct.add(path.dataset.from); direct.add(path.dataset.to); }
+    }
+    wrap.classList.toggle("sprint-wire-focus", on);
+    for (const [id, card] of Object.entries(cardById)) card.classList.toggle("lit", on && direct.has(id));
+  };
+  for (const [id, card] of Object.entries(cardById)) {
+    card.onmouseenter = () => highlight(id, true);
+    card.onmouseleave = () => highlight(id, false);
+    card.onfocus = () => highlight(id, true);
+    card.onblur = () => highlight(id, false);
+  }
+}
+
+function sprintBoardNode(snapshot) {
+  const sprint = snapshot.sprint;
+  const header = el("div", { className: "card sprint-board-head" });
+  const heading = el("div", { className: "sprint-heading" },
+    el("h2", {}, `Sprint ${sprint.sprint_id}`),
+    el("span", { className: `pill sprint-${sprint.lifecycle}` }, sprint.lifecycle));
+  const feature = el("a", {
+    href: `#roadmap-feature-${sprint.feature.feature_id}`,
+    textContent: sprint.feature.title,
+  });
+  const specs = el("span", { className: "sprint-spec-links" });
+  for (const spec of snapshot.specs) specs.append(" ", el("a", {
+    href: `/api/documents/${spec.document_id}/open`, target: "_blank", rel: "noopener",
+    textContent: `${spec.kind} #${spec.document_id}`,
+  }));
+  const times = [
+    ["Created", sprint.created_at], ["Armed", sprint.armed_at],
+    ["Paused", sprint.paused_at],
+    [sprint.lifecycle === "aborted" ? "Aborted" : "Completed", sprint.aborted_at || sprint.completed_at],
+  ].filter(([, value]) => value);
+  header.append(heading,
+    el("div", { className: "sprint-header-context" },
+      el("span", {}, "Feature: ", feature),
+      el("span", {}, `Planner: ${sprint.planner.shortname}`), specs),
+    el("div", { className: "sprint-header-times" },
+      ...times.map(([label, value]) => el("span", {}, `${label}: ${sprintTimestamp(value)}`)),
+      el("span", {}, `Elapsed: ${sprintElapsed(sprint)}`)),
+    sprintActionButtons(sprint));
+  if (sprint.terminal_outcome) header.append(
+    el("div", { className: "sprint-terminal-outcome" }, `Outcome: ${sprint.terminal_outcome}`));
+
+  const scroll = el("div", { className: "sprint-board-scroll" });
+  const canvas = el("div", { className: "sprint-board-canvas" });
+  const svg = document.createElementNS(SVGNS, "svg");
+  svg.setAttribute("class", "sprint-wires");
+  svg.setAttribute("aria-hidden", "true");
+  const columns = el("div", { className: "sprint-columns" });
+  const cardById = {};
+  for (const [key, label] of SPRINT_COLUMNS) {
+    const units = snapshot.work_units.filter((unit) => unit.column === key);
+    const column = el("section", { className: `sprint-column sprint-column-${key}` },
+      el("h3", {}, label, el("span", { className: "count" }, String(units.length))));
+    const cards = el("div", { className: "sprint-column-cards" });
+    if (!units.length) cards.append(el("div", { className: "sprint-column-empty" }, "No work units"));
+    for (const unit of units) {
+      const card = sprintWorkUnitCard(unit, snapshot);
+      cards.append(card);
+      cardById[unit.work_unit_id] = card;
+    }
+    column.append(cards);
+    columns.append(column);
+  }
+  canvas.append(svg, columns);
+  scroll.append(canvas);
+  sprintWireGraph(scroll, canvas, svg, cardById, snapshot.dependencies);
+  return el("div", { className: "sprint-board-view" }, header, scroll,
+    sprintFeedsNode(sprint.sprint_id));
+}
+
+async function renderSprints(root, { refresh = false } = {}) {
+  const generation = ++sprintRenderGeneration;
+  const previousScroll = refresh
+    ? root.querySelector?.(".sprint-board-scroll")?.scrollLeft || 0
+    : 0;
+  const focusedUnitId = refresh ? document.activeElement?.dataset?.unitId || null : null;
+  sprintStopPolling();
+  if (!refresh || !root.firstChild) root.replaceChildren(el("div", { className: "muted" }, "Loading Sprints…"));
+  if (Number.isNaN(sprintRouteId)) {
+    renderSprintRouteState(root, "Sprint not found", "The Sprint route must contain a positive integer ID.");
+    return;
+  }
+  let list;
+  try {
+    list = (await api("/sprints?limit=100")).items;
+  } catch (error) {
+    if (generation !== sprintRenderGeneration) return;
+    if (refresh && sprintKeepLastGood(root, generation, error)) return;
+    renderSprintRouteState(root, "Sprints unavailable", error.message, () => renderSprints(root));
+    return;
+  }
+  if (generation !== sprintRenderGeneration) return;
+  if (!list.length && sprintRouteId === null) {
+    sprintSelectedId = null;
+    renderSprintRouteState(
+      root,
+      "No Sprints yet",
+      "Prepared Sprints appear here after declaration.",
+    );
+    return;
+  }
+
+  const preferred = sprintRouteId === null ? sprintPriority(list) : null;
+  const selectedId = sprintRouteId ?? preferred?.sprint_id ?? null;
+  if (selectedId === null) return;
+  sprintSelectedId = selectedId;
+  if (sprintRouteId === null && globalThis.history?.replaceState) {
+    history.replaceState(null, "", `#sprints/${selectedId}`);
+    sprintRouteId = selectedId;
+  }
+
+  let board;
+  try {
+    board = await api(`/sprints/${selectedId}`);
+  } catch (error) {
+    if (generation !== sprintRenderGeneration) return;
+    if (refresh && sprintKeepLastGood(root, generation, error)) return;
+    renderSprintRouteState(
+      root,
+      "Sprint unavailable",
+      `Sprint ${selectedId} was not found or is not available: ${error.message}`,
+      () => renderSprints(root),
+    );
+    return;
+  }
+  if (generation !== sprintRenderGeneration) return;
+  if (!list.some((item) => item.sprint_id === selectedId)) {
+    list = [{
+      sprint_id: selectedId,
+      lifecycle: board.sprint.lifecycle,
+      feature: board.sprint.feature,
+    }, ...list];
+  }
+  const shell = sprintPageShell(list, selectedId);
+  shell.content.append(sprintBoardNode(board));
+  root.replaceChildren(shell.node);
+  sprintLastGoodId = selectedId;
+  setDocumentTitle("sprints");
+  requestAnimationFrame(() => {
+    const scroll = root.querySelector?.(".sprint-board-scroll");
+    if (scroll) scroll.scrollLeft = previousScroll;
+    if (focusedUnitId)
+      root.querySelector?.(`[data-unit-id="${focusedUnitId}"]`)?.focus();
+  });
+  for (const kind of ["events", "summaries"])
+    if (sprintFeedState[kind].open) sprintLoadFeed(kind, { refresh: true });
+  sprintScheduleRefresh(root, generation);
+}
+
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
 const VIEWS = {
   shells: ["#view-shells", renderShells],
   interface: ["#view-interface", renderInterface],
+  sprints: ["#view-sprints", renderSprints],
   roadmap: ["#view-roadmap", renderRoadmap],
   docs: ["#view-docs", renderDocs],
   flags: ["#view-flags", renderFlags],
@@ -4721,9 +5344,12 @@ function setDocumentTitle(tab) {
   const label = document.querySelector(
     `nav button[data-tab="${tab}"]`,
   )?.textContent || tab;
-  document.title = forkName ? `${label} · ${forkName}` : label;
+  const viewLabel = tab === "sprints" && sprintSelectedId
+    ? `Sprint ${sprintSelectedId}` : label;
+  document.title = forkName ? `${viewLabel} · ${forkName}` : viewLabel;
 }
 function show(tab) {
+  activeTab = tab;
   for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b.dataset.tab === tab);
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
   document.body.classList.toggle("interface-view", tab === "interface");
@@ -4733,6 +5359,7 @@ function show(tab) {
     chatStopReview();
     chatModeController = null;
   }
+  if (tab !== "sprints") sprintStopPolling();
   setDocumentTitle(tab);
   load(tab);
 }
@@ -4769,7 +5396,18 @@ function routeFromHash() {
     show("shells");
     return;
   }
+  if (raw === "sprints" || raw.startsWith("sprints/")) {
+    const parts = raw.split("/");
+    const requested = parts.length === 1 ? null : Number(parts[1]);
+    sprintRouteId = parts.length === 1
+      ? null
+      : (parts.length === 2 && Number.isInteger(requested) && requested > 0 ? requested : NaN);
+    show("sprints");
+    return;
+  }
   if (raw === "roadmap" || raw.startsWith("roadmap-")) {
+    const featureMatch = raw.match(/^roadmap-feature-(\d+)$/);
+    roadmapFeatureId = featureMatch ? Number(featureMatch[1]) : null;
     roadmapView = raw === "roadmap-flow" ? "flow" : "board";
     show("roadmap");
     return;
@@ -4785,6 +5423,10 @@ function routeFromHash() {
 document.querySelectorAll("nav button").forEach((b) => (b.onclick = () => { location.hash = b.dataset.tab; }));
 window.addEventListener("hashchange", routeFromHash);
 window.addEventListener("popstate", routeFromHash);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) sprintStopPolling();
+  else if (activeTab === "sprints") load("sprints");
+});
 // Close any open popover menu on an outside click (one handler for all .gmenu).
 document.addEventListener("mousedown", (e) => {
   for (const m of document.querySelectorAll(".gmenu:not([hidden])"))

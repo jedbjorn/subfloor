@@ -21,7 +21,6 @@ import server  # noqa: E402
 class RemovedHttpSurfaceTest(unittest.TestCase):
     def test_every_removed_route_has_the_standard_unknown_response(self):
         routes = (
-            ("GET", "/api/sprints"),
             ("POST", "/api/sprints"),
             ("GET", "/api/sprint-units?sprint_doc_id=1"),
             ("POST", "/api/sprint-units"),
@@ -53,6 +52,7 @@ class RemovedHttpSurfaceTest(unittest.TestCase):
     def test_retained_route_modules_remain_registered(self):
         self.assertTrue(hasattr(server, "conversation_routes"))
         self.assertTrue(hasattr(server, "review_routes"))
+        self.assertTrue(hasattr(server, "sprint_board"))
         for name in (
             "conductor_routes",
             "conductor_runtime",
@@ -64,54 +64,32 @@ class RemovedHttpSurfaceTest(unittest.TestCase):
 
 
 class RemovedBrowserSurfaceTest(unittest.TestCase):
-    def test_navigation_keeps_the_retained_views_only(self):
+    def test_navigation_adds_only_the_new_v2_sprints_view(self):
         html = INDEX_HTML.read_text()
-        buttons = [
-            name
-            for name in (
-                "shells",
-                "interface",
-                "roadmap",
-                "docs",
-                "flags",
-                "worktrees",
-                "map",
-                "analytics",
-                "scripts",
-            )
-            if f'data-tab="{name}"' in html
+        nav = html[html.index("<nav>"):html.index("</nav>")]
+        positions = [
+            nav.index(f'data-tab="{name}"')
+            for name in ("interface", "sprints", "shells")
         ]
-        self.assertEqual(
-            buttons,
-            [
-                "shells",
-                "interface",
-                "roadmap",
-                "docs",
-                "flags",
-                "worktrees",
-                "map",
-                "analytics",
-                "scripts",
-            ],
-        )
-        self.assertNotIn('data-tab="sprints"', html)
-        self.assertNotIn('id="view-sprints"', html)
+        self.assertEqual(sorted(positions), positions)
+        self.assertEqual(1, nav.count('data-tab="sprints"'))
+        self.assertEqual(1, html.count('id="view-sprints"'))
 
-    def test_app_has_no_sprint_board_poll_or_analytics_grouping(self):
+    def test_app_uses_new_v2_board_names_without_restoring_v1_state(self):
         source = APP_JS.read_text()
         for removed in (
-            '"/sprints',
-            "renderSprints",
             "sprintsState",
-            "SPRINTS_REFRESH_MS",
             "sprint_ref",
             "sprint_titles",
             "an-sprint",
         ):
             with self.subTest(removed=removed):
                 self.assertNotIn(removed, source)
+        self.assertIn('api("/sprints?limit=100")', source)
+        self.assertIn("async function renderSprints", source)
+        self.assertIn("const SPRINTS_REFRESH_MS = 5000", source)
         self.assertIn('interface: ["#view-interface", renderInterface]', source)
+        self.assertIn('sprints: ["#view-sprints", renderSprints]', source)
         self.assertIn('analytics: ["#view-analytics", renderAnalytics]', source)
 
 
