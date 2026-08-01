@@ -77,7 +77,7 @@ TRANSCRIPT_MAX_TURNS = 200
 TRANSCRIPT_MAX_SOURCE_EVENTS = 20_000
 TRANSCRIPT_MAX_SOURCE_BYTES = 8 * 1024 * 1024
 TRANSCRIPT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
-TRANSCRIPT_PROJECTION_VERSION = 1
+TRANSCRIPT_PROJECTION_VERSION = 2
 TRANSCRIPT_MAX_WARNINGS = 20
 TRANSCRIPT_MAX_ACTIVITY_LABEL_BYTES = 1024
 
@@ -1529,15 +1529,25 @@ def _transcript_projection(
             "SELECT r.run_id,r.trigger_message_id,r.state,"
             "r.started_at,r.ended_at,r.error_code,r.error_detail,"
             "r.harness_session_before,r.harness_session_after,r.runner_ref,"
-            "(SELECT COUNT(*) FROM conversation_events delta_count "
-            " WHERE delta_count.run_id=r.run_id "
-            " AND delta_count.event_type='assistant.delta' "
-            " AND delta_count.sequence<=?) AS assistant_delta_count "
+            "(SELECT COUNT(*) FROM conversation_events evidence_count "
+            " WHERE evidence_count.run_id=r.run_id "
+            " AND evidence_count.event_type IN "
+            " ('assistant.delta','tool.started','tool.completed',"
+            "'permission.requested','input.requested') "
+            " AND evidence_count.sequence<=?) AS segmentation_evidence_count,"
+            "(SELECT COALESCE(MAX(boundary.sequence),0) "
+            " FROM conversation_events boundary "
+            " WHERE boundary.run_id=r.run_id "
+            " AND boundary.event_type IN "
+            " ('tool.started','tool.completed','permission.requested',"
+            "'input.requested') "
+            " AND boundary.sequence<=?) AS latest_boundary_sequence "
             "FROM conversation_runs r WHERE r.conversation_id=? AND ("
             + run_where
             + (" OR r.run_id=?" if active_run_id is not None else "")
             + ") ORDER BY r.run_id",
             (
+                through_sequence,
                 through_sequence,
                 conversation_id,
                 *message_ids,
@@ -1557,7 +1567,13 @@ def _transcript_projection(
             " ORDER BY sequence ROWS BETWEEN UNBOUNDED PRECEDING "
             " AND 1 PRECEDING"
             ") AS older_count,"
-            "LAG(sequence) OVER (ORDER BY sequence) AS prior_sequence "
+            "LAG(sequence) OVER (ORDER BY sequence) AS prior_sequence,"
+            "MAX(CASE WHEN run_id IS NOT NULL AND event_type IN "
+            " ('tool.started','tool.completed','permission.requested',"
+            "'input.requested') THEN sequence ELSE 0 END) OVER ("
+            " PARTITION BY run_id ORDER BY sequence "
+            " ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
+            ") AS segment_anchor_sequence "
             " FROM conversation_events "
             " WHERE conversation_id=? AND sequence<=?"
             ") SELECT * FROM ranked "
@@ -1631,6 +1647,7 @@ def _transcript_projection(
                 "message_id": row["message_id"],
                 "run_id": row["run_id"],
                 "created_at": row["created_at"],
+                "segment_anchor_sequence": int(row["segment_anchor_sequence"]),
             })
 
         accepted_sequence = {
@@ -1639,8 +1656,15 @@ def _transcript_projection(
             if event["event_type"] == "message.accepted"
             and event["message_id"] is not None
         }
-        deltas_by_run: dict[int, list[dict]] = {}
+        segments_by_run: dict[int, dict[int, list[dict]]] = {}
+        evidence_count_by_run: dict[int, int] = {}
         activities = []
+        boundary_types = {
+            "tool.started",
+            "tool.completed",
+            "permission.requested",
+            "input.requested",
+        }
         activity_types = {
             "permission.requested",
             "input.requested",
@@ -1649,13 +1673,27 @@ def _transcript_projection(
             "run.unknown",
         }
         for event in events:
-            if event["event_type"] == "assistant.delta" and event["run_id"] is not None:
-                deltas_by_run.setdefault(int(event["run_id"]), []).append(event)
+            run_id = event["run_id"]
+            if run_id is not None and (
+                event["event_type"] == "assistant.delta"
+                or event["event_type"] in boundary_types
+            ):
+                evidence_count_by_run[int(run_id)] = (
+                    evidence_count_by_run.get(int(run_id), 0) + 1
+                )
+            if event["event_type"] == "assistant.delta" and run_id is not None:
+                anchor = event["segment_anchor_sequence"]
+                segments_by_run.setdefault(int(run_id), {}).setdefault(
+                    anchor,
+                    [],
+                ).append(event)
             elif event["event_type"] in activity_types:
                 activities.append(event)
 
         run_by_message: dict[int, list] = {}
+        run_by_id = {}
         for row in run_rows:
+            run_by_id[int(row["run_id"])] = row
             run_by_message.setdefault(
                 int(row["trigger_message_id"]),
                 [],
@@ -1668,8 +1706,8 @@ def _transcript_projection(
             order_sequence = accepted_sequence.get(message_id)
             message_runs = run_by_message.get(message_id, [])
             loaded_complete = all(
-                len(deltas_by_run.get(int(run["run_id"]), []))
-                == int(run["assistant_delta_count"])
+                evidence_count_by_run.get(int(run["run_id"]), 0)
+                == int(run["segmentation_evidence_count"])
                 for run in message_runs
             )
             non_terminal = any(
@@ -1693,22 +1731,27 @@ def _transcript_projection(
             })
             for run in message_runs:
                 run_id = int(run["run_id"])
-                deltas = deltas_by_run.get(run_id, [])
-                if not deltas:
-                    continue
-                items.append({
-                    "item_id": f"run:{run_id}:assistant",
-                    "kind": "assistant",
-                    "order_sequence": deltas[0]["sequence"],
-                    "message_id": message_id,
-                    "run_id": run_id,
-                    "created_at": deltas[0]["created_at"],
-                    "text": "".join(delta["payload"]["text"] for delta in deltas),
-                    "outcome": run["state"],
-                    "first_sequence": deltas[0]["sequence"],
-                    "last_sequence": deltas[-1]["sequence"],
-                    "text_truncated": False,
-                })
+                segments = segments_by_run.get(run_id, {})
+                for anchor, deltas in sorted(
+                    segments.items(),
+                    key=lambda entry: entry[1][0]["sequence"],
+                ):
+                    items.append({
+                        "item_id": f"run:{run_id}:assistant:{anchor}",
+                        "kind": "assistant",
+                        "order_sequence": deltas[0]["sequence"],
+                        "message_id": message_id,
+                        "run_id": run_id,
+                        "created_at": deltas[0]["created_at"],
+                        "text": "".join(
+                            delta["payload"]["text"] for delta in deltas
+                        ),
+                        "outcome": run["state"],
+                        "segment_anchor_sequence": anchor,
+                        "first_sequence": deltas[0]["sequence"],
+                        "last_sequence": deltas[-1]["sequence"],
+                        "text_truncated": False,
+                    })
 
         for event in activities:
             message_id = (
@@ -1799,6 +1842,14 @@ def _transcript_projection(
                 else None
             ),
         }
+        if active_run_id is not None and int(active_run_id) in run_by_id:
+            active_run = run_by_id[int(active_run_id)]
+            projection["assistant_cursor"] = {
+                "run_id": int(active_run_id),
+                "segment_anchor_sequence": int(
+                    active_run["latest_boundary_sequence"]
+                ),
+            }
         if warnings:
             projection["warnings"] = warnings
         _bound_transcript_response(

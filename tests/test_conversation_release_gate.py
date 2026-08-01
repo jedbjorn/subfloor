@@ -13,8 +13,6 @@ from collections.abc import Iterator
 from pathlib import Path
 from unittest import mock
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 sys.path.insert(0, str(ENGINE / "api"))
@@ -494,11 +492,6 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
     def test_codex_release_journey_and_crash_windows(self) -> None:
         self.assert_release_journey("codex")
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="unit 2 removes this projection marker",
-    )
-    @unittest.expectedFailure
     def test_same_adapter_conversations_keep_segment_ids_run_scoped(self) -> None:
         state = NativeHarnessState("codex")
         state.segmented_trace = True
@@ -544,7 +537,7 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
                 [(item["item_id"], item["text"]) for item in assistant],
                 [
                     (f"run:{run_id}:assistant:0", "codex before tool"),
-                    (f"run:{run_id}:assistant:6", "codex after tool"),
+                    (f"run:{run_id}:assistant:7", "codex after tool"),
                 ],
             )
 
