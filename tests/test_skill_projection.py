@@ -172,7 +172,14 @@ class SkillProjectionTest(unittest.TestCase):
             root_live.write_text("preserve live unowned projection\n")
             root_retired = repo / ".claude/skills/retired_upstream/SKILL.md"
             root_retired.parent.mkdir()
-            root_retired.write_text("remove retired projection\n")
+            root_retired.write_text(
+                "---\nrendered_by: super-coder\n---\nremove retired projection\n"
+            )
+            foreign_control = (
+                repo / ".claude/skills/my_custom_tool/operator-control.txt"
+            )
+            foreign_control.parent.mkdir()
+            foreign_control.write_text("operator-owned\n")
             dev1_root = repo / ".sc-worktrees/dev1/.claude/skills"
             dev1_root.mkdir(parents=True)
             stale = dev1_root / "stale/SKILL.md"
@@ -190,6 +197,8 @@ class SkillProjectionTest(unittest.TestCase):
                 root_live.read_text(), "preserve live unowned projection\n"
             )
             self.assertFalse(root_retired.parent.exists())
+            self.assertEqual(foreign_control.read_text(), "operator-owned\n")
+            self.assertNotIn(foreign_control.parent, summary["deleted"])
             self.assertFalse((repo / ".sc-worktrees/dev2").exists())
             self.assertEqual(summary["checkouts"], [repo, repo / ".sc-worktrees/dev1"])
             self.assertEqual(

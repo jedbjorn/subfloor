@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 import artifact_policy
+import seed_skills
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -94,6 +95,24 @@ def _remove_tree(path: Path) -> None:
     shutil.rmtree(path)
 
 
+def _banner_owned_skill_directory(path: Path) -> bool:
+    """Return whether a real directory carries a managed SKILL.md banner."""
+    if path.is_symlink() or not path.is_dir():
+        return False
+    skill_file = path / "SKILL.md"
+    if skill_file.is_symlink() or not skill_file.is_file():
+        return False
+    try:
+        return RENDER_BANNER in skill_file.read_text()
+    except (OSError, UnicodeError):
+        return False
+
+
+def _upstream_skill_slugs() -> set[str]:
+    names = (*seed_skills.seeded_skill_names(), *seed_skills.tombstoned_skill_names())
+    return {name.strip().lower().replace(" ", "-") for name in names}
+
+
 def reconcile_root(
     con, shell_id: int | None, checkout: Path, relative: Path, *, create: bool
 ) -> dict:
@@ -115,6 +134,7 @@ def reconcile_root(
     written: list[Path] = []
     skipped: list[Path] = []
     deleted: list[Path] = []
+    root_sweep_names = _upstream_skill_slugs() if shell_id is None else set()
 
     if root.exists():
         for child in root.iterdir():
@@ -123,6 +143,12 @@ def reconcile_root(
                     raise ProjectionError(
                         f"granted skill directory is a symlink: {child}"
                     )
+                continue
+            if (
+                shell_id is None
+                and child.name not in root_sweep_names
+                and not _banner_owned_skill_directory(child)
+            ):
                 continue
             if child.is_dir() or child.is_symlink():
                 _remove_tree(child)
