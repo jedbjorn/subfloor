@@ -1,7 +1,9 @@
 """FnB Sprint board read projections, auth boundary, cursors, and sanitization."""
 from __future__ import annotations
 
+import ast
 import json
+import re
 import sqlite3
 import sys
 import tempfile
@@ -9,14 +11,53 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 sys.path[:0] = [str(ENGINE / "api"), str(ENGINE / "scripts")]
 
-import server  # noqa: E402
-import sprint_board  # noqa: E402
-from github_pull_requests import PullRequest  # noqa: E402
+import server
+import sprint_board
+from github_pull_requests import PullRequest
+
+_DYNAMIC_EVENT_CALLS = {
+    ("sprint_domain.py", "f'lifecycle.{target}'"): {"lifecycle.completed"},
+    ("sprint_review_loop.py", "f'review.{verdict}'"): {
+        "review.approved",
+        "review.changes_requested",
+    },
+    ("sprint_liveness.py", "event_type"): {
+        "liveness.escalated",
+        "liveness.escalation_delivery_unavailable",
+    },
+}
+
+
+def emitted_sprint_event_types() -> set[str]:
+    emitted = set()
+    for path in sorted((ENGINE / "scripts").glob("sprint_*.py")):
+        if path.name == "sprint_board.py":
+            continue
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if "INSERT INTO sprint_events" in node.value:
+                    emitted.update(re.findall(r"'([a-z_]+\.[a-z_]+)'", node.value))
+                continue
+            if not isinstance(node, ast.Call) or len(node.args) < 2:
+                continue
+            function = node.func
+            name = function.attr if isinstance(function, ast.Attribute) else None
+            if name != "_event":
+                continue
+            event = node.args[1]
+            if isinstance(event, ast.Constant) and isinstance(event.value, str):
+                emitted.add(event.value)
+                continue
+            key = (path.name, ast.unparse(event))
+            if key not in _DYNAMIC_EVENT_CALLS:
+                raise AssertionError(f"unresolved dynamic Sprint event emitter: {key}")
+            emitted.update(_DYNAMIC_EVENT_CALLS[key])
+    return emitted
 
 
 def apply_schema(con: sqlite3.Connection) -> None:
@@ -347,6 +388,62 @@ class SprintBoardApiCase(unittest.TestCase):
         ids = [row["event_id"] for row in first["items"] + second["items"]]
         self.assertEqual(3, len(ids))
         self.assertEqual(3, len(set(ids)))
+
+    def test_event_projection_matches_emitters_and_projects_review_and_conformance_evidence(self):
+        self.assertEqual(emitted_sprint_event_types(), set(sprint_board._EVENT_FIELDS))
+        cases = (
+            (
+                "review.approved",
+                {
+                    "work_unit_id": self.ids["unit"],
+                    "registered_pr_id": 1,
+                    "message_id": 8,
+                    "conversation_id": "cv-approve",
+                    "head_sha": "approved-head",
+                    "secret": "hidden",
+                },
+            ),
+            (
+                "review.changes_requested",
+                {
+                    "work_unit_id": self.ids["unit"],
+                    "registered_pr_id": 1,
+                    "message_id": 9,
+                    "conversation_id": "cv-fix",
+                    "head_sha": "fix-head",
+                    "secret": "hidden",
+                },
+            ),
+            (
+                "conformance.recorded",
+                {
+                    "report_id": 4,
+                    "followup_count": 2,
+                    "followup_ids": [11, 12],
+                    "secret": "hidden",
+                },
+            ),
+        )
+        with self.connect() as con:
+            con.executemany(
+                "INSERT INTO sprint_events "
+                "(sprint_id,event_type,actor_kind,payload,created_at) "
+                "VALUES (?,?,'system',?,'2026-08-01 14:00:00')",
+                (
+                    (self.ids["sprint_id"], event_type, json.dumps(payload))
+                    for event_type, payload in cases
+                ),
+            )
+
+        status, _, body = self.request(
+            "GET", f"/api/sprints/{self.ids['sprint_id']}/events?limit=100"
+        )
+        self.assertEqual(status, 200, body)
+        projected = {item["type"]: item["details"] for item in body["items"]}
+        for event_type, payload in cases:
+            expected = {key: value for key, value in payload.items() if key != "secret"}
+            self.assertEqual(expected, projected[event_type])
+            self.assertNotIn("secret", projected[event_type])
 
     def test_summaries_paginate_equal_timestamps_without_duplicates(self):
         status, _, first = self.request(

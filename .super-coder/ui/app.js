@@ -4714,8 +4714,8 @@ let sprintOpenUnitId = null;
 let sprintLastGoodId = null;
 let sprintFeedSprintId = null;
 let sprintFeedState = {
-  events: { open: false, items: [], cursor: null, loading: false },
-  summaries: { open: false, items: [], cursor: null, loading: false },
+  events: { open: false, openRows: new Set(), items: [], cursor: null, loading: false },
+  summaries: { open: false, openRows: new Set(), items: [], cursor: null, loading: false },
 };
 const sprintFeedRefs = {};
 
@@ -4839,8 +4839,16 @@ function sprintFeedIdentity(kind, item) {
   return kind === "events" ? `event:${item.event_id}` : `${item.source}:${item.id}`;
 }
 
-function sprintFeedRow(kind, item) {
-  const detail = el("details", { className: "sprint-feed-row" });
+function sprintFeedRow(kind, item, state) {
+  const identity = sprintFeedIdentity(kind, item);
+  const detail = el("details", {
+    className: "sprint-feed-row",
+    open: state.openRows.has(identity),
+  });
+  detail.ontoggle = () => {
+    if (detail.open) state.openRows.add(identity);
+    else state.openRows.delete(identity);
+  };
   const label = kind === "events"
     ? `${item.actor.shortname || item.actor.kind} · ${item.type}`
     : `${item.author.shortname || "system"} · ${item.kind}`;
@@ -4867,7 +4875,7 @@ function sprintPaintFeed(kind) {
   refs.list.replaceChildren();
   if (!state.items.length) refs.list.append(
     el("div", { className: "muted sprint-feed-empty" }, state.loading ? "Loading…" : "No entries."));
-  else for (const item of state.items) refs.list.append(sprintFeedRow(kind, item));
+  else for (const item of state.items) refs.list.append(sprintFeedRow(kind, item, state));
   refs.more.hidden = !state.cursor;
   refs.more.disabled = state.loading;
   refs.more.textContent = state.loading ? "Loading…" : "Load more";
@@ -4917,8 +4925,8 @@ function sprintFeedsNode(sprintId) {
   if (sprintFeedSprintId !== sprintId) {
     sprintFeedSprintId = sprintId;
     sprintFeedState = {
-      events: { open: false, items: [], cursor: null, loading: false },
-      summaries: { open: false, items: [], cursor: null, loading: false },
+      events: { open: false, openRows: new Set(), items: [], cursor: null, loading: false },
+      summaries: { open: false, openRows: new Set(), items: [], cursor: null, loading: false },
     };
   }
   const wrap = el("div", { className: "sprint-feeds" });

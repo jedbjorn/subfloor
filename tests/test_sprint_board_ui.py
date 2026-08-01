@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 INDEX = (ROOT / ".super-coder" / "ui" / "index.html").read_text()
@@ -257,6 +256,76 @@ console.log(JSON.stringify({
     }
 
 
+def test_all_lifecycle_fixtures_render_exact_badge_actions_times_and_terminal_outcome():
+    harness = r"""
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag; this.nodeType = 1; this.children = []; this.className = "";
+    this.dataset = {}; this.attributes = {}; this.isConnected = false;
+    this.scrollWidth = 1200; this.scrollHeight = 500; this.open = false;
+    this.hidden = false; this.disabled = false;
+    this.classList = {toggle() {}};
+  }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = [...nodes]; this._text = ""; }
+  set textContent(value) { this._text = String(value ?? ""); this.children = []; }
+  get textContent() { return (this._text || "") + this.children.map(
+    (node) => node.textContent || "").join(""); }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  querySelectorAll() { return []; }
+  getBoundingClientRect() { return {left: 0, right: 100, top: 0, height: 50}; }
+}
+globalThis.document = {
+  createElement: (tag) => new FakeElement(tag),
+  createTextNode: (text) => ({nodeType: 3, textContent: String(text ?? "")}),
+  createElementNS: (_ns, tag) => new FakeElement(tag),
+};
+globalThis.window = {addEventListener() {}, removeEventListener() {}};
+globalThis.requestAnimationFrame = () => {};
+globalThis.SVGNS = "svg";
+const el = (tag, props = {}, ...kids) => {
+  const node = Object.assign(new FakeElement(tag), props);
+  node.append(...kids.map((kid) => kid?.nodeType ? kid : document.createTextNode(kid ?? "")));
+  return node;
+};
+function openModal() { return () => {}; }
+"""
+    script = harness + SPRINT_BLOCK + r"""
+const expected = {
+  prepared: {actions: ["Abort Sprint"], times: ["Created:", "Elapsed:"], outcome: false},
+  armed: {actions: ["Pause Sprint", "Abort Sprint"], times: ["Created:", "Armed:", "Elapsed:"], outcome: false},
+  paused: {actions: ["Resume Sprint", "Abort Sprint"], times: ["Created:", "Armed:", "Paused:", "Elapsed:"], outcome: false},
+  completed: {actions: [], times: ["Created:", "Armed:", "Completed:", "Elapsed:"], outcome: true},
+  aborted: {actions: [], times: ["Created:", "Armed:", "Aborted:", "Elapsed:"], outcome: true},
+};
+const actual = {};
+for (const lifecycle of Object.keys(expected)) {
+  const terminal = ["completed", "aborted"].includes(lifecycle);
+  const sprint = {
+    sprint_id: 9, feature: {feature_id: 31, title: "Board"}, planner: {shortname: "PLN1"},
+    lifecycle, created_at: "2026-08-01 10:00:00",
+    armed_at: lifecycle === "prepared" ? null : "2026-08-01 10:01:00",
+    paused_at: lifecycle === "paused" ? "2026-08-01 10:02:00" : null,
+    completed_at: lifecycle === "completed" ? "2026-08-01 10:03:00" : null,
+    aborted_at: lifecycle === "aborted" ? "2026-08-01 10:03:00" : null,
+    terminal_outcome: terminal ? `${lifecycle} outcome` : null,
+  };
+  const root = sprintBoardNode({sprint, specs: [], work_units: [], dependencies: []});
+  const header = root.children[0];
+  actual[lifecycle] = {
+    badge: header.children[0].children[1].textContent,
+    actions: header.children[3].children.map((node) => node.textContent),
+    times: header.children[2].children.map((node) => node.textContent.split(" ")[0]),
+    outcome: header.children.some((node) => node.className === "sprint-terminal-outcome"),
+  };
+}
+console.log(JSON.stringify({actual, expected}));
+"""
+    result = run_js(script)
+    for lifecycle, expected in result["expected"].items():
+        assert result["actual"][lifecycle] == {"badge": lifecycle, **expected}
+
+
 def test_global_and_scoped_audit_feeds_do_not_read_until_expanded():
     harness = r"""
 class FakeElement {
@@ -302,6 +371,60 @@ function toast() {}
             "/sprints/9/events?limit=50",
             "/sprints/9/events?limit=50&work_unit_id=27",
         ],
+    }
+
+
+def test_feed_row_accordion_survives_refresh_repaint_by_stable_identity():
+    harness = r"""
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag; this.nodeType = 1; this.children = []; this.open = false;
+    this.hidden = false; this.disabled = false; this.className = "";
+  }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = [...nodes]; }
+  set textContent(value) { this._text = String(value ?? ""); this.children = []; }
+  get textContent() { return this._text || ""; }
+}
+globalThis.document = {
+  createElement: (tag) => new FakeElement(tag),
+  createTextNode: (text) => ({nodeType: 3, textContent: String(text ?? "")}),
+};
+const el = (tag, props = {}, ...kids) => {
+  const node = Object.assign(new FakeElement(tag), props);
+  node.append(...kids.map((kid) => kid?.nodeType ? kid : document.createTextNode(kid ?? "")));
+  return node;
+};
+let call = 0;
+async function api() {
+  call += 1;
+  return call === 1
+    ? {items: [{event_id: 1, actor: {kind: "system"}, type: "work_unit.ready",
+        created_at: "2026-08-01 10:00:00", details: {work_unit_id: 1}}], next_cursor: null}
+    : {items: [{event_id: 2, actor: {kind: "system"}, type: "review.approved",
+        created_at: "2026-08-01 10:01:00", details: {work_unit_id: 1}}], next_cursor: null};
+}
+function toast() {}
+"""
+    script = harness + SPRINT_BLOCK + r"""
+(async () => {
+  sprintSelectedId = 9;
+  const feeds = sprintFeedsNode(9);
+  feeds.children[0].open = true;
+  feeds.children[0].ontoggle();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  sprintFeedRefs.events.list.children[0].open = true;
+  sprintFeedRefs.events.list.children[0].ontoggle();
+  await sprintLoadFeed("events", {refresh: true});
+  console.log(JSON.stringify({
+    rowOpenStates: sprintFeedRefs.events.list.children.map((row) => row.open),
+    remembered: [...sprintFeedState.events.openRows],
+  }));
+})();
+"""
+    assert run_js(script) == {
+        "rowOpenStates": [False, True],
+        "remembered": ["event:1"],
     }
 
 

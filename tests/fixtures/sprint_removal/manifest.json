@@ -491,7 +491,7 @@
         "const content = el(\"div\", { className: \"sprint-content\" });",
         "const detail = el(\"details\", { className: \"card sprint-feed\", open: state.open },",
         "const detail = el(\"details\", { className: \"sprint-audit-section sprint-scoped-feed\" },",
-        "const detail = el(\"details\", { className: \"sprint-feed-row\" });",
+        "className: \"sprint-feed-row\",",
         "const endValue = sprint.completed_at || sprint.aborted_at;",
         "const facts = el(\"div\", { className: \"grid2 sprint-unit-facts\" },",
         "const header = el(\"div\", { className: \"card sprint-board-head\" });",

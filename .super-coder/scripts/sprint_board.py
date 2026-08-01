@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Read-only browser projections for the Sprints v2 FnB board.
 
 The board is assembled from authoritative Sprint records inside one SQLite
@@ -13,7 +12,6 @@ import re
 import sqlite3
 from collections import defaultdict
 from typing import Any
-
 
 LIFECYCLES = frozenset({"prepared", "armed", "paused", "completed", "aborted"})
 UNIT_COLUMNS = {
@@ -32,37 +30,114 @@ _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 # Payloads are internal evidence.  Only fields with an explicit browser use
 # are projected; an unknown event remains visible with an empty detail object.
 _EVENT_FIELDS = {
-    "lifecycle.armed": frozenset({"from", "reason", "initial_wake_ids", "dispatched_wake_ids"}),
-    "lifecycle.paused": frozenset({"from", "reason", "report_id"}),
-    "lifecycle.aborted": frozenset({"from", "reason", "report_id"}),
+    "lifecycle.armed": frozenset(
+        {
+            "from",
+            "reason",
+            "initial_conversation_ids",
+            "initial_wake_ids",
+            "reconciled",
+            "dispatched_wake_ids",
+        }
+    ),
+    "lifecycle.paused": frozenset(
+        {"from", "reason", "report_id", "interrupt_run_ids", "wake_id", "attempts"}
+    ),
+    "lifecycle.aborted": frozenset(
+        {"from", "reason", "report_id", "interrupt_run_ids"}
+    ),
     "lifecycle.completed": frozenset({"from", "reason"}),
     "lifecycle.reconciled": frozenset(
         {
+            "trigger",
             "requeued_wake_ids",
             "projected_work_unit_ids",
             "resolved_review_message_ids",
-            "spec_drift_document_ids",
+            "spec_drift",
+            "anomalies",
         }
     ),
+    "pause.interrupt_delivery_failed": frozenset({"run_id"}),
     "work_unit.created": frozenset(
-        {"work_unit_id", "task_ids", "dependency_ids", "planned_wave", "output_kind"}
+        {
+            "work_unit_id",
+            "assigned_shell_id",
+            "reviewer_shell_id",
+            "task_ids",
+            "dependency_ids",
+            "planned_wave",
+            "output_kind",
+        }
     ),
-    "work_unit.replanned": frozenset(
-        {"work_unit_id", "dependency_ids", "planned_wave", "output_kind"}
-    ),
+    "work_unit.replanned": frozenset({"work_unit_id", "before", "after"}),
     "work_unit.ready": frozenset({"work_unit_id", "message_id", "wake_id"}),
+    "work_unit.accepted": frozenset({"work_unit_id", "message_id"}),
     "work_unit.completed": frozenset(
-        {"work_unit_id", "result", "output_kind", "source", "registered_pr_id"}
+        {"work_unit_id", "result", "output_kind", "source", "transition_key"}
     ),
     "work_unit.cancelled": frozenset({"work_unit_id", "reason"}),
-    "review.requested": frozenset({"work_unit_id", "registered_pr_id", "message_id"}),
-    "review.recorded": frozenset(
-        {"work_unit_id", "registered_pr_id", "outcome", "review_head_sha"}
+    "review.requested": frozenset(
+        {
+            "work_unit_id",
+            "registered_pr_id",
+            "message_id",
+            "head_sha",
+            "previous_head_sha",
+            "source",
+        }
     ),
-    "merge.authorized": frozenset({"work_unit_id", "registered_pr_id", "head_sha"}),
-    "conformance.recorded": frozenset({"report_id", "document_id", "verdict"}),
-    "followup.dispositioned": frozenset({"followup_id", "disposition"}),
-    "wake.requeued": frozenset({"wake_id", "participant_id"}),
+    "review.approved": frozenset(
+        {"work_unit_id", "registered_pr_id", "message_id", "conversation_id", "head_sha"}
+    ),
+    "review.changes_requested": frozenset(
+        {"work_unit_id", "registered_pr_id", "message_id", "conversation_id", "head_sha"}
+    ),
+    "review.approval_invalidated": frozenset(
+        {
+            "work_unit_id",
+            "registered_pr_id",
+            "invalidated_message_id",
+            "head_sha",
+            "previous_head_sha",
+            "transition_key",
+        }
+    ),
+    "merge.authorized": frozenset(
+        {"work_unit_id", "registered_pr_id", "pr_number", "head_sha"}
+    ),
+    "merge.grant_bypassed": frozenset({"work_unit_id", "before", "transition_key"}),
+    "conformance.recorded": frozenset({"report_id", "followup_count", "followup_ids"}),
+    "final_report.recorded": frozenset({"report_id"}),
+    "followup.dispositioned": frozenset({"followup_id", "disposition", "resolution"}),
+    "wake.requeued": frozenset({"failed_wake_id", "replacement_wake_id"}),
+    "liveness.nudged": frozenset(
+        {"expectation_message_id", "silence_episode", "nudge_message_id"}
+    ),
+    "liveness.escalated": frozenset(
+        {
+            "expectation_message_id",
+            "silence_episode",
+            "escalation_message_id",
+            "planner_delivery_route",
+        }
+    ),
+    "liveness.escalation_delivery_unavailable": frozenset(
+        {
+            "expectation_message_id",
+            "silence_episode",
+            "escalation_message_id",
+            "planner_delivery_route",
+        }
+    ),
+    "pr.registered": frozenset(
+        {"registered_pr_id", "repository", "pr_number", "work_unit_ids"}
+    ),
+    "pr.transition": frozenset(
+        {"registered_pr_id", "transition_id", "normalized_state"}
+    ),
+    "pr.poll_failed": frozenset(
+        {"registered_pr_id", "pr_number", "failure_count", "backoff_seconds", "trigger"}
+    ),
 }
 
 
@@ -97,7 +172,7 @@ def _cursor_decode(raw: str | None, kind: str, size: int) -> list[Any] | None:
     try:
         padding = "=" * (-len(raw) % 4)
         value = json.loads(base64.urlsafe_b64decode(raw + padding))
-    except Exception as exc:  # noqa: BLE001 - every malformed cursor is one contract error
+    except Exception as exc:
         raise ProjectionError(422, "cursor_invalid", f"invalid {kind} cursor") from exc
     if not isinstance(value, dict):
         raise ProjectionError(422, "cursor_invalid", f"invalid {kind} cursor")
