@@ -17,6 +17,7 @@ ENGINE = ROOT / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
 FOUNDATION = MIGRATIONS / "0146_sprint_v2_domain.sql"
+GENERATION_MIGRATION = MIGRATIONS / "0155_sprint_conversation_generations.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
@@ -112,6 +113,131 @@ class SprintDomainCase(unittest.TestCase):
 
 
 class MigrationAndShapeTest(SprintDomainCase):
+    def test_conversation_generation_backfills_prepared_plan_without_drift(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.row_factory = sqlite3.Row
+            apply_schema(con, through="0154_remove_tombstoned_skills.sql")
+            con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
+            con.executemany(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (?,?,?,?,?,1)",
+                (
+                    (1, "Developer", "DEV1", "dev", "prompt"),
+                    (2, "Reviewer", "REV1", "reviewer", "prompt"),
+                    (3, "Planner", "PLN1", "planner", "prompt"),
+                ),
+            )
+            feature_id = con.execute(
+                "INSERT INTO roadmap (title,roadmap_status) "
+                "VALUES ('Prepared feature','in_progress')"
+            ).lastrowid
+            body = "exact prepared governing revision"
+            document_id = con.execute(
+                "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                "VALUES (?,'spec',1,'Prepared spec',?)",
+                (feature_id, body),
+            ).lastrowid
+            revision = hashlib.sha256(body.encode()).hexdigest()
+            approval_id = con.execute(
+                "INSERT INTO sprint_spec_approvals "
+                "(document_id,revision_sha256,reviewer_shell_id,verdict) "
+                "VALUES (?,?,2,'pass')",
+                (document_id, revision),
+            ).lastrowid
+            sprint_id = con.execute(
+                "INSERT INTO sprints "
+                "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+                "VALUES (?,3,1)",
+                (feature_id,),
+            ).lastrowid
+            con.execute(
+                "INSERT INTO sprint_specs "
+                "(sprint_id,document_id,bound_revision_sha256,approval_id) "
+                "VALUES (?,?,?,?)",
+                (sprint_id, document_id, revision, approval_id),
+            )
+            con.executemany(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness,model,effort) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    (sprint_id, 3, "planner", "codex", "planner-model", "high"),
+                    (sprint_id, 1, "developer", "kimi", "dev-model", "high"),
+                    (sprint_id, 2, "reviewer", "claude", "review-model", "high"),
+                ),
+            )
+            con.execute(
+                "INSERT INTO sprint_work_units "
+                "(sprint_id,assigned_shell_id,reviewer_shell_id,title,expected_output) "
+                "VALUES (?,1,2,'Tiny unit','One small verified change')",
+                (sprint_id,),
+            )
+            before = {
+                "sprint": tuple(
+                    con.execute(
+                        "SELECT sprint_id,feature_id,originating_planner_shell_id,"
+                        "lifecycle,merge_grant_enabled FROM sprints"
+                    ).fetchone()
+                ),
+                "spec": tuple(con.execute("SELECT * FROM sprint_specs").fetchone()),
+                "participants": [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT participant_id,sprint_id,shell_id,role,harness,"
+                        "model,effort,persistent_conversation_id,current_conversation_id "
+                        "FROM sprint_participants ORDER BY participant_id"
+                    )
+                ],
+                "unit": tuple(
+                    con.execute(
+                        "SELECT work_unit_id,sprint_id,assigned_shell_id,"
+                        "reviewer_shell_id,title,expected_output,disposition "
+                        "FROM sprint_work_units"
+                    ).fetchone()
+                ),
+            }
+
+            con.executescript(GENERATION_MIGRATION.read_text())
+
+            generation = con.execute(
+                "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
+                (sprint_id,),
+            ).fetchone()[0]
+            self.assertRegex(generation, r"^[0-9a-f]{32}$")
+            after = {
+                "sprint": tuple(
+                    con.execute(
+                        "SELECT sprint_id,feature_id,originating_planner_shell_id,"
+                        "lifecycle,merge_grant_enabled FROM sprints"
+                    ).fetchone()
+                ),
+                "spec": tuple(con.execute("SELECT * FROM sprint_specs").fetchone()),
+                "participants": [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT participant_id,sprint_id,shell_id,role,harness,"
+                        "model,effort,persistent_conversation_id,current_conversation_id "
+                        "FROM sprint_participants ORDER BY participant_id"
+                    )
+                ],
+                "unit": tuple(
+                    con.execute(
+                        "SELECT work_unit_id,sprint_id,assigned_shell_id,"
+                        "reviewer_shell_id,title,expected_output,disposition "
+                        "FROM sprint_work_units"
+                    ).fetchone()
+                ),
+            }
+            self.assertEqual(before, after)
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "conversation generation is immutable"
+            ):
+                con.execute(
+                    "UPDATE sprints SET conversation_generation=? WHERE sprint_id=?",
+                    ("f" * 32, sprint_id),
+                )
+
     def test_upgrade_from_zero_sprint_baseline_creates_v2_domain(self) -> None:
         with closing(sqlite3.connect(":memory:")) as con:
             apply_schema(con, through="0145_reseed_generic_guidance.sql")
@@ -424,6 +550,68 @@ class LifecycleTest(SprintDomainCase):
                     (sprint_id,),
                 )
             ],
+        )
+
+    def test_arm_ignores_orphan_conversation_keys_from_reused_numeric_ids(self) -> None:
+        historical = (
+            ("cv_old_planner", 3, "sprint:1:participant:1:work"),
+            ("cv_old_developer", 1, "sprint:1:participant:2:work"),
+            ("cv_old_reviewer", 2, "sprint:1:participant:3:work"),
+        )
+        self.con.executemany(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,worktree,state,"
+            "closed_at,title,creation_idempotency_key,creation_request_hash,"
+            "conversation_scope) "
+            "VALUES (?,?,1,'codex','/historical','closed',datetime('now'),"
+            "'Closed historical Sprint',?,'historical-request','sprint')",
+            historical,
+        )
+        self.con.commit()
+
+        sprint_id, _ = self.create_sprint()
+        participants = self.con.execute(
+            "SELECT participant_id FROM sprint_participants "
+            "WHERE sprint_id=? ORDER BY participant_id",
+            (sprint_id,),
+        ).fetchall()
+        self.assertEqual(1, sprint_id)
+        self.assertEqual([1, 2, 3], [row[0] for row in participants])
+
+        wake_ids = self.store.arm(sprint_id, 3)
+
+        self.assertEqual(1, len(wake_ids))
+        self.assertEqual(
+            "armed",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?", (sprint_id,)
+            ).fetchone()[0],
+        )
+        linked = self.con.execute(
+            "SELECT c.conversation_id,c.creation_idempotency_key "
+            "FROM sprint_participant_conversations link "
+            "JOIN conversations c ON c.conversation_id=link.conversation_id "
+            "ORDER BY link.sprint_participant_id"
+        ).fetchall()
+        self.assertEqual(3, len(linked))
+        self.assertTrue(
+            all(
+                row["conversation_id"] not in {item[0] for item in historical}
+                and row["creation_idempotency_key"].startswith(
+                    "sprint-generation:"
+                )
+                and len(row["creation_idempotency_key"]) <= 255
+                for row in linked
+            )
+        )
+        first_ids = [row["conversation_id"] for row in linked]
+        replay_ids = sprint_domain.sprint_participant_chats.provision_at_arming(
+            self.con, sprint_id
+        )
+        self.assertEqual(first_ids, replay_ids)
+        self.assertEqual(
+            6,
+            self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
         )
 
     def test_armed_sprint_merge_grant_is_immutable(self) -> None:
