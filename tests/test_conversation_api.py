@@ -12,8 +12,6 @@ from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 sys.path.insert(0, str(ROOT / "tests"))
@@ -1628,7 +1626,7 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
         self.assertEqual(status, 200, transcript)
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(transcript["conversation_id"], conversation_id)
-        self.assertEqual(transcript["projection_version"], 1)
+        self.assertEqual(transcript["projection_version"], 2)
         self.assertEqual(transcript["through_sequence"], through_sequence)
         self.assertEqual(transcript["truncation"], None)
         self.assertEqual(
@@ -1644,7 +1642,7 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
             [
                 (f"message:{message_ids[0]}", "user", message_ids[0], None),
                 (
-                    f"run:{transcript['items'][1]['run_id']}:assistant",
+                    f"run:{transcript['items'][1]['run_id']}:assistant:0",
                     "assistant",
                     message_ids[0],
                     transcript["items"][1]["run_id"],
@@ -1665,51 +1663,21 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
                 source_rows,
             )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Sprint 63 unit 2 removes this projection-v2 marker",
-    )
-    @unittest.expectedFailure
     def test_segmented_plain_prose_keeps_one_stable_anchor_zero_item(self) -> None:
         self.assert_historical_segment_trace("plain_prose")
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Sprint 63 unit 2 removes this projection-v2 marker",
-    )
-    @unittest.expectedFailure
     def test_segmented_prose_tool_prose_has_exact_items_ids_and_order(self) -> None:
         self.assert_historical_segment_trace("prose_tool_prose")
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Sprint 63 unit 2 removes this projection-v2 marker",
-    )
-    @unittest.expectedFailure
     def test_segmented_multiple_tools_use_only_the_latest_boundary(self) -> None:
         self.assert_historical_segment_trace("multiple_tools")
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Sprint 63 unit 2 removes this projection-v2 marker",
-    )
-    @unittest.expectedFailure
     def test_segmented_tool_before_prose_creates_no_empty_bubble(self) -> None:
         self.assert_historical_segment_trace("tool_before_prose")
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Sprint 63 unit 2 removes this projection-v2 marker",
-    )
-    @unittest.expectedFailure
     def test_segmented_actionable_pauses_remain_between_assistant_items(self) -> None:
         self.assert_historical_segment_trace("permission_and_input_pauses")
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Sprint 63 unit 2 removes this projection-v2 marker",
-    )
-    @unittest.expectedFailure
     def test_segmented_pending_boundary_snapshot_carries_active_cursor(self) -> None:
         with closing(self.connect()) as con:
             conversation_id = self.seed_conversation(
@@ -1736,11 +1704,6 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
             "segment_anchor_sequence": 5,
         })
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Sprint 63 unit 2 removes this projection-v2 marker",
-    )
-    @unittest.expectedFailure
     def test_segmented_fresh_run_cursor_does_not_leak_prior_run_boundary(self) -> None:
         with closing(self.connect()) as con:
             conversation_id = self.seed_conversation(
@@ -1775,11 +1738,6 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
             "segment_anchor_sequence": 0,
         })
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Sprint 63 unit 2 removes this projection-v2 marker",
-    )
-    @unittest.expectedFailure
     def test_segmented_cursor_uses_full_prefix_when_boundary_is_source_capped(
         self,
     ) -> None:
@@ -1814,6 +1772,52 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
             "run_id": run_id,
             "segment_anchor_sequence": 5,
         })
+
+    def test_segmented_terminal_suffix_omits_incomplete_boundary_evidence(
+        self,
+    ) -> None:
+        trace = next(
+            item
+            for item in HISTORICAL_SEGMENT_TRACES
+            if item["name"] == "prose_tool_prose"
+        )
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=714,
+                state="closed",
+            )
+            self.seed_segmented_trace(
+                con,
+                conversation_id=conversation_id,
+                events=trace["events"],
+            )
+            source_rows = con.execute(
+                "SELECT COUNT(*) FROM conversation_events "
+                "WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()[0]
+            con.commit()
+            transcript = conversation_routes._transcript_projection(
+                con,
+                conversation_id,
+                owner_user_id=1,
+                limits=conversation_routes.TranscriptLimits(
+                    max_turns=200,
+                    max_source_events=3,
+                    max_source_bytes=1_000_000,
+                    max_response_bytes=1_000_000,
+                ),
+            )
+            retained_source_rows = con.execute(
+                "SELECT COUNT(*) FROM conversation_events "
+                "WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()[0]
+
+        self.assertEqual(transcript["items"], [])
+        self.assertEqual(transcript["truncation"]["reason"], "source_event_limit")
+        self.assertEqual(retained_source_rows, source_rows)
 
     def test_transcript_caps_are_injected_explicit_and_never_mutate_sources(
         self,
