@@ -30,6 +30,9 @@ _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 # Payloads are internal evidence.  Only fields with an explicit browser use
 # are projected; an unknown event remains visible with an empty detail object.
 _EVENT_FIELDS = {
+    "sprint.declared": frozenset(
+        {"feature_id", "spec_approval_ids", "participant_shell_ids"}
+    ),
     "lifecycle.armed": frozenset(
         {
             "from",

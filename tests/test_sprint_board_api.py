@@ -34,7 +34,11 @@ _DYNAMIC_EVENT_CALLS = {
 
 def emitted_sprint_event_types() -> set[str]:
     emitted = set()
-    for path in sorted((ENGINE / "scripts").glob("sprint_*.py")):
+    emitter_paths = [
+        *(ENGINE / "scripts").glob("sprint_*.py"),
+        ENGINE / "api" / "server.py",
+    ]
+    for path in sorted(emitter_paths):
         if path.name == "sprint_board.py":
             continue
         tree = ast.parse(path.read_text(), filename=str(path))
@@ -392,6 +396,15 @@ class SprintBoardApiCase(unittest.TestCase):
     def test_event_projection_matches_emitters_and_projects_review_and_conformance_evidence(self):
         self.assertEqual(emitted_sprint_event_types(), set(sprint_board._EVENT_FIELDS))
         cases = (
+            (
+                "sprint.declared",
+                {
+                    "feature_id": self.ids["feature_id"],
+                    "spec_approval_ids": [1],
+                    "participant_shell_ids": [2, 3, 4],
+                    "secret": "hidden",
+                },
+            ),
             (
                 "review.approved",
                 {
