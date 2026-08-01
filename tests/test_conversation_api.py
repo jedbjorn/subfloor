@@ -12,8 +12,11 @@ from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
+sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ENGINE / "api"))
 sys.path.insert(0, str(ENGINE / "scripts"))
 
@@ -21,6 +24,10 @@ import conversation_broker
 import conversation_events
 import conversation_routes
 import sprint_participant_chats
+from segmented_response_traces import (
+    HISTORICAL_SEGMENT_TRACES,
+    PENDING_BOUNDARY_TRACE,
+)
 
 
 def apply_schema(con: sqlite3.Connection) -> None:
@@ -281,6 +288,145 @@ class ConversationApiCase(unittest.TestCase):
                 (conversation_id, sequence, message_id, run_id),
             )
         return message_ids, sequence
+
+    def seed_segmented_trace(
+        self,
+        con: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        events: tuple[tuple[str, dict], ...],
+        active: bool = False,
+        body: str = "trace prompt",
+        start_sequence: int = 0,
+    ) -> tuple[int, int, int]:
+        message = con.execute(
+            "INSERT INTO conversation_messages "
+            "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+            "idempotency_key,request_hash,state,completed_at) "
+            "VALUES (?,'user','operator','prompt',?,?,?, ?,?)",
+            (
+                conversation_id,
+                body,
+                f"trace-{start_sequence}-{body}",
+                f"hash-{start_sequence}-{body}",
+                "running" if active else "completed",
+                None if active else "2026-07-30 12:01:00",
+            ),
+        )
+        message_id = int(message.lastrowid)
+        run = con.execute(
+            "INSERT INTO conversation_runs "
+            "(conversation_id,shell_id,trigger_message_id,lease_owner,"
+            "lease_expires_at,state,started_at,ended_at) "
+            "VALUES (?,1,?,'fixture','2026-07-30 13:00:00',?,"
+            "'2026-07-30 12:00:00',?)",
+            (
+                conversation_id,
+                message_id,
+                "running" if active else "succeeded",
+                None if active else "2026-07-30 12:01:00",
+            ),
+        )
+        run_id = int(run.lastrowid)
+        sequence = start_sequence + 1
+        con.execute(
+            "INSERT INTO conversation_events "
+            "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+            "VALUES (?,?,'message.accepted',?,?,NULL)",
+            (conversation_id, sequence, json.dumps({"text": body}), message_id),
+        )
+        sequence += 1
+        con.execute(
+            "INSERT INTO conversation_events "
+            "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+            "VALUES (?,?,'run.started','{}',?,?)",
+            (conversation_id, sequence, message_id, run_id),
+        )
+        for event_type, payload in events:
+            sequence += 1
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    conversation_id,
+                    sequence,
+                    event_type,
+                    json.dumps(payload),
+                    message_id,
+                    run_id,
+                ),
+            )
+        if active:
+            con.execute(
+                "UPDATE conversations SET state='running' WHERE conversation_id=?",
+                (conversation_id,),
+            )
+        else:
+            sequence += 1
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,message_id,run_id) "
+                "VALUES (?,?,'run.completed','{}',?,?)",
+                (conversation_id, sequence, message_id, run_id),
+            )
+        return message_id, run_id, sequence
+
+    def assert_historical_segment_trace(self, name: str) -> None:
+        trace = next(
+            item for item in HISTORICAL_SEGMENT_TRACES if item["name"] == name
+        )
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=710,
+                state="closed",
+            )
+            _message_id, run_id, _through = self.seed_segmented_trace(
+                con,
+                conversation_id=conversation_id,
+                events=trace["events"],
+            )
+            con.commit()
+
+        status, _, transcript = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/transcript",
+        )
+        self.assertEqual(status, 200, transcript)
+        actual = []
+        for item in transcript["items"]:
+            if item["kind"] == "user":
+                continue
+            if item["kind"] == "assistant":
+                actual.append((
+                    item["item_id"],
+                    item["kind"],
+                    item.get("segment_anchor_sequence"),
+                    item["first_sequence"],
+                    item["last_sequence"],
+                    item["text"],
+                ))
+            else:
+                actual.append((
+                    item["item_id"],
+                    item["kind"],
+                    None,
+                    item["sequence"],
+                    item["sequence"],
+                    item["activity_type"],
+                ))
+        expected = []
+        for kind, anchor, first, last, value in trace["expected"]:
+            item_id = (
+                f"run:{run_id}:assistant:{anchor}"
+                if kind == "assistant"
+                else f"event:{anchor}"
+            )
+            expected.append((item_id, kind, anchor if kind == "assistant" else None,
+                             first, last, value))
+        self.assertEqual(actual, expected)
+        self.assertEqual(transcript["projection_version"], 2)
 
     def test_creation_observation_is_post_commit_and_cannot_fail_create(self):
         def observer(db_path, conversation_id):
@@ -1518,6 +1664,156 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
                 ).fetchone()[0],
                 source_rows,
             )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Sprint 63 unit 2 removes this projection-v2 marker",
+    )
+    @unittest.expectedFailure
+    def test_segmented_plain_prose_keeps_one_stable_anchor_zero_item(self) -> None:
+        self.assert_historical_segment_trace("plain_prose")
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Sprint 63 unit 2 removes this projection-v2 marker",
+    )
+    @unittest.expectedFailure
+    def test_segmented_prose_tool_prose_has_exact_items_ids_and_order(self) -> None:
+        self.assert_historical_segment_trace("prose_tool_prose")
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Sprint 63 unit 2 removes this projection-v2 marker",
+    )
+    @unittest.expectedFailure
+    def test_segmented_multiple_tools_use_only_the_latest_boundary(self) -> None:
+        self.assert_historical_segment_trace("multiple_tools")
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Sprint 63 unit 2 removes this projection-v2 marker",
+    )
+    @unittest.expectedFailure
+    def test_segmented_tool_before_prose_creates_no_empty_bubble(self) -> None:
+        self.assert_historical_segment_trace("tool_before_prose")
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Sprint 63 unit 2 removes this projection-v2 marker",
+    )
+    @unittest.expectedFailure
+    def test_segmented_actionable_pauses_remain_between_assistant_items(self) -> None:
+        self.assert_historical_segment_trace("permission_and_input_pauses")
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Sprint 63 unit 2 removes this projection-v2 marker",
+    )
+    @unittest.expectedFailure
+    def test_segmented_pending_boundary_snapshot_carries_active_cursor(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=711,
+                state="running",
+            )
+            _message_id, run_id, through = self.seed_segmented_trace(
+                con,
+                conversation_id=conversation_id,
+                events=PENDING_BOUNDARY_TRACE,
+                active=True,
+            )
+            con.commit()
+
+        status, _, transcript = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/transcript",
+        )
+        self.assertEqual(status, 200, transcript)
+        self.assertEqual(transcript["through_sequence"], through)
+        self.assertEqual(transcript["assistant_cursor"], {
+            "run_id": run_id,
+            "segment_anchor_sequence": 5,
+        })
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Sprint 63 unit 2 removes this projection-v2 marker",
+    )
+    @unittest.expectedFailure
+    def test_segmented_fresh_run_cursor_does_not_leak_prior_run_boundary(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=712,
+                state="running",
+            )
+            _message_id, _old_run_id, through = self.seed_segmented_trace(
+                con,
+                conversation_id=conversation_id,
+                events=PENDING_BOUNDARY_TRACE,
+                body="earlier tool turn",
+            )
+            _message_id, active_run_id, through = self.seed_segmented_trace(
+                con,
+                conversation_id=conversation_id,
+                events=(("assistant.delta", {"text": "fresh prose"}),),
+                active=True,
+                body="fresh boundary-free turn",
+                start_sequence=through,
+            )
+            con.commit()
+
+        status, _, transcript = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/transcript",
+        )
+        self.assertEqual(status, 200, transcript)
+        self.assertEqual(transcript["through_sequence"], through)
+        self.assertEqual(transcript["assistant_cursor"], {
+            "run_id": active_run_id,
+            "segment_anchor_sequence": 0,
+        })
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="Sprint 63 unit 2 removes this projection-v2 marker",
+    )
+    @unittest.expectedFailure
+    def test_segmented_cursor_uses_full_prefix_when_boundary_is_source_capped(
+        self,
+    ) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=713,
+                state="running",
+            )
+            events = (*PENDING_BOUNDARY_TRACE, ("usage.updated", {"tokens": 3}))
+            _message_id, run_id, through = self.seed_segmented_trace(
+                con,
+                conversation_id=conversation_id,
+                events=events,
+                active=True,
+            )
+            con.commit()
+            transcript = conversation_routes._transcript_projection(
+                con,
+                conversation_id,
+                owner_user_id=1,
+                limits=conversation_routes.TranscriptLimits(
+                    max_turns=200,
+                    max_source_events=1,
+                    max_source_bytes=1_000_000,
+                    max_response_bytes=1_000_000,
+                ),
+            )
+
+        self.assertEqual(transcript["through_sequence"], through)
+        self.assertEqual(transcript["assistant_cursor"], {
+            "run_id": run_id,
+            "segment_anchor_sequence": 5,
+        })
 
     def test_transcript_caps_are_injected_explicit_and_never_mutate_sources(
         self,

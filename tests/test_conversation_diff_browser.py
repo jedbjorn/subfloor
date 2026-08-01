@@ -8,7 +8,9 @@ end-to-end DOM/runtime gate over the actual static UI and mocked read API.
 from __future__ import annotations
 
 import json
+import sys
 import threading
+from contextlib import closing
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -16,10 +18,12 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tests"))
 pytest.importorskip("playwright.sync_api")
 from playwright.sync_api import sync_playwright
+from segmented_response_traces import LIVE_SEGMENT_EVENTS, version_two_snapshot
 
-ROOT = Path(__file__).resolve().parents[1]
 UI = ROOT / ".super-coder" / "ui"
 CONVERSATION_ID = "cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 TARGET_ID = "gt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -1136,9 +1140,25 @@ def test_chat_performance_uses_bounded_requests_and_keyed_frames(static_ui):
               transcriptReplacements: 0,
               assistantReplacements: 0,
             });
+            window.__fakeEventSources[0].emit("tool.started", {
+              sequence: 7001,
+              event_type: "tool.started",
+              message_id: 1,
+              run_id: 77,
+              created_at: "2026-07-30 20:01:00",
+              payload: { name: "write" },
+            });
+            window.__fakeEventSources[0].emit("tool.completed", {
+              sequence: 7002,
+              event_type: "tool.completed",
+              message_id: 1,
+              run_id: 77,
+              created_at: "2026-07-30 20:01:01",
+              payload: { name: "write" },
+            });
             for (let offset = 1; offset <= 500; offset += 1) {
               window.__fakeEventSources[0].emit("assistant.delta", {
-                sequence: 7000 + offset,
+                sequence: 7002 + offset,
                 event_type: "assistant.delta",
                 message_id: 1,
                 run_id: 77,
@@ -1167,4 +1187,169 @@ def test_chat_performance_uses_bounded_requests_and_keyed_frames(static_ui):
         )
         browser.close()
 
+    assert not browser_errors
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="projection v2 live segment reducer lands in Sprint 63 unit 3",
+)
+def test_segmented_live_trace_refresh_replay_and_node_identity(static_ui):
+    requests: list[str] = []
+    browser_errors: list[str] = []
+    selected = {**conversation(), "title": "Segmented trace"}
+    snapshot = version_two_snapshot()
+
+    def fulfill(route, payload, *, status=200):
+        route.fulfill(
+            status=status,
+            content_type="application/json",
+            body=json.dumps(payload),
+        )
+
+    def route_api(route):
+        parsed = urlparse(route.request.url)
+        requests.append(parsed.path)
+        if parsed.path == "/api/health":
+            return fulfill(route, {"repo": "subfloor"})
+        if parsed.path == "/api/shells":
+            return fulfill(route, {
+                "shells": [{
+                    "shell_id": 1,
+                    "display_name": "CC",
+                    "shortname": "cc",
+                    "flavor": "dev",
+                }]
+            })
+        if parsed.path == "/api/conversations":
+            return fulfill(route, {"items": [selected], "next_cursor": None})
+        if parsed.path == f"/api/conversations/{CONVERSATION_ID}":
+            return fulfill(route, selected)
+        if parsed.path == f"/api/conversations/{CONVERSATION_ID}/transcript":
+            return fulfill(route, snapshot)
+        return fulfill(
+            route,
+            {"error": {"code": "UNMOCKED", "message": parsed.path}},
+            status=404,
+        )
+
+    with (
+        sync_playwright() as playwright,
+        closing(playwright.chromium.launch(headless=True)) as browser,
+    ):
+        page = browser.new_page(viewport={"width": 1280, "height": 800})
+        page.add_init_script(
+            """
+            window.__chatPerf = {
+              rafOutstanding: 0,
+              maxRafOutstanding: 0,
+              transcriptReplacements: 0,
+              assistantReplacements: 0,
+            };
+            const nativeFrame = window.requestAnimationFrame.bind(window);
+            window.requestAnimationFrame = (callback) => {
+              window.__chatPerf.rafOutstanding += 1;
+              window.__chatPerf.maxRafOutstanding = Math.max(
+                window.__chatPerf.maxRafOutstanding,
+                window.__chatPerf.rafOutstanding);
+              return nativeFrame((timestamp) => {
+                window.__chatPerf.rafOutstanding -= 1;
+                callback(timestamp);
+              });
+            };
+            const nativeReplace = Element.prototype.replaceChildren;
+            Element.prototype.replaceChildren = function(...children) {
+              if (this.classList?.contains("chat-transcript"))
+                window.__chatPerf.transcriptReplacements += 1;
+              if (this.classList?.contains("chat-assistant-body"))
+                window.__chatPerf.assistantReplacements += 1;
+              return nativeReplace.apply(this, children);
+            };
+            window.__fakeEventSources = [];
+            class FakeEventSource {
+              constructor(url) {
+                this.url = url;
+                this.listeners = {};
+                window.__fakeEventSources.push(this);
+                queueMicrotask(() => this.onopen && this.onopen());
+              }
+              addEventListener(type, callback) {
+                (this.listeners[type] ||= []).push(callback);
+              }
+              emit(type, payload) {
+                for (const callback of this.listeners[type] || [])
+                  callback({ data: JSON.stringify(payload) });
+              }
+              close() {}
+            }
+            window.EventSource = FakeEventSource;
+            """
+        )
+        page.route("**/api/**", route_api)
+        page.on(
+            "pageerror",
+            lambda error: browser_errors.append(f"pageerror: {error}"),
+        )
+        page.goto(
+            f"{static_ui}/#interface/cc/{CONVERSATION_ID}",
+            wait_until="networkidle",
+        )
+        page.locator(".chat-transcript").wait_for()
+        assert page.locator(".chat-bubble.chat-assistant").all_text_contents() == [
+            "before tool"
+        ]
+
+        for event in LIVE_SEGMENT_EVENTS[:2]:
+            page.evaluate(
+                "([type, payload]) => "
+                "window.__fakeEventSources[0].emit(type, payload)",
+                [event["event_type"], event],
+            )
+        snapshot["through_sequence"] = 7
+        snapshot["assistant_cursor"] = {
+            "run_id": 77,
+            "segment_anchor_sequence": 7,
+        }
+        page.reload(wait_until="networkidle")
+        page.locator(".chat-transcript").wait_for()
+        page.evaluate(
+            """
+            window.__firstSegmentNode =
+              document.querySelector('.chat-bubble.chat-assistant');
+            Object.assign(window.__chatPerf, {
+              rafOutstanding: 0,
+              maxRafOutstanding: 0,
+              transcriptReplacements: 0,
+              assistantReplacements: 0,
+            });
+            """
+        )
+
+        replayed_boundary = LIVE_SEGMENT_EVENTS[1]
+        delta = LIVE_SEGMENT_EVENTS[2]
+        for event in (replayed_boundary, delta):
+            page.evaluate(
+                "([type, payload]) => "
+                "window.__fakeEventSources[0].emit(type, payload)",
+                [event["event_type"], event],
+            )
+        page.get_by_text("after tool", exact=True).wait_for()
+
+        assert page.locator(".chat-bubble.chat-assistant").all_text_contents() == [
+            "before tool",
+            "after tool",
+        ]
+        assert page.locator(".chat-bubble.chat-activity").count() == 0
+        assert page.evaluate(
+            "window.__firstSegmentNode === "
+            "document.querySelector('.chat-bubble.chat-assistant')"
+        )
+        counts = page.evaluate("window.__chatPerf")
+        assert counts["maxRafOutstanding"] <= 1
+        assert counts["transcriptReplacements"] == 0
+        assert counts["assistantReplacements"] <= 1
+
+    assert requests.count(
+        f"/api/conversations/{CONVERSATION_ID}/transcript"
+    ) == 2
     assert not browser_errors

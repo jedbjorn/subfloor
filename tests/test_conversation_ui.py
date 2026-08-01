@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 INDEX = (ROOT / ".super-coder" / "ui" / "index.html").read_text()
@@ -129,6 +131,26 @@ def test_transcript_installs_snapshot_then_coalesces_keyed_live_updates():
       interface.index("const loadTranscript = async"):
       interface.index("await loadTranscript()")
     ]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="projection v2 keyed assistant segments land in Sprint 63 unit 3",
+)
+def test_segmented_transcript_source_contract_is_versioned_and_run_scoped():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    keyed = interface[interface.index("function chatCreateTranscriptState"):
+                      interface.index("async function renderInterface")]
+
+    assert "snapshot.projection_version !== 2" in keyed
+    assert "assistant_cursor" in keyed
+    assert "segment_anchor_sequence" in keyed
+    assert "tool.started" in keyed
+    assert "tool.completed" in keyed
+    assert "permission.requested" in keyed
+    assert "input.requested" in keyed
+    assert ":assistant:${" in keyed
 
 
 def test_connection_status_is_attached_to_transcript_without_visible_copy():
