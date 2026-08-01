@@ -2283,7 +2283,7 @@ function anWindowRow(w) {
 // rendered while the operator was signed in and working (#196, #197).
 const AN_STATUS_NOTE = {
   na: "no readable credential file",
-  unauth: "token not usable — refreshes when you next use this harness",
+  unauth: "token not usable",
   error: "probe failed",
 };
 
@@ -2301,8 +2301,15 @@ function anProviderCard(prov) {
   head.append(el("span", { className: "pill" }, prov.provider));
   if (status && status !== "ok") {
     const note = AN_STATUS_NOTE[status] || status;
-    head.append(el("span", { className: "pill warn" },
-      note + (prov.detail ? " · " + prov.detail : "")));
+    const tokenRefreshes = status === "unauth";
+    const badge = el("span", { className: "pill " + (tokenRefreshes ? "info" : "warn") },
+      note + (!tokenRefreshes && prov.detail ? " · " + prov.detail : ""));
+    if (tokenRefreshes) {
+      const provider = AN_PROVIDER_LABEL[prov.provider] || prov.provider;
+      badge.title = "Refreshes automatically the next time you use " + provider + "."
+        + (prov.detail ? " Last probe: " + prov.detail : "");
+    }
+    head.append(badge);
   }
   card.append(head);
 
