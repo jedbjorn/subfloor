@@ -71,8 +71,8 @@ main { padding: 1.2rem; flex: 1 0 auto; min-height: 0; }
 .view[hidden] { display: none; }  /* class selector would otherwise beat [hidden] */
 #view-sprints { max-width: none; }
 .sprint-page { min-width: 0; }
-.sprint-toolbar { display: flex; justify-content: flex-end; margin-bottom: .8rem; }
-.sprint-selector { max-width: min(36rem, 100%); }
+.sprint-toolbar { display: flex; justify-content: center; margin-bottom: .8rem; }
+.sprint-selector { width: min(50ch, 100%); max-width: 100%; }
 .sprint-preview-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 .sprint-preview-head h2 { margin: 0; }
 .sprint-route-state { max-width: 48rem; margin: 0 auto; }
@@ -989,7 +989,7 @@ a { color: var(--accent); }
    flavor (docs-style separation); one .dm-row per (flavor, harness): star
    radio (default harness) · harness label · current value · search bar.
    The focus-opened exact-route list renders inline below the row. */
-.subbar-inert { opacity: .4; pointer-events: none; }
+.subbar-inert { opacity: .85; pointer-events: none; }
 .dm-card + .dm-card { margin-top: 5px; }
 .dm-meta { padding: .1rem .2rem .4rem; font-size: 11px; color: var(--dim); }
 .dm-row {

@@ -12,6 +12,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 APP = (ROOT / ".super-coder" / "ui" / "app.js").read_text()
 INDEX = (ROOT / ".super-coder" / "ui" / "index.html").read_text()
+STYLE = (ROOT / ".super-coder" / "ui" / "style.css").read_text()
 SHELL_STATE = APP[APP.index("let selectedShell ="):
                   APP.index("// Rough token estimator")]
 SHELL_RENDER = APP[APP.index("async function renderShells(root)"):
@@ -52,6 +53,17 @@ def test_new_shell_creator_offers_bespoke_without_a_flavor_template():
     assert "openActionModal" in creator
     assert "dismissNode: cancel, actionNode: create" in creator
     assert "footNodes" not in creator
+
+
+def test_fork_global_shell_header_is_inert_with_only_fifteen_percent_transparency():
+    assert 'sub.classList.add("subbar-inert")' in SHELL_RENDER
+    inert = STYLE[
+        STYLE.index(".subbar-inert {"):
+        STYLE.index("}", STYLE.index(".subbar-inert {")) + 1
+    ]
+    assert "opacity: .85" in inert
+    assert "pointer-events: none" in inert
+    assert "opacity: .4" not in inert
 
 
 def test_skill_assignments_are_flavor_scoped_with_bespoke_exceptions():

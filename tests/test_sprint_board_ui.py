@@ -81,6 +81,55 @@ console.log(JSON.stringify({
     assert run_js(script) == {"armed": 5, "paused": 4, "prepared": 2, "terminal": 1}
 
 
+def test_sprint_selector_truncates_to_a_fifty_character_display_label():
+    script = r"""
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag; this.nodeType = 1; this.children = []; this._text = "";
+  }
+  append(...nodes) { this.children.push(...nodes); }
+  set textContent(value) { this._text = String(value ?? ""); this.children = []; }
+  get textContent() { return this._text + this.children.map(
+    (child) => typeof child === "string" ? child : child.textContent).join(""); }
+}
+globalThis.document = {
+  createElement: (tag) => new FakeElement(tag),
+  createTextNode: (text) => ({nodeType: 3, textContent: String(text ?? "")}),
+};
+globalThis.location = {hash: ""};
+const el = (tag, props = {}, ...kids) => {
+  const node = Object.assign(new FakeElement(tag), props);
+  for (const kid of kids)
+    node.append(kid?.nodeType ? kid : document.createTextNode(kid ?? ""));
+  return node;
+};
+""" + SPRINT_BLOCK + r"""
+const short = {sprint_id: 1, lifecycle: "armed", feature: {title: "Polish"}};
+const long = {sprint_id: 27, lifecycle: "completed", feature: {
+  title: "A deliberately long feature title that must not stretch the selector",
+}};
+const shell = sprintPageShell([short, long], 1);
+const selector = shell.node.children[0].children[0];
+const options = selector.children;
+console.log(JSON.stringify({
+  short: {text: options[0].textContent, title: options[0].title},
+  long: {text: options[1].textContent, title: options[1].title},
+}));
+"""
+    result = run_js(script)
+    assert result["short"] == {
+        "text": "Sprint 1 · armed · Polish",
+        "title": "Sprint 1 · armed · Polish",
+    }
+    assert result["long"]["title"] == (
+        "Sprint 27 · completed · A deliberately long feature title "
+        "that must not stretch the selector"
+    )
+    assert len(result["long"]["text"]) == 50
+    assert result["long"]["text"].endswith("…")
+    assert result["long"]["text"] == result["long"]["title"][:49] + "…"
+
+
 def test_hash_router_preserves_empty_shells_and_exact_sprint_and_roadmap_feature_routes():
     state = r"""
 let shellTab = "harness", roadmapView = "board", roadmapFeatureId = null;
@@ -540,3 +589,11 @@ def test_wide_and_narrow_visual_contract_keeps_five_fixed_columns_scrollable():
     assert 'svg.setAttribute("aria-hidden", "true")' in SPRINT_BLOCK
     assert 'card.onfocus = () => highlight(id, true)' in SPRINT_BLOCK
     assert 'root.querySelector?.(`[data-unit-id="${focusedUnitId}"]`)?.focus()' in SPRINT_BLOCK
+
+
+def test_sprint_selector_is_centered_at_the_redline_width():
+    assert (
+        ".sprint-toolbar { display: flex; justify-content: center; "
+        "margin-bottom: .8rem; }"
+    ) in STYLE
+    assert ".sprint-selector { width: min(50ch, 100%); max-width: 100%; }" in STYLE
