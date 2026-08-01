@@ -1,2 +1,0 @@
-Sprint 51 unit 10 disposable serial GitHub proof fixture.
-Target: fixture/s2-u10-20260801-0022-base (never main).
