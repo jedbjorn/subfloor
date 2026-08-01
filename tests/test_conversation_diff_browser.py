@@ -687,11 +687,12 @@ export { mode };"""
             "tabsBottomRightRadius: getComputedStyle(nodes[4]).borderBottomRightRadius, "
             "tabsBottomLeftRadius: getComputedStyle(nodes[4]).borderBottomLeftRadius, "
             "activeClip: getComputedStyle(nodes[5]).clipPath, "
+            "activeAlign: getComputedStyle(nodes[5]).alignItems, "
+            "activeJustify: getComputedStyle(nodes[5]).justifyContent, "
             "activeHeight: active.height, "
             "activeLayer: getComputedStyle(nodes[5]).zIndex, "
             "inactiveLayer: getComputedStyle(nodes[6]).zIndex, "
-            "dividerBorder: getComputedStyle(nodes[6], '::before').borderLeftWidth, "
-            "dividerHeight: parseFloat(getComputedStyle(nodes[6], '::before').height), "
+            "inactiveHeight: nodes[6].getBoundingClientRect().height, "
             "buttonBorder: getComputedStyle(nodes[6]).borderLeftWidth}; }"
         )
         assert patch_header["tabsLeft"] - patch_header["titleRight"] >= 12
@@ -702,18 +703,17 @@ export { mode };"""
         assert abs(summary_alignment["tabsCenter"] - patch_header["tabsCenter"]) <= 1
         assert abs(patch_header["headerTop"] - patch_header["tabsTop"]) <= 1
         assert patch_header["tabsClip"].startswith("shape(")
-        assert patch_header["activeClip"].startswith("shape(")
-        assert patch_header["tabsTopLeftRadius"] == "4px"
-        assert patch_header["tabsTopRightRadius"] == "4px"
+        assert patch_header["activeClip"] == "none"
+        assert patch_header["tabsTopLeftRadius"] == "0px"
+        assert patch_header["tabsTopRightRadius"] == "0px"
         assert patch_header["tabsBottomRightRadius"] == "0px"
-        assert patch_header["tabsBottomLeftRadius"] == "4px"
+        assert patch_header["tabsBottomLeftRadius"] == "0px"
+        assert patch_header["activeAlign"] == "center"
+        assert patch_header["activeJustify"] == "center"
         assert patch_header["activeLayer"] == "1"
         assert patch_header["inactiveLayer"] == "0"
-        assert patch_header["dividerBorder"] == "1px"
-        assert patch_header["buttonBorder"] == "0px"
-        assert abs(
-            patch_header["activeHeight"] - patch_header["dividerHeight"] - 16
-        ) <= 1
+        assert patch_header["buttonBorder"] == "1px"
+        assert abs(patch_header["activeHeight"] - patch_header["inactiveHeight"]) <= 1
         initial_observations = sum(
             method == "POST" and path.endswith("/review-observations")
             for method, path, _query in requests
@@ -822,13 +822,15 @@ export { mode };"""
             "nodes => ({inactiveLayer: getComputedStyle(nodes[0]).zIndex, "
             "activeLayer: getComputedStyle(nodes[1]).zIndex, "
             "dividerBorder: getComputedStyle(nodes[0], '::after').borderRightWidth, "
-            "activeBorder: getComputedStyle(nodes[1]).borderLeftWidth})"
+            "activeBorder: getComputedStyle(nodes[1]).borderLeftWidth, "
+            "activeClip: getComputedStyle(nodes[1]).clipPath})"
         )
         assert shell_layers == {
             "inactiveLayer": "0",
             "activeLayer": "1",
-            "dividerBorder": "1px",
-            "activeBorder": "0px",
+            "dividerBorder": "0px",
+            "activeBorder": "1px",
+            "activeClip": "none",
         }
         page.get_by_role("button", name="CLAUDE.md").click()
         page.locator(".review-shell-file").wait_for()
