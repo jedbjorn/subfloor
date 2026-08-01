@@ -142,6 +142,7 @@ function groupSkills(skills, { alwaysRepo = false } = {}) {
 let selectedShell = null;
 let shellTab = "harness";     // 'harness' | 'skills' | 'assignments' | 'models'
 let activeSkillId = null;     // skill-viewer selection; reset on shell switch
+let shellRenderEpoch = 0;     // discard stale async renders after re-navigation
 const SHELL_TAB_HASH = {
   harness: "shells",
   skills: "shells-skills",
@@ -291,13 +292,18 @@ function openNewShellModal(templates, root) {
 }
 
 async function renderShells(root) {
+  const epoch = ++shellRenderEpoch;
   const { shells } = await api("/shells");
+  if (epoch !== shellRenderEpoch) return;
   const { templates } = await api("/shell-templates");
+  if (epoch !== shellRenderEpoch) return;
   root.replaceChildren();
   if (!shells.length) { root.append(el("div", { className: "card muted" }, "No shells.")); return; }
   if (selectedShell == null || !shells.find((s) => s.shell_id === selectedShell))
     selectedShell = shells[0].shell_id;
   const s = await api("/shells/" + selectedShell);
+  if (epoch !== shellRenderEpoch) return;
+  root.replaceChildren();
 
   // sticky identity sub-header
   const sub = el("div", { className: "subbar" });
