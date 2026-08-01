@@ -270,6 +270,7 @@ class SprintCliApiTest(unittest.TestCase):
                     (1, "Developer", "DEV1", "dev", "prompt", TOKENS["developer"]),
                     (2, "Reviewer", "REV1", "reviewer", "prompt", TOKENS["reviewer"]),
                     (3, "Planner", "PLN1", "planner", "prompt", TOKENS["planner"]),
+                    (4, "Developer 2", "DEV2", "dev", "prompt", "dev2-token"),
                     (5, "FnB", "FNB", "admin", "prompt", TOKENS["admin"]),
                 ),
             )
@@ -386,6 +387,307 @@ class SprintCliApiTest(unittest.TestCase):
                     "ORDER BY event_id LIMIT 2",
                     (sprint_id,),
                 ).fetchall(),
+            )
+        finally:
+            con.close()
+
+    def test_remediation_surfaces_are_authenticated_and_durable(self):
+        self.use_isolated_db()
+        con = sqlite3.connect(self.db)
+        try:
+            feature_id = int(
+                con.execute(
+                    "INSERT INTO roadmap (title,roadmap_status) "
+                    "VALUES ('Surface remediation','in_progress')"
+                ).lastrowid
+            )
+            document_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',1,'Surface spec','REV9 body')",
+                    (feature_id,),
+                ).lastrowid
+            )
+            task_ids = [
+                int(
+                    con.execute(
+                        "INSERT INTO spec_tasks "
+                        "(feature_id,document_id,seq,title) VALUES (?,?,?,?)",
+                        (feature_id, document_id, seq, title),
+                    ).lastrowid
+                )
+                for seq, title in enumerate(("Report", "Optional lane"))
+            ]
+            con.commit()
+        finally:
+            con.close()
+
+        approval = self.run_cli(
+            TOKENS["reviewer"],
+            "record-qaqc",
+            "--document",
+            str(document_id),
+            "--verdict",
+            "pass",
+        )
+        self.assertTrue(approval["created"])
+        with self.assertRaisesRegex(SystemExit, "HTTP 403.*Review shell"):
+            self.run_cli(
+                TOKENS["developer"],
+                "record-qaqc",
+                "--document",
+                str(document_id),
+                "--verdict",
+                "pass",
+            )
+
+        participants = self.write(
+            json.dumps(
+                [
+                    {"shell_id": 3, "role": "planner", "harness": "codex"},
+                    {"shell_id": 1, "role": "developer", "harness": "codex"},
+                    {"shell_id": 4, "role": "developer", "harness": "codex"},
+                    {"shell_id": 2, "role": "reviewer", "harness": "kimi"},
+                ]
+            )
+        )
+        con = sqlite3.connect(self.db)
+        try:
+            bad_approval_id = int(
+                con.execute(
+                    "INSERT INTO sprint_spec_approvals "
+                    "(document_id,revision_sha256,reviewer_shell_id,verdict) "
+                    "VALUES (?,?,1,'pass')",
+                    (document_id, hashlib.sha256(b"REV9 body").hexdigest()),
+                ).lastrowid
+            )
+            con.commit()
+        finally:
+            con.close()
+        with self.assertRaisesRegex(
+            SystemExit, "HTTP 409.*current passing approvals"
+        ):
+            self.run_cli(
+                TOKENS["planner"],
+                "declare",
+                "--feature",
+                str(feature_id),
+                "--spec-approval",
+                str(bad_approval_id),
+                "--participants-file",
+                participants,
+                "--merge-grant",
+            )
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(0, con.execute("SELECT COUNT(*) FROM sprints").fetchone()[0])
+        finally:
+            con.close()
+        sprint_id = self.run_cli(
+            TOKENS["planner"],
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec-approval",
+            str(approval["approval_id"]),
+            "--participants-file",
+            participants,
+            "--merge-grant",
+        )["sprint_id"]
+        report_unit = self.run_cli(
+            TOKENS["planner"],
+            "plan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--developer-shell",
+            "1",
+            "--reviewer-shell",
+            "2",
+            "--title",
+            "Report lane",
+            "--expected-output-file",
+            self.write("Durable report"),
+            "--task",
+            str(task_ids[0]),
+            "--output-kind",
+            "report-only",
+        )["work_unit_id"]
+        optional_unit = self.run_cli(
+            TOKENS["planner"],
+            "plan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--developer-shell",
+            "4",
+            "--reviewer-shell",
+            "2",
+            "--title",
+            "Optional lane",
+            "--expected-output-file",
+            self.write("Optional result"),
+            "--task",
+            str(task_ids[1]),
+        )["work_unit_id"]
+        replanned = self.run_cli(
+            TOKENS["planner"],
+            "replan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--work-unit",
+            str(optional_unit),
+            "--developer-shell",
+            "4",
+            "--reviewer-shell",
+            "2",
+            "--wave",
+            "7",
+            "--output-kind",
+            "no-code",
+        )
+        self.assertTrue(replanned["changed"])
+        self.run_cli(TOKENS["planner"], "arm", "--sprint", str(sprint_id))
+
+        inbox = self.run_cli(
+            TOKENS["developer"], "inbox", "--sprint", str(sprint_id)
+        )
+        self.assertEqual(1, len(inbox["messages"]))
+        report_message = inbox["messages"][0]["message_id"]
+        accepted = self.run_cli(
+            TOKENS["developer"],
+            "accept",
+            "--sprint",
+            str(sprint_id),
+            "--message",
+            str(report_message),
+        )
+        self.assertEqual("accepted", accepted["disposition"])
+        declined_inbox = self.run_cli(
+            "dev2-token", "inbox", "--sprint", str(sprint_id)
+        )
+        declined_message = declined_inbox["messages"][0]["message_id"]
+        decline = self.run_cli(
+            "dev2-token",
+            "decline",
+            "--sprint",
+            str(sprint_id),
+            "--message",
+            str(declined_message),
+            "--reason",
+            "capacity moved",
+        )
+        self.assertIsInstance(decline["result_message_id"], int)
+        cancelled = self.run_cli(
+            TOKENS["planner"],
+            "cancel-unit",
+            "--sprint",
+            str(sprint_id),
+            "--work-unit",
+            str(optional_unit),
+            "--reason",
+            "Declined lane removed from scope",
+        )
+        self.assertTrue(cancelled["changed"])
+        completed_unit = self.run_cli(
+            TOKENS["developer"],
+            "complete-unit",
+            "--sprint",
+            str(sprint_id),
+            "--work-unit",
+            str(report_unit),
+            "--result-file",
+            self.write("Report document #77"),
+        )
+        self.assertEqual([], completed_unit["wake_ids"])
+
+        conformance = self.run_cli(
+            TOKENS["reviewer"],
+            "record-conformance",
+            "--sprint",
+            str(sprint_id),
+            "--body-file",
+            self.write("Conformance complete"),
+            "--findings-file",
+            self.write(
+                json.dumps(
+                    [{"severity": "Low", "title": "Note", "body": "Track it"}]
+                )
+            ),
+            "--key",
+            "surface-conformance",
+        )
+        followup_id = conformance["followup_ids"][0]
+        with self.assertRaisesRegex(SystemExit, "HTTP 403.*only FnB"):
+            self.run_cli(
+                TOKENS["planner"],
+                "disposition-followup",
+                "--sprint",
+                str(sprint_id),
+                "--followup",
+                str(followup_id),
+                "--disposition",
+                "accepted",
+            )
+        disposition = self.run_cli(
+            TOKENS["admin"],
+            "disposition-followup",
+            "--sprint",
+            str(sprint_id),
+            "--followup",
+            str(followup_id),
+            "--disposition",
+            "accepted",
+        )
+        self.assertTrue(disposition["changed"])
+
+        completed = self.run_cli(
+            TOKENS["planner"],
+            "complete",
+            "--sprint",
+            str(sprint_id),
+            "--reason",
+            "close",
+            "--outcome",
+            "accepted",
+            "--report-file",
+            self.write("Final Sprint report"),
+            "--key",
+            "surface-final-report",
+        )
+        self.assertTrue(completed["changed"])
+        self.assertIsInstance(completed["report_id"], int)
+
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                [
+                    (report_unit, "report_only", "completed", "Report document #77"),
+                    (
+                        optional_unit,
+                        "no_code",
+                        "cancelled",
+                        "Declined lane removed from scope",
+                    ),
+                ],
+                con.execute(
+                    "SELECT work_unit_id,output_kind,disposition,completion_result "
+                    "FROM sprint_work_units WHERE sprint_id=? ORDER BY work_unit_id",
+                    (sprint_id,),
+                ).fetchall(),
+            )
+            self.assertEqual(
+                [("final", "Final Sprint report")],
+                con.execute(
+                    "SELECT report_kind,body FROM sprint_reports WHERE sprint_id=? "
+                    "AND report_kind='final'",
+                    (sprint_id,),
+                ).fetchall(),
+            )
+            self.assertEqual(
+                "accepted",
+                con.execute(
+                    "SELECT disposition FROM sprint_followups WHERE followup_id=?",
+                    (followup_id,),
+                ).fetchone()[0],
             )
         finally:
             con.close()

@@ -11,6 +11,12 @@ Use for an actionable work-unit assignment in an armed Sprint. Marking that
 Sprint message read is acceptance and starts work immediately. If you cannot
 accept, decline with a concrete reason; never leave it unread and waking.
 
+```text
+sc sprint inbox --sprint <id>
+sc sprint accept --sprint <id> --message <message-id>
+sc sprint decline --sprint <id> --message <message-id> --reason <reason>
+```
+
 ## Orient and bound the lane
 
 Read the assignment, expected output, bound spec revision, dependencies,
@@ -33,6 +39,15 @@ Verification must exercise the unit's independent stage gate and realistic
 failure paths. A local exploratory number is not merge evidence. Record real CI
 failures, anomalous infrastructure failures, retries, review friction, and
 known departures for the final report.
+
+An explicitly planned report-only or no-code lane completes with its durable
+result instead of a PR. Code lanes cannot use this path; they complete only
+after merge authorization and observation.
+
+```text
+sc sprint complete-unit --sprint <id> --work-unit <id> \
+  --result-file <path>
+```
 
 Register the PR through the authoritative Sprint surface and retain ownership
 until it is green. The watcher supplies red/green facts; do not write PR state

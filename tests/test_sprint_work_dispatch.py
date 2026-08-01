@@ -124,6 +124,7 @@ class SprintWorkDispatchCase(unittest.TestCase):
         wave: int = 0,
         dependencies: tuple[int, ...] = (),
         title: str | None = None,
+        output_kind: str = "code",
     ) -> int:
         task_id = self.task_ids[self.next_task]
         self.next_task += 1
@@ -137,6 +138,7 @@ class SprintWorkDispatchCase(unittest.TestCase):
             task_ids=(task_id,),
             planned_wave=wave,
             dependency_ids=dependencies,
+            output_kind=output_kind,
         )
 
     def assignment_message(self, unit_id: int) -> int:
@@ -204,7 +206,9 @@ class DispatchGateTest(SprintWorkDispatchCase):
         )
 
     def test_dependencies_block_and_each_developer_gets_one_editing_lane(self) -> None:
-        first = self.create_unit(developer=1, wave=0, title="First")
+        first = self.create_unit(
+            developer=1, wave=0, title="First", output_kind="no_code"
+        )
         same_shell = self.create_unit(developer=1, wave=1, title="Second")
         blocked = self.create_unit(
             developer=4,
@@ -224,7 +228,9 @@ class DispatchGateTest(SprintWorkDispatchCase):
         )
         self.assertEqual("active", self.dispositions()[0][1])
 
-        released = self.units.complete(self.sprint_id, first, 1)
+        released = self.units.complete(
+            self.sprint_id, first, 1, result="Durable non-code result"
+        )
 
         self.assertEqual(2, len(released))
         self.assertEqual(
@@ -243,6 +249,86 @@ class DispatchGateTest(SprintWorkDispatchCase):
                 )
             ],
         )
+        self.assertEqual(
+            ("no_code", "Durable non-code result"),
+            tuple(
+                self.con.execute(
+                    "SELECT output_kind,completion_result FROM sprint_work_units "
+                    "WHERE work_unit_id=?",
+                    (first,),
+                ).fetchone()
+            ),
+        )
+
+    def test_only_explicit_non_code_lane_completes_with_exact_result(self) -> None:
+        code = self.create_unit(developer=1, title="Code")
+        report = self.create_unit(
+            developer=4, title="Report", output_kind="report_only"
+        )
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.messages.mark_read(self.assignment_message(code), 1)
+        self.messages.mark_read(self.assignment_message(report), 4)
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "merge judgment chain"
+        ):
+            self.units.complete(self.sprint_id, code, 1, result="Not allowed")
+        self.assertEqual("active", self.dispositions()[0][1])
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT completion_result FROM sprint_work_units "
+                "WHERE work_unit_id=?",
+                (code,),
+            ).fetchone()[0]
+        )
+
+        self.assertEqual(
+            [],
+            self.units.complete(
+                self.sprint_id, report, 4, result="Published conformance report #77"
+            ),
+        )
+        row = self.con.execute(
+            "SELECT disposition,completion_result FROM sprint_work_units "
+            "WHERE work_unit_id=?",
+            (report,),
+        ).fetchone()
+        self.assertEqual(("completed", "Published conformance report #77"), tuple(row))
+        event = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE event_type='work_unit.completed' "
+            "AND actor_shell_id=4"
+        ).fetchone()
+        self.assertEqual(
+            "Published conformance report #77", json.loads(event[0])["result"]
+        )
+
+    def test_planner_cancels_only_unreleased_lane_with_reason(self) -> None:
+        cancelled = self.create_unit(developer=1, title="Cancelled")
+        self.assertTrue(
+            self.units.cancel(
+                self.sprint_id, cancelled, 3, reason="Superseded by unit 99"
+            )
+        )
+        self.assertEqual(
+            ("cancelled", "Superseded by unit 99"),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,completion_result FROM sprint_work_units "
+                    "WHERE work_unit_id=?",
+                    (cancelled,),
+                ).fetchone()
+            ),
+        )
+        self.assertFalse(
+            self.units.cancel(
+                self.sprint_id, cancelled, 3, reason="Superseded by unit 99"
+            )
+        )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintAuthorityError, "originating Planner"
+        ):
+            other = self.create_unit(developer=4, title="Still planned")
+            self.units.cancel(self.sprint_id, other, 1, reason="Not mine")
 
     def test_declined_assignment_returns_to_pool_with_a_new_durable_identity(self) -> None:
         unit = self.create_unit(developer=1)
@@ -279,7 +365,9 @@ class DispatchGateTest(SprintWorkDispatchCase):
         self.assertEqual([(unit, "ready")], self.dispositions())
 
     def test_replanning_is_acyclic_and_preserves_before_after_history(self) -> None:
-        upstream = self.create_unit(developer=1, title="Upstream")
+        upstream = self.create_unit(
+            developer=1, title="Upstream", output_kind="no_code"
+        )
         target = self.create_unit(
             developer=4,
             dependencies=(upstream,),
@@ -328,8 +416,9 @@ class DispatchGateTest(SprintWorkDispatchCase):
             {
                 "assigned_shell_id": 4,
                 "reviewer_shell_id": 2,
-                "planned_wave": 1,
-                "dependency_ids": [upstream],
+            "planned_wave": 1,
+            "output_kind": "code",
+            "dependency_ids": [upstream],
             },
             payload["before"],
         )
@@ -337,15 +426,18 @@ class DispatchGateTest(SprintWorkDispatchCase):
             {
                 "assigned_shell_id": 4,
                 "reviewer_shell_id": 5,
-                "planned_wave": 7,
-                "dependency_ids": [],
+            "planned_wave": 7,
+            "output_kind": "code",
+            "dependency_ids": [],
             },
             payload["after"],
         )
 
         self.lifecycle.arm(self.sprint_id, 3)
         self.messages.mark_read(self.assignment_message(upstream), 1)
-        self.units.complete(self.sprint_id, upstream, 1)
+        self.units.complete(
+            self.sprint_id, upstream, 1, result="Upstream planning result"
+        )
         with self.assertRaisesRegex(
             sprint_domain.SprintInvariantError, "only planned"
         ):

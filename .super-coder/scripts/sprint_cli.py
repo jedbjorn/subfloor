@@ -58,6 +58,20 @@ def cmd_declare(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_record_qaqc(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/qaqc",
+        {
+            "document_id": args.document,
+            "verdict": args.verdict,
+            "findings_document_id": args.findings_document,
+        },
+        idempotent=True,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_plan_unit(args: argparse.Namespace) -> int:
     result = _post(
         "/_sc/sprint/plan-unit",
@@ -70,6 +84,82 @@ def cmd_plan_unit(args: argparse.Namespace) -> int:
             "task_ids": _integer_list(args.task),
             "planned_wave": args.wave,
             "dependency_ids": _integer_list(args.depends_on),
+            "output_kind": args.output_kind.replace("-", "_"),
+        },
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_replan_unit(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/replan-unit",
+        {
+            "sprint_id": args.sprint,
+            "work_unit_id": args.work_unit,
+            "assigned_shell_id": args.developer_shell,
+            "reviewer_shell_id": args.reviewer_shell,
+            "planned_wave": args.wave,
+            "dependency_ids": _integer_list(args.depends_on),
+            "output_kind": (
+                args.output_kind.replace("-", "_") if args.output_kind else None
+            ),
+        },
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_inbox(args: argparse.Namespace) -> int:
+    result = mem._api("GET", f"/_sc/sprint/{args.sprint}/inbox")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_accept(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/inbox-read",
+        {"sprint_id": args.sprint, "message_id": args.message},
+        idempotent=True,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_decline(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/inbox-decline",
+        {
+            "sprint_id": args.sprint,
+            "message_id": args.message,
+            "reason": args.reason,
+        },
+        idempotent=True,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_complete_unit(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/complete-unit",
+        {
+            "sprint_id": args.sprint,
+            "work_unit_id": args.work_unit,
+            "result": _text(args.result_file, "completion result"),
+        },
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_cancel_unit(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/cancel-unit",
+        {
+            "sprint_id": args.sprint,
+            "work_unit_id": args.work_unit,
+            "reason": args.reason,
         },
     )
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -115,12 +205,18 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 
 def cmd_complete(args: argparse.Namespace) -> int:
+    if bool(args.report_file) != bool(args.key):
+        raise SystemExit("sprint: --report-file and --key must be provided together")
     result = _post(
         "/_sc/sprint/complete",
         {
             "sprint_id": args.sprint,
             "reason": args.reason,
             "terminal_outcome": args.outcome,
+            "final_report": (
+                _text(args.report_file, "final report") if args.report_file else None
+            ),
+            "idempotency_key": args.key,
         },
     )
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -215,6 +311,25 @@ def cmd_record_conformance(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_disposition_followup(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/followup-disposition",
+        {
+            "sprint_id": args.sprint,
+            "followup_id": args.followup,
+            "disposition": args.disposition,
+            "resolution": (
+                _text(args.resolution_file, "resolution")
+                if args.resolution_file
+                else None
+            ),
+        },
+        idempotent=True,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_compile_report(args: argparse.Namespace) -> int:
     result = mem._api("GET", f"/_sc/sprint/{args.sprint}/report?limit={args.limit}")
     print(json.dumps(result["evidence_packet"], indent=2, sort_keys=True))
@@ -230,6 +345,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    qaqc = sub.add_parser(
+        "record-qaqc", help="Review shell signs the current exact spec revision"
+    )
+    qaqc.add_argument("--document", type=int, required=True)
+    qaqc.add_argument("--verdict", choices=("pass", "fail"), required=True)
+    qaqc.add_argument("--findings-document", type=int)
+    qaqc.set_defaults(fn=cmd_record_qaqc)
 
     declare = sub.add_parser(
         "declare", help="Planner creates one editable prepared Sprint envelope"
@@ -256,11 +379,65 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--task", type=int, action="append", required=True)
     plan.add_argument("--wave", type=int, default=0)
     plan.add_argument("--depends-on", type=int, action="append")
+    plan.add_argument(
+        "--output-kind",
+        choices=("code", "report-only", "no-code"),
+        default="code",
+    )
     plan.set_defaults(fn=cmd_plan_unit)
+
+    replan = sub.add_parser(
+        "replan-unit", help="Planner revises one still-planned editing lane"
+    )
+    replan.add_argument("--sprint", type=int, required=True)
+    replan.add_argument("--work-unit", type=int, required=True)
+    replan.add_argument("--developer-shell", type=int, required=True)
+    replan.add_argument("--reviewer-shell", type=int, required=True)
+    replan.add_argument("--wave", type=int, default=0)
+    replan.add_argument("--depends-on", type=int, action="append")
+    replan.add_argument(
+        "--output-kind", choices=("code", "report-only", "no-code")
+    )
+    replan.set_defaults(fn=cmd_replan_unit)
 
     arm = sub.add_parser("arm", help="Planner atomically arms an eligible plan")
     arm.add_argument("--sprint", type=int, required=True)
     arm.set_defaults(fn=cmd_arm)
+
+    inbox = sub.add_parser("inbox", help="Read unread messages addressed to this shell")
+    inbox.add_argument("--sprint", type=int, required=True)
+    inbox.set_defaults(fn=cmd_inbox)
+
+    accept = sub.add_parser(
+        "accept", help="Mark one Sprint message read and accept actionable work"
+    )
+    accept.add_argument("--sprint", type=int, required=True)
+    accept.add_argument("--message", type=int, required=True)
+    accept.set_defaults(fn=cmd_accept)
+
+    decline = sub.add_parser(
+        "decline", help="Decline one actionable Sprint message with a reason"
+    )
+    decline.add_argument("--sprint", type=int, required=True)
+    decline.add_argument("--message", type=int, required=True)
+    decline.add_argument("--reason", required=True)
+    decline.set_defaults(fn=cmd_decline)
+
+    complete_unit = sub.add_parser(
+        "complete-unit", help="Developer completes an explicit report-only/no-code lane"
+    )
+    complete_unit.add_argument("--sprint", type=int, required=True)
+    complete_unit.add_argument("--work-unit", type=int, required=True)
+    complete_unit.add_argument("--result-file", required=True)
+    complete_unit.set_defaults(fn=cmd_complete_unit)
+
+    cancel_unit = sub.add_parser(
+        "cancel-unit", help="Planner cancels one unreleased planned lane"
+    )
+    cancel_unit.add_argument("--sprint", type=int, required=True)
+    cancel_unit.add_argument("--work-unit", type=int, required=True)
+    cancel_unit.add_argument("--reason", required=True)
+    cancel_unit.set_defaults(fn=cmd_cancel_unit)
 
     register = sub.add_parser(
         "register-pr", help="Developer registers one PR to its owning work unit"
@@ -285,6 +462,8 @@ def build_parser() -> argparse.ArgumentParser:
     complete.add_argument("--sprint", type=int, required=True)
     complete.add_argument("--reason", required=True)
     complete.add_argument("--outcome", required=True)
+    complete.add_argument("--report-file")
+    complete.add_argument("--key", help="stable final-report retry identity")
     complete.set_defaults(fn=cmd_complete)
 
     abort = sub.add_parser(
@@ -337,6 +516,19 @@ def build_parser() -> argparse.ArgumentParser:
     conformance.add_argument("--findings-file", required=True)
     conformance.add_argument("--key", required=True, help="stable retry identity")
     conformance.set_defaults(fn=cmd_record_conformance)
+
+    followup = sub.add_parser(
+        "disposition-followup", help="FnB records a terminal follow-up disposition"
+    )
+    followup.add_argument("--sprint", type=int, required=True)
+    followup.add_argument("--followup", type=int, required=True)
+    followup.add_argument(
+        "--disposition",
+        choices=("accepted", "resolved", "dismissed"),
+        required=True,
+    )
+    followup.add_argument("--resolution-file")
+    followup.set_defaults(fn=cmd_disposition_followup)
 
     report = sub.add_parser(
         "compile-report", help="Planner prints the bounded evidence packet"

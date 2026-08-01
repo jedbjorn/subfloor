@@ -10,6 +10,16 @@ common: false
 Use in one of two modes: a work-unit PR review during the loop, or the final
 whole-Sprint conformance pass. The evidence differs; independence does not.
 
+Read and accept the actionable request before beginning. During preparation,
+sign the exact current spec revision through the same authenticated surface:
+
+```text
+sc sprint inbox --sprint <id>
+sc sprint accept --sprint <id> --message <message-id>
+sc sprint record-qaqc --document <spec-document-id> \
+  --verdict pass [--findings-document <document-id>]
+```
+
 ## Severity rubric
 
 This skill owns severity. The governing spec intentionally does not.

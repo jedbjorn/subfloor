@@ -81,9 +81,16 @@ class SprintSkillTest(unittest.TestCase):
 
     def test_skills_use_only_the_shipped_shell_command_surface(self):
         expected = {
+            "record-qaqc",
             "declare",
             "plan-unit",
+            "replan-unit",
             "arm",
+            "inbox",
+            "accept",
+            "decline",
+            "complete-unit",
+            "cancel-unit",
             "register-pr",
             "pause",
             "resume",
@@ -95,6 +102,7 @@ class SprintSkillTest(unittest.TestCase):
             "dispatch",
             "monitor",
             "record-conformance",
+            "disposition-followup",
             "compile-report",
         }
         combined = "\n".join(

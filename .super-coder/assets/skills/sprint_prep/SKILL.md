@@ -33,6 +33,17 @@ Read the feature, selected spec bodies, task ledgers, QAQC records, shell roster
 model routes, quota state, repository access, and worktree availability. Record
 the exact revision hash you inspected; a title or document id is not a revision.
 
+The Review shell records its verdict against the current exact body through the
+authenticated Sprint surface:
+
+```text
+sc sprint record-qaqc --document <spec-document-id> --verdict pass \
+  [--findings-document <document-id>]
+```
+
+Use `fail` until every blocking finding is resolved. A body edit changes the
+revision hash and therefore needs a fresh signed record.
+
 Refuse arming when any of these is true:
 
 - a selected current revision lacks Review-shell QAQC approval;
@@ -72,7 +83,8 @@ sc sprint declare --feature <feature-id> \
 sc sprint plan-unit --sprint <id> \
   --developer-shell <id> --reviewer-shell <id> --title <title> \
   --expected-output-file <path> --task <task-id> \
-  [--task <task-id>] [--wave <n>] [--depends-on <work-unit-id>]
+  [--task <task-id>] [--wave <n>] [--depends-on <work-unit-id>] \
+  [--output-kind code|report-only|no-code]
 ```
 
 The participant file contains `shell_id`, `role`, and `harness`, with optional

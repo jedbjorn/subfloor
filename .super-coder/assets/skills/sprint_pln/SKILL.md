@@ -17,6 +17,11 @@ participant routes, active conversations, registered PRs, unresolved
 expectations, and recent anomalies. Viewing a participant conversation is
 observation, not activity; never manufacture progress from browser presence.
 
+```text
+sc sprint inbox --sprint <id>
+sc sprint accept --sprint <id> --message <message-id>
+```
+
 Release every dependency-ready lane through the production surface:
 
 ```text
@@ -50,6 +55,17 @@ sc sprint monitor --sprint <id>
 
 Do not poll this command on a schedule. It evaluates only due accepted
 expectations and its nudge/escalation identities are durable.
+
+Revise only a still-planned lane; name its complete new projection so the
+before/after event is reviewable. Cancel only an unreleased lane, with the
+reason retained as its terminal result:
+
+```text
+sc sprint replan-unit --sprint <id> --work-unit <id> \
+  --developer-shell <id> --reviewer-shell <id> --wave <n> \
+  [--depends-on <work-unit-id>] [--output-kind code|report-only|no-code]
+sc sprint cancel-unit --sprint <id> --work-unit <id> --reason <reason>
+```
 
 ## Escalation judgment
 

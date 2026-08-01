@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 MIGRATIONS = ENGINE / "migrations"
 MIGRATION = MIGRATIONS / "0150_sprint_close_reports.sql"
+SURFACE_MIGRATION = MIGRATIONS / "0152_sprint_surface_completion.sql"
 
 sys.path[:0] = [str(ENGINE / "scripts"), str(ROOT / "tests")]
 import sprint_close  # noqa: E402
@@ -94,6 +95,73 @@ class SprintCloseMigrationTest(unittest.TestCase):
                 ).fetchone()
             )
             self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
+
+    def test_surface_migration_preserves_code_units_and_accepts_non_code_result(self):
+        with closing(sqlite3.connect(":memory:")) as con:
+            apply_schema(con, through="0151_seed_sprint_v2_skills.sql")
+            con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
+            con.executemany(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,system_prompt,user_id) "
+                "VALUES (?,?,?,?,1)",
+                (
+                    (1, "Developer", "DEV1", "prompt"),
+                    (2, "Reviewer", "REV1", "prompt"),
+                    (3, "Planner", "PLN1", "prompt"),
+                ),
+            )
+            feature_id = int(
+                con.execute("INSERT INTO roadmap (title) VALUES ('Feature')").lastrowid
+            )
+            sprint_id = int(
+                con.execute(
+                    "INSERT INTO sprints "
+                    "(feature_id,originating_planner_shell_id) VALUES (?,3)",
+                    (feature_id,),
+                ).lastrowid
+            )
+            unit_id = int(
+                con.execute(
+                    "INSERT INTO sprint_work_units "
+                    "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+                    "expected_output) VALUES (?,1,2,'Existing','Code PR')",
+                    (sprint_id,),
+                ).lastrowid
+            )
+
+            con.executescript(SURFACE_MIGRATION.read_text())
+
+            self.assertEqual(
+                ("code", None),
+                tuple(
+                    con.execute(
+                        "SELECT output_kind,completion_result "
+                        "FROM sprint_work_units WHERE work_unit_id=?",
+                        (unit_id,),
+                    ).fetchone()
+                ),
+            )
+            con.execute(
+                "UPDATE sprint_work_units SET output_kind='report_only',"
+                "completion_result='Report #77' WHERE work_unit_id=?",
+                (unit_id,),
+            )
+            self.assertEqual(
+                ("report_only", "Report #77"),
+                tuple(
+                    con.execute(
+                        "SELECT output_kind,completion_result "
+                        "FROM sprint_work_units WHERE work_unit_id=?",
+                        (unit_id,),
+                    ).fetchone()
+                ),
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute(
+                    "UPDATE sprint_work_units SET output_kind='spreadsheet' "
+                    "WHERE work_unit_id=?",
+                    (unit_id,),
+                )
 
 
 class ConformanceFollowupTest(SprintCloseCase):
@@ -269,6 +337,153 @@ class ConformanceFollowupTest(SprintCloseCase):
                 (self.sprint_id,),
             ).fetchone()[0],
         )
+
+    def test_final_report_is_idempotent_and_replays_after_completion(self):
+        first = self.close.record_final_report(
+            self.sprint_id,
+            3,
+            body="Delivered scope, conformance, judgments, and follow-ups.",
+            idempotency_key="final-synthesis",
+        )
+        self.assertTrue(first.created)
+        sprint_domain.SprintLifecycleStore(self.con).transition(
+            self.sprint_id,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="close",
+            terminal_outcome="accepted",
+        )
+        replay = self.close.record_final_report(
+            self.sprint_id,
+            3,
+            body="Delivered scope, conformance, judgments, and follow-ups.",
+            idempotency_key="final-synthesis",
+        )
+        self.assertFalse(replay.created)
+        self.assertEqual(first.report_id, replay.report_id)
+        self.assertEqual(
+            (
+                "final",
+                3,
+                "Delivered scope, conformance, judgments, and follow-ups.",
+            ),
+            tuple(
+                self.con.execute(
+                    "SELECT report_kind,author_shell_id,body FROM sprint_reports "
+                    "WHERE report_id=?",
+                    (first.report_id,),
+                ).fetchone()
+            ),
+        )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "different final report"
+        ):
+            self.close.record_final_report(
+                self.sprint_id,
+                3,
+                body="Conflicting report",
+                idempotency_key="final-synthesis",
+            )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "different final report"
+        ):
+            self.close.record_final_report(
+                self.sprint_id,
+                3,
+                body="Delivered scope, conformance, judgments, and follow-ups.",
+                idempotency_key="second-final-key",
+            )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=? "
+                "AND report_kind='final'",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+
+    def test_only_fnb_dispositions_followup_and_only_pending_is_unresolved(self):
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (5,'FnB','FNB','admin','prompt',1)"
+        )
+        self.con.commit()
+        receipt = self.close.record_conformance(
+            self.sprint_id,
+            2,
+            body="Two follow-ups",
+            findings=[
+                self.finding(title="Accepted"),
+                self.finding(title="Resolved"),
+            ],
+            idempotency_key="disposition-pass",
+        )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintAuthorityError, "only FnB"
+        ):
+            self.close.disposition_followup(
+                self.sprint_id,
+                receipt.followup_ids[0],
+                3,
+                disposition="accepted",
+            )
+        self.assertEqual(
+            "pending",
+            self.con.execute(
+                "SELECT disposition FROM sprint_followups WHERE followup_id=?",
+                (receipt.followup_ids[0],),
+            ).fetchone()[0],
+        )
+
+        self.assertTrue(
+            self.close.disposition_followup(
+                self.sprint_id,
+                receipt.followup_ids[0],
+                5,
+                disposition="accepted",
+            )
+        )
+        self.assertTrue(
+            self.close.disposition_followup(
+                self.sprint_id,
+                receipt.followup_ids[1],
+                5,
+                disposition="resolved",
+                resolution="Fixed by PR #900",
+            )
+        )
+        self.assertFalse(
+            self.close.disposition_followup(
+                self.sprint_id,
+                receipt.followup_ids[1],
+                5,
+                disposition="resolved",
+                resolution="Fixed by PR #900",
+            )
+        )
+        self.assertEqual(
+            [
+                ("accepted", None, None),
+                ("resolved", "Fixed by PR #900", 1),
+            ],
+            [
+                (
+                    row["disposition"],
+                    row["resolution"],
+                    int(row["resolved_at"] is not None) if row["resolved_at"] else None,
+                )
+                for row in self.con.execute(
+                    "SELECT disposition,resolution,resolved_at "
+                    "FROM sprint_followups WHERE source_report_id=? "
+                    "ORDER BY followup_id",
+                    (receipt.report_id,),
+                )
+            ],
+        )
+        packet = self.close.compile_evidence_packet(self.sprint_id, 3)
+        self.assertEqual(0, packet["unresolved_work"]["followups"]["total"])
+        self.assertEqual([], packet["unresolved_work"]["followups"]["items"])
 
 
 class EvidenceCompilerTest(SprintCloseCase):

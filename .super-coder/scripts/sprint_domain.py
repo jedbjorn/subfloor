@@ -29,6 +29,7 @@ SPRINT_TRANSITIONS = {
 EDITING_UNIT_DISPOSITIONS = frozenset(
     {"active", "in_review", "fixing", "merge_ready"}
 )
+WORK_UNIT_OUTPUT_KINDS = frozenset({"code", "report_only", "no_code"})
 
 
 class SprintLifecycleError(ValueError):
@@ -85,12 +86,115 @@ class AbortReceipt:
     notification_conversation_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SpecApprovalReceipt:
+    approval_id: int
+    revision_sha256: str
+    verdict: str
+    created: bool
+
+
 def transition_allowed(current: str, target: str) -> bool:
     return (
         current in SPRINT_TRANSITIONS
         and target in SPRINT_TRANSITIONS
         and (target == current or target in SPRINT_TRANSITIONS[current])
     )
+
+
+class SprintSpecApprovalStore:
+    """Append exact-revision QAQC approvals signed by Review shells."""
+
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+        self.con.row_factory = sqlite3.Row
+
+    def record(
+        self,
+        document_id: int,
+        reviewer_shell_id: int,
+        *,
+        verdict: str,
+        findings_document_id: int | None = None,
+    ) -> SpecApprovalReceipt:
+        if verdict not in {"pass", "fail"}:
+            raise ValueError("QAQC verdict must be pass or fail")
+        with db_driver.write_transaction(self.con, "sprint.spec_approval.record"):
+            reviewer = self.con.execute(
+                "SELECT flavor FROM shells WHERE shell_id=? "
+                "AND COALESCE(is_deleted,0)=0",
+                (reviewer_shell_id,),
+            ).fetchone()
+            if reviewer is None or reviewer["flavor"] != "reviewer":
+                raise SprintAuthorityError(
+                    "only an active Review shell may record Sprint QAQC"
+                )
+            document = self.con.execute(
+                "SELECT feature_id,kind,body FROM documents WHERE document_id=?",
+                (document_id,),
+            ).fetchone()
+            if document is None:
+                raise KeyError(f"unknown document: {document_id}")
+            if document["kind"] != "spec" or document["body"] is None:
+                raise SprintInvariantError("Sprint QAQC requires a spec document body")
+            if findings_document_id is not None:
+                findings = self.con.execute(
+                    "SELECT feature_id FROM documents WHERE document_id=?",
+                    (findings_document_id,),
+                ).fetchone()
+                if findings is None:
+                    raise KeyError(f"unknown findings document: {findings_document_id}")
+                if findings["feature_id"] != document["feature_id"]:
+                    raise SprintInvariantError(
+                        "QAQC findings must belong to the reviewed spec feature"
+                    )
+            revision = hashlib.sha256(document["body"].encode()).hexdigest()
+            existing = self.con.execute(
+                "SELECT approval_id,verdict,findings_document_id "
+                "FROM sprint_spec_approvals WHERE document_id=? "
+                "AND revision_sha256=? AND reviewer_shell_id=?",
+                (document_id, revision, reviewer_shell_id),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["verdict"] != verdict
+                    or existing["findings_document_id"] != findings_document_id
+                ):
+                    raise SprintInvariantError(
+                        "QAQC approval already exists with different evidence"
+                    )
+                return SpecApprovalReceipt(
+                    int(existing["approval_id"]), revision, verdict, False
+                )
+            approval_id = int(
+                self.con.execute(
+                    "INSERT INTO sprint_spec_approvals "
+                    "(document_id,revision_sha256,reviewer_shell_id,verdict,"
+                    "findings_document_id) VALUES (?,?,?,?,?)",
+                    (
+                        document_id,
+                        revision,
+                        reviewer_shell_id,
+                        verdict,
+                        findings_document_id,
+                    ),
+                ).lastrowid
+            )
+        return SpecApprovalReceipt(approval_id, revision, verdict, True)
+
+    def for_document(self, document_id: int) -> list[dict]:
+        return [
+            dict(row)
+            for row in self.con.execute(
+                "SELECT a.approval_id,a.document_id,a.revision_sha256,"
+                "a.reviewer_shell_id,s.shortname AS reviewer_shortname,"
+                "a.verdict,a.findings_document_id,a.reviewed_at "
+                "FROM sprint_spec_approvals a JOIN shells s "
+                "ON s.shell_id=a.reviewer_shell_id WHERE a.document_id=? "
+                "ORDER BY a.approval_id",
+                (document_id,),
+            )
+        ]
 
 
 class SprintLifecycleStore:
@@ -1108,10 +1212,13 @@ class SprintLifecycleStore:
             "SELECT COUNT(*) FROM sprint_specs ss "
             "JOIN sprint_spec_approvals a ON a.approval_id=ss.approval_id "
             "JOIN documents d ON d.document_id=ss.document_id "
+            "JOIN shells reviewer ON reviewer.shell_id=a.reviewer_shell_id "
             "WHERE ss.sprint_id=? AND "
             "(a.verdict<>'pass' OR a.document_id<>ss.document_id "
             "OR a.revision_sha256<>ss.bound_revision_sha256 "
-            "OR d.kind<>'spec' OR d.feature_id<>?)",
+            "OR d.kind<>'spec' OR d.feature_id<>? "
+            "OR reviewer.flavor<>'reviewer' "
+            "OR COALESCE(reviewer.is_deleted,0)<>0)",
             (sprint_id, sprint["feature_id"]),
         ).fetchone()[0]
         bound_specs = self.con.execute(
@@ -1254,6 +1361,7 @@ class SprintWorkUnitStore:
         task_ids: Iterable[int],
         planned_wave: int = 0,
         dependency_ids: Iterable[int] = (),
+        output_kind: str = "code",
     ) -> int:
         """Create one planned editing lane from existing governing-spec tasks."""
         title = title.strip()
@@ -1268,6 +1376,8 @@ class SprintWorkUnitStore:
             raise SprintInvariantError("work units require at least one spec task")
         if planned_wave < 0:
             raise ValueError("planned wave must be non-negative")
+        if output_kind not in WORK_UNIT_OUTPUT_KINDS:
+            raise ValueError("work-unit output kind must be code, report_only, or no_code")
 
         with db_driver.write_transaction(self.con, "sprint.work_unit.create"):
             lifecycle, _ = self._require_planner(sprint_id, planner_shell_id)
@@ -1280,7 +1390,7 @@ class SprintWorkUnitStore:
                 self.con.execute(
                     "INSERT INTO sprint_work_units "
                     "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
-                    "expected_output,planned_wave) VALUES (?,?,?,?,?,?)",
+                    "expected_output,planned_wave,output_kind) VALUES (?,?,?,?,?,?,?)",
                     (
                         sprint_id,
                         assigned_shell_id,
@@ -1288,6 +1398,7 @@ class SprintWorkUnitStore:
                         title,
                         expected_output,
                         planned_wave,
+                        output_kind,
                     ),
                 ).lastrowid
             )
@@ -1306,6 +1417,7 @@ class SprintWorkUnitStore:
                     "assigned_shell_id": assigned_shell_id,
                     "reviewer_shell_id": reviewer_shell_id,
                     "planned_wave": planned_wave,
+                    "output_kind": output_kind,
                     "task_ids": list(tasks),
                     "dependency_ids": list(dependencies),
                 },
@@ -1322,6 +1434,7 @@ class SprintWorkUnitStore:
         reviewer_shell_id: int,
         planned_wave: int,
         dependency_ids: Iterable[int],
+        output_kind: str | None = None,
     ) -> bool:
         """Replace the editable plan projection and append its before/after fact."""
         if planned_wave < 0:
@@ -1339,23 +1452,32 @@ class SprintWorkUnitStore:
                 )
             self._require_participant(sprint_id, assigned_shell_id, "developer")
             self._require_participant(sprint_id, reviewer_shell_id, "reviewer")
+            if output_kind is None:
+                output_kind = str(unit["output_kind"])
+            if output_kind not in WORK_UNIT_OUTPUT_KINDS:
+                raise ValueError(
+                    "work-unit output kind must be code, report_only, or no_code"
+                )
             before = self._plan_projection(unit)
             after = {
                 "assigned_shell_id": assigned_shell_id,
                 "reviewer_shell_id": reviewer_shell_id,
                 "planned_wave": planned_wave,
+                "output_kind": output_kind,
                 "dependency_ids": sorted(dependencies),
             }
             if before == after:
                 return False
             self.con.execute(
                 "UPDATE sprint_work_units SET assigned_shell_id=?,"
-                "reviewer_shell_id=?,planned_wave=?,updated_at=datetime('now') "
+                "reviewer_shell_id=?,planned_wave=?,output_kind=?,"
+                "updated_at=datetime('now') "
                 "WHERE work_unit_id=?",
                 (
                     assigned_shell_id,
                     reviewer_shell_id,
                     planned_wave,
+                    output_kind,
                     work_unit_id,
                 ),
             )
@@ -1399,29 +1521,49 @@ class SprintWorkUnitStore:
         sprint_id: int,
         work_unit_id: int,
         shell_id: int,
+        *,
+        result: str,
     ) -> list[int]:
-        """Record Developer completion and release newly unblocked work."""
+        """Record a non-code Developer result and release newly unblocked work."""
+        result = result.strip()
+        if not result:
+            raise ValueError("work-unit completion result is required")
+        if len(result) > 8000:
+            raise ValueError("work-unit completion result exceeds 8000 characters")
         with db_driver.write_transaction(self.con, "sprint.work_unit.complete"):
             unit = self._unit(sprint_id, work_unit_id)
             if int(unit["assigned_shell_id"]) != shell_id:
                 raise SprintAuthorityError("only the assigned Developer owns completion")
             if unit["disposition"] == "completed":
+                if unit["completion_result"] != result:
+                    raise SprintInvariantError(
+                        "work unit was already completed with a different result"
+                    )
                 return []
-            if unit["disposition"] not in EDITING_UNIT_DISPOSITIONS:
+            if unit["output_kind"] not in {"report_only", "no_code"}:
+                raise SprintInvariantError(
+                    "code work units complete only through the merge judgment chain"
+                )
+            if unit["disposition"] != "active":
                 raise SprintInvariantError(
                     f"cannot complete work unit from {unit['disposition']}"
                 )
             self.con.execute(
                 "UPDATE sprint_work_units SET disposition='completed',"
-                "completed_at=datetime('now'),updated_at=datetime('now') "
+                "completion_result=?,completed_at=datetime('now'),"
+                "updated_at=datetime('now') "
                 "WHERE work_unit_id=?",
-                (work_unit_id,),
+                (result, work_unit_id),
             )
             self._event(
                 sprint_id,
                 "work_unit.completed",
                 shell_id,
-                {"work_unit_id": work_unit_id},
+                {
+                    "work_unit_id": work_unit_id,
+                    "output_kind": str(unit["output_kind"]),
+                    "result": result,
+                },
                 actor_kind="participant",
             )
             sprint = self.con.execute(
@@ -1440,6 +1582,45 @@ class SprintWorkUnitStore:
                 sprint_id,
                 planner_participant_id=planner,
             )
+
+    def cancel(
+        self,
+        sprint_id: int,
+        work_unit_id: int,
+        planner_shell_id: int,
+        *,
+        reason: str,
+    ) -> bool:
+        """Cancel one unreleased plan without rewriting completed history."""
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("work-unit cancellation reason is required")
+        if len(reason) > 8000:
+            raise ValueError("work-unit cancellation reason exceeds 8000 characters")
+        with db_driver.write_transaction(self.con, "sprint.work_unit.cancel"):
+            self._require_planner(sprint_id, planner_shell_id)
+            unit = self._unit(sprint_id, work_unit_id)
+            if unit["disposition"] == "cancelled":
+                if unit["completion_result"] != reason:
+                    raise SprintInvariantError(
+                        "work unit was already cancelled with a different reason"
+                    )
+                return False
+            if unit["disposition"] != "planned":
+                raise SprintInvariantError("only planned work units may be cancelled")
+            self.con.execute(
+                "UPDATE sprint_work_units SET disposition='cancelled',"
+                "completion_result=?,completed_at=datetime('now'),"
+                "updated_at=datetime('now') WHERE work_unit_id=?",
+                (reason, work_unit_id),
+            )
+            self._event(
+                sprint_id,
+                "work_unit.cancelled",
+                planner_shell_id,
+                {"work_unit_id": work_unit_id, "reason": reason},
+            )
+        return True
 
     def complete_from_merge_in_transaction(
         self,
@@ -1782,6 +1963,7 @@ class SprintWorkUnitStore:
             "assigned_shell_id": int(unit["assigned_shell_id"]),
             "reviewer_shell_id": int(unit["reviewer_shell_id"]),
             "planned_wave": int(unit["planned_wave"]),
+            "output_kind": str(unit["output_kind"]),
             "dependency_ids": dependencies,
         }
 

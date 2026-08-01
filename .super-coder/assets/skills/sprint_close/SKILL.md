@@ -14,9 +14,11 @@ been chosen. Close-out supplies meaning; the compiler supplies facts.
 
 Before conformance, re-read work units, dependencies, registered PRs, checks,
 merge observations, task membership, pending actionable messages, and active
-native runs. Every planned unit must be completed/cancelled with an explicit
-disposition, and code units must have their real PR outcome. Do not infer task
-completion from PR state alone.
+native runs. Normally every planned unit is completed/cancelled with an
+explicit disposition, and code units have their real PR outcome. Close-out is
+advisory: the packet surfaces gaps but never prevents the owning Planner or FnB
+from making and reporting a completion judgment. Do not infer code completion
+from PR state alone.
 
 Boot an independent Reviewer into `sprint_rev` conformance mode with the bound
 spec revision hashes, integrated main SHA, and ratified judgment list. Do not
@@ -33,6 +35,16 @@ evidence rather than a silently reopened editing lane.
 
 Verify report id, follow-up ids, author identity, and idempotent replay before
 synthesis.
+
+FnB records one terminal disposition per follow-up. `accepted` acknowledges
+ship-as-is; `resolved` and `dismissed` require a resolution file.
+
+```text
+sc sprint disposition-followup --sprint <id> --followup <id> \
+  --disposition accepted
+sc sprint disposition-followup --sprint <id> --followup <id> \
+  --disposition resolved --resolution-file <path>
+```
 
 ## Compile bounded evidence
 
@@ -93,14 +105,16 @@ nothing.
 
 ## Terminal handoff
 
-Commit the final or abort report before the lifecycle transition. Complete only
-after conformance evidence and synthesis are durable; abort only under Planner
-or FnB authority. Terminal state stops Sprint services and removes live pills
-while retaining conversations, messages, events, PR evidence, reports, and
-follow-ups.
+Pass the final synthesis to `complete`; the surface commits the append-only
+`final` report before attempting the lifecycle transition. Omitting the report
+is permitted under advisory close-out, but the evidence packet records the gap.
+Abort only under Planner or FnB authority. Terminal state stops Sprint services
+and removes live pills while retaining conversations, messages, events, PR
+evidence, reports, and follow-ups.
 
 ```text
-sc sprint complete --sprint <id> --reason <summary> --outcome <outcome>
+sc sprint complete --sprint <id> --reason <summary> --outcome <outcome> \
+  --report-file <path> --key <stable-key>
 sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
 ```
 

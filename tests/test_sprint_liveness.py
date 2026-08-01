@@ -130,8 +130,9 @@ class SprintLivenessCase(unittest.TestCase):
         self.unit_id = int(
             self.con.execute(
                 "INSERT INTO sprint_work_units "
-                "(sprint_id,assigned_shell_id,reviewer_shell_id,title,expected_output) "
-                "VALUES (?,1,2,'Unit','Ship it')",
+                "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+                "expected_output,output_kind) "
+                "VALUES (?,1,2,'Unit','Ship it','no_code')",
                 (self.sprint_id,),
             ).lastrowid
         )
@@ -652,7 +653,10 @@ class DeliveryAndActivationTest(SprintLivenessCase):
 
     def test_terminal_work_unit_resolves_assignment_expectation(self) -> None:
         sprint_domain.SprintWorkUnitStore(self.con).complete(
-            self.sprint_id, self.unit_id, 1
+            self.sprint_id,
+            self.unit_id,
+            1,
+            result="Liveness fixture completed without code",
         )
         expectation = self.expectation()
         self.assertIsNotNone(expectation["resolved_at"])
