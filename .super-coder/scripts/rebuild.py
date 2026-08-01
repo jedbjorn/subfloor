@@ -254,15 +254,26 @@ def main(argv: list[str]) -> int:
             print(f"rebuild: no {SNAPSHOT.relative_to(REPO_ROOT)} — built empty "
                   "(no per-instance content).")
 
-        # The migrations above seeded every engine skill live (is_deleted=0) —
-        # re-assert the fork retire list so a rebuilt DB doesn't resurrect skills
-        # this fork has retired (a shell created before the next launch/update
-        # would otherwise be granted them).
+        # A downstream snapshot may predate the tombstone registry and reinsert
+        # retired rows after the cleanup migration was stamped. Validate the
+        # authored namespace, then reconcile the loaded candidate before any
+        # retire-list, key, FK, or publication step.
         con = db_driver.connect(candidate)
         try:
+            seed_skills.validate_upstream_skill_namespace(
+                seed_skills.seeded_skill_names(),
+                allow_legacy_seed_overlap=True,
+            )
+            reconciled = seed_skills.reconcile_tombstoned_skills(con)
             flipped = seed_skills.apply_retired(con)
         finally:
             con.close()
+        if reconciled.changed_names:
+            print(
+                "rebuild: tombstoned skills removed "
+                f"({', '.join(reconciled.changed_names)}; "
+                f"{reconciled.grant_count} grant(s))"
+            )
         if flipped:
             print(f"rebuild: fork retire list applied ({', '.join(flipped)})")
 
