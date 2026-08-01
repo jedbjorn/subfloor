@@ -18,6 +18,9 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 ACCEPTANCE = ROOT / "tests" / "fixtures" / "sprint_v2_acceptance.json"
+HANDOFF_ACCEPTANCE = (
+    ROOT / "tests" / "fixtures" / "sprint_handoff_hardening_acceptance.json"
+)
 sys.path[:0] = [
     str(ENGINE / "scripts"),
     str(ENGINE / "api"),
@@ -288,6 +291,50 @@ class SprintLiveProof(unittest.TestCase):
             pulse_seconds=1,
         )
         self.assertTrue(runtime.pulse_once())
+
+    def deliver_terminal_turn(self, wake_id: int) -> tuple[str, str]:
+        """Deliver one wake into a native turn that has already terminated."""
+        captured: list[tuple[str, str]] = []
+
+        def deliver(conversation_id: str, prompt: str, key: str) -> str:
+            captured.append((conversation_id, prompt))
+            message_id = int(
+                self.con.execute(
+                    "INSERT INTO conversation_messages "
+                    "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                    "idempotency_key,request_hash,state,completed_at) "
+                    "VALUES (?,'engine','live-proof','prompt',?,?,?,'completed',"
+                    "'2026-08-01 00:00:01')",
+                    (conversation_id, prompt, key, key),
+                ).lastrowid
+            )
+            run_id = int(
+                self.con.execute(
+                    "INSERT INTO conversation_runs "
+                    "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                    "lease_expires_at,started_at,ended_at,exit_code) "
+                    "SELECT ?,shell_id,?,'succeeded','live-proof',"
+                    "'2026-08-01 00:00:01','2026-08-01 00:00:00',"
+                    "'2026-08-01 00:00:01',0 FROM conversations "
+                    "WHERE conversation_id=?",
+                    (conversation_id, message_id, conversation_id),
+                ).lastrowid
+            )
+            for state in ("queued", "running", "waiting"):
+                self.con.execute(
+                    "UPDATE conversations SET state=? WHERE conversation_id=?",
+                    (state, conversation_id),
+                )
+            self.con.commit()
+            return f"conversation-run:{run_id}"
+
+        outcome = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con
+        ).deliver_once(f"live-proof-terminal:{wake_id}", deliver)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(wake_id, outcome.wake_id)
+        self.assertEqual("delivered", outcome.state)
+        return captured[0]
 
     def assignment_message(self, unit_id: int) -> int:
         row = self.con.execute(
@@ -673,6 +720,282 @@ class SprintLiveProof(unittest.TestCase):
                 )
             ],
         )
+
+    def test_relay_review_and_terminal_pickup_recovery_form_one_durable_chain(
+        self,
+    ) -> None:
+        sprint_id, _document_id, units = self.prepare(((1, 2, ()),))
+        self.run_cli(3, "arm", "--sprint", str(sprint_id))
+        self.deliver_browser_turns()
+        self.run_cli(
+            1,
+            "accept",
+            "--sprint",
+            str(sprint_id),
+            "--message",
+            str(self.assignment_message(units[0])),
+        )
+
+        planner_conversation = str(
+            self.con.execute(
+                "SELECT current_conversation_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=3",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        question_prefix = "Which downstream compatibility fixture owns the proof? "
+        question = question_prefix + "q" * (6000 - len(question_prefix))
+        question_receipt = self.run_cli(
+            1,
+            "send",
+            "--sprint",
+            str(sprint_id),
+            "--to",
+            "PLN1",
+            "--body-file",
+            self.write_input(question),
+        )
+        self.assertTrue(question_receipt["message_created"])
+        self.assertEqual("pending", question_receipt["wake_state"])
+        self.assertEqual(planner_conversation, question_receipt["conversation_id"])
+        self.assertEqual(
+            (1, 3, 6000, question),
+            tuple(
+                self.con.execute(
+                    "SELECT sender.shell_id,recipient.shell_id,length(m.body),m.body "
+                    "FROM sprint_messages m "
+                    "JOIN sprint_participants sender "
+                    "ON sender.participant_id=m.from_participant_id "
+                    "JOIN sprint_participants recipient "
+                    "ON recipient.participant_id=m.to_participant_id "
+                    "WHERE m.message_id=?",
+                    (question_receipt["message_id"],),
+                ).fetchone()
+            ),
+        )
+        self.deliver_browser_turns()
+        self.assertEqual(
+            sprint_message_delivery.wake_prompt(sprint_id, "planner"),
+            self.con.execute(
+                "SELECT cm.body FROM sprint_wake_outbox w "
+                "JOIN conversation_messages cm "
+                "ON cm.idempotency_key=w.idempotency_key WHERE w.wake_id=?",
+                (question_receipt["wake_id"],),
+            ).fetchone()[0],
+        )
+        self.run_cli(
+            3,
+            "accept",
+            "--sprint",
+            str(sprint_id),
+            "--message",
+            str(question_receipt["message_id"]),
+        )
+
+        answer_receipt = self.run_cli(
+            3,
+            "send",
+            "--sprint",
+            str(sprint_id),
+            "--to",
+            "DEV1",
+            "--body-file",
+            self.write_input(
+                "Use the legacy update fixture with its pre-existing linked worktree."
+            ),
+        )
+        self.deliver_browser_turns()
+        self.run_cli(
+            1,
+            "accept",
+            "--sprint",
+            str(sprint_id),
+            "--message",
+            str(answer_receipt["message_id"]),
+        )
+
+        self.github.set(6801, "OPEN")
+        registration = self.run_cli(
+            1,
+            "register-pr",
+            "--sprint",
+            str(sprint_id),
+            "--repository",
+            "acme/live-proof",
+            "--pr",
+            "6801",
+            "--work-unit",
+            str(units[0]),
+        )
+        reviewer_old = str(
+            self.con.execute(
+                "SELECT current_conversation_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=2",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+            "WHERE conversation_id=?",
+            (reviewer_old,),
+        )
+        self.con.commit()
+        review_request = self.run_cli(
+            1,
+            "request-review",
+            "--sprint",
+            str(sprint_id),
+            "--registered-pr",
+            str(registration["registered_pr_id"]),
+            "--readiness-file",
+            self.write_input("The downstream handoff proof is green and ready."),
+            "--key",
+            "proof:68:dev-to-review",
+        )
+        reviewer_new = str(
+            self.con.execute(
+                "SELECT current_conversation_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=2",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertNotEqual(reviewer_old, reviewer_new)
+        self.assertEqual(
+            ("fallback", reviewer_old),
+            tuple(
+                self.con.execute(
+                    "SELECT purpose,parent_conversation_id "
+                    "FROM sprint_participant_conversations "
+                    "WHERE conversation_id=?",
+                    (reviewer_new,),
+                ).fetchone()
+            ),
+        )
+        self.deliver_browser_turns()
+        self.run_cli(
+            2,
+            "accept",
+            "--sprint",
+            str(sprint_id),
+            "--message",
+            str(review_request["message_id"]),
+        )
+
+        outcome = self.run_cli(
+            2,
+            "record-review",
+            "--sprint",
+            str(sprint_id),
+            "--registered-pr",
+            str(registration["registered_pr_id"]),
+            "--verdict",
+            "changes_requested",
+            "--body-file",
+            self.write_input("Retain the terminal-turn recovery evidence."),
+            "--key",
+            "proof:68:review-to-dev",
+        )
+        terminal_conversation, terminal_prompt = self.deliver_terminal_turn(
+            outcome["wake_id"]
+        )
+        self.assertEqual(outcome["conversation_id"], terminal_conversation)
+        self.assertEqual(
+            sprint_message_delivery.wake_prompt(sprint_id, "developer"),
+            terminal_prompt,
+        )
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT read_at FROM sprint_messages WHERE message_id=?",
+                (outcome["message_id"],),
+            ).fetchone()[0]
+        )
+        prior_pickup_turns = [
+            int(row[0])
+            for row in self.con.execute(
+                "SELECT m.message_id FROM conversation_messages m "
+                "JOIN sprint_participant_conversations pc "
+                "ON pc.conversation_id=m.conversation_id "
+                "JOIN sprint_participants p "
+                "ON p.participant_id=pc.sprint_participant_id "
+                "WHERE p.sprint_id=? AND p.shell_id=1 AND m.state='queued'",
+                (sprint_id,),
+            )
+        ]
+        for message_id in prior_pickup_turns:
+            self.con.execute(
+                "UPDATE conversation_messages SET state='running' WHERE message_id=?",
+                (message_id,),
+            )
+            self.con.execute(
+                "UPDATE conversation_messages SET state='completed',"
+                "completed_at=datetime('now') WHERE message_id=?",
+                (message_id,),
+            )
+        self.con.commit()
+
+        self.run_cli(
+            1,
+            "pause",
+            "--sprint",
+            str(sprint_id),
+            "--reason",
+            "Prove delivered-unread pickup recovery",
+        )
+        resumed = self.run_cli(
+            3,
+            "resume",
+            "--sprint",
+            str(sprint_id),
+            "--reason",
+            "Restore the Developer correction handoff",
+        )
+        self.assertEqual(1, len(resumed["requeued_wake_ids"]))
+        replacement = resumed["requeued_wake_ids"][0]
+        self.assertNotEqual(outcome["wake_id"], replacement)
+        self.deliver_browser_turns()
+        self.run_cli(
+            1,
+            "accept",
+            "--sprint",
+            str(sprint_id),
+            "--message",
+            str(outcome["message_id"]),
+        )
+        evidence = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='wake.requeued' ORDER BY event_id DESC LIMIT 1",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual("delivered", evidence["prior_wake_state"])
+        self.assertEqual("completed", evidence["prior_turn_state"]["message_state"])
+        self.assertEqual("succeeded", evidence["prior_turn_state"]["run_state"])
+        self.assertEqual(outcome["wake_id"], evidence["prior_wake_id"])
+        self.assertEqual(replacement, evidence["replacement_wake_id"])
+        self.assertEqual(
+            ("fixing", "armed", "delivered"),
+            tuple(
+                self.con.execute(
+                    "SELECT u.disposition,s.lifecycle,w.state "
+                    "FROM sprint_work_units u JOIN sprints s USING (sprint_id) "
+                    "JOIN sprint_wake_outbox w ON w.wake_id=? "
+                    "WHERE u.work_unit_id=?",
+                    (replacement, units[0]),
+                ).fetchone()
+            ),
+        )
+
+    def test_handoff_hardening_manifest_references_compositional_proof(self) -> None:
+        manifest = json.loads(HANDOFF_ACCEPTANCE.read_text())
+        self.assertEqual(68, manifest["spec_document_id"])
+        self.assertEqual(6, len(manifest["gates"]))
+        identities = {(entry["file"], entry["test"]) for entry in manifest["gates"]}
+        self.assertEqual(len(manifest["gates"]), len(identities))
+        for entry in manifest["gates"]:
+            with self.subTest(gate=entry["gate"]):
+                source = ROOT.joinpath(entry["file"]).read_text()
+                self.assertIn(f"def {entry['test']}", source)
 
     def test_adversarial_acceptance_manifest_references_real_gates(self) -> None:
         manifest = json.loads(ACCEPTANCE.read_text())
