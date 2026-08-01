@@ -74,14 +74,77 @@ def _participant(con, participant_id: int):
     row = con.execute(
         "SELECT p.participant_id,p.sprint_id,p.shell_id,"
         "p.persistent_conversation_id,p.current_conversation_id,"
-        "s.shortname,s.flavor FROM sprint_participants p "
-        "JOIN shells s ON s.shell_id=p.shell_id "
+        "s.conversation_generation,sh.shortname,sh.flavor "
+        "FROM sprint_participants p "
+        "JOIN sprints s ON s.sprint_id=p.sprint_id "
+        "JOIN shells sh ON sh.shell_id=p.shell_id "
         "WHERE p.participant_id=?",
         (participant_id,),
     ).fetchone()
     if row is None:
         raise SprintConversationError("Sprint participant does not exist")
     return row
+
+
+def _scoped_idempotency_key(participant, purpose: str, operation_key: str) -> str:
+    generation = _nonblank(
+        participant["conversation_generation"],
+        "Sprint conversation generation",
+        maximum=32,
+    )
+    digest = hashlib.sha256(operation_key.encode()).hexdigest()
+    return (
+        f"sprint-generation:{generation}:participant:"
+        f"{participant['participant_id']}:{purpose}:{digest}"
+    )
+
+
+def _reroute_operation_key(operation_key: str, index: int) -> str:
+    if index == 0:
+        return operation_key
+    digest = hashlib.sha256(operation_key.encode()).hexdigest()
+    return f"reroute:{index}:{digest}"
+
+
+def conversation_idempotency_key(
+    con,
+    participant_id: int,
+    purpose: str,
+    operation_key: str,
+) -> str:
+    """Return the generation-stable global key for one participant operation."""
+    if purpose not in _PURPOSES:
+        raise SprintConversationError(f"unsupported conversation purpose: {purpose}")
+    operation_key = _nonblank(
+        operation_key, "idempotency_key", maximum=255
+    )
+    return _scoped_idempotency_key(
+        _participant(con, participant_id), purpose, operation_key
+    )
+
+
+def linked_conversation_for_key(
+    con,
+    participant_id: int,
+    purpose: str,
+    operation_key: str,
+) -> str | None:
+    """Find a new scoped key or one legacy raw key linked to this participant."""
+    operation_key = _nonblank(
+        operation_key, "idempotency_key", maximum=255
+    )
+    scoped_key = conversation_idempotency_key(
+        con, participant_id, purpose, operation_key
+    )
+    row = con.execute(
+        "SELECT c.conversation_id FROM sprint_participant_conversations link "
+        "JOIN conversations c ON c.conversation_id=link.conversation_id "
+        "WHERE link.sprint_participant_id=? AND link.purpose=? "
+        "AND c.creation_idempotency_key IN (?,?) "
+        "ORDER BY c.creation_idempotency_key=? DESC LIMIT 1",
+        (participant_id, purpose, scoped_key, operation_key, scoped_key),
+    ).fetchone()
+    return None if row is None else str(row["conversation_id"])
 
 
 def _linked_to_participant(con, participant_id: int, conversation_id: str) -> bool:
@@ -306,8 +369,11 @@ def create_and_select(
     harness = _nonblank(harness, "harness", maximum=64)
     worktree = _nonblank(worktree, "worktree", maximum=4096)
     title = _nonblank(title, "title", maximum=200)
-    idempotency_key = _nonblank(idempotency_key, "idempotency_key", maximum=255)
+    operation_key = _nonblank(idempotency_key, "idempotency_key", maximum=255)
     participant = _participant(con, participant_id)
+    idempotency_key = _scoped_idempotency_key(
+        participant, purpose, operation_key
+    )
 
     if parent_conversation_id and not _linked_to_participant(
         con, participant_id, parent_conversation_id
@@ -327,7 +393,10 @@ def create_and_select(
                 "WHERE conversation_id=?",
                 (existing_work["conversation_id"],),
             ).fetchone()
-            if existing["creation_idempotency_key"] != idempotency_key:
+            if existing["creation_idempotency_key"] not in {
+                idempotency_key,
+                operation_key,
+            }:
                 raise SprintConversationError(
                     "the participant already has a persistent work conversation"
                 )
@@ -353,6 +422,16 @@ def create_and_select(
         "WHERE owner_user_id=? AND creation_idempotency_key=?",
         (owner_user_id, idempotency_key),
     ).fetchone()
+    if existing is None:
+        legacy = con.execute(
+            "SELECT conversation_id,creation_request_hash FROM conversations "
+            "WHERE owner_user_id=? AND creation_idempotency_key=?",
+            (owner_user_id, operation_key),
+        ).fetchone()
+        if legacy is not None and _linked_to_participant(
+            con, participant_id, legacy["conversation_id"]
+        ):
+            existing = legacy
     if existing is not None:
         if existing["creation_request_hash"] != request_hash:
             raise SprintConversationError(
@@ -485,13 +564,33 @@ def ensure_wake_conversation(
             parent_id = str(candidate)
             break
     purpose = "fallback" if parent_id is not None else "work"
-    prior_routes = con.execute(
-        "SELECT conversation_id,state,creation_idempotency_key "
-        "FROM conversations WHERE owner_user_id=? "
-        "AND (creation_idempotency_key=? "
-        "OR creation_idempotency_key LIKE ?) ORDER BY rowid",
-        (row["user_id"], idempotency_key, f"{idempotency_key}:reroute:%"),
+    linked_routes = con.execute(
+        "SELECT c.conversation_id,c.state,c.creation_idempotency_key "
+        "FROM sprint_participant_conversations link "
+        "JOIN conversations c ON c.conversation_id=link.conversation_id "
+        "WHERE link.sprint_participant_id=? AND link.purpose=? "
+        "AND c.owner_user_id=? ORDER BY c.rowid",
+        (participant_id, purpose, row["user_id"]),
     ).fetchall()
+    routes_by_key = {
+        str(route["creation_idempotency_key"]): route for route in linked_routes
+    }
+    prior_routes = []
+    route_indices = []
+    for index in range(len(linked_routes) + 2):
+        operation_key = _reroute_operation_key(idempotency_key, index)
+        scoped_key = conversation_idempotency_key(
+            con, participant_id, purpose, operation_key
+        )
+        legacy_key = (
+            idempotency_key
+            if index == 0
+            else f"{idempotency_key}:reroute:{index}"
+        )
+        prior = routes_by_key.get(scoped_key) or routes_by_key.get(legacy_key)
+        if prior is not None:
+            prior_routes.append(prior)
+            route_indices.append(index)
     for prior in reversed(prior_routes):
         if (
             prior["state"] in _USABLE_WAKE_STATES
@@ -503,10 +602,9 @@ def ensure_wake_conversation(
                 (prior["conversation_id"], participant_id),
             )
             return WakeConversationRoute(str(prior["conversation_id"]), False)
-    route_key = (
-        idempotency_key
-        if not prior_routes
-        else f"{idempotency_key}:reroute:{len(prior_routes)}"
+    route_key = _reroute_operation_key(
+        idempotency_key,
+        0 if not route_indices else max(route_indices) + 1,
     )
     worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
     conversation_id = create_and_select(

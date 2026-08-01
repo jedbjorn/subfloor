@@ -40,6 +40,7 @@ def substrate():
           sprint_id INTEGER PRIMARY KEY,
           feature_id INTEGER NOT NULL REFERENCES roadmap(feature_id),
           originating_planner_shell_id INTEGER NOT NULL REFERENCES shells(shell_id),
+          conversation_generation TEXT NOT NULL,
           lifecycle TEXT NOT NULL,
           paused_at TEXT
         );
@@ -112,8 +113,9 @@ def substrate():
         INSERT INTO shells VALUES
           (10,'DEV1','dev',1),(20,'REV1','reviewer',1),(30,'PLN1','planner',1);
         INSERT INTO sprints
-          (sprint_id,feature_id,originating_planner_shell_id,lifecycle)
-          VALUES (7,31,30,'armed');
+          (sprint_id,feature_id,originating_planner_shell_id,
+           conversation_generation,lifecycle)
+          VALUES (7,31,30,'0123456789abcdef0123456789abcdef','armed');
         INSERT INTO sprint_specs VALUES (7,46,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
         INSERT INTO sprint_participants
           (participant_id,sprint_id,shell_id,role,harness,model,effort,disposition)
@@ -220,6 +222,101 @@ def test_replay_is_idempotent_and_conflicting_reuse_changes_nothing() -> None:
             == work
         )
         assert con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 1
+
+
+def test_every_purpose_ignores_orphan_legacy_keys_and_replays_scoped_key() -> None:
+    operations = {
+        "work": "s7:p101:work",
+        "fix": "review:55:fix:conversation",
+        "merge": "review:56:merge:conversation",
+        "fallback": "s7:p101:fallback:quota-1",
+    }
+    with substrate() as con:
+        con.executemany(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,worktree,state,title,"
+            "creation_idempotency_key,creation_request_hash,conversation_scope) "
+            "VALUES (?,?,1,'codex','/historical','closed','Orphan',?,"
+            "'historical-request','sprint')",
+            (
+                (f"cv_orphan_{purpose}", 10, key)
+                for purpose, key in operations.items()
+            ),
+        )
+        work = create(con, 101, "work", operations["work"])
+        created = {"work": work}
+        for purpose in ("fix", "merge", "fallback"):
+            changes = {"parent_conversation_id": work}
+            if purpose == "fallback":
+                changes["context_packet"] = {"reason": "route exhausted"}
+            created[purpose] = create(
+                con, 101, purpose, operations[purpose], **changes
+            )
+            assert (
+                create(con, 101, purpose, operations[purpose], **changes)
+                == created[purpose]
+            )
+
+        assert len(set(created.values())) == 4
+        keys = {
+            row["purpose"]: row["creation_idempotency_key"]
+            for row in con.execute(
+                "SELECT link.purpose,c.creation_idempotency_key "
+                "FROM sprint_participant_conversations link "
+                "JOIN conversations c ON c.conversation_id=link.conversation_id"
+            )
+        }
+        for purpose, operation_key in operations.items():
+            assert keys[purpose] == sprint_participant_chats.conversation_idempotency_key(
+                con, 101, purpose, operation_key
+            )
+            assert keys[purpose] != operation_key
+            assert len(keys[purpose]) <= 255
+        assert con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 8
+
+
+def test_wake_reroutes_use_bounded_scoped_keys_and_replay_latest_route() -> None:
+    with substrate() as con:
+        work = create(con, 101, "work", "s7:p101:work")
+        con.execute(
+            "UPDATE conversations SET state='closed' WHERE conversation_id=?",
+            (work,),
+        )
+        maximum_key = "k" * 255
+        first = sprint_participant_chats.ensure_wake_conversation(
+            con, 101, idempotency_key=maximum_key
+        )
+        assert first.created
+        con.execute(
+            "UPDATE conversations SET state='closed' WHERE conversation_id=?",
+            (first.conversation_id,),
+        )
+        second = sprint_participant_chats.ensure_wake_conversation(
+            con, 101, idempotency_key=maximum_key
+        )
+        assert second.created
+        assert second.conversation_id != first.conversation_id
+
+        replay = sprint_participant_chats.ensure_wake_conversation(
+            con, 101, idempotency_key=maximum_key
+        )
+        assert replay == sprint_participant_chats.WakeConversationRoute(
+            second.conversation_id, False
+        )
+        keys = [
+            row[0]
+            for row in con.execute(
+                "SELECT c.creation_idempotency_key "
+                "FROM sprint_participant_conversations link "
+                "JOIN conversations c ON c.conversation_id=link.conversation_id "
+                "WHERE link.sprint_participant_id=101 AND link.purpose='fallback' "
+                "ORDER BY link.participant_conversation_id"
+            )
+        ]
+        assert len(keys) == 2
+        assert len(set(keys)) == 2
+        assert all(key.startswith("sprint-generation:") for key in keys)
+        assert all(len(key) <= 255 for key in keys)
 
 
 def test_caller_transaction_rolls_back_every_row_when_pointer_selection_fails() -> None:

@@ -167,7 +167,11 @@ class SprintReviewLoopStore:
                 raise SprintInvariantError("active review outcome has no wake")
             conversation_key = f"{idempotency_key}:conversation"
             if not receipt.created:
-                conversation_id = self._conversation_for_key(conversation_key)
+                conversation_id = self._conversation_for_key(
+                    int(lane["developer_participant_id"]),
+                    purpose,
+                    conversation_key,
+                )
                 outcome = self._outcome_receipt(
                     lane, conversation_id, receipt, disposition
                 )
@@ -420,15 +424,15 @@ class SprintReviewLoopStore:
         ).fetchone()
         return json.loads(row["payload"]).get("head_sha") if row is not None else None
 
-    def _conversation_for_key(self, key: str) -> str:
-        row = self.con.execute(
-            "SELECT conversation_id FROM conversations "
-            "WHERE creation_idempotency_key=?",
-            (key,),
-        ).fetchone()
-        if row is None:
+    def _conversation_for_key(
+        self, participant_id: int, purpose: str, key: str
+    ) -> str:
+        conversation_id = sprint_participant_chats.linked_conversation_for_key(
+            self.con, participant_id, purpose, key
+        )
+        if conversation_id is None:
             raise SprintInvariantError("review outcome replay lost its conversation")
-        return str(row["conversation_id"])
+        return conversation_id
 
     @staticmethod
     def _require_live_green(identity: sqlite3.Row, live: PullRequest) -> None:

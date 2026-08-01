@@ -507,15 +507,15 @@ class PlannerEscalationRouter:
         incident_source = primary.key or primary.provider or "unknown"
         incident = hashlib.sha256(incident_source.encode()).hexdigest()[:16]
         fallback_key = f"sprint:{sprint_id}:liveness:planner-fallback:{incident}"
-        existing = self.con.execute(
-            "SELECT c.conversation_id,c.harness "
-            "FROM sprint_participant_conversations link "
-            "JOIN conversations c ON c.conversation_id=link.conversation_id "
-            "WHERE link.sprint_participant_id=? AND link.purpose='fallback' "
-            "AND c.creation_idempotency_key=?",
-            (participant_id, fallback_key),
-        ).fetchone()
-        if existing is not None:
+        existing_id = sprint_participant_chats.linked_conversation_for_key(
+            self.con, participant_id, "fallback", fallback_key
+        )
+        if existing_id is not None:
+            existing = self.con.execute(
+                "SELECT conversation_id,harness FROM conversations "
+                "WHERE conversation_id=?",
+                (existing_id,),
+            ).fetchone()
             self.con.execute(
                 "UPDATE sprint_participants SET current_conversation_id=? "
                 "WHERE participant_id=?",
