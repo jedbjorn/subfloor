@@ -79,10 +79,6 @@ PROJECT_VS_ENGINE_SOURCE = (
     "4. **The live DB is the one you are migrating.** Back it up before applying\n"
     "   anything, and name the DB path explicitly rather than trusting whichever\n"
     "   one the dispatcher resolves.\n"
-    "\n"
-    "Procedure for the heavier moves — three-artifact engine-skill commits,\n"
-    "migrating the live DB, reconcile-vs-restart sequencing — is the\n"
-    "`engine_surgery` skill."
 )
 # The repo catalogue (dr_*) lives in its OWN db, separate from shell_db.db.
 MAP_DB_PATH = ENGINE.parent / ".sc-state" / "map.db"

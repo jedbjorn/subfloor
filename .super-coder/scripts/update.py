@@ -924,9 +924,7 @@ def sync_skills() -> None:
         print("  (no skills seed to sync)")
         return
     seed_skills.validate_upstream_skill_namespace(
-        seed_skills.seeded_skill_names(),
-        allow_legacy_seed_overlap=True,
-    )
+        seed_skills.seeded_skill_names())
     con = db_driver.connect(DB_PATH)
     try:
         con.executescript(seed.read_text())

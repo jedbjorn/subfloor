@@ -22,17 +22,17 @@ import shell_factory as sf  # noqa: E402
 
 TPL = {"flavor": "dev", "abbr": "DEV", "role": "Dev shell",
        "mandate": "Build in {{repo}}.",
-       "skills": ["docs", "git", "test_authoring", "test_authoring_pg"]}
+       "skills": ["docs", "git", "test_authoring", "query_authoring_pg"]}
 
 
 class ApplyOverlayTest(unittest.TestCase):
     def test_legacy_skill_keys_are_ignored(self):
         out = sf._apply_overlay(TPL, {
             "skills_add": ["test_authoring_dosarch"],
-            "skills_remove": ["test_authoring", "test_authoring_pg"]})
+            "skills_remove": ["test_authoring", "query_authoring_pg"]})
         self.assertEqual(out["skills"], TPL["skills"])
         self.assertEqual(TPL["skills"],
-                         ["docs", "git", "test_authoring", "test_authoring_pg"],
+                         ["docs", "git", "test_authoring", "query_authoring_pg"],
                          "overlay must not mutate the input template")
 
     def test_scalar_override_but_never_flavor(self):
@@ -68,7 +68,7 @@ class OverlayFileTest(unittest.TestCase):
     def test_load_flavor_ignores_legacy_skill_overlay(self):
         (self.overlays / "dev.json").write_text(json.dumps(
             {"skills_add": ["test_authoring_dosarch"],
-             "skills_remove": ["test_authoring", "test_authoring_pg"]}))
+             "skills_remove": ["test_authoring", "query_authoring_pg"]}))
         got = sf.load_flavor("dev")["skills"]
         self.assertEqual(got, TPL["skills"])
 

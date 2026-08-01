@@ -261,9 +261,7 @@ def main(argv: list[str]) -> int:
         con = db_driver.connect(candidate)
         try:
             seed_skills.validate_upstream_skill_namespace(
-                seed_skills.seeded_skill_names(),
-                allow_legacy_seed_overlap=True,
-            )
+                seed_skills.seeded_skill_names())
             reconciled = seed_skills.reconcile_tombstoned_skills(con)
             flipped = seed_skills.apply_retired(con)
         finally:

@@ -101,6 +101,18 @@ class RegistryTest(unittest.TestCase):
             ["retired_name"],
         )
 
+    def test_active_seed_and_assets_exclude_every_tombstone(self):
+        seeded = set(seed_skills.seeded_skill_names())
+        assets = {spec["name"] for spec in seed_skills.engine_skill_specs()}
+        for name in TOMBSTONES:
+            with self.subTest(name=name):
+                self.assertNotIn(name, seeded)
+                self.assertNotIn(name, assets)
+        self.assertEqual(
+            seed_skills.validate_upstream_skill_namespace(sorted(seeded)),
+            TOMBSTONES,
+        )
+
 
 class ReconciliationTest(unittest.TestCase):
     def setUp(self):
@@ -254,7 +266,7 @@ class ReservedAssetTest(unittest.TestCase):
             seed_skills._fork_mode = saved_fork_mode
         self.assertEqual(seed_skills.OUT.read_text(), before)
 
-    def test_legacy_tolerance_dies_when_regenerated_seed_drops_overlap(self):
+    def test_legacy_seed_membership_does_not_tolerate_reserved_asset(self):
         seed_skills.TOMBSTONES_FILE.write_text('["engine_surgery"]\n')
         seed_skills.OUT.write_text(
             "INSERT INTO skills (name) VALUES ('engine_surgery') "
@@ -268,15 +280,6 @@ class ReservedAssetTest(unittest.TestCase):
             "common": 0,
             "content": "legacy upstream body",
         }
-        # The temporary tolerance permits the still-authored upstream asset to
-        # pass validation, but the live reconciler never restores its authority.
-        self.assertEqual(seed_skills.sync_engine_skills(self.con, specs=[spec]), [])
-        self.assertEqual(self.con.execute("SELECT * FROM skills").fetchall(), [])
-
-        seed_skills.OUT.write_text(
-            "INSERT INTO skills (name) VALUES ('active_name') "
-            "ON CONFLICT(name) DO NOTHING;\n"
-        )
         with self.assertRaisesRegex(ValueError, "engine_surgery"):
             seed_skills.sync_engine_skills(self.con, specs=[spec])
         self.assertEqual(self.con.execute("SELECT * FROM skills").fetchall(), [])

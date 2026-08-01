@@ -7,10 +7,10 @@ common: false
 
 # query_authoring_pg — diagnostic SQL against the app's Postgres
 
-The pg kit's query half: `dev_kit` = the sidecar, `test_authoring_pg` = the
-test infra, this = ad-hoc SQL against the fork's app DB. Use when diagnosing
-data issues, verifying a migration's effect, or checking an invariant by
-query.
+The PG feature provides the Postgres sidecar through `dev_kit` and this
+diagnostic-SQL procedure. Test fixtures and database setup remain owned by the
+downstream repository. Use this skill when diagnosing data issues, verifying a
+migration's effect, or checking an invariant by query.
 
 ## Know which DB you're pointed at
 
