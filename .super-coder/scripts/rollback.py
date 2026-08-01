@@ -8,7 +8,8 @@ restores both:
 
     1. back up the CURRENT (post-bad-update) DB first — so rollback is itself
        reversible; you can never lose state by rolling back.
-    2. restore the DB from the most recent shell_db.prerebuild.<ts>.db.
+    2. restore the DB from the most recent shell_db.preupdate.<ts>.db
+       (falling back to legacy prerebuild restore points).
     3. re-materialize the engine at .sc-state/engine.ref.prev; restore engine.ref.
     4. clear the -wal/-shm sidecars (the restored .db is a complete snapshot).
 
@@ -38,11 +39,11 @@ ENGINE_REF = STATE_DIR / "engine.ref"
 ENGINE_REF_PREV = STATE_DIR / "engine.ref.prev"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
-import db_backup as db_backup_mod  # noqa: E402
 import callable_floor  # noqa: E402
+import db_backup as db_backup_mod  # noqa: E402
 import engine_manifest  # noqa: E402
 import rebuild as rebuild_mod  # noqa: E402  (BACKUP_DIR, backup_db, prune_backups, KEEP_BACKUPS)
-import update as update_mod    # noqa: E402  (materialize_engine, super_coder_remote, git)
+import update as update_mod  # noqa: E402  (materialize_engine, super_coder_remote, git)
 
 # Compatibility alias for callers that inspect the preferred location. Runtime
 # reads/writes use rebuild_mod.backup_dir() so restricted seats share the same
@@ -51,9 +52,10 @@ BACKUP_DIR = rebuild_mod.BACKUP_DIR
 
 
 def latest_db_restore_point() -> Path | None:
-    return db_backup_mod.latest_backup(
-        REPO_ROOT, "shell_db.prerebuild.*.db"
-    )
+    paired = db_backup_mod.latest_backup(REPO_ROOT, "shell_db.preupdate.*.db")
+    if paired is not None:
+        return paired
+    return db_backup_mod.latest_backup(REPO_ROOT, "shell_db.prerebuild.*.db")
 
 
 def backup_current_db() -> None:
@@ -249,7 +251,8 @@ def main(argv: list[str] | None = None) -> int:
 
     src = latest_db_restore_point()
     if src is None:
-        sys.exit("rollback: no shell_db.prerebuild.*.db restore point found in "
+        sys.exit("rollback: no shell_db.preupdate.*.db (or legacy prerebuild) "
+                 "restore point found in "
                  f"{rebuild_mod.backup_dir()} — nothing to roll back to.")
 
     print("→ rolling back the last update (DB + engine pair-restore)")

@@ -39,6 +39,35 @@ BACKUP_DIR = db_backup_mod.preferred_home_dir(REPO_ROOT)
 SNAPSHOT = artifact_policy.content_path()
 
 
+def _promote_legacy_update_restore_point(target: Path) -> None:
+    """Bridge one update launched by the pre-prefix engine.
+
+    The update process imports its old ``rebuild`` module before materializing
+    this release, so that first adoption still writes a ``prerebuild`` backup.
+    Before a later verify can create a newer backup with the same legacy class,
+    preserve the existing latest row as the engine-paired ``preupdate`` point.
+    """
+    engine_ref_prev = REPO_ROOT / ".sc-state" / "engine.ref.prev"
+    if not engine_ref_prev.exists():
+        return
+    if db_backup_mod.latest_backup(REPO_ROOT, "shell_db.preupdate.*.db"):
+        return
+    legacy = db_backup_mod.latest_backup(REPO_ROOT, "shell_db.prerebuild.*.db")
+    if legacy is None:
+        return
+    promoted_name = legacy.name.replace(
+        "shell_db.prerebuild.", "shell_db.preupdate.", 1
+    )
+    promoted = target / promoted_name
+    if not promoted.exists():
+        backup_db(promoted, src=legacy)
+        print(
+            "rebuild: preserved legacy update restore point -> "
+            f"{promoted}"
+        )
+    prune_backups("shell_db.preupdate", target)
+
+
 def snapshot_path() -> Path:
     artifact_policy.prepare_local_state()
     if SNAPSHOT.exists():
@@ -148,14 +177,23 @@ def backup_db(dst: Path, src: Path | None = None) -> None:
         src_con.close()
 
 
-def backup_existing() -> None:
+def backup_existing(prefix: str = "prerebuild") -> None:
+    """Back up the live DB under the lifecycle-specific restore-point class.
+
+    Direct rebuild/verify backups are diagnostics and must not outrank the
+    pre-update DB that pairs with ``engine.ref.prev`` during rollback.
+    """
     if not DB_PATH.exists():
         return
+    if prefix not in {"prerebuild", "preupdate"}:
+        raise ValueError(f"unsupported DB backup prefix: {prefix}")
     target = backup_dir()
+    if prefix == "prerebuild":
+        _promote_legacy_update_restore_point(target)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dst = target / f"shell_db.prerebuild.{ts}.db"
+    dst = target / f"shell_db.{prefix}.{ts}.db"
     backup_db(dst)
-    prune_backups("shell_db.prerebuild", target)
+    prune_backups(f"shell_db.{prefix}", target)
     print(f"rebuild: backed up existing DB -> {dst}")
 
 
