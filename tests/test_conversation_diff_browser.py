@@ -310,8 +310,12 @@ def test_diff_workspace_preserves_live_chat_and_uses_get_only(
     ]
     transcript_page = {
         "conversation_id": CONVERSATION_ID,
-        "projection_version": 1,
+        "projection_version": 2,
         "through_sequence": 22,
+        "assistant_cursor": {
+            "run_id": 77,
+            "segment_anchor_sequence": 0,
+        },
         "controls": {
             "conversation_version": 4,
             "conversation_state": "running",
@@ -335,7 +339,7 @@ def test_diff_workspace_preserves_live_chat_and_uses_get_only(
             for item in messages
         ] + [
             {
-                "item_id": "run:77:assistant",
+                "item_id": "run:77:assistant:0",
                 "kind": "assistant",
                 "order_sequence": 22,
                 "message_id": 1,
@@ -343,6 +347,7 @@ def test_diff_workspace_preserves_live_chat_and_uses_get_only(
                 "created_at": "2026-07-30 20:00:02",
                 "text": "initial",
                 "outcome": None,
+                "segment_anchor_sequence": 0,
                 "first_sequence": 22,
                 "last_sequence": 22,
                 "text_truncated": False,
@@ -853,6 +858,7 @@ export { mode };"""
         current["state"] = "closed"
         transcript_page["controls"]["conversation_state"] = "closed"
         transcript_page["controls"]["active_run_id"] = None
+        transcript_page.pop("assistant_cursor")
         page.reload(wait_until="networkidle")
         page.locator(".review-workspace").wait_for()
         assert page.get_by_role("button", name="Close").is_disabled()
@@ -893,8 +899,12 @@ def test_chat_performance_uses_bounded_requests_and_keyed_frames(static_ui):
     stars = [summary(100 + number, starred=True) for number in range(3)]
     transcript = {
         "conversation_id": CONVERSATION_ID,
-        "projection_version": 1,
+        "projection_version": 2,
         "through_sequence": 7000,
+        "assistant_cursor": {
+            "run_id": 77,
+            "segment_anchor_sequence": 0,
+        },
         "controls": {
             "conversation_version": 4,
             "conversation_state": "running",
@@ -916,7 +926,7 @@ def test_chat_performance_uses_bounded_requests_and_keyed_frames(static_ui):
                 "text_truncated": False,
             },
             {
-                "item_id": "run:77:assistant",
+                "item_id": "run:77:assistant:0",
                 "kind": "assistant",
                 "order_sequence": 2,
                 "message_id": 1,
@@ -924,6 +934,7 @@ def test_chat_performance_uses_bounded_requests_and_keyed_frames(static_ui):
                 "created_at": "2026-07-30 20:00:02",
                 "text": "initial",
                 "outcome": None,
+                "segment_anchor_sequence": 0,
                 "first_sequence": 2,
                 "last_sequence": 7000,
                 "text_truncated": False,
@@ -1175,7 +1186,10 @@ def test_chat_performance_uses_bounded_requests_and_keyed_frames(static_ui):
         assert hidden_counts["assistantReplacements"] == 0
 
         page.get_by_role("tab", name="Chat").click()
-        page.get_by_text("initial" + ("x" * 500), exact=True).wait_for()
+        page.get_by_text("x" * 500, exact=True).wait_for()
+        assert page.locator(".chat-assistant-body").evaluate_all(
+            "nodes => nodes.map((node) => node.textContent.trim())"
+        ) == ["initial", "x" * 500]
         catch_up = page.evaluate("window.__chatPerf")
         assert catch_up["maxRafOutstanding"] <= 1
         assert catch_up["markdownParses"] <= 1
@@ -1190,10 +1204,6 @@ def test_chat_performance_uses_bounded_requests_and_keyed_frames(static_ui):
     assert not browser_errors
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="projection v2 live segment reducer lands in Sprint 63 unit 3",
-)
 def test_segmented_live_trace_refresh_replay_and_node_identity(static_ui):
     requests: list[str] = []
     browser_errors: list[str] = []
@@ -1295,7 +1305,9 @@ def test_segmented_live_trace_refresh_replay_and_node_identity(static_ui):
             wait_until="networkidle",
         )
         page.locator(".chat-transcript").wait_for()
-        assert page.locator(".chat-bubble.chat-assistant").all_text_contents() == [
+        assert page.locator(".chat-assistant-body").evaluate_all(
+            "nodes => nodes.map((node) => node.textContent.trim())"
+        ) == [
             "before tool"
         ]
 
@@ -1325,24 +1337,48 @@ def test_segmented_live_trace_refresh_replay_and_node_identity(static_ui):
             """
         )
 
-        replayed_boundary = LIVE_SEGMENT_EVENTS[1]
         delta = LIVE_SEGMENT_EVENTS[2]
-        for event in (replayed_boundary, delta):
+        page.evaluate(
+            "([type, payload]) => "
+            "window.__fakeEventSources[0].emit(type, payload)",
+            [delta["event_type"], delta],
+        )
+        page.get_by_text("after tool", exact=True).wait_for()
+        page.evaluate(
+            """
+            window.__secondSegmentNode =
+              document.querySelectorAll('.chat-bubble.chat-assistant')[1];
+            """
+        )
+
+        replayed_boundary = LIVE_SEGMENT_EVENTS[0]
+        continued_delta = {
+            **delta,
+            "sequence": 9,
+            "payload": {"text": " continued"},
+        }
+        for event in (replayed_boundary, continued_delta):
             page.evaluate(
                 "([type, payload]) => "
                 "window.__fakeEventSources[0].emit(type, payload)",
                 [event["event_type"], event],
             )
-        page.get_by_text("after tool", exact=True).wait_for()
+        page.get_by_text("after tool continued", exact=True).wait_for()
 
-        assert page.locator(".chat-bubble.chat-assistant").all_text_contents() == [
+        assert page.locator(".chat-assistant-body").evaluate_all(
+            "nodes => nodes.map((node) => node.textContent.trim())"
+        ) == [
             "before tool",
-            "after tool",
+            "after tool continued",
         ]
         assert page.locator(".chat-bubble.chat-activity").count() == 0
         assert page.evaluate(
             "window.__firstSegmentNode === "
             "document.querySelector('.chat-bubble.chat-assistant')"
+        )
+        assert page.evaluate(
+            "window.__secondSegmentNode === "
+            "document.querySelectorAll('.chat-bubble.chat-assistant')[1]"
         )
         counts = page.evaluate("window.__chatPerf")
         assert counts["maxRafOutstanding"] <= 1
