@@ -3,6 +3,7 @@
   "launch": ["codex", "--dangerously-bypass-hook-trust"],
   "boot_artifact": "AGENTS.md",
   "emit": [".codex/hooks.json"],
+  "skill_dirs": [".claude/skills", ".agents/skills"],
   "env": {},
   "model": { "flag": "--model" },
   "headless": {

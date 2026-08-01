@@ -10,16 +10,14 @@ reverse):
     suffix flags provenance and avoids colliding with a host repo's own `/docs`.
     DB → flat is one-way; the files are never read back.
 
-  • Harness skills — `.claude/skills/<name>/SKILL.md` for the booting shell's
-    granted skills. A NON-load-bearing convenience cache for harnesses that
-    auto-discover this path natively (Claude Code / OpenCode / Crush). It is NOT
-    the source of truth and NOT the cross-harness load path: codex reads its own
-    `$CODEX_HOME/skills`, kimi its `.kimi-code/skills` / `.agents/skills`, and
-    vibe (Mistral) has no skill dir at all. The
-    canonical, harness-agnostic load path is the DB — the boot doc's `## SKILLS`
-    block renders each grant's exact `SELECT content FROM skills …` query
-    (see compose.render_skills). Like the boot artifact (CLAUDE.md/AGENTS.md)
-    this dir is GITIGNORED and rebuilt at launch — a per-shell cache.
+  • Harness skills — granted skills rendered as Agent Skills `SKILL.md` files
+    for the booting shell. `.claude/skills` is the stable cross-harness mirror;
+    adapters may request an additional native tree such as Codex's
+    `.agents/skills` or OpenCode's `.opencode/skills`. These are generated caches,
+    not sources of truth. The boot doc's `## SKILLS` block points at the stable
+    mirror so every harness can load the same procedure with a file read, never
+    an ad-hoc DB query. Like the boot artifact (CLAUDE.md/AGENTS.md), managed
+    skill trees are rebuilt at launch for the selected shell.
 
 Render is incremental: an artifact whose composed content already matches what
 is on disk is skipped (no write, no mtime churn), so re-rendering an unchanged
@@ -260,7 +258,8 @@ def render_skill_md(con: sqlite3.Connection, shell_id: int,
     """Render the booting shell's granted skills to
     `<skills_dir>/<name>/SKILL.md` (Agent Skills format: name + description
     frontmatter, content body). The default is `.claude/skills`; adapters may
-    request an additional native directory such as `.opencode/skills`.
+    request an additional native directory such as `.agents/skills` or
+    `.opencode/skills`.
 
     Harness-consumed and gitignored, like the boot artifact — rebuilt every
     launch for whichever shell boots. Stale skill folders (a grant since
