@@ -495,7 +495,8 @@ for name in sys.argv[2:]:
         html = (ENGINE / "ui" / "index.html").read_text()
         style = (ENGINE / "ui" / "style.css").read_text()
         self.assertIn('<button data-tab="interface">Chats</button>', html)
-        self.assertNotIn(".sprint-board", style)
+        self.assertIn('<button data-tab="sprints">Sprints</button>', html)
+        self.assertIn(".sprint-board", style)
         self.assertNotIn(".an-sprint", style)
 
     def test_task_170_historical_migrations_are_absent_and_mixed_inputs_are_clean(

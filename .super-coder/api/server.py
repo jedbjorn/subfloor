@@ -73,6 +73,7 @@ import sprint_message_delivery  # noqa: E402  (Sprints v2 inbox acceptance)
 import sprint_recovery  # noqa: E402  (Sprints v2 pause/resume reconciliation)
 import sprint_review_loop  # noqa: E402  (Sprints v2 Dev/Review command surface)
 import sprint_runtime  # noqa: E402  (armed-only Sprint dispatch + wake delivery)
+import sprint_board  # noqa: E402  (read-only Sprints v2 FnB board projections)
 sys.path.insert(0, str(ENGINE / "api"))
 import conversation_routes  # noqa: E402  (Feature #24 browser conversations)
 import review_routes  # noqa: E402  (Feature #26 browser Diff review)
@@ -1825,6 +1826,93 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return shell_id
 
+    def _require_browser_operator(self, con):
+        """Accept the loopback browser operator and reject shell credentials."""
+        token = self._bearer_token()
+        if token:
+            shell = con.execute(
+                "SELECT 1 FROM shells WHERE api_key=? AND COALESCE(is_deleted,0)=0",
+                (token,),
+            ).fetchone()
+            if shell is None:
+                self._send(401, {"error": {
+                    "code": "unauthorized",
+                    "message": "invalid browser authorization",
+                    "details": {},
+                }})
+            else:
+                self._send(403, {"error": {
+                    "code": "fnb_operator_required",
+                    "message": "the Sprint board is owned by the browser FnB operator",
+                    "details": {},
+                }})
+            return False
+        operator = con.execute(
+            "SELECT 1 FROM users WHERE is_active=1 ORDER BY user_id LIMIT 1"
+        ).fetchone()
+        if operator is None:
+            self._send(401, {"error": {
+                "code": "unauthorized",
+                "message": "no active browser operator exists",
+                "details": {},
+            }})
+            return False
+        return True
+
+    def _sprint_board_error(self, exc: Exception):
+        if isinstance(exc, sprint_board.ProjectionError):
+            return self._send(exc.status, {"error": {
+                "code": exc.code,
+                "message": exc.message,
+                "details": exc.details,
+            }})
+        return self._fail(exc)
+
+    def _require_browser_mutation_origin(self) -> bool:
+        origin = self.headers.get("Origin")
+        host = self.headers.get("Host") or ""
+        if origin:
+            parsed = urlparse(origin)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or parsed.netloc != host
+                or parsed.path
+                or parsed.params
+                or parsed.query
+                or parsed.fragment
+            ):
+                self._send(403, {"error": {
+                    "code": "same_origin_required",
+                    "message": "Sprint lifecycle actions require the browser origin",
+                    "details": {},
+                }})
+                return False
+        if self.headers.get("Sec-Fetch-Site") not in {None, "same-origin", "none"}:
+            self._send(403, {"error": {
+                "code": "same_origin_required",
+                "message": "Sprint lifecycle actions require the browser origin",
+                "details": {},
+            }})
+            return False
+        return True
+
+    def _sprint_board_mutation_error(self, exc: Exception):
+        if isinstance(exc, sprint_domain.SprintAuthorityError):
+            status, code = 403, "forbidden"
+        elif isinstance(
+            exc, (sprint_domain.SprintStateError, sprint_domain.SprintInvariantError)
+        ):
+            status, code = 409, "lifecycle_conflict"
+        elif isinstance(exc, KeyError):
+            status, code = 404, "sprint_not_found"
+        else:
+            return self._fail(exc)
+        return self._send(status, {"error": {
+            "code": code,
+            "message": str(exc).strip("'"),
+            "details": {},
+        }})
+
     # -- /sprint/* token-scoped collaboration endpoints --
 
     @staticmethod
@@ -3381,6 +3469,67 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, tag_origin([dict(r)])[0])
             if path == "/api/roadmap":
                 return self._send(200, get_roadmap(con))
+            if path == "/api/sprints":
+                if not self._require_browser_operator(con):
+                    return None
+                q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+                try:
+                    result = sprint_board.SprintBoardProjection(con).list_sprints(
+                        lifecycle=q.get("lifecycle", [None])[0],
+                        limit=sprint_board.parse_limit(q.get("limit", [None])[0]),
+                        cursor=q.get("cursor", [None])[0],
+                    )
+                except Exception as exc:
+                    return self._sprint_board_error(exc)
+                return self._send(200, result)
+            if path.startswith("/api/sprints/"):
+                if not self._require_browser_operator(con):
+                    return None
+                parts = path.strip("/").split("/")
+                try:
+                    if len(parts) not in {3, 4}:
+                        raise sprint_board.ProjectionError(
+                            404, "not_found", "resource not found"
+                        )
+                    sprint_id = int(parts[2])
+                    if sprint_id <= 0:
+                        raise ValueError
+                except ValueError:
+                    return self._send(404, {"error": {
+                        "code": "sprint_not_found",
+                        "message": "Sprint not found",
+                        "details": {},
+                    }})
+                q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+                projection = sprint_board.SprintBoardProjection(con)
+                try:
+                    if len(parts) == 3:
+                        result = projection.board(sprint_id)
+                    elif parts[3] == "events":
+                        result = projection.events(
+                            sprint_id,
+                            limit=sprint_board.parse_limit(q.get("limit", [None])[0]),
+                            cursor=q.get("cursor", [None])[0],
+                            work_unit_id=sprint_board.parse_work_unit_id(
+                                q.get("work_unit_id", [None])[0]
+                            ),
+                        )
+                    elif parts[3] == "summaries":
+                        result = projection.summaries(
+                            sprint_id,
+                            limit=sprint_board.parse_limit(q.get("limit", [None])[0]),
+                            cursor=q.get("cursor", [None])[0],
+                            work_unit_id=sprint_board.parse_work_unit_id(
+                                q.get("work_unit_id", [None])[0]
+                            ),
+                        )
+                    else:
+                        raise sprint_board.ProjectionError(
+                            404, "not_found", "resource not found"
+                        )
+                except Exception as exc:
+                    return self._sprint_board_error(exc)
+                return self._send(200, result)
             if path == "/api/docs":
                 return self._send(200, get_docs(con))
             if path == "/api/map":
@@ -3606,6 +3755,76 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
         con = db()
         try:
+            if path.startswith("/api/sprints/") and path.count("/") == 3:
+                if not self._require_browser_operator(con):
+                    return None
+                if not self._require_browser_mutation_origin():
+                    return None
+                try:
+                    sprint_id = int(path.rsplit("/", 1)[1])
+                except ValueError:
+                    sprint_id = 0
+                if sprint_id <= 0:
+                    return self._send(404, {"error": {
+                        "code": "sprint_not_found",
+                        "message": "Sprint not found",
+                        "details": {},
+                    }})
+                if not isinstance(body, dict):
+                    return self._send(422, {"error": {
+                        "code": "validation_error",
+                        "message": "request body must be a JSON object",
+                        "details": {},
+                    }})
+                unknown = sorted(set(body) - {"lifecycle", "reason"})
+                if unknown:
+                    return self._send(422, {"error": {
+                        "code": "validation_error",
+                        "message": "unknown field(s): " + ", ".join(unknown),
+                        "details": {"fields": unknown},
+                    }})
+                target = body.get("lifecycle")
+                if target not in {"paused", "armed", "aborted"}:
+                    return self._send(422, {"error": {
+                        "code": "validation_error",
+                        "message": "lifecycle must be paused, armed, or aborted",
+                        "details": {"field": "lifecycle"},
+                    }})
+                reason = body.get("reason")
+                if not isinstance(reason, str) or not reason.strip():
+                    return self._send(422, {"error": {
+                        "code": "validation_error",
+                        "message": "reason must be a nonblank string",
+                        "details": {"field": "reason"},
+                    }})
+                reason = reason.strip()
+                if len(reason) > 2000:
+                    return self._send(422, {"error": {
+                        "code": "validation_error",
+                        "message": "reason must be at most 2000 characters",
+                        "details": {"field": "reason"},
+                    }})
+                try:
+                    coordinator = sprint_recovery.SprintRecoveryCoordinator(
+                        con, repo_root=REPO_ROOT
+                    )
+                    actor = sprint_domain.LifecycleActor("fnb")
+                    if target == "paused":
+                        changed = coordinator.pause(
+                            sprint_id, actor, reason=reason
+                        ).changed
+                    elif target == "armed":
+                        changed = coordinator.resume(
+                            sprint_id, actor, reason=reason
+                        ).changed
+                    else:
+                        changed = coordinator.abort(
+                            sprint_id, actor, reason=reason
+                        ).changed
+                    sprint = sprint_board.SprintBoardProjection(con).board(sprint_id)["sprint"]
+                except Exception as exc:
+                    return self._sprint_board_mutation_error(exc)
+                return self._send(200, {"changed": changed, "sprint": sprint})
             if path.startswith("/api/shells/") and path.count("/") == 3:
                 sid = int(path.rsplit("/", 1)[1])
                 ok, err = patch_shell(con, sid, body)

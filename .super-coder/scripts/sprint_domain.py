@@ -333,7 +333,7 @@ class SprintLifecycleStore:
         detail: dict | None = None,
     ) -> PauseReceipt:
         """Atomically pause, persist intent/report/reason, and notify Planner."""
-        reason = self._required_text(reason, "pause reason", 1000)
+        reason = self._required_text(reason, "pause reason", 2000)
         with db_driver.write_transaction(self.con, "sprint.pause"):
             sprint = self._sprint(sprint_id)
             current = str(sprint["lifecycle"])

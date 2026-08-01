@@ -69,6 +69,68 @@ main { padding: 1.2rem; flex: 1 0 auto; min-height: 0; }
    cards — past the max-width instead of truncating. Clamp the track to 0. */
 .view { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1rem; margin: 0 auto; width: 100%; max-width: 1000px; }
 .view[hidden] { display: none; }  /* class selector would otherwise beat [hidden] */
+#view-sprints { max-width: none; }
+.sprint-page { min-width: 0; }
+.sprint-toolbar { display: flex; justify-content: flex-end; margin-bottom: .8rem; }
+.sprint-selector { max-width: min(36rem, 100%); }
+.sprint-preview-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.sprint-preview-head h2 { margin: 0; }
+.sprint-route-state { max-width: 48rem; margin: 0 auto; }
+.pill.sprint-armed { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+.pill.sprint-paused { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+.pill.sprint-completed, .pill.sprint-aborted { color: var(--dim); }
+.sprint-board-head { margin-bottom: .8rem; }
+.sprint-heading, .sprint-header-context, .sprint-header-times {
+  display: flex; align-items: center; flex-wrap: wrap; gap: .6rem 1rem;
+}
+.sprint-heading { justify-content: space-between; }
+.sprint-heading h2 { margin: 0; }
+.sprint-header-context, .sprint-header-times { margin-top: .55rem; font-size: .76rem; color: var(--dim); }
+.sprint-spec-links { display: inline-flex; gap: .45rem; }
+.sprint-terminal-outcome { margin-top: .7rem; padding-top: .6rem; border-top: 1px solid var(--line); }
+.sprint-actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: .65rem; }
+.sprint-stale-notice { display: flex; align-items: center; justify-content: space-between; gap: .75rem; margin-bottom: .65rem; padding: .55rem .7rem; color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--line)); background: color-mix(in srgb, var(--warn) 8%, var(--panel)); border-radius: 7px; }
+.sprint-board-scroll { overflow-x: auto; padding-bottom: .7rem; }
+.sprint-board-canvas { position: relative; min-width: 1280px; }
+.sprint-columns { position: relative; z-index: 2; display: grid; grid-template-columns: repeat(5, minmax(230px, 1fr)); gap: .8rem; }
+.sprint-column { min-width: 0; }
+.sprint-column > h3 { display: flex; align-items: center; gap: .4rem; margin: 0 0 .55rem; padding: 0 .25rem .45rem; border-bottom: 1px solid var(--line); text-transform: uppercase; letter-spacing: .08em; font-size: .72rem; }
+.sprint-column-cards { display: grid; gap: .6rem; align-content: start; }
+.sprint-column-empty { min-height: 7rem; display: grid; place-items: center; border: 1px dashed var(--line); color: var(--dim); font-size: .72rem; }
+.sprint-unit { width: 100%; min-height: 9rem; padding: .7rem; display: grid; align-content: start; gap: .4rem; text-align: left; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 7px; cursor: pointer; }
+.sprint-unit:hover, .sprint-unit:focus-visible, .sprint-unit.lit { border-color: var(--accent); outline: none; box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent); }
+.sprint-unit-title { display: flex; min-width: 0; gap: .35rem; font-weight: 600; }
+.sprint-unit-title > span:last-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.sprint-unit-id { color: var(--accent); flex: none; }
+.sprint-unit-meta, .sprint-unit-foot { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+.sprint-unit-people, .sprint-unit-deps, .sprint-unit-foot { font-size: .7rem; color: var(--dim); }
+.sprint-cancelled-note { color: var(--warn); font-size: .7rem; }
+.sprint-wires { position: absolute; inset: 0; z-index: 1; pointer-events: none; overflow: visible; }
+.sprint-wire { fill: none; stroke: color-mix(in srgb, var(--accent) 22%, transparent); stroke-width: 1.5; }
+.sprint-wire-focus .sprint-wire { opacity: .18; }
+.sprint-wire-focus .sprint-wire.lit { opacity: 1; stroke: var(--accent); stroke-width: 2.5; }
+.sprint-unit-detail { flex: 1; min-width: 0; overflow: auto; padding-right: .25rem; }
+.sprint-unit-detail h3 { margin: 1rem 0 .45rem; font-size: .8rem; }
+.sprint-unit-facts { margin-bottom: .8rem; }
+.sprint-long-text { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); }
+.sprint-audit-section { border-top: 1px solid var(--line); margin-top: .9rem; padding-top: .15rem; }
+.sprint-audit-row { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem; padding: .35rem 0; }
+.sprint-message-audit + .sprint-message-audit { border-top: 1px solid var(--line); }
+.sprint-feeds { display: grid; gap: .5rem; margin-top: .3rem; }
+.sprint-feed { padding-top: .75rem; padding-bottom: .75rem; }
+.sprint-feed > summary, .sprint-scoped-feed > summary { cursor: pointer; font-weight: 600; }
+.sprint-feed-list { margin-top: .55rem; }
+.sprint-feed-row { border-top: 1px solid var(--line-soft); }
+.sprint-feed-row > summary { display: flex; justify-content: space-between; gap: 1rem; padding: .5rem 0; cursor: pointer; }
+.sprint-feed-detail { margin: 0 0 .55rem; padding: .55rem; background: var(--panel2); border-radius: 6px; overflow-wrap: anywhere; }
+.sprint-feed-empty { padding: .6rem 0; }
+.sprint-action-form { flex: 1; display: grid; align-content: start; gap: .55rem; }
+.sprint-action-form textarea { min-height: 7rem; resize: vertical; }
+.sprint-abort-note { color: var(--warn); }
+@media (max-width: 760px) {
+  main { padding-left: .7rem; padding-right: .7rem; }
+  .sprint-board-canvas { min-width: 1180px; }
+}
 
 /* ── Browser-native Interface ───────────────────────────────────────────────
    The old Interface rail/transcript silhouette, without its embedded terminal

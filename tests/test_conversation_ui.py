@@ -309,7 +309,8 @@ def test_shell_rail_hides_labels_but_retains_ordered_flavor_dividers():
     assert 'className: "chat-shell-group"' not in interface
     assert ".chat-shell-group" not in STYLE
     assert ".chat-shell-divider" in STYLE
-    assert ".sprint-board" not in STYLE
+    assert ".sprint-board" in STYLE
+    assert ".an-sprint" not in STYLE
 
 
 def test_history_metadata_and_all_shell_accents_poll_without_repainting_interface():
