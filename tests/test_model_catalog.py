@@ -266,6 +266,38 @@ class RoutePersistenceTest(unittest.TestCase):
         self.assertIn("high-effort", got["error"])
 
 
+class RouteCliConnectionTest(unittest.TestCase):
+    def test_list_and_resolve_open_the_hard_read_only_lane(self):
+        con = mock.Mock()
+        with mock.patch.object(routes_cli, "_open_db", return_value=con) as opened:
+            with mock.patch.object(routes_cli, "_list", return_value=0):
+                self.assertEqual(routes_cli.main(["list"]), 0)
+            opened.assert_called_once_with(read_only=True)
+
+        opened.reset_mock()
+        with mock.patch.object(routes_cli, "_open_db", return_value=con) as opened:
+            with mock.patch.object(
+                routes_cli,
+                "resolve",
+                return_value={"ok": False, "error": "missing"},
+            ):
+                self.assertEqual(
+                    routes_cli.main(["resolve", "codex", "missing"]),
+                    2,
+                )
+            opened.assert_called_once_with(read_only=True)
+
+    def test_refresh_keeps_the_wal_enabled_write_lane(self):
+        con = mock.Mock()
+        payload = {"stale": False, "sources": ["test-source"]}
+        with (
+            mock.patch.object(routes_cli, "_open_db", return_value=con) as opened,
+            mock.patch.object(routes_cli.model_catalog, "catalog", return_value=payload),
+        ):
+            self.assertEqual(routes_cli.main(["refresh"]), 0)
+        opened.assert_called_once_with(read_only=False)
+
+
 class CatalogCacheTest(NoCLI):
     def setUp(self):
         super().setUp()

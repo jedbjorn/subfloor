@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import shutil
 import sqlite3
@@ -388,6 +389,64 @@ class LiveSurfacesStillResolveTest(WorktreeFixture):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, ENGINE_PIN + "\n")
         self.assertEqual(done.stderr, "")
+
+    def _make_live_engine_read_only(self) -> None:
+        """Model the linked shell seat: canonical source is readable, not writable."""
+        engine = self.main / ".super-coder"
+        engine_mode = engine.stat().st_mode
+        db_mode = self.live_db.stat().st_mode
+        self.live_db.chmod(0o444)
+        engine.chmod(0o555)
+        self.addCleanup(engine.chmod, engine_mode)
+        self.addCleanup(self.live_db.chmod, db_mode)
+
+    def test_model_list_and_resolve_read_the_read_only_live_database(self):
+        con = sqlite3.connect(self.live_db)
+        con.executescript(
+            (self.main / ".super-coder" / "migrations" /
+             "0075_model_routes.sql").read_text()
+        )
+        con.execute(
+            "INSERT INTO model_routes (harness, selector, source, availability, "
+            "headless_supported, high_effort_supported, supported_efforts, "
+            "last_seen_at) VALUES ('codex', 'wt-live-model', 'live-marker', "
+            "'available', 1, 1, '[\"high\"]', datetime('now'))"
+        )
+        con.commit()
+        con.close()
+        before = state_digest(self.main)
+        self._make_live_engine_read_only()
+
+        listed = run_sc(self.wt, "models", "list", "codex")
+        resolved = run_sc(
+            self.wt, "models", "resolve", "codex", "wt-live-model", "--json"
+        )
+
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn("codex/wt-live-model", listed.stdout)
+        self.assertIn("live-marker", listed.stdout)
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.assertEqual(json.loads(resolved.stdout)["selector"], "wt-live-model")
+        self.assertEqual(state_digest(self.main), before)
+        self.assertFalse((self.wt / ".super-coder" / "shell_db.db").exists())
+
+    def test_skill_list_reads_the_read_only_live_database(self):
+        con = sqlite3.connect(self.live_db)
+        con.execute(
+            "INSERT INTO skills (name, description, content, common, is_deleted) "
+            "VALUES ('wt-live-skill', 'live marker', 'body', 0, 0)"
+        )
+        con.commit()
+        con.close()
+        before = state_digest(self.main)
+        self._make_live_engine_read_only()
+
+        listed = run_sc(self.wt, "skill", "list")
+
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn("wt-live-skill", listed.stdout)
+        self.assertEqual(state_digest(self.main), before)
+        self.assertFalse((self.wt / ".super-coder" / "shell_db.db").exists())
 
     def test_bare_sc_works_when_the_worktree_launcher_is_absent(self):
         launcher = self.wt / "sc"

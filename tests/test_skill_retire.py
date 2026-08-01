@@ -21,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
@@ -192,6 +193,26 @@ class RetireTest(unittest.TestCase):
         skill_cli.cmd_retire(self.con, "test_authoring")
         with self.assertRaises(SystemExit):
             skill_cli.resolve_skill(self.con, "test_authoring")
+
+
+class SkillCliConnectionTest(unittest.TestCase):
+    def test_exact_list_uses_read_only_connection(self):
+        con = mock.Mock()
+        with (
+            mock.patch.object(skill_cli, "connect", return_value=con) as opened,
+            mock.patch.object(skill_cli, "cmd_list", return_value=0),
+        ):
+            self.assertEqual(skill_cli.main(["list"]), 0)
+        opened.assert_called_once_with(read_only=True)
+
+    def test_mutation_keeps_the_wal_enabled_write_connection(self):
+        con = mock.Mock()
+        with (
+            mock.patch.object(skill_cli, "connect", return_value=con) as opened,
+            mock.patch.object(skill_cli, "cmd_grant", return_value=0),
+        ):
+            self.assertEqual(skill_cli.main(["grant", "review", "DEV1"]), 0)
+        opened.assert_called_once_with(read_only=False)
 
 
 if __name__ == "__main__":

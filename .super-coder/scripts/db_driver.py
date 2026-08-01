@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 import logging
+from pathlib import Path
 import random
 import sqlite3
 import time
@@ -129,6 +130,33 @@ def connect(path):
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys=ON")
         _enable_wal(con)
+        con.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
+        return con
+    except BaseException:
+        con.close()
+        raise
+
+
+def connect_readonly(path):
+    """Open an existing engine DB without requiring a writable DB directory.
+
+    Read surfaces used from linked shell worktrees deliberately target the
+    canonical main checkout's live database.  That checkout can be outside the
+    worktree's writable seat, so the normal connector cannot be used: enabling
+    WAL is itself a write and may need to create SQLite sidecars.  URI
+    ``mode=ro`` is the hard write boundary; ``query_only`` is a second guard
+    against accidental mutation by a caller that receives this connection.
+    """
+    uri = Path(path).resolve().as_uri() + "?mode=ro"
+    con = sqlite3.connect(
+        uri,
+        uri=True,
+        timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000,
+    )
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("PRAGMA query_only=ON")
         con.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
         return con
     except BaseException:

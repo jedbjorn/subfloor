@@ -113,6 +113,36 @@ class WriteTransactionTest(unittest.TestCase):
 
         con.close.assert_called_once_with()
 
+    def test_readonly_connection_skips_wal_and_enforces_query_only(self) -> None:
+        con = db_driver.connect(self.path)
+        con.execute("CREATE TABLE readable (value TEXT NOT NULL)")
+        con.execute("INSERT INTO readable VALUES ('yes')")
+        con.commit()
+        con.close()
+
+        with mock.patch.object(
+            db_driver,
+            "_enable_wal",
+            side_effect=AssertionError("read-only open attempted WAL setup"),
+        ):
+            reader = db_driver.connect_readonly(self.path)
+        try:
+            self.assertEqual(
+                reader.execute("SELECT value FROM readable").fetchone()[0],
+                "yes",
+            )
+            self.assertEqual(reader.execute("PRAGMA query_only").fetchone()[0], 1)
+            with self.assertRaisesRegex(sqlite3.OperationalError, "readonly"):
+                reader.execute("INSERT INTO readable VALUES ('no')")
+        finally:
+            reader.close()
+
+    def test_readonly_connection_does_not_create_a_missing_database(self) -> None:
+        missing = Path(self.tmp.name) / "missing.db"
+        with self.assertRaises(sqlite3.OperationalError):
+            db_driver.connect_readonly(missing)
+        self.assertFalse(missing.exists())
+
     def test_rolls_back_the_whole_body_on_failure(self) -> None:
         timings: list[db_driver.WriteTransactionTiming] = []
         con = db_driver.connect(self.path)

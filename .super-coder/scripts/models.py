@@ -22,10 +22,11 @@ import model_catalog  # noqa: E402
 import db_driver  # noqa: E402
 
 
-def _open_db():
+def _open_db(*, read_only: bool = False):
     if not DB_PATH.exists():
         raise SystemExit(f"models: no DB at {DB_PATH} — run `sc rebuild`")
-    return db_driver.connect(DB_PATH)
+    connector = db_driver.connect_readonly if read_only else db_driver.connect
+    return connector(DB_PATH)
 
 
 def _route(con, harness: str, selector: str):
@@ -35,11 +36,6 @@ def _route(con, harness: str, selector: str):
             (harness, selector)).fetchone()
     except db_driver.OperationalError:
         raise SystemExit("models: model_routes unavailable — run `sc rebuild` to migrate")
-    if row is None:
-        model_catalog.catalog(con=con)
-        row = con.execute(
-            "SELECT * FROM model_routes WHERE harness=? AND selector=?",
-            (harness, selector)).fetchone()
     return dict(row) if row else None
 
 
@@ -93,8 +89,8 @@ def _list(con, harness: str | None) -> int:
     except db_driver.OperationalError:
         raise SystemExit("models: model_routes unavailable — run `sc rebuild` to migrate")
     if not rows:
-        model_catalog.catalog(con=con)
-        rows = con.execute(sql, params).fetchall()
+        print("models: no routes — run `sc models refresh`", file=sys.stderr)
+        return 2
     for r in rows:
         runnable = (r["availability"] == "available" and r["headless_supported"]
                     and r["high_effort_supported"])
@@ -111,7 +107,12 @@ def main(argv: list[str] | None = None) -> int:
         print("usage: sc models refresh | list [harness] | "
               "resolve <harness> <selector> [--shell <shortname>] [--json]")
         return 0
-    con = _open_db()
+    # list/resolve are inspection surfaces and must stay callable from a linked
+    # shell worktree whose canonical live DB is outside its writable seat.
+    # refresh remains the one explicit route mutation and keeps the normal WAL
+    # connector.
+    read_only = args[0] in ("list", "resolve")
+    con = _open_db(read_only=read_only)
     try:
         if args[0] == "refresh":
             payload = model_catalog.catalog(refresh=True, con=con)

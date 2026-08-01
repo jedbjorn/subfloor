@@ -62,10 +62,11 @@ ENGINE = Path(__file__).resolve().parents[1]
 DB_PATH = ENGINE / "shell_db.db"
 
 
-def connect():
+def connect(*, read_only: bool = False):
     if not DB_PATH.exists() or not DB_PATH.stat().st_size:
         sys.exit("sc skill: no live DB — run `./sc rebuild` (or `./sc launch`) first.")
-    return db_driver.connect(DB_PATH)
+    connector = db_driver.connect_readonly if read_only else db_driver.connect
+    return connector(DB_PATH)
 
 
 def resolve_shell(con, ref: str) -> tuple[int, str]:
@@ -381,7 +382,10 @@ def main(argv: list[str]) -> int:
         print(usage)
         return 0
     cmd, args = argv[0], argv[1:]
-    con = connect()
+    # Catalogue inspection is valid from linked shell worktrees, where the
+    # canonical live DB can be outside the writable seat.  Every mutation keeps
+    # the standard WAL-enabled connection.
+    con = connect(read_only=cmd == "list" and not args)
     try:
         if cmd == "list" and not args:
             return cmd_list(con)
