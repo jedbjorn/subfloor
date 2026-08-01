@@ -23,15 +23,19 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
@@ -58,15 +62,62 @@ SENTINEL_SQL = (
 )
 
 
-def run_sc(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+def run_sc(cwd: Path, *args: str,
+           env_overrides: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """`./sc <args>` from `cwd`, with the dispatcher's own `sc` — the one under
     test — resolved relative to that checkout."""
     env = dict(os.environ)
-    env.pop("SC_PYTHON", None)
+    for name in ("SC_PYTHON", "SC_API_TOKEN", "SC_API_BASE"):
+        env.pop(name, None)
+    env.update(env_overrides or {})
     return subprocess.run(
         [str(cwd / "sc"), *args],
         cwd=str(cwd), capture_output=True, text=True, timeout=600,
         check=False, env=env)
+
+
+class _CatalogApiHandler(BaseHTTPRequestHandler):
+    """Tiny authenticated peer for proving the subprocess chooses HTTP."""
+
+    route = {
+        "harness": "codex", "selector": "wt-live-model", "source": "live-api",
+        "availability": "available", "stale": 0, "headless_supported": 1,
+        "high_effort_supported": 1, "cli_version": "test",
+        "supported_efforts": '["high"]',
+    }
+    skill = {
+        "skill_id": 999, "name": "wt-live-skill", "common": 0,
+        "is_deleted": 0, "grant_scopes": ["flavor:dev"],
+    }
+
+    def do_GET(self):
+        if self.headers.get("Authorization") != "Bearer shell-token":
+            return self._json(401, {"error": "unauthorized"})
+        path = urlparse(self.path).path
+        if path == "/_sc/model-routes":
+            return self._json(200, {"routes": [self.route]})
+        if path == "/_sc/skills":
+            return self._json(200, {"skills": [self.skill]})
+        return self._json(404, {"error": "not found"})
+
+    def _json(self, status: int, payload: dict):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args):
+        pass
+
+
+def start_catalog_api() -> tuple[ThreadingHTTPServer, threading.Thread, str]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CatalogApiHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    return server, thread, base
 
 
 def run_bare_sc(cwd: Path, live_root: Path,
@@ -388,6 +439,73 @@ class LiveSurfacesStillResolveTest(WorktreeFixture):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, ENGINE_PIN + "\n")
         self.assertEqual(done.stderr, "")
+
+    def _make_live_engine_read_only(self) -> None:
+        """Model the linked shell seat: canonical source is readable, not writable."""
+        engine = self.main / ".super-coder"
+        engine_mode = engine.stat().st_mode
+        db_mode = self.live_db.stat().st_mode
+        self.live_db.chmod(0o444)
+        engine.chmod(0o555)
+        self.addCleanup(engine.chmod, engine_mode)
+        self.addCleanup(self.live_db.chmod, db_mode)
+
+    def test_model_list_and_resolve_use_current_api_when_live_db_is_unwritable(self):
+        # The shell worktree may lag the installed floor.  Sabotage its tracked
+        # model script so success also proves the dispatcher reaches the
+        # canonical live-instance script and DB, not the stale caller copy.
+        stale_script = self.wt / ".super-coder" / "scripts" / "models.py"
+        stale_source = stale_script.read_bytes()
+        stale_script.write_text("raise SystemExit('STALE-WORKTREE-MODELS')\n")
+        self.addCleanup(stale_script.write_bytes, stale_source)
+
+        before = state_digest(self.main)
+        self._make_live_engine_read_only()
+        api, thread, base = start_catalog_api()
+        env = {"SC_API_TOKEN": "shell-token", "SC_API_BASE": base}
+        try:
+            listed = run_sc(
+                self.wt, "models", "list", "codex", env_overrides=env
+            )
+            resolved = run_sc(
+                self.wt, "models", "resolve", "codex", "wt-live-model", "--json",
+                env_overrides=env,
+            )
+        finally:
+            api.shutdown()
+            api.server_close()
+            thread.join(2)
+
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertNotIn("STALE-WORKTREE-MODELS", listed.stdout + listed.stderr)
+        self.assertIn("codex/wt-live-model", listed.stdout)
+        self.assertIn("live-api", listed.stdout)
+        self.assertEqual(resolved.returncode, 0, resolved.stderr)
+        self.assertNotIn("STALE-WORKTREE-MODELS", resolved.stdout + resolved.stderr)
+        self.assertEqual(json.loads(resolved.stdout)["selector"], "wt-live-model")
+        self.assertEqual(state_digest(self.main), before)
+        self.assertFalse((self.wt / ".super-coder" / "shell_db.db").exists())
+
+    def test_skill_list_uses_current_api_when_live_db_is_unwritable(self):
+        before = state_digest(self.main)
+        self._make_live_engine_read_only()
+        api, thread, base = start_catalog_api()
+        try:
+            listed = run_sc(
+                self.wt, "skill", "list",
+                env_overrides={
+                    "SC_API_TOKEN": "shell-token", "SC_API_BASE": base,
+                },
+            )
+        finally:
+            api.shutdown()
+            api.server_close()
+            thread.join(2)
+
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn("wt-live-skill", listed.stdout)
+        self.assertEqual(state_digest(self.main), before)
+        self.assertFalse((self.wt / ".super-coder" / "shell_db.db").exists())
 
     def test_bare_sc_works_when_the_worktree_launcher_is_absent(self):
         launcher = self.wt / "sc"
