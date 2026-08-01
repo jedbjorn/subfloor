@@ -125,7 +125,7 @@ def test_transcript_installs_snapshot_then_coalesces_keyed_live_updates():
     keyed = interface[interface.index("function chatCreateTranscriptState"):
                       interface.index("async function renderInterface")]
 
-    assert "snapshot.projection_version !== 1" in keyed
+    assert "snapshot.projection_version !== 2" in keyed
     assert "items.has(item.item_id)" in keyed
     assert "nodes: new Map()" in keyed
     assert "dirty: new Set(items.keys())" in keyed
@@ -139,7 +139,7 @@ def test_transcript_installs_snapshot_then_coalesces_keyed_live_updates():
     assert "transcriptState.hiddenDirty = true" in keyed
     assert "sequence !== transcriptState.lastSequence + 1" in keyed
     assert "if (reconcilePromise" in keyed
-    assert "`run:${runId}:assistant`" in keyed
+    assert "`run:${runId}:assistant:${anchor}`" in keyed
     assert "assistant.text += event.payload?.text || \"\"" in keyed
     assert "transcriptState.throughSequence" in keyed
     assert "/events?after=${afterSequence}" in interface
@@ -150,10 +150,6 @@ def test_transcript_installs_snapshot_then_coalesces_keyed_live_updates():
     ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="projection v2 keyed assistant segments land in Sprint 63 unit 3",
-)
 def test_segmented_transcript_source_contract_is_versioned_and_run_scoped():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
@@ -189,10 +185,12 @@ def test_connection_status_is_attached_to_transcript_without_visible_copy():
 def test_transcript_hides_routine_tools_but_keeps_actionable_activity():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
-    activity = interface[
-        interface.index("const activityLabel = (event) =>"):
-        interface.index("chatOpenStream(", interface.index(
-          "const activityLabel = (event) =>"))
+    reducer = interface[interface.index("const reduceEvent = (event) =>"):
+                        interface.index("chatOpenStream(", interface.index(
+                            "const reduceEvent = (event) =>"))]
+    activity = reducer[
+        reducer.index('} else if ([\n      "permission.requested"'):
+        reducer.index("transcriptState.lastSequence = sequence")
     ]
     assert '"tool.started"' not in activity
     assert '"tool.completed"' not in activity

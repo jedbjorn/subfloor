@@ -3517,19 +3517,47 @@ async function chatRenderNew(host, shell, defaults, catalog) {
 }
 
 function chatCreateTranscriptState(snapshot) {
-  if (snapshot.projection_version !== 1)
+  if (snapshot.projection_version !== 2)
     throw new Error("Unsupported transcript projection.");
   const items = new Map();
   for (const item of snapshot.items || []) {
     if (!item.item_id || items.has(item.item_id))
       throw new Error("Transcript contains a keyed identity conflict.");
+    if (item.kind === "assistant") {
+      const anchor = Number(item.segment_anchor_sequence);
+      if (item.run_id == null || !Number.isInteger(anchor) || anchor < 0
+          || item.item_id !== `run:${item.run_id}:assistant:${anchor}`)
+        throw new Error("Transcript contains an invalid assistant segment.");
+    }
     items.set(item.item_id, { ...item });
+  }
+  const activeRunId = snapshot.controls?.active_run_id;
+  const cursor = snapshot.assistant_cursor || null;
+  if ((activeRunId == null) !== (cursor == null)
+      || cursor && (cursor.run_id !== activeRunId
+        || !Number.isInteger(Number(cursor.segment_anchor_sequence))
+        || Number(cursor.segment_anchor_sequence) < 0
+        || Number(cursor.segment_anchor_sequence)
+          > Number(snapshot.through_sequence || 0)))
+    throw new Error("Transcript contains an invalid assistant cursor.");
+  if (cursor && [...items.values()].some((item) =>
+    item.kind === "assistant" && item.run_id === activeRunId
+      && Number(item.segment_anchor_sequence)
+        > Number(cursor.segment_anchor_sequence)))
+    throw new Error("Transcript assistant cursor moved backward.");
+  const assistantAnchors = new Map();
+  if (cursor) {
+    assistantAnchors.set(
+      cursor.run_id,
+      Number(cursor.segment_anchor_sequence),
+    );
   }
   return {
     projectionVersion: snapshot.projection_version,
     throughSequence: Number(snapshot.through_sequence || 0),
     lastSequence: Number(snapshot.through_sequence || 0),
     items,
+    assistantAnchors,
     order: [...items.keys()].sort((left, right) => {
       const a = items.get(left);
       const b = items.get(right);
@@ -4104,6 +4132,22 @@ async function chatRenderOpen(host, initialConversation, initialSnapshot) {
     const userItem = event.message_id == null
       ? null
       : transcriptState.items.get(`message:${event.message_id}`);
+    const boundary = [
+      "tool.started",
+      "tool.completed",
+      "permission.requested",
+      "input.requested",
+    ].includes(type);
+
+    if (boundary && event.run_id != null) {
+      const previousAnchor = transcriptState.assistantAnchors.get(event.run_id)
+        || 0;
+      if (sequence <= previousAnchor) {
+        reconcileTranscript();
+        return;
+      }
+      transcriptState.assistantAnchors.set(event.run_id, sequence);
+    }
 
     if (type === "message.accepted") {
       if (!userItem) {
@@ -4125,9 +4169,16 @@ async function chatRenderOpen(host, initialConversation, initialSnapshot) {
         return;
       }
       const runId = event.run_id;
-      const itemId = `run:${runId}:assistant`;
+      if (runId == null || runId !== conversation.active_run_id) {
+        reconcileTranscript();
+        return;
+      }
+      const anchor = transcriptState.assistantAnchors.get(runId) || 0;
+      const itemId = `run:${runId}:assistant:${anchor}`;
       let assistant = transcriptState.items.get(itemId);
-      if (assistant && assistant.message_id !== event.message_id) {
+      if (assistant && (assistant.message_id !== event.message_id
+          || assistant.run_id !== runId
+          || Number(assistant.segment_anchor_sequence) !== anchor)) {
         reconcileTranscript();
         return;
       }
@@ -4141,6 +4192,7 @@ async function chatRenderOpen(host, initialConversation, initialSnapshot) {
           created_at: event.created_at,
           text: "",
           outcome: null,
+          segment_anchor_sequence: anchor,
           first_sequence: sequence,
           last_sequence: sequence,
           text_truncated: false,
@@ -4191,6 +4243,8 @@ async function chatRenderOpen(host, initialConversation, initialSnapshot) {
     if (type === "run.started") {
       conversation.state = "running";
       conversation.active_run_id = event.run_id;
+      if (event.run_id != null)
+        transcriptState.assistantAnchors.set(event.run_id, 0);
     }
     if (type === "conversation.updated" || type === "conversation.renamed")
       Object.assign(conversation, event.payload || {});
@@ -4207,6 +4261,8 @@ async function chatRenderOpen(host, initialConversation, initialSnapshot) {
       .includes(type)) {
       stopRequest = null;
       conversation.active_run_id = null;
+      if (event.run_id != null)
+        transcriptState.assistantAnchors.delete(event.run_id);
     }
 
     if (type === "assistant.delta") {
