@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
@@ -17,9 +17,9 @@ MIGRATIONS = ENGINE / "migrations"
 ROOT_ONLY_MARKER = "<!-- sc-root-only:"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import run  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot  # noqa: E402
-import run  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "api"))
 import server  # noqa: E402
@@ -233,6 +233,48 @@ class GrantApiTest(unittest.TestCase):
         )
         self.assertIn("dev", row["granted_flavors"])
         self.assertEqual(row["granted_shells"], [self.custom1])
+
+    def test_flavor_toggle_reconciles_the_flavor(self) -> None:
+        con = mock.Mock()
+        with (
+            mock.patch.object(server, "db", return_value=con),
+            mock.patch.object(
+                server, "set_flavor_grant", return_value=(True, None)
+            ) as mutate,
+            mock.patch.object(
+                server.skill_projection, "reconcile_flavors"
+            ) as reconcile,
+        ):
+            status, _headers, body = server.dispatch_http(
+                "PUT",
+                f"/api/flavors/dev/skills/{self.kid}",
+                "Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                "Content-Length: 17\r\n",
+                b'{"granted": true}',
+            )
+        self.assertEqual(status, 200, body)
+        mutate.assert_called_once_with(con, "dev", self.kid, True)
+        reconcile.assert_called_once_with(con, ["dev"])
+
+    def test_bespoke_toggle_reconciles_only_the_shell(self) -> None:
+        con = mock.Mock()
+        with (
+            mock.patch.object(server, "db", return_value=con),
+            mock.patch.object(server, "set_grant", return_value=(True, None)) as mutate,
+            mock.patch.object(
+                server.skill_projection, "reconcile_assignment_targets"
+            ) as reconcile,
+        ):
+            status, _headers, body = server.dispatch_http(
+                "PUT",
+                f"/api/shells/{self.custom1}/skills/{self.kid}",
+                "Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                "Content-Length: 18\r\n",
+                b'{"granted": false}',
+            )
+        self.assertEqual(status, 200, body)
+        mutate.assert_called_once_with(con, self.custom1, self.kid, False)
+        reconcile.assert_called_once_with(con, [self.custom1])
 
 
 class ShellFactoryTest(unittest.TestCase):
