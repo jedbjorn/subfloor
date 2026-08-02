@@ -1,0 +1,54 @@
+---
+rendered_by: super-coder
+source: db
+edit: changes here are overwritten — author via the shell or localhost GUI
+feature: Browser-native headless conversations
+roadmap_status: in_progress
+frozen: true
+---
+
+# SPRINT: Segmented assistant responses (F24 spec 56)
+status: CLOSED                      # ACTIVE | CLOSED
+closed: 2026-08-01 · all 5 units merged · conformance settled (doc 66 + F1 addendum) @ main d56fdff
+declared: 2026-08-01 · planner: PLN2
+
+Governing spec: doc #56 (feature #24, Segmented assistant responses, spec seq 8) — QA/QC'd by PLN2 session 0004; phase 0 below is the reviewer QA/QC pass that gates implementation. Spec tasks #194–#197 map to units 1–4.
+Work repo: ~/Repos/subfloor (github.com/jedbjorn/subfloor). Branch naming: `feat/f24-u<seq>-<slug>`.
+Models: flavor defaults (informal sprint, FnB-delegated — no interview round).
+
+Scope notes:
+- Mini sprint, standard substrate eventing (this is NOT F31's deviation set): watch daemon live, devs register PR watches, `pr_event` rows wake PLN2, dev merge-on-green+clean authority per the `sprint` skill.
+- Crew chosen for zero contention with F31's tail: DEV5/DEV6/REV3 are not in F31's sprint (DEV3+REV2 still hold F31 unit 13 / PR #881).
+- Shared-surface caution: F31 U13/U14 (PR #881) touches browser header/routing around the Chat view. Unit 3 here touches the Chat view's live reducer/DOM. Unit 3's dev MUST sync base over #881's merge if it lands first; PLN1 pings PLN2 on that merge.
+- Sequencing context: spec 56 was QA'd "execute after F31 lands"; F31 conformance is settled dual-PASS @ main b5f5c29 with only the U13 UI follow-up in flight — FnB directed start now, informal, PLN2 drives.
+
+## Board
+
+| seq | unit | shell | reviewer | depends on | branch | pr | status |
+|---|---|---|---|---|---|---|---|
+| 0 | QA/QC round on spec #56 vs current main — verdict PASS/FAIL, Medium+ findings block activation | REV3 | — | — | — | — | round 1 done — FAIL (verdict doc #64): 1 Medium (M1/flag #84: R5 cursor anchor not run-scoped), 3 Lows (L1 R3 fields already exist, L2 R4 'view' is a CTE, L3 permission/input boundaries Codex/OpenCode-only). Spec amended (M1 + all Lows applied, unit-1 fixture added for the M1 scenario); flag #84 closed; scoped re-round PASS (result #689) — spec clear for activation |
+| 1 | Executable segmented-response traces — fixtures + instrumented Playwright traces for all boundary scenarios; gate proves v1 fails (task #194) | DEV5 | REV3 | 0 (PASS) | feat/f24-u1-seg-traces | #885 | **merged** @ 1623516 (pr_event #733, watch retired); task #194 done; review: 1 Medium ruled (R1 amended, flag #97 closed) + 3 Lows banked; one ci-red cycle self-fixed; unit report FILED (#736): shipped 5 trace shapes + strict staged contracts, v1 demonstrably fails v2 contracts, CI mergeable; deviations none; side-flags SC-034 (baked Chromium mismatch), SC-035 (work-repo sc lacks watch). **U3 carry-ins from report:** (1) strengthen reconnect replay so naive reprocessing visibly moves cursor/duplicates a bubble — current seq-7/same-anchor case doesn't discriminate dedupe; (2) update modified perf assertion from one concatenated bubble to v2 two-bubble shape |
+| 2 | Transcript projection version 2 — durable sequence-anchored segments, cursor from full pre-cap prefix, boundary-evidence completeness; caps/redaction/5-query contract preserved (task #195) | DEV6 | REV3 | 1 | feat/f24-u2-projection-v2 | #891 | review-clean + green @ 190978d (REV3 #749) — 3 Lows banked: (1) warning-only omission on malformed boundary payload (v1-inherited), (2) evidence COUNT subquery full-scans conversation_events (v1-inherited, v2 adds an indexable one), (3) boundary-completeness test passes verbatim under v1 — window reshape suggested (report follow-up). **merged** @ 190978d (pr_event #751, watch retired); task #195 done; unit report FILED (#754): v2 segments + full-prefix cursor + fail-closed boundary evidence, caps/redaction/5-reads/1-snapshot preserved; deviations none; judgements R2+R3; 1 anomalous timing race (no product fix); 3 Lows → follow-ups |
+| 3 | Keyed live assistant segments — browser hydrate/reduce on the same anchors; DOM identity + frame behavior proven in instrumented Playwright Chat harness (task #196) | DEV5 | REV3 | 2 | feat/f24-u3-live-segments | #893 | review-clean first round + green @ 38c0360 (REV3 #764, CI 6/6, 0 Majors/Mediums) — 2 Lows banked: dead stale-boundary reconcile branch app.js:4145; live test pre-reload boundary emissions unasserted. **merged** @ 38c0360 (pr_event #766, watch retired) — R3 window CLOSED, main serves matched v2; task #196 done; unit report FILED (#768): keyed segments on validated run-scoped anchors, outer DOM identity preserved, stale replay deduped, projection_version=2 gate; both u1 carry-ins landed; exactly 2 U3 markers removed; issues none (first-round clean); deviations none; follow-ups = flag #100 → u4 + 2 REV3 Lows |
+| 4 | Cross-harness segmented-response gate — Claude/Codex/Kimi/OpenCode traces + live browser smoke with refresh at pending boundary and Chat/Diff switch (task #197) | DEV6 | REV3 | 3 | feat/f24-u4-crossharness-gate | #896 | pr-open (result #771) — watch #17 live → PLN2; ambiguity ruled R4: U4 marker set empty post-R1-amendment → cross-harness assertions added as direct passing gates, zero markers remain; flag #100 CLOSED (deterministic all-runs-terminal wait); review-clean + green 6/6 @ 652e56b (REV3 #777, 0M/0M) — 2 Lows banked: dead non-segmented fake-adapter branch in release gate; scroll not re-proved in u4 smoke. Zero-marker invariant verified repo-wide. **merged** @ 652e56b (pr_event #779, watch retired); task #197 done; unit report FILED (#781): per-harness journeys (Claude/Kimi tool-only, Codex/OpenCode +permission/input) assert exact ordered v2 id+text equality; live smoke proves pending-boundary refresh + Chat/Diff switch with bounded catch-up and both node identities; wait_for_run_count now deterministic (flag #100); deviations none; 2 Lows → follow-ups |
+| C | Close-out conformance: spec #56 vs main @ 652e56b | REV3 | — | 4 (merged) | — | — | done — doc #66: 13/14 as-specced, 1 deviated-intentionally (R1/R4 ratified), 1 deviated-silently = F1 Medium (per-message completeness gate masks incomplete terminal sibling → transient fabricated merge). 4 Lows F2–F5 (F2–F4 already banked in unit reviews; F5 new, pre-existing v1-era, backlog). F1 ROUTED → fix unit 5 under active authority |
+| 5 | Conformance F1 fix — per-run completeness gate + F1 regression scenario (task #217) | DEV6 | REV3 | C (ruled) | feat/f24-u5-per-run-completeness | #902 | review-clean @ 97eb911 (REV3 #804, re-review after 1 Medium SC-037/flag #101 — fixed, mutation-verified) + 1 Low banked (mixed-terminal composition unasserted); **merged** @ 97eb911 (pr_event #806, watch retired); task #217 done; unit report FILED (#807): per-run gate ships, capped sibling can't fabricate a merge; R5 fixture; SC-037 loop closed w/ mutation proof; deviations none; 1 Low → follow-ups |
+| C2 | Scoped conformance re-run: F1 only vs main @ 97eb911 | REV3 | — | 5 (merged) | — | — | done — F1 CLOSED, as-specced @ main d56fdff (==97eb911 tree): per-run gate verified, incomplete terminal sibling + activity omitted, active suffix survives, no new query class; addendum on doc 66; F2–F5 stand (result #809) |
+
+Chain is genuinely serial (fixtures gate projection; projection anchors the reducer; the gate rides both) — no parallel width to mine. DEV5/DEV6 alternate so the next dev preps locally while the prior unit is in review.
+
+## Rulings
+
+- **R1 (2026-08-01, msgs #696/#698):** unit 1's "v1 must fail the fixtures" gate vs. green-merge requirement — DEV5's call RATIFIED: v1-red proof ships as strict staged contract probes (`pytest.xfail(strict=True)` / `unittest.expectedFailure`), executable now, green in CI, XPASS-is-red so behavior landing forces marker removal. Pin: markers partitioned by owning unit in the reason string (API/projection → u2, UI/reducer → u3, cross-harness gate → u4); REV3 verifies marker coverage of the gate assertions at unit-1 review; each later unit removes exactly the markers its behavior satisfies (DEV6 FYI'd, #699). **Amended (2026-08-01, msgs #724/#725, flag #97):** the same-adapter concurrency probe re-owns U4→U2 — REV3 verified its only red assertion is projection-v2 behavior; U4's gate is the harness-journey matrix, not this probe.
+- **R2 (2026-08-01, msgs #740/#741):** unit-1 fixture defect — same-adapter probe expected anchor tool.started:6; R1's every-boundary-replaces rule makes it tool.completed:7. DEV6's in-unit-2 correction RATIFIED; must be a named change in the unit-2 PR description + report (edits a reviewed unit-1 artifact — REV3 verifies deliberately). One pre-assert timing race (run row still running), rerun clean, anomalous-unless-repeats.
+- **R5 (2026-08-01, msgs #786/#787):** F1 regression fixture — naive suffix cap removes message.accepted with the boundary and short-circuits projection before the F1 path; DEV6's adversarial multi-attempt fixture (retained later acceptance marker isolates the per-run gate) RATIFIED; rationale required in PR description; production fix exact and unchanged.
+- **R4 (2026-08-01, msgs #771/#772):** U4 strict-xfail marker set was empty on main after R1's amendment (concurrency probe → U2) — DEV6's call RATIFIED: cross-harness assertions added as direct passing gates, no synthetic marker churn; zero-markers-remain invariant satisfied.
+- **R3 (2026-08-01, msgs #749/#750):** post-u2-merge main serves projection v2 while the UI reducer is v1 → browser Chat rides R7's safe-failure (retryable error) until u3 merges. ACCEPTED: R7 defines exactly this mismatch, CI green throughout (u3 contracts staged as xfail), and no deployment consumes subfloor main mid-sprint. Unit 3 closes the window; the sprint report names it.
+
+## Notes
+
+- GitHub notifier: fork watch daemon confirmed live at declaration (75s poll). Each dev registers its PR watch per the `sprint` skill; watches retire at merge/close.
+- PLN1 ack (msg #677, 2026-08-01): no claims on DEV5/DEV6/REV3; will send a result row the moment PR #881 merges so unit-3 rebases over it.
+- Adjacent F24-surface work: FnB-directed PR #884 (post-#855 broker buffering/recovery hardening) **MERGED @ 1341863** (DEV6 msgs #713/#717) — delivery layer; all sprint units build on main ≥ 1341863 from here. DEV6 acked R1 marker discipline for units 2/4 (#716).
+- Entrypoint trap (DEV5 msgs #711/#712): work-repo ./sc lacks `watch` — PR watches register via the home-engine sc; stale skill addressing tracked by DEV5 as SC-035.
+- **PR #881 MERGED** (PLN1 msg #692, 2026-08-01): main @ 012c40a — header tabs reordered (Chats→Sprints→Shells), #sprints routes, board UI in ui/, sprint read API in api/. Unit-3 caution SETTLED: all units build on main ≥ 012c40a. DEV5 nudged mid-sync (#693). F31 entering close-out; DEV3/REV2 free up shortly.

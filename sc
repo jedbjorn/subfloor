@@ -121,6 +121,26 @@ sc_host_server_alive() {
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
   ps -p "$pid" -o args= 2>/dev/null | grep -q "api/server\\.py"
 }
+
+# A checkout move can strand a live server after its pidfile disappears. Find
+# only listeners that are unmistakably this checkout's server: same configured
+# port, server.py command, and kernel-resolved cwd. This keeps restart from
+# killing an unrelated service that happens to own the port.
+sc_host_server_orphan_pids() {
+  command -v fuser >/dev/null 2>&1 || return 0
+  p="$(port)"
+  root_real="$(readlink -f "$ROOT" 2>/dev/null || printf '%s' "$ROOT")"
+  for candidate in $(fuser -n tcp "$p" 2>/dev/null || true); do
+    args="$(ps -p "$candidate" -o args= 2>/dev/null || true)"
+    cwd="$(readlink -f "/proc/$candidate/cwd" 2>/dev/null || true)"
+    case "$args" in
+      *".super-coder/api/server.py"*"--port $p"*)
+        [ "$cwd" = "$root_real" ] && printf '%s\n' "$candidate"
+        ;;
+    esac
+  done
+}
+
 sc_host_server_up() {
   "$PY" "$S/ports.py" ensure >/dev/null
   p="$(port)"
@@ -154,7 +174,27 @@ sc_host_server_down() {
     kill "$(cat "$HOST_SERVER_PID")"
     echo "→ bare-metal server stopped"
   else
-    echo "→ bare-metal server not running"
+    orphan_pids="$(sc_host_server_orphan_pids)"
+    if [ -n "$orphan_pids" ]; then
+      for orphan_pid in $orphan_pids; do
+        kill "$orphan_pid"
+      done
+      # Give ThreadingHTTPServer's signal handler a moment to close the socket
+      # before restart attempts to bind the same port.
+      i=0
+      while [ "$i" -lt 30 ]; do
+        still_alive=""
+        for orphan_pid in $orphan_pids; do
+          kill -0 "$orphan_pid" 2>/dev/null && still_alive=1
+        done
+        [ -z "$still_alive" ] && break
+        sleep 0.1
+        i=$((i + 1))
+      done
+      echo "→ orphaned bare-metal server stopped"
+    else
+      echo "→ bare-metal server not running"
+    fi
   fi
   rm -f "$HOST_SERVER_PID"
 }

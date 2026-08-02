@@ -7,6 +7,28 @@
 BEGIN;
 
 DELETE FROM dr_section;
-INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (1, '.super-coder', '.super-coder/', NULL, 0);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (1, 'Engine Core', '.super-coder/', 'Complete super-coder engine source and runtime substrate', 10);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (2, 'Runtime API', '.super-coder/api/', 'Engine HTTP API, brokers, models, and host service endpoints', 11);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (3, 'Harness Adapters', '.super-coder/adapters/', 'Harness integration manifests, guards, and harness-specific guidance', 12);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (4, 'Engine Skills', '.super-coder/assets/skills/', 'Authoritative engine skill sources distributed to shells', 13);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (5, 'Engine Seed', '.super-coder/assets/seed/', 'Founding specification and seed skill content', 14);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (6, 'Engine Database', '.super-coder/migrations/', 'Engine memory DB migrations; never the product app database', 15);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (7, 'Engine Docs', '.super-coder/docs/', 'Operational documentation for engine services and brokers', 16);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (8, 'Engine Hooks', '.super-coder/hooks/', 'Git hooks for guards, telemetry, previews, and automatic remapping', 17);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (9, 'Rendering', '.super-coder/render/', 'Boot and flat-file rendering from authoritative engine state', 18);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (10, 'Runtime Scripts', '.super-coder/scripts/', 'Engine CLI implementations, lifecycle tools, mapping, memory, and jobs', 19);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (11, 'Engine Templates', '.super-coder/templates/', 'Boot, shell, fork, and semantic extractor templates', 20);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (12, 'Review UI', '.super-coder/ui/', 'Browser review GUI application and styles', 21);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (13, 'CI', '.github/', 'Repository test and render-check workflows', 30);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (14, 'Project Docs', 'docs/', 'User-facing documentation, demos, and screenshots', 31);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (15, 'Tests', 'tests/', 'Engine regression and integration test suite', 32);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (19, 'CLI Entrypoint', 'sc', 'Top-level super-coder command dispatcher', 40);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (20, 'Build Entrypoint', 'Makefile', 'Host build, install, test, and maintenance commands', 41);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (21, 'Project Overview', 'README.md', 'Repository landing page and primary introduction', 42);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (22, 'License', 'LICENSE', 'Repository license terms', 43);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (23, 'Git Configuration', '.gitignore', 'Repository ignore policy', 44);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (24, 'Container Configuration', '.dockerignore', 'Container build-context ignore policy', 45);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (25, 'Python Dependencies', 'requirements.txt', 'Python package requirements for local engine tooling', 90);
+INSERT INTO dr_section (section_id, name, path_prefix, description, sort_order) VALUES (27, 'Shared Reference Drop Zone', 'shared/', 'Gitignored, variable reference files dropped by the operator; never a stable project source.', 91);
 
 COMMIT;

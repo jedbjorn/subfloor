@@ -3,7 +3,7 @@ rendered_by: super-coder
 source: db
 edit: changes here are overwritten — author via the shell or localhost GUI
 feature: Token & session analytics
-roadmap_status: in_progress
+roadmap_status: shipped
 frozen: false
 title: Token & Session Analytics — Spec
 tags: [super-coder, spec, analytics, telemetry, harness]

@@ -2,7 +2,7 @@
 rendered_by: super-coder
 source: db
 edit: changes here are overwritten — author via the shell or localhost GUI
-feature: Sprint model routing catalogue
+feature: Headless model routing catalogue
 roadmap_status: shipped
 frozen: true
 title: Sprint Model Routing

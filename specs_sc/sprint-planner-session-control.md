@@ -3,7 +3,7 @@ rendered_by: super-coder
 source: db
 edit: changes here are overwritten — author via the shell or localhost GUI
 feature: Sprint eventing — GitHub→inbox daemon + headless worker boot
-roadmap_status: in_progress
+roadmap_status: retired
 frozen: false
 title: Sprint planner session control
 tags: [sprints, sessions, daemon, claude, codex, kimi]

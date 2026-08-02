@@ -3,7 +3,7 @@ rendered_by: super-coder
 source: db
 edit: changes here are overwritten — author via the shell or localhost GUI
 feature: Sprint reporting — unit reports, conformance pass, planner synthesis
-roadmap_status: next
+roadmap_status: retired
 frozen: false
 title: Sprint reporting & conformance
 tags: [sprints, reporting, conformance, review, orchestration]
