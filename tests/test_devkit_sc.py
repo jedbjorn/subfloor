@@ -128,6 +128,12 @@ class PythonTestPresenceTest(unittest.TestCase):
                              "presence detection consumed candidates after a match")
 
     def test_sc_test_caches_one_presence_result_for_both_gates(self):
+        body = _extract("sc_test")
+        self.assertEqual(body.count("_sc_has_python_tests"), 1)
+        self.assertEqual(body.count('[ -n "$python_tests" ]'), 2)
+        self.assertNotIn('ls "$here"/tests/test_*.py', body)
+
+    def test_sc_test_calls_presence_probe_once_at_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             calls = root / "presence-calls"
