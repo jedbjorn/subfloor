@@ -161,6 +161,15 @@ class ReaperStore:
             "AND active.process_start_ticks=r.process_start_ticks)"
         )
 
+    @staticmethod
+    def _sweepable_sql() -> str:
+        return (
+            "(r.state IN ('starting','running') OR (r.state='unknown' "
+            "AND NOT EXISTS(SELECT 1 FROM conversation_events reaped "
+            "WHERE reaped.run_id=r.run_id "
+            "AND reaped.event_type='run.interrupted')))"
+        )
+
     def candidates(self) -> list[ReaperCandidate]:
         con = self.connect()
         try:
@@ -169,7 +178,7 @@ class ReaperStore:
                 "r.process_pid,r.process_start_ticks,r.process_group_id,"
                 "r.started_at,r.reaper_last_signal,r.reaper_signaled_at "
                 "FROM conversation_runs r "
-                "WHERE r.state IN ('starting','running') "
+                f"WHERE {self._sweepable_sql()} "
                 "AND r.process_pid IS NOT NULL "
                 f"AND NOT {self._protected_sql()} "
                 "ORDER BY r.run_id"
@@ -215,7 +224,7 @@ class ReaperStore:
             return (
                 con.execute(
                     "SELECT 1 FROM conversation_runs r "
-                    "WHERE r.run_id=? AND r.state IN ('starting','running') "
+                    f"WHERE r.run_id=? AND {self._sweepable_sql()} "
                     "AND r.process_pid=? AND r.process_start_ticks=? "
                     "AND r.process_group_id=? "
                     f"AND NOT {self._protected_sql()}",
@@ -239,7 +248,7 @@ class ReaperStore:
                 changed = con.execute(
                     "UPDATE conversation_runs AS r SET reaper_last_signal=?,"
                     "reaper_signaled_at=? WHERE run_id=? "
-                    "AND state IN ('starting','running') "
+                    f"AND {self._sweepable_sql()} "
                     "AND process_pid=? AND process_start_ticks=? "
                     "AND process_group_id=? "
                     f"AND NOT {self._protected_sql()}",
@@ -300,7 +309,7 @@ class ReaperStore:
                     "JOIN conversations c ON c.conversation_id=r.conversation_id "
                     "JOIN conversation_messages m "
                     "ON m.message_id=r.trigger_message_id "
-                    "WHERE r.run_id=? AND r.state IN ('starting','running') "
+                    f"WHERE r.run_id=? AND {self._sweepable_sql()} "
                     "AND r.process_pid=? AND r.process_start_ticks=? "
                     "AND r.process_group_id=? "
                     f"AND NOT {self._protected_sql()}",
@@ -313,38 +322,41 @@ class ReaperStore:
                 ).fetchone()
                 if row is None:
                     return False
-                require_transition("run", str(row["state"]), "cancelled")
-                con.execute(
-                    "UPDATE conversation_runs SET state='cancelled',ended_at=?,"
-                    "error_code='CONVERSATION_RUN_REAPED',error_detail=? "
-                    "WHERE run_id=?",
-                    (now, reason[:16384], candidate.run_id),
-                )
-                message_state = str(row["message_state"])
-                if message_state not in TERMINAL_MESSAGE_STATES:
-                    require_transition("message", message_state, "cancelled")
+                run_state = str(row["state"])
+                if run_state != "unknown":
+                    require_transition("run", run_state, "cancelled")
                     con.execute(
-                        "UPDATE conversation_messages SET state='cancelled',"
-                        "completed_at=? WHERE message_id=?",
-                        (now, candidate.message_id),
+                        "UPDATE conversation_runs SET state='cancelled',ended_at=?,"
+                        "error_code='CONVERSATION_RUN_REAPED',error_detail=? "
+                        "WHERE run_id=?",
+                        (now, reason[:16384], candidate.run_id),
                     )
-                conversation_state = str(row["conversation_state"])
-                if conversation_state == "running":
-                    pending = (
+                    message_state = str(row["message_state"])
+                    if message_state not in TERMINAL_MESSAGE_STATES:
+                        require_transition("message", message_state, "cancelled")
                         con.execute(
-                            "SELECT 1 FROM conversation_outbox WHERE conversation_id=? "
-                            "AND state IN ('pending','claimed') LIMIT 1",
-                            (candidate.conversation_id,),
-                        ).fetchone()
-                        is not None
-                    )
-                    target = "queued" if pending else "idle"
-                    require_transition("conversation", conversation_state, target)
-                    con.execute(
-                        "UPDATE conversations SET state=?,last_activity_at=?,"
-                        "version=version+1 WHERE conversation_id=?",
-                        (target, now, candidate.conversation_id),
-                    )
+                            "UPDATE conversation_messages SET state='cancelled',"
+                            "completed_at=? WHERE message_id=?",
+                            (now, candidate.message_id),
+                        )
+                    conversation_state = str(row["conversation_state"])
+                    if conversation_state == "running":
+                        pending = (
+                            con.execute(
+                                "SELECT 1 FROM conversation_outbox "
+                                "WHERE conversation_id=? "
+                                "AND state IN ('pending','claimed') LIMIT 1",
+                                (candidate.conversation_id,),
+                            ).fetchone()
+                            is not None
+                        )
+                        target = "queued" if pending else "idle"
+                        require_transition("conversation", conversation_state, target)
+                        con.execute(
+                            "UPDATE conversations SET state=?,last_activity_at=?,"
+                            "version=version+1 WHERE conversation_id=?",
+                            (target, now, candidate.conversation_id),
+                        )
                 self._append_interrupted_event(con, candidate, reason)
         finally:
             con.close()

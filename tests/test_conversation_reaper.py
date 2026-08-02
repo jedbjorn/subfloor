@@ -18,6 +18,7 @@ SCRIPTS = ENGINE / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import conversation_reaper
+from conversation_broker import BrokerStore
 from conversation_reaper import (
     ConversationReaper,
     ProcessSnapshot,
@@ -161,6 +162,18 @@ class ConversationReaperTest(unittest.TestCase):
             signal_group=signal_group or (lambda _group, _value: None),
         )
 
+    def finish_unknown(self, run_id: int) -> None:
+        self.assertTrue(
+            BrokerStore(self.db_path, clock=self.clock).finish_run(
+                run_id,
+                "unknown",
+                event_type="run.unknown",
+                payload={"detail": "adopted outcome could not be proven"},
+                error_code="HARNESS_OUTCOME_UNKNOWN",
+                error_detail="adopted outcome could not be proven",
+            )
+        )
+
     def test_exact_registry_identity_is_the_only_protection(self) -> None:
         _conversation, _message, protected_run = self.add_run(protected=True)
         snapshot = ProcessSnapshot(4242, 9001, 4242)
@@ -240,6 +253,98 @@ class ConversationReaperTest(unittest.TestCase):
             '"reason":"recorded process identity exited or was recycled"',
             event["payload"],
         )
+
+    def test_adopted_unknown_live_process_is_swept_once(self) -> None:
+        conversation_id, message_id, run_id = self.add_run()
+        self.finish_unknown(run_id)
+        interrupted: list[int] = []
+        signals: list[tuple[int, signal.Signals]] = []
+        reaper = self.build_reaper(
+            ProcessSnapshot(4242, 9001, 4242),
+            native_interrupt=interrupted.append,
+            signal_group=lambda group, value: signals.append((group, value)),
+        )
+
+        self.assertEqual(reaper.sweep_once(), 1)
+        self.clock.advance(15)
+        self.assertEqual(reaper.sweep_once(), 1)
+        self.clock.advance(15)
+        self.assertEqual(reaper.sweep_once(), 1)
+        self.assertEqual(reaper.sweep_once(), 0)
+        self.assertEqual(interrupted, [run_id])
+        self.assertEqual(
+            signals,
+            [(4242, signal.SIGTERM), (4242, signal.SIGKILL)],
+        )
+
+        con = self.connect()
+        run = con.execute(
+            "SELECT state,error_code,process_pid,process_start_ticks,"
+            "process_group_id,reaper_last_signal FROM conversation_runs "
+            "WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        message_state = con.execute(
+            "SELECT state FROM conversation_messages WHERE message_id=?",
+            (message_id,),
+        ).fetchone()[0]
+        conversation_state = con.execute(
+            "SELECT state FROM conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()[0]
+        events = con.execute(
+            "SELECT event_type FROM conversation_events WHERE run_id=? "
+            "ORDER BY sequence",
+            (run_id,),
+        ).fetchall()
+        con.close()
+        self.assertEqual(
+            tuple(run),
+            ("unknown", "HARNESS_OUTCOME_UNKNOWN", 4242, 9001, 4242, "SIGKILL"),
+        )
+        self.assertEqual(message_state, "failed")
+        self.assertEqual(conversation_state, "error")
+        self.assertEqual(
+            [row["event_type"] for row in events],
+            ["run.unknown", "run.interrupted"],
+        )
+
+    def test_unknown_run_without_process_identity_is_untouched(self) -> None:
+        _conversation_id, _message_id, run_id = self.add_run()
+        self.finish_unknown(run_id)
+        con = self.connect()
+        con.execute(
+            "UPDATE conversation_runs SET process_pid=NULL,"
+            "process_start_ticks=NULL,process_group_id=NULL WHERE run_id=?",
+            (run_id,),
+        )
+        con.commit()
+        con.close()
+        interrupted: list[int] = []
+        signals: list[tuple[int, signal.Signals]] = []
+        reaper = self.build_reaper(
+            None,
+            native_interrupt=interrupted.append,
+            signal_group=lambda group, value: signals.append((group, value)),
+        )
+
+        self.assertEqual(reaper.sweep_once(), 0)
+        self.assertEqual(interrupted, [])
+        self.assertEqual(signals, [])
+        con = self.connect()
+        run = con.execute(
+            "SELECT state,process_pid,process_start_ticks,process_group_id,"
+            "reaper_last_signal FROM conversation_runs WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        events = con.execute(
+            "SELECT event_type FROM conversation_events WHERE run_id=? "
+            "ORDER BY sequence",
+            (run_id,),
+        ).fetchall()
+        con.close()
+        self.assertEqual(tuple(run), ("unknown", None, None, None, None))
+        self.assertEqual([row["event_type"] for row in events], ["run.unknown"])
 
     def test_ladder_persists_across_heartbeats_and_kills_process_group(self) -> None:
         conversation_id, message_id, run_id = self.add_run()
