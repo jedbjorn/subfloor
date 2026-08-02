@@ -20,6 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".super-coder" / "s
 import install  # noqa: E402
 
 MAP_DB = "/.sc-state/map.db"
+DB_BACKUPS = "/.sc-state/db_backups/"
+CODEX_SKILLS = "/.agents/skills/"
+OPENCODE_SKILLS = "/.opencode/skills/"
 
 
 class EnsureGitignoreTest(unittest.TestCase):
@@ -36,6 +39,7 @@ class EnsureGitignoreTest(unittest.TestCase):
         self.assertIn(install._GITIGNORE_MARKER, text)
         for pat in install._required_ignores():
             self.assertIn(pat, text)
+        self.assertIn(DB_BACKUPS, text)
 
     def test_idempotent(self):
         install.ensure_gitignore(self.root)
@@ -53,9 +57,32 @@ class EnsureGitignoreTest(unittest.TestCase):
         self.assertTrue(changed)
         text = self.gi.read_text()
         self.assertIn(MAP_DB, text)
+        self.assertIn(DB_BACKUPS, text)
         # existing lines are not duplicated
         self.assertEqual(text.count("/.super-coder/"), 1)
         # and a second run is a no-op
+        self.assertFalse(install.ensure_gitignore(self.root))
+
+    def test_tops_up_codex_native_skill_render_on_existing_fork(self):
+        old = "\n".join(
+            ln for ln in install._GITIGNORE_BLOCK.splitlines()
+            if ln != CODEX_SKILLS
+        )
+        self.gi.write_text(old + "\n")
+
+        self.assertTrue(install.ensure_gitignore(self.root))
+        self.assertIn(CODEX_SKILLS, self.gi.read_text())
+        self.assertFalse(install.ensure_gitignore(self.root))
+
+    def test_tops_up_opencode_native_skill_render_on_existing_fork(self):
+        old = "\n".join(
+            ln for ln in install._GITIGNORE_BLOCK.splitlines()
+            if ln != OPENCODE_SKILLS
+        )
+        self.gi.write_text(old + "\n")
+
+        self.assertTrue(install.ensure_gitignore(self.root))
+        self.assertIn(OPENCODE_SKILLS, self.gi.read_text())
         self.assertFalse(install.ensure_gitignore(self.root))
 
     def test_no_marker_unrelated_content_appends_once(self):

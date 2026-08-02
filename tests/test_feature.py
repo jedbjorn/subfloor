@@ -5,8 +5,7 @@ Two layers: the REGISTRY must stay consistent with the assets it points at
 (every granted skill exists in assets/skills/ and is common:false — a feature
 must never grant a skill the seed doesn't ship, or auto-grant a common one
 twice; every flavor has a template), and the GRANT/REVOKE SQL must do what the
-registry means (grant to live shells of the named flavors only, revoke without
-touching other shells' grants).
+registry means (grant each named flavor pack once and leave other packs alone).
 
 Run:
     python3 tests/test_feature.py
@@ -18,6 +17,7 @@ import sqlite3
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
@@ -38,12 +38,14 @@ def _mini_db() -> sqlite3.Connection:
                              is_deleted INTEGER DEFAULT 0);
         CREATE TABLE shell_skills (shell_id INTEGER, skill_id INTEGER,
                                    PRIMARY KEY (shell_id, skill_id));
+        CREATE TABLE flavor_skills (flavor TEXT, skill_id INTEGER,
+                                    PRIMARY KEY (flavor, skill_id));
     """)
     con.executemany("INSERT INTO shells (shell_id, flavor, is_deleted) VALUES (?,?,?)",
                     [(1, "dev", 0), (2, "dev", 0), (3, "reviewer", 0),
                      (4, "admin", 0), (5, "dev", 1),      # deleted — never granted
                      (6, "planner", 0)])
-    con.execute("INSERT INTO skills (skill_id, name) VALUES (10, 'test_authoring_pg')")
+    con.execute("INSERT INTO skills (skill_id, name) VALUES (10, 'query_authoring_pg')")
     return con
 
 
@@ -95,19 +97,25 @@ class RegistryIntegrityTest(unittest.TestCase):
         self.assertIn("d['pg']={}", sc.replace(" ", ""),
                       "sc pg-init no longer writes the `pg` key feature.py expects")
 
+    def test_pg_grants_only_diagnostic_sql(self):
+        self.assertEqual(
+            feature.FEATURES["pg"]["grants"],
+            {"query_authoring_pg": ["dev", "reviewer", "planner"]},
+        )
+
 
 class GrantRevokeTest(unittest.TestCase):
-    def test_grant_targets_live_shells_of_named_flavors(self):
+    def test_grant_targets_each_named_flavor_once(self):
         con = _mini_db()
-        n = feature.grant(con, "test_authoring_pg", ["dev", "reviewer"])
-        self.assertEqual(n, 3)  # dev(1,2) + reviewer(3); deleted dev(5) skipped
-        rows = {r[0] for r in con.execute("SELECT shell_id FROM shell_skills")}
-        self.assertEqual(rows, {1, 2, 3})
+        n = feature.grant(con, "query_authoring_pg", ["dev", "reviewer"])
+        self.assertEqual(n, 2)
+        rows = {r[0] for r in con.execute("SELECT flavor FROM flavor_skills")}
+        self.assertEqual(rows, {"dev", "reviewer"})
 
     def test_grant_is_idempotent(self):
         con = _mini_db()
-        feature.grant(con, "test_authoring_pg", ["dev"])
-        n = feature.grant(con, "test_authoring_pg", ["dev"])
+        feature.grant(con, "query_authoring_pg", ["dev"])
+        n = feature.grant(con, "query_authoring_pg", ["dev"])
         self.assertEqual(n, 0)
 
     def test_grant_unknown_skill_grants_nothing(self):
@@ -116,14 +124,46 @@ class GrantRevokeTest(unittest.TestCase):
 
     def test_revoke_leaves_other_flavors_grants(self):
         con = _mini_db()
-        feature.grant(con, "test_authoring_pg", ["dev", "reviewer"])
-        # A manual grant to a planner shell — outside the feature's flavors.
-        con.execute("INSERT INTO shell_skills VALUES (6, 10)")
-        n = feature.revoke(con, "test_authoring_pg", ["dev", "reviewer"])
-        self.assertEqual(n, 3)
-        rows = {r[0] for r in con.execute("SELECT shell_id FROM shell_skills")}
-        self.assertEqual(rows, {6}, "revoke must not touch grants outside the "
-                                    "feature's flavors")
+        feature.grant(con, "query_authoring_pg", ["dev", "reviewer"])
+        # A manual planner-pack grant — outside the feature's flavors.
+        con.execute("INSERT INTO flavor_skills VALUES ('planner', 10)")
+        n = feature.revoke(con, "query_authoring_pg", ["dev", "reviewer"])
+        self.assertEqual(n, 2)
+        rows = {r[0] for r in con.execute("SELECT flavor FROM flavor_skills")}
+        self.assertEqual(rows, {"planner"}, "revoke must not touch packs outside "
+                                           "the feature's flavors")
+
+
+class ProjectionTriggerTest(unittest.TestCase):
+    def _run(self, command) -> list[tuple[sqlite3.Connection, list[str]]]:
+        con = _mini_db()
+        calls: list[tuple[sqlite3.Connection, list[str]]] = []
+
+        def capture(target_con, flavors) -> dict:
+            calls.append((target_con, list(flavors)))
+            return {"written": [], "skipped": [], "deleted": [], "checkouts": []}
+
+        with (
+            mock.patch.object(feature, "DB_PATH", ROOT / "sc"),
+            mock.patch.object(feature.db_driver, "connect", return_value=con),
+            mock.patch.object(feature.skill_projection, "reconcile_flavors",
+                              side_effect=capture),
+            mock.patch.object(feature, "_instance", return_value={"pg": {}}),
+            mock.patch.object(feature, "_write_instance"),
+            mock.patch.object(feature, "_snapshot"),
+        ):
+            self.assertEqual(command("pg"), 0)
+        return calls
+
+    def test_enable_reconciles_every_granted_flavor(self):
+        calls = self._run(feature.cmd_enable)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], ["dev", "reviewer", "planner"])
+
+    def test_disable_reconciles_every_revoked_flavor(self):
+        calls = self._run(feature.cmd_disable)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], ["dev", "reviewer", "planner"])
 
 
 if __name__ == "__main__":

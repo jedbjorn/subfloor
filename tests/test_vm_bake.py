@@ -15,6 +15,7 @@ Run:
 """
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -36,6 +37,15 @@ def _virsh_op(argv: list[str]) -> str:
 
 
 class BakeTest(unittest.TestCase):
+    def setUp(self):
+        # The suite itself often runs inside a sandbox (SC_SANDBOX=1 in the
+        # env); clear it so only test_refuses_in_sandbox exercises the
+        # refusal path.
+        patcher = mock.patch.dict("os.environ")
+        patcher.start()
+        os.environ.pop("SC_SANDBOX", None)
+        self.addCleanup(patcher.stop)
+
     def test_refuses_in_sandbox(self):
         with mock.patch.dict("os.environ", {"SC_SANDBOX": "1"}):
             r = vm.do_bake()

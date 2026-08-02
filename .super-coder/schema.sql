@@ -273,46 +273,22 @@ CREATE TABLE shell_messages (
     created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
     read_at       TEXT                          -- NULL = unread
     -- kind TEXT NOT NULL DEFAULT 'shell' CHECK (kind IN
-    -- ('shell','task','result','pr_event')) — typed sprint-eventing traffic,
+    -- ('shell','task','result')) — typed generic traffic,
     -- added by migration 0059. Kept out of this baseline CREATE on purpose:
     -- ADD COLUMN can't be IF NOT EXISTS and rebuild applies migrations after
     -- schema.sql, so inlining would double-define (the 0047 precedent). See
-    -- migrations/0059_sprint_eventing.sql.
+    -- migration 0059 (generic message-kind support).
     -- dedupe_key TEXT — idempotent send (#333), added by migration 0062
     -- (same migration-only precedent; unique partial index
     -- idx_shell_messages_dedupe rides in the migration).
 );
 
--- ── Watched PRs (sprint eventing — subscription registry + daemon state) ────
--- One row per (repo, PR, subscriber shell). `./sc watch pr` registers; the
--- GitHub watcher daemon (`./sc watch daemon`, supervised by launch/down) polls
--- every live watch on one batched query, diffs against last_seen, and writes a
--- `pr_event` message row to the owning shell on each transition. On merge or
--- close it emits the final event and sets closed_at — the watch retires
--- itself. See migrations/0059_sprint_eventing.sql (convergent — carries an
--- existing fork).
-
-CREATE TABLE watched_prs (
-    watch_id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    repo           TEXT    NOT NULL,          -- owner/name
-    pr_number      INTEGER NOT NULL,
-    shell_id       INTEGER NOT NULL REFERENCES shells(shell_id),
-    last_seen      TEXT,                      -- JSON: checks/review/state fingerprint
-    created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
-    closed_at      TEXT,                      -- set on merge/close; NULL = live
-    UNIQUE (repo, pr_number, shell_id)
-);
-
--- Daemon liveness (#359): the watcher daemon UPSERTs its row once per poll
--- cycle; the /_sc/watches API turns beat age into a live/stale/never verdict
--- so `./sc watch list` can't report watches "live" with nobody polling.
--- See migrations/0068_watch_daemon_heartbeat.sql (convergent — carries an
--- existing fork).
+-- ── Supervised daemon liveness ────────────────────────────────────────────
 
 CREATE TABLE daemon_heartbeats (
-    name        TEXT PRIMARY KEY,              -- 'watch' — one row per daemon
-    beat_at     TEXT    NOT NULL,              -- datetime('now') at last poll cycle
-    interval_s  INTEGER NOT NULL               -- the daemon's configured poll interval
+    name        TEXT PRIMARY KEY,
+    beat_at     TEXT    NOT NULL,
+    interval_s  INTEGER NOT NULL
 );
 
 -- ── Skills (system content — seeded from assets/, propagates) ────────────────
@@ -334,6 +310,27 @@ CREATE TABLE shell_skills (
     skill_id        INTEGER NOT NULL REFERENCES skills(skill_id),
     UNIQUE(shell_id, skill_id)
 );
+
+-- Standard shells share one skill pack per flavor. shell_skills is reserved
+-- for bespoke shells (flavor IS NULL); resolved_shell_skills is the only read
+-- path consumers use, so stale per-shell rows can never make flavored siblings
+-- diverge.
+CREATE TABLE flavor_skills (
+    flavor    TEXT    NOT NULL,
+    skill_id  INTEGER NOT NULL REFERENCES skills(skill_id),
+    PRIMARY KEY (flavor, skill_id)
+);
+
+CREATE VIEW resolved_shell_skills AS
+SELECT sh.shell_id, fs.skill_id
+FROM shells sh
+JOIN flavor_skills fs ON fs.flavor = sh.flavor
+WHERE sh.flavor IS NOT NULL
+UNION ALL
+SELECT ss.shell_id, ss.skill_id
+FROM shell_skills ss
+JOIN shells sh ON sh.shell_id = ss.shell_id
+WHERE sh.flavor IS NULL;
 
 -- ── Projects (per-shell project standing) ───────────────────────────────────
 
@@ -430,7 +427,6 @@ CREATE INDEX idx_sie_shell_kind_active
     ON shell_identity_entries(shell_id, kind)
     WHERE is_deleted = 0 AND retired_at IS NULL;
 CREATE INDEX idx_shell_messages_to_unread ON shell_messages(to_shell_id, read_at);
-CREATE INDEX idx_watched_prs_live ON watched_prs(closed_at) WHERE closed_at IS NULL;
 CREATE INDEX idx_dr_filepath_role ON dr_filepath(role);
 CREATE INDEX idx_dr_filepath_lang ON dr_filepath(lang);
 CREATE INDEX idx_dr_dependency_mgr ON dr_dependency(manager);

@@ -123,17 +123,30 @@ class VisualQaSeedTest(unittest.TestCase):
         with sqlite3.connect(database) as con:
             con.executescript(
                 "CREATE TABLE users(user_id INTEGER PRIMARY KEY, username TEXT, is_active INTEGER);"
-                "CREATE TABLE shells(shell_id INTEGER PRIMARY KEY, shortname TEXT, is_deleted INTEGER DEFAULT 0);"
+                "CREATE TABLE shells(shell_id INTEGER PRIMARY KEY, shortname TEXT, "
+                "flavor TEXT, is_deleted INTEGER DEFAULT 0);"
                 "CREATE TABLE shell_skills(shell_id INTEGER, skill_id INTEGER);"
+                "CREATE TABLE flavor_skills(flavor TEXT, skill_id INTEGER);"
+                "CREATE VIEW resolved_shell_skills AS "
+                "SELECT sh.shell_id, fs.skill_id FROM shells sh "
+                "JOIN flavor_skills fs ON fs.flavor=sh.flavor "
+                "WHERE sh.flavor IS NOT NULL "
+                "UNION ALL "
+                "SELECT ss.shell_id, ss.skill_id FROM shell_skills ss "
+                "JOIN shells sh ON sh.shell_id=ss.shell_id "
+                "WHERE sh.flavor IS NULL;"
             )
 
-        next_shell_id = iter(range(1, 7))
+        next_shell_id = iter(range(1, 11))
+        identity_flags = []
 
-        def create_shell(con, *, flavor, **_kwargs):
+        def create_shell(con, *, flavor, **kwargs):
+            identity_flags.append(kwargs.get("seed_identity", False))
             shell_id = next(next_shell_id)
             con.execute(
-                "INSERT INTO shells(shell_id, shortname, is_deleted) VALUES (?, ?, 0)",
-                (shell_id, f"{flavor[:3].upper()}{shell_id}"),
+                "INSERT INTO shells(shell_id, shortname, flavor, is_deleted) "
+                "VALUES (?, ?, ?, 0)",
+                (shell_id, f"{flavor[:3].upper()}{shell_id}", flavor),
             )
             return shell_id
 
@@ -146,7 +159,8 @@ class VisualQaSeedTest(unittest.TestCase):
                 init_fork,
                 "flavors",
                 return_value=[{"flavor": name} for name in
-                              ("admin", "planner", "dev", "reviewer", "cartographer")],
+                              ("admin", "planner", "dev", "reviewer",
+                               "cartographer")],
             ),
         ):
             self.assertEqual(init_fork.main(["--username", "Jed"]), 0)
@@ -154,7 +168,27 @@ class VisualQaSeedTest(unittest.TestCase):
         seed.assert_called_once_with()
         with sqlite3.connect(database) as con:
             self.assertEqual(con.execute("SELECT username FROM users").fetchall(), [("Jed",)])
-            self.assertEqual(con.execute("SELECT COUNT(*) FROM shells").fetchone()[0], 6)
+            flavors = con.execute(
+                "SELECT flavor FROM shells ORDER BY shell_id"
+            ).fetchall()
+            self.assertEqual(
+                flavors,
+                [
+                    ("planner",),
+                    ("admin",),
+                    ("planner",),
+                    ("dev",),
+                    ("dev",),
+                    ("dev",),
+                    ("dev",),
+                    ("reviewer",),
+                    ("reviewer",),
+                    ("cartographer",),
+                ],
+            )
+            self.assertNotIn(("devops",), flavors)
+            self.assertNotIn(("conductor",), flavors)
+        self.assertEqual(identity_flags, [True] + [False] * 9)
 
 
 class VisualQaUpdateTest(unittest.TestCase):

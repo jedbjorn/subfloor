@@ -15,10 +15,11 @@ from "engine present" to "a team you can launch":
                  SYSTEM (schema + skill catalogue + render chain), never the memory.
     5. Build   — the system DB (schema + migrations; no per-instance content yet).
     6. Seed    — the fork's first user + starting TEAM (delegates to init_fork:
-                 your primary planner plus an admin, two dev, a reviewer, and the
-                 singleton cartographer — each with the CC lineage + a genesis seed
-                 + skill grants). Shells ship pre-named, so install asks only for a
-                 username; no shell-naming interview.
+                 two planners, four dev, two reviewers, an admin, and the singleton
+                 cartographer). The designated primary alone receives CC lineage +
+                 a genesis seed; roster/operational shells are role-only. Shells
+                 ship pre-named, so install asks only for a username; no shell-naming
+                 interview.
     7. Persist — `./sc snapshot` (serialize the team) + `./sc render` (flat _sc).
     8. Done    — print how to launch.
 
@@ -40,7 +41,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import date
+from datetime import datetime, timezone
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -49,12 +50,25 @@ PY = sys.executable
 IS_MAC = platform.system() == "Darwin"  # guidance arms differ (colima/brew vs systemd/apt)
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import callable_floor  # noqa: E402
 import engine_manifest  # noqa: E402
 import ports as ports_mod  # noqa: E402
 
 
 # --- make-alias wiring (shared by install + update) -------------------------
 ALIASES_INCLUDE = "-include .super-coder/aliases.mk"
+INSTALLER_MAKEFILE = (
+    "# Fork Makefile — super-coder convenience aliases (make dos-e / dos-enter).\n"
+    "# Every target is dos--prefixed; add your own targets below the include.\n"
+    f"{ALIASES_INCLUDE}\n"
+)
+APPENDED_ALIASES_BLOCK = (
+    "\n# super-coder convenience aliases (designs-OS 'dos-' command standard).\n"
+    "# Appended by ./sc; every target is dos--prefixed so it can't collide with\n"
+    "# this Makefile's own targets. Delete this line to opt out — `./sc <cmd>`\n"
+    "# stays equivalent.\n"
+    f"{ALIASES_INCLUDE}\n"
+)
 # Matches an existing include of the alias file in any form: hard `include` or
 # soft `-include`, with arbitrary surrounding whitespace.
 _ALIASES_RE = re.compile(r"^\s*-?include\s+\.super-coder/aliases\.mk\s*$", re.M)
@@ -79,23 +93,14 @@ def wire_make_aliases(repo_root: Path | None = None) -> str:
     """
     mk = (repo_root or REPO_ROOT) / "Makefile"
     if not mk.exists():
-        mk.write_text(
-            "# Fork Makefile — super-coder convenience aliases (make dos-e / dos-enter).\n"
-            "# Every target is dos--prefixed; add your own targets below the include.\n"
-            f"{ALIASES_INCLUDE}\n"
-        )
+        mk.write_text(INSTALLER_MAKEFILE)
         return "wrote Makefile (-include .super-coder/aliases.mk) → `make dos-e` works"
     text = mk.read_text()
     if _ALIASES_RE.search(text):
         return "Makefile already wired (-include .super-coder/aliases.mk) — left as-is"
     sep = "" if text.endswith("\n") else "\n"
     mk.write_text(
-        text + sep
-        + "\n# super-coder convenience aliases (designs-OS 'dos-' command standard).\n"
-        + "# Appended by ./sc; every target is dos--prefixed so it can't collide with\n"
-        + "# this Makefile's own targets. Delete this line to opt out — `./sc <cmd>`\n"
-        + "# stays equivalent.\n"
-        + f"{ALIASES_INCLUDE}\n"
+        text + sep + APPENDED_ALIASES_BLOCK
     )
     return "appended -include .super-coder/aliases.mk to existing Makefile → `make dos-e` works"
 
@@ -124,6 +129,25 @@ VISUAL_QA_TEMPLATE_TARGETS = {
     "subfloor-visual-qa.yml": Path(".github/workflows/subfloor-visual-qa.yml"),
     "visual-qa.example.json": Path(".sc-state/visual-qa.example.json"),
 }
+
+# Repo-local surfaces emitted or wholly owned by an installed engine.  Teardown
+# imports this inventory so install and remove cannot quietly disagree about
+# which generated paths belong to subfloor.  Mixed host files (Makefile,
+# .gitignore, shared/) are handled surgically instead.
+GENERATED_INSTALL_PATHS = (
+    Path("CLAUDE.md"),
+    Path("AGENTS.md"),
+    Path("opencode.json"),
+    Path(".claude/settings.local.json"),
+    Path(".codex/hooks.json"),
+    Path(".claude/skills"),
+    Path(".agents/skills"),
+    Path(".opencode/skills"),
+    Path("roadmap_sc.md"),
+    Path("docs_sc"),
+    Path("specs_sc"),
+    Path("skills_sc"),
+)
 
 
 def origin_basename() -> str | None:
@@ -160,6 +184,20 @@ def work_repo() -> "str | None":
     substrate (memory + launcher). Drives the external-work PROJECT vs ENGINE
     boot variant and the pre-commit home-repo guard. None = unset (normal
     install: the work happens here)."""
+    cfg = ENGINE / "instance.json"
+    try:
+        raw = (json.loads(cfg.read_text()).get("work_repo") or "").strip()
+    except (OSError, json.JSONDecodeError):
+        return None
+    return str(Path(raw).expanduser()) if raw else None
+
+
+def work_repo() -> str | None:
+    """Return this install's declared work project, if it has one.
+
+    An external-work install keeps its engine, local map database, and hooks in
+    the home repo but directs shells to maintain a different project.
+    """
     cfg = ENGINE / "instance.json"
     try:
         raw = (json.loads(cfg.read_text()).get("work_repo") or "").strip()
@@ -227,8 +265,9 @@ HARNESS_INSTALL = {
 # Where each installer drops its binary. Checked post-install because the new
 # bin dir is NOT on this process's PATH — the installer edits shell rc files,
 # which only a fresh shell picks up. shutil.which alone would miss a just-
-# installed CLI. (codex's native installer drops into ~/.local/bin, same as
-# claude; ~/.codex is its config/auth home, not the binary.)
+# installed CLI. Codex's native installer drops a launcher into ~/.local/bin,
+# but its standalone package lives under ~/.codex; the Dockerfile relocates
+# that executable because the runtime mounts ~/.codex for durable state.)
 HARNESS_BIN = {
     "claude":   Path.home() / ".local" / "bin" / "claude",
     "opencode": Path.home() / ".opencode" / "bin" / "opencode",
@@ -240,6 +279,72 @@ HARNESS_BIN = {
 
 def _harness_installed(name: str) -> bool:
     return bool(shutil.which(name)) or HARNESS_BIN.get(name, Path("/nonexistent")).exists()
+
+
+# ── Harness epoch (sandbox harness freshness) ────────────────────────────────
+# The functions above install harnesses on THIS machine's $HOME. That is the
+# right thing on the no-docker path, where the host IS the runtime — and a no-op
+# for shells on the docker path, where the harness binaries are baked into the
+# `super-coder-sandbox` image. The container mounts harness state homes
+# (~/.claude, ~/.codex, …), but an image launcher must never resolve a binary
+# from those mounts. Binaries cannot be host-selected: they are host-ABI
+# artifacts (a darwin binary is fatal in a linux container, vibe's entry point
+# carries an absolute shebang into a host uv interpreter, glibc baselines differ
+# across the distros we support), which is why the Dockerfile bakes them.
+#
+# Baking froze them: docker serves the installer RUNs from layer cache forever,
+# so `./sc launch|restart` — which DO run `docker build` — could never make a
+# harness newer, and `docker rm -f` on every launch discards any in-container
+# update. A claude one release behind Opus 5 therefore stayed one release behind
+# through an update, a harness update, and a restart.
+#
+# The epoch is that layer's cache key. `./sc restart`, `./sc update`, and
+# `./sc update-harnesses` roll it; `./sc build` passes it as
+# SC_HARNESS_EPOCH; the Dockerfile references it inside both harness RUNs, so a
+# changed value re-runs the installers (which resolve "latest" themselves —
+# the epoch is an expiry token, never a version pin).
+#
+# MACHINE-scoped, not per-repo: every fork on a host shares the image tag, so
+# the harness layer is a machine fact and a per-repo file would let one fork
+# roll an epoch its neighbours never see. Every explicit refresh gets a unique
+# UTC token: a normal restart means "ask every installer for current now", even
+# after another refresh earlier the same day. Plain launch/build remain
+# cache-warm; restart --no-build deliberately pins the existing image. The path
+# follows the engine's existing host-state idiom (XDG_CONFIG_HOME).
+HARNESS_EPOCH_UNSET = "0"  # the Dockerfile's default — "never rolled here"
+
+
+def harness_epoch_path() -> Path:
+    """Where the rolled epoch is stored. SC_HARNESS_EPOCH_FILE overrides (tests)."""
+    override = os.environ.get("SC_HARNESS_EPOCH_FILE")
+    if override:
+        return Path(override)
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(base) / "super-coder" / "harness-epoch"
+
+
+def harness_epoch() -> str:
+    """The stored epoch, or "0" when never rolled — so an untouched machine
+    builds exactly the image an un-instrumented build would have produced."""
+    try:
+        value = harness_epoch_path().read_text().strip()
+    except OSError:
+        return HARNESS_EPOCH_UNSET
+    return value or HARNESS_EPOCH_UNSET
+
+
+def roll_harness_epoch() -> str:
+    """Give the image's harness layers a fresh cache key and return it.
+
+    Each explicit refresh must be unique: restart is the operator's convergence
+    boundary, so a second restart on the same day still asks the official
+    installers for current releases. Microseconds make sequential calls unique
+    while keeping the image label human-readable."""
+    value = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    path = harness_epoch_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value + "\n")
+    return value
 
 
 # ── Harness install progress ─────────────────────────────────────────────────
@@ -478,14 +583,15 @@ _GITIGNORE_BLOCK = f"""
 {_GITIGNORE_MARKER}
 # The engine is a materialized, gitignored DEPENDENCY (B7) — fetched from
 # upstream, refreshed by `./sc update`, never committed to the fork. Your project
-# is everything ELSE in this repo. The one fork-owned artifact that must survive,
-# the DB serialization, lives in the tracked .sc-state/ below.
+# is everything ELSE in this repo.
 /.super-coder/
 # Boot artifacts + per-shell skill render — rebuilt at launch from the DB.
 /CLAUDE.md
 /AGENTS.md
 /opencode.json
 /.claude/skills/
+/.agents/skills/
+/.opencode/skills/
 # Engine-managed harness config re-emitted each launch (per-harness branch-guard
 # hook); kept apart from a fork's own tracked config (claude settings.json /
 # codex config.toml).
@@ -493,14 +599,22 @@ _GITIGNORE_BLOCK = f"""
 /.codex/hooks.json
 # Shell worktrees — one per shell, linked inside the repo root.
 /.sc-worktrees/
-# .sc-state/ is TRACKED (content.sql + engine.ref). Only the ephemeral
-# pre-update restore pointer and the derived map cache are ignored.
+# The engine pin is tracked. Every generated instance artifact is local-only.
 /.sc-state/engine.ref.prev
-# Map DB — derived cache of the repo (dr_*), rebuilt by `./sc map`. Its authored
-# layer (sections) is tracked in .sc-state/map_content.sql.
+/.sc-state/content.sql
+/.sc-state/map_content.sql
+/.sc-state/map.config.json
+/.sc-state/skills_retired.json
+/.sc-state/local/
+/roadmap_sc.md
+/docs_sc/
+/specs_sc/
+/skills_sc/
+# Map DB — derived cache of the repo (dr_*), rebuilt by `./sc map`.
 /.sc-state/map.db
 /.sc-state/map.db-wal
 /.sc-state/map.db-shm
+/.sc-state/db_backups/
 """
 
 
@@ -567,12 +681,8 @@ def untrack_engine() -> bool:
     return True
 
 
-def pin_engine() -> str | None:
-    """Record the upstream SHA the engine was materialized at → .sc-state/engine.ref
-    (the fork's version record + the engine half of a sound rollback). Best-effort:
-    if the remote ref can't be resolved, `./sc update` will pin it later."""
-    state = REPO_ROOT / ".sc-state"
-    state.mkdir(parents=True, exist_ok=True)
+def resolve_engine_ref() -> str | None:
+    """Resolve the materialized upstream SHA without publishing a pin."""
     remote = sc_remote()
     if not remote:
         return None
@@ -582,8 +692,14 @@ def pin_engine() -> str | None:
     sha = r.stdout.strip()
     if r.returncode != 0 or len(sha) != 40 or not all(c in "0123456789abcdef" for c in sha):
         return None
-    (state / "engine.ref").write_text(sha + "\n")
     return sha
+
+
+def write_engine_ref(sha: str) -> None:
+    """Publish a callable engine SHA as the fork's rollback/version pin."""
+    state = REPO_ROOT / ".sc-state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "engine.ref").write_text(sha + "\n")
 
 
 def step(msg: str) -> None:
@@ -594,9 +710,19 @@ def main(argv: list[str]) -> int:
     force = "--force" in argv
     skip_harness = "--skip-harness-install" in argv
     # super-coder's own flags — strip them so they don't reach init_fork's parser.
-    own = {"--force", "--skip-harness-install", "--ensure-harness",
-           "--update-harnesses", "--check-docker", "--check-host"}
+    own = {"--force", "--skip-harness-install", "--ensure-harness", "--update-harnesses",
+           "--check-docker", "--check-host", "--harness-epoch", "--roll-harness-epoch"}
     fork_args = [a for a in argv if a not in own]
+
+    # Standalone, machine-readable: the sandbox harness epoch. `sc` shells out to
+    # these rather than reimplementing the file format, so there is one owner of
+    # it. Bare values on stdout — no step banner — because callers capture them.
+    if "--harness-epoch" in argv:
+        print(harness_epoch())
+        return 0
+    if "--roll-harness-epoch" in argv:
+        print(roll_harness_epoch())
+        return 0
 
     # Standalone: force-update all harness CLIs to latest and exit.
     if "--update-harnesses" in argv:
@@ -684,9 +810,18 @@ def main(argv: list[str]) -> int:
     step("Making the engine a dependency (untrack + pin)")
     print("  git rm -r --cached .super-coder (files kept on disk)" if untrack_engine()
           else "  (engine already untracked)")
-    pinned = pin_engine()
-    print(f"  pinned engine.ref at {pinned[:12]}" if pinned
-          else "  (could not resolve upstream ref — `./sc update` will pin it)")
+    pinned = resolve_engine_ref()
+    callable_floor.require_callable_floor(
+        REPO_ROOT,
+        expected_ref=pinned,
+        allow_unpinned=pinned is None,
+        context="install",
+    )
+    if pinned is not None:
+        write_engine_ref(pinned)
+        print(f"  pinned engine.ref at {pinned[:12]}")
+    else:
+        print("  (could not resolve upstream ref — `./sc update` will pin it)")
     # First engine hash manifest: the checkout just brought the engine in, so
     # disk == upstream right now. From here, `./sc update` detects (and refuses
     # to silently overwrite) any local edit to an engine file.
@@ -767,7 +902,7 @@ def main(argv: list[str]) -> int:
     # Record harness + installed marker in instance.json ---------------------
     cfg = ports_mod.resolve(persist=False)
     cfg["harness"] = harness
-    cfg["installed_at"] = date.today().isoformat()
+    cfg["installed_at"] = datetime.now(timezone.utc).date().isoformat()
     ports_mod.CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
 
     # 9. Done -----------------------------------------------------------------
@@ -782,4 +917,6 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main, sys.argv[1:]))

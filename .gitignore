@@ -3,6 +3,9 @@
 .super-coder/shell_db.db
 .super-coder/shell_db.db-wal
 .super-coder/shell_db.db-shm
+.super-coder/shell_db.db.rebuild
+.super-coder/shell_db.db.rebuild-wal
+.super-coder/shell_db.db.rebuild-shm
 
 # Boot artifact — rebuilt at launch from the DB. The harness dictates the name;
 # we dual-write both. Ignored everywhere. opencode.json is emitted from the
@@ -11,10 +14,13 @@
 /AGENTS.md
 /opencode.json
 
-# Per-shell skill render — .claude/skills/<name>/SKILL.md, rebuilt at boot for
-# whichever shell launches (harness-consumed cache, like the boot artifact).
-# Only the render output is ignored; a fork's own .claude/settings stays tracked.
+# Per-shell skill renders — rebuilt at boot for whichever shell launches
+# (harness-consumed caches, like the boot artifact). `.claude/skills` is the
+# stable mirror; `.agents/skills` is Codex-native and `.opencode/skills` is
+# OpenCode-native. Only render output is ignored; other harness config stays tracked.
 /.claude/skills/
+/.agents/skills/
+/.opencode/skills/
 
 # Engine-managed harness config, re-emitted each launch (the branch-guard hook
 # per harness). Kept separate from the fork's own tracked config: claude's
@@ -39,21 +45,44 @@
 # as untracked content in the main working tree.
 /.sc-worktrees/
 
-# Fork-owned state (B7): .sc-state/ is TRACKED (content.sql is the memory
-# serialization; engine.ref pins the engine version). Only the ephemeral
-# pre-update restore pointer is ignored. NOTE: this SOURCE repo deliberately
-# tracks all of .super-coder/ — the engine IS the project here; a *fork*
-# gitignores the whole engine dir (install.py writes that rule).
+# The engine pin is the only tracked .sc-state artifact. Per-instance snapshots,
+# map authorship, retire lists, and flat views are generated local state.
 /.sc-state/engine.ref.prev
-# The map DB is a derived cache of the repo (dr_*), rebuilt by `./sc map` from
-# the tree + its authored layer in .sc-state/map_content.sql (which IS tracked).
+/.sc-state/content.sql
+/.sc-state/map_content.sql
+/.sc-state/map.config.json
+/.sc-state/skills_retired.json
+/.sc-state/local/
+# Flat visibility views are disposable local renders, never authored source.
+/roadmap_sc.md
+/docs_sc/
+/specs_sc/
+/skills_sc/
+# The map DB is a derived cache of the repo (dr_*), rebuilt by `./sc map`.
 /.sc-state/map.db
 /.sc-state/map.db-wal
 /.sc-state/map.db-shm
+/.sc-state/db_backups/
+
+# Local DB safety backups (pre-migration snapshots) and the cross-shell
+# scratch/handoff dir — local-only artifacts, never tracked. A few ancient
+# backups predate this rule and stay tracked; gitignore doesn't affect them.
+/db_backups/
+/shared/
+/sprint-result.md
+
+# The live_model opencode fixture is a real WAL-mode database, so even a
+# READ-ONLY open re-creates these two side files on every test run. The .db
+# itself is tracked (it is the fixture); these are run artifacts.
+/tests/fixtures/live_model/opencode/opencode.db-wal
+/tests/fixtures/live_model/opencode/opencode.db-shm
 
 # Python / tooling
 __pycache__/
 *.pyc
 .venv/
+# Source-repo shadow uses a symlink to the image's shared node toolchain; the
+# directory-only rule below does not match a symlink.
+/.super-coder/shadow/node_modules
 node_modules/
 .svelte-kit/

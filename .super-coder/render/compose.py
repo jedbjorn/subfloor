@@ -59,7 +59,26 @@ PROJECT_VS_ENGINE_SOURCE = (
     "\n"
     "Engine skills speak fork-language. Where a skill says \"never edit\n"
     "`.super-coder/`\" or \"report/file it upstream\", that guidance is for forks —\n"
-    "here you author the fix directly instead."
+    "here you author the fix directly instead.\n"
+    "\n"
+    "**You are operating on the engine you are running — surgery on a moving\n"
+    "car.** Four standing consequences, all of which have produced wrong answers\n"
+    "in this repo:\n"
+    "\n"
+    "1. **Your `./sc` resolves the engine from the MAIN CHECKOUT, not your\n"
+    "   worktree** (`sc:11-21` derives it from git's common dir). That tree also\n"
+    "   hosts the gitignored live DB and runs the server. Being current in your\n"
+    "   own worktree says nothing about it — see the `floor:` line in ACTIVE\n"
+    "   SESSION, which reports exactly that.\n"
+    "2. **Verify claims about engine code against the remote, not your tree** —\n"
+    "   `git show origin/main:<path>` — because a stale checkout answers\n"
+    "   confidently and a command that reads it inherits the staleness.\n"
+    "3. **Pull after every merge; reconcile before restarting.** Pulling is\n"
+    "   cheap and safe. A restart kills live sessions, so the FnB owns that\n"
+    "   boundary.\n"
+    "4. **The live DB is the one you are migrating.** Back it up before applying\n"
+    "   anything, and name the DB path explicitly rather than trusting whichever\n"
+    "   one the dispatcher resolves.\n"
 )
 # Third variant: this install's shells maintain a DIFFERENT repo (declared as
 # `work_repo` in instance.json — see install.work_repo()). The home repo then
@@ -118,7 +137,6 @@ def pick_project_vs_engine(source_mode: bool,
 
 # The repo catalogue (dr_*) lives in its OWN db, separate from shell_db.db.
 MAP_DB_PATH = ENGINE.parent / ".sc-state" / "map.db"
-
 
 def open_map_ro() -> "sqlite3.Connection | None":
     """Read-only handle to the map DB, or None if the repo isn't mapped yet
@@ -243,7 +261,7 @@ def render_connections(con) -> str:
 def render_skills(con, shell_id: int) -> str:
     rows = con.execute(
         "SELECT s.name, s.description FROM skills s "
-        "JOIN shell_skills ss ON ss.skill_id = s.skill_id "
+        "JOIN resolved_shell_skills ss ON ss.skill_id = s.skill_id "
         "WHERE ss.shell_id=? AND s.is_deleted=0 ORDER BY s.name",
         (shell_id,),
     ).fetchall()
@@ -273,29 +291,76 @@ def render_skills(con, shell_id: int) -> str:
 
 def render_api(port: "int | None", api_key: "str | None") -> str:
     if port is None or not api_key:
-        return "(API not configured — run `./sc rebuild` to assign a key)"
+        return "(API not configured — run `sc rebuild` to assign a key)"
     return (
-        f"- **Base URL:** `http://127.0.0.1:{port}`\n"
-        "- **Token:** available as `$SC_API_TOKEN` in your environment (set at launch).\n\n"
-        "Write memory via `./sc mem` (proxied here automatically when `SC_API_TOKEN` is set). "
+        f"- **Base URL:** `http://127.0.0.1:{port}`\n\n"
+        "Write memory via `sc mem` — it is already wired to this launched shell; the engine "
+        "resolves API identity for you. "
         "Read messages: `GET /_sc/mem/messages`. Command reference: the `memory` and `db_map` skills."
     )
 
 
+# L&S writes since the last curation sweep that trip the STATUS advisory.
+# Five, replayed against a real shell's write order, catches both of its large
+# clusters at or before full formation. Three fires twice as often and sees
+# clusters at two members, where a merge is usually wrong — two statements of a
+# rule are often legitimately two rules; three is where a pattern becomes
+# distinguishable from coincidence.
+LNS_CURATION_DUE = 5
+
+
 def fetch_counts(con, shell_id: int) -> dict:
-    def one(q):
-        return con.execute(q, (shell_id,)).fetchone()[0]
+    def one(q, params=None):
+        return con.execute(q, params if params is not None else (shell_id,)).fetchone()[0]
     return {
         "seed": one("SELECT COUNT(*) FROM shell_identity_entries WHERE shell_id=? AND kind='seed' AND is_deleted=0 AND retired_at IS NULL"),
         "lns": one("SELECT COUNT(*) FROM shell_identity_entries WHERE shell_id=? AND kind='lns' AND is_deleted=0 AND retired_at IS NULL"),
+        # Display-only: the cost of the section is in CHARACTERS, and the count
+        # cap is structurally blind to it. Not a threshold — the per-entry
+        # length cap bounds the total by construction (20 x 500), so this is
+        # cheap awareness, nothing to watch.
+        "lns_chars": one(
+            "SELECT COALESCE(SUM(LENGTH(body)),0) FROM shell_identity_entries "
+            "WHERE shell_id=? AND kind='lns' AND is_deleted=0 AND retired_at IS NULL"),
+        # The one threshold. Counts writes, not retirements: curating AT the cap
+        # net-added chars at constant count, so any signal that resets on "a
+        # retirement happened" is gameable by the behaviour already observed.
+        # A NULL stamp (never swept) makes every entry count — correct, that
+        # shell is genuinely uncurated. Strictly `>`, at the whole-second
+        # granularity both sides share: the merged entries a sweep writes just
+        # before stamping must NOT count against the next interval, or a sweep
+        # would re-arm its own advisory and never converge.
+        "lns_since_curation": one(
+            "SELECT COUNT(*) FROM shell_identity_entries "
+            "WHERE shell_id=? AND kind='lns' AND is_deleted=0 AND retired_at IS NULL "
+            "  AND created_at > COALESCE("
+            "        (SELECT lns_curated_at FROM shells WHERE shell_id=?), '')",
+            (shell_id, shell_id)),
         "flags": one("SELECT COUNT(*) FROM flags WHERE shell_id=? AND resolved=0 AND is_deleted=0"),
         "unread": one("SELECT COUNT(*) FROM shell_messages WHERE to_shell_id=? AND read_at IS NULL"),
     }
 
 
+def render_lns_status(counts: dict) -> str:
+    """The L&S STATUS line — count, size, and the curation advisory.
+
+    Advisory, never an ABORT: hard rejection is right for a single write with
+    an obvious remedy (shorten it), wrong for "go do a curation pass," which is
+    work, not a correction. Same shape as the Inbox line — a cheap DB-derived
+    count plus a conditional that fires a skill only when evidence says so.
+    """
+    kchars = f"{counts['lns_chars'] / 1000:.1f}k chars"
+    line = f"{counts['lns']}/20 · {kchars}"
+    since = counts["lns_since_curation"]
+    if since >= LNS_CURATION_DUE:
+        return f"{line} · {since} since curation — curation due (`curate` skill)"
+    return line
+
+
 def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                  archive_id: int, work_dir: "Path | None" = None,
                  sync_note: "str | None" = None,
+                 floor_note: "str | None" = None,
                  api_key: "str | None" = None,
                  api_port: "int | None" = None,
                  source_mode: bool = False,
@@ -308,7 +373,12 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     operates from a worktree rather than the repo root. sync_note is the
     launcher's worktree-drift status (run.sync_worktree) — surfaced alongside
     so a stale or divergent worktree is ambient knowledge, not something the
-    shell must remember to check. source_mode flips PROJECT vs ENGINE to the
+    shell must remember to check. floor_note is run.main_checkout_note — the
+    MAIN CHECKOUT's drift, which is a different tree from the shell's worktree
+    and the one every `./sc` resolves the engine from; it renders for EVERY
+    shell including admin at the repo root, because admin maintains main and was
+    previously the only shell given no drift line at all. source_mode flips
+    PROJECT vs ENGINE to the
     source-repo variant (caller decides via install.is_source_repo() — compose
     stays a pure render, no git). work_repo (install.work_repo(): the separate
     repo this install's shells maintain) overrides both modes with the
@@ -402,6 +472,12 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
             "- working dir: repo root, branch `main` — you maintain main "
             "directly (the only shell that does; every other shell works "
             "from a worktree and lands changes via PRs)")
+    # The engine floor is a DIFFERENT tree from the shell's cwd, so it is
+    # reported unconditionally — a worktree can be current while the tree its
+    # ./sc resolves from is stale, and admin (repo root) got no drift line here
+    # at all before this.
+    if floor_note:
+        active_session.append(f"- floor: {floor_note}")
 
     # WORKSPACE: the shell's own repo-discriminator (shells.workspace) — which
     # repos it works in and what each is. Rendered only when curated; rows
@@ -442,7 +518,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
         "## STATUS", "",
         f"- **Session:** {session_id}",
         f"- **Seed:** {counts['seed']}",
-        f"- **L&S:** {counts['lns']}",
+        f"- **L&S:** {render_lns_status(counts)}",
         f"- **Flags:** {counts['flags']} open",
         f"- **Inbox:** {counts['unread']} unread — `--message check` to surface.",
         f"- **Repo map:** {map_status}",

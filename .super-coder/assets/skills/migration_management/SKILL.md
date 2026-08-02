@@ -9,8 +9,7 @@ common: false
 
 Migrations live in `.super-coder/migrations/`, apply in numeric order, tracked
 by the `schema_migrations` ledger table. Engine updates apply pending
-migrations automatically; apply locally without a fetch via
-`sc update --no-fetch`.
+migrations automatically; apply local pending migrations with `./sc migrate`.
 
 **Scope:** fork-specific changes — tables, columns, constraints, or
 system-content seeds (skills, flavor defaults) this fork needs that will not
@@ -19,27 +18,35 @@ from you.
 
 ## Authoring a migration
 
-1. **Find the next number:**
+1. **Create it through the guardrail:**
    ```bash
-   ls .super-coder/migrations/ | sort | tail -5
+   ./sc migration new <slug>
    ```
-   Name the file `NNNN_<slug>.sql`, NNNN = next integer zero-padded to 4
-   digits (e.g. `0012`).
+   Use a lowercase `snake_case` slug. The command refuses unexpected duplicate
+   number prefixes, allocates the next free zero-padded number, writes the
+   standard transaction/idempotence skeleton, and (in the subfloor source
+   repo) updates the source removal-test allowlist in the same act. The
+   exact historical `0155` pair is frozen and explicitly allowed; never
+   renumber an applied migration.
 
-2. **Write the file** at `.super-coder/migrations/NNNN_<slug>.sql`:
+2. **Fill in the generated file** at
+   `.super-coder/migrations/NNNN_<slug>.sql`:
    - Wrap in `BEGIN; ... COMMIT;`
    - Idempotent: `CREATE TABLE IF NOT EXISTS`, `INSERT OR IGNORE`,
      `CREATE INDEX IF NOT EXISTS`, `DROP TABLE IF EXISTS` before recreate
    - Comment header: migration number + intent (+ doctrine notes if relevant)
    - Structure + system content only — per-instance data (shell memory,
-     grants, roadmap, flags) lives in `.sc-state/content.sql` via snapshot,
+     grants, roadmap, flags) lives in `.sc-state/local/content.sql` via snapshot,
      never in migrations
 
 3. **Apply locally:**
    ```bash
-   sc update --no-fetch
+   ./sc migrate
    ```
-   Skips the upstream fetch; applies all pending local migrations in order.
+   This takes a WAL-safe `premigrate` backup before opening the migration
+   chain and keeps the newest 5 backups in that lifecycle class. `./sc update`
+   retains its separate `preupdate` backup and does not double-back up during
+   the same update run. Both paths apply pending migrations in order.
    Confirm it landed:
    ```sql
    SELECT * FROM schema_migrations ORDER BY applied_at DESC LIMIT 5;
@@ -47,7 +54,7 @@ from you.
 
 4. **Verify:**
    ```bash
-   sc verify
+   ./sc verify
    ```
    Headless boot proof — shells, memory, and schema intact.
 
@@ -55,14 +62,14 @@ from you.
    ```bash
    SC_ADMIN=1 sc snapshot
    ```
-   Commit `.sc-state/content.sql` + `migrations/NNNN_<slug>.sql`.
-   - **Content-seed migration** (seeds system content that renders — skills,
-     flavor defaults) also changes the flat `_sc` mirrors, but only once the
-     new rows are in the DB: after `sc update --no-fetch`, run
-     `SC_ADMIN=1 sc render && sc render-check` and commit the re-rendered `_sc` files
-     alongside the migration. A render against a DB predating the seed passes
-     locally while CI's hermetic rebuild goes red — the stale-mirror trap; see
-     the `snapshot` skill.
+   Commit the migration and any authoritative source asset it carries; the
+   snapshot remains local.
+   - **Engine skill seed:** edit `assets/skills/<name>/SKILL.md`, run
+     `./sc seed-skills` to regenerate `0001_seed_skills.sql`, and put the same
+     full-body UPSERT in the new trailing migration so existing installations
+     converge. Then run `./sc render-check`: its hermetic rebuild proves the
+     ignored local `skills_sc/` mirror, which is verification output rather
+     than a tracked artifact.
 
 ## What makes a good migration
 

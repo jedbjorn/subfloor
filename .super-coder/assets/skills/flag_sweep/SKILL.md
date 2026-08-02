@@ -49,7 +49,8 @@ only on unambiguous evidence — any doubt -> Step 4, not a close.
 Close with `sc mem flag close <flag_id> --notes "…"`. The note MUST cite the
 evidence.
 
-**A. Docs-pending flag, doc now exists** = `[Docs] … docs pending` flag on a
+**A. Docs-pending flag, doc now exists** = `[Docs]`-tagged doc-pending flag
+(however worded — "doc pending", "docs pending", "feature doc pending") on a
 feature with `frozen_docs > 0`:
 ```
 sc mem flag close <flag_id> --notes "Auto: frozen spec doc now exists for feature #<id> (flag_sweep)."
@@ -101,7 +102,8 @@ WHERE r.roadmap_status NOT IN ('shipped','retired')
   AND NOT EXISTS (
     SELECT 1 FROM flags f
     WHERE f.feature_id = r.feature_id AND f.resolved=0 AND COALESCE(f.is_deleted,0)=0
-      AND (f.description LIKE '%not marked shipped%' OR f.description LIKE '%docs pending%'));
+      AND (f.description LIKE '[Ship]%' OR f.description LIKE '[Docs]%'
+           OR f.description LIKE '%not marked shipped%' OR f.description LIKE '%doc%pending%'));
 ```
 
 Per row: open + message the planner (no planner -> surface to the FnB) — same
@@ -129,8 +131,16 @@ WHERE r.roadmap_status = 'shipped'
   AND NOT EXISTS (
     SELECT 1 FROM flags f
     WHERE f.feature_id = r.feature_id AND f.resolved=0 AND COALESCE(f.is_deleted,0)=0
-      AND f.description LIKE '%docs pending%');
+      AND (f.description LIKE '[Docs]%' OR f.description LIKE '%doc%pending%'));
 ```
+
+The dedup guards match the `[Docs]`/`[Ship]` tag at position zero FIRST — the
+templates below mint "doc pending" (singular) and legacy hand-written flags say
+"feature doc pending", so a prose-only `'%docs pending%'` pattern matched
+neither and every later sweep re-listed already-flagged rows (found session
+ADM1/0003, seven covered rows re-surfaced). The `'%doc%pending%'` fallback
+catches untagged organic wordings; its over-breadth only ever SKIPS an open —
+the conservative direction.
 
 Per row: open + message the planner (no planner -> surface to the FnB) — same
 contract as the `flags` skill:

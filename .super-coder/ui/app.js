@@ -48,36 +48,77 @@ function mdBlock(text) {
   return div;
 }
 
-async function api(path, method = "GET", body) {
+async function api(path, method = "GET", body, extraHeaders = {}) {
   const r = await fetch("/api" + path, {
-    method, headers: body ? { "Content-Type": "application/json" } : {},
+    method, headers: {
+      ...(body ? { "Content-Type": "application/json" } : {}),
+      ...extraHeaders,
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await r.json().catch(() => ({}));
-  // publish/scripts report failure as {ok:false, output:<step trace>} with no
+  // maintenance scripts report failure as {ok:false, output:<step trace>} with no
   // `error` key — the trace names the refusing guard and the remedy, so it is
   // the message, not statusText.
-  if (!r.ok) throw new Error(data.error || data.output || r.statusText);
+  if (!r.ok) {
+    const err = data.error;
+    const message = typeof err === "object" && err
+      ? [err.code, err.message].filter(Boolean).join(": ")
+      : (err || data.output || r.statusText);
+    throw new Error(message);
+  }
+  return data;
+}
+
+function requestKey() {
+  return globalThis.crypto?.randomUUID?.()
+    || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function chatApi(path, method = "GET", body, idempotencyKey) {
+  const headers = body === undefined ? {} : { "Content-Type": "application/json" };
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  let response;
+  try {
+    response = await fetch("/api" + path, {
+      method, headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (cause) {
+    const error = new Error("The conversation service could not be reached.");
+    error.code = "NETWORK_ERROR";
+    error.cause = cause;
+    throw error;
+  }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = data.error || {};
+    const error = new Error(detail.message || response.statusText);
+    error.code = detail.code || "CONVERSATION_REQUEST_FAILED";
+    error.details = detail.details || {};
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
 function toast(msg) {
   const t = el("div", { className: "toast" }, msg);
   document.body.append(t);
-  // Multi-line traces (publish refusals) need longer than one-liners.
+  // Multi-line maintenance traces need longer than one-liners.
   setTimeout(() => t.remove(), Math.min(12000, Math.max(4000, String(msg).length * 30)));
 }
 function setStatus(s) { $("#status").textContent = s; }
 
 // ── Skill sections ──────────────────────────────────────────────────────────
-// One grouping rule for the Skills tab AND the Shells grant list. "Repo skills"
-// are fork-local (origin='repo', derived server-side from the snapshot rule:
-// name not under engine assets/skills) and always lead; engine skills section
-// by their category.
+// One grouping rule for the Shells skill viewer AND Skill Assignments. "Repo
+// skills" are fork-local (origin='repo', derived server-side from the snapshot
+// rule: name not under engine assets/skills) and always lead; engine skills
+// section by their category.
 const SECTION_ORDER = ["repo", "substrate", "craft"];
 const SECTION_LABEL = { repo: "Repo skills", substrate: "Substrate", craft: "Craft", other: "Other" };
 const SECTION_NOTE = {
-  repo: "Authored in this repo — not engine catalogue. Durable via .sc-state/content.sql; see the local_skill_management skill.",
+  repo: "Authored in this repo — not engine catalogue. Durable in the local engine DB and gitignored snapshot; see the local_skill_management skill.",
 };
 const sectionOf = (s) => (s.origin === "repo" ? "repo" : (s.category || "other"));
 const sectionLabel = (k) => SECTION_LABEL[k] || k.charAt(0).toUpperCase() + k.slice(1);
@@ -96,11 +137,18 @@ function groupSkills(skills, { alwaysRepo = false } = {}) {
 // ── Shells ──────────────────────────────────────────────────────────────────
 // dos-arch-style viewer (ported from dos-arch shell_core/ui /shells): sticky
 // identity sub-header (pill shell picker + role/mandate), then Harness |
-// Skills sub-tabs scoped to the selected shell. Flat panels, accordions,
-// popover pickers, and a unified edit modal.
+// Skills | Skill Assignments | Default Models sub-tabs. Flat panels,
+// accordions, popover pickers, and a unified edit modal.
 let selectedShell = null;
-let shellTab = "harness";     // 'harness' | 'skills' | 'models'
+let shellTab = "harness";     // 'harness' | 'skills' | 'assignments' | 'models'
 let activeSkillId = null;     // skill-viewer selection; reset on shell switch
+let shellRenderEpoch = 0;     // discard stale async renders after re-navigation
+const SHELL_TAB_HASH = {
+  harness: "shells",
+  skills: "shells-skills",
+  assignments: "shells-skill-assignments",
+  models: "shells-default-models",
+};
 
 // Rough token estimator — BPE-ish, ~15% off for English; the tilde in the
 // readout makes the approximation explicit. No bundled tokenizer.
@@ -146,25 +194,52 @@ function glassDropdown({ items, value, onChange }) {
 }
 
 // Modal base (dos-arch dialog): overlay click or Esc closes; header carries
-// the title + an optional readout; footer nodes sit space-between. Returns
-// the close function.
-function openModal({ title, headExtra, bodyNode, footNodes, width = 650, height = 700 }) {
+// the title + an optional readout; footer content uses explicit physical
+// start/end slots. Returns the close function.
+let modalSequence = 0;
+function openModal({
+  title, headExtra, bodyNode, footerStart, footerEnd, width = 650, height = 700,
+}) {
+  const priorFocus = document.activeElement;
   const overlay = el("div", { className: "modal-overlay" });
-  const close = () => overlay.remove();
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    overlay.remove();
+    if (priorFocus?.isConnected && typeof priorFocus.focus === "function") priorFocus.focus();
+  };
+  overlay.closeModal = close;
   overlay.onmousedown = (e) => { if (e.target === overlay) close(); };
   const dlg = el("div", { className: "modal" });
+  const titleId = `modal-title-${++modalSequence}`;
+  dlg.setAttribute("role", "dialog");
+  dlg.setAttribute("aria-modal", "true");
+  dlg.setAttribute("aria-labelledby", titleId);
   dlg.style.width = width + "px";
   dlg.style.height = height + "px";
-  const head = el("div", { className: "modal-head" }, el("div", { className: "modal-title" }, title));
+  const head = el("div", { className: "modal-head" },
+    el("div", { className: "modal-title", id: titleId }, title));
   if (headExtra) head.append(headExtra);
   dlg.append(head, el("div", { className: "modal-body" }, bodyNode));
-  if (footNodes?.length) dlg.append(el("div", { className: "modal-foot" }, ...footNodes));
+  if (footerStart || footerEnd) {
+    const foot = el("div", { className: "modal-foot" });
+    if (footerStart) foot.append(el("div", { className: "modal-foot-start" }, footerStart));
+    if (footerEnd) foot.append(el("div", { className: "modal-foot-end" }, footerEnd));
+    dlg.append(foot);
+  }
   overlay.append(dlg);
   document.body.append(overlay);
   return close;
 }
 
-// Unified edit modal — 650×700, Save bottom-LEFT / Cancel bottom-RIGHT,
+// Action dialogs name intent instead of physical position. Dismissal is always
+// first/left and the primary or destructive action is always last/right.
+function openActionModal({ dismissNode, actionNode, ...modal }) {
+  return openModal({ ...modal, footerStart: dismissNode, footerEnd: actionNode });
+}
+
+// Unified edit modal — 650×700, Cancel bottom-left / Save bottom-right,
 // live ~tokens / chars readout in the header.
 function openEditModal({ title, value, onSave }) {
   const counter = el("div", { className: "modal-count" });
@@ -173,7 +248,9 @@ function openEditModal({ title, value, onSave }) {
   ta.oninput = upd; upd();
   const save = el("button", { className: "act primary", type: "button", textContent: "Save" });
   const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
-  const close = openModal({ title, headExtra: counter, bodyNode: ta, footNodes: [save, cancel] });
+  const close = openActionModal({
+    title, headExtra: counter, bodyNode: ta, dismissNode: cancel, actionNode: save,
+  });
   save.onclick = async () => {
     save.disabled = true; save.textContent = "Saving…";
     try { await onSave(ta.value); close(); }
@@ -203,32 +280,38 @@ async function openSkillContentModal(skill) {
     const closeBtn = el("button", { className: "act", type: "button", textContent: "Close" });
     const close = openModal({
       title: skill.name, headExtra: counter, bodyNode: body,
-      footNodes: [rawBtn, closeBtn],
+      footerStart: rawBtn, footerEnd: closeBtn,
       width: 800, height: 650,
     });
     closeBtn.onclick = close;
   } catch (e) { toast("error: " + e.message); }
 }
 
-// New-shell form in a 600×300 modal — Create bottom-left, Cancel bottom-right,
-// same dialog pattern as the new-flag modal.
+// New-shell form in a 600×300 modal — Cancel bottom-left, Create bottom-right.
 function openNewShellModal(templates, root) {
   const fl = el("select", {});
   for (const t of templates)
     fl.append(el("option", { value: t.flavor, textContent: `${t.flavor} — ${t.role}` }));
+  fl.append(el("option", {
+    value: "",
+    textContent: "Bespoke — custom skill pack",
+  }));
   const nm = el("input", { type: "text", placeholder: "name (e.g. Arch)" });
   const create = el("button", { className: "act primary", type: "button", textContent: "Create" });
   const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
   const form = el("div", { className: "modal-form" },
-    el("span", { className: "k" }, "flavor"), fl,
+    el("span", { className: "k" }, "shell type"), fl,
     el("span", { className: "k" }, "name"), nm);
-  const close = openModal({ title: "New shell", bodyNode: form,
-    footNodes: [create, cancel], width: 600, height: 300 });
+  const close = openActionModal({ title: "New shell", bodyNode: form,
+    dismissNode: cancel, actionNode: create, width: 600, height: 300 });
   create.onclick = async () => {
     if (!nm.value.trim()) return toast("name required");
     create.disabled = true; create.textContent = "Creating…";
     try {
-      const r = await api("/shells", "POST", { flavor: fl.value, name: nm.value.trim() });
+      const r = await api("/shells", "POST", {
+        flavor: fl.value || null,
+        name: nm.value.trim(),
+      });
       selectedShell = r.shell_id; activeSkillId = null;
       close(); setStatus(`shell created — ${r.shortname}`); renderShells(root);
     } catch (e) { toast("error: " + e.message); create.disabled = false; create.textContent = "Create"; }
@@ -238,13 +321,18 @@ function openNewShellModal(templates, root) {
 }
 
 async function renderShells(root) {
+  const epoch = ++shellRenderEpoch;
   const { shells } = await api("/shells");
+  if (epoch !== shellRenderEpoch) return;
   const { templates } = await api("/shell-templates");
+  if (epoch !== shellRenderEpoch) return;
   root.replaceChildren();
   if (!shells.length) { root.append(el("div", { className: "card muted" }, "No shells.")); return; }
   if (selectedShell == null || !shells.find((s) => s.shell_id === selectedShell))
     selectedShell = shells[0].shell_id;
   const s = await api("/shells/" + selectedShell);
+  if (epoch !== shellRenderEpoch) return;
+  root.replaceChildren();
 
   // sticky identity sub-header
   const sub = el("div", { className: "subbar" });
@@ -289,24 +377,30 @@ async function renderShells(root) {
   sub.append(delBtn);
   // Default Models is fork-global config — the shell-scoped header (picker,
   // role/mandate, ＋New shell) is greyed out and inert there, not load-bearing.
-  if (shellTab === "models") sub.classList.add("subbar-inert");
+  if (shellTab === "assignments" || shellTab === "models")
+    sub.classList.add("subbar-inert");
   root.append(sub);
 
-  // sub-tabs — Harness / Skills scoped to the selected shell; Default Models
-  // is the fork-global launch matrix (same content from any shell)
+  // Harness / Skills are scoped to the selected shell. Skill Assignments and
+  // Default Models are fork-global views nested here to keep shell setup in
+  // one place. Hash navigation gives every section a reload-safe URL.
   const tabs = el("div", { className: "vtabs" });
   for (const [key, label] of [["harness", "Harness"], ["skills", "Skills"],
+                              ["assignments", "Skill Assignments"],
                               ["models", "Default Models"]]) {
     const b = el("button", { className: shellTab === key ? "active-tab" : "", type: "button", textContent: label });
-    b.onclick = () => { shellTab = key; renderShells(root); };
+    b.onclick = () => { location.hash = SHELL_TAB_HASH[key]; };
     tabs.append(b);
   }
   root.append(tabs);
 
-  const pane = el("div", { className: "shell-pane" });
+  const pane = el("div", {
+    className: "shell-pane" + (shellTab === "assignments" ? " skill-assignments" : ""),
+  });
   root.append(pane);
   if (shellTab === "harness") renderHarness(pane, s);
   else if (shellTab === "models") renderDefaultModels(pane, s);
+  else if (shellTab === "assignments") renderSkillAssignments(pane);
   else renderSkillViewer(pane, s);
 }
 
@@ -315,126 +409,129 @@ async function renderShells(root) {
 // resolves at boot). Fork-global config — the selected shell's flavor leads,
 // but the matrix is the same from any shell.
 //
-// The model picker is family-first: family chips are FILTERS — click one to
-// narrow the list to that line (opus / sonnet / fable, deepseek / glm, …),
-// then select a model from its stacked cards. Where a family has a
-// self-tracking CLI alias (opus/sonnet/haiku) an "alias — tracks latest" card
-// is pinned on top of that family's list; elsewhere the newest release
-// already leads. The panel opens on focus (family chips first), the card
-// list appears once a family is active or a query is typed, "all" + Enter
-// browses everything, Enter stores any typed id as-is, Escape / outside
-// click / a pick collapses. Catalog: /api/models v2 — advisory, never a
-// constraint. Payload v3 adds local route authority + effort capability: a
-// public suggestion remains typeable, but only a locally available model with
-// verified high effort is sprint-runnable through `sc models resolve`.
-const DM_MODEL_CAP = 60;   // rendered cards per view — "all" on opencode is huge
+// One shared harness-first picker for Default Models.
+// Focus opens Harness default + every exact locally available route for that
+// harness. Search only filters that list; it is never itself a selectable
+// value. Arrow keys move the highlight, Enter chooses it, and Escape/outside
+// click closes without changing the current selection.
 
 function dmModelPicker(harness, cat, row, save) {
-  const data = cat.harnesses?.[harness] || { families: [], models: [] };
+  const data = cat.harnesses?.[harness] || { models: [] };
   const currentRoute = (data.models || []).find((m) => m.id === row.model);
-  const current = el("span", { className: "dm-current" + (row.model ? "" : " dm-unset"),
-                               textContent: row.model || "harness default",
-                               title: currentRoute
-                                 ? `${currentRoute.availability || "advisory"} · ${currentRoute.source || "unknown source"}`
-                                 : (row.model ? "not present in the latest catalogue" : "") });
+  const currentAvailable = !row.model || (
+    currentRoute && currentRoute.availability === "available" && !cat.stale);
+  const current = el("span", {
+    className: "dm-current" + (row.model ? "" : " dm-unset") +
+      (currentAvailable ? "" : " dm-stale"),
+    textContent: row.model
+      ? row.model + (currentAvailable ? "" : " (stale)")
+      : "Harness default",
+    title: currentAvailable
+      ? (currentRoute
+        ? `${currentRoute.availability} · ${currentRoute.source || "unknown source"}`
+        : "")
+      : "This stored route is unavailable. Choose an available model or Harness default before launch.",
+  });
   const input = el("input", { className: "dm-search",
-                              placeholder: "search · click a family to filter · “all” ⏎" });
+                              placeholder: "Search models for " + harness,
+                              role: "combobox", ariaExpanded: "false" });
   const results = el("div", { className: "dm-results", hidden: true });
-  let open = false, activeFam = null, allMode = false;
+  let open = false, highlighted = 0, choices = [];
+  // Moving the highlight must never go through paint(). paint() rebuilds every
+  // card node, so a repaint driven by hover destroys the card under the cursor
+  // — mousedown lands on one node, the rebuild detaches it, mouseup lands on
+  // its replacement, and with no common ancestor the browser never fires a
+  // click. That is why picking a model by mouse did nothing and only
+  // search-then-Enter worked. The highlight is presentational: move it in
+  // place. paint() stays for changes that genuinely alter the list.
+  let applyHighlight = () => {};
+  const setHighlight = (i) => { highlighted = i; applyHighlight(); };
 
-  // model family labels are raw ("claude-opus"); family chips are stripped
-  const famOf = (m) => harness === "claude"
-    ? (m.family || "").replace(/^claude-/, "") : (m.family || "");
-
-  const close = () => { open = false; activeFam = null; allMode = false; input.value = ""; paint(); };
+  const close = () => {
+    open = false; highlighted = 0; input.value = "";
+    input.ariaExpanded = "false"; paint();
+  };
   const pick = async (value) => {
-    await save(value);
-    current.textContent = value || "harness default";
+    try {
+      await save(value);
+    } catch (e) {
+      current.title = e.message;
+      return;
+    }
+    row.model = value || null;
+    current.textContent = value || "Harness default";
     current.classList.toggle("dm-unset", !value);
+    current.classList.remove("dm-stale");
     close();
-  };
-
-  const famChip = (f) => {
-    const c = el("button", { className: "dm-chip dm-fam" + (activeFam === f.family ? " dm-active" : ""),
-                             type: "button",
-                             title: `filter to the ${f.family} line (${f.n} model${f.n > 1 ? "s" : ""})` });
-    c.append(el("b", {}, f.family), el("span", { className: "dm-chip-sub" }, String(f.n)));
-    c.onclick = () => { activeFam = activeFam === f.family ? null : f.family; allMode = false; paint(); };
-    return c;
-  };
-  const mcard = (id, sub, cls) => {
-    const c = el("button", { className: "dm-mcard" + (cls ? " " + cls : ""), type: "button", title: id });
-    c.append(el("b", {}, id), el("span", { className: "dm-mcard-sub" }, sub || ""));
-    c.onclick = () => pick(id);
-    return c;
   };
   const routeSub = (m) => {
     const efforts = m.supported_efforts || [];
-    const route = m.availability === "available"
-      ? (efforts.includes("high") ? "local · high-effort route" : "local · no verified high effort")
-      : (m.availability || "advisory");
+    const route = efforts.includes("high")
+      ? "local · high-effort route" : "local route";
     return [route, m.source, m.release_date].filter(Boolean).join(" · ");
   };
 
   const paint = () => {
     results.textContent = "";
+    applyHighlight = () => {};   // the list this closed over is detached now
     if (!open) { results.hidden = true; return; }
     const q = input.value.trim().toLowerCase();
-    const hit = (s) => !q || (s || "").toLowerCase().includes(q);
-
-    // family filter row — always visible while open; the query narrows it too
-    const fams = (data.families || []).filter((f) => hit(f.family) || f.family === activeFam);
-    if (fams.length) {
-      results.append(el("div", { className: "dm-sect" }, "families — click to filter"));
-      const frow = el("div", { className: "dm-famrow" });
-      for (const f of fams) frow.append(famChip(f));
-      results.append(frow);
-    }
-
-    // stacked model cards — once a family is active, a query is typed, or all-mode
-    let models = null;
-    if (activeFam) {
-      models = (data.models || []).filter(
-        (m) => famOf(m) === activeFam && (hit(m.id) || hit(m.name)));
-    } else if (allMode) {
-      models = data.models || [];
-    } else if (q) {
-      models = (data.models || []).filter(
-        (m) => hit(m.id) || hit(m.name) || hit(m.family));
-    }
-    if (models) {
-      const label = activeFam ? `${activeFam} models` : "models";
-      results.append(el("div", { className: "dm-sect" },
-        `${label} (${models.length})`
-        + (models.length > DM_MODEL_CAP ? ` — first ${DM_MODEL_CAP}, type to narrow` : "")));
-      const list = el("div", { className: "dm-cardlist" });
-      // aliased family → pin the self-tracking card on top of its list
-      const famMeta = activeFam && (data.families || []).find((f) => f.family === activeFam);
-      if (famMeta && !models.some((m) => m.id === famMeta.latest) && hit(famMeta.latest))
-        list.append(mcard(famMeta.latest, "alias — tracks this family's latest", "dm-alias"));
-      for (const m of models.slice(0, DM_MODEL_CAP))
-        list.append(mcard(m.id, routeSub(m)));
-      if (q && !allMode)
-        list.append(mcard(input.value.trim(), "use as typed", "dm-raw"));
-      results.append(list);
-      if (!models.length && !q)
-        results.append(el("div", { className: "dm-sect" }, "no models in this family"));
-    } else {
-      results.append(el("div", { className: "dm-sect" },
-        "click a family to filter · type to search · “all” ⏎ for everything"));
-    }
+    const hit = (m) => !q || [m.id, m.name, m.family]
+      .some((s) => (s || "").toLowerCase().includes(q));
+    const models = cat.stale ? [] : (data.models || []).filter(
+      (m) => m.availability === "available" && hit(m));
+    choices = [
+      ...(!q || "harness default".includes(q)
+        ? [{ value: null, label: "Harness default", sub: "clear the model override" }]
+        : []),
+      ...models.map((m) => ({ value: m.id, label: m.id, sub: routeSub(m) })),
+    ];
+    highlighted = Math.max(0, Math.min(highlighted, choices.length - 1));
+    results.append(el("div", { className: "dm-sect" },
+      `${models.length} available model${models.length === 1 ? "" : "s"} for ${harness}`));
+    const list = el("div", { className: "dm-cardlist", role: "listbox" });
+    choices.forEach((choice, i) => {
+      const card = el("button", {
+        className: "dm-mcard", type: "button", role: "option",
+        title: choice.value || "Harness default",
+      });
+      card.append(el("b", {}, choice.label),
+        el("span", { className: "dm-mcard-sub" }, choice.sub));
+      card.onmouseenter = () => setHighlight(i);
+      card.onclick = () => pick(choice.value);
+      list.append(card);
+    });
+    applyHighlight = () => {
+      // Index loop, not forEach — `children` is a live HTMLCollection in the
+      // browser and has no forEach, so an array method would silently no-op.
+      for (let j = 0; j < list.children.length; j += 1) {
+        const node = list.children[j];
+        node.classList.toggle("dm-highlight", j === highlighted);
+        node.ariaSelected = String(j === highlighted);
+      }
+      list.children[highlighted]?.scrollIntoView({ block: "nearest" });
+    };
+    results.append(list);
+    applyHighlight();
     results.hidden = false;
   };
 
-  input.onfocus = () => { if (!open) { open = true; paint(); } };
-  input.oninput = () => { allMode = false; paint(); };
+  input.onfocus = () => {
+    if (!open) { open = true; highlighted = 0; input.ariaExpanded = "true"; paint(); }
+  };
+  input.oninput = () => { highlighted = 0; paint(); };
   input.onkeydown = (e) => {
     if (e.key === "Escape") { close(); input.blur(); return; }
-    if (e.key !== "Enter") return;
-    const q = input.value.trim();
-    if (!q) return;
-    if (q.toLowerCase() === "all") { allMode = true; activeFam = null; input.value = ""; paint(); }
-    else pick(q);
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const delta = e.key === "ArrowDown" ? 1 : -1;
+      setHighlight(Math.max(0, Math.min(highlighted + delta, choices.length - 1)));
+      return;
+    }
+    if (e.key === "Enter" && choices[highlighted]) {
+      e.preventDefault();
+      pick(choices[highlighted].value);
+    }
   };
   // outside click collapses; chips/cards live inside `results`, so picks land
   // first. Self-unregisters once this render generation is detached.
@@ -452,7 +549,7 @@ async function renderDefaultModels(root, s) {
   try { fd = await api("/flavor-defaults"); }
   catch (e) { root.append(el("div", { className: "vpanel" }, "flavor-defaults error: " + e.message)); return; }
   let cat = { harnesses: {}, sources: [], fetched_at: null, stale: true };
-  try { cat = await api("/models"); } catch { /* pickers still store typed ids */ }
+  try { cat = await api("/models"); } catch { /* picker shows Harness default only */ }
 
   const head = el("div", { className: "viewer-head" }, microlabel("Default Models"));
   const refresh = el("button", { className: "act", type: "button", textContent: "↻ Refresh models" });
@@ -494,7 +591,7 @@ async function renderDefaultModels(root, s) {
         try {
           await api("/flavor-defaults", "POST", { flavor, harness: h, model: value });
           toast(`${flavor} · ${h} → ${value || "(harness default)"}`);
-        } catch (e) { toast("error: " + e.message); }
+        } catch (e) { toast("error: " + e.message); throw e; }
       });
       panel.append(el("div", { className: "dm-row" },
         star, el("span", { className: "dm-harness" }, h),
@@ -504,7 +601,7 @@ async function renderDefaultModels(root, s) {
     root.append(panel);
   }
   root.append(el("div", { className: "dm-note" },
-    "★ = default harness at launch. Local + high-effort = sprint-runnable. Advisory entries remain free-text suggestions. Family chip = track that line's latest."));
+    "★ = default harness at launch. Model overrides must be exact locally available routes; Harness default clears the override."));
 }
 
 // Harness — the shell's surfaces as grouped accordions: Operational
@@ -596,17 +693,22 @@ function renderSkillViewer(root, s) {
   btn.append(el("span", { className: "gdrop-label mono" }, active.name),
     el("span", { className: "gdrop-caret" }, "⇅"));
   const menu = el("div", { className: "gmenu", hidden: true });
+  const grantPath = (skillId) => s.flavor
+    ? `/flavors/${encodeURIComponent(s.flavor)}/skills/${skillId}`
+    : `/shells/${s.shell_id}/skills/${skillId}`;
   for (const k of skills) {
     const row = el("div", { className: "gmenu-item" + (k.skill_id === activeSkillId ? " active-row" : "") });
     const tog = el("button", { className: "gmenu-check", type: "button",
       title: k.granted ? "Revoke" : "Grant", textContent: k.granted ? "☑" : "☐" });
     tog.onclick = async () => {
       try {
-        await api(`/shells/${s.shell_id}/skills/${k.skill_id}`, "PUT", { granted: !k.granted });
+        await api(grantPath(k.skill_id), "PUT", { granted: !k.granted });
         k.granted = k.granted ? 0 : 1;
         tog.textContent = k.granted ? "☑" : "☐";
         tog.title = k.granted ? "Revoke" : "Grant";
-        setStatus("grant updated");
+        setStatus(s.flavor
+          ? `${s.flavor} flavor pack updated`
+          : `${s.display_name} Bespoke pack updated`);
       } catch (e) { toast("error: " + e.message); }
     };
     const sel = el("button", { className: "gmenu-name mono", type: "button", textContent: k.name });
@@ -623,7 +725,12 @@ function renderSkillViewer(root, s) {
   // rendered markdown by default; the right-aligned toggle shows raw text
   const rawBtn = el("button", { className: "rawtoggle", type: "button",
     title: "Toggle raw markdown", textContent: "raw", hidden: true });
-  root.append(el("div", { className: "viewer-head" }, microlabel("Skill Viewer"), wrap, rawBtn));
+  root.append(
+    el("div", { className: "muted note" },
+      s.flavor
+        ? `Shared ${s.flavor} pack — changes apply to every ${s.flavor} shell.`
+        : `Bespoke pack — changes apply only to ${s.display_name}.`),
+    el("div", { className: "viewer-head" }, microlabel("Skill Viewer"), wrap, rawBtn));
   const stats = statRow([["Char Count", "…"], ["Est. Tokens", "…"]]);
   const panel = el("div", { className: "vpanel viewer-panel" });
   root.append(stats, panel);
@@ -645,12 +752,13 @@ function renderSkillViewer(root, s) {
   }).catch((e) => panel.append(el("div", { className: "muted" }, "error: " + e.message)));
 }
 
-// ── Skills (catalogue, sectioned) ────────────────────────────────────────────
-async function renderSkills(root) {
-  const { skills, shells } = await api("/skills");
+// ── Skill Assignments (catalogue, sectioned) ─────────────────────────────────
+async function renderSkillAssignments(root) {
+  const { skills, shells, flavors } = await api("/skills");
+  const bespokeShells = shells.filter((sh) => !sh.flavor);
   root.replaceChildren();
   root.append(el("div", { className: "muted" },
-    "The skills catalogue, sectioned. Engine skills ship with super-coder and group by category; repo skills are authored in this fork. Grants are editable here and on each shell."));
+    "Assign each skill once per standard flavor. Every shell of that flavor inherits the same pack. Bespoke shells remain individually assignable."));
   for (const sec of groupSkills(skills, { alwaysRepo: true })) {
     const wrap = el("div", { className: "bucket" });
     const h = el("h2", {}, `${sec.label} `, el("span", { className: "count" }, String(sec.skills.length)));
@@ -663,13 +771,13 @@ async function renderSkills(root) {
       continue;
     }
     const card = el("div", { className: "card skills" });
-    for (const s of sec.skills) card.append(skillRow(s, shells));
+    for (const s of sec.skills) card.append(skillRow(s, flavors, bespokeShells));
     wrap.append(card);
     root.append(wrap);
   }
 }
 
-function skillRow(s, shells) {
+function skillRow(s, flavors, bespokeShells) {
   const row = el("details", { className: "skill" });
   // collapsed row stays quiet: mono name + truncated description, no badges —
   // origin/section is the group header, grants live in the expanded body
@@ -682,16 +790,34 @@ function skillRow(s, shells) {
   const body = el("div", { className: "skill-body" });
   if (s.command) body.append(el("div", { className: "tag" }, "command: ", el("code", {}, s.command)));
 
-  // grants — every available shell as a row with an on/off toggle; same PUT
-  // the Shells tab uses, managed from the skill's side here
+  // One row per standard flavor, then one row per Bespoke shell.
   const gr = el("div", { className: "grants" });
-  gr.append(el("label", { className: "k", textContent: "granted to" }));
+  gr.append(el("label", { className: "k", textContent: "assigned to" }));
   const list = el("div", { className: "grant-list" });
-  for (const sh of shells) {
+  list.append(el("div", { className: "k", textContent: "Standard flavors" }));
+  for (const fl of flavors) {
+    const sw = toggleSwitch(s.granted_flavors.includes(fl.flavor), async (next, cb) => {
+      try {
+        await api(`/flavors/${encodeURIComponent(fl.flavor)}/skills/${s.skill_id}`,
+          "PUT", { granted: next });
+        setStatus(`${fl.flavor} flavor pack updated`);
+        const i = s.granted_flavors.indexOf(fl.flavor);
+        if (next && i < 0) s.granted_flavors.push(fl.flavor);
+        if (!next && i >= 0) s.granted_flavors.splice(i, 1);
+      } catch (e) { toast("error: " + e.message); cb.checked = !next; }
+    });
+    list.append(el("div", { className: "grant-row" },
+      sw,
+      el("span", { className: "grant-name" }, fl.flavor,
+        el("span", { className: "muted", textContent: fl.role ? " · " + fl.role : "" }))));
+  }
+  if (bespokeShells.length)
+    list.append(el("div", { className: "k", textContent: "Bespoke shells" }));
+  for (const sh of bespokeShells) {
     const sw = toggleSwitch(s.granted_shells.includes(sh.shell_id), async (next, cb) => {
       try {
         await api(`/shells/${sh.shell_id}/skills/${s.skill_id}`, "PUT", { granted: next });
-        setStatus("grant updated");
+        setStatus(`${sh.display_name} Bespoke pack updated`);
         const i = s.granted_shells.indexOf(sh.shell_id);
         if (next && i < 0) s.granted_shells.push(sh.shell_id);
         if (!next && i >= 0) s.granted_shells.splice(i, 1);
@@ -700,7 +826,8 @@ function skillRow(s, shells) {
     list.append(el("div", { className: "grant-row" },
       sw,
       el("span", { className: "grant-name" }, sh.display_name,
-        el("span", { className: "muted", textContent: sh.shortname ? " /" + sh.shortname : "" }))));
+        el("span", { className: "muted",
+          textContent: sh.shortname ? " /" + sh.shortname : "" }))));
   }
   gr.append(list);
   body.append(gr);
@@ -723,6 +850,7 @@ const SLABEL = { brainstorm: "Brainstorm", in_progress: "In Progress", next: "Ne
 const FLOW_STAGES = ["in_progress", "next", "near_term", "long_term", "shipped"];
 let roadmapFilter = null;            // null = show all (default); single-select
 let roadmapView = "board";           // "board" | "flow"
+let roadmapFeatureId = null;          // exact #roadmap-feature-<id> modal route
 let roadmapQuery = "";               // board search; persists across re-renders
 const roadmapCollapsed = new Set();  // statuses whose section is collapsed
 
@@ -808,6 +936,14 @@ async function renderRoadmap(root) {
     }
   }
   drawBoard();
+  if (roadmapFeatureId !== null) {
+    const requested = roadmapFeatureId;
+    roadmapFeatureId = null;
+    const feature = buckets.flatMap((bucket) => bucket.features)
+      .find((item) => item.feature_id === requested);
+    if (feature) openFeatureModal(feature, candidates, projects);
+    else toast(`feature #${requested} not found`);
+  }
 }
 
 // Flow view: one section per work-stream (project). Inside a section the
@@ -1122,14 +1258,14 @@ function featureForm(f, candidates = [], projects = []) {
 
 // Click-to-open edit modal — the same editor as the Board card's inline expand,
 // reachable from any card (small Flow cards, shipped cards, and the Board card's
-// ⤢ button). Save bottom-left / Cancel bottom-right; reloads the roadmap on save.
+// ⤢ button). Cancel bottom-left / Save bottom-right; reloads the roadmap on save.
 function openFeatureModal(f, candidates = [], projects = []) {
   const { node, save } = featureForm(f, candidates, projects);
   const saveBtn = el("button", { className: "act primary", type: "button", textContent: "Save" });
   const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
-  const close = openModal({
+  const close = openActionModal({
     title: (f.title || "(untitled)") + "  #" + f.feature_id,
-    bodyNode: node, footNodes: [saveBtn, cancel],
+    bodyNode: node, dismissNode: cancel, actionNode: saveBtn,
     width: 680, height: 720,
   });
   saveBtn.onclick = async () => {
@@ -1265,32 +1401,59 @@ async function renderDocs(root) {
 let flagFilter = "open";   // open | resolved | all — persists across re-renders
 let flagQuery = "";        // flags search; persists across re-renders
 
-// New-flag form in a 600×400 modal — Create bottom-left, Cancel bottom-right.
-function openNewFlagModal(features) {
-  const name = el("input", { type: "text", placeholder: "display name (e.g. SC-001)" });
-  const desc = el("textarea", { rows: 4, placeholder: "[Area] description | Blocker for: …" });
+// Shared create/edit flag form — roomy description, dismissal left, action right.
+function openFlagModal(features, flag = null) {
+  const editing = Boolean(flag);
+  const name = el("input", {
+    type: "text", placeholder: "display name (e.g. SC-001)", value: flag?.display_name || "",
+  });
+  const desc = el("textarea", {
+    rows: 8, placeholder: "[Area] description | Blocker for: …", value: flag?.description || "",
+  });
   const feat = el("select", {});
-  feat.append(el("option", { value: "", textContent: "— no feature —" }));
-  for (const f of features) feat.append(el("option", { value: f.feature_id, textContent: `#${f.feature_id} ${f.title}` }));
+  feat.append(el("option", {
+    value: "", selected: flag?.feature_id == null, textContent: "— no feature —",
+  }));
+  for (const f of features) feat.append(el("option", {
+    value: f.feature_id,
+    selected: String(f.feature_id) === String(flag?.feature_id),
+    textContent: `#${f.feature_id} ${f.title}`,
+  }));
   const prio = el("select", {});
-  for (const p of ["High", "Medium", "Low"]) prio.append(el("option", { value: p, selected: p === "Medium", textContent: p }));
-  const create = el("button", { className: "act primary", type: "button", textContent: "Create" });
+  for (const p of ["High", "Medium", "Low"]) prio.append(el("option", {
+    value: p, selected: p === (flag?.priority || "Medium"), textContent: p,
+  }));
+  const actionLabel = editing ? "Save" : "Create";
+  const action = el("button", {
+    className: "act primary", type: "button", textContent: actionLabel,
+  });
   const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
   const form = el("div", { className: "modal-form" },
     el("span", { className: "k" }, "name"), name,
     el("span", { className: "k" }, "description"), desc,
     el("span", { className: "k" }, "feature"), feat,
     el("span", { className: "k" }, "priority"), prio);
-  const close = openModal({ title: "New flag", bodyNode: form,
-    footNodes: [create, cancel], width: 600, height: 400 });
-  create.onclick = async () => {
+  const close = openActionModal({
+    title: editing ? `Edit flag #${flag.flag_id}` : "New flag",
+    bodyNode: form, dismissNode: cancel, actionNode: action,
+    width: 600, height: 520,
+  });
+  action.onclick = async () => {
     if (!desc.value) return toast("description required");
-    create.disabled = true; create.textContent = "Creating…";
+    action.disabled = true; action.textContent = editing ? "Saving…" : "Creating…";
+    const payload = {
+      display_name: name.value || null,
+      description: desc.value,
+      feature_id: feat.value || null,
+      priority: prio.value,
+    };
     try {
-      await api("/flags", "POST", { display_name: name.value || null, description: desc.value,
-        feature_id: feat.value || null, priority: prio.value });
-      close(); setStatus("flag created"); load("flags");
-    } catch (e) { toast("error: " + e.message); create.disabled = false; create.textContent = "Create"; }
+      await api(editing ? "/flags/" + flag.flag_id : "/flags", editing ? "PATCH" : "POST", payload);
+      close(); setStatus(editing ? "flag saved" : "flag created"); load("flags");
+    } catch (e) {
+      toast("error: " + e.message);
+      action.disabled = false; action.textContent = actionLabel;
+    }
   };
   cancel.onclick = close;
   desc.focus();
@@ -1313,7 +1476,7 @@ async function renderFlags(root) {
     bar.append(chip);
   }
   const newBtn = el("button", { className: "act newflag", type: "button", textContent: "＋ New flag" });
-  newBtn.onclick = () => openNewFlagModal(features);
+  newBtn.onclick = () => openFlagModal(features);
   root.append(el("div", { className: "flagbar" }, bar, newBtn));
 
   // results repaint in place: filter by the toggle, then narrow by the query
@@ -1340,14 +1503,14 @@ async function renderFlags(root) {
     for (const [title, list] of unlinkedLast(Object.entries(byFeat))) {
       const c = el("div", { className: "card" });
       c.append(el("h2", {}, title));
-      for (const f of list) c.append(flagRow(f));
+      for (const f of list) c.append(flagRow(f, features));
       results.append(c);
     }
   }
   draw();
 }
 
-function flagRow(f) {
+function flagRow(f, features) {
   // Expandable: collapsed row shows the priority badge + title + #id;
   // expanding reveals the full description, linked items as cards, and the
   // resolution note (resolved) or the resolve action (open).
@@ -1376,18 +1539,26 @@ function flagRow(f) {
     body.append(lc);
   }
 
+  const actions = el("div", { className: "flag-actions" });
   if (f.resolved) {
     body.append(el("div", { className: "tag" }, `resolved ${f.resolved_date || ""} — ${f.resolution_notes || ""}`));
   } else {
-    const btn = el("button", { className: "act", textContent: "resolve" });
+    const btn = el("button", { className: "act", type: "button", textContent: "resolve" });
     btn.onclick = async () => {
       const notes = prompt("Resolution notes:");
       if (notes === null) return;
       try { await api("/flags/" + f.flag_id, "PATCH", { resolved: 1, resolution_notes: notes }); setStatus("flag resolved"); load("flags"); }
       catch (e) { toast("error: " + e.message); }
     };
-    body.append(btn);
+    actions.append(btn);
   }
+  const edit = el("button", { className: "act flag-edit", type: "button", textContent: "edit" });
+  edit.onclick = (e) => {
+    e.preventDefault(); e.stopPropagation();
+    openFlagModal(features, f);
+  };
+  actions.append(edit);
+  body.append(actions);
   row.append(body);
   return row;
 }
@@ -1397,7 +1568,7 @@ async function renderScripts(root) {
   const { scripts } = await api("/scripts");
   root.replaceChildren();
   root.append(el("div", { className: "muted" },
-    "Run a maintenance script. Output appears below it. Per-instance DB edits → run Snapshot, then Render flat, to persist them to git-tracked text."));
+    "Run a maintenance script. Output appears below it. Per-instance DB edits → Save locally to refresh the ignored snapshot and flat renders."));
 
   // Windows Test VM — opt-in, link-only. Links this fork to an operator-run
   // Windows VM for installer/system-level testing. Config lives in instance.json
@@ -1520,10 +1691,10 @@ async function openWinVmModal() {
 
   const save = el("button", { className: "act primary", textContent: "save" });
   const cancel = el("button", { className: "act", textContent: "close" });
-  const close = openModal({
+  const close = openActionModal({
     title: "Windows Test VM", width: 680, height: 760,
     bodyNode: el("div", {}, form, el("div", { className: "modal-form-foot" }, runAll), note, results),
-    footNodes: [save, cancel],
+    dismissNode: cancel, actionNode: save,
   });
   save.onclick = async () => {
     save.disabled = true; setStatus("saving VM config…");
@@ -1700,6 +1871,7 @@ let anSessions = [];      // accumulated cards across "More" pages
 let anNextBefore = null;  // cursor for the next page (null = no older rows)
 let anDaysLoaded = 0;     // window size loaded so far (7 per page)
 let anClass = null;  // selected stat card; null = combined (all classes summed)
+let anView = "tokens";    // 'tokens' | 'quota' — sub-view, carried in the hash
 
 const AN_CLASSES = [
   ["input_tokens", "Input"], ["output_tokens", "Output"],
@@ -1892,7 +2064,7 @@ function anSelect(label, key, values, onChange) {
   return wrap;
 }
 
-function anSessionCard(c, sprintTitles) {
+function anSessionCard(c) {
   const row = el("details", { className: "sess" });
   const head = el("summary", { className: "sess-head" });
   head.append(el("span", { className: "sess-time" },
@@ -1917,7 +2089,6 @@ function anSessionCard(c, sprintTitles) {
   const meta = [];
   if (c.providers) meta.push(["provider", c.providers]);
   if (c.shell_session) meta.push(["session", c.shell_session]);
-  if (c.sprint_ref) meta.push(["sprint", sprintTitles[c.sprint_ref] || "#" + c.sprint_ref]);
   if (c.status !== "ok") meta.push(["status", c.status]);
   if (meta.length) body.append(statRow(meta));
   body.append(el("code", { className: "sess-ref" }, c.harness_session_ref));
@@ -1925,7 +2096,7 @@ function anSessionCard(c, sprintTitles) {
   return row;
 }
 
-async function renderAnalytics(root) {
+async function anTokenSection(root) {
   root.replaceChildren(el("div", { className: "muted" }, "sweeping harness data…"));
   try { await api("/analytics/sweep", "POST"); } catch { /* sweep is best-effort; show what's stored */ }
   const winDays = anDaysLoaded || anRange;
@@ -1947,7 +2118,7 @@ async function renderAnalytics(root) {
   const reset = (k) => (v) => {
     anFilters[k] = v;
     anSessions = []; anNextBefore = null; anDaysLoaded = 0;
-    renderAnalytics(root);
+    anTokenSection(root);
   };
   const rangeSeg = el("div", { className: "filters seg an-range" });
   for (const [label, days] of AN_RANGES) {
@@ -1956,7 +2127,7 @@ async function renderAnalytics(root) {
     chip.onclick = () => {
       anRange = days;
       anSessions = []; anNextBefore = null; anDaysLoaded = 0;
-      renderAnalytics(root);
+      anTokenSection(root);
     };
     rangeSeg.append(chip);
   }
@@ -1998,7 +2169,6 @@ async function renderAnalytics(root) {
   // specs shipped · docs outstanding. Peak day is client-computed from the
   // combined buckets (all classes, all models in the slice); the shipped
   // counts are window-scoped server-side; outstanding is current-state.
-  const sprintTitles = usage.sprint_titles || {};
   const panelsTop = el("div", { className: "an-panels" });
   const panels = el("div", { className: "an-panels" });
   // items: strings, or {id, label} — an id renders as #id with a copy button
@@ -2046,9 +2216,7 @@ async function renderAnalytics(root) {
     (usage.docs_outstanding || []).map((f) => ({ id: f.feature_id, label: f.title }))));
   root.append(panelsTop, panels);
 
-  // session history — grouped by LOCAL day, newest first; within a day,
-  // sessions sharing a sprint_ref cluster under a sprint header with rolled-up
-  // totals; solo sessions list flat.
+  // Session history is grouped by local day, newest first.
   const list = el("div", {});
   root.append(list);
   if (!anSessions.length) {
@@ -2063,43 +2231,3291 @@ async function renderAnalytics(root) {
   for (const [day, cards] of byDay) {
     const dayCard = el("div", { className: "card an-day" });
     dayCard.append(el("h2", {}, day));
-    const bySprint = new Map();
-    for (const c of cards) {
-      const k = c.sprint_ref || null;
-      if (!bySprint.has(k)) bySprint.set(k, []);
-      bySprint.get(k).push(c);
-    }
-    for (const [ref, group] of bySprint) {
-      if (ref && group.length > 1) {
-        const cl = el("div", { className: "an-sprint" });
-        cl.append(el("div", { className: "an-sprint-head" },
-          el("span", { className: "pill next" }, "sprint"),
-          " " + (sprintTitles[ref] || "#" + ref),
-          el("span", { className: "sess-tok" },
-            fmtTok(group.reduce((t, c) => t + cardTotal(c), 0)))));
-        for (const c of group) cl.append(anSessionCard(c, sprintTitles));
-        dayCard.append(cl);
-      } else {
-        for (const c of group) dayCard.append(anSessionCard(c, sprintTitles));
-      }
-    }
+    for (const c of cards) dayCard.append(anSessionCard(c));
     list.append(dayCard);
   }
   if (anNextBefore) {
     const more = el("button", { className: "act", type: "button", textContent: "More ↓ (7 more days)" });
     more.onclick = async () => {
       more.disabled = true;
-      try { await anLoadPage(7); renderAnalytics(root); }
+      try { await anLoadPage(7); anTokenSection(root); }
       catch (e) { toast("error: " + e.message); more.disabled = false; }
     };
     list.append(el("div", { className: "an-more" }, more));
   }
 }
 
+// ── Provider Quota — harness quota (spec doc #57, superseding #49) ────────────
+// Token Analytics answers *what did we spend*; this answers *how much is left*.
+// ONE CARD PER PROVIDER, showing that provider's most recent reading and the
+// age of the reading. Nothing about who is signed in — decision #75.
+//
+// Three rules carry the whole section, and all three are about not lying:
+//
+// 1. COLOUR IS THRESHOLD-DRIVEN AND PROVIDER-BLIND. It is computed from
+//    used_percent alone, never from a provider's own severity field: anthropic
+//    sends severity=normal at 22%, openai limit_reached=true at 100%, moonshot
+//    nothing at all. Three vocabularies would be three colour rules on one page.
+// 2. A MISSING NUMBER IS NEVER DRAWN AS A ZERO. used_percent NULL renders
+//    "n/a" with no bar — a window whose percent could not be derived, or a
+//    provider that reports counts against limit_value 0. A 0% meter reads as
+//    measured, and "we did not get a number" is not 0%.
+// 3. THE CARD NEVER MAKES A CLAIM ABOUT THE OPERATOR'S SESSION. It has no
+//    label, no account id, no plan and no sign-in language, so the two defects
+//    that shipped as false claims — a 403 rendered "signed out — last known"
+//    while the operator was actively using Codex (#196), and a lapsed 15-minute
+//    Kimi token rendered "no account identified" (#197) — cannot be expressed
+//    here at all. A failed probe leaves the last-known figures standing with
+//    their age, and says nothing else.
+//
+// The per-provider status still comes from the response's status field, never
+// inferred from whether windows arrived: no windows is both "nothing
+// configured" and "the probe failed", and the operator has to be able to tell
+// those apart.
+const AN_PROVIDER_LABEL = { anthropic: "Claude", openai: "Codex", moonshot: "Kimi" };
+// Where the operator goes to manage the account itself. This panel deliberately
+// stops at "how much is left" — the FnB's ruling that retired account identity
+// rests on the provider's own page being one click away, so the link is part of
+// the design and not a convenience. Each URL is taken from the harness CLI's own
+// binary rather than guessed; Kimi links to its Code usage console.
+const AN_PROVIDER_USAGE_URL = {
+  anthropic: "https://claude.ai/settings/usage",
+  openai: "https://chatgpt.com/codex/settings/usage",
+  moonshot: "https://www.kimi.com/code/console",
+};
+// Display order for a card's windows. Unrecognized kinds sort last rather than
+// being dropped — the probe stores a window it could not map under its raw
+// duration precisely so the panel still shows it.
+const AN_WINDOW_ORDER = ["session", "five_hour", "weekly", "weekly_scoped", "short"];
+const AN_WINDOW_LABEL = {
+  session: "Session", five_hour: "5-hour", weekly: "Weekly",
+  weekly_scoped: "Weekly · scoped", short: "Short",
+};
+const anWindowRank = (w) => {
+  const i = AN_WINDOW_ORDER.indexOf(w.window_kind);
+  return i < 0 ? AN_WINDOW_ORDER.length : i;
+};
+const anWindowName = (w) => (AN_WINDOW_LABEL[w.window_kind] || w.window_kind)
+  + (w.scope ? " · " + w.scope : "");
+
+// below 80 normal · 80+ amber · 95+ red. NULL has no class: an absent number is
+// not a low one, so it gets no colour rather than the reassuring one.
+const anQuotaClass = (pct) => pct == null ? "" : pct >= 95 ? " red" : pct >= 80 ? " amber" : "";
+const anPct = (pct) => pct == null ? "n/a" : Math.round(pct * 10) / 10 + "%";
+
+function anDuration(ms) {
+  const mins = Math.round(ms / 60000);
+  if (mins < 1) return "<1m";
+  if (mins < 60) return mins + "m";
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs + "h" + (mins % 60 ? " " + (mins % 60) + "m" : "");
+  const days = Math.floor(hrs / 24);
+  return days + "d" + (hrs % 24 ? " " + (hrs % 24) + "h" : "");
+}
+// Reset renders as a countdown, not a timestamp — "in 3h 12m" answers the
+// question the operator actually has. A reset already past reads "due" rather
+// than a negative duration; an absent or unparseable one reads "—", never now.
+function anCountdown(iso) {
+  const t = iso ? new Date(iso).getTime() : NaN;
+  if (!Number.isFinite(t)) return "—";
+  const ms = t - Date.now();
+  return ms <= 0 ? "due" : "in " + anDuration(ms);
+}
+function anAge(iso) {
+  const t = iso ? new Date(iso).getTime() : NaN;
+  if (!Number.isFinite(t)) return "—";
+  const ms = Date.now() - t;
+  return ms <= 0 ? "just now" : anDuration(ms) + " ago";
+}
+
+function anWindowRow(w) {
+  const pct = w.used_percent;
+  const row = el("div", { className: "an-win" });
+  row.append(el("div", { className: "an-win-head" },
+    el("span", { className: "an-win-name" }, anWindowName(w)),
+    el("span", { className: "an-win-pct" + anQuotaClass(pct) }, anPct(pct))));
+  const meter = el("div", { className: "an-meter" });
+  if (pct != null) {
+    // Clamped: a provider reporting over 100 fills the track, it does not
+    // overflow it. NULL draws no fill at all — an empty track is honest.
+    const fill = el("div", { className: "an-meter-fill" + anQuotaClass(pct) });
+    fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+    meter.append(fill);
+  }
+  row.append(meter);
+  const meta = [];
+  if (w.used != null || w.limit_value != null)
+    meta.push(["used", (w.used == null ? "—" : fmt(w.used))
+      + " / " + (w.limit_value == null ? "—" : fmt(w.limit_value))]);
+  meta.push(["resets", anCountdown(w.resets_at)]);
+  if (w.status && w.status !== "ok") meta.push(["status", w.status]);
+  const line = statRow(meta);
+  if (w.resets_at) line.title = "resets " + w.resets_at;
+  row.append(line);
+  return row;
+}
+
+// The status line a card carries under its heading. It describes THE PROBE, never
+// the operator: `unauth` says the token we hold is not usable, which is a fact
+// about a credential file, and stops there. The words "signed out" and "no
+// account identified" are gone from this section on purpose — both were
+// rendered while the operator was signed in and working (#196, #197).
+const AN_STATUS_NOTE = {
+  na: "no readable credential file",
+  unauth: "token not usable",
+  error: "probe failed",
+};
+
+function anProviderCard(prov) {
+  const status = prov.status;
+  const card = el("div", { className: "card an-acct" });
+
+  // No muted styling and no dimming, for any status. Muting existed to mark a
+  // card as "not the current account", a distinction a provider-level panel
+  // does not have — and a dimmed card reads as a lesser truth, when in fact the
+  // numbers on a degraded card are exactly as real as the ones on a fresh card.
+  // The AGE is what distinguishes them, and it is right there in the footer.
+  const head = el("div", { className: "an-acct-head" });
+  head.append(el("h2", {}, AN_PROVIDER_LABEL[prov.provider] || prov.provider));
+  head.append(el("span", { className: "pill" }, prov.provider));
+  if (status && status !== "ok") {
+    const note = AN_STATUS_NOTE[status] || status;
+    const tokenRefreshes = status === "unauth";
+    const badge = el("span", { className: "pill " + (tokenRefreshes ? "info" : "warn") },
+      note + (!tokenRefreshes && prov.detail ? " · " + prov.detail : ""));
+    if (tokenRefreshes) {
+      const provider = AN_PROVIDER_LABEL[prov.provider] || prov.provider;
+      badge.title = "Refreshes automatically the next time you use " + provider + "."
+        + (prov.detail ? " Last probe: " + prov.detail : "");
+    }
+    head.append(badge);
+  }
+  card.append(head);
+
+  const wins = [...(prov.windows || [])].sort((a, b) => anWindowRank(a) - anWindowRank(b));
+  // "No reading yet" is not the same sentence as "no windows reported", and the
+  // difference is the operator's next move. A provider that has never returned
+  // anything has nothing to show; one that returned an intact envelope carrying
+  // zero windows is genuinely idle and that IS its reading.
+  //
+  // THE SIGNAL IS THE STATUS, NOT captured_at, and the distinction is the whole
+  // reason this branch exists at all. captured_at is derived from window rows,
+  // so a card with no windows never has one — reading it here asked a question
+  // whose answer was fixed, and the idle sentence could not be reached by any
+  // response the API can emit (L-614-2). `ok` with zero windows is the probe
+  // saying it got an intact answer and there was nothing in it; any other
+  // status with zero windows means nothing has ever been read, and the pill
+  // above already says why.
+  if (!wins.length)
+    card.append(el("div", { className: "muted" },
+      prov.status === "ok" ? "no windows reported" : "no reading yet"));
+  for (const w of wins) card.append(anWindowRow(w));
+
+  const foot = el("div", { className: "an-acct-foot" });
+  // THE AGE IS NEVER OMITTED AND NEVER SOFTENED. It is the whole of the
+  // empty-state rule: a probe that cannot get fresh numbers leaves the last
+  // known ones standing, and the only thing that keeps that honest is saying
+  // how old they are. A card with no age would present stale figures as fresh.
+  if (prov.captured_at)
+    foot.append(el("span", { className: "muted" }, "as of " + anAge(prov.captured_at)));
+  // NO PER-CARD REFRESH. There was one, and it re-probed all three providers —
+  // one probe run is the only thing the route can do. Per-card refresh made
+  // sense under the ACCOUNT model, where cards differed in whether they could
+  // be refreshed at all; provider cards do not differ that way, so three
+  // buttons doing one thing were three labels under-describing it. The
+  // section's own "refresh all" says what actually happens and is one control
+  // instead of four.
+  const actions = el("div", { className: "an-acct-actions" });
+  const usageUrl = AN_PROVIDER_USAGE_URL[prov.provider];
+  if (usageUrl)
+    actions.append(el("a", { className: "act", textContent: "usage page ↗",
+      href: usageUrl, target: "_blank", rel: "noopener noreferrer" }));
+  foot.append(actions);
+  card.append(foot);
+  return card;
+}
+
+function anDrawQuota(root, d) {
+  root.replaceChildren();
+  const providers = d.providers || [];
+
+  const head = el("div", { className: "an-acct-bar" });
+  head.append(el("span", { className: "muted" }, "most recent reading per provider"));
+  const probeAll = el("button", { className: "act", type: "button", textContent: "refresh all ⟳" });
+  probeAll.onclick = () => anProbeNow(root, probeAll);
+  head.append(probeAll);
+  root.append(head);
+
+  if (!providers.length) {
+    root.append(el("div", { className: "card muted" }, "No probe has run yet."));
+    return;
+  }
+
+  // EVERY provider gets a card, including one with no credential file and one
+  // that has never been probed. Nothing is filtered out: hiding a card is how a
+  // panel stops lying and starts saying nothing, and the operator cannot tell
+  // "not configured" from "not readable" from a card that is not there.
+  for (const prov of providers) root.append(anProviderCard(prov));
+}
+
+// The refresh control — POSTs the probe route, which bypasses the 60s TTL. The
+// redraw replaces the button along with everything else, so it is only
+// re-enabled on the failure path. It is never disabled by a judgement about
+// whether a probe can succeed: the old panel made that judgement from the
+// registry's idea of who was signed in and was wrong in exactly the case the
+// operator most wants it — a lapsed Kimi token that a re-probe fixes the moment
+// they boot the harness.
+async function anProbeNow(root, btn) {
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "probing…";
+  try {
+    anDrawQuota(root, await api("/analytics/quota/probe", "POST"));
+  } catch (e) {
+    toast("probe error: " + e.message);
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+}
+
+// GET is the arrival probe: the route probes for itself when its last attempt
+// has aged past the TTL, so the section fires exactly one probe per minute of
+// toggling and the client asks for nothing extra.
+async function anQuotaSection(root) {
+  root.replaceChildren(el("div", { className: "muted" }, "probing providers…"));
+  try {
+    anDrawQuota(root, await api("/analytics/quota"));
+  } catch (e) {
+    root.replaceChildren(el("div", { className: "card" }, "error: " + e.message));
+  }
+}
+
+// The Analytics tab carries its sub-view in the hash, the convention the
+// roadmap tab already uses for #roadmap / #roadmap-flow: #analytics = Token
+// Analytics, #analytics-quota = Provider Quota. Both keep `analytics` as the
+// active nav tab; routeFromHash sets anView and re-renders.
+//
+// The hash moved with the section's name. #analytics-accounts described a
+// per-account panel that no longer exists, and an operator who lands on a URL
+// naming a surface they cannot find is exactly the confusion the rename exists
+// to prevent — the old hash simply falls through to Token Analytics.
+//
+// Each section renders into its OWN node, so its replaceChildren() cannot wipe
+// the toggle above it — and so arriving at one section never runs the other's
+// work: the token sweep and the account probe both fire on entry, and firing
+// both would mean three third-party calls every time someone reads their spend.
+async function renderAnalytics(root) {
+  const seg = el("div", { className: "filters seg an-view" });
+  for (const [mode, label] of [["tokens", "Token Analytics"], ["quota", "Provider Quota"]]) {
+    const b = el("button", { className: "chip" + (anView === mode ? " on" : ""),
+      type: "button", textContent: label });
+    b.onclick = () => { location.hash = mode === "quota" ? "analytics-quota" : "analytics"; };
+    seg.append(b);
+  }
+  const body = el("div", {});
+  root.replaceChildren(el("div", { className: "an-head" }, seg), body);
+  return anView === "quota" ? anQuotaSection(body) : anTokenSection(body);
+}
+
+// ── Interface / browser-native conversations ────────────────────────────────
+// A browser conversation owns the shell's single session slot until ended. It
+// uses the normal CLI preparation path server-side, but deliberately has no
+// terminal, tmux controls, or live hand-off between browser and CLI.
+const CHAT_HARNESSES = ["opencode", "claude", "codex", "kimi"];
+const CHAT_FLAVOR_ORDER = [
+  "cartographer", "admin", "planner", "dev", "reviewer", "devops",
+];
+const CHAT_CONFIGURE_ROUTE = "configure";
+const CHAT_HISTORY_POLL_MS = 2000;
+const CHAT_MODES = ["chat", "diff"];
+let chatRouteShell = "";
+let chatRouteConversation = "";
+let chatRouteMode = "chat";
+let chatSource = null;
+let chatHistoryPollTimer = null;
+let chatRenderGeneration = 0;
+let chatPendingSend = null;
+let chatModeController = null;
+let chatReviewCleanup = null;
+let chatConfiguration = null;
+let chatConfigurationPromise = null;
+
+function chatLoadConfiguration() {
+  if (chatConfiguration) return Promise.resolve(chatConfiguration);
+  if (chatConfigurationPromise) return chatConfigurationPromise;
+  const request = Promise.all([
+    api("/flavor-defaults"),
+    api("/models"),
+  ]).then(([defaults, catalog]) => {
+    chatConfiguration = { defaults, catalog };
+    return chatConfiguration;
+  });
+  chatConfigurationPromise = request;
+  request.catch(() => {
+    if (chatConfigurationPromise === request) chatConfigurationPromise = null;
+  });
+  return request;
+}
+
+function chatStopStream() {
+  if (chatSource) chatSource.close();
+  chatSource = null;
+}
+
+function chatStopHistoryPoll() {
+  if (chatHistoryPollTimer) clearInterval(chatHistoryPollTimer);
+  chatHistoryPollTimer = null;
+}
+
+function chatStopReview() {
+  if (chatReviewCleanup) chatReviewCleanup();
+  chatReviewCleanup = null;
+  document.body.classList.remove("chat-diff-view");
+}
+
+function chatHash(shortname, conversationId = "") {
+  return `interface/${encodeURIComponent(shortname)}`
+    + (conversationId ? `/${encodeURIComponent(conversationId)}` : "");
+}
+
+function chatModeHash(shortname, conversationId, mode = "chat") {
+  return chatHash(shortname, conversationId)
+    + (mode === "diff" ? "/diff" : "");
+}
+
+function chatModelLabel(conversation) {
+  return conversation.route?.model || "harness default";
+}
+
+function chatStartedLabel(conversation) {
+  if (!conversation.created_at) return "Start time unavailable";
+  const raw = String(conversation.created_at);
+  const timestamp = /(?:Z|[+-]\d\d:\d\d)$/.test(raw) ? raw : `${raw}Z`;
+  const started = new Date(timestamp);
+  if (Number.isNaN(started.getTime())) return raw;
+  return new Intl.DateTimeFormat(undefined, {
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(started);
+}
+
+function chatShellLabel(conversation) {
+  const shell = conversation?.shell || {};
+  return [shell.display_name, shell.shortname].filter(Boolean).join(" | ") || "Shell";
+}
+
+function chatUnreadBadge(shell) {
+  const count = Number(shell.unread_message_count) || 0;
+  if (count < 1) return null;
+  const label = `${count} unread ${count === 1 ? "message" : "messages"}`;
+  return el("span", {
+    className: "chat-shell-mail",
+    title: label,
+    ariaLabel: label,
+  }, "📩");
+}
+
+function chatHeaderLabel(conversation) {
+  return [
+    conversation.shell?.shortname,
+    chatModelLabel(conversation),
+    conversation.route?.harness,
+  ].filter(Boolean).join(" | ");
+}
+
+// Admin shells stay on the rail but never chat here: they maintain main at
+// the repo root, whose single un-attributable session slot would make browser
+// turns refuse whenever anyone works anywhere in the repo. The notice hands
+// the operator the exact terminal commands instead.
+function chatAdminCliOnly(shell) {
+  return (shell?.flavor || "") === "admin";
+}
+
+function chatAdminCliOnlyNotice(shell, repoRoot) {
+  return el("div", { className: "chat-empty chat-admin-cli-only" },
+    el("b", {}, "Admin is CLI-only."),
+    el("div", {},
+      `${shell.display_name} maintains main directly at the repo root, `
+      + "so browser chats are disabled for it. Open a terminal and run:"),
+    el("pre", { className: "chat-admin-commands" },
+      `cd ${repoRoot || "<repo root>"}\nmake dos-e s=${shell.shortname}`));
+}
+
+function chatWorkingDots() {
+  return el("span", { className: "chat-working-dots", ariaHidden: "true" },
+    el("span", {}, "."),
+    el("span", {}, "."),
+    el("span", {}, "."));
+}
+
+function chatStatePill(state) {
+  const label = {
+    queued: "queued", running: "working", waiting: "waiting",
+    error: "failed", idle: "idle", closed: "closed",
+  }[state] || state;
+  const pill = el("span", {
+    className: `chat-state state-${state || "idle"}`,
+  });
+  if (state !== "running") {
+    pill.textContent = label;
+    return pill;
+  }
+  pill.append(label, chatWorkingDots());
+  return pill;
+}
+
+function chatWorkingIndicator() {
+  const indicator = el("div", {
+    className: "chat-working-indicator",
+    role: "status",
+    ariaLabel: "Working",
+  });
+  indicator.append("<Working>", chatWorkingDots());
+  return indicator;
+}
+
+const CHAT_SHELL_STATE_CLASSES = [
+  "active-chat", "state-idle", "state-queued", "state-running",
+  "state-waiting", "state-error",
+];
+
+function chatPaintShellState(button, state) {
+  button.classList.remove(...CHAT_SHELL_STATE_CLASSES);
+  if (!["idle", "queued", "running", "waiting", "error"].includes(state)) return;
+  button.classList.add("active-chat", `state-${state}`);
+}
+
+function chatPaintStar(button, starred) {
+  button.textContent = starred ? "★" : "☆";
+  button.classList.toggle("starred", starred);
+  button.title = starred ? "Unstar chat" : "Star chat";
+  button.setAttribute("aria-label", button.title);
+  button.setAttribute("aria-pressed", String(starred));
+}
+
+function chatPaintHistoryItem(item, conversation) {
+  item.conversation = conversation;
+  item.context.textContent =
+    `${chatStartedLabel(conversation)} | ${chatModelLabel(conversation)}`;
+  item.name.textContent = chatConversationName(conversation);
+  const nextState = conversation.state || "idle";
+  if (!item.state.classList.contains(`state-${nextState}`)) {
+    const state = chatStatePill(nextState);
+    item.state.replaceWith(state);
+    item.state = state;
+  }
+  chatPaintStar(item.star, Boolean(conversation.starred));
+}
+
+function chatQueuedCount(messages) {
+  return messages.filter(
+    (message) => message.message_kind !== "control"
+      && ["accepted", "queued"].includes(message.state)
+  ).length;
+}
+
+function chatConversationName(conversation) {
+  return conversation.title || "Untitled chat";
+}
+
+async function chatCloseForSwitch(conversation) {
+  if (!conversation) return true;
+  if (conversation.scope === "sprint") return true;
+  try {
+    const latest = await chatApi(
+      `/conversations/${conversation.conversation_id}`,
+    );
+    if (latest.state === "closed") return true;
+    if (!["idle", "waiting", "error"].includes(latest.state)) {
+      toast("Finish the current turn and queued messages before switching chats.");
+      return false;
+    }
+    const closed = await chatApi(
+      `/conversations/${conversation.conversation_id}`,
+      "PATCH",
+      { version: latest.version, state: "closed" },
+    );
+    Object.assign(conversation, closed);
+    return true;
+  } catch (error) {
+    toast(`${error.code}: ${error.message}`);
+    return false;
+  }
+}
+
+function chatBubble(kind, body, meta = "", conversation = null) {
+  const bubble = el("article", { className: `chat-bubble chat-${kind}` });
+  bubble.append(el("div", { className: "chat-who" },
+    kind === "user" ? "You"
+      : kind === "assistant" ? chatShellLabel(conversation)
+      : "Activity"));
+  const content = kind === "activity"
+    ? el("div", { className: "chat-activity-text" }, body)
+    : mdBlock(body);
+  if (kind === "assistant") content.classList.add("chat-assistant-body");
+  bubble.append(content);
+  if (meta) bubble.append(el("div", { className: "chat-meta" }, meta));
+  return bubble;
+}
+
+function chatTranscriptAtBottom(transcript) {
+  return transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight <= 32;
+}
+
+async function chatRefreshConversation(conversationId, generation, onUpdate) {
+  try {
+    const [next, messagePage] = await Promise.all([
+      chatApi(`/conversations/${conversationId}`),
+      chatApi(`/conversations/${conversationId}/messages?limit=100`),
+    ]);
+    if (generation === chatRenderGeneration) onUpdate(next, messagePage.items);
+  } catch { /* SSE remains authoritative enough to keep the open view usable. */ }
+}
+
+function chatOpenStream(
+  conversationId, generation, afterSequence, onEvent, onState,
+) {
+  chatStopStream();
+  const source = new EventSource(
+    `/api/conversations/${conversationId}/events?after=${afterSequence}`);
+  chatSource = source;
+  source.onopen = () => onState("connected");
+  source.onerror = () => onState("reconnecting");
+  const types = [
+    "conversation.created", "conversation.updated", "conversation.renamed",
+    "conversation.close.requested", "conversation.closed",
+    "conversation.reopened",
+    "message.accepted", "session.started", "run.started",
+    "assistant.delta", "tool.started", "tool.completed", "permission.requested",
+    "input.requested", "usage", "run.completed", "run.failed",
+    "run.interrupt.requested", "run.interrupted", "run.unknown",
+  ];
+  for (const type of types) {
+    source.addEventListener(type, (raw) => {
+      if (generation !== chatRenderGeneration) return;
+      try { onEvent(JSON.parse(raw.data)); } catch { /* malformed frames reconnect */ }
+    });
+  }
+  return source;
+}
+
+function chatModelOptions(select, catalog, harness, defaultModel) {
+  select.replaceChildren();
+  const models = catalog.harnesses?.[harness]?.models || [];
+  const available = models.filter((model) => model.availability === "available");
+  const connectedDefault = Boolean(
+    defaultModel && available.some((model) => model.id === defaultModel));
+  if (harness !== "opencode" || connectedDefault) {
+    select.append(el("option", {
+      value: "",
+      textContent: defaultModel
+        ? `Use shell default — ${defaultModel}`
+        : "Use harness default",
+    }));
+  }
+  for (const model of available) {
+    select.append(el("option", { value: model.id, textContent: model.id }));
+  }
+  if (!select.options.length) {
+    select.append(el("option", {
+      value: "",
+      textContent: "No connected provider models available",
+      disabled: true,
+      selected: true,
+    }));
+  }
+  return harness !== "opencode" || available.length > 0;
+}
+
+function chatCreateConversation(shell, fields = {}) {
+  return chatApi(
+    "/conversations",
+    "POST",
+    { shell_id: shell.shell_id, ...fields },
+    requestKey(),
+  );
+}
+
+async function reviewObservationApi(path, { method = "GET", key = "" } = {}) {
+  const headers = key ? { "Idempotency-Key": key } : {};
+  let response;
+  try {
+    response = await fetch("/api" + path, { method, headers });
+  } catch (cause) {
+    const error = new Error("Diff observation could not be reached.");
+    error.code = "REVIEW_TARGET_UNAVAILABLE";
+    error.cause = cause;
+    throw error;
+  }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = data.error || {};
+    const error = new Error(detail.message || response.statusText);
+    error.code = detail.code || "REVIEW_TARGET_UNAVAILABLE";
+    error.details = detail.details || {};
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+function reviewObservedLabel(value) {
+  if (!value) return "observed just now";
+  const parsed = new Date(/(?:Z|[+-]\d\d:\d\d)$/.test(value) ? value : `${value}Z`);
+  return Number.isNaN(parsed.getTime())
+    ? `observed ${value}`
+    : `observed ${parsed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+}
+
+function reviewTypedState(title, detail = "", tone = "") {
+  const state = el("div", {
+    className: `review-typed-state${tone ? ` ${tone}` : ""}`,
+  }, el("strong", {}, title));
+  if (detail) state.append(el("span", {}, detail));
+  return state;
+}
+
+function reviewPatchRows(text) {
+  const patch = el("div", { className: "review-patch" });
+  const rows = [];
+  let oldLine = null;
+  let newLine = null;
+  for (const line of String(text || "").split("\n")) {
+    let kind = "context";
+    let oldNumber = "";
+    let newNumber = "";
+    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunk) {
+      kind = "hunk";
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+    } else if (line.startsWith("diff --git ") || line.startsWith("index ")
+        || line.startsWith("--- ") || line.startsWith("+++ ")) {
+      kind = "header";
+    } else if (line.startsWith("+")) {
+      kind = "add";
+      newNumber = newLine ?? "";
+      if (newLine !== null) newLine += 1;
+    } else if (line.startsWith("-")) {
+      kind = "delete";
+      oldNumber = oldLine ?? "";
+      if (oldLine !== null) oldLine += 1;
+    } else if (line.startsWith("\\")) {
+      kind = "notice";
+    } else {
+      oldNumber = oldLine ?? "";
+      newNumber = newLine ?? "";
+      if (oldLine !== null) oldLine += 1;
+      if (newLine !== null) newLine += 1;
+    }
+    const row = el("div", { className: `review-line review-line-${kind}` });
+    row.append(
+      el("span", { className: "review-line-number" }, oldNumber),
+      el("span", { className: "review-line-number" }, newNumber),
+      el("span", { className: "review-line-code" }, line),
+    );
+    patch.append(row);
+    rows.push({ kind, row });
+  }
+
+  const changeBlocks = [];
+  for (const entry of rows) {
+    if (entry.kind !== "add" && entry.kind !== "delete") continue;
+    const previous = changeBlocks.at(-1);
+    if (!previous || previous.last !== entry.row.previousElementSibling) {
+      changeBlocks.push({ first: entry.row, last: entry.row });
+    } else {
+      previous.last = entry.row;
+    }
+  }
+  const scrollToChange = (index) => {
+    const target = changeBlocks[index]?.first;
+    const scroller = target?.closest(".review-patch-wrap");
+    if (!target || !scroller) return;
+    const targetBox = target.getBoundingClientRect();
+    const scrollerBox = scroller.getBoundingClientRect();
+    const top = scroller.scrollTop + targetBox.top - scrollerBox.top
+      - (scroller.clientHeight - targetBox.height) / 2;
+    scroller.scrollTo({
+      top: Math.max(0, top),
+      left: scroller.scrollLeft,
+      behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches
+        ? "auto" : "smooth",
+    });
+  };
+  const changeStep = (direction, targetIndex, customLabel = "") => {
+    const label = customLabel
+      || (direction === "previous" ? "Previous change" : "Next change");
+    const button = el("button", {
+      type: "button",
+      className: `review-change-step review-change-step-${direction}`,
+      ariaLabel: label,
+      title: label,
+    });
+    button.onclick = () => scrollToChange(targetIndex);
+    return button;
+  };
+  if (changeBlocks.length && changeBlocks[0].first !== rows[0]?.row) {
+    const firstChange = changeStep("next", 0, "Jump to first change");
+    firstChange.classList.add("review-change-step-first");
+    rows[0].row.append(firstChange);
+  }
+  changeBlocks.forEach((block, index) => {
+    block.first.classList.add("review-change-first");
+    block.last.classList.add("review-change-last");
+    if (index > 0) block.first.append(changeStep("previous", index - 1));
+    if (index < changeBlocks.length - 1) {
+      block.last.append(changeStep("next", index + 1));
+    }
+  });
+  return patch;
+}
+
+function reviewFileTree(files, selectedPath, viewed, onSelect) {
+  const tree = { directories: new Map(), files: [] };
+  for (const file of files) {
+    const parts = file.path.split("/");
+    let node = tree;
+    for (const part of parts.slice(0, -1)) {
+      if (!node.directories.has(part))
+        node.directories.set(part, { directories: new Map(), files: [] });
+      node = node.directories.get(part);
+    }
+    node.files.push(file);
+  }
+  const renderNode = (node, depth = 0) => {
+    const fragment = document.createDocumentFragment();
+    for (const [name, child] of [...node.directories].sort(([a], [b]) => a.localeCompare(b))) {
+      fragment.append(el("div", {
+        className: "review-tree-directory",
+        style: `--review-depth:${depth}`,
+      }, el("span", { ariaHidden: "true" }, "▾"), name));
+      fragment.append(renderNode(child, depth + 1));
+    }
+    for (const file of [...node.files].sort((a, b) => a.path.localeCompare(b.path))) {
+      const status = file.conflict ? "!" : file.status === "untracked" ? "?"
+        : file.status?.slice(0, 1).toUpperCase() || "M";
+      const button = el("button", {
+        className: "review-file-row"
+          + (file.path === selectedPath ? " selected" : "")
+          + (viewed.has(file.path) ? " viewed" : ""),
+        type: "button",
+        style: `--review-depth:${depth}`,
+        title: file.old_path ? `${file.old_path} → ${file.path}` : file.path,
+      });
+      const fileFacts = [
+        file.binary ? "binary" : "",
+        file.submodule ? "submodule" : "",
+        file.oversized ? "large" : "",
+        file.generated ? "generated" : "",
+      ].filter(Boolean);
+      button.append(
+        el("span", { className: `review-file-status status-${file.status}` }, status),
+        el("span", { className: "review-file-path" }, file.path.split("/").at(-1)),
+        el("span", { className: "review-file-counts" },
+          fileFacts.length ? fileFacts.join(" · ")
+            : [file.additions != null ? `+${file.additions}` : "",
+              file.deletions != null ? `−${file.deletions}` : ""]
+              .filter(Boolean).join(" ")),
+      );
+      button.onclick = () => onSelect(file);
+      fragment.append(button);
+    }
+    return fragment;
+  };
+  const host = el("div", { className: "review-file-tree" });
+  host.append(renderNode(tree));
+  return host;
+}
+
+function chatReviewWorkspace(host, conversation) {
+  const state = {
+    mode: "chat",
+    snapshot: null,
+    loaded: false,
+    loading: false,
+    refreshInFlight: false,
+    requestGeneration: 0,
+    group: "changes",
+    section: "dirty",
+    selectedPath: "",
+    pathFilter: "",
+    statusFilter: "",
+    patch: null,
+    shellFile: null,
+    contentLoading: false,
+    contentError: null,
+    error: null,
+    refreshWarning: "",
+  };
+  let refreshButton = null;
+
+  const sectionFiles = (snapshot = state.snapshot) => {
+    if (!snapshot || state.group !== "changes") return [];
+    if (state.section === "dirty") return snapshot.changes.dirty || [];
+    if (state.section === "branch") return snapshot.changes.branch || [];
+    return [];
+  };
+  const shellFiles = (snapshot = state.snapshot) => snapshot?.shell_files || [];
+  const itemPath = (item) => state.group === "shell"
+    ? (item.paths || []).join("\n")
+    : item.path;
+  const selectedItem = () => {
+    const items = state.group === "shell" ? shellFiles() : sectionFiles();
+    return items.find((item) => itemPath(item) === state.selectedPath) || null;
+  };
+  const visibleFiles = () => sectionFiles().filter((file) => {
+    if (state.pathFilter
+      && !file.path.toLowerCase().includes(state.pathFilter.toLowerCase())) return false;
+    if (state.statusFilter && file.status !== state.statusFilter) return false;
+    return true;
+  });
+  const capturePosition = () => {
+    const navigator = $(".review-file-tree", host);
+    const patch = $(".review-patch-wrap", host);
+    return {
+      navigatorTop: navigator?.scrollTop || 0,
+      navigatorLeft: navigator?.scrollLeft || 0,
+      patchTop: patch?.scrollTop || 0,
+      patchLeft: patch?.scrollLeft || 0,
+    };
+  };
+  const restorePosition = (position, preservePatch) => queueMicrotask(() => {
+    const navigator = $(".review-file-tree", host);
+    if (navigator) {
+      navigator.scrollTop = position?.navigatorTop || 0;
+      navigator.scrollLeft = position?.navigatorLeft || 0;
+    }
+    const patch = $(".review-patch-wrap", host);
+    if (patch && preservePatch) {
+      patch.scrollTop = position?.patchTop || 0;
+      patch.scrollLeft = position?.patchLeft || 0;
+    }
+  });
+  const typedError = (error) => reviewTypedState(
+    error?.code || "REVIEW_TARGET_UNAVAILABLE",
+    error?.message || "Diff is unavailable.",
+    "error",
+  );
+  const tabButton = (value, label, active, onclick) => {
+    const button = el("button", {
+      type: "button",
+      role: "tab",
+      className: active === value ? "active" : "",
+      ariaSelected: String(active === value),
+      textContent: label,
+    });
+    button.onclick = onclick;
+    return button;
+  };
+
+  const paint = () => {
+    if (!state.loaded && state.loading) {
+      host.replaceChildren(reviewTypedState(
+        "Observing current worktree…",
+        "Fetching origin/main once and reading the selected shell.",
+      ));
+      return;
+    }
+    if (!state.snapshot) {
+      host.replaceChildren(state.error ? typedError(state.error) : reviewTypedState(
+        "Diff unavailable",
+        "Select Refresh Diff to try the current shell again.",
+      ));
+      return;
+    }
+    const snapshot = state.snapshot;
+    const status = snapshot.status || {};
+    const facts = [
+      status.branch || `detached ${String(status.head_sha || "").slice(0, 8)}`,
+      `${status.dirty_count || 0} dirty`,
+      `${status.ahead_count || 0} ahead`,
+    ];
+    if (status.behind) facts.push(`${status.behind} behind origin/main`);
+    const warning = state.refreshWarning
+      || (!snapshot.fetch?.fresh && snapshot.fetch?.base_stale
+        ? "Fetch failed; this observation uses stale origin/main."
+        : !status.base_available
+          ? "Remote main unavailable; only Dirty can be inspected."
+          : "");
+    refreshButton = el("button", {
+      type: "button",
+      className: "act review-refresh",
+      textContent: state.refreshInFlight ? "Refreshing…" : "Refresh Diff",
+      disabled: state.refreshInFlight,
+    });
+    refreshButton.onclick = () => observe(true);
+    let sectionSwitch = null;
+    if (state.group === "changes") {
+      sectionSwitch = el("div", {
+        className: "review-scope-switch review-change-switch",
+        role: "tablist",
+        ariaLabel: "Changes view",
+      });
+      for (const [value, label] of [
+        ["dirty", "Dirty"], ["branch", "Branch"], ["commits", "Commits"],
+      ]) sectionSwitch.append(tabButton(value, label, state.section, () => {
+        if (state.section === value) return;
+        state.section = value;
+        state.selectedPath = value === "commits" ? "" : sectionFiles()[0]?.path || "";
+        state.patch = null;
+        state.contentError = null;
+        paint();
+        loadSelected();
+      }));
+    }
+    const summaryStatus = el("div", { className: "review-status" },
+      el("div", { className: "review-lifecycle-block" },
+        el("span", { className: "review-lifecycle lifecycle-local" }, "ON DISK"),
+        el("span", { className: "review-facts" }, facts.slice(1).join(" · "))),
+      el("div", { className: "review-freshness" },
+        el("span", {}, reviewObservedLabel(snapshot.observed_at)),
+        el("span", {
+          className: "warning review-refresh-warning",
+          textContent: warning,
+          hidden: !warning,
+        })));
+    const summaryActions = el("div", { className: "review-summary-actions" },
+      summaryStatus,
+      refreshButton);
+    const summary = el("div", { className: "review-summary" },
+      el("div", { className: "review-target-control" },
+        el("label", { className: "k" }, "Current worktree"),
+        el("strong", {}, facts[0])),
+      ...(sectionSwitch ? [sectionSwitch] : []),
+      summaryActions);
+    const groupSwitch = el("div", {
+      className: "review-scope-switch review-group-switch",
+      role: "tablist",
+      ariaLabel: "Diff section",
+    },
+    tabButton("changes", "Changes", state.group, () => {
+      if (state.group === "changes") return;
+      state.group = "changes";
+      state.section = "dirty";
+      state.selectedPath = sectionFiles()[0]?.path || "";
+      state.patch = null;
+      state.shellFile = null;
+      state.contentError = null;
+      paint();
+      loadSelected();
+    }),
+    tabButton("shell", "Shell files", state.group, () => {
+      if (state.group === "shell") return;
+      state.group = "shell";
+      state.selectedPath = itemPath(
+        shellFiles().find((file) => file.available) || {},
+      );
+      state.patch = null;
+      state.shellFile = null;
+      state.contentError = null;
+      paint();
+      loadSelected();
+    }));
+    const patchHeader = (title, detail, extraClass = "") => el("div", {
+      className: `review-patch-head${extraClass ? ` ${extraClass}` : ""}`,
+    },
+    el("div", { className: "review-patch-title" },
+      el("strong", {}, title),
+      el("span", { title: detail }, detail)),
+    groupSwitch);
+    const workspace = el("div", {
+      className: `review-workspace review-workspace-${state.group}`,
+    }, summary);
+
+    if (state.group === "changes") {
+      if (state.section === "commits") {
+        const commits = snapshot.changes.commits || [];
+        const body = el("div", { className: "review-commits-pane" },
+          patchHeader("Commits", "Ahead commits relative to origin/main", "review-commits-head"));
+        if (!commits.length) body.append(reviewTypedState("No visible ahead commits."));
+        else {
+          const list = el("div", { className: "review-commit-list" });
+          for (const commit of commits) list.append(el("article", { className: "review-commit" },
+            el("code", {}, commit.short_sha),
+            el("div", { className: "review-commit-main" },
+              el("strong", {}, commit.subject),
+              el("span", {}, `${commit.author} · ${reviewObservedLabel(commit.authored_at)}`))));
+          body.append(list);
+        }
+        workspace.append(body);
+        host.replaceChildren(workspace);
+        return;
+      }
+      const pathInput = el("input", {
+        type: "search",
+        className: "review-path-filter",
+        placeholder: "Filter paths",
+        value: state.pathFilter,
+      });
+      pathInput.oninput = () => {
+        const start = pathInput.selectionStart;
+        state.pathFilter = pathInput.value;
+        paint();
+        const next = $(".review-path-filter", host);
+        next?.focus();
+        next?.setSelectionRange(start, start);
+      };
+      const statuses = [...new Set(sectionFiles().map((file) => file.status))].sort();
+      const statusSelect = el("select", {
+        className: "review-status-filter",
+        ariaLabel: "File status",
+      }, el("option", { value: "", textContent: "All statuses" }));
+      for (const value of statuses) statusSelect.append(el("option", {
+        value,
+        selected: value === state.statusFilter,
+        textContent: value,
+      }));
+      statusSelect.onchange = () => {
+        state.statusFilter = statusSelect.value;
+        paint();
+      };
+      const navigator = el("aside", { className: "review-navigator" },
+        el("div", { className: "review-filters" }, pathInput, statusSelect));
+      const files = visibleFiles();
+      if (!files.length) navigator.append(reviewTypedState(
+        snapshot.no_code_changes ? "No code changes" : `No ${state.section} changes.`,
+      ));
+      else navigator.append(reviewFileTree(
+        files,
+        state.selectedPath,
+        new Set(),
+        (file) => selectItem(file),
+      ));
+      const selected = selectedItem();
+      const patchHead = patchHeader(
+        selected?.path || "Patch",
+        state.section === "dirty"
+          ? "staged, unstaged, conflicted, or untracked relative to HEAD"
+          : "merge-base(origin/main, HEAD) through HEAD",
+      );
+      let patchBody;
+      if (state.contentError) patchBody = typedError(state.contentError);
+      else if (state.contentLoading) patchBody = reviewTypedState("Loading patch…");
+      else if (!selected) patchBody = reviewTypedState("Select a changed file.");
+      else if (!state.patch) patchBody = reviewTypedState("Patch unavailable.");
+      else if (state.patch.binary) patchBody = reviewTypedState("Binary file", "Binary bytes are never transported.");
+      else if (state.patch.truncated) patchBody = reviewTypedState(
+        "Patch exceeds review limits",
+        state.patch.unavailable_reason || "The bounded patch cannot be displayed.",
+        "warning",
+      );
+      else {
+        patchBody = el("div", { className: "review-patch-wrap" });
+        patchBody.append(reviewPatchRows(state.patch.patch || ""));
+      }
+      workspace.append(el("div", { className: "review-body" }, navigator, patchHead,
+        el("section", { className: "review-patch-pane" }, patchBody)));
+    } else {
+      const navigator = el("aside", { className: "review-navigator" });
+      const list = el("div", { className: "review-file-tree review-shell-tree" });
+      for (const file of shellFiles()) {
+        const key = itemPath(file);
+        const row = el("button", {
+          type: "button",
+          className: `review-file-row${key === state.selectedPath ? " selected" : ""}`,
+          disabled: !file.available,
+          title: (file.paths || []).join("\n"),
+        },
+        el("span", { className: "review-file-status" }, file.available ? "R" : "!"),
+        el("span", { className: "review-file-path" }, file.name),
+        el("span", { className: "review-file-counts" },
+          file.mismatch ? "mirror mismatch" : (file.paths || []).join(" · ")));
+        row.onclick = () => selectItem(file);
+        list.append(row);
+        if (!file.available) list.append(reviewTypedState(
+          file.error || "Unavailable",
+          (file.paths || []).join(" · "),
+          "warning",
+        ));
+      }
+      navigator.append(list);
+      const selected = selectedItem();
+      const head = patchHeader(
+        selected?.name || "Shell file",
+        selected ? (selected.paths || []).join(" · ") : "Read-only exact text",
+      );
+      let body;
+      if (state.contentError) body = typedError(state.contentError);
+      else if (state.contentLoading) body = reviewTypedState("Loading shell file…");
+      else if (!selected) body = reviewTypedState("Select an available Shell file.");
+      else if (!state.shellFile) body = reviewTypedState("Shell file unavailable.");
+      else body = el("pre", {
+        className: "review-shell-file review-patch-wrap",
+        textContent: state.shellFile.body,
+      });
+      workspace.append(el("div", { className: "review-body" }, navigator, head,
+        el("section", { className: "review-patch-pane" }, body)));
+    }
+    host.replaceChildren(workspace);
+  };
+
+  const loadSelected = async ({ position = null, preservePatch = false } = {}) => {
+    const selected = selectedItem();
+    if (!selected || (state.group === "changes" && state.section === "commits")) {
+      paint();
+      restorePosition(position, false);
+      return;
+    }
+    const request = ++state.requestGeneration;
+    state.contentLoading = true;
+    state.contentError = null;
+    state.patch = null;
+    state.shellFile = null;
+    paint();
+    try {
+      const resource = state.group === "shell" ? "shell-file" : "patch";
+      const data = await reviewObservationApi(
+        `/review-observations/${state.snapshot.fingerprint}/${resource}`
+        + `?file=${encodeURIComponent(selected.file_id)}`,
+      );
+      if (request !== state.requestGeneration) return;
+      if (state.group === "shell") state.shellFile = data;
+      else state.patch = data;
+    } catch (error) {
+      if (request !== state.requestGeneration) return;
+      state.contentError = error;
+    } finally {
+      if (request === state.requestGeneration) {
+        state.contentLoading = false;
+        paint();
+        restorePosition(position, preservePatch && !state.contentError);
+      }
+    }
+  };
+
+  const selectItem = (item) => {
+    const nextPath = itemPath(item);
+    if (!nextPath || nextPath === state.selectedPath) return;
+    state.selectedPath = nextPath;
+    state.contentError = null;
+    loadSelected();
+  };
+
+  const observe = async (manual = false) => {
+    if (state.refreshInFlight) return;
+    state.refreshInFlight = true;
+    state.loading = !state.snapshot;
+    state.error = null;
+    const position = capturePosition();
+    const oldSnapshot = state.snapshot;
+    const oldItems = state.group === "shell"
+      ? shellFiles(oldSnapshot).filter((file) => file.available)
+      : sectionFiles(oldSnapshot);
+    const oldIndex = oldItems.findIndex((item) => itemPath(item) === state.selectedPath);
+    const oldPath = state.selectedPath;
+    if (!oldSnapshot) paint();
+    if (refreshButton) {
+      refreshButton.disabled = true;
+      refreshButton.textContent = "Refreshing…";
+    }
+    try {
+      const next = await reviewObservationApi(
+        `/conversations/${conversation.conversation_id}/review-observations`,
+        { method: "POST", key: requestKey() },
+      );
+      state.loaded = true;
+      if (manual && oldSnapshot && !next.fetch?.fresh) {
+        state.refreshWarning = next.fetch?.error
+          ? `Refresh failed: ${next.fetch.error}`
+          : "Refresh failed; the current observation is retained.";
+        const warning = $(".review-refresh-warning", host);
+        if (warning) {
+          warning.hidden = false;
+          warning.textContent = state.refreshWarning;
+        }
+        return;
+      }
+      state.refreshWarning = "";
+      if (oldSnapshot && oldSnapshot.fingerprint === next.fingerprint) return;
+      state.snapshot = next;
+      const nextItems = state.group === "shell"
+        ? shellFiles(next).filter((file) => file.available)
+        : sectionFiles(next);
+      const stillPresent = nextItems.find((item) => itemPath(item) === oldPath);
+      const nearest = nextItems[Math.min(Math.max(oldIndex, 0), nextItems.length - 1)];
+      state.selectedPath = itemPath(stillPresent || nearest || {});
+      state.patch = null;
+      state.shellFile = null;
+      state.contentError = null;
+      paint();
+      await loadSelected({ position, preservePatch: Boolean(stillPresent) });
+    } catch (error) {
+      state.error = error;
+      state.loaded = true;
+      if (!oldSnapshot) paint();
+      else {
+        state.refreshWarning = error.message || "Refresh failed.";
+        const warning = $(".review-refresh-warning", host);
+        if (warning) {
+          warning.hidden = false;
+          warning.textContent = state.refreshWarning;
+        }
+      }
+    } finally {
+      state.loading = false;
+      state.refreshInFlight = false;
+      if (refreshButton) {
+        refreshButton.disabled = false;
+        refreshButton.textContent = "Refresh Diff";
+      }
+    }
+  };
+
+  const setMode = (mode) => {
+    state.mode = mode;
+    if (mode === "diff" && !state.loaded && !state.loading) observe(false);
+  };
+  const cleanup = () => {
+    state.requestGeneration += 1;
+  };
+  chatReviewCleanup = cleanup;
+  return { setMode, cleanup };
+}
+
+async function chatRenderNew(host, shell, defaults, catalog) {
+  const rows = defaults.flavors?.[shell.flavor] || [];
+  const byHarness = Object.fromEntries(rows.map((row) => [row.harness, row]));
+  const defaultHarness = rows.find((row) => row.is_default)?.harness;
+  const availableHarnesses = CHAT_HARNESSES;
+  let harness = availableHarnesses.includes(defaultHarness)
+    ? defaultHarness : availableHarnesses[0];
+  const form = el("form", { className: "chat-new-form" });
+  const harnessSelect = el("select");
+  for (const value of availableHarnesses) {
+    harnessSelect.append(el("option", {
+      value,
+      selected: value === harness,
+      textContent: value + (value === defaultHarness ? " — shell default" : ""),
+    }));
+  }
+  const modelSelect = el("select");
+  const title = el("input", {
+    type: "text",
+    placeholder: "Optional chat title",
+    maxlength: 200,
+  });
+  const submit = el("button", {
+    className: "act primary",
+    type: "submit",
+    textContent: "Start chat",
+  });
+  const routeNote = el("div", { className: "chat-route-note" });
+  const paintModels = () => {
+    harness = harnessSelect.value;
+    const ready = chatModelOptions(
+      modelSelect, catalog, harness, byHarness[harness]?.model);
+    submit.disabled = !ready;
+    routeNote.textContent = harness === "opencode"
+      ? "OpenCode models come only from providers connected in OpenCode."
+      : "Choose an exact installed model, or keep the shell/harness default.";
+  };
+  harnessSelect.onchange = paintModels;
+  paintModels();
+  form.append(
+    el("div", { className: "chat-new-copy" },
+      el("h2", {}, `Start a chat with ${shell.display_name}`),
+      el("p", { className: "muted" },
+        "This prepares the shell through its normal CLI path, then runs each turn headlessly.")),
+    el("label", { className: "k" }, "Harness"), harnessSelect,
+    el("label", { className: "k" }, "Model"), modelSelect,
+    routeNote,
+    el("label", { className: "k" }, "Title"), title,
+    submit,
+  );
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    submit.disabled = true;
+    submit.textContent = "Starting…";
+    const body = {
+      harness: harnessSelect.value,
+      title: title.value.trim() || null,
+    };
+    if (modelSelect.value) body.model = modelSelect.value;
+    try {
+      const conversation = await chatCreateConversation(shell, body);
+      location.hash = chatHash(shell.shortname, conversation.conversation_id);
+    } catch (error) {
+      toast(`${error.code}: ${error.message}`);
+      submit.disabled = false;
+      submit.textContent = "Start chat";
+    }
+  };
+  host.replaceChildren(form);
+}
+
+function chatCreateTranscriptState(snapshot) {
+  if (snapshot.projection_version !== 2)
+    throw new Error("Unsupported transcript projection.");
+  const items = new Map();
+  for (const item of snapshot.items || []) {
+    if (!item.item_id || items.has(item.item_id))
+      throw new Error("Transcript contains a keyed identity conflict.");
+    if (item.kind === "assistant") {
+      const anchor = Number(item.segment_anchor_sequence);
+      if (item.run_id == null || !Number.isInteger(anchor) || anchor < 0
+          || item.item_id !== `run:${item.run_id}:assistant:${anchor}`)
+        throw new Error("Transcript contains an invalid assistant segment.");
+    }
+    items.set(item.item_id, { ...item });
+  }
+  const activeRunId = snapshot.controls?.active_run_id;
+  const cursor = snapshot.assistant_cursor || null;
+  if ((activeRunId == null) !== (cursor == null)
+      || cursor && (cursor.run_id !== activeRunId
+        || !Number.isInteger(Number(cursor.segment_anchor_sequence))
+        || Number(cursor.segment_anchor_sequence) < 0
+        || Number(cursor.segment_anchor_sequence)
+          > Number(snapshot.through_sequence || 0)))
+    throw new Error("Transcript contains an invalid assistant cursor.");
+  if (cursor && [...items.values()].some((item) =>
+    item.kind === "assistant" && item.run_id === activeRunId
+      && Number(item.segment_anchor_sequence)
+        > Number(cursor.segment_anchor_sequence)))
+    throw new Error("Transcript assistant cursor moved backward.");
+  const assistantAnchors = new Map();
+  if (cursor) {
+    assistantAnchors.set(
+      cursor.run_id,
+      Number(cursor.segment_anchor_sequence),
+    );
+  }
+  return {
+    projectionVersion: snapshot.projection_version,
+    throughSequence: Number(snapshot.through_sequence || 0),
+    lastSequence: Number(snapshot.through_sequence || 0),
+    items,
+    assistantAnchors,
+    order: [...items.keys()].sort((left, right) => {
+      const a = items.get(left);
+      const b = items.get(right);
+      return Number(a.order_sequence) - Number(b.order_sequence)
+        || left.localeCompare(right);
+    }),
+    nodes: new Map(),
+    dirty: new Set(items.keys()),
+    fullBuild: true,
+    hiddenDirty: false,
+    frame: null,
+    truncation: snapshot.truncation || null,
+    reconcileError: null,
+  };
+}
+
+function chatTranscriptItemNode(item, conversation, retry) {
+  if (item.kind === "activity")
+    return chatBubble("activity", item.label || item.activity_type);
+  const node = chatBubble(
+    item.kind,
+    item.text || "",
+    item.kind === "user" ? item.state || "" : "",
+    conversation,
+  );
+  if (item.kind === "user" && item.state === "failed") {
+    const button = el("button", {
+      className: "chat-retry",
+      type: "button",
+      textContent: "Retry",
+    });
+    button.onclick = () => retry(item.text);
+    node.append(button);
+  }
+  return node;
+}
+
+function chatUpdateTranscriptNode(node, item, retry) {
+  if (item.kind === "assistant") {
+    const body = node.querySelector(".chat-assistant-body");
+    const rendered = mdBlock(item.text || "");
+    body.replaceChildren(...rendered.childNodes);
+    return;
+  }
+  if (item.kind !== "user") return;
+  let meta = node.querySelector(".chat-meta");
+  if (item.state) {
+    if (!meta) {
+      meta = el("div", { className: "chat-meta" });
+      node.append(meta);
+    }
+    meta.textContent = item.state;
+  }
+  let retryButton = node.querySelector(".chat-retry");
+  if (item.state === "failed" && !retryButton) {
+    retryButton = el("button", {
+      className: "chat-retry",
+      type: "button",
+      textContent: "Retry",
+    });
+    retryButton.onclick = () => retry(item.text);
+    node.append(retryButton);
+  } else if (item.state !== "failed" && retryButton) {
+    retryButton.remove();
+  }
+}
+
+function chatTranscriptBanner(state) {
+  if (!state.truncation) return null;
+  return el(
+    "div",
+    { className: "chat-transcript-omission", role: "status" },
+    "Earlier transcript omitted from this view; durable history was not deleted.",
+  );
+}
+
+function chatReconcileBanner(state, reconcile) {
+  if (!state.reconcileError) return null;
+  const retry = el("button", {
+    className: "act",
+    type: "button",
+    textContent: "Retry",
+  });
+  retry.onclick = reconcile;
+  return el(
+    "div",
+    { className: "chat-transcript-reconcile error" },
+    `Transcript reconciliation failed — ${state.reconcileError.message} `,
+    retry,
+  );
+}
+
+function chatFlushTranscript(
+  transcript,
+  state,
+  conversation,
+  retry,
+  reconcile,
+  shouldFollow,
+  onPosition,
+) {
+  const previousTop = transcript.scrollTop;
+  const followTail = shouldFollow();
+  if (state.fullBuild) {
+    state.nodes.clear();
+    const nodes = [];
+    const banner = chatTranscriptBanner(state);
+    const reconcileBanner = chatReconcileBanner(state, reconcile);
+    if (banner) nodes.push(banner);
+    if (reconcileBanner) nodes.push(reconcileBanner);
+    for (const id of state.order) {
+      const item = state.items.get(id);
+      const node = chatTranscriptItemNode(item, conversation, retry);
+      state.nodes.set(id, node);
+      nodes.push(node);
+    }
+    if (!state.order.length) {
+      nodes.push(el(
+        "div",
+        { className: "chat-empty" },
+        `Start a conversation with ${conversation.shell.display_name}.`,
+      ));
+    }
+    transcript.replaceChildren(...nodes);
+    state.fullBuild = false;
+    state.dirty.clear();
+  } else {
+    if (state.order.length && state.nodes.size === 0)
+      transcript.querySelector(".chat-empty")?.remove();
+    for (const id of state.order) {
+      if (!state.dirty.has(id)) continue;
+      const item = state.items.get(id);
+      let node = state.nodes.get(id);
+      if (!node) {
+        node = chatTranscriptItemNode(item, conversation, retry);
+        state.nodes.set(id, node);
+        const index = state.order.indexOf(id);
+        const next = state.order
+          .slice(index + 1)
+          .map((nextId) => state.nodes.get(nextId))
+          .find(Boolean);
+        const working = transcript.querySelector(".chat-working-indicator");
+        transcript.insertBefore(node, next || working || null);
+      } else {
+        chatUpdateTranscriptNode(node, item, retry);
+      }
+    }
+    state.dirty.clear();
+  }
+  const working = transcript.querySelector(".chat-working-indicator");
+  if (conversation.state === "running" && !working)
+    transcript.append(chatWorkingIndicator());
+  else if (conversation.state !== "running" && working)
+    working.remove();
+  transcript.scrollTop = followTail ? transcript.scrollHeight : previousTop;
+  onPosition();
+}
+
+async function chatRenderOpen(host, initialConversation, initialSnapshot) {
+  const generation = chatRenderGeneration;
+  let conversation = initialConversation;
+  let transcriptState = chatCreateTranscriptState(initialSnapshot);
+  let messages = [...transcriptState.items.values()]
+    .filter((item) => item.kind === "user")
+    .map((item) => ({
+      message_id: item.message_id,
+      message_kind: "prompt",
+      body: item.text,
+      state: item.state,
+      created_at: item.created_at,
+      completed_at: item.completed_at,
+    }));
+  conversation = {
+    ...conversation,
+    version: initialSnapshot.controls.conversation_version,
+    state: initialSnapshot.controls.conversation_state,
+    close_requested_at: initialSnapshot.controls.close_requested_at,
+    active_run_id: initialSnapshot.controls.active_run_id,
+  };
+  let streamStatus = "connecting";
+  let stopRequest = null;
+  let reconcilePromise = null;
+  let reconcileFailures = 0;
+  let currentMode = CHAT_MODES.includes(chatRouteMode) ? chatRouteMode : "chat";
+
+  const header = el("div", { className: "chat-pane-head" });
+  const title = el("div", { className: "chat-pane-title" });
+  const modeSwitch = el("div", {
+    className: "chat-mode-switch",
+    role: "tablist",
+    ariaLabel: "Conversation mode",
+  });
+  const chatModeButton = el("button", {
+    type: "button",
+    role: "tab",
+    textContent: "Chat",
+  });
+  const diffModeButton = el("button", {
+    type: "button",
+    role: "tab",
+    textContent: "Diff",
+  });
+  modeSwitch.append(chatModeButton, diffModeButton);
+  const queueState = el("span", { className: "chat-queue-state", hidden: true });
+  const actions = el("div", { className: "chat-actions" });
+  const transcriptHost = el("div", { className: "chat-transcript-host" });
+  const reviewHost = el("div", { className: "chat-review-host", hidden: true });
+  const transcript = el("div", { className: "chat-transcript" });
+  const jumpToLatest = el("button", {
+    className: "chat-jump-latest",
+    type: "button",
+    title: "Jump to latest",
+    ariaLabel: "Jump to latest message",
+    textContent: "↓",
+    hidden: true,
+  });
+  transcriptHost.append(transcript, jumpToLatest);
+  let followTranscriptTail = true;
+  const updateTranscriptFollow = () => {
+    if (currentMode !== "chat") return;
+    followTranscriptTail = chatTranscriptAtBottom(transcript);
+    jumpToLatest.hidden = followTranscriptTail;
+  };
+  transcript.onscroll = updateTranscriptFollow;
+  jumpToLatest.onclick = () => {
+    transcript.scrollTop = transcript.scrollHeight;
+    updateTranscriptFollow();
+  };
+  const composer = el("textarea", {
+    className: "chat-composer-input",
+    placeholder: "Message this shell…",
+    rows: 3,
+  });
+  const send = el("button", { className: "act primary", type: "button", textContent: "Send" });
+  const stop = el("button", {
+    className: "act danger chat-stop",
+    type: "button",
+    textContent: "Stop",
+    title: "Interrupt the active turn",
+  });
+  const headerStop = el("button", {
+    className: "act danger chat-stop-header",
+    type: "button",
+    textContent: "Stop",
+    title: "Interrupt the active turn",
+    hidden: true,
+  });
+  const pending = el("div", { className: "chat-pending", hidden: true });
+  const composerRow = el("div", { className: "chat-composer" },
+    composer, el("div", { className: "chat-compose-actions" }, pending, send, stop));
+  const reviewWorkspace = chatReviewWorkspace(reviewHost, conversation);
+  const updateStreamStatus = () => {
+    const connected = streamStatus === "connected";
+    const connectionLabel = connected
+      ? "Connected"
+      : streamStatus === "reconnecting" ? "Reconnecting" : "Connecting";
+    transcriptHost.title = `Connection: ${connectionLabel}`;
+    transcriptHost.setAttribute(
+      "aria-label",
+      `Conversation transcript; connection ${connectionLabel.toLowerCase()}`,
+    );
+    transcriptHost.classList.toggle("stream-disconnected", !connected);
+  };
+
+  const retry = async (text) => {
+    composer.value = text;
+    composer.focus();
+    await submit();
+  };
+  const flushTranscript = () => chatFlushTranscript(
+    transcript,
+    transcriptState,
+    conversation,
+    retry,
+    () => reconcileTranscript(true),
+    () => followTranscriptTail,
+    updateTranscriptFollow,
+  );
+  const scheduleTranscript = () => {
+    if (currentMode !== "chat") {
+      transcriptState.hiddenDirty = true;
+      return;
+    }
+    if (transcriptState.frame !== null) return;
+    transcriptState.frame = requestAnimationFrame(() => {
+      transcriptState.frame = null;
+      transcriptState.hiddenDirty = false;
+      flushTranscript();
+    });
+  };
+  const installSnapshot = (snapshot) => {
+    if (snapshot.conversation_id !== conversation.conversation_id)
+      throw new Error("Transcript conversation identity changed.");
+    if (transcriptState.frame !== null)
+      cancelAnimationFrame(transcriptState.frame);
+    transcriptState = chatCreateTranscriptState(snapshot);
+    messages = [...transcriptState.items.values()]
+      .filter((item) => item.kind === "user")
+      .map((item) => ({
+        message_id: item.message_id,
+        message_kind: "prompt",
+        body: item.text,
+        state: item.state,
+        created_at: item.created_at,
+        completed_at: item.completed_at,
+      }));
+    conversation.version = snapshot.controls.conversation_version;
+    conversation.state = snapshot.controls.conversation_state;
+    conversation.close_requested_at = snapshot.controls.close_requested_at;
+    conversation.active_run_id = snapshot.controls.active_run_id;
+  };
+  const reconcileTranscript = async (manual = false) => {
+    if (manual) reconcileFailures = 0;
+    if (reconcilePromise || (!manual && reconcileFailures >= 2))
+      return reconcilePromise;
+    const request = chatApi(
+      `/conversations/${conversation.conversation_id}/transcript`,
+    );
+    reconcilePromise = request;
+    try {
+      const snapshot = await request;
+      if (generation !== chatRenderGeneration) return;
+      installSnapshot(snapshot);
+      reconcileFailures = 0;
+      transcriptState.reconcileError = null;
+      paint();
+    } catch (error) {
+      reconcileFailures += 1;
+      transcriptState.reconcileError = error;
+      transcriptState.fullBuild = true;
+      if (currentMode === "chat") scheduleTranscript();
+    } finally {
+      if (reconcilePromise === request) reconcilePromise = null;
+    }
+    return null;
+  };
+  const setMode = (mode) => {
+    currentMode = CHAT_MODES.includes(mode) ? mode : "chat";
+    chatRouteMode = currentMode;
+    document.body.classList.toggle("chat-diff-view", currentMode === "diff");
+    transcriptHost.hidden = currentMode !== "chat";
+    composerRow.hidden = currentMode !== "chat";
+    reviewHost.hidden = currentMode !== "diff";
+    chatModeButton.classList.toggle("active", currentMode === "chat");
+    diffModeButton.classList.toggle("active", currentMode === "diff");
+    chatModeButton.setAttribute("aria-selected", String(currentMode === "chat"));
+    diffModeButton.setAttribute("aria-selected", String(currentMode === "diff"));
+    reviewWorkspace.setMode(currentMode);
+    if (currentMode === "chat" && transcriptState.hiddenDirty)
+      scheduleTranscript();
+  };
+  const selectMode = (mode) => {
+    if (mode === currentMode) return;
+    history.pushState(
+      null,
+      "",
+      `#${chatModeHash(
+        conversation.shell.shortname,
+        conversation.conversation_id,
+        mode,
+      )}`,
+    );
+    setMode(mode);
+    paint();
+  };
+  chatModeButton.onclick = () => selectMode("chat");
+  diffModeButton.onclick = () => selectMode("diff");
+  const renameConversation = async () => {
+    const value = (prompt("Conversation title", conversation.title || "") || "").trim();
+    if (!value) return;
+    try {
+      conversation = await chatApi(`/conversations/${conversation.conversation_id}`,
+        "PATCH", { version: conversation.version, title: value });
+      paint();
+    } catch (error) { toast(`${error.code}: ${error.message}`); refresh(); }
+  };
+  const paint = () => {
+    const rename = el("button", {
+      className: "chat-title-button",
+      type: "button",
+      title: "Rename conversation",
+      textContent: chatConversationName(conversation),
+    });
+    rename.onclick = renameConversation;
+    title.replaceChildren(
+      el("h2", {}, chatHeaderLabel(conversation)),
+      el("div", { className: "chat-conversation-line" },
+        el("span", {}, chatStartedLabel(conversation)),
+        el("span", { className: "chat-context-separator" }, " | "),
+        rename));
+    const queued = chatQueuedCount(messages);
+    queueState.hidden = queued === 0;
+    queueState.textContent = `${queued} queued`;
+    updateStreamStatus();
+    const closed = conversation.state === "closed";
+    const closing = !closed && Boolean(conversation.close_requested_at);
+    const sprintManaged = conversation.scope === "sprint";
+    const reopenable = closed && !sprintManaged;
+    composer.disabled = closing || (closed && !reopenable);
+    send.disabled = closing || (closed && !reopenable);
+    stop.disabled = conversation.state !== "running" || closing || Boolean(stopRequest);
+    stop.textContent = stopRequest ? "Stopping…" : "Stop";
+    headerStop.disabled = stop.disabled;
+    headerStop.textContent = stop.textContent;
+    headerStop.hidden = currentMode !== "diff";
+    close.hidden = sprintManaged;
+    close.disabled = sprintManaged || closed || closing;
+    close.textContent = closing ? "Closing…" : "Close";
+    composer.placeholder = closed
+      ? (reopenable
+        ? "This conversation is closed — send a message to reopen it."
+        : "This conversation is closed.")
+      : closing ? "Stopping work and closing…" : "Message this shell…";
+    scheduleTranscript();
+  };
+  const refresh = () => chatRefreshConversation(
+    conversation.conversation_id,
+    generation,
+    (next, nextMessages) => {
+      conversation = next;
+      messages = nextMessages;
+      for (const message of nextMessages) {
+        const item = transcriptState.items.get(
+          `message:${message.message_id}`);
+        if (!item || item.state === message.state) continue;
+        item.state = message.state;
+        item.completed_at = message.completed_at;
+        transcriptState.dirty.add(item.item_id);
+      }
+      paint();
+    });
+
+  const analytics = el("button", { className: "act", type: "button", textContent: "Analytics" });
+  analytics.onclick = () => {
+    anFilters.harness = conversation.route.harness || "";
+    anFilters.model = conversation.route.model || "";
+    location.hash = "analytics";
+  };
+  const close = el("button", {
+    className: "act danger",
+    type: "button",
+    textContent: "Close",
+  });
+  close.onclick = async () => {
+    if (close.disabled) return;
+    close.disabled = true;
+    close.textContent = "Closing…";
+    try {
+      const latest = await chatApi(
+        `/conversations/${conversation.conversation_id}`);
+      if (latest.state === "closed") {
+        conversation = latest;
+        paint();
+        return;
+      }
+      conversation = await chatApi(`/conversations/${conversation.conversation_id}`,
+        "PATCH", { version: latest.version, state: "closed" });
+      paint();
+    } catch (error) { toast(`${error.code}: ${error.message}`); refresh(); }
+  };
+  actions.append(analytics, close);
+  actions.insertBefore(headerStop, close);
+  header.append(title, queueState, actions);
+  header.insertBefore(modeSwitch, queueState);
+
+  async function submit() {
+    const text = composer.value.trim();
+    if (!text || send.disabled) return;
+    if (!chatPendingSend || chatPendingSend.text !== text
+        || chatPendingSend.conversationId !== conversation.conversation_id) {
+      chatPendingSend = {
+        conversationId: conversation.conversation_id,
+        text,
+        key: requestKey(),
+      };
+    }
+    send.disabled = true;
+    pending.hidden = false;
+    pending.textContent = "sending…";
+    try {
+      const result = await chatApi(
+        `/conversations/${conversation.conversation_id}/messages`,
+        "POST", { text }, chatPendingSend.key);
+      if (!messages.some((item) => item.message_id === result.message.message_id))
+        messages.push(result.message);
+      const userItemId = `message:${result.message.message_id}`;
+      if (!transcriptState.items.has(userItemId)) {
+        transcriptState.items.set(userItemId, {
+          item_id: userItemId,
+          kind: "user",
+          order_sequence: transcriptState.lastSequence + 1,
+          message_id: result.message.message_id,
+          run_id: null,
+          created_at: result.message.created_at,
+          text,
+          state: result.message.state,
+          completed_at: result.message.completed_at,
+          text_truncated: false,
+        });
+        transcriptState.order.push(userItemId);
+        transcriptState.dirty.add(userItemId);
+      }
+      chatPendingSend = null;
+      composer.value = "";
+      pending.hidden = true;
+      if (conversation.state !== "running") conversation.state = "queued";
+      conversation.closed_at = null;
+      conversation.close_requested_at = null;
+      paint();
+      refresh();
+    } catch (error) {
+      pending.hidden = false;
+      pending.textContent = `${error.code} — retry keeps this exact send`;
+      toast(`${error.code}: ${error.message}`);
+    } finally {
+      send.disabled = (conversation.state === "closed"
+        && conversation.scope !== "normal")
+        || (conversation.state !== "closed"
+          && Boolean(conversation.close_requested_at));
+    }
+  }
+  send.onclick = submit;
+  stop.onclick = async () => {
+    if (conversation.state !== "running") return;
+    if (!stopRequest) stopRequest = { key: requestKey() };
+    paint();
+    try {
+      await chatApi(
+        `/conversations/${conversation.conversation_id}/interruptions`,
+        "POST", {}, stopRequest.key);
+    } catch (error) {
+      stopRequest = null;
+      toast(`${error.code}: ${error.message}`);
+      refresh();
+      paint();
+    }
+  };
+  headerStop.onclick = () => stop.click();
+  composer.onkeydown = (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      submit();
+    }
+  };
+  host.replaceChildren(header, transcriptHost, reviewHost, composerRow);
+  chatModeController = {
+    shell: conversation.shell.shortname,
+    conversationId: conversation.conversation_id,
+    setMode: (mode) => {
+      setMode(mode);
+      paint();
+    },
+  };
+  setMode(currentMode);
+  paint();
+  const activityLabel = (event) => {
+    const payload = event.payload || {};
+    if (event.event_type === "permission.requested")
+      return "Waiting for permission";
+    if (event.event_type === "input.requested") return "Waiting for input";
+    if (event.event_type === "run.interrupted") return "Turn interrupted";
+    if (event.event_type === "run.unknown")
+      return "Turn outcome could not be proven";
+    return payload.error
+      ? `Turn failed — ${payload.error}`
+      : "Turn failed";
+  };
+  const reduceEvent = (event) => {
+    const sequence = Number(event.sequence);
+    if (!Number.isFinite(sequence) || sequence <= transcriptState.lastSequence)
+      return;
+    if (sequence !== transcriptState.lastSequence + 1) {
+      reconcileTranscript();
+      return;
+    }
+    const type = event.event_type;
+    const message = messages.find(
+      (item) => item.message_id === event.message_id);
+    const userItem = event.message_id == null
+      ? null
+      : transcriptState.items.get(`message:${event.message_id}`);
+    const boundary = [
+      "tool.started",
+      "tool.completed",
+      "permission.requested",
+      "input.requested",
+    ].includes(type);
+
+    if (boundary && event.run_id != null) {
+      const previousAnchor = transcriptState.assistantAnchors.get(event.run_id)
+        || 0;
+      if (sequence <= previousAnchor) {
+        reconcileTranscript();
+        return;
+      }
+      transcriptState.assistantAnchors.set(event.run_id, sequence);
+    }
+
+    if (type === "message.accepted") {
+      if (!userItem) {
+        reconcileTranscript();
+        return;
+      }
+      userItem.order_sequence = sequence;
+      userItem.state = "queued";
+      transcriptState.order.sort((left, right) => {
+        const a = transcriptState.items.get(left);
+        const b = transcriptState.items.get(right);
+        return Number(a.order_sequence) - Number(b.order_sequence)
+          || left.localeCompare(right);
+      });
+      transcriptState.dirty.add(userItem.item_id);
+    } else if (type === "assistant.delta") {
+      if (typeof event.payload?.text !== "string") {
+        reconcileTranscript();
+        return;
+      }
+      const runId = event.run_id;
+      if (runId == null || runId !== conversation.active_run_id) {
+        reconcileTranscript();
+        return;
+      }
+      const anchor = transcriptState.assistantAnchors.get(runId) || 0;
+      const itemId = `run:${runId}:assistant:${anchor}`;
+      let assistant = transcriptState.items.get(itemId);
+      if (assistant && (assistant.message_id !== event.message_id
+          || assistant.run_id !== runId
+          || Number(assistant.segment_anchor_sequence) !== anchor)) {
+        reconcileTranscript();
+        return;
+      }
+      if (!assistant) {
+        assistant = {
+          item_id: itemId,
+          kind: "assistant",
+          order_sequence: sequence,
+          message_id: event.message_id,
+          run_id: runId,
+          created_at: event.created_at,
+          text: "",
+          outcome: null,
+          segment_anchor_sequence: anchor,
+          first_sequence: sequence,
+          last_sequence: sequence,
+          text_truncated: false,
+        };
+        transcriptState.items.set(itemId, assistant);
+        transcriptState.order.push(itemId);
+      }
+      assistant.text += event.payload?.text || "";
+      assistant.last_sequence = sequence;
+      transcriptState.dirty.add(itemId);
+    } else if ([
+      "permission.requested",
+      "input.requested",
+      "run.failed",
+      "run.interrupted",
+      "run.unknown",
+    ].includes(type)) {
+      const itemId = `event:${sequence}`;
+      transcriptState.items.set(itemId, {
+        item_id: itemId,
+        kind: "activity",
+        order_sequence: sequence,
+        message_id: event.message_id,
+        run_id: event.run_id,
+        created_at: event.created_at,
+        activity_type: type,
+        label: activityLabel(event),
+        sequence,
+      });
+      transcriptState.order.push(itemId);
+      transcriptState.dirty.add(itemId);
+    }
+
+    transcriptState.lastSequence = sequence;
+    if (message && type === "run.started") message.state = "running";
+    if (message && type === "run.completed") message.state = "completed";
+    if (message && ["run.failed", "run.unknown"].includes(type))
+      message.state = "failed";
+    if (message && type === "run.interrupted") message.state = "cancelled";
+    if (userItem && message) {
+      userItem.state = message.state;
+      userItem.completed_at = message.completed_at;
+      if (type !== "assistant.delta")
+        transcriptState.dirty.add(userItem.item_id);
+    }
+    if (type === "message.accepted" && conversation.state !== "running")
+      conversation.state = "queued";
+    if (type === "run.started") {
+      conversation.state = "running";
+      conversation.active_run_id = event.run_id;
+      if (event.run_id != null)
+        transcriptState.assistantAnchors.set(event.run_id, 0);
+    }
+    if (type === "conversation.updated" || type === "conversation.renamed")
+      Object.assign(conversation, event.payload || {});
+    if (type === "conversation.close.requested")
+      conversation.close_requested_at = event.created_at || true;
+    if (["permission.requested", "input.requested"].includes(type))
+      conversation.state = "waiting";
+    if (["run.completed", "run.interrupted"].includes(type))
+      conversation.state = chatQueuedCount(messages) ? "queued" : "idle";
+    if (["run.failed", "run.unknown"].includes(type))
+      conversation.state = "error";
+    if (type === "conversation.closed") conversation.state = "closed";
+    if (type === "conversation.reopened") {
+      conversation.state = "idle";
+      conversation.closed_at = null;
+      conversation.close_requested_at = null;
+    }
+    if (["run.completed", "run.failed", "run.interrupted", "run.unknown"]
+      .includes(type)) {
+      stopRequest = null;
+      conversation.active_run_id = null;
+      if (event.run_id != null)
+        transcriptState.assistantAnchors.delete(event.run_id);
+    }
+
+    if (type === "assistant.delta") {
+      scheduleTranscript();
+      return;
+    }
+    paint();
+    if (["message.accepted", "run.completed", "run.failed",
+         "run.interrupted", "run.unknown",
+         "conversation.updated", "conversation.renamed",
+         "conversation.close.requested",
+         "conversation.closed", "conversation.reopened"].includes(type))
+      refresh();
+  };
+  chatOpenStream(
+    conversation.conversation_id,
+    generation,
+    transcriptState.throughSequence,
+    reduceEvent,
+    (value) => {
+      streamStatus = value;
+      updateStreamStatus();
+    },
+  );
+}
+
+async function renderInterface(root) {
+  chatStopStream();
+  chatStopHistoryPoll();
+  chatStopReview();
+  chatModeController = null;
+  const generation = ++chatRenderGeneration;
+  root.replaceChildren(
+    el("div", { className: "chat-loading" }, "Loading conversations…"));
+
+  const shellRequest = api("/shells");
+  const openRequest = chatApi("/conversations?open=true&limit=100")
+    .catch((error) => ({ items: [], next_cursor: null, error }));
+  const deepLinked = chatRouteConversation
+    && chatRouteConversation !== CHAT_CONFIGURE_ROUTE;
+  const detailRequest = deepLinked
+    ? chatApi(`/conversations/${chatRouteConversation}`)
+      .then((conversation) => ({ conversation }))
+      .catch((error) => ({ error }))
+    : Promise.resolve({ conversation: null });
+  const [
+    { shells: allShells, repo_root: repoRoot },
+    openPage,
+    detailResult,
+  ] = await Promise.all([
+    shellRequest,
+    openRequest,
+    detailRequest,
+  ]);
+  if (generation !== chatRenderGeneration) return;
+
+  const shells = allShells;
+  if (!shells.length) {
+    root.replaceChildren(el("div", { className: "card muted" }, "No shells."));
+    return;
+  }
+
+  let selectedConversation = detailResult.conversation;
+  if (selectedConversation
+      && selectedConversation.shell.shortname !== chatRouteShell) {
+    chatRouteShell = selectedConversation.shell.shortname;
+    history.replaceState(
+      null,
+      "",
+      `#${chatModeHash(
+        chatRouteShell,
+        selectedConversation.conversation_id,
+        chatRouteMode,
+      )}`,
+    );
+  }
+  const openConversation = openPage.items.find(
+    (item) => item.state !== "closed");
+  const shell = selectedConversation?.shell
+    ? shells.find(
+      (item) => item.shell_id === selectedConversation.shell.shell_id)
+    : shells.find((item) => item.shortname === chatRouteShell)
+      || (!chatRouteShell && openConversation
+        ? shells.find(
+          (item) => item.shell_id === openConversation.shell.shell_id)
+        : null)
+      || shells[0];
+  const configuring = chatRouteConversation === CHAT_CONFIGURE_ROUTE;
+  if (!selectedConversation && !configuring && !deepLinked) {
+    selectedConversation = openPage.items.find(
+      (item) => item.shell.shell_id === shell.shell_id
+        && item.state !== "closed",
+    ) || null;
+  }
+  const selectedId = selectedConversation?.conversation_id
+    || (deepLinked ? chatRouteConversation : "");
+
+  const recentRequest = chatApi(
+    `/conversations?shell_id=${shell.shell_id}&starred=false&limit=20`,
+  ).catch((error) => ({ items: [], next_cursor: null, error }));
+  const recentPage = await recentRequest;
+  if (generation !== chatRenderGeneration) return;
+
+  const layout = el("div", { className: "chat-layout" });
+  const rail = el("aside", { className: "chat-rail" });
+  rail.append(el("div", { className: "chat-rail-title" }, "Shells"));
+  const orderedFlavors = [
+    ...CHAT_FLAVOR_ORDER.filter(
+      (flavor) => shells.some((item) => item.flavor === flavor)),
+    ...[...new Set(shells.map((item) => item.flavor || "bespoke"))]
+      .filter((flavor) => !CHAT_FLAVOR_ORDER.includes(flavor)).sort(),
+  ];
+  const orderedShells = orderedFlavors.flatMap((flavor) =>
+    shells.filter((item) => (item.flavor || "bespoke") === flavor));
+  const shellItems = new Map();
+  const openByShell = new Map();
+  for (const conversation of openPage.items) {
+    if (conversation.state !== "closed")
+      openByShell.set(
+        conversation.shell.shell_id,
+        conversation.state || "idle",
+      );
+  }
+  let previousFlavor = "";
+  for (const item of orderedShells) {
+    const flavor = item.flavor || "bespoke";
+    if (previousFlavor && flavor !== previousFlavor)
+      rail.append(
+        el("div", { className: "chat-shell-divider", role: "separator" }));
+    previousFlavor = flavor;
+    const button = el("button", {
+      className: "chat-shell"
+        + (item.shell_id === shell.shell_id ? " selected" : ""),
+      type: "button",
+    },
+    el("span", { className: "chat-shell-name" }, item.display_name),
+    chatUnreadBadge(item),
+    el("span", { className: "chat-shell-shortname" }, item.shortname || ""));
+    chatPaintShellState(button, openByShell.get(item.shell_id));
+    shellItems.set(item.shell_id, button);
+    button.onclick = () => {
+      if (item.shell_id === shell.shell_id) return;
+      location.hash = chatHash(item.shortname);
+    };
+    const shellRow = el("div", { className: "chat-shell-row" }, button);
+    if (item.sprint) {
+      const sprint = item.sprint;
+      const pill = el("button", {
+        className: "chat-sprint-pill",
+        type: "button",
+        title: `Sprint ${sprint.sprint_id} · ${sprint.role} · ${sprint.disposition}`,
+        ariaLabel: `Enter Sprint ${sprint.sprint_id} ${sprint.role} conversation`,
+      },
+      el("span", {}, `Sprint ${sprint.sprint_id}`),
+      el("span", { className: "chat-sprint-meta" },
+        `${sprint.role} · ${sprint.disposition}`));
+      pill.onclick = () => {
+        location.hash = chatHash(
+          item.shortname,
+          sprint.current_conversation_id,
+        );
+      };
+      shellRow.append(pill);
+    }
+    rail.append(shellRow);
+  }
+
+  const side = el("aside", { className: "chat-history" });
+  const adminCliOnly = chatAdminCliOnly(shell);
+  const newChat = el("button", {
+    className: "act primary",
+    type: "button",
+    textContent: "＋ Chat",
+    disabled: adminCliOnly,
+    title: adminCliOnly ? "Admin is CLI-only — see the pane for the commands" : "",
+  });
+  const configure = el("button", {
+    className: "chat-configure",
+    type: "button",
+    textContent: "Configure",
+    disabled: adminCliOnly,
+  });
+  newChat.onclick = async () => {
+    if (!await chatCloseForSwitch(selectedConversation)) return;
+    newChat.disabled = true;
+    configure.disabled = true;
+    newChat.textContent = "Starting…";
+    try {
+      const conversation = await chatCreateConversation(shell);
+      location.hash = chatHash(shell.shortname, conversation.conversation_id);
+    } catch (error) {
+      toast(`${error.code}: ${error.message}`);
+      newChat.disabled = false;
+      configure.disabled = false;
+      newChat.textContent = "＋ Chat";
+    }
+  };
+  configure.onclick = async () => {
+    configure.disabled = true;
+    if (!await chatCloseForSwitch(selectedConversation)) {
+      configure.disabled = false;
+      return;
+    }
+    location.hash = chatHash(shell.shortname, CHAT_CONFIGURE_ROUTE);
+  };
+  side.append(el("div", { className: "chat-history-head" },
+    el("div", { className: "chat-history-shell" },
+      el("div", {}, el("b", {}, shell.display_name),
+        el("span", { className: "chat-shortname" }, ` /${shell.shortname}`)),
+      configure),
+    newChat));
+
+  const history = el("div", { className: "chat-history-list" });
+  const summaries = new Map();
+  const historyItems = new Map();
+  const recentIds = [];
+  const starredIds = new Set();
+  let moreCursor = recentPage.next_cursor;
+  let moreInFlight = false;
+  let starsInFlight = false;
+  const starsStatus = el(
+    "div",
+    { className: "chat-history-status" },
+    "Loading starred chats…",
+  );
+  const more = el("button", {
+    className: "chat-history-more",
+    type: "button",
+    textContent: "More",
+  });
+
+  const acceptSummary = (conversation) => {
+    const current = summaries.get(conversation.conversation_id);
+    if (current && Number(current.version || 0) > Number(conversation.version || 0))
+      return current;
+    summaries.set(conversation.conversation_id, conversation);
+    return conversation;
+  };
+  for (const conversation of recentPage.items) {
+    acceptSummary(conversation);
+    recentIds.push(conversation.conversation_id);
+  }
+  if (selectedConversation) acceptSummary(selectedConversation);
+
+  const historyOrder = () => {
+    const pinned = [...starredIds]
+      .map((id) => summaries.get(id))
+      .filter(Boolean)
+      .sort((left, right) =>
+        String(right.last_activity_at || "").localeCompare(
+          String(left.last_activity_at || ""))
+        || right.conversation_id.localeCompare(left.conversation_id));
+    const recent = recentIds
+      .map((id) => summaries.get(id))
+      .filter((conversation) => conversation && !conversation.starred);
+    const selected = selectedId && !pinned.some(
+      (item) => item.conversation_id === selectedId)
+      && !recent.some((item) => item.conversation_id === selectedId)
+      ? summaries.get(selectedId)
+      : null;
+    return [...pinned, ...recent, ...(selected ? [selected] : [])];
+  };
+
+  const historyCard = (conversation) => {
+    const card = el("div", {
+      className: "chat-history-item"
+        + (conversation.conversation_id === selectedId ? " selected" : ""),
+    });
+    const open = el("button", {
+      className: "chat-history-open",
+      type: "button",
+    });
+    const context = el("span", { className: "chat-history-context" });
+    const name = el("span", { className: "chat-history-name" });
+    const state = chatStatePill(conversation.state);
+    const star = el("button", {
+      className: "chat-history-star",
+      type: "button",
+    });
+    const item = { card, open, context, name, state, star, conversation };
+    open.append(context, name, state);
+    card.append(open, star);
+    chatPaintHistoryItem(item, conversation);
+    open.onclick = async () => {
+      const target = item.conversation;
+      if (target.conversation_id === selectedId) return;
+      if (await chatCloseForSwitch(selectedConversation))
+        location.hash = chatHash(shell.shortname, target.conversation_id);
+    };
+    star.onclick = async (event) => {
+      event.stopPropagation();
+      star.disabled = true;
+      try {
+        const current = item.conversation;
+        const updated = await chatApi(
+          `/conversations/${current.conversation_id}`,
+          "PATCH",
+          { version: current.version, starred: !current.starred },
+        );
+        acceptSummary(updated);
+        if (updated.starred) {
+          starredIds.add(updated.conversation_id);
+          const index = recentIds.indexOf(updated.conversation_id);
+          if (index >= 0) recentIds.splice(index, 1);
+        } else {
+          starredIds.delete(updated.conversation_id);
+          if (!recentIds.includes(updated.conversation_id)
+              && updated.conversation_id === selectedId)
+            recentIds.push(updated.conversation_id);
+        }
+        if (updated.conversation_id === selectedConversation?.conversation_id)
+          selectedConversation = updated;
+        renderHistory();
+      } catch (error) {
+        toast(`${error.code}: ${error.message}`);
+      } finally {
+        star.disabled = false;
+      }
+    };
+    historyItems.set(conversation.conversation_id, item);
+    return item;
+  };
+
+  const renderHistory = () => {
+    const cards = historyOrder().map((conversation) => {
+      let item = historyItems.get(conversation.conversation_id);
+      if (!item) item = historyCard(conversation);
+      chatPaintHistoryItem(item, conversation);
+      item.card.classList.toggle(
+        "selected",
+        conversation.conversation_id === selectedId,
+      );
+      return item.card;
+    });
+    history.replaceChildren(...cards);
+    if (!cards.length && !recentPage.error)
+      history.append(
+        el("div", { className: "chat-history-empty" }, "No chats yet."));
+    if (recentPage.error)
+      history.append(el(
+        "div",
+        { className: "chat-history-status error" },
+        `Recent chats unavailable — ${recentPage.error.message}`,
+      ));
+    if (!starsStatus.hidden) history.append(starsStatus);
+    if (moreCursor) history.append(more);
+  };
+  more.onclick = async () => {
+    if (moreInFlight || !moreCursor) return;
+    moreInFlight = true;
+    more.disabled = true;
+    more.textContent = "Loading…";
+    const requestedCursor = moreCursor;
+    try {
+      const page = await chatApi(
+        `/conversations?shell_id=${shell.shell_id}`
+        + `&starred=false&limit=20&cursor=${encodeURIComponent(requestedCursor)}`,
+      );
+      if (generation !== chatRenderGeneration) return;
+      for (const conversation of page.items) {
+        acceptSummary(conversation);
+        if (!recentIds.includes(conversation.conversation_id))
+          recentIds.push(conversation.conversation_id);
+      }
+      moreCursor = page.next_cursor;
+      more.textContent = "More";
+      renderHistory();
+    } catch (error) {
+      moreCursor = requestedCursor;
+      more.textContent = "Retry";
+      toast(`${error.code}: ${error.message}`);
+    } finally {
+      moreInFlight = false;
+      more.disabled = false;
+    }
+  };
+  side.append(history);
+  renderHistory();
+
+  const pane = el("section", { className: "chat-pane" });
+  layout.append(rail, side, pane);
+  root.replaceChildren(layout);
+
+  const loadStars = async () => {
+    if (starsInFlight) return;
+    starsInFlight = true;
+    starsStatus.hidden = false;
+    starsStatus.classList.remove("error");
+    starsStatus.textContent = "Loading starred chats…";
+    renderHistory();
+    let cursor = null;
+    try {
+      do {
+        const suffix = cursor
+          ? `&cursor=${encodeURIComponent(cursor)}`
+          : "";
+        const page = await chatApi(
+          `/conversations?shell_id=${shell.shell_id}`
+          + `&starred=true&limit=100${suffix}`,
+        );
+        if (generation !== chatRenderGeneration) return;
+        for (const conversation of page.items) {
+          acceptSummary(conversation);
+          starredIds.add(conversation.conversation_id);
+        }
+        cursor = page.next_cursor;
+        renderHistory();
+      } while (cursor);
+      starsStatus.hidden = true;
+    } catch (error) {
+      const retry = el("button", {
+        className: "chat-history-retry",
+        type: "button",
+        textContent: "Retry",
+      });
+      retry.onclick = loadStars;
+      starsStatus.replaceChildren(
+        `Starred chats unavailable — ${error.message} `,
+        retry,
+      );
+      starsStatus.classList.add("error");
+      starsStatus.hidden = false;
+    } finally {
+      starsInFlight = false;
+    }
+    renderHistory();
+  };
+  loadStars();
+
+  let historyPollInFlight = false;
+  const pollHistory = async () => {
+    if (document.hidden || historyPollInFlight) return;
+    historyPollInFlight = true;
+    try {
+      let cursor = null;
+      let selectedSeen = false;
+      const nextOpenByShell = new Map();
+      do {
+        const suffix = cursor
+          ? `&cursor=${encodeURIComponent(cursor)}`
+          : "";
+        const page = await chatApi(
+          `/conversations?open=true&limit=100${suffix}`,
+        );
+        for (const conversation of page.items) {
+          nextOpenByShell.set(
+            conversation.shell.shell_id,
+            conversation.state || "idle",
+          );
+          const item = historyItems.get(conversation.conversation_id);
+          if (item) {
+            const accepted = acceptSummary(conversation);
+            chatPaintHistoryItem(item, accepted);
+          }
+          if (conversation.conversation_id
+              === selectedConversation?.conversation_id) {
+            selectedSeen = true;
+            selectedConversation = acceptSummary(conversation);
+          }
+        }
+        cursor = page.next_cursor;
+      } while (cursor);
+      if (selectedConversation
+          && selectedConversation.state !== "closed"
+          && !selectedSeen) {
+        const conversation = await chatApi(
+          `/conversations/${selectedConversation.conversation_id}`,
+        );
+        const accepted = acceptSummary(conversation);
+        const item = historyItems.get(conversation.conversation_id);
+        if (item) chatPaintHistoryItem(item, accepted);
+        selectedConversation = accepted;
+      }
+      if (generation !== chatRenderGeneration || !chatHistoryPollTimer) return;
+      for (const [shellId, button] of shellItems)
+        chatPaintShellState(button, nextOpenByShell.get(shellId));
+    } catch { /* The next poll retries without disrupting the open chat. */ }
+    finally { historyPollInFlight = false; }
+  };
+  chatHistoryPollTimer = setInterval(pollHistory, CHAT_HISTORY_POLL_MS);
+
+  if (adminCliOnly && (configuring || !selectedId)) {
+    pane.append(chatAdminCliOnlyNotice(shell, repoRoot));
+    return;
+  }
+  if (configuring) {
+    const loadConfiguration = async () => {
+      pane.replaceChildren(
+        el("div", { className: "chat-loading" }, "Loading configuration…"));
+      try {
+        const { defaults, catalog } = await chatLoadConfiguration();
+        if (generation !== chatRenderGeneration) return;
+        await chatRenderNew(pane, shell, defaults, catalog);
+      } catch (error) {
+        if (generation !== chatRenderGeneration) return;
+        const retry = el("button", {
+          className: "act",
+          type: "button",
+          textContent: "Retry",
+        });
+        retry.onclick = loadConfiguration;
+        pane.replaceChildren(el(
+          "div",
+          { className: "card chat-config-error" },
+          el("div", {}, `Configuration unavailable — ${error.message}`),
+          retry,
+        ));
+      }
+    };
+    await loadConfiguration();
+    return;
+  }
+  if (!selectedId) {
+    pane.append(el("div", { className: "chat-empty chat-no-selection" },
+      "No chat selected."));
+    return;
+  }
+  if (detailResult.error) {
+    const retry = el("button", {
+      className: "act",
+      type: "button",
+      textContent: "Retry",
+    });
+    retry.onclick = () => renderInterface(root);
+    pane.replaceChildren(el(
+      "div",
+      { className: "card" },
+      `Conversation unavailable — ${detailResult.error.message}`,
+      retry,
+    ));
+    return;
+  }
+  const conversation = selectedConversation
+    || await chatApi(`/conversations/${selectedId}`);
+  const loadTranscript = async () => {
+    pane.replaceChildren(
+      el("div", { className: "chat-loading" }, "Loading transcript…"));
+    try {
+      const snapshot = await chatApi(
+        `/conversations/${selectedId}/transcript`);
+      if (generation !== chatRenderGeneration) return;
+      await chatRenderOpen(pane, conversation, snapshot);
+    } catch (error) {
+      if (generation !== chatRenderGeneration) return;
+      const retry = el("button", {
+        className: "act",
+        type: "button",
+        textContent: "Retry",
+      });
+      retry.onclick = loadTranscript;
+      const close = el("button", {
+        className: "act danger",
+        type: "button",
+        textContent: "Close",
+        disabled: conversation.scope === "sprint" || conversation.state === "closed",
+        hidden: conversation.scope === "sprint",
+      });
+      close.onclick = async () => {
+        close.disabled = true;
+        try {
+          const latest = await chatApi(
+            `/conversations/${conversation.conversation_id}`);
+          if (latest.state !== "closed") {
+            await chatApi(
+              `/conversations/${conversation.conversation_id}`,
+              "PATCH",
+              { version: latest.version, state: "closed" },
+            );
+          }
+          await renderInterface(root);
+        } catch (closeError) {
+          close.disabled = false;
+          toast(`${closeError.code}: ${closeError.message}`);
+        }
+      };
+      pane.replaceChildren(el(
+        "div",
+        { className: "card chat-transcript-error" },
+        el("h2", {}, chatHeaderLabel(conversation)),
+        el("div", {}, `Transcript unavailable — ${error.message}`),
+        el("div", { className: "row" }, retry, close),
+      ));
+    }
+  };
+  await loadTranscript();
+}
+
+// ── Sprints v2 FnB board ────────────────────────────────────────────────────
+const SPRINTS_REFRESH_MS = 5000;
+let sprintRouteId = null;      // null = priority selection; NaN = invalid exact route
+let sprintSelectedId = null;
+let sprintRenderGeneration = 0;
+let sprintPollTimer = null;
+let activeTab = "shells";
+let sprintOpenUnitId = null;
+let sprintLastGoodId = null;
+let sprintFeedSprintId = null;
+let sprintFeedState = {
+  events: { open: false, openRows: new Set(), items: [], cursor: null, loading: false },
+  summaries: { open: false, openRows: new Set(), items: [], cursor: null, loading: false },
+};
+const sprintFeedRefs = {};
+
+const SPRINT_COLUMNS = [
+  ["done", "Done"],
+  ["review", "Review"],
+  ["dev", "Dev"],
+  ["waiting", "Waiting"],
+  ["blocked", "Blocked"],
+];
+
+function sprintStopPolling() {
+  if (sprintPollTimer !== null) clearTimeout(sprintPollTimer);
+  sprintPollTimer = null;
+}
+
+function sprintPriority(items) {
+  const newest = (rows, field) => rows.slice().sort((a, b) =>
+    String(b[field] || "").localeCompare(String(a[field] || ""))
+    || b.sprint_id - a.sprint_id)[0];
+  return items.find((item) => item.lifecycle === "armed")
+    || newest(items.filter((item) => item.lifecycle === "paused"), "paused_at")
+    || newest(items.filter((item) => item.lifecycle === "prepared"), "created_at")
+    || newest(items.filter((item) => ["completed", "aborted"].includes(item.lifecycle)), "created_at")
+    || null;
+}
+
+function sprintScheduleRefresh(root, generation) {
+  sprintStopPolling();
+  if (activeTab !== "sprints" || document.hidden) return;
+  sprintPollTimer = setTimeout(() => {
+    if (generation !== sprintRenderGeneration || activeTab !== "sprints" || document.hidden) return;
+    renderSprints(root, { refresh: true });
+  }, SPRINTS_REFRESH_MS);
+}
+
+function sprintRoute(sprintId) {
+  sprintRouteId = sprintId;
+  sprintSelectedId = sprintId;
+  location.hash = `sprints/${sprintId}`;
+}
+
+function sprintPageShell(list, selectedId) {
+  const selector = el("select", {
+    className: "sprint-selector",
+    title: "Select Sprint",
+  });
+  for (const item of list) {
+    const label = `Sprint ${item.sprint_id} · ${item.lifecycle} · ${item.feature.title}`;
+    selector.append(el("option", {
+      title: label,
+      value: String(item.sprint_id),
+      selected: item.sprint_id === selectedId,
+      textContent: label.length > 50 ? `${label.slice(0, 49)}…` : label,
+    }));
+  }
+  selector.onchange = () => sprintRoute(Number(selector.value));
+  const content = el("div", { className: "sprint-content" });
+  return {
+    node: el("div", { className: "sprint-page" },
+      el("div", { className: "sprint-toolbar" }, selector), content),
+    content,
+  };
+}
+
+function renderSprintRouteState(root, title, detail, retry = null) {
+  const card = el("div", { className: "card sprint-route-state" },
+    el("h2", {}, title), el("div", { className: "muted" }, detail));
+  if (retry) {
+    const button = el("button", { className: "act", type: "button", textContent: "Retry" });
+    button.onclick = retry;
+    card.append(button);
+  }
+  root.replaceChildren(card);
+}
+
+function sprintKeepLastGood(root, generation, error) {
+  if (sprintLastGoodId === null || sprintLastGoodId !== sprintSelectedId || !root.firstChild)
+    return false;
+  root.querySelector?.(".sprint-stale-notice")?.remove();
+  const retry = el("button", { className: "act", type: "button", textContent: "Retry now" });
+  retry.onclick = () => renderSprints(root, { refresh: true });
+  const notice = el("div", { className: "sprint-stale-notice", role: "status" },
+    el("span", {}, `Showing the last good Sprint snapshot — refresh failed: ${error.message}`),
+    retry);
+  root.prepend(notice);
+  sprintScheduleRefresh(root, generation);
+  return true;
+}
+
+function sprintTimestamp(value) {
+  if (!value) return null;
+  const parsed = new Date(value.replace(" ", "T") + (value.includes("Z") ? "" : "Z"));
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+}
+
+function sprintElapsed(sprint) {
+  const start = new Date((sprint.armed_at || sprint.created_at).replace(" ", "T") + "Z");
+  const endValue = sprint.completed_at || sprint.aborted_at;
+  const end = endValue ? new Date(endValue.replace(" ", "T") + "Z") : new Date();
+  const seconds = Math.max(0, Math.floor((end - start) / 1000));
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return [days ? `${days}d` : "", hours ? `${hours}h` : "", `${minutes}m`]
+    .filter(Boolean).join(" ");
+}
+
+function sprintParticipantLink(person) {
+  if (!person?.current_conversation_id) return el("span", {}, person?.shortname || "—");
+  return el("a", {
+    href: `#interface/${encodeURIComponent(person.shortname)}/${encodeURIComponent(person.current_conversation_id)}/chat`,
+    textContent: person.shortname,
+  });
+}
+
+function sprintAuditSection(title, rows, renderRow) {
+  const section = el("div", { className: "sprint-audit-section" }, el("h3", {}, title));
+  if (!rows.length) section.append(el("div", { className: "muted" }, "None"));
+  else for (const row of rows) section.append(renderRow(row));
+  return section;
+}
+
+function sprintFeedIdentity(kind, item) {
+  return kind === "events" ? `event:${item.event_id}` : `${item.source}:${item.id}`;
+}
+
+function sprintFeedRow(kind, item, state) {
+  const identity = sprintFeedIdentity(kind, item);
+  const detail = el("details", {
+    className: "sprint-feed-row",
+    open: state.openRows.has(identity),
+  });
+  detail.ontoggle = () => {
+    if (detail.open) state.openRows.add(identity);
+    else state.openRows.delete(identity);
+  };
+  const label = kind === "events"
+    ? `${item.actor.shortname || item.actor.kind} · ${item.type}`
+    : `${item.author.shortname || "system"} · ${item.kind}`;
+  detail.append(el("summary", {},
+    el("span", {}, label),
+    el("span", { className: "muted" }, sprintTimestamp(item.created_at))));
+  if (kind === "events") {
+    const keys = Object.keys(item.details || {});
+    detail.append(keys.length
+      ? el("pre", { className: "sprint-feed-detail" }, JSON.stringify(item.details, null, 2))
+      : el("div", { className: "muted sprint-feed-detail" }, "No display details."));
+  } else {
+    detail.append(el("div", { className: "sprint-feed-detail" },
+      item.work_unit_id ? el("div", { className: "muted" }, `Work unit U${item.work_unit_id}`) : "",
+      el("div", { className: "sprint-long-text" }, item.body)));
+  }
+  return detail;
+}
+
+function sprintPaintFeed(kind) {
+  const refs = sprintFeedRefs[kind];
+  if (!refs) return;
+  const state = sprintFeedState[kind];
+  refs.list.replaceChildren();
+  if (!state.items.length) refs.list.append(
+    el("div", { className: "muted sprint-feed-empty" }, state.loading ? "Loading…" : "No entries."));
+  else for (const item of state.items) refs.list.append(sprintFeedRow(kind, item, state));
+  refs.more.hidden = !state.cursor;
+  refs.more.disabled = state.loading;
+  refs.more.textContent = state.loading ? "Loading…" : "Load more";
+}
+
+async function sprintLoadFeed(kind, { more = false, refresh = false } = {}) {
+  const state = sprintFeedState[kind];
+  if (state.loading || sprintFeedSprintId === null) return;
+  const requestedSprintId = sprintFeedSprintId;
+  state.loading = true;
+  sprintPaintFeed(kind);
+  try {
+    const cursor = more ? state.cursor : null;
+    const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
+    const page = await api(`/sprints/${requestedSprintId}/${kind}?limit=50${suffix}`);
+    if (
+      requestedSprintId !== sprintFeedSprintId
+      || requestedSprintId !== sprintSelectedId
+      || state !== sprintFeedState[kind]
+    ) return;
+    if (!state.items.length || more) {
+      state.items = more ? [...state.items, ...page.items] : page.items;
+      state.cursor = page.next_cursor;
+    } else if (refresh) {
+      const seen = new Set(state.items.map((item) => sprintFeedIdentity(kind, item)));
+      state.items = [
+        ...page.items.filter((item) => !seen.has(sprintFeedIdentity(kind, item))),
+        ...state.items,
+      ];
+    }
+    const unique = new Set();
+    state.items = state.items.filter((item) => {
+      const identity = sprintFeedIdentity(kind, item);
+      if (unique.has(identity)) return false;
+      unique.add(identity);
+      return true;
+    });
+  } catch (error) {
+    toast(`${kind} unavailable: ${error.message}`);
+  } finally {
+    state.loading = false;
+    if (state === sprintFeedState[kind]) sprintPaintFeed(kind);
+  }
+}
+
+function sprintFeedsNode(sprintId) {
+  if (sprintFeedSprintId !== sprintId) {
+    sprintFeedSprintId = sprintId;
+    sprintFeedState = {
+      events: { open: false, openRows: new Set(), items: [], cursor: null, loading: false },
+      summaries: { open: false, openRows: new Set(), items: [], cursor: null, loading: false },
+    };
+  }
+  const wrap = el("div", { className: "sprint-feeds" });
+  for (const [kind, label] of [["events", "Sprint events"], ["summaries", "Sprint summaries"]]) {
+    const state = sprintFeedState[kind];
+    const list = el("div", { className: "sprint-feed-list" });
+    const more = el("button", { className: "act", type: "button", textContent: "Load more" });
+    more.onclick = () => sprintLoadFeed(kind, { more: true });
+    const detail = el("details", { className: "sprint-feed", open: state.open },
+      el("summary", {}, `${label} (${kind === "events" ? "timeline" : "judgments and reports"})`),
+      list, more);
+    detail.ontoggle = () => {
+      state.open = detail.open;
+      if (detail.open && !state.items.length) sprintLoadFeed(kind);
+    };
+    sprintFeedRefs[kind] = { detail, list, more };
+    sprintPaintFeed(kind);
+    wrap.append(detail);
+  }
+  return wrap;
+}
+
+function sprintScopedFeed(sprintId, workUnitId, kind, label) {
+  const detail = el("details", { className: "sprint-audit-section sprint-scoped-feed" },
+    el("summary", {}, label));
+  const list = el("div", { className: "sprint-feed-list" });
+  const more = el("button", { className: "act", type: "button", textContent: "Load more", hidden: true });
+  let cursor = null;
+  let items = [];
+  let loading = false;
+  const paint = () => {
+    list.replaceChildren(...items.map((item) => sprintFeedRow(kind, item)));
+    if (!items.length) list.append(el("div", { className: "muted" }, loading ? "Loading…" : "No entries."));
+    more.hidden = !cursor;
+    more.disabled = loading;
+  };
+  const loadPage = async () => {
+    if (loading) return;
+    loading = true; paint();
+    try {
+      const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
+      const page = await api(
+        `/sprints/${sprintId}/${kind}?limit=50&work_unit_id=${workUnitId}${suffix}`);
+      items = [...items, ...page.items];
+      cursor = page.next_cursor;
+    } catch (error) { toast(`${label} unavailable: ${error.message}`); }
+    finally { loading = false; paint(); }
+  };
+  detail.ontoggle = () => { if (detail.open && !items.length) loadPage(); };
+  more.onclick = loadPage;
+  detail.append(list, more);
+  return detail;
+}
+
+function openSprintActionModal(sprint, target, label) {
+  const reason = el("textarea", {
+    rows: 5,
+    maxlength: 2000,
+    placeholder: `Reason for ${label.toLowerCase()} (required)`,
+  });
+  const confirmButton = el("button", { className: "act danger", type: "button", textContent: label });
+  const cancel = el("button", { className: "act", type: "button", textContent: "Cancel" });
+  const body = el("div", { className: "sprint-action-form" },
+    target === "aborted" ? el("div", { className: "sprint-abort-note" },
+      "Abort stops active work but retains the complete Sprint history and the Planner's durable abort-report request.") : "",
+    el("label", { className: "k" }, "Reason"), reason);
+  const close = openActionModal({
+    title: `${label} · Sprint ${sprint.sprint_id}`,
+    bodyNode: body,
+    dismissNode: cancel,
+    actionNode: confirmButton,
+    width: 560,
+    height: 360,
+  });
+  confirmButton.onclick = async () => {
+    const value = reason.value.trim();
+    if (!value) return toast("reason required");
+    confirmButton.disabled = true;
+    try {
+      const result = await api(`/sprints/${sprint.sprint_id}`, "PATCH", {
+        lifecycle: target,
+        reason: value,
+      });
+      close();
+      setStatus(result.changed ? `Sprint ${sprint.sprint_id} ${target}` : `Sprint already ${target}`);
+      await renderSprints($("#view-sprints"), { refresh: true });
+    } catch (error) {
+      toast(`action failed: ${error.message}`);
+      confirmButton.disabled = false;
+    }
+  };
+  cancel.onclick = close;
+  reason.focus();
+}
+
+function sprintActionButtons(sprint) {
+  const actions = [];
+  if (sprint.lifecycle === "armed") actions.push(["paused", "Pause Sprint"]);
+  if (sprint.lifecycle === "paused") actions.push(["armed", "Resume Sprint"]);
+  if (["prepared", "armed", "paused"].includes(sprint.lifecycle))
+    actions.push(["aborted", "Abort Sprint"]);
+  const row = el("div", { className: "sprint-actions" });
+  for (const [target, label] of actions) {
+    const button = el("button", {
+      className: `act ${target === "aborted" ? "danger" : ""}`,
+      type: "button",
+      textContent: label,
+    });
+    button.onclick = () => openSprintActionModal(sprint, target, label);
+    row.append(button);
+  }
+  return row;
+}
+
+function openSprintUnitModal(unit, snapshot) {
+  sprintOpenUnitId = unit.work_unit_id;
+  const body = el("div", { className: "sprint-unit-detail" });
+  const facts = el("div", { className: "grid2 sprint-unit-facts" },
+    el("span", { className: "k" }, "disposition"), el("span", {}, unit.disposition),
+    el("span", { className: "k" }, "wave"), el("span", {}, String(unit.planned_wave)),
+    el("span", { className: "k" }, "output kind"), el("span", {}, unit.output_kind),
+    el("span", { className: "k" }, "developer"), sprintParticipantLink(unit.developer),
+    el("span", { className: "k" }, "reviewer"), sprintParticipantLink(unit.reviewer),
+    el("span", { className: "k" }, "prerequisites"),
+    el("span", {}, unit.prerequisite_ids.length ? unit.prerequisite_ids.map((id) => `U${id}`).join(", ") : "None"),
+    el("span", { className: "k" }, "dependents"),
+    el("span", {}, unit.dependent_ids.length ? unit.dependent_ids.map((id) => `U${id}`).join(", ") : "None"));
+  body.append(facts,
+    el("h3", {}, "Expected output"), el("div", { className: "sprint-long-text" }, unit.expected_output));
+  if (unit.completion_result) body.append(
+    el("h3", {}, unit.disposition === "cancelled" ? "Cancellation result" : "Completion result"),
+    el("div", { className: "sprint-long-text" }, unit.completion_result));
+
+  body.append(sprintAuditSection("Included tasks", unit.tasks, (task) =>
+    el("div", { className: "sprint-audit-row" },
+      el("a", {
+        href: `/api/documents/${task.document_id}/open`, target: "_blank", rel: "noopener",
+        textContent: `#${task.task_id} ${task.title}`,
+      }), el("span", { className: "pill" }, task.status))));
+  body.append(sprintAuditSection("Pull requests", unit.pull_requests, (pr) => {
+    const label = `${pr.repository}#${pr.pr_number}`;
+    const link = pr.url ? el("a", {
+      href: pr.url, target: "_blank", rel: "noopener", textContent: label,
+    }) : el("span", {}, label);
+    return el("div", { className: "sprint-audit-row" }, link,
+      el("span", { className: "pill" }, pr.normalized_state || "registered"),
+      el("span", { className: "muted" }, pr.observed_head_sha || "no head observed",
+        pr.observed_at ? ` · ${sprintTimestamp(pr.observed_at)}` : ""));
+  }));
+  body.append(sprintAuditSection("Participant messages", unit.messages, (message) =>
+    el("div", { className: "sprint-message-audit" },
+      el("div", { className: "sprint-audit-row" },
+        el("span", {}, `${message.sender?.shortname || "system"} → ${message.recipient.shortname}`),
+        el("span", { className: "pill" }, message.kind),
+        el("span", { className: "muted" }, sprintTimestamp(message.created_at))),
+      el("div", { className: "sprint-long-text" }, message.body))));
+  body.append(
+    sprintScopedFeed(snapshot.sprint.sprint_id, unit.work_unit_id, "events", "Scoped events"),
+    sprintScopedFeed(snapshot.sprint.sprint_id, unit.work_unit_id, "summaries", "Scoped judgments and reports"));
+
+  const closeButton = el("button", { className: "act", type: "button", textContent: "Close" });
+  const close = openModal({
+    title: `U${unit.work_unit_id} · ${unit.title}`,
+    bodyNode: body,
+    footerStart: el("span", { className: "muted" }, `Sprint ${snapshot.sprint.sprint_id}`),
+    footerEnd: closeButton,
+    width: 840,
+    height: 760,
+  });
+  closeButton.onclick = () => { sprintOpenUnitId = null; close(); };
+}
+
+function sprintWorkUnitCard(unit, snapshot) {
+  const card = el("button", {
+    className: `sprint-unit sprint-unit-${unit.disposition}`,
+    type: "button",
+    title: `U${unit.work_unit_id} ${unit.title}`,
+  });
+  card.dataset.unitId = String(unit.work_unit_id);
+  const pr = unit.pull_requests[0];
+  card.append(
+    el("div", { className: "sprint-unit-title" },
+      el("span", { className: "sprint-unit-id" }, `U${unit.work_unit_id}`),
+      el("span", {}, unit.title)),
+    el("div", { className: "sprint-unit-meta" },
+      el("span", { className: "pill" }, unit.disposition),
+      el("span", { className: "muted" }, `wave ${unit.planned_wave}`)),
+    el("div", { className: "sprint-unit-people" },
+      `Dev: ${unit.developer.shortname} · Review: ${unit.reviewer.shortname}`),
+    el("div", { className: "sprint-unit-deps" },
+      unit.prerequisite_ids.length
+        ? `Depends: ${unit.prerequisite_ids.map((id) => `U${id}`).join(", ")}`
+        : "Depends: none"),
+    el("div", { className: "sprint-unit-foot" },
+      el("span", {}, unit.output_kind.replaceAll("_", " ")),
+      el("span", {}, pr ? `PR #${pr.pr_number} · ${pr.normalized_state || "registered"}` : "No PR")));
+  if (unit.disposition === "cancelled") card.append(
+    el("div", { className: "sprint-cancelled-note" }, "Cancelled — not completed"));
+  card.onclick = () => openSprintUnitModal(unit, snapshot);
+  return card;
+}
+
+function sprintWireGraph(wrap, canvas, svg, cardById, dependencies) {
+  const draw = () => {
+    if (!canvas.isConnected) return;
+    const base = canvas.getBoundingClientRect();
+    const width = canvas.scrollWidth;
+    const height = canvas.scrollHeight;
+    svg.setAttribute("width", width);
+    svg.setAttribute("height", height);
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.replaceChildren();
+    for (const edge of dependencies) {
+      const source = cardById[edge.depends_on_work_unit_id];
+      const target = cardById[edge.work_unit_id];
+      if (!source || !target) continue;
+      const a = source.getBoundingClientRect();
+      const b = target.getBoundingClientRect();
+      const x1 = a.right - base.left;
+      const y1 = a.top - base.top + a.height / 2;
+      const x2 = b.left - base.left;
+      const y2 = b.top - base.top + b.height / 2;
+      const bend = Math.max(36, Math.abs(x2 - x1) * .4);
+      const path = document.createElementNS(SVGNS, "path");
+      path.setAttribute("d", `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`);
+      path.setAttribute("class", "sprint-wire");
+      path.dataset.from = String(edge.depends_on_work_unit_id);
+      path.dataset.to = String(edge.work_unit_id);
+      svg.append(path);
+    }
+  };
+  requestAnimationFrame(draw);
+  const onResize = () => canvas.isConnected ? draw() : window.removeEventListener("resize", onResize);
+  window.addEventListener("resize", onResize);
+
+  const highlight = (unitId, on) => {
+    const direct = new Set([String(unitId)]);
+    for (const path of svg.querySelectorAll(".sprint-wire")) {
+      const lit = path.dataset.from === String(unitId) || path.dataset.to === String(unitId);
+      path.classList.toggle("lit", on && lit);
+      if (lit) { direct.add(path.dataset.from); direct.add(path.dataset.to); }
+    }
+    wrap.classList.toggle("sprint-wire-focus", on);
+    for (const [id, card] of Object.entries(cardById)) card.classList.toggle("lit", on && direct.has(id));
+  };
+  for (const [id, card] of Object.entries(cardById)) {
+    card.onmouseenter = () => highlight(id, true);
+    card.onmouseleave = () => highlight(id, false);
+    card.onfocus = () => highlight(id, true);
+    card.onblur = () => highlight(id, false);
+  }
+}
+
+function sprintBoardNode(snapshot) {
+  const sprint = snapshot.sprint;
+  const header = el("div", { className: "sprint-board-head" });
+  const heading = el("div", { className: "sprint-heading" },
+    el("h2", {}, `Sprint ${sprint.sprint_id}`),
+    el("span", { className: `pill sprint-${sprint.lifecycle}` }, sprint.lifecycle));
+  const feature = el("a", {
+    href: `#roadmap-feature-${sprint.feature.feature_id}`,
+    textContent: sprint.feature.title,
+  });
+  const specs = el("span", { className: "sprint-spec-links" });
+  for (const spec of snapshot.specs) specs.append(" ", el("a", {
+    href: `/api/documents/${spec.document_id}/open`, target: "_blank", rel: "noopener",
+    textContent: `${spec.kind} #${spec.document_id}`,
+  }));
+  const times = [
+    ["Created", sprint.created_at], ["Armed", sprint.armed_at],
+    ["Paused", sprint.paused_at],
+    [sprint.lifecycle === "aborted" ? "Aborted" : "Completed", sprint.aborted_at || sprint.completed_at],
+  ].filter(([, value]) => value);
+  header.append(heading,
+    el("div", { className: "sprint-header-context" },
+      el("span", {}, "Feature: ", feature),
+      el("span", {}, `Planner: ${sprint.planner.shortname}`), specs),
+    el("div", { className: "sprint-header-times" },
+      ...times.map(([label, value]) => el("span", {}, `${label}: ${sprintTimestamp(value)}`)),
+      el("span", {}, `Elapsed: ${sprintElapsed(sprint)}`)),
+    sprintActionButtons(sprint));
+  if (sprint.terminal_outcome) header.append(
+    el("div", { className: "sprint-terminal-outcome" }, `Outcome: ${sprint.terminal_outcome}`));
+
+  const scroll = el("div", { className: "sprint-board-scroll" });
+  const canvas = el("div", { className: "sprint-board-canvas" });
+  const svg = document.createElementNS(SVGNS, "svg");
+  svg.setAttribute("class", "sprint-wires");
+  svg.setAttribute("aria-hidden", "true");
+  const columns = el("div", { className: "sprint-columns" });
+  const cardById = {};
+  for (const [key, label] of SPRINT_COLUMNS) {
+    const units = snapshot.work_units.filter((unit) => unit.column === key);
+    const column = el("section", { className: `sprint-column sprint-column-${key}` },
+      el("h3", {}, label, el("span", { className: "count" }, String(units.length))));
+    const cards = el("div", { className: "sprint-column-cards" });
+    if (!units.length) cards.append(el("div", { className: "sprint-column-empty" }, "No work units"));
+    for (const unit of units) {
+      const card = sprintWorkUnitCard(unit, snapshot);
+      cards.append(card);
+      cardById[unit.work_unit_id] = card;
+    }
+    column.append(cards);
+    columns.append(column);
+  }
+  canvas.append(svg, columns);
+  scroll.append(canvas);
+  sprintWireGraph(scroll, canvas, svg, cardById, snapshot.dependencies);
+  return el("div", { className: "sprint-board-view" }, header, scroll,
+    sprintFeedsNode(sprint.sprint_id));
+}
+
+async function renderSprints(root, { refresh = false } = {}) {
+  const generation = ++sprintRenderGeneration;
+  const previousScroll = refresh
+    ? root.querySelector?.(".sprint-board-scroll")?.scrollLeft || 0
+    : 0;
+  const focusedUnitId = refresh ? document.activeElement?.dataset?.unitId || null : null;
+  sprintStopPolling();
+  if (!refresh || !root.firstChild) root.replaceChildren(el("div", { className: "muted" }, "Loading Sprints…"));
+  if (Number.isNaN(sprintRouteId)) {
+    renderSprintRouteState(root, "Sprint not found", "The Sprint route must contain a positive integer ID.");
+    return;
+  }
+  let list;
+  try {
+    list = (await api("/sprints?limit=100")).items;
+  } catch (error) {
+    if (generation !== sprintRenderGeneration) return;
+    if (refresh && sprintKeepLastGood(root, generation, error)) return;
+    renderSprintRouteState(root, "Sprints unavailable", error.message, () => renderSprints(root));
+    return;
+  }
+  if (generation !== sprintRenderGeneration) return;
+  if (!list.length && sprintRouteId === null) {
+    sprintSelectedId = null;
+    renderSprintRouteState(
+      root,
+      "No Sprints yet",
+      "Prepared Sprints appear here after declaration.",
+    );
+    return;
+  }
+
+  const preferred = sprintRouteId === null ? sprintPriority(list) : null;
+  const selectedId = sprintRouteId ?? preferred?.sprint_id ?? null;
+  if (selectedId === null) return;
+  sprintSelectedId = selectedId;
+  if (sprintRouteId === null && globalThis.history?.replaceState) {
+    history.replaceState(null, "", `#sprints/${selectedId}`);
+    sprintRouteId = selectedId;
+  }
+
+  let board;
+  try {
+    board = await api(`/sprints/${selectedId}`);
+  } catch (error) {
+    if (generation !== sprintRenderGeneration) return;
+    if (refresh && sprintKeepLastGood(root, generation, error)) return;
+    renderSprintRouteState(
+      root,
+      "Sprint unavailable",
+      `Sprint ${selectedId} was not found or is not available: ${error.message}`,
+      () => renderSprints(root),
+    );
+    return;
+  }
+  if (generation !== sprintRenderGeneration) return;
+  if (!list.some((item) => item.sprint_id === selectedId)) {
+    list = [{
+      sprint_id: selectedId,
+      lifecycle: board.sprint.lifecycle,
+      feature: board.sprint.feature,
+    }, ...list];
+  }
+  const shell = sprintPageShell(list, selectedId);
+  shell.content.append(sprintBoardNode(board));
+  root.replaceChildren(shell.node);
+  sprintLastGoodId = selectedId;
+  setDocumentTitle("sprints");
+  requestAnimationFrame(() => {
+    const scroll = root.querySelector?.(".sprint-board-scroll");
+    if (scroll) scroll.scrollLeft = previousScroll;
+    if (focusedUnitId)
+      root.querySelector?.(`[data-unit-id="${focusedUnitId}"]`)?.focus();
+  });
+  for (const kind of ["events", "summaries"])
+    if (sprintFeedState[kind].open) sprintLoadFeed(kind, { refresh: true });
+  sprintScheduleRefresh(root, generation);
+}
+
 // ── Tabs + boot ────────────────────────────────────────────────────────────────
 const VIEWS = {
   shells: ["#view-shells", renderShells],
-  skills: ["#view-skills", renderSkills],
+  interface: ["#view-interface", renderInterface],
+  sprints: ["#view-sprints", renderSprints],
   roadmap: ["#view-roadmap", renderRoadmap],
   docs: ["#view-docs", renderDocs],
   flags: ["#view-flags", renderFlags],
@@ -2112,26 +5528,100 @@ async function load(tab) {
   const [sel, fn] = VIEWS[tab];
   try { await fn($(sel)); } catch (e) { $(sel).replaceChildren(el("div", { className: "card" }, "error: " + e.message)); }
 }
+// The tab title names the view and the fork (spec #43 U4), replacing a static
+// per-fork string that named neither: every tab reads "<tab name> · <fork>".
+// <fork> is the repo root basename, read from the same /health field the header
+// breadcrumb renders, so the two can never disagree. It stays empty until
+// /health answers — the title then omits the fork rather than naming one we
+// have not confirmed.
+let forkName = "";
+function setDocumentTitle(tab) {
+  const label = document.querySelector(
+    `nav button[data-tab="${tab}"]`,
+  )?.textContent || tab;
+  const viewLabel = tab === "sprints" && sprintSelectedId
+    ? `Sprint ${sprintSelectedId}` : label;
+  document.title = forkName ? `${viewLabel} · ${forkName}` : viewLabel;
+}
 function show(tab) {
+  activeTab = tab;
   for (const b of document.querySelectorAll("nav button")) b.classList.toggle("active", b.dataset.tab === tab);
   for (const k of Object.keys(VIEWS)) $(VIEWS[k][0]).hidden = k !== tab;
+  document.body.classList.toggle("interface-view", tab === "interface");
+  if (tab !== "interface") {
+    chatStopStream();
+    chatStopHistoryPoll();
+    chatStopReview();
+    chatModeController = null;
+  }
+  if (tab !== "sprints") sprintStopPolling();
+  setDocumentTitle(tab);
   load(tab);
 }
 // Hash routing: the active tab lives in the URL (#roadmap), so a refresh stays
 // put (and re-fetches that tab) instead of snapping back to Shells. Tabs set the
 // hash; hashchange drives show — back/forward and deep links work too. The
 // roadmap tab carries its sub-view in the hash: #roadmap (board) | #roadmap-flow.
+// The analytics tab does the same: #analytics (token) | #analytics-quota.
+// Shells: #shells (Harness) | #shells-skills | #shells-skill-assignments |
+// #shells-default-models.
 function routeFromHash() {
   const raw = location.hash.slice(1);
+  if (raw === "interface" || raw.startsWith("interface/")) {
+    const [, shell = "", conversation = "", requestedMode = ""] = raw.split("/");
+    const nextMode = requestedMode === "diff" ? "diff" : "chat";
+    chatRouteShell = decodeURIComponent(shell);
+    chatRouteConversation = decodeURIComponent(conversation);
+    const sameOpenConversation = Boolean(
+      chatModeController
+      && chatModeController.shell === chatRouteShell
+      && chatModeController.conversationId === chatRouteConversation
+    );
+    chatRouteMode = nextMode;
+    if (sameOpenConversation) {
+      chatModeController.setMode(nextMode);
+      return;
+    }
+    show("interface");
+    return;
+  }
+  if (raw === "" || raw === "shells" || raw.startsWith("shells-")) {
+    shellTab = Object.entries(SHELL_TAB_HASH).find(([, hash]) => hash === raw)?.[0]
+      || "harness";
+    show("shells");
+    return;
+  }
+  if (raw === "sprints" || raw.startsWith("sprints/")) {
+    const parts = raw.split("/");
+    const requested = parts.length === 1 ? null : Number(parts[1]);
+    sprintRouteId = parts.length === 1
+      ? null
+      : (parts.length === 2 && Number.isInteger(requested) && requested > 0 ? requested : NaN);
+    show("sprints");
+    return;
+  }
   if (raw === "roadmap" || raw.startsWith("roadmap-")) {
+    const featureMatch = raw.match(/^roadmap-feature-(\d+)$/);
+    roadmapFeatureId = featureMatch ? Number(featureMatch[1]) : null;
     roadmapView = raw === "roadmap-flow" ? "flow" : "board";
     show("roadmap");
     return;
   }
+  if (raw === "analytics" || raw.startsWith("analytics-")) {
+    anView = raw === "analytics-quota" ? "quota" : "tokens";
+    show("analytics");
+    return;
+  }
+  if (!VIEWS[raw]) shellTab = "harness";
   show(VIEWS[raw] ? raw : "shells");
 }
 document.querySelectorAll("nav button").forEach((b) => (b.onclick = () => { location.hash = b.dataset.tab; }));
 window.addEventListener("hashchange", routeFromHash);
+window.addEventListener("popstate", routeFromHash);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) sprintStopPolling();
+  else if (activeTab === "sprints") load("sprints");
+});
 // Close any open popover menu on an outside click (one handler for all .gmenu).
 document.addEventListener("mousedown", (e) => {
   for (const m of document.querySelectorAll(".gmenu:not([hidden])"))
@@ -2141,28 +5631,25 @@ document.addEventListener("mousedown", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     const overlays = document.querySelectorAll(".modal-overlay");
-    overlays[overlays.length - 1]?.remove();
+    const overlay = overlays[overlays.length - 1];
+    if (overlay?.closeModal) overlay.closeModal();
   }
 });
 $("#snapshot").onclick = async () => {
-  setStatus("snapshotting…");
-  try { const r = await api("/snapshot", "POST"); toast(r.output || "done"); setStatus("snapshot done"); }
+  setStatus("saving locally…");
+  try {
+    const r = await api("/snapshot", "POST");
+    toast(r.output || "done");
+    setStatus("saved locally");
+  }
   catch (e) { toast("error: " + e.message); }
 };
-$("#publish").onclick = async (e) => {
-  const btn = e.currentTarget;
-  btn.disabled = true;
-  setStatus("publishing…");
-  try {
-    const r = await api("/publish", "POST");
-    toast(r.output || "published");
-    setStatus(r.pr_url ? "published → PR ready" : "published");
-    if (r.pr_url) window.open(r.pr_url, "_blank", "noopener");
-  } catch (e) { toast("publish error: " + e.message); setStatus("publish failed"); }
-  finally { btn.disabled = false; }
-};
 (async () => {
-  try { const h = await api("/health"); $("#repo").textContent = h.repo; setStatus("port " + h.port); }
+  try {
+    const h = await api("/health");
+    $("#repo").textContent = h.repo;
+    forkName = h.repo || "";
+  }
   catch { setStatus("offline"); }
   routeFromHash();   // honor #tab on load (refresh / deep link), else Shells
 })();

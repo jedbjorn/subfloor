@@ -1,0 +1,35 @@
+{
+  "spec_document_id": 68,
+  "gates": [
+    {
+      "gate": "An updated downstream-style fork repairs the callable floor while preserving a pre-existing linked worktree",
+      "file": "tests/test_update_materialize.py",
+      "test": "test_legacy_bridge_repairs_stale_dispatcher_and_rebaselines_manifest"
+    },
+    {
+      "gate": "The installed dispatcher is coherent with the pinned engine or materialized manifest",
+      "file": "tests/test_callable_floor.py",
+      "test": "test_exact_dispatcher_and_present_route_are_coherent"
+    },
+    {
+      "gate": "Question, answer, typed review handoffs, active and replacement chats, near-budget payload, and terminal pickup recovery form one durable chain",
+      "file": "tests/test_sprint_live_proof.py",
+      "test": "test_relay_review_and_terminal_pickup_recovery_form_one_durable_chain"
+    },
+    {
+      "gate": "Every role receives the exact general wake template",
+      "file": "tests/test_sprint_message_delivery.py",
+      "test": "test_every_participant_role_receives_the_exact_general_template"
+    },
+    {
+      "gate": "Delivered-unread recovery is idempotent across startup passes",
+      "file": "tests/test_sprint_recovery.py",
+      "test": "test_startup_reconciliation_repairs_once_across_repeated_passes"
+    },
+    {
+      "gate": "Role skills cover handoff contingencies using the shipped command surface",
+      "file": "tests/test_sprint_skills.py",
+      "test": "test_role_skills_cover_every_handoff_contingency_with_real_commands"
+    }
+  ]
+}

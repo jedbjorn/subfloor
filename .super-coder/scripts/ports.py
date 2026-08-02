@@ -61,20 +61,54 @@ def _resolve_offset(base: int, avoid: set[int]) -> int:
         port = PORT_BASE + (base + i) % SPAN
         if port not in avoid and _free(port):
             return port
-    return PORT_BASE + base  # pragma: no cover — all 100 offsets busy is implausible
+    raise RuntimeError(
+        f"no free super-coder port in {PORT_BASE}-{PORT_BASE + SPAN - 1}"
+    )
 
 
-def _dev_offset(port: int) -> int:
+def _dev_offset(port: int, avoid: set[int] | None = None) -> int:
     """Derive a dev port from a distinct seed, kept free and != the serve port."""
-    return _resolve_offset(_offset(str(REPO_ROOT) + ":dev"), avoid={port})
+    return _resolve_offset(
+        _offset(str(REPO_ROOT) + ":dev"),
+        avoid=set(avoid or ()) | {port},
+    )
 
 
-def _derive() -> dict:
+def _sibling_ports() -> set[int]:
+    """Read both assigned ports from every sibling fork we can discover.
+
+    Installed forks conventionally share one parent (for example ``~/Repos``).
+    Their gitignored instance configs are the durable host-local registry.  A
+    malformed or unrelated sibling is ignored; this fork's own config is
+    excluded.
+    """
+    occupied: set[int] = set()
+    try:
+        children = REPO_ROOT.parent.iterdir()
+    except OSError:
+        return occupied
+    for child in children:
+        candidate = child / ".super-coder" / "instance.json"
+        if candidate == CONFIG or not candidate.is_file():
+            continue
+        try:
+            sibling = json.loads(candidate.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        for key in ("port", "dev_port"):
+            value = sibling.get(key)
+            if isinstance(value, int):
+                occupied.add(value)
+    return occupied
+
+
+def _derive(avoid: set[int] | None = None) -> dict:
     """Derive serve + dev ports from the repo path. Each is bumped past any
     occupied port so it lands free, and dev_port is kept distinct from port."""
-    port = _resolve_offset(_offset(str(REPO_ROOT)), avoid=set())
+    occupied = set(avoid or ())
+    port = _resolve_offset(_offset(str(REPO_ROOT)), avoid=occupied)
     return {"repo": REPO_ROOT.name, "port": port,
-            "dev_port": _dev_offset(port), "harness": "claude"}
+            "dev_port": _dev_offset(port, occupied), "harness": "claude"}
 
 
 def resolve(persist: bool = False) -> dict:
@@ -83,6 +117,7 @@ def resolve(persist: bool = False) -> dict:
     path. `persist=True` writes it to instance.json so it stays stable. To force
     a re-derive (e.g. after a port clash), delete the file."""
     cfg = None
+    occupied = _sibling_ports()
     if CONFIG.exists():
         try:
             loaded = json.loads(CONFIG.read_text())
@@ -91,11 +126,26 @@ def resolve(persist: bool = False) -> dict:
         except json.JSONDecodeError:
             pass
     if cfg is None:
-        cfg = _derive()
-    elif "dev_port" not in cfg:
+        cfg = _derive(occupied)
+    else:
+        # Existing configs remain stable unless they collide with another
+        # fork's API *or* dev assignment. A bound copy of our own port is not a
+        # reason to move it: resolve() commonly runs while this fork is live.
+        port = cfg["port"]
+        dev_port = cfg.get("dev_port")
+        if port in occupied:
+            base = port - PORT_BASE if PORT_BASE <= port < PORT_BASE + SPAN \
+                else _offset(str(REPO_ROOT))
+            port = _resolve_offset(
+                base, occupied | ({dev_port} if isinstance(dev_port, int) else set())
+            )
+            cfg["port"] = port
+        if not isinstance(dev_port, int) or dev_port == port or dev_port in occupied:
+            cfg["dev_port"] = _dev_offset(port, occupied)
+    if "dev_port" not in cfg:
         # Instance predates dev_port — backfill without disturbing the serve port
         # (respects hand-edits to `port`); persisted below if requested.
-        cfg["dev_port"] = _dev_offset(cfg["port"])
+        cfg["dev_port"] = _dev_offset(cfg["port"], occupied)
     if persist:
         CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
     return cfg
@@ -125,4 +175,6 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main, sys.argv[1:]))

@@ -3,10 +3,10 @@
 
 Wraps `render/flat.py`. The boot launcher (`run.py`) calls the render functions
 directly for the chosen shell; this CLI is the standalone entry the sc dispatcher and
-the (later) commit→PR automation use.
+the dispatcher uses.
 
 Usage:
-    python3 .super-coder/scripts/render.py flat              # tracked _sc files
+    python3 .super-coder/scripts/render.py flat              # local ignored _sc files
     python3 .super-coder/scripts/render.py skills <shortname> # .claude/skills/ for a shell
     python3 .super-coder/scripts/render.py all <shortname>    # both
 """
@@ -20,8 +20,10 @@ DB_PATH = ENGINE / "shell_db.db"
 
 sys.path.insert(0, str(ENGINE / "render"))
 sys.path.insert(0, str(ENGINE / "scripts"))
+import artifact_policy  # noqa: E402
 import db_driver  # noqa: E402
 import flat  # noqa: E402
+import skill_projection  # noqa: E402
 from _serialize_guard import require_admin  # noqa: E402
 from seed_skills import sync_engine_skills  # noqa: E402
 
@@ -32,21 +34,22 @@ def _open():
     return db_driver.connect(DB_PATH)
 
 
-def _resolve_shell(con, shortname: str) -> int:
+def _resolve_shell(con, shortname: str):
     row = con.execute(
-        "SELECT shell_id FROM shells WHERE shortname=? AND COALESCE(is_deleted,0)=0",
+        "SELECT shell_id, shortname, flavor FROM shells "
+        "WHERE shortname=? AND COALESCE(is_deleted,0)=0",
         (shortname,),
     ).fetchone()
     if row is None:
         sys.exit(f"render: no shell '{shortname}'")
-    return row["shell_id"]
+    return row
 
 
 def _heal_fresh(con) -> None:
-    """Self-heal stale engine skills BEFORE rendering the tracked mirror.
+    """Self-heal stale engine skills BEFORE rendering the local mirror.
 
     Rendering from a DB whose engine skills lag assets/skills/ is exactly how a
-    shipped skill body silently gets DELETED from the committed `_sc` mirror.
+    shipped skill body silently gets deleted from the local `_sc` mirror.
     Rather than refuse, we repair the cache from assets first (the same heal the
     launcher runs at boot), so the mirror is always rendered from current engine
     skills. Project-local skills are untouched. A no-op on a fresh DB."""
@@ -58,9 +61,10 @@ def _heal_fresh(con) -> None:
 
 def _report(label: str, summary: dict) -> None:
     w, s = len(summary["written"]), len(summary["skipped"])
-    print(f"render {label}: {w} written, {s} unchanged")
+    print(f"render {label}: {w} changed, {s} unchanged")
     for p in summary["written"]:
-        print(f"  + {p.relative_to(flat.REPO_ROOT)}")
+        marker = "+" if p.exists() else "-"
+        print(f"  {marker} {p.relative_to(flat.REPO_ROOT)}")
 
 
 def main(argv: list[str]) -> int:
@@ -72,6 +76,7 @@ def main(argv: list[str]) -> int:
         if mode == "flat":
             require_admin("render flat")
             _heal_fresh(con)
+            artifact_policy.prepare_local_state()
             _report("flat", flat.render_visibility(con))
         elif mode in ("skills", "all"):
             if len(argv) < 2:
@@ -79,9 +84,24 @@ def main(argv: list[str]) -> int:
             if mode == "all":
                 require_admin("render flat")
                 _heal_fresh(con)
+                artifact_policy.prepare_local_state()
                 _report("flat", flat.render_visibility(con))
-            shell_id = _resolve_shell(con, argv[1])
-            _report(f"skills[{argv[1]}]", flat.render_skill_md(con, shell_id))
+            shell = _resolve_shell(con, argv[1])
+            checkout = skill_projection.shell_checkout(
+                shell["shortname"], shell["flavor"]
+            )
+            if not checkout.is_dir():
+                sys.exit(
+                    f"render: shell checkout {checkout} does not exist — launch "
+                    f"{shell['shortname']} once before rendering its skills"
+                )
+            summary = skill_projection.reconcile_shell(
+                con,
+                shell["shell_id"],
+                checkout,
+                ensure_dirs=skill_projection.managed_skill_dirs(),
+            )
+            _report(f"skills[{argv[1]}]", summary)
         else:
             sys.exit(f"render: unknown mode '{mode}' (flat | skills <shell> | all <shell>)")
     finally:
@@ -90,4 +110,6 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main, sys.argv[1:]))

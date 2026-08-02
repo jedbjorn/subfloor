@@ -22,8 +22,10 @@ Run:
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -53,6 +55,9 @@ def seed(con: sqlite3.Connection) -> dict:
         "INSERT INTO shells (display_name, system_prompt, flavor, shortname) "
         "VALUES ('Dev', 'x', 'dev', 'dev')")
     sid = cur.lastrowid
+    bespoke_sid = con.execute(
+        "INSERT INTO shells (display_name, system_prompt, flavor, shortname) "
+        "VALUES ('Custom', 'x', NULL, 'custom')").lastrowid
     fid = con.execute(
         "INSERT INTO roadmap (title, roadmap_status, sort_order, owning_shell, summary) "
         "VALUES ('Feature A', 'next', 1, ?, 'a summary')", (sid,)).lastrowid
@@ -72,10 +77,13 @@ def seed(con: sqlite3.Connection) -> dict:
     kid = con.execute(
         "INSERT INTO skills (name, description, category, common, is_deleted) "
         "VALUES ('local_only_skill', 'fixture repo skill', 'craft', 0, 0)").lastrowid
+    con.execute("INSERT INTO flavor_skills (flavor, skill_id) VALUES ('dev', ?)",
+                (kid,))
     con.execute("INSERT INTO shell_skills (shell_id, skill_id) VALUES (?, ?)",
-                (sid, kid))
+                (bespoke_sid, kid))
     con.commit()
-    return {"shell_id": sid, "feature_id": fid, "skill_id": kid}
+    return {"shell_id": sid, "bespoke_shell_id": bespoke_sid,
+            "feature_id": fid, "skill_id": kid}
 
 
 class AssemblerSmokeTest(unittest.TestCase):
@@ -90,6 +98,204 @@ class AssemblerSmokeTest(unittest.TestCase):
         out = server.get_shells(self.con)
         self.assertTrue(any(s["shell_id"] == self.ids["shell_id"] for s in out))
 
+    def test_get_shells_projects_recipient_scoped_unread_message_counts(self) -> None:
+        target = self.ids["shell_id"]
+        sender = self.ids["bespoke_shell_id"]
+        self.con.execute(
+            "INSERT INTO shell_messages "
+            "(from_shell_id,to_shell_id,kind,body) VALUES (?,?,'shell','first')",
+            (sender, target),
+        )
+        self.con.execute(
+            "INSERT INTO shell_messages "
+            "(from_shell_id,to_shell_id,kind,body) VALUES (?,?,'task','second')",
+            (sender, target),
+        )
+        self.con.execute(
+            "INSERT INTO shell_messages "
+            "(from_shell_id,to_shell_id,kind,body,read_at) "
+            "VALUES (?,?,'result','already read',datetime('now'))",
+            (sender, target),
+        )
+        self.con.commit()
+
+        by_id = {row["shell_id"]: row for row in server.get_shells(self.con)}
+        self.assertEqual(2, by_id[target]["unread_message_count"])
+        self.assertEqual(0, by_id[sender]["unread_message_count"])
+
+    def test_get_shells_projects_only_live_current_sprint_conversation(self) -> None:
+        shell_id = self.ids["shell_id"]
+        self.con.execute(
+            "INSERT INTO users (user_id,username) VALUES (1,'operator')"
+        )
+        self.con.execute(
+            "UPDATE shells SET user_id=1 WHERE shell_id=?", (shell_id,)
+        )
+        sprint_id = self.con.execute(
+            "INSERT INTO sprints "
+            "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+            "VALUES (?,?,1)",
+            (self.ids["feature_id"], shell_id),
+        ).lastrowid
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?", (sprint_id,)
+        )
+        participant_id = self.con.execute(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness,disposition) "
+            "VALUES (?,?,'developer','codex','active')",
+            (sprint_id, shell_id),
+        ).lastrowid
+        conversation_id = server.sprint_participant_chats.create_and_select(
+            self.con,
+            participant_id=int(participant_id),
+            owner_user_id=1,
+            purpose="work",
+            harness="codex",
+            provider="openai",
+            model=None,
+            effort="high",
+            worktree="/fixture/dev",
+            title="Sprint participant",
+            idempotency_key="fixture:sprint:participant:work",
+        )
+        self.con.commit()
+
+        by_id = {row["shell_id"]: row for row in server.get_shells(self.con)}
+        self.assertEqual(
+            {
+                "sprint_id": int(sprint_id),
+                "lifecycle": "armed",
+                "role": "developer",
+                "disposition": "active",
+                "current_conversation_id": conversation_id,
+            },
+            by_id[shell_id]["sprint"],
+        )
+
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='completed',terminal_outcome='shipped' "
+            "WHERE sprint_id=?",
+            (sprint_id,),
+        )
+        self.con.commit()
+        by_id = {row["shell_id"]: row for row in server.get_shells(self.con)}
+        self.assertIsNone(by_id[shell_id]["sprint"])
+
+    def test_get_shells_prioritizes_armed_then_latest_paused_sprint(self) -> None:
+        shell_id = self.ids["shell_id"]
+        self.con.execute(
+            "INSERT INTO users (user_id,username) VALUES (1,'operator')"
+        )
+        self.con.execute(
+            "UPDATE shells SET user_id=1 WHERE shell_id=?", (shell_id,)
+        )
+
+        paused_id = self.con.execute(
+            "INSERT INTO sprints "
+            "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+            "VALUES (?,?,1)",
+            (self.ids["feature_id"], shell_id),
+        ).lastrowid
+        paused_participant_id = self.con.execute(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness,disposition) "
+            "VALUES (?,?,'developer','codex','active')",
+            (paused_id, shell_id),
+        ).lastrowid
+        paused_conversation_id = server.sprint_participant_chats.create_and_select(
+            self.con,
+            participant_id=int(paused_participant_id),
+            owner_user_id=1,
+            purpose="work",
+            harness="codex",
+            provider="openai",
+            model=None,
+            effort="high",
+            worktree="/fixture/paused",
+            title="Paused Sprint participant",
+            idempotency_key="fixture:sprint:paused:participant:work",
+        )
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='armed',armed_at='2026-07-31 08:00:00' "
+            "WHERE sprint_id=?",
+            (paused_id,),
+        )
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='paused',paused_at='2026-07-31 10:00:00' "
+            "WHERE sprint_id=?",
+            (paused_id,),
+        )
+
+        armed_id = self.con.execute(
+            "INSERT INTO sprints "
+            "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+            "VALUES (?,?,1)",
+            (self.ids["feature_id"], shell_id),
+        ).lastrowid
+        armed_participant_id = self.con.execute(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness,disposition) "
+            "VALUES (?,?,'reviewer','kimi','idle')",
+            (armed_id, shell_id),
+        ).lastrowid
+        armed_conversation_id = server.sprint_participant_chats.create_and_select(
+            self.con,
+            participant_id=int(armed_participant_id),
+            owner_user_id=1,
+            purpose="work",
+            harness="kimi",
+            provider="kimi",
+            model=None,
+            effort="high",
+            worktree="/fixture/armed",
+            title="Armed Sprint participant",
+            idempotency_key="fixture:sprint:armed:participant:work",
+        )
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='armed',armed_at='2026-07-31 11:00:00' "
+            "WHERE sprint_id=?",
+            (armed_id,),
+        )
+        self.con.commit()
+
+        by_id = {row["shell_id"]: row for row in server.get_shells(self.con)}
+        self.assertEqual(
+            {
+                "sprint_id": int(armed_id),
+                "lifecycle": "armed",
+                "role": "reviewer",
+                "disposition": "idle",
+                "current_conversation_id": armed_conversation_id,
+            },
+            by_id[shell_id]["sprint"],
+        )
+
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='paused',paused_at='2026-07-31 09:00:00' "
+            "WHERE sprint_id=?",
+            (armed_id,),
+        )
+        self.con.commit()
+        by_id = {row["shell_id"]: row for row in server.get_shells(self.con)}
+        self.assertEqual(
+            {
+                "sprint_id": int(paused_id),
+                "lifecycle": "paused",
+                "role": "developer",
+                "disposition": "active",
+                "current_conversation_id": paused_conversation_id,
+            },
+            by_id[shell_id]["sprint"],
+        )
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participants WHERE shell_id=?",
+                (shell_id,),
+            ).fetchone()[0],
+        )
+
     def test_get_shell(self) -> None:
         out = server.get_shell(self.con, self.ids["shell_id"])
         self.assertIsNotNone(out)
@@ -98,6 +304,23 @@ class AssemblerSmokeTest(unittest.TestCase):
 
     def test_get_shell_missing_returns_none(self) -> None:
         self.assertIsNone(server.get_shell(self.con, 999999))
+
+    def test_health_exposes_local_artifact_capabilities(self) -> None:
+        with mock.patch.object(server.ports_mod, "resolve",
+                               return_value={"repo": "source", "port": 17171}), \
+             mock.patch.object(server.artifact_policy, "mode", return_value="local"):
+            out = server.health_payload()
+        self.assertEqual(out["artifact_mode"], "local")
+        self.assertFalse(out["git_publication"])
+        self.assertEqual(out["repo"], "source")
+
+    def test_health_never_offers_git_publication(self) -> None:
+        with mock.patch.object(server.ports_mod, "resolve",
+                               return_value={"repo": "fork", "port": 17172}), \
+             mock.patch.object(server.artifact_policy, "mode", return_value="local"):
+            out = server.health_payload()
+        self.assertEqual(out["artifact_mode"], "local")
+        self.assertFalse(out["git_publication"])
 
     def test_get_roadmap_with_linked_flag_and_doc(self) -> None:
         # The regression: this path raised KeyError('feature_id') when a flag
@@ -126,7 +349,9 @@ class AssemblerSmokeTest(unittest.TestCase):
         # the fixture skill has no assets/skills/ dir → repo origin, granted once
         fixture = by_name["local_only_skill"]
         self.assertEqual(fixture["origin"], "repo")
-        self.assertEqual(fixture["granted_shells"], [self.ids["shell_id"]])
+        self.assertEqual(fixture["granted_flavors"], ["dev"])
+        self.assertEqual(
+            fixture["granted_shells"], [self.ids["bespoke_shell_id"]])
         # an engine-seeded skill derives as engine
         self.assertEqual(by_name["db_map"]["origin"], "engine")
 
@@ -245,6 +470,14 @@ class FlavorDefaultsTest(unittest.TestCase):
             "SELECT model, is_default FROM flavor_defaults "
             "WHERE flavor=? AND harness=?", (flavor, harness)).fetchone()
 
+    def _route(self, harness, selector, *, availability="available", stale=0):
+        self.con.execute(
+            "INSERT INTO model_routes "
+            "(harness, selector, source, availability, last_seen_at, stale) "
+            "VALUES (?, ?, 'test', ?, datetime('now'), ?)",
+            (harness, selector, availability, stale))
+        self.con.commit()
+
     def test_matrix_includes_template_flavors_and_harnesses(self) -> None:
         got = server.get_flavor_defaults(self.con)
         self.assertIn("planner", got["flavors"])
@@ -253,6 +486,7 @@ class FlavorDefaultsTest(unittest.TestCase):
             self.assertIn(h, got["harnesses"])
 
     def test_set_model(self) -> None:
+        self._route("claude", "opus")
         ok, err = server.set_flavor_default(
             self.con, {"flavor": "planner", "harness": "claude", "model": "opus"})
         self.assertTrue(ok, err)
@@ -272,6 +506,7 @@ class FlavorDefaultsTest(unittest.TestCase):
     def test_upsert_missing_cell(self) -> None:
         # 'vibe' has no seeded row for planner — a write must create it
         self.assertIsNone(self._row("planner", "vibe"))
+        self._route("vibe", "devstral-latest")
         ok, err = server.set_flavor_default(
             self.con, {"flavor": "planner", "harness": "vibe",
                        "model": "devstral-latest", "is_default": True})
@@ -281,11 +516,45 @@ class FlavorDefaultsTest(unittest.TestCase):
         self.assertEqual(row["is_default"], 1)
 
     def test_empty_model_clears_to_null(self) -> None:
+        self._route("claude", "opus")
         server.set_flavor_default(
             self.con, {"flavor": "planner", "harness": "claude", "model": "opus"})
         server.set_flavor_default(
-            self.con, {"flavor": "planner", "harness": "claude", "model": ""})
+            self.con, {"flavor": "planner", "harness": "claude", "model": None})
         self.assertIsNone(self._row("planner", "claude")["model"])
+
+    def test_empty_string_is_not_harness_default(self) -> None:
+        ok, err = server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "claude", "model": ""})
+        self.assertFalse(ok)
+        self.assertIn("invalid_model_route", err)
+
+    def test_invalid_model_does_not_create_missing_cell(self) -> None:
+        self.assertIsNone(self._row("planner", "vibe"))
+        ok, err = server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "vibe",
+                       "model": "not-local"})
+        self.assertFalse(ok)
+        self.assertIn("invalid_model_route", err)
+        self.assertIsNone(self._row("planner", "vibe"))
+
+    def test_model_requires_exact_available_route_for_harness(self) -> None:
+        self._route("codex", "gpt-5.6-sol")
+        ok, err = server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "claude",
+                       "model": "gpt-5.6-sol"})
+        self.assertFalse(ok)
+        self.assertIn("invalid_model_route", err)
+        self.assertNotEqual(self._row("planner", "claude")["model"],
+                            "gpt-5.6-sol")
+
+    def test_stale_route_is_not_settable(self) -> None:
+        self._route("claude", "opus-next", stale=1)
+        ok, err = server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "claude",
+                       "model": "opus-next"})
+        self.assertFalse(ok)
+        self.assertIn("invalid_model_route", err)
 
     def test_unknown_names_and_empty_writes_are_loud(self) -> None:
         self.assertFalse(server.set_flavor_default(
@@ -366,6 +635,89 @@ class PatchShellTest(unittest.TestCase):
         ok, err = server.patch_shell(self.con, sid, {"system_prompt": "hijack"})
         self.assertFalse(ok)
         self.assertEqual(self._shell(sid)["system_prompt"], "x")
+
+
+class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "engine.db"
+        source = build_db()
+        ids = seed(source)
+        source.execute(
+            "UPDATE shells SET api_key='shell-token' WHERE shell_id=?",
+            (ids["shell_id"],),
+        )
+        source.execute(
+            "INSERT INTO model_routes (harness,selector,source,availability,"
+            "headless_supported,high_effort_supported,supported_efforts,"
+            "last_seen_at) VALUES "
+            "('codex','api-model','api-source-v1','available',1,1,'[\"high\"]',"
+            "datetime('now'))"
+        )
+        source.commit()
+        target = sqlite3.connect(self.path)
+        source.backup(target)
+        target.close()
+        source.close()
+
+    def connect(self) -> sqlite3.Connection:
+        con = sqlite3.connect(self.path)
+        con.row_factory = sqlite3.Row
+        return con
+
+    def request(self, path: str, token: str | None = "shell-token"):
+        headers = "Host: 127.0.0.1"
+        if token is not None:
+            headers += f"\r\nAuthorization: Bearer {token}"
+        with mock.patch.object(server, "db", side_effect=self.connect):
+            status, _headers, body = server.dispatch_http("GET", path, headers, b"")
+        return status, json.loads(body)
+
+    def test_model_routes_require_shell_auth_and_apply_exact_filters(self) -> None:
+        self.assertEqual(self.request("/_sc/model-routes", None)[0], 401)
+        self.assertEqual(self.request("/_sc/model-routes", "wrong")[0], 401)
+
+        status, body = self.request(
+            "/_sc/model-routes?harness=codex&selector=api-model"
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(len(body["routes"]), 1)
+        self.assertEqual(body["routes"][0]["source"], "api-source-v1")
+
+        con = self.connect()
+        con.execute(
+            "UPDATE model_routes SET source='api-source-v2' "
+            "WHERE harness='codex' AND selector='api-model'"
+        )
+        con.commit()
+        con.close()
+        status, current = self.request(
+            "/_sc/model-routes?harness=codex&selector=api-model"
+        )
+        self.assertEqual(status, 200, current)
+        self.assertEqual(current["routes"][0]["source"], "api-source-v2")
+
+    def test_skill_catalogue_requires_auth_and_includes_grant_scopes(self) -> None:
+        self.assertEqual(self.request("/_sc/skills", None)[0], 401)
+        status, body = self.request("/_sc/skills")
+        self.assertEqual(status, 200, body)
+        skill = next(
+            row for row in body["skills"] if row["name"] == "local_only_skill"
+        )
+        self.assertEqual(
+            skill["grant_scopes"], ["flavor:dev", "shell:custom"]
+        )
+
+    def test_catalogue_filters_reject_unknown_or_repeated_input(self) -> None:
+        self.assertEqual(
+            self.request("/_sc/model-routes?sort=source")[0], 400
+        )
+        self.assertEqual(
+            self.request("/_sc/model-routes?harness=codex&harness=kimi")[0],
+            400,
+        )
+        self.assertEqual(self.request("/_sc/skills?harness=codex")[0], 400)
 
 
 if __name__ == "__main__":

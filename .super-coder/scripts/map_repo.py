@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Map the host repo into the dr_* catalogue — how the shell reads its repo.
+"""Map the shell work surface into the dr_* catalogue.
 
-super-coder lives INSIDE a host repo. This walks that repo and records what's
-there — files (with language + role), dependencies (from the common manifests),
-and env-var names — into the dr_* tables, so the shell queries the catalogue
-instead of grepping blind (see the `surface_catalogue` skill).
+Normally super-coder lives inside the project it maps. An external-work install
+instead declares ``work_repo`` in ``instance.json``: this maps that project
+while retaining the map database and generated state in the home repo.
 
 The catalogue is a DERIVED CACHE of the repo, not authored content: it is NOT
 snapshotted. Re-run any time the repo changes:
@@ -25,10 +24,10 @@ import json
 import re
 import sqlite3
 import subprocess
-import sys
 from datetime import datetime
 from pathlib import Path
 
+import artifact_policy  # noqa: E402
 import map_db  # noqa: E402 — sibling module in scripts/ (on sys.path for script + importers)
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -36,16 +35,12 @@ REPO_ROOT = ENGINE.parent
 
 
 def _resolve_map_root() -> Path:
-    """The tree the map SCANS. Normally the home repo; when instance.json
-    declares a work_repo (this install's shells maintain a different repo),
-    the map covers THAT tree — the shells' 'query the map before grepping'
-    doctrine must point where they actually work. The map DB, config, and
-    serialized sections stay in the HOME repo's .sc-state/ regardless: the
-    work repo is not ours to drop cache files into (it may carry its own
-    substrate with its own .sc-state)."""
+    """Return the project tree to scan, never the home-state location."""
     import install
-    wr = install.work_repo()
-    return Path(wr) if wr and Path(wr).is_dir() else REPO_ROOT
+
+    work_repo = install.work_repo()
+    candidate = Path(work_repo) if work_repo else None
+    return candidate if candidate and candidate.is_dir() else REPO_ROOT
 
 
 MAP_ROOT = _resolve_map_root()
@@ -53,12 +48,13 @@ MAP_ROOT = _resolve_map_root()
 # skill). Tracked fork-owned state, kept OUTSIDE the gitignored engine dir (B7)
 # so a wholesale engine refresh never touches it. Absent → built-in defaults
 # only. The legacy in-engine path is read as a one-release fallback.
-CONFIG_PATH = REPO_ROOT / ".sc-state" / "map.config.json"
+CONFIG_PATH = artifact_policy.map_config_path()
 CONFIG_PATH_LEGACY = ENGINE / "map.config.json"
 
 # Built-in defaults. A fork's map.config.json EXTENDS the skip sets and may add
 # role_overrides — it never shrinks these (so the engine dirs below stay hidden).
-SKIP_DIRS = {".git", "node_modules", ".super-coder", ".sc-state", ".venv", "venv",
+SKIP_DIRS = {".git", ".sc-worktrees", "node_modules", ".super-coder", ".sc-state",
+             ".venv", "venv",
              "__pycache__", ".svelte-kit", "dist", "build", ".next", "target",
              "vendor", ".claude", ".idea", ".vscode", "coverage", ".pytest_cache",
              # super-coder's own render output — mirrors the DB, not host source.
@@ -80,6 +76,17 @@ LANG = {
 CODE_LANGS = {"Python", "JavaScript", "TypeScript", "Svelte", "Vue", "Go", "Rust",
               "Ruby", "Java", "Kotlin", "C", "C++", "C#", "PHP", "Swift", "Shell", "SQL"}
 CONFIG_EXTS = {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf"}
+
+
+def path_is_skipped(
+    rel_parts: tuple[str, ...],
+    skip_dirs: set[str],
+    skip_files: set[str],
+) -> bool:
+    """One testable exclusion predicate for the derived repo catalogue."""
+    return any(part in skip_dirs for part in rel_parts) or (
+        bool(rel_parts) and rel_parts[-1] in skip_files
+    )
 
 
 def infer_role(path: str, ext: str, lang: str | None) -> str:
@@ -105,7 +112,11 @@ def load_config() -> dict:
                             {"glob": "*.proto", "role": "code"}]}
     Malformed config is a warning, not a failure — fall back to defaults so a
     bad edit never breaks the auto-remap hooks."""
-    path = CONFIG_PATH if CONFIG_PATH.exists() else CONFIG_PATH_LEGACY
+    artifact_policy.prepare_local_state()
+    tracked = REPO_ROOT / ".sc-state" / "map.config.json"
+    path = CONFIG_PATH if CONFIG_PATH.exists() else (
+        tracked if tracked.exists() else CONFIG_PATH_LEGACY
+    )
     if not path.exists():
         return {}
     try:
@@ -148,18 +159,13 @@ def git(*args: str) -> str | None:
 
 
 def is_source_repo() -> bool:
-    """Answers for the MAPPED repo: is its engine the project (map .super-coder
-    too) or infrastructure (skip it)? Home-mapped -> delegate to
-    install.is_source_repo() (one detection: origin basename OR tracked
-    engine). Work-repo-mapped -> decide by the same ground truth applied to
-    that tree: a tracked engine source file means the engine IS its project."""
-    import install
-    if MAP_ROOT == REPO_ROOT:
-        return install.is_source_repo()
-    r = subprocess.run(
-        ["git", "-C", str(MAP_ROOT), "ls-files", "--", ".super-coder/schema.sql"],
-        capture_output=True, text=True)
-    return r.returncode == 0 and bool(r.stdout.strip())
+    """In a fork, .super-coder is infrastructure (skip it). In the SOURCE repo
+    the engine IS the project, so map it too. Names canonical in
+    install.SOURCE_REPO_NAMES (super-coder → subfloor rename: both valid)."""
+    from install import SOURCE_REPO_NAMES
+    url = git("remote", "get-url", "origin")
+    return bool(url) and (url.rstrip("/").split("/")[-1].removesuffix(".git")
+                          in SOURCE_REPO_NAMES)
 
 
 # ── Dependency parsers (best-effort; each guarded) ───────────────────────────
@@ -321,9 +327,7 @@ def main() -> int:
         truncated = False
         for p in sorted(MAP_ROOT.rglob("*")):
             rel_parts = p.relative_to(MAP_ROOT).parts
-            if any(part in skip for part in rel_parts):
-                continue
-            if not p.is_file() or p.name in skip_files:
+            if path_is_skipped(rel_parts, skip, skip_files) or not p.is_file():
                 continue
             if files >= MAX_FILES:
                 truncated = True
@@ -390,4 +394,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main))

@@ -1,6 +1,7 @@
 {
   "harness": "kimi",
   "launch": ["kimi"],
+  "comm_aliases": ["kimi-code"],
   "boot_artifact": "AGENTS.md",
   "emit": [],
   "env": {},
@@ -11,5 +12,53 @@
     "effort": { "env": "KIMI_MODEL_THINKING_EFFORT" }
   },
   "sandbox": { "launch_flags": ["--yolo"] },
-  "trusted_host": { "launch_flags": ["--yolo"] }
+  "trusted_host": { "launch_flags": ["--yolo"] },
+  "conversation": {
+    "contract_version": 1,
+    "minimum_cli_version": "0.30.0",
+    "verified_cli_version": "0.30.0",
+    "driver": "kimi-print",
+    "session_ref": {
+      "source": "native-session-store",
+      "field": "session-directory-name"
+    },
+    "start": {
+      "stream_flags": ["--output-format", "stream-json"],
+      "identity_source": "new-main-wire-turn.prompt"
+    },
+    "resume": {
+      "session_flag": "-S",
+      "identity_source": "appended-main-wire-turn.prompt"
+    },
+    "stream": { "transport": "stdout-jsonl-with-raw-interleave" },
+    "interrupt": { "mechanism": "signal", "signal": "SIGINT" },
+    "inspect": { "mechanism": "native-session-store" },
+    "permission_policy": "kimi-prompt-auto-mode",
+    "execution_permissions": {
+      "requirement": "worktree-command-access",
+      "unrestricted_mechanism": "prompt-mode-auto",
+      "sandbox_flag_required": false
+    },
+    "normalized_events": [
+      "session.started",
+      "run.started",
+      "assistant.delta",
+      "tool.started",
+      "tool.completed",
+      "permission.requested",
+      "input.requested",
+      "usage",
+      "run.completed",
+      "run.failed",
+      "run.interrupted"
+    ],
+    "capabilities": {
+      "exact_session_resume": true,
+      "structured_streaming": true,
+      "interruption": true,
+      "interactive_permission_response": false,
+      "server_backed": false,
+      "session_inspection": true
+    }
+  }
 }

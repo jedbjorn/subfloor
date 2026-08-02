@@ -36,15 +36,137 @@ Usage:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+
+import artifact_policy
 
 ENGINE = Path(__file__).resolve().parents[1]
 SKILLS_DIR = ENGINE / "assets" / "skills"
 OUT = ENGINE / "migrations" / "0001_seed_skills.sql"
 DB_PATH = ENGINE / "shell_db.db"
-RETIRED_FILE = ENGINE.parent / ".sc-state" / "skills_retired.json"
+RETIRED_FILE = artifact_policy.retired_skills_path()
+TOMBSTONES_FILE = ENGINE / "assets" / "skill_tombstones.json"
+SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+@dataclass(frozen=True)
+class TombstoneReconciliation:
+    """The authority removed by one tombstone reconciliation pass."""
+
+    changed_names: tuple[str, ...]
+    grant_count: int
+
+
+def tombstoned_skill_names() -> list[str]:
+    """Load the permanent upstream skill-name reservations.
+
+    The registry is authored source, not best-effort configuration. Refuse a
+    malformed registry before any catalogue write can partially apply.
+    """
+    try:
+        names = json.loads(TOMBSTONES_FILE.read_text())
+    except FileNotFoundError as e:
+        raise ValueError(f"skill tombstone registry missing: {TOMBSTONES_FILE}") from e
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"skill tombstone registry {TOMBSTONES_FILE} is not valid JSON: {e}"
+        ) from e
+    if not isinstance(names, list):
+        raise TypeError(
+            f"skill tombstone registry {TOMBSTONES_FILE} must be a JSON array"
+        )
+    if not names:
+        raise ValueError(f"skill tombstone registry {TOMBSTONES_FILE} is empty")
+
+    seen: set[str] = set()
+    validated: list[str] = []
+    for index, name in enumerate(names):
+        if not isinstance(name, str):
+            raise TypeError(
+                f"skill tombstone registry entry {index} must be a string"
+            )
+        if not SKILL_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"skill tombstone registry entry {index} has malformed name {name!r}"
+            )
+        if name in seen:
+            raise ValueError(
+                f"skill tombstone registry contains duplicate name {name!r}"
+            )
+        seen.add(name)
+        validated.append(name)
+    return validated
+
+
+def validate_upstream_skill_namespace(active_names: list[str]) -> list[str]:
+    """Prove that active upstream names and permanent tombstones are disjoint."""
+    tombstones = tombstoned_skill_names()
+    tombstone_set = set(tombstones)
+    overlap = set(active_names) & tombstone_set
+    if overlap:
+        raise ValueError(
+            "active and tombstoned upstream skill names overlap: "
+            + ", ".join(sorted(overlap))
+        )
+    return tombstones
+
+
+def _validate_skill_specs_claimable(specs: list[dict]) -> None:
+    """Reject a fork-local asset that claims a reserved upstream name."""
+    tombstones = set(tombstoned_skill_names())
+    claimed = sorted(
+        spec["name"] for spec in specs
+        if spec["name"] in tombstones
+    )
+    if claimed:
+        raise ValueError(
+            "skill asset claims tombstoned upstream name(s): " + ", ".join(claimed)
+        )
+
+
+def reconcile_tombstoned_skills(con) -> TombstoneReconciliation:
+    """Hard-delete tombstoned skills and both kinds of child grant.
+
+    A savepoint makes the operation atomic both as a standalone lifecycle step
+    and inside a caller-owned transaction. Releasing an outermost savepoint
+    commits; nested callers keep ownership of their surrounding transaction.
+    """
+    tombstones = tombstoned_skill_names()
+    placeholders = ",".join("?" for _ in tombstones)
+    rows = con.execute(
+        f"SELECT skill_id, name FROM skills WHERE name IN ({placeholders}) "
+        "ORDER BY name",
+        tombstones,
+    ).fetchall()
+    if not rows:
+        return TombstoneReconciliation((), 0)
+
+    skill_ids = [row[0] for row in rows]
+    id_placeholders = ",".join("?" for _ in skill_ids)
+    con.execute("SAVEPOINT reconcile_skill_tombstones")
+    try:
+        grant_count = con.execute(
+            f"DELETE FROM shell_skills WHERE skill_id IN ({id_placeholders})",
+            skill_ids,
+        ).rowcount
+        grant_count += con.execute(
+            f"DELETE FROM flavor_skills WHERE skill_id IN ({id_placeholders})",
+            skill_ids,
+        ).rowcount
+        con.execute(
+            f"DELETE FROM skills WHERE skill_id IN ({id_placeholders})",
+            skill_ids,
+        )
+    except Exception:
+        con.execute("ROLLBACK TO reconcile_skill_tombstones")
+        con.execute("RELEASE reconcile_skill_tombstones")
+        raise
+    con.execute("RELEASE reconcile_skill_tombstones")
+    return TombstoneReconciliation(tuple(row[1] for row in rows), grant_count)
 
 
 def sql_str(v) -> str:
@@ -131,6 +253,7 @@ def retired_skill_names() -> list[str]:
     so retirement must live OUTSIDE the DB and be re-applied after each sync —
     same shape as the flavor overlays (#247). Loud on a malformed file: a
     silently-ignored list means superseded skills quietly come back."""
+    artifact_policy.prepare_local_state()
     if not RETIRED_FILE.exists():
         return []
     try:
@@ -164,6 +287,12 @@ def apply_retired(con) -> list[str]:
     flipped: list[str] = []
     for name in sorted(engine):
         want = 1 if name in retired else 0
+        row = con.execute(
+            "SELECT is_deleted FROM skills WHERE name=?",
+            (name,),
+        ).fetchone()
+        if row is None or row[0] == want:
+            continue
         cur = con.execute(
             "UPDATE skills SET is_deleted=? WHERE name=? AND is_deleted<>?",
             (want, name, want))
@@ -180,7 +309,12 @@ def _engine_specs() -> list[dict]:
     upstream to lag, and healing it "from assets" would clobber a DB row that
     is canonical once seeded."""
     seeded = set(seeded_skill_names())
-    return [s for s in engine_skill_specs() if s["name"] in seeded]
+    tombstones = set(tombstoned_skill_names())
+    return [
+        spec
+        for spec in engine_skill_specs()
+        if spec["name"] in seeded and spec["name"] not in tombstones
+    ]
 
 
 def stale_engine_skills(con, specs: list[dict] | None = None) -> list[str]:
@@ -227,6 +361,9 @@ def sync_engine_skills(con, specs: list[dict] | None = None) -> list[str]:
     transaction boundary intent; we commit our own writes."""
     if specs is None:
         specs = _engine_specs()
+    _validate_skill_specs_claimable(specs)
+    tombstones = set(tombstoned_skill_names())
+    specs = [spec for spec in specs if spec["name"] not in tombstones]
     stale = stale_engine_skills(con, specs)
     by_name = {s["name"]: s for s in specs}
     for name in stale:                       # stale ⊆ spec names, so always hits
@@ -243,6 +380,9 @@ def sync_engine_skills(con, specs: list[dict] | None = None) -> list[str]:
         )
     if stale:
         con.commit()
+    # Boot, render, and explicit seed all use this shared heal. Clean retired
+    # authority even when every active skill was already fresh.
+    reconcile_tombstoned_skills(con)
     # The heal above (and the full-seed sync on update) resurrects rows with
     # is_deleted=0 — re-assert the fork retire list so a retired skill stays
     # retired across heals, syncs, and rebuilds.
@@ -294,16 +434,21 @@ def main() -> int:
     if _fork_mode():
         print("seed_skills: fork — the engine seed (0001) is upstream-owned; "
               "skipping regen. Local skills persist via `./sc snapshot` "
-              "(.sc-state/content.sql), not the seed.")
+              "(.sc-state/local/content.sql), not the seed.")
         _upsert_live(skills)
         return 0
+
+    # Validate BEFORE replacing the generated seed. Otherwise a newly-authored
+    # asset could claim a permanently reserved name, write it into 0001, and
+    # only fail later while touching the live DB.
+    validate_upstream_skill_namespace([skill["name"] for skill in skills])
 
     lines = [
         "-- super-coder skills seed — GENERATED by scripts/seed_skills.py.",
         "-- System content: the engine catalogue propagates to every fork. Idempotent",
         "-- and ID-STABLE: UPSERTs each authored engine skill by name, but never",
         "-- retires names absent from assets/skills because those may be project-local",
-        "-- skills serialized by .sc-state/content.sql. Do not hand-edit; author",
+        "-- skills serialized by .sc-state/local/content.sql. Do not hand-edit; author",
         "-- assets/skills/<name>/SKILL.md then `./sc seed-skills`.",
         "",
         "BEGIN;",
@@ -331,4 +476,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main))

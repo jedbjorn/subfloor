@@ -1,7 +1,7 @@
--- 0070 — flavor default refit from sprint success telemetry
+-- 0070 — flavor default refit from observed delivery telemetry
 --
 -- Operator decision (2026-07-19): re-point the per-flavor defaults at what the
--- fleet's real sprint outcomes favor, not a-priori doctrine:
+-- fleet's real reviewed outcomes favor, not a-priori doctrine:
 --
 --   planner      claude  opus -> fable          (stays default harness)
 --   reviewer     claude  opus -> fable          (stays default harness)

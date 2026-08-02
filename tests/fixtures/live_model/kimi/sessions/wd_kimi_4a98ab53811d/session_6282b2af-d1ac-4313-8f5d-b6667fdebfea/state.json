@@ -1,0 +1,21 @@
+{
+  "createdAt": "2026-07-25T11:19:25.127Z",
+  "updatedAt": "2026-07-25T11:26:06.859Z",
+  "title": "Reply with exactly one word: ALPHA",
+  "isCustomTitle": false,
+  "agents": {
+    "main": {
+      "homedir": "/home/j3d1/.kimi-code/sessions/wd_kimi_4a98ab53811d/session_6282b2af-d1ac-4313-8f5d-b6667fdebfea/agents/main",
+      "type": "main",
+      "parentAgentId": null
+    },
+    "agent-0": {
+      "homedir": "/home/j3d1/.kimi-code/sessions/wd_kimi_4a98ab53811d/session_6282b2af-d1ac-4313-8f5d-b6667fdebfea/agents/agent-0",
+      "type": "sub",
+      "parentAgentId": "main"
+    }
+  },
+  "custom": {},
+  "workDir": "/tmp/lm-capture/kimi",
+  "lastPrompt": "Use your subagent/task tool to delegate one trivial job to a sub-agent: have it reply with the word DELTA. Then reply DONE."
+}

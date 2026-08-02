@@ -6,9 +6,9 @@ catalogue, the render chain) but **no per-instance content** — a fork inherits
 the system, never super-coder's memory or roadmap. So a just-installed fork has
 no users and no shells, and `./sc launch` has nothing to authenticate or boot.
 This provisions the local user, then seeds the starting team via the shared
-shell factory: your primary shell (default `planner`) plus an `admin`, two
-`dev`, a `reviewer`, and the singleton `cartographer` — the full roster out of
-the box.
+shell factory: two `planner`, four `dev`, two `reviewer` shells, an `admin`, the
+singleton `cartographer` — a ten-shell roster out of the box. One planner is
+your primary by default.
 
 Run ONCE, right after `./sc rebuild`, on a fresh fork. Refuses if a shell already
 exists. After it runs: `SC_ADMIN=1 ./sc snapshot`, then `./sc launch`. More shells (or
@@ -39,8 +39,18 @@ import install as install_mod  # noqa: E402
 
 # The starting team seeded at install, besides the singleton cartographer (added
 # separately below). Your interviewed primary shell — default planner — fills one
-# of these slots; the rest are auto-named team members (ADM1, DEV1, DEV2, REV1).
-TEAM_ROSTER = ["admin", "planner", "dev", "dev", "reviewer"]
+# of these slots; the rest use the canonical out-of-the-box identities.
+TEAM_ROSTER = [
+    ("admin", "Admin", "ADM1"),
+    ("planner", "Planner-01", "PLN1"),
+    ("planner", "Planner-02", "PLN2"),
+    ("dev", "Dev-01", "DEV1"),
+    ("dev", "Dev-02", "DEV2"),
+    ("dev", "Dev-03", "DEV3"),
+    ("dev", "Dev-04", "DEV4"),
+    ("reviewer", "Rev-01", "REV1"),
+    ("reviewer", "Rev-02", "REV2"),
+]
 
 from shell_factory import create_shell, flavors  # noqa: E402
 
@@ -102,17 +112,25 @@ def main(argv: list[str]) -> int:
 
         username = need(a.username, "Your username")
         # Your primary shell — default planner (every fork needs a planner to
-        # scope the work + carry the lineage seed). --flavor picks which roster
-        # slot is *yours*; the rest of the team seeds alongside it.
+        # scope the work). This is the one personal shell that carries lineage
+        # + genesis identity; every roster/operational shell is role-only.
+        # --flavor picks which roster slot is *yours*; the rest of the team
+        # seeds alongside it.
         flavor = a.flavor or "planner"
         if flavor not in flavor_names:
             sys.exit(f"init_fork: unknown flavor '{flavor}' (have: {', '.join(flavor_names)})")
         # Pre-named out of the box — no naming interview. The primary takes the
-        # flavor's default display name (e.g. "Planner"), exactly like the rest of
-        # the roster; create_shell auto-names the shortname <ABBR><n> (e.g. PLN1).
-        # --name/--shortname remain optional scripted overrides, never prompted.
-        name = a.name or flavor.capitalize()
-        shortname = a.shortname or None
+        # first canonical slot for its flavor. --name/--shortname remain optional
+        # scripted overrides, never prompted.
+        primary_slot = next(
+            (slot for slot in TEAM_ROSTER if slot[0] == flavor), None
+        )
+        name = a.name or (
+            primary_slot[1] if primary_slot else flavor.capitalize()
+        )
+        shortname = a.shortname or (
+            primary_slot[2] if primary_slot else None
+        )
 
         con.execute(
             "INSERT INTO users (user_id, username, is_active) VALUES (1, ?, 1)",
@@ -121,16 +139,22 @@ def main(argv: list[str]) -> int:
         shell_id = create_shell(
             con, flavor=flavor, name=name, shortname=shortname,
             partner=a.partner or username, repo=repo,
-            role=a.role, mandate=a.mandate)
+            role=a.role, mandate=a.mandate, seed_identity=True)
         # The rest of the starting team — the full roster minus the slot your
-        # primary already fills — auto-named by the factory (ADM1/DEV1/DEV2/REV1).
+        # primary already fills — auto-named by the factory.
         rest = list(TEAM_ROSTER)
-        if flavor in rest:
-            rest.remove(flavor)
+        if primary_slot:
+            rest.remove(primary_slot)
         team = []
-        for fl in rest:
-            sid = create_shell(con, flavor=fl, name=fl.capitalize(),
-                               partner=a.partner or username, repo=repo)
+        for fl, default_name, default_shortname in rest:
+            sid = create_shell(
+                con,
+                flavor=fl,
+                name=default_name,
+                shortname=default_shortname if a.shortname is None else None,
+                partner=a.partner or username,
+                repo=repo,
+            )
             team.append((fl, sid))
         # The singleton Cartographer owns the repo map so no working shell ever
         # maps; configured + wired by `./sc map-setup` (install runs it). Skip if
@@ -139,6 +163,7 @@ def main(argv: list[str]) -> int:
         if flavor != "cartographer":
             cart_id = create_shell(
                 con, flavor="cartographer", name="Cartographer",
+                shortname="CART1" if a.shortname is None else None,
                 partner=a.partner or username, repo=repo)
         con.commit()
 
@@ -147,7 +172,8 @@ def main(argv: list[str]) -> int:
                 "SELECT shortname FROM shells WHERE shell_id=?", (sid,)).fetchone()[0]
 
         n = con.execute(
-            "SELECT COUNT(*) FROM shell_skills WHERE shell_id=?", (shell_id,)).fetchone()[0]
+            "SELECT COUNT(*) FROM resolved_shell_skills WHERE shell_id=?",
+            (shell_id,)).fetchone()[0]
         print(f"init_fork: created '{_sn(shell_id)}' ({flavor}, shell_id={shell_id}) "
               f"for user '{username}' — your primary, {n} skills, lineage + genesis seed.")
         for fl, sid in team:
@@ -164,4 +190,6 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main, sys.argv[1:]))

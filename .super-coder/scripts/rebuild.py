@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Rebuild the super-coder DB from git-tracked text.
+"""Rebuild the super-coder DB from public system text + instance state.
 
   1. apply schema.sql            (the v1 baseline)
   2. apply migrations/*.sql      (ordered deltas, ledger-tracked)
-  3. load .sc-state/content.sql  (per-instance content + memory)
+  3. load the active snapshot   (per-instance content + memory)
 
-The .db file is gitignored and disposable. Text serializations are the source
-of truth; the DB is a cache.
+The .db file is gitignored and disposable. Public migrations plus the active
+tracked/local instance serialization are the reconstruction source.
 
 Usage:
     python3 .super-coder/scripts/rebuild.py [--no-backup]
 """
 from __future__ import annotations
 
-import os
 import sqlite3
 import sys
 from datetime import datetime
@@ -23,33 +22,64 @@ ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
 SCHEMA_SQLITE = ENGINE / "schema.sql"
-SNAPSHOT       = REPO_ROOT / ".sc-state" / "content.sql"
 SNAPSHOT_LEGACY = ENGINE / "snapshot" / "content.sql"
-# PER-FORK backup dir, keyed by the host repo's dir name. This was a fixed
-# "super-coder" for every fork, which pooled all forks' pre-update dumps in one
-# dir — and rollback restores the MOST RECENT dump, so a multi-fork update
-# sweep could roll one fork back onto ANOTHER FORK'S DB. In the source repo the
-# name IS super-coder, so its path is unchanged. Old pooled dumps stay where
-# they are: they cannot be attributed to a fork after the fact.
-BACKUP_DIR = Path(os.environ.get(
-    "SC_BACKUP_DIR", str(Path.home() / "db_backups" / REPO_ROOT.name)))
-
 sys.path.insert(0, str(ENGINE / "scripts"))
-import db_driver    # noqa: E402
-import migrate as migrate_mod  # noqa: E402
-import map_repo     # noqa: E402
+import artifact_policy  # noqa: E402
 import backfill_shell_api_keys  # noqa: E402  (re-provision api_keys post-rebuild)
+import db_backup as db_backup_mod  # noqa: E402
+import db_driver  # noqa: E402
+import map_repo  # noqa: E402
+import migrate as migrate_mod  # noqa: E402
 import seed_skills  # noqa: E402  (re-assert the fork retire list post-seed)
+
+# Compatibility/readability constant: the historical preferred location.
+# Writes resolve dynamically through backup_dir() so a restricted host seat can
+# fall through to SC_DB_BACKUP_DIR or the repo-local gitignored destination.
+BACKUP_DIR = db_backup_mod.preferred_home_dir(REPO_ROOT)
+SNAPSHOT = artifact_policy.content_path()
+
+
+def _promote_legacy_update_restore_point(target: Path) -> None:
+    """Bridge one update launched by the pre-prefix engine.
+
+    The update process imports its old ``rebuild`` module before materializing
+    this release, so that first adoption still writes a ``prerebuild`` backup.
+    Before a later verify can create a newer backup with the same legacy class,
+    preserve the existing latest row as the engine-paired ``preupdate`` point.
+    """
+    engine_ref_prev = REPO_ROOT / ".sc-state" / "engine.ref.prev"
+    if not engine_ref_prev.exists():
+        return
+    if db_backup_mod.latest_backup(REPO_ROOT, "shell_db.preupdate.*.db"):
+        return
+    legacy = db_backup_mod.latest_backup(REPO_ROOT, "shell_db.prerebuild.*.db")
+    if legacy is None:
+        return
+    promoted_name = legacy.name.replace(
+        "shell_db.prerebuild.", "shell_db.preupdate.", 1
+    )
+    promoted = target / promoted_name
+    if not promoted.exists():
+        backup_db(promoted, src=legacy)
+        print(
+            "rebuild: preserved legacy update restore point -> "
+            f"{promoted}"
+        )
+    prune_backups("shell_db.preupdate", target)
 
 
 def snapshot_path() -> Path:
-    return SNAPSHOT if SNAPSHOT.exists() else SNAPSHOT_LEGACY
+    artifact_policy.prepare_local_state()
+    if SNAPSHOT.exists():
+        return SNAPSHOT
+    tracked = REPO_ROOT / ".sc-state" / "content.sql"
+    return tracked if tracked.exists() else SNAPSHOT_LEGACY
 
 
-def read_existing_keys() -> dict:
+def read_existing_keys(db_path: Path | None = None) -> dict:
     """shell_id -> (api_key, api_key_rotated_at) from the outgoing DB.
 
-    content.sql never serializes api_key (secret in a git-tracked file), so
+    content.sql never serializes api_key (runtime credential), so
     without a carry-over every rebuild re-minted all keys — orphaning the
     SC_API_TOKEN run.py injected into each live session at boot and 401-ing
     every mem call engine-wide until the sessions re-entered (#265). Read the
@@ -63,12 +93,13 @@ def read_existing_keys() -> dict:
     a CLI transaction racing `sc verify`) used to be swallowed into {}, which
     silently rotated every key and 401'd all live sessions (#279). A rebuild
     that cannot read the keys it is about to destroy must not proceed."""
-    if not DB_PATH.exists():
+    path = db_path or DB_PATH
+    if not path.exists():
         print("rebuild: no outgoing DB — every shell will be minted a fresh key.")
         return {}
     con = None
     try:
-        con = db_driver.connect(DB_PATH)
+        con = db_driver.connect(path)
         rows = con.execute(
             "SELECT shell_id, api_key, api_key_rotated_at FROM shells "
             "WHERE api_key IS NOT NULL"
@@ -94,14 +125,14 @@ def read_existing_keys() -> dict:
     return keys
 
 
-def restore_keys(keys: dict) -> int:
+def restore_keys(keys: dict, db_path: Path | None = None) -> int:
     """Re-attach carried keys to the rebuilt shells. Guarded on api_key IS
     NULL so a loaded value (should content.sql ever carry one) is never
     clobbered; a shell_id absent from the new content matches nothing and its
     key is dropped with it."""
     if not keys:
         return 0
-    con = db_driver.connect(DB_PATH)
+    con = db_driver.connect(db_path or DB_PATH)
     try:
         restored = 0
         for sid, (key, rotated) in keys.items():
@@ -120,18 +151,23 @@ def restore_keys(keys: dict) -> int:
 KEEP_BACKUPS = 5
 
 
-def prune_backups(prefix: str) -> None:
-    backups = sorted(BACKUP_DIR.glob(f"{prefix}.*.db"))
+def backup_dir() -> Path:
+    return db_backup_mod.select_backup_dir(REPO_ROOT)
+
+
+def prune_backups(prefix: str, directory: Path | None = None) -> None:
+    target = directory or backup_dir()
+    backups = sorted(target.glob(f"{prefix}.*.db"))
     for old in backups[:-KEEP_BACKUPS]:
         old.unlink(missing_ok=True)
 
 
-def backup_db(dst: Path, src: Path = DB_PATH) -> None:
+def backup_db(dst: Path, src: Path | None = None) -> None:
     """WAL-safe snapshot via sqlite3's online-backup API. A plain file copy of
     a live WAL database misses every un-checkpointed page (they live in the
     -wal sidecar), so a copy2 restore point could silently drop the most
     recent writes — the exact rows it exists to protect."""
-    src_con = sqlite3.connect(src)
+    src_con = sqlite3.connect(src or DB_PATH)
     dst_con = sqlite3.connect(dst)
     try:
         with dst_con:
@@ -141,74 +177,161 @@ def backup_db(dst: Path, src: Path = DB_PATH) -> None:
         src_con.close()
 
 
-def backup_existing() -> None:
+def backup_existing(prefix: str = "prerebuild") -> None:
+    """Back up the live DB under the lifecycle-specific restore-point class.
+
+    Direct rebuild/verify backups are diagnostics and must not outrank the
+    pre-update DB that pairs with ``engine.ref.prev`` during rollback.
+    """
     if not DB_PATH.exists():
         return
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    if prefix not in {"prerebuild", "preupdate"}:
+        raise ValueError(f"unsupported DB backup prefix: {prefix}")
+    target = backup_dir()
+    if prefix == "prerebuild":
+        _promote_legacy_update_restore_point(target)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dst = BACKUP_DIR / f"shell_db.prerebuild.{ts}.db"
+    dst = target / f"shell_db.{prefix}.{ts}.db"
     backup_db(dst)
-    prune_backups("shell_db.prerebuild")
+    prune_backups(f"shell_db.{prefix}", target)
     print(f"rebuild: backed up existing DB -> {dst}")
 
 
+def _remove_database(path: Path) -> None:
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(path) + suffix).unlink(missing_ok=True)
+
+
+def validate_foreign_keys(path: Path) -> None:
+    """Refuse a candidate with the exact first orphan named."""
+    con = db_driver.connect(path)
+    try:
+        violations = con.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            table, rowid, parent, fk_id = violations[0]
+            raise SystemExit(
+                "rebuild: foreign-key check failed: "
+                f"table {table} row {rowid} references {parent} (fk {fk_id}) "
+                "— outgoing DB and backup preserved")
+        # Make the candidate main file self-contained before its atomic rename.
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+    finally:
+        con.close()
+
+
+USAGE = "usage: ./sc rebuild [--no-backup]"
+
+HELP = f"""{USAGE}
+
+Rebuild the engine DB from schema.sql + migrations/ + the active snapshot.
+The outgoing DB is backed up first, then atomically replaced by a validated
+candidate.
+
+  --no-backup  skip the pre-rebuild backup of the outgoing DB
+  -h, --help   print this help and exit without reading or writing any state"""
+
+
+def parse_args(argv: list[str]) -> bool:
+    """Return no_backup, print help, or reject — touching NO state.
+
+    Spec #67: rebuild used to interpret arguments only after it had read the
+    schema, carried the outgoing keys and taken a
+    backup, so `./sc rebuild --help` and every typo ran a real rebuild. The
+    whole argument contract lives here, ahead of all of it, and this function
+    opens no database and touches no path.
+
+    Help wins over any action flag and over an unknown token (req 7): it
+    asserts nothing about the instance, so there is no state in which it can
+    fail — and nothing it prints can degrade into a rebuild.
+    """
+    if "-h" in argv or "--help" in argv:
+        print(HELP)
+        raise SystemExit(0)
+    unknown = [arg for arg in argv if arg != "--no-backup"]
+    if unknown:
+        print(f"rebuild: unknown argument '{unknown[0]}' ({USAGE})",
+              file=sys.stderr)
+        raise SystemExit(2)
+    return "--no-backup" in argv
+
+
 def main(argv: list[str]) -> int:
+    no_backup = parse_args(argv)
+
     schema = SCHEMA_SQLITE
     if not schema.exists():
         sys.exit(f"rebuild: missing {schema}")
 
-    if "--no-backup" not in argv:
-        backup_existing()
     keys = read_existing_keys()
-    for suffix in ("", "-wal", "-shm"):
-        p = Path(str(DB_PATH) + suffix)
-        if p.exists():
-            p.unlink()
+    if not no_backup:
+        backup_existing()
 
-    con = db_driver.connect(DB_PATH)
+    candidate = Path(str(DB_PATH) + ".rebuild")
+    _remove_database(candidate)
     try:
-        con.executescript(schema.read_text())
-        con.commit()
-        print("rebuild: schema.sql applied")
-    finally:
-        con.close()
-
-    migrate_mod.migrate(str(DB_PATH))
-
-    snap = snapshot_path()
-    if snap.exists():
-        con = db_driver.connect(DB_PATH)
+        con = db_driver.connect(candidate)
         try:
-            con.executescript(snap.read_text())
+            con.executescript(schema.read_text())
             con.commit()
-            print(f"rebuild: loaded {snap.relative_to(REPO_ROOT)}")
+            print("rebuild: schema.sql applied")
         finally:
             con.close()
-    else:
-        print("rebuild: no .sc-state/content.sql — built empty (no per-instance content).")
 
-    # The migrations above seeded every engine skill live (is_deleted=0) —
-    # re-assert the fork retire list so a rebuilt DB doesn't resurrect skills
-    # this fork has retired (a shell created before the next launch/update
-    # would otherwise be granted them).
-    con = db_driver.connect(DB_PATH)
-    try:
-        flipped = seed_skills.apply_retired(con)
-    finally:
-        con.close()
-    if flipped:
-        print(f"rebuild: fork retire list applied ({', '.join(flipped)})")
+        migrate_mod.migrate(str(candidate))
 
-    # Re-attach the keys carried over from the outgoing DB (content.sql never
-    # carries api_key — it is a secret and content.sql is git-tracked, see
-    # snapshot.py's no-serialize set), then mint only what is still missing:
-    # new shells from the content load, or everything on a fresh/pre-key build.
-    # Rotation is never a rebuild side effect — live sessions keep the
-    # SC_API_TOKEN they booted with (#265). Rotate deliberately, not here.
-    restored = restore_keys(keys)
-    if restored:
-        print(f"rebuild: preserved {restored} shell api_key(s)")
-    backfill_shell_api_keys.backfill(str(DB_PATH))
+        snap = snapshot_path()
+        if snap.exists():
+            con = db_driver.connect(candidate)
+            try:
+                con.executescript(snap.read_text())
+                con.commit()
+                print(f"rebuild: loaded {snap.relative_to(REPO_ROOT)}")
+            finally:
+                con.close()
+        else:
+            print(f"rebuild: no {SNAPSHOT.relative_to(REPO_ROOT)} — built empty "
+                  "(no per-instance content).")
+
+        # A downstream snapshot may predate the tombstone registry and reinsert
+        # retired rows after the cleanup migration was stamped. Validate the
+        # authored namespace, then reconcile the loaded candidate before any
+        # retire-list, key, FK, or publication step.
+        con = db_driver.connect(candidate)
+        try:
+            seed_skills.validate_upstream_skill_namespace(
+                seed_skills.seeded_skill_names())
+            reconciled = seed_skills.reconcile_tombstoned_skills(con)
+            flipped = seed_skills.apply_retired(con)
+        finally:
+            con.close()
+        if reconciled.changed_names:
+            print(
+                "rebuild: tombstoned skills removed "
+                f"({', '.join(reconciled.changed_names)}; "
+                f"{reconciled.grant_count} grant(s))"
+            )
+        if flipped:
+            print(f"rebuild: fork retire list applied ({', '.join(flipped)})")
+
+        # Re-attach carried keys and mint only what remains absent on the
+        # candidate. The outgoing DB stays untouched until every load and
+        # integrity check has succeeded.
+        restored = restore_keys(keys, candidate)
+        if restored:
+            print(f"rebuild: preserved {restored} shell api_key(s)")
+        backfill_shell_api_keys.backfill(str(candidate))
+        validate_foreign_keys(candidate)
+    except BaseException:
+        _remove_database(candidate)
+        raise
+
+    # The candidate is closed, checkpointed, and valid. Remove stale sidecars
+    # belonging to the outgoing inode, then atomically replace only now.
+    for suffix in ("-wal", "-shm"):
+        Path(str(DB_PATH) + suffix).unlink(missing_ok=True)
+    candidate.replace(DB_PATH)
+    for suffix in ("-wal", "-shm"):
+        Path(str(candidate) + suffix).unlink(missing_ok=True)
 
     try:
         map_repo.main()
@@ -223,4 +346,6 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main, sys.argv[1:]))

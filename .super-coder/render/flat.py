@@ -5,21 +5,19 @@ Two render targets live here, both pure (read DB, write files — never the
 reverse):
 
   • Flat `_sc` visibility files — `specs_sc/`, `docs_sc/`, `skills_sc/`,
-    `roadmap_sc.md` at the repo root. These are TRACKED (committed) and exist
-    for the outsider FnB browsing the repo without localhost. The `_sc` suffix
-    flags provenance and avoids colliding with a host repo's own `/docs`.
+    `roadmap_sc.md`. Tracked mode writes them at the repo root; local mode writes
+    the same logical tree beneath ignored `.sc-state/local/renders/`. The `_sc`
+    suffix flags provenance and avoids colliding with a host repo's own `/docs`.
     DB → flat is one-way; the files are never read back.
 
-  • Harness skills — `.claude/skills/<name>/SKILL.md` for the booting shell's
-    granted skills. A NON-load-bearing convenience cache for harnesses that
-    auto-discover this path natively (Claude Code / OpenCode / Crush). It is NOT
-    the source of truth and NOT the cross-harness load path: codex reads its own
-    `$CODEX_HOME/skills`, kimi its `.kimi-code/skills` / `.agents/skills`, and
-    vibe (Mistral) has no skill dir at all. The
-    canonical, harness-agnostic load path is the DB — the boot doc's `## SKILLS`
-    block renders each grant's exact `SELECT content FROM skills …` query
-    (see compose.render_skills). Like the boot artifact (CLAUDE.md/AGENTS.md)
-    this dir is GITIGNORED and rebuilt at launch — a per-shell cache.
+  • Harness skills — granted skills rendered as Agent Skills `SKILL.md` files
+    for the booting shell. `.claude/skills` is the stable cross-harness mirror;
+    adapters may request an additional native tree such as Codex's
+    `.agents/skills` or OpenCode's `.opencode/skills`. These are generated caches,
+    not sources of truth. The boot doc's `## SKILLS` block points at the stable
+    mirror so every harness can load the same procedure with a file read, never
+    an ad-hoc DB query. Like the boot artifact (CLAUDE.md/AGENTS.md), managed
+    skill trees are rebuilt at launch for the selected shell.
 
 Render is incremental: an artifact whose composed content already matches what
 is on disk is skipped (no write, no mtime churn), so re-rendering an unchanged
@@ -30,10 +28,14 @@ DB alone.
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
+sys.path.insert(0, str(ENGINE / "scripts"))
+import artifact_policy  # noqa: E402
+import skill_projection  # noqa: E402
 
 # The do-not-edit banner (spec §Content & Render). No timestamp — render must be
 # deterministic so unchanged DB → unchanged file → clean diff.
@@ -76,6 +78,17 @@ def _write_if_changed(path: Path, content: str, written: list, skipped: list) ->
     written.append(path)
 
 
+def _document_target(root: Path, rel: str, kind: str) -> Path:
+    """Confine DB-authored render paths to their managed visibility folder."""
+    path = Path(rel)
+    expected = "specs_sc" if kind == "spec" else "docs_sc"
+    if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != expected:
+        raise ValueError(
+            f"invalid {kind} render_path {rel!r}; expected a relative path under {expected}/"
+        )
+    return root / path
+
+
 # ── Flat visibility render ────────────────────────────────────────────────────
 
 def _render_documents(con, written, skipped, root: Path) -> None:
@@ -107,7 +120,8 @@ def _render_documents(con, written, skipped, root: Path) -> None:
             f"roadmap_status: {r['roadmap_status'] or ''}",
             f"frozen: {'true' if r['frozen'] else 'false'}",
         ]
-        _write_if_changed(root / rel, with_banner(r["body"], extra),
+        _write_if_changed(_document_target(root, rel, r["kind"]),
+                          with_banner(r["body"], extra),
                           written, skipped)
 
 
@@ -177,11 +191,23 @@ def _skill_slug(name: str) -> str:
 def _render_skills_catalogue(con, written, skipped, root: Path) -> None:
     """skills_sc/ — the substrate's skill catalogue for browsers: one file per
     skill plus a README index. This is the *catalogue* (every non-deleted
-    skill), distinct from `.claude/skills/` which renders one shell's grants."""
+    skill), distinct from `.claude/skills/` which renders one shell's grants.
+    Retired skill mirrors are pruned so the directory remains an exact render,
+    not an accumulating archive."""
     rows = con.execute(
         "SELECT name, description, category, command, content FROM skills "
         "WHERE is_deleted=0 ORDER BY name"
     ).fetchall()
+    skills_root = root / "skills_sc"
+    current = {
+        "README.md",
+        *(f"{_skill_slug(row['name'])}.md" for row in rows),
+    }
+    if skills_root.exists():
+        for path in skills_root.glob("*.md"):
+            if path.name not in current:
+                path.unlink()
+                written.append(path)
     index = ["# Skills", "",
              "> The substrate's skill catalogue, rendered from the DB. "
              "Per-shell grants live in `.claude/skills/` (rebuilt at boot).", ""]
@@ -201,20 +227,22 @@ def _render_skills_catalogue(con, written, skipped, root: Path) -> None:
             parts += ["  ·  ".join(meta), ""]
         if r["content"]:
             parts += ["---", "", r["content"].strip()]
-        _write_if_changed(root / "skills_sc" / f"{slug}.md",
+        _write_if_changed(skills_root / f"{slug}.md",
                           with_banner("\n".join(parts).rstrip()), written, skipped)
-    _write_if_changed(root / "skills_sc" / "README.md",
+    _write_if_changed(skills_root / "README.md",
                       with_banner("\n".join(index).rstrip()), written, skipped)
 
 
 def render_visibility(con: sqlite3.Connection, root: "Path | None" = None) -> dict:
-    """Render the tracked flat `_sc` visibility files. Returns a written/skipped
+    """Render flat `_sc` visibility files under the active artifact root.
+
+    Returns a written/skipped
     summary. Incremental: unchanged artifacts are not rewritten.
 
-    `root` overrides the write base (defaults to the real REPO_ROOT). The
+    `root` overrides the write base (defaults to the active artifact root). The
     hermetic render-check passes a temp dir so it can render the committed
     SOURCE and diff it against the committed mirror without touching the tree."""
-    root = root or REPO_ROOT
+    root = root or artifact_policy.render_root()
     written: list[Path] = []
     skipped: list[Path] = []
     _render_documents(con, written, skipped, root)
@@ -226,47 +254,25 @@ def render_visibility(con: sqlite3.Connection, root: "Path | None" = None) -> di
 # ── Harness skill render (per booting shell; gitignored cache) ────────────────
 
 def render_skill_md(con: sqlite3.Connection, shell_id: int,
-                    work_dir: "Path | None" = None) -> dict:
-    """Render the booting shell's granted skills to `.claude/skills/<name>/SKILL.md`
-    (Agent Skills format: name + description frontmatter, content body).
+                    work_dir: "Path | None" = None,
+                    skills_dir: "Path | None" = None) -> dict:
+    """Render the booting shell's granted skills to
+    `<skills_dir>/<name>/SKILL.md` (Agent Skills format: name + description
+    frontmatter, content body). The default is `.claude/skills`; adapters may
+    request an additional native directory such as `.agents/skills` or
+    `.opencode/skills`.
 
     Harness-consumed and gitignored, like the boot artifact — rebuilt every
     launch for whichever shell boots. Stale skill folders (a grant since
     revoked, or another shell's skills) are pruned so the dir reflects exactly
     this shell's current grants.
 
-    work_dir overrides the write root (used for dev-shell worktrees)."""
-    rows = con.execute(
-        "SELECT s.name, s.description, s.content FROM skills s "
-        "JOIN shell_skills ss ON ss.skill_id = s.skill_id "
-        "WHERE ss.shell_id=? AND s.is_deleted=0 ORDER BY s.name",
-        (shell_id,),
-    ).fetchall()
-    skills_root = (work_dir or REPO_ROOT) / ".claude" / "skills"
-    written: list[Path] = []
-    skipped: list[Path] = []
-    current = {_skill_slug(r["name"]) for r in rows}
-
-    # Prune folders that no longer correspond to a current grant.
-    if skills_root.exists():
-        for child in skills_root.iterdir():
-            if child.is_dir() and child.name not in current:
-                for f in child.rglob("*"):
-                    if f.is_file():
-                        f.unlink()
-                child.rmdir()
-
-    for r in rows:
-        desc = (r["description"] or "").strip().replace("\n", " ")
-        body = "\n".join([
-            "---", f"name: {r['name']}", f"description: {desc}", "---", "",
-            (r["content"] or "").strip(), "",
-        ])
-        path = skills_root / _skill_slug(r["name"]) / "SKILL.md"
-        if path.exists() and path.read_text() == body:
-            skipped.append(path)
-            continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(body)
-        written.append(path)
-    return {"written": written, "skipped": skipped}
+    work_dir overrides the write root (used for dev-shell worktrees).
+    skills_dir is relative to that root."""
+    return skill_projection.reconcile_root(
+        con,
+        shell_id,
+        work_dir or REPO_ROOT,
+        skills_dir or Path(".claude/skills"),
+        create=True,
+    )

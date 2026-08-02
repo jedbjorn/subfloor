@@ -15,15 +15,17 @@ through the engine API, via `sc mem`:
   `decisions`, `flags`, `narrative`, `messages`; shared planning state
   `roadmap`, `projects`, `documents`, `tasks`, `shells` (`--json` for raw).
   `documents`/`tasks` take `--feature <id>` / `--doc <id>`; `--doc` on
-  `documents` returns the one doc *with* its body.
+  `documents` returns the one doc *with* its body. `flags` is open-only by
+  default; `get flags <id>` includes one resolved row, while `get flags
+  --feature <id> --resolved` returns bounded closure evidence.
 - **Write** = `sc mem <cmd> …` (see `## Common writes`).
 
 There is NO raw `sqlite3` path — not as a fallback, not for "ad-hoc" reads.
 If the API isn't wired, `sc mem` fails loud instead of writing the DB behind
-its back. Your identity rides in your bearer token — the server resolves
-token -> shell; never name a shell in a write. Decisions read FLEET-WIDE
-(every row, tagged `@shortname`) so cross-shell citations resolve; every
-other identity surface reads as you.
+its back. `sc mem` is already wired to this launched shell — the engine
+resolves API identity for you; never name a shell in a write. Decisions read
+FLEET-WIDE (every row, tagged `@shortname`) so cross-shell citations
+resolve; every other identity surface reads as you.
 
 **The `sc sql` lane** (read-only; `sc sql-rw` gated) is real and blessed for
 what `sc mem` doesn't cover: admin/reporting reads and sweep queries — the
@@ -65,7 +67,7 @@ are ALWAYS empty there — a `dr_*` query against `shell_db.db` silently returns
 | `feature_blockers` | roadmap dependency edges: one row = `feature_id` depends on `blocked_by` (prerequisite lands first). Directed, kept acyclic (GUI Flow view wires them; the card's "depends on" picker sets them) | INSERT/DELETE the edge; set the whole set via `sc mem roadmap depends` |
 | `documents` | content store — spec/doc bodies; `frozen=1` on ship (immutable); `render_path` = flat-file target | INSERT a new `seq` per stage; NEVER edit a frozen body |
 | `flags` | open + resolved tasks; `feature_id` links a flag to the feature it blocks | INSERT to open; UPDATE `resolved=1` + `resolved_date` to close |
-| `skills` / `shell_skills` | skill catalogue (system, seeded from `assets/skills/` via migration) + per-shell grants | managed by engine; grants via `./sc skill grant/revoke` |
+| `skills` / `flavor_skills` / `shell_skills` | skill catalogue + shared packs for standard flavors + per-shell packs for Bespoke shells; `resolved_shell_skills` is the effective read view | managed by engine; name any standard shell to change its flavor pack, or a Bespoke shell to change only itself, via `sc skill grant/revoke` |
 | `projects` / `project_shells` | project standing + shell linkage; a `projects` row also doubles as a work-stream that roadmap features attach to via `roadmap.project_id` (the Flow-view grouping) | UPDATE `standing`; INSERT to add |
 
 `<self>` = your `shell_id` (in the boot doc's ACTIVE SESSION block).
@@ -74,7 +76,7 @@ are ALWAYS empty there — a `dr_*` query against `shell_db.db` silently returns
 
 Each routes through the engine API to the live shared DB. `sc mem which`
 orients; `sc mem <cmd> -h` shows flags. Writes always target your own shell —
-the server resolves it from your token.
+the engine resolves API identity for you.
 
 ```
 # current_state (rolling status, not a log — replaces in place):
@@ -105,6 +107,8 @@ sc mem task start <task_id>     # sc mem task done <task_id>
 sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"   # split/re-scope — never mark unbuilt work done
 
 # open / edit / close a flag:
+sc mem get flags <flag_id>                         # exact, open or resolved
+sc mem get flags --feature <feature_id> --resolved # bounded closure evidence
 sc mem flag open "[Area] … | Blocker for: …" --name CC-001 [--feature <id>]
 sc mem flag edit <flag_id> [--description "…"] [--priority High] [--feature <id>]
 sc mem flag close <flag_id> --notes "…"

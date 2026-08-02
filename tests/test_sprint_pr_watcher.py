@@ -1,0 +1,546 @@
+"""Stage 5 gates for registered-PR observation and routed wakes."""
+from __future__ import annotations
+
+import json
+import sys
+import unittest
+from dataclasses import replace
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / ".super-coder" / "scripts"
+sys.path[:0] = [str(SCRIPTS), str(ROOT / "tests")]
+
+import sprint_domain
+import sprint_message_delivery
+import sprint_pr_watcher
+from github_pull_requests import GitHubReadError, PullRequest, normalize_pull_request
+from test_sprint_message_delivery import SprintMessageCase
+
+
+def pull_request(
+    *,
+    number: int = 42,
+    state: str = "OPEN",
+    checks: str | None = "FAILURE",
+    checks_failed: bool = True,
+    head_sha: str = "a" * 40,
+) -> PullRequest:
+    return PullRequest(
+        number=number,
+        head_ref=f"feature/pr-{number}",
+        base_ref="main",
+        head_sha=head_sha,
+        state=state,
+        merged_at="2026-07-31T20:00:00Z" if state == "MERGED" else None,
+        merge_sha="b" * 40 if state == "MERGED" else None,
+        title=f"PR {number}",
+        url=f"https://github.example/acme/repo/pull/{number}",
+        review_decision=None,
+        checks=checks,
+        checks_failed=checks_failed,
+    )
+
+
+class FakeReader:
+    def __init__(self, current: PullRequest | Exception) -> None:
+        self.current = current
+        self.by_number: dict[int, PullRequest] = {}
+        self.get_calls: list[int] = []
+        self.list_calls = 0
+
+    def get(self, number: int) -> PullRequest:
+        self.get_calls.append(number)
+        if isinstance(self.current, Exception):
+            raise self.current
+        return self.by_number.get(number, self.current)
+
+    def list(self) -> list[PullRequest]:
+        self.list_calls += 1
+        if isinstance(self.current, Exception):
+            raise self.current
+        return list(self.by_number.values()) or [self.current]
+
+
+class SprintPRWatcherCase(SprintMessageCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.clock = [0.0]
+        self.reader = FakeReader(pull_request())
+        self.repositories: list[str] = []
+
+        def reader_factory(repository: str) -> FakeReader:
+            self.repositories.append(repository)
+            return self.reader
+
+        self.watcher = sprint_pr_watcher.SprintPRWatcher(
+            self.con,
+            repo_root=ROOT,
+            reader_factory=reader_factory,
+            monotonic=lambda: self.clock[0],
+        )
+
+    def register(self, *, number: int = 42):
+        return self.watcher.register(
+            self.sprint_id,
+            owner_shell_id=1,
+            repository="Acme/Repo",
+            pr_number=number,
+            work_unit_ids=(self.unit_id,),
+        )
+
+    def _states(self) -> list[str]:
+        return [
+            str(row[0])
+            for row in self.con.execute(
+                "SELECT normalized_state FROM sprint_pr_transitions "
+                "ORDER BY transition_id"
+            )
+        ]
+
+
+class RegistrationTest(SprintPRWatcherCase):
+    def test_registration_is_exactly_idempotent_and_takes_initial_snapshot(self):
+        first = self.register()
+        second = self.register()
+
+        self.assertTrue(first.created)
+        self.assertFalse(second.created)
+        self.assertEqual(first.registered_pr_id, second.registered_pr_id)
+        self.assertEqual([42], self.reader.get_calls)
+        self.assertEqual(["acme/repo"], self.repositories)
+        self.assertEqual(
+            [("acme/repo", 42)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT repository,pr_number FROM sprint_registered_prs"
+                )
+            ],
+        )
+        self.assertEqual(
+            [(self.unit_id,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT work_unit_id FROM sprint_pr_work_units"
+                )
+            ],
+        )
+        self.assertEqual(
+            [("red", "a" * 40)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT normalized_state,observed_head_sha "
+                    "FROM sprint_pr_transitions"
+                )
+            ],
+        )
+
+    def test_registration_rejects_multiple_work_units_without_side_effects(self):
+        other_unit = int(
+            self.con.execute(
+                "INSERT INTO sprint_work_units "
+                "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+                "expected_output,planned_wave) VALUES (?,1,2,'Other','No',2)",
+                (self.sprint_id,),
+            ).lastrowid
+        )
+        self.con.commit()
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "exactly one owning work unit",
+        ):
+            self.watcher.register(
+                self.sprint_id,
+                owner_shell_id=1,
+                repository="acme/repo",
+                pr_number=41,
+                work_unit_ids=(self.unit_id, other_unit),
+            )
+
+        self.assertEqual([], self.reader.get_calls)
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_registered_prs"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_pr_work_units"
+            ).fetchone()[0],
+        )
+
+    def test_registration_rejects_non_owner_work_and_non_armed_sprint(self):
+        other_unit = int(
+            self.con.execute(
+                "INSERT INTO sprint_work_units "
+                "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+                "expected_output,planned_wave) VALUES (?,2,2,'Other','No',2)",
+                (self.sprint_id,),
+            ).lastrowid
+        )
+        self.con.commit()
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "owning Developer"
+        ):
+            self.watcher.registration.register(
+                self.sprint_id,
+                owner_shell_id=1,
+                repository="acme/repo",
+                pr_number=41,
+                work_unit_ids=(other_unit,),
+            )
+
+        sprint_domain.SprintLifecycleStore(self.con).transition(
+            self.sprint_id,
+            "paused",
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="test",
+        )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "only for an armed Sprint"
+        ):
+            self.watcher.registration.register(
+                self.sprint_id,
+                owner_shell_id=1,
+                repository="acme/repo",
+                pr_number=41,
+                work_unit_ids=(self.unit_id,),
+            )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_registered_prs"
+            ).fetchone()[0],
+        )
+
+
+class TransitionRoutingTest(SprintPRWatcherCase):
+    def test_queued_checkrun_stays_pending_without_green_owner_wake(self):
+        raw = {
+            "number": 42,
+            "headRefName": "feature/pr-42",
+            "baseRefName": "main",
+            "headRefOid": "a" * 40,
+            "state": "OPEN",
+            "mergedAt": None,
+            "mergeCommit": None,
+            "title": "PR 42",
+            "url": "https://github.example/acme/repo/pull/42",
+            "reviewDecision": None,
+            "statusCheckRollup": [
+                {
+                    "name": "fast-tests",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+                {"name": "pytest", "status": "QUEUED", "conclusion": None},
+            ],
+        }
+        self.reader.current = normalize_pull_request(raw)
+
+        self.register()
+
+        self.assertEqual(["pending"], self._states())
+        active_recipients = self.con.execute(
+            "SELECT m.to_participant_id FROM sprint_messages m "
+            "JOIN sprint_wake_messages wm USING (message_id) "
+            "WHERE m.idempotency_key LIKE 'pr-transition:%'"
+        ).fetchall()
+        self.assertEqual([], active_recipients)
+
+        raw["statusCheckRollup"][1] = {
+            "name": "pytest",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+        }
+        self.reader.current = normalize_pull_request(raw)
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(["pending", "green"], self._states())
+        active_recipients = self.con.execute(
+            "SELECT m.to_participant_id FROM sprint_messages m "
+            "JOIN sprint_wake_messages wm USING (message_id) "
+            "WHERE m.idempotency_key LIKE 'pr-transition:%'"
+        ).fetchall()
+        self.assertEqual(
+            [(self.developer_id,)],
+            [tuple(row) for row in active_recipients],
+        )
+
+    def test_first_red_routes_one_active_owner_wake_and_passive_evidence(self):
+        self.register()
+
+        transition = self.con.execute(
+            "SELECT transition_id,normalized_state,evidence "
+            "FROM sprint_pr_transitions"
+        ).fetchone()
+        self.assertEqual("red", transition["normalized_state"])
+        self.assertEqual("registration", json.loads(transition["evidence"])["trigger"])
+        routed = self.con.execute(
+            "SELECT message_id,to_participant_id,body FROM sprint_messages "
+            "WHERE idempotency_key LIKE 'pr-transition:%' ORDER BY to_participant_id"
+        ).fetchall()
+        self.assertEqual(
+            sorted([self.developer_id, self.reviewer_id, self.planner_id]),
+            [int(row["to_participant_id"]) for row in routed],
+        )
+        self.assertEqual(
+            {"GitHub observed acme/repo PR #42: red at " + "a" * 40 + "."},
+            {str(row["body"]) for row in routed},
+        )
+        wakes = self.con.execute(
+            "SELECT m.to_participant_id,w.wake_id,w.state "
+            "FROM sprint_messages m "
+            "JOIN sprint_wake_messages wm USING (message_id) "
+            "JOIN sprint_wake_outbox w USING (wake_id) "
+            "WHERE m.idempotency_key LIKE 'pr-transition:%'"
+        ).fetchall()
+        self.assertEqual(
+            [(self.developer_id, wakes[0]["wake_id"], "pending")],
+            [(int(row[0]), row[1], row[2]) for row in wakes],
+        )
+        lease = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con
+        ).claim_next("watch-test")
+        self.assertEqual(self.developer_id, lease.participant_id)
+        self.assertEqual(self.developer_conversation_id, lease.target_conversation_id)
+
+    def test_red_green_red_occurrences_wake_once_each_and_coalesce(self):
+        self.register()
+        self.reader.current = pull_request(
+            checks="SUCCESS", checks_failed=False, head_sha="b" * 40
+        )
+        self.assertTrue(self.watcher.poll_once())
+        self.reader.current = pull_request(
+            checks="FAILURE", checks_failed=True, head_sha="b" * 40
+        )
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(
+            ["red", "green", "red"],
+            [
+                row[0]
+                for row in self.con.execute(
+                    "SELECT normalized_state FROM sprint_pr_transitions "
+                    "ORDER BY transition_id"
+                )
+            ],
+        )
+        owner_messages = self.con.execute(
+            "SELECT message_id FROM sprint_messages "
+            "WHERE to_participant_id=? AND idempotency_key LIKE 'pr-transition:%'",
+            (self.developer_id,),
+        ).fetchall()
+        self.assertEqual(3, len(owner_messages))
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(DISTINCT wm.wake_id) FROM sprint_wake_messages wm "
+                "JOIN sprint_messages m USING (message_id) "
+                "WHERE m.to_participant_id=? "
+                "AND m.idempotency_key LIKE 'pr-transition:%'",
+                (self.developer_id,),
+            ).fetchone()[0],
+        )
+
+    def test_closed_without_merge_actively_notifies_only_planner(self):
+        self.reader.current = pull_request(
+            state="CLOSED", checks=None, checks_failed=False
+        )
+        self.register()
+
+        active_recipients = [
+            int(row[0])
+            for row in self.con.execute(
+                "SELECT m.to_participant_id FROM sprint_messages m "
+                "JOIN sprint_wake_messages wm USING (message_id) "
+                "WHERE m.idempotency_key LIKE 'pr-transition:%'"
+            )
+        ]
+        self.assertEqual([self.planner_id], active_recipients)
+        self.assertEqual(
+            sorted([self.developer_id, self.reviewer_id, self.planner_id]),
+            sorted(
+                int(row[0])
+                for row in self.con.execute(
+                    "SELECT to_participant_id FROM sprint_messages "
+                    "WHERE idempotency_key LIKE 'pr-transition:%'"
+                )
+            ),
+        )
+
+
+class RecoveryAndFailureTest(SprintPRWatcherCase):
+    def test_restart_and_unchanged_resume_emit_no_duplicate(self):
+        self.register()
+        before = tuple(
+            self.con.execute(
+                "SELECT (SELECT COUNT(*) FROM sprint_pr_transitions),"
+                "(SELECT COUNT(*) FROM sprint_messages "
+                "WHERE idempotency_key LIKE 'pr-transition:%'),"
+                "(SELECT COUNT(*) FROM sprint_wake_messages wm "
+                "JOIN sprint_messages m USING (message_id) "
+                "WHERE m.idempotency_key LIKE 'pr-transition:%')"
+            ).fetchone()
+        )
+        restarted = sprint_pr_watcher.SprintPRWatcher(
+            self.con,
+            repo_root=ROOT,
+            reader_factory=lambda _repository: self.reader,
+        )
+        self.assertTrue(restarted.poll_once(startup=True))
+
+        lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+        lifecycle.transition(
+            self.sprint_id,
+            "paused",
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="test",
+        )
+        calls_before_pause = len(self.reader.get_calls)
+        self.assertFalse(restarted.poll_once())
+        self.assertEqual(calls_before_pause, len(self.reader.get_calls))
+        lifecycle.transition(
+            self.sprint_id,
+            "armed",
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+        self.assertTrue(restarted.poll_once())
+
+        after = tuple(
+            self.con.execute(
+                "SELECT (SELECT COUNT(*) FROM sprint_pr_transitions),"
+                "(SELECT COUNT(*) FROM sprint_messages "
+                "WHERE idempotency_key LIKE 'pr-transition:%'),"
+                "(SELECT COUNT(*) FROM sprint_wake_messages wm "
+                "JOIN sprint_messages m USING (message_id) "
+                "WHERE m.idempotency_key LIKE 'pr-transition:%')"
+            ).fetchone()
+        )
+        self.assertEqual(before, after)
+
+    def test_paused_change_is_observed_once_after_resume(self):
+        self.register()
+        lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+        lifecycle.transition(
+            self.sprint_id,
+            "paused",
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="test",
+        )
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
+        self.assertFalse(self.watcher.poll_once())
+        self.assertEqual(["red"], self._states())
+
+        lifecycle.transition(
+            self.sprint_id,
+            "armed",
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(["red", "green"], self._states())
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(["red", "green"], self._states())
+
+    def test_terminal_sprint_performs_zero_github_calls(self):
+        self.register()
+        lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+        lifecycle.transition(
+            self.sprint_id,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            terminal_outcome="delivered",
+        )
+        calls = len(self.reader.get_calls)
+
+        self.assertFalse(self.watcher.poll_once())
+        self.assertEqual(calls, len(self.reader.get_calls))
+        self.assertEqual(0, self.reader.list_calls)
+
+    def test_failure_is_durable_backs_off_and_never_invents_state(self):
+        self.reader.current = GitHubReadError("rate limit reached")
+        self.register()
+        self.assertEqual([42], self.reader.get_calls)
+        self.assertEqual([], self._states())
+        failure = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE event_type='pr.poll_failed'"
+        ).fetchone()
+        payload = json.loads(failure["payload"])
+        self.assertEqual(60.0, payload["backoff_seconds"])
+        self.assertEqual("rate limit reached", payload["error"])
+
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
+        self.clock[0] = 59.0
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual([42], self.reader.get_calls)
+        self.assertEqual([], self._states())
+        self.clock[0] = 60.0
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual([42, 42], self.reader.get_calls)
+        self.assertEqual(["green"], self._states())
+        active_recipient = self.con.execute(
+            "SELECT m.to_participant_id FROM sprint_messages m "
+            "JOIN sprint_wake_messages wm USING (message_id) "
+            "WHERE m.idempotency_key LIKE 'pr-transition:%'"
+        ).fetchone()
+        self.assertEqual(self.developer_id, int(active_recipient[0]))
+
+class BatchAndNormalizationTest(SprintPRWatcherCase):
+    def test_multiple_registered_prs_share_one_repository_list_read(self):
+        self.reader.by_number = {42: pull_request(number=42)}
+        self.register(number=42)
+        self.reader.by_number[43] = pull_request(number=43)
+        self.register(number=43)
+        get_count = len(self.reader.get_calls)
+
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(1, self.reader.list_calls)
+        self.assertEqual(get_count, len(self.reader.get_calls))
+        self.assertEqual(
+            [(42, "red"), (43, "red")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT p.pr_number,t.normalized_state "
+                    "FROM sprint_registered_prs p "
+                    "JOIN sprint_pr_transitions t USING (registered_pr_id) "
+                    "ORDER BY p.pr_number"
+                )
+            ],
+        )
+
+    def test_normalized_state_precedence_is_literal(self):
+        closed_with_merge_evidence = replace(
+            pull_request(state="CLOSED", checks=None, checks_failed=False),
+            merged_at="2026-07-31T20:00:00Z",
+            merge_sha="b" * 40,
+        )
+        cases = (
+            (pull_request(state="MERGED", checks="FAILURE"), "merged"),
+            (closed_with_merge_evidence, "merged"),
+            (pull_request(state="CLOSED", checks="SUCCESS"), "closed"),
+            (pull_request(), "red"),
+            (pull_request(checks="SUCCESS", checks_failed=False), "green"),
+            (pull_request(checks="PENDING", checks_failed=False), "pending"),
+            (pull_request(checks=None, checks_failed=False), "created"),
+        )
+        for observed, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(expected, sprint_pr_watcher.normalize_state(observed))
+
+    def test_service_default_is_the_five_second_armed_pulse(self):
+        service = sprint_pr_watcher.SprintPRWatcherService(
+            ROOT / "unused.db", repo_root=ROOT
+        )
+        self.assertEqual(5.0, service.pulse_seconds)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -3,12 +3,56 @@
   "launch": ["codex", "--dangerously-bypass-hook-trust"],
   "boot_artifact": "AGENTS.md",
   "emit": [".codex/hooks.json"],
+  "skill_dirs": [".claude/skills", ".agents/skills"],
   "env": {},
   "model": { "flag": "--model" },
   "headless": {
     "launch": ["codex", "exec"],
     "model_flag": "-m",
     "effort": { "config_flag": "-c", "config_key": "model_reasoning_effort" }
+  },
+  "conversation": {
+    "contract_version": 1,
+    "minimum_cli_version": "0.145.0",
+    "verified_cli_version": "0.145.0",
+    "driver": "codex-app-server",
+    "session_ref": { "source": "thread.start", "field": "thread.id" },
+    "start": { "method": "thread/start" },
+    "resume": { "method": "thread/resume", "session_field": "threadId" },
+    "stream": { "transport": "jsonl-rpc-notifications" },
+    "interrupt": { "method": "turn/interrupt" },
+    "inspect": { "method": "thread/read" },
+    "permission_policy": "approvalPolicy-and-sandbox",
+    "permission_values": {
+      "approval": "never",
+      "unrestricted": "danger-full-access"
+    },
+    "execution_permissions": {
+      "requirement": "worktree-command-access",
+      "unrestricted_mechanism": "thread-policy",
+      "sandbox_flag_required": false
+    },
+    "normalized_events": [
+      "session.started",
+      "run.started",
+      "assistant.delta",
+      "tool.started",
+      "tool.completed",
+      "permission.requested",
+      "input.requested",
+      "usage",
+      "run.completed",
+      "run.failed",
+      "run.interrupted"
+    ],
+    "capabilities": {
+      "exact_session_resume": true,
+      "structured_streaming": true,
+      "interruption": true,
+      "interactive_permission_response": true,
+      "server_backed": true,
+      "session_inspection": true
+    }
   },
   "sandbox": {
     "launch_flags": ["--dangerously-bypass-approvals-and-sandbox"],

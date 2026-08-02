@@ -10,7 +10,7 @@ one cwd — no cross-repo confusion.
 ## MEMORY ARCHITECTURE
 
 Source of truth: `.super-coder/shell_db.db` (gitignored, rebuilt from
-`schema.sql` + `migrations/` + `.sc-state/content.sql`). All identity and memory
+`schema.sql` + `migrations/` + the active tracked/local instance snapshot). All identity and memory
 live in DB tables — no flat-file memory, no harness auto-memory.
 
 | Surface | Where |
@@ -33,6 +33,13 @@ architectural or approach decision, lazy-load the log: `sc mem get decisions`
 (index of active decisions; `sc mem get decisions <id>` for the full row with
 rationale). Honor a prior decision or supersede it explicitly (`--parent`) —
 never silently re-litigate.
+
+**Chains are provenance, not trails.** Active decisions are working context —
+load them by subject when they bear on the work. A citation in a flag, spec, or
+feature may resolve to a superseded decision; that's fine — read the superseding
+row it points to and move on. Never walk parent chains as context-gathering;
+load decision history only when explicitly directed, or when auditing why a
+decision changed.
 
 **Flat files are renders, not sources.** Every local `.md` and git-tracked file
 — docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is generated from the DB.

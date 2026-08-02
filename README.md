@@ -24,7 +24,8 @@ development team in a box.** Add it to an existing project from the command
 line, install it, launch it, and start working with a Shell (subfloor's name for
 an AI agent). Launching also prints the address of the local Review GUI: a
 friendly home base where you can see your team, roadmap, specs and docs, open
-flags, repo map, worktrees, and token use.
+flags, repo map, worktrees, and token use — and, in the **Chats** tab, hold a
+durable browser conversation with any available Shell.
 
 ![./sc enter — pick a shell, pick a harness, boot into your agent with the Review GUI link on screen](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/demo.gif)
 
@@ -46,14 +47,6 @@ review; simple work can go straight to your merge approval. Booting each Shell
 manually is a good way to learn the system, and you can always ask the Shell
 you're with what should happen next — every role knows the workflow.
 
-Once that feels familiar, try a **sprint**: subfloor's built-in workflow for
-larger efforts across models and providers. A Planner Shell oversees the work
-from start to finish, handing units between developers and reviewers. Outside a
-sprint, Shells never merge without your approval. During a declared sprint,
-they receive narrow permission to merge reviewed, passing work; this runs most
-smoothly when GitHub does not require a human to merge into `main`. If it does,
-the planner will tell you when your approval is needed.
-
 If you are ever unsure what is happening, open the Review GUI or boot the
 **Admin Shell**. Admin works from `main` and looks after the system as a whole:
 it can check the team's health, help update subfloor, and create skills tailored
@@ -72,15 +65,17 @@ Free to use, open source, MIT License.
 > **Specialized repo:** [github.com/jedbjorn/sc-cachy](https://github.com/jedbjorn/sc-cachy) ·
 > **Upstream:** [github.com/jedbjorn/subfloor-cli](https://github.com/jedbjorn/subfloor-cli).
 
-![subfloor's Review GUI, Shells tab — a shell's role, mandate, harness token count, editable current state, and identity (seed, lessons, decisions)](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/cover.png)
-
 ### The headliners
 
-- **Cross-provider orchestration.** A sprint runs planner → devs → reviewers
-  **across providers** — devs on Codex, reviewers on Claude, the planner woken
-  by events, workers booted headless per task. Zero scheduled polling: typed
-  message rows, one PR-watch daemon, and session-surviving jobs carry the
-  whole coordination. ([*Sprints*](docs/README.md#sprints))
+- **Durable browser conversations.** The **Chats** tab provides normal
+  multi-turn conversations with exact harness-session resume, queued messages,
+  streamed state, explicit Stop/Close recovery, history, stars, and a read-only
+  Diff view for the same worktree. No harness credential reaches the browser.
+  ([*Browser conversations*](docs/README.md#browser-conversations))
+- **Generic headless work.** Shell-to-shell `task` and `result` messages,
+  session-surviving jobs, and exact model-route resolution support bounded
+  automation without inventing a second conversation or memory system.
+  ([*Messages, jobs & headless launch*](docs/README.md#messages-jobs--headless-launch))
 - **A standing team, not a session.** Shells are DB rows — identity, memory,
   decisions, skills — that survive every session and boot on any of four
   harnesses; the same shell can run Claude Code today and OpenCode tomorrow.
@@ -111,7 +106,7 @@ graph TD
   REN --> BOOT[CLAUDE.md / AGENTS.md]:::class2
   BOOT --> H[harness loop]:::class3
   H --> REPO[your repo]:::class4
-  DB -.serialize.-> SQL[.sc-state/content.sql]:::class2
+  DB -.local snapshot.-> SQL[.sc-state/local/content.sql]:::class2
 ```
 
 How the overlay works — every property injected through an extension point the
@@ -128,8 +123,8 @@ Drop subfloor into an existing git repo and boot a shell:
 ```bash
 cd your-repo                                                  # an existing git repo
 
-# 1. Pull in the engine + entry script (files only, no history merge):
-git remote add super-coder https://github.com/jedbjorn/subfloor.git
+# 1. Pull in the engine + entry script (files only, main branch only, no history merge):
+git remote add -t main super-coder https://github.com/jedbjorn/subfloor.git
 git fetch super-coder
 git checkout super-coder/main -- .super-coder sc
 
@@ -141,10 +136,12 @@ claude                          # or:  opencode auth login  ·  codex login  · 
 
 # 4. Launch the host server + GUI and boot a trusted bare-metal session:
 ./sc launch
-./sc enter                      # auth + pick a shell + pick a harness + boot
 
-# 5. Commit the install (engine is gitignored — only sc + .sc-state + config track):
+# 5. Commit the install before creating shell worktrees:
 git add -A && git commit -m "chore: install subfloor"
+
+# 6. Attach a session:
+./sc enter                      # auth + pick a shell + pick a harness + boot
 ```
 
 That's the happy path — you're talking to a planner shell in your repo, with a
@@ -154,7 +151,7 @@ whole team behind it. Installer internals and harness sign-in, step by step:
 
 ## Docs
 
-One page, ten sections — [docs/README.md](docs/README.md), or tab through it
+One page, eleven sections — [docs/README.md](docs/README.md), or tab through it
 themed: [**open the docs in md-converter**](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/docs/README.md).
 
 | Section | What's in it |
@@ -164,11 +161,12 @@ themed: [**open the docs in md-converter**](https://md-converter.designs-os.com/
 | [**The loop**](docs/README.md#the-loop) | The everyday cycle: map → spec → build → review → freeze → verify |
 | [**Harnesses & models**](docs/README.md#harnesses--models) | Plans over API keys; which model each role runs, and why |
 | [**Shells & worktrees**](docs/README.md#shells--worktrees) | How a whole team shares one repo without clobbering it |
-| [**Sprints**](docs/README.md#sprints) | The multi-shell mode: declared pushes on a zero-polling event loop |
+| [**Browser conversations**](docs/README.md#browser-conversations) | Durable Chat and Diff, exact resume, queues, Stop/Close, history and stars |
+| [**Messages, jobs & headless launch**](docs/README.md#messages-jobs--headless-launch) | Generic shell handoffs, detached jobs, model routes, and `sc run` |
 | [**Update a fork**](docs/README.md#update-a-fork) | `./sc update` / `rollback`; customize vs upstream vs eject |
 | [**CLI & dev kit**](docs/README.md#cli--dev-kit) | Every `./sc` command, the `make dos-` aliases, the sandbox toolchain |
 | [**Opt-in features**](docs/README.md#opt-in-features) | pg sidecar · Windows Test VM · tailnet / pm2 / db brokers |
-| [**Review GUI**](docs/README.md#review-gui) | The localhost GUI's nine tabs + token & session analytics |
+| [**Review GUI**](docs/README.md#review-gui) | The localhost GUI's ten tabs + token & session analytics |
 
 > [!class2]
 > **Reading the docs.** The docs are themed markdown — GitHub renders the page fine, and the md-converter link above serves the intended render: one tab per section, arrow keys to move between them.

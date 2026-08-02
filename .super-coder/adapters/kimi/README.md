@@ -16,12 +16,13 @@ catch-all; kimi is the native Moonshot path.
 | field | meaning |
 |---|---|
 | `launch` | argv exec'd to start the harness (`kimi` — cwd is the workspace; no dir flag exists) |
+| `comm_aliases` | extra `/proc/<pid>/comm` values a live kimi presents (`kimi-code` — see below) |
 | `boot_artifact` | the context file this harness reads (`AGENTS.md`, informational) |
 | `emit` | files copied to the repo root at launch (none — kimi reads `~/.kimi-code` + `AGENTS.md`) |
 | `headless.launch` | non-interactive base argv (`kimi`) |
 | `headless.prompt_flag` | `-p`; run.py emits it immediately before the prompt value |
 | `headless.model_flag` | `-m`; the selector must be an alias discovered from `~/.kimi-code/config.toml` |
-| `headless.effort.env` | `KIMI_MODEL_THINKING_EFFORT`; sprint headless boots set it to `high` |
+| `headless.effort.env` | `KIMI_MODEL_THINKING_EFFORT`; applies an explicitly requested headless effort level |
 | `sandbox.launch_flags` | flags appended ONLY inside the docker sandbox, interactive launches only (`--yolo`) |
 
 **`--yolo` (sandbox, interactive only):** auto-approves all actions inside the
@@ -37,11 +38,26 @@ per-action approval prompts.
 
 **No interactive `model` field:** Kimi's `-m` selects a user-local alias from
 `~/.kimi-code/config.toml`, not a portable provider id, so an interactive flavor
-default remains unsafe. Headless sprint boots are different: Refresh models
+default remains unsafe. Headless boots are different: Refresh models
 discovers the exact local aliases (for example `kimi-code/k3`), the resolver
 accepts only a locally available high-effort route, and the adapter emits
 `kimi -m <alias> -p <prompt>`. A requested selector that cannot be applied fails
 before the worker session opens.
+
+**`comm_aliases: ["kimi-code"]` — the liveness seam:** the shell-liveness scan
+identifies a live harness by `/proc/<pid>/comm`, which is the process's RUNTIME
+name, not its launch binary. kimi execs `/usr/local/bin/kimi` (a single ELF; no
+wrapper, no child) and then renames ITSELF to `kimi-code` via `PR_SET_NAME`
+roughly 0.7s in — measured on a real headless worker, `exe → /usr/local/bin/kimi`,
+no child processes, 11 threads in the one tgid. Without the alias a live kimi
+worker matched nothing, so its shell projected as **available** and the operator
+was invited to double-book it. Two consequences worth knowing: during that ~0.7s
+startup window comm reads `MainThread` (the bun runtime's initial thread name)
+and the worker is briefly invisible — deliberately NOT aliased, because
+`MainThread` would match every unrelated bun/node process on the machine, trading
+a 0.7s false-available for a permanent false-busy. And a finished-but-unreaped
+kimi keeps `comm=kimi-code` while its `cwd` link becomes unreadable, so it lands
+in the scan's existing `indeterminate` bucket rather than holding a shell.
 
 **Skills:** kimi does not read `.claude/skills/` (its discovery dirs are
 `.kimi-code/skills/` + `.agents/skills/`), so like codex/vibe it loads skills

@@ -1,0 +1,1424 @@
+"""Stage 8 gates for Sprint pause, resume, abort, and restart recovery."""
+from __future__ import annotations
+
+import json
+import sqlite3
+import sys
+import tempfile
+from contextlib import closing
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / ".super-coder" / "scripts"
+sys.path[:0] = [str(SCRIPTS), str(ROOT / "tests")]
+
+import conversation_broker
+import sprint_domain
+import sprint_message_delivery
+import sprint_participant_chats
+import sprint_recovery
+from github_pull_requests import GitHubReadError
+from test_sprint_pr_watcher import SprintPRWatcherCase, pull_request
+from test_sprint_review_loop import SprintReviewLoopCase
+from test_sprint_v2_domain import SprintDomainCase
+
+
+class SprintRecoveryCase(SprintPRWatcherCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.interrupts: list[int] = []
+        self.notifications = 0
+
+    def coordinator(self) -> sprint_recovery.SprintRecoveryCoordinator:
+        def interrupt(run_id: int) -> bool:
+            self.assertFalse(self.con.in_transaction)
+            self.assertEqual(
+                "paused",
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0],
+            )
+            self.interrupts.append(run_id)
+            return True
+
+        def notify() -> bool:
+            self.notifications += 1
+            return True
+
+        return sprint_recovery.SprintRecoveryCoordinator(
+            self.con,
+            repo_root=ROOT,
+            reader_factory=lambda _repository: self.reader,
+            interrupt_run=interrupt,
+            notify_commit=notify,
+        )
+
+    def add_live_run(self, shell_id: int = 1) -> int:
+        participant = self.con.execute(
+            "SELECT current_conversation_id FROM sprint_participants "
+            "WHERE sprint_id=? AND shell_id=?",
+            (self.sprint_id, shell_id),
+        ).fetchone()
+        conversation_id = str(participant[0])
+        token = self.con.execute(
+            "SELECT COUNT(*)+1 FROM conversation_runs"
+        ).fetchone()[0]
+        message_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'engine','test','prompt','active Sprint turn',?,?,"
+                "'running')",
+                (conversation_id, f"active:{token}", f"active:{token}"),
+            ).lastrowid
+        )
+        run_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                "lease_expires_at,started_at,heartbeat_at) "
+                "VALUES (?,?,?,'running','test-broker','2999-01-01 00:00:00',"
+                "'2026-08-01 00:00:00','2026-08-01 00:00:00')",
+                (conversation_id, shell_id, message_id),
+            ).lastrowid
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='queued' WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='running' WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        self.con.commit()
+        return run_id
+
+    def deliver_wake_with_turn(
+        self,
+        wake_id: int,
+        *,
+        terminal: bool,
+    ) -> tuple[str, str]:
+        prompts: list[str] = []
+
+        def deliver(conversation_id: str, prompt: str, key: str) -> str:
+            prompts.append(prompt)
+            message_state = "completed" if terminal else "queued"
+            message_id = int(
+                self.con.execute(
+                    "INSERT INTO conversation_messages "
+                    "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                    "idempotency_key,request_hash,state,completed_at) "
+                    "VALUES (?,'engine','test','prompt',?,?,?, ?,?)",
+                    (
+                        conversation_id,
+                        prompt,
+                        key,
+                        key,
+                        message_state,
+                        "2026-08-01 00:00:01" if terminal else None,
+                    ),
+                ).lastrowid
+            )
+            if terminal:
+                run_id = int(
+                    self.con.execute(
+                        "INSERT INTO conversation_runs "
+                        "(conversation_id,shell_id,trigger_message_id,state,"
+                        "lease_owner,lease_expires_at,started_at,ended_at,exit_code) "
+                        "SELECT ?,shell_id,?,'succeeded','test-broker',"
+                        "'2026-08-01 00:00:01','2026-08-01 00:00:00',"
+                        "'2026-08-01 00:00:01',0 FROM conversations "
+                        "WHERE conversation_id=?",
+                        (conversation_id, message_id, conversation_id),
+                    ).lastrowid
+                )
+                for state in ("queued", "running", "waiting"):
+                    self.con.execute(
+                        "UPDATE conversations SET state=? WHERE conversation_id=?",
+                        (state, conversation_id),
+                    )
+                self.con.commit()
+                return f"conversation-run:{run_id}"
+            self.con.execute(
+                "UPDATE conversations SET state='queued' WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            self.con.commit()
+            return f"conversation-message:{message_id}"
+
+        outcome = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con
+        ).deliver_once(f"delivery-{wake_id}", deliver)
+        self.assertIsNotNone(outcome)
+        self.assertEqual(wake_id, outcome.wake_id)
+        self.assertEqual("delivered", outcome.state)
+        return prompts[0], self.con.execute(
+            "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
+            (wake_id,),
+        ).fetchone()[0]
+
+    def test_participant_pause_atomically_persists_report_interrupt_and_notice(self):
+        self.register()
+        run_id = self.add_live_run()
+        coordinator = self.coordinator()
+
+        receipt = coordinator.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="GitHub state cannot be trusted",
+            detail={"provider": "github"},
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual((run_id,), receipt.interrupt_run_ids)
+        self.assertEqual([run_id], self.interrupts)
+        self.assertEqual(1, self.notifications)
+        self.assertEqual(
+            ("paused", "run.interrupt.requested"),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,e.event_type FROM sprints s "
+                    "JOIN conversation_events e ON e.run_id=? "
+                    "WHERE s.sprint_id=? "
+                    "AND e.event_type='run.interrupt.requested'",
+                    (run_id, self.sprint_id),
+                ).fetchone()
+            ),
+        )
+        report = json.loads(
+            self.con.execute(
+                "SELECT body FROM sprint_reports WHERE report_id=?",
+                (receipt.report_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual("GitHub state cannot be trusted", report["reason"])
+        self.assertEqual(
+            {"kind": "participant", "shell_id": 1}, report["actor"]
+        )
+        self.assertEqual([run_id], [row["run_id"] for row in report["deterministic"]["active_turns"]])
+        self.assertEqual(
+            [self.unit_id],
+            [row["work_unit_id"] for row in report["deterministic"]["work_units"]],
+        )
+        self.assertEqual(
+            ["red"],
+            [row["normalized_state"] for row in report["deterministic"]["registered_prs"]],
+        )
+        self.assertEqual("", report["integrity_threat"])
+        self.assertEqual("", report["judgment"])
+        self.assertEqual("", report["recommendation"])
+        self.assertEqual(
+            [(self.planner_id, 0, "Sprint 1 paused: GitHub state cannot be trusted")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT to_participant_id,actionable,body FROM sprint_messages "
+                    "WHERE idempotency_key LIKE 'sprint-pause:%'"
+                )
+            ],
+        )
+        self.assertEqual(
+            [
+                (
+                    "engine",
+                    "sprint-recovery",
+                    "queued",
+                    sprint_message_delivery.wake_prompt(self.sprint_id, "planner"),
+                )
+            ],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT sender_kind,sender_ref,state,body "
+                    "FROM conversation_messages "
+                    "WHERE idempotency_key LIKE 'sprint-pause:%:planner-conversation'"
+                )
+            ],
+        )
+
+        replay = coordinator.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="GitHub state cannot be trusted",
+        )
+        self.assertFalse(replay.changed)
+        self.assertEqual(
+            (1, 1, 1),
+            tuple(
+                self.con.execute(
+                    "SELECT (SELECT COUNT(*) FROM sprint_reports WHERE report_kind='pause'),"
+                    "(SELECT COUNT(*) FROM conversation_events WHERE run_id=? "
+                    "AND event_type='run.interrupt.requested'),"
+                    "(SELECT COUNT(*) FROM sprint_messages "
+                    "WHERE idempotency_key LIKE 'sprint-pause:%')",
+                    (run_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_terminal_wake_failure_uses_the_same_pause_machinery(self):
+        run_id = self.add_live_run()
+        wake_id = int(self.send("auto-pause-wake").wake_id)
+        store = sprint_domain.SprintLifecycleStore(
+            self.con,
+            interrupt_run=lambda item: self.interrupts.append(item) or True,
+            notify_commit=lambda: True,
+        )
+
+        self.assertEqual(1, store.record_wake_failure(wake_id, "one"))
+        self.assertEqual(2, store.record_wake_failure(wake_id, "two"))
+        self.assertEqual(3, store.record_wake_failure(wake_id, "three"))
+
+        self.assertEqual([run_id], self.interrupts)
+        report = json.loads(
+            self.con.execute(
+                "SELECT body FROM sprint_reports WHERE sprint_id=? "
+                "AND report_kind='pause'",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual("wake_delivery_exhausted", report["reason"])
+        self.assertEqual(
+            {"attempts": 3, "last_error": "three", "wake_id": wake_id},
+            report["detail"],
+        )
+        self.assertEqual([run_id], [row["run_id"] for row in report["deterministic"]["active_turns"]])
+
+        receipt = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="retry the stranded assignment",
+        )
+        self.assertEqual(1, len(receipt.requeued_wake_ids))
+        replacement = receipt.requeued_wake_ids[0]
+        self.assertNotEqual(wake_id, replacement)
+        self.assertEqual(
+            [(wake_id, "failed", 3), (replacement, "pending", 0)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT wake_id,state,attempt_count FROM sprint_wake_outbox "
+                    "WHERE wake_id IN (?,?) ORDER BY wake_id",
+                    (wake_id, replacement),
+                )
+            ],
+        )
+        self.assertEqual(
+            [(replacement,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT wake_id FROM sprint_wake_messages WHERE sprint_id=?",
+                    (self.sprint_id,),
+                )
+                if row[0] == replacement
+            ],
+        )
+        evidence = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='lifecycle.reconciled' ORDER BY event_id DESC LIMIT 1",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual([replacement], evidence["requeued_wake_ids"])
+        self.assertIn(
+            replacement,
+            [wake["wake_id"] for wake in evidence["pending_wakes"]],
+        )
+        lease = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con
+        ).claim_next("requeued-wake")
+        self.assertEqual(replacement, lease.wake_id)
+        self.assertEqual(1, lease.attempt_number)
+
+    def test_failed_recovery_wake_is_bounded_and_leaves_manual_evidence(self):
+        message = self.send("bounded-recovery-wake")
+        original = int(message.wake_id)
+        store = sprint_domain.SprintLifecycleStore(
+            self.con,
+            interrupt_run=lambda _run_id: True,
+            notify_commit=lambda: True,
+        )
+        coordinator = self.coordinator()
+
+        for error in ("original one", "original two", "original three"):
+            store.record_wake_failure(original, error)
+        first = coordinator.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="attempt one bounded recovery wake",
+        )
+        self.assertEqual(1, len(first.requeued_wake_ids))
+        replacement = first.requeued_wake_ids[0]
+
+        for error in ("fallback one", "fallback two", "fallback three"):
+            store.record_wake_failure(replacement, error)
+        second = coordinator.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="hand the durable failure evidence to FnB",
+        )
+
+        self.assertEqual((), second.requeued_wake_ids)
+        self.assertEqual(
+            (None, replacement, "failed", 3),
+            tuple(
+                self.con.execute(
+                    "SELECT m.read_at,wm.wake_id,w.state,w.attempt_count "
+                    "FROM sprint_messages m JOIN sprint_wake_messages wm "
+                    "USING (message_id) JOIN sprint_wake_outbox w USING (wake_id) "
+                    "WHERE m.message_id=?",
+                    (message.message_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_outbox WHERE sprint_id=? "
+                "AND (idempotency_key LIKE 'sprint-recovery:%' "
+                "OR idempotency_key LIKE '%:failed-wake:%')",
+                (self.sprint_id,),
+            ).fetchone()[0],
+            "the bounded fallback does not become a recursive recovery loop",
+        )
+
+    def test_resume_repairs_delivered_unread_assignment_once(self):
+        assignment = self.send(
+            "pickup-assignment",
+            kind="work_assignment",
+            actionable=True,
+        )
+        old_wake = int(assignment.wake_id)
+        prompt, _ = self.deliver_wake_with_turn(old_wake, terminal=True)
+        self.assertEqual(
+            sprint_message_delivery.wake_prompt(self.sprint_id, "developer"),
+            prompt,
+        )
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="exercise delivered-unread recovery",
+        )
+
+        receipt = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="recover the unread assignment",
+        )
+
+        self.assertEqual(1, len(receipt.requeued_wake_ids))
+        replacement = receipt.requeued_wake_ids[0]
+        self.assertNotEqual(old_wake, replacement)
+        self.assertEqual(
+            (replacement, "pending"),
+            tuple(
+                self.con.execute(
+                    "SELECT wm.wake_id,w.state FROM sprint_wake_messages wm "
+                    "JOIN sprint_wake_outbox w USING (wake_id) "
+                    "WHERE wm.message_id=?",
+                    (assignment.message_id,),
+                ).fetchone()
+            ),
+        )
+        event = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='wake.requeued' ORDER BY event_id DESC LIMIT 1",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual("delivered", event["prior_wake_state"])
+        self.assertEqual("completed", event["prior_turn_state"]["message_state"])
+        self.assertEqual("succeeded", event["prior_turn_state"]["run_state"])
+        self.assertEqual(old_wake, event["prior_wake_id"])
+        self.assertEqual(replacement, event["replacement_wake_id"])
+
+        self.assertEqual(
+            (),
+            self.lifecycle.reconcile_unread_pickup(
+                self.sprint_id,
+                trigger="monitor",
+            ),
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_outbox "
+                "WHERE idempotency_key LIKE 'sprint-recovery:%'"
+            ).fetchone()[0],
+        )
+
+    def test_resume_repairs_delivered_unread_participant_relay(self):
+        relay = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=3,
+            to_shortname="DEV1",
+            body="Which compatibility fixture should I use?",
+            idempotency_key="pickup-relay",
+        )
+        old_wake = relay.wake_id
+        self.deliver_wake_with_turn(old_wake, terminal=True)
+        before = self.con.execute(
+            "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+            (self.unit_id,),
+        ).fetchone()[0]
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="recover a participant question",
+        )
+
+        receipt = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="restore message pickup",
+        )
+
+        replacement = receipt.requeued_wake_ids[0]
+        captured: list[tuple[int, str]] = []
+        delivery = sprint_message_delivery.SprintWakeDeliveryService(self.con)
+        outcome = None
+        while outcome is None or outcome.wake_id != replacement:
+            actual_prompt: list[str] = []
+            outcome = delivery.deliver_once(
+                "relay-recovery",
+                lambda _conversation, prompt, _key: actual_prompt.append(prompt)
+                or "native",
+            )
+            self.assertIsNotNone(outcome)
+            captured.append((outcome.wake_id, actual_prompt[0]))
+        self.assertEqual(replacement, outcome.wake_id)
+        self.assertEqual(
+            sprint_message_delivery.wake_prompt(self.sprint_id, "developer"),
+            captured[-1][1],
+        )
+        self.assertEqual(
+            before,
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+
+    def test_resume_does_not_replace_an_adequate_turn_or_deliverable_wake(self):
+        queued_turn = self.send("pickup-queued-turn")
+        _, queued_key = self.deliver_wake_with_turn(
+            int(queued_turn.wake_id),
+            terminal=False,
+        )
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="test adequate queued turn",
+        )
+        first = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+        self.assertEqual((), first.requeued_wake_ids)
+
+        self.messages.mark_read(queued_turn.message_id, 1)
+        self.con.execute(
+            "UPDATE conversation_messages SET state='running' "
+            "WHERE idempotency_key=?",
+            (queued_key,),
+        )
+        self.con.execute(
+            "UPDATE conversation_messages SET state='completed',"
+            "completed_at=datetime('now') WHERE idempotency_key=?",
+            (queued_key,),
+        )
+        for state in ("running", "waiting"):
+            self.con.execute(
+                "UPDATE conversations SET state=? WHERE conversation_id=?",
+                (state, self.developer_conversation_id),
+            )
+        self.con.commit()
+        terminal = self.send("pickup-existing-wake")
+        self.deliver_wake_with_turn(int(terminal.wake_id), terminal=True)
+        deliverable = self.send("pickup-already-pending")
+        wake_count = self.con.execute(
+            "SELECT COUNT(*) FROM sprint_wake_outbox"
+        ).fetchone()[0]
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="test adequate pending wake",
+        )
+        second = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+        self.assertIn(deliverable.wake_id, second.requeued_wake_ids)
+        self.assertEqual(
+            wake_count,
+            self.con.execute("SELECT COUNT(*) FROM sprint_wake_outbox").fetchone()[0],
+            "resume reuses existing wakes instead of adding a pickup fallback",
+        )
+        self.assertEqual(
+            [(deliverable.wake_id,), (deliverable.wake_id,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT wake_id FROM sprint_wake_messages "
+                    "WHERE message_id IN (?,?) ORDER BY message_id",
+                    (terminal.message_id, deliverable.message_id),
+                )
+            ],
+        )
+
+    def test_error_conversation_queued_turn_does_not_suppress_recovery(self):
+        message = self.send("pickup-error-conversation")
+        old_wake = int(message.wake_id)
+        self.deliver_wake_with_turn(old_wake, terminal=False)
+        self.con.execute(
+            "UPDATE conversations SET state='running' WHERE conversation_id=?",
+            (self.developer_conversation_id,),
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='error' WHERE conversation_id=?",
+            (self.developer_conversation_id,),
+        )
+        self.con.commit()
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="queued turn cannot run from an error conversation",
+        )
+
+        receipt = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+
+        self.assertEqual(1, len(receipt.requeued_wake_ids))
+        replacement = receipt.requeued_wake_ids[0]
+        self.assertNotEqual(old_wake, replacement)
+        self.assertEqual(
+            (replacement, "pending"),
+            tuple(
+                self.con.execute(
+                    "SELECT wm.wake_id,w.state FROM sprint_wake_messages wm "
+                    "JOIN sprint_wake_outbox w USING (wake_id) "
+                    "WHERE wm.message_id=?",
+                    (message.message_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_resume_attaches_wakeless_unread_planner_notice_once(self):
+        assignment = self.send(
+            "paused-decline-recovery",
+            kind="work_assignment",
+            actionable=True,
+        )
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="decline while paused",
+        )
+        result_id = self.messages.decline(
+            assignment.message_id,
+            1,
+            "cannot safely continue",
+        )
+        self.con.execute(
+            "UPDATE conversation_messages SET state='running' "
+            "WHERE conversation_id IN (SELECT conversation_id "
+            "FROM sprint_participant_conversations "
+            "WHERE sprint_participant_id=?) AND state='queued'",
+            (self.planner_id,),
+        )
+        self.con.execute(
+            "UPDATE conversation_messages SET state='completed',"
+            "completed_at=datetime('now') WHERE conversation_id IN ("
+            "SELECT conversation_id FROM sprint_participant_conversations "
+            "WHERE sprint_participant_id=?) AND state='running'",
+            (self.planner_id,),
+        )
+        self.con.commit()
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_messages WHERE message_id=?",
+                (result_id,),
+            ).fetchone()[0],
+        )
+
+        first = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+        self.assertEqual(1, len(first.requeued_wake_ids))
+        wake_id = first.requeued_wake_ids[0]
+        self.assertEqual(
+            [(wake_id, result_id, "pending")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT wm.wake_id,wm.message_id,w.state "
+                    "FROM sprint_wake_messages wm JOIN sprint_wake_outbox w "
+                    "USING (wake_id) WHERE wm.message_id=?",
+                    (result_id,),
+                )
+            ],
+        )
+        self.assertEqual(
+            (),
+            self.lifecycle.reconcile_unread_pickup(
+                self.sprint_id,
+                trigger="monitor",
+            ),
+        )
+
+    def test_startup_reconciliation_repairs_once_across_repeated_passes(self):
+        message = self.send("pickup-startup")
+        old_wake = int(message.wake_id)
+        self.deliver_wake_with_turn(old_wake, terminal=True)
+        coordinator = self.coordinator()
+
+        self.assertEqual("armed", coordinator.recover_on_startup(self.sprint_id))
+        replacement = int(
+            self.con.execute(
+                "SELECT wake_id FROM sprint_wake_messages WHERE message_id=?",
+                (message.message_id,),
+            ).fetchone()[0]
+        )
+        self.assertNotEqual(old_wake, replacement)
+        count = self.con.execute(
+            "SELECT COUNT(*) FROM sprint_wake_outbox"
+        ).fetchone()[0]
+
+        self.assertEqual("armed", coordinator.recover_on_startup(self.sprint_id))
+        self.assertEqual(
+            count,
+            self.con.execute("SELECT COUNT(*) FROM sprint_wake_outbox").fetchone()[0],
+        )
+        self.assertEqual(
+            (replacement,),
+            tuple(
+                self.con.execute(
+                    "SELECT wake_id FROM sprint_wake_messages WHERE message_id=?",
+                    (message.message_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_resume_projects_observed_merge_before_releasing_downstream(self):
+        registered = self.register()
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='merge_ready' "
+            "WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        downstream = int(
+            self.con.execute(
+                "INSERT INTO sprint_work_units "
+                "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+                "expected_output,planned_wave) "
+                "VALUES (?,1,2,'Downstream','Continue the lane',2)",
+                (self.sprint_id,),
+            ).lastrowid
+        )
+        self.con.execute(
+            "INSERT INTO sprint_work_unit_dependencies "
+            "(sprint_id,work_unit_id,depends_on_work_unit_id) VALUES (?,?,?)",
+            (self.sprint_id, downstream, self.unit_id),
+        )
+        self.con.commit()
+        coordinator = self.coordinator()
+        coordinator.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="merge observation race",
+        )
+        self.con.execute(
+            "INSERT INTO sprint_pr_transitions "
+            "(registered_pr_id,normalized_state,transition_key,observed_head_sha) "
+            "VALUES (?,'merged','paused-merge',?)",
+            (registered.registered_pr_id, "b" * 40),
+        )
+        self.con.commit()
+        self.reader.current = pull_request(
+            state="MERGED",
+            checks="SUCCESS",
+            checks_failed=False,
+            head_sha="b" * 40,
+        )
+
+        receipt = coordinator.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="evidence reviewed",
+        )
+
+        self.assertEqual((self.unit_id,), receipt.projected_work_unit_ids)
+        self.assertEqual(1, len(receipt.dispatched_wake_ids))
+        self.assertEqual(
+            [(self.unit_id, "completed"), (downstream, "ready")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT work_unit_id,disposition FROM sprint_work_units "
+                    "WHERE work_unit_id IN (?,?) ORDER BY work_unit_id",
+                    (self.unit_id, downstream),
+                )
+            ],
+        )
+        self.assertEqual(
+            [(downstream, "work_assignment", "pending")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT work_unit_id,message_kind,disposition "
+                    "FROM sprint_messages WHERE work_unit_id=?",
+                    (downstream,),
+                )
+            ],
+        )
+
+    def test_resume_records_drift_and_github_failure_without_blocking(self):
+        self.register()
+        coordinator = self.coordinator()
+        coordinator.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="inspect drift",
+        )
+        document_id = int(
+            self.con.execute(
+                "SELECT document_id FROM sprint_specs WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.con.execute(
+            "UPDATE documents SET body='edited while paused' WHERE document_id=?",
+            (document_id,),
+        )
+        self.con.commit()
+        self.reader.current = GitHubReadError("github unavailable")
+
+        receipt = coordinator.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual((document_id,), receipt.spec_drift_document_ids)
+        self.assertEqual(
+            ("acme/repo#42 reconciliation failed: github unavailable",),
+            receipt.anomalies,
+        )
+        self.assertEqual(
+            "armed",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+        payload = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='lifecycle.reconciled'",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual([str(document_id)], sorted(payload["spec_drift"]))
+        self.assertEqual(list(receipt.anomalies), payload["anomalies"])
+        self.assertEqual(
+            [(self.planner_id, 0)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT to_participant_id,actionable FROM sprint_messages "
+                    "WHERE idempotency_key LIKE 'sprint-resume:%'"
+                )
+            ],
+        )
+
+    def test_resume_surfaces_native_and_capacity_anomalies_without_blocking(self):
+        run_id = self.add_live_run()
+        coordinator = self.coordinator()
+        coordinator.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="participant capacity check",
+        )
+        self.con.execute("UPDATE shells SET is_deleted=1 WHERE shell_id=2")
+        self.con.commit()
+
+        receipt = coordinator.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+
+        self.assertEqual(
+            (
+                (
+                    "native-run reconciliation deferred: conversation broker "
+                    f"unavailable for run(s) {run_id}"
+                ),
+                f"participant {self.reviewer_id} (reviewer) has no usable capacity",
+            ),
+            receipt.anomalies,
+        )
+        self.assertEqual(
+            "armed",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_messages "
+                "WHERE idempotency_key LIKE 'sprint-resume:%'",
+            ).fetchone()[0],
+        )
+
+
+class ClosedReviewRecoveryTest(SprintReviewLoopCase):
+    def test_closed_without_merge_resolves_every_review_expectation(self):
+        handoff = self.request_review()
+        self.accept_review(handoff.message_id)
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            interrupt_run=lambda _run_id: True,
+            notify_commit=lambda: True,
+        )
+        lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="PR ownership changed",
+        )
+        self.reader.current = pull_request(
+            state="CLOSED",
+            checks=None,
+            checks_failed=False,
+        )
+        coordinator = sprint_recovery.SprintRecoveryCoordinator(
+            self.con,
+            repo_root=ROOT,
+            reader_factory=lambda _repository: self.reader,
+            interrupt_run=lambda _run_id: True,
+            notify_commit=lambda: True,
+        )
+
+        receipt = coordinator.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+
+        self.assertEqual((handoff.message_id,), receipt.resolved_review_message_ids)
+        self.assertEqual(
+            ("registered_pr.closed_without_merge", None),
+            tuple(
+                self.con.execute(
+                    "SELECT resolution,next_evaluation_at "
+                    "FROM sprint_liveness_expectations WHERE message_id=?",
+                    (handoff.message_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            "in_review",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+            "closed PR resolution must not invent a review outcome",
+        )
+
+
+class LifecycleExitAndRestartTest(SprintDomainCase):
+    def coordinator(self) -> sprint_recovery.SprintRecoveryCoordinator:
+        def no_reader(_repository: str):
+            raise AssertionError("non-armed restart performed GitHub egress")
+
+        return sprint_recovery.SprintRecoveryCoordinator(
+            self.con,
+            repo_root=ROOT,
+            reader_factory=no_reader,
+            interrupt_run=lambda _run_id: True,
+            notify_commit=lambda: True,
+        )
+
+    def add_live_run(self, sprint_id: int, shell_id: int) -> tuple[str, int]:
+        conversation_id = str(
+            self.con.execute(
+                "SELECT pc.conversation_id "
+                "FROM sprint_participant_conversations pc "
+                "JOIN sprint_participants participant "
+                "ON participant.participant_id=pc.sprint_participant_id "
+                "WHERE participant.sprint_id=? AND participant.shell_id=?",
+                (sprint_id, shell_id),
+            ).fetchone()[0]
+        )
+        token = int(
+            self.con.execute("SELECT COUNT(*)+1 FROM conversation_runs").fetchone()[0]
+        )
+        message_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'engine','test','prompt','active Sprint turn',?,?,"
+                "'running')",
+                (
+                    conversation_id,
+                    f"terminal-active:{token}",
+                    f"terminal-active:{token}",
+                ),
+            ).lastrowid
+        )
+        run_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                "lease_expires_at,started_at,heartbeat_at) "
+                "VALUES (?,?,?,'running','test-broker','2999-01-01 00:00:00',"
+                "'2026-08-02 00:00:00','2026-08-02 00:00:00')",
+                (conversation_id, shell_id, message_id),
+            ).lastrowid
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='queued' WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='running' WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        self.con.commit()
+        return conversation_id, run_id
+
+    def test_prepared_abort_records_stub_report_and_preserves_plan(self):
+        sprint_id, unit_id = self.create_sprint()
+        coordinator = self.coordinator()
+
+        receipt = coordinator.abort(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="Sprint will not arm",
+            terminal_outcome="discarded before arming",
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual(
+            ("aborted", "discarded before arming"),
+            tuple(
+                self.con.execute(
+                    "SELECT lifecycle,terminal_outcome FROM sprints "
+                    "WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone()
+            ),
+        )
+        report = json.loads(
+            self.con.execute(
+                "SELECT body FROM sprint_reports WHERE report_id=?",
+                (receipt.report_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual([], report["completed_work"])
+        self.assertEqual(
+            [(unit_id, "planned")],
+            [
+                (row["work_unit_id"], row["disposition"])
+                for row in report["outstanding_work"]
+            ],
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_work_units WHERE work_unit_id=?",
+                (unit_id,),
+            ).fetchone()[0],
+        )
+
+    def test_completed_defers_only_owning_planner_run_until_broker_finish(self):
+        sprint_id, _ = self.create_sprint()
+        self.store.arm(sprint_id, 3)
+        planner_conversation, planner_run = self.add_live_run(sprint_id, 3)
+        _, developer_run = self.add_live_run(sprint_id, 1)
+        queued_message_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'engine','test','prompt','queued follow-up',"
+                "'terminal-follow-up','terminal-follow-up','queued')",
+                (planner_conversation,),
+            ).lastrowid
+        )
+        self.con.execute(
+            "INSERT INTO conversation_outbox (conversation_id,message_id) "
+            "VALUES (?,?)",
+            (planner_conversation, queued_message_id),
+        )
+        self.con.commit()
+        interrupts: list[int] = []
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            interrupt_run=lambda run_id: interrupts.append(run_id) or True,
+            notify_commit=lambda: True,
+        )
+
+        self.assertTrue(
+            lifecycle.transition(
+                sprint_id,
+                "completed",
+                sprint_domain.LifecycleActor("planner", 3),
+                reason="final response follows",
+                terminal_outcome="accepted",
+            )
+        )
+
+        self.assertEqual([developer_run], interrupts)
+        self.assertEqual(
+            [(developer_run,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT run_id FROM conversation_events "
+                    "WHERE event_type='run.interrupt.requested' ORDER BY run_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            [(planner_run,), (developer_run,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT run_id FROM conversation_events "
+                    "WHERE event_type='conversation.close.requested' ORDER BY run_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            ("cancelled", "cancelled"),
+            tuple(
+                self.con.execute(
+                    "SELECT message.state,outbox.state "
+                    "FROM conversation_messages message "
+                    "JOIN conversation_outbox outbox USING(message_id) "
+                    "WHERE message.message_id=?",
+                    (queued_message_id,),
+                ).fetchone()
+            ),
+        )
+        terminal_fact_counts = tuple(
+            self.con.execute(
+                "SELECT "
+                "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                " AND event_type='lifecycle.completed'),"
+                "(SELECT COUNT(*) FROM conversation_events "
+                " WHERE event_type='conversation.close.requested')",
+                (sprint_id,),
+            ).fetchone()
+        )
+        self.assertFalse(
+            lifecycle.transition(
+                sprint_id,
+                "completed",
+                sprint_domain.LifecycleActor("planner", 3),
+                reason="retry",
+                terminal_outcome="accepted",
+            )
+        )
+        self.assertEqual(
+            terminal_fact_counts,
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    " AND event_type='lifecycle.completed'),"
+                    "(SELECT COUNT(*) FROM conversation_events "
+                    " WHERE event_type='conversation.close.requested')",
+                    (sprint_id,),
+                ).fetchone()
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "terminal.db"
+            with closing(sqlite3.connect(db_path)) as target:
+                self.con.backup(target)
+            broker = conversation_broker.BrokerStore(db_path)
+            self.assertTrue(
+                broker.finish_run(
+                    planner_run,
+                    "succeeded",
+                    event_type="run.completed",
+                    payload={"final_output": "Sprint completed successfully."},
+                )
+            )
+            self.assertTrue(
+                broker.finish_run(
+                    developer_run,
+                    "cancelled",
+                    event_type="run.interrupted",
+                    payload={"interrupt_evidence": "sprint completion"},
+                )
+            )
+            with closing(sqlite3.connect(db_path)) as observed:
+                observed.row_factory = sqlite3.Row
+                self.assertEqual(
+                    [("closed", 1)] * 3,
+                    [
+                        tuple(row)
+                        for row in observed.execute(
+                            "SELECT conversation.state,"
+                            "conversation.closed_at IS NOT NULL "
+                            "FROM conversations conversation "
+                            "JOIN sprint_participant_conversations linked "
+                            "ON linked.conversation_id=conversation.conversation_id "
+                            "JOIN sprint_participants participant "
+                            "ON participant.participant_id=linked.sprint_participant_id "
+                            "WHERE participant.sprint_id=? "
+                            "ORDER BY conversation.conversation_id",
+                            (sprint_id,),
+                        )
+                    ],
+                )
+                planner_terminal = observed.execute(
+                    "SELECT event_type,payload FROM conversation_events "
+                    "WHERE conversation_id=? AND run_id=? "
+                    "AND event_type='run.completed'",
+                    (planner_conversation, planner_run),
+                ).fetchone()
+                self.assertEqual("run.completed", planner_terminal["event_type"])
+                self.assertEqual(
+                    "Sprint completed successfully.",
+                    json.loads(planner_terminal["payload"])["final_output"],
+                )
+                self.assertEqual(
+                    "cancelled",
+                    observed.execute(
+                        "SELECT state FROM conversation_runs WHERE run_id=?",
+                        (developer_run,),
+                    ).fetchone()[0],
+                )
+
+    def test_fnb_completion_still_defers_owning_planner_run(self):
+        sprint_id, _ = self.create_sprint()
+        self.store.arm(sprint_id, 3)
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (5,'FnB','FNB','admin','prompt',1)"
+        )
+        self.con.commit()
+        _, planner_run = self.add_live_run(sprint_id, 3)
+        _, developer_run = self.add_live_run(sprint_id, 1)
+        interrupts: list[int] = []
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            interrupt_run=lambda run_id: interrupts.append(run_id) or True,
+            notify_commit=lambda: True,
+        )
+
+        self.assertTrue(
+            lifecycle.transition(
+                sprint_id,
+                "completed",
+                sprint_domain.LifecycleActor("fnb", 5),
+                reason="FnB accepts the completed Sprint",
+                terminal_outcome="accepted",
+            )
+        )
+
+        self.assertEqual([developer_run], interrupts)
+        self.assertEqual(
+            [(developer_run,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT run_id FROM conversation_events "
+                    "WHERE event_type='run.interrupt.requested' ORDER BY run_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            [(planner_run,), (developer_run,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT run_id FROM conversation_events "
+                    "WHERE event_type='conversation.close.requested' ORDER BY run_id"
+                )
+            ],
+        )
+
+    def test_abort_interrupts_owning_planner_and_other_active_participants(self):
+        sprint_id, _ = self.create_sprint()
+        self.store.arm(sprint_id, 3)
+        _, planner_run = self.add_live_run(sprint_id, 3)
+        _, developer_run = self.add_live_run(sprint_id, 1)
+        interrupts: list[int] = []
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            interrupt_run=lambda run_id: interrupts.append(run_id) or True,
+            notify_commit=lambda: True,
+        )
+
+        receipt = lifecycle.abort(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="stop all work",
+            terminal_outcome="aborted",
+        )
+
+        self.assertEqual((planner_run, developer_run), receipt.interrupt_run_ids)
+        self.assertEqual([planner_run, developer_run], interrupts)
+        self.assertEqual(
+            [(planner_run,), (developer_run,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT run_id FROM conversation_events "
+                    "WHERE event_type='run.interrupt.requested' ORDER BY run_id"
+                )
+            ],
+        )
+
+    def test_terminal_lifecycle_closes_every_sprint_conversation(self):
+        terminal_sprints = []
+        for target in ("completed", "aborted"):
+            sprint_id, _ = self.create_sprint()
+            self.store.arm(sprint_id, 3)
+            conversation_ids = [
+                str(row[0])
+                for row in self.con.execute(
+                    "SELECT pc.conversation_id "
+                    "FROM sprint_participant_conversations pc "
+                    "JOIN sprint_participants p "
+                    "ON p.participant_id=pc.sprint_participant_id "
+                    "WHERE p.sprint_id=? ORDER BY pc.conversation_id",
+                    (sprint_id,),
+                )
+            ]
+            self.assertEqual(3, len(conversation_ids))
+
+            self.store.transition(
+                sprint_id,
+                target,
+                sprint_domain.LifecycleActor("planner", 3),
+                reason=f"finish as {target}",
+                terminal_outcome=f"terminal {target}",
+            )
+
+            marks = ",".join("?" for _ in conversation_ids)
+            self.assertEqual(
+                [("closed", 1)] * 3,
+                [
+                    tuple(row)
+                    for row in self.con.execute(
+                        "SELECT state,closed_at IS NOT NULL FROM conversations "
+                        f"WHERE conversation_id IN ({marks}) ORDER BY conversation_id",
+                        conversation_ids,
+                    )
+                ],
+            )
+            self.assertEqual(
+                3,
+                self.con.execute(
+                    "SELECT COUNT(*) FROM conversation_events "
+                    f"WHERE conversation_id IN ({marks}) "
+                    "AND event_type='conversation.closed'",
+                    conversation_ids,
+                ).fetchone()[0],
+            )
+            terminal_sprints.append(sprint_id)
+
+        self.assertEqual(
+            [{"shell_id": 1, "sprint": None}, {"shell_id": 2, "sprint": None}],
+            sprint_participant_chats.attach_live_participations(
+                self.con,
+                [{"shell_id": 1}, {"shell_id": 2}],
+            ),
+        )
+        self.assertEqual(
+            ["completed", "aborted"],
+            [
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone()[0]
+                for sprint_id in terminal_sprints
+            ],
+        )
+
+    def test_restart_recovers_prepared_armed_and_paused_without_state_drift(self):
+        sprint_id, _ = self.create_sprint()
+        coordinator = self.coordinator()
+
+        self.assertEqual("prepared", coordinator.recover_on_startup(sprint_id))
+        self.assertEqual(
+            "prepared",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?", (sprint_id,)
+            ).fetchone()[0],
+        )
+        self.store.arm(sprint_id, 3)
+        armed = sprint_recovery.SprintRecoveryCoordinator(
+            self.con,
+            repo_root=ROOT,
+            reader_factory=lambda _repository: None,
+            interrupt_run=lambda _run_id: True,
+            notify_commit=lambda: True,
+        )
+        self.assertEqual("armed", armed.recover_on_startup(sprint_id))
+        self.assertEqual(
+            "armed",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?", (sprint_id,)
+            ).fetchone()[0],
+        )
+        self.store.pause(
+            sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="restart while paused",
+        )
+        self.assertEqual("paused", coordinator.recover_on_startup(sprint_id))
+        self.assertEqual(
+            "paused",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?", (sprint_id,)
+            ).fetchone()[0],
+        )
+
+    def test_resume_cannot_bypass_prepared_arming_transaction(self):
+        sprint_id, _ = self.create_sprint()
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "prepared Sprints must use arm",
+        ):
+            self.store.resume(
+                sprint_id,
+                sprint_domain.LifecycleActor("planner", 3),
+            )
+        self.assertEqual(
+            ("prepared", 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,"
+                    "(SELECT COUNT(*) FROM sprint_messages WHERE sprint_id=s.sprint_id),"
+                    "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=s.sprint_id) "
+                    "FROM sprints s WHERE s.sprint_id=?",
+                    (sprint_id,),
+                ).fetchone()
+            ),
+        )
+
+
+if __name__ == "__main__":
+    import unittest
+
+    unittest.main(verbosity=2)

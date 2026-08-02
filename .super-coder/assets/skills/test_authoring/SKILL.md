@@ -1,6 +1,6 @@
 ---
 name: test_authoring
-description: Principles for stringent pytest tests — tests a realistic bug turns red. Pair with a granted stack-infra testing skill (test_authoring_sqlite / test_authoring_pg / a fork-local one) if the shell has one.
+description: Principles for stringent pytest tests — tests a realistic bug turns red. The downstream repository owns stack-specific fixtures and database setup.
 category: craft
 common: false
 ---
@@ -11,10 +11,10 @@ Apply when writing a test or reviewing a diff that touches `tests/`.
 Pass condition for any test: a realistic bug turns it red. A test no bug
 can fail reads as coverage while guarding nothing — sharpen or cut it.
 
-Stack infra (fixture setup, callers, DB access pattern) lives in the granted
-stack skill — `test_authoring_sqlite` / `test_authoring_pg` / a fork-local
-skill that supersedes this one. Load it alongside. None granted -> this skill
-stands alone; do NOT hunt for one the fork doesn't ship.
+Stack infrastructure—fixture setup, callers, and database access patterns—lives
+in the downstream repository. Load its fork-local testing skill alongside this
+one when granted. None granted means this skill stands alone; infer setup from
+the repository's existing tests and development tooling.
 
 ## Rules (the floor)
 
@@ -61,7 +61,7 @@ stands alone; do NOT hunt for one the fork doesn't ship.
    the worst possible correlation: the suite hangs or exhausts a pool
    only when it is catching bugs (a close-after-assert probe connection
    deadlocked three concurrent pytest runs of one file for four hours in
-   a dos-arch sprint). Open in a fixture (`yield` + teardown /
+   a release gate). Open in a fixture (`yield` + teardown /
    `addfinalizer`) or a `with` block; teardown must run on the red path.
    Audit pattern: AST-scan the suite for opens whose close sits after an
    `assert` in the same body.

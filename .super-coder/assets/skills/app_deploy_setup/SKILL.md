@@ -15,7 +15,7 @@ NEVER save the result by editing this skill: engine skills self-heal on every
 `sc update` — a fork edit to any skill named in `assets/skills/` is detected
 as stale and reverted to the shipped body. A project-local name (one the
 engine doesn't ship) is never touched and persists through rebuilds via
-`sc snapshot` -> `.sc-state/content.sql`. Leave this scaffold as shipped.
+`sc snapshot` -> `.sc-state/local/content.sql`. Leave this scaffold as shipped.
 
 ## 1. Scaffold the migration dirs
 
@@ -94,8 +94,8 @@ contract in the same catalogue):
 2. Seed it into the catalogue + grant it live: `sc seed-skills` (upserts the
    asset into the DB, grants common skills to every live shell).
 
-3. Persist: `SC_ADMIN=1 sc snapshot` → the skill + grants survive in
-   `.sc-state/content.sql`; commit per that skill's steps.
+3. Persist: `SC_ADMIN=1 sc snapshot` → the skill + grants survive in the
+   ignored local snapshot. There is no generated-content commit.
 
 Details, updates, and removal: the `local_skill_management` skill.
 

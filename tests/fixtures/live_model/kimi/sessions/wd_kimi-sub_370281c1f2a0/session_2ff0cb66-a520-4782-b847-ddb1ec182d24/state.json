@@ -1,0 +1,21 @@
+{
+  "createdAt": "2026-07-25T11:28:43.377Z",
+  "updatedAt": "2026-07-25T11:29:18.876Z",
+  "title": "Use your subagent/task tool to delegate one trivial job to a sub-agent: have it reply with the word DELTA. Then reply DONE.",
+  "isCustomTitle": false,
+  "agents": {
+    "main": {
+      "homedir": "/home/j3d1/.kimi-code/sessions/wd_kimi-sub_370281c1f2a0/session_2ff0cb66-a520-4782-b847-ddb1ec182d24/agents/main",
+      "type": "main",
+      "parentAgentId": null
+    },
+    "agent-0": {
+      "homedir": "/home/j3d1/.kimi-code/sessions/wd_kimi-sub_370281c1f2a0/session_2ff0cb66-a520-4782-b847-ddb1ec182d24/agents/agent-0",
+      "type": "sub",
+      "parentAgentId": "main"
+    }
+  },
+  "custom": {},
+  "workDir": "/tmp/lm-capture/kimi-sub",
+  "lastPrompt": "Reply with exactly one word: OMEGA"
+}

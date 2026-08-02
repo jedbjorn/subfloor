@@ -3,29 +3,30 @@
 Everything super-coder owns. The host project's own code is untouched; this dir
 is the substrate that runs it.
 
-## The DB is rebuilt, never committed
+## The DB and generated artifacts stay local
 
-`shell_db.db` is **gitignored**. It reconstructs from two git-tracked text
-serializations:
+`shell_db.db` is **gitignored**. It reconstructs from public system text plus
+one gitignored local per-instance snapshot:
 
 | Category | File(s) | Git? | Role |
 |---|---|---|---|
 | **System migrations** | `migrations/*.sql` | tracked | ordered; **propagate** to forks; schema + system content |
-| **Per-instance snapshot** | `.sc-state/content.sql` | tracked (fork-owned, outside the engine dir) | idempotent dump of *this* repo's content + memory; **stays local** |
+| **Per-instance snapshot** | `.sc-state/local/content.sql` | ignored | idempotent dump of *this* repo's content + memory |
 | **Baseline schema** | `schema.sql` | tracked | full current schema; applied on fresh build |
 | **`.db`, boot artifact** | — | ignored | rebuilt at launch |
 
 The split that matters: **system content propagates, per-instance content does
-not.** Migrations are pulled downstream by every fork; the snapshot belongs to
-one repo only.
+not.** Snapshot, map authorship, skill retirement, and flat renders always live
+under ignored `.sc-state/local/`. `./sc artifact-mode show` inspects these
+paths; mode switching and Git publication are retired.
 
 ## Scripts
 
 | Script | Does |
 |---|---|
-| `scripts/rebuild.py` | apply `schema.sql` → stamp/apply `migrations/` → load `.sc-state/content.sql`. Builds a fresh `.db`. |
+| `scripts/rebuild.py` | apply `schema.sql` → stamp/apply `migrations/` → load the active per-instance snapshot. Builds a fresh `.db`. |
 | `scripts/migrate.py` | apply pending `migrations/*.sql` to an existing `.db`; record in `schema_migrations`. |
-| `scripts/snapshot.py` | dump per-instance tables → `.sc-state/content.sql` (deterministic). |
+| `scripts/snapshot.py` | dump per-instance tables → the active artifact root (deterministic). |
 | `scripts/update.py` | fetch + materialize the engine (gitignored dep) at an upstream ref → pin `.sc-state/engine.ref` → migrate in place → sync skills → snapshot. |
 | `scripts/rollback.py` | sound undo of a bad update — restore the DB + engine (`engine.ref.prev`) pair. |
 | `scripts/run.py` | launcher: username-only auth → pick shell → render boot (`CLAUDE.md` + `AGENTS.md`) → exec harness. |
@@ -40,17 +41,16 @@ matches disk is skipped, so an unchanged DB renders to nothing):
 |---|---|---|---|
 | Boot doc → `CLAUDE.md` + `AGENTS.md` | `compose.py` | ignored | the harness at launch |
 | Per-shell skills → `.claude/skills/<name>/SKILL.md` | `flat.render_skill_md` | ignored | the harness (Agent Skills) |
-| Flat `_sc` files → `specs_sc/` `docs_sc/` `skills_sc/` `roadmap_sc.md` | `flat.render_visibility` | **tracked** | the outsider FnB browsing the repo |
+| Flat `_sc` files → `renders/specs_sc/` `renders/docs_sc/` `renders/skills_sc/` `renders/roadmap_sc.md` | `flat.render_visibility` | ignored local render root | operator/browser visibility |
 
 The boot doc + SKILL.md are rebuilt every launch by `run.py` for the chosen
-shell — gitignored caches, like `.db`. The flat `_sc` files are the tracked
-visibility surface for browsers without localhost; `./sc render` (and `make
-dos-verify`) regenerate them, and the publish flow (`POST /api/publish`, B6)
-refreshes them on every content edit. Each rendered file carries the do-not-edit banner (spec
+shell — gitignored caches, like `.db`. The flat `_sc` files are a local
+visibility surface; `./sc render` (and `make dos-verify`) regenerate them.
+Each rendered file carries the do-not-edit banner (spec
 §Content & Render); for bodies that already open with YAML frontmatter the
 banner keys are spliced into it rather than prepended, so the YAML stays valid.
 
-`scripts/render.py` is the standalone CLI: `flat` (tracked `_sc`),
+`scripts/render.py` is the standalone CLI: `flat` (local `_sc`),
 `skills <shortname>` (one shell's `.claude/skills/`), or `all <shortname>`.
 
 ## Skills
@@ -70,6 +70,7 @@ is harness-blind. Each holds an `adapter.json`:
 | field | meaning |
 |---|---|
 | `launch` | argv exec'd to start the harness |
+| `comm_aliases` | optional; extra `/proc/<pid>/comm` values a live harness presents when its runtime name differs from its launch binary (liveness scanning — see `scripts/shell_liveness.py`) |
 | `boot_artifact` | the context file this harness reads (informational) |
 | `emit` | files in the adapter dir copied to the repo root at launch (gitignored, regenerated each launch from the tracked template) |
 | `env` | extra env merged into the launch environment |
@@ -111,8 +112,8 @@ and the static `ui/` (one page, vanilla JS) on a single per-fork port.
   2–4, 7) — not a disabled control, an absent endpoint. Frozen documents reject
   edits server-side.
 - `POST /api/snapshot` runs `snapshot.py` + `render.py flat` — the local-only
-  serialize + render. `POST /api/publish` (B6) extends it into the full
-  commit→force-push→PR cycle on the ephemeral `sc_gui_content` branch.
+  serialize + render. `POST /api/publish` is a retired endpoint and returns
+  HTTP 410.
 
 `scripts/ports.py` derives this fork's port from its repo path (`8800 + sha1 %
 100`), bumping past anything occupied, and persists it to the gitignored

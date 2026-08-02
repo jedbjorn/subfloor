@@ -22,7 +22,7 @@ also be procedure-only (`block: None`) — no infrastructure half at all, just
 grants; `app-deploy` is one.
 
 Grants land in shell_skills, which is fork memory — enable/disable therefore
-re-snapshots, so `.sc-state/content.sql` stays current and a rebuild keeps the
+re-snapshots, so `.sc-state/local/content.sql` stays current and a rebuild keeps the
 grants.
 
 Usage:
@@ -47,6 +47,8 @@ PY = sys.executable
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
+import artifact_policy  # noqa: E402
+import skill_projection  # noqa: E402
 
 # The registry. `block` is the instance.json key (None = procedure-only, no
 # infrastructure half); `block_auto` says whether enable may create it (only
@@ -58,8 +60,7 @@ FEATURES: dict[str, dict] = {
         "title": "Postgres sidecar (app-only)",
         "block": "pg",
         "block_auto": True,
-        "grants": {"test_authoring_pg": ["dev", "reviewer"],
-                   "query_authoring_pg": ["dev", "reviewer", "planner"]},
+        "grants": {"query_authoring_pg": ["dev", "reviewer", "planner"]},
         "next": ["./sc launch   # starts the sidecar + forwards DATABASE_URL "
                  "(or: ./sc pg-up)"],
     },
@@ -123,48 +124,46 @@ def _write_instance(cfg: dict) -> None:
 
 
 def grant(con, skill: str, flavors: list[str]) -> int:
-    """Grant `skill` to every live shell of the given flavors. Idempotent."""
+    """Grant `skill` once to each named flavor pack. Idempotent."""
     q = ",".join("?" for _ in flavors)
     cur = con.execute(
-        f"INSERT OR IGNORE INTO shell_skills (shell_id, skill_id) "
-        f"SELECT s.shell_id, k.skill_id FROM shells s, skills k "
-        f"WHERE COALESCE(s.is_deleted,0)=0 AND s.flavor IN ({q}) "
-        f"AND k.name=? AND k.is_deleted=0",
-        (*flavors, skill))
+        f"INSERT OR IGNORE INTO flavor_skills (flavor, skill_id) "
+        f"SELECT f.flavor, k.skill_id "
+        f"FROM (SELECT flavor FROM flavor_skills WHERE flavor IN ({q}) "
+        f"      UNION SELECT flavor FROM shells WHERE flavor IN ({q})) f, skills k "
+        f"WHERE k.name=? AND k.is_deleted=0",
+        (*flavors, *flavors, skill))
     return cur.rowcount
 
 
 def revoke(con, skill: str, flavors: list[str]) -> int:
-    """Revoke `skill` from shells of the given flavors — only the grants enable
-    would have made; a grant to a bespoke/other-flavor shell is left alone."""
+    """Revoke `skill` from named flavor packs; Bespoke grants stay untouched."""
     q = ",".join("?" for _ in flavors)
     cur = con.execute(
-        f"DELETE FROM shell_skills WHERE skill_id IN "
+        f"DELETE FROM flavor_skills WHERE skill_id IN "
         f"(SELECT skill_id FROM skills WHERE name=? AND is_deleted=0) "
-        f"AND shell_id IN (SELECT shell_id FROM shells "
-        f"WHERE COALESCE(is_deleted,0)=0 AND flavor IN ({q}))",
+        f"AND flavor IN ({q})",
         (skill, *flavors))
     return cur.rowcount
 
 
 def _grant_state(con, skill: str) -> list[str]:
-    """['dev(2)', 'reviewer(1)'] — live shells holding the skill, by flavor."""
+    """['dev', 'reviewer'] — flavor packs holding the skill."""
     rows = con.execute(
-        "SELECT COALESCE(s.flavor,'bespoke'), COUNT(*) FROM shell_skills g "
-        "JOIN shells s ON s.shell_id=g.shell_id "
+        "SELECT g.flavor FROM flavor_skills g "
         "JOIN skills k ON k.skill_id=g.skill_id "
-        "WHERE k.name=? AND COALESCE(s.is_deleted,0)=0 AND k.is_deleted=0 "
-        "GROUP BY 1 ORDER BY 1", (skill,)).fetchall()
-    return [f"{flavor}({n})" for flavor, n in rows]
+        "WHERE k.name=? AND k.is_deleted=0 ORDER BY g.flavor", (skill,)).fetchall()
+    return [flavor for (flavor,) in rows]
 
 
 def _snapshot() -> None:
-    """Grants are fork memory — persist them to the tracked serialization."""
+    """Grants are fork memory — persist them under the active artifact policy."""
     env = {**os.environ, "SC_ADMIN": "1"}
     r = subprocess.run([PY, str(ENGINE / "scripts" / "snapshot.py")], env=env)
     if r.returncode != 0:
-        print("⚠ snapshot failed — grants are live in the DB but "
-              ".sc-state/content.sql is stale; run ./sc snapshot", file=sys.stderr)
+        target = artifact_policy.content_path().relative_to(REPO_ROOT)
+        print(f"⚠ snapshot failed — grants are live in the DB but {target} is stale; "
+              "run ./sc snapshot", file=sys.stderr)
 
 
 def cmd_list() -> int:
@@ -218,6 +217,15 @@ def cmd_enable(name: str) -> int:
             note = f"  (no live {'/'.join(missing)} shell yet — create one and re-run)" if missing else ""
             print(f"  skill {skill} → {state}{note}")
         con.commit()
+        try:
+            skill_projection.reconcile_flavors(
+                con,
+                (flavor for flavors in f["grants"].values() for flavor in flavors),
+            )
+        except skill_projection.ProjectionError as exc:
+            sys.exit(skill_projection.partial_failure_message(
+                f"feature enable {name}", exc
+            ))
     finally:
         con.close()
 
@@ -259,6 +267,15 @@ def cmd_disable(name: str) -> int:
                 print(f"  skill {skill}: revoked {n} grant(s) "
                       f"(flavors: {', '.join(flavors)}; other shells untouched)")
             con.commit()
+            try:
+                skill_projection.reconcile_flavors(
+                    con,
+                    (flavor for flavors in f["grants"].values() for flavor in flavors),
+                )
+            except skill_projection.ProjectionError as exc:
+                sys.exit(skill_projection.partial_failure_message(
+                    f"feature disable {name}", exc
+                ))
         finally:
             con.close()
         if revoked:
@@ -293,4 +310,6 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main, sys.argv[1:]))

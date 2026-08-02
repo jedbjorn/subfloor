@@ -11,8 +11,10 @@
 # node_modules via `./sc deps`, so versions track the fork's pins, not the image.
 #
 # Why bake the binaries but mount the creds: claude installs as a symlink into
-# ~/.local/share/claude/versions/<v> (awkward to bind-mount); opencode + codex
-# are fat self-contained binaries. Baking them sidesteps the symlink dance.
+# ~/.local/share/claude/versions/<v> (awkward to bind-mount); opencode is a fat
+# self-contained binary; Codex's standalone package lives under ~/.codex and
+# must be relocated after install because that state home is mounted at runtime.
+# Baking them sidesteps host ABI differences and the symlink dance.
 # Auth/config (~/.claude, ~/.claude.json, ~/.config/opencode,
 # ~/.local/share/opencode, ~/.codex, ~/.vibe, ~/.kimi-code) is mounted rw from
 # the host so the container reuses the login you already did — no in-container
@@ -34,8 +36,14 @@ RUN apt-get update \
       sqlite3 git curl bash ca-certificates ripgrep \
  && rm -rf /var/lib/apt/lists/*
 
-# GitHub CLI (gh) — the in-container push/PR path: the GUI "publish" flow
-# (snapshot → render → commit → push → PR) and shells that open their own PRs.
+# websockets 16.1.1 (BSD-3-Clause) — the sans-io WS layer for the one-port
+# HTTP+WS transport (api/transport.py; WS upgrades currently answer
+# unavailable). Baked into the IMAGE python
+# because the engine server runs on the image's interpreter, not the fork's
+# .venv.
+RUN pip install --no-cache-dir "websockets==16.1.1"
+
+# GitHub CLI (gh) — shells open their own feature PRs from the sandbox.
 # Not in Debian's default repos, so add the official gh apt source. Auth is NOT
 # baked: the token arrives at runtime via GH_TOKEN (`./sc launch` forwards the
 # host's `gh auth token`, or a repo-scoped SC_GH_TOKEN) — never in the image.
@@ -74,12 +82,17 @@ RUN pip install --no-cache-dir "playwright==1.60.0" \
  && playwright install --with-deps chromium \
  && chmod -R a+rX /opt/ms-playwright
 
-# Dev-kit fallback tools. `./sc lint` / `./sc typecheck` prefer the fork's .venv
-# copy (its pins + config), but a host-managed .venv (pinned out-of-tree
-# interpreter mounted by launch) is pip-skipped in the sandbox — so bake the
-# PATH fallback here or the tools are unobtainable from inside the box
-# (dos-arch QAQC-02). _sc_devtool in ./sc resolves .venv → PATH in that order.
-RUN pip install --no-cache-dir ruff mypy
+# Dev-kit fallback tools. `./sc lint` / `./sc typecheck` / `./sc test` prefer
+# the fork's .venv copy (its pins + config), but a host-managed .venv (pinned
+# out-of-tree interpreter mounted by launch) is pip-skipped in the sandbox, and
+# a .venv built by a python minor that differs from the one resolving in here
+# is present-but-unimportable — so bake the PATH fallback here or the tools are
+# unobtainable from inside the box (dos-arch QAQC-02). _sc_devtool and sc_test
+# in ./sc resolve .venv → PATH in that order, gated on _sc_venv_runnable.
+# pytest belongs in this set: sc_test's fallback lands on it, and it was
+# previously present in the running image only by accident (pip-installed, in
+# no Dockerfile layer), so a clean rebuild would have taken it away.
+RUN pip install --no-cache-dir ruff mypy pytest
 
 # Durable bare `sc` on PATH for EVERY harness. run.py prepends the repo root to
 # PATH at exec, but that only survives into a harness that hands its env verbatim
@@ -104,13 +117,36 @@ RUN printf '%s\n' \
       > /usr/local/bin/sc \
  && chmod 0755 /usr/local/bin/sc
 
+# ── Harness freshness seam ───────────────────────────────────────────────────
+# The harness CLIs are BAKED (here + below), never mounted from the host: their
+# binaries are host-ABI artifacts, not portable config. A darwin binary in a
+# linux container is fatal (see kimi's note below), vibe's entry point is a
+# script with an absolute shebang into a host uv interpreter, and glibc baselines
+# differ across the distros we support. Auth travels; binaries do not.
+#
+# Baking alone froze them, though: docker serves the installer RUNs from layer
+# cache forever, so `./sc launch|restart` — which DO build — could never make a
+# harness newer, and a new model (Opus 5, in claude 2.1.219) stayed invisible to
+# every shell. This ARG is the expiry. Rolling it invalidates the two harness
+# layers and nothing above them (node/playwright/pip stay cached); it is
+# REFERENCED inside each RUN so the bust is guaranteed, not merely implied by
+# docker's arg-cache heuristics.
+#
+# Who rolls it: every normal `./sc restart`, plus `./sc update` (dos-u),
+# `./sc update-harnesses`, and `./sc build --harnesses` — see sc's
+# harness_epoch()/harness_epoch_roll(). Each explicit refresh gets a unique UTC
+# token; routine launch/plain build reuse the stored value and stay cache-warm.
+# `restart --no-build` deliberately reuses the existing image.
+ARG SC_HARNESS_EPOCH=0
+
 # Kimi Code — baked HERE (root stage) with its binary DELIBERATELY redirected to
 # /usr/local/bin (root-writable, on every PATH), unlike the $HOME installs below.
 # Its default home, ~/.kimi-code, holds bin/ AND config in one dir, and
 # `./sc launch` bind-mounts the host's ~/.kimi-code for creds — installing there
 # would let the mount shadow the baked binary (fatal on a macOS host: darwin
 # binary, linux container). KIMI_NO_MODIFY_PATH skips its shell-rc edit.
-RUN curl -fsSL https://code.kimi.com/kimi-code/install.sh \
+RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
+ && curl -fsSL https://code.kimi.com/kimi-code/install.sh \
       | env KIMI_INSTALL_DIR=/usr/local KIMI_NO_MODIFY_PATH=1 bash
 
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.
@@ -129,13 +165,32 @@ ENV HOME=/home/${SC_USER}
 ENV PATH=/home/${SC_USER}/.local/bin:/home/${SC_USER}/.opencode/bin:${PATH}
 
 # Harness CLIs — official native installers, no npm (mirrors install.py).
-# codex drops into ~/.local/bin (already on PATH above), same as claude. vibe's
-# installer self-bootstraps uv (astral.sh) then `uv tool install`s into ~/.local/bin.
+# Codex drops a launcher in ~/.local/bin whose standalone target is under
+# ~/.codex/packages. Runtime mounts the host's whole ~/.codex so auth, sessions,
+# goals, plugins, and other durable state survive; without relocation that mount
+# also masks the image's newer package (#775). Copy the resolved standalone
+# executable into image-owned ~/.local/libexec and repoint the launcher there.
+# Vibe's installer self-bootstraps uv (astral.sh) then `uv tool install`s into
+# ~/.local/bin.
 # (kimi is baked earlier, in the root stage — see the comment there.)
-RUN curl -fsSL https://claude.ai/install.sh | bash \
+# SC_HARNESS_EPOCH is referenced so a rolled epoch re-runs these installers; they
+# resolve "latest" themselves, so the epoch is an expiry, not a version pin.
+RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
+ && curl -fsSL https://claude.ai/install.sh | bash \
  && curl -fsSL https://opencode.ai/install | bash \
  && curl -fsSL https://chatgpt.com/codex/install.sh | sh \
+ && codex_installed="$(readlink -f "$HOME/.local/bin/codex")" \
+ && test -x "$codex_installed" \
+ && mkdir -p "$HOME/.local/libexec" \
+ && install -m 0755 "$codex_installed" "$HOME/.local/libexec/codex" \
+ && ln -sfn "$HOME/.local/libexec/codex" "$HOME/.local/bin/codex" \
+ && "$HOME/.local/bin/codex" --version \
  && curl -LsSf https://mistral.ai/vibe/install.sh | bash
+
+# Stamp the epoch the harness layers were built with, so an image can be asked
+# what it is rather than guessed at: `./sc harness-status` reads this label and
+# says so when the image predates the stored epoch (i.e. a build is owed).
+LABEL sc.harness_epoch="${SC_HARNESS_EPOCH}"
 
 # Safe in-container git auth — structurally prevents a token in a URL. The
 # sandbox has no ssh, so `git@github.com:` remotes (e.g. a fork's default

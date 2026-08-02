@@ -3,14 +3,14 @@ title: subfloor — Docs
 tags: [substrate, shells, agentic-coding, harness-agnostic, sqlite]
 date: 2026-07-20
 project: subfloor
-purpose: The full documentation, ten sections
+purpose: The full documentation, eleven sections
 ---
 
 # subfloor — Docs
 
 [![Open in md-converter](https://img.shields.io/badge/Open%20in-md--converter-6b46c1?style=flat-square)](https://md-converter.designs-os.com/?url=https://github.com/jedbjorn/subfloor/blob/main/docs/README.md)
 
-One page, ten sections — each `##` heading renders as a tab in md-converter;
+One page, eleven sections — each `##` heading renders as a tab in md-converter;
 on GitHub this reads as one long page with the same anchors.
 
 ## Architecture
@@ -26,10 +26,10 @@ ships — nothing patched, nothing forked:
 | Property | Ours | Enters the harness via |
 |---|---|---|
 | **Boot context** | identity · memory · laws · current state | the boot doc it reads natively (`CLAUDE.md` / `AGENTS.md`) |
-| **Native tooling** | the `./sc` CLI — `mem` · jobs · watches · brokers | the shell it already executes commands in |
+| **Native tooling** | the `./sc` CLI — `mem` · jobs · models · brokers | the shell it already executes commands in |
 | **Skills** | DB-canonical catalogue, per-shell grants | the skill dirs it already discovers |
 | **Guardrails** | branch-guard · sandbox · worktrees | its own hook / plugin seams + the environment it boots into |
-| **Orchestration** | eventing · headless boots · sprints | its headless mode (`claude -p` · `codex exec` · `opencode run`) |
+| **Coordination** | messages · detached jobs · headless boots | its headless mode (`claude -p` · `codex exec` · `opencode run` · `kimi -p`) |
 
 The overlay makes the harness you rent behave like it has all of this built
 in — without touching its loop. Think **distro over kernel**: the kernel (the
@@ -51,7 +51,7 @@ value: 5
 label: Shell flavors
 description: planner · reviewer · dev · cartographer · admin
 :::class2
-value: 8
+value: 9
 label: Review-GUI tabs
 :::class2
 value: 88xx
@@ -64,10 +64,8 @@ label: Per-repo port band
 .super-coder/         the engine — a gitignored, materialized DEPENDENCY in a
                       fork (see .super-coder/README.md); tracked only in this
                       source repo, where the engine IS the project
-.sc-state/            fork-owned, tracked: content.sql (DB serialization / memory)
-                      + engine.ref (the upstream SHA the engine is pinned at)
-specs_sc/ docs_sc/    rendered from the DB, read-only (the _sc suffix = provenance)
-skills_sc/ roadmap_sc.md
+.sc-state/            fork-owned: tracked engine.ref (the upstream SHA pin)
+                      + ignored local/ (DB snapshot, map, flat renders)
 .claude/skills/       per-shell skills, rendered at boot — gitignored
 .sc-worktrees/        one git worktree per shell — gitignored (admin excepted;
                       see "How shells share one repo")
@@ -75,15 +73,16 @@ CLAUDE.md / AGENTS.md boot artifact — gitignored, rebuilt at launch
 ```
 
 A fork's git surfaces show **only its project** — the engine is a dependency,
-not committed source, exactly like `node_modules/`. The one fork-owned artifact
-that must survive is its DB, serialized to the tracked `.sc-state/content.sql`.
+not committed source, exactly like `node_modules/`. Instance identity, memory,
+maps, and renders stay local. A fresh clone is a new instance; it does not clone
+another installation's shells or memory.
 
 ## Install
 
 ### Quick start
 
 > [!class2]
-> **UI** Shells (your landing tab) · **Shells** your starting team — planner · 2×dev · reviewer · admin · cartographer
+> **UI** Shells (your landing tab) · **Shells** your starting team — 2×planner · 4×dev · 2×reviewer · admin · cartographer
 
 **Preparation**
 
@@ -109,8 +108,8 @@ boot a shell:
 ```bash
 cd your-repo                                                  # an existing git repo
 
-# 1. Pull in the engine + entry script (files only, no history merge):
-git remote add super-coder https://github.com/jedbjorn/subfloor.git
+# 1. Pull in the engine + entry script (files only, main branch only, no history merge):
+git remote add -t main super-coder https://github.com/jedbjorn/subfloor.git
 git fetch super-coder
 git checkout super-coder/main -- .super-coder sc
 
@@ -122,10 +121,12 @@ claude                          # or:  opencode auth login  ·  codex login  · 
 
 # 4. Launch the host server + GUI and boot a bare-metal session:
 ./sc launch
-./sc enter                      # auth + pick a shell + pick a harness + boot
 
-# 5. Commit the install (engine is gitignored — only sc + .sc-state + config track):
+# 5. Commit the install before creating shell worktrees:
 git add -A && git commit -m "chore: install subfloor"
+
+# 6. Attach a session:
+./sc enter                      # auth + pick a shell + pick a harness + boot
 ```
 
 That's the happy path. Each step is covered in depth below — installer internals,
@@ -135,7 +136,7 @@ arc from a fresh repo through ship-and-loop, see [*The loop*](#the-loop).
 ### Installer internals
 
 > [!class2]
-> **UI** Shells · Scripts · **Shells** seeds the starting team — planner · 2×dev · reviewer · admin · cartographer
+> **UI** Shells · Scripts · **Shells** seeds the starting team — 2×planner · 4×dev · 2×reviewer · admin · cartographer
 
 subfloor installs **alongside** your code — it renders to `_sc` dirs, so it
 never collides with your repo's own `/docs`, `/specs`, or skills. A fork
@@ -185,9 +186,9 @@ files stay on disk; pins its upstream SHA in `.sc-state/engine.ref`), **strips
 subfloor's own per-instance content** (a fork inherits the *system* — schema +
 skill catalogue + render chain — never the memory or roadmap), builds the system
 DB, seeds your fork's **starting team** (your user + a planner-flavor *primary*
-carrying the CC Lineage Seed and its own genesis seed, plus two `dev`, a
-`reviewer`, the `admin` that owns `main`, and the singleton **Cartographer**
-repo-map owner), and renders. So after install
+carrying the CC Lineage Seed and its own genesis seed, plus a second `planner`,
+four `dev`, two `reviewer` shells, the `admin` that owns `main`, and the singleton
+**Cartographer** repo-map owner), and renders. So after install
 your git surfaces show only your project — the engine no longer appears in
 `git status`. It refuses to run in the subfloor source repo or on an
 already-installed fork (guarding against content loss).
@@ -286,9 +287,10 @@ it owns:
 | **reviewer** | `test_authoring` · `database-migrations` · `redline_review` · `api-design` · `flags` | review |
 | **admin** | `git_cleanup` · `self_update` · `migration_management` · `local_skill_management` | engine · verify-clean |
 
-1. **Install** — `./sc install` seeds your **starting team**: a `planner` (your
-   primary), two `dev`, a `reviewer`, the `admin` that owns `main` + the engine,
-   and the singleton `cartographer`. *(admin · `self_update`, `migration_management` · UI: Shells)*
+1. **Install** — `./sc install` seeds your **starting team**: two `planner`
+   (one is your primary), four `dev`, two `reviewer` shells, the `admin` that owns
+   `main` + the engine, and the singleton `cartographer`.
+   *(admin · `self_update`, `migration_management` · UI: Shells)*
 2. **Map the repo** — the cartographer configures the index once with
    `./sc map-setup`, then `./sc map` builds it; git hooks re-map on every pull.
    It's infrastructure working shells *read* via `surface_catalogue`.
@@ -318,16 +320,16 @@ it owns:
    re-pushes; the thread closes when it's clean.
    *(dev · `dev_kit`, `test_authoring`, `flags`, `git` · UI: Flags)*
 10. **Operator merges** — merging is the FnB's gate, never a shell's (the one
-    scoped exception is a declared sprint — see *Sprints*). On dev's next boot
+    exception requires separate explicit operator authority). On dev's next boot
     the launcher auto-syncs the base onto `origin/main` and prunes the merged
     branch. *(operator gate; no shell skill · UI: Worktrees)*
 11. **Freeze spec + write docs** — on ship, the spec freezes (`frozen=1`,
     immutable; the next stage opens a fresh `seq`) and the feature doc is authored
-    — both via `docs`. `snapshot` + `./sc render` write read-only `specs_sc/` +
-    `docs_sc/`. *(planner / dev · `docs`, `snapshot` · UI: Docs)*
+    — both via `docs`. `snapshot` + `./sc render` write read-only local renders.
+    *(planner / dev · `docs`, `snapshot` · UI: Docs)*
 12. **Verify git trees clean** — the admin's `git_cleanup` triages every worktree
     (clean trees, prunable merged branches, preserved work); `./sc render-check`
-    (committed `_sc` must match the DB render) and `./sc verify` (rebuild +
+    (local `_sc` must match the DB render) and `./sc verify` (rebuild +
     headless boot) are the operator-run proofs.
     *(admin · `git_cleanup`, `snapshot` · UI: Worktrees)*
 13. **Re-map** — the cartographer re-runs (auto on pull, or `./sc map`) so the
@@ -379,9 +381,8 @@ default per harness (the `flavor_defaults` table — the picker pre-selects it;
 
 ★ = the harness the picker pre-selects for that flavor.
 
-The logic — defaults are set from **sprint success telemetry** (which
-model/flavor pairings actually land reviewed, merged work across the fleet),
-re-fit as the telemetry moves, plus three standing rules:
+The logic — defaults are set from observed model/flavor outcomes across the
+fleet, re-fit as the evidence moves, plus three standing rules:
 
 - **Bookends premium.** Planner and reviewer are *low-volume, high-leverage
   reasoning* — one good plan or one sharp review pays for the premium model
@@ -405,31 +406,44 @@ re-fit as the telemetry moves, plus three standing rules:
 > [!class2]
 > **Vibe and Kimi Code sit outside this matrix.** Neither takes a model from the launch seam. Vibe selects its own via `active_model` in `~/.vibe/config.toml` (`vibe --setup`) or `VIBE_ACTIVE_MODEL`, and takes no headless boot. Kimi Code selects via `default_model` in `~/.kimi-code/config.toml` (its `-m` wants a user-local alias, not a portable model id) — it *does* boot headless (`kimi -p`), on that configured default (`./sc run` covers claude · codex · opencode · kimi).
 
-### The sprint interview — models per role, per sprint
+### Headless model routing
 
-`flavor_defaults` + the picker cover interactive boots. Sprints boot workers
-**headlessly** (`./sc run` — no picker), so the model seam moves to the sprint
-declaration: the planner asks the operator exactly **two questions** — which
-harness and model for **devs** (one answer, every dev runs it), and which for
-**reviewers** (one answer, every reviewer runs it). The answers land in the
-sprint doc's header —
+`flavor_defaults` and the picker cover interactive boots. Generic headless
+launches have no picker, so resolve the exact local route before automation:
+
+```bash
+./sc models refresh
+./sc models list <harness>
+./sc models resolve <harness> <selector> --shell <shortname>
+./sc run <shortname> --harness <harness> -m <selector> -p "<bounded task>"
+```
+
+Refresh reads each installed harness's local catalogue. Resolve refuses
+advisory-only models, unsupported headless adapters, and effort levels the
+adapter cannot apply exactly. A failed refresh retains the last known routes as
+stale evidence instead of silently erasing them. Route records are local
+machine/account state and are not serialized into content snapshots.
+
+### Keeping harnesses (and therefore models) current
+
+A new model arrives in a new harness **CLI release** — so a shell can only reach
+the models its CLI knows about. The CLIs are image-owned (harness state homes
+are mounted, but their executables must never resolve from the host: a darwin
+binary is fatal in a linux container, and vibe's entry point carries an absolute
+shebang into a host interpreter), and docker caches those layers indefinitely.
+`SC_HARNESS_EPOCH` is their cache key. A normal restart gives it a unique value
+and reinstalls every harness at latest before replacing the running sandbox.
 
 ```
-models: devs=<harness>/<model> · reviewers=<harness>/<model>
+./sc harness-status      # what the sandbox actually runs + is a rebuild owed
+./sc restart             # refresh harnesses, build safely, then bounce
+./sc restart --no-build  # deliberately reuse the current image
 ```
 
-— and parameterize every `./sc run` the planner issues for that sprint. No
-answer → `flavor_defaults`, unchanged. One answer per flavor is deliberate:
-shells of a flavor are interchangeable workers, and reviewers stay a
-*different lineage* from the code they gate — the doctrine above, chosen per
-sprint instead of per boot.
-
-The planner itself is not interviewed — it is already booted. **Strong
-recommendation, not a gate: run the planner on Claude.** The planner is the
-low-volume, high-leverage reasoning seat, the one long-lived context in the
-loop, and the only role the inbox watcher (`./sc watch inbox`, claude-only)
-fully serves. Any harness *works* in the planner seat — wake latency and
-ergonomics degrade, correctness doesn't.
+If a model that exists is not offered to a shell, start there — it is nearly
+always the CLI build, not the picker or the account. Full runbook, including the
+multi-fork case and why the regression was invisible:
+[`.super-coder/docs/harness-freshness.md`](../.super-coder/docs/harness-freshness.md).
 
 ## Shells & worktrees
 
@@ -464,200 +478,104 @@ needed. They all work the same repo without clobbering each other:
   fork's dev port, routed by subdomain — `http://<shortname>.localhost:<port>/`
   — and the post-commit hook prints the shell's URL after each commit.
 
-## Sprints
+## Browser conversations
 
 > [!class2]
-> **UI** Docs · **Shells** planner governs (`sprint_orchestration`) · devs build + reviewers gate (`sprint`)
+> **UI** Chats · **Modes** Chat and Diff · **Shells** any ordinary shell
 
-The everyday loop ships one feature through one dev, with the operator merging.
-A **sprint** is the multi-shell mode: a declared, planner-governed push where
-several shells build **dependent units** — B builds on A, C on B — and run the
-handoffs themselves. Every unit is built, reviewed, fixed, and **merged by the
-shells**: the loop is planner → devs → reviewers → devs → planner, self-running
-what the operator used to orchestrate by hand. You declare *that* a sprint
-happens; the planner makes it run.
+The **Chats** tab hosts durable normal conversations. Select an available shell,
+choose a supported harness and model, and create a chat without opening a
+terminal. Each accepted message is stored before dispatch, queued in order, and
+resumed against the exact harness-native session recorded for that conversation.
 
-> [!class4]
-> **Prerequisite: a planned, spec'd feature.** A sprint doesn't start from an
-> idea — it starts from a thorough, multi-step feature already worked out with
-> the planner: recommendation, feature design, and the specs (usually more than
-> one) the units are cut from. Then start a **fresh session** and declare the
-> sprint — planning and sprinting don't share a chat.
+A shell has at most one open browser conversation. Browser and CLI ownership
+are mutually exclusive: a CLI launch refuses while browser chat is open, and a
+browser conversation refuses while a CLI session owns the shell. **Close** is
+the explicit browser-to-CLI handoff.
 
-```linear
-Recommendation :::class3 -> Design feature + specs :::class3 -> New session :::class4 -> Sprint :::class1
+### Chat lifecycle
+
+- **New chat** creates a distinct durable conversation and closes only an idle,
+  waiting, or failed prior chat for that shell.
+- Messages submitted during an active turn remain ordered in the queue; they do
+  not interrupt the running turn.
+- **Stop** interrupts only the active turn and preserves queued follow-ups.
+- **Close** cancels queued work, requests interruption when needed, waits for
+  terminal proof, and then releases the shell.
+- Closed conversations remain readable history. Stars pin important chats
+  without changing their lifecycle.
+- Browser refresh resumes from a bounded transcript snapshot plus the live event
+  cursor; the harness transcript is evidence, never the message queue.
+
+The broker owns dispatch and crash recovery. It leases an outbox item, creates
+one run, starts or exactly resumes the harness session, stores normalized
+events, and commits the terminal result before releasing the lease. Startup and
+lease-expiry scans are bounded recovery, not scheduled work discovery.
+
+### Chat and Diff
+
+**Chat** renders user prompts, assistant output, durable activity, queue state,
+and recovery controls. Large histories load in bounded pages and transcript
+snapshots; omitted display history remains durable.
+
+**Diff** is a read-only projection of the same conversation's live worktree,
+branch, or pull request. Switching to Diff does not stop the run or open a
+second conversation. The view preserves review after local branch cleanup by
+using the stored Git target and canonical merged-PR patch when available.
+
+The browser receives normalized conversation and Git-review resources only. It
+never receives harness credentials or mutates a harness transcript directly.
+
+## Messages, jobs & headless launch
+
+> [!class2]
+> **UI** Shells · Scripts · **Shells** all flavors
+
+Three generic tools cover work that should not live in one interactive context.
+
+### Shell messages
+
+`./sc mem message` provides durable shell-to-shell mail:
+
+| Kind | Meaning |
+|---|---|
+| `shell` | ordinary coordination |
+| `task` | a bounded instruction for another shell |
+| `result` | completion evidence or a job outcome |
+
+`check` reads unread messages without acknowledging them; `mark-read` clears
+one only after it has been acted on. Sends carry a dedupe key, so a timed-out
+request can be verified with `sent` before any retry.
+
+### Session-surviving jobs
+
+```bash
+./sc job start --label suite --timeout 1800 -- pytest
+./sc job list
+./sc job status <id>
+./sc job tail <id>
+./sc job wait <id>
+./sc job kill <id>
 ```
 
-```linear
-Declare :::class1 -> Kick off :::class1 -> Build :::class2 -> Review :::class3 -> Merge :::class2 -> Hand off :::class2 -> Close out :::class1
+A job is a detached supervised one-shot. It outlives the shell session that
+started it, captures bounded output, group-kills on timeout, and posts a
+`result` message to the starting shell when it completes. Use it for suites,
+builds, and benchmarks that would otherwise die with the harness process.
+
+### Generic headless launch
+
+```bash
+./sc models refresh
+./sc models resolve <harness> <selector> --shell <shortname>
+./sc run <shortname> --harness <harness> -m <selector> -p "<bounded task>"
 ```
 
-```mermaid
-graph TD
-  F[FnB directs a push]:::class4 --> D[Planner declares the sprint doc]:::class1
-  D --> K[Kickoff — scoped authority ON · task rows + headless worker boots]:::class1
-  K --> B[Dev builds its unit]:::class2
-  B --> P[PR open + watch registered → CI green]:::class2
-  P --> R[Sprint review]:::class3
-  R -->|Major / Medium findings| B
-  R -->|review-clean| M[Dev merges its own PR]:::class2
-  M -->|pr_event wakes planner → boots downstream dev| B
-  M --> C[all units merged]:::class1
-  C --> Q[Conformance pass — spec vs main]:::class3
-  Q -->|Major finding → fix unit| B
-  Q --> X[Close out — freeze the doc, authority OFF · watches self-retired · sprint report]:::class1
-```
-
-| Slot | Skill | Owns |
-|---|---|---|
-| **planner** | `sprint_orchestration` | decompose into units · sequence the chain · declare the board · kick off · monitor · unblock stalls · conformance pass + rulings · close out + synthesized report |
-| **dev** | `sprint` | build its unit · PR · babysit CI · fix review findings · merge on green+clean · file its unit report · hand off downstream |
-| **reviewer** | `sprint` | gate assigned units — Major/Medium block, Low goes to the report · declare `review-clean` |
-| **conformance** | `sprint` | judge the spec against `main` pre-freeze — four-way verdicts filed as a `CONFORMANCE:` doc · verdicts, never rulings |
-
-- **The sprint doc is the board — one writer.** The declaration is a
-  `documents` row (`SPRINT: <title>`, visible in the Docs tab): status line
-  (`ACTIVE | CLOSED`) plus one table row per unit — `seq · unit · shell ·
-  reviewer · depends on · branch · pr · status`. Unit status walks
-  `waiting → building → pr-open → in-review → fixing → merged`. The planner is
-  the doc's **only writer**; participants report transitions by message and the
-  planner folds them in. One writer, one board, no drift — the board is what
-  the operator and any rebooted shell reads to re-orient mid-sprint.
-- **Crew size is the planner's call, not a formula.** The planner weighs the
-  magnitude of the push against the capacity actually available — the shells
-  that exist, reviewer bandwidth, how wide the dependency graph genuinely
-  runs. More units than shells is fine (units queue behind the chain); more
-  shells than parallel work is waste. One reviewer may gate several units —
-  it just mustn't become the whole sprint's bottleneck.
-- **Scoped merge authority.** Merging stays the operator's gate everywhere —
-  a sprint grants the one narrow exception. A dev may merge **only** its
-  assigned unit's PR, **only** on all-green checks, **only** after its reviewer
-  declared review-clean (every Major/Medium fixed), **only** while the doc says
-  `ACTIVE` and isn't frozen. Anything outside those four conditions is the
-  default gate, unchanged — and the authority dies when the sprint closes.
-- **Events wake shells — nobody polls on a schedule.** A sprint is mostly
-  waiting for someone else's PR, and idle waiting used to cost a full-context
-  harness turn per poll, per shell. Now every instruction and result is a
-  typed `shell_messages` row: the planner sends `task` rows and boots workers
-  headless; a dev opens its PR and registers a watch for the planner; the
-  fork's ONE GitHub watcher daemon turns CI conclusions, reviews, and merges
-  into `pr_event` rows; the planner's zero-token inbox watcher wakes it the
-  moment any row lands. Waking is not knowing: on wake a shell re-reads the
-  board and its inbox — the event only says "look". The pieces and their
-  commands are *Under the hood — the event loop*, below.
-- **Models are declared per sprint.** Headless boots never pass the launch
-  picker, so the model seam moves to the declaration: the planner asks the
-  operator exactly two questions — which harness/model for **devs**, which
-  for **reviewers** — and the answers ride the sprint doc's `models:` line
-  into every `./sc run` of the sprint (see *Harnesses & models · The sprint
-  interview*). No answer → `flavor_defaults`, unchanged. Cross-provider is
-  first-class: devs on one harness, reviewers on another.
-- **Ambiguities are called, then reported.** A dev that hits a spec ambiguity
-  mid-unit makes the judgment call and keeps building — the chain doesn't wait
-  for a ruling — and reports the call to the planner in one line (what was
-  open, what it chose, why). The planner may overrule while the unit is
-  un-merged; silence ratifies. Every call lands in the sprint report.
-- **Review runs at sprint pace.** Same adversarial method as the everyday
-  loop, different gate: **Major/Medium findings block** the merge and loop the
-  dev through `fixing`; **Low findings inform** — one summary note to the
-  planner, landing in the sprint report as the post-sprint cleanup list.
-  Reviewers hand findings to the dev directly (scoped, like the merge
-  authority) instead of routing through the operator.
-- **Every merge closes with a unit report.** A dev's merged-notification is
-  a structured result row — `shipped / judgements / issues / deviations /
-  follow-ups` — filed at merge, while the unit's history is still in the
-  worker's context. `deviations` is the honesty field: declared here it's a
-  judgement to ratify; found later by the conformance pass it's a finding.
-- **A conformance pass gates the close.** "All units merged" and "the spec
-  shipped" are different claims — unit reviewers gate diffs, nobody else
-  reads the integrated whole. So after the last merge, **before** the freeze,
-  the planner boots review shell(s) to judge the spec against `main`: every
-  requirement gets one of four verdicts — `as-specced`,
-  `deviated-intentionally` (matches a ratified call), `deviated-silently`,
-  `unimplemented`. Major findings become fix units under still-active sprint
-  authority; Medium is a planner ruling; Low never holds the close. The
-  design is [`specs_sc/sprint-reporting.md`](../specs_sc/sprint-reporting.md).
-- **Close-out revokes everything, then reports.** Conformance rulings settled
-  → the planner sets `CLOSED`, freezes the doc (freezing **is** the
-  revocation — it's exactly what the `sprint` skill checks before any merge),
-  verifies every PR watch retired itself (`./sc watch list`), and
-  **synthesizes the sprint report** from the unit reports and the conformance
-  doc reconciled against each other — fixed skeleton: Verdict · Units
-  Shipped · Judgements Made · Spec Accuracy · Issues Encountered · Deferred &
-  Follow-ups · Spec Debt · Metrics — filed as a doc row and dropped as a copy
-  in the fork's `shared/` dir, with the `CONFORMANCE:` doc alongside as the
-  evidence trail.
-
-Enforcement is advisory in v1 — merge order and authority live in the skill
-text and the board, not in a pre-commit check. The planner absorbs mechanics
-(re-sequencing, stalls, severity disputes, booting workers — `./sc run` is
-the nudge that replaces "is it alive?"), and escalates judgment: scope cuts
-and interface changes stay the operator's calls. The daemon never boots
-anything — it only writes rows; only the planner (or the operator) starts a
-session.
-
-### Under the hood — the event loop
-
-Five pieces carry a sprint's coordination, one direction of flow. The frozen
-design is [`specs_sc/sprint-eventing.md`](../specs_sc/sprint-eventing.md).
-
-- **Typed messages.** Every `shell_messages` row carries a `kind`: `shell`
-  (ordinary shell-to-shell mail, the default), `task` (planner → worker
-  instruction), `result` (worker → planner completion report), `pr_event`
-  (daemon → shell GitHub transition). The sprint trail is one query, and a
-  rebooted planner — or the operator — can replay the whole coordination
-  history from the table alone.
-- **One watcher daemon per fork.** `./sc watch pr <owner/repo> <n>
-  --shell <shortname>` registers a PR in the `watched_prs` registry (the
-  `sprint` skill does it in the same step that opens the PR). The daemon —
-  supervised by `./sc launch` / `./sc down` like the brokers — covers every
-  live watch with one batched GraphQL poll and turns transitions (checks
-  concluded, review submitted, merged, closed) into one-line `pr_event`
-  rows: the message is the wake-up, not the payload. On merge/close a watch
-  retires itself (a merge whose checks are still pending keeps its watch until
-  they conclude); `./sc watch list` shows what's live. Each cycle the daemon
-  also beats a heartbeat row, so `list` / `pr` can say whether anybody is
-  actually polling — a watch can no longer report live with the daemon down.
-  The daemon only ever writes rows — it never boots shells and never touches
-  git.
-- **Headless workers.** `./sc run <shortname> [-p "<prompt>"]
-  [--harness <h>] [-m <model>]` boots a shell non-interactively: the same
-  render as `./sc enter`, then a per-harness adapter — `claude -p` ·
-  `codex exec` · `opencode run`. The default prompt is *"Check your inbox
-  and act on your unread messages."* Harness + model resolve explicit flags
-  → the sprint doc's `models:` line → `flavor_defaults`; a liveness guard
-  refuses a shell that already has a live session — and classifies sessions
-  that outlived their terminal as *orphaned*, so a dead boot is a labeled
-  fact, not a silent block. Workers become
-  ephemeral, per-task sessions — boot fresh, act, report a `result` row,
-  exit — so no worker context accretes across the sprint, while memory,
-  archives, and messages accrete in the DB exactly as in an interactive
-  session.
-- **A zero-token wake for the planner.** `./sc watch inbox` blocks until a
-  message row lands, then exits — armed as a background task, its exit
-  wakes the live planner session the moment anything arrives, at zero token
-  cost while idle. Claude-harness only; on other harnesses the planner
-  keeps the task-boundary inbox check, so correctness is identical and only
-  wake latency degrades.
-- **Session-surviving jobs.** `./sc job start [--label <slug>] [--timeout <s>]
-  -- <cmd>` runs long local work — a suite, a bench, a build — as a detached,
-  supervised one-shot that **outlives the session that started it** (a harness
-  background task is session-scoped and dies with a headless boot, silently).
-  Completion lands as a `result` row in the starting shell's own inbox — the
-  same wake path PR events ride — and `--timeout` group-kills a wedged run
-  into a bounded failure *with* a wake-up, never a silent hole. `list` /
-  `status` / `tail` / `kill` complete the set; `./sc job wait <id>` is the
-  bounded foreground slice (≤ 550 s; exit 2 = still running — drain your inbox
-  between slices). Full doc: [`docs_sc/job-runner.md`](../docs_sc/job-runner.md).
-
-```linear
-Planner sends task row :::class1 -> sc run dev (headless) :::class2 -> Dev builds, opens PR + watch :::class2 -> CI concludes :::class3 -> Daemon writes pr_event :::class3 -> Watcher wakes planner :::class1 -> Planner boots next unit :::class1
-```
-
-The bar the feature shipped against: a unit goes task → build → PR → green →
-review → merge with **zero scheduled polling by any shell** — the planner is
-woken by rows, workers are booted per task, and the full history replays
-from `shell_messages`.
+`./sc run` renders the same shell identity and skills as an interactive boot,
+executes one non-interactive harness turn, records its archive, and exits.
+Model resolution is exact: unsupported aliases, headless adapters, or effort
+levels fail before launch. The caller owns the task contract and any follow-up
+message; the launcher does not invent workflow or merge authority.
 
 ## Update a fork
 
@@ -672,7 +590,7 @@ floor with every row intact. (The shell-facing version of this is the
 
 ```bash
 ./sc update                     # fetch + materialize the engine, reconcile in place
-git add -A && git commit -m "chore: update subfloor"   # commits only .sc-state/ + _sc
+git add .sc-state/engine.ref sc && git commit -m "chore: update subfloor"
 ```
 
 `./sc update` fetches the engine from the `super-coder` remote and
@@ -684,16 +602,16 @@ live DB, **applies pending migrations in place** (never a rebuild-from-snapshot 
 your unsnapshotted in-session writes survive), syncs the skills catalogue
 (id-stable, so grants stay valid), re-grants any new common skills, refreshes the
 repo map, and re-snapshots the live state. Nothing under `.super-coder/` is
-committed — you commit only `.sc-state/` (refreshed `content.sql` + bumped
-`engine.ref`) and any `_sc` renders. Then restart the session to boot onto the
-new floor.
+committed — you commit only the bumped `.sc-state/engine.ref` and any
+deliberately authored project changes. Generated snapshots and `_sc` renders
+remain ignored. Then restart the session to boot onto the new floor.
 
 - `./sc update --no-fetch` reconciles against the current working tree (offline /
   dev) — engine + `engine.ref` unchanged. `--branch <name>` to track a non-`main`
   engine branch. `--ref <tag|sha>` pins the materialize to a specific upstream
   version instead of the branch head — hold a fork at a known-good engine and
   move deliberately.
-- Missing remote? `git remote add super-coder https://github.com/jedbjorn/subfloor.git`
+- Missing remote? `git remote add -t main super-coder https://github.com/jedbjorn/subfloor.git`
 
 > [!class4]
 > **Local engine edits block the update — never silently overwritten.** The
@@ -786,9 +704,8 @@ launch, enter, snapshot, render, and the GUI work unchanged.
 ./sc launch              # start host services + Review GUI, 127.0.0.1 only
 ./sc enter               # boot a trusted bare-metal session
 ./sc enter-<shortname>   # boot one shell directly, skip the shell picker
-./sc run <shortname>     # headless boot: render + exec, drain the inbox, act, exit (sprint workers)
-./sc watch pr <o/r> <n>  # register a PR watch — the daemon turns its transitions into pr_event rows
-./sc watch inbox         # block until this shell has unread messages — the planner's zero-token wake
+./sc url                 # reprint this fork's Review GUI + dev-server URLs
+./sc run <shortname>     # headless boot: render + exec one bounded task, then exit (sprint workers)
 ./sc job start -- <cmd>  # run a long local command detached + supervised — survives the session,
                          #   completion lands in your inbox (wait/list/status/tail/kill complete the set)
 ./sc mem <cmd>           # a shell's own memory over the engine API (state · seed · lns · decision ·
@@ -799,9 +716,9 @@ sc sql "<query>"         # read-only passthrough to the engine DB; `sc map-sql` 
 ./sc persist             # reboot-proof the host daemons: install every applicable systemd --user unit
 ./sc logs                # tail the host server log
 ./sc rebuild             # rebuild .super-coder/shell_db.db from schema + migrations + snapshot
-./sc render              # regenerate the tracked flat _sc files from the DB
-./sc render-check        # fail if the committed _sc files drift from the DB render (CI guard)
-./sc snapshot            # serialize per-instance tables → .sc-state/content.sql
+./sc render              # regenerate ignored flat _sc files beneath .sc-state/local/
+./sc render-check        # fail if the local _sc files drift from the DB render
+./sc snapshot            # serialize per-instance tables → .sc-state/local/content.sql
 ./sc preview             # live worktree UI previews, one subdomain per shell
 ./sc update              # fetch + materialize the engine, reconcile in place (--ref <tag|sha> pins)
 ./sc rollback            # sound undo of a bad update (restore DB + engine)
@@ -890,7 +807,7 @@ front door to the pair:
 
 | Feature | Config block | Skills → flavors | What it gives the fork |
 |---|---|---|---|
-| **`pg`** | `pg` (auto-created) | `test_authoring_pg` → dev, reviewer · `query_authoring_pg` → dev, reviewer, planner | A `postgres:17` sidecar on `sc-net`, `DATABASE_URL` forwarded into the sandbox — develop + test the fork's **app** against real Postgres (the engine DB stays SQLite, always) — plus the diagnostic-SQL runbook (psql mechanics, dialect traps, read-only handoff scripts) |
+| **`pg`** | `pg` (auto-created) | `query_authoring_pg` → dev, reviewer, planner | A `postgres:17` sidecar on `sc-net`, `DATABASE_URL` forwarded into the sandbox — infrastructure for the fork's **app** against real Postgres (the engine DB stays SQLite, always) — plus the diagnostic-SQL runbook (psql mechanics, dialect traps, read-only handoff scripts). The fork owns its test fixtures and database setup; generic test doctrine continues through ordinary flavor packs. |
 | **`windows`** | `vm` (operator-linked) | `windows_devkit` → dev, reviewer · `windows_vm_gui` → dev, reviewer · `configure_winbox` → admin | The Windows Test VM loop — push → exec → capture → reset against a real Windows box, via the host-side broker (next section) — plus UIA-based GUI driving for exploratory QAQC |
 | **`tailnet`** | `ts` (operator-linked) | `tailscale` → devops | The tailnet broker — reach declared build/deploy hosts from the sandbox without holding a tailnet credential (section after) |
 | **`pm2`** | `pm2` (operator-linked) | `pm2` → admin, devops | The pm2 broker — observe + manage the host's pm2-supervised **app** stack (status, health, logs, scoped restarts) from the sandbox (section after) |
@@ -1221,20 +1138,24 @@ plus the host steps it prints are the whole setup. Full design:
 [`.super-coder/docs/db-broker.md`](../.super-coder/docs/db-broker.md).
 
 > [!class2]
-> **Reboot-proof it all in one verb.** Every host-side daemon — the GitHub watch daemon and the four brokers — has a `-install` verb (a systemd `--user` unit). `./sc persist` runs them all in one pass: installs + enables every unit that applies to this fork (the watch daemon when `gh` is present; each broker when its block is linked), enables linger so they survive logout and reboot, and skips the rest with a reason. Idempotent — re-run any time.
+> **Reboot-proof it all in one verb.** Each host-side broker has a `-install`
+> verb (a systemd `--user` unit). `./sc persist` installs and enables every
+> broker linked to this fork, enables linger so they survive logout and reboot,
+> and skips the rest with a reason. Idempotent — re-run any time.
 
 ## Review GUI
 
 > [!class2]
-> **UI** this IS the GUI — Shells · Skills · Roadmap · Docs · Flags · Worktrees · Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)
+> **UI** this IS the GUI — Chats · Shells · Roadmap · Docs · Flags · Worktrees · Map · Analytics · Scripts · **Shells** reviewer (every shell reads it)
 
-A zero-dependency localhost GUI to review the substrate — shells, roadmap,
-flags. One stdlib Python server serves both the JSON API and a static UI; no
-venv, no npm, no build step. Its nine tabs are the windows the workflow above
-refers to:
+A zero-dependency localhost GUI to review the substrate and hold normal browser
+conversations. One stdlib Python server serves the JSON API, static UI, and
+conversation event stream; no venv, no npm, no build step. Its nine tabs are
+the windows the workflow above refers to:
 
 | Tab | What it shows |
 |---|---|
+| **Chats** | Durable normal conversations by shell: queued turns, streamed state, history, stars, Stop/Close recovery, and read-only Diff review. See [Browser conversations](#browser-conversations). |
 | **Shells** | Each shell's role, mandate, editable `current_state`, identity, decisions, and skill grants. The default landing tab. |
 | **Skills** | The skill catalogue (Repo · Substrate · Craft), with per-shell grant toggles and full content in a modal. |
 | **Roadmap** | Features in a planning funnel (Brainstorm → … → Shipped), each with its spec tasks, linked docs, and flag blockers. Two views — a **Board** for editing a feature inline, and a **Flow** that groups features by work-stream and wires their blocker dependencies (see below). |
@@ -1245,11 +1166,8 @@ refers to:
 | **Analytics** | Token & session analytics — per-class spend cards, a local-day graph, and the session history swept from each harness's on-disk usage data (see [Token & session analytics](#token--session-analytics)). |
 | **Scripts** | Run the maintenance chores (snapshot, render, seed-skills, migrate, rebuild) from a button. |
 
-The header's **snapshot ⤓** / **publish ⤴** buttons serialize the DB and open a
-rolling content PR. How they authenticate to GitHub (`gh auth login` or a scoped
-`SC_GH_TOKEN`), and the rolling event log (`.super-coder/logs/webapp.log` /
-`GET /api/logs`, last 20 events) for seeing what a publish actually did:
-[`.super-coder/docs/publish-and-gh-auth.md`](../.super-coder/docs/publish-and-gh-auth.md).
+The header's **save locally ⤓** button refreshes the ignored DB snapshot and
+flat renders. Generated artifacts are never committed or published.
 
 ![Review GUI, Roadmap tab — Board view: a feature expanded into its inline editor with title, status, summary, and spec-task checklist](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/roadmap-tab.png)
 
@@ -1280,9 +1198,10 @@ The Roadmap tab renders the same feature rows two ways, toggled top-centre:
 
 The server runs **inside the sandbox container** as its foreground process, so
 `./sc launch` brings it up (printing its URL) and `./sc down` stops it;
-`./sc enter` then attaches the interactive harness session into that same
-container via `docker exec`, so the shell and the GUI run side by side, sharing
-the one bind-mounted repo + creds. The port publishes to `127.0.0.1` only.
+`./sc enter` starts a CLI-owned shell session, while the Chats tab starts a
+separate browser-owned conversation through the same harness adapters. The two
+surfaces never own one shell concurrently. The port publishes to `127.0.0.1`
+only.
 
 ```bash
 ./sc health    # curl /api/health
@@ -1300,19 +1219,18 @@ operational fields (`current_state`, `connections`, `workspace`) and skill
 grants; edit the roadmap (linear status buckets, with toggle-filters) and
 **non-frozen** documents; create and resolve flags. **seed and L&S are
 read-only** — the laws say the shell curates them, so the API ships no endpoint
-to write them at all. A `snapshot ⤓` button re-serializes + renders after
-edits; **publish** goes one further — it snapshots, then commits your content
-edits onto an ephemeral `sc_gui_content` branch, force-pushes it, and opens (or
-refreshes) one PR to `main` — then returns to `main` and drops the local branch.
-No merge: `main` stays clean and merging the PR stays yours.
+to write them at all. A **save locally ⤓** button re-serializes + renders after
+edits into `.sc-state/local/`. There is no Git publication path for generated
+instance state.
 
 The **Scripts** tab lists the maintenance scripts (snapshot, render, seed-skills,
 migrate, rebuild) — each with a description and a **run** button, so the common
 chores work from the GUI without dropping to a terminal (rebuild prompts first,
 since it discards un-snapshotted DB edits).
 
-The live `.super-coder/shell_db.db` is **gitignored and rebuilt** from
-git-tracked text. See `.super-coder/README.md` for the full model.
+The live `.super-coder/shell_db.db` is **gitignored** and rebuilt from authored
+schema/migrations plus the ignored local snapshot. See `.super-coder/README.md`
+for the full model.
 
 > [!class2]
 > **Spec:** the founding design lives in the roadmap (`super-coder` feature row) and renders to `specs_sc/`.
@@ -1345,10 +1263,8 @@ shortname names it) and archive time-window; anything ambiguous stays visibly
 **unattributed** rather than guessed. The Analytics tab reads it all back:
 per-class stat cards with harness/model filters, a local-day spend graph,
 usage panels (favorite model by flavor, peak day, features and specs shipped,
-docs outstanding), and a session history grouped by local day with sprint
-clusters and per-session token rollups.
-
-![Review GUI, Analytics tab — token-class stat cards with harness and model filters, the total-tokens spend graph, usage panels (favorite model by flavor, peak day, features and specs shipped, docs outstanding), and the day-grouped session history](https://raw.githubusercontent.com/jedbjorn/subfloor/main/docs/images/analytics.png)
+docs outstanding), and a session history grouped by local day with per-session
+token rollups.
 
 The same reads are served as JSON at `/api/analytics/*` (session window +
 cursor, token totals and series, filters) for anything outside the GUI.

@@ -36,6 +36,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from github_pull_requests import (
+    GitHubPullRequestReader,
+    GitHubReadError,
+    newest_by_branch,
+)
+
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 
@@ -122,28 +128,13 @@ def _gh_merged_prs() -> tuple[dict[str, dict] | None, bool]:
     if shutil.which("gh") is None:
         return None, False
     try:
-        r = subprocess.run(
-            ["gh", "pr", "list", "--state", "all", "--limit", "300",
-             "--json", "number,headRefName,state,mergedAt"],
-            cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=20)
-        if r.returncode != 0:
-            return None, False
-        by_branch: dict[str, dict] = {}
-        for pr in json.loads(r.stdout or "[]"):
-            ref = pr.get("headRefName")
-            if not ref:
-                continue
-            # A reused branch name carries several PRs; the NEWEST (highest
-            # number) is authoritative. MERGED-always-wins was unsafe: a new
-            # OPEN PR on a branch whose earlier PR merged got misread as merged,
-            # marking the branch stale -> `git branch -D` on live work. Newest-
-            # wins also handles reopen-then-merge (newest merged -> prunable).
-            num = pr.get("number") or 0
-            prev = by_branch.get(ref)
-            if prev is None or num > (prev.get("number") or 0):
-                by_branch[ref] = {"number": pr.get("number"), "state": pr.get("state")}
-        return by_branch, True
-    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        reader = GitHubPullRequestReader(REPO_ROOT, runner=subprocess.run)
+        by_branch = newest_by_branch(reader.list())
+        return {
+            branch: pull_request.hygiene_dict()
+            for branch, pull_request in by_branch.items()
+        }, True
+    except (GitHubReadError, subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
         return None, False
 
 
@@ -274,4 +265,6 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main, sys.argv[1:]))

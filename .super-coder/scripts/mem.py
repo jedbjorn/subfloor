@@ -18,20 +18,32 @@ act as another shell (identity isn't a spoofable argument; it's the secret
 token). The one place a *recipient* is named is `message send <to>` — that
 addresses someone else's inbox; the sender is always the token.
 
+Host Admin discovery (spec doc #30 req 11): a host Admin seat booted outside
+run.py has neither var. When BOTH are absent, `sc mem` may adopt the unique
+owner-only runtime credential the supervised API provisions per Admin shell
+(`.super-coder/run/mem/<shortname>.json`, mode 0600) — `SC_MEM_AS=<shortname>`
+selects one when several exist; ambiguity, a symlinked or otherwise insecure
+artifact, and a stale (rotated) token all refuse with the supported action.
+Discovery still calls the API; it is never a direct-DB path.
+
 Run from the repo root, like every engine command:
 
-    ./sc mem which                                 # confirm API reachability + who your token resolves to
+    ./sc mem which                                 # confirm the memory API is reachable + which shell this session resolves as
     ./sc mem get <surface>           [--json]      # read: state|seed|lns|decisions|flags|roadmap|narrative|messages
     ./sc mem get decisions [<id>|--all]            # default: active index (no rationale); <id> = full row; --all incl. superseded
+    ./sc mem get flags [<id>] [--feature ID --resolved]
+                                                   # default: open; <id>: exact incl. resolved; history: feature-scoped only
                                                    # decisions read FLEET-WIDE (author tagged @shortname); writes stay your own
     ./sc mem state "<text>"
     ./sc mem seed  "<body>"          [--date YYYY-MM-DD] [--tag cc]
-    ./sc mem lns   "<body>"          [--date …] [--tag …]
+    ./sc mem lns   "<body>"          (--supersedes 29,36 | --new) [--date …] [--tag …]
+                                                   # ≤500 chars: the RULE, not the incident
+    ./sc mem curated                 # stamp a curation sweep (clears the STATUS advisory)
     ./sc mem retire <entry_id>
     ./sc mem decision "<decision>"   [--rationale "…"] [--date …] [--parent ID] [--feature ID] [--doc ID]
     ./sc mem flag open  "<description>" [--name CC-001] [--priority Medium] [--feature ID]
     ./sc mem flag close <flag_id>    [--notes "…"]
-    ./sc mem flag edit  <flag_id>    [--description "…"] [--priority P] [--feature ID]
+    ./sc mem flag edit  <flag_id>    [--name SC-002] [--description "…"] [--append "…"] [--priority P] [--feature ID]
     ./sc mem roadmap add "<title>"   [--status brainstorm] [--summary "…"] [--project <shortname|id>]
     ./sc mem roadmap status <feature_id> <status>
     ./sc mem roadmap edit <feature_id> [--title "…"] [--summary "…"]   # revise a feature's title/summary
@@ -48,11 +60,12 @@ Run from the repo root, like every engine command:
     ./sc mem doc add "<title>" --body-file PATH [--feature ID] [--kind spec|doc] [--seq N]
     ./sc mem doc edit <document_id>  [--title "…"] [--body-file PATH] [--render-path …]   # unfrozen only
     ./sc mem doc freeze <document_id>
+    ./sc mem doc qaqc <spec_document_id> --verdict approved|changes_requested [--findings-doc ID]
     ./sc mem narrative "<line>"
     ./sc mem message check [N]                         # your unread inbox (read-only)
     ./sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
     ./sc mem message sent                              # outbound view — verify delivery
-    ./sc mem message mark-read <message_id>            # (pr_event rows are daemon-emitted)
+    ./sc mem message mark-read <message_id>
 
 Writes retry on engine-DB contention (#331): the server answers 503 when the
 shared DB is busy (nothing committed) and every method retries it; ambiguous
@@ -62,9 +75,10 @@ per-invocation dedupe_key, so a retry can never write a duplicate, #333).
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
-import signal
+import stat
 import sys
 import time
 import urllib.error
@@ -77,9 +91,138 @@ from pathlib import Path
 SC_API_TOKEN = os.environ.get("SC_API_TOKEN", "")
 SC_API_BASE  = os.environ.get("SC_API_BASE", "")
 
+# Runtime credential discovery (spec doc #30 req 11, issue #516): a host Admin
+# seat booted outside run.py has neither var. The supervised API provisions one
+# owner-only artifact per Admin shell at every boot (scripts/mem_credentials.py)
+# under .super-coder/run/mem/; when BOTH vars are absent we may discover the
+# unique Admin artifact. We still call the API and only the API — the artifact
+# carries the same bearer token run.py would have injected, never a DB path.
+_CRED_DIR = Path(os.environ.get("SC_MEM_CRED_DIR") or
+                 (Path(__file__).resolve().parents[1] / "run" / "mem"))
+_DISCOVERED_FROM: "Path | None" = None  # artifact the token came from, if any
 
-def die(msg: str) -> "NoReturn":  # noqa: F821
-    sys.exit(f"mem: {msg}")
+
+# Refusal prefix — `sc token` overrides this so its refusals name the right
+# command (scripts/token.py reuses the discovery below).
+_PROG = "mem"
+
+
+# Two refusal classes, two stable exit statuses (spec doc #30 req 23): a caller
+# can tell "there is nothing usable to read" from "an artifact is there but sits
+# outside the trust boundary" without parsing stderr.
+EXIT_UNAVAILABLE = 1   # service down / artifact missing, unreadable, malformed, ambiguous
+EXIT_UNSAFE = 2        # artifact present but not an owner-only regular file
+
+
+def die(msg: str, code: int = EXIT_UNAVAILABLE) -> "NoReturn":  # noqa: F821
+    if code == EXIT_UNAVAILABLE:
+        sys.exit(f"{_PROG}: {msg}")   # sys.exit(str) := stderr + status 1
+    print(f"{_PROG}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def _read_all(fd: int) -> bytes:
+    chunks = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _unsafe_reason(st: os.stat_result) -> "str | None":
+    """The local trust boundary as a predicate on a stat result: a real file,
+    owned by this user, with no group/world permission bits (the service writes
+    0600 under a 0700 dir). Returns why it fails, or None when it passes."""
+    if stat.S_ISLNK(st.st_mode):
+        return "a symbolic link"
+    if not stat.S_ISREG(st.st_mode):
+        return "not a regular file"
+    if st.st_uid != os.geteuid():
+        return f"owned by another user (uid {st.st_uid})"
+    if st.st_mode & 0o077:
+        return f"not owner-only (mode {oct(stat.S_IMODE(st.st_mode))})"
+    return None
+
+
+def _refuse_unsafe(path: Path, reason: str) -> "NoReturn":  # noqa: F821
+    die(f"runtime credential {path} is {reason} — the trust boundary covers "
+        "only an owner-only regular file; remove what is there and let the "
+        "supervised service re-provision it with mode 0600 at boot "
+        "(`./sc restart` / `make dos-r`).", EXIT_UNSAFE)
+
+
+def _load_runtime_credential(path: Path) -> None:
+    """Trust-boundary check, then adopt the artifact's bearer token + base.
+
+    Classified twice, deliberately. lstat first, because opening the path is
+    not a free observation: a FIFO planted at the artifact name blocks open()
+    forever — O_NOFOLLOW does not help, it only refuses symlinks — and a
+    wrong-owner artifact fails open() with EACCES, which is a trust-boundary
+    refusal (exit 2), not a "nothing to read" (exit 1). lstat answers both
+    without opening anything.
+
+    lstat is a path check, so it cannot be the authority: fstat on the opened
+    descriptor re-runs the same predicate, and the read comes off that same
+    descriptor — no window to swap the path between checking and using it.
+    O_NOFOLLOW closes the symlink half of that race, O_NONBLOCK the blocking
+    half."""
+    global SC_API_TOKEN, SC_API_BASE, _DISCOVERED_FROM
+    try:
+        pre = os.lstat(path)
+    except OSError as exc:
+        die(f"runtime credential {path} is unreadable ({exc}) — restart the "
+            "supervised service (`./sc restart` / `make dos-r`), which re-provisions it.")
+    reason = _unsafe_reason(pre)
+    if reason:
+        _refuse_unsafe(path, reason)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            _refuse_unsafe(path, "a symbolic link")
+        die(f"runtime credential {path} is unreadable ({exc}) — restart the "
+            "supervised service (`./sc restart` / `make dos-r`), which re-provisions it.")
+    try:
+        reason = _unsafe_reason(os.fstat(fd))   # the authoritative check
+        if reason:
+            _refuse_unsafe(path, reason)
+        try:
+            data = json.loads(_read_all(fd))
+            token, base = data["token"], data["api_base"]
+        except (OSError, ValueError, KeyError):
+            die(f"runtime credential {path} is malformed — the supervised service "
+                "re-provisions it at boot: `./sc restart` / `make dos-r`.")
+    finally:
+        os.close(fd)
+    SC_API_TOKEN, SC_API_BASE, _DISCOVERED_FROM = token, base, path
+
+
+def _discover_runtime_credential() -> bool:
+    """Adopt the unique Admin runtime credential when no env wiring exists.
+
+    Selection: SC_MEM_AS=<shortname> picks one artifact explicitly; without
+    it exactly one artifact must exist — multiple Admin identities are
+    ambiguous and refused, never guessed."""
+    try:
+        artifacts = sorted(p for p in _CRED_DIR.glob("*.json"))
+    except OSError:
+        return False
+    want = os.environ.get("SC_MEM_AS", "")
+    if want:
+        artifacts = [p for p in artifacts if p.stem.lower() == want.lower()]
+        if not artifacts:
+            die(f"no runtime credential for Admin shell '{want}' in {_CRED_DIR} — "
+                "the supervised service provisions one per Admin shell at boot "
+                "(`./sc restart` / `make dos-r`).")
+    if not artifacts:
+        return False
+    if len(artifacts) > 1:
+        die(f"multiple Admin runtime credentials in {_CRED_DIR} "
+            f"({', '.join(p.stem for p in artifacts)}) — identity is ambiguous; "
+            "re-run with SC_MEM_AS=<shortname> to choose one explicitly.")
+    _load_runtime_credential(artifacts[0])
+    return True
 
 
 def _require_api() -> None:
@@ -88,11 +231,15 @@ def _require_api() -> None:
     shell think a write was API-backed when it wasn't)."""
     if SC_API_TOKEN and SC_API_BASE:
         return
+    if not SC_API_TOKEN and not SC_API_BASE and _discover_runtime_credential():
+        return
     missing = [n for n, v in (("SC_API_BASE", SC_API_BASE), ("SC_API_TOKEN", SC_API_TOKEN)) if not v]
     die(f"the engine API is required but {' + '.join(missing)} "
         f"{'is' if len(missing) == 1 else 'are'} unset — this shell isn't API-wired. "
         f"Boot via `./sc enter` (run.py injects them) with the server up (`./sc launch`). "
-        f"`./sc mem` does not fall back to direct DB.")
+        f"On a host Admin seat, the supervised service provisions a runtime "
+        f"credential at {_CRED_DIR}/<shortname>.json that `sc mem` discovers "
+        f"automatically. `./sc mem` does not fall back to direct DB.")
 
 
 _RETRIES = 3          # extra attempts beyond the first
@@ -100,7 +247,7 @@ _RETRY_PAUSE = 2.0    # seconds between attempts (503 may override via Retry-Aft
 _TIMEOUT = 10         # default per-request HTTP timeout (seconds)
 # Doc add/edit/freeze commit fast but then SYNCHRONOUSLY run snapshot+render
 # server-side (each subprocess capped at 180s — up to ~360s, plus queueing on
-# the shared content-write lock behind another serialize or a Publish). With
+# the shared content-write lock behind another local serialize). With
 # the generic timeout a slow success surfaced as "API unreachable" and a PATCH
 # retry re-ran the whole serialize (SC-013). Doc writes carry their own budget.
 _DOC_WRITE_TIMEOUT = 420
@@ -108,7 +255,8 @@ _DOC_WRITE_TIMEOUT = 420
 
 def _api(method: str, path: str, payload: "dict | None" = None,
          idempotent: "bool | None" = None,
-         timeout: "float | None" = None) -> dict:
+         timeout: "float | None" = None,
+         idem_key: "str | None" = None) -> dict:
     """POST/PATCH/GET to the engine API; die loud on any error.
 
     Retries (#331 — multi-shell write contention on the engine DB):
@@ -130,6 +278,8 @@ def _api(method: str, path: str, payload: "dict | None" = None,
     headers: dict = {"Authorization": f"Bearer {SC_API_TOKEN}"}
     if data is not None:
         headers["Content-Type"] = "application/json"
+    if idem_key is not None:
+        headers["Idempotency-Key"] = idem_key
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     for attempt in range(1 + _RETRIES):
         last = attempt == _RETRIES
@@ -144,6 +294,11 @@ def _api(method: str, path: str, payload: "dict | None" = None,
                     pause = _RETRY_PAUSE
                 time.sleep(pause)
                 continue
+            if e.code == 401 and _DISCOVERED_FROM is not None:
+                die(f"the runtime credential {_DISCOVERED_FROM} is stale — the API "
+                    "refused it (the key was rotated after the artifact was written). "
+                    "The supervised service refreshes the artifact at boot: "
+                    "`./sc restart` / `make dos-r`, then retry.")
             try:
                 msg = json.loads(e.read()).get("error", e.reason)
             except Exception:
@@ -172,13 +327,16 @@ def cmd_which(args) -> int:
     me = _api("GET", "/_sc/mem/whoami")
     print(f"engine API : {SC_API_BASE}")
     print(f"shell      : {me.get('display_name')} ({me.get('shortname')}) #{me.get('shell_id')}")
-    print("identity   : resolved from your bearer token (SC_API_TOKEN), server-side")
+    if _DISCOVERED_FROM is not None:
+        print(f"credential : discovered from runtime artifact {_DISCOVERED_FROM}")
+    else:
+        print("identity   : resolved by the engine for this launched shell, server-side")
     return 0
 
 
 GET_SURFACES = ("state", "seed", "lns", "decisions", "flags",
                 "roadmap", "narrative", "messages",
-                "projects", "documents", "tasks", "shells")
+                "projects", "documents", "tasks", "shells", "qaqc")
 
 # The write surface is `sc mem doc …` and boot docs say "doc" — accept the
 # obvious short forms on the read side too instead of costing a round-trip.
@@ -240,14 +398,29 @@ def _render_get(surface: str, data: dict) -> int:
                       f"`get decisions <id>` for detail + rationale)")
         return 0
     if surface == "flags":
-        fs = data.get("flags", [])
+        fs = [data["flag"]] if "flag" in data else data.get("flags", [])
         if not fs:
-            print("mem: no open flags")
+            print("mem: no matching flags")
             return 0
         for f in fs:
-            nm = f.get("display_name") or f"#{f['flag_id']}"
+            # id AND label, always both (#149): a named flag used to print its
+            # name alone, so the id needed to close it had to be guessed — and
+            # SC-### names and flag_ids are drawn from two counters drifting
+            # through the same integer range, so a guess resolves to a real
+            # row rather than failing.
+            nm = f.get("display_name") or "unnamed"
             who = f" @{f['owner']}" if f.get("owner") else ""
-            print(f"[{nm}]{who} ({f.get('priority') or 'Medium'}) {f.get('description') or ''}")
+            status = "resolved" if f.get("resolved") else "open"
+            feature = f"#{f['feature_id']}" if f.get("feature_id") else "none"
+            if f.get("feature_title"):
+                feature += f" — {f['feature_title']}"
+            print(f"#{f['flag_id']} [{nm}]{who} ({f.get('priority') or 'Medium'}) "
+                  f"[{status}]")
+            print(f"  feature: {feature}")
+            print(f"  opened: {f.get('created_date') or '—'} · "
+                  f"resolved: {f.get('resolved_date') or '—'}")
+            print(f"  description: {f.get('description') or '—'}")
+            print(f"  closure notes: {f.get('resolution_notes') or '—'}")
         return 0
     if surface == "roadmap":
         rm = data.get("roadmap", [])
@@ -315,6 +488,22 @@ def _render_get(surface: str, data: dict) -> int:
             if t.get("resolution_notes"):
                 print("  ⤷ " + t["resolution_notes"])
         return 0
+    if surface == "qaqc":
+        reviews = data.get("approvals", [])
+        if not reviews:
+            print("mem: no QAQC reviews")
+            return 0
+        for review in reviews:
+            reviewer = (
+                review.get("reviewer_shortname")
+                or f"shell #{review['reviewer_shell_id']}"
+            )
+            print(
+                f"#{review['approval_id']} [{review['verdict']}] "
+                f"spec #{review['document_id']} · {reviewer} · "
+                f"{review['revision_sha256']} · {review['reviewed_at']}"
+            )
+        return 0
     if surface == "messages":
         msgs = data.get("messages", [])
         if not msgs:
@@ -332,14 +521,27 @@ def _render_get(surface: str, data: dict) -> int:
 
 def cmd_get(args) -> int:
     surface = args.surface
+    if args.resolved and surface != "flags":
+        die("--resolved is only valid with get flags --feature <id>")
     path = f"/_sc/mem/{surface}"
     if surface == "decisions":
         if args.id is not None:                   # single decision, with rationale
             path = f"/_sc/mem/decisions/{args.id}"
         elif args.all:                            # full log incl. superseded
             path = "/_sc/mem/decisions?all=1"
+    elif surface == "flags":
+        if args.id is not None:
+            if args.feature is not None or args.resolved:
+                die("get flags <id> cannot be combined with --feature or --resolved")
+            path = f"/_sc/mem/flags/{args.id}"
+        elif args.resolved:
+            if args.feature is None:
+                die("get flags --resolved needs --feature <id>; unscoped resolved history is refused")
+            path = f"/_sc/mem/flags?feature={args.feature}&resolved=1"
+        elif args.feature is not None:
+            die("get flags --feature <id> needs --resolved")
     elif args.id is not None:
-        die(f"get {surface} takes no <id> (only decisions)")
+        die(f"get {surface} takes no <id> (only decisions and flags)")
     if surface == "documents":
         if args.doc is not None:                  # single doc, with body
             path = f"/_sc/mem/documents/{args.doc}"
@@ -352,6 +554,10 @@ def cmd_get(args) -> int:
             path = f"/_sc/mem/tasks?feature={args.feature}"
         else:
             die("get tasks needs --doc <id> or --feature <id>")
+    elif surface == "qaqc":
+        if args.doc is None:
+            die("get qaqc needs --doc <spec_document_id>")
+        path = f"/_sc/sprint/approvals/{args.doc}"
     data = _api("GET", path)
     if args.json:
         print(json.dumps(data, indent=2, default=str))
@@ -365,13 +571,16 @@ def cmd_state(args) -> int:
     return _finish_api(f"mem: current_state updated ({len(args.text)} chars)")
 
 
-def _insert_identity(args, kind: str) -> int:
-    r = _api("POST", f"/_sc/mem/{kind}",
-             {"body": args.body,
-              "entry_date": args.date or str(date.today()),
-              "source_tag": args.tag})
+def _insert_identity(args, kind: str, extra: "dict | None" = None) -> int:
+    payload = {"body": args.body,
+               "entry_date": args.date or str(date.today()),
+               "source_tag": args.tag}
+    payload.update(extra or {})
+    r = _api("POST", f"/_sc/mem/{kind}", payload)
     label = "seed" if kind == "seed" else "L&S"
-    return _finish_api(f"mem: {label} entry #{r.get('entry_id', '')} added")
+    gone = r.get("retired") or []
+    note = f" (superseding {', '.join('#' + str(i) for i in gone)})" if gone else ""
+    return _finish_api(f"mem: {label} entry #{r.get('entry_id', '')} added{note}")
 
 
 def cmd_seed(args) -> int:
@@ -379,7 +588,38 @@ def cmd_seed(args) -> int:
 
 
 def cmd_lns(args) -> int:
-    return _insert_identity(args, "lns")
+    """Add an L&S entry — with the triage that keeps the set a SET.
+
+    Exactly one of --supersedes / --new is required. This is the whole fix:
+    the active set is already rendered into your boot doc, so checking a new
+    rule against it costs no extra read, and the shell doing that check had
+    nowhere to put the answer — `lns` offered one verb, `add`. The flag is the
+    landing place, and requiring it makes the triage auditable rather than
+    hoped-for. `sc mem decision` already carries `--parent` for exactly this.
+    """
+    if bool(args.supersedes) == bool(args.new):
+        die("`lns` needs exactly one of --supersedes / --new.\n"
+            "  Check the new rule against your active set (already in your boot doc):\n"
+            "    --supersedes 29,36   it contradicts or refines those — retires them, adds this\n"
+            "    --new                checked, and genuinely unrelated to every entry")
+    ids: list[int] = []
+    if args.supersedes:
+        for part in args.supersedes.replace(" ", ",").split(","):
+            if not part:
+                continue
+            if not part.lstrip("#").isdigit():
+                die(f"--supersedes takes entry ids, got '{part}'")
+            ids.append(int(part.lstrip("#")))
+        if not ids:
+            die("--supersedes needs at least one entry id")
+    return _insert_identity(args, "lns", {"supersedes": ids})
+
+
+def cmd_curated(args) -> int:
+    """Stamp a curation sweep. Unconditional — a sweep that retires nothing is
+    still a sweep, and must clear the counter or the advisory never goes quiet."""
+    _api("POST", "/_sc/mem/lns/curated", {}, idempotent=True)
+    return _finish_api("mem: L&S curation stamped — the counter restarts here")
 
 
 def cmd_retire(args) -> int:
@@ -417,6 +657,12 @@ def cmd_decision(args) -> int:
     return _finish_api(f"mem: decision #{r.get('decision_id', '')} recorded{link}")
 
 
+def _one_line(text: "str | None", limit: int = 240) -> str:
+    """A long body as one readable line — enough of it to recognise the row."""
+    s = " ".join((text or "").split())
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
 def cmd_flag(args) -> int:
     if args.flag_cmd == "open":
         r = _api("POST", "/_sc/mem/flags",
@@ -429,20 +675,48 @@ def cmd_flag(args) -> int:
     if args.flag_cmd == "edit":
         # Long-lived tracker flags update their description progressively
         # (#316) — the API always supported the PATCH; this exposes it.
+        if args.description is not None and args.append is not None:
+            die("--description replaces the body and --append adds to it — pick one")
         payload: dict = {}
+        if args.name is not None:
+            payload["display_name"] = args.name
         if args.description is not None:
             payload["description"] = args.description
+        if args.append is not None:
+            payload["append_description"] = args.append
         if args.priority is not None:
             payload["priority"] = args.priority
         if args.feature is not None:
             payload["feature_id"] = args.feature
         if not payload:
-            die("nothing to edit — pass at least one of --description / --priority / --feature")
+            die("nothing to edit — pass at least one of "
+                "--name / --description / --append / --priority / --feature")
         _api("PATCH", f"/_sc/mem/flags/{args.flag_id}", payload)
         return _finish_api(f"mem: flag #{args.flag_id} edited ({' + '.join(payload)})")
+    # close. Read the row and NAME THE TARGET BEFORE THE WRITE (#149): flag_id
+    # and the SC-### display_name are both small integers drawn from two
+    # counters that drift through the same range, so a stale or mistranscribed
+    # reference does not fail loudly — it resolves to a different real record
+    # and resolves THAT. Printing the row first is what lets a caller see it
+    # holds the wrong record while the record still exists.
+    row = _api("GET", f"/_sc/mem/flags/{args.flag_id}").get("flag") or {}
+    name = row.get("display_name") or ""
+    label = f" ({name})" if name else " (unnamed)"
+    print(f"mem: closing flag #{args.flag_id}{label} "
+          f"[{row.get('priority') or '?'}, opened {row.get('created_date') or '?'}"
+          f" by {row.get('owner') or '?'}]")
+    print(f"    {_one_line(row.get('description'))}")
+    if row.get("resolved"):
+        # Closing an already-closed flag is not a no-op: it OVERWRITES the
+        # resolution notes of whoever verified it with the closer's. Refuse,
+        # and print what that write would have destroyed.
+        die(f"flag #{args.flag_id}{label} is already closed "
+            f"({row.get('resolved_date') or 'no date'}) — closing it again would "
+            f"overwrite its resolution notes: "
+            f"{_one_line(row.get('resolution_notes')) or '(none recorded)'}")
     _api("PATCH", f"/_sc/mem/flags/{args.flag_id}",
          {"resolved": True, "resolution_notes": args.notes})
-    return _finish_api(f"mem: flag #{args.flag_id} closed")
+    return _finish_api(f"mem: flag #{args.flag_id}{label} closed")
 
 
 def cmd_roadmap(args) -> int:
@@ -528,6 +802,26 @@ def cmd_oriented(args) -> int:
 
 
 def cmd_doc(args) -> int:
+    if args.doc_cmd == "qaqc":
+        payload = {
+            "document_id": args.document_id,
+            "verdict": (
+                "pass" if args.verdict == "approved" else "fail"
+            ),
+        }
+        if args.findings_doc is not None:
+            payload["findings_document_id"] = args.findings_doc
+        review = _api(
+            "POST",
+            "/_sc/sprint/qaqc",
+            payload,
+            idempotent=True,
+            idem_key=f"qaqc|{args.document_id}|{uuid.uuid4()}",
+        )
+        return _finish_api(
+            f"mem: QAQC approval #{review['approval_id']} → {review['verdict']} "
+            f"for spec #{args.document_id} at {review['revision_sha256']}"
+        )
     if args.doc_cmd == "freeze":
         r = _api("PATCH", f"/_sc/mem/docs/{args.document_id}/freeze",
                  timeout=_DOC_WRITE_TIMEOUT)
@@ -566,14 +860,14 @@ def cmd_doc(args) -> int:
 
 def _note_serialize(r: dict) -> int:
     """Surface the server-side snapshot+render that follows a doc write
-    (subfloor#434): the flat file + content.sql refresh headlessly on the main
-    checkout. A failed serialize never fails the write — it prints a warning
+    (subfloor#434): the ignored flat render + local content.sql refresh
+    headlessly. A failed serialize never fails the write — it prints a warning
     and exits nonzero so the drift is visible, not silent."""
     s = r.get("serialize") if isinstance(r, dict) else None
     if not s:
         return 0
     if s.get("ok"):
-        print("  (snapshot + flat render refreshed on the main checkout)")
+        print("  (local snapshot + flat render refreshed)")
         return 0
     print(f"  WARNING: post-write snapshot/render failed — the DB row is live "
           f"but the flat file + content.sql did not refresh:\n{s.get('output')}")
@@ -587,8 +881,7 @@ def cmd_narrative(args) -> int:
 
 
 def _kind_tag(m: dict) -> str:
-    """' task' / ' result' / ' pr_event' label; blank for ordinary mail (and
-    for rows from a pre-0059 server that returns no kind)."""
+    """' task' / ' result' label; blank for ordinary mail."""
     kind = m.get("kind") or "shell"
     return f" {kind}" if kind != "shell" else ""
 
@@ -645,19 +938,21 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sc mem", description="engine memory surface (over the API)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("which", help="confirm API reachability + who your token resolves to") \
+    sub.add_parser("which", help="confirm the memory API is reachable + which shell this session resolves as") \
        .set_defaults(fn=cmd_which)
 
     sp = sub.add_parser("get", help=f"read a memory surface ({'/'.join(GET_SURFACES)}; doc/docs = documents)")
     sp.add_argument("surface", choices=GET_SURFACES,
                     type=lambda s: GET_SURFACE_ALIASES.get(s, s))
     sp.add_argument("id", nargs="?", type=int,
-                    help="decisions: one decision WITH rationale")
+                    help="decisions: one with rationale; flags: exact row incl. resolved")
     sp.add_argument("--all", action="store_true",
                     help="decisions: full log incl. superseded (default: active index)")
     sp.add_argument("--json", action="store_true", help="raw JSON instead of formatted text")
     sp.add_argument("--feature", type=int,
-                    help="scope to a feature (documents/tasks)")
+                    help="scope documents/tasks; flags: required with --resolved")
+    sp.add_argument("--resolved", action="store_true",
+                    help="flags: resolved rows for one --feature (unscoped history refused)")
     sp.add_argument("--doc", type=int,
                     help="documents: one doc WITH body; tasks: that doc's plan")
     sp.set_defaults(fn=cmd_get)
@@ -671,7 +966,18 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("body")
         sp.add_argument("--date")
         sp.add_argument("--tag")
+        if k == "lns":
+            # Required one-of, enforced in cmd_lns rather than by a mutually
+            # exclusive required group so the refusal can teach the triage
+            # instead of printing argparse's bare usage line.
+            sp.add_argument("--supersedes",
+                            help="entry id(s) this rule replaces — retires them, adds this")
+            sp.add_argument("--new", action="store_true",
+                            help="checked against the active set and genuinely unrelated")
         sp.set_defaults(fn=fn)
+
+    sub.add_parser("curated", help="stamp an L&S curation sweep (clears the STATUS advisory)") \
+       .set_defaults(fn=cmd_curated)
 
     sp = sub.add_parser("retire", help="retire an identity entry (frees a cap slot)")
     sp.add_argument("entry_id", type=int)
@@ -697,9 +1003,11 @@ def build_parser() -> argparse.ArgumentParser:
     fo.add_argument("--name")
     fo.add_argument("--priority", default="Medium", choices=["High", "Medium", "Low"])
     fo.add_argument("--feature", type=int)
-    fe = fsub.add_parser("edit", help="update an open flag's description/priority/feature")
+    fe = fsub.add_parser("edit", help="update an open flag's name/description/priority/feature")
     fe.add_argument("flag_id", type=int)
-    fe.add_argument("--description")
+    fe.add_argument("--name", help="set or correct the display_name (#288)")
+    fe.add_argument("--description", help="REPLACES the whole body — see --append")
+    fe.add_argument("--append", help="append to the description instead of replacing it")
     fe.add_argument("--priority", choices=["High", "Medium", "Low"])
     fe.add_argument("--feature", type=int)
     fc = fsub.add_parser("close")
@@ -790,6 +1098,17 @@ def build_parser() -> argparse.ArgumentParser:
     de.add_argument("--render-path", dest="render_path")
     df = dsub.add_parser("freeze")
     df.add_argument("document_id", type=int)
+    dq = dsub.add_parser(
+        "qaqc",
+        help="record an append-only review of the spec's current canonical body",
+    )
+    dq.add_argument("document_id", type=int)
+    dq.add_argument(
+        "--verdict",
+        required=True,
+        choices=("approved", "changes_requested"),
+    )
+    dq.add_argument("--findings-doc", dest="findings_doc", type=int)
     sp.set_defaults(fn=cmd_doc)
 
     sp = sub.add_parser("narrative", help="append a [HH:MM] line to the active archive")
@@ -805,8 +1124,6 @@ def build_parser() -> argparse.ArgumentParser:
     ms = msub.add_parser("send")
     ms.add_argument("to")
     ms.add_argument("body")
-    # 'pr_event' is deliberately not offered — it is the daemon's kind; a shell
-    # forging PR transitions would poison the wake loop's ground truth.
     ms.add_argument("--kind", default="shell", choices=["shell", "task", "result"],
                     help="message kind: shell (default) | task (planner→worker) | result (worker→planner)")
     mm = msub.add_parser("mark-read")
@@ -817,18 +1134,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str]) -> int:
-    # Restore the default SIGPIPE disposition so piping a render into `head`
-    # (or any reader that closes early) terminates quietly like a normal Unix
-    # filter, instead of raising BrokenPipeError mid-render loop (#299). Python
-    # installs SIG_IGN by default, which turns the closed pipe into an
-    # exception; SIG_DFL makes the write kill the process cleanly. Guarded for
-    # platforms without SIGPIPE (Windows), though this only ever runs on Linux.
-    if hasattr(signal, "SIGPIPE"):
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    # A reader that closes early (`| head`) is handled at the entrypoint, by
+    # cli_entry.run_cli — one mechanism for every sc script (#384). This used to
+    # restore SIG_DFL here (#299), which killed the process with signal 13
+    # mid-write and cost the command its own exit status.
     args = build_parser().parse_args(argv)
     _require_api()  # every command goes through the API — fail loud if unwired
     return args.fn(args)
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    from cli_entry import run_cli
+
+    sys.exit(run_cli(main, sys.argv[1:]))

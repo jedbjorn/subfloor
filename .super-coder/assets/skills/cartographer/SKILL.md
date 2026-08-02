@@ -29,11 +29,11 @@ the HOME clone, so a work-repo sync does NOT auto-remap. After the work repo
 moves (pull, merge, branch switch), re-run `sc map` yourself — treat a
 work-repo sync message from any shell as a remap trigger.
 
-Map db = `.sc-state/map.db`, separate from the engine memory db
+Map db = `.sc-state/local/map/map.db`, separate from the engine memory db
 (`shell_db.db`) so an engine schema change never touches the map. Reads: `sc
 map-sql "…"`. Authoring writes (UPDATE/INSERT/DELETE on `dr_*`): `sc
 map-sql-rw "…"` — `sc map-sql` refuses writes. Authored sections serialize to
-`.sc-state/map_content.sql` on snapshot (admin/GUI step — see Standing jobs)
+`.sc-state/local/map/content.sql` on snapshot (admin/GUI step — see Standing jobs)
 and reload on a fresh map db.
 
 `<self>` = your `shell_id` (ACTIVE SESSION block).
@@ -64,10 +64,11 @@ and reload on a fresh map db.
    Eyeball the top-level dirs -> anything mis-classified, or a
    generated/vendored dir being indexed?
 
-2. **Author `.sc-state/map.config.json`** — authored content (tracked,
-   per-fork, survives `sc update`; lives in `.sc-state/`, outside the
-   gitignored engine dir). All keys optional; each merges over `map_repo.py`
-   defaults:
+2. **Author the active map config at the canonical live root** —
+   `$SC_ROOT/.sc-state/local/map/config.json`. The mapper
+   deliberately reads the shared live checkout, not your shell worktree. It is
+   per-instance and survives `sc update`. All keys optional; each merges over
+   `map_repo.py` defaults:
    ```json
    {
      "skip_dirs":  ["generated", "fixtures"],
@@ -99,12 +100,12 @@ and reload on a fresh map db.
    Spot-check overrides took:
    `SELECT path, role FROM dr_filepath WHERE path LIKE 'cmd/%';`
 
-5. **Describe all NULLs** — run the description worklist (Standing jobs § 2);
-   leave only when it returns zero rows.
+5. **Describe — NULLs and filler** — run the description worklist (Standing
+   jobs § 2); leave only when it returns zero rows, NULLs and filler both.
 
-6. **Commit** the config + hooks (`git` skill) -> `sc mem state "…"` ->
-   `sc mem oriented` (sets `bootstrapped=1` — the write is live in the
-   shared DB; it does NOT snapshot).
+6. **Persist locally.** Hook wiring and map config are per-clone runtime state,
+   never a commit. Then `sc mem state "…"` -> `sc mem oriented` (sets
+   `bootstrapped=1` — the write is live in the shared DB; it does NOT snapshot).
 
 ## Heal — run whenever the map looks wrong
 
@@ -112,16 +113,16 @@ Triggers: repo restructured / new language or dir / files mis-roled / map
 stale or empty on a clone whose hooks never got wired.
 
 1. Re-inspect (step 1) — what changed?
-2. Edit `.sc-state/map.config.json` to match (step 2).
+2. Edit the active canonical-root config from step 2 to match.
 3. `sc map-setup` (idempotent) — re-wires hooks + re-maps.
 4. Verify (step 4). Vanished paths are auto-pruned from `dr_filepath` by the
    remap.
 5. **Stale sections** — `dr_section` is authored, never auto-pruned. After any
    migration/restructure run the stale-section worklist (Standing jobs § 1);
    DELETE or repath every row it returns.
-6. **Describe all NULLs** (Standing jobs § 2) -> worklist empty before you
-   leave.
-7. Commit.
+6. **Describe — NULLs and filler** (Standing jobs § 2) -> worklist empty
+   before you leave.
+7. Persist by mode as in first-boot step 6.
 
 ## Standing jobs — sections, descriptions, product DB
 
@@ -161,18 +162,43 @@ ORDER BY s.name;
 -- For each row: DELETE (area gone) or UPDATE path_prefix (area renamed).
 ```
 
-**2. Descriptions (`dr_filepath.desc`)** — per-file one-liners, ≤100 chars.
-Run the worklist every session; every run ends with zero NULLs — not optional.
-Queried by working shells within a chosen section (`surface_catalogue`), never
-bulk-loaded at boot.
+**2. Descriptions (`dr_filepath.desc`)** — per-file one-liners, ≤100 chars,
+**adequate, not merely present**. A desc must say something the path does not:
+what the file *does* or *holds*, never its kind restated from the name —
+"Engine database migration: 0042_x.sql" is filler (non-NULL, zero information
+beyond the path), and a NULL-only worklist is blind to it: one mapped repo
+carried 263 such placeholders, invisible for months because every row was
+non-NULL. Derive each one-liner from the file's own docstring / frontmatter /
+header comment; hand-write the few with nothing extractable. Run the worklist
+every session; every run ends with zero rows — NULLs *and* filler — not
+optional. Queried by working shells within a chosen section
+(`surface_catalogue`), never bulk-loaded at boot.
 
 ```sql
--- WORKLIST — undescribed files, most-load-bearing first:
-SELECT path, role FROM dr_filepath WHERE desc IS NULL ORDER BY role, path;
+-- WORKLIST — undescribed OR filler, most-load-bearing first. The filler clause
+-- is a heuristic (desc ENDS with the filename or its stem — the "<kind
+-- restated>: <name>" shape); judge each hit — and treat a desc you could have
+-- written from the path alone as filler even if the query missed it:
+WITH f AS (SELECT path, role, desc,
+                  replace(path, rtrim(path, replace(path,'/','')), '') AS base
+           FROM dr_filepath),
+     g AS (SELECT *, CASE WHEN instr(base,'.') > 0
+                          THEN substr(base, 1, instr(base,'.')-1)
+                          ELSE base END AS stem FROM f)
+SELECT path, role, desc FROM g
+WHERE desc IS NULL
+   OR (length(stem) >= 5 AND (lower(substr(desc, -length(base))) = lower(base)
+                           OR lower(substr(desc, -length(stem))) = lower(stem)))
+ORDER BY (desc IS NULL) DESC, role, path;
 
 -- describe (≤100 chars; preserved across the next auto-remap):
 UPDATE dr_filepath SET desc='Boot composer — assembles CLAUDE.md from DB state' WHERE path='.super-coder/render/compose.py';
 ```
+
+Before leaving the job, spot-read a few descs per section against the files
+themselves; any desc derivable from the path alone goes back on the list.
+(Deliberate uniform tags — e.g. Standing job 3's product-DB tagging — pass the
+bar: they state tenancy the path doesn't.)
 
 **3. Product DB** — the app's own database, separate from engine memory
 (`.super-coder/shell_db.db`); working shells change them in completely
@@ -195,7 +221,7 @@ Fork ships no database of its own -> skip.
 
 After a curation pass your writes are already live in the shared map db —
 done. NEVER run a plain `sc snapshot` from a shell — it is refused by design;
-persistence = the GUI Snapshot button or an admin's `SC_ADMIN=1 ./sc
+persistence = the GUI Snapshot button or an admin's `SC_ADMIN=1 sc
 snapshot`. Don't chase it. (Sections are snapshotted; descriptions ride the
 live DB + survive remap — refill from the worklist if a rebuild drops them.)
 
@@ -217,7 +243,8 @@ Adopt one per stack:
    (fastapi? flask? svelte? next?) + the file mix
    (`SELECT lang, COUNT(*) FROM dr_filepath GROUP BY lang`).
 2. **Copy the matching reference** from the engine's
-   `.super-coder/templates/map_extractors/` into `.sc-state/map_extractors/`:
+   `.super-coder/templates/map_extractors/` into
+   `$SC_ROOT/.sc-state/map_extractors/`:
    - `fastapi_endpoints.py` — decorator routes (`@app.get(...)`, Flask `@app.route`) → `dr_endpoint`
    - `sqlite_schema.py` — SQL `CREATE TABLE/VIEW` → `dr_db_table`/`dr_db_column`
    - `sveltekit_routes.py` — filesystem routes + `*.svelte` → `dr_route`/`dr_component`
@@ -226,8 +253,10 @@ Adopt one per stack:
    rewrite the match — target the dominant pattern, not 100%.
 3. **Run + verify:** `sc map` -> table populated, rows look right
    (`SELECT method, path FROM dr_endpoint LIMIT 10;`).
-4. **Commit** `.sc-state/map_extractors/`. (Snapshotting the authored layer =
-   the admin/GUI step above — not yours to run.)
+4. **Hand off authored extractor code** to admin via the `messaging` skill,
+   naming each changed `.sc-state/map_extractors/` path and the verification
+   result. Extractor code is deliberate source; generated map DB/content stays
+   local.
 
 **Contract** (full version: `templates/map_extractors/README.md`): each module
 defines `extract(con, repo_root, cfg) -> str`. `con` = the live map db with

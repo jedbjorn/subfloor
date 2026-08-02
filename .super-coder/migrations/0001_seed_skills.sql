@@ -2,7 +2,7 @@
 -- System content: the engine catalogue propagates to every fork. Idempotent
 -- and ID-STABLE: UPSERTs each authored engine skill by name, but never
 -- retires names absent from assets/skills because those may be project-local
--- skills serialized by .sc-state/content.sql. Do not hand-edit; author
+-- skills serialized by .sc-state/local/content.sql. Do not hand-edit; author
 -- assets/skills/<name>/SKILL.md then `./sc seed-skills`.
 
 BEGIN;
@@ -14,8 +14,6 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   NULL,
   0,
   '# agents — delegated waves under your discipline
-
-> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
 
 FnB invokes this as `--agents [model]`. It is an **overlay** on `spec` (dev
 mode) and `review` (review mode): it changes only what is written here.
@@ -70,7 +68,7 @@ procedure solo; at most spawn one adversarial skeptic against your own diff
    reaching for isolation — it has real costs. Reviewer/checker agents are
    read-only; no isolation needed.
 4. **Agent claims are inputs, not results.** Re-run the real check yourself
-   — `./sc test`, lint, the spec''s done-condition — before marking anything
+   — `sc test`, lint, the spec''s done-condition — before marking anything
    done. "Agent says tests pass" is not verification. Diffs: pull them
    yourself (`git -C <worktree> diff`); NEVER adjudicate pasted diffs or
    pasted test output — pastes are lossy and unverifiable.
@@ -291,7 +289,7 @@ NEVER save the result by editing this skill: engine skills self-heal on every
 `sc update` — a fork edit to any skill named in `assets/skills/` is detected
 as stale and reverted to the shipped body. A project-local name (one the
 engine doesn''t ship) is never touched and persists through rebuilds via
-`sc snapshot` -> `.sc-state/content.sql`. Leave this scaffold as shipped.
+`sc snapshot` -> `.sc-state/local/content.sql`. Leave this scaffold as shipped.
 
 ## 1. Scaffold the migration dirs
 
@@ -370,8 +368,8 @@ contract in the same catalogue):
 2. Seed it into the catalogue + grant it live: `sc seed-skills` (upserts the
    asset into the DB, grants common skills to every live shell).
 
-3. Persist: `SC_ADMIN=1 sc snapshot` → the skill + grants survive in
-   `.sc-state/content.sql`; commit per that skill''s steps.
+3. Persist: `SC_ADMIN=1 sc snapshot` → the skill + grants survive in the
+   ignored local snapshot. There is no generated-content commit.
 
 Details, updates, and removal: the `local_skill_management` skill.
 
@@ -563,38 +561,21 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'cartographer',
-  'Own the repo map — configure mapping of the work surface (the declared work_repo when this install names one, else this repo), wire the auto-remap git hooks, heal both on drift. Cartographer-only; no working shell maps. Run on first boot + whenever the map looks wrong.',
+  'Own the repo map — configure mapping to THIS repo, wire the auto-remap git hooks, heal both on drift. Cartographer-only; no working shell maps. Run on first boot + whenever the map looks wrong.',
   'substrate',
   'sc map-setup',
   0,
   '# cartographer — own the repo map so no other shell has to
 
 Working shells consume the `dr_*` catalogue (`surface_catalogue`) and never
-map. You alone do three things: **configure** how the mapped repo is scanned,
-**wire** the automation that keeps it fresh, **heal** both on drift.
+map. You alone do three things: **configure** how this repo is mapped, **wire**
+the automation that keeps it fresh, **heal** both on drift.
 
-## Mapping target — work repo vs home repo
-
-The map scans the shells'' WORK SURFACE. When `instance.json` declares a
-`work_repo`, that repo is what `sc map` scans and what every `dr_*` row
-describes; otherwise it is this repo. Verify after any remap:
-`sc map-sql "SELECT root FROM dr_repo"` -> must print the work-repo path.
-
-The map DB, `map.config.json`, and serialized sections stay in the HOME
-repo''s `.sc-state/` regardless. NEVER write cache files, wire hooks, or set
-`core.hooksPath` in the work repo — it may run its own substrate with its own
-hooks (subfloor does).
-
-Freshness caveat in work-repo mode: the auto-remap git hooks and cron watch
-the HOME clone, so a work-repo sync does NOT auto-remap. After the work repo
-moves (pull, merge, branch switch), re-run `sc map` yourself — treat a
-work-repo sync message from any shell as a remap trigger.
-
-Map db = `.sc-state/map.db`, separate from the engine memory db
+Map db = `.sc-state/local/map/map.db`, separate from the engine memory db
 (`shell_db.db`) so an engine schema change never touches the map. Reads: `sc
 map-sql "…"`. Authoring writes (UPDATE/INSERT/DELETE on `dr_*`): `sc
 map-sql-rw "…"` — `sc map-sql` refuses writes. Authored sections serialize to
-`.sc-state/map_content.sql` on snapshot (admin/GUI step — see Standing jobs)
+`.sc-state/local/map/content.sql` on snapshot (admin/GUI step — see Standing jobs)
 and reload on a fresh map db.
 
 `<self>` = your `shell_id` (ACTIVE SESSION block).
@@ -625,10 +606,11 @@ and reload on a fresh map db.
    Eyeball the top-level dirs -> anything mis-classified, or a
    generated/vendored dir being indexed?
 
-2. **Author `.sc-state/map.config.json`** — authored content (tracked,
-   per-fork, survives `sc update`; lives in `.sc-state/`, outside the
-   gitignored engine dir). All keys optional; each merges over `map_repo.py`
-   defaults:
+2. **Author the active map config at the canonical live root** —
+   `$SC_ROOT/.sc-state/local/map/config.json`. The mapper
+   deliberately reads the shared live checkout, not your shell worktree. It is
+   per-instance and survives `sc update`. All keys optional; each merges over
+   `map_repo.py` defaults:
    ```json
    {
      "skip_dirs":  ["generated", "fixtures"],
@@ -660,12 +642,12 @@ and reload on a fresh map db.
    Spot-check overrides took:
    `SELECT path, role FROM dr_filepath WHERE path LIKE ''cmd/%'';`
 
-5. **Describe all NULLs** — run the description worklist (Standing jobs § 2);
-   leave only when it returns zero rows.
+5. **Describe — NULLs and filler** — run the description worklist (Standing
+   jobs § 2); leave only when it returns zero rows, NULLs and filler both.
 
-6. **Commit** the config + hooks (`git` skill) -> `sc mem state "…"` ->
-   `sc mem oriented` (sets `bootstrapped=1` — the write is live in the
-   shared DB; it does NOT snapshot).
+6. **Persist locally.** Hook wiring and map config are per-clone runtime state,
+   never a commit. Then `sc mem state "…"` -> `sc mem oriented` (sets
+   `bootstrapped=1` — the write is live in the shared DB; it does NOT snapshot).
 
 ## Heal — run whenever the map looks wrong
 
@@ -673,16 +655,16 @@ Triggers: repo restructured / new language or dir / files mis-roled / map
 stale or empty on a clone whose hooks never got wired.
 
 1. Re-inspect (step 1) — what changed?
-2. Edit `.sc-state/map.config.json` to match (step 2).
+2. Edit the active canonical-root config from step 2 to match.
 3. `sc map-setup` (idempotent) — re-wires hooks + re-maps.
 4. Verify (step 4). Vanished paths are auto-pruned from `dr_filepath` by the
    remap.
 5. **Stale sections** — `dr_section` is authored, never auto-pruned. After any
    migration/restructure run the stale-section worklist (Standing jobs § 1);
    DELETE or repath every row it returns.
-6. **Describe all NULLs** (Standing jobs § 2) -> worklist empty before you
-   leave.
-7. Commit.
+6. **Describe — NULLs and filler** (Standing jobs § 2) -> worklist empty
+   before you leave.
+7. Persist by mode as in first-boot step 6.
 
 ## Standing jobs — sections, descriptions, product DB
 
@@ -722,18 +704,43 @@ ORDER BY s.name;
 -- For each row: DELETE (area gone) or UPDATE path_prefix (area renamed).
 ```
 
-**2. Descriptions (`dr_filepath.desc`)** — per-file one-liners, ≤100 chars.
-Run the worklist every session; every run ends with zero NULLs — not optional.
-Queried by working shells within a chosen section (`surface_catalogue`), never
-bulk-loaded at boot.
+**2. Descriptions (`dr_filepath.desc`)** — per-file one-liners, ≤100 chars,
+**adequate, not merely present**. A desc must say something the path does not:
+what the file *does* or *holds*, never its kind restated from the name —
+"Engine database migration: 0042_x.sql" is filler (non-NULL, zero information
+beyond the path), and a NULL-only worklist is blind to it: one mapped repo
+carried 263 such placeholders, invisible for months because every row was
+non-NULL. Derive each one-liner from the file''s own docstring / frontmatter /
+header comment; hand-write the few with nothing extractable. Run the worklist
+every session; every run ends with zero rows — NULLs *and* filler — not
+optional. Queried by working shells within a chosen section
+(`surface_catalogue`), never bulk-loaded at boot.
 
 ```sql
--- WORKLIST — undescribed files, most-load-bearing first:
-SELECT path, role FROM dr_filepath WHERE desc IS NULL ORDER BY role, path;
+-- WORKLIST — undescribed OR filler, most-load-bearing first. The filler clause
+-- is a heuristic (desc ENDS with the filename or its stem — the "<kind
+-- restated>: <name>" shape); judge each hit — and treat a desc you could have
+-- written from the path alone as filler even if the query missed it:
+WITH f AS (SELECT path, role, desc,
+                  replace(path, rtrim(path, replace(path,''/'','''')), '''') AS base
+           FROM dr_filepath),
+     g AS (SELECT *, CASE WHEN instr(base,''.'') > 0
+                          THEN substr(base, 1, instr(base,''.'')-1)
+                          ELSE base END AS stem FROM f)
+SELECT path, role, desc FROM g
+WHERE desc IS NULL
+   OR (length(stem) >= 5 AND (lower(substr(desc, -length(base))) = lower(base)
+                           OR lower(substr(desc, -length(stem))) = lower(stem)))
+ORDER BY (desc IS NULL) DESC, role, path;
 
 -- describe (≤100 chars; preserved across the next auto-remap):
 UPDATE dr_filepath SET desc=''Boot composer — assembles CLAUDE.md from DB state'' WHERE path=''.super-coder/render/compose.py'';
 ```
+
+Before leaving the job, spot-read a few descs per section against the files
+themselves; any desc derivable from the path alone goes back on the list.
+(Deliberate uniform tags — e.g. Standing job 3''s product-DB tagging — pass the
+bar: they state tenancy the path doesn''t.)
 
 **3. Product DB** — the app''s own database, separate from engine memory
 (`.super-coder/shell_db.db`); working shells change them in completely
@@ -756,7 +763,7 @@ Fork ships no database of its own -> skip.
 
 After a curation pass your writes are already live in the shared map db —
 done. NEVER run a plain `sc snapshot` from a shell — it is refused by design;
-persistence = the GUI Snapshot button or an admin''s `SC_ADMIN=1 ./sc
+persistence = the GUI Snapshot button or an admin''s `SC_ADMIN=1 sc
 snapshot`. Don''t chase it. (Sections are snapshotted; descriptions ride the
 live DB + survive remap — refill from the worklist if a rebuild drops them.)
 
@@ -778,7 +785,8 @@ Adopt one per stack:
    (fastapi? flask? svelte? next?) + the file mix
    (`SELECT lang, COUNT(*) FROM dr_filepath GROUP BY lang`).
 2. **Copy the matching reference** from the engine''s
-   `.super-coder/templates/map_extractors/` into `.sc-state/map_extractors/`:
+   `.super-coder/templates/map_extractors/` into
+   `$SC_ROOT/.sc-state/map_extractors/`:
    - `fastapi_endpoints.py` — decorator routes (`@app.get(...)`, Flask `@app.route`) → `dr_endpoint`
    - `sqlite_schema.py` — SQL `CREATE TABLE/VIEW` → `dr_db_table`/`dr_db_column`
    - `sveltekit_routes.py` — filesystem routes + `*.svelte` → `dr_route`/`dr_component`
@@ -787,8 +795,10 @@ Adopt one per stack:
    rewrite the match — target the dominant pattern, not 100%.
 3. **Run + verify:** `sc map` -> table populated, rows look right
    (`SELECT method, path FROM dr_endpoint LIMIT 10;`).
-4. **Commit** `.sc-state/map_extractors/`. (Snapshotting the authored layer =
-   the admin/GUI step above — not yours to run.)
+4. **Hand off authored extractor code** to admin via the `messaging` skill,
+   naming each changed `.sc-state/map_extractors/` path and the verification
+   result. Extractor code is deliberate source; generated map DB/content stays
+   local.
 
 **Contract** (full version: `templates/map_extractors/README.md`): each module
 defines `extract(con, repo_root, cfg) -> str`. `con` = the live map db with
@@ -946,6 +956,137 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'curate',
+  'The periodic L&S sweep. Run when the STATUS L&S line says "curation due" — resolve contradictions, merge entries stating one rule, recommend recurring processes upstream, move environment facts out, then stamp `sc mem curated`. Yours alone; never delegate it.',
+  'substrate',
+  NULL,
+  1,
+  '# curate — the L&S sweep
+
+Write-time triage (`--supersedes` / `--new`) catches contradiction and
+restatement pairwise, at the moment of writing. It **cannot** catch the
+emergent cluster: five entries can each be a valid distinct rule and only in
+aggregate be five instances of one principle. That is this pass''s job, along
+with recommendation, category drift, and size drift.
+
+**Yours alone.** Law 3 and Law 7 reserve curation to the shell. Never hand this
+to a subagent, never let another shell run it for you, never accept a proposed
+retirement from anyone else. Read your own set; decide yourself.
+
+Trigger: `## STATUS` says `L&S: … — curation due`. Nothing else fires it.
+
+## Load the set
+
+```
+sc mem get lns          # entry ids + bodies — the active set, all of it
+```
+
+Read every entry before deciding anything. This is one cheap read; the whole
+set is already in your boot doc anyway.
+
+## Pass 1 — Consistency
+
+Find entries that **contradict** each other. One of them is the newer
+understanding; the other is superseded and still rendering as live guidance.
+
+```
+sc mem lns "<the surviving rule>" --supersedes <old_id>
+```
+
+Write-time triage should prevent most of these from ever forming. What you find
+here predates the loop or crossed in while two sessions ran.
+
+## Pass 2 — Cluster
+
+Group entries that state **one rule**. Merge each group to a single imperative
+rule:
+
+```
+sc mem lns "<the one rule>" --supersedes 30,33,34,37,38
+```
+
+Three or more members is the bar. Two statements of a rule are often
+legitimately two rules — merging at two is usually wrong.
+
+The incidents behind the entries are already in the narrative. They do not need
+a second home, and the merged rule must not try to carry them: an entry is the
+rule, ≤500 chars, hard-enforced.
+
+## Pass 3 — Recommend
+
+A cluster of three or more that keeps **recurring across sessions** is a
+candidate reusable process. Curation never creates or promotes a skill
+directly. Deduplicate against all upstream issues first:
+
+```bash
+gh issue list --repo jedbjorn/subfloor --state all --search "skills: recommend <topic>"
+```
+
+An existing recommendation gets the new evidence in a comment. Otherwise open
+one issue titled `skills: recommend <topic>` containing:
+
+- the trigger that makes the procedure useful;
+- the repeated incidents that exposed the need;
+- the proposed ownership boundary;
+- the expected users;
+- why existing skills do not cover it; and
+- a compact candidate procedure.
+
+```bash
+gh issue comment <number> --repo jedbjorn/subfloor --body "<new evidence>"
+gh issue create --repo jedbjorn/subfloor \
+  --title "skills: recommend <topic>" \
+  --body "<trigger, incidents, ownership, users, coverage gap, procedure>"
+```
+
+Keep one compressed L&S entry carrying the knowledge until a reviewed upstream
+skill ships **and is granted**. Filing or updating an issue is not grounds to
+retire it. If issue search or creation is unavailable, surface the failure to
+the FnB, keep the L&S, and create no local skill or asset.
+
+Deliberate fork-specific skill authoring is separate from curation and remains
+administrator-owned. The admin follows `local_skill_management`: authored
+asset → explicit seed → grant → snapshot → render.
+
+## Pass 4 — Category
+
+An entry that is an **environment fact** (a routing quirk, a term to avoid, a
+path) is not an operating principle. Move it into an existing authoritative
+skill when one owns that fact. Otherwise keep one compressed entry and include
+the missing ownership in a recommendation; do not invent a local skill during
+curation.
+
+```
+sc mem retire <entry_id>  # only after the authoritative replacement is live
+```
+
+## Stamp
+
+```
+sc mem curated
+```
+
+**Stamp even if you retired nothing.** A clean set is a legitimate outcome; if
+an honest sweep left the counter running, the advisory would stand forever and
+you would learn to ignore it. The stamp says "I looked," not "I cut."
+
+## Stance
+
+Curate the set toward ~12–14 entries, not toward the cap. Cap 20 is a ceiling
+never to reach — if you ever hit it, this sweep is not running. Recommendation
+issues do not bypass the cap by deleting knowledge before its replacement ships.
+
+The trigger firing often does not mean the threshold is wrong; it means entries
+are being written faster than they are reconciled. Fix that at write time, with
+`--supersedes`.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'database-migrations',
   'Database migration safety + how super-coder''s own migrations work (schema.sql baseline + ordered migrations/ deltas + ledger). Use when altering tables, adding columns, or running backfills — in the host repo''s DB or super-coder''s.',
   'craft',
@@ -1022,15 +1163,17 @@ through the engine API, via `sc mem`:
   `decisions`, `flags`, `narrative`, `messages`; shared planning state
   `roadmap`, `projects`, `documents`, `tasks`, `shells` (`--json` for raw).
   `documents`/`tasks` take `--feature <id>` / `--doc <id>`; `--doc` on
-  `documents` returns the one doc *with* its body.
+  `documents` returns the one doc *with* its body. `flags` is open-only by
+  default; `get flags <id>` includes one resolved row, while `get flags
+  --feature <id> --resolved` returns bounded closure evidence.
 - **Write** = `sc mem <cmd> …` (see `## Common writes`).
 
 There is NO raw `sqlite3` path — not as a fallback, not for "ad-hoc" reads.
 If the API isn''t wired, `sc mem` fails loud instead of writing the DB behind
-its back. Your identity rides in your bearer token — the server resolves
-token -> shell; never name a shell in a write. Decisions read FLEET-WIDE
-(every row, tagged `@shortname`) so cross-shell citations resolve; every
-other identity surface reads as you.
+its back. `sc mem` is already wired to this launched shell — the engine
+resolves API identity for you; never name a shell in a write. Decisions read
+FLEET-WIDE (every row, tagged `@shortname`) so cross-shell citations
+resolve; every other identity surface reads as you.
 
 **The `sc sql` lane** (read-only; `sc sql-rw` gated) is real and blessed for
 what `sc mem` doesn''t cover: admin/reporting reads and sweep queries — the
@@ -1072,7 +1215,7 @@ are ALWAYS empty there — a `dr_*` query against `shell_db.db` silently returns
 | `feature_blockers` | roadmap dependency edges: one row = `feature_id` depends on `blocked_by` (prerequisite lands first). Directed, kept acyclic (GUI Flow view wires them; the card''s "depends on" picker sets them) | INSERT/DELETE the edge; set the whole set via `sc mem roadmap depends` |
 | `documents` | content store — spec/doc bodies; `frozen=1` on ship (immutable); `render_path` = flat-file target | INSERT a new `seq` per stage; NEVER edit a frozen body |
 | `flags` | open + resolved tasks; `feature_id` links a flag to the feature it blocks | INSERT to open; UPDATE `resolved=1` + `resolved_date` to close |
-| `skills` / `shell_skills` | skill catalogue (system, seeded from `assets/skills/` via migration) + per-shell grants | managed by engine; grants via `./sc skill grant/revoke` |
+| `skills` / `flavor_skills` / `shell_skills` | skill catalogue + shared packs for standard flavors + per-shell packs for Bespoke shells; `resolved_shell_skills` is the effective read view | managed by engine; name any standard shell to change its flavor pack, or a Bespoke shell to change only itself, via `sc skill grant/revoke` |
 | `projects` / `project_shells` | project standing + shell linkage; a `projects` row also doubles as a work-stream that roadmap features attach to via `roadmap.project_id` (the Flow-view grouping) | UPDATE `standing`; INSERT to add |
 
 `<self>` = your `shell_id` (in the boot doc''s ACTIVE SESSION block).
@@ -1081,7 +1224,7 @@ are ALWAYS empty there — a `dr_*` query against `shell_db.db` silently returns
 
 Each routes through the engine API to the live shared DB. `sc mem which`
 orients; `sc mem <cmd> -h` shows flags. Writes always target your own shell —
-the server resolves it from your token.
+the engine resolves API identity for you.
 
 ```
 # current_state (rolling status, not a log — replaces in place):
@@ -1112,6 +1255,8 @@ sc mem task start <task_id>     # sc mem task done <task_id>
 sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"   # split/re-scope — never mark unbuilt work done
 
 # open / edit / close a flag:
+sc mem get flags <flag_id>                         # exact, open or resolved
+sc mem get flags --feature <feature_id> --resolved # bounded closure evidence
 sc mem flag open "[Area] … | Blocker for: …" --name CC-001 [--feature <id>]
 sc mem flag edit <flag_id> [--description "…"] [--priority High] [--feature <id>]
 sc mem flag close <flag_id> --notes "…"
@@ -1227,6 +1372,49 @@ sc mem doc add "…" --kind doc --feature <id> --body-file ./draft.md --render-p
 # a feature''s next spec stage (kind=''spec''); seq auto-advances:
 sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-path specs_sc/….md
 ```
+
+## Specs carry "Anticipated User Activity"
+
+Every spec (`kind=''spec''`) ships an `## Anticipated User Activity` section —
+the feature''s posture statement: who is expected to touch it, where it can be
+reached, whose data it holds, and what it does not intend to allow. Soft
+vocabulary, hard invariants — the nouns stay gentle, every statement stays
+checkable from code ("a Valid User only ever sees rows tied to their own
+account"), because review + Verification test the build against this section.
+
+Shape (H3s under the section H2):
+
+| H3 | holds |
+|---|---|
+| `### Vocabulary` | the cast — roles from the shared roster below + any feature-specific ones, each defined in one line |
+| `### Expected Activity` | per role: what they do, what they see, what they can change |
+| `### Reach` | where the feature meets the world — pages, endpoints, jobs, files it adds or alters, and which roles can arrive at each |
+| `### Data Tenancy` | whose data the feature touches; what stays within one account; what, if anything, is deliberately shared |
+| `### Beyond Intention` | activity the feature does not intend to accommodate — anything observed here in review is a finding, not a nuance |
+
+Shared roster (always available; same meaning in every spec):
+
+| role | means |
+|---|---|
+| **Valid Privileged User** | signed-in user with an operator/admin role, acting within what that role allows |
+| **Valid User** | signed-in user acting inside their own account and their own data |
+| **Visitor** | expected traffic that has not signed in (public/shared surfaces) |
+| **Future Potential User** | a role anticipated later, not built now — the design must not wall it out |
+| **System** | the product acting on a schedule or trigger — daemons, jobs, watchers |
+| **Shell** | an AI agent shell acting through its granted tools — its activity is messages, memory writes, file edits |
+| **Unexpected Participant** | anyone acting outside the roles above — where the spec says what must never be reachable |
+
+Language — soft by design. Specs never use: threat model, attack or attack
+surface, adversary, exploit, abuse case, vulnerability, breach, privilege
+escalation, exfiltration, malicious. Say it in roster words instead: threat
+model -> anticipated activity · attacker -> Unexpected Participant · abuse
+case -> Beyond Intention · access matrix -> Expected Activity · attack
+surface -> Reach · isolation -> tenancy. Describe behavior and boundaries,
+never hostility.
+
+Internal-only feature -> the section still ships, one line ("All activity is
+by Valid Privileged Users; no tenancy boundary"). Whole section ≤ ~40 lines —
+it frames the build, it does not enumerate it.
 
 ## Revise before freeze
 
@@ -1508,7 +1696,8 @@ only on unambiguous evidence — any doubt -> Step 4, not a close.
 Close with `sc mem flag close <flag_id> --notes "…"`. The note MUST cite the
 evidence.
 
-**A. Docs-pending flag, doc now exists** = `[Docs] … docs pending` flag on a
+**A. Docs-pending flag, doc now exists** = `[Docs]`-tagged doc-pending flag
+(however worded — "doc pending", "docs pending", "feature doc pending") on a
 feature with `frozen_docs > 0`:
 ```
 sc mem flag close <flag_id> --notes "Auto: frozen spec doc now exists for feature #<id> (flag_sweep)."
@@ -1560,7 +1749,8 @@ WHERE r.roadmap_status NOT IN (''shipped'',''retired'')
   AND NOT EXISTS (
     SELECT 1 FROM flags f
     WHERE f.feature_id = r.feature_id AND f.resolved=0 AND COALESCE(f.is_deleted,0)=0
-      AND (f.description LIKE ''%not marked shipped%'' OR f.description LIKE ''%docs pending%''));
+      AND (f.description LIKE ''[Ship]%'' OR f.description LIKE ''[Docs]%''
+           OR f.description LIKE ''%not marked shipped%'' OR f.description LIKE ''%doc%pending%''));
 ```
 
 Per row: open + message the planner (no planner -> surface to the FnB) — same
@@ -1588,8 +1778,16 @@ WHERE r.roadmap_status = ''shipped''
   AND NOT EXISTS (
     SELECT 1 FROM flags f
     WHERE f.feature_id = r.feature_id AND f.resolved=0 AND COALESCE(f.is_deleted,0)=0
-      AND f.description LIKE ''%docs pending%'');
+      AND (f.description LIKE ''[Docs]%'' OR f.description LIKE ''%doc%pending%''));
 ```
+
+The dedup guards match the `[Docs]`/`[Ship]` tag at position zero FIRST — the
+templates below mint "doc pending" (singular) and legacy hand-written flags say
+"feature doc pending", so a prose-only `''%docs pending%''` pattern matched
+neither and every later sweep re-listed already-flagged rows (found session
+ADM1/0003, seven covered rows re-surfaced). The `''%doc%pending%''` fallback
+catches untagged organic wordings; its over-breadth only ever SKIPS an open —
+the conservative direction.
 
 Per row: open + message the planner (no planner -> surface to the FnB) — same
 contract as the `flags` skill:
@@ -1650,12 +1848,27 @@ engine API) — there is no `sqlite3` path.
 ## Surface
 
 ```
-sc mem get flags          # your open flags (id, name, priority, description)
+sc mem get flags          # open flags as five-line evidence blocks (identity/status + four detail lines)
 sc mem get flags --json   # same, as JSON
+sc mem get flags <id>     # exact non-deleted row, open or resolved
+sc mem get flags --feature <id> --resolved
+                          # resolved non-deleted rows for one feature
 ```
 
 Each flag carries its `feature_id`; cross-reference `sc mem get roadmap` for
 the blocked feature''s title.
+
+The default list forms are **open-only**. Exact and feature-scoped resolved
+reads include numeric id, display name, owner, feature, priority, description,
+opened date, resolved date, and closure notes in human and JSON output. Resolved
+history without `--feature` is refused; there is no fleet-wide history read.
+
+The exact CLI form reuses the authenticated single-row endpoint that protects
+`flag close`:
+
+```
+GET /_sc/mem/flags/{id}
+```
 
 ## Open
 
@@ -1691,12 +1904,20 @@ open; NEVER message on `close`.
 ## Edit
 
 ```
-sc mem flag edit <flag_id> [--description "…"] [--priority High] [--feature <id>]
+sc mem flag edit <flag_id> [--name SC-002] [--description "…"] [--append "…"] [--priority High] [--feature <id>]
 ```
 
 For long-lived tracker flags (one flag per arc, description updated
-progressively as gates clear). `--description` replaces the whole text —
-carry forward what still applies.
+progressively as gates clear).
+
+- `--name` sets or corrects a `display_name` — including on a flag opened
+  without one. An unnamed flag is referred to by bare integer, which is the
+  precondition for the id/name collision `close` guards against.
+- `--description` REPLACES the whole body — carry forward what still applies.
+- `--append` grows the body server-side in one statement. Use it on a tracker
+  flag: two shells doing fetch -> concatenate -> `--description` concurrently
+  lose one edit. It concatenates raw — pass your own leading `\n` separator.
+- `--description` + `--append` together -> the command refuses. Pick one.
 
 ## Resolve
 
@@ -1705,6 +1926,17 @@ sc mem flag close <flag_id> --notes "…"
 ```
 
 `--notes` states *how* it was resolved — that''s the trail.
+
+`close` prints the row it holds — id, label, priority, opened date, owner,
+description — BEFORE it writes. **Read that line and confirm it names the flag
+you meant.** SC-### display names and `flag_id`s are drawn from two counters
+drifting through the same small-integer range, so a stale or mistranscribed
+reference does not fail loudly: it resolves a different real record and closes
+THAT.
+
+Closing an already-resolved flag -> refused, and it prints the resolution notes
+the write would have destroyed. A second close overwrites the notes of whoever
+verified the flag.
 
 ## Stance
 
@@ -1721,89 +1953,93 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'git',
-  'Git conventions for this install — ALL version control happens in the work repo (~/Repos/subfloor), addressed explicitly with git -C / gh --repo. Sync the base before work, branch before committing, open PRs (never merge without the FnB''s OK). Use before any git work.',
+  'Git conventions for a super-coder shell — one repo, one cwd. Sync the base before work, branch before committing, open PRs (never merge without the FnB''s OK), attribute commits per-shell. Use before any git work.',
   'substrate',
   NULL,
   0,
-  '# git — version control, the work-repo way
+  '# git — version control, the super-coder way
 
-Two repos are in reach; only one takes commits from you:
+One repo at its root -> plain `git` (cwd = repo root) is safe.
 
-| Repo | Path | Git role |
-|---|---|---|
-| **work repo** | `~/Repos/subfloor` (GitHub `jedbjorn/subfloor`) | ALL of it: sync, branch, commit, push, PR |
-| **home repo** | the repo your cwd sits in | NONE. Local-only (no remotes); commits refused by a pre-commit guard |
-
-Your cwd is a home worktree -> a bare `git`/`gh` command targets the WRONG repo.
-Address the work repo explicitly, every time:
-
-- `git -C ~/Repos/subfloor <cmd>` — never rely on cwd, even right after a `cd`.
-- `gh --repo jedbjorn/subfloor <cmd>` for PR operations.
-- Success condition: `git -C ~/Repos/subfloor rev-parse --show-toplevel` prints
-  the subfloor path before your first write of a session.
-
-NEVER commit, branch, or open a PR in the home repo. The guard blocks the
-commit and prints this redirect; `SC_HOME_MAINTENANCE=1` is for FnB-approved
-home maintenance only — never a way around a mistake. Home and work repo are
-different products with divergent histories: NEVER retarget a commit, branch,
-or diff from one onto the other. Built against the wrong repo -> rebuild from
-scratch in the right one.
+Project = this repo minus `.super-coder/`. Engine = `.super-coder/` — gitignored, materialized by `sc update`, authored upstream in super-coder. NEVER commit or edit anything under `.super-coder/`.
 
 ## Sync before you start — hard pre-code gate
 
-Run before each new unit of work. A stale base -> you read code that no longer
-exists + your PRs conflict on arrival.
+Run the gate every session + before each new unit of work. `shell/<shortname>` = a moving base pinned to `origin/main`, not a content branch — cut feature branches from it. A stale base -> you read code that no longer exists + your PRs conflict on arrival.
 
-1. `git -C ~/Repos/subfloor fetch origin main && git -C ~/Repos/subfloor rev-list --count HEAD..origin/main` -> 0 = carry on.
-2. Behind -> take stock BEFORE touching anything: `git -C ~/Repos/subfloor status` (uncommitted) + `git -C ~/Repos/subfloor rev-list origin/main..HEAD` (unmerged commits) + `git -C ~/Repos/subfloor branch --no-merged origin/main` (unlanded branches).
-3. Local state that is NOT yours -> another shell''s in-flight work: leave it untouched, take a worktree seat (below). Yours -> land or stash before syncing.
-4. Clean (or FnB said go) -> `git -C ~/Repos/subfloor checkout main && git -C ~/Repos/subfloor pull --ff-only`. Stale feature branch -> `git -C ~/Repos/subfloor rebase origin/main`.
+The launcher auto-syncs at boot when provably nothing can be lost (on base branch + clean tree + no local-only commits). Read the `sync:` line in ACTIVE SESSION: auto-synced + nothing done since -> current, carry on. Says **NOT auto-synced** / you''re mid-session about to start new work -> run:
 
-## Shared checkout — one clone, many shells
-
-`~/Repos/subfloor` is ONE checkout shared by every shell. Before switching
-branches: `git -C ~/Repos/subfloor status` — a dirty tree or a sibling''s
-checked-out branch = someone is mid-work. NEVER reset, stash, or branch-switch
-under them; take a worktree seat instead:
-
-    git -C ~/Repos/subfloor worktree add ~/Repos/subfloor-wt/<shortname> -b <type>/<short-desc> origin/main
-
-Work in it with `git -C ~/Repos/subfloor-wt/<shortname> …`; remove the seat
-(`git -C ~/Repos/subfloor worktree remove ~/Repos/subfloor-wt/<shortname>`)
-once its PR is open.
+1. `git fetch origin main && git rev-list --count HEAD..origin/main` -> 0 = carry on.
+2. Behind -> take stock BEFORE touching anything: `git status` (uncommitted) + `git rev-list origin/main..HEAD` (unmerged commits) + `git branch --no-merged origin/main` (unlanded branches).
+3. Anything local -> surface to the FnB first: list the commits/files, ask land / stash / discard. No sync without their call (soft gate).
+4. Clean (or FnB said go) -> `git checkout shell/<shortname> && git reset --hard origin/main`. NEVER `git pull`/merge on the base — merge bubbles accumulate + your squash-merged work replays as conflicts.
+5. Reset only the base, never a feature branch. Stale feature branch -> `git rebase origin/main`.
 
 ## Branch -> commit -> push -> PR -> stop
 
-1. NEVER commit to `main`. Branch first: `git -C ~/Repos/subfloor checkout -b <type>/<short-desc>` (feat/fix/chore/docs).
+1. NEVER commit to the default branch. Branch first: `git checkout -b <type>/<short-desc>` (feat/fix/chore/docs). *Admin-shell exception:* it boots at the repo root on `main`, exempt from the branch-guard; committing to main is its mandate (engine updates, migrations, approved patches) and it starts each session with `git pull --ff-only`. Every other shell branches, always.
 2. Commit in logical units. End every message with your shell''s trailer:
    ```
    Co-Authored-By: <shell display_name> (super-coder) <noreply@…>
    ```
-3. Push -> open the PR (`gh --repo jedbjorn/subfloor pr create`) -> stop. Do NOT merge without an explicit FnB directive — opening is the default, merging is a separate gate.
+3. Push -> open a PR -> stop. Do NOT merge without an explicit FnB directive — opening is the default, merging is a separate gate.
 
 ## Merging a stack (only when the FnB hands you one)
 
 Merge bottom-up, retargeting before each merge — never rely on GitHub''s auto-retarget:
 
-1. `gh --repo jedbjorn/subfloor pr view <n> --json mergeable,mergeStateStatus` -> clean.
-2. `gh --repo jedbjorn/subfloor pr merge <low> --squash --delete-branch`.
-3. BEFORE the next merge: `gh --repo jedbjorn/subfloor pr edit <next> --base main` — deleting the merged base otherwise orphans the PR above it (GitHub closes it `CONFLICTING`, base ref gone).
+1. `gh pr view <n> --json mergeable,mergeStateStatus` -> clean.
+2. `gh pr merge <low> --squash --delete-branch`.
+3. BEFORE the next merge: `gh pr edit <next> --base main` — deleting the merged base otherwise orphans the PR above it (GitHub closes it `CONFLICTING`, base ref gone).
 4. Re-check `MERGEABLE` -> merge. Repeat up the stack.
 
 PR already orphaned (base deleted under it) -> the head branch still holds the commits; reopen the SAME PR, don''t rebuild:
 
-1. `git -C ~/Repos/subfloor push origin <merged-sha>:refs/heads/<deleted-branch>` — `<merged-sha>` = `gh --repo jedbjorn/subfloor pr view <merged-pr> --json headRefOid`.
-2. `gh --repo jedbjorn/subfloor pr reopen <closed-pr>` -> `gh --repo jedbjorn/subfloor pr edit <closed-pr> --base main`.
-3. Verify `MERGEABLE` -> merge/close as directed; delete the recreated branch again.
+1. `git push origin <merged-sha>:refs/heads/<deleted-branch>` — `<merged-sha>` = `gh pr view <merged-pr> --json headRefOid`.
+2. `gh pr reopen <closed-pr>` -> `gh pr edit <closed-pr> --base main`.
+3. Verify `MERGEABLE` -> delete the recreated branch again.
 
 ## Finish before you stop
 
-Bookend to the sync gate. At end of session: `git -C ~/Repos/subfloor status` (uncommitted) + `git -C ~/Repos/subfloor rev-list origin/main..HEAD` (unpushed) -> resolve every hit:
+Bookend to the sync gate. At end of session: `git status` (uncommitted) + `git rev-list origin/<base>..HEAD` (unpushed) -> resolve every hit:
 
 1. Real work -> commit (attributed, trailer above) + push + open the PR. Don''t skip because the session is ending.
-2. Throwaway / experiment -> discard deliberately: `git -C ~/Repos/subfloor restore` / `stash`.
+2. Throwaway / experiment -> discard deliberately: `git restore` / `git stash`.
 3. Genuinely unsure -> surface to the FnB + leave it committed-and-pushed on a branch — never sitting uncommitted.
-4. Took a worktree seat -> remove it once its PR is open.',
+
+Pass = tree clean, or on a pushed branch with a PR. A dirty/unpushed tree forces the admin''s `git_cleanup` to map attribution, check liveness, and commit on your behalf.
+
+## After a merge — clean up local
+
+Only after the PR is merged:
+
+1. Re-pin the base. In a worktree `git checkout main` fails (main is checked out at the repo root; git refuses a branch checked out elsewhere) -> `git checkout shell/<shortname> && git fetch origin && git reset --hard origin/main`. Admin at repo root: `git pull --ff-only` on main.
+2. `git branch -d <branch>`. Squash-merged -> `-d` refuses (commits aren''t ancestors of main); confirm the PR shows *merged* on the remote -> `git branch -D <branch>`.
+3. `git fetch --prune`.
+
+NEVER delete a branch carrying unmerged, un-PR''d work — no PR = lost work.
+
+## Never commit the engine or derived files
+
+- `/.super-coder/` is gitignored — never force-add anything under it.
+- Gitignored + regenerated, never commit: `CLAUDE.md`, `AGENTS.md`, `opencode.json`, `.claude/skills/`, `.sc-state/engine.ref.prev` (ephemeral rollback pointer).
+- From a worktree, commit only your project''s authored files. Generated
+  snapshots and `_sc` renders live under ignored `.sc-state/local/` and never
+  enter Git. `.sc-state/engine.ref` is the deliberate tracked exception: it is
+  the dependency pin and is updated by `sc update`.
+- Exception: in the super-coder SOURCE repo, `schema.sql` + `migrations/` are tracked — there the engine *is* the project.
+
+## After DB work
+
+An `sc mem` write lands in the shared engine DB immediately. The admin/API
+save-local path refreshes the ignored snapshot and renders used by rebuild and
+review. There is no generated-content commit or Publish PR. See `snapshot`.
+
+## Notes
+
+- Before destructive ops, confirm the repo — `git -C <abs-path>` if ever in doubt.
+- Multi-shell: each shell boots into its own worktree at `.sc-worktrees/<shortname>/` on branch `shell/<shortname>`; the launcher keeps the base pinned to `origin/main` (see the sync gate). Worktree isolation is automatic — no shared cwd. Admin shell = the one exception: repo root on `main`.
+- UI preview: worktree edits do NOT show on the fork''s main dev server. `sc preview` (start once from the main checkout if not running) serves every shell''s worktree UI live (HMR) on the fork''s `dev_port`, one subdomain each: `http://<shortname>.localhost:<dev_port>/`. The `post-commit` hook prints your URL after each commit — surface that line to the FnB.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -1924,81 +2160,123 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'issue_reporting',
-  'Route engine defects the maintainer way — a subfloor defect is yours to triage and fix in ~/Repos/subfloor (or file on its tracker as backlog); a HOME-substrate defect becomes a flag for the FnB, never an in-place fix. Fires the moment a command fails or lies, a skill contradicts reality, or you work around anything to proceed.',
+  'Report engine defects upstream — the moment a sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on super-coder; your repo''s app bugs stay in the fork.',
   'substrate',
   NULL,
   1,
-  '# issue_reporting — defects land where they''re fixed
+  '# issue_reporting — the backwards flow
 
-You maintain subfloor: there is no upstream above you to report engine defects
-to. A defect either lands in **your backlog** (subfloor) or in **the FnB''s
-hands** (home substrate). Route it while the failure is on screen — NEVER
-batch to session end.
+An engine defect fixed upstream reaches every fork via `sc update`; worked
+around silently, every fork re-derives the workaround. File the issue while
+the failure is on screen — NEVER batch to session end.
 
-A workaround IS a signal: deviating from a skill''s steps, wrapping a command,
-or hand-patching state to proceed -> you hold the exact repro; route it now.
+A workaround IS a report: deviating from a skill''s steps, wrapping a command,
+or hand-patching state to proceed -> you hold the exact repro; file it now.
 
-## Boundary — whose defect is it
+## Boundary — engine vs fork
 
-| Where it lives | What you do |
+| Where | What |
 |---|---|
-| **subfloor engine** (`~/Repos/subfloor`: its `sc` + subcommands, `.super-coder/` code, migrations, adapters, boot render, engine skills, `sc mem` API) | You are the maintainer. In current scope -> fix it in subfloor (`git` skill flow). Out of scope -> file it on the tracker (below) so it survives your session. |
-| **HOME substrate** (the engine your cwd runs on: its boot doc, its `sc mem`, its launcher) | NOT your work surface. Open a flag (`sc mem flag open "[Engine] <symptom> | Blocker for: <x>"`) + surface to the FnB. NEVER fix in place — home-engine edits are FnB-gated. |
-| **Fork reports** (issues filed on subfloor by installed forks: dos-arch, md-converter, ami, rst-c) | Your intake queue — triage like your own findings. |
+| **Upstream — file it** | anything the engine materializes/owns: `.super-coder/`, `sc` + every subcommand, engine skills (this catalogue), the boot doc render, the sandbox / dev kit, `sc update` + migrations, the `_sc` API + `sc mem` |
+| **Fork — don''t** | the repo''s app code, fork-local skills (see `local_skill_management`), operator-owned host config |
 
-Unsure which install misbehaved -> check where the failing command ran:
-your cwd = home substrate; `~/Repos/subfloor` or a fork = subfloor engine.
+Unsure -> "would the same problem hit any other fork?" yes = upstream.
 
 ## Triggers
 
-Each row = a real engine-defect shape (filed by fork shells doing ordinary
-work). Match the left column -> route it.
+Each row = a real engine defect filed by a fork shell doing ordinary work.
+Match the left column -> file.
 
 | You hit | Real case |
 |---|---|
-| A `./sc` command fails out of the box | `./sc verify` always aborted — its own render step needed `SC_ADMIN` it never set (#227) |
-| A command exits green without doing the work | `./sc test` silently fell back to unittest when pytest was missing — green-washed suites (#219) |
-| The documented remedy is a closed loop | `./sc lint` said "run `./sc deps` first," but deps skips pip in the sandbox — tool unobtainable from inside the box (#246) |
-| A skill instructs tools/paths the seat doesn''t have | `configure_winbox` drove raw `ssh`/`virsh` — neither exists in the broker-only sandbox (#248) |
+| A `sc` command fails out of the box | `sc verify` always aborted — its own render step needed `SC_ADMIN` it never set (#227) |
+| A command exits green without doing the work | `sc test` silently fell back to unittest when pytest was missing — green-washed suites (#219) |
+| The documented remedy is a closed loop | `sc lint` said "run `sc deps` first," but deps skips pip in the sandbox — tool unobtainable from inside the box (#246) |
+| A skill instructs tools/paths your seat doesn''t have | `configure_winbox` drove raw `ssh`/`virsh` — neither exists in the broker-only sandbox (#248) |
 | A skill contradicts what the engine actually does | skills still taught raw `sqlite3` against the substrate DB after memory went API-only (#226) |
 | The API refuses what the skills document | `sc mem doc add` 400''d standalone docs the docs + onboard skills both document (#245) |
 | A permission wall mid-workflow | a dev shell could read a planner-owned feature but 404''d advancing its status (#224) |
 | Every write suddenly 401s | rebuild didn''t re-mint api_keys — all live shells locked out until an API bounce (#214) |
-| `./sc update` / migrate wedges or half-applies | migration failed partway, retry died on `duplicate column name` (#229) |
-| A structural foot-gun keeps re-biting | the cwd trap — bare git resolving to the wrong tree, "my edits vanished" (#225) |
+| `sc update` / migrate wedges or half-applies | migration failed partway, retry died on `duplicate column name` (#229); update aborted crossing a commit that deleted an engine file (#209) |
+| A structural foot-gun keeps re-biting you | the cwd trap — `cd` to root for `sc`, then bare git hit the wrong tree, "my edits vanished" (#225) |
+| The sandbox can reach something it shouldn''t | `do_push` src/dest weren''t contained — sandbox→host escape (#228) |
 
-Stale guidance (skill says X, engine does Y) routes the same as a crash.
+Stale guidance (skill says X, engine does Y) files the same as a crash.
 
 ## Capture — while the failure is on screen
 
-- **where**: which install (subfloor / fork name / home), shell, host seat
+- **engine ref** = `sc engine-ref` — first line of every report
+- **staleness** = compare that ref to upstream head:
+  `git ls-remote https://github.com/jedbjorn/subfloor HEAD` — write
+  `current` or `behind head <sha7>`. Behind + the symptom is a missing
+  command or a skill/engine mismatch -> the fix may already be shipped:
+  ask your FnB for `sc update` first, and file only if the defect
+  survives the update (or updating isn''t an option — then the staleness
+  note carries that caveat). Triage reads this line to tell a live
+  engine defect from a stale fork build.
+- **fork + seat**: repo name, shell flavor, sandbox/host
 - **ran / followed**: the exact command, or skill name + step
 - **expected vs actual**: exact output, trimmed to the failing lines
 - **workaround**: what unblocked you, or "blocked, none found"
 
-The tracker is public: NEVER paste api keys, tokens, secrets, or private paths.
+The issue is public: NEVER paste api keys, tokens, secrets, or private paths.
 
-## Backlog it (subfloor defects out of current scope)
+## File it
 
 ```bash
-# 1. dedup — a fork may have hit it first
-gh --repo jedbjorn/subfloor issue list --search "<symptom keywords>" --state all
+# 1. dedup — someone may have hit it first
+gh issue list --repo jedbjorn/subfloor --search "<symptom keywords>" --state all
 
-# 2. file — title: <area>: <one-line symptom>
-gh --repo jedbjorn/subfloor issue create \
-  --title "<area>: <symptom>" \
-  --body "<capture block above>"
+# 2. file — title: [<fork>] <area>: <one-line symptom>
+gh issue create --repo jedbjorn/subfloor \
+  --title "[<fork>] <area>: <symptom>" \
+  --body "$(cat <<''EOF''
+- engine ref: <sha from .sc-state/engine.ref> · <current | behind head <sha7>>
+- fork/seat: <repo> · <shell flavor> · <sandbox|host>
+
+**Ran / followed:** <command or skill+step>
+**Expected:** <what the docs/skill promise>
+**Actual:** <exact trimmed output>
+**Workaround:** <what unblocked you, or "blocked">
+EOF
+)"
 ```
 
-Dedup hit -> comment your repro on the existing issue; do NOT file a duplicate.
+`jedbjorn/subfloor` = engine upstream; confirm: `git remote get-url super-coder`.
+
+Dedup hit -> comment your engine ref + repro on the existing issue; do NOT
+file a duplicate.
+
+No `gh` / no network from your seat -> save the identical body as a fork flag:
+`sc mem flag open "[Engine] <symptom> | Blocker for: <x>" --name UP-###`, then
+message the **admin** shell to relay it upstream (see `messaging`).
+
+## Authorized curation recommendation
+
+The `curate` skill has one FnB-authorized exception to the normal enhancement
+gate below. When a recurring L&S cluster may warrant a reusable upstream skill,
+the curating shell may search and file the recommendation directly without
+asking the FnB first.
+
+Search all upstream issues before opening anything. Add evidence to a matching
+recommendation, or open one titled `skills: recommend <topic>` containing the
+trigger, repeated incidents, proposed ownership boundary, expected users, why
+existing skills do not cover it, and a compact candidate procedure.
+
+This route recommends; it never creates or promotes a skill. Keep one compressed
+L&S entry until a reviewed upstream skill ships and is granted. If issue search
+or creation is unavailable, surface the failure to the FnB, keep the L&S, and
+create no local skill or asset. Deliberate fork-specific authoring remains the
+administrator-owned workflow in `local_skill_management`.
 
 ## Rules
 
-- One defect per issue/flag. Batch nothing.
+- One defect per issue. Batch nothing.
 - Observed failure = the bar for filing unasked; enhancement ideas ("the
-  engine should…") go to the FnB first.
-- Filing ≠ unblocked: defect blocks current work -> also open a flag linking
-  the issue URL.',
+  engine should…") go to your FnB first, except the authorized curation
+  recommendation route above.
+- Filing ≠ unblocked: defect blocks work -> also open a fork flag linking the
+  issue URL.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -2014,16 +2292,16 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# local_skill_management — fork-specific skills that survive
 
-Fork-specific skills live in the DB and persist via `.sc-state/content.sql`
+Fork-specific skills live in the DB and persist via `.sc-state/local/content.sql`
 (the snapshot). The asset file under `.super-coder/assets/skills/<name>/` is
 the **authoring source only** — it sits in gitignored engine territory, and
 that is safe: the engine/local boundary is the seed migration (0001,
 upstream-owned in a fork), not asset-file presence. The snapshot serializes
 your skill to content.sql whether or not the asset file is kept, and
-`sc update` neither manifests it nor heals over its DB row. **content.sql =
-the durable form; the asset file = your editor.**
+`sc update` neither manifests it nor heals over its DB row. **The live DB plus
+its local snapshot are durable; the asset file is your editor.**
 
-The path: **file -> seed -> grant -> snapshot -> commit**.
+The path: **file -> seed -> grant -> local snapshot**.
 
 ## Creating a fork-specific skill
 
@@ -2049,10 +2327,13 @@ The path: **file -> seed -> grant -> snapshot -> commit**.
    upstream-owned engine territory. DB skills with no asset file = other local
    skills, left intact.
 
-3. **Grant to target shell(s)** — by shell id or shortname:
+3. **Grant to the target pack** — name a shell by id or shortname:
    ```bash
    sc skill grant <skill_name> <shell>...
    ```
+   A standard shell targets its shared flavor pack; every shell of that flavor
+   receives the skill. A Bespoke shell targets only itself. To create an
+   intentional one-shell assignment, create/use a Bespoke shell.
    Unknown skill/shell names = hard error (no silent no-op grants).
    `sc skill list` = catalogue with origins + current grants;
    `sc skill revoke <name> <shell>...` reverses a grant.
@@ -2062,27 +2343,28 @@ The path: **file -> seed -> grant -> snapshot -> commit**.
    SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render
    ```
    `snapshot.py` serializes local skills (any skill the engine seed doesn''t
-   own) into `.sc-state/content.sql` — what survives `sc update` and
-   `sc rebuild`; the row + grants reconstruct from content.sql. Skip this ->
-   the skill is lost on next update.
+   own) into `.sc-state/local/content.sql` — what survives `sc update` and
+   `sc rebuild`; the row + flavor/Bespoke grants reconstruct from content.sql.
+   Skip this -> the skill is lost on next update.
 
-5. **Commit.** Run `sc render-check` first — hermetic rebuild, fails if the
-   `skills_sc/` mirror drifts from the DB render (the CI guard; see the
-   `snapshot` skill). Then stage `.sc-state/content.sql` + `skills_sc/`
-   together — snapshot without re-rendered mirror = the drift.
+5. **Finish.** Run `sc render-check` — it fails if the local `skills_sc/`
+   mirror drifts from the DB render. Snapshot and renders stay ignored; commit
+   only deliberately authored engine assets/migrations in the source repo.
 
 ## Updating a skill
 
-Edit the asset file -> repeat seed -> snapshot -> commit (steps 2, 4, 5).
+Edit the asset file -> repeat seed -> snapshot (steps 2, 4, 5).
 Asset file gone (removed / authored elsewhere) -> recreate it from the DB body
 first: `sc sql "SELECT content FROM skills WHERE name=''<name>''"`.
 
-## Assigning an existing skill to additional shells
+## Assigning an existing skill
 
 ```bash
 sc skill grant <skill_name> <shell>...
 ```
-Then `SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render` + commit.
+Name one standard shell to update its whole flavor, or name a Bespoke shell to
+update only that shell. Then `SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render`
+to refresh the local artifacts.
 
 ## Removing a skill
 
@@ -2092,34 +2374,36 @@ Then `SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render` + commit.
    ```
    Refuses engine skills — the seed resurrects those on next update/rebuild.
    Engine skill this fork has superseded -> retire fork-wide:
-   `sc skill retire <name>` (writes the tracked
-   `.sc-state/skills_retired.json`, which rides updates; `sc skill unretire`
-   reverses). Per-shell removal -> `sc skill revoke`.
+   `sc skill retire <name>` (writes the ignored local
+   `.sc-state/local/skills_retired.json`; `sc skill unretire`
+   reverses). Flavor/Bespoke removal -> `sc skill revoke`.
 
 2. **Remove the asset file** (`.super-coder/assets/skills/<name>/`) —
    otherwise the next `sc seed-skills` re-inserts the skill.
 
-3. **Snapshot, render, commit:**
+3. **Snapshot and render locally:**
    ```bash
    SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render
    ```
 
 ## How the GUI organizes skills
 
-The review GUI Skills tab shows the full catalogue in sections with per-shell
-grant toggles; the Shells tab groups its grant list by the same sections.
+Shells → Skill Assignments shows the full catalogue in sections. Each standard
+flavor appears once; Bespoke shells appear individually.
 
 - **Repo skills** — lead section: skills authored in this fork. Membership is
   *derived* — a skill the engine seed doesn''t own is repo-local. Same rule
-  snapshot.py uses to decide what serializes into `.sc-state/content.sql`, so
+  snapshot.py uses to decide what serializes into local `content.sql`, so
   the section shows exactly what the snapshot keeps durable. No frontmatter
   flag exists or is needed.
 - **Substrate / Craft / …** — engine skills, sectioned by `category`
   frontmatter. A repo skill''s `category` displays as a row label but never
   moves it out of the Repo section.
 
-GUI grant toggles hit the same DB table as `sc skill grant` — they still need
-a snapshot (header button or `SC_ADMIN=1 sc snapshot`) to survive a rebuild.
+GUI grant toggles hit the same ownership boundary as `sc skill grant`:
+`flavor_skills` for standard flavors, `shell_skills` for Bespoke shells. They
+still need a snapshot (header button or `SC_ADMIN=1 sc snapshot`) to survive a
+rebuild.
 
 ## What NOT to do
 
@@ -2139,7 +2423,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'memory',
-  'When + how this shell persists memory — current_state, session narrative, seed (cap 10), L&S (cap 20), decisions — all via sc mem, written as it happens, not at close.',
+  'When + how this shell persists memory — current_state (≤300), session narrative, seed (cap 10), L&S (cap 20, ≤500/entry, --supersedes|--new), decisions — all via sc mem, written as it happens, not at close.',
   'substrate',
   NULL,
   1,
@@ -2149,16 +2433,29 @@ All memory = DB rows; no flat files. Write at the moment it matters, never in a
 close ritual.
 
 Every write goes through `sc mem` -> lands in the live shared engine DB, visible
-to all shells on commit. It always targets your own shell (identity resolved
-from your token) — never name a shell.
+to all shells on commit. It always targets your own shell (the engine resolves
+API identity for you) — never name a shell.
 
 ## current_state — rolling status, NOT a log
 
-Present focus + what''s next. Replace in place; NEVER append. Soft target ~500
-chars. Rewrite when focus shifts.
+Present focus + what''s next. Replace in place; NEVER append. **300 chars, hard
+— the write is rejected over it.** Rewrite when focus shifts.
 ```
 sc mem state "…"
 ```
+
+**Point, do not reproduce.** The overrun is never verbosity, it is restatement:
+a decision''s reasoning, a spec''s gate, a flag''s argument all pasted inline when
+each is a live row one query away. Name what is in flight and carry the id:
+
+```
+Feature #29 task #171 gate — see doc #44.
+Blocked on flag #200. Next: task #172 after the blocker clears.
+```
+
+Not the argument, the ruling, or the rationale — those have rows, and a reader
+who needs them runs `sc mem get`. Same principle the boot doc already applies
+to decisions: carry the pointer, lazy-load the payload.
 
 ## Session narrative — append at inflection points
 
@@ -2181,12 +2478,25 @@ sc mem retire <entry_id>   # curate out (frees a cap slot)
 
 ## L&S (cap 20) — how you work
 
-Operating lessons, imperative voice. Add when a lesson lands; curate by
-retiring. Caps are trigger-enforced (seed 10, L&S 20): at cap, `sc mem` returns
-the cap message -> retire an entry to free the slot.
+Operating lessons, imperative voice. An entry is **the RULE** — **≤500 chars,
+hard**. The incident that taught it goes in the narrative, where you already
+wrote it; if the text opens with an incident timestamp, it is a narrative entry.
+
+**Exactly one of `--supersedes` / `--new` is required.** Your active set is
+already rendered in your boot doc, so checking a new rule against it costs no
+extra read — and this flag is where that check lands:
 ```
-sc mem lns "…"
+sc mem lns "…" --supersedes 29,36   # contradicts or refines those — retires them, adds this
+sc mem lns "…" --new                # checked against the set, genuinely unrelated
 ```
+`--supersedes` works at 20/20: it frees the slot it uses.
+
+Caps are trigger-enforced (seed 10, L&S 20, L&S body 500, current_state 300) —
+a rejected write is the feedback, and the message routes the fix.
+
+Periodic sweep: when `## STATUS` says `L&S: … — curation due`, run the `curate`
+skill, then `sc mem curated` to stamp it — even if you retired nothing. Cap 20
+is a ceiling never to reach, not a target; curation holds the set near 12–14.
 
 ## Decisions — Major only
 
@@ -2221,7 +2531,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'messaging',
-  'Shell-to-shell inbox — send a markdown message to another shell (typed: shell/task/result; pr_event is daemon-emitted), check your unread inbox, verify delivery via the sent view, mark messages read. Driven by `sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.',
+  'Shell-to-shell inbox — send a markdown message to another shell (typed: shell/task/result), check your unread inbox, verify delivery via the sent view, mark messages read. Driven by `sc mem message`. Use to coordinate with another shell; the recipient sees it on its next boot via the STATUS Inbox count.',
   'substrate',
   'sc mem message',
   1,
@@ -2236,19 +2546,13 @@ Args: `check [N] | send <to-shortname> <body> [--kind k] | sent | mark-read <id>
 
 ## Message kinds
 
-Every message carries a `kind` — the trail stays filterable
-(`SELECT * FROM shell_messages WHERE kind != ''shell''` replays a sprint''s
-whole coordination history):
+Every message carries a `kind`, so ordinary mail, delegated tasks, and
+completion evidence remain independently filterable:
 
 - `shell` — ordinary shell-to-shell mail (the default; what `send` does
   unless told otherwise).
-- `task` — planner → worker instruction (a sprint kickoff / re-task).
+- `task` — a bounded instruction for another shell.
 - `result` — worker → planner completion or transition report.
-- `pr_event` — GitHub watcher daemon → shell PR transition (checks
-  green/red, review submitted, merged, closed). Daemon-emitted only:
-  `send` refuses it — a forged PR event would poison the wake loop''s
-  ground truth. Detail lives in `gh`; the row is the wake-up, not the
-  payload.
 
 ## check — your unread inbox
 
@@ -2268,7 +2572,7 @@ sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
 
 - Multi-word body = one quoted argument; markdown preserved verbatim.
 - Examples: `sc mem message send cartographer "map is stale — re-run sc map"`
-  · `sc mem message send plan1 "sprint 12: unit 3 merged (PR #41)" --kind result`
+  · `sc mem message send plan1 "feature 12 task 3 complete (PR #41)" --kind result`
 - `cartographer` is a **role alias**: when no shell has that literal
   shortname, it resolves to the fork''s cartographer shell whatever its
   shortname (e.g. `CART1`). Address the map-keeper as `cartographer` — no
@@ -2323,8 +2627,7 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 
 Migrations live in `.super-coder/migrations/`, apply in numeric order, tracked
 by the `schema_migrations` ledger table. Engine updates apply pending
-migrations automatically; apply locally without a fetch via
-`sc update --no-fetch`.
+migrations automatically; apply local pending migrations with `./sc migrate`.
 
 **Scope:** fork-specific changes — tables, columns, constraints, or
 system-content seeds (skills, flavor defaults) this fork needs that will not
@@ -2333,27 +2636,35 @@ from you.
 
 ## Authoring a migration
 
-1. **Find the next number:**
+1. **Create it through the guardrail:**
    ```bash
-   ls .super-coder/migrations/ | sort | tail -5
+   ./sc migration new <slug>
    ```
-   Name the file `NNNN_<slug>.sql`, NNNN = next integer zero-padded to 4
-   digits (e.g. `0012`).
+   Use a lowercase `snake_case` slug. The command refuses unexpected duplicate
+   number prefixes, allocates the next free zero-padded number, writes the
+   standard transaction/idempotence skeleton, and (in the subfloor source
+   repo) updates the source removal-test allowlist in the same act. The
+   exact historical `0155` pair is frozen and explicitly allowed; never
+   renumber an applied migration.
 
-2. **Write the file** at `.super-coder/migrations/NNNN_<slug>.sql`:
+2. **Fill in the generated file** at
+   `.super-coder/migrations/NNNN_<slug>.sql`:
    - Wrap in `BEGIN; ... COMMIT;`
    - Idempotent: `CREATE TABLE IF NOT EXISTS`, `INSERT OR IGNORE`,
      `CREATE INDEX IF NOT EXISTS`, `DROP TABLE IF EXISTS` before recreate
    - Comment header: migration number + intent (+ doctrine notes if relevant)
    - Structure + system content only — per-instance data (shell memory,
-     grants, roadmap, flags) lives in `.sc-state/content.sql` via snapshot,
+     grants, roadmap, flags) lives in `.sc-state/local/content.sql` via snapshot,
      never in migrations
 
 3. **Apply locally:**
    ```bash
-   sc update --no-fetch
+   ./sc migrate
    ```
-   Skips the upstream fetch; applies all pending local migrations in order.
+   This takes a WAL-safe `premigrate` backup before opening the migration
+   chain and keeps the newest 5 backups in that lifecycle class. `./sc update`
+   retains its separate `preupdate` backup and does not double-back up during
+   the same update run. Both paths apply pending migrations in order.
    Confirm it landed:
    ```sql
    SELECT * FROM schema_migrations ORDER BY applied_at DESC LIMIT 5;
@@ -2361,7 +2672,7 @@ from you.
 
 4. **Verify:**
    ```bash
-   sc verify
+   ./sc verify
    ```
    Headless boot proof — shells, memory, and schema intact.
 
@@ -2369,14 +2680,14 @@ from you.
    ```bash
    SC_ADMIN=1 sc snapshot
    ```
-   Commit `.sc-state/content.sql` + `migrations/NNNN_<slug>.sql`.
-   - **Content-seed migration** (seeds system content that renders — skills,
-     flavor defaults) also changes the flat `_sc` mirrors, but only once the
-     new rows are in the DB: after `sc update --no-fetch`, run
-     `SC_ADMIN=1 sc render && sc render-check` and commit the re-rendered `_sc` files
-     alongside the migration. A render against a DB predating the seed passes
-     locally while CI''s hermetic rebuild goes red — the stale-mirror trap; see
-     the `snapshot` skill.
+   Commit the migration and any authoritative source asset it carries; the
+   snapshot remains local.
+   - **Engine skill seed:** edit `assets/skills/<name>/SKILL.md`, run
+     `./sc seed-skills` to regenerate `0001_seed_skills.sql`, and put the same
+     full-body UPSERT in the new trailing migration so existing installations
+     converge. Then run `./sc render-check`: its hermetic rebuild proves the
+     ignored local `skills_sc/` mirror, which is verification output rather
+     than a tracked artifact.
 
 ## What makes a good migration
 
@@ -2569,10 +2880,10 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# query_authoring_pg — diagnostic SQL against the app''s Postgres
 
-The pg kit''s query half: `dev_kit` = the sidecar, `test_authoring_pg` = the
-test infra, this = ad-hoc SQL against the fork''s app DB. Use when diagnosing
-data issues, verifying a migration''s effect, or checking an invariant by
-query.
+The PG feature provides the Postgres sidecar through `dev_kit` and this
+diagnostic-SQL procedure. Test fixtures and database setup remain owned by the
+downstream repository. Use this skill when diagnosing data issues, verifying a
+migration''s effect, or checking an invariant by query.
 
 ## Know which DB you''re pointed at
 
@@ -2741,8 +3052,6 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# review — gate a diff against its spec
 
-> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
-
 The reviewer''s job end to end. You are a **different lineage than the code**
 — reviewer shells are deliberately booted on a different model family than
 the authoring dev, so the review doesn''t share the author''s blind spots ->
@@ -2903,26 +3212,17 @@ you.
    - Then `sc render && sc render-check` before step 5. `sc update` re-renders
      from the live DB, which can skip a change the new engine shipped (e.g. a
      skill body) — only `render-check`''s hermetic rebuild surfaces it. A red
-     render-check here = a mirror to re-render + commit, NOT a stale diff to
-     wave through. Pipeline + guard details: `snapshot` skill.
+     render-check here = a local mirror to regenerate. Pipeline + guard details:
+     `snapshot` skill.
 
 4. **Record the crossing.** Append a narrative entry — identity event for a
    shell that updates its own floor. Note what changed + write the handoff.
 
-5. **Commit the full regenerated set — NEVER a bare `engine.ref` bump.**
-   Stage every tracked file the update regenerated: `.sc-state/content.sql`
-   (refreshed memory) + `.sc-state/engine.ref` (the pin) + the root `sc`
-   dispatcher if it changed + any `_sc` renders. `sc` is the live tracked
-   entrypoint — a pin-only commit leaves it and the renders stale against the
-   engine just pinned, silently dropping commands the new engine ships.
-   `.super-coder/` and `engine.ref.prev` are gitignored — nothing to commit
-   there.
-   - **Render conflict** (committing via PR while main advances):
-     `content.sql` + `_sc` renders are serialized DB state and collide with a
-     concurrent publisher. NEVER hand-merge serialized SQL — live DB canonical,
-     renders derived. Rebase onto main, then either take main''s renders
-     (re-applying just the pin + `sc`) or re-run `sc update` against the live
-     DB so they regenerate clean.
+5. **Commit only the public update.**
+   Stage `.sc-state/engine.ref` (the pin), the root `sc` dispatcher if it
+   changed, and other deliberately authored public files. Snapshot SQL and
+   `_sc` renders remain ignored beneath `.sc-state/local/`; never force-add
+   them. `.super-coder/` and `engine.ref.prev` are also gitignored in forks.
 
 6. **Reboot** the session -> boot onto the new floor.
 
@@ -2960,7 +3260,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'snapshot',
-  'Serialize DB work to git-tracked text via sc snapshot / sc render. The .db is the live shared source of truth; serializing writes the shared main tree, so it is gated to admin (SC_ADMIN) + the GUI Publish button, NOT a per-write shell step.',
+  'Refresh the gitignored local DB snapshot and flat renders. Generated instance state never enters Git.',
   'substrate',
   'sc snapshot',
   0,
@@ -2968,15 +3268,15 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 
 Live `shell_db.db` = the single source of truth shared by every shell; a
 `sc mem` write is durable + visible to all shells the instant it commits. The
-`.db` is gitignored and reconstructs from git-tracked text on `sc rebuild` —
+`.db` is gitignored and reconstructs from schema, migrations, and
+`.sc-state/local/content.sql` on `sc rebuild` —
 an edit not yet serialized is discarded by a rebuild.
 
 Serializing is an admin/GUI operation, NOT a per-write shell step: it writes
-`.sc-state/` + the flat `_sc` mirror into the shared MAIN worktree, and from a
-shell''s linked worktree it churns and collides with other shells. `sc snapshot`
+the shared instance''s gitignored local cache. `sc snapshot`
 and `sc render flat` refuse unless `SC_ADMIN=1` (GUI/API, `install`, `update`,
 and `render-check` set it for you). A shell does not run them; its writes are
-captured when admin snapshots (GUI **Publish**/Snapshot button, or
+captured when admin saves locally (GUI **Save locally** button, or
 `SC_ADMIN=1 sc snapshot`) before a rebuild. The rest of this skill = the
 admin/GUI path.
 
@@ -2986,145 +3286,67 @@ admin/GUI path.
 |---|---|---|---|
 | `schema.sql` | the v1 baseline schema | yes (forks) | hand, rarely |
 | `migrations/*.sql` | ordered schema + **system content** deltas (e.g. the skills catalogue) | yes (forks) | author / `sc seed-skills` |
-| `.sc-state/content.sql` | **this repo''s** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants. Tracked, fork-owned, kept OUTSIDE the gitignored engine dir | no (stays local) | `sc snapshot` |
+| `.sc-state/local/content.sql` | **this repo''s** per-instance content + memory — shells, seed/L&S, decisions, roadmap, documents, flags, projects, skill grants | no (instance-only, gitignored) | `sc snapshot` |
 
 The split: system content propagates via migrations; per-instance content stays
 in the snapshot. Skill *bodies* = system (migration); which shell is *granted*
 a skill = per-instance (snapshot).
 
-## When admin serializes (the GUI Publish button does all of this)
+Generated artifacts always live beneath `.sc-state/local/`. A legacy
+`artifact_mode: tracked` setting is accepted only as upgrade input and resolves
+to local; mode switching and Git publication are retired.
+
+## When admin serializes
 
 All commands require `SC_ADMIN=1`, run from the main checkout.
 
-1. `SC_ADMIN=1 sc snapshot` -> dumps the per-instance tables to
-   `.sc-state/content.sql`. Deterministic DELETE-then-INSERT in PK order ->
-   re-running is byte-identical -> clean diffs.
+1. `SC_ADMIN=1 sc snapshot` -> dumps the per-instance tables to the active
+   local snapshot path. Deterministic DELETE-then-INSERT in PK order makes
+   re-running byte-identical.
 
-2. `SC_ADMIN=1 sc render` -> regenerates the tracked flat `_sc` files
-   (`specs_sc/`, `docs_sc/`, `skills_sc/`, `roadmap_sc.md`) from the DB. Run
+2. `SC_ADMIN=1 sc render` -> regenerates the flat `_sc` files
+   (`renders/specs_sc/`, `renders/docs_sc/`, `renders/skills_sc/`,
+   `renders/roadmap_sc.md`) beneath `.sc-state/local/`. Run
    after changing a document body, the roadmap, or skills. Incremental —
    unchanged files not rewritten. (`.claude/skills/` rebuilds at boot and is
    gitignored — not rendered here.)
 
-3. Verify reproducibility: `sc rebuild && sc verify` -> DB rebuilds from text
+3. Verify reproducibility: `sc rebuild && sc verify` -> DB rebuilds from local text
    alone, byte-for-byte.
-   Before committing any `_sc` render: `sc render-check` — rebuilds the DB
-   hermetically from text and fails if the committed mirror drifts from that
-   render (the CI guard, run locally). A plain `sc render` reads the *live* DB,
+   `sc render-check` rebuilds the DB hermetically from text and fails if the
+   local mirror drifts from that render. A plain `sc render` reads the *live* DB,
    which can lag the source just edited (skill-catalogue trap below);
    `render-check`''s rebuild-first catches the stale mirror the live-DB render
    silently passed.
 
-4. Publish — do NOT hand-commit from a shell branch. snapshot/render write
-   `.sc-state/content.sql`, `.sc-state/engine.ref`, and the `_sc` files to the
-   main checkout root (where the shared engine + DB live), not your worktree —
-   they are not yours to stage. GUI **Publish** = snapshot -> render -> commit
-   -> push -> PR on `sc_gui_content`; the admin shell on `main` may commit them
-   directly. NEVER commit the `.db` or anything under the gitignored
-   `.super-coder/` engine dir. (super-coder SOURCE repo only: `schema.sql` +
-   `migrations/` are tracked and committed here too.)
+4. Do not stage the output. Generated snapshots and renders are gitignored.
+   Only authored engine source and explicit migrations belong in Git.
 
 ## Authoring vs. snapshotting
 
 - **Per-instance content** (your memory, this repo''s roadmap/docs): edit the
-  DB -> `sc snapshot`. The snapshot is the canonical reproducer.
+  DB -> `sc snapshot`. The local DB is primary; the ignored snapshot is its
+  rebuild source.
 - **Skill catalogue** (system, propagates): edit
   `assets/skills/<name>/SKILL.md` -> `sc seed-skills` — upserts the live DB
   *and* (source repo only) regenerates the seed migration. Not the snapshot.
   See `seed_skills.py`.
-  - Sequence: `sc seed-skills && sc render`, then `sc render-check` before
-    committing. Commit the regenerated `migrations/0001_seed_skills.sql` +
-    the re-rendered `skills_sc/` mirror together — migration without mirror =
-    the drift.
+  - Sequence: `sc seed-skills && sc render`, then `sc render-check`. Commit the
+    regenerated `migrations/0001_seed_skills.sql`; the mirror stays ignored.
 
-Steps 1–3 = durability (a `sc rebuild` cannot lose serialized work). Step 4 =
-the GUI Publish button; you rarely commit this text by hand.
+Steps 1–3 are the local durability path. There is no generated-artifact
+publication path.
 
 ## Related skills
 
 This skill owns the render/snapshot pipeline + the `render-check` guard:
 
-- `self_update` — `sc update` re-renders the same `_sc` files; its verify step
-  runs `render-check` before committing the engine bump.
-- `local_skill_management` — fork-local skills persist via `sc snapshot`; run
-  `render-check` before committing the `skills_sc/` mirror.
+- `self_update` — `sc update` refreshes the same local `_sc` files.
+- `local_skill_management` — fork-local skills persist via the local snapshot.
 - `migration_management` — a **content-seed** migration (skills, flavor
   defaults) changes what renders; rebuild + render + `render-check` after.
 - `docs` / `spec` — document bodies live in the DB, render to `docs_sc/` /
   `specs_sc/`; authored via `sc mem doc`, serialized here.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'source-maintenance',
-  'Maintain the subfloor engine source at ~/Repos/subfloor — you are its upstream. Use for changes to its sc, .super-coder code, migrations, adapters, prompts, shell templates, engine skills, update/rollback behavior, or its tracked dogfood state. NEVER for the home repo''s engine.',
-  'substrate',
-  NULL,
-  0,
-  '# Source maintenance — the subfloor engine
-
-The engine source you maintain lives at **`~/Repos/subfloor`** (GitHub
-`jedbjorn/subfloor`). THERE, `.super-coder/` and `sc` are the product and you
-are upstream: fix engine defects in that repo directly; the fork
-report-upstream / never-edit-engine procedures do not apply to it.
-
-The engine under your OWN cwd (the home repo''s `.super-coder/`) is a different
-install: your memory substrate, NOT your work surface. NEVER apply this skill
-to it — home-engine changes are FnB-gated maintenance (see the boot doc''s
-PROJECT vs ENGINE).
-
-Every command below runs against the work repo: `git -C ~/Repos/subfloor …`,
-or scripts from that root — never from your cwd (the `git` skill has the full
-addressing contract).
-
-## Orient
-
-1. Confirm the target: `git -C ~/Repos/subfloor remote get-url origin` ->
-   `…jedbjorn/subfloor…`. Anything else = wrong repo; stop.
-2. Read subfloor''s active decisions/specs before choosing an architecture.
-3. Work from a branch (or a worktree seat — `git` skill). Preserve subfloor''s
-   tracked `.sc-state/content.sql`; it is that repo''s dogfood memory, not a
-   disposable fork seed.
-
-## Change the right source (paths within ~/Repos/subfloor)
-
-| Concern | Authoritative source |
-|---|---|
-| Runtime and CLI lifecycle | `sc` plus `.super-coder/scripts/` |
-| Harness behavior | `.super-coder/adapters/<harness>/adapter.json` |
-| Boot-wide instructions | `.super-coder/templates/boot.md` and `render/compose.py` |
-| Shell flavor defaults | `.super-coder/templates/shells/*.json` |
-| Engine skill | `.super-coder/assets/skills/<name>/SKILL.md`, then `./sc seed-skills` |
-| Schema/system content | a new ordered migration; never rewrite an applied migration except the generated skill seed |
-| Subfloor''s own team state | its live DB, then `SC_ADMIN=1 ./sc snapshot` (run in subfloor) |
-
-Flat `_sc` markdown and `AGENTS.md`/`CLAUDE.md` are renders. Never author a
-behavioral change in them.
-
-## Downstream contract
-
-A subfloor change reaches installed forks (dos-arch, md-converter, ami, rst-c)
-only after it merges and they `./sc update` — keep migrations ordered and
-non-destructive, and never assume a running shell inherits a changed prompt or
-skill before its next boot.
-
-## Finish
-
-Run focused tests, then from `~/Repos/subfloor`:
-
-```bash
-./sc map
-./sc render-check
-./sc verify
-git -C ~/Repos/subfloor diff --check
-```
-
-If skill assets changed, run `./sc seed-skills` first (in subfloor). Then the
-`git` skill''s finish gate: branch -> commit -> push -> PR -> stop.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -3139,8 +3361,6 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   NULL,
   0,
   '# spec — analyze and execute a spec
-
-> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
 
 Load at the start of any session that builds or implements a feature, whether
 or not the work is framed as a "spec". A spec governs the work -> this skill
@@ -3187,6 +3407,12 @@ Surface all three before any planning or code:
   migrations / unknown dependencies = no -> say so + propose a session-sized
   slice.
 - No stated done-condition in the spec -> that is the first unclear item.
+
+### Anticipated User Activity
+The spec''s `## Anticipated User Activity` section is governing intent: its
+roles, reach, and tenancy invariants shape the plan — access and tenancy
+checks are planned tasks, not afterthoughts. Older specs predate the section;
+absence there is not a blocker.
 
 ### Unclear items
 Anything you cannot act on without guessing:
@@ -3247,7 +3473,7 @@ Always this shape:
 |---|---|---|
 | 0 | Preparation | Always first — read code paths, verify DB state, confirm entry points |
 | 1..N | `<impl step title>` | As many as the scope needs; each independently verifiable |
-| N+1 | Verification | Always last — run tests, smoke-test against done-condition, snapshot + render |
+| N+1 | Verification | Always last — run tests, smoke-test against done-condition, check the build against the spec''s Anticipated User Activity section, snapshot + render |
 
 Add one task per seq with `sc mem task add` — each write is live in the
 shared DB immediately:
@@ -3256,7 +3482,7 @@ shared DB immediately:
 sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points"
 sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>"
 sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>"
-sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, snapshot + render"
+sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, check the build against the spec''s Anticipated User Activity section, snapshot + render"
 ```
 
 Then set `current_state` — nothing done yet, next = Preparation:
@@ -3367,6 +3593,9 @@ Mid-build, the work grows past the spec''s stated what/why:
   marked done.
 - **Verification is not optional.** It is the last task; skipping it makes
   "done" meaningless.
+- **Anticipated User Activity is intent.** Verification checks the build
+  against the spec''s section — a capability beyond its stated roles, or data
+  crossing a tenancy line it states, is a finding, not a nuance.
 - **Spec too large for one session** -> scope a slice at Preparation: cover
   steps 1–K verifiable now, leave K+1–N pending. NEVER start work that can''t
   be verified before the session ends.
@@ -3386,328 +3615,195 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'sprint',
-  'Participant loop for a declared multi-shell sprint — dev, reviewer, or conformance slot. Read your slot from the task message + sprint doc, take your turn when your dependency lands, open your PR and register its watch for the planner, babysit CI while live, pass sprint review (Major/Medium fixed), merge your own PR on green+clean under scoped authority, close your unit with a structured unit-report result row, report every transition as a result row. Conformance slot: judge the spec against main pre-freeze, four-way verdicts. No scheduled polling — the planner and the watcher daemon wake you. Local long work (suites/benches) rides ./sc job, never a harness background task. Load when a sprint task message names you a participant.',
-  'craft',
+  'sprint_close',
+  'Close or abort a Sprints v2 run — boot whole-Sprint conformance, compile the bounded evidence packet, synthesize the final report, preserve follow-ups, and transition terminally without deleting history.',
+  'workflow',
   NULL,
   0,
-  '# sprint — your slot in a coordinated multi-shell push
+  '# sprint_close — synthesize and finish
 
-> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
+Use as the owning Planner when delivery work is terminal, or when abort has
+been chosen. Close-out supplies meaning; the compiler supplies facts.
+On entry or any wake, load `sprint_close`, run `sc sprint inbox --sprint <id>`,
+inspect the durable message, and accept or decline it only when actionable.
 
-A sprint = a declared, planner-governed push where shells build dependent
-units (B on A, C on B); loop = planner → devs → reviewers → devs → planner,
-the shells running the handoffs themselves. This skill is the participant
-side: a **dev slot** ("The loop"), a **reviewer slot** ("Reviewer slot"),
-or a **conformance slot** ("Conformance slot" — the close-out spec-vs-main
-pass). Planner side (declare / monitor / close / report) =
-`sprint_orchestration`.
-`git`, `review`, `messaging` remain the base disciplines underneath.
-
-You are in a sprint ONLY when a planner `task` message names you a
-participant and points at a sprint doc. No kickoff -> this skill is inert.
-
-**You never poll on a schedule.** The sprint is event-driven: the planner
-wakes you with `task` rows (often by booting you headless — `./sc run` —
-with the task as your prompt), the GitHub watcher daemon turns your PR''s
-transitions into `pr_event` rows for the planner, and you report every
-state change back as a `result` row. A session that has nothing left to
-act on ends; the next event boots the next one. Your memory, archives,
-and messages accrete across boots — an ephemeral session is still you.
-
-## The sprint doc — one board, planner-owned
-
-Declaration = a `documents` row (kind `doc`, title `SPRINT: …`). Read:
-
-```
-sc mem get docs                     # find it in the index
-sc mem get doc --doc <N>            # full body
+```text
+sc sprint accept --sprint <id> --message <message-id>
+sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 ```
 
-Body contract:
+Use `accept` or `decline` for actionable work. After acting on an informational
+question, answer, blocker, or context message, run `accept` for that message.
+For informational messages it only marks the message read; it does not change
+Sprint or work-unit state.
 
-```
-# SPRINT: <title>
-status: ACTIVE                      # ACTIVE | CLOSED
-declared: <date> · planner: <shortname>
-models: devs=<harness>/<model> · reviewers=<harness>/<model>
+## Questions, answers, blockers, and failures
 
-| seq | unit | shell | reviewer | depends on | branch | pr | status |
-```
+Put a concrete question, answer, blocker, or context request in a short body
+file, then send it to the conformance Reviewer or participant who owns the fact:
 
-Unit `status` walks `waiting → building → pr-open → in-review → fixing →
-merged`; `fixing` loops back to `in-review` until clean; `ci-red` can
-interleave anywhere from `pr-open` on.
-
-The planner is the doc''s only writer. NEVER `sc mem doc edit` the sprint
-doc — report state changes to the planner as `result` rows; the planner
-updates the board.
-
-## Scoped merge authority
-
-The `git` skill''s rule stands: merging is the FnB''s gate. A sprint grants
-one narrow exception — merge only when ALL four hold:
-
-- the PR is for **your assigned unit** in this sprint,
-- **all checks are green**,
-- your unit''s reviewer declared **review-clean** (every Major/Medium
-  finding fixed),
-- the sprint doc says `status: ACTIVE` and is not frozen.
-
-Everything outside those four — other PRs, other repos, a red or pending
-check, an unreviewed diff, a closed or frozen sprint — is the default FnB
-gate, unchanged. The authority dies when the sprint closes; in doubt ->
-read the doc; `CLOSED` or frozen -> no merge authority.
-
-## Ambiguity calls
-
-A spec ambiguity mid-unit — more than one defensible reading and the
-spec doesn''t pick — is yours to call inside a sprint: pick the reading
-that keeps your unit shippable and keep building; don''t stall the chain
-waiting for a ruling. Scoped like the merge authority: it covers *how*
-your unit meets its spec, never *what* the unit is — an interface
-another shell reads, scope growth, or cutting a deliverable stays a
-planner escalation.
-
-Every call is reported, never silent: with your next `result` row to the
-planner, one line per call —
-`ambiguity: <what the spec left open> → chose <reading> — <why>`. No
-planner overrule -> your call stands; an overrule arrives as a `task`
-row and is worked like a review finding. Repeat your open calls in the
-review request (step 6) so the reviewer gates against your reading, not
-its own guess.
-
-## Local long work — suites, benches, builds
-
-A harness background task is session-scoped: in a headless boot it dies
-with the session, silently — "the harness will wake me" is false there.
-Never park a suite, bench, build, or watcher on one. Long local work
-goes through `./sc job`, two patterns:
-
-- **Fire-and-wake (default):** `./sc job start [--label <x>]
-  [--timeout <s>] -- <cmd>` — the job survives your session; completion
-  lands in YOUR inbox as a `result` row, and the normal event loop (your
-  next boot''s inbox drain) acts on it. If the sprint waits on the
-  outcome, report the job id to the planner, then end the turn.
-- **Wait-slice (the result decides THIS turn''s next step):**
-  `./sc job wait <id>` blocks ≤550s in the foreground — exit 0 =
-  finished · 2 = still running. Between slices drain your inbox
-  (`sc mem message check`) and act on what landed — a planner hold read
-  only after your suite finished was a stale-slot build — then slice
-  again.
-
-Set `--timeout` on anything that can wedge: a deadlocked suite becomes
-a bounded failure with a completion row, not a four-hour hole in the
-sprint.
-
-**Measurements:** a local bench is exploratory only. A perf number that
-gates a merge or decides a design is CI-vs-CI on the same runner, in
-one run — local numbers die with sessions and double-launches; they
-have contaminated a sprint decision before.
-
-## The loop (dev slot)
-
-At the start of every step: `sc mem message check`. A planner `task` row
-(hold, re-sequence, scope change) is authoritative over the board — never
-start a step on a stale slot. Report to the planner with
-`sc mem message send <planner> "…" --kind result` — every transition,
-one line each.
-
-**1. Know your slot.** Your kickoff `task` row carries the doc id and
-your unit; read the sprint doc, find your row; note upstream (unit +
-shell), your reviewer, and downstream (shell). No upstream -> start
-immediately. Embed one line in `current_state`, keep it current as your
-status walks, drop it at stand-down:
-
-```
-SPRINT doc=<id> unit=<seq> upstream=<seq|none> downstream=<shortname|none> status=<...>
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --key <stable-key>
 ```
 
-**2. Prepare.** Run the `git` skill''s sync gate; cut your feature branch
-from your base. Your unit needs upstream code that hasn''t merged -> branch
-stacked on the upstream shell''s branch + accept the retarget duty in
-step 4. Buildable against current `main` -> branch from `main`; stack only
-for real code dependencies.
+Answer incoming questions through `send`, confirm that write, then mark the
+handled question read with `accept`. For a blocker, relay the evidence, impact,
+and exact action needed to every directly affected Sprint participant, and
+surface the exceptional recovery need separately to FnB. Continue safe
+synthesis, but stop at a decision boundary when the answer is required. Do not
+send duplicate reminders; unread recovery owns re-waking.
 
-**3. Build.** Your dependency not yet merged? Build and commit locally,
-but do NOT open your PR out of turn — the planner''s next `task` row (sent
-on your upstream''s merge event) is your turn signal; a booted-headless
-session simply ends here and the planner re-boots you when the chain
-reaches you. Don''t schedule a watcher; don''t poll. Upstream visibly
-stalls from where you sit -> `result` row to the planner; don''t sit
-silent behind a stuck link.
+Choose one stable key for the intended recipient and exact body. Reuse it only
+when retrying that same write; use a new key when the recipient or body changes.
 
-**4. Take your turn** the moment your dependency is on `main` (your
-kickoff said "start now", or a planner `task` row says so):
+Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
+characters is the hard maximum. Before submitting, run `wc -m < <path>` and
+condense if needed. The handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake where applicable.
 
-- stacked on the upstream branch -> retarget first: `gh pr edit <your-pr>
-  --base main` if the PR exists, otherwise note your base is gone — same
-  discipline as the `git` skill''s stacked-merge procedure;
-- `git fetch origin && git rebase origin/main` on your feature branch;
-- push, open your PR — then, in the SAME step:
+If a Sprint command is rejected or transport fails, the write or handoff is
+incomplete. Correct and retry when safe. If the relay itself fails, surface the
+attempted command and durable evidence to FnB; do not invent an alternate
+delivery protocol. This skill is Planner-owned: the Planner or FnB decides
+whether an integrity threat warrants pause. Send any needed participant context
+before pausing; an active relay is not available after the lifecycle becomes
+paused.
 
-```
-./sc watch pr <owner/repo> <pr-number> --shell <planner-shortname>
-sc mem message send <planner> "sprint <doc-id>: unit <seq> pr-open — PR #<n>" --kind result
-```
+Treat an exhausted recovery wake as bounded manual-recovery evidence for FnB;
+preserve the unread message and failed wake, and do not create recursive
+fallbacks.
 
-The watch is what makes the loop event-driven: the daemon now turns every
-CI conclusion, review, and merge on your PR into a `pr_event` row in the
-planner''s inbox. Registration is explicit and happens at PR open — a PR
-without a watch is invisible to the sprint.
-
-**5. Babysit CI while live.** `gh pr checks <your-pr> --watch` blocks in
-your session at zero scheduled cost — use it while you''re booted; if your
-session ends first, the daemon''s red/green event reaches the planner and
-a `task` row re-boots you. Never a cron, never a scheduled wake.
-
-Triage before fixing: is the failure in something your diff touches? Does
-`main` show the same failure? Does the log say timeout / runner died /
-network / flaky test you never touched? Anomalous -> `gh run rerun
-<run-id> --failed`, don''t patch healthy code. Anomalous red survives two
-reruns -> `result` row to the planner (flaky suite, broken `main`, infra)
-and hold — planner''s to fix as a unit, not yours to absorb. When a fix
-needs a fix, suspect the diagnosis.
-
-Real red -> read the failure, fix, push, watch again — your loop to run,
-not the planner''s to chase. Three honest fix attempts without green ->
-`result` row with what''s failing and what you''ve tried. Reruns of flakes
-count neither as attempts nor as green: merge authority requires actual
-green checks — "it''s just a flake" is never a merge.
-
-**6. Pass sprint review.** CI green -> message your unit''s reviewer
-`sprint <doc-id>: unit <seq> ready for review — PR #<n>, checks green`
-(+ your open ambiguity calls) and tell the planner `in-review`
-(--kind result). Major/Medium findings block: fix, push, re-request; keep
-CI green across fix pushes. Low findings = notes for the sprint report,
-not gates. Disagree with a severity call -> planner rules; don''t litigate
-in the thread while the chain waits.
-
-**7. Merge on green + clean, file your unit report, hand off.** All
-checks green + reviewer declared review-clean + boundary above satisfied:
-
-```
-gh pr merge <your-pr> --squash --delete-branch
-sc mem message send <downstream-shortname> "sprint <doc-id>: unit <seq> merged — your dependency is on main. Your turn."
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
 ```
 
-Then close your unit with the **unit report** — your merged-notification
-to the planner, grown from one line into ONE structured `result` row,
-fixed template:
+## Delivery-complete gate
 
+Before conformance, re-read work units, dependencies, registered PRs, checks,
+merge observations, task membership, pending actionable messages, and active
+native runs. Normally every planned unit is completed/cancelled with an
+explicit disposition, and code units have their real PR outcome. Close-out is
+advisory: the packet surfaces gaps but never prevents the owning Planner or FnB
+from making and reporting a completion judgment. Do not infer code completion
+from PR state alone.
+
+Request an independent Reviewer through the durable Sprint relay, using the
+`sc sprint send` command above with the bound spec revision hashes, integrated
+main SHA, ratified judgment list, and `sprint_rev` conformance mode. Confirm the
+write and wake receipt, then stop and await the native conformance-result wake.
+Give the Reviewer recorded judgments, not unit authors'' narrative; conformance
+judges artifacts.
+
+## Conformance boundary
+
+The Reviewer records its report and findings with `sc sprint
+record-conformance`. Every finding becomes a pending follow-up for FnB review.
+No conformance finding is fixed inside this Sprint at any severity. A safety
+finding may demand immediate operator action, but it still remains follow-up
+evidence rather than a silently reopened editing lane.
+
+Verify report id, follow-up ids, author identity, and idempotent replay before
+synthesis.
+
+FnB records one terminal disposition per follow-up. `accepted` acknowledges
+ship-as-is; `resolved` and `dismissed` require a resolution file.
+
+Keep a resolution at about 6,000 characters or fewer; 8,000 is the hard
+maximum. Run `wc -m < <path>` and require a successful durable disposition.
+
+```text
+sc sprint disposition-followup --sprint <id> --followup <id> \
+  --disposition accepted
+sc sprint disposition-followup --sprint <id> --followup <id> \
+  --disposition resolved --resolution-file <path>
 ```
-sc mem message send <planner-shortname> "$(cat <<''EOF''
-unit-report <doc-id> unit=<seq> pr=#<n>
-shipped: <what the unit does now, 1-2 lines — the claim, not the diff>
-judgements: <ambiguity calls incl. final state (ratified/overruled); ''none''>
-issues: <CI reds (real vs anomalous), fix loops, stalls, review friction; ''none''>
-deviations: <known departures from the spec''s reading + why; ''none''>
-follow-ups: <Lows deferred, TODOs left, cleanup owed; ''none''>
-EOF
-)" --kind result
+
+## Compile bounded evidence
+
+Generate the packet through the authenticated production surface:
+
+```text
+sc sprint compile-report --sprint <id> --limit 50 > evidence.json
 ```
 
-One report per unit, at merge, mandatory — written NOW, while the unit''s
-history is still in your context, never reconstructed later. Every field
-answered; `none` is an answer. `deviations` is the honesty field: a
-deviation declared here is a judgement for the planner to ratify; the
-same deviation found only by the conformance pass is a finding. This is
-the one sanctioned multi-line `result` row — transitions stay one-line.
+Increase the per-section bound only when the default truncation counters show
+that synthesis needs more detail; the maximum is 200. Follow the packet''s full
+timeline and participant-conversation links for raw history. Never paste the
+entire event stream into the final report.
 
-(The daemon also emits the merge to the planner and retires your watch —
-the `pr_event` is the wake-up, your unit report is the record; send it
-anyway: worker self-reports and daemon ground truth cross-check each
-other.) No downstream (last link) -> the planner report is the handoff.
-Then clean up local per the `git` skill (re-pin base, delete the branch).
+The packet supplies:
 
-**8. Stand down.** Planner close-out message / frozen or `CLOSED` sprint
-doc = sprint over: merge authority gone, default gates resume. Drop the
-SPRINT line from `current_state` and confirm in a final `result` row.
-Your PR watches retired themselves at merge/close — nothing to tear down.
+- scope and lifecycle times;
+- exact bound spec revisions and recorded mid-Sprint edits;
+- planned versus actual work;
+- PR outcomes and links;
+- judgments and deviations;
+- pause, resume, recovery, interrupt, and drift evidence;
+- wake states, attempts, liveness aggregates, nudges, and escalations;
+- anomalies with bounded detail;
+- unresolved units, actionable messages, and follow-ups; and
+- links to the complete timeline and every participant conversation.
 
-## Reviewer slot
+The compiler does not decide whether a deviation was wise or an anomaly was
+acceptable. That is your synthesis.
 
-Gate the units the doc''s `reviewer` column assigns you. Method = the base
-`review` skill (adversarial, verify-don''t-trust, review against the unit''s
-scope); this overlay changes only pace and severity:
+## Final report
 
-1. **Wake = a review request.** A dev''s `ready for review` message — or a
-   planner `task` row booting you headless with the request as prompt —
-   is next-in-queue work; a waiting review stalls the chain exactly like
-   red CI. Keep a `SPRINT doc=<id> reviewing=<seq,seq,…>` line in
-   `current_state`. No trackers, no scheduled polls.
-2. **Major/Medium block; Low informs.** Wrong-behavior / data-loss /
-   security / spec-violation (Major) or will-bite-soon (Medium) -> the dev
-   fixes now; re-review on the fix push. Style / naming / nice-to-have
-   refactors (Low) -> one summary note to the planner for the sprint
-   report; Low never blocks merge and you don''t re-litigate it.
-3. **Handoffs go direct** — scoped relaxation, same shape as the merge
-   authority. The base `review` skill gates handoffs behind the FnB;
-   inside an ACTIVE sprint, for your assigned units only: message the
-   author dev your findings directly + copy the planner one line
-   (`unit <seq>: N major, M medium — with <dev>` or `unit <seq>:
-   review-clean`), --kind result. The FnB gate is unchanged everywhere
-   else and returns the moment the doc freezes.
-4. **Clean is a declaration.** Say `review-clean` explicitly to dev +
-   planner — it is what unlocks the dev''s merge; never leave it implied.
-5. **Stand down** on close-out: drop your SPRINT line, confirm to the
-   planner in a final `result` row.
+Write a concise report that answers:
 
-## Conformance slot
+1. What scope and exact revisions governed the Sprint?
+2. What was planned, what actually shipped, and which PRs produced it?
+3. Which judgments and intentional deviations shaped the result?
+4. What failed, retried, paused, recovered, or remained anomalous?
+5. What did conformance conclude?
+6. Which unresolved items and follow-ups now require FnB disposition?
+7. Where can the complete evidence be inspected?
 
-The sprint''s final gate: after every unit is merged and `main` is green,
-*before* the freeze, the planner boots you to answer the one question no
-unit reviewer is positioned to answer — **does what shipped on `main`
-actually match the spec?** Unit reviewers gated diffs against unit
-scopes; you read the integrated whole. Cross-unit seams — one unit''s
-interface drifting from what another assumed, a requirement that fell
-between two units — are yours to catch.
+Name discrepancies; do not smooth them into a success narrative. A recovered
+stall can be a successful Sprint when the failure stayed durable, visible, and
+contained.
 
-1. **Wake = the planner''s kickoff.** Its `task` row carries exactly: the
-   spec doc id, the sprint doc id, the merge SHA of `main`, your section
-   scope (if the pass is sharded), and the planner''s list of **ratified
-   judgement calls**. That list is your only narrative input — it is what
-   lets you tell an intentional deviation from a silent one. Everything
-   else is artifact: judge the spec against the code on `main` at that
-   SHA — never the diffs, never the message trail, never the devs''
-   reasoning.
-2. **Verdicts.** Every spec requirement in scope gets exactly one:
-   - `as-specced` — code matches the spec''s reading;
-   - `deviated-intentionally` — matches a ratified judgement call;
-   - `deviated-silently` — departs from spec, nobody declared it;
-   - `unimplemented` — spec requires it, nothing on `main` does it.
-   The last two are findings: attach spec section, code location, and
-   Major/Medium/Low — the sprint''s severity bar, same meanings.
-3. **Output.** Write a `documents` row — `CONFORMANCE: <sprint title>`,
-   kind `doc` (`sc mem doc add`) — holding the verdict table + findings,
-   then send the planner ONE line pointing at it:
-   `sprint <doc-id>: conformance done — doc <id>, N findings (x Major, y
-   Medium, z Low)` (--kind result). Detail in the doc, wake-up in the
-   message.
-4. **No authority.** You file verdicts; you rule on nothing. Fix units,
-   deferrals, and severity disputes are the planner''s; anything that
-   changes what the sprint *means* is the FnB''s. Same escalation ladder
-   as every other slot.
-5. **Stand down** when the planner confirms receipt (a re-run on fix
-   units arrives as a fresh scoped `task` row).
+## Pause and abort reports
 
-## Stance
+When closing after a pause, include the integrity threat, deterministic state at
+pause, interrupt delivery, reconciliation, spec drift, judgment, and resume
+outcome. Keep this section behind the pause/recovery evidence seam; missing
+optional pause facts must not prevent compiling an otherwise valid packet.
 
-- No scheduled polling, ever: `task` rows and headless boots wake you;
-  `pr_event` rows wake the planner; the sprint doc tells you what a wake
-  means.
-- Nothing that must outlive the turn rides a harness background task —
-  local long work goes through `./sc job`; measurement claims are
-  CI-vs-CI on one runner.
-- Register the watch in the same step that opens the PR — an unwatched PR
-  is a silent link, and silent links revert the sprint to polling.
-- Report state transitions (`building → pr-open → in-review → fixing →
-  merged`) as `result` rows, one line each — not progress prose. The
-  unit report at merge is the one sanctioned multi-line row.
-- Merge-on-green+clean and direct review handoffs are scoped authority
-  inside a declared sprint, never precedent outside one.
-- "All units merged" and "the spec shipped" are different claims — the
-  conformance slot exists because only the first is otherwise checked.',
+Abort is terminal and history-preserving. Its report names reason, completed
+work, partial artifacts, outstanding work, active interruption outcome, and
+recovery disposition. A prepared Sprint may abort with a stub report; delete
+nothing.
+
+## Terminal handoff
+
+Pass the final synthesis to `complete`; the surface commits the append-only
+`final` report before attempting the lifecycle transition. Omitting the report
+is permitted under advisory close-out, but the evidence packet records the gap.
+Abort only under Planner or FnB authority. Terminal state stops Sprint services
+and removes live pills while retaining conversations, messages, events, PR
+evidence, reports, and follow-ups.
+
+Immediately before `complete`, re-run `sc sprint inbox --sprint <id>` to drain
+newly arrived messages, mark every handled informational message read with
+`accept`, and confirm the final report file is the intended synthesis. This is
+the last pre-terminal evidence read.
+
+Keep the final report at about 6,000 characters or fewer; 8,000 is the hard
+maximum. Run `wc -m < <path>` before the typed terminal handoff, then require
+the successful report receipt and lifecycle transition.
+
+```text
+sc sprint complete --sprint <id> --reason <summary> --outcome <outcome> \
+  --report-file <path> --key <stable-key>
+sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
+```
+
+After `complete` succeeds, emit one bounded final response from its receipt:
+final report id, follow-up list, integrated SHA, and evidence links. Run no
+further Sprint command; close intent terminalizes the owning conversation and
+Sprint-scoped authority is over.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -3716,360 +3812,659 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'sprint_orchestration',
-  'Planner-side governance of a multi-shell sprint — decompose the push, sequence the dependency chain, assign devs and reviewers, run the model & provider interview, declare the sprint doc, arm your inbox watcher, boot workers per task (./sc run), monitor the event stream (result + pr_event rows), unblock stalls, close out — run the pre-freeze conformance pass (review shells judge the spec against main), freeze the doc (revoking all scoped authority), and synthesize the sprint report from unit reports + the conformance doc into the fixed skeleton. Zero scheduled polling by any shell. Load when the FnB directs a coordinated multi-dev push. Companion to the participant-side `sprint` skill.',
-  'craft',
+  'sprint_dev',
+  'Execute a Sprints v2 Developer lane — accept one assignment, implement and verify it, own the PR through green and review, merge only after live authorization, and record judgment without overlapping edits.',
+  'workflow',
   NULL,
   0,
-  '# sprint_orchestration — governing a coordinated multi-shell push
+  '# sprint_dev — own one editing lane
 
-> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
+Use for an actionable work-unit assignment in an armed Sprint. Marking that
+Sprint message read is acceptance and starts work immediately. If you cannot
+accept, decline with a concrete reason; never leave it unread and waking.
+On every wake or re-entry, load `sprint_dev`, run the exact inbox command below,
+and inspect the durable message before deciding what to do.
 
-The FnB declares *that* a sprint happens; you make it run: decompose the
-push into units, sequence who builds on whom, assign a reviewer to every
-unit, interview the FnB for the sprint''s models, boot each worker when its
-turn comes, watch the event stream, unblock stalls, close out with a
-report. The participant loop (build → PR + watch → CI → sprint review →
-merge on green+clean → hand off, plus the reviewer slot) = the `sprint`
-skill — devs and reviewers run it; you run this.
-
-The skills meet at one artifact, the **sprint doc**: your declaration
-turns the participants'' scoped authority ON (dev merge-on-green+clean,
-reviewer direct handoffs); your close-out turns it OFF.
-
-**The sprint is event-driven — nobody polls on a schedule.** Every
-instruction and result is a `shell_messages` row: you send `task` rows and
-boot workers headless; workers send `result` rows and register their PRs
-with the watcher daemon, which sends you `pr_event` rows. Your inbox
-watcher wakes you the moment any row lands. Workers are ephemeral,
-per-task sessions; you are the one long-lived context in the loop — you
-manage, you never load code. The full trail replays with
-`SELECT * FROM shell_messages WHERE kind != ''shell'' ORDER BY created_at`.
-
-## Step 1: Declare the sprint
-
-Decompose the push into units a single shell can own end-to-end. Map
-dependency order stingily: a dependency edge = a real code dependency, not
-a preference. Units that don''t touch each other run in parallel; keep
-chains short and the graph wide where the code allows.
-
-Assign each unit a dev shell + a reviewer shell (one reviewer may gate
-several units — don''t let one reviewer become the whole sprint''s
-bottleneck).
-
-**How many shells to deploy = your call, not a formula.** Weigh the
-magnitude of the push against the capacity actually available — the shells
-that exist, reviewer bandwidth, how wide the dependency graph genuinely
-runs — and make the call. More units than shells is fine (units queue
-behind the chain); more shells than parallel work is waste.
-
-**The model & provider interview — exactly two questions to the FnB:**
-
-1. **Devs** — which harness and model? One answer; every dev in the
-   sprint runs it.
-2. **Reviewers** — which harness and model? One answer; every reviewer
-   runs it.
-
-Flavor-uniform by design: shells of a flavor are interchangeable workers,
-and one answer per flavor keeps the board readable and the review lineage
-coherent — reviewers stay a different lineage from the code they gate,
-chosen per sprint instead of per boot. No answer -> `flavor_defaults`,
-unchanged (omit the `models:` line). Every sprint worker still runs at high
-effort. Per-unit model mixing is out of scope — the interview covers the real
-need, provider choice per role.
-
-**Resolve each answered route before declaring it.** Lazy-load only the two
-choices the FnB made — never trust a display name or translate a provider id by
-hand:
-
-```
-sc models resolve <devs-harness> <devs-model>
-sc models resolve <reviewers-harness> <reviewers-model>
+```text
+sc sprint inbox --sprint <id>
+sc sprint accept --sprint <id> --message <message-id>
+sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 ```
 
-Each must return `route:` plus an exact `call:` ending in `--effort high`.
-Failure means the selector is not locally callable, the harness lacks a
-headless/high-effort seam, or Refresh models has not seen it. Run
-`sc models list <harness>` for the local choices; the FnB''s **Refresh models**
-button in `/#shells` repopulates the same runtime table. Resolve again after a
-refresh. Never silently fall back across a provider or lineage.
+Use `accept` or `decline` for actionable work. After acting on an informational
+question, answer, blocker, or context message, run `accept` for that message.
+For informational messages it only marks the message read; it does not change
+Sprint or work-unit state.
 
-Common exact selectors: Claude aliases (`fable`, `opus`) and Codex ids
-(`gpt-5.6-sol`, `gpt-5.6-terra`) pass directly. Kimi takes the configured alias
-shown by `sc models list kimi` (for example `kimi-code/k3`), never the bare
-provider model `k3`.
+## Orient and bound the lane
 
-Write the board as a `documents` row:
+Read the assignment, expected output, bound spec revision, dependencies,
+assigned Reviewer, repository/worktree, merge grant, and prior judgments. One
+Developer shell may own one active work unit in the Sprint. Do not start a
+second editing lane or edit another shell''s worktree.
 
-```
-sc mem doc add "SPRINT: <title>" --kind doc --body-file <draft.md>
-```
+If the requirement is ambiguous, choose the shippable reading within your
+unit''s scope, record the choice and rationale, and continue. Escalate changes to
+the unit boundary, interfaces another unit consumes, deliverable cuts, or scope
+growth to the Planner.
 
-Body contract (the `sprint` skill quotes the same one — keep it exact):
+## Questions, answers, blockers, and failures
 
-```
-# SPRINT: <title>
-status: ACTIVE                      # ACTIVE | CLOSED
-declared: <date> · planner: <shortname>
-models: devs=<harness>/<model> · reviewers=<harness>/<model>
+Write a concrete question, answer, blocker, or useful context to a short body
+file, then send it durably to the participant who can act:
 
-| seq | unit | shell | reviewer | depends on | branch | pr | status |
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --key <stable-key>
 ```
 
-Unit `status` walks `waiting → building → pr-open → in-review → fixing →
-merged`; `fixing` loops back to `in-review` until clean; `ci-red` can
-interleave anywhere from `pr-open` on.
+Ask the Planner about scope, priority, or cross-unit decisions; ask the assigned
+Reviewer about review evidence. Answer an incoming question through `send` so it
+wakes the asker, confirm that write, then mark the handled question read with
+`accept`. For a blocker or integrity concern, send the Planner concise evidence,
+impact, the exact action needed, and your recommendation. Continue safe
+independent work, but stop at a decision boundary when the answer is required.
+No immediate response is not a reason to send duplicates: the durable message
+and recovery reconciler own re-waking.
 
-Note the returned `document_id` — every task and report references it —
-and embed `SPRINT doc=<id> governing` in your own `current_state`; drop
-it at close-out.
+Choose one stable key for the intended recipient and exact body. Reuse it only
+when retrying that same write; use a new key when the recipient or body changes.
 
-You are the doc''s only writer: devs report transitions as `result` rows;
-fold them into the board with `sc mem doc edit <id> --body-file`.
+Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
+characters is the hard maximum. Before submitting, run `wc -m < <path>` and
+condense if needed. The handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake where applicable.
 
-## Step 2: Arm the watcher, kick off
+If a Sprint command is rejected or transport fails, the write or handoff is
+incomplete. Correct and retry when safe. If the relay itself fails, surface the
+attempted command, evidence, impact, and recommendation to FnB; do not invent an
+alternate delivery protocol. A Developer does not pause the Sprint. The Planner
+decides whether the reported condition warrants continuing, re-planning, or
+pausing.
 
-**Arm your inbox watcher first** — the zero-token wake-up that replaces
-every scheduled tracker. On the claude harness, run it as a background
-task (it blocks until any message row lands for you, then exits — the
-exit is your wake-up):
+## Build and verify
 
-```
-./sc watch inbox        # background it via your harness''s background-task tool
-```
+Sync the assigned repository, work on a feature branch, match the surrounding
+code, and implement the smallest complete change. Keep external calls outside
+database transactions. Preserve durable identities and append-only evidence.
 
-**Interactive sessions only.** A harness background task is
-session-scoped: in a headless (`-p`) boot it dies with the session,
-silently — six sprint stalls traced to exactly this. A headless planner
-turn arms nothing: drain the inbox, act, end the turn — the next event
-row boots you again. The watcher belongs to the long-lived interactive
-planner seat, nowhere else.
+Verification must exercise the unit''s independent stage gate and realistic
+failure paths. A local exploratory number is not merge evidence. Record real CI
+failures, anomalous infrastructure failures, retries, review friction, and
+known departures for the final report.
 
-Re-arm it every time you finish draining your inbox. On other harnesses
-the watcher isn''t available — check your inbox at every task boundary
-instead; correctness is identical, latency degrades gracefully. (Strong
-recommendation, not a gate: the planner seat runs best on claude/Fable —
-the one long-lived, low-volume, high-leverage context in the loop, and
-the only seat the watcher fully serves.)
+An explicitly planned report-only or no-code lane completes with its durable
+result instead of a PR. Code lanes cannot use this path; they complete only
+after merge authorization and observation.
 
-**Kick off** — a `task` row per participant (doc id + the instruction to
-load the `sprint` skill + the slot), then boot whoever can start:
+Keep the result at about 6,000 characters or fewer; 8,000 is the hard maximum.
+Run `wc -m < <path>` before submitting, then require a successful command and
+durable completion receipt.
 
-```
-# devs — unit, dependencies, reviewer:
-sc mem message send <dev> "SPRINT <doc-id>: you own unit <seq> — <one line>. Depends on unit <k> (<shell>); <shell''> depends on you; <reviewer> reviews you. Load the sprint skill and take your slot; your merge closes with the unit report. First move: <start now | build locally, wait for unit <k>>." --kind task
-
-# reviewers — assigned units, the severity bar:
-sc mem message send <reviewer> "SPRINT <doc-id>: you review units <seq,seq> — Major/Medium block, Low goes to the report. Load the sprint skill (reviewer slot). Review requests come to you directly as units go green." --kind task
-
-# boot each first-in-chain dev with the RESOLVED selector; high is invariant:
-./sc run <dev> --harness <devs-harness> -m <devs-model> --effort high
+```text
+sc sprint complete-unit --sprint <id> --work-unit <id> \
+  --result-file <path>
 ```
 
-`./sc run` renders the shell''s boot doc and drains its inbox
-non-interactively — the `task` row you just sent is what it acts on. The
-default prompt is exactly that ("check your inbox and act"); pass
-`-p` only to say something the task row doesn''t. A shell with a live
-session refuses to boot (one shell, one session) — a live session reads
-the same `task` row at its next inbox check.
+Register the PR through the authoritative Sprint surface and retain ownership
+until it is green. After `register-pr` succeeds, the native registered-PR
+watcher supplies red/green facts and their durable wakes. On red, diagnose and
+fix the PR. On green, judge readiness rather than forwarding mechanically.
 
-Keep `task` bodies model-neutral and constraint-explicit: point at the
-sprint doc, the unit, the spec, and the skill — don''t restate them in
-your own phrasing. Constraints live in specs, which every lineage reads
-the same way.
+```text
+sc sprint register-pr --sprint <id> --repository <owner/name> \
+  --pr <number> --work-unit <id>
+```
 
-This kickoff activates each dev''s scoped merge authority and each
-reviewer''s direct-handoff authority for its assigned units.
+When no local implementation action remains, stop and await the native PR-fact
+wake. Use Sprint-native wakes for coordination. Do not start a recurring shell
+loop, scheduled job, manual watcher daemon, or external PR watcher to track the
+registered PR.
 
-## Step 3: Monitor the event stream
+## Review handoff
 
-Your watcher wakes you on every row. On wake, drain the inbox and act:
+Put the readiness claim in a file, then use one stable retry key:
 
-- **`result` rows** (dev/reviewer transitions — pr-open, in-review,
-  review-clean, merged, ambiguity calls, stall reports): fold into the
-  board, then move whatever it unblocks. A dev''s merge arrives as its
-  **unit report** (the one multi-line `result` row — shipped /
-  judgements / issues / deviations / follow-ups): file it whole; it is
-  a primary source for the sprint report, and its `deviations` +
-  `judgements` lines feed the conformance kickoff. A bare one-line
-  `merged` with no report -> nudge the dev (`task` row) for it now,
-  while the unit is still in its context.
-- **`pr_event` rows** (daemon ground truth — checks green/red, review
-  submitted, merged, closed): the wake-up for transitions no worker is
-  live to report. Green on an in-review unit -> nothing (the reviewer
-  gate holds); red -> re-task the unit''s dev (`task` row + `./sc run`);
-  merged -> boot the downstream dev whose turn it is.
-- Mark rows read as you fold them; then **re-arm the watcher**.
+Keep the readiness claim at about 6,000 characters or fewer; 8,000 is the hard
+maximum. Run `wc -m < <path>` and condense before the typed handoff. The handoff
+exists only after the command succeeds and confirms its durable write and wake.
 
-A worker self-report is never the verdict — green checks + the reviewer
-gate are the only ground truth; the `pr_event` stream is what makes a
-"done" checkable without a context switch. `gh pr checks <n>` /
-`gh pr list` remain your on-demand detail reads — detail lives in `gh`,
-the message is the wake-up.
+```text
+sc sprint request-review \
+  --sprint <id> --registered-pr <registered-id> \
+  --readiness-file <path> --key <stable-key>
+```
 
-At any moment, be able to answer: which link is the bottleneck? The board
-is what the FnB and any rebooted shell reads to re-orient mid-sprint —
-fold every state change in as it happens. The board + message table ARE
-the sprint''s state: a rebooted planner replays the rows and loses
-nothing.
+The assigned Reviewer receives an actionable request. After `request-review`
+succeeds, stop and await the native verdict wake. A changes-requested verdict
+opens a fresh linked fix conversation and makes it current. Apply every
+blocking finding, re-establish green, and hand back with a new stable review
+key. Record disagreements as judgment; the Planner resolves scope/severity
+disputes.
 
-Messages are your steering wheel: every dev checks its inbox at each
-step start, and a headless boot drains it first thing — your `task` row
-is read before that dev''s next move. Steer with `task` rows — holds,
-re-sequencing, nudges, rulings on reported reds. The board records state;
-messages change behavior; on conflict your latest message wins -> then
-update the board to match.
+## Merge boundary
 
-Dev ambiguity reports (`ambiguity: … → chose …`) get a ruling on
-receipt: overrule by `task` row while the unit is still un-merged, or
-stay silent and the call stands. Either way log the call + outcome the
-moment it arrives — the sprint report lists every one, and calls
-reconstructed at close-out from old messages are calls lost.
+Approval alone is stale evidence. Immediately before merge, ask the engine to
+re-read live GitHub state and revalidate the armed grant, ownership, work-unit
+state, approved head, and checks:
 
-## Step 4: Unblock
+```text
+sc sprint authorize-merge \
+  --sprint <id> --registered-pr <registered-id>
+```
 
-Stalls and the moves:
+Merge only the exact repository, PR number, and head SHA returned. If the
+command refuses, do not work around it; wait for the watcher or return to the
+appropriate loop. After merge, clean the worktree, submit the unit result and
+judgments, and let automatic merge observation advance dependencies.
 
-- **Dev wedged on red CI** (it reports after three failed fix attempts,
-  per the `sprint` skill): pair another shell onto it / re-scope the
-  unit / pull the failing part into a follow-up unit so the chain moves.
-- **Anomalous red** (flaky test, runner death, `main` red underneath — the
-  dev''s job was to rerun and report, not patch healthy code): fix the
-  cause as its own unit, or hold the chain while infra recovers; rule by
-  `task` row when the dev may proceed. Don''t count phantom reds against
-  the dev''s fix attempts — and don''t let anyone merge over one; green
-  means green.
-- **Unit growing past scope**: split it — the piece downstream needs ships
-  first; the rest becomes a new unit at the chain''s tail.
-- **Merge broke `main`**: `task` row to all devs to hold merges, insert a
-  fix unit at the front of the chain, resume when green.
-- **Review stall** (unit sitting `in-review` while its reviewer is idle):
-  boot the reviewer — `./sc run <reviewer> --harness <reviewers-harness>
-  -m <reviewers-model> --effort high`; its inbox holds the review request. Still stuck
-  -> reassign the unit to another reviewer. Severity dispute (dev says
-  Low, reviewer says Medium) -> rule by message immediately — a chain
-  waiting on a classification argument is pure loss. Dispute about what
-  the unit *should do* -> FnB.
-- **Link gone quiet** (no `result` row, no `pr_event` movement): boot it with
-  its declared sprint route — `./sc run <shortname> --harness <role-harness>
-  -m <role-model> --effort high` drains its inbox and acts; that IS the nudge in
-  an event-driven sprint. The liveness guard refusing (session already
-  live) + still silent -> escalate to the FnB with the worktree state.
-  The bottleneck question in Step 3 is what surfaces a dead link.
-- **Re-sequencing**: edit the board + `task` row to *every* affected dev
-  with its new slot — a dev acting on a stale slot is worse than a paused
-  one.
-- **Every worker boot failing at once**: check provider auth and spend
-  limits BEFORE debugging the engine — a monthly cap presents as a
-  fleet-wide boot failure and costs an hour of misdiagnosis. Pause at a
-  clean gate (units green, nothing mid-merge), surface to the FnB (auth
-  switch is theirs), resume where the board says you stopped.
-- **CI queue clogged at the tail**: a queued verify whose commit a later
-  stack head already supersedes is pure queue time — cancel it (`gh run
-  cancel`) and let the head''s run stand for the stack. Cancelling
-  anything to protect a measurement run is allowed but logged: rationale
-  in the board or a `result` row, and re-run the cancelled check after.
-  Green means green — cancellation never substitutes for a verdict on
-  what still needs one.
-- **Judgment calls** (scope vs. deadline, cutting a unit, changing an
-  interface another team reads): escalate to the FnB immediately — the one
-  stall you can''t unblock yourself.
+## Report and stop
 
-You boot workers; the daemon never does (it only writes rows), and the
-FnB is only pulled in for judgment. Autonomous wake stays a deliberate
-non-goal.
+Report broken bases, destructive ambiguity, unavailable GitHub, untrustworthy
+runners, provider exhaustion, or an unrecoverable environment to the Planner
+with evidence, impact, and a recommendation. Stop at the unsafe boundary while
+the Planner decides whether to continue, re-plan, or pause.
 
-## Step 5: Close out
+Stop when the unit is merged and reported, declined, awaiting Planner/FnB
+recovery, or returned to review. Before stopping, re-run `sc sprint inbox
+--sprint <id>`, act on newly arrived messages, mark every handled informational
+message read with `accept`, and confirm the final typed handoff succeeded. Ask
+the Planner for later work only after the current editing lane is terminal.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
 
-When every unit is `merged` and `main` is green:
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_pln',
+  'Run an armed Sprints v2 collaboration loop as Planner — dispatch ready lanes, respond to durable evidence and escalations, re-plan honestly, and coordinate pause/resume without becoming a transition bottleneck.',
+  'workflow',
+  NULL,
+  0,
+  '# sprint_pln — govern the armed Sprint
 
-1. **Run the conformance pass — before the freeze.** "All units merged"
-   and "the spec shipped" are different claims; this is where the second
-   one gets checked. Boot review shell(s) — reviewer lineage, the
-   sprint''s reviewer harness/model; one shell by default, shard by spec
-   section only when the spec genuinely exceeds one context:
+Use as the originating Planner after `sprint_prep` arms the Sprint. The system
+captures deterministic facts; you decide scope, sequencing, and recovery.
+On every wake or re-entry, load `sprint_pln`, run the exact inbox command below,
+and inspect the durable message before deciding what to do.
 
-   ```
-   sc mem message send <reviewer> "SPRINT <doc-id>: conformance pass — spec doc <spec-id>, main @ <merge-sha><, sections <scope> if sharded>. Ratified judgement calls: <list — the only narrative input>. Load the sprint skill (conformance slot)." --kind task
-   ./sc run <reviewer> --harness <reviewers-harness> -m <reviewers-model> --effort high
-   ```
+## Start from durable state
 
-   The shell judges the spec against the code on `main` — never the
-   diffs, never the trail — and files four-way verdicts (`as-specced` /
-   `deviated-intentionally` / `deviated-silently` / `unimplemented`) as
-   a `CONFORMANCE: <title>` doc + a one-line `result` pointer.
+The armed runtime owns scheduled dispatch, unread wake recovery, liveness
+evaluation, and registered-PR observation. React to its durable inbox and wake
+facts; use the Planner turn for decisions, re-plans, escalation, and close-out.
 
-   **Rule on the findings** — they route like any sprint event:
-   - **Major** -> insert a fix unit at the front of the chain under
-     still-ACTIVE authority (this is exactly why the pass runs before
-     the freeze — a reopened sprint re-grants nothing); re-run the pass
-     scoped to the fix when it merges.
-   - **Medium** -> your judgment: fix unit now, or defer with the FnB
-     told explicitly in the report''s Verdict.
-   - **Low** -> Deferred & Follow-ups; never holds the close.
-2. Set `status: CLOSED` in the body, then freeze:
-   `sc mem doc freeze <doc-id>`. Freezing IS the revocation — a frozen or
-   `CLOSED` sprint doc is exactly what the `sprint` skill checks before
-   any merge; every participant''s scoped authority ends with it.
-3. Message every participant (`task` row): sprint closed, default merge
-   gates resume.
-4. Verify the watches are gone: `./sc watch list` — every sprint PR''s
-   watch retired itself at merge/close; a survivor means an unmerged PR
-   or a mis-registered watch — resolve it, don''t leave it. Then stop
-   re-arming your inbox watcher (a running one just times out — it holds
-   no authority and wakes nothing that matters).
-5. Write the sprint report — one `documents` row, the durable record:
+Read the Sprint inbox, lifecycle, bound spec revisions, work-unit graph,
+participant routes, active conversations, registered PRs, unresolved
+expectations, and recent anomalies. Viewing a participant conversation is
+observation, not activity; never manufacture progress from browser presence.
 
-   ```
-   sc mem doc add "SPRINT REPORT: <title>" --kind doc --body-file <report.md>
-   ```
+```text
+sc sprint inbox --sprint <id>
+sc sprint accept --sprint <id> --message <message-id>
+sc sprint decline --sprint <id> --message <message-id> --reason <reason>
+```
 
-   Fixed skeleton — fill it by **reasoning over the unit reports and the
-   conformance doc against each other** (a dev''s `deviations: none`
-   meeting a `deviated-silently` finding on its unit is exactly what the
-   report exists to say), not by pasting either verbatim:
+Release every dependency-ready lane through the production surface:
 
-   | Section | Primary source |
-   |---|---|
-   | `## Verdict` | your synthesis — five-second answer: N units / N PRs, conformance state (conforms / conforms-with-deviations / gaps-found), main green, anything deferred-with-eyes-open |
-   | `## Units Shipped` | the board — final table, planned vs. actual order |
-   | `## Judgements Made` | unit reports (`judgements:`) + your rulings + severity disputes; every call with its final state |
-   | `## Spec Accuracy` | conformance doc — verdict table + findings, cross-checked against unit reports'' `deviations:` |
-   | `## Issues Encountered` | unit reports (`issues:`) + the `pr_event`/stall trail — CI fights, anomalous reds, re-scopes, unblocks |
-   | `## Deferred & Follow-ups` | unit reports (`follow-ups:`) + reviewers'' Lows + conformance Lows + anything cut — one actionable backlog, the next sprint''s seed list |
-   | `## Spec Debt` | judgement calls that should be written back into the spec + places the spec was silent, wrong, or contradictory — the input to the spec-update pass |
-   | `## Metrics` (optional) | mechanical from the trail: review cycles per unit, CI reds, boots per shell, planned vs. actual merge order |
+```text
+sc sprint dispatch --sprint <id>
+```
 
-   The `kind != ''shell''` message trail remains the in-order backbone;
-   the CONFORMANCE doc stays alongside as the report''s evidence trail.
+The returned ids are wake identities. Work-unit disposition and messages are
+the authoritative release facts. Dispatch is safe to repeat: occupied Developer
+lanes and stable assignment generations prevent double booking.
 
-   Then drop a copy at the repo root: write the same body to
-   `shared/SPRINT_REPORT_<slug>.md` (`mkdir -p shared` — the dir may
-   not exist yet). Message the FnB: sprint closed, report at doc
-   `<id>` + the `shared/` file.
-6. Settle the bookkeeping — close the sprint''s flags, advance roadmap /
-   feature status, note docs-pending.
+Accept or decline only when the inbox item is actionable. After acting on an
+informational question, answer, blocker, or evidence message, run `accept` for
+that message. For informational messages it only marks the message read; it does
+not change Sprint or work-unit state.
 
-## Stance
+## Running loop
 
-- Enforcement is advisory in v1 — merge order and authority live in skill
-  text and the board, not a pre-commit check. An out-of-date board = a
-  false authority grant; board accuracy is your discipline.
-- Zero scheduled polling by any shell: rows wake you, you boot workers,
-  watches retire themselves. A scheduled tracker anywhere in the sprint
-  is a defect.
-- Local long work rides `./sc job` (see the `sprint` skill) — a job''s
-  completion is a `result` row like any other wake-up. A hand-rolled
-  nohup/poll waiter anywhere in the sprint is a defect: one sprint''s
-  hand-rolled waiter carried a self-match bug that masked a dead bench.
-- You manage; you never load code. Your context grows at coordination
-  density — the workers'' grows at code density and is discarded per task.
-- Monitor > interrogate: `pr_event` rows and `gh` reads cost no dev a
-  context switch; `task` rows are for changing behavior.
-- The conformance shell files verdicts, never rulings — Major/Medium/Low
-  routing stays yours; what the sprint *means* stays the FnB''s.
-- Escalate judgment, absorb mechanics: re-sequencing and worker boots are
-  yours; changing what the sprint *means* is the FnB''s.',
+- Keep dependencies as the only hard sequence. Re-plan assignments, waves, or
+  dependencies when reality changes, but never rewrite completed history.
+- Let Developers own their PRs through green, review, correction, and merge.
+  Let Reviewers own verdicts. Do not proxy routine handoffs.
+- Consume passive system facts without waking yourself into every transition.
+  Act on decisions, escalations, re-plans, pauses, and terminal synthesis.
+- Record scope calls, spec edits, ratified deviations, and their rationale as
+  judgment evidence while context is live.
+- A mid-Sprint spec edit is allowed only by the owning Planner or FnB. Record
+  the prior and new exact revision hashes. The running Sprint remains bound to
+  its approved revision unless an explicit recorded judgment says otherwise.
+
+The armed runtime evaluates liveness on its five-second pulse. A one-shot
+diagnostic/evaluation is available when evidence requires it:
+
+```text
+sc sprint monitor --sprint <id>
+```
+
+Run `monitor` once for concrete evidence, then return control to native
+delivery. It evaluates only due accepted expectations and its
+nudge/escalation identities are durable. Use Sprint-native wakes for
+coordination. Do not start a recurring shell loop, scheduled job, manual
+participant boot, or external PR watcher to track Sprint state.
+
+## Questions, answers, blockers, and failures
+
+Put a concrete question, answer, decision, blocker, or useful context in a short
+body file and address the participant who owns the needed fact or action:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --key <stable-key>
+```
+
+Answer incoming questions through `send` so the answer is durable and wakes the
+asker, confirm that write, then mark the handled question read with `accept`.
+For a cross-unit blocker, send evidence, impact, and the exact action needed to
+every directly affected participant. Continue safe independent governance, but
+stop at a decision boundary when an answer is required. Do not spam duplicates
+when no response is immediate; unread recovery owns re-waking.
+
+Choose one stable key for the intended recipient and exact body. Reuse it only
+when retrying that same write; use a new key when the recipient or body changes.
+
+Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
+characters is the hard maximum. Before submitting, run `wc -m < <path>` and
+condense if needed. The handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake where applicable.
+
+If a Sprint command is rejected or transport fails, the write or handoff is
+incomplete. Correct and retry when safe. If the relay itself fails, surface the
+attempted command and durable evidence to FnB; do not invent an alternate
+delivery protocol. When a Developer or Reviewer reports an integrity concern,
+evaluate its evidence, impact, and recommendation. Decide whether to continue,
+re-plan, or pause. Send any needed participant context before pausing; an active
+relay is not available after the lifecycle becomes paused.
+
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
+```
+
+Revise only a still-planned lane; name its complete new projection so the
+before/after event is reviewable. Cancel only an unreleased lane, with the
+reason retained as its terminal result:
+
+```text
+sc sprint replan-unit --sprint <id> --work-unit <id> \
+  --developer-shell <id> --reviewer-shell <id> --wave <n> \
+  [--depends-on <work-unit-id>] [--output-kind code|report-only|no-code]
+sc sprint cancel-unit --sprint <id> --work-unit <id> --reason <reason>
+```
+
+## Escalation judgment
+
+Read the evidence packet before acting: last strong evidence, supporting
+signals, unreadable signals, failure identity, nudge history, route/quota state,
+and current work facts. A proven failure may justify re-plan, route recovery, or
+pause. Ambiguous silence does not justify corrupting a work-unit disposition.
+
+If a Developer or Reviewer declines, preserve the reason, return the lane or
+review request to the eligible pool, and issue a fresh assignment identity.
+Never edit the declined message into a different instruction.
+
+## Pause and resume
+
+Developer and Reviewer participants report integrity concerns; the Planner or
+FnB decides whether to pause. When pause is warranted, transition durably, stop
+external Sprint services, persist interrupt intent, preserve every partial
+artifact, and retain the judgment and evidence for FnB recovery.
+
+Only Planner or FnB resumes. Review reconciliation for native runs, unread
+messages, pending wakes, work units, registered PRs, capacity, and spec drift.
+An exhausted recovery wake is one bounded fallback, not a retry loop. Preserve
+the unread message and failed wake as evidence, involve FnB for manual recovery,
+and do not create recursive fallbacks.
+Drift informs; it never silently blocks resume. Record the exact revision facts
+and choose continue, re-plan, or abort.
+
+```text
+sc sprint pause --sprint <id> --reason <integrity-threat>
+sc sprint resume --sprint <id> [--reason <reconciliation-judgment>]
+```
+
+Abort only when continuing would be dishonest or unsafe. It is terminal and
+deletes nothing.
+
+## Handoffs and stop
+
+Assign ready work in the Developer''s persistent Sprint conversation. Review
+outcomes move the Developer to fresh fix/merge conversations automatically;
+the next work assignment returns it to the persistent lane.
+
+When all planned delivery work is terminal and merged or explicitly no-code,
+re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message, confirm
+every handled informational message is marked read with `accept`, confirm the
+final typed transition succeeded, stop dispatching, and hand control to
+`sprint_close`. Close-out conformance findings become follow-ups rather than
+new editing lanes in this Sprint.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_prep',
+  'Prepare and arm a Sprints v2 run — bind reviewed spec revisions, shape work units and dependencies, assign routes and capacity, and refuse arming until the durable plan is eligible.',
+  'workflow',
+  NULL,
+  0,
+  '# sprint_prep — declare the riverbed
+
+Use as the owning Planner while a Sprint is `prepared`. Preparation ends at one
+atomic arming decision; it does not launch participants piecemeal.
+
+## Outcome
+
+Produce one editable prepared Sprint with:
+
+- one roadmap feature;
+- exact governing spec revision hashes and their qualifying QAQC approvals;
+- work units made from existing spec tasks, each with one Developer and one
+  assigned Reviewer;
+- dependency edges and planned waves;
+- one primary harness/model/effective effort per participant plus eligible
+  Planner fallback capacity;
+- a committed Sprint merge grant; and
+- enough local/GitHub capacity to execute the plan.
+
+The arming transaction creates every participant conversation, the initial
+assignment messages and wake intents, and the armed transition together.
+
+## Eligibility pass
+
+Read the feature, selected spec bodies, task ledgers, QAQC records, shell roster,
+model routes, quota state, repository access, and worktree availability. Record
+the exact revision hash you inspected; a title or document id is not a revision.
+
+The Review shell records its verdict against the current exact body through the
+authenticated Sprint surface:
+
+```text
+sc sprint record-qaqc --document <spec-document-id> --verdict pass \
+  [--findings-document <document-id>]
+```
+
+Use `fail` until every blocking finding is resolved. A body edit changes the
+revision hash and therefore needs a fresh signed record.
+
+Refuse arming when any of these is true:
+
+- a selected current revision lacks Review-shell QAQC approval;
+- any Medium-or-higher QAQC finding is unresolved;
+- a selected task belongs to no work unit or more than one work unit;
+- a dependency cycle exists;
+- a work unit lacks an assigned Developer or Reviewer;
+- participant routes or required capacity are unavailable;
+- another Sprint is armed, or a selected shell already participates in an armed
+  Sprint; or
+- the merge grant was not committed as part of the final plan.
+
+Deficiencies remain editable in `prepared`. Do not weaken an invariant merely
+to get to `armed`; surface the missing fact or capacity to the FnB.
+
+## Shape work, do not script behavior
+
+A work unit is one coherent editing lane and may group related spec tasks. Use
+dependencies only for hard prerequisites. Waves express intent and later report
+comparison; they do not forbid safe out-of-order completion. Reviews are not
+editing lanes.
+
+Prefer the smallest dependency graph that preserves correctness. Record the
+expected output in outcome language. Do not encode a shell''s implementation
+steps into the durable plan when its role skill and judgment can decide them.
+
+For every participant, record role, route, model, effective effort, persistent
+conversation ownership, and fallback facts the plan actually depends on. Never
+pretend a native session can resume across harnesses.
+
+Declare the prepared envelope from a JSON array of participant objects, then
+add each editing lane from existing spec tasks:
+
+```text
+sc sprint declare --feature <feature-id> \
+  --spec-approval <approval-id> --participants-file <path> --merge-grant
+sc sprint plan-unit --sprint <id> \
+  --developer-shell <id> --reviewer-shell <id> --title <title> \
+  --expected-output-file <path> --task <task-id> \
+  [--task <task-id>] [--wave <n>] [--depends-on <work-unit-id>] \
+  [--output-kind code|report-only|no-code]
+```
+
+The participant file contains `shell_id`, `role`, and `harness`, with optional
+`model`, `effort`, and `route`. FnB may add `--planner-shell <id>` when declaring
+for the originating Planner. Keep the Sprint prepared while shaping the plan.
+
+## Final arming check
+
+Immediately before arming, re-read the spec revision hashes, QAQC records,
+participant capacity, single-armed invariant, repository access, and merge
+grant. The final read and durable plan commit belong to the authoritative
+arming transaction; external harness and GitHub work occurs after it commits.
+
+Arming succeeds only when the first assignments and wake intents are durable.
+A process crash after commit is outbox recovery; a crash before commit exposes
+no partial Sprint.
+
+```text
+sc sprint arm --sprint <id>
+```
+
+After `arm` succeeds, participant pickup belongs to native delivery. The armed
+runtime dispatches ready work and wake recovery reconciles unread pickup; the
+preparing Planner does not manually boot participants or create a second wake
+path.
+
+## Handoff
+
+Once armed, hand control to `sprint_pln` and stop preparation work. Give the FnB
+a compact declaration:
+Sprint id, feature, exact spec revisions, participants/routes, work-unit graph,
+planned waves, merge-grant state, and known accepted risks.
+
+Stop when the Sprint is armed or when one concrete eligibility blocker has been
+surfaced. Do not dispatch from a partially prepared plan.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_rev',
+  'Review Sprints v2 work and whole-Sprint conformance — apply the Medium-and-above gate, record precise verdicts through the authenticated surface, and route conformance findings only to post-Sprint follow-ups.',
+  'workflow',
+  NULL,
+  0,
+  '# sprint_rev — independent review and conformance
+
+Use in one of two modes: a work-unit PR review during the loop, or the final
+whole-Sprint conformance pass. Pre-declaration QAQC is a third entry condition,
+before a Sprint exists. The evidence differs; independence does not.
+
+## Entry and durable state
+
+Pre-declaration QAQC begins from an explicit Planner or FnB request. Read the
+exact current spec document and sign that body directly; there is no Sprint id
+or Sprint inbox to inspect yet:
+
+```text
+sc sprint record-qaqc --document <spec-document-id> \
+  --verdict pass [--findings-document <document-id>]
+```
+
+Once a Sprint is armed, every review or conformance entry arrives through its
+durable wake/inbox. On every wake or re-entry, load `sprint_rev`, inspect the
+message, and accept the actionable request before beginning:
+
+```text
+sc sprint inbox --sprint <id>
+sc sprint accept --sprint <id> --message <message-id>
+```
+
+Decline an actionable request you cannot take, with a concrete reason:
+
+```text
+sc sprint decline --sprint <id> --message <message-id> --reason <reason>
+```
+
+Use `accept` or `decline` for actionable work. After acting on an informational
+question, answer, blocker, or context message, run `accept` for that message.
+For informational messages it only marks the message read; it does not change
+Sprint or work-unit state.
+
+## Questions, answers, blockers, and failures
+
+Put a concrete question, answer, blocker, or useful context in a short body file
+and send it to the participant who can act. Ask the Developer for missing PR
+evidence and the Planner for scope or severity decisions:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --key <stable-key>
+```
+
+Answer incoming questions through `send` so the answer is durable and wakes the
+asker, confirm that write, then mark the handled question read with `accept`. A
+blocker or integrity concern goes to the Planner with concise evidence, impact,
+the exact action needed, and your recommendation. Continue independent safe
+review, but stop at a decision boundary when the answer is required. Do not send
+duplicate reminders; unread recovery owns re-waking.
+
+Choose one stable key for the intended recipient and exact body. Reuse it only
+when retrying that same write; use a new key when the recipient or body changes.
+
+Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
+characters is the hard maximum. Before submitting, run `wc -m < <path>` and
+condense if needed. The handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake where applicable.
+
+If a Sprint command is rejected or transport fails, the verdict or handoff is
+incomplete. Correct and retry when safe. If the relay itself fails, surface the
+attempted command, evidence, impact, and recommendation to FnB; do not invent an
+alternate delivery protocol. A Reviewer does not pause the Sprint. The Planner
+decides whether the reported condition warrants continuing, re-planning, or
+pausing.
+
+## Severity rubric
+
+This skill owns severity. The governing spec intentionally does not.
+
+- **Critical** — active security/authority violation, destructive corruption,
+  or a condition that makes continued operation unsafe.
+- **Major** — wrong behavior, data loss, broken invariant, material spec
+  violation, or a loop/recovery path that can silently wedge delivery.
+- **Medium** — a concrete correctness or recovery gap likely to bite normal
+  use soon, including missing negative enforcement or an unreliable handoff.
+- **Low** — bounded cleanup, clarity, test depth, or resilience improvement that
+  does not make the delivered behavior wrong now.
+
+During a work-unit review, Critical/Major/Medium block approval; Low is a
+report note. During close-out conformance, every severity becomes a follow-up
+and none is fixed inside the Sprint.
+
+## Work-unit review
+
+Accept the actionable review request, then inspect the exact bound spec
+revision, readiness claim, PR head, diff, checks, tests, relevant runtime
+evidence, and prior judgment calls. Review code quality, edge cases/failure
+paths, and spec conformance. Trace the real path; do not trust names or PR prose.
+
+Read resolved closure evidence through the authenticated memory surface; no SQL
+or mutation is needed. Use the exact form for a cited flag and the scoped form
+to audit every resolved flag attached to the feature:
+
+```text
+sc mem get flags <flag-id>
+sc mem get flags --feature <feature-id> --resolved
+```
+
+Findings must state:
+
+- severity and concise title;
+- violated behavior or invariant;
+- exact code/evidence location;
+- a reproducible consequence; and
+- the fix boundary, without prescribing unnecessary architecture.
+
+Put the verdict body in a file and record it through the authenticated surface:
+
+Keep the verdict at about 6,000 characters or fewer; 8,000 is the hard maximum.
+Run `wc -m < <path>` before submission. The typed review handoff exists only
+after the command succeeds and confirms its durable write and Developer wake.
+
+```text
+sc sprint record-review \
+  --sprint <id> --registered-pr <registered-id> \
+  --verdict changes_requested --body-file <path> --key <stable-key>
+```
+
+Use `approved` only when no Critical/Major/Medium finding remains. The engine
+checks that the request was accepted and still binds to the reviewed head,
+records judgment evidence, opens the correct fresh Developer conversation, and
+resolves the review liveness expectation. Do not message around this surface;
+an unrecorded verdict cannot unlock merge.
+
+## Whole-Sprint conformance
+
+Judge integrated `main` against every governing bound revision, plus the exact
+recorded mid-Sprint revision facts and ratified judgments. Review the integrated
+system, not unit diffs. Classify each requirement as:
+
+- `as-specced`;
+- `deviated-intentionally` with its ratified judgment;
+- `deviated-silently`; or
+- `unimplemented`.
+
+The last two are findings. Include spec document id and work-unit id when known.
+Write the narrative report and a JSON findings array:
+
+```json
+[
+  {
+    "severity": "Major",
+    "title": "Integrated seam diverges",
+    "body": "Evidence and consequence.",
+    "spec_document_id": 46,
+    "work_unit_id": 9
+  }
+]
+```
+
+Then record both atomically:
+
+Keep the conformance report and each finding body at about 6,000 characters or
+fewer; 8,000 is the hard maximum for each. Run `wc -m < <report>` and length-check
+each finding body before submission. Require the successful report and
+follow-up receipt before stopping.
+
+```text
+sc sprint record-conformance \
+  --sprint <id> --body-file <report> --findings-file <json> \
+  --key <stable-pass-key>
+```
+
+This creates append-only conformance evidence and pending follow-ups for FnB
+disposition. It must not create a fix lane, reopen a completed work unit, or
+send findings to a Developer for in-Sprint repair — including Critical ones.
+Surface immediate safety risk to the FnB, but preserve the close-out rule.
+
+## Stop
+
+For either mode, re-run `sc sprint inbox --sprint <id>` and act on newly arrived
+messages before stopping. For unit review, stop after the durable verdict is
+recorded and every handled informational message is marked read with `accept`.
+For conformance, also require the report and all findings to replay
+idempotently and give the Planner their report/follow-up ids. The typed receipt
+completes the handoff; stop until another native wake arrives.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -4079,17 +4474,14 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'surface_catalogue',
-  'Read the mapped work surface via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree — it covers the declared work repo when this install names one, else the host repo. Query first, lazy-load the few files it points at. Use to orient fast.',
+  'Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree. Query first, lazy-load the few files it points at. Use to orient in an unfamiliar repo fast.',
   'substrate',
   NULL,
   1,
   '# surface_catalogue — read the repo from the map, not by grepping
 
-The `dr_*` tables = a scan of your WORK SURFACE — the declared work repo when
-this install names one (boot doc PROJECT vs ENGINE; confirm with
-`sc map-sql "SELECT root FROM dr_repo"`), else the host repo super-coder lives
-in. Query them first to orient, not the tree. Paths in `dr_filepath` are
-relative to that mapped root — open them from there, not from your cwd. They live in the **map db**,
+super-coder lives inside a host repo. The `dr_*` tables = a scan of that repo
+— query them first to orient, not the tree. They live in the **map db**,
 `.sc-state/map.db` — a separate file from your memory db
 (`.super-coder/shell_db.db`). Query it via `sc map-sql "…"`.
 
@@ -4264,7 +4656,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'test_authoring',
-  'Principles for stringent pytest tests — tests a realistic bug turns red. Pair with a granted stack-infra testing skill (test_authoring_sqlite / test_authoring_pg / a fork-local one) if the shell has one.',
+  'Principles for stringent pytest tests — tests a realistic bug turns red. The downstream repository owns stack-specific fixtures and database setup.',
   'craft',
   NULL,
   0,
@@ -4274,10 +4666,10 @@ Apply when writing a test or reviewing a diff that touches `tests/`.
 Pass condition for any test: a realistic bug turns it red. A test no bug
 can fail reads as coverage while guarding nothing — sharpen or cut it.
 
-Stack infra (fixture setup, callers, DB access pattern) lives in the granted
-stack skill — `test_authoring_sqlite` / `test_authoring_pg` / a fork-local
-skill that supersedes this one. Load it alongside. None granted -> this skill
-stands alone; do NOT hunt for one the fork doesn''t ship.
+Stack infrastructure—fixture setup, callers, and database access patterns—lives
+in the downstream repository. Load its fork-local testing skill alongside this
+one when granted. None granted means this skill stands alone; infer setup from
+the repository''s existing tests and development tooling.
 
 ## Rules (the floor)
 
@@ -4324,7 +4716,7 @@ stands alone; do NOT hunt for one the fork doesn''t ship.
    the worst possible correlation: the suite hangs or exhausts a pool
    only when it is catching bugs (a close-after-assert probe connection
    deadlocked three concurrent pytest runs of one file for four hours in
-   a dos-arch sprint). Open in a fixture (`yield` + teardown /
+   a release gate). Open in a fixture (`yield` + teardown /
    `addfinalizer`) or a `with` block; teardown must run on the red path.
    Audit pattern: AST-scan the suite for opens whose close sits after an
    `assert` in the same body.
@@ -4358,178 +4750,6 @@ this skill.
 - Let a count or status code stand in for "the right thing happened."
 - Test only the happy path of code that has error branches.
 - Ship a test whose assertions no realistic bug could violate.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'test_authoring_pg',
-  'Postgres test infrastructure for postgres-backed forks — throwaway DB, Alice/Bob tenants, psycopg 3 direct assertions. Read alongside test_authoring for the rules.',
-  'craft',
-  NULL,
-  0,
-  '# test_authoring_pg — Postgres test infra
-
-Rules live in `test_authoring` — read it alongside. This skill = the test
-infrastructure PATTERN for Postgres-backed forks.
-
-**Your fork''s `tests/conftest.py` is the source of truth** for the throwaway
-DB''s naming, what schema artifact seeds it (a live `schema.sql`, a squash, a
-migration replay), and the fixture roster — read it before writing a test.
-Everything below is the typical shape, not a contract; where your conftest
-differs, the conftest wins. A fork may also ship its own superseding
-test-authoring skill — if one is granted, prefer it.
-
-## Foundation (typical shape)
-
-`tests/conftest.py` creates a throwaway Postgres DB at session start, applies
-the fork''s schema artifact, seeds two tenants (Alice / Bob) + a shared system
-shell, and drives the real app through `TestClient` with real auth.
-
-**Key identities (an example roster — confirm against your conftest):**
-
-| Name | Kind | ID |
-|---|---|---|
-| `USER_ADMIN` | admin user | 1 |
-| `USER_A` / Alice | tenant user | 10 |
-| `USER_B` / Bob | tenant user | 20 |
-| `SHELL_SHARED` | shared system shell | 100 |
-| `SHELL_A` / `SHELL_B` | per-tenant shells | 101 / 102 |
-| `PROJ_A` / `PROJ_B` | per-tenant projects | 500 / 501 |
-| `KEY_A` / `KEY_B` | shell bearer keys | `"ALICEKEY"` / `"BOBKEY"` |
-
-**Throwaway DB setup:**
-- An admin connection (`psycopg.connect(DATABASE_URL_ADMIN, autocommit=True)`)
-  creates a uniquely-named `<fork>_test_<unique>` database at session start
-  and drops it at session teardown — the naming scheme is the conftest''s.
-- `DATABASE_URL` injected via `os.environ["DATABASE_URL"]` BEFORE importing
-  the app — the app''s DB layer reads it at import time.
-- The fork''s schema artifact applied on the throwaway connection — which
-  artifact (postgres `schema.sql`, a schema squash, a migration replay) is a
-  per-fork choice; read the conftest, don''t assume.
-- Some forks isolate egress/spend rows in a second throwaway DB/schema —
-  only if your conftest declares one.
-
-**Callers** — same `Caller` pattern as the SQLite variant; identity carried
-via cookie or `Authorization: Bearer` header:
-```python
-alice   # session-cookie caller, USER_A identity
-bob     # session-cookie caller, USER_B identity
-admin   # session-cookie caller, USER_ADMIN identity
-anon    # no auth
-shell_a # bearer-key caller, KEY_A
-shell_b # bearer-key caller, KEY_B
-```
-
-**TestClient:**
-- Create WITHOUT a `with` block -> skips startup hooks (catalogue / model
-  sync) that would hit the network.
-- `scope="session"` -> one DB shared across the whole run. A test needing
-  isolation seeds its own fixture rows + cleans up explicitly.
-
-**Direct DB assertions:**
-```python
-import os, psycopg
-from psycopg.rows import dict_row
-con = psycopg.connect(os.environ["DATABASE_URL"], autocommit=True, row_factory=dict_row)
-cur = con.cursor()
-cur.execute("SELECT * FROM table WHERE ...")
-rows = cur.fetchall()
-```
-Assert against real rows, not the response payload.
-
-**Mocking boundary:** mock only true external egress — outbound HTTP, broker
-calls, third-party APIs. NEVER mock the router, the DB layer, or the
-function under test.',
-  0
-)
-ON CONFLICT(name) DO UPDATE SET
-  description=excluded.description, category=excluded.category,
-  command=excluded.command, common=excluded.common,
-  content=excluded.content, is_deleted=0;
-
-INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
-  'test_authoring_sqlite',
-  'SQLite test infrastructure for super-coder-style forks — throwaway DB, Alice/Bob tenants, Caller/TestClient. Read alongside test_authoring for the rules.',
-  'craft',
-  NULL,
-  0,
-  '# test_authoring_sqlite — SQLite test infra
-
-Rules live in `test_authoring` — read it alongside. This skill = the test
-infrastructure PATTERN for SQLite-backed forks.
-
-**Your fork''s `tests/conftest.py` is the source of truth** for how the
-throwaway DB is built and what fixtures exist — read it before writing a
-test. Everything below is the typical shape, not a contract; where your
-conftest differs, the conftest wins. A fork may also ship its own superseding
-test-authoring skill — if one is granted, prefer it.
-
-## Foundation (typical shape)
-
-`tests/conftest.py` builds a throwaway SQLite DB from the fork''s schema
-artifact (schema.sql + a migration replay, or a squash), seeds two tenants
-(Alice / Bob) + a shared system shell, and drives the real app through
-`TestClient` with real auth.
-
-**Key identities (an example roster — confirm against your conftest):**
-
-| Name | Kind | ID |
-|---|---|---|
-| `USER_ADMIN` | admin user | 1 |
-| `USER_A` / Alice | tenant user | 10 |
-| `USER_B` / Bob | tenant user | 20 |
-| `SHELL_SHARED` | shared system shell | 100 |
-| `SHELL_A` / `SHELL_B` | per-tenant shells | 101 / 102 |
-| `PROJ_A` / `PROJ_B` | per-tenant projects | 500 / 501 |
-| `KEY_A` / `KEY_B` | shell bearer keys | `"ALICEKEY"` / `"BOBKEY"` |
-
-**Throwaway DB setup:**
-- `tempfile.NamedTemporaryFile(suffix=".db")` -> path injected via
-  `os.environ["SHELL_DB_PATH"]` BEFORE importing the app — the auth
-  middleware calls `db()` directly; a `Depends` override alone misses it.
-- The conftest''s schema builder (e.g. `apply_schema_and_migrations(con)`)
-  builds the throwaway DB — single source shared by all test harnesses;
-  NEVER copy-paste it.
-- Some forks isolate egress/spend rows in a second throwaway DB — only if
-  your conftest declares one.
-- `os.environ.setdefault("AUTH_COOKIE_SECURE", "")` -> plain `dsess` cookie,
-  no `__Host-` prefix in tests.
-
-**Callers** — all pytest fixtures:
-```python
-alice   # session-cookie caller, USER_A identity
-bob     # session-cookie caller, USER_B identity
-admin   # session-cookie caller, USER_ADMIN identity
-anon    # no auth
-shell_a # bearer-key caller, KEY_A
-shell_b # bearer-key caller, KEY_B
-```
-`shell_a` / `shell_b` send `Authorization: Bearer`.
-
-**TestClient:**
-- Create WITHOUT a `with` block -> skips startup hooks (catalogue / model
-  sync) that would hit the network.
-- `scope="session"` -> one DB shared across the whole run. Never depend on a
-  clean DB; a test needing isolation seeds its own via
-  `build_substrate_db()` (in-memory, returns a `sqlite3.Connection`).
-
-**Direct DB assertions:**
-```python
-import sqlite3, os
-con = sqlite3.connect(os.environ["SHELL_DB_PATH"])
-con.row_factory = sqlite3.Row
-rows = con.execute("SELECT * FROM table WHERE ...").fetchall()
-```
-Assert against real rows, not the response payload. The throwaway path is
-stable for the lifetime of the test session.
-
-**Mocking boundary:** mock only true external egress — outbound IMAP, HTTP,
-broker calls. NEVER mock the router, the DB layer, or the function under
-test.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET

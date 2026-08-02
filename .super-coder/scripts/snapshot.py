@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Serialize this fork's per-instance content + memory to text.
 
-Dumps the per-instance tables of the live `shell_db.db` to
-`.sc-state/content.sql` as a deterministic, idempotent SQL script:
+Dumps the per-instance tables of the live `shell_db.db` to the gitignored local
+content path as a deterministic, idempotent SQL script:
 each table is `DELETE`d then re-`INSERT`ed in primary-key order, so re-running
 produces a byte-identical file (clean git diffs) and loading it is repeatable.
 
@@ -25,6 +25,7 @@ from __future__ import annotations
 import sqlite3  # kept for map.db (which stays SQLite)
 from pathlib import Path
 
+import artifact_policy  # noqa: E402
 import db_driver  # noqa: E402
 import map_db  # noqa: E402 — sibling module in scripts/
 import seed_skills  # noqa: E402 — seeded_skill_names is the engine/local line
@@ -33,17 +34,46 @@ from _serialize_guard import require_admin  # noqa: E402
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
-# Per-fork memory lives OUTSIDE the gitignored engine dir (B7) — see rebuild.py.
-OUT_PATH = REPO_ROOT / ".sc-state" / "content.sql"
+# Generated instance state is always local and gitignored.
+OUT_PATH = artifact_policy.content_path()
 # One-release cleanup: if a not-yet-migrated fork still carries the old in-engine
 # copy, remove it once we write the new one so it can't shadow or drift.
 LEGACY_PATH = ENGINE / "snapshot" / "content.sql"
 
+# Every durable Sprints v2 table.  Keep this as the one snapshot authority for
+# the domain: tests compare it to the migrated schema so a future sprint_*
+# table cannot silently fall out of rebuilds.  Generic conversations are
+# listed before this group in PER_INSTANCE_TABLES because participant links,
+# pointers, and wake attempts reference them.
+SPRINT_INSTANCE_TABLES = [
+    "sprint_spec_approvals",
+    "sprints",
+    "sprint_specs",
+    "sprint_participants",
+    "sprint_participant_conversations",
+    "sprint_work_units",
+    "sprint_work_unit_tasks",
+    "sprint_work_unit_dependencies",
+    "sprint_messages",
+    "sprint_wake_outbox",
+    "sprint_wake_messages",
+    "sprint_wake_attempts",
+    "sprint_liveness_expectations",
+    "sprint_registered_prs",
+    "sprint_pr_work_units",
+    "sprint_pr_transitions",
+    "sprint_judgments",
+    "sprint_reports",
+    "sprint_followups",
+    "sprint_events",
+]
+
+
 # Per-instance tables, parents-before-children for readability.
 # `schema_migrations` is excluded. Engine-authored skills are system content
 # seeded from migrations; project-local skills are serialized by the special
-# `skills` dumper below. `shell_skills` loads after `skills`, so grants to
-# local skill names resolve on rebuild.
+# `skills` dumper below. Grant tables load after `skills`, so grants to local
+# skill names resolve on rebuild.
 PER_INSTANCE_TABLES = [
     "users",
     "shells",
@@ -61,25 +91,39 @@ PER_INSTANCE_TABLES = [
     "projects",
     "project_shells",
     "skills",
+    "flavor_skills",
     "shell_skills",
     # shell_messages is per-instance memory (the inbox between this fork's
     # shells), so it survives a rebuild like flags/decisions — not a derived
     # cache. Loads after `shells` (its FK target). read_at is preserved, so an
     # unread message stays unread across a rebuild.
     "shell_messages",
-    # watched_prs is per-instance eventing state (this fork's live PR
-    # subscriptions + the daemon's diff fingerprints), so a mid-sprint rebuild
-    # doesn't drop the planner's watches. Loads after `shells` (its FK target).
-    "watched_prs",
     # flavor_defaults is operator-tuned launch config (the Default Models GUI:
     # model per harness + starred default harness, per flavor). Migrations seed
     # the engine's baseline; content.sql loads AFTER migrations on rebuild, so
     # the fork's edits win — without this the GUI's changes vanish on rebuild.
     "flavor_defaults",
+    # Browser-native conversations are durable instance truth: exact harness
+    # refs, message queues, recovery evidence, replay events, and pending
+    # outbox work must all survive update/rebuild. Parents precede
+    # children so a snapshot stays readable and foreign-key-valid when loaded.
+    "conversations",
+    "conversation_git_targets",
+    "conversation_messages",
+    "conversation_runs",
+    "conversation_events",
+    "conversation_outbox",
+    # Sprints are durable orchestration truth, not a derived runtime cache.
+    # This includes terminal rows and append-only evidence: numeric allocators,
+    # exact approvals, active routes, retries, reports, and history must all
+    # survive update/rebuild together.
+    *SPRINT_INSTANCE_TABLES,
     # NOTE: dr_section is authored navigation but lives in the MAP DB now
     # (.sc-state/map.db), not shell_db.db — it is serialized separately to
-    # .sc-state/map_content.sql by snapshot_map() below, not here.
+    # .sc-state/local/map/content.sql by snapshot_map() below, not here.
 ]
+
+SNAPSHOT_ROW_FILTERS = {}
 
 
 def quote(v) -> str:
@@ -103,7 +147,7 @@ def engine_skill_names() -> list[str]:
     migrations/0001, upstream-materialized in a fork).
 
     Any live skill whose name is not in this set is project-local and belongs in
-    `.sc-state/content.sql`. Keyed off the seed, NOT asset-file presence (#253):
+    local `content.sql`. Keyed off the seed, NOT asset-file presence (#253):
     a fork-authored skill keeps its SKILL.md under assets/skills/ as authoring
     source, and classifying by asset presence would silently drop it from
     content.sql — losing it on the next update's materialize.
@@ -112,13 +156,16 @@ def engine_skill_names() -> list[str]:
 
 
 def dump_shell_skills(con) -> list[str]:
-    """Grants resolved by skill NAME, not raw skill_id. Skill ids are positional
-    (they shift when the catalogue grows), so a raw-id dump would bind a fork's
-    grants to the wrong skills after an update. Resolving by name at load time
-    makes grants id-churn-proof."""
+    """Bespoke grants resolved by skill NAME, not raw skill_id."""
+    tombstones = seed_skills.tombstoned_skill_names()
+    placeholders = ",".join("?" for _ in tombstones)
     rows = con.execute(
         "SELECT ss.shell_id, s.name FROM shell_skills ss "
-        "JOIN skills s ON s.skill_id = ss.skill_id ORDER BY ss.shell_id, s.name"
+        "JOIN skills s ON s.skill_id = ss.skill_id "
+        "JOIN shells sh ON sh.shell_id = ss.shell_id "
+        f"WHERE sh.flavor IS NULL AND s.name NOT IN ({placeholders}) "
+        "ORDER BY ss.shell_id, s.name",
+        tombstones,
     ).fetchall()
     lines = ["DELETE FROM shell_skills;"]
     for shell_id, name in rows:
@@ -129,36 +176,58 @@ def dump_shell_skills(con) -> list[str]:
     return lines
 
 
+def dump_flavor_skills(con) -> list[str]:
+    """Flavor packs resolved by skill NAME so catalogue id churn is harmless."""
+    tombstones = seed_skills.tombstoned_skill_names()
+    placeholders = ",".join("?" for _ in tombstones)
+    rows = con.execute(
+        "SELECT fs.flavor, s.name FROM flavor_skills fs "
+        "JOIN skills s ON s.skill_id = fs.skill_id "
+        f"WHERE s.name NOT IN ({placeholders}) ORDER BY fs.flavor, s.name",
+        tombstones,
+    ).fetchall()
+    lines = ["DELETE FROM flavor_skills;"]
+    for flavor, name in rows:
+        lines.append(
+            f"INSERT INTO flavor_skills (flavor, skill_id) "
+            f"SELECT {quote(flavor)}, skill_id FROM skills WHERE name={quote(name)};")
+    lines.append("")
+    return lines
+
+
 def dump_local_skills(con) -> list[str]:
     """Serialize project-local skills only, keyed by name.
 
-    The engine seed owns rows whose names exist under assets/skills. Everything
-    else is fork-local content and must survive rebuild/update from snapshot.
+    The engine seed owns active rows; the tombstone registry owns retired names.
+    Everything outside both sets is fork-local content and must survive
+    rebuild/update from snapshot.
     """
     engine_names = engine_skill_names()
+    excluded_names = sorted(
+        set(engine_names) | set(seed_skills.tombstoned_skill_names())
+    )
     if engine_names:
-        placeholders = ", ".join("?" for _ in engine_names)
-        where = f"name NOT IN ({placeholders})"
-        params = engine_names
         delete_line = (
             "DELETE FROM skills WHERE name NOT IN ("
             + ", ".join(quote(n) for n in engine_names)
             + ");"
         )
     else:
-        where = "1=1"
-        params = []
         delete_line = "DELETE FROM skills;"
 
     cols = [r[1] for r in con.execute("PRAGMA table_info(skills)")]
-    collist = ", ".join(cols)
     mutable_cols = [c for c in cols if c != "skill_id"]
     insert_cols = ", ".join(mutable_cols)
     update_cols = [c for c in mutable_cols if c != "name"]
     update_clause = ", ".join(f"{c}=excluded.{c}" for c in update_cols)
 
+    excluded_placeholders = ", ".join("?" for _ in excluded_names)
+    local_where = (
+        f"name NOT IN ({excluded_placeholders})" if excluded_names else "1=1"
+    )
     rows = con.execute(
-        f"SELECT {insert_cols} FROM skills WHERE {where} ORDER BY name", params
+        f"SELECT {insert_cols} FROM skills WHERE {local_where} ORDER BY name",
+        excluded_names,
     ).fetchall()
 
     lines = [
@@ -175,44 +244,263 @@ def dump_local_skills(con) -> list[str]:
     return lines
 
 
-# Columns that must NEVER be serialized to content.sql — content.sql is
-# git-tracked, and these are live credentials managed at runtime, not memory to
+# Columns that must NEVER be serialized to content.sql — these are live
+# credentials managed at runtime, not memory to
 # preserve across a rebuild. `api_key` is (re)provisioned at rebuild time
 # (rebuild.py's final backfill step) and again at server startup; `password_*`
 # are launcher auth fields. Omitting them from the INSERT means they load as NULL
 # on rebuild, which is correct: the key is re-minted by rebuild itself (so a
 # rebuilt DB is never NULL-keyed, even under an already-running server) and they
-# never reach git. Without this, a snapshot taken while keys are provisioned
-# writes every shell's bearer token into a committed file (the gitleaks default
-# ruleset does not catch the bare token format, so the gate would not flag it
-# either).
+# never enter the portable rebuild snapshot. This defense remains necessary
+# even though the snapshot itself is ignored.
 SENSITIVE_COLUMNS = {
     "shells": {"api_key", "api_key_rotated_at"},
     "users": {"password_hash", "password_salt"},
 }
 
 
-def dump_table(con, table: str) -> list[str]:
-    if table == "skills":
-        return dump_local_skills(con)
-    if table == "shell_skills":
-        return dump_shell_skills(con)
-    cols = [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
-    cols = [c for c in cols if c not in SENSITIVE_COLUMNS.get(table, ())]
-    if not cols:
-        return []
-    collist = ", ".join(cols)
-    rows = con.execute(f"SELECT {collist} FROM {table} ORDER BY rowid").fetchall()
+def _table_columns(con, table: str) -> list[str]:
+    return [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+
+
+def _insert_line(table: str, cols: list[str], row) -> str:
+    vals = ", ".join(quote(v) for v in row)
+    return f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({vals});"
+
+
+def _dependency_ordered_rows(
+    rows,
+    cols: list[str],
+    *,
+    table: str,
+    identity: str,
+    parent: str,
+    scope: tuple[str, ...],
+):
+    """Order immutable self-references parent-first for trigger-safe replay."""
+    identity_index = cols.index(identity)
+    parent_index = cols.index(parent)
+    scope_indexes = tuple(cols.index(column) for column in scope)
+
+    def row_key(row) -> tuple:
+        return tuple(row[index] for index in scope_indexes) + (row[identity_index],)
+
+    by_key = {row_key(row): row for row in rows}
+    if len(by_key) != len(rows):
+        raise RuntimeError(f"snapshot: duplicate dependency identity in {table}")
+
+    keys = [row_key(row) for row in rows]
+    children: dict[tuple, list[tuple]] = {key: [] for key in keys}
+    indegree = {key: 0 for key in keys}
+    for key, row in zip(keys, rows):
+        parent_identity = row[parent_index]
+        if parent_identity is not None:
+            parent_key = tuple(row[index] for index in scope_indexes) + (
+                parent_identity,
+            )
+            if parent_key not in by_key:
+                raise RuntimeError(
+                    f"snapshot: missing dependency in {table}: {parent_key!r}"
+                )
+            children[parent_key].append(key)
+            indegree[key] += 1
+
+    ready = [key for key in keys if indegree[key] == 0]
+    ordered = []
+    cursor = 0
+    while cursor < len(ready):
+        key = ready[cursor]
+        cursor += 1
+        ordered.append(by_key[key])
+        for child_key in children[key]:
+            indegree[child_key] -= 1
+            if indegree[child_key] == 0:
+                ready.append(child_key)
+    if len(ordered) != len(rows):
+        raise RuntimeError(f"snapshot: dependency cycle in {table}")
+    return ordered
+
+
+def dump_dependency_ordered_table(
+    con,
+    table: str,
+    *,
+    identity: str,
+    parent: str,
+    scope: tuple[str, ...],
+) -> list[str]:
+    """Dump a self-referential table in legal immutable-insert order."""
+    cols = _table_columns(con, table)
+    rows = con.execute(
+        f"SELECT {', '.join(cols)} FROM {table} ORDER BY rowid"
+    ).fetchall()
+    ordered = _dependency_ordered_rows(
+        rows,
+        cols,
+        table=table,
+        identity=identity,
+        parent=parent,
+        scope=scope,
+    )
     lines = [f"DELETE FROM {table};"]
-    for row in rows:
-        vals = ", ".join(quote(v) for v in row)
-        lines.append(f"INSERT INTO {table} ({collist}) VALUES ({vals});")
+    lines.extend(_insert_line(table, cols, row) for row in ordered)
     lines.append("")
     return lines
 
 
+def dump_sprints(con) -> list[str]:
+    """Serialize lifecycle rows through their legal transition path.
+
+    The schema correctly refuses inserting an armed/terminal Sprint directly.
+    A rebuild therefore inserts the exact row as prepared (with no terminal
+    outcome), then replays only the lifecycle edges needed to restore its
+    projection.  All timestamps, generation identity, version, and plan fields
+    are inserted at their original values and remain byte-for-byte unchanged.
+    """
+    table = "sprints"
+    cols = _table_columns(con, table)
+    rows = con.execute(
+        f"SELECT {', '.join(cols)} FROM {table} ORDER BY rowid"
+    ).fetchall()
+    lifecycle_index = cols.index("lifecycle")
+    outcome_index = cols.index("terminal_outcome")
+    lines = [f"DELETE FROM {table};"]
+    restores: list[tuple[str, list[str]]] = []
+    for original in rows:
+        row = list(original)
+        lifecycle = str(row[lifecycle_index])
+        outcome = row[outcome_index]
+        sprint_id = row[cols.index("sprint_id")]
+        if lifecycle != "prepared":
+            row[lifecycle_index] = "prepared"
+            row[outcome_index] = None
+        lines.append(_insert_line(table, cols, row))
+        transitions: list[str] = []
+        if lifecycle in {"armed", "paused", "completed"}:
+            transitions.append(
+                f"UPDATE sprints SET lifecycle='armed' WHERE sprint_id={quote(sprint_id)};"
+            )
+        if lifecycle == "paused":
+            transitions.append(
+                f"UPDATE sprints SET lifecycle='paused' WHERE sprint_id={quote(sprint_id)};"
+            )
+        elif lifecycle == "completed":
+            transitions.append(
+                "UPDATE sprints SET lifecycle='completed', terminal_outcome="
+                f"{quote(outcome)} WHERE sprint_id={quote(sprint_id)};"
+            )
+        elif lifecycle == "aborted":
+            transitions.append(
+                "UPDATE sprints SET lifecycle='aborted', terminal_outcome="
+                f"{quote(outcome)} WHERE sprint_id={quote(sprint_id)};"
+            )
+        restores.append((lifecycle, transitions))
+    # The unique partial index permits only one armed Sprint.  Restore every
+    # row that finishes non-armed first, then the current armed row.  This is
+    # independent of creation order (an older paused Sprint can be resumed
+    # after a newer Sprint is paused).
+    for lifecycle, transitions in restores:
+        if lifecycle != "armed":
+            lines.extend(transitions)
+    for lifecycle, transitions in restores:
+        if lifecycle == "armed":
+            lines.extend(transitions)
+    lines.append("")
+    return lines
+
+
+def dump_sprint_participants(con) -> list[str]:
+    """Insert participants before immutable links, with pointers deferred."""
+    table = "sprint_participants"
+    cols = _table_columns(con, table)
+    rows = con.execute(
+        f"SELECT {', '.join(cols)} FROM {table} ORDER BY rowid"
+    ).fetchall()
+    pointer_indexes = (
+        cols.index("persistent_conversation_id"),
+        cols.index("current_conversation_id"),
+    )
+    lines = [f"DELETE FROM {table};"]
+    for original in rows:
+        row = list(original)
+        for index in pointer_indexes:
+            row[index] = None
+        lines.append(_insert_line(table, cols, row))
+    lines.append("")
+    return lines
+
+
+def dump_sprint_participant_conversations(con) -> list[str]:
+    """Restore immutable links, then select the participants' exact pointers."""
+    lines = dump_dependency_ordered_table(
+        con,
+        "sprint_participant_conversations",
+        identity="conversation_id",
+        parent="parent_conversation_id",
+        scope=("sprint_participant_id",),
+    )
+    pointers = con.execute(
+        "SELECT participant_id,persistent_conversation_id,current_conversation_id "
+        "FROM sprint_participants "
+        "WHERE persistent_conversation_id IS NOT NULL "
+        "OR current_conversation_id IS NOT NULL ORDER BY participant_id"
+    ).fetchall()
+    if pointers:
+        lines.pop()  # keep pointer selection in the same readable table block
+    for participant_id, persistent, current in pointers:
+        lines.append(
+            "UPDATE sprint_participants SET persistent_conversation_id="
+            f"{quote(persistent)}, current_conversation_id={quote(current)} "
+            f"WHERE participant_id={quote(participant_id)};"
+        )
+    if pointers:
+        lines.append("")
+    return lines
+
+
+def dump_plain_table(con, table: str) -> list[str]:
+    cols = _table_columns(con, table)
+    cols = [c for c in cols if c not in SENSITIVE_COLUMNS.get(table, ())]
+    if not cols:
+        return []
+    collist = ", ".join(cols)
+    where = SNAPSHOT_ROW_FILTERS.get(table, "")
+    rows = con.execute(
+        f"SELECT {collist} FROM {table} {where} ORDER BY rowid"
+    ).fetchall()
+    lines = [f"DELETE FROM {table};"]
+    for row in rows:
+        lines.append(_insert_line(table, cols, row))
+    lines.append("")
+    return lines
+
+
+def dump_table(con, table: str) -> list[str]:
+    if table == "skills":
+        return dump_local_skills(con)
+    if table == "flavor_skills":
+        return dump_flavor_skills(con)
+    if table == "shell_skills":
+        return dump_shell_skills(con)
+    if table == "conversation_messages":
+        return dump_dependency_ordered_table(
+            con,
+            table,
+            identity="message_id",
+            parent="caused_by_message_id",
+            scope=("conversation_id",),
+        )
+    if table == "sprints":
+        return dump_sprints(con)
+    if table == "sprint_participants":
+        return dump_sprint_participants(con)
+    if table == "sprint_participant_conversations":
+        return dump_sprint_participant_conversations(con)
+    return dump_plain_table(con, table)
+
+
 def snapshot_map() -> None:
-    """Serialize the map's AUTHORED layer (dr_section) to .sc-state/map_content.sql.
+    """Serialize the map's authored layer under the active artifact policy.
 
     The map DB (.sc-state/map.db) is a derived cache — its files/deps/env are
     re-mapped, not snapshotted. Only the cartographer-curated sections must
@@ -239,18 +527,15 @@ def snapshot_map() -> None:
             *dump_table(con, "dr_section"),
             "COMMIT;",
         ]
-        map_db.MAP_CONTENT.parent.mkdir(parents=True, exist_ok=True)
-        map_db.MAP_CONTENT.write_text("\n".join(out) + "\n")
+        artifact_policy.atomic_write_text(map_db.MAP_CONTENT, "\n".join(out) + "\n")
         print(f"snapshot: wrote {map_db.MAP_CONTENT.relative_to(REPO_ROOT)}")
     finally:
         con.close()
 
 
-def main() -> int:
-    require_admin("snapshot")
-    if not DB_PATH.exists():
-        raise SystemExit(f"snapshot: no live DB at {DB_PATH} — run `./sc rebuild` first.")
-    con = db_driver.connect(DB_PATH)
+def serialize_instance(con) -> str:
+    """Render one coherent read view of every per-instance table."""
+    con.execute("BEGIN")
     try:
         out = [
             "-- super-coder per-instance snapshot — GENERATED by scripts/snapshot.py.",
@@ -267,10 +552,32 @@ def main() -> int:
             if table_exists(con, table):
                 out.extend(dump_table(con, table))
         out.extend(["COMMIT;", "PRAGMA foreign_keys=ON;"])
-        OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        OUT_PATH.write_text("\n".join(out) + "\n")
+        return "\n".join(out) + "\n"
+    finally:
+        # End the fixed read view without taking ownership of any live writes.
+        con.rollback()
+
+
+def main() -> int:
+    require_admin("snapshot")
+    copied = artifact_policy.prepare_local_state()
+    if copied:
+        print(f"snapshot: localized {len(copied)} existing artifact(s)")
+    if not DB_PATH.exists():
+        raise SystemExit(f"snapshot: no live DB at {DB_PATH} — run `./sc rebuild` first.")
+    con = db_driver.connect(DB_PATH)
+    try:
+        reconciled = seed_skills.reconcile_tombstoned_skills(con)
+        content = serialize_instance(con)
+        artifact_policy.atomic_write_text(OUT_PATH, content)
     finally:
         con.close()
+    if reconciled.changed_names:
+        print(
+            "snapshot: removed tombstoned skills "
+            f"({', '.join(reconciled.changed_names)}; "
+            f"{reconciled.grant_count} grant(s))"
+        )
     # Relocate-on-write: drop a stale legacy copy so the new .sc-state/ path is
     # the single source after the first snapshot post-B7.
     if LEGACY_PATH.exists():
@@ -286,4 +593,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main))

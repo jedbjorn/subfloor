@@ -9,29 +9,110 @@ set -e
 here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 cd "$here"
 
-# The engine (`.super-coder/`) and its gitignored live DB sit at the MAIN worktree
-# root. A linked worktree (a shell's `.sc-worktrees/<name>/`) has a tracked copy of
-# THIS script — and, in the canonical repo where `.super-coder/` is tracked, even a
-# DB-less engine copy — but never the live DB. So always resolve the engine at the
-# main root via git's common dir (its parent is the main worktree), so `./sc` works
-# from any worktree. We do NOT cd there: cwd stays the caller's worktree so git ops
-# + shell inference see it. Fall back to $here outside a git checkout.
-ROOT="$here"
-_root="$(cd "$here" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd || true)"
-[ -n "$_root" ] && [ -d "$_root/.super-coder" ] && ROOT="$_root"
+# FOUR identities, never one ROOT (spec #68). The CALLER is the checkout holding
+# the `sc` that was invoked; the LIVE instance is the MAIN worktree root, which
+# owns `.super-coder/` and its gitignored DB. A linked worktree (a shell's
+# `.sc-worktrees/<name>/`) has a tracked copy of THIS script — and, in the
+# canonical repo where `.super-coder/` is tracked, even a DB-less engine copy —
+# but never the live DB, map or runtime identity. Resolving the live root via
+# git's common dir (its parent is the main worktree) is what makes `./sc mem`
+# work from any worktree; it is ALSO what used to make `./sc migrate` silently
+# maintain the shared instance from a worktree. So both values are kept, commands
+# are CLASSIFIED against them below, and neither is a default for the other.
+#
+# We do NOT cd to the live root: cwd stays the caller's worktree so git ops +
+# shell inference see it. `pwd -P` on both sides so a symlinked or relatively
+# invoked caller compares as itself rather than as a second identity. If the
+# git-common-dir resolution fails (no checkout, no engine there), the caller is a
+# STANDALONE root — one identity, and we never guess a second target.
+CALLER_ROOT="$(CDPATH= cd -- "$here" && pwd -P)"
+CALLER_ENGINE="$CALLER_ROOT/.super-coder"
+LIVE_ROOT="$CALLER_ROOT"
+_root="$(cd "$here" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd -P || true)"
+[ -n "$_root" ] && [ -d "$_root/.super-coder" ] && LIVE_ROOT="$_root"
 
+# LINKED=1 means caller != live: this invocation can reach shared state it does
+# not own. Compared as normalized paths — never a branch name, never the
+# `.sc-worktrees` spelling (req 7), so a fork that keeps worktrees anywhere (or
+# none at all) is judged by the same test.
+LINKED=0
+[ "$CALLER_ROOT" != "$LIVE_ROOT" ] && LINKED=1
+
+ROOT="$LIVE_ROOT"          # every path below this line is the LIVE instance's
 ENGINE="$ROOT/.super-coder"
 PY="${SC_PYTHON:-python3}"
 DB="$ENGINE/shell_db.db"
-MAPDB="$ROOT/.sc-state/map.db"
 S="$ENGINE/scripts"
 # Keep this bare-metal specialization self-contained on hosts where $HOME is
 # read-only or shared. Operators can still override with an absolute path.
+# Upstream's db_backup.py reads SC_DB_BACKUP_DIR; keep the historical
+# SC_BACKUP_DIR name working by bridging one onto the other.
 SC_BACKUP_DIR="${SC_BACKUP_DIR:-$ENGINE/run/db_backups/$(basename "$ROOT")}"
-export SC_BACKUP_DIR
+SC_DB_BACKUP_DIR="${SC_DB_BACKUP_DIR:-$SC_BACKUP_DIR}"
+export SC_BACKUP_DIR SC_DB_BACKUP_DIR
+MAPDB="$("$PY" "$S/artifact_policy.py" path map-db)"
+
+# --- linked-worktree target safety (spec #68, decision #81) -------------------
+# A command whose subject is the SHARED live instance refuses from a linked
+# worktree, BEFORE it opens or deletes anything. The worktree has no DB, map,
+# instance config or runtime identity of its own, so there is nothing local to
+# act on instead: decision #81 declined a worktree-local runtime mode, because a
+# partial instance replaces one ambiguity with another. A named refusal is the
+# whole fix — `./sc migrate` from a worktree used to maintain the main
+# checkout's live DB and say nothing about which DB it meant.
+#
+# `-h`/`--help` is not an action and must work from any checkout:
+# parse first, refuse second, act third. Only the commands whose target
+# actually implements help consult sc_help_form; for the rest every form is an
+# action form and refuses.
+sc_help_form() {
+  for _a in "$@"; do
+    case "$_a" in -h|--help) return 0 ;; esac
+  done
+  return 1
+}
+
+# $1 = the command as the operator typed it · $2 = the live target declined.
+# stderr + exit 1: nothing ran, so nothing may read as having run.
+sc_refuse_linked() {
+  [ "$LINKED" -eq 1 ] || return 0
+  {
+    echo "✗ ./sc $1 refused: this is a linked worktree, not the live instance."
+    echo "    caller worktree : $CALLER_ROOT"
+    echo "    live instance   : $LIVE_ROOT"
+    echo "    declined target : $2"
+    echo "  ./sc $1 acts on the shared live instance above, which this worktree"
+    echo "  does not own. Nothing was opened, written or deleted."
+    echo "  For live maintenance, run it from the main checkout:"
+    echo "      cd $LIVE_ROOT && ./sc $1"
+  } >&2
+  exit 1
+}
 
 port() { "$PY" "$S/ports.py" port; }
 devport() { "$PY" "$S/ports.py" devport; }
+
+# The two localhost URLs an operator needs, derived from this fork's ports —
+# never a fixed 8800, because every fork lands on its own offset (ports.py).
+# One printer, three callers (`url`, `enter`, `enter-<shortname>`): entry
+# restates the links before handing the terminal to the harness, and `./sc url`
+# / `make dos-url` is the recall path once they have scrolled away.
+sc_urls() {
+  # Under `set -e` a failed derivation would abort the caller, so it is a
+  # return here and `enter` ignores it: an operator who cannot be told the
+  # URL still gets their shell. `url` propagates it — a recall command that
+  # printed nothing and exited 0 would read as "this fork has no GUI".
+  sc_url_gui="$(port)" && sc_url_dev="$(devport)" || {
+    echo "✗ could not derive this fork's ports — is ${PY} able to run $S/ports.py?" >&2
+    return 1
+  }
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    printf '  \033[1mReview GUI  \033[36mhttp://127.0.0.1:%s\033[0m\n' "$sc_url_gui"
+  else
+    printf '  Review GUI  http://127.0.0.1:%s\n' "$sc_url_gui"
+  fi
+  printf '  dev server  http://127.0.0.1:%s\n' "$sc_url_dev"
+}
 
 # Host-side docker orchestration (raw docker — no compose plugin dependency).
 # The sandbox runs as you (uid/gid → no root-owned files), bind-mounts this repo
@@ -62,7 +143,7 @@ SC_PG_SHM="${SC_PG_SHM:-1g}"
 dcheck() {
   if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
     echo "✗ docker daemon not reachable — the sandbox needs it." >&2
-    echo "  Install/start Docker, or use the primary bare-metal path: ./sc launch + ./sc enter" >&2
+    echo "  Setup (one-time): ./sc doctor — or use the primary bare-metal path: ./sc launch + ./sc enter" >&2
     exit 1
   fi
 }
@@ -98,13 +179,34 @@ dnet() {
     || docker network create "$SC_NET" >/dev/null
 }
 
+# Sandbox harness freshness. The harness CLIs are baked into the image (their
+# binaries are host-ABI artifacts — see install.py's harness-epoch note for why
+# host state mounts must never choose them), and docker serves those installer
+# layers from cache forever. The epoch is their cache key: rolling it re-runs
+# the installers on the next build, and nothing else above the harness seam is
+# invalidated.
+# install.py owns the value + its file; these are thin readers so there is one
+# implementation of it, not two that can disagree.
+harness_epoch()      { "$PY" "$S/install.py" --harness-epoch; }
+harness_epoch_roll() { "$PY" "$S/install.py" --roll-harness-epoch; }
+
+# What the CURRENT image was actually built with, read back from the label the
+# Dockerfile stamps. Empty for an image built before this seam existed (or none
+# at all) — callers treat that as "unknown", never as "current".
+harness_epoch_built() {
+  docker image inspect "$IMG" --format '{{index .Config.Labels "sc.harness_epoch"}}' 2>/dev/null \
+    | sed 's/^<no value>$//' || true
+}
+
 # Build the env image (the repo is bind-mounted at run time, never baked — see
-# .dockerignore: the build context is empty). Cheap to re-run; layers cache.
+# .dockerignore: the build context is empty). Cheap to re-run; layers cache —
+# including the harness layers, unless the epoch below has been rolled since.
 dbuild() {
   docker build -t "$IMG" -f "$ENGINE/Dockerfile" \
     --build-arg SC_USER="$(id -un)" \
     --build-arg SC_UID="$(id -u)" \
     --build-arg SC_GID="$(id -g)" \
+    --build-arg SC_HARNESS_EPOCH="$(harness_epoch)" \
     "$here"
 }
 
@@ -199,6 +301,50 @@ sc_host_server_down() {
   rm -f "$HOST_SERVER_PID"
 }
 
+dimage_preflight() {
+  if docker image inspect "$IMG" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "✗ --no-build: sandbox image '$IMG:latest' is missing; nothing was stopped." >&2
+  echo "  Run ./sc build, then retry with --no-build." >&2
+  return 1
+}
+
+drunning() { [ "$(docker inspect -f '{{.State.Running}}' "$CNAME" 2>/dev/null || echo false)" = true ]; }
+
+# Which harness CLIs the shells will actually run, and whether the image owes a
+# build. Answers from INSIDE the sandbox when one is up, because that is the
+# runtime shells get — the host's own CLIs are not mounted in and do not decide
+# anything on the docker path. Never fatal: this is a status surface, and a
+# probe that cannot run should say so rather than take a launch down with it.
+sc_harness_status() {
+  # In-container (or no docker at all): this process IS the runtime.
+  if [ -n "${SC_SANDBOX:-}" ] || ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    echo "harness CLIs (this runtime):"
+    "$PY" "$S/harness_versions.py" || true
+    return 0
+  fi
+  stored="$(harness_epoch)"
+  built="$(harness_epoch_built)"
+  if drunning; then
+    echo "harness CLIs (in the sandbox — what shells run):"
+    # python3, not $PY: the container's interpreter is its own (the image's), and
+    # a host SC_PYTHON pointing at a host venv would not exist in there. $S is a
+    # host absolute path that resolves identically inside — launch bind-mounts
+    # the repo at its own path, which is what makes this exec work at all.
+    docker exec "$CNAME" python3 "$S/harness_versions.py" 2>/dev/null \
+      || echo "  (could not probe $CNAME)"
+  else
+    echo "harness CLIs: sandbox '$CNAME' is not running — ./sc launch to start it."
+  fi
+  echo "harness epoch: image built with ${built:-<none — predates the epoch seam>} · stored ${stored}"
+  # A rolled-but-unbuilt epoch is the actionable state: the operator asked for
+  # fresh harnesses and the image has not caught up yet. Say the command.
+  if [ "$stored" != "0" ] && [ "$stored" != "$built" ]; then
+    echo "  ! the image predates the stored epoch — ./sc restart (or ./sc build) to bake fresh harnesses"
+  fi
+}
+
 # ── dev kit (deps + test) — in-container primitives, like serve/boot ──────────
 # A shell runs these from INSIDE the sandbox, where pip/npm act directly on the
 # bind-mounted repo: the .venv / node_modules they create live in the mount and so
@@ -222,16 +368,50 @@ _sc_find_manifests() {  # $1 = filename glob, e.g. 'requirements*.txt'
     -name "$1" -type f -print
 }
 
+# One map-independent presence gate for Python suites. Reuse the manifest walk
+# so tests inherit its engine, worktree, environment, dependency, and build
+# pruning; pytest still owns actual recursive collection from the repo root.
+_sc_has_python_tests() {
+  _sc_find_manifests 'test_*.py' | (
+    while IFS= read -r test_file; do
+      relative_test=${test_file#"$here"/}
+      case "$relative_test" in tests/*|*/tests/*) exit 0 ;; esac
+    done
+    exit 1
+  )
+}
+
+# Is the repo .venv's tooling runnable BY THE INTERPRETER THAT RESOLVES HERE?
+# Existence is not runnability. A .venv is bind-mounted into the sandbox from
+# the host, and `python -m venv` records its interpreter as an UNVERSIONED
+# symlink (.venv/bin/python3 -> /usr/bin/python3). That path exists in both
+# places and resolves to a DIFFERENT minor version in each whenever the host's
+# python3 and the image's python3 disagree. The venv's packages live in
+# lib/python<X.Y>/site-packages for the host's X.Y, so under the image's
+# interpreter every .venv/bin/* shim is still present and executable and
+# imports NOTHING — `ModuleNotFoundError: No module named '_pytest'`, which
+# reads as a broken tool or a failing suite rather than as the version skew it
+# is. Probe the interpreter against its own site-packages before trusting the
+# shims. (The launch-time py_mount passthrough solves this properly for a venv
+# built from an out-of-tree interpreter under $HOME; it deliberately declines
+# to shadow /usr, so a system-python venv lands here instead.)
+_sc_venv_runnable() {
+  venv="$here/.venv"
+  [ -x "$venv/bin/python" ] || return 1
+  vv="$("$venv/bin/python" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)" || return 1
+  [ -n "$vv" ] && [ -d "$venv/lib/python$vv/site-packages" ]
+}
+
 # Resolve a dev-kit tool (ruff / mypy): the fork's .venv copy wins (its pins +
-# config), else the image/PATH copy (baked into the sandbox for exactly this
-# case), else fail with the honest fix. A host-managed .venv (pinned out-of-tree
-# interpreter mounted by launch) is pip-skipped in the sandbox BY DESIGN, so
-# "run ./sc deps first" was a closed loop there — the tool was unobtainable from
-# inside the box (dos-arch QAQC-02). Say what is actually wrong and where the
-# fix runs instead.
+# config) WHEN IT RUNS HERE, else the image/PATH copy (baked into the sandbox
+# for exactly this case), else fail with the honest fix. A host-managed .venv
+# (pinned out-of-tree interpreter mounted by launch) is pip-skipped in the
+# sandbox BY DESIGN, so "run ./sc deps first" was a closed loop there — the
+# tool was unobtainable from inside the box (dos-arch QAQC-02). Say what is
+# actually wrong and where the fix runs instead.
 _sc_devtool() {  # $1 = tool name → prints the executable path, or fails
   venv="$here/.venv"
-  if [ -x "$venv/bin/$1" ]; then printf '%s\n' "$venv/bin/$1"; return 0; fi
+  if [ -x "$venv/bin/$1" ] && _sc_venv_runnable; then printf '%s\n' "$venv/bin/$1"; return 0; fi
   if command -v "$1" >/dev/null 2>&1; then command -v "$1"; return 0; fi
   hostmanaged=""
   if [ -n "${SC_SANDBOX:-}" ] && [ -e "$venv/bin/python" ]; then
@@ -240,7 +420,11 @@ _sc_devtool() {  # $1 = tool name → prints the executable path, or fails
       *) hostmanaged=1 ;;                   # pinned host interpreter — pip skipped here
     esac
   fi
-  if [ -n "$hostmanaged" ]; then
+  if [ -x "$venv/bin/$1" ] && ! _sc_venv_runnable; then
+    # Present but unimportable: name the skew, not a phantom missing package.
+    echo "✗ $1: $venv/bin/$1 exists but its interpreter cannot import it — this .venv was built by a different python minor than the one resolving here ($("$venv/bin/python" -V 2>&1), packages under $(ls -d "$venv"/lib/python* 2>/dev/null | tr '\n' ' '))." >&2
+    echo "  Fix: \`./sc build\` to bake $1 into the image as the PATH fallback — or on the HOST rebuild .venv from an interpreter launch can mount (a uv-managed one under \$HOME), which carries the SAME binary into the sandbox." >&2
+  elif [ -n "$hostmanaged" ]; then
     echo "✗ $1: unavailable, and this .venv is host-managed (pinned out-of-tree interpreter) — in-sandbox pip is skipped by design, so \`./sc deps\` cannot provision it here." >&2
     echo "  Fix on the HOST: install $1 into the pinned venv (e.g. uv pip install $1) — or \`./sc build\` to refresh the sandbox image, which bakes $1 as the PATH fallback." >&2
   else
@@ -256,6 +440,10 @@ _sc_devtool() {  # $1 = tool name → prints the executable path, or fails
 # A map-backed fast path would read dr_filepath.path (dr_dependency.source_file is
 # basename-only, so it can't locate a manifest's dir).
 sc_deps() {
+  if sc_help_form "$@"; then
+    echo "Usage: ./sc deps [-h|--help]"
+    return 0
+  fi
   rc=0
   venv="$here/.venv"
   # In the sandbox, a .venv whose interpreter lives OUTSIDE the repo is host-built
@@ -379,21 +567,49 @@ _sc_wants_pytest() {
 # vitest in any package.json dir that declares a test script). Non-zero if any fail.
 sc_test() {
   venv="$here/.venv"
-  # Self-heal: a fork with python tests but no .venv/bin/pytest is an unprovisioned
-  # worktree (the .venv is only populated by the first `./sc deps`), NOT a fork that
-  # opted out of pytest. Provision the dev kit + fork deps rather than silently
-  # downgrading to stdlib unittest — under which a pytest-based suite fails with
-  # ModuleNotFoundError (pytest / the fork's own libs) that reads as a real test
-  # failure. We gate on the pytest binary, not sc_deps' exit code, so a partial
-  # provision (e.g. npm leg fails) still runs pytest if it landed.
-  if [ ! -x "$venv/bin/pytest" ] && ls "$here"/tests/test_*.py >/dev/null 2>&1; then
-    echo "→ test: $venv/bin/pytest missing — provisioning first (./sc deps)"
+  python_tests=""
+  _sc_has_python_tests && python_tests=1
+  # Self-heal an unprovisioned OR unrunnable host venv before selecting a test
+  # runner. A dangling interpreter leaves the pytest shim executable, so -x is
+  # not evidence that the venv can run. On the host the repo-local .venv is ours
+  # to rebuild; in the sandbox a host-managed venv stays untouched and sc_deps'
+  # existing ownership check chooses the safe PATH fallback.
+  provision_reason=""
+  if [ -n "$python_tests" ]; then
+    if [ ! -x "$venv/bin/pytest" ]; then
+      provision_reason=missing
+    elif ! _sc_venv_runnable; then
+      provision_reason=unrunnable
+    fi
+  fi
+  if [ -n "$provision_reason" ]; then
+    if [ "$provision_reason" = unrunnable ] && [ -z "${SC_SANDBOX:-}" ]; then
+      echo "→ test: $venv is not runnable — rebuilding before provisioning"
+      ( cd "$here" && rm -rf -- .venv )
+    else
+      echo "→ test: $venv/bin/pytest unavailable — provisioning first (./sc deps)"
+    fi
     sc_deps || echo "→ test: provisioning incomplete — continuing" >&2
   fi
+  # Which pytest can we actually RUN? The .venv copy wins (fork pins + config)
+  # only when its interpreter can import it — see _sc_venv_runnable. Running a
+  # present-but-unimportable shim anyway fails the ENTIRE suite with
+  # ModuleNotFoundError, which reads as a real test failure and sends whoever
+  # sees it hunting a bug that is not there. The image bakes pytest as the
+  # fallback for exactly this case; it is a real pytest, not the stdlib
+  # downgrade the branch below guards against, so a fork's own missing deps
+  # still fail loudly rather than passing green.
+  pytest_bin=""
+  if [ -x "$venv/bin/pytest" ] && _sc_venv_runnable; then
+    pytest_bin="$venv/bin/pytest"
+  elif command -v pytest >/dev/null 2>&1; then
+    pytest_bin="$(command -v pytest)"
+    [ -x "$venv/bin/pytest" ] && echo "→ test: $venv/bin/pytest is not importable by its interpreter ($("$venv/bin/python" -V 2>&1)) — using $pytest_bin" >&2
+  fi
   rc=0
-  if [ -x "$venv/bin/pytest" ]; then
-    echo "→ test: $venv/bin/pytest"
-    ( cd "$here" && "$venv/bin/pytest" "$@" )
+  if [ -n "$pytest_bin" ]; then
+    echo "→ test: $pytest_bin"
+    ( cd "$here" && "$pytest_bin" "$@" )
     prc=$?
     if [ "$prc" -eq 5 ] && [ $# -eq 0 ]; then
       # pytest exit 5 = collected nothing. On a bare `./sc test` in a fork with
@@ -405,13 +621,13 @@ sc_test() {
     elif [ "$prc" -ne 0 ]; then
       rc=1
     fi
-  elif ls "$here"/tests/test_*.py >/dev/null 2>&1; then
+  elif [ -n "$python_tests" ]; then
     # pytest still unavailable after provisioning (venv create failed, or a
     # host-managed sandbox interpreter that skips pip). A fork that *declares*
     # pytest must not be green-washed through stdlib unittest — fail loud with the
     # fix. Only a fork with no pytest config keeps the legacy stdlib fallback.
     if _sc_wants_pytest; then
-      echo "✗ test: pytest required (pytest config present) but unavailable in $venv — run ./sc deps to provision it" >&2
+      echo "✗ test: pytest required (pytest config present) but unavailable — neither $venv nor PATH has a runnable copy; run ./sc deps to provision it (or ./sc build to bake the image fallback)" >&2
       rc=1
     else
       echo "→ test: python3 -m unittest discover (stdlib)"
@@ -521,7 +737,11 @@ UNIT
   loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
   # A pidfile-managed broker would hold the socket; stop it so systemd owns it.
   sc_vm_broker_down >/dev/null 2>&1 || true
-  systemctl --user enable --now "$VM_BROKER_UNIT"
+  # `enable --now` does not restart an already-active unit after ExecStart was
+  # rewritten (notably when the fork moved). Enable, then restart explicitly so
+  # the live process always executes the path in the freshly written unit.
+  systemctl --user enable "$VM_BROKER_UNIT"
+  systemctl --user restart "$VM_BROKER_UNIT"
   echo "→ vm-broker installed as systemd --user unit: $VM_BROKER_UNIT (enabled, started, linger on)"
   echo "  status: systemctl --user status $VM_BROKER_UNIT   ·   logs: journalctl --user -u $VM_BROKER_UNIT"
 }
@@ -592,7 +812,8 @@ UNIT
   loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
   # A pidfile-managed broker would hold the socket; stop it so systemd owns it.
   sc_ts_broker_down >/dev/null 2>&1 || true
-  systemctl --user enable --now "$TS_BROKER_UNIT"
+  systemctl --user enable "$TS_BROKER_UNIT"
+  systemctl --user restart "$TS_BROKER_UNIT"
   echo "→ ts-broker installed as systemd --user unit: $TS_BROKER_UNIT (enabled, started, linger on)"
   echo "  status: systemctl --user status $TS_BROKER_UNIT   ·   logs: journalctl --user -u $TS_BROKER_UNIT"
 }
@@ -664,7 +885,8 @@ UNIT
   loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
   # A pidfile-managed broker would hold the socket; stop it so systemd owns it.
   sc_pm2_broker_down >/dev/null 2>&1 || true
-  systemctl --user enable --now "$PM2_BROKER_UNIT"
+  systemctl --user enable "$PM2_BROKER_UNIT"
+  systemctl --user restart "$PM2_BROKER_UNIT"
   echo "→ pm2-broker installed as systemd --user unit: $PM2_BROKER_UNIT (enabled, started, linger on)"
   echo "  status: systemctl --user status $PM2_BROKER_UNIT   ·   logs: journalctl --user -u $PM2_BROKER_UNIT"
 }
@@ -738,7 +960,8 @@ UNIT
   systemctl --user daemon-reload
   loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
   sc_db_broker_down >/dev/null 2>&1 || true
-  systemctl --user enable --now "$DB_BROKER_UNIT"
+  systemctl --user enable "$DB_BROKER_UNIT"
+  systemctl --user restart "$DB_BROKER_UNIT"
   echo "→ db-broker installed as systemd --user unit: $DB_BROKER_UNIT (enabled, started, linger on)"
   echo "  DSN env-file: $envfile (create it host-side with: SC_RO_DSN=postgresql://…)"
   echo "  status: systemctl --user status $DB_BROKER_UNIT   ·   logs: journalctl --user -u $DB_BROKER_UNIT"
@@ -795,6 +1018,10 @@ sc_pg_configured() {
 sc_pg_alive() {
   docker inspect --format '{{.State.Running}}' "$PGNAME" 2>/dev/null | grep -q true
 }
+sc_pg_absent() {
+  names="$(docker ps -a --filter "name=^/${PGNAME}$" --format '{{.Names}}')" || return 1
+  [ -z "$names" ]
+}
 sc_pg_up() {
   if ! sc_pg_configured; then
     echo "→ pg: no \`pg\` key in instance.json — skipping (run: ./sc pg-init)"; return 0
@@ -813,9 +1040,17 @@ sc_pg_up() {
   echo "→ pg 17 up ($PGNAME on $SC_NET) · DATABASE_URL=postgresql://sc:sc@$PGNAME:5432/sc"
 }
 sc_pg_down() {
-  if docker inspect "$PGNAME" >/dev/null 2>&1; then
-    docker rm -f "$PGNAME" >/dev/null 2>&1 && echo "→ pg stopped (volume $PGVOL retained)" || true
+  remove_rc=0
+  docker rm -f "$PGNAME" >/dev/null 2>&1 || remove_rc=$?
+  if sc_pg_absent; then
+    if [ "$remove_rc" -eq 0 ]; then
+      echo "→ pg stopped (volume $PGVOL retained)"
+    fi
+    return 0
   fi
+  echo "✗ postgres teardown could not verify removal of '$PGNAME'." >&2
+  echo "  Fix Docker access, run ./sc pg-down, then retry ./sc restart." >&2
+  return 1
 }
 sc_pg_init() {
   f="$ENGINE/instance.json"
@@ -839,93 +1074,6 @@ print('-> pg: added to $f')
 }
 
 
-# ── GitHub watcher daemon (HOST-side; the fork's ONE PR poller) ───────────────
-# Sprint eventing (specs_sc/sprint-eventing.md): one poller for the whole fork
-# watches every registered PR (watched_prs) and turns transitions into
-# `pr_event` message rows. Runs HOST-side like the brokers — the host owns the
-# gh login — with the same supervision: `launch` brings it up, `down` stops it.
-# No socket, so aliveness is the pidfile, not a health curl. Self-skips when gh
-# is absent (the fork degrades to task-boundary inbox checks, never breaks).
-# `watch-daemon-install` writes a systemd --user unit for reboot-survival
-# (#359: a host reboot killed the nohup'd daemon while the sandbox
-# auto-restarted); `up`/`down` defer to systemd when the unit is active.
-WATCH_DAEMON_PID="$ENGINE/run/watch-daemon.pid"
-WATCH_DAEMON_UNIT="sc-watch-daemon-$(basename "$here").service"
-
-sc_watch_daemon_unit_active() {
-  command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet "$WATCH_DAEMON_UNIT" 2>/dev/null
-}
-sc_watch_daemon_alive() {
-  # pid exists AND is actually the daemon — a stale pidfile surviving a host
-  # reboot can point at a reused pid, and a bare kill -0 would false-skip the
-  # relaunch (#359: reboot killed the daemon; the sandbox auto-restarted, so
-  # nothing else looked wrong).
-  [ -f "$WATCH_DAEMON_PID" ] || return 1
-  pid="$(cat "$WATCH_DAEMON_PID" 2>/dev/null)"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
-  ps -p "$pid" -o args= 2>/dev/null | grep -q "watch\.py daemon"
-}
-sc_watch_daemon_up() {
-  if ! command -v gh >/dev/null 2>&1; then
-    echo "→ watch-daemon: gh CLI not found on the host — PR eventing disabled (install gh + login to enable)"; return 0
-  fi
-  if sc_watch_daemon_unit_active; then
-    echo "→ watch-daemon systemd-managed ($WATCH_DAEMON_UNIT) — already running"; return 0
-  fi
-  if sc_watch_daemon_alive; then
-    echo "→ watch-daemon already running (pid $(cat "$WATCH_DAEMON_PID"))"; return 0
-  fi
-  mkdir -p "$ENGINE/run"
-  nohup "$PY" "$S/watch.py" daemon >"$ENGINE/run/watch-daemon.log" 2>&1 &
-  echo $! > "$WATCH_DAEMON_PID"
-  echo "→ watch-daemon up (pid $!) · log $ENGINE/run/watch-daemon.log"
-}
-sc_watch_daemon_down() {
-  if sc_watch_daemon_alive; then
-    kill "$(cat "$WATCH_DAEMON_PID")" && echo "→ watch-daemon stopped"
-  elif sc_watch_daemon_unit_active; then
-    echo "→ watch-daemon is systemd-managed ($WATCH_DAEMON_UNIT) — leaving it; use watch-daemon-uninstall"
-  else
-    echo "→ watch-daemon not running"
-  fi
-  rm -f "$WATCH_DAEMON_PID"
-}
-sc_watch_daemon_install() {
-  command -v systemctl >/dev/null 2>&1 || { echo "✗ watch-daemon-install: systemd (systemctl) not found on this host" >&2; return 1; }
-  command -v gh >/dev/null 2>&1 || { echo "✗ watch-daemon-install: gh CLI not found — nothing to poll GitHub with (install gh + login first)" >&2; return 1; }
-  unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-  mkdir -p "$unit_dir"
-  cat > "$unit_dir/$WATCH_DAEMON_UNIT" <<UNIT
-[Unit]
-Description=super-coder watch-daemon ($(basename "$here")) — GitHub PR watcher (sprint eventing)
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-ExecStart=$PY $S/watch.py daemon
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=default.target
-UNIT
-  systemctl --user daemon-reload
-  loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
-  # A pidfile-managed daemon would double-poll and double-emit pr_events;
-  # stop it so systemd owns the one poller.
-  sc_watch_daemon_down >/dev/null 2>&1 || true
-  systemctl --user enable --now "$WATCH_DAEMON_UNIT"
-  echo "→ watch-daemon installed as systemd --user unit: $WATCH_DAEMON_UNIT (enabled, started, linger on)"
-  echo "  status: systemctl --user status $WATCH_DAEMON_UNIT   ·   logs: journalctl --user -u $WATCH_DAEMON_UNIT"
-}
-sc_watch_daemon_uninstall() {
-  command -v systemctl >/dev/null 2>&1 || { echo "✗ watch-daemon-uninstall: systemd not found" >&2; return 1; }
-  systemctl --user disable --now "$WATCH_DAEMON_UNIT" 2>/dev/null || true
-  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$WATCH_DAEMON_UNIT"
-  systemctl --user daemon-reload
-  echo "→ watch-daemon systemd unit removed ($WATCH_DAEMON_UNIT)"
-}
-
 # ── persist: reboot-proof every applicable host-side daemon in one verb ───────
 # The #359 incident shape: a host reboot kills the nohup'd daemons while the
 # docker sandbox resurrects itself — the fork looks healthy with nobody
@@ -935,11 +1083,6 @@ sc_watch_daemon_uninstall() {
 sc_persist() {
   command -v systemctl >/dev/null 2>&1 || {
     echo "✗ persist: systemd (systemctl) not found — nohup + \`./sc launch\` is the only supervision on this host" >&2; return 1; }
-  if command -v gh >/dev/null 2>&1; then
-    sc_watch_daemon_install
-  else
-    echo "→ persist: gh CLI not found — watch-daemon skipped (PR eventing disabled)"
-  fi
   if "$PY" "$S/vm.py" configured;  then sc_vm_broker_install;  else echo "→ persist: no VM linked — vm-broker skipped"; fi
   if "$PY" "$S/ts.py" configured;  then sc_ts_broker_install;  else echo "→ persist: no tailnet linked — ts-broker skipped"; fi
   if "$PY" "$S/pm2.py" configured; then sc_pm2_broker_install; else echo "→ persist: no pm2 stack linked — pm2-broker skipped"; fi
@@ -948,30 +1091,130 @@ sc_persist() {
 }
 
 
-# WAL-safe DB backup via sqlite3's online-backup API — a plain file copy of a
-# live WAL database misses un-checkpointed pages (they live in the -wal
-# sidecar). Same dir + naming + keep-5 pruning as rebuild.py/rollback.py.
+# Resolve + write-probe the destination before a restart changes any runtime
+# state. db_backup.py is also used by rebuild/rollback, keeping one deterministic
+# override → home → repo-local fallback contract across every engine backup.
+sc_db_backup_preflight() {
+  "$PY" "$S/db_backup.py" select "$ROOT"
+}
 sc_db_backup() {
-  "$PY" - "$DB" "$(basename "$ROOT")" "${1:-manual}" <<'EOF'
-import os, sqlite3, sys, time
-from pathlib import Path
-db, repo, prefix = sys.argv[1:4]
-if not Path(db).exists():
-    print("→ no DB yet — nothing to back up"); raise SystemExit(0)
-bdir = Path(os.environ.get("SC_BACKUP_DIR",
-                           str(Path.home() / "db_backups" / repo)))
-bdir.mkdir(parents=True, exist_ok=True)
-dst = bdir / f"shell_db.{prefix}.{time.strftime('%Y%m%d_%H%M%S')}.db"
-src = sqlite3.connect(db); out = sqlite3.connect(dst)
-try:
-    with out:
-        src.backup(out)
-finally:
-    out.close(); src.close()
-for old in sorted(bdir.glob(f"shell_db.{prefix}.*.db"))[:-5]:
-    old.unlink()
-print(f"→ DB backed up -> {dst}")
-EOF
+  prefix="${1:-manual}"
+  destination="${2:-}"
+  if [ -n "$destination" ]; then
+    "$PY" "$S/db_backup.py" backup "$DB" "$ROOT" "$prefix" "$destination"
+  else
+    "$PY" "$S/db_backup.py" backup "$DB" "$ROOT" "$prefix"
+  fi
+}
+
+sc_systemd_unit_loaded() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [ "$(systemctl --user show "$1" -p LoadState --value 2>/dev/null)" = "loaded" ]
+}
+
+sc_wait_until() {
+  check="$1"
+  attempts=0
+  while [ "$attempts" -lt 20 ]; do
+    "$check" && return 0
+    attempts=$((attempts + 1))
+    sleep 0.25
+  done
+  return 1
+}
+
+sc_sandbox_alive() {
+  docker inspect --format '{{.State.Running}}' "$CNAME" 2>/dev/null | grep -q true \
+    && curl -fsS "http://127.0.0.1:$(port)/api/health" >/dev/null 2>&1
+}
+
+sc_pg_healthy() {
+  sc_pg_alive && docker exec "$PGNAME" pg_isready -U sc -d sc >/dev/null 2>&1
+}
+
+sc_vm_broker_configured() { "$PY" "$S/vm.py" configured; }
+sc_ts_broker_configured() { "$PY" "$S/ts.py" configured; }
+sc_pm2_broker_configured() { "$PY" "$S/pm2.py" configured; }
+sc_db_broker_configured() { "$PY" "$S/dbq.py" configured; }
+
+# Restart one configured broker through its actual supervisor. launch has
+# already recreated pidfile-managed brokers; systemd-managed brokers remain
+# alive across down by design, so restart them explicitly to load current code.
+sc_restart_broker() {
+  label="$1"
+  configured="$2"
+  alive="$3"
+  up="$4"
+  down="$5"
+  pidfile="$6"
+  unit="$7"
+  if ! "$configured"; then
+    echo "  $label: skipped (unconfigured)"
+    return 0
+  fi
+  supervisor="pidfile"
+  if sc_systemd_unit_loaded "$unit"; then
+    supervisor="systemd"
+    # A loaded-but-previously-inactive unit may have let launch create a
+    # pidfile process. Remove that exact process before handing ownership back
+    # to systemd; an already-active systemd process is deliberately left alone
+    # by the broker's down helper and then restarted by its supervisor.
+    "$down" >/dev/null 2>&1 || true
+    if ! systemctl --user restart "$unit"; then
+      echo "  $label: failed (systemd restart)"
+      SC_RESTART_FAILED=1
+      return 0
+    fi
+  elif ! "$up"; then
+    echo "  $label: failed (start)"
+    SC_RESTART_FAILED=1
+    return 0
+  elif [ ! -f "$pidfile" ]; then
+    echo "  $label: failed (live broker has no recognized supervisor)"
+    SC_RESTART_FAILED=1
+    return 0
+  fi
+  if sc_wait_until "$alive"; then
+    echo "  $label: restarted ($supervisor)"
+  else
+    echo "  $label: failed (unhealthy after $supervisor restart)"
+    SC_RESTART_FAILED=1
+  fi
+}
+
+sc_restart_health_summary() {
+  launch_rc="$1"
+  SC_RESTART_FAILED=0
+  echo "→ restart health"
+  if [ "$launch_rc" -eq 0 ] && sc_wait_until sc_sandbox_alive; then
+    echo "  sandbox: restarted"
+  else
+    echo "  sandbox: failed (launch or health)"
+    SC_RESTART_FAILED=1
+  fi
+  sc_restart_broker "vm-broker" \
+    sc_vm_broker_configured sc_vm_broker_alive sc_vm_broker_up \
+    sc_vm_broker_down "$VM_BROKER_PID" "$VM_BROKER_UNIT"
+  sc_restart_broker "ts-broker" \
+    sc_ts_broker_configured sc_ts_broker_alive sc_ts_broker_up \
+    sc_ts_broker_down "$TS_BROKER_PID" "$TS_BROKER_UNIT"
+  sc_restart_broker "pm2-broker" \
+    sc_pm2_broker_configured sc_pm2_broker_alive sc_pm2_broker_up \
+    sc_pm2_broker_down "$PM2_BROKER_PID" "$PM2_BROKER_UNIT"
+  sc_restart_broker "db-broker" \
+    sc_db_broker_configured sc_db_broker_alive sc_db_broker_up \
+    sc_db_broker_down "$DB_BROKER_PID" "$DB_BROKER_UNIT"
+  if sc_pg_configured; then
+    if sc_wait_until sc_pg_healthy; then
+      echo "  postgres: restarted"
+    else
+      echo "  postgres: failed (unhealthy after restart)"
+      SC_RESTART_FAILED=1
+    fi
+  else
+    echo "  postgres: skipped (unconfigured)"
+  fi
+  [ "$SC_RESTART_FAILED" -eq 0 ]
 }
 
 
@@ -982,22 +1225,72 @@ case "$cmd" in
   ensure-harness)  exec "$PY" "$S/install.py" --ensure-harness ;;
   doctor)          exec "$PY" "$S/install.py" --check-host ;;
   update)            exec "$PY" "$S/update.py" "$@" ;;
-  update-harnesses) exec "$PY" "$S/install.py" --update-harnesses ;;
+  # Refresh the harness CLIs the SHELLS run — which, on the docker path, means
+  # the image and nothing else. Running the installers on the host here is what
+  # this command used to do, and it reported success while changing nothing:
+  # the container mounts harness state homes but image-owned launchers must
+  # resolve image-owned binaries, and every launch `docker rm -f`s the writable
+  # layer that an in-container install would land in. So: roll the epoch,
+  # rebuild, and name the no-rebuild bounce that activates exactly this image.
+  # Without docker the host IS the runtime, so the installers are correct there.
+  update-harnesses)
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+      epoch="$(harness_epoch_roll)"
+      echo "→ harness epoch rolled to $epoch"
+      dbuild
+      echo "→ image rebuilt with fresh harness CLIs"
+      sc_harness_status || true
+      echo "  running sandboxes keep the OLD image until they restart: ./sc restart --no-build"
+    else
+      echo "→ no docker — updating this host's harness CLIs (the no-docker runtime)"
+      "$PY" "$S/install.py" --update-harnesses
+    fi ;;
+  harness-status)  sc_harness_status ;;
   rollback)     exec "$PY" "$S/rollback.py" "$@" ;;
   feature)      exec "$PY" "$S/feature.py" "$@" ;;
+  artifact-mode) exec "$PY" "$S/artifact_policy.py" "$@" ;;
   eject)        exec "$PY" "$S/eject.py" "$@" ;;
+  remove)       if sc_help_form "$@"; then
+                  exec "$PY" "$CALLER_ENGINE/scripts/remove.py" "$@"
+                fi
+                sc_refuse_linked remove "$ROOT"
+                exec "$PY" "$S/remove.py" "$@" ;;
   init)         exec "$PY" "$S/init_fork.py" "$@" ;;
-  rebuild)      exec "$PY" "$S/rebuild.py" "$@" ;;
-  migrate)      exec "$PY" "$S/migrate.py" "$DB" ;;
-  snapshot)     exec "$PY" "$S/snapshot.py" ;;
+  # rebuild/migrate: the script owns the whole argument contract (help, unknown
+  # tokens), so the dispatcher forwards VERBATIM and only inserts the refusal —
+  # after the help question, before the action.
+  rebuild)      sc_help_form "$@" || sc_refuse_linked rebuild "$DB"
+                exec "$PY" "$S/rebuild.py" "$@" ;;
+  migrate)      sc_help_form "$@" || sc_refuse_linked migrate "$DB"
+                exec "$PY" "$S/migrate.py" "$DB" "$@" ;;
+  migration)    exec "$PY" "$CALLER_ENGINE/scripts/migration.py" "$@" ;;
+  # snapshot/render name the artifact they would overwrite as well as the DB
+  # they read; resolving that path costs a subprocess, so only the refusing
+  # branch pays for it.
+  snapshot)     if [ "$LINKED" -eq 1 ]; then
+                  sc_refuse_linked snapshot \
+                    "$DB -> $("$PY" "$S/artifact_policy.py" path content)"
+                fi
+                exec "$PY" "$S/snapshot.py" ;;
   mem)          exec "$PY" "$S/mem.py" "$@" ;;
-  # ── sprint eventing: PR watches + inbox watcher (shell-side, API) and the
-  # GitHub watcher daemon (HOST-side foreground; -up/-down supervise it) ──
-  watch)             exec "$PY" "$S/watch.py" "$@" ;;
-  watch-daemon-up)   sc_watch_daemon_up ;;
-  watch-daemon-down) sc_watch_daemon_down ;;
-  watch-daemon-install)   sc_watch_daemon_install ;;
-  watch-daemon-uninstall) sc_watch_daemon_uninstall ;;
+  sprint)       exec "$PY" "$S/sprint_cli.py" "$@" ;;
+  token)        exec "$PY" "$S/operator_token.py" "$@" ;;
+  engine-ref)   sc_engine_ref_path="$LIVE_ROOT/.sc-state/engine.ref"
+                if [ ! -r "$sc_engine_ref_path" ]; then
+                  echo "✗ sc engine-ref: no readable engine pin at $sc_engine_ref_path" >&2
+                  exit 1
+                fi
+                IFS= read -r sc_engine_ref < "$sc_engine_ref_path" || true
+                case "$sc_engine_ref" in
+                  ""|*[!0-9a-f]*)
+                    echo "✗ sc engine-ref: invalid engine pin at $sc_engine_ref_path" >&2
+                    exit 1 ;;
+                esac
+                if [ "${#sc_engine_ref}" -ne 40 ]; then
+                  echo "✗ sc engine-ref: invalid engine pin at $sc_engine_ref_path" >&2
+                  exit 1
+                fi
+                printf '%s\n' "$sc_engine_ref" ;;
   # ── persist (HOST-side): reboot-proof all applicable daemons via systemd ──
   persist)           sc_persist ;;
   # ── session-surviving local jobs: detached supervised one-shots whose
@@ -1017,10 +1310,26 @@ case "$cmd" in
   map-sql)      exec sqlite3 -readonly "$MAPDB" "$@" ;;
   sql-rw)       exec sqlite3 "$DB" "$@" ;;
   map-sql-rw)   exec sqlite3 "$MAPDB" "$@" ;;
-  render)       [ $# -gt 0 ] && exec "$PY" "$S/render.py" "$@" || exec "$PY" "$S/render.py" flat ;;
-  render-check) exec "$PY" "$S/render_check.py" ;;
+  render)       if [ "$LINKED" -eq 1 ]; then
+                  sc_refuse_linked render \
+                    "$DB -> $("$PY" "$S/artifact_policy.py" path renders)"
+                fi
+                [ $# -gt 0 ] && exec "$PY" "$S/render.py" "$@" || exec "$PY" "$S/render.py" flat ;;
+  # render-check is SOURCE-PURE: it builds a throwaway DB from tracked text and
+  # diffs the mirror, touching no live state. So it runs the CALLER's engine —
+  # that is the source the caller is about to commit, and running the main
+  # checkout's copy verified the wrong tree from every worktree. A missing caller
+  # engine fails naming that path; falling back to live source would answer a
+  # question nobody asked.
+  render-check) if [ ! -f "$CALLER_ENGINE/scripts/render_check.py" ]; then
+                  echo "✗ ./sc render-check: no engine source at $CALLER_ENGINE" >&2
+                  echo "  render-check verifies THIS checkout's tracked sources; it does not" >&2
+                  echo "  fall back to the live instance at $LIVE_ROOT." >&2
+                  exit 1
+                fi
+                exec "$PY" "$CALLER_ENGINE/scripts/render_check.py" ;;
   map)          case "${1:-}" in
-                  -h|--help) echo "usage: ./sc map — rescan the host repo into the dr_* catalogue (.sc-state/map.db); takes no arguments"
+                  -h|--help) echo "usage: ./sc map — rescan the host repo into the dr_* catalogue ($MAPDB); takes no arguments"
                              exit 0 ;;
                   ?*)        echo "sc map: unknown argument '$1' (takes none; -h for usage)" >&2
                              exit 2 ;;
@@ -1031,11 +1340,21 @@ case "$cmd" in
   # THIS repo into session_token_usage (incremental, idempotent; doc #11).
   analytics)    exec "$PY" "$S/analytics.py" "$@" ;;
   models)       exec "$PY" "$S/models.py" "$@" ;;
-  seed-skills)  exec "$PY" "$S/seed_skills.py" ;;
+  # Like render-check, seed generation authors the CALLER's tracked engine
+  # source. A linked source worktree must never regenerate the main checkout's
+  # 0001 from a different branch's assets or upsert that shared live DB.
+  seed-skills)  if [ ! -f "$CALLER_ENGINE/scripts/seed_skills.py" ]; then
+                  echo "✗ ./sc seed-skills: no engine source at $CALLER_ENGINE" >&2
+                  echo "  seed-skills authors THIS checkout's tracked catalogue; it does not" >&2
+                  echo "  fall back to the live instance at $LIVE_ROOT." >&2
+                  exit 1
+                fi
+                exec "$PY" "$CALLER_ENGINE/scripts/seed_skills.py" ;;
   # Skill catalogue write surface — grants/retirement by name, loud on a miss
   # (the raw-SQL grant's silent no-op class). Snapshot is still the persist step.
   skill)        exec "$PY" "$S/skill.py" "$@" ;;
   ports)        exec "$PY" "$S/ports.py" show ;;
+  url)          sc_urls ;;
   preview)      exec "$PY" "$S/preview.py" "$@" ;;
   # ── in-container primitives (no docker; also the host escape hatch) ──
   serve)        exec "$PY" "$ENGINE/api/server.py" "$@" ;;
@@ -1082,9 +1401,9 @@ case "$cmd" in
   pg-down)      sc_pg_down ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
-  # Headless boot (sprint eventing): same render-then-exec path as boot, minus
-  # the picker and the TTY. In-container primitive like boot — the planner
-  # calls it to stand up an ephemeral worker; also the no-docker host path.
+  # Headless boot: same render-then-exec path as boot, minus the picker and
+  # the TTY. In-container primitive like boot — the planner calls it to stand
+  # up an ephemeral worker; also the no-docker host path (trusted bare metal).
   run)          export SC_TRUSTED_HOST=1 SC_DEV_PORT="$(devport)"
                 exec "$PY" "$S/run.py" --headless "$@" ;;
   deps)         sc_deps "$@" ;;
@@ -1092,14 +1411,14 @@ case "$cmd" in
   lint)         sc_lint "$@" ;;
   typecheck)    sc_typecheck "$@" ;;
   # ── bare-metal lifecycle (primary) ──
-  launch)       sc_host_server_up
-                sc_watch_daemon_up || true ;;
+  # (The v1 standalone watch daemon is gone: sprint v2's PR watcher runs inside
+  # the API server itself — sc_host_server_up is the whole host lifecycle.)
+  launch)       sc_host_server_up ;;
   enter)        export SC_TRUSTED_HOST=1 SC_DEV_PORT="$(devport)"
                 exec "$0" boot "$@" ;;
   enter-*)      export SC_TRUSTED_HOST=1 SC_DEV_PORT="$(devport)"
                 exec "$0" boot "${cmd#enter-}" "$@" ;;
-  down)         sc_host_server_down
-                sc_watch_daemon_down ;;
+  down)         sc_host_server_down ;;
   restart)      sc_db_backup prerestart
                 "$0" down
                 exec "$0" launch "$@" ;;
@@ -1107,17 +1426,31 @@ case "$cmd" in
                   echo "✗ no host server log yet — run ./sc launch" >&2; exit 1; }
                 exec tail -f "$HOST_SERVER_LOG" ;;
 
-  # ── optional docker compatibility lifecycle ──
+  # ── docker sandbox (optional compatibility lifecycle) ──
   sandbox-launch)
+    no_build=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --no-build) no_build=1 ;;
+        -h|--help)
+          echo "usage: ./sc sandbox-launch [--no-build]"
+          echo "  --no-build  reuse the existing $IMG:latest image; refuse if absent"
+          exit 0 ;;
+        *)
+          echo "sc sandbox-launch: unknown argument '$1' (usage: ./sc sandbox-launch [--no-build])" >&2
+          exit 2 ;;
+      esac
+      shift
+    done
     dcheck
+    if [ -n "$no_build" ]; then dimage_preflight; else dbuild; fi
     dcreds
     "$PY" "$S/ports.py" ensure >/dev/null
     p="$(port)"
     dp="$(devport)"
-    dbuild
     dnet
-    # Forward GitHub auth for the in-container push/PR path (GUI publish + shells
-    # opening their own PRs). Prefer a repo-scoped SC_GH_TOKEN; else reuse the
+    # Forward GitHub auth for shells opening their own feature PRs. Prefer a
+    # repo-scoped SC_GH_TOKEN; else reuse the
     # host's gh login. NOTE: this widens the sandbox — anything in the container
     # can act as you on GitHub within the token's scope. A fine-grained,
     # single-repo PAT in SC_GH_TOKEN is the tighter option.
@@ -1177,7 +1510,11 @@ case "$cmd" in
       esac
     fi
     docker rm -f "$CNAME" >/dev/null 2>&1 || true
-    docker run -d --name "$CNAME" --restart unless-stopped \
+    # Docker's init shim is PID 1 so orphaned harness/worker subprocesses are
+    # reaped. Without it the Python API server becomes PID 1, never wait()s on
+    # reparented children, and long-running multi-shell work exhausts the
+    # container's PID limit with zombies (flag #323).
+    docker run -d --name "$CNAME" --restart unless-stopped --init \
       --network "$SC_NET" \
       --user "$(duser)" \
       -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
@@ -1205,6 +1542,13 @@ case "$cmd" in
     fi
     echo "  dev server:    bind 0.0.0.0:$dp inside (\$SC_DEV_PORT) → http://127.0.0.1:$dp"
     echo "  boot a shell:  ./sc sandbox-enter   (or ./sc sandbox-enter-<shortname>)"
+    # One line naming the claude build the shells got. It is the version that
+    # decides which models an alias like `opus` can resolve to, and until this
+    # line existed nothing anywhere reported it — a sandbox stuck one release
+    # behind a new model looked identical to a current one. Best-effort: a probe
+    # that cannot answer must not fail a launch that otherwise succeeded.
+    claude_v="$(docker exec "$CNAME" claude --version 2>/dev/null | head -1 || true)"
+    [ -n "$claude_v" ] && echo "  harnesses:     claude $claude_v   (all: ./sc harness-status)"
     # Bring the VM broker up alongside the sandbox when a VM is linked (self-skips
     # otherwise, and no-ops if systemd already owns it). The shells need it to
     # drive the VM; this keeps it from being a forgotten manual step.
@@ -1213,18 +1557,18 @@ case "$cmd" in
     sc_ts_broker_up || true
     # Same for the pm2 broker — self-skips when no `pm2` block is linked.
     sc_pm2_broker_up || true
-    # GitHub watcher daemon — the fork's one PR poller (sprint eventing).
-    # Self-skips when gh is absent; idles cheaply when no watches are live.
-    sc_watch_daemon_up || true
+    # Same for the read-only DB broker — it was previously omitted from the
+    # sandbox lifecycle, so a restart could leave configured diagnostics down.
+    sc_db_broker_up || true
     # Start the PG sidecar when configured — self-skips otherwise.
     sc_pg_up || true ;;
-  sandbox-enter)        exec docker exec -it "$CNAME" ./sc boot "$@" ;;
-  sandbox-enter-*)      exec docker exec -it "$CNAME" ./sc boot "${cmd#sandbox-enter-}" "$@" ;;
+  sandbox-enter)        sc_urls || true; exec docker exec -it "$CNAME" ./sc boot "$@" ;;
+  sandbox-enter-*)      sc_urls || true; exec docker exec -it "$CNAME" ./sc boot "${cmd#sandbox-enter-}" "$@" ;;
   sandbox-down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
                 sc_vm_broker_down
                 sc_ts_broker_down
                 sc_pm2_broker_down
-                sc_watch_daemon_down
+                sc_db_broker_down
                 sc_pg_down ;;
   # restart is a hard bounce — down runs `docker rm -f`, which SIGKILLs every
   # live session inside the sandbox along with whatever those sessions had not
@@ -1232,28 +1576,104 @@ case "$cmd" in
   # dos-e), so: typed confirmation (only YES / Yes / yes proceed — anything
   # else, including a closed stdin, aborts) + a WAL-safe DB backup BEFORE
   # anything is torn down. --yes/-y skips the prompt for scripted callers.
+  # --no-build validates and deliberately reuses the existing image. The
+  # default path gives every harness installer a fresh cache key, then completes
+  # that build before down, so a network/install failure cannot strand a
+  # healthy fork offline.
   sandbox-restart)
+    assume_yes=""
+    no_build=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -y|--yes) assume_yes=1 ;;
+        --no-build) no_build=1 ;;
+        -h|--help)
+          echo "usage: ./sc sandbox-restart [-y|--yes] [--no-build]"
+          echo "  default     refresh harness CLIs, rebuild the image, then bounce"
+          echo "  --no-build  reuse the existing $IMG:latest image; preflight before down"
+          exit 0 ;;
+        *)
+          echo "sc sandbox-restart: unknown argument '$1' (usage: ./sc sandbox-restart [-y|--yes] [--no-build])" >&2
+          exit 2 ;;
+      esac
+      shift
+    done
+    if [ -z "$assume_yes" ]; then
+      echo "restart recreates the sandbox — live sessions inside it are killed."
+      printf "ARE YOU SURE YOU WANT TO RESTART? (YES/no): "
+      ans=""; read -r ans || true
+      case "$ans" in
+        YES|Yes|yes) ;;
+        *) echo "→ restart aborted (nothing touched)"; exit 1 ;;
+      esac
+    fi
+    dcheck
+    if [ -n "$no_build" ]; then
+      dimage_preflight
+    else
+      epoch="$(harness_epoch_roll)"
+      echo "→ refresh harnesses for restart (epoch $epoch)"
+      dbuild
+    fi
+    backup_dir="$(sc_db_backup_preflight)"
+    sc_db_backup prerestart "$backup_dir"
+    if ! "$0" sandbox-down; then
+      echo "✗ restart stopped: teardown did not complete; no replacement services were launched." >&2
+      exit 1
+    fi
+    launch_rc=0
+    "$0" sandbox-launch --no-build || launch_rc=$?
+    sc_restart_health_summary "$launch_rc" ;;
+  # --harnesses expires the baked harness CLIs first, so the build re-runs their
+  # installers instead of serving them from a cache that has no expiry of its own.
+  build|sandbox-build)
+    dcheck
     case "${1:-}" in
-      -y|--yes) shift ;;
-      *)
-        echo "restart recreates the sandbox — live sessions inside it are killed."
-        printf "ARE YOU SURE YOU WANT TO RESTART? (YES/no): "
-        ans=""; read -r ans || true
-        case "$ans" in
-          YES|Yes|yes) ;;
-          *) echo "→ restart aborted (nothing touched)"; exit 1 ;;
-        esac ;;
+      --harnesses)
+        epoch="$(harness_epoch_roll)"
+        echo "→ harness epoch rolled to $epoch"
+        shift ;;
+      "") : ;;
+      *) echo "sc build: unknown argument '$1' (usage: ./sc build [--harnesses])" >&2; exit 2 ;;
     esac
-    sc_db_backup prerestart
-    "$0" sandbox-down; exec "$0" sandbox-launch "$@" ;;
-  build|sandbox-build) dcheck; dbuild ;;
+    dbuild ;;
   sandbox-logs) exec docker logs -f "$CNAME" ;;
   verify)
+    sc_refuse_linked verify "$DB"
+    # Destructive by design: rebuild.py REPLACES the DB below. Say which DB and
+    # which source before that happens — a footer printed after the fact is a
+    # disclosure a crash can skip, and this is the command that eats unsnapshotted
+    # memory when it is pointed at an instance the caller did not mean.
+    echo "→ verify: about to REBUILD $DB"
+    echo "          from engine source $ENGINE"
     "$PY" "$S/rebuild.py"
+    # The engine source intentionally carries no per-instance snapshot in local
+    # artifact mode. Exercise the real fresh-fork initialization path before
+    # the headless boot when rebuild therefore produced an empty instance.
+    if "$PY" - "$DB" <<'PY'
+import sqlite3
+import sys
+
+con = sqlite3.connect(sys.argv[1])
+try:
+    populated = con.execute(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE is_active=1) "
+        "AND EXISTS(SELECT 1 FROM shells WHERE COALESCE(is_deleted,0)=0)"
+    ).fetchone()[0]
+finally:
+    con.close()
+raise SystemExit(0 if populated else 1)
+PY
+    then
+      :
+    else
+      "$PY" "$S/init_fork.py" --username verify
+    fi
     SC_ADMIN=1 "$PY" "$S/render.py" flat
     RENDER_ONLY=1 exec "$PY" "$S/run.py" --first ;;
   health)       curl -s "http://127.0.0.1:$(port)/api/health" && echo "" ;;
-  clean-db)     rm -f "$DB" "$DB-wal" "$DB-shm" && echo "removed $DB (rebuild with: ./sc rebuild)" ;;
+  clean-db)     sc_refuse_linked clean-db "$DB"
+                rm -f "$DB" "$DB-wal" "$DB-shm" && echo "removed $DB (rebuild with: ./sc rebuild)" ;;
   help|-h|--help)
     cat <<'EOF'
 super-coder — forkable shell substrate
@@ -1263,21 +1683,42 @@ super-coder — forkable shell substrate
   ./sc doctor              bare-metal readiness: host tools + harness login
   ./sc update              fetch + materialize the engine (gitignored dep) + reconcile IN PLACE (migrate, sync skills, map);
                              --no-fetch skips the fetch · --ref <tag|sha> pins a version · blocks on local engine edits (--force discards them)
-  ./sc update-harnesses    update claude + opencode + codex + vibe + kimi to latest (force-reruns official installers)
+                             first runs git pull --ff-only for any tracked checkout; source repos then reconcile FROM that tree.
+                             Advisory, never blocking: an unsafe/offline pull WARNS and engine update continues from the current
+                             checkout. Update never merges, rebases or resets. --no-fetch skips checkout and engine network sync.
+  ./sc update-harnesses    refresh the harness CLIs the SHELLS run: rolls the harness epoch + rebuilds the sandbox image
+                             (they are image-owned — activate that exact build with ./sc restart --no-build)
+                             without docker, updates this host's CLIs instead — there the host IS the runtime
+  ./sc harness-status      report the harness CLI versions inside the sandbox + whether the image owes a harness rebuild
+                             (a model the shells cannot reach is nearly always this — see .super-coder/docs/harness-freshness.md)
   ./sc rollback            sound undo of a bad update — restore the DB + engine (engine.ref.prev) together
+                             --engine-only repairs a new-engine / unchanged-old-DB half floor without restoring a DB backup
   ./sc feature             list the opt-in features (pg · windows · tailnet · pm2 · app-deploy) and the state of both halves (config block + skill grants)
   ./sc feature enable <f>  enable one: grant its skills to the owning flavors + create/point-at its instance.json block (disable reverses)
   ./sc eject               ONE-WAY: stop tracking upstream and own the engine — un-gitignore + stage .super-coder/ as fork source (confirm-gated)
+  ./sc remove              safely uninstall subfloor from this repo after a verified DB backup
+                             --dry-run previews; --yes skips confirmation, never safety gates
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db
-  ./sc snapshot            dump per-instance tables -> .sc-state/content.sql
+  ./sc migration new <slug>
+                           allocate the next free migration number, write the standard skeleton, and update the source removal-test allowlist
+  ./sc snapshot            dump per-instance tables to gitignored .sc-state/local/
+                             live-state commands (rebuild · migrate · verify · snapshot · render · clean-db) act on the SHARED live
+                             instance at the main checkout, so they REFUSE from a linked worktree rather than substitute it, naming
+                             the target declined (decision #81); -h/--help still answers from any checkout. render-check is the
+                             source-pure one: it verifies the CALLER's engine sources and local artifacts, and names the checkout it read.
   ./sc mem <cmd> [args]    a shell's own memory, over the engine API (get/state/seed/lns/decision/flag/roadmap/doc/narrative);
-                             identity is the shell's token, server-resolved — no DB path, no direct-DB fallback. `./sc mem which` to orient
-  ./sc watch pr <o/r> <n>  register a PR watch (--shell <name> subscribes another shell, e.g. the planner);
-                             the watcher daemon turns its transitions into pr_event inbox rows
-  ./sc watch list          live PR watches (--all includes retired)
-  ./sc watch inbox         block until this shell has unread messages, then exit — the zero-token
-                             inbox watcher; arm as a background task and its exit is your wake-up
+                             already wired to this launched shell, identity resolved by the engine — no DB path, no direct-DB fallback. `./sc mem which` to orient
+  ./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)
+                             caller identity is resolved by the engine; report and review bodies use files, and mutating retries carry stable keys where required
+  ./sc token               print the browser sign-in operator token (an operator capability: the Admin runtime
+                             credential from the owner-only artifact .super-coder/run/mem/<shortname>.json, mode 0600)
+                             — stdout carries ONLY the token, for paste into the browser sign-in prompt. Never
+                             rotates; a missing/unreadable/insecure artifact refuses on stderr with the service
+                             action (`./sc restart` / `make dos-r`). A recovery path — the browser attaches its
+                             own credential, so pasting a token by hand is no longer the everyday sign-in
+  sc engine-ref            print the full engine pin from the canonical live checkout — safe from any shell
+                             worktree; stdout is the 40-character SHA only
   ./sc job start -- <cmd>  run a long local command (suite/bench/build) detached + supervised — it
                              survives your session; completion lands in YOUR inbox as a result row
                              (--label <slug> names it, --timeout <s> kills the wedged process group)
@@ -1285,17 +1726,22 @@ super-coder — forkable shell substrate
                              (drain your inbox between slices); list/status/tail/kill complete the set
   ./sc models refresh      refresh local model routes (same action as Shells → Refresh models)
   ./sc models resolve <h> <model> [--shell <shortname>]
-                             print one exact, locally runnable high-effort sprint call; list [harness] shows routes
+                             print one exact, locally runnable high-effort call; list [harness] shows routes
   ./sc visual-qa <mode>    viewport screenshot QA: ci boots/captures · run captures a local app · init scaffolds config
   sc sql "<query>"         read-only passthrough to the engine DB (schema/skills/flags) — absolute path, cwd-independent (no `cd` to root)
   sc map-sql "<query>"     read-only passthrough to the repo-map DB (dr_* catalogue) — absolute path, cwd-independent
-  sc sql-rw / map-sql-rw   read-WRITE passthroughs — bypass the API's triggers/caps; `sc mem` is the write path.
+  sc sql-rw · sc map-sql-rw
+                           read-WRITE passthroughs — bypass the API's triggers/caps; `sc mem` is the write path.
                              Only for procedures with no API surface (map authoring) where a skill names it
   ./sc skill <cmd>         skill catalogue surface: list · grant <name> <shell>... · revoke <name> <shell>... · rm <name> · retire <name> · unretire <name>
                              shells by id or shortname; rm refuses engine skills — retire/unretire manages the fork retire
-                             list (.sc-state/skills_retired.json, rides updates); snapshot after writes to persist
-  ./sc render              render tracked flat _sc files (specs/docs/skills/roadmap)
-  ./sc render-check        fail if committed flat _sc files drift from the DB render (CI guard; rebuild first for a hermetic check)
+                             list (active tracked/local retire path, rides updates); snapshot after writes to persist
+  ./sc artifact-mode       inspect the local-only artifact paths (mode switching is retired)
+  ./sc render              render flat _sc files under the active artifact policy
+  ./sc render-check        fail if the active flat _sc files drift from the DB render (hermetic check)
+  ./sc analytics sweep     parse each harness's on-disk token usage for this repo into session_token_usage
+                             (incremental + idempotent; --harness <name> · --quiet · --full re-parses everything).
+                             Also runs at boot and behind the GUI Analytics tab
   ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)
   ./sc map-setup           wire the auto-remap git hooks (core.hooksPath) + map — the cartographer's one-shot
   ./sc seed-skills         upsert assets/skills/ into the live DB (+ regenerate the seed migration — source repo only)
@@ -1307,11 +1753,13 @@ super-coder — forkable shell substrate
   ./sc enter-<shortname>   attach + boot that shell directly (skip the shell picker)
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)
+  make dos-help            supported operator aliases for lifecycle, models,
+                             job, maintenance, browser token, and generic ./sc forwarding
   ./sc run <shortname>     headless boot: render + exec the harness NON-interactively (claude · codex ·
                              opencode · kimi) to drain the shell's inbox and act; -p "<prompt>" overrides the
                              default prompt · --harness <h> · -m <model> (else flavor_defaults);
                              --effort defaults to high; refuses a shell that already has a live session
-  ./sc down                stop the host review server + watcher
+  ./sc down                stop the host review server
   ./sc restart             DB backup, then restart the host services
   ./sc logs                tail the host review-server log
 
@@ -1325,7 +1773,7 @@ super-coder — forkable shell substrate
 
   Primitives:
   ./sc serve               run the review layer (api + static UI) in the foreground
-  ./sc boot [shortname]    auth + pick shell + pick harness + boot (no container, no GUI)
+  ./sc boot [shortname]    direct interactive launch (host/no-docker primitive)
   ./sc deps                install this fork's python (.venv) + node (node_modules) deps into the bind-mount
                              (plus an only-if-needed dev kit: pytest httpx coverage ruff mypy datasette)
   ./sc test                run backend (.venv pytest or stdlib unittest) + UI (vitest) suites; non-zero on any failure
@@ -1381,20 +1829,9 @@ super-coder — forkable shell substrate
   ./sc db-broker-install   supervise via a systemd --user unit (survives logout/reboot)
   ./sc db-broker-uninstall remove the systemd unit
 
-  GitHub watcher daemon (HOST-side — the fork's ONE PR poller, sprint eventing:
-  diffs every registered watch on one batched GraphQL query and writes pr_event
-  message rows; watches retire themselves on merge/close). `launch` brings it
-  up when gh is present; `down` stops it:
-  ./sc watch daemon        run the daemon in the foreground (--once = single cycle)
-  ./sc watch-daemon-up     start it in the background (nohup + pidfile); self-skips if gh missing/already up
-  ./sc watch-daemon-down   stop the backgrounded daemon
-  ./sc watch-daemon-install   supervise via a systemd --user unit (survives logout/reboot)
-  ./sc watch-daemon-uninstall remove the systemd unit
-
   Persist (HOST-side — reboot-proof the fork in one verb; #359): installs the
-  systemd --user unit for every daemon that applies here (watch-daemon when gh
-  is present; vm/ts/pm2/db brokers when linked), enables linger, skips the
-  rest with a reason. Idempotent — re-run any time:
+  systemd --user unit for every daemon that applies here (vm/ts/pm2/db brokers
+  when linked), enables linger, skips the rest with a reason. Idempotent:
   ./sc persist             install + enable --now every applicable unit
 
   Postgres sidecar (app-only; docker container on SC_NET, data in a named volume).
@@ -1409,6 +1846,8 @@ super-coder — forkable shell substrate
   ./sc verify              rebuild + flat render + render-only boot (headless proof)
   ./sc health              curl the review layer's /api/health
   ./sc ports               show this fork's derived port
+  ./sc url                 print this fork's review GUI + dev-server URLs (derived, never a fixed 8800)
+                             — the recall path when the boot summary has scrolled away. Alias: make dos-url
   ./sc preview             live-preview every dev shell's worktree UI on one port,
                              routed by subdomain (http://<shortname>.localhost:<dev_port>/)
   ./sc clean-db            remove the rebuilt .db (text serializations untouched)

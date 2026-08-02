@@ -16,16 +16,18 @@ Usage:
     python3 .super-coder/scripts/run.py [shortname] [--first]
     RENDER_ONLY=1 python3 .super-coder/scripts/run.py --first   # render, don't exec
 
+Interactive and headless launches share this direct boot path. `./sc enter`
+dispatches here for a human session; `./sc run` supplies `--headless`.
+
 Headless (`./sc run <shortname> [-p "<prompt>"] [--harness <h>] [-m <model>]
 [--effort <level>]`):
 the same render-then-exec path minus the picker and the TTY. The harness runs
 non-interactively via its adapter's `headless` block (claude -p · codex exec ·
-opencode run), streams a final message, and exits — the ephemeral-worker
-primitive of sprint eventing (specs_sc/sprint-eventing.md). Default prompt
-drains the inbox; a liveness guard refuses a shell whose worktree already
-hosts a live session (one shell, one session). Harness + model resolve:
-explicit flags → the shell's flavor_defaults (a sprint's `models:` line rides
-in AS flags — the planner passes it on every `sc run` it issues).
+opencode run), streams a final message, and exits. Headless launches keep the
+inbox-drain default. A liveness
+guard refuses a shell whose worktree already hosts a live session (one shell,
+one session). Harness + model resolve: explicit flags → the shell's
+flavor_defaults.
 """
 from __future__ import annotations
 
@@ -35,8 +37,10 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -47,6 +51,8 @@ from compose import compose_boot  # noqa: E402
 import flat  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "scripts"))
+import artifact_policy  # noqa: E402
+import callable_floor  # noqa: E402
 import db_driver  # noqa: E402
 import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
@@ -54,13 +60,16 @@ import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
 import style  # noqa: E402  — launcher ANSI; degrades to plain text off-TTY
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
 import shell_liveness  # noqa: E402  — headless boot's one-shell-one-session guard
+import skill_projection  # noqa: E402  — exact bounded harness skill mirrors
 
 sys.path.insert(0, str(ENGINE / "api"))
 import model_catalog  # noqa: E402  — HARNESS_PROVIDER: one source for harness → provider
 
 ADAPTERS = ENGINE / "adapters"
+PROC_SELF_STAT = Path("/proc/self/stat")   # H-25: our own start ticks, pre-exec
 
 DEFAULT_HEADLESS_PROMPT = "Check your inbox and act on your unread messages."
+SESSION_OPEN_RETRY_DELAYS_S = (0.1, 0.3)
 
 
 def resolve_headless_model(flag_model: "str | None", fdef: "dict | None",
@@ -90,6 +99,11 @@ def _headless_effort_args(hcfg: dict, effort: "str | None",
 def headless_effort_env(adapter: dict, effort: "str | None") -> dict[str, str]:
     ecfg = ((adapter.get("headless") or {}).get("effort") or {})
     return {ecfg["env"]: effort} if effort and ecfg.get("env") else {}
+
+
+def default_headless_effort(adapter: dict) -> "str | None":
+    """Use high only when the adapter has an effort transport."""
+    return "high" if ((adapter.get("headless") or {}).get("effort")) else None
 
 
 def validate_headless_request(adapter: dict, model: "str | None",
@@ -152,6 +166,22 @@ def emit_adapter(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
             atomic_write(dst, src.read_text())
             written.append(fname)
     return written
+
+
+def render_harness_skills(con: sqlite3.Connection, shell_id: int,
+                          work_dir: Path, adapter: dict) -> dict:
+    """Render exact shell grants into every skill directory consumed by the
+    selected harness. Adapters default to the Claude-compatible path and may
+    add a native path where compatibility discovery is incomplete."""
+    skill_dirs = adapter.get("skill_dirs") or [".claude/skills"]
+    try:
+        summary = skill_projection.reconcile_shell(
+            con, shell_id, work_dir, ensure_dirs=skill_dirs
+        )
+    except skill_projection.ProjectionError as exc:
+        raise LaunchError(str(exc)) from exc
+    summary["dirs"] = list(skill_dirs)
+    return summary
 
 
 def resolve_opencode_plugins(work_dir: Path) -> None:
@@ -254,14 +284,54 @@ def apply_trusted_host(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
         (adapter.get("trusted_host") or {}).get("merge_json") or {}, root)
 
 
+def shell_work_dir(shortname: "str | None", flavor: "str | None") -> Path:
+    """The one worktree rule, shared by every boot path (interactive CLI,
+    headless `sc run`, Interface exec): the admin flavor boots at the repo
+    root (it maintains `main` itself); every other shell — dev, planner,
+    reviewer alike — gets an isolated git worktree at
+    `.sc-worktrees/<shortname>` on branch `shell/<shortname>`."""
+    if shortname and flavor != "admin":
+        return REPO_ROOT / ".sc-worktrees" / shortname.lower()
+    return REPO_ROOT
+
+
 def ensure_worktree(work_dir: Path, shortname: str) -> None:
     """Create a git worktree for a shell at work_dir on branch shell/<shortname>.
 
-    Idempotent: if work_dir already exists, assumes the worktree is intact and
-    returns immediately. Creates the branch from HEAD if it doesn't exist yet;
-    checks it out if it does. Exits with a clear message on git failure.
+    An existing directory is repaired before reuse. Git stores absolute paths
+    on both sides of a linked-worktree relationship, so moving a whole fork
+    leaves the directory present but its ``.git`` file and the main repo's
+    ``worktrees/<name>/gitdir`` pointing at the old location. ``git worktree
+    repair`` is lossless: it rewrites those links without touching the branch,
+    index, or working tree. Creates the branch from HEAD if it doesn't exist
+    yet; checks it out if it does. Exits with a clear message on git failure.
     """
     if work_dir.exists():
+        repair = subprocess.run(
+            [
+                "git", "-C", str(REPO_ROOT), "worktree", "repair",
+                str(work_dir),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if repair.returncode != 0:
+            sys.exit(
+                f"FATAL: could not repair existing worktree at {work_dir}:\n"
+                f"{repair.stderr.strip()}"
+            )
+        probe = subprocess.run(
+            ["git", "-C", str(work_dir), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode != 0:
+            sys.exit(
+                f"FATAL: existing shell worktree at {work_dir} is not usable "
+                f"after repair:\n{probe.stderr.strip()}"
+            )
+        if repair.stdout.strip() or repair.stderr.strip():
+            print(f"→ worktree: repaired Git links for {shortname} at {work_dir}")
         return
     work_dir.parent.mkdir(parents=True, exist_ok=True)
     branch = f"shell/{shortname.lower()}"
@@ -278,7 +348,7 @@ def ensure_worktree(work_dir: Path, shortname: str) -> None:
 
 
 def link_worktree_map(work_dir: Path) -> "str | None":
-    """Point a shell worktree's .sc-state/map.db at the ROOT's map DB.
+    """Point a shell worktree's compatibility map path at the active map DB.
 
     The dr_* repo map is a single derived cache at the main repo root (built by
     `./sc map`; read by map_db.py / compose.py via __file__, so writers + the
@@ -297,7 +367,7 @@ def link_worktree_map(work_dir: Path) -> "str | None":
     root, where `./sc map` then populates it."""
     sc_state = work_dir / ".sc-state"
     link = sc_state / "map.db"
-    target = REPO_ROOT / ".sc-state" / "map.db"
+    target = artifact_policy.map_db_path()
     try:
         sc_state.mkdir(parents=True, exist_ok=True)
         if link.is_symlink():
@@ -406,6 +476,47 @@ def sync_worktree(work_dir: Path, shortname: str) -> str:
         return "drift check skipped (git timed out or errored)"
 
 
+def main_checkout_note(repo_root: Path) -> "str | None":
+    """Report the MAIN CHECKOUT's position against the default branch — the tree
+    every shell's `./sc` resolves the engine from (sc:11-21 derives ROOT via
+    git's common dir), which hosts the gitignored live DB and runs the
+    supervised server.
+
+    Why this exists separately from sync_worktree: that function reports the
+    SHELL'S OWN worktree, so a shell could be exactly current, be told so at
+    boot, and still drive a stale engine. That produced three wrong answers in
+    one session — a `./sc help` query answered from a stale tree, a
+    pending-migration check that came back empty because it globbed a stale
+    migrations dir, and dormant PR watches against a stale running floor.
+    Admin is the shell that maintains main directly and, before this, was the
+    only shell given no drift line at all.
+
+    STRICTLY READ-ONLY. sync_worktree may `reset --hard` a shell base; this must
+    never touch the main checkout — the server is running from it and a reset
+    would discard whatever the operator has in flight. Soft-fails like its
+    sibling: an offline boot must not block on a drift check.
+    """
+    default = (os.environ.get("SC_PROTECTED_BRANCHES") or "main").split()[0]
+    upstream = f"origin/{default}"
+    try:
+        if _git(repo_root, "rev-parse", "--verify", "--quiet",
+                upstream).returncode != 0:
+            return None
+        behind = int(_git(repo_root, "rev-list", "--count",
+                          f"HEAD..{upstream}").stdout.strip() or 0)
+        if behind == 0:
+            return f"engine floor current with {upstream}"
+        return (f"\u26a0 engine floor is {behind} commit(s) BEHIND {upstream} — "
+                f"your `./sc`, the live DB and the running server all resolve "
+                f"from `{repo_root}`, so commands may answer from stale code. "
+                "Verify engine claims with `git show origin/"
+                f"{default}:<path>` rather than the working tree, and ask the "
+                "FnB to pull + reconcile (restart is theirs; it kills live "
+                "sessions).")
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+
+
 def ensure_harness_path() -> None:
     """Prepend the dirs where the official installers drop harness binaries onto
     this process's PATH, so detection (shutil.which) and exec (execvpe) agree
@@ -507,6 +618,40 @@ def open_db():
     return con
 
 
+def browser_conversation_active(con, shell_id: int) -> bool:
+    """Does an open browser chat own this shell's single session slot?"""
+    try:
+        row = con.execute(
+            "SELECT COUNT(*) FROM conversations WHERE shell_id=? "
+            "AND state!='closed'",
+            (shell_id,),
+        ).fetchone()
+        return row is not None and int(row[0]) > 0
+    except db_driver.OperationalError as exc:
+        # An older, not-yet-migrated fork has no conversation tables. Its
+        # existing CLI launch path must remain usable. Other DB failures must
+        # stay fail-closed instead of silently permitting a second surface.
+        if "no such table: conversations" in str(exc):
+            return False
+        raise
+    except (IndexError, KeyError, TypeError, ValueError):
+        # Mock/partial databases used by launcher tests do not assert a lease.
+        return False
+
+
+def browser_conversation_shell_ids(con) -> set[int]:
+    """Shells whose single session slot is owned by an open browser chat."""
+    try:
+        rows = con.execute(
+            "SELECT DISTINCT shell_id FROM conversations WHERE state!='closed'"
+        ).fetchall()
+        return {int(row[0]) for row in rows}
+    except db_driver.OperationalError as exc:
+        if "no such table: conversations" in str(exc):
+            return set()
+        raise
+
+
 # ── Auth (username-only) ────────────────────────────────────────────────────
 
 def authenticate(con, interactive: bool = True):
@@ -545,20 +690,9 @@ def list_shells(con, user_id: int) -> list:
         "ORDER BY flavor IS NULL, flavor, shell_id",
         (user_id,),
     ).fetchall()]
-    refs_by_shell = [_sprint_doc_refs(shell) for shell in shells]
-    referenced = set().union(*refs_by_shell)
-    active = set()
-    if referenced:
-        placeholders = ",".join("?" for _ in referenced)
-        docs = con.execute(
-            f"SELECT document_id, frozen, body FROM documents "
-            f"WHERE kind='doc' AND document_id IN ({placeholders})",
-            tuple(sorted(referenced)),
-        ).fetchall()
-        active = {doc["document_id"] for doc in docs
-                  if _sprint_doc_is_active(doc)}
-    for shell, refs in zip(shells, refs_by_shell):
-        shell["sprint_reserved"] = bool(refs & active)
+    browser_shell_ids = browser_conversation_shell_ids(con)
+    for shell in shells:
+        shell["browser_active"] = shell["shell_id"] in browser_shell_ids
     return shells
 
 
@@ -594,42 +728,12 @@ def _default_label(defaults: dict, flavor: str | None) -> str:
     return harness + (f" · {model.split('/')[-1]}" if model else "")
 
 
-def _sprint_doc_refs(shell) -> set[int]:
-    """Tracker document ids named by current_state's sprint marker lines."""
-    current_state = dict(shell).get("current_state") or ""
-    refs = set()
-    prefix = "SPRINT doc="
-    for line in current_state.splitlines():
-        marker = line.strip()
-        if not marker.startswith(prefix):
-            continue
-        value = marker[len(prefix):].split(maxsplit=1)[0]
-        if value.isdigit():
-            refs.add(int(value))
-    return refs
-
-
-def _sprint_doc_is_active(doc) -> bool:
-    """The tracker contract says ACTIVE, and freeze has not revoked authority."""
-    if doc["frozen"]:
-        return False
-    for line in (doc["body"] or "").splitlines():
-        field, separator, value = line.strip().partition(":")
-        if field == "status" and separator:
-            status = value.strip().split(maxsplit=1)
-            return bool(status) and status[0] == "ACTIVE"
-    return False
-
-
-def _is_sprint_reserved(shell) -> bool:
-    """Picker-only annotation computed by list_shells; never a boot gate."""
-    return bool(dict(shell).get("sprint_reserved"))
-
-
 def _shell_status(shell, snap: "dict | None") -> str:
-    """Styled picker status derived from liveness plus sprint reservation."""
+    """Styled picker status derived from liveness."""
     if shell["flavor"] == "admin":
         label, paint = "Exempt", style.dim
+    elif dict(shell).get("browser_active"):
+        label, paint = "BROWSER", style.red
     elif not snap or not snap.get("supported"):
         label, paint = "Unknown", style.dim
     else:
@@ -640,8 +744,6 @@ def _shell_status(shell, snap: "dict | None") -> str:
             label, paint = "Orphaned", style.red
         elif snap.get("indeterminate"):
             label, paint = "Unknown", style.dim
-        elif _is_sprint_reserved(shell):
-            label, paint = "Sprint", style.amber
         else:
             label, paint = "Available", style.green
     return f"{paint(label)}{' ' * (12 - len(label))}"
@@ -743,15 +845,17 @@ def session_provider(harness: str, model: "str | None") -> "str | None":
     return model_catalog.HARNESS_PROVIDER.get(harness)
 
 
-def open_session(con, shell_id: int,
-                 lifecycle: "dict | None" = None) -> tuple[str, int]:
-    """`lifecycle` carries the launch telemetry persisted onto the archive row
-    (started_at/harness/provider/model/sprint_ref — migration 0071). ended_at is
-    NOT written here: run.py execs the harness, so no code runs at exit; the
-    analytics sweep backfills it from harness session data."""
-    life = {"started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            **(lifecycle or {})}
-    life_cols = ["started_at", "harness", "provider", "model", "sprint_ref"]
+class SessionOpenError(RuntimeError):
+    """A bounded session-open refusal that is safe to show to the operator."""
+
+
+def _is_db_busy(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
+def _write_session(con, shell_id: int, life: dict,
+                   life_cols: list[str]) -> tuple[str, int]:
     # Reuse the active session if it was opened but never used (e.g. install
     # opened session 0001, or a prior launch did no work) — avoids phantom empty
     # sessions and the incidental first-snapshot diff. The reused stub becomes
@@ -776,7 +880,6 @@ def open_session(con, shell_id: int,
                 f"UPDATE shell_memory_archives SET {', '.join(c + '=?' for c in life_cols)} "
                 "WHERE archive_id=?",
                 [life.get(c) for c in life_cols] + [row["archive_id"]])
-            con.commit()
             return row["session_id"], row["archive_id"]
 
     last = con.execute(
@@ -796,14 +899,304 @@ def open_session(con, shell_id: int,
     archive_id = cur.lastrowid
     con.execute("UPDATE shells SET active_archive_id=? WHERE shell_id=?",
                 (archive_id, shell_id))
-    con.commit()
     return session_id, archive_id
+
+
+def open_session(con, shell_id: int,
+                 lifecycle: "dict | None" = None) -> tuple[str, int]:
+    """Atomically open a lifecycle archive, with bounded lock retries.
+
+    `lifecycle` carries the launch telemetry persisted onto the archive row
+    (started_at/harness/provider/model). ended_at is
+    NOT written here: run.py execs the harness, so no code runs at exit; the
+    analytics sweep backfills it from harness session data.
+
+    Launch connections enter with no transaction. BEGIN IMMEDIATE obtains the
+    writer reservation before the read/allocate/write sequence, so a retry
+    always restarts from fresh state and can never leave a half-open archive.
+    shell_factory calls inside its own write transaction; preserve its existing
+    transaction and commit contract rather than nesting BEGIN.
+    """
+    life = {"started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            **(lifecycle or {})}
+    life_cols = ["started_at", "harness", "provider", "model"]
+    delays = SESSION_OPEN_RETRY_DELAYS_S if not con.in_transaction else ()
+    attempts = len(delays) + 1
+
+    for attempt in range(attempts):
+        try:
+            if not con.in_transaction:
+                con.execute("BEGIN IMMEDIATE")
+            result = _write_session(con, shell_id, life, life_cols)
+            con.commit()
+            return result
+        except db_driver.OperationalError as exc:
+            con.rollback()
+            if not _is_db_busy(exc):
+                raise
+            if attempt < len(delays):
+                time.sleep(delays[attempt])
+                continue
+            wait_ms = con.execute("PRAGMA busy_timeout").fetchone()[0]
+            raise SessionOpenError(
+                f"engine DB remained busy across {attempts} bounded "
+                f"session-open attempt(s) (up to {wait_ms} ms each); no session "
+                "or archive was created. Retry after the concurrent engine write "
+                "finishes; if this persists, inspect the engine API/worker logs "
+                "for a long-running DB writer."
+            ) from exc
+        except Exception:
+            con.rollback()
+            raise
+
+    raise AssertionError("unreachable")
 
 
 def atomic_write(path: Path, content: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content)
     os.replace(tmp, path)
+
+
+# ── Programmatic launch (Interface pane entrypoint, spec #20) ──────────────
+
+class LaunchError(Exception):
+    """A prepare_launch refusal: bad shell, unresolvable route, or a harness
+    that cannot take the requested model/effort. The caller (interface_exec)
+    maps this to its own exit code; it never reaches the operator as a
+    traceback."""
+
+
+class LaunchPlan(NamedTuple):
+    """Everything an engine-driven launcher needs to BECOME the harness:
+    the exec argv, the fully-injected env, the cwd to exec from, and the
+    session identifiers the launcher reports back to the API."""
+    argv: list[str]
+    env: dict[str, str]
+    cwd: str
+    session_id: str
+    archive_id: int
+    harness: str
+    model: "str | None"
+    effort: "str | None"
+    cli_version: "str | None"
+
+
+def _cli_version(binary: str) -> "str | None":
+    """Best-effort `<binary> --version` first line, for the session_start
+    hook's cli_version telemetry. Cheap and never load-bearing: any failure
+    (not on PATH, slow, odd output) degrades to None."""
+    path = shutil.which(binary)
+    if not path:
+        return None
+    try:
+        out = subprocess.run([path, "--version"],
+                             capture_output=True, text=True, timeout=3)
+    except Exception:
+        return None
+    lines = (out.stdout or out.stderr or "").strip().splitlines()
+    return lines[0].strip() if lines else None
+
+
+def prepare_launch(*, shell_id: int, harness: "str | None" = None,
+                   model: "str | None" = None, effort: "str | None" = None,
+                   headless_prompt: "str | None" = None) -> LaunchPlan:
+    """Prepare a launch exactly as main() would, without any TTY.
+
+    A browser chat uses the normal harness, model, effort, permission,
+    worktree, render, boot, and archive
+    paths. This is that path as a library call: it runs main()'s boot
+    pipeline step-for-step — authenticate, session archive, worktree
+    ensure/sync, boot-doc + skill render, adapter emit + config merges,
+    sandbox permission flags, env injection — and returns the plan instead
+    of exec'ing. What it deliberately does NOT do: pickers (harness/model
+    resolve from the argument or the shell's flavor_defaults, never a
+    prompt), the liveness confirm (the Interface reservation capability is
+    the gate — the caller refuses before this runs), the banner/spinner/
+    boot summary, tab titles, and git_prune (a hygiene sweep for human
+    boots; an engine-driven pane launch must never delete branches).
+
+    Raises LaunchError on a refusal it owns; shared helpers that predate
+    this seam (open_db, authenticate, ensure_worktree) still sys.exit, so
+    callers must also treat SystemExit as a refusal."""
+    headless = headless_prompt is not None
+    con = open_db()
+    # Same best-effort skill heal as main() — compose's SKILLS block reads
+    # what this repairs. RENDER_ONLY never mutates, here as there.
+    if not os.environ.get("RENDER_ONLY"):
+        try:
+            seed_skills.sync_engine_skills(con)
+        except Exception:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+
+    user = authenticate(con, interactive=False)
+    fdefaults = flavor_defaults(con)
+    # The shell pick, non-interactively: the reservation names the shell_id;
+    # it must be one this user could have picked (own or shared, not deleted).
+    row = con.execute(
+        "SELECT shell_id, display_name, shortname, mandate, is_shared, flavor, "
+        "current_state FROM shells "
+        "WHERE shell_id=? AND (user_id=? OR is_shared=1) "
+        "AND COALESCE(is_deleted,0)=0",
+        (shell_id, user["user_id"]),
+    ).fetchone()
+    if row is None:
+        con.close()
+        raise LaunchError(
+            f"shell_id {shell_id} is not launchable by '{user['username']}' "
+            "(unknown, deleted, or neither owned nor shared)")
+    chosen = dict(row)
+
+    # Harness route, picker-free: the reservation's harness wins; else this
+    # flavor's default harness; else instance.json / 'claude' — the same
+    # fallback chain main() feeds its picker as the default.
+    fdef = fdefaults.get(chosen["flavor"])
+    ensure_harness_path()
+    harness = (harness or (fdef["default_harness"] if fdef else None)
+               or _configured_harness() or "claude")
+    adapter = load_adapter(harness)
+
+    # Model route: an explicit model wins; else the (flavor, harness) cell,
+    # exactly main()'s flavor_defaults routing. Effort mirrors main(): a
+    # headless plan defaults to high only when the adapter can transport it;
+    # OpenCode's no-effort seam stays unset instead of failing before launch.
+    flavor_model = fdef["models"].get(harness) if fdef else None
+    session_model = model or flavor_model
+    session_effort = (
+        effort if effort is not None
+        else (default_headless_effort(adapter) if headless else None)
+    )
+    if headless:
+        try:
+            validate_headless_request(adapter, session_model, session_effort)
+        except ValueError as e:
+            con.close()
+            raise LaunchError(str(e)) from e
+
+    # Pre-session analytics sweep — same correctness dependency as main():
+    # open_session's stub-reuse check relies on the previous boot's usage
+    # already being attributed. Best-effort; RENDER_ONLY never mutates.
+    if not os.environ.get("RENDER_ONLY"):
+        try:
+            import analytics
+            analytics.sweep(quiet=True)
+        except Exception:
+            pass
+
+    try:
+        session_id, archive_id = open_session(con, shell_id, lifecycle={
+            "harness": harness,
+            "provider": session_provider(harness, session_model),
+            "model": session_model,
+        })
+    except SessionOpenError as exc:
+        con.close()
+        raise LaunchError(str(exc)) from exc
+
+    full = con.execute(
+        "SELECT shell_id, display_name, shortname, partner, role, mandate, "
+        "current_state, system_prompt, connections, flavor, api_key FROM shells WHERE shell_id=?",
+        (shell_id,),
+    ).fetchone()
+    api_port = ports_mod.resolve().get("port")
+
+    # Worktree: identical rule to main() — every non-admin shell boots in
+    # .sc-worktrees/<shortname>; admin boots at the repo root.
+    work_dir = shell_work_dir(chosen["shortname"], chosen["flavor"])
+    sync_note = None
+    if work_dir != REPO_ROOT:
+        ensure_worktree(work_dir, chosen["shortname"])
+        sync_note = sync_worktree(work_dir, chosen["shortname"])
+        link_worktree_map(work_dir)
+        if harness == "codex":
+            trust_codex_worktree(work_dir)
+    # Every shell — including admin at the repo root — is told whether the tree
+    # its ./sc resolves from is current. Read-only; never syncs main.
+    floor_note = main_checkout_note(REPO_ROOT)
+
+    content = compose_boot(con, full, user, session_id, archive_id,
+                           work_dir=work_dir if work_dir != REPO_ROOT else None,
+                           sync_note=sync_note,
+                           floor_note=floor_note,
+                           source_mode=install.is_source_repo(),
+                           api_key=full["api_key"],
+                           api_port=api_port)
+    render_harness_skills(
+        con, full["shell_id"], work_dir, adapter
+    )
+    con.close()
+    for name in ("CLAUDE.md", "AGENTS.md"):
+        atomic_write(work_dir / name, content)
+
+    # Adapter seam: emitted config, plugin path resolution, always-on and
+    # sandbox-only JSON merges — the same permission/config files a normal
+    # boot writes.
+    emit_adapter(adapter, work_dir)
+    resolve_opencode_plugins(work_dir)
+    apply_merge_json(adapter, work_dir)
+    apply_sandbox(adapter, work_dir)
+
+    # Interactive model routing (main()'s non-headless block): the adapter
+    # declares a launch flag or a config-file key for the resolved model.
+    model_args: list[str] = []
+    mcfg = adapter.get("model") or {}
+    if headless:
+        pass
+    elif session_model and mcfg.get("flag"):
+        model_args = [mcfg["flag"], session_model]
+    elif session_model and mcfg.get("file"):
+        mfile = work_dir / mcfg["file"]
+        if mfile.exists():
+            try:
+                cfg = json.loads(mfile.read_text())
+            except (json.JSONDecodeError, OSError):
+                cfg = {}
+            cfg[mcfg.get("key", "model")] = session_model
+            atomic_write(mfile, json.dumps(cfg, indent=2) + "\n")
+
+    # Sandbox elevation, main()'s split kept: launch_flags for the TUI,
+    # headless_flags for a non-interactive plan, plus sandbox-only env.
+    sandbox_flags: list[str] = []
+    sandbox_env: dict[str, str] = {}
+    if os.environ.get("SC_SANDBOX"):
+        scfg = adapter.get("sandbox") or {}
+        key = "headless_flags" if headless else "launch_flags"
+        sandbox_flags = list(scfg.get(key) or [])
+        sandbox_env = {k: str(v) for k, v in (scfg.get("env") or {}).items()}
+
+    name_args: list[str] = []
+    ncfg = adapter.get("name") or {}
+    if not headless and ncfg.get("flag") and full["display_name"]:
+        name_args = [ncfg["flag"], full["display_name"]]
+
+    if headless:
+        argv = headless_command(adapter, headless_prompt, session_model,
+                                sandbox_flags, session_effort)
+        if argv is None:
+            raise LaunchError(f"harness '{harness}' has no headless adapter")
+    else:
+        argv = list(adapter.get("launch") or [harness]) + name_args + model_args + sandbox_flags
+
+    # Env injection, verbatim from main()'s exec block: adapter env, sandbox
+    # env, effort env, then the engine's own SC_* contract + PATH prepend.
+    effort_env = headless_effort_env(adapter, session_effort) if headless else {}
+    env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()},
+           **sandbox_env, **effort_env}
+    env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
+    env["SC_API_TOKEN"] = full["api_key"] or ""
+    env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""
+    env["SC_ENGINE_DIR"] = str(ENGINE)
+    env["SC_SHELL_WORKTREE"] = str(work_dir)
+    env["SC_ROOT"] = str(REPO_ROOT)
+    env["PATH"] = os.pathsep.join([str(REPO_ROOT), env.get("PATH", "")])
+
+    return LaunchPlan(argv=argv, env=env, cwd=str(work_dir),
+                      session_id=session_id, archive_id=archive_id,
+                      harness=harness, model=session_model,
+                      effort=session_effort, cli_version=_cli_version(argv[0]))
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -831,6 +1224,33 @@ def review_gui_panel(api_port: int, has_key: bool) -> str:
 
 
 def main() -> None:
+    source_repo = install.is_source_repo()
+    tracked_engine = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(REPO_ROOT),
+            "ls-files",
+            "--error-unmatch",
+            ".super-coder/scripts/run.py",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+    owns_engine = (
+        source_repo
+        or tracked_engine
+        or (REPO_ROOT / ".sc-state" / "ejected").is_file()
+    )
+    callable_floor.require_callable_floor(
+        REPO_ROOT,
+        expected_ref=(
+            None if owns_engine else callable_floor.read_engine_ref(REPO_ROOT)
+        ),
+        allow_unpinned=owns_engine,
+        context="session launch",
+    )
     args = sys.argv[1:]
     first = "--first" in args
     headless = "--headless" in args
@@ -845,6 +1265,9 @@ def main() -> None:
     i = 0
     while i < len(args):
         a = args[i]
+        if a in ("--first", "--headless"):
+            i += 1
+            continue
         if a == "--harness":
             flag_harness = args[i + 1] if i + 1 < len(args) else None
             i += 2
@@ -869,6 +1292,8 @@ def main() -> None:
             flag_effort = a.split("=", 1)[1]
         elif a.startswith("--prompt="):
             prompt = a.split("=", 1)[1]
+        elif a.startswith("-"):
+            sys.exit(f"session launch: unknown option {a!r}")
         elif not a.startswith("-"):
             positional.append(a)
         i += 1
@@ -904,14 +1329,20 @@ def main() -> None:
     user = authenticate(con, interactive=not headless)
     fdefaults = flavor_defaults(con)
     # Liveness snapshot for the interactive picker: one /proc pass (ms) so the
-    # boot list can show shell status — Busy / Orphaned / Sprint / Available /
-    # Exempt — and
+    # boot list can show shell status — BROWSER / Busy / Orphaned /
+    # Available / Exempt — and
     # confirm before booting into a live worktree. Headless keeps its own lazy
     # compute below; non-TTY boots (--first, piped) can't confirm, so no snap.
     snap = (shell_liveness.compute()
             if not headless and sys.stdin.isatty() else None)
-    chosen = pick_shell(list_shells(con, user["user_id"]), requested, first,
-                        fdefaults, snap)
+    launchable = list_shells(con, user["user_id"])
+    chosen = pick_shell(launchable, requested, first, fdefaults, snap)
+    if browser_conversation_active(con, chosen["shell_id"]):
+        con.close()
+        sys.exit(
+            f"shell '{chosen['shortname']}': Browser chat is open. "
+            "Close it in Interface before starting a CLI session."
+        )
     # Direct interactive boots (`./sc enter dev3`) skip the picker and its
     # confirm — run the same guard here. Picker path already confirmed.
     if requested and not headless and not confirm_live(chosen, snap):
@@ -963,13 +1394,16 @@ def main() -> None:
                or default_harness)
 
     # Resolve + validate the complete headless route before opening a session.
-    # `sc run` is the sprint-worker primitive, so high effort is its default;
-    # the orchestration skill passes it explicitly as well for auditability.
+    # High effort is the default where the harness exposes an effort seam.
+    # OpenCode exposes none and keeps the model's own default.
     flavor_model = fdef["models"].get(harness) if fdef else None
+    adapter = load_adapter(harness)
     session_model = (resolve_headless_model(flag_model, fdef, harness)
                      if headless else flavor_model)
-    session_effort = flag_effort or ("high" if headless else None)
-    adapter = load_adapter(harness)
+    session_effort = (
+        flag_effort if flag_effort is not None
+        else (default_headless_effort(adapter) if headless else None)
+    )
     if headless:
         try:
             validate_headless_request(adapter, session_model, session_effort)
@@ -1006,12 +1440,16 @@ def main() -> None:
         # The model this launch will actually route (headless resolves via flags →
         # flavor default; interactive routes the flavor default). None = the harness
         # picks its own — recorded as NULL, honest about what we know at boot.
-        session_id, archive_id = open_session(con, chosen["shell_id"], lifecycle={
-            "harness": harness,
-            "provider": session_provider(harness, session_model),
-            "model": session_model,
-            "sprint_ref": os.environ.get("SC_SPRINT_REF") or None,
-        })
+        try:
+            session_id, archive_id = open_session(con, chosen["shell_id"], lifecycle={
+                "harness": harness,
+                "provider": session_provider(harness, session_model),
+                "model": session_model,
+            })
+        except SessionOpenError as exc:
+            con.close()
+            prefix = "sc run" if headless else "session launch"
+            sys.exit(f"{prefix}: {exc}")
 
         full = con.execute(
             "SELECT shell_id, display_name, shortname, partner, role, mandate, "
@@ -1029,16 +1467,18 @@ def main() -> None:
         # it maintains `main` itself (engine updates, migrations, applying approved
         # patches), so it boots in the repo root — no worktree, no shell/* branch.
         # The branch-guard exempts it via SC_SHELL_FLAVOR (exported at exec below).
-        work_dir = REPO_ROOT
+        work_dir = shell_work_dir(chosen["shortname"], chosen["flavor"])
         sync_note = None
-        if chosen["shortname"] and chosen["flavor"] != "admin":
+        if work_dir != REPO_ROOT:
             spinner.label = "syncing worktree"
-            work_dir = REPO_ROOT / ".sc-worktrees" / chosen["shortname"].lower()
             ensure_worktree(work_dir, chosen["shortname"])
             sync_note = sync_worktree(work_dir, chosen["shortname"])
             map_note = link_worktree_map(work_dir)
             if harness == "codex":
                 trust_note = trust_codex_worktree(work_dir)
+        # Read-only floor check for EVERY shell, admin included — see
+        # main_checkout_note. The tree ./sc resolves from is not the shell's own.
+        floor_note = main_checkout_note(REPO_ROOT)
 
         # Repo-global branch hygiene: delete local branches whose PR is provably
         # merged (git_hygiene's `stale` set — gh-confirmed MERGED, never a base or a
@@ -1059,15 +1499,18 @@ def main() -> None:
         content = compose_boot(con, full, user, session_id, archive_id,
                                work_dir=work_dir if work_dir != REPO_ROOT else None,
                                sync_note=sync_note,
+                               floor_note=floor_note,
                                source_mode=install.is_source_repo(),
                                work_repo=install.work_repo(),
                                sandbox_mode=bool(os.environ.get("SC_SANDBOX")),
                                api_key=full["api_key"],
                                api_port=api_port)
 
-        # Render this shell's granted skills to .claude/skills/<name>/SKILL.md —
-        # harness-consumed, gitignored, rebuilt per boot (like the boot artifact).
-        skills = flat.render_skill_md(con, full["shell_id"], work_dir)
+        # Render this shell's granted skills to every directory declared by the
+        # selected harness — gitignored and rebuilt per boot.
+        skills = render_harness_skills(
+            con, full["shell_id"], work_dir, adapter
+        )
         con.close()
 
         # One compose, two outputs — Claude Code reads CLAUDE.md, the AGENTS.md
@@ -1097,8 +1540,10 @@ def main() -> None:
     print(f"→ wrote {work_dir / 'AGENTS.md'}")
     if headless and api_port and full["api_key"]:
         print(f"→ api: http://127.0.0.1:{api_port} (SC_API_TOKEN set)")
-    print(f"→ skills: {len(skills['written'])} written, "
-          f"{len(skills['skipped'])} unchanged → .claude/skills/")
+    print(f"→ skills: {len(skills['written'])} changed "
+          f"({len(skills['deleted'])} deleted), "
+          f"{len(skills['skipped'])} unchanged → "
+          f"{', '.join(skills['dirs'])}")
 
     # Harness was resolved up front (override / picker / default); the adapter
     # seam owns the launch command + any harness-specific config to emit.
@@ -1180,8 +1625,9 @@ def main() -> None:
     headless_cmd = None
     if headless:
         hmodel = session_model  # resolved up front (persisted on the archive row)
+        effective_prompt = prompt or DEFAULT_HEADLESS_PROMPT
         headless_cmd = headless_command(
-            adapter, prompt or DEFAULT_HEADLESS_PROMPT, hmodel, mode_flags,
+            adapter, effective_prompt, hmodel, mode_flags,
             session_effort)
         if headless_cmd is None:
             sys.exit(f"sc run: harness '{harness}' has no headless adapter — "
@@ -1190,7 +1636,7 @@ def main() -> None:
             src = "explicit -m" if flag_model else f"flavor default for {chosen['flavor']}"
             print(f"→ model: {hmodel} ({src})")
         print(f"→ effort: {session_effort}")
-        print(f"→ headless prompt: {(prompt or DEFAULT_HEADLESS_PROMPT)[:120]}")
+        print(f"→ headless prompt: {effective_prompt[:120]}")
 
     # Close the boot summary with the review GUI — the link lives in a different
     # place per fork, so every interactive boot restates it where it can't be
@@ -1256,9 +1702,94 @@ def main() -> None:
     # supported env var alongside SC_PROTECTED_BRANCHES and SC_SHELL_WORKTREE.
     if not headless:
         set_terminal_tab_title(full["display_name"])
+    # H-25: claim the pid we are ABOUT to become for this shell.
+    record_launch(full["shell_id"], work_dir, harness, headless=headless)
     os.chdir(work_dir)
     print(f"→ exec {' '.join(cmd)}\n")
     os.execvpe(cmd[0], cmd, env)
+
+
+def _self_start_ticks() -> "int | None":
+    """This process's start time — /proc/<pid>/stat field 22.
+
+    The discriminator that makes a recorded pid safe to trust later: a pid on
+    its own is a reusable integer, so a record naming a dead worker would
+    resurrect as a false "working" the moment the kernel handed that number to
+    something unrelated. execvpe does not reset the value — it belongs to the
+    PROCESS, not to the program image — so reading it here, before the exec,
+    describes the harness that is about to replace us.
+
+    comm (field 2) may contain spaces and parens, so the split starts after the
+    final ')': rest[0] is state (field 3), rest[19] is starttime (field 22) —
+    the same indexing shell_liveness._stat_fields already uses.
+    """
+    try:
+        data = (PROC_SELF_STAT).read_text()
+    except OSError:
+        return None
+    rest = data[data.rfind(")") + 2:].split()
+    try:
+        return int(rest[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def record_launch(shell_id: int, work_dir: Path, harness: "str | None",
+                  *, headless: bool) -> None:
+    """Record the harness pid this launch is about to become (spec #76 H-25).
+
+    HEADLESS ONLY, deliberately — hence the parameter rather than a caller-side
+    `if`: the rule is the requirement, so it is stated and tested here. A
+    headless worker runs detached — no controlling TTY, launcher gone,
+    ppid==1 — so the
+    lineage scan can only ever call it 'detached' and project 'unreconciled';
+    between relaunches nothing holds the worktree at all and the same shell
+    projects 'available'. The record is what replaces that inference. An
+    INTERACTIVE boot has a live parent, which the lineage scan reads correctly
+    today, and recording one would suppress a TRUE orphan verdict — a closed
+    terminal's survivor would arrive pre-claimed and the operator would never be
+    told to clear it. So the claim covers exactly the launches whose lineage is
+    unreadable, and no others.
+
+    One row per shell, upserted: the newest launch is the only claim, which is
+    what "re-stamped on each relaunch" means. Accepted cost, stated in the spec's
+    own terms: run.py execs and never returns, so nothing clears the row at exit
+    — a worker that has finished for good keeps reading expected-but-absent
+    until its next launch. That is the honest reading ("the record claimed a
+    worker here; it is gone") and it is the evidence row feature #27's compare
+    consumes; deciding whether an absence is a FAULT stays with #27.
+
+    Best-effort: a failed stamp must never block a boot. The only consequence is
+    that this session falls back to the lineage scan — where it was before.
+    """
+    if not headless:
+        return
+    ticks = _self_start_ticks()
+    if ticks is None:
+        return                       # non-Linux / unreadable — no claim to make
+    try:
+        con = open_db()
+    except SystemExit:
+        return
+    try:
+        con.execute(
+            "INSERT INTO shell_launch_records "
+            "(shell_id, pid, start_ticks, worktree, harness, launched_at) "
+            "VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(shell_id) DO UPDATE SET "
+            " pid=excluded.pid, start_ticks=excluded.start_ticks,"
+            " worktree=excluded.worktree, harness=excluded.harness,"
+            " launched_at=excluded.launched_at",
+            (shell_id, os.getpid(), ticks, str(work_dir), harness,
+             datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
+        )
+        con.commit()
+    except (db_driver.OperationalError, db_driver.IntegrityError):
+        # An un-migrated fork (no such table) or a busy writer. Neither is worth
+        # a boot failure; the lineage fallback still answers.
+        con.rollback()
+    finally:
+        con.close()
 
 
 def set_terminal_tab_title(name: str) -> None:
@@ -1294,4 +1825,6 @@ def set_terminal_tab_title(name: str) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from cli_entry import run_cli
+
+    run_cli(main)

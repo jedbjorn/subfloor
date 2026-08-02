@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Tests that `./sc snapshot` never serializes live credentials to content.sql.
 
-content.sql is git-tracked. The `shells` table carries each shell's `api_key`
+The `shells` table carries each shell's `api_key`
 (its bearer token, provisioned by the server's startup backfill) and the `users`
 table carries `password_*` auth fields. A snapshot taken while keys are
-provisioned must NOT write those into the committed file — and the bare
+provisioned must NOT write those into the portable snapshot — and the bare
 `token_urlsafe` format is not caught by the gitleaks default ruleset, so the
 serializer is the only line of defense. These build a throwaway engine DB with a
 keyed shell + a user with password fields, run the real `snapshot.dump_table`,
@@ -88,6 +88,21 @@ class SnapshotSecretsTest(unittest.TestCase):
             live = {r[1] for r in self.con.execute(f"PRAGMA table_info({table})")}
             missing = cols - live
             self.assertFalse(missing, f"{table}: SENSITIVE_COLUMNS names not in schema: {missing}")
+
+    def test_retired_interface_and_wake_audit_is_not_snapshotted(self):
+        retired = {
+            "interface_generations",
+            "interface_sessions",
+            "interface_input_state",
+            "interface_idempotency_keys",
+            "interface_writer_leases",
+            "sprint_planner_bindings",
+            "planner_wake_batches",
+            "planner_wake_items",
+            "planner_action_receipts",
+        }
+        self.assertTrue(retired.isdisjoint(snapshot.PER_INSTANCE_TABLES))
+        self.assertTrue(retired.isdisjoint(snapshot.SNAPSHOT_ROW_FILTERS))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,16 @@
+{
+  "createdAt": "2026-07-25T11:33:21.266Z",
+  "updatedAt": "2026-07-25T11:33:29.114Z",
+  "title": "Reply with exactly one word: ALPHA",
+  "isCustomTitle": false,
+  "agents": {
+    "main": {
+      "homedir": "/home/j3d1/.kimi-code/sessions/wd_kimi-single_0ecc7feae05c/session_fb0a7580-03b1-4b78-bba2-cc84be32cea0/agents/main",
+      "type": "main",
+      "parentAgentId": null
+    }
+  },
+  "custom": {},
+  "workDir": "/tmp/lm-capture/kimi-single",
+  "lastPrompt": "Reply with exactly one word: BRAVO"
+}

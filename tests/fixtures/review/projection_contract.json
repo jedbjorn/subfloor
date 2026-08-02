@@ -1,0 +1,158 @@
+{
+  "contract_version": 1,
+  "target_kinds": {
+    "workspace": {
+      "stable_identity": [
+        "conversation_id",
+        "observed_worktree"
+      ]
+    },
+    "local_branch": {
+      "stable_identity": [
+        "target_id",
+        "branch_name",
+        "first_head_sha"
+      ]
+    },
+    "pull_request": {
+      "stable_identity": [
+        "repository",
+        "pr_number"
+      ]
+    }
+  },
+  "lifecycle_statuses": {
+    "local_branch": "LOCAL BRANCH",
+    "pushed": "PUSHED",
+    "pr_open": "PR OPEN",
+    "checks_failed": "CHECKS FAILED",
+    "pr_merged": "PR MERGED",
+    "pr_closed": "PR CLOSED",
+    "remote_unknown": "REMOTE UNKNOWN"
+  },
+  "comparison_scopes": {
+    "review": {
+      "question": "What does this branch or PR introduce?",
+      "local_source": "merge-base-to-selected-head-or-worktree",
+      "remote_source": "canonical-pr-patch"
+    },
+    "local": {
+      "question": "What is present locally but absent from the selected PR or head?",
+      "local_source": "selected-head-to-index-and-worktree"
+    },
+    "commits": {
+      "question": "Which commits belong to this change set?",
+      "local_source": "merge-base-to-selected-head"
+    }
+  },
+  "freshness_states": [
+    "fresh",
+    "cached",
+    "unavailable"
+  ],
+  "freshness_fields": {
+    "local": [
+      "observed_at",
+      "base_sha",
+      "head_sha",
+      "fingerprint"
+    ],
+    "remote": [
+      "state",
+      "refreshed_at"
+    ]
+  },
+  "error_codes": [
+    "REVIEW_TARGET_NOT_FOUND",
+    "REVIEW_TARGET_UNAVAILABLE",
+    "REVIEW_WORKTREE_MISSING",
+    "REVIEW_NOT_A_GIT_REPOSITORY",
+    "REVIEW_REF_MISSING",
+    "REVIEW_REMOTE_UNAVAILABLE",
+    "REVIEW_PATH_INVALID",
+    "REVIEW_DIFF_TOO_LARGE",
+    "REVIEW_TARGET_CHANGED"
+  ],
+  "scenario_expectations": {
+    "clean": {
+      "selected_kind": "workspace",
+      "lifecycle": null,
+      "empty_reason": "clean_workspace"
+    },
+    "dirty": {
+      "selected_kind": "workspace",
+      "lifecycle": "local_branch",
+      "facts": [
+        "dirty_files"
+      ]
+    },
+    "local": {
+      "selected_kind": "local_branch",
+      "lifecycle": "local_branch"
+    },
+    "pushed": {
+      "selected_kind": "local_branch",
+      "lifecycle": "pushed"
+    },
+    "open": {
+      "selected_kind": "pull_request",
+      "lifecycle": "pr_open",
+      "remote_freshness": "fresh"
+    },
+    "checks_failed": {
+      "selected_kind": "pull_request",
+      "lifecycle": "checks_failed",
+      "remote_freshness": "fresh"
+    },
+    "closed": {
+      "selected_kind": "pull_request",
+      "lifecycle": "pr_closed",
+      "remote_freshness": "fresh"
+    },
+    "squash_merged": {
+      "selected_kind": "pull_request",
+      "lifecycle": "pr_merged",
+      "remote_overrides_ancestry": true
+    },
+    "retained_behind": {
+      "selected_kind": "pull_request",
+      "lifecycle": "pr_merged",
+      "facts": [
+        "cleanup_pending",
+        "local_base_not_refreshed"
+      ]
+    },
+    "pruned": {
+      "selected_kind": "pull_request",
+      "lifecycle": "pr_merged",
+      "facts": [
+        "branch_pruned"
+      ]
+    },
+    "branch_reuse": {
+      "selected_kind": "pull_request",
+      "target_count": 2,
+      "identity_field": "pr_number"
+    },
+    "offline_cached": {
+      "selected_kind": "pull_request",
+      "lifecycle": "pr_open",
+      "remote_freshness": "cached"
+    },
+    "offline_uncached": {
+      "selected_kind": "local_branch",
+      "lifecycle": "remote_unknown",
+      "remote_freshness": "unavailable"
+    }
+  },
+  "file_states": [
+    "added",
+    "modified",
+    "deleted",
+    "renamed",
+    "untracked",
+    "conflict",
+    "binary",
+    "oversized"
+  ]
+}

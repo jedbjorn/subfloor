@@ -2,7 +2,7 @@
 """Resolve, open, and seed the map DB — the repo catalogue (dr_*).
 
 The map is a derived cache of the host repo, owned by the cartographer. It lives
-in its OWN sqlite file (`.sc-state/map.db`), separate from the engine memory DB
+in its OWN sqlite file (`.sc-state/local/map/map.db`), separate from the engine memory DB
 (`shell_db.db`), so an engine schema migration or a memory rebuild never touches
 it. This module is the single place that knows where the map DB is and how to
 bring a fresh one up to a usable state.
@@ -11,7 +11,7 @@ Layers:
 - DERIVED  (dr_repo / dr_filepath / dr_dependency / dr_env) — repopulated by
   map_repo on every map; nothing to persist.
 - AUTHORED (dr_section, and dr_filepath.desc) — cartographer-curated. dr_section
-  is serialized to `.sc-state/map_content.sql` (tracked) by snapshot.py and
+  is serialized to `.sc-state/local/map/content.sql` by snapshot.py and
   reloaded here when a fresh map DB has no sections yet.
 
 Transition shim: a fork created before the split has its authored dr_section in
@@ -24,11 +24,13 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import artifact_policy
+
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
-MAP_DB_PATH = REPO_ROOT / ".sc-state" / "map.db"
+MAP_DB_PATH = artifact_policy.map_db_path()
 MAP_SCHEMA = ENGINE / "map_schema.sql"
-MAP_CONTENT = REPO_ROOT / ".sc-state" / "map_content.sql"
+MAP_CONTENT = artifact_policy.map_content_path()
 ENGINE_DB = ENGINE / "shell_db.db"  # legacy source of pre-split dr_section
 
 
@@ -87,6 +89,7 @@ def seed_authored(con: sqlite3.Connection) -> None:
 def connect(*, seed: bool = True) -> sqlite3.Connection:
     """Open the map DB (creating + schema-applying if absent), row_factory set.
     When `seed`, also load the authored layer into a fresh DB."""
+    artifact_policy.prepare_local_state()
     MAP_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(MAP_DB_PATH)
     con.row_factory = sqlite3.Row

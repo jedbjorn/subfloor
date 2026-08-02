@@ -48,6 +48,8 @@ def backfill(db_path: str) -> int:
 
 
 if __name__ == "__main__":
+    from cli_entry import run_cli
+
     if len(sys.argv) != 2:
         sys.exit(f"usage: {Path(sys.argv[0]).name} <path-to-db>")
-    sys.exit(backfill(sys.argv[1]))
+    sys.exit(run_cli(backfill, sys.argv[1]))

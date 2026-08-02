@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import sqlite3
 import sys
@@ -37,6 +38,36 @@ import server  # noqa: E402
 
 TOKEN = "test-token-deadbeef"
 PEER_TOKEN = "peer-token-cafebabe"   # second shell — cross-shell read coverage
+REVIEW_TOKEN = "review-token-012345"
+
+
+class MemMessageHelpContractTest(unittest.TestCase):
+    def test_authored_send_help_matches_parser_options(self):
+        parser = mem.build_parser()
+        message = next(
+            action for action in parser._actions
+            if isinstance(action, mem.argparse._SubParsersAction)
+        ).choices["message"]
+        send = next(
+            action for action in message._actions
+            if isinstance(action, mem.argparse._SubParsersAction)
+        ).choices["send"]
+        options = {
+            option
+            for action in send._actions
+            for option in action.option_strings
+        }
+        self.assertEqual(options, {"-h", "--help", "--kind"})
+
+        rendered = send.format_help()
+        synopsis = (
+            './sc mem message send <to-shortname> "<body>" '
+            '[--kind shell|task|result]'
+        )
+        self.assertIn(synopsis, mem.__doc__)
+        for retired in ("--assignment", "--result-kind", "--directive"):
+            self.assertNotIn(retired, mem.__doc__)
+            self.assertNotIn(retired, rendered)
 
 
 def build_engine_db(path: Path) -> None:
@@ -55,6 +86,13 @@ def build_engine_db(path: Path) -> None:
         "INSERT INTO shells (shell_id, display_name, shortname, mandate, system_prompt, "
         "user_id, is_shared, has_identity, bootstrapped, api_key) "
         "VALUES (2, 'Peer', 'peer', 'test', 'sp', 1, 0, 1, 0, ?)", (PEER_TOKEN,))
+    con.execute(
+        "INSERT INTO shells (shell_id, display_name, shortname, flavor, mandate, "
+        "system_prompt, user_id, is_shared, has_identity, bootstrapped, api_key) "
+        "VALUES (3, 'Reviewer', 'rev1', 'reviewer', 'test', 'sp', "
+        "1, 0, 1, 0, ?)",
+        (REVIEW_TOKEN,),
+    )
     con.execute(
         "INSERT INTO shell_memory_archives (archive_id, shell_id, session_id, date) "
         "VALUES (1, 1, '0001', '2026-01-01')")
@@ -171,11 +209,11 @@ class ApiMemTest(unittest.TestCase):
         self.assertIn("older active", buf.getvalue())   # cap is never silent
         self.assertIn("--all", buf.getvalue())
 
-    def test_decisions_get_404_and_id_only_for_decisions(self):
+    def test_decisions_get_404_and_unrelated_surface_rejects_id(self):
         with self.assertRaises(SystemExit):
             self.run_mem("get", "decisions", "999999")
         with self.assertRaises(SystemExit):
-            self.run_mem("get", "flags", "1")          # <id> is decisions-only
+            self.run_mem("get", "state", "1")
 
     # ── decisions why-audit link: feature_id + document_id (#0047) ─────────────
     def test_decision_feature_and_doc_link(self):
@@ -246,6 +284,226 @@ class ApiMemTest(unittest.TestCase):
         fid = self.q("SELECT flag_id FROM flags WHERE display_name='SC-1'")[0]
         self.run_mem("flag", "close", str(fid), "--notes", "fixed")
         self.assertEqual(self.q("SELECT resolved FROM flags WHERE flag_id=?", fid)[0], 1)
+
+    def test_flag_exact_id_reads_open_row_with_complete_human_evidence(self):
+        self.run_mem("roadmap", "add", "open evidence feature")
+        feature = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='open evidence feature'"
+        )[0]
+        self.run_mem(
+            "flag", "open", "[audit] open evidence | Blocker for: review",
+            "--name", "SC-922-OPEN-EXACT", "--priority", "Low",
+            "--feature", str(feature),
+        )
+        flag_id = self.q(
+            "SELECT flag_id FROM flags WHERE display_name='SC-922-OPEN-EXACT'"
+        )[0]
+        created = self.q(
+            "SELECT created_date FROM flags WHERE flag_id=?", flag_id
+        )[0]
+
+        human = io.StringIO()
+        with contextlib.redirect_stdout(human):
+            self.run_mem("get", "flags", str(flag_id))
+        self.assertEqual(
+            human.getvalue(),
+            f"#{flag_id} [SC-922-OPEN-EXACT] @tc (Low) [open]\n"
+            f"  feature: #{feature} — open evidence feature\n"
+            f"  opened: {created} · resolved: —\n"
+            "  description: [audit] open evidence | Blocker for: review\n"
+            "  closure notes: —\n",
+        )
+
+    def test_flag_exact_id_reads_resolved_row_with_complete_human_and_json_evidence(self):
+        self.run_mem("roadmap", "add", "resolved evidence feature")
+        feature = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='resolved evidence feature'"
+        )[0]
+        saved = mem.SC_API_TOKEN
+        mem.SC_API_TOKEN = PEER_TOKEN
+        try:
+            self.run_mem(
+                "flag", "open", "[audit] exact closure | Blocker for: review",
+                "--name", "SC-922-EXACT", "--priority", "High",
+                "--feature", str(feature),
+            )
+        finally:
+            mem.SC_API_TOKEN = saved
+        flag_id = self.q(
+            "SELECT flag_id FROM flags WHERE display_name='SC-922-EXACT'"
+        )[0]
+        self.run_mem("flag", "close", str(flag_id), "--notes", "REV2 verified at abc123")
+        expected = self.q(
+            "SELECT created_date, resolved_date FROM flags WHERE flag_id=?", flag_id
+        )
+
+        human = io.StringIO()
+        with contextlib.redirect_stdout(human):
+            self.run_mem("get", "flags", str(flag_id))
+        output = human.getvalue()
+        for value in (
+            f"#{flag_id}", "SC-922-EXACT", "@peer", "High", "resolved",
+            f"#{feature}", "resolved evidence feature", expected["created_date"],
+            expected["resolved_date"], "[audit] exact closure",
+            "REV2 verified at abc123",
+        ):
+            self.assertIn(str(value), output)
+
+        raw = io.StringIO()
+        with contextlib.redirect_stdout(raw):
+            self.run_mem("get", "flags", str(flag_id), "--json")
+        row = json.loads(raw.getvalue())["flag"]
+        self.assertEqual(
+            {
+                key: row[key]
+                for key in (
+                    "flag_id", "display_name", "owner", "feature_id", "priority",
+                    "description", "created_date", "resolved_date", "resolution_notes",
+                )
+            },
+            {
+                "flag_id": flag_id,
+                "display_name": "SC-922-EXACT",
+                "owner": "peer",
+                "feature_id": feature,
+                "priority": "High",
+                "description": "[audit] exact closure | Blocker for: review",
+                "created_date": expected["created_date"],
+                "resolved_date": expected["resolved_date"],
+                "resolution_notes": "REV2 verified at abc123",
+            },
+        )
+
+    def test_flag_resolved_history_is_feature_scoped_and_excludes_open_deleted_and_other(self):
+        self.run_mem("roadmap", "add", "flag history A")
+        self.run_mem("roadmap", "add", "flag history B")
+        feature_a = self.q("SELECT feature_id FROM roadmap WHERE title='flag history A'")[0]
+        feature_b = self.q("SELECT feature_id FROM roadmap WHERE title='flag history B'")[0]
+
+        def open_flag(name: str, feature: int) -> int:
+            self.run_mem(
+                "flag", "open", f"[history] {name} | Blocker for: audit",
+                "--name", name, "--feature", str(feature),
+            )
+            return self.q("SELECT flag_id FROM flags WHERE display_name=?", name)[0]
+
+        wanted = open_flag("SC-922-WANTED", feature_a)
+        still_open = open_flag("SC-922-OPEN", feature_a)
+        other = open_flag("SC-922-OTHER", feature_b)
+        deleted = open_flag("SC-922-DELETED", feature_a)
+        self.run_mem("flag", "close", str(wanted), "--notes", "wanted closure")
+        self.run_mem("flag", "close", str(other), "--notes", "other closure")
+        self.run_mem("flag", "close", str(deleted), "--notes", "deleted closure")
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            con.execute("UPDATE flags SET is_deleted=1 WHERE flag_id=?", (deleted,))
+            con.commit()
+
+        raw = io.StringIO()
+        with contextlib.redirect_stdout(raw):
+            self.run_mem(
+                "get", "flags", "--feature", str(feature_a), "--resolved", "--json"
+            )
+        rows = json.loads(raw.getvalue())["flags"]
+        self.assertEqual([row["flag_id"] for row in rows], [wanted])
+        self.assertEqual(rows[0]["resolution_notes"], "wanted closure")
+        self.assertNotIn(still_open, [row["flag_id"] for row in rows])
+        self.assertNotIn(other, [row["flag_id"] for row in rows])
+        self.assertNotIn(deleted, [row["flag_id"] for row in rows])
+
+        dates = self.q(
+            "SELECT created_date, resolved_date FROM flags WHERE flag_id=?", wanted
+        )
+        human = io.StringIO()
+        with contextlib.redirect_stdout(human):
+            self.run_mem(
+                "get", "flags", "--feature", str(feature_a), "--resolved"
+            )
+        self.assertEqual(
+            human.getvalue(),
+            f"#{wanted} [SC-922-WANTED] @tc (Medium) [resolved]\n"
+            f"  feature: #{feature_a} — flag history A\n"
+            f"  opened: {dates['created_date']} · resolved: {dates['resolved_date']}\n"
+            "  description: [history] SC-922-WANTED | Blocker for: audit\n"
+            "  closure notes: wanted closure\n",
+        )
+        with self.assertRaises(SystemExit):
+            self.run_mem("get", "flags", str(deleted))
+
+    def test_flag_resolved_history_refuses_unscoped_or_malformed_reads(self):
+        with self.assertRaises(SystemExit):
+            self.run_mem("get", "flags", "--resolved")
+        with self.assertRaises(SystemExit):
+            self.run_mem("get", "flags", "--feature", "1")
+        with self.assertRaises(SystemExit):
+            self.run_mem("get", "flags", "1", "--resolved", "--feature", "1")
+        with self.assertRaises(SystemExit):
+            self.run_mem("get", "state", "--resolved")
+        with self.assertRaises(SystemExit):
+            mem._api("GET", "/_sc/mem/flags?resolved=1")
+        with self.assertRaises(SystemExit):
+            mem._api("GET", "/_sc/mem/flags?feature=1")
+        with self.assertRaises(SystemExit):
+            mem._api("GET", "/_sc/mem/flags?feature=wat&resolved=1")
+
+    # ── #149: close names the row it is about to resolve, and never twice ─────
+    def test_flag_close_names_the_target_before_it_writes(self):
+        """flag_id and the SC-### display_name are both small integers from two
+        counters that drift through the same range, so a wrong number resolves
+        to a different real row rather than failing. The one thing that lets a
+        caller SEE it holds the wrong record is the row itself, echoed by the
+        command that is about to resolve it."""
+        self.run_mem("flag", "open", "[x] the wrong one | Blocker for: nothing",
+                     "--name", "SC-149-A", "--priority", "High")
+        fid = self.q("SELECT flag_id FROM flags WHERE display_name='SC-149-A'")[0]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.run_mem("flag", "close", str(fid), "--notes", "done")
+        out = buf.getvalue()
+        self.assertIn("SC-149-A", out)          # the name, not just the number
+        self.assertIn("the wrong one", out)     # and enough body to recognise it
+        self.assertIn("High", out)
+
+    def test_flag_close_refuses_to_overwrite_an_existing_resolution(self):
+        """A redundant close is not a no-op: it replaces the resolution notes
+        of whoever verified the flag with the closer's. The first writer's
+        evidence must survive the second close attempt."""
+        self.run_mem("flag", "open", "[x] verified | Blocker for: y",
+                     "--name", "SC-149-B")
+        fid = self.q("SELECT flag_id FROM flags WHERE display_name='SC-149-B'")[0]
+        self.run_mem("flag", "close", str(fid),
+                     "--notes", "REV1 verified at head f7f687c")
+        with self.assertRaises(SystemExit):
+            self.run_mem("flag", "close", str(fid), "--notes", "closed without evidence")
+        row = self.q("SELECT resolution_notes, resolved FROM flags WHERE flag_id=?",
+                     fid)
+        self.assertEqual(row["resolution_notes"], "REV1 verified at head f7f687c")
+        self.assertEqual(row["resolved"], 1)
+
+    # ── #288: a flag opened unnamed can be given a name; --append never eats ──
+    def test_flag_edit_sets_a_display_name_a_flag_was_opened_without(self):
+        self.run_mem("flag", "open", "[x] unnamed | Blocker for: naming")
+        fid = self.q("SELECT flag_id FROM flags WHERE description LIKE '%unnamed%'")[0]
+        self.assertIsNone(
+            self.q("SELECT display_name FROM flags WHERE flag_id=?", fid)[0])
+        self.run_mem("flag", "edit", str(fid), "--name", "SC-288")
+        self.assertEqual(
+            self.q("SELECT display_name FROM flags WHERE flag_id=?", fid)[0],
+            "SC-288")
+
+    def test_flag_edit_append_extends_the_body_instead_of_replacing_it(self):
+        self.run_mem("flag", "open", "[x] tracker gate 1 | Blocker for: arc",
+                     "--name", "SC-288-B")
+        fid = self.q("SELECT flag_id FROM flags WHERE display_name='SC-288-B'")[0]
+        self.run_mem("flag", "edit", str(fid), "--append", "\n\nGATE 2 CLEARED.")
+        desc = self.q("SELECT description FROM flags WHERE flag_id=?", fid)[0]
+        self.assertIn("tracker gate 1", desc)      # the original body survives
+        self.assertIn("GATE 2 CLEARED.", desc)
+        with self.assertRaises(SystemExit):        # replace and append conflict
+            self.run_mem("flag", "edit", str(fid), "--description", "new",
+                         "--append", "more")
+        self.assertIn("tracker gate 1",
+                      self.q("SELECT description FROM flags WHERE flag_id=?",
+                             fid)[0])
 
     # ── roadmap: add / status / work-stream / deps + cycle ────────────────────
     def test_roadmap_lifecycle_and_cycle(self):
@@ -399,6 +657,42 @@ class ApiMemTest(unittest.TestCase):
         self.run_mem("task", "done", str(tid))
         self.assertEqual(self.q("SELECT status FROM spec_tasks WHERE task_id=?", tid)[0], "done")
 
+    def test_legacy_mem_qaqc_command_uses_the_sprint_approval_surface(self):
+        self.run_mem("roadmap", "add", "feat QAQC")
+        fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat QAQC'")[0]
+        body = self.tmp / "qaqc.md"
+        body.write_text("# exact QAQC body\n")
+        self.run_mem(
+            "doc",
+            "add",
+            "spec QAQC",
+            "--body-file",
+            str(body),
+            "--feature",
+            str(fid),
+        )
+        did = self.q("SELECT document_id FROM documents WHERE title='spec QAQC'")[0]
+        original_token = mem.SC_API_TOKEN
+        mem.SC_API_TOKEN = REVIEW_TOKEN
+        try:
+            self.assertEqual(
+                0,
+                self.run_mem(
+                    "doc", "qaqc", str(did), "--verdict", "approved"
+                ),
+            )
+        finally:
+            mem.SC_API_TOKEN = original_token
+
+        approval = self.q(
+            "SELECT reviewer_shell_id,verdict,revision_sha256 "
+            "FROM sprint_spec_approvals WHERE document_id=?",
+            did,
+        )
+        self.assertEqual((3, "pass"), tuple(approval[:2]))
+        self.assertEqual(64, len(approval["revision_sha256"]))
+        self.assertEqual(0, self.run_mem("get", "qaqc", "--doc", str(did)))
+
     # ── doc writes serialize headlessly (subfloor#434) ───────────────────────
     def test_doc_write_serializes(self):
         # Real hook, fake subprocess pair: assert the wiring, not the scripts.
@@ -436,13 +730,11 @@ class ApiMemTest(unittest.TestCase):
             server.run_snapshot_render = real_rsr
             server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
 
-    # ── SC-012: doc write vs Publish — ONE shared serialization boundary ──────
-    def test_doc_write_and_publish_share_one_lock(self):
-        # Doc-write serialize, /api/snapshot, and Publish all write the same
-        # non-atomic files (content.sql + flat renders) and Publish switches
-        # branches — per-path private locks let them interleave. Force a Publish
-        # to sit inside its critical section, then prove a concurrent doc
-        # write's serialize cannot enter until the Publish releases the lock.
+    # ── doc write vs local save — ONE shared serialization boundary ───────────
+    def test_doc_write_and_snapshot_share_one_lock(self):
+        # Doc-write serialize and /api/snapshot both write the same non-atomic
+        # local files. Force a snapshot to sit inside its critical section, then
+        # prove a concurrent doc write waits for it.
         self.run_mem("roadmap", "add", "feat race")
         fid = self.q("SELECT feature_id FROM roadmap WHERE title='feat race'")[0]
         body = self.tmp / "race.md"
@@ -451,50 +743,57 @@ class ApiMemTest(unittest.TestCase):
                      "--feature", str(fid))
         did = self.q("SELECT document_id FROM documents WHERE title='spec race'")[0]
         server.serialize_doc_write = self._real_serialize
-        real_publish = server.git_publish
         real_rsr = server.run_snapshot_render
-        in_publish = threading.Event()
+        in_snapshot = threading.Event()
         release = threading.Event()
         overlap = []
 
-        def fake_publish():
-            in_publish.set()
-            release.wait(5)
-            return {"ok": True, "output": "published (test stub)", "pr_url": None}
-
         def fake_rsr():
-            # runs inside serialize_doc_write's lock hold — if Publish is still
-            # inside ITS section (release unset), the two paths interleaved
-            overlap.append(in_publish.is_set() and not release.is_set())
+            if not in_snapshot.is_set():
+                in_snapshot.set()
+                release.wait(5)
+                return "snapshot endpoint (test stub)"
+            overlap.append(in_snapshot.is_set() and not release.is_set())
             return "snapshot+render (test stub)"
 
-        server.git_publish = fake_publish
         server.run_snapshot_render = fake_rsr
-        publish_rc = []
+        snapshot_rc = []
 
-        def do_publish():
+        def do_snapshot():
             req = urllib.request.Request(
-                f"http://127.0.0.1:{self.port}/api/publish", data=b"", method="POST")
+                f"http://127.0.0.1:{self.port}/api/snapshot", data=b"", method="POST")
             with urllib.request.urlopen(req, timeout=30) as resp:
-                publish_rc.append(resp.status)
+                snapshot_rc.append(resp.status)
 
         try:
-            t = threading.Thread(target=do_publish)
+            t = threading.Thread(target=do_snapshot)
             t.start()
-            self.assertTrue(in_publish.wait(5), "publish never entered its section")
-            # hold the Publish inside its section while the doc write arrives;
+            self.assertTrue(in_snapshot.wait(5), "snapshot never entered its section")
+            # hold the snapshot inside its section while the doc write arrives;
             # the timer releases it well after an unshared lock would overlap
             threading.Timer(0.5, release.set).start()
             self.assertEqual(
                 self.run_mem("doc", "edit", str(did), "--title", "spec race v2"), 0)
             t.join(10)
-            self.assertEqual(publish_rc, [200])
-            self.assertEqual(overlap, [False])  # serialize ran AFTER publish released
+            self.assertEqual(snapshot_rc, [200])
+            self.assertEqual(overlap, [False])
         finally:
             release.set()
-            server.git_publish = real_publish
             server.run_snapshot_render = real_rsr
             server.serialize_doc_write = lambda: {"ok": True, "output": "(test stub)"}
+
+    def test_publish_endpoint_is_permanently_retired(self):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/publish",
+            data=b"",
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as failed:
+            urllib.request.urlopen(req, timeout=30)
+        self.assertEqual(failed.exception.code, 410)
+        payload = json.loads(failed.exception.read())
+        self.assertEqual(payload["error"]["code"], "publish_retired")
+        self.assertIn("save locally", payload["error"]["message"])
 
     # ── SC-013: a slow successful serialize is still a successful write ────────
     def test_doc_write_slow_serializer_succeeds(self):
@@ -711,6 +1010,8 @@ class ApiMemTest(unittest.TestCase):
         for surface in mem.GET_SURFACES:
             if surface == "tasks":
                 self.assertEqual(self.run_mem("get", "tasks", "--feature", "0"), 0, surface)
+                continue
+            if surface == "qaqc":
                 continue
             self.assertEqual(self.run_mem("get", surface), 0, surface)
 

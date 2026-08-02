@@ -4,8 +4,8 @@
 super-coder maintains super-coder, so its own DB carries: the maintainer shell,
 the `super-coder` feature on the roadmap, and the founding spec as a frozen
 document. This script writes those rows into a fresh DB; `snapshot.py` then
-serializes them to `.sc-state/content.sql`, which becomes the tracked seed every
-`rebuild.py` reproduces.
+serializes them to `.sc-state/local/content.sql`, the ignored local rebuild
+source.
 
 Not part of the rebuild path — it is the *authoring* step that produced the
 first snapshot. Re-run only to regenerate the seed from scratch.
@@ -13,16 +13,16 @@ first snapshot. Re-run only to regenerate the seed from scratch.
 Flow (regen from scratch — skills must be seeded first; the existing snapshot
 must be out of the way so the rebuild starts empty and this can re-author):
     ./sc seed-skills                     # author migrations/0001_seed_skills.sql
-    rm .sc-state/content.sql             # step aside; seed_dogfood reproduces it
+    rm .sc-state/local/content.sql       # step aside; seed_dogfood reproduces it
     ./sc clean-db && ./sc rebuild        # empty content + skills (from migration)
     python3 .super-coder/scripts/seed_dogfood.py   # cc + grants (skills now exist)
-    ./sc snapshot                        # -> .sc-state/content.sql (incl. grants)
+    ./sc snapshot                        # -> .sc-state/local/content.sql (incl. grants)
     ./sc rebuild && ./sc render && ./sc verify     # reproduce + render; verify
 
 Maintainer-shell lineage is RESOLVED (decision #185): the maintainer is a
 succession child of CC, carrying the CC Lineage Seed (3 immutable entries,
 Law 6) plus its own genesis seed. This script seeds that identity so a
-from-scratch regen reproduces what .sc-state/content.sql already holds.
+from-scratch regen reproduces what the local snapshot already holds.
 """
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ shell, one repo, one cwd — the inversion that retires cross-repo confusion.
 ## MEMORY ARCHITECTURE
 
 Source of truth: `.super-coder/shell_db.db` (gitignored, rebuilt from
-`schema.sql` + `migrations/` + `.sc-state/content.sql`). All identity and memory
+`schema.sql` + `migrations/` + `.sc-state/local/content.sql`). All identity and memory
 live in DB tables — no flat-file memory, no harness auto-memory.
 
 | Surface | Where |
@@ -57,19 +57,20 @@ live in DB tables — no flat-file memory, no harness auto-memory.
 | Content | `documents` — specs/docs; DB owns the body; freeze via frozen=1 on ship |
 | Session narrative | `shell_memory_archives` — one row per session, appended progressively |
 
-Write as it happens, not at close. **Writes go through `./sc mem`** (state · seed ·
+Write as it happens, not at close. **Writes go through `sc mem`** (state · seed ·
 lns · decision · flag · roadmap · doc · narrative): it routes through the engine
-API, which resolves your identity from your token — no DB path, no direct-DB
-fallback. The write lands in the live engine DB — the single source of truth
-shared by every shell, durable and visible to all at once. That is the whole
-write: **you don't snapshot or render** — persisting to git is an admin/GUI step.
-`./sc mem which` to orient. See the `memory` and `db_map` skills.
+API — already wired to this launched shell, identity resolved by the engine —
+no DB path, no direct-DB fallback. The write lands in the live engine DB — the
+single source of truth shared by every shell, durable and visible to all at
+once. That is the whole write: **you don't snapshot or render** — persisting
+to git is an admin/GUI step.
+`sc mem which` to orient. See the `memory` and `db_map` skills.
 
 **Flat files are renders, not sources.** Every local `.md` and git-tracked file
 — docs, specs, skills, this `CLAUDE.md`/`AGENTS.md` — is rendered from the DB by
-`./sc render`. They are derived artifacts: a photograph of a DB row, not the row.
+`sc render`. They are derived artifacts: a photograph of a DB row, not the row.
 Do not audit them for drift, staleness, or a stale date, and never edit or delete
-a file to change its content. If one looks wrong or out of date, fix the DB (`./sc
+a file to change its content. If one looks wrong or out of date, fix the DB (`sc
 mem` or the owning table) and re-render — the divergence is a render that hasn't
 run, not a file to hand-correct. The DB is the authoritative content; the tree is
 its projection.
@@ -235,4 +236,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from cli_entry import run_cli
+
+    raise SystemExit(run_cli(main))

@@ -36,9 +36,10 @@ What that buys you in practice:
 - **Parallel work without clobbering.** Every shell gets its own git worktree;
   a branch-guard keeps everyone off `main`; merging stays yours.
 - **A localhost Review GUI** for reading and steering it all — shells,
-  roadmap, flags, docs, analytics.
-- **Sprints** — a declared multi-shell mode where devs and reviewers run the
-  handoffs themselves on an event loop, with zero scheduled polling.
+  roadmap, flags, docs, analytics — including a **Chats** tab for durable
+  browser conversations and read-only Diff review.
+- **Durable handoffs** through shell messages and session-surviving jobs,
+  with generic headless launches when a bounded non-interactive run is useful.
 
 > [!class2]
 > The full model — the harness-overlay design, the engine/fork boundary, the
@@ -70,18 +71,24 @@ Five steps, from an existing git repo to a booted shell:
 
 ## First boot
 
-`./sc enter` — authenticate, pick a shell, pick a harness (the picker
-pre-selects each flavor's default model), and you're in a session, talking to
-your **planner** in your own repo.
+`./sc enter` — pick a shell, pick a harness (the picker pre-selects each
+flavor's default model), and you're in a session, talking to your **planner**
+in your own repo.
 
-- **Open the Review GUI.** `./sc launch` printed its URL; the Shells tab is
-  the landing view — each shell's role, mandate, current state, and identity.
-  The other tabs, the roadmap views, and the token analytics:
+- **Or start a browser conversation.** The GUI's **Chats** tab lists every
+  shell; **New chat** on an available one opens a durable conversation with
+  queued turns, explicit Stop/Close controls, history, stars, and a read-only
+  Diff mode. Browser chat and CLI ownership are mutually exclusive for a shell:
+  [*Browser conversations*](README.md#browser-conversations).
+- **Open the Review GUI.** `./sc launch` printed its URL (`./sc url` reprints
+  it once the harness TUI has painted over the boot summary); the Shells tab
+  is the landing view — each shell's role, mandate, current state, and
+  identity. The other tabs, the roadmap views, and the token analytics:
   [*Review GUI*](README.md#review-gui).
-- **Meet the team.** The installer seeded a planner (your primary), two devs,
-  a reviewer, the admin that owns `main`, and the cartographer that owns the
-  repo map. Each boots into its own worktree; how they share one repo without
-  collisions: [*Shells & worktrees*](README.md#shells--worktrees).
+- **Meet the team.** The installer seeded two planners (one is your primary),
+  four devs, two reviewers, the admin that owns `main`, and the cartographer
+  that owns the repo map. Each boots into its own worktree; how they share one
+  repo without collisions: [*Shells & worktrees*](README.md#shells--worktrees).
 - **First acts.** Let the cartographer map the repo on its first boot, then
   tell the planner what you're building — it authors the roadmap and the
   first spec.
@@ -92,7 +99,8 @@ your **planner** in your own repo.
 ## The daily loop
 
 The rhythm a fork settles into — you move between seats with
-`./sc enter-<shortname>`, and every step is owned by a flavor:
+`./sc enter-<shortname>` or open a separate browser conversation in **Chats**, and
+every step is owned by a flavor:
 
 1. The **cartographer** keeps the repo map fresh; working shells read it
    instead of grepping blind.
@@ -108,9 +116,9 @@ The rhythm a fork settles into — you move between seats with
 The step-by-step version, with each flavor's skills and GUI tab:
 [*The loop*](README.md#the-loop).
 
-- **Bigger than one dev?** Declare a **sprint** — a planner-governed,
-  event-driven push where devs merge their own reviewed units under scoped
-  authority: [*Sprints*](README.md#sprints).
+- **Hand work to another shell.** Use the shell inbox for a durable task/result
+  handoff, and use `./sc job` for a suite or build that must outlive the current
+  session: [*Messages, jobs & headless launch*](README.md#messages-jobs--headless-launch).
 - **The command surface.** Every `./sc` command and the `make dos-` aliases:
   [*CLI & dev kit*](README.md#cli--dev-kit).
 - **Opt-in extras.** A Postgres sidecar, a Windows test VM, tailnet / pm2 /

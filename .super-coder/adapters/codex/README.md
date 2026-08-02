@@ -1,8 +1,10 @@
 # adapters/codex — OpenAI Codex CLI
 
 Codex reads the boot artifact (`AGENTS.md`) and project `AGENTS.md` conventions
-natively — already emitted by the render chain — so the adapter only carries the
-launch command plus how it takes a model and a sandbox flag.
+natively. The render chain also emits each shell's exact grants to Codex's
+native `.agents/skills/<name>/SKILL.md` tree while retaining the cross-harness
+`.claude/skills/<name>/SKILL.md` mirror. The adapter carries those skill targets,
+the launch command, and how Codex takes a model and sandbox flag.
 
 **Why it exists:** the *subscription* path for OpenAI models. Signing into Codex
 with a ChatGPT plan bills against that plan (flat, capped) instead of per-token
@@ -18,9 +20,10 @@ billing. opencode stays as the universal metered catch-all.
 | `launch` | argv exec'd to start the harness (`codex --dangerously-bypass-hook-trust`) |
 | `boot_artifact` | the context file this harness reads (`AGENTS.md`, informational) |
 | `emit` | files copied to the repo root at launch (`.codex/hooks.json` — the branch-guard hook) |
+| `skill_dirs` | exact shell grants rendered to `.claude/skills` and Codex-native `.agents/skills` |
 | `env` | extra env merged into the launch environment |
 | `model` | `{ "flag": "--model" }` — run.py appends `--model <id>` for the flavor's codex model |
-| `headless.effort` | maps sprint `high` to `-c model_reasoning_effort="high"` |
+| `headless.effort` | maps requested effort to `-c model_reasoning_effort="<level>"` |
 | `sandbox.launch_flags` | flags appended ONLY inside the docker sandbox (`SC_SANDBOX`) |
 
 ## Branch-guard hook
@@ -57,3 +60,20 @@ claude/opencode get).
 mounted from the host — so `codex` must be installed + logged in on the host once:
 `curl -fsSL https://chatgpt.com/codex/install.sh | sh` then `codex` and sign in
 with ChatGPT. That writes `~/.codex/auth.json`, which `./sc launch` mounts in.
+
+## Conversation capability
+
+Feature #24 selected `codex app-server`, not transcript mutation and not
+`exec resume --last`. The broker records `thread/start`'s `thread.id`, later
+opens it with `thread/resume`, starts one turn at a time, consumes JSONL-RPC
+notifications, interrupts with `turn/interrupt`, and inspects persisted state
+with `thread/read`.
+
+The contract was live-probed on 0.145.0. Exact `codex exec resume <thread-id>`
+kept two same-cwd conversations isolated. The app-server probe ran with
+`approvalPolicy=never` and `sandbox=danger-full-access`, interrupted a live
+harmless command, observed terminal status `interrupted`, stopped the server,
+started a new server, resumed the exact thread, and recovered the original
+nonce. Permission policy is the requirement; `--sandbox` is not part of the
+shared contract. This CLI version expects kebab-case `danger-full-access` in
+the app-server payload.
