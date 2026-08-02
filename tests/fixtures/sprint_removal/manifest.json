@@ -12,6 +12,7 @@
     ".super-coder/migrations/0154_remove_tombstoned_skills.sql",
     ".super-coder/migrations/0155_sprint_conversation_generations.sql",
     ".super-coder/migrations/0158_sprint_terminal_liveness_hardening.sql",
+    ".super-coder/migrations/0159_reseed_sprint_native_wake_skills.sql",
     ".super-coder/assets/skills/sprint_prep/SKILL.md",
     ".super-coder/assets/skills/sprint_pln/SKILL.md",
     ".super-coder/assets/skills/sprint_dev/SKILL.md",
