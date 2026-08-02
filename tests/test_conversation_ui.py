@@ -63,20 +63,29 @@ def test_open_chat_restore_matches_the_flat_shell_projection():
     )
 
 
-def test_sprint_pill_enters_the_current_conversation_without_a_wake():
+def test_sprint_badge_enters_the_current_conversation_without_a_wake():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]
-    pill = interface[interface.index('className: "chat-sprint-pill"'):
-                     interface.index("shellRow.append(pill)")]
-    assert "sprint.current_conversation_id" in pill
-    assert "location.hash = chatHash(" in pill
-    assert "chatApi(" not in pill
-    assert "Sprint ${sprint.sprint_id}" in pill
-    assert "${sprint.role} · ${sprint.disposition}" in pill
-    assert ".chat-sprint-pill" in STYLE
-    assert "color: var(--warn)" in STYLE[
-        STYLE.index(".chat-sprint-pill"):STYLE.index(".chat-sprint-meta")
+    shell_button = interface[interface.index('const button = el("button"'):
+                             interface.index("const shellRow = el(")]
+    badge = interface[interface.index('className: "chat-sprint-badge"'):
+                      interface.index("shellRow.append(badge)")]
+    assert '+ (sprint ? " has-sprint" : "")' in shell_button
+    assert 'className: "chat-shell-identity"' in shell_button
+    assert "sprint.current_conversation_id" in badge
+    assert "location.hash = chatHash(" in badge
+    assert "chatApi(" not in badge
+    assert "Sprint ${sprint.sprint_id}" in badge
+    assert "${sprint.role} · ${sprint.disposition}" in badge
+    assert "chat-sprint-meta" not in badge
+    assert "chat-sprint-pill" not in APP
+    assert ".chat-sprint-pill" not in STYLE
+    assert ".chat-sprint-badge" in STYLE
+    badge_style = STYLE[
+        STYLE.index(".chat-sprint-badge {"):STYLE.index(".chat-sprint-badge:hover")
     ]
+    assert "left: 50%" in badge_style
+    assert "color: var(--warn)" in badge_style
 
 
 def test_sprint_conversations_are_not_closed_by_normal_chat_controls():
@@ -688,9 +697,13 @@ def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():
         ".chat-history-star",
     ):
         assert selector in STYLE
-    assert "grid-template-columns: 260px 260px minmax(0, 1fr)" in STYLE
+    assert "grid-template-columns: 280px 270px minmax(0, 1fr)" in STYLE
     assert "grid-template-columns: 210px 210px minmax(0, 1fr)" in STYLE
     assert "grid-template-columns: 101px minmax(0, 1fr)" in STYLE
+    bubble = STYLE[STYLE.index(".chat-bubble {"):
+                   STYLE.index(".chat-bubble.chat-activity")]
+    assert "max-width: min(840px, 85%)" in bubble
+    assert "min-width: min(640px, 65%)" in bubble
     assert ".chat-working-dots" in STYLE
     assert "@keyframes chat-working-dot" in STYLE
     assert ".chat-queue-state" in STYLE
