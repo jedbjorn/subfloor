@@ -386,6 +386,16 @@ body.interface-view main {
   margin: auto; color: var(--dim); text-align: center; padding: 2rem;
 }
 .chat-no-selection { grid-row: 1 / -1; }
+.chat-admin-cli-only {
+  grid-row: 1 / -1; display: flex; flex-direction: column; gap: .6rem;
+  align-items: center; justify-content: center;
+}
+.chat-admin-cli-only b { color: var(--ink); }
+.chat-admin-commands {
+  margin: 0; padding: .7rem 1rem; border: 1px solid var(--line);
+  border-radius: 10px; background: var(--panel); color: var(--ink);
+  font-size: .78rem; text-align: left; user-select: all;
+}
 .chat-composer {
   padding: .8rem clamp(1rem, 4vw, 4rem) 1rem; border-top: 1px solid var(--line);
   background: var(--bg);

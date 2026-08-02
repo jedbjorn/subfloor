@@ -497,6 +497,7 @@ def _reopen_conversation(con, operator: dict, conversation) -> list[str]:
             "SHELL_NOT_LAUNCHABLE",
             "shell is unknown, deleted, or unavailable to this operator",
         )
+    _refuse_admin_browser_chat(shell)
     open_conversations = con.execute(
         "SELECT conversation_id,state FROM conversations "
         "WHERE shell_id=? AND state!='closed' AND conversation_scope='normal'",
@@ -677,6 +678,28 @@ def _live_shell_session(shell) -> str | None:
     )
 
 
+def _refuse_admin_browser_chat(shell) -> None:
+    """Admin maintains main directly at the repo root — one working tree with
+    no per-shell attribution (any harness process under the root reads as "the
+    admin slot"), so a browser chat would surface timing-dependent SHELL_BUSY
+    refusals whenever anyone works anywhere in the repo. Refuse deliberately
+    instead, carrying the exact CLI commands the operator runs in its place."""
+    if shell["flavor"] != "admin":
+        return
+    root = str(run_mod.REPO_ROOT)
+    raise ApiError(
+        422,
+        "ADMIN_SHELL_CLI_ONLY",
+        f"shell {shell['shortname']!r} is admin-flavor and CLI-only; open a "
+        f"terminal and run: cd {root} && make dos-e s={shell['shortname']}",
+        {
+            "shell_id": int(shell["shell_id"]),
+            "shortname": shell["shortname"],
+            "repo_root": root,
+        },
+    )
+
+
 def _wait_for_cli_release(shell) -> str | None:
     """Drain a just-finished browser process, but never steal a live CLI slot."""
     state = _live_shell_session(shell)
@@ -730,6 +753,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             "SHELL_NOT_LAUNCHABLE",
             "shell is unknown, deleted, or unavailable to this operator",
         )
+    _refuse_admin_browser_chat(shell)
     open_conversations = con.execute(
         "SELECT conversation_id,state FROM conversations "
         "WHERE shell_id=? AND state!='closed' AND conversation_scope='normal'",

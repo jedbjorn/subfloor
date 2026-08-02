@@ -3540,7 +3540,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/health":
                 return self._send(200, health_payload())
             if path == "/api/shells":
-                return self._send(200, {"shells": get_shells(con)})
+                # repo_root rides along for the browser chat rail: admin
+                # shells are CLI-only there, and the notice shows the exact
+                # `cd <repo_root> && make dos-e s=<shortname>` to run instead.
+                return self._send(200, {"shells": get_shells(con),
+                                        "repo_root": str(REPO_ROOT)})
             if path == "/api/shell-templates":
                 return self._send(200, {"templates": shell_factory.flavors()})
             if path == "/api/flavor-defaults":

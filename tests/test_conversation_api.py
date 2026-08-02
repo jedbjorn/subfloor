@@ -78,7 +78,8 @@ class ConversationApiCase(unittest.TestCase):
             "(shell_id,display_name,shortname,flavor,system_prompt,user_id,"
             "api_key) VALUES "
             "(1,'Dev','dev','dev','prompt',1,'shell-token'),"
-            "(2,'Review','review','dev','prompt',1,'review-token')"
+            "(2,'Review','review','dev','prompt',1,'review-token'),"
+            "(3,'Admin','ADM1','admin','prompt',1,'admin-token')"
         )
         con.commit()
         con.close()
@@ -551,6 +552,56 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(status, 409)
         self.assertEqual(error["error"]["code"], "SHELL_BUSY")
         self.assertIn("live CLI session", error["error"]["message"])
+
+    def test_admin_shell_create_is_cli_only_with_exact_commands(self) -> None:
+        status, _, error = self.request(
+            "POST",
+            "/api/conversations",
+            body={"shell_id": 3, "harness": "codex"},
+            key="admin-cli-only-create",
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(error["error"]["code"], "ADMIN_SHELL_CLI_ONLY")
+        self.assertIn(f"cd {self.root}", error["error"]["message"])
+        self.assertIn("make dos-e s=ADM1", error["error"]["message"])
+        self.assertEqual(
+            error["error"]["details"],
+            {"shell_id": 3, "shortname": "ADM1", "repo_root": str(self.root)},
+        )
+        con = self.connect()
+        try:
+            count = con.execute(
+                "SELECT COUNT(*) FROM conversations WHERE shell_id=3"
+            ).fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(count, 0)
+
+    def test_admin_shell_reopen_is_cli_only(self) -> None:
+        con = self.connect()
+        try:
+            conversation_id = self.seed_conversation(
+                con, number=901, shell_id=3, state="closed")
+            con.commit()
+        finally:
+            con.close()
+        status, _, error = self.request(
+            "POST",
+            f"/api/conversations/{conversation_id}/messages",
+            body={"text": "hello admin"},
+            key="admin-cli-only-reopen",
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(error["error"]["code"], "ADMIN_SHELL_CLI_ONLY")
+        con = self.connect()
+        try:
+            state = con.execute(
+                "SELECT state FROM conversations WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(state, "closed")
 
     def test_creating_a_chat_closes_the_previous_idle_chat(self) -> None:
         first = self.create(key="first-chat", title="First")
