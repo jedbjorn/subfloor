@@ -1848,7 +1848,7 @@ engine API) — there is no `sqlite3` path.
 ## Surface
 
 ```
-sc mem get flags          # your open flags — `#<id> [<label>] (<priority>) <description>`
+sc mem get flags          # open flags as five-line evidence blocks (identity/status + four detail lines)
 sc mem get flags --json   # same, as JSON
 sc mem get flags <id>     # exact non-deleted row, open or resolved
 sc mem get flags --feature <id> --resolved

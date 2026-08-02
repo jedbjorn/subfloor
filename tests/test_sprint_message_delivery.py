@@ -195,10 +195,23 @@ class MessageTransactionTest(SprintMessageCase):
         self,
     ) -> None:
         before = self.con.execute("SELECT COUNT(*) FROM sprint_messages").fetchone()[0]
-        with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError, "only work assignments"
-        ):
+        with self.assertRaises(sprint_domain.SprintInvariantError) as direct:
             self.send("bad-action", kind="system", actionable=True)
+        self.con.execute("BEGIN")
+        try:
+            with self.assertRaises(sprint_domain.SprintInvariantError) as nested:
+                self.messages.send_in_transaction(
+                    self.sprint_id,
+                    to_participant_id=self.developer_id,
+                    message_kind="system",
+                    body="bad nested action",
+                    idempotency_key="bad-nested-action",
+                    actionable=True,
+                )
+        finally:
+            self.con.rollback()
+        self.assertEqual(str(direct.exception), delivery.ACTIONABLE_KIND_ERROR)
+        self.assertEqual(str(nested.exception), delivery.ACTIONABLE_KIND_ERROR)
         self.assertEqual(
             before,
             self.con.execute("SELECT COUNT(*) FROM sprint_messages").fetchone()[0],

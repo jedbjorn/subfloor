@@ -98,11 +98,65 @@ class PythonTestPresenceTest(unittest.TestCase):
             source.write_text("pass\n")
             self.assertFalse(_run_python_test_presence(root))
 
+    def test_presence_stops_after_first_matching_test(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "walked-every-candidate"
+            first = root / "tests" / "test_first.py"
+            first.parent.mkdir()
+            first.write_text("pass\n")
+            script = (
+                f'here="{root}"\n'
+                "_sc_find_manifests() {\n"
+                f'  printf "%s\\n" "{first}"\n'
+                "  candidate=0\n"
+                "  while [ \"$candidate\" -lt 10000 ]; do\n"
+                f'    printf "%s\\n" "{root}/src/test_$candidate.py" || exit\n'
+                "    candidate=$((candidate + 1))\n"
+                "  done\n"
+                f'  : > "{marker}"\n'
+                "}\n"
+                f'{_extract("_sc_has_python_tests")}\n'
+                "_sc_has_python_tests\n"
+            )
+            done = subprocess.run(
+                ["sh", "-c", script], capture_output=True, text=True,
+                check=False, timeout=5,
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertFalse(marker.exists(),
+                             "presence detection consumed candidates after a match")
+
     def test_sc_test_caches_one_presence_result_for_both_gates(self):
         body = _extract("sc_test")
         self.assertEqual(body.count("_sc_has_python_tests"), 1)
         self.assertEqual(body.count('[ -n "$python_tests" ]'), 2)
         self.assertNotIn('ls "$here"/tests/test_*.py', body)
+
+    def test_sc_test_calls_presence_probe_once_at_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = root / "presence-calls"
+            pytest = root / ".venv" / "bin" / "pytest"
+            pytest.parent.mkdir(parents=True)
+            pytest.write_text("#!/bin/sh\nexit 0\n")
+            pytest.chmod(0o755)
+            script = (
+                f'here="{root}"\nPY=python3\n'
+                f'_sc_has_python_tests() {{ echo called >> "{calls}"; return 0; }}\n'
+                "_sc_venv_runnable() { return 0; }\n"
+                "_sc_find_manifests() { return 0; }\n"
+                "_sc_wants_pytest() { return 1; }\n"
+                "sc_deps() { echo unexpected provisioning >&2; return 99; }\n"
+                f'{_extract("sc_test")}\n'
+                "sc_test\n"
+            )
+            done = subprocess.run(
+                ["sh", "-c", script], capture_output=True, text=True,
+                check=False,
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertEqual(calls.read_text().splitlines(), ["called"])
 
     def test_nested_suite_provisions_then_runs_one_root_pytest(self):
         with tempfile.TemporaryDirectory() as tmp:

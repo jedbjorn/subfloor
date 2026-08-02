@@ -21,6 +21,9 @@ from sprint_domain import SprintInvariantError, SprintLifecycleStore
 wake_prompt = sprint_participant_chats.wake_prompt
 
 ACTIONABLE_KINDS = frozenset({"work_assignment", "review_request", "notification"})
+ACTIONABLE_KIND_ERROR = (
+    "only work assignments, review requests, and notifications are actionable"
+)
 
 
 @dataclass(frozen=True)
@@ -89,10 +92,7 @@ class SprintMessageStore:
         if not key:
             raise ValueError("Sprint message idempotency key is empty")
         if actionable and message_kind not in ACTIONABLE_KINDS:
-            raise SprintInvariantError(
-                "only work assignments, review requests, and notifications "
-                "are actionable"
-            )
+            raise SprintInvariantError(ACTIONABLE_KIND_ERROR)
         with db_driver.write_transaction(self.con, "sprint.message.send"):
             return self.send_in_transaction(
                 sprint_id,
@@ -210,10 +210,7 @@ class SprintMessageStore:
         if not key:
             raise ValueError("Sprint message idempotency key is empty")
         if actionable and message_kind not in ACTIONABLE_KINDS:
-            raise SprintInvariantError(
-                "only work assignments, review requests, and notifications "
-                "are actionable"
-            )
+            raise SprintInvariantError(ACTIONABLE_KIND_ERROR)
         return self._send(
             sprint_id,
             to_participant_id=to_participant_id,

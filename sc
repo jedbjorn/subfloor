@@ -274,12 +274,11 @@ _sc_find_manifests() {  # $1 = filename glob, e.g. 'requirements*.txt'
 # pruning; pytest still owns actual recursive collection from the repo root.
 _sc_has_python_tests() {
   _sc_find_manifests 'test_*.py' | (
-    found=""
     while IFS= read -r test_file; do
       relative_test=${test_file#"$here"/}
-      case "$relative_test" in tests/*|*/tests/*) found=1 ;; esac
+      case "$relative_test" in tests/*|*/tests/*) exit 0 ;; esac
     done
-    [ -n "$found" ]
+    exit 1
   )
 }
 
