@@ -4324,14 +4324,17 @@ def main(argv):
             )
             sprint_pr_watcher.start_service(DB_PATH, repo_root=REPO_ROOT)
 
-        await transport.serve(
-            bind,
-            port,
-            dispatch_http,
-            _ws_unavailable,
-            on_started=start_runtime_services,
-            stream_handler=conversation_routes.stream_events,
-        )
+        try:
+            await transport.serve(
+                bind,
+                port,
+                dispatch_http,
+                _ws_unavailable,
+                on_started=start_runtime_services,
+                stream_handler=conversation_routes.stream_events,
+            )
+        finally:
+            conversation_reaper.stop_service()
 
     print(f"super-coder review layer → http://127.0.0.1:{port}  (bind {bind}, DB: {DB_PATH.name})")
     try:

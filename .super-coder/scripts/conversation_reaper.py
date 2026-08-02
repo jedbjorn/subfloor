@@ -535,5 +535,16 @@ def start_service(
         return _SERVICE
 
 
+def stop_service() -> None:
+    """Stop and join the process-wide service before its DB can disappear."""
+    global _SERVICE
+    with _SERVICE_LOCK:
+        if _SERVICE is None:
+            return
+        _SERVICE.stop()
+        _SERVICE.join()
+        _SERVICE = None
+
+
 def service() -> ConversationReaper | None:
     return _SERVICE

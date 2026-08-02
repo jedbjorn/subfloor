@@ -10,12 +10,14 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SCRIPTS = ENGINE / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import conversation_reaper
 from conversation_reaper import (
     ConversationReaper,
     ProcessSnapshot,
@@ -320,6 +322,17 @@ class ConversationReaperTest(unittest.TestCase):
         ).fetchone()
         con.close()
         self.assertEqual(tuple(heartbeat), ("conversation-reaper", 60))
+
+    def test_stop_service_stops_joins_and_clears_the_worker(self) -> None:
+        worker = mock.Mock()
+        with mock.patch.object(conversation_reaper, "_SERVICE", worker):
+            conversation_reaper.stop_service()
+            self.assertIsNone(conversation_reaper.service())
+
+        self.assertEqual(
+            worker.mock_calls,
+            [mock.call.stop(), mock.call.join()],
+        )
 
     def test_schema_rejects_partial_identity_and_ladder_state(self) -> None:
         _conversation, _message, run_id = self.add_run()

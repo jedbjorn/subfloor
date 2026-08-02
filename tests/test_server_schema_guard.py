@@ -320,8 +320,8 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
     def _start(self, bind, *, container=False, port=8800):
         """Run main([]) to the bind decision.
 
-        Returns refusal, served host, and whether the conversation broker and
-        armed Sprint runtime started after that successful bind.
+        Returns refusal, served host, and whether the conversation broker,
+        reaper, and armed Sprint services crossed their lifecycle boundaries.
         """
         served = []
 
@@ -370,6 +370,12 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
                 broker_start = enter(mock.patch.object(
                     server.conversation_broker, "start_service"
                 ))
+                reaper_start = enter(mock.patch.object(
+                    server.conversation_reaper, "start_service"
+                ))
+                reaper_stop = enter(mock.patch.object(
+                    server.conversation_reaper, "stop_service"
+                ))
                 sprint_start = enter(mock.patch.object(
                     server.sprint_runtime, "start_service"
                 ))
@@ -388,6 +394,8 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
             refusal,
             served[0] if served else None,
             broker_start.called,
+            reaper_start.called,
+            reaper_stop.called,
             sprint_start.called,
             watcher_start.called,
         )
@@ -399,6 +407,8 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
                     refusal,
                     served,
                     broker_started,
+                    reaper_started,
+                    reaper_stopped,
                     sprint_started,
                     watcher_started,
                 ) = self._start(bind)
@@ -415,6 +425,14 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
                     "conversation broker started before bind refusal",
                 )
                 self.assertFalse(
+                    reaper_started,
+                    "conversation reaper started before bind refusal",
+                )
+                self.assertFalse(
+                    reaper_stopped,
+                    "conversation reaper shutdown ran without a server",
+                )
+                self.assertFalse(
                     sprint_started,
                     "Sprint runtime started before bind refusal",
                 )
@@ -426,7 +444,7 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
     def test_startup_serves_a_loopback_bind(self):
         self.assertEqual(
             self._start("127.0.0.1"),
-            (None, "127.0.0.1", True, True, True),
+            (None, "127.0.0.1", True, True, True, True, True),
         )
 
     def test_startup_imports_no_removed_scheduler(self):
@@ -447,7 +465,7 @@ class LoopbackBindStartupWiringTest(unittest.TestCase):
         # unbootable, so the sandbox exception has to survive the wiring too.
         self.assertEqual(
             self._start("0.0.0.0", container=True),
-            (None, "0.0.0.0", True, True, True),
+            (None, "0.0.0.0", True, True, True, True, True),
         )
 
     def test_startup_binds_the_csp_to_the_served_port(self):
