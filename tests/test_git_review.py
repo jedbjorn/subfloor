@@ -20,6 +20,7 @@ from github_pull_requests import (
     GitHubPullRequestReader,
     GitHubReadError,
     GitHubResponseTooLarge,
+    _check_state,
     normalize_pull_request,
 )
 from review_fixtures import MockGitHub, ReviewRepository
@@ -40,6 +41,41 @@ class FixtureGitHubReader:
 
 
 class GitHubReaderTest(unittest.TestCase):
+    def test_check_rollups_stay_pending_until_every_item_succeeds(self) -> None:
+        fixture = MockGitHub()
+        queued = fixture.pr(827)["statusCheckRollup"]
+        failed = fixture.pr(822)["statusCheckRollup"]
+        cases = (
+            (queued, ("PENDING", False)),
+            ([{"status": "QUEUED", "conclusion": None}], ("PENDING", False)),
+            ([{"status": "IN_PROGRESS", "conclusion": None}], ("PENDING", False)),
+            ([{"status": "WAITING", "conclusion": None}], ("PENDING", False)),
+            ([{"status": "REQUESTED", "conclusion": None}], ("PENDING", False)),
+            ([{"status": "COMPLETED", "conclusion": None}], ("PENDING", False)),
+            ([{"state": "UNKNOWN"}], ("PENDING", False)),
+            (failed + queued, ("FAILURE", True)),
+            (
+                [
+                    {"status": "COMPLETED", "conclusion": "SUCCESS"},
+                    {"status": "COMPLETED", "conclusion": "NEUTRAL"},
+                ],
+                ("SUCCESS", False),
+            ),
+            (fixture.pr(821)["statusCheckRollup"], ("SUCCESS", False)),
+            (fixture.pr(828)["statusCheckRollup"], ("PENDING", False)),
+            ([{"state": "SUCCESS"}], ("SUCCESS", False)),
+            ([{"state": "FAILURE"}], ("FAILURE", True)),
+            (
+                [{"conclusion": "SUCCESS", "state": "FAILURE", "status": "QUEUED"}],
+                ("SUCCESS", False),
+            ),
+            ([], (None, False)),
+        )
+
+        for rollup, expected in cases:
+            with self.subTest(rollup=rollup):
+                self.assertEqual(expected, _check_state(rollup))
+
     def test_list_normalizes_full_projection_with_read_only_command(self) -> None:
         payload = json.dumps(MockGitHub().list_prs()).encode()
         calls = []

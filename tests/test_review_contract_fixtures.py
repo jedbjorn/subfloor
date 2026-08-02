@@ -275,21 +275,37 @@ class GitComparisonFixtureTest(unittest.TestCase):
 
 
 class MockGitHubFixtureTest(unittest.TestCase):
-    def test_open_and_failing_check_rollups_are_explicit(self) -> None:
+    def test_checkrun_and_status_context_rollups_are_explicit(self) -> None:
         github = MockGitHub()
         open_pr = github.pr(821)
         failing_pr = github.pr(822)
         closed_pr = github.pr(826)
+        queued_pr = github.pr(827)
+        pending_pr = github.pr(828)
 
         self.assertEqual(open_pr["state"], "OPEN")
         self.assertEqual(
-            open_pr["statusCheckRollup"][0]["conclusion"],
+            open_pr["statusCheckRollup"][0]["state"],
+            "SUCCESS",
+        )
+        self.assertNotIn("conclusion", open_pr["statusCheckRollup"][0])
+        self.assertEqual(
+            open_pr["statusCheckRollup"][1]["conclusion"],
             "SUCCESS",
         )
         self.assertEqual(failing_pr["state"], "OPEN")
         self.assertEqual(
-            failing_pr["statusCheckRollup"][0]["conclusion"],
+            failing_pr["statusCheckRollup"][0]["state"],
             "FAILURE",
+        )
+        self.assertNotIn("conclusion", failing_pr["statusCheckRollup"][0])
+        self.assertEqual(
+            queued_pr["statusCheckRollup"][1],
+            {"name": "pytest", "status": "QUEUED", "conclusion": None},
+        )
+        self.assertEqual(
+            pending_pr["statusCheckRollup"][0],
+            {"context": "legacy/tests", "state": "PENDING"},
         )
         self.assertEqual(closed_pr["state"], "CLOSED")
         self.assertIsNone(closed_pr["mergedAt"])
