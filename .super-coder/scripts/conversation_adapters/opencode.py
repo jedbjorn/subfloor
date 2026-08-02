@@ -412,12 +412,9 @@ class OpenCodeAdapter(ConversationAdapter):
             session_ref=session_ref,
             run_ref=run_ref,
             worktree=worktree,
-            process_ref=(
-                str(_SERVER_PROCESS.pid)
-                if _SERVER_PROCESS is not None
-                and _SERVER_PROCESS.poll() is None
-                else None
-            ),
+            # The OpenCode server is shared across shells and turns, so it is
+            # not a turn-owned process the active-chat reaper may terminate.
+            process_ref=None,
             metadata={
                 "context": context,
                 "event_stream": event_stream,

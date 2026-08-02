@@ -80,6 +80,28 @@ WHERE c.state<>'closed'
     LIMIT 1
   );
 
+-- Closing a chat makes its queued work permanently unclaimable.  Mirror the
+-- runtime close path by cancelling pending/claimed delivery intent first.
+UPDATE conversation_messages
+SET state='cancelled',completed_at=datetime('now')
+WHERE state IN ('accepted','queued','running')
+  AND message_id IN (
+    SELECT outbox.message_id
+    FROM conversation_outbox outbox
+    WHERE outbox.state IN ('pending','claimed')
+      AND NOT EXISTS (
+        SELECT 1 FROM _active_shell_chat_seed seed
+        WHERE seed.chat_id=outbox.conversation_id
+      )
+  );
+UPDATE conversation_outbox
+SET state='cancelled',claim_owner=NULL,claimed_at=NULL,lease_expires_at=NULL
+WHERE state IN ('pending','claimed')
+  AND NOT EXISTS (
+    SELECT 1 FROM _active_shell_chat_seed seed
+    WHERE seed.chat_id=conversation_outbox.conversation_id
+  );
+
 -- Walk legal state edges before closing legacy extras.  This keeps the
 -- migration compatible with the conversation transition trigger.
 UPDATE conversations

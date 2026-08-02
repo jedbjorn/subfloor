@@ -366,13 +366,46 @@ class MigrationAndShapeTest(ConversationDbCase):
                 "INSERT INTO conversations "
                 "(conversation_id,shell_id,owner_user_id,harness,worktree,"
                 "conversation_scope,creation_idempotency_key,"
-                "creation_request_hash,last_activity_at) VALUES "
+                "creation_request_hash,state,last_activity_at) VALUES "
                 "('cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',9,9,'codex',"
-                "'/tmp/legacy','normal','legacy-normal','hash-normal',"
+                "'/tmp/legacy','normal','legacy-normal','hash-normal','queued',"
                 "'2026-08-02 10:00:00'),"
                 "('cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',9,9,'codex',"
-                "'/tmp/legacy','sprint','legacy-sprint','hash-sprint',"
-                "'2026-08-02 11:00:00')"
+                "'/tmp/legacy','sprint','legacy-running','hash-running','running',"
+                "'2026-08-02 11:00:00'),"
+                "('cv_cccccccccccccccccccccccccccccccc',9,9,'codex',"
+                "'/tmp/legacy','sprint','legacy-newest','hash-newest','idle',"
+                "'2026-08-02 12:00:00')"
+            )
+            con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) VALUES "
+                "('cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','user','9','prompt',"
+                "'queued','queued-message','hash-queued','queued'),"
+                "('cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','user','9','prompt',"
+                "'running','running-message','hash-running','running'),"
+                "('cv_cccccccccccccccccccccccccccccccc','user','9','prompt',"
+                "'active','active-message','hash-active','queued')"
+            )
+            con.execute(
+                "INSERT INTO conversation_outbox "
+                "(conversation_id,message_id,state,claim_owner,claimed_at,"
+                "lease_expires_at) "
+                "SELECT conversation_id,message_id,'pending',NULL,NULL,NULL "
+                "FROM conversation_messages "
+                "WHERE conversation_id IN ("
+                "'cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',"
+                "'cv_cccccccccccccccccccccccccccccccc')"
+            )
+            con.execute(
+                "INSERT INTO conversation_outbox "
+                "(conversation_id,message_id,state,claim_owner,claimed_at,"
+                "lease_expires_at) "
+                "SELECT conversation_id,message_id,'claimed','broker',"
+                "'2026-08-02 11:01:00','2026-08-02 11:06:00' "
+                "FROM conversation_messages WHERE conversation_id="
+                "'cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'"
             )
 
             con.executescript(ACTIVE_REGISTRY.read_text())
@@ -392,7 +425,8 @@ class MigrationAndShapeTest(ConversationDbCase):
                 states,
                 {
                     "cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "closed",
-                    "cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": "idle",
+                    "cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": "closed",
+                    "cv_cccccccccccccccccccccccccccccccc": "idle",
                 },
             )
             self.assertEqual(
@@ -400,10 +434,46 @@ class MigrationAndShapeTest(ConversationDbCase):
                 [
                     (
                         9,
-                        "cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "cv_cccccccccccccccccccccccccccccccc",
                         None,
                         None,
                     )
+                ],
+            )
+            queued_work = [
+                tuple(row)
+                for row in con.execute(
+                    "SELECT m.conversation_id,m.state,o.state,"
+                    "m.completed_at IS NOT NULL,o.claim_owner "
+                    "FROM conversation_messages m "
+                    "JOIN conversation_outbox o USING (message_id) "
+                    "ORDER BY m.conversation_id"
+                )
+            ]
+            self.assertEqual(
+                queued_work,
+                [
+                    (
+                        "cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "cancelled",
+                        "cancelled",
+                        1,
+                        None,
+                    ),
+                    (
+                        "cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "cancelled",
+                        "cancelled",
+                        1,
+                        None,
+                    ),
+                    (
+                        "cv_cccccccccccccccccccccccccccccccc",
+                        "queued",
+                        "pending",
+                        0,
+                        None,
+                    ),
                 ],
             )
 
@@ -423,7 +493,7 @@ class MigrationAndShapeTest(ConversationDbCase):
 
             con.execute(
                 "UPDATE conversations SET state='closed',closed_at=datetime('now') "
-                "WHERE conversation_id='cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'"
+                "WHERE conversation_id='cv_cccccccccccccccccccccccccccccccc'"
             )
             self.assertEqual(
                 con.execute("SELECT COUNT(*) FROM active_shell_chats").fetchone()[0],

@@ -32,6 +32,7 @@ from conversation_adapters import (  # noqa: E402
     ReconcileResult,
     adapter_for,
 )
+from conversation_adapters import opencode as opencode_adapter
 
 KIMI_FIXTURES = ROOT / "tests" / "fixtures" / "conversations" / "kimi"
 
@@ -927,6 +928,21 @@ class ConversationAdapterTest(unittest.TestCase):
         recovered = adapter.reconcile(fresh, self.context)
         self.assertEqual(recovered.outcome, "unknown")
         self.assertFalse(recovered.proven)
+
+    def test_opencode_shared_server_is_not_the_turn_process(self) -> None:
+        adapter, _native = self.build("opencode")
+        shared_server = mock.Mock(pid=4242)
+        shared_server.poll.return_value = None
+
+        with mock.patch.object(
+            opencode_adapter,
+            "_SERVER_PROCESS",
+            shared_server,
+        ):
+            turn = adapter.start(self.context, "hello")
+
+        self.assertIsNone(turn.process_ref)
+        self.assertEqual(shared_server.poll.call_count, 0)
 
     def test_opencode_shell_tools_use_the_conversation_launch_identity(
         self,
