@@ -470,15 +470,26 @@ sc_test() {
   venv="$here/.venv"
   python_tests=""
   _sc_has_python_tests && python_tests=1
-  # Self-heal: a fork with python tests but no .venv/bin/pytest is an unprovisioned
-  # worktree (the .venv is only populated by the first `./sc deps`), NOT a fork that
-  # opted out of pytest. Provision the dev kit + fork deps rather than silently
-  # downgrading to stdlib unittest — under which a pytest-based suite fails with
-  # ModuleNotFoundError (pytest / the fork's own libs) that reads as a real test
-  # failure. We gate on the pytest binary, not sc_deps' exit code, so a partial
-  # provision (e.g. npm leg fails) still runs pytest if it landed.
-  if [ ! -x "$venv/bin/pytest" ] && [ -n "$python_tests" ]; then
-    echo "→ test: $venv/bin/pytest missing — provisioning first (./sc deps)"
+  # Self-heal an unprovisioned OR unrunnable host venv before selecting a test
+  # runner. A dangling interpreter leaves the pytest shim executable, so -x is
+  # not evidence that the venv can run. On the host the repo-local .venv is ours
+  # to rebuild; in the sandbox a host-managed venv stays untouched and sc_deps'
+  # existing ownership check chooses the safe PATH fallback.
+  provision_reason=""
+  if [ -n "$python_tests" ]; then
+    if [ ! -x "$venv/bin/pytest" ]; then
+      provision_reason=missing
+    elif ! _sc_venv_runnable; then
+      provision_reason=unrunnable
+    fi
+  fi
+  if [ -n "$provision_reason" ]; then
+    if [ "$provision_reason" = unrunnable ] && [ -z "${SC_SANDBOX:-}" ]; then
+      echo "→ test: $venv is not runnable — rebuilding before provisioning"
+      ( cd "$here" && rm -rf -- .venv )
+    else
+      echo "→ test: $venv/bin/pytest unavailable — provisioning first (./sc deps)"
+    fi
     sc_deps || echo "→ test: provisioning incomplete — continuing" >&2
   fi
   # Which pytest can we actually RUN? The .venv copy wins (fork pins + config)

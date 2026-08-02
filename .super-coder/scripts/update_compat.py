@@ -15,6 +15,7 @@ previous ref.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -35,6 +36,14 @@ def _read_ref(path: Path) -> str | None:
     except OSError:
         return None
     return value if _SHA_RE.fullmatch(value) else None
+
+
+def _current_update_ref() -> str | None:
+    """Prefer the not-yet-published target supplied by a current updater."""
+    pending = os.environ.get("SC_UPDATE_TARGET_REF", "").strip()
+    if _SHA_RE.fullmatch(pending):
+        return pending
+    return _read_ref(ENGINE_REF)
 
 
 def _ref_contains_bridge(ref: str) -> bool:
@@ -60,7 +69,7 @@ def needs_legacy_bridge() -> tuple[bool, str | None]:
 
 
 def main() -> int:
-    current = _read_ref(ENGINE_REF)
+    current = _current_update_ref()
     if current is not None:
         # Unlike the path-repair migration below, dispatcher coherence is a
         # standing invariant. Existing forks may already carry the v1 marker
@@ -68,6 +77,7 @@ def main() -> int:
         import update
 
         update.repair_callable_dispatcher(current)
+        update.reconcile_linked_dispatchers(current)
 
     needed, current = needs_legacy_bridge()
     if not needed:

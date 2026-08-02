@@ -323,6 +323,43 @@ class VenvRunnabilityGateTest(unittest.TestCase):
             self.assertIn("_sc_venv_runnable", body[max(0, m.start() - 200):m.start()],
                           "the venv pytest was selected without the probe")
 
+    def test_sc_test_rebuilds_dangling_venv_before_running_pytest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            venv = root / ".venv"
+            (venv / "bin").mkdir(parents=True)
+            (venv / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
+            (venv / "bin" / "python").symlink_to("missing-python")
+            pytest = venv / "bin" / "pytest"
+            pytest.write_text("#!/bin/sh\necho STALE-PYTEST-RAN\n")
+            pytest.chmod(0o755)
+            script = (
+                f'here="{root}"\nPY=/bin/false\nPATH=/usr/bin:/bin\n'
+                "_sc_has_python_tests() { return 0; }\n"
+                "_sc_find_manifests() { return 0; }\n"
+                "_sc_wants_pytest() { return 1; }\n"
+                f'{_extract("_sc_venv_runnable")}\n'
+                "sc_deps() {\n"
+                "  [ ! -e \"$here/.venv\" ] || { echo NOT-REBUILT >&2; return 91; }\n"
+                "  mkdir -p \"$here/.venv/bin\" \"$here/.venv/lib/python3.12/site-packages\"\n"
+                "  printf '#!/bin/sh\\necho 3.12\\n' > \"$here/.venv/bin/python\"\n"
+                "  printf '#!/bin/sh\\necho FRESH-PYTEST-RAN\\n' > \"$here/.venv/bin/pytest\"\n"
+                "  chmod +x \"$here/.venv/bin/python\" \"$here/.venv/bin/pytest\"\n"
+                "  echo PROVISIONED\n"
+                "}\n"
+                f'{_extract("sc_test")}\n'
+                "sc_test\n"
+            )
+            done = subprocess.run(
+                ["sh", "-c", script], capture_output=True, text=True, check=False,
+            )
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(done.stderr, "")
+        self.assertIn("PROVISIONED\n", done.stdout)
+        self.assertIn("FRESH-PYTEST-RAN\n", done.stdout)
+        self.assertNotIn("STALE-PYTEST-RAN", done.stdout)
+
 
 class DepsHostManagedVerifyTest(unittest.TestCase):
     """#314/#324/#339 — the sandbox pip-skip must never green-lie: declared
