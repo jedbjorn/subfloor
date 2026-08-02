@@ -4431,17 +4431,20 @@ async function renderInterface(root) {
   let previousFlavor = "";
   for (const item of orderedShells) {
     const flavor = item.flavor || "bespoke";
+    const sprint = item.sprint;
     if (previousFlavor && flavor !== previousFlavor)
       rail.append(
         el("div", { className: "chat-shell-divider", role: "separator" }));
     previousFlavor = flavor;
     const button = el("button", {
       className: "chat-shell"
-        + (item.shell_id === shell.shell_id ? " selected" : ""),
+        + (item.shell_id === shell.shell_id ? " selected" : "")
+        + (sprint ? " has-sprint" : ""),
       type: "button",
     },
-    el("span", { className: "chat-shell-name" }, item.display_name),
-    chatUnreadBadge(item),
+    el("span", { className: "chat-shell-identity" },
+      el("span", { className: "chat-shell-name" }, item.display_name),
+      chatUnreadBadge(item)),
     el("span", { className: "chat-shell-shortname" }, item.shortname || ""));
     chatPaintShellState(button, openByShell.get(item.shell_id));
     shellItems.set(item.shell_id, button);
@@ -4450,24 +4453,20 @@ async function renderInterface(root) {
       location.hash = chatHash(item.shortname);
     };
     const shellRow = el("div", { className: "chat-shell-row" }, button);
-    if (item.sprint) {
-      const sprint = item.sprint;
-      const pill = el("button", {
-        className: "chat-sprint-pill",
+    if (sprint) {
+      const badge = el("button", {
+        className: "chat-sprint-badge",
         type: "button",
         title: `Sprint ${sprint.sprint_id} · ${sprint.role} · ${sprint.disposition}`,
         ariaLabel: `Enter Sprint ${sprint.sprint_id} ${sprint.role} conversation`,
-      },
-      el("span", {}, `Sprint ${sprint.sprint_id}`),
-      el("span", { className: "chat-sprint-meta" },
-        `${sprint.role} · ${sprint.disposition}`));
-      pill.onclick = () => {
+      }, `Sprint ${sprint.sprint_id}`);
+      badge.onclick = () => {
         location.hash = chatHash(
           item.shortname,
           sprint.current_conversation_id,
         );
       };
-      shellRow.append(pill);
+      shellRow.append(badge);
     }
     rail.append(shellRow);
   }
