@@ -251,6 +251,12 @@ def close_for_terminal_lifecycle(
         raise RuntimeError("Sprint conversation cleanup requires a transaction")
     if lifecycle not in {"completed", "aborted"}:
         raise ValueError("Sprint conversation cleanup requires a terminal lifecycle")
+    owning_planner_shell_id = int(
+        con.execute(
+            "SELECT originating_planner_shell_id FROM sprints WHERE sprint_id=?",
+            (sprint_id,),
+        ).fetchone()[0]
+    )
     rows = con.execute(
         "SELECT DISTINCT c.conversation_id,c.state "
         "FROM sprint_participant_conversations pc "
@@ -270,14 +276,13 @@ def close_for_terminal_lifecycle(
         conversation_ids.append(conversation_id)
         cancelled = _cancel_queued_turns(con, conversation_id)
         active = con.execute(
-            "SELECT run_id FROM conversation_runs WHERE conversation_id=? "
+            "SELECT run_id,shell_id FROM conversation_runs WHERE conversation_id=? "
             "AND state IN ('leased','starting','running') "
             "ORDER BY run_id DESC LIMIT 1",
             (conversation_id,),
         ).fetchone()
         if active is not None:
             run_id = int(active["run_id"])
-            run_ids.append(run_id)
             close_requested = con.execute(
                 "SELECT 1 FROM conversation_events WHERE conversation_id=? "
                 "AND event_type='conversation.close.requested' LIMIT 1",
@@ -295,6 +300,12 @@ def close_for_terminal_lifecycle(
                     },
                     run_id=run_id,
                 )
+            if (
+                lifecycle == "completed"
+                and int(active["shell_id"]) == owning_planner_shell_id
+            ):
+                continue
+            run_ids.append(run_id)
             conversation_broker.BrokerStore.request_interrupt_in_transaction(
                 con,
                 run_id,

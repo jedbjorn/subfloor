@@ -159,7 +159,7 @@ class SprintReviewLoopStore:
                 work_unit_id=int(lane["work_unit_id"]),
                 message_kind="notification",
                 body=notification,
-                actionable=False,
+                actionable=verdict == "changes_requested",
                 active=True,
                 idempotency_key=idempotency_key,
             )

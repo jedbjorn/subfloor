@@ -133,6 +133,13 @@ class ReviewHandoffTest(SprintReviewLoopCase):
         self.assertTrue(outcome.created)
 
     def test_green_readiness_commits_judgment_and_active_reviewer_request(self):
+        assignment_message_id = int(
+            self.con.execute(
+                "SELECT message_id FROM sprint_messages WHERE work_unit_id=? "
+                "AND message_kind='work_assignment'",
+                (self.unit_id,),
+            ).fetchone()[0]
+        )
         handoff = self.request_review()
 
         self.assertTrue(handoff.created)
@@ -171,6 +178,19 @@ class ReviewHandoffTest(SprintReviewLoopCase):
             ),
             tuple(judgment),
         )
+        assignment_expectation = self.con.execute(
+            "SELECT resolved_at,resolution,next_evaluation_at "
+            "FROM sprint_liveness_expectations WHERE message_id=?",
+            (assignment_message_id,),
+        ).fetchone()
+        self.assertIsNotNone(assignment_expectation["resolved_at"])
+        self.assertEqual(
+            ("work_unit.in_review", None),
+            (
+                assignment_expectation["resolution"],
+                assignment_expectation["next_evaluation_at"],
+            ),
+        )
         lease = sprint_message_delivery.SprintWakeDeliveryService(
             self.con
         ).claim_next("stage6-review")
@@ -181,6 +201,15 @@ class ReviewHandoffTest(SprintReviewLoopCase):
         ).fetchone()[0]
         self.assertEqual(self.reviewer_id, lease.participant_id)
         self.assertEqual(reviewer_chat, lease.target_conversation_id)
+        self.accept_review(handoff.message_id)
+        review_expectation = self.con.execute(
+            "SELECT resolved_at,resolution,next_evaluation_at "
+            "FROM sprint_liveness_expectations WHERE message_id=?",
+            (handoff.message_id,),
+        ).fetchone()
+        self.assertIsNone(review_expectation["resolved_at"])
+        self.assertIsNone(review_expectation["resolution"])
+        self.assertIsNotNone(review_expectation["next_evaluation_at"])
         self.assertEqual(
             0,
             self.con.execute(
@@ -295,7 +324,22 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
             (changed.conversation_id,),
         ).fetchone()
         self.assertEqual(("fix", self.developer_conversation_id), tuple(fix_link))
-        self.assertIsNone(self.messages.mark_read(changed.message_id, 1))
+        self.assertEqual("accepted", self.messages.mark_read(changed.message_id, 1))
+        changed_expectation = self.con.execute(
+            "SELECT resolved_at,resolution,next_evaluation_at "
+            "FROM sprint_liveness_expectations WHERE message_id=?",
+            (changed.message_id,),
+        ).fetchone()
+        self.assertIsNone(changed_expectation["resolved_at"])
+        self.assertIsNone(changed_expectation["resolution"])
+        self.assertIsNotNone(changed_expectation["next_evaluation_at"])
+        assignment_expectation = self.con.execute(
+            "SELECT resolution FROM sprint_liveness_expectations expectation "
+            "JOIN sprint_messages message USING(message_id) "
+            "WHERE message.work_unit_id=? AND message.message_kind='work_assignment'",
+            (self.unit_id,),
+        ).fetchone()
+        self.assertEqual("work_unit.in_review", assignment_expectation["resolution"])
         self.assertEqual(
             ("review submitted: changes_requested", 0),
             tuple(
@@ -329,6 +373,15 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
         )
         self.watcher.poll_once()
         second = self.request_review("review-2")
+        changed_expectation = self.con.execute(
+            "SELECT resolution,next_evaluation_at "
+            "FROM sprint_liveness_expectations WHERE message_id=?",
+            (changed.message_id,),
+        ).fetchone()
+        self.assertEqual(
+            ("work_unit.in_review", None),
+            tuple(changed_expectation),
+        )
         self.accept_review(second.message_id)
         approved = self.loop.record_review(
             self.sprint_id,

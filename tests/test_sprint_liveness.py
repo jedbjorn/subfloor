@@ -663,8 +663,161 @@ class DeliveryAndActivationTest(SprintLivenessCase):
         self.assertEqual("work_unit.completed", expectation["resolution"])
         self.assertIsNone(expectation["next_evaluation_at"])
 
+    def test_in_review_resolves_assignment_before_liveness_nudge(self) -> None:
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='in_review',"
+            "updated_at=datetime('now') WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        self.con.commit()
+
+        expectation = self.expectation()
+        self.assertIsNotNone(expectation["resolved_at"])
+        self.assertEqual("work_unit.in_review", expectation["resolution"])
+        self.assertIsNone(expectation["next_evaluation_at"])
+
+        self.advance(20)
+        self.assertEqual((), self.monitor().evaluate(self.sprint_id))
+        self.assertEqual([], self.message_rows("nudge"))
+
 
 class MigrationGateTest(unittest.TestCase):
+    def test_in_review_upgrade_backfills_dirty_assignment_once(self) -> None:
+        con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
+        con.row_factory = sqlite3.Row
+        con.executescript((ENGINE / "schema.sql").read_text())
+        target = "0158_sprint_terminal_liveness_hardening.sql"
+        for migration in sorted(MIGRATIONS.glob("*.sql")):
+            if migration.name >= target:
+                break
+            con.executescript(migration.read_text())
+        con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
+        con.executemany(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (?,?,?,?,?,1)",
+            (
+                (1, "Developer", "DEV1", "dev", "prompt"),
+                (2, "Reviewer", "REV1", "reviewer", "prompt"),
+                (3, "Planner", "PLN1", "planner", "prompt"),
+            ),
+        )
+        feature_id = int(
+            con.execute(
+                "INSERT INTO roadmap (title,roadmap_status) "
+                "VALUES ('Feature','in_progress')"
+            ).lastrowid
+        )
+        body = "governing spec"
+        document_id = int(
+            con.execute(
+                "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                "VALUES (?,'spec',1,'Spec',?)",
+                (feature_id, body),
+            ).lastrowid
+        )
+        revision = hashlib.sha256(body.encode()).hexdigest()
+        approval_id = int(
+            con.execute(
+                "INSERT INTO sprint_spec_approvals "
+                "(document_id,revision_sha256,reviewer_shell_id,verdict) "
+                "VALUES (?,?,2,'pass')",
+                (document_id, revision),
+            ).lastrowid
+        )
+        sprint_id = int(
+            con.execute(
+                "INSERT INTO sprints "
+                "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+                "VALUES (?,3,1)",
+                (feature_id,),
+            ).lastrowid
+        )
+        con.execute(
+            "INSERT INTO sprint_specs "
+            "(sprint_id,document_id,bound_revision_sha256,approval_id) "
+            "VALUES (?,?,?,?)",
+            (sprint_id, document_id, revision, approval_id),
+        )
+        con.executemany(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness) VALUES (?,?,?,?)",
+            (
+                (sprint_id, 3, "planner", "codex"),
+                (sprint_id, 1, "developer", "codex"),
+                (sprint_id, 2, "reviewer", "kimi"),
+            ),
+        )
+        task_id = int(
+            con.execute(
+                "INSERT INTO spec_tasks (feature_id,document_id,seq,title) "
+                "VALUES (?,?,1,'Task')",
+                (feature_id, document_id),
+            ).lastrowid
+        )
+        unit_id = int(
+            con.execute(
+                "INSERT INTO sprint_work_units "
+                "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+                "expected_output,output_kind) "
+                "VALUES (?,1,2,'Unit','Ship it','no_code')",
+                (sprint_id,),
+            ).lastrowid
+        )
+        con.execute(
+            "INSERT INTO sprint_work_unit_tasks (sprint_id,work_unit_id,task_id) "
+            "VALUES (?,?,?)",
+            (sprint_id, unit_id, task_id),
+        )
+        con.commit()
+        wake_id = sprint_domain.SprintLifecycleStore(con).arm(sprint_id, 3)[0]
+        assignment_message_id = int(
+            con.execute(
+                "SELECT message_id FROM sprint_wake_messages WHERE wake_id=?",
+                (wake_id,),
+            ).fetchone()[0]
+        )
+        messages = sprint_message_delivery.SprintMessageStore(con)
+        self.assertEqual("accepted", messages.mark_read(assignment_message_id, 1))
+        con.execute(
+            "UPDATE sprint_work_units SET disposition='in_review',"
+            "updated_at='2026-08-02 00:00:00' WHERE work_unit_id=?",
+            (unit_id,),
+        )
+        con.commit()
+        self.assertIsNone(
+            con.execute(
+                "SELECT resolved_at FROM sprint_liveness_expectations "
+                "WHERE message_id=?",
+                (assignment_message_id,),
+            ).fetchone()[0]
+        )
+
+        migration_sql = (MIGRATIONS / target).read_text()
+        con.executescript(migration_sql)
+        first = tuple(
+            con.execute(
+                "SELECT resolved_at,resolution,next_evaluation_at "
+                "FROM sprint_liveness_expectations WHERE message_id=?",
+                (assignment_message_id,),
+            ).fetchone()
+        )
+        self.assertIsNotNone(first[0])
+        self.assertEqual(("work_unit.in_review", None), first[1:])
+
+        con.executescript(migration_sql)
+        self.assertEqual(
+            first,
+            tuple(
+                con.execute(
+                    "SELECT resolved_at,resolution,next_evaluation_at "
+                    "FROM sprint_liveness_expectations WHERE message_id=?",
+                    (assignment_message_id,),
+                ).fetchone()
+            ),
+        )
+
     def test_upgrade_backfills_only_armed_nonterminal_expectations(self) -> None:
         con = sqlite3.connect(":memory:")
         self.addCleanup(con.close)
