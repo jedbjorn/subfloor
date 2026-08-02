@@ -1079,6 +1079,8 @@ class LinkedDispatcherReconciliationTest(unittest.TestCase):
         current.write_text("#!/bin/sh\necho next-dispatcher\n")
         current.chmod(0o755)
         next_sha = self._commit("next dispatcher")
+        (state / "engine.ref.prev").write_text(self.target_sha + "\n")
+        (state / "engine.ref").write_text(next_sha + "\n")
         with mock.patch.object(update, "REPO_ROOT", self.root), \
                 contextlib.redirect_stdout(io.StringIO()):
             changed = update.reconcile_linked_dispatchers(
@@ -1097,9 +1099,11 @@ class UpdateRefPublicationTest(unittest.TestCase):
         ref = state / "engine.ref"
         ref.write_text(self.OLD + "\n")
         scripts = []
+        events = []
 
         def run_script(name: str, **kwargs) -> None:
             scripts.append((name, kwargs))
+            events.append(name)
             if fail == name:
                 raise RuntimeError(f"{name} failed")
 
@@ -1107,11 +1111,21 @@ class UpdateRefPublicationTest(unittest.TestCase):
             if kwargs.get("publish_ref", True):
                 ref.write_text(sha + "\n")
 
-        migration = (
-            mock.Mock(side_effect=RuntimeError("migration failed"))
-            if fail == "migration"
-            else mock.Mock()
-        )
+        def migrate() -> None:
+            events.append("migration")
+            if fail == "migration":
+                raise RuntimeError("migration failed")
+
+        def publish(sha: str) -> None:
+            events.append("publish")
+            ref.write_text(sha + "\n")
+
+        def reconcile(_sha: str, **_kwargs) -> tuple[Path, ...]:
+            events.append("reconcile")
+            if fail == "reconcile":
+                raise RuntimeError("reconcile failed")
+            return ()
+
         stack = contextlib.ExitStack()
         stack.enter_context(mock.patch.multiple(
             update,
@@ -1127,10 +1141,11 @@ class UpdateRefPublicationTest(unittest.TestCase):
             migrate_engine_untrack=mock.Mock(),
             migrate_generated_artifacts_local=mock.Mock(),
             materialize_fetched_engine=mock.Mock(side_effect=materialize),
-            reconcile_linked_dispatchers=mock.Mock(return_value=()),
+            publish_engine_ref=mock.Mock(side_effect=publish),
+            reconcile_linked_dispatchers=mock.Mock(side_effect=reconcile),
             ensure_workflows=mock.Mock(return_value=("current", [])),
             expire_sandbox_harnesses=mock.Mock(return_value=None),
-            migrate_with_service_cutover=migration,
+            migrate_with_service_cutover=mock.Mock(side_effect=migrate),
             refresh_installed_brokers=mock.Mock(),
             sync_skills=mock.Mock(),
             regrant=mock.Mock(return_value=0),
@@ -1146,23 +1161,38 @@ class UpdateRefPublicationTest(unittest.TestCase):
             wire_make_aliases=mock.Mock(return_value=()),
         ))
         stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-        return stack, ref, scripts
+        return stack, ref, scripts, events
 
-    def test_failed_migration_or_snapshot_does_not_publish_target_ref(self):
+    def test_failure_before_publication_never_overlays_linked_dispatchers(self):
         for failed in ("migration", "snapshot.py"):
             with self.subTest(failed=failed), tempfile.TemporaryDirectory() as raw:
                 state = Path(raw) / ".sc-state"
                 state.mkdir()
-                stack, ref, _scripts = self._patch_main(state, fail=failed)
+                stack, ref, _scripts, events = self._patch_main(state, fail=failed)
                 with stack, self.assertRaises(RuntimeError):
                     update.main([])
                 self.assertEqual(ref.read_text(), self.OLD + "\n")
+                self.assertNotIn("publish", events)
+                self.assertNotIn("reconcile", events)
 
-    def test_success_publishes_target_ref_after_snapshot(self):
+    def test_dispatcher_crash_keeps_published_target_recognizable(self):
         with tempfile.TemporaryDirectory() as raw:
             state = Path(raw) / ".sc-state"
             state.mkdir()
-            stack, ref, scripts = self._patch_main(state, fail=None)
+            stack, ref, _scripts, events = self._patch_main(
+                state, fail="reconcile"
+            )
+            with stack, self.assertRaisesRegex(RuntimeError, "reconcile failed"):
+                update.main([])
+
+            self.assertEqual(ref.read_text(), self.NEW + "\n")
+            self.assertEqual(events[-2:], ["publish", "reconcile"])
+
+    def test_ref_publishes_after_migrate_and_snapshot_before_dispatchers(self):
+        with tempfile.TemporaryDirectory() as raw:
+            state = Path(raw) / ".sc-state"
+            state.mkdir()
+            stack, ref, scripts, events = self._patch_main(state, fail=None)
             with stack:
                 update.main([])
             self.assertEqual(
@@ -1170,6 +1200,16 @@ class UpdateRefPublicationTest(unittest.TestCase):
                 [
                     ("map_setup.py", {"update_target_ref": self.NEW}),
                     ("snapshot.py", {}),
+                ],
+            )
+            self.assertEqual(
+                events,
+                [
+                    "migration",
+                    "map_setup.py",
+                    "snapshot.py",
+                    "publish",
+                    "reconcile",
                 ],
             )
             self.assertEqual(ref.read_text(), self.NEW + "\n")

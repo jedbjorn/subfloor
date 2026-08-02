@@ -810,12 +810,22 @@ def reconcile_linked_dispatchers(
         return ()
 
     changed = []
-    pinned = callable_floor.read_engine_ref(REPO_ROOT)
-    pinned_dispatcher = None
-    if pinned is not None:
-        prior = git("show", f"{pinned}:sc", check=False)
+    managed_dispatchers = set()
+    managed_refs = [callable_floor.read_engine_ref(REPO_ROOT)]
+    try:
+        previous = (
+            REPO_ROOT / ".sc-state" / "engine.ref.prev"
+        ).read_text().strip()
+    except OSError:
+        previous = None
+    if previous and re.fullmatch(r"[0-9a-fA-F]{40}", previous):
+        managed_refs.append(previous)
+    for managed_ref in managed_refs:
+        if managed_ref is None:
+            continue
+        prior = git("show", f"{managed_ref}:sc", check=False)
         if prior.returncode == 0:
-            pinned_dispatcher = prior.stdout.encode()
+            managed_dispatchers.add(prior.stdout.encode())
     candidates = worktrees if worktrees is not None else _linked_worktree_paths()
     for worktree in candidates:
         dispatcher = worktree / "sc"
@@ -825,8 +835,7 @@ def reconcile_linked_dispatchers(
         except OSError:
             current = None
         managed_versions = {head.stdout.encode()} if head.returncode == 0 else set()
-        if pinned_dispatcher is not None:
-            managed_versions.add(pinned_dispatcher)
+        managed_versions.update(managed_dispatchers)
         if current not in managed_versions:
             print(
                 f"  WARNING: dispatcher locally edited, left stale: {dispatcher}",
@@ -1207,14 +1216,6 @@ def main(argv: list[str]) -> int:
         assert target_sha is not None
         materialize_fetched_engine(target_sha, force=force, publish_ref=False)
 
-    dispatcher_ref = target_sha
-    if source:
-        dispatcher_ref = git("rev-parse", "HEAD").stdout.strip()
-    elif no_fetch:
-        dispatcher_ref = callable_floor.read_engine_ref(REPO_ROOT)
-    if dispatcher_ref and not source:
-        reconcile_linked_dispatchers(dispatcher_ref, worktrees=worktrees)
-
     workflow_action, workflow_changes = ensure_workflows(source_repo=source)
     if workflow_action == "seeded":
         print("→ visual QA: seeded the managed workflow shim")
@@ -1277,6 +1278,11 @@ def main(argv: list[str]) -> int:
 
     if target_sha is not None:
         publish_engine_ref(target_sha)
+        reconcile_linked_dispatchers(target_sha, worktrees=worktrees)
+    elif not source:
+        dispatcher_ref = callable_floor.read_engine_ref(REPO_ROOT)
+        if dispatcher_ref:
+            reconcile_linked_dispatchers(dispatcher_ref, worktrees=worktrees)
 
     print("\nupdate: done — new floor laid in place; your rows are intact.")
     if source:

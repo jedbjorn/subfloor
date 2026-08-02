@@ -238,7 +238,7 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 self.assertEqual(0, update_compat.main())
 
         repair_dispatcher.assert_called_once_with(pending)
-        reconcile_dispatchers.assert_called_once_with(pending)
+        reconcile_dispatchers.assert_not_called()
 
 
 if __name__ == "__main__":
