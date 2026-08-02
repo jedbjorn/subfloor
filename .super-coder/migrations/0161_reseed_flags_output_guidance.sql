@@ -1,14 +1,20 @@
----
-name: flags
-description: Track blockers as flags — surface open ones, open new ones, edit long-lived ones, resolve them. Link a flag to the roadmap feature it blocks. Mirrors the GUI Flags tab. Use when something blocks progress or needs follow-up.
-category: substrate
-common: false
----
+-- 0161 — Keep the flags skill's output contract aligned with sc mem.
+--
+-- Existing installs have already ledgered the generated 0001 seed, so replay
+-- the authoritative flags asset through a trailing idempotent UPSERT.
 
-# flags — blockers & follow-ups
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'flags',
+  'Track blockers as flags — surface open ones, open new ones, edit long-lived ones, resolve them. Link a flag to the roadmap feature it blocks. Mirrors the GUI Flags tab. Use when something blocks progress or needs follow-up.',
+  'substrate',
+  NULL,
+  0,
+  '# flags — blockers & follow-ups
 
 flag = open question / blocker. `--feature <id>` set -> the flag is that
-feature's blocker (joined on the roadmap; shown on the Roadmap card + Flags
+feature''s blocker (joined on the roadmap; shown on the Roadmap card + Flags
 tab). `<self>` = your shell_id. All reads/writes go through `sc mem` (the
 engine API) — there is no `sqlite3` path.
 
@@ -23,7 +29,7 @@ sc mem get flags --feature <id> --resolved
 ```
 
 Each flag carries its `feature_id`; cross-reference `sc mem get roadmap` for
-the blocked feature's title.
+the blocked feature''s title.
 
 The default list forms are **open-only**. Exact and feature-scoped resolved
 reads include numeric id, display name, owner, feature, priority, description,
@@ -40,7 +46,7 @@ GET /_sc/mem/flags/{id}
 ## Open
 
 ```
-sc mem flag open "[Area] what's blocked | Blocker for: X" --name SC-001 --priority Medium [--feature <id>]
+sc mem flag open "[Area] what''s blocked | Blocker for: X" --name SC-001 --priority Medium [--feature <id>]
 ```
 
 - `--name` = short id, format `SC-###`.
@@ -62,7 +68,7 @@ Recipient = whoever the flag blocks:
 |---|---|
 | docs pending after ship | the **planner** |
 | a review failure on a diff | the **author dev** |
-| a blocker on another shell's work | **that shell** |
+| a blocker on another shell''s work | **that shell** |
 | an FnB decision / no shell owns it | **surface to the FnB** (no `send`) |
 
 Message pairs with the *open* only: NEVER re-message a flag that is already
@@ -92,7 +98,7 @@ progressively as gates clear).
 sc mem flag close <flag_id> --notes "…"
 ```
 
-`--notes` states *how* it was resolved — that's the trail.
+`--notes` states *how* it was resolved — that''s the trail.
 
 `close` prints the row it holds — id, label, priority, opened date, owner,
 description — BEFORE it writes. **Read that line and confirm it names the flag
@@ -107,7 +113,15 @@ verified the flag.
 
 ## Stance
 
-Open a flag the moment something blocks or needs follow-up — don't hold it in
+Open a flag the moment something blocks or needs follow-up — don''t hold it in
 your head. Open flags on a feature = its blockers; clear them all before
 calling the feature done. An opened flag with no message sent = a dropped
-handoff.
+handoff.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;

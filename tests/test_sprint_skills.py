@@ -22,7 +22,7 @@ SKILLS = {
     "sprint_rev": "reviewer",
     "sprint_close": "planner",
 }
-RESEEDED_SKILLS = set(SKILLS) | {"db_map", "flags"}
+RESEEDED_SKILLS = set(SKILLS) | {"db_map"}
 
 
 class SprintSkillTest(unittest.TestCase):
@@ -134,6 +134,43 @@ class SprintSkillTest(unittest.TestCase):
                     self.assertEqual(tuple(rows[0]), (expected, 0))
         finally:
             con.close()
+
+    def test_flags_output_reseed_matches_fresh_seed_and_replays_idempotently(self):
+        upgraded = sqlite3.connect(":memory:")
+        fresh = sqlite3.connect(":memory:")
+        try:
+            for con in (upgraded, fresh):
+                con.executescript((ENGINE / "schema.sql").read_text())
+            fresh.executescript(
+                (ENGINE / "migrations" / "0001_seed_skills.sql").read_text()
+            )
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0161_reseed_flags_output_guidance.sql":
+                    break
+                upgraded.executescript(migration.read_text())
+            upgraded.execute(
+                "UPDATE skills SET content='stale flags guidance', is_deleted=1 "
+                "WHERE name='flags'"
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0161_reseed_flags_output_guidance.sql"
+            ).read_text()
+            upgraded.executescript(migration)
+            upgraded.executescript(migration)
+
+            expected = seed_skills.parse_skill(
+                ASSETS / "flags" / "SKILL.md"
+            )["content"]
+            for con in (fresh, upgraded):
+                rows = con.execute(
+                    "SELECT content, is_deleted FROM skills WHERE name='flags'"
+                ).fetchall()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(tuple(rows[0]), (expected, 0))
+        finally:
+            upgraded.close()
+            fresh.close()
 
     def test_reviewer_skill_owns_severity_and_conformance_never_fixes(self):
         reviewer = (ASSETS / "sprint_rev" / "SKILL.md").read_text()

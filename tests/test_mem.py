@@ -285,6 +285,35 @@ class ApiMemTest(unittest.TestCase):
         self.run_mem("flag", "close", str(fid), "--notes", "fixed")
         self.assertEqual(self.q("SELECT resolved FROM flags WHERE flag_id=?", fid)[0], 1)
 
+    def test_flag_exact_id_reads_open_row_with_complete_human_evidence(self):
+        self.run_mem("roadmap", "add", "open evidence feature")
+        feature = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='open evidence feature'"
+        )[0]
+        self.run_mem(
+            "flag", "open", "[audit] open evidence | Blocker for: review",
+            "--name", "SC-922-OPEN-EXACT", "--priority", "Low",
+            "--feature", str(feature),
+        )
+        flag_id = self.q(
+            "SELECT flag_id FROM flags WHERE display_name='SC-922-OPEN-EXACT'"
+        )[0]
+        created = self.q(
+            "SELECT created_date FROM flags WHERE flag_id=?", flag_id
+        )[0]
+
+        human = io.StringIO()
+        with contextlib.redirect_stdout(human):
+            self.run_mem("get", "flags", str(flag_id))
+        self.assertEqual(
+            human.getvalue(),
+            f"#{flag_id} [SC-922-OPEN-EXACT] @tc (Low) [open]\n"
+            f"  feature: #{feature} — open evidence feature\n"
+            f"  opened: {created} · resolved: —\n"
+            "  description: [audit] open evidence | Blocker for: review\n"
+            "  closure notes: —\n",
+        )
+
     def test_flag_exact_id_reads_resolved_row_with_complete_human_and_json_evidence(self):
         self.run_mem("roadmap", "add", "resolved evidence feature")
         feature = self.q(
@@ -380,6 +409,23 @@ class ApiMemTest(unittest.TestCase):
         self.assertNotIn(still_open, [row["flag_id"] for row in rows])
         self.assertNotIn(other, [row["flag_id"] for row in rows])
         self.assertNotIn(deleted, [row["flag_id"] for row in rows])
+
+        dates = self.q(
+            "SELECT created_date, resolved_date FROM flags WHERE flag_id=?", wanted
+        )
+        human = io.StringIO()
+        with contextlib.redirect_stdout(human):
+            self.run_mem(
+                "get", "flags", "--feature", str(feature_a), "--resolved"
+            )
+        self.assertEqual(
+            human.getvalue(),
+            f"#{wanted} [SC-922-WANTED] @tc (Medium) [resolved]\n"
+            f"  feature: #{feature_a} — flag history A\n"
+            f"  opened: {dates['created_date']} · resolved: {dates['resolved_date']}\n"
+            "  description: [history] SC-922-WANTED | Blocker for: audit\n"
+            "  closure notes: wanted closure\n",
+        )
         with self.assertRaises(SystemExit):
             self.run_mem("get", "flags", str(deleted))
 
