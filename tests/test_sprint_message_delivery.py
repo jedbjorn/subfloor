@@ -373,6 +373,40 @@ class AcceptanceAndDeclineTest(SprintMessageCase):
 
 
 class WakeDeliveryTest(SprintMessageCase):
+    def test_claim_respects_available_at_backoff_boundary(self) -> None:
+        sent = self.send("backoff-boundary")
+        clock = [datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc)]
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET available_at='2099-07-31 12:00:15' "
+            "WHERE wake_id=?",
+            (sent.wake_id,),
+        )
+        self.con.commit()
+        service = delivery.SprintWakeDeliveryService(
+            self.con,
+            now=lambda: clock[0],
+        )
+
+        self.assertIsNone(service.claim_next("before-backoff"))
+        self.assertEqual(
+            "pending",
+            self.con.execute(
+                "SELECT state FROM sprint_wake_outbox WHERE wake_id=?",
+                (sent.wake_id,),
+            ).fetchone()[0],
+        )
+        clock[0] += timedelta(seconds=15)
+        lease = service.claim_next("at-backoff")
+        self.assertIsNotNone(lease)
+        self.assertEqual(sent.wake_id, lease.wake_id)
+        self.assertEqual(
+            "delivering",
+            self.con.execute(
+                "SELECT state FROM sprint_wake_outbox WHERE wake_id=?",
+                (sent.wake_id,),
+            ).fetchone()[0],
+        )
+
     def test_role_aware_prompt_and_target_are_durable_delivery_evidence(self) -> None:
         sent = self.send("deliver")
         observed: list[tuple[str, str, str]] = []
