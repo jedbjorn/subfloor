@@ -269,6 +269,20 @@ _sc_find_manifests() {  # $1 = filename glob, e.g. 'requirements*.txt'
     -name "$1" -type f -print
 }
 
+# One map-independent presence gate for Python suites. Reuse the manifest walk
+# so tests inherit its engine, worktree, environment, dependency, and build
+# pruning; pytest still owns actual recursive collection from the repo root.
+_sc_has_python_tests() {
+  _sc_find_manifests 'test_*.py' | (
+    found=""
+    while IFS= read -r test_file; do
+      relative_test=${test_file#"$here"/}
+      case "$relative_test" in tests/*|*/tests/*) found=1 ;; esac
+    done
+    [ -n "$found" ]
+  )
+}
+
 # Is the repo .venv's tooling runnable BY THE INTERPRETER THAT RESOLVES HERE?
 # Existence is not runnability. A .venv is bind-mounted into the sandbox from
 # the host, and `python -m venv` records its interpreter as an UNVERSIONED
@@ -328,6 +342,10 @@ _sc_devtool() {  # $1 = tool name → prints the executable path, or fails
 # A map-backed fast path would read dr_filepath.path (dr_dependency.source_file is
 # basename-only, so it can't locate a manifest's dir).
 sc_deps() {
+  if sc_help_form "$@"; then
+    echo "Usage: ./sc deps [-h|--help]"
+    return 0
+  fi
   rc=0
   venv="$here/.venv"
   # In the sandbox, a .venv whose interpreter lives OUTSIDE the repo is host-built
@@ -451,6 +469,8 @@ _sc_wants_pytest() {
 # vitest in any package.json dir that declares a test script). Non-zero if any fail.
 sc_test() {
   venv="$here/.venv"
+  python_tests=""
+  _sc_has_python_tests && python_tests=1
   # Self-heal: a fork with python tests but no .venv/bin/pytest is an unprovisioned
   # worktree (the .venv is only populated by the first `./sc deps`), NOT a fork that
   # opted out of pytest. Provision the dev kit + fork deps rather than silently
@@ -458,7 +478,7 @@ sc_test() {
   # ModuleNotFoundError (pytest / the fork's own libs) that reads as a real test
   # failure. We gate on the pytest binary, not sc_deps' exit code, so a partial
   # provision (e.g. npm leg fails) still runs pytest if it landed.
-  if [ ! -x "$venv/bin/pytest" ] && ls "$here"/tests/test_*.py >/dev/null 2>&1; then
+  if [ ! -x "$venv/bin/pytest" ] && [ -n "$python_tests" ]; then
     echo "→ test: $venv/bin/pytest missing — provisioning first (./sc deps)"
     sc_deps || echo "→ test: provisioning incomplete — continuing" >&2
   fi
@@ -492,7 +512,7 @@ sc_test() {
     elif [ "$prc" -ne 0 ]; then
       rc=1
     fi
-  elif ls "$here"/tests/test_*.py >/dev/null 2>&1; then
+  elif [ -n "$python_tests" ]; then
     # pytest still unavailable after provisioning (venv create failed, or a
     # host-managed sandbox interpreter that skips pip). A fork that *declares*
     # pytest must not be green-washed through stdlib unittest — fail loud with the

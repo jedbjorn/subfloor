@@ -36,6 +36,15 @@ def _extract_find_manifests() -> str:
     return m.group(0)
 
 
+def _run_python_test_presence(root: Path) -> bool:
+    script = (
+        f'here="{root}"\n{_extract_find_manifests()}\n'
+        f'{_extract("_sc_has_python_tests")}\n'
+        "_sc_has_python_tests\n"
+    )
+    return subprocess.run(["sh", "-c", script], check=False).returncode == 0
+
+
 class FindManifestsTest(unittest.TestCase):
     def test_prunes_sc_worktrees_live(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -52,6 +61,85 @@ class FindManifestsTest(unittest.TestCase):
             self.assertEqual(out, [str(root / "app" / "package.json")],
                              "worktree copies must be pruned — one repo, one "
                              "manifest walk")
+
+
+class PythonTestPresenceTest(unittest.TestCase):
+    def test_nested_tests_directory_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            test = root / "nested" / "app" / "tests" / "test_health.py"
+            test.parent.mkdir(parents=True)
+            test.write_text("def test_health(): pass\n")
+            self.assertTrue(_run_python_test_presence(root))
+
+    def test_pruned_and_non_test_paths_do_not_count(self):
+        ignored = (
+            ".super-coder", ".sc-state", ".sc-worktrees/dev", ".git",
+            ".venv", "venv", "__pycache__", "node_modules", "dist", "build",
+            "vendor",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for directory in ignored:
+                test = root / directory / "tests" / "test_shadow.py"
+                test.parent.mkdir(parents=True)
+                test.write_text("raise AssertionError('must stay pruned')\n")
+            (root / "app").mkdir()
+            (root / "app" / "test_outside_tests.py").write_text("pass\n")
+            (root / "tests").mkdir()
+            (root / "tests" / "health.py").write_text("pass\n")
+            self.assertFalse(_run_python_test_presence(root))
+
+    def test_tests_component_in_repo_parent_does_not_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "tests" / "repo"
+            source = root / "app" / "test_health.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("pass\n")
+            self.assertFalse(_run_python_test_presence(root))
+
+    def test_sc_test_caches_one_presence_result_for_both_gates(self):
+        body = _extract("sc_test")
+        self.assertEqual(body.count("_sc_has_python_tests"), 1)
+        self.assertEqual(body.count('[ -n "$python_tests" ]'), 2)
+        self.assertNotIn('ls "$here"/tests/test_*.py', body)
+
+    def test_nested_suite_provisions_then_runs_one_root_pytest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            test = root / "nested" / "app" / "tests" / "test_health.py"
+            test.parent.mkdir(parents=True)
+            test.write_text("def test_health(): pass\n")
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            pytest = fake_bin / "pytest"
+            pytest.write_text(
+                "#!/bin/sh\n"
+                "printf 'PYTEST cwd=%s args=%s\\n' \"$PWD\" \"$*\"\n"
+            )
+            pytest.chmod(0o755)
+            script = (
+                f'here="{root}"\nPY=python3\n'
+                f'PATH="{fake_bin}:$PATH"\nexport PATH\n'
+                f'{_extract_find_manifests()}\n'
+                f'{_extract("_sc_has_python_tests")}\n'
+                f'{_extract("_sc_wants_pytest")}\n'
+                "sc_deps() { echo PROVISIONED; }\n"
+                f'{_extract("sc_test")}\n'
+                "sc_test\n"
+            )
+            done = subprocess.run(
+                ["sh", "-c", script], capture_output=True, text=True,
+                check=False,
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertEqual(done.stderr, "")
+            self.assertEqual(done.stdout.count("PROVISIONED\n"), 1)
+            self.assertEqual(
+                [line for line in done.stdout.splitlines()
+                 if line.startswith("PYTEST ")],
+                [f"PYTEST cwd={root} args="],
+            )
 
 
 class DevtoolResolutionTest(unittest.TestCase):
