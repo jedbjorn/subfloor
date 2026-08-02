@@ -12,6 +12,7 @@ import base64
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import urllib.error
@@ -420,8 +421,72 @@ class ProcessRunner(Protocol):
     ) -> Any: ...
 
 
+def signal_owned_process(process: Any, value: signal.Signals) -> None:
+    """Signal the complete turn-owned process group, with a narrow fallback."""
+    process_group = getattr(process, "_sc_conversation_process_group", None)
+    if isinstance(process_group, int) and process_group > 0:
+        try:
+            os.killpg(process_group, value)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    if value == signal.SIGTERM:
+        terminate = getattr(process, "terminate", None)
+        if callable(terminate):
+            terminate()
+            return
+    if value == signal.SIGKILL:
+        kill = getattr(process, "kill", None)
+        if callable(kill):
+            kill()
+            return
+    send_signal = getattr(process, "send_signal", None)
+    if callable(send_signal):
+        send_signal(value)
+
+
+def owned_process_group_alive(process: Any) -> bool:
+    process_group = getattr(process, "_sc_conversation_process_group", None)
+    if not isinstance(process_group, int) or process_group <= 0:
+        return False
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def cleanup_owned_process(process: Any, timeout: float) -> None:
+    """Apply the shared TERM/KILL cleanup ladder to an owned subprocess."""
+    poll = getattr(process, "poll", None)
+    running = callable(poll) and poll() is None
+    if running or owned_process_group_alive(process):
+        signal_owned_process(process, signal.SIGTERM)
+    wait = getattr(process, "wait", None)
+    if not callable(wait):
+        return
+    try:
+        wait(timeout=min(timeout, 1.0))
+    except TypeError:
+        wait()
+    except subprocess.TimeoutExpired:
+        pass
+    if owned_process_group_alive(process):
+        signal_owned_process(process, signal.SIGKILL)
+    elif callable(poll) and poll() is None:
+        signal_owned_process(process, signal.SIGKILL)
+    try:
+        wait(timeout=1.0)
+    except (TypeError, subprocess.TimeoutExpired):
+        pass
+
+
 class SubprocessRunner:
-    def __init__(self, *, start_new_session: bool = False) -> None:
+    def __init__(self, *, start_new_session: bool = True) -> None:
         self.start_new_session = start_new_session
 
     def spawn(
@@ -444,6 +509,19 @@ class SubprocessRunner:
         )
         if self.start_new_session:
             process.__dict__["_sc_conversation_process_group"] = process.pid
+
+            def reap_owned_group() -> None:
+                try:
+                    process.wait()
+                except (OSError, subprocess.SubprocessError):
+                    return
+                cleanup_owned_process(process, 1.0)
+
+            threading.Thread(
+                target=reap_owned_group,
+                name=f"conversation-process-group-{process.pid}",
+                daemon=True,
+            ).start()
         captured: list[str] = []
 
         def drain_stderr() -> None:

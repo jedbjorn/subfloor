@@ -63,6 +63,7 @@ import artifact_policy  # noqa: E402
 import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
 import conversation_broker  # noqa: E402  (Feature #24 durable turn service)
 import conversation_launch  # noqa: E402  (canonical shell launch preparation)
+import conversation_reaper  # noqa: E402  (Feature #31 orphan process ladder)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
@@ -4263,10 +4264,11 @@ def require_loopback_bind(bind: str) -> None:
 
 def start_runtime_services() -> None:
     """Start commit-woken conversations and the armed Sprint services."""
-    conversation_broker.start_service(
+    broker = conversation_broker.start_service(
         DB_PATH,
         launch_preparer=conversation_launch.ConversationLaunchPreparer(DB_PATH),
     )
+    conversation_reaper.start_service(DB_PATH, native_interrupt=broker.interrupt)
     sprint_runtime.start_service(DB_PATH)
     sprint_pr_watcher.start_service(DB_PATH, repo_root=REPO_ROOT)
 
@@ -4322,14 +4324,17 @@ def main(argv):
             )
             sprint_pr_watcher.start_service(DB_PATH, repo_root=REPO_ROOT)
 
-        await transport.serve(
-            bind,
-            port,
-            dispatch_http,
-            _ws_unavailable,
-            on_started=start_runtime_services,
-            stream_handler=conversation_routes.stream_events,
-        )
+        try:
+            await transport.serve(
+                bind,
+                port,
+                dispatch_http,
+                _ws_unavailable,
+                on_started=start_runtime_services,
+                stream_handler=conversation_routes.stream_events,
+            )
+        finally:
+            conversation_reaper.stop_service()
 
     print(f"super-coder review layer → http://127.0.0.1:{port}  (bind {bind}, DB: {DB_PATH.name})")
     try:

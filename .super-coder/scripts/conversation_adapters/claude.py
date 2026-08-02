@@ -28,6 +28,7 @@ from .base import (
     ensure_nonempty_message,
     load_manifest,
     merged_env,
+    signal_owned_process,
     terminal_outcome,
 )
 
@@ -361,7 +362,7 @@ class ClaudeAdapter(ConversationAdapter):
         process = turn.opaque
         if process is None or process.poll() is not None:
             return InterruptResult(False, "Claude process is not running")
-        process.send_signal(signal.SIGINT)
+        signal_owned_process(process, signal.SIGINT)
         return InterruptResult(True)
 
     def _session_path(self, session_ref: str, worktree: Path) -> Path:
