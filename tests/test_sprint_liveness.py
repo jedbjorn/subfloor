@@ -663,6 +663,51 @@ class DeliveryAndActivationTest(SprintLivenessCase):
         self.assertEqual("work_unit.completed", expectation["resolution"])
         self.assertIsNone(expectation["next_evaluation_at"])
 
+    def test_cancelled_work_unit_resolves_assignment_expectation(self) -> None:
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='cancelled',"
+            "updated_at=datetime('now') WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        self.con.commit()
+
+        expectation = self.expectation()
+        self.assertIsNotNone(expectation["resolved_at"])
+        self.assertEqual("work_unit.cancelled", expectation["resolution"])
+        self.assertIsNone(expectation["next_evaluation_at"])
+
+    def test_reassignment_does_not_resolve_former_developer_notification(self) -> None:
+        notification = self.messages.send(
+            self.sprint_id,
+            to_participant_id=self.developer_id,
+            from_participant_id=self.reviewer_id,
+            work_unit_id=self.unit_id,
+            message_kind="notification",
+            body="Review changes requested",
+            actionable=True,
+            active=False,
+            idempotency_key="changes-requested:former-developer",
+        )
+        self.assertEqual("accepted", self.messages.mark_read(notification.message_id, 1))
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (4,'Replacement Developer','DEV2','dev','prompt',1)"
+        )
+        self.con.execute(
+            "UPDATE sprint_work_units SET assigned_shell_id=4,"
+            "disposition='in_review',updated_at=datetime('now') "
+            "WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        self.con.commit()
+
+        self.assertIsNotNone(self.expectation()["resolved_at"])
+        former = self.expectation(notification.message_id)
+        self.assertIsNone(former["resolved_at"])
+        self.assertIsNone(former["resolution"])
+        self.assertIsNotNone(former["next_evaluation_at"])
+
     def test_in_review_resolves_assignment_before_liveness_nudge(self) -> None:
         self.con.execute(
             "UPDATE sprint_work_units SET disposition='in_review',"

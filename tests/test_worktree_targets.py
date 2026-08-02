@@ -330,6 +330,14 @@ class HelpSurvivesTheRefusalTest(WorktreeFixture):
             f"exec {shlex.quote(shutil.which('find') or '/usr/bin/find')} \"$@\"\n"
         )
         find_probe.chmod(0o755)
+        for executable in ("pip", "npm"):
+            install_probe = probe_dir / executable
+            install_probe.write_text(
+                "#!/bin/sh\n"
+                f"echo {executable} >> {shlex.quote(str(calls))}\n"
+                "exit 97\n"
+            )
+            install_probe.chmod(0o755)
         env = {
             "SC_PYTHON": str(python_probe),
             "PATH": f"{probe_dir}:{os.environ['PATH']}",
