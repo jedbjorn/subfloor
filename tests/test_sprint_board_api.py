@@ -233,10 +233,17 @@ class SprintBoardApiCase(unittest.TestCase):
             (pr_id,),
         )
         con.execute(
-            "INSERT INTO sprint_messages "
-            "(sprint_id,from_participant_id,to_participant_id,work_unit_id,message_kind,"
-            "body,actionable,idempotency_key) VALUES (?,?,?,?,'notification','audit note',0,'audit-1')",
-            (sprint_id, participant_ids["planner"], participant_ids["developer"], unit_ids[2]),
+            "INSERT INTO wake_message "
+            "(sprint_id,sender_shell_id,receiver_shell_id,from_participant_id,"
+            "to_participant_id,work_unit_id,message_kind,body,declared_type,"
+            "actionable,idempotency_key) VALUES (?,2,3,?,?,?,'notification',"
+            "'audit note','re-enter',0,'audit-1')",
+            (
+                sprint_id,
+                participant_ids["planner"],
+                participant_ids["developer"],
+                unit_ids[2],
+            ),
         )
         for event_type, payload in (
             ("work_unit.ready", {"work_unit_id": unit_ids[2], "message_id": 7, "token": "nope"}),

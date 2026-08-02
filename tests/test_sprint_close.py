@@ -712,8 +712,8 @@ class EvidenceCompilerTest(SprintCloseCase):
             f"/_sc/sprint/{self.sprint_id}/timeline",
             packet["full_history_links"]["timeline"],
         )
-        self.assertGreaterEqual(
-            len(packet["full_history_links"]["participant_conversations"]), 3
+        self.assertEqual(
+            [], packet["full_history_links"]["participant_conversations"]
         )
         self.assertGreater(packet["anomalies"]["events"]["truncated"], 0)
 

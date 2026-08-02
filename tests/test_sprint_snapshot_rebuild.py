@@ -194,16 +194,17 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         "updated_at='2026-08-01 21:01:00' WHERE work_unit_id=1"
     )
     con.execute(
-        "INSERT INTO sprint_messages "
-        "(message_id,sprint_id,from_participant_id,to_participant_id,work_unit_id,"
-        "message_kind,body,actionable,disposition,read_at,idempotency_key) "
-        "VALUES (1,1,1,2,1,'work_assignment','Implement now',1,'accepted',"
-        "'2026-08-01 21:01:00','assignment-1')"
+        "INSERT INTO wake_message "
+        "(message_id,sprint_id,sender_shell_id,receiver_shell_id,"
+        "from_participant_id,to_participant_id,work_unit_id,message_kind,body,"
+        "declared_type,actionable,disposition,read_at,delivered_at,idempotency_key) "
+        "VALUES (1,1,3,1,1,2,1,'work_assignment','Implement now','new',1,"
+        "'accepted','2026-08-01 21:01:00','2026-08-01 21:01:01','assignment-1')"
     )
     con.execute(
         "INSERT INTO sprint_wake_outbox "
-        "(wake_id,sprint_id,participant_id,state,attempt_count,idempotency_key,"
-        "delivered_at) VALUES (1,1,2,'delivered',1,'wake-1',"
+        "(wake_id,sprint_id,participant_id,receiver_shell_id,state,attempt_count,"
+        "idempotency_key,delivered_at) VALUES (1,1,2,1,'delivered',1,'wake-1',"
         "'2026-08-01 21:01:01')"
     )
     con.execute(
@@ -503,7 +504,7 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
                 row[0]
                 for row in con.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' "
-                    "AND (name='sprints' OR name LIKE 'sprint_%')"
+                    "AND (name IN ('sprints','wake_message') OR name LIKE 'sprint_%')"
                 )
             }
         finally:

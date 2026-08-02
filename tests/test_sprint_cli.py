@@ -439,7 +439,7 @@ class SprintCliApiTest(unittest.TestCase):
             message = con.execute(
                 "SELECT from_participant_id,to_participant_id,"
                 "message_kind,body,actionable,work_unit_id,disposition "
-                "FROM sprint_messages WHERE message_id=?",
+                "FROM wake_message WHERE message_id=?",
                 (response["message_id"],),
             ).fetchone()
             self.assertEqual(
@@ -897,7 +897,7 @@ class SprintCliApiTest(unittest.TestCase):
                 ("prepared", "planned", 0),
                 con.execute(
                     "SELECT s.lifecycle,u.disposition,"
-                    "(SELECT COUNT(*) FROM sprint_messages WHERE sprint_id=s.sprint_id) "
+                    "(SELECT COUNT(*) FROM wake_message WHERE sprint_id=s.sprint_id) "
                     "FROM sprints s JOIN sprint_work_units u USING(sprint_id) "
                     "WHERE s.sprint_id=? AND u.work_unit_id=?",
                     (sprint_id, unit_id),
@@ -1075,7 +1075,7 @@ class SprintCliApiTest(unittest.TestCase):
                 dispatch["wake_ids"][0],
                 con.execute(
                     "SELECT wm.wake_id FROM sprint_wake_messages wm "
-                    "JOIN sprint_messages m USING(message_id) "
+                    "JOIN wake_message m USING(message_id) "
                     "WHERE m.work_unit_id=? ORDER BY m.message_id DESC LIMIT 1",
                     (self.dispatch_unit_id,),
                 ).fetchone()[0],

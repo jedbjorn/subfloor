@@ -144,7 +144,7 @@ class SprintWorkDispatchCase(unittest.TestCase):
     def assignment_message(self, unit_id: int) -> int:
         return int(
             self.con.execute(
-                "SELECT message_id FROM sprint_messages "
+                "SELECT message_id FROM wake_message "
                 "WHERE work_unit_id=? AND message_kind='work_assignment' "
                 "ORDER BY message_id DESC LIMIT 1",
                 (unit_id,),
@@ -199,7 +199,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
             [
                 row[0]
                 for row in self.con.execute(
-                    "SELECT work_unit_id FROM sprint_messages "
+                    "SELECT work_unit_id FROM wake_message "
                     "WHERE message_kind='work_assignment' ORDER BY message_id"
                 )
             ],
@@ -242,7 +242,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
             [
                 row[0]
                 for row in self.con.execute(
-                    "SELECT work_unit_id FROM sprint_messages "
+                    "SELECT work_unit_id FROM wake_message "
                     "WHERE message_kind='work_assignment' AND work_unit_id<>? "
                     "ORDER BY message_id",
                     (first,),
@@ -418,7 +418,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
         self.lifecycle.arm(self.sprint_id, 3)
         first_message = self.assignment_message(unit)
         first_key = self.con.execute(
-            "SELECT idempotency_key FROM sprint_messages WHERE message_id=?",
+            "SELECT idempotency_key FROM wake_message WHERE message_id=?",
             (first_message,),
         ).fetchone()[0]
 
@@ -427,7 +427,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
 
         second_message = self.assignment_message(unit)
         second_key = self.con.execute(
-            "SELECT idempotency_key FROM sprint_messages WHERE message_id=?",
+            "SELECT idempotency_key FROM wake_message WHERE message_id=?",
             (second_message,),
         ).fetchone()[0]
         self.assertEqual(1, len(released))
@@ -438,7 +438,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
             [
                 tuple(row)
                 for row in self.con.execute(
-                    "SELECT disposition,decline_reason FROM sprint_messages "
+                    "SELECT disposition,decline_reason FROM wake_message "
                     "WHERE work_unit_id=? AND message_kind='work_assignment' "
                     "ORDER BY message_id",
                     (unit,),
@@ -625,7 +625,6 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
             (wake_id,),
         ).fetchone()[0]
-        conversation_id = self.conversation_for(1)
         runtime = sprint_runtime.SprintRuntimeService(
             self.db_path,
             owner="runtime-test",
@@ -633,6 +632,14 @@ class ProductionPulseTest(SprintWorkDispatchCase):
 
         self.assertTrue(runtime.pulse_once(startup=True))
         self.assertTrue(runtime.pulse_once())
+        conversation_id = self.conversation_for(1)
+        wake_message_id = int(
+            self.con.execute(
+                "SELECT message_id FROM wake_message WHERE work_unit_id=? "
+                "AND message_kind='work_assignment'",
+                (unit,),
+            ).fetchone()[0]
+        )
 
         wake = self.con.execute(
             "SELECT state,attempt_count FROM sprint_wake_outbox WHERE wake_id=?",
@@ -650,7 +657,9 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             f"{self.sprint_id}` now and act on the Sprint message(s) using "
             "`sprint_dev`. Confirm every Sprint write succeeds before stopping. "
             "If the handoff is not complete, load `sprint_dev` again and run `sc "
-            f"sprint inbox --sprint {self.sprint_id}` again."
+            f"sprint inbox --sprint {self.sprint_id}` again.\n\n"
+            f"## wake_message #{wake_message_id} (declared New)\n\n"
+            "Unit 1\n\nOutput 1"
         )
         self.assertEqual(expected_prompt, native["body"])
         self.assertEqual(wake_key, native["idempotency_key"])
@@ -711,7 +720,7 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             tuple(
                 self.con.execute(
                     "SELECT "
-                    "(SELECT COUNT(*) FROM sprint_messages),"
+                    "(SELECT COUNT(*) FROM wake_message),"
                     "(SELECT COUNT(*) FROM sprint_wake_outbox),"
                     "(SELECT COUNT(*) FROM conversation_outbox)"
                 ).fetchone()

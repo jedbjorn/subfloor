@@ -54,7 +54,7 @@ SPRINT_INSTANCE_TABLES = [
     "sprint_work_units",
     "sprint_work_unit_tasks",
     "sprint_work_unit_dependencies",
-    "sprint_messages",
+    "wake_message",
     "sprint_wake_outbox",
     "sprint_wake_messages",
     "sprint_wake_attempts",

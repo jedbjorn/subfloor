@@ -17,9 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import db_driver
-import run as run_mod
 import shell_liveness
-import sprint_participant_chats
 from sprint_message_delivery import SprintMessageStore
 
 EVALUATION_INTERVAL = timedelta(minutes=5)
@@ -312,7 +310,7 @@ class SprintEvidenceCollector:
             )
 
         row = self.con.execute(
-            "SELECT message_id,message_kind,created_at FROM sprint_messages "
+            "SELECT message_id,message_kind,created_at FROM wake_message "
             "WHERE from_participant_id=? AND created_at>=? "
             "ORDER BY created_at DESC,message_id DESC LIMIT 1",
             (participant_id, threshold),
@@ -489,64 +487,16 @@ class PlannerEscalationRouter:
         reason: str,
     ) -> tuple[int, str]:
         planner = self.con.execute(
-            "SELECT p.participant_id,p.harness,p.model,p.effort,sh.flavor "
-            "FROM sprint_participants p JOIN shells sh ON sh.shell_id=p.shell_id "
-            "WHERE p.sprint_id=? AND p.role='planner'",
+            "SELECT participant_id FROM sprint_participants "
+            "WHERE sprint_id=? AND role='planner'",
             (sprint_id,),
         ).fetchone()
         if planner is None:
             raise RuntimeError("armed Sprint has no Planner participant")
-        participant_id = int(planner["participant_id"])
-        primary_provider = _provider(
-            run_mod.session_provider(planner["harness"], planner["model"])
-        )
-        primary = self.collector.quota_state(primary_provider, now)
-        if not primary.exhausted:
-            return participant_id, "primary"
-
-        incident_source = primary.key or primary.provider or "unknown"
-        incident = hashlib.sha256(incident_source.encode()).hexdigest()[:16]
-        fallback_key = f"sprint:{sprint_id}:liveness:planner-fallback:{incident}"
-        existing_id = sprint_participant_chats.linked_conversation_for_key(
-            self.con, participant_id, "fallback", fallback_key
-        )
-        if existing_id is not None:
-            existing = self.con.execute(
-                "SELECT conversation_id,harness FROM conversations "
-                "WHERE conversation_id=?",
-                (existing_id,),
-            ).fetchone()
-            self.con.execute(
-                "UPDATE sprint_participants SET current_conversation_id=? "
-                "WHERE participant_id=?",
-                (existing["conversation_id"], participant_id),
-            )
-            return participant_id, f"fallback:{existing['harness']}"
-
-        candidates = self.con.execute(
-            "SELECT harness,model FROM flavor_defaults WHERE flavor=? "
-            "AND harness<>? ORDER BY is_default DESC,harness",
-            (planner["flavor"], planner["harness"]),
-        ).fetchall()
-        for candidate in candidates:
-            candidate_provider = _provider(
-                run_mod.session_provider(candidate["harness"], candidate["model"])
-            )
-            if candidate_provider == primary.provider:
-                continue
-            if self.collector.quota_state(candidate_provider, now).exhausted:
-                continue
-            sprint_participant_chats.create_planner_fallback(
-                self.con,
-                participant_id=participant_id,
-                reason=reason,
-                harness=candidate["harness"],
-                model=candidate["model"],
-                effort=planner["effort"],
-                idempotency_key=fallback_key,
-            )
-            return participant_id, f"fallback:{candidate['harness']}"
-        return participant_id, "unavailable"
+        # Chat placement is no longer a producer concern.  The escalation
+        # commits through the unified wake-message store; the delivery worker
+        # resolves live-turn protection, Re-enter, or New afterward.
+        return int(planner["participant_id"]), "delivery-time"
 
 
 class SprintLivenessMonitor:
@@ -572,7 +522,7 @@ class SprintLivenessMonitor:
             return ()
         due = self.con.execute(
             "SELECT e.* FROM sprint_liveness_expectations e "
-            "JOIN sprint_messages m ON m.message_id=e.message_id "
+            "JOIN wake_message m ON m.message_id=e.message_id "
             "WHERE e.sprint_id=? AND e.resolved_at IS NULL "
             "AND e.next_evaluation_at IS NOT NULL "
             "AND e.next_evaluation_at<=? AND m.disposition='accepted' "
@@ -618,7 +568,7 @@ class SprintLivenessMonitor:
             raise ValueError("liveness expectation resolution is empty")
         rows = self.con.execute(
             "SELECT e.message_id FROM sprint_liveness_expectations e "
-            "JOIN sprint_messages m ON m.message_id=e.message_id "
+            "JOIN wake_message m ON m.message_id=e.message_id "
             "WHERE m.work_unit_id=? AND m.message_kind='review_request' "
             "AND e.resolved_at IS NULL ORDER BY e.message_id",
             (work_unit_id,),
@@ -709,7 +659,7 @@ class SprintLivenessMonitor:
                         f"liveness:{message_id}:episode:{episode}:nudge"
                     ),
                     actionable=False,
-                    active=True,
+                    declared_type="re-enter",
                 )
                 self._event(
                     int(row["sprint_id"]),
@@ -793,7 +743,7 @@ class SprintLivenessMonitor:
                 f"planner-escalation:{escalation_key}"
             ),
             actionable=False,
-            active=route != "unavailable",
+            declared_type="re-enter",
         )
         event_type = (
             "liveness.escalation_delivery_unavailable"

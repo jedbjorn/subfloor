@@ -24,6 +24,8 @@ class ActiveChat:
     shell_id: int
     chat_id: str
     state: str
+    process_pid: int | None
+    process_start_ticks: int | None
 
 
 @dataclass(frozen=True)
@@ -35,14 +37,35 @@ class ProcessIdentity:
 
 def get(con, shell_id: int) -> ActiveChat | None:
     row = con.execute(
-        "SELECT a.shell_id,a.chat_id,c.state "
+        "SELECT a.shell_id,a.chat_id,c.state,a.process_pid,"
+        "a.process_start_ticks "
         "FROM active_shell_chats a JOIN conversations c "
         "ON c.conversation_id=a.chat_id WHERE a.shell_id=?",
         (shell_id,),
     ).fetchone()
     if row is None:
         return None
-    return ActiveChat(int(row["shell_id"]), str(row["chat_id"]), str(row["state"]))
+    return ActiveChat(
+        int(row["shell_id"]),
+        str(row["chat_id"]),
+        str(row["state"]),
+        int(row["process_pid"]) if row["process_pid"] is not None else None,
+        (
+            int(row["process_start_ticks"])
+            if row["process_start_ticks"] is not None
+            else None
+        ),
+    )
+
+
+def has_live_process(active: ActiveChat) -> bool:
+    """Return true only when the registry pid still names the same process."""
+    if active.process_pid is None or active.process_start_ticks is None:
+        return False
+    return process_identity(str(active.process_pid)) == (
+        active.process_pid,
+        active.process_start_ticks,
+    )
 
 
 def close_active(con, shell_id: int) -> ActiveChat | None:
@@ -73,6 +96,44 @@ def close_active(con, shell_id: int) -> ActiveChat | None:
     if get(con, shell_id) is not None:
         raise ActiveChatError(f"active chat {active.chat_id} did not unlink")
     return active
+
+
+def close_for_wake(con, shell_id: int) -> ActiveChat | None:
+    """Close an idle/stale active chat for New delivery, never a live turn."""
+    active = get(con, shell_id)
+    if active is None:
+        return None
+    if has_live_process(active):
+        raise ActiveChatBusy(f"active chat {active.chat_id} has a live turn")
+    if active.state in {"queued", "running"}:
+        message_ids = [
+            int(row[0])
+            for row in con.execute(
+                "SELECT message_id FROM conversation_outbox "
+                "WHERE conversation_id=? AND state IN ('pending','claimed')",
+                (active.chat_id,),
+            )
+        ]
+        if message_ids:
+            marks = ",".join("?" for _ in message_ids)
+            con.execute(
+                "UPDATE conversation_messages SET state='cancelled',"
+                "completed_at=datetime('now') WHERE message_id IN (" + marks + ")",
+                message_ids,
+            )
+        con.execute(
+            "UPDATE conversation_outbox SET state='cancelled',claim_owner=NULL,"
+            "claimed_at=NULL,lease_expires_at=NULL "
+            "WHERE conversation_id=? AND state IN ('pending','claimed')",
+            (active.chat_id,),
+        )
+        target = "idle" if active.state == "queued" else "error"
+        con.execute(
+            "UPDATE conversations SET state=?,last_activity_at=datetime('now'),"
+            "version=version+1 WHERE conversation_id=? AND state=?",
+            (target, active.chat_id, active.state),
+        )
+    return close_active(con, shell_id)
 
 
 def register(con, shell_id: int, chat_id: str) -> None:
