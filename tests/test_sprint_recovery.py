@@ -606,7 +606,9 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         reset = json.loads(
             self.con.execute(
                 "SELECT payload FROM sprint_events WHERE sprint_id=? "
-                "AND event_type='wake.contention_episode_reset'",
+                "AND event_type='wake.requeued' "
+                "AND json_extract(payload,'$.classification')="
+                "'contention_episode_reset'",
                 (self.sprint_id,),
             ).fetchone()[0]
         )

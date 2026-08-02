@@ -534,9 +534,11 @@ class SprintLifecycleStore:
         )
         self._event(
             sprint_id,
-            "wake.contention_episode_reset",
+            "wake.requeued",
             actor,
             {
+                "trigger": "resume",
+                "classification": "contention_episode_reset",
                 "prior_wake_id": wake_id,
                 "replacement_wake_id": replacement_wake_id,
                 "prior_idempotency_key": str(wake["idempotency_key"]),
