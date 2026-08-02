@@ -37,6 +37,10 @@ _FAILED_CHECKS = frozenset(
         "TIMED_OUT",
     }
 )
+_PENDING_CHECKS = frozenset(
+    {"EXPECTED", "IN_PROGRESS", "PENDING", "QUEUED", "REQUESTED", "WAITING"}
+)
+_SUCCESSFUL_CHECKS = frozenset({"NEUTRAL", "SKIPPED", "SUCCESS"})
 _READ_ONLY_ENV = {
     **os.environ,
     "GH_PROMPT_DISABLED": "1",
@@ -141,18 +145,18 @@ def _check_state(raw: Any) -> tuple[str | None, bool]:
     for item in raw:
         if not isinstance(item, dict):
             continue
-        state = item.get("conclusion") or item.get("state")
+        state = item.get("conclusion") or item.get("state") or item.get("status")
         if state:
             states.append(str(state).upper())
     if any(state in _FAILED_CHECKS for state in states):
         return "FAILURE", True
-    if any(
-        state in {"PENDING", "EXPECTED", "IN_PROGRESS", "QUEUED"} for state in states
-    ):
+    if any(state in _PENDING_CHECKS for state in states):
         return "PENDING", False
-    if states and all(state in {"SUCCESS", "NEUTRAL", "SKIPPED"} for state in states):
-        return "SUCCESS", False
-    return (states[0], False) if states else (None, False)
+    if "COMPLETED" in states:
+        return "PENDING", False
+    if any(state not in _SUCCESSFUL_CHECKS for state in states):
+        return "PENDING", False
+    return ("SUCCESS", False) if states else (None, False)
 
 
 def normalize_pull_request(raw: dict[str, Any]) -> PullRequest:

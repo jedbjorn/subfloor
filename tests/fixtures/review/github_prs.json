@@ -13,6 +13,10 @@
       "reviewDecision": "",
       "statusCheckRollup": [
         {
+          "context": "legacy/tests",
+          "state": "SUCCESS"
+        },
+        {
           "name": "tests",
           "status": "COMPLETED",
           "conclusion": "SUCCESS"
@@ -32,9 +36,8 @@
       "reviewDecision": "CHANGES_REQUESTED",
       "statusCheckRollup": [
         {
-          "name": "tests",
-          "status": "COMPLETED",
-          "conclusion": "FAILURE"
+          "context": "legacy/tests",
+          "state": "FAILURE"
         }
       ]
     },
@@ -93,6 +96,48 @@
       "url": "https://example.test/pulls/825",
       "reviewDecision": "",
       "statusCheckRollup": []
+    },
+    {
+      "number": 827,
+      "headRefName": "feature/queued-check",
+      "baseRefName": "main",
+      "headRefOid": "9999999999999999999999999999999999999999",
+      "state": "OPEN",
+      "mergedAt": null,
+      "mergeCommit": null,
+      "title": "Queued-check fixture",
+      "url": "https://example.test/pulls/827",
+      "reviewDecision": "",
+      "statusCheckRollup": [
+        {
+          "name": "fast-tests",
+          "status": "COMPLETED",
+          "conclusion": "SUCCESS"
+        },
+        {
+          "name": "pytest",
+          "status": "QUEUED",
+          "conclusion": null
+        }
+      ]
+    },
+    {
+      "number": 828,
+      "headRefName": "feature/pending-status",
+      "baseRefName": "main",
+      "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "state": "OPEN",
+      "mergedAt": null,
+      "mergeCommit": null,
+      "title": "Pending-status fixture",
+      "url": "https://example.test/pulls/828",
+      "reviewDecision": "",
+      "statusCheckRollup": [
+        {
+          "context": "legacy/tests",
+          "state": "PENDING"
+        }
+      ]
     }
   ],
   "patches": {

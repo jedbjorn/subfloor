@@ -14,7 +14,7 @@ sys.path[:0] = [str(SCRIPTS), str(ROOT / "tests")]
 import sprint_domain
 import sprint_message_delivery
 import sprint_pr_watcher
-from github_pull_requests import GitHubReadError, PullRequest
+from github_pull_requests import GitHubReadError, PullRequest, normalize_pull_request
 from test_sprint_message_delivery import SprintMessageCase
 
 
@@ -88,6 +88,15 @@ class SprintPRWatcherCase(SprintMessageCase):
             pr_number=number,
             work_unit_ids=(self.unit_id,),
         )
+
+    def _states(self) -> list[str]:
+        return [
+            str(row[0])
+            for row in self.con.execute(
+                "SELECT normalized_state FROM sprint_pr_transitions "
+                "ORDER BY transition_id"
+            )
+        ]
 
 
 class RegistrationTest(SprintPRWatcherCase):
@@ -212,6 +221,58 @@ class RegistrationTest(SprintPRWatcherCase):
 
 
 class TransitionRoutingTest(SprintPRWatcherCase):
+    def test_queued_checkrun_stays_pending_without_green_owner_wake(self):
+        raw = {
+            "number": 42,
+            "headRefName": "feature/pr-42",
+            "baseRefName": "main",
+            "headRefOid": "a" * 40,
+            "state": "OPEN",
+            "mergedAt": None,
+            "mergeCommit": None,
+            "title": "PR 42",
+            "url": "https://github.example/acme/repo/pull/42",
+            "reviewDecision": None,
+            "statusCheckRollup": [
+                {
+                    "name": "fast-tests",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+                {"name": "pytest", "status": "QUEUED", "conclusion": None},
+            ],
+        }
+        self.reader.current = normalize_pull_request(raw)
+
+        self.register()
+
+        self.assertEqual(["pending"], self._states())
+        active_recipients = self.con.execute(
+            "SELECT m.to_participant_id FROM sprint_messages m "
+            "JOIN sprint_wake_messages wm USING (message_id) "
+            "WHERE m.idempotency_key LIKE 'pr-transition:%'"
+        ).fetchall()
+        self.assertEqual([], active_recipients)
+
+        raw["statusCheckRollup"][1] = {
+            "name": "pytest",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+        }
+        self.reader.current = normalize_pull_request(raw)
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(["pending", "green"], self._states())
+        active_recipients = self.con.execute(
+            "SELECT m.to_participant_id FROM sprint_messages m "
+            "JOIN sprint_wake_messages wm USING (message_id) "
+            "WHERE m.idempotency_key LIKE 'pr-transition:%'"
+        ).fetchall()
+        self.assertEqual(
+            [(self.developer_id,)],
+            [tuple(row) for row in active_recipients],
+        )
+
     def test_first_red_routes_one_active_owner_wake_and_passive_evidence(self):
         self.register()
 
@@ -429,16 +490,6 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
             "WHERE m.idempotency_key LIKE 'pr-transition:%'"
         ).fetchone()
         self.assertEqual(self.developer_id, int(active_recipient[0]))
-
-    def _states(self) -> list[str]:
-        return [
-            str(row[0])
-            for row in self.con.execute(
-                "SELECT normalized_state FROM sprint_pr_transitions "
-                "ORDER BY transition_id"
-            )
-        ]
-
 
 class BatchAndNormalizationTest(SprintPRWatcherCase):
     def test_multiple_registered_prs_share_one_repository_list_read(self):
