@@ -721,6 +721,7 @@ class ProductionPulseTest(SprintWorkDispatchCase):
     def test_server_startup_wires_broker_before_sprint_runtime(self) -> None:
         order: list[str] = []
         preparer = object()
+        broker = mock.Mock()
         with (
             mock.patch.object(
                 server.conversation_launch,
@@ -730,8 +731,15 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             mock.patch.object(
                 server.conversation_broker,
                 "start_service",
-                side_effect=lambda *_args, **_kwargs: order.append("broker"),
+                side_effect=lambda *_args, **_kwargs: (
+                    order.append("broker") or broker
+                ),
             ) as broker_start,
+            mock.patch.object(
+                server.conversation_reaper,
+                "start_service",
+                side_effect=lambda *_args, **_kwargs: order.append("reaper"),
+            ) as reaper_start,
             mock.patch.object(
                 server.sprint_runtime,
                 "start_service",
@@ -740,10 +748,14 @@ class ProductionPulseTest(SprintWorkDispatchCase):
         ):
             server.start_runtime_services()
 
-        self.assertEqual(["broker", "sprint"], order)
+        self.assertEqual(["broker", "reaper", "sprint"], order)
         broker_start.assert_called_once_with(
             server.DB_PATH,
             launch_preparer=preparer,
+        )
+        reaper_start.assert_called_once_with(
+            server.DB_PATH,
+            native_interrupt=broker.interrupt,
         )
         sprint_start.assert_called_once_with(server.DB_PATH)
         self.assertIn(

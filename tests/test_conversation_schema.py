@@ -17,6 +17,7 @@ MIGRATIONS = ENGINE / "migrations"
 FOUNDATION = MIGRATIONS / "0132_conversation_foundation.sql"
 GIT_TARGETS = MIGRATIONS / "0142_conversation_git_targets.sql"
 ACTIVE_REGISTRY = MIGRATIONS / "0162_active_chat_registry.sql"
+REAPER_IDENTITY = MIGRATIONS / "0163_conversation_run_process_identity.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import conversation_state  # noqa: E402
@@ -210,6 +211,54 @@ class MigrationAndShapeTest(ConversationDbCase):
             "conversation_outbox",
         }.issubset(tables))
         con.close()
+
+    def test_reaper_identity_migration_preserves_legacy_live_run(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            apply_schema(con, through="0162_active_chat_registry.sql")
+            con.execute("INSERT INTO users (user_id,username) VALUES (9,'legacy')")
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (9,'Legacy','legacy','dev','prompt',9)"
+            )
+            con.execute(
+                "INSERT INTO conversations "
+                "(shell_id,owner_user_id,harness,worktree,state,"
+                "creation_idempotency_key,creation_request_hash) "
+                "VALUES (9,9,'codex','/tmp/legacy','running','legacy','hash')"
+            )
+            conversation_id = con.execute(
+                "SELECT conversation_id FROM conversations "
+                "WHERE creation_idempotency_key='legacy'"
+            ).fetchone()[0]
+            message_id = con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'user','9','prompt','live','message','hash','running')",
+                (conversation_id,),
+            ).lastrowid
+            run_id = con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                "lease_expires_at,started_at) VALUES "
+                "(?,9,?,'running','legacy-broker','2999-01-01 00:00:00',"
+                "'2026-08-02 00:00:00')",
+                (conversation_id, message_id),
+            ).lastrowid
+
+            con.executescript(REAPER_IDENTITY.read_text())
+
+            row = con.execute(
+                "SELECT state,process_pid,process_start_ticks,process_group_id,"
+                "reaper_last_signal,reaper_signaled_at FROM conversation_runs "
+                "WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            self.assertEqual(
+                row,
+                ("running", None, None, None, None, None),
+            )
 
     def test_star_migration_defaults_legacy_rows_and_enforces_boolean_values(self) -> None:
         with closing(sqlite3.connect(":memory:")) as con:

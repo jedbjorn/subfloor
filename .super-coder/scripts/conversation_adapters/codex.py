@@ -21,6 +21,7 @@ from .base import (
     ReconcileResult,
     SessionInspection,
     TERMINAL_EVENTS,
+    cleanup_owned_process,
     command_version,
     ensure_exact_session,
     ensure_nonempty_message,
@@ -61,7 +62,9 @@ class JsonLineRpcProcess:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
+        self.process.__dict__["_sc_conversation_process_group"] = self.process.pid
         self._write_lock = threading.Lock()
         self._pending: dict[int, queue.Queue[Any]] = {}
         self._pending_lock = threading.Lock()
@@ -205,12 +208,7 @@ class JsonLineRpcProcess:
     def close(self) -> None:
         if self.process.poll() is not None:
             return
-        self.process.terminate()
-        try:
-            self.process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait(timeout=5)
+        cleanup_owned_process(self.process, 5.0)
 
 
 class CodexAdapter(ConversationAdapter):

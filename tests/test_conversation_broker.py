@@ -551,15 +551,22 @@ class StoreContractTest(ConversationBrokerCase):
             "SELECT chat_id,process_pid,process_start_ticks "
             "FROM active_shell_chats WHERE shell_id=1"
         ).fetchone()
-        run_state = con.execute(
-            "SELECT state FROM conversation_runs WHERE run_id=?",
+        run_row = con.execute(
+            "SELECT state,process_pid,process_start_ticks,process_group_id "
+            "FROM conversation_runs WHERE run_id=?",
             (run.run_id,),
-        ).fetchone()[0]
+        ).fetchone()
         con.close()
         self.assertEqual(active["chat_id"], conversation_id)
         self.assertEqual(active["process_pid"], os.getpid())
         self.assertGreater(active["process_start_ticks"], 0)
-        self.assertEqual(run_state, "running")
+        self.assertEqual(run_row["state"], "running")
+        self.assertEqual(run_row["process_pid"], os.getpid())
+        self.assertEqual(
+            run_row["process_start_ticks"],
+            active["process_start_ticks"],
+        )
+        self.assertEqual(run_row["process_group_id"], os.getpgid(os.getpid()))
 
         store.finish_run(
             run.run_id,
@@ -577,6 +584,40 @@ class StoreContractTest(ConversationBrokerCase):
         ).fetchone()
         con.close()
         self.assertEqual(tuple(finalized), ("succeeded", None, None))
+
+    def test_recovery_leaves_unprotected_process_identity_for_reaper(self) -> None:
+        conversation_id, _message_id, run_id = self.add_live_run(
+            state="running",
+            session_after="native-session",
+            runner_ref="native-run",
+        )
+        con = self.connect()
+        con.execute(
+            "UPDATE conversation_runs SET process_pid=4242,"
+            "process_start_ticks=9001,process_group_id=4242 WHERE run_id=?",
+            (run_id,),
+        )
+        con.execute(
+            "UPDATE active_shell_chats SET process_pid=NULL,"
+            "process_start_ticks=NULL WHERE chat_id=?",
+            (conversation_id,),
+        )
+        con.commit()
+        con.close()
+
+        store = BrokerStore(self.db_path)
+        self.assertEqual(store.adopt_recoverable("new-broker", startup=True, limit=8), [])
+
+        con = self.connect()
+        con.execute(
+            "UPDATE active_shell_chats SET process_pid=4242,"
+            "process_start_ticks=9001 WHERE chat_id=?",
+            (conversation_id,),
+        )
+        con.commit()
+        con.close()
+        adopted = store.adopt_recoverable("new-broker", startup=True, limit=8)
+        self.assertEqual([run.run_id for run in adopted], [run_id])
 
     def test_process_registration_failure_rolls_back_run_start(self) -> None:
         conversation_id = self.add_conversation()

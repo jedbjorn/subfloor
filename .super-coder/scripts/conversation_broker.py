@@ -384,6 +384,11 @@ class BrokerStore:
                 selected = con.execute(
                     self._run_select()
                     + "WHERE r.state IN ('leased','starting','running') "
+                    "AND (r.process_pid IS NULL OR EXISTS ("
+                    " SELECT 1 FROM active_shell_chats active "
+                    " WHERE active.process_pid=r.process_pid "
+                    " AND active.process_start_ticks=r.process_start_ticks"
+                    ")) "
                     "AND r.lease_expires_at<=? ORDER BY r.run_id LIMIT ?",
                     (now, limit),
                 ).fetchall()
@@ -482,8 +487,11 @@ class BrokerStore:
         # Filesystem normalization is external preparation, never writer-lock
         # work. Conversation creation stores an already-resolved absolute path.
         actual_worktree = Path(turn.worktree).resolve()
-        process_pid, process_start_ticks = active_chat_registry.process_identity(
-            turn.process_ref
+        process = active_chat_registry.process_details(turn.process_ref)
+        process_pid = process.pid if process is not None else None
+        process_start_ticks = process.start_ticks if process is not None else None
+        process_group_id = (
+            process.process_group_id if process is not None else None
         )
         con = self.connect()
         now, expires = self._times()
@@ -534,13 +542,17 @@ class BrokerStore:
                 changed = con.execute(
                     "UPDATE conversation_runs SET state='running',"
                     "harness_session_after=?,runner_ref=?,heartbeat_at=?,"
-                    "lease_expires_at=? WHERE run_id=? AND lease_owner=? "
+                    "lease_expires_at=?,process_pid=?,process_start_ticks=?,"
+                    "process_group_id=? WHERE run_id=? AND lease_owner=? "
                     "AND state='starting'",
                     (
                         turn.session_ref,
                         turn.run_ref,
                         now,
                         expires,
+                        process_pid,
+                        process_start_ticks,
+                        process_group_id,
                         run_id,
                         owner,
                     ),

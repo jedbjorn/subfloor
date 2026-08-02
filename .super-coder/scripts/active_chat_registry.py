@@ -26,6 +26,13 @@ class ActiveChat:
     state: str
 
 
+@dataclass(frozen=True)
+class ProcessIdentity:
+    pid: int
+    start_ticks: int
+    process_group_id: int
+
+
 def get(con, shell_id: int) -> ActiveChat | None:
     row = con.execute(
         "SELECT a.shell_id,a.chat_id,c.state "
@@ -75,20 +82,31 @@ def register(con, shell_id: int, chat_id: str) -> None:
     )
 
 
-def process_identity(process_ref: str | None) -> tuple[int | None, int | None]:
-    """Resolve a numeric native process ref to Linux pid/start-ticks identity."""
+def process_details(process_ref: str | None) -> ProcessIdentity | None:
+    """Resolve a numeric native process ref from one Linux procfs snapshot."""
     if process_ref is None or not process_ref.isdecimal():
-        return None, None
+        return None
     pid = int(process_ref)
     if pid <= 0:
-        return None, None
+        return None
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
         fields_after_comm = stat.rsplit(")", 1)[1].split()
+        process_group_id = int(fields_after_comm[2])
         start_ticks = int(fields_after_comm[19])
     except (IndexError, OSError, ValueError):
+        return None
+    if process_group_id <= 0 or start_ticks < 0:
+        return None
+    return ProcessIdentity(pid, start_ticks, process_group_id)
+
+
+def process_identity(process_ref: str | None) -> tuple[int | None, int | None]:
+    """Resolve the registry's pid/start-ticks identity pair."""
+    details = process_details(process_ref)
+    if details is None:
         return None, None
-    return pid, start_ticks
+    return details.pid, details.start_ticks
 
 
 def set_process(
