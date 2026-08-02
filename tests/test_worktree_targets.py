@@ -25,6 +25,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -35,8 +36,8 @@ import unittest
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
 from unittest import mock
+from urllib.parse import urlparse
 
 REPO = Path(__file__).resolve().parents[1]
 ENGINE = REPO / ".super-coder"
@@ -309,6 +310,44 @@ class HelpSurvivesTheRefusalTest(WorktreeFixture):
         done = run_sc(self.wt, "migrate", "--halp")
         self.assertEqual(done.returncode, 1)
         self.assertIn("./sc migrate refused", done.stderr)
+
+    def test_deps_help_is_read_only_and_byte_stable_from_both_checkouts(self):
+        probe_dir = Path(self._tmp) / "deps-help-probes"
+        shutil.rmtree(probe_dir, ignore_errors=True)
+        probe_dir.mkdir()
+        calls = probe_dir / "calls"
+        python_probe = probe_dir / "python3"
+        python_probe.write_text(
+            "#!/bin/sh\n"
+            f"if [ \"$1\" = -m ] && [ \"$2\" = venv ]; then echo venv >> {shlex.quote(str(calls))}; exit 97; fi\n"
+            f"exec {shlex.quote(sys.executable)} \"$@\"\n"
+        )
+        python_probe.chmod(0o755)
+        find_probe = probe_dir / "find"
+        find_probe.write_text(
+            "#!/bin/sh\n"
+            f"echo find >> {shlex.quote(str(calls))}\n"
+            f"exec {shlex.quote(shutil.which('find') or '/usr/bin/find')} \"$@\"\n"
+        )
+        find_probe.chmod(0o755)
+        env = {
+            "SC_PYTHON": str(python_probe),
+            "PATH": f"{probe_dir}:{os.environ['PATH']}",
+        }
+        before = state_digest(self.main)
+        outputs = []
+        for root in (self.main, self.wt):
+            for flag in ("-h", "--help"):
+                with self.subTest(root=root.name, flag=flag):
+                    done = run_sc(root, "deps", flag, env_overrides=env)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    self.assertEqual(done.stderr, "")
+                    outputs.append(done.stdout)
+                    self.assertFalse((root / ".venv").exists())
+        self.assertEqual(outputs, ["Usage: ./sc deps [-h|--help]\n"] * 4)
+        self.assertFalse(calls.exists(),
+                         "help discovered manifests or touched .venv")
+        self.assertEqual(state_digest(self.main), before)
 
 
 class RootCheckoutUnchangedTest(WorktreeFixture):
