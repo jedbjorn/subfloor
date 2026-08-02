@@ -919,7 +919,7 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             ).fetchone()[0],
         )
 
-    def test_observed_merge_completes_board_and_assigns_next_in_persistent_lane(self):
+    def test_observed_merge_completes_board_and_assigns_next_in_fresh_active_lane(self):
         approved = self.approve()
         self.messages.mark_read(approved.message_id, 1)
         document = self.con.execute(
@@ -979,7 +979,18 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
         lease = sprint_message_delivery.SprintWakeDeliveryService(
             self.con
         ).claim_next("stage6-next")
-        self.assertEqual(self.developer_conversation_id, lease.target_conversation_id)
+        self.assertNotEqual(
+            self.developer_conversation_id,
+            lease.target_conversation_id,
+        )
+        active = self.con.execute(
+            "SELECT chat_id,process_pid,process_start_ticks "
+            "FROM active_shell_chats WHERE shell_id=1"
+        ).fetchone()
+        self.assertEqual(
+            tuple(active),
+            (lease.target_conversation_id, None, None),
+        )
         self.assertEqual(
             ["work_unit.completed", "work_unit.ready", "pr.transition"],
             [

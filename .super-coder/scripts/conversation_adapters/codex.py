@@ -300,12 +300,18 @@ class CodexAdapter(ConversationAdapter):
                 "HARNESS_PROTOCOL_ERROR",
                 "Codex turn/start returned no turn id",
             )
+        process = getattr(rpc, "process", None)
+        pid = getattr(process, "pid", None)
         return NativeTurn(
             harness=self.harness,
             session_ref=session_ref,
             run_ref=run_ref,
             worktree=context.checked_worktree(),
-            process_ref=f"app-server:{run_ref}",
+            process_ref=(
+                str(pid)
+                if isinstance(pid, int) and pid > 0
+                else f"app-server:{run_ref}"
+            ),
             metadata={"resumed": resumed},
         )
 

@@ -412,6 +412,9 @@ class OpenCodeAdapter(ConversationAdapter):
             session_ref=session_ref,
             run_ref=run_ref,
             worktree=worktree,
+            # The OpenCode server is shared across shells and turns, so it is
+            # not a turn-owned process the active-chat reaper may terminate.
+            process_ref=None,
             metadata={
                 "context": context,
                 "event_stream": event_stream,

@@ -108,6 +108,7 @@ PER_INSTANCE_TABLES = [
     # outbox work must all survive update/rebuild. Parents precede
     # children so a snapshot stays readable and foreign-key-valid when loaded.
     "conversations",
+    "active_shell_chats",
     "conversation_git_targets",
     "conversation_messages",
     "conversation_runs",
