@@ -95,14 +95,19 @@ sc sprint complete-unit --sprint <id> --work-unit <id> \
 ```
 
 Register the PR through the authoritative Sprint surface and retain ownership
-until it is green. The watcher supplies red/green facts; do not write PR state
-yourself. On red, diagnose and fix the PR. On green, judge readiness rather
-than forwarding mechanically.
+until it is green. After `register-pr` succeeds, the native registered-PR
+watcher supplies red/green facts and their durable wakes. On red, diagnose and
+fix the PR. On green, judge readiness rather than forwarding mechanically.
 
 ```text
 sc sprint register-pr --sprint <id> --repository <owner/name> \
   --pr <number> --work-unit <id>
 ```
+
+When no local implementation action remains, stop and await the native PR-fact
+wake. Use Sprint-native wakes for coordination. Do not start a recurring shell
+loop, scheduled job, manual watcher daemon, or external PR watcher to track the
+registered PR.
 
 ## Review handoff
 
@@ -118,11 +123,12 @@ sc sprint request-review \
   --readiness-file <path> --key <stable-key>
 ```
 
-The assigned Reviewer receives an actionable request. Stop until its durable
-outcome arrives. A changes-requested verdict opens a fresh linked fix
-conversation and makes it current. Apply every blocking finding, re-establish
-green, and hand back with a new stable review key. Record disagreements as
-judgment; the Planner resolves scope/severity disputes.
+The assigned Reviewer receives an actionable request. After `request-review`
+succeeds, stop and await the native verdict wake. A changes-requested verdict
+opens a fresh linked fix conversation and makes it current. Apply every
+blocking finding, re-establish green, and hand back with a new stable review
+key. Record disagreements as judgment; the Planner resolves scope/severity
+disputes.
 
 ## Merge boundary
 

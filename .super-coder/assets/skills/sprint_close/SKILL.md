@@ -73,10 +73,12 @@ advisory: the packet surfaces gaps but never prevents the owning Planner or FnB
 from making and reporting a completion judgment. Do not infer code completion
 from PR state alone.
 
-Boot an independent Reviewer into `sprint_rev` conformance mode with the bound
-spec revision hashes, integrated main SHA, and ratified judgment list. Do not
-feed it unit authors' narrative beyond recorded judgments; conformance judges
-artifacts.
+Request an independent Reviewer through the durable Sprint relay, using the
+`sc sprint send` command above with the bound spec revision hashes, integrated
+main SHA, ratified judgment list, and `sprint_rev` conformance mode. Confirm the
+write and wake receipt, then stop and await the native conformance-result wake.
+Give the Reviewer recorded judgments, not unit authors' narrative; conformance
+judges artifacts.
 
 ## Conformance boundary
 
@@ -168,6 +170,11 @@ Abort only under Planner or FnB authority. Terminal state stops Sprint services
 and removes live pills while retaining conversations, messages, events, PR
 evidence, reports, and follow-ups.
 
+Immediately before `complete`, re-run `sc sprint inbox --sprint <id>` to drain
+newly arrived messages, mark every handled informational message read with
+`accept`, and confirm the final report file is the intended synthesis. This is
+the last pre-terminal evidence read.
+
 Keep the final report at about 6,000 characters or fewer; 8,000 is the hard
 maximum. Run `wc -m < <path>` before the typed terminal handoff, then require
 the successful report receipt and lifecycle transition.
@@ -178,7 +185,7 @@ sc sprint complete --sprint <id> --reason <summary> --outcome <outcome> \
 sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
 ```
 
-Hand the FnB the final report id, follow-up list, integrated SHA, and evidence
-links. Re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message,
-mark every handled informational message read with `accept`, and stop after the
-terminal transition; Sprint-scoped authority is over.
+After `complete` succeeds, emit one bounded final response from its receipt:
+final report id, follow-up list, integrated SHA, and evidence links. Run no
+further Sprint command; close intent terminalizes the owning conversation and
+Sprint-scoped authority is over.

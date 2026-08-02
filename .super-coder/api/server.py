@@ -2772,14 +2772,36 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/_sc/mem/flags":
                 # Shared: flags coordinate the project, not one shell's memory —
-                # return every open flag in the fleet, tagged with its author's
-                # shortname so a caller can tell whose blocker it is.
+                # default to every open flag in the fleet. Resolved history is
+                # available only for one feature so this surface cannot become
+                # an unbounded fleet-wide history dump.
+                q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+                if not q:
+                    where = "COALESCE(f.resolved,0)=0"
+                    params = ()
+                else:
+                    unknown = set(q) - {"feature", "resolved"}
+                    repeated = [name for name, values in q.items() if len(values) != 1]
+                    if unknown or repeated or q.get("resolved") != ["1"]:
+                        return self._send(400, {
+                            "error": "flag history needs one feature=<id> and resolved=1",
+                        })
+                    raw_feature = (q.get("feature") or [""])[0]
+                    if not raw_feature.isdigit() or int(raw_feature) < 1:
+                        return self._send(400, {
+                            "error": "flag history needs one positive feature=<id>",
+                        })
+                    where = "f.feature_id=? AND COALESCE(f.resolved,0)=1"
+                    params = (int(raw_feature),)
                 fs = rows(con.execute(
                     "SELECT f.flag_id, f.display_name, f.priority, f.description, "
-                    "f.feature_id, f.created_date, s.shortname AS owner FROM flags f "
+                    "f.feature_id, f.created_date, f.resolved, f.resolved_date, "
+                    "f.resolution_notes, s.shortname AS owner, r.title AS feature_title "
+                    "FROM flags f "
                     "LEFT JOIN shells s ON s.shell_id=f.shell_id "
-                    "WHERE COALESCE(f.resolved,0)=0 AND COALESCE(f.is_deleted,0)=0 "
-                    "ORDER BY f.created_date, f.flag_id"))
+                    "LEFT JOIN roadmap r ON r.feature_id=f.feature_id "
+                    f"WHERE {where} AND COALESCE(f.is_deleted,0)=0 "
+                    "ORDER BY f.created_date, f.flag_id", params))
                 return self._send(200, {"flags": fs})
 
             if len(parts) == 4 and parts[2] == "flags":
