@@ -58,7 +58,10 @@
     "tests/fixtures/sprint_v2_acceptance.json",
     "tests/fixtures/sprint_handoff_hardening_acceptance.json",
     "tests/test_callable_floor.py",
-    "tests/test_update_materialize.py"
+    "tests/test_update_materialize.py",
+    ".super-coder/migrations/0160_reseed_migration_management.sql",
+    ".super-coder/scripts/migration.py",
+    "tests/test_migration_management.py"
   ],
   "baseline_migration_ledger": {
     "count": 142,

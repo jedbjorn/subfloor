@@ -1153,6 +1153,7 @@ case "$cmd" in
                 exec "$PY" "$S/rebuild.py" "$@" ;;
   migrate)      sc_help_form "$@" || sc_refuse_linked migrate "$DB"
                 exec "$PY" "$S/migrate.py" "$DB" "$@" ;;
+  migration)    exec "$PY" "$CALLER_ENGINE/scripts/migration.py" "$@" ;;
   # snapshot/render name the artifact they would overwrite as well as the DB
   # they read; resolving that path costs a subprocess, so only the refusing
   # branch pays for it.
@@ -1571,6 +1572,8 @@ super-coder — forkable shell substrate
                              --dry-run previews; --yes skips confirmation, never safety gates
   ./sc rebuild             build the .db from schema + migrations + snapshot
   ./sc migrate             apply pending migrations to an existing .db
+  ./sc migration new <slug>
+                           allocate the next free migration number, write the standard skeleton, and update the source removal-test allowlist
   ./sc snapshot            dump per-instance tables to gitignored .sc-state/local/
                              live-state commands (rebuild · migrate · verify · snapshot · render · clean-db) act on the SHARED live
                              instance at the main checkout, so they REFUSE from a linked worktree rather than substitute it, naming

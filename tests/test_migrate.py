@@ -12,10 +12,13 @@ Run:
 """
 from __future__ import annotations
 
+import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -43,9 +46,9 @@ class AtomicMigrateTests(unittest.TestCase):
     def _write(self, name: str, sql: str) -> None:
         (self.migdir / name).write_text(sql)
 
-    def _run(self):
+    def _run(self, *, backup: bool = False):
         with mock.patch.object(migrate, "MIGRATIONS_DIR", self.migdir):
-            return migrate.migrate(self.db)
+            return migrate.migrate(self.db, backup=backup)
 
     def _stamped(self) -> set[str]:
         con = db_driver.connect(self.db)
@@ -147,6 +150,67 @@ class AtomicMigrateTests(unittest.TestCase):
         finally:
             con.close()
         self.assertIn("0001_swap.sql", self._stamped())
+
+    def test_bare_migrate_takes_wal_safe_premigrate_backup_and_prunes_its_class(self):
+        self._write("0001_add_b.sql", "ALTER TABLE t ADD COLUMN b;\n")
+        backup_dir = self.tmp / "backups"
+        backup_dir.mkdir()
+        old_backups = []
+        for index in range(6):
+            old = backup_dir / f"shell_db.premigrate.20000101_00000{index}.db"
+            old.write_bytes(b"old")
+            old_backups.append(old)
+        preupdate = backup_dir / "shell_db.preupdate.20000101_000000.db"
+        preupdate.write_bytes(b"separate lifecycle")
+
+        writer = sqlite3.connect(self.db)
+        try:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("INSERT INTO t (a) VALUES (41)")
+            writer.commit()
+            with mock.patch.dict(
+                os.environ,
+                {"SC_DB_BACKUP_DIR": str(backup_dir)},
+            ):
+                self._run(backup=True)
+        finally:
+            writer.close()
+
+        backups = sorted(backup_dir.glob("shell_db.premigrate.*.db"))
+        self.assertEqual(len(backups), migrate.db_backup.KEEP_BACKUPS)
+        self.assertFalse(old_backups[0].exists())
+        self.assertFalse(old_backups[1].exists())
+        created = [path for path in backups if path not in old_backups]
+        self.assertEqual(len(created), 1)
+        self.assertTrue(preupdate.exists())
+
+        with closing(sqlite3.connect(created[0])) as restored:
+            self.assertEqual(restored.execute("SELECT a FROM t").fetchall(), [(41,)])
+            self.assertEqual(
+                [row[1] for row in restored.execute("PRAGMA table_info(t)")],
+                ["a"],
+            )
+        self.assertIn("b", self._cols())
+
+    def test_backup_failure_prevents_migration_application(self):
+        self._write("0001_add_b.sql", "ALTER TABLE t ADD COLUMN b;\n")
+        with mock.patch.object(
+            migrate.db_backup,
+            "select_backup_dir",
+            side_effect=migrate.db_backup.BackupDestinationError("no destination"),
+        ), self.assertRaisesRegex(
+            migrate.db_backup.BackupDestinationError,
+            "no destination",
+        ):
+            self._run(backup=True)
+
+        self.assertNotIn("b", self._cols())
+        with closing(sqlite3.connect(self.db)) as con:
+            ledger = con.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='schema_migrations'"
+            ).fetchall()
+        self.assertEqual(ledger, [])
 
 
 if __name__ == "__main__":
