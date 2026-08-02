@@ -2606,6 +2606,17 @@ function chatShellLabel(conversation) {
   return [shell.display_name, shell.shortname].filter(Boolean).join(" | ") || "Shell";
 }
 
+function chatUnreadBadge(shell) {
+  const count = Number(shell.unread_message_count) || 0;
+  if (count < 1) return null;
+  const label = `${count} unread ${count === 1 ? "message" : "messages"}`;
+  return el("span", {
+    className: "chat-shell-mail",
+    title: label,
+    ariaLabel: label,
+  }, "📩");
+}
+
 function chatHeaderLabel(conversation) {
   return [
     conversation.shell?.shortname,
@@ -4430,6 +4441,7 @@ async function renderInterface(root) {
       type: "button",
     },
     el("span", { className: "chat-shell-name" }, item.display_name),
+    chatUnreadBadge(item),
     el("span", { className: "chat-shell-shortname" }, item.shortname || ""));
     chatPaintShellState(button, openByShell.get(item.shell_id));
     shellItems.set(item.shell_id, button);

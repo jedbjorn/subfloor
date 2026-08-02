@@ -192,6 +192,9 @@ body.interface-view main {
 .chat-shell.state-waiting { --shell-state-color: var(--accent); }
 .chat-shell.state-error { --shell-state-color: #ef7d86; }
 .chat-shell-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.chat-shell-mail {
+  color: var(--accent); flex: none; font: .8rem/1 ui-sans-serif, sans-serif;
+}
 .chat-shell-shortname {
   color: rgba(255,255,255,.46); font: .68rem ui-monospace, monospace;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: none;

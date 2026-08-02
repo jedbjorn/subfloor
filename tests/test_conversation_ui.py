@@ -355,6 +355,58 @@ def test_conversation_identity_uses_shell_context_and_neutral_user_label():
     assert "chatPaintShellState(button, openByShell.get(item.shell_id))" in interface
 
 
+def test_shell_rail_mail_badge_only_renders_for_unread_messages():
+    helper = APP[
+        APP.index("function chatUnreadBadge(shell)"):
+        APP.index("function chatHeaderLabel(conversation)")
+    ]
+    script = r"""
+const document = {
+  createElement(tag) {
+    return {
+      tag, nodeType: 1, children: [],
+      append(...children) { this.children.push(...children); },
+    };
+  },
+  createTextNode(value) { return { nodeType: 3, textContent: String(value) }; },
+};
+const el = (t, props = {}, ...kids) => {
+  const n = Object.assign(document.createElement(t), props);
+  for (const k of kids) n.append(k?.nodeType ? k : document.createTextNode(k ?? ""));
+  return n;
+};
+""" + helper + r"""
+const none = chatUnreadBadge({ unread_message_count: 0 });
+const badge = chatUnreadBadge({ unread_message_count: 3 });
+console.log(JSON.stringify({
+  none,
+  badge: {
+    tag: badge.tag,
+    className: badge.className,
+    title: badge.title,
+    ariaLabel: badge.ariaLabel,
+    text: badge.children[0].textContent,
+  },
+}));
+"""
+    assert run_js(script) == {
+        "none": None,
+        "badge": {
+            "tag": "span",
+            "className": "chat-shell-mail",
+            "title": "3 unread messages",
+            "ariaLabel": "3 unread messages",
+            "text": "📩",
+        },
+    }
+    interface = APP[
+        APP.index("async function renderInterface"):
+        APP.index("// ── Tabs + boot")
+    ]
+    assert "chatUnreadBadge(item)" in interface
+    assert ".chat-shell-mail" in STYLE
+
+
 def test_interface_owns_scroll_with_fixed_history_and_conversation_controls():
     assert "body.interface-view { height: 100dvh; overflow: hidden; }" in STYLE
     assert "height: calc(100dvh - 52px);" in STYLE

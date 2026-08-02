@@ -341,8 +341,12 @@ def _json_default(o):
 
 def get_shells(con) -> list[dict]:
     shells = rows(con.execute(
-        "SELECT shell_id, display_name, shortname, role, flavor, mandate, is_shared "
-        "FROM shells WHERE COALESCE(is_deleted,0)=0 ORDER BY shell_id"))
+        "SELECT s.shell_id, s.display_name, s.shortname, s.role, s.flavor, "
+        "s.mandate, s.is_shared, "
+        "(SELECT COUNT(*) FROM shell_messages m "
+        " WHERE m.to_shell_id=s.shell_id AND m.read_at IS NULL "
+        " AND m.kind IN ('shell','task','result')) AS unread_message_count "
+        "FROM shells s WHERE COALESCE(s.is_deleted,0)=0 ORDER BY s.shell_id"))
     return sprint_participant_chats.attach_live_participations(con, shells)
 
 
