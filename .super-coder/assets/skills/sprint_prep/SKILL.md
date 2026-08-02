@@ -106,9 +106,15 @@ no partial Sprint.
 sc sprint arm --sprint <id>
 ```
 
+After `arm` succeeds, participant pickup belongs to native delivery. The armed
+runtime dispatches ready work and wake recovery reconciles unread pickup; the
+preparing Planner does not manually boot participants or create a second wake
+path.
+
 ## Handoff
 
-Once armed, hand control to `sprint_pln`. Give the FnB a compact declaration:
+Once armed, hand control to `sprint_pln` and stop preparation work. Give the FnB
+a compact declaration:
 Sprint id, feature, exact spec revisions, participants/routes, work-unit graph,
 planned waves, merge-grant state, and known accepted risks.
 

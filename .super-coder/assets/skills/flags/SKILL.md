@@ -17,15 +17,24 @@ engine API) — there is no `sqlite3` path.
 ```
 sc mem get flags          # your open flags — `#<id> [<label>] (<priority>) <description>`
 sc mem get flags --json   # same, as JSON
+sc mem get flags <id>     # exact non-deleted row, open or resolved
+sc mem get flags --feature <id> --resolved
+                          # resolved non-deleted rows for one feature
 ```
 
 Each flag carries its `feature_id`; cross-reference `sc mem get roadmap` for
 the blocked feature's title.
 
-Both list forms are **open-only**. One flag by id, resolved rows included:
+The default list forms are **open-only**. Exact and feature-scoped resolved
+reads include numeric id, display name, owner, feature, priority, description,
+opened date, resolved date, and closure notes in human and JSON output. Resolved
+history without `--feature` is refused; there is no fleet-wide history read.
+
+The exact CLI form reuses the authenticated single-row endpoint that protects
+`flag close`:
 
 ```
-GET /_sc/mem/flags/{id}   # no CLI verb — `flag close` reads it before it writes
+GET /_sc/mem/flags/{id}
 ```
 
 ## Open

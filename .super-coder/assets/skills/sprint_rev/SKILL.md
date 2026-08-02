@@ -8,18 +8,27 @@ common: false
 # sprint_rev — independent review and conformance
 
 Use in one of two modes: a work-unit PR review during the loop, or the final
-whole-Sprint conformance pass. The evidence differs; independence does not.
-On every wake or re-entry, load `sprint_rev`, run the exact inbox command below,
-and inspect the durable message before deciding what to do.
+whole-Sprint conformance pass. Pre-declaration QAQC is a third entry condition,
+before a Sprint exists. The evidence differs; independence does not.
 
-Read and accept the actionable request before beginning. During preparation,
-sign the exact current spec revision through the same authenticated surface:
+## Entry and durable state
+
+Pre-declaration QAQC begins from an explicit Planner or FnB request. Read the
+exact current spec document and sign that body directly; there is no Sprint id
+or Sprint inbox to inspect yet:
+
+```text
+sc sprint record-qaqc --document <spec-document-id> \
+  --verdict pass [--findings-document <document-id>]
+```
+
+Once a Sprint is armed, every review or conformance entry arrives through its
+durable wake/inbox. On every wake or re-entry, load `sprint_rev`, inspect the
+message, and accept the actionable request before beginning:
 
 ```text
 sc sprint inbox --sprint <id>
 sc sprint accept --sprint <id> --message <message-id>
-sc sprint record-qaqc --document <spec-document-id> \
-  --verdict pass [--findings-document <document-id>]
 ```
 
 Decline an actionable request you cannot take, with a concrete reason:
@@ -89,6 +98,15 @@ Accept the actionable review request, then inspect the exact bound spec
 revision, readiness claim, PR head, diff, checks, tests, relevant runtime
 evidence, and prior judgment calls. Review code quality, edge cases/failure
 paths, and spec conformance. Trace the real path; do not trust names or PR prose.
+
+Read resolved closure evidence through the authenticated memory surface; no SQL
+or mutation is needed. Use the exact form for a cited flag and the scoped form
+to audit every resolved flag attached to the feature:
+
+```text
+sc mem get flags <flag-id>
+sc mem get flags --feature <feature-id> --resolved
+```
 
 Findings must state:
 
@@ -166,4 +184,5 @@ For either mode, re-run `sc sprint inbox --sprint <id>` and act on newly arrived
 messages before stopping. For unit review, stop after the durable verdict is
 recorded and every handled informational message is marked read with `accept`.
 For conformance, also require the report and all findings to replay
-idempotently and give the Planner their report/follow-up ids.
+idempotently and give the Planner their report/follow-up ids. The typed receipt
+completes the handoff; stop until another native wake arrives.

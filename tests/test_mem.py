@@ -209,11 +209,11 @@ class ApiMemTest(unittest.TestCase):
         self.assertIn("older active", buf.getvalue())   # cap is never silent
         self.assertIn("--all", buf.getvalue())
 
-    def test_decisions_get_404_and_id_only_for_decisions(self):
+    def test_decisions_get_404_and_unrelated_surface_rejects_id(self):
         with self.assertRaises(SystemExit):
             self.run_mem("get", "decisions", "999999")
         with self.assertRaises(SystemExit):
-            self.run_mem("get", "flags", "1")          # <id> is decisions-only
+            self.run_mem("get", "state", "1")
 
     # ── decisions why-audit link: feature_id + document_id (#0047) ─────────────
     def test_decision_feature_and_doc_link(self):
@@ -284,6 +284,120 @@ class ApiMemTest(unittest.TestCase):
         fid = self.q("SELECT flag_id FROM flags WHERE display_name='SC-1'")[0]
         self.run_mem("flag", "close", str(fid), "--notes", "fixed")
         self.assertEqual(self.q("SELECT resolved FROM flags WHERE flag_id=?", fid)[0], 1)
+
+    def test_flag_exact_id_reads_resolved_row_with_complete_human_and_json_evidence(self):
+        self.run_mem("roadmap", "add", "resolved evidence feature")
+        feature = self.q(
+            "SELECT feature_id FROM roadmap WHERE title='resolved evidence feature'"
+        )[0]
+        saved = mem.SC_API_TOKEN
+        mem.SC_API_TOKEN = PEER_TOKEN
+        try:
+            self.run_mem(
+                "flag", "open", "[audit] exact closure | Blocker for: review",
+                "--name", "SC-922-EXACT", "--priority", "High",
+                "--feature", str(feature),
+            )
+        finally:
+            mem.SC_API_TOKEN = saved
+        flag_id = self.q(
+            "SELECT flag_id FROM flags WHERE display_name='SC-922-EXACT'"
+        )[0]
+        self.run_mem("flag", "close", str(flag_id), "--notes", "REV2 verified at abc123")
+        expected = self.q(
+            "SELECT created_date, resolved_date FROM flags WHERE flag_id=?", flag_id
+        )
+
+        human = io.StringIO()
+        with contextlib.redirect_stdout(human):
+            self.run_mem("get", "flags", str(flag_id))
+        output = human.getvalue()
+        for value in (
+            f"#{flag_id}", "SC-922-EXACT", "@peer", "High", "resolved",
+            f"#{feature}", "resolved evidence feature", expected["created_date"],
+            expected["resolved_date"], "[audit] exact closure",
+            "REV2 verified at abc123",
+        ):
+            self.assertIn(str(value), output)
+
+        raw = io.StringIO()
+        with contextlib.redirect_stdout(raw):
+            self.run_mem("get", "flags", str(flag_id), "--json")
+        row = json.loads(raw.getvalue())["flag"]
+        self.assertEqual(
+            {
+                key: row[key]
+                for key in (
+                    "flag_id", "display_name", "owner", "feature_id", "priority",
+                    "description", "created_date", "resolved_date", "resolution_notes",
+                )
+            },
+            {
+                "flag_id": flag_id,
+                "display_name": "SC-922-EXACT",
+                "owner": "peer",
+                "feature_id": feature,
+                "priority": "High",
+                "description": "[audit] exact closure | Blocker for: review",
+                "created_date": expected["created_date"],
+                "resolved_date": expected["resolved_date"],
+                "resolution_notes": "REV2 verified at abc123",
+            },
+        )
+
+    def test_flag_resolved_history_is_feature_scoped_and_excludes_open_deleted_and_other(self):
+        self.run_mem("roadmap", "add", "flag history A")
+        self.run_mem("roadmap", "add", "flag history B")
+        feature_a = self.q("SELECT feature_id FROM roadmap WHERE title='flag history A'")[0]
+        feature_b = self.q("SELECT feature_id FROM roadmap WHERE title='flag history B'")[0]
+
+        def open_flag(name: str, feature: int) -> int:
+            self.run_mem(
+                "flag", "open", f"[history] {name} | Blocker for: audit",
+                "--name", name, "--feature", str(feature),
+            )
+            return self.q("SELECT flag_id FROM flags WHERE display_name=?", name)[0]
+
+        wanted = open_flag("SC-922-WANTED", feature_a)
+        still_open = open_flag("SC-922-OPEN", feature_a)
+        other = open_flag("SC-922-OTHER", feature_b)
+        deleted = open_flag("SC-922-DELETED", feature_a)
+        self.run_mem("flag", "close", str(wanted), "--notes", "wanted closure")
+        self.run_mem("flag", "close", str(other), "--notes", "other closure")
+        self.run_mem("flag", "close", str(deleted), "--notes", "deleted closure")
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            con.execute("UPDATE flags SET is_deleted=1 WHERE flag_id=?", (deleted,))
+            con.commit()
+
+        raw = io.StringIO()
+        with contextlib.redirect_stdout(raw):
+            self.run_mem(
+                "get", "flags", "--feature", str(feature_a), "--resolved", "--json"
+            )
+        rows = json.loads(raw.getvalue())["flags"]
+        self.assertEqual([row["flag_id"] for row in rows], [wanted])
+        self.assertEqual(rows[0]["resolution_notes"], "wanted closure")
+        self.assertNotIn(still_open, [row["flag_id"] for row in rows])
+        self.assertNotIn(other, [row["flag_id"] for row in rows])
+        self.assertNotIn(deleted, [row["flag_id"] for row in rows])
+        with self.assertRaises(SystemExit):
+            self.run_mem("get", "flags", str(deleted))
+
+    def test_flag_resolved_history_refuses_unscoped_or_malformed_reads(self):
+        with self.assertRaises(SystemExit):
+            self.run_mem("get", "flags", "--resolved")
+        with self.assertRaises(SystemExit):
+            self.run_mem("get", "flags", "--feature", "1")
+        with self.assertRaises(SystemExit):
+            self.run_mem("get", "flags", "1", "--resolved", "--feature", "1")
+        with self.assertRaises(SystemExit):
+            self.run_mem("get", "state", "--resolved")
+        with self.assertRaises(SystemExit):
+            mem._api("GET", "/_sc/mem/flags?resolved=1")
+        with self.assertRaises(SystemExit):
+            mem._api("GET", "/_sc/mem/flags?feature=1")
+        with self.assertRaises(SystemExit):
+            mem._api("GET", "/_sc/mem/flags?feature=wat&resolved=1")
 
     # ── #149: close names the row it is about to resolve, and never twice ─────
     def test_flag_close_names_the_target_before_it_writes(self):

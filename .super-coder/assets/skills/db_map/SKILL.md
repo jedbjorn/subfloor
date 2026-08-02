@@ -15,7 +15,9 @@ through the engine API, via `sc mem`:
   `decisions`, `flags`, `narrative`, `messages`; shared planning state
   `roadmap`, `projects`, `documents`, `tasks`, `shells` (`--json` for raw).
   `documents`/`tasks` take `--feature <id>` / `--doc <id>`; `--doc` on
-  `documents` returns the one doc *with* its body.
+  `documents` returns the one doc *with* its body. `flags` is open-only by
+  default; `get flags <id>` includes one resolved row, while `get flags
+  --feature <id> --resolved` returns bounded closure evidence.
 - **Write** = `sc mem <cmd> …` (see `## Common writes`).
 
 There is NO raw `sqlite3` path — not as a fallback, not for "ad-hoc" reads.
@@ -105,6 +107,8 @@ sc mem task start <task_id>     # sc mem task done <task_id>
 sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"   # split/re-scope — never mark unbuilt work done
 
 # open / edit / close a flag:
+sc mem get flags <flag_id>                         # exact, open or resolved
+sc mem get flags --feature <feature_id> --resolved # bounded closure evidence
 sc mem flag open "[Area] … | Blocker for: …" --name CC-001 [--feature <id>]
 sc mem flag edit <flag_id> [--description "…"] [--priority High] [--feature <id>]
 sc mem flag close <flag_id> --notes "…"

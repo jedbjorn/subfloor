@@ -1163,7 +1163,9 @@ through the engine API, via `sc mem`:
   `decisions`, `flags`, `narrative`, `messages`; shared planning state
   `roadmap`, `projects`, `documents`, `tasks`, `shells` (`--json` for raw).
   `documents`/`tasks` take `--feature <id>` / `--doc <id>`; `--doc` on
-  `documents` returns the one doc *with* its body.
+  `documents` returns the one doc *with* its body. `flags` is open-only by
+  default; `get flags <id>` includes one resolved row, while `get flags
+  --feature <id> --resolved` returns bounded closure evidence.
 - **Write** = `sc mem <cmd> …` (see `## Common writes`).
 
 There is NO raw `sqlite3` path — not as a fallback, not for "ad-hoc" reads.
@@ -1253,6 +1255,8 @@ sc mem task start <task_id>     # sc mem task done <task_id>
 sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"   # split/re-scope — never mark unbuilt work done
 
 # open / edit / close a flag:
+sc mem get flags <flag_id>                         # exact, open or resolved
+sc mem get flags --feature <feature_id> --resolved # bounded closure evidence
 sc mem flag open "[Area] … | Blocker for: …" --name CC-001 [--feature <id>]
 sc mem flag edit <flag_id> [--description "…"] [--priority High] [--feature <id>]
 sc mem flag close <flag_id> --notes "…"
@@ -1846,15 +1850,24 @@ engine API) — there is no `sqlite3` path.
 ```
 sc mem get flags          # your open flags — `#<id> [<label>] (<priority>) <description>`
 sc mem get flags --json   # same, as JSON
+sc mem get flags <id>     # exact non-deleted row, open or resolved
+sc mem get flags --feature <id> --resolved
+                          # resolved non-deleted rows for one feature
 ```
 
 Each flag carries its `feature_id`; cross-reference `sc mem get roadmap` for
 the blocked feature''s title.
 
-Both list forms are **open-only**. One flag by id, resolved rows included:
+The default list forms are **open-only**. Exact and feature-scoped resolved
+reads include numeric id, display name, owner, feature, priority, description,
+opened date, resolved date, and closure notes in human and JSON output. Resolved
+history without `--feature` is refused; there is no fleet-wide history read.
+
+The exact CLI form reuses the authenticated single-row endpoint that protects
+`flag close`:
 
 ```
-GET /_sc/mem/flags/{id}   # no CLI verb — `flag close` reads it before it writes
+GET /_sc/mem/flags/{id}
 ```
 
 ## Open
@@ -3668,10 +3681,12 @@ advisory: the packet surfaces gaps but never prevents the owning Planner or FnB
 from making and reporting a completion judgment. Do not infer code completion
 from PR state alone.
 
-Boot an independent Reviewer into `sprint_rev` conformance mode with the bound
-spec revision hashes, integrated main SHA, and ratified judgment list. Do not
-feed it unit authors'' narrative beyond recorded judgments; conformance judges
-artifacts.
+Request an independent Reviewer through the durable Sprint relay, using the
+`sc sprint send` command above with the bound spec revision hashes, integrated
+main SHA, ratified judgment list, and `sprint_rev` conformance mode. Confirm the
+write and wake receipt, then stop and await the native conformance-result wake.
+Give the Reviewer recorded judgments, not unit authors'' narrative; conformance
+judges artifacts.
 
 ## Conformance boundary
 
@@ -3763,6 +3778,11 @@ Abort only under Planner or FnB authority. Terminal state stops Sprint services
 and removes live pills while retaining conversations, messages, events, PR
 evidence, reports, and follow-ups.
 
+Immediately before `complete`, re-run `sc sprint inbox --sprint <id>` to drain
+newly arrived messages, mark every handled informational message read with
+`accept`, and confirm the final report file is the intended synthesis. This is
+the last pre-terminal evidence read.
+
 Keep the final report at about 6,000 characters or fewer; 8,000 is the hard
 maximum. Run `wc -m < <path>` before the typed terminal handoff, then require
 the successful report receipt and lifecycle transition.
@@ -3773,10 +3793,10 @@ sc sprint complete --sprint <id> --reason <summary> --outcome <outcome> \
 sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
 ```
 
-Hand the FnB the final report id, follow-up list, integrated SHA, and evidence
-links. Re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message,
-mark every handled informational message read with `accept`, and stop after the
-terminal transition; Sprint-scoped authority is over.',
+After `complete` succeeds, emit one bounded final response from its receipt:
+final report id, follow-up list, integrated SHA, and evidence links. Run no
+further Sprint command; close intent terminalizes the owning conversation and
+Sprint-scoped authority is over.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -3880,14 +3900,19 @@ sc sprint complete-unit --sprint <id> --work-unit <id> \
 ```
 
 Register the PR through the authoritative Sprint surface and retain ownership
-until it is green. The watcher supplies red/green facts; do not write PR state
-yourself. On red, diagnose and fix the PR. On green, judge readiness rather
-than forwarding mechanically.
+until it is green. After `register-pr` succeeds, the native registered-PR
+watcher supplies red/green facts and their durable wakes. On red, diagnose and
+fix the PR. On green, judge readiness rather than forwarding mechanically.
 
 ```text
 sc sprint register-pr --sprint <id> --repository <owner/name> \
   --pr <number> --work-unit <id>
 ```
+
+When no local implementation action remains, stop and await the native PR-fact
+wake. Use Sprint-native wakes for coordination. Do not start a recurring shell
+loop, scheduled job, manual watcher daemon, or external PR watcher to track the
+registered PR.
 
 ## Review handoff
 
@@ -3903,11 +3928,12 @@ sc sprint request-review \
   --readiness-file <path> --key <stable-key>
 ```
 
-The assigned Reviewer receives an actionable request. Stop until its durable
-outcome arrives. A changes-requested verdict opens a fresh linked fix
-conversation and makes it current. Apply every blocking finding, re-establish
-green, and hand back with a new stable review key. Record disagreements as
-judgment; the Planner resolves scope/severity disputes.
+The assigned Reviewer receives an actionable request. After `request-review`
+succeeds, stop and await the native verdict wake. A changes-requested verdict
+opens a fresh linked fix conversation and makes it current. Apply every
+blocking finding, re-establish green, and hand back with a new stable review
+key. Record disagreements as judgment; the Planner resolves scope/severity
+disputes.
 
 ## Merge boundary
 
@@ -3959,6 +3985,10 @@ and inspect the durable message before deciding what to do.
 
 ## Start from durable state
 
+The armed runtime owns scheduled dispatch, unread wake recovery, liveness
+evaluation, and registered-PR observation. React to its durable inbox and wake
+facts; use the Planner turn for decisions, re-plans, escalation, and close-out.
+
 Read the Sprint inbox, lifecycle, bound spec revisions, work-unit graph,
 participant routes, active conversations, registered PRs, unresolved
 expectations, and recent anomalies. Viewing a participant conversation is
@@ -4006,8 +4036,11 @@ diagnostic/evaluation is available when evidence requires it:
 sc sprint monitor --sprint <id>
 ```
 
-Do not poll this command on a schedule. It evaluates only due accepted
-expectations and its nudge/escalation identities are durable.
+Run `monitor` once for concrete evidence, then return control to native
+delivery. It evaluates only due accepted expectations and its
+nudge/escalation identities are durable. Use Sprint-native wakes for
+coordination. Do not start a recurring shell loop, scheduled job, manual
+participant boot, or external PR watcher to track Sprint state.
 
 ## Questions, answers, blockers, and failures
 
@@ -4100,8 +4133,9 @@ the next work assignment returns it to the persistent lane.
 When all planned delivery work is terminal and merged or explicitly no-code,
 re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message, confirm
 every handled informational message is marked read with `accept`, confirm the
-final typed transition succeeded, stop dispatching, and invoke `sprint_close`.
-Do not fix close-out conformance findings inside this Sprint.',
+final typed transition succeeded, stop dispatching, and hand control to
+`sprint_close`. Close-out conformance findings become follow-ups rather than
+new editing lanes in this Sprint.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -4216,9 +4250,15 @@ no partial Sprint.
 sc sprint arm --sprint <id>
 ```
 
+After `arm` succeeds, participant pickup belongs to native delivery. The armed
+runtime dispatches ready work and wake recovery reconciles unread pickup; the
+preparing Planner does not manually boot participants or create a second wake
+path.
+
 ## Handoff
 
-Once armed, hand control to `sprint_pln`. Give the FnB a compact declaration:
+Once armed, hand control to `sprint_pln` and stop preparation work. Give the FnB
+a compact declaration:
 Sprint id, feature, exact spec revisions, participants/routes, work-unit graph,
 planned waves, merge-grant state, and known accepted risks.
 
@@ -4240,18 +4280,27 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   '# sprint_rev — independent review and conformance
 
 Use in one of two modes: a work-unit PR review during the loop, or the final
-whole-Sprint conformance pass. The evidence differs; independence does not.
-On every wake or re-entry, load `sprint_rev`, run the exact inbox command below,
-and inspect the durable message before deciding what to do.
+whole-Sprint conformance pass. Pre-declaration QAQC is a third entry condition,
+before a Sprint exists. The evidence differs; independence does not.
 
-Read and accept the actionable request before beginning. During preparation,
-sign the exact current spec revision through the same authenticated surface:
+## Entry and durable state
+
+Pre-declaration QAQC begins from an explicit Planner or FnB request. Read the
+exact current spec document and sign that body directly; there is no Sprint id
+or Sprint inbox to inspect yet:
+
+```text
+sc sprint record-qaqc --document <spec-document-id> \
+  --verdict pass [--findings-document <document-id>]
+```
+
+Once a Sprint is armed, every review or conformance entry arrives through its
+durable wake/inbox. On every wake or re-entry, load `sprint_rev`, inspect the
+message, and accept the actionable request before beginning:
 
 ```text
 sc sprint inbox --sprint <id>
 sc sprint accept --sprint <id> --message <message-id>
-sc sprint record-qaqc --document <spec-document-id> \
-  --verdict pass [--findings-document <document-id>]
 ```
 
 Decline an actionable request you cannot take, with a concrete reason:
@@ -4321,6 +4370,15 @@ Accept the actionable review request, then inspect the exact bound spec
 revision, readiness claim, PR head, diff, checks, tests, relevant runtime
 evidence, and prior judgment calls. Review code quality, edge cases/failure
 paths, and spec conformance. Trace the real path; do not trust names or PR prose.
+
+Read resolved closure evidence through the authenticated memory surface; no SQL
+or mutation is needed. Use the exact form for a cited flag and the scoped form
+to audit every resolved flag attached to the feature:
+
+```text
+sc mem get flags <flag-id>
+sc mem get flags --feature <feature-id> --resolved
+```
 
 Findings must state:
 
@@ -4398,7 +4456,8 @@ For either mode, re-run `sc sprint inbox --sprint <id>` and act on newly arrived
 messages before stopping. For unit review, stop after the durable verdict is
 recorded and every handled informational message is marked read with `accept`.
 For conformance, also require the report and all findings to replay
-idempotently and give the Planner their report/follow-up ids.',
+idempotently and give the Planner their report/follow-up ids. The typed receipt
+completes the handoff; stop until another native wake arrives.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET

@@ -22,6 +22,7 @@ SKILLS = {
     "sprint_rev": "reviewer",
     "sprint_close": "planner",
 }
+RESEEDED_SKILLS = set(SKILLS) | {"db_map", "flags"}
 
 
 class SprintSkillTest(unittest.TestCase):
@@ -70,12 +71,14 @@ class SprintSkillTest(unittest.TestCase):
 
     def test_handoff_migration_converges_a_drifted_existing_skill_body(self):
         con = sqlite3.connect(":memory:")
+        reference = sqlite3.connect(":memory:")
         try:
-            con.executescript((ENGINE / "schema.sql").read_text())
-            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
-                if migration.name >= "0153_harden_sprint_handoff_skills.sql":
-                    break
-                con.executescript(migration.read_text())
+            for target in (con, reference):
+                target.executescript((ENGINE / "schema.sql").read_text())
+                for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                    if migration.name >= "0153_harden_sprint_handoff_skills.sql":
+                        break
+                    target.executescript(migration.read_text())
             con.execute(
                 "UPDATE skills SET content='fork-local drift' WHERE name='sprint_dev'"
             )
@@ -84,16 +87,51 @@ class SprintSkillTest(unittest.TestCase):
                 ENGINE / "migrations" / "0153_harden_sprint_handoff_skills.sql"
             ).read_text()
             con.executescript(migration)
+            reference.executescript(migration)
 
-            expected = seed_skills.parse_skill(
-                ASSETS / "sprint_dev" / "SKILL.md"
-            )["content"]
             self.assertEqual(
-                expected,
+                reference.execute(
+                    "SELECT content FROM skills WHERE name='sprint_dev'"
+                ).fetchone()[0],
                 con.execute(
                     "SELECT content FROM skills WHERE name='sprint_dev'"
                 ).fetchone()[0],
             )
+        finally:
+            con.close()
+            reference.close()
+
+    def test_native_wake_reseed_converges_dirty_rows_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0159_reseed_sprint_native_wake_skills.sql":
+                    break
+                con.executescript(migration.read_text())
+            placeholders = ",".join("?" for _ in RESEEDED_SKILLS)
+            con.execute(
+                f"UPDATE skills SET content='stale pre-0159 body' "
+                f"WHERE name IN ({placeholders})",
+                tuple(sorted(RESEEDED_SKILLS)),
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0159_reseed_sprint_native_wake_skills.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for name in sorted(RESEEDED_SKILLS):
+                with self.subTest(name=name):
+                    expected = seed_skills.parse_skill(
+                        ASSETS / name / "SKILL.md"
+                    )["content"]
+                    rows = con.execute(
+                        "SELECT content, is_deleted FROM skills WHERE name=?", (name,)
+                    ).fetchall()
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(tuple(rows[0]), (expected, 0))
         finally:
             con.close()
 
@@ -241,3 +279,66 @@ class SprintSkillTest(unittest.TestCase):
                         if argument in action.option_strings
                     )
                     self.assertIn("8,000 characters", action.help)
+
+    def test_role_contracts_assign_scheduled_coordination_to_native_wakes(self):
+        bodies = {
+            name: (ASSETS / name / "SKILL.md").read_text()
+            for name in SKILLS
+        }
+        self.assertIn(
+            "participant pickup belongs to native delivery", bodies["sprint_prep"]
+        )
+        planner = " ".join(bodies["sprint_pln"].split())
+        for fact in (
+            "scheduled dispatch",
+            "unread wake recovery",
+            "liveness evaluation",
+            "registered-PR observation",
+        ):
+            self.assertIn(fact, planner)
+        self.assertIn(
+            "Run `monitor` once for concrete evidence", bodies["sprint_pln"]
+        )
+        self.assertIn(
+            "After `register-pr` succeeds", bodies["sprint_dev"]
+        )
+        self.assertIn(
+            "stop and await the native verdict wake", bodies["sprint_dev"]
+        )
+        self.assertIn(
+            "stop and await the native conformance-result wake",
+            bodies["sprint_close"],
+        )
+
+        combined = "\n".join(bodies.values()).lower()
+        for shell_owned_loop in (
+            "while true",
+            "./sc watch pr",
+            "gh pr checks --watch",
+            "sc job start",
+        ):
+            self.assertNotIn(shell_owned_loop, combined)
+
+    def test_reviewer_entry_separates_predeclaration_qaqc_from_armed_inbox(self):
+        reviewer = (ASSETS / "sprint_rev" / "SKILL.md").read_text()
+        normalized = " ".join(reviewer.split())
+        qaqc = reviewer.index("sc sprint record-qaqc")
+        inbox = reviewer.index("sc sprint inbox --sprint <id>")
+        self.assertLess(qaqc, inbox)
+        self.assertIn(
+            "there is no Sprint id or Sprint inbox to inspect yet", normalized
+        )
+        self.assertIn("sc mem get flags <flag-id>", reviewer)
+        self.assertIn(
+            "sc mem get flags --feature <feature-id> --resolved", reviewer
+        )
+
+    def test_close_drains_before_complete_and_runs_nothing_after_success(self):
+        close = (ASSETS / "sprint_close" / "SKILL.md").read_text()
+        drain = close.index("Immediately before `complete`, re-run")
+        complete = close.index("sc sprint complete --sprint <id>")
+        self.assertLess(drain, complete)
+        after_success = close.split("After `complete` succeeds", 1)[1]
+        normalized = " ".join(after_success.lower().split())
+        self.assertIn("run no further sprint command", normalized)
+        self.assertNotIn("sc sprint ", after_success.lower())

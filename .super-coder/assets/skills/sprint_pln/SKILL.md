@@ -14,6 +14,10 @@ and inspect the durable message before deciding what to do.
 
 ## Start from durable state
 
+The armed runtime owns scheduled dispatch, unread wake recovery, liveness
+evaluation, and registered-PR observation. React to its durable inbox and wake
+facts; use the Planner turn for decisions, re-plans, escalation, and close-out.
+
 Read the Sprint inbox, lifecycle, bound spec revisions, work-unit graph,
 participant routes, active conversations, registered PRs, unresolved
 expectations, and recent anomalies. Viewing a participant conversation is
@@ -61,8 +65,11 @@ diagnostic/evaluation is available when evidence requires it:
 sc sprint monitor --sprint <id>
 ```
 
-Do not poll this command on a schedule. It evaluates only due accepted
-expectations and its nudge/escalation identities are durable.
+Run `monitor` once for concrete evidence, then return control to native
+delivery. It evaluates only due accepted expectations and its
+nudge/escalation identities are durable. Use Sprint-native wakes for
+coordination. Do not start a recurring shell loop, scheduled job, manual
+participant boot, or external PR watcher to track Sprint state.
 
 ## Questions, answers, blockers, and failures
 
@@ -155,5 +162,6 @@ the next work assignment returns it to the persistent lane.
 When all planned delivery work is terminal and merged or explicitly no-code,
 re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message, confirm
 every handled informational message is marked read with `accept`, confirm the
-final typed transition succeeded, stop dispatching, and invoke `sprint_close`.
-Do not fix close-out conformance findings inside this Sprint.
+final typed transition succeeded, stop dispatching, and hand control to
+`sprint_close`. Close-out conformance findings become follow-ups rather than
+new editing lanes in this Sprint.

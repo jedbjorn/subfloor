@@ -31,6 +31,8 @@ Run from the repo root, like every engine command:
     ./sc mem which                                 # confirm the memory API is reachable + which shell this session resolves as
     ./sc mem get <surface>           [--json]      # read: state|seed|lns|decisions|flags|roadmap|narrative|messages
     ./sc mem get decisions [<id>|--all]            # default: active index (no rationale); <id> = full row; --all incl. superseded
+    ./sc mem get flags [<id>] [--feature ID --resolved]
+                                                   # default: open; <id>: exact incl. resolved; history: feature-scoped only
                                                    # decisions read FLEET-WIDE (author tagged @shortname); writes stay your own
     ./sc mem state "<text>"
     ./sc mem seed  "<body>"          [--date YYYY-MM-DD] [--tag cc]
@@ -396,9 +398,9 @@ def _render_get(surface: str, data: dict) -> int:
                       f"`get decisions <id>` for detail + rationale)")
         return 0
     if surface == "flags":
-        fs = data.get("flags", [])
+        fs = [data["flag"]] if "flag" in data else data.get("flags", [])
         if not fs:
-            print("mem: no open flags")
+            print("mem: no matching flags")
             return 0
         for f in fs:
             # id AND label, always both (#149): a named flag used to print its
@@ -408,8 +410,17 @@ def _render_get(surface: str, data: dict) -> int:
             # row rather than failing.
             nm = f.get("display_name") or "unnamed"
             who = f" @{f['owner']}" if f.get("owner") else ""
+            status = "resolved" if f.get("resolved") else "open"
+            feature = f"#{f['feature_id']}" if f.get("feature_id") else "none"
+            if f.get("feature_title"):
+                feature += f" — {f['feature_title']}"
             print(f"#{f['flag_id']} [{nm}]{who} ({f.get('priority') or 'Medium'}) "
-                  f"{f.get('description') or ''}")
+                  f"[{status}]")
+            print(f"  feature: {feature}")
+            print(f"  opened: {f.get('created_date') or '—'} · "
+                  f"resolved: {f.get('resolved_date') or '—'}")
+            print(f"  description: {f.get('description') or '—'}")
+            print(f"  closure notes: {f.get('resolution_notes') or '—'}")
         return 0
     if surface == "roadmap":
         rm = data.get("roadmap", [])
@@ -510,14 +521,27 @@ def _render_get(surface: str, data: dict) -> int:
 
 def cmd_get(args) -> int:
     surface = args.surface
+    if args.resolved and surface != "flags":
+        die("--resolved is only valid with get flags --feature <id>")
     path = f"/_sc/mem/{surface}"
     if surface == "decisions":
         if args.id is not None:                   # single decision, with rationale
             path = f"/_sc/mem/decisions/{args.id}"
         elif args.all:                            # full log incl. superseded
             path = "/_sc/mem/decisions?all=1"
+    elif surface == "flags":
+        if args.id is not None:
+            if args.feature is not None or args.resolved:
+                die("get flags <id> cannot be combined with --feature or --resolved")
+            path = f"/_sc/mem/flags/{args.id}"
+        elif args.resolved:
+            if args.feature is None:
+                die("get flags --resolved needs --feature <id>; unscoped resolved history is refused")
+            path = f"/_sc/mem/flags?feature={args.feature}&resolved=1"
+        elif args.feature is not None:
+            die("get flags --feature <id> needs --resolved")
     elif args.id is not None:
-        die(f"get {surface} takes no <id> (only decisions)")
+        die(f"get {surface} takes no <id> (only decisions and flags)")
     if surface == "documents":
         if args.doc is not None:                  # single doc, with body
             path = f"/_sc/mem/documents/{args.doc}"
@@ -921,12 +945,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("surface", choices=GET_SURFACES,
                     type=lambda s: GET_SURFACE_ALIASES.get(s, s))
     sp.add_argument("id", nargs="?", type=int,
-                    help="decisions: one decision WITH rationale")
+                    help="decisions: one with rationale; flags: exact row incl. resolved")
     sp.add_argument("--all", action="store_true",
                     help="decisions: full log incl. superseded (default: active index)")
     sp.add_argument("--json", action="store_true", help="raw JSON instead of formatted text")
     sp.add_argument("--feature", type=int,
-                    help="scope to a feature (documents/tasks)")
+                    help="scope documents/tasks; flags: required with --resolved")
+    sp.add_argument("--resolved", action="store_true",
+                    help="flags: resolved rows for one --feature (unscoped history refused)")
     sp.add_argument("--doc", type=int,
                     help="documents: one doc WITH body; tasks: that doc's plan")
     sp.set_defaults(fn=cmd_get)
