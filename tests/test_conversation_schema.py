@@ -647,9 +647,17 @@ class TransitionMatrixTest(ConversationDbCase):
             conversation_state.ConversationStateError
         ) as raised:
             conversation_state.require_transition(
-                "conversation", "closed", "idle"
+                "conversation", "closed", "running"
             )
-        self.assertIn("closed -> idle", str(raised.exception))
+        self.assertIn("closed -> running", str(raised.exception))
+        self.assertIn("allowed: idle", str(raised.exception))
+        with self.assertRaises(
+            conversation_state.ConversationStateError
+        ) as raised:
+            conversation_state.require_transition(
+                "message", "completed", "queued"
+            )
+        self.assertIn("completed -> queued", str(raised.exception))
         self.assertIn("terminal", str(raised.exception))
 
 

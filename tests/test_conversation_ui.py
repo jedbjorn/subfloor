@@ -289,6 +289,28 @@ def test_composer_is_retry_safe_and_has_turn_controls():
     assert "chatCloseForSwitch" not in shell_switch
 
 
+def test_closed_chat_composer_offers_reopen():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    assert "const reopenable = closed && !sprintManaged" in interface
+    assert "composer.disabled = closing || (closed && !reopenable)" in interface
+    assert "send.disabled = closing || (closed && !reopenable)" in interface
+    assert (
+        "This conversation is closed — send a message to reopen it."
+        in interface
+    )
+    assert '"conversation.reopened"' in interface
+    reopen_reduce = interface[
+        interface.index('if (type === "conversation.reopened")'):
+        interface.index('if (["run.completed", "run.failed"',
+                        interface.index(
+                            'if (type === "conversation.reopened")'))
+    ]
+    assert 'conversation.state = "idle"' in reopen_reduce
+    assert "conversation.closed_at = null" in reopen_reduce
+    assert "conversation.close_requested_at = null" in reopen_reduce
+
+
 def test_chat_switch_refetches_authoritative_version_before_close():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]

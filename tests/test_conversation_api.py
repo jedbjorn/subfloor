@@ -1302,23 +1302,229 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertTrue(starred["starred"])
         self.assertEqual(starred["version"], closed["version"] + 1)
 
-    def test_closed_conversation_rejects_messages(self) -> None:
-        conversation = self.create()
+    def test_sending_to_a_closed_chat_reopens_and_queues(self) -> None:
+        conversation = self.create(key="reopen-chat")
+        conversation_id = conversation["conversation_id"]
+        con = self.connect()
+        try:
+            con.execute(
+                "UPDATE conversations SET harness_session_ref='native-123' "
+                "WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
+        status, _, closed = self.request(
+            "PATCH",
+            f"/api/conversations/{conversation_id}",
+            body={"version": conversation["version"], "state": "closed"},
+        )
+        self.assertEqual(status, 200, closed)
+
+        status, _, accepted = self.request(
+            "POST",
+            f"/api/conversations/{conversation_id}/messages",
+            body={"text": "picking this back up"},
+            key="reopen-send",
+        )
+        self.assertEqual(status, 202, accepted)
+        self.assertEqual(accepted["message"]["state"], "queued")
+
+        con = self.connect()
+        try:
+            row = con.execute(
+                "SELECT state,closed_at,harness_session_ref "
+                "FROM conversations WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+            events = [
+                item[0]
+                for item in con.execute(
+                    "SELECT event_type FROM conversation_events "
+                    "WHERE conversation_id=? ORDER BY sequence",
+                    (conversation_id,),
+                )
+            ]
+        finally:
+            con.close()
+        self.assertEqual(row["state"], "queued")
+        self.assertIsNone(row["closed_at"])
+        self.assertEqual(row["harness_session_ref"], "native-123")
+        self.assertIn("conversation.reopened", events)
+        self.assertLess(
+            events.index("conversation.closed"),
+            events.index("conversation.reopened"),
+        )
+        status, _, projection = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}",
+        )
+        self.assertEqual(status, 200, projection)
+        self.assertEqual(projection["state"], "queued")
+        self.assertIsNone(projection["closed_at"])
+        self.assertIsNone(projection["close_requested_at"])
+
+    def test_reopening_a_chat_closes_the_open_idle_chat(self) -> None:
+        first = self.create(key="reopen-first", title="First")
+        second = self.create(key="reopen-second", title="Second")
+
+        status, _, accepted = self.request(
+            "POST",
+            f"/api/conversations/{first['conversation_id']}/messages",
+            body={"text": "back to the first thread"},
+            key="reopen-first-send",
+        )
+        self.assertEqual(status, 202, accepted)
+
+        con = self.connect()
+        try:
+            rows = con.execute(
+                "SELECT conversation_id,state,closed_at FROM conversations"
+            ).fetchall()
+            reason = con.execute(
+                "SELECT payload FROM conversation_events "
+                "WHERE conversation_id=? "
+                "AND event_type='conversation.closed' "
+                "ORDER BY sequence DESC LIMIT 1",
+                (second["conversation_id"],),
+            ).fetchone()[0]
+        finally:
+            con.close()
+        by_id = {row["conversation_id"]: row for row in rows}
+        self.assertEqual(by_id[first["conversation_id"]]["state"], "queued")
+        self.assertIsNone(by_id[first["conversation_id"]]["closed_at"])
+        self.assertEqual(by_id[second["conversation_id"]]["state"], "closed")
+        self.assertIsNotNone(by_id[second["conversation_id"]]["closed_at"])
+        self.assertEqual(
+            json.loads(reason)["reason"],
+            "another browser chat reopened",
+        )
+
+    def test_reopen_refuses_while_the_open_chat_turn_is_running(self) -> None:
+        first = self.create(key="busy-reopen-first")
+        second = self.create(key="busy-reopen-second")
+        con = self.connect()
+        try:
+            con.execute(
+                "UPDATE conversations SET state='queued' "
+                "WHERE conversation_id=?",
+                (second["conversation_id"],),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        status, _, error = self.request(
+            "POST",
+            f"/api/conversations/{first['conversation_id']}/messages",
+            body={"text": "not yet"},
+            key="busy-reopen-send",
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(error["error"]["code"], "BROWSER_CHAT_BUSY")
+        con = self.connect()
+        try:
+            state = con.execute(
+                "SELECT state FROM conversations WHERE conversation_id=?",
+                (first["conversation_id"],),
+            ).fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(state, "closed")
+
+    def test_reopen_refuses_a_live_cli_owner(self) -> None:
+        conversation = self.create(key="cli-reopen")
         conversation_id = conversation["conversation_id"]
         status, _, closed = self.request(
             "PATCH",
             f"/api/conversations/{conversation_id}",
-            body={"version": 1, "state": "closed"},
+            body={"version": conversation["version"], "state": "closed"},
         )
         self.assertEqual(status, 200, closed)
+
+        with mock.patch.object(
+            conversation_routes,
+            "_live_shell_session",
+            return_value="busy",
+        ):
+            status, _, error = self.request(
+                "POST",
+                f"/api/conversations/{conversation_id}/messages",
+                body={"text": "shell is occupied"},
+                key="cli-reopen-send",
+            )
+        self.assertEqual(status, 409)
+        self.assertEqual(error["error"]["code"], "SHELL_BUSY")
+        con = self.connect()
+        try:
+            state = con.execute(
+                "SELECT state FROM conversations WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(state, "closed")
+
+    def test_closed_sprint_conversation_never_reopens(self) -> None:
+        conversation_id = self.seed_sprint_conversation()
+        con = self.connect()
+        try:
+            con.execute(
+                "UPDATE conversations SET state='closed',"
+                "closed_at=datetime('now') WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
+
         status, _, error = self.request(
             "POST",
             f"/api/conversations/{conversation_id}/messages",
-            body={"text": "too late"},
-            key="message-closed",
+            body={"text": "sprint chats stay managed"},
+            key="sprint-reopen-send",
         )
         self.assertEqual(status, 409)
-        self.assertEqual(error["error"]["code"], "CONVERSATION_CLOSED")
+        self.assertEqual(error["error"]["code"], "SPRINT_CONVERSATION_MANAGED")
+
+    def test_reopen_outscopes_a_stale_close_request(self) -> None:
+        conversation = self.create(key="stale-close-request")
+        conversation_id = conversation["conversation_id"]
+        con = self.connect()
+        try:
+            con.execute(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload) VALUES (?,"
+                "(SELECT COALESCE(MAX(sequence),0)+1 FROM conversation_events"
+                " WHERE conversation_id=?),"
+                "'conversation.close.requested','{}')",
+                (conversation_id, conversation_id),
+            )
+            con.commit()
+        finally:
+            con.close()
+        status, _, closed = self.request(
+            "PATCH",
+            f"/api/conversations/{conversation_id}",
+            body={"version": conversation["version"], "state": "closed"},
+        )
+        self.assertEqual(status, 200, closed)
+
+        status, _, accepted = self.request(
+            "POST",
+            f"/api/conversations/{conversation_id}/messages",
+            body={"text": "the old close request must not strand this"},
+            key="stale-close-send",
+        )
+        self.assertEqual(status, 202, accepted)
+        status, _, projection = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}",
+        )
+        self.assertEqual(status, 200, projection)
+        self.assertEqual(projection["state"], "queued")
+        self.assertIsNone(projection["close_requested_at"])
 
     def test_message_cursor_and_auditable_idempotent_interruption(self) -> None:
         conversation_id = self.create()["conversation_id"]
