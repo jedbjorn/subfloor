@@ -558,6 +558,148 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             ).fetchone()[0],
         )
 
+        receipt = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="the orphaned slot was cleared",
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual(1, len(receipt.requeued_wake_ids))
+        reset_wake = receipt.requeued_wake_ids[0]
+        self.assertNotEqual(current, reset_wake)
+        self.assertEqual(
+            (
+                "armed",
+                "pending",
+                f"sprint-resume:{self.sprint_id}:contention-episode:{current}",
+                0,
+                None,
+                1,
+                None,
+                None,
+            ),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,w.state,w.idempotency_key,w.attempt_count,"
+                    "w.last_error,w.available_at<=datetime('now'),"
+                    "w.delivered_at,w.failed_at FROM sprints s "
+                    "JOIN sprint_wake_outbox w ON w.sprint_id=s.sprint_id "
+                    "WHERE s.sprint_id=? AND w.wake_id=?",
+                    (self.sprint_id, reset_wake),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            ("delivered", 0, 1),
+            tuple(
+                self.con.execute(
+                    "SELECT w.state,COUNT(wm.message_id),"
+                    "(SELECT COUNT(*) FROM sprint_wake_attempts a "
+                    "WHERE a.wake_id=w.wake_id) "
+                    "FROM sprint_wake_outbox w LEFT JOIN sprint_wake_messages wm "
+                    "USING (wake_id) WHERE w.wake_id=? GROUP BY w.wake_id",
+                    (current,),
+                ).fetchone()
+            ),
+        )
+        reset = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='wake.contention_episode_reset'",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(
+            (
+                current,
+                reset_wake,
+                f"sprint-recovery:{self.sprint_id}:busy:{original}:5",
+                f"sprint-resume:{self.sprint_id}:contention-episode:{current}",
+            ),
+            (
+                reset["prior_wake_id"],
+                reset["replacement_wake_id"],
+                reset["prior_idempotency_key"],
+                reset["idempotency_key"],
+            ),
+        )
+
+        self.fail_wake_turn(reset_wake, error_code="SHELL_BUSY")
+        fresh_retry = self.lifecycle.reconcile_unread_pickup(
+            self.sprint_id,
+            trigger="fresh-episode-attempt-2",
+        )
+        self.assertEqual(1, len(fresh_retry))
+        self.assertEqual(
+            (
+                "armed",
+                f"sprint-recovery:{self.sprint_id}:busy:{reset_wake}:2",
+                4,
+            ),
+            (
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT idempotency_key FROM sprint_wake_outbox "
+                    "WHERE wake_id=?",
+                    (fresh_retry[0],),
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_wake_outbox "
+                    "WHERE sprint_id=? AND idempotency_key LIKE ?",
+                    (
+                        self.sprint_id,
+                        f"sprint-recovery:{self.sprint_id}:busy:{original}:%",
+                    ),
+                ).fetchone()[0],
+            ),
+        )
+
+    def test_resume_reports_unchanged_when_reconciliation_repauses(self):
+        message = self.send("busy-chain-under-manual-pause")
+        current = int(message.wake_id)
+        for attempt in range(2, 6):
+            self.fail_wake_turn(current, error_code="SHELL_BUSY")
+            current = self.lifecycle.reconcile_unread_pickup(
+                self.sprint_id,
+                trigger=f"prepare-attempt-{attempt}",
+            )[0]
+            self.con.execute(
+                "UPDATE sprint_wake_outbox SET available_at="
+                "datetime('now','-1 second') WHERE wake_id=?",
+                (current,),
+            )
+            self.con.commit()
+        self.fail_wake_turn(current, error_code="SHELL_BUSY")
+        coordinator = self.coordinator()
+        coordinator.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="manual pause before the contention pulse",
+        )
+
+        receipt = coordinator.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+
+        self.assertFalse(receipt.changed)
+        self.assertEqual((), receipt.requeued_wake_ids)
+        self.assertEqual(
+            ("paused", "wake_contention_exhausted"),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,json_extract(r.body,'$.reason') "
+                    "FROM sprints s JOIN sprint_reports r USING (sprint_id) "
+                    "WHERE s.sprint_id=? ORDER BY r.report_id DESC LIMIT 1",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+
     def test_read_message_stops_pending_shell_busy_chain(self):
         message = self.send("busy-chain-read")
         original = int(message.wake_id)

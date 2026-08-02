@@ -396,13 +396,19 @@ class SprintLifecycleStore:
                 target="armed",
                 outcome=None,
             )
+            reset_wake_ids = self._reset_contention_episode_in_transaction(
+                sprint_id,
+                actor,
+            )
             if reconcile_in_transaction is not None:
                 reconcile_in_transaction(self.con)
             reconciliation = self._reconcile_unread_wakes_in_transaction(
                 sprint_id,
                 trigger="resume",
             )
-            requeued = reconciliation.wake_ids
+            requeued = tuple(
+                sorted(set(reset_wake_ids) | set(reconciliation.wake_ids))
+            )
             pause_receipt = reconciliation.pause_receipt
             projected, resolved = (
                 self._reconcile_registered_prs_in_transaction(sprint_id)
@@ -466,7 +472,7 @@ class SprintLifecycleStore:
         else:
             self._signal_notifications(notice_conversations)
         return ResumeReceipt(
-            True,
+            pause_receipt is None,
             dispatched,
             requeued,
             tuple(projected),
@@ -474,6 +480,71 @@ class SprintLifecycleStore:
             tuple(sorted(drift)),
             all_anomalies,
         )
+
+    def _reset_contention_episode_in_transaction(
+        self,
+        sprint_id: int,
+        actor: LifecycleActor,
+    ) -> tuple[int, ...]:
+        """Make a human resume the durable anchor of a fresh busy episode."""
+        report = self.con.execute(
+            "SELECT body FROM sprint_reports WHERE sprint_id=? "
+            "AND report_kind='pause' ORDER BY report_id DESC LIMIT 1",
+            (sprint_id,),
+        ).fetchone()
+        if report is None:
+            return ()
+        pause = json.loads(str(report["body"]))
+        if pause.get("reason") != "wake_contention_exhausted":
+            return ()
+        wake_id = int(pause["detail"]["wake_id"])
+        wake = self.con.execute(
+            "SELECT w.participant_id,w.idempotency_key "
+            "FROM sprint_wake_outbox w "
+            "WHERE w.sprint_id=? AND w.wake_id=? "
+            "AND w.state IN ('delivered','failed') AND EXISTS ("
+            "SELECT 1 FROM sprint_wake_messages wm "
+            "JOIN sprint_messages m USING (message_id) "
+            "WHERE wm.sprint_id=w.sprint_id AND wm.wake_id=w.wake_id "
+            "AND m.read_at IS NULL)",
+            (sprint_id, wake_id),
+        ).fetchone()
+        if wake is None:
+            return ()
+        reset_key = f"sprint-resume:{sprint_id}:contention-episode:{wake_id}"
+        replacement_wake_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_wake_outbox "
+                "(sprint_id,participant_id,idempotency_key,available_at) "
+                "VALUES (?,?,?,datetime('now'))",
+                (sprint_id, int(wake["participant_id"]), reset_key),
+            ).lastrowid
+        )
+        self.con.execute(
+            "UPDATE sprint_wake_messages SET wake_id=? "
+            "WHERE sprint_id=? AND wake_id=?",
+            (replacement_wake_id, sprint_id, wake_id),
+        )
+        route = sprint_participant_chats.ensure_wake_conversation(
+            self.con,
+            int(wake["participant_id"]),
+            idempotency_key=(
+                f"sprint:{sprint_id}:wake:{replacement_wake_id}:conversation"
+            ),
+        )
+        self._event(
+            sprint_id,
+            "wake.contention_episode_reset",
+            actor,
+            {
+                "prior_wake_id": wake_id,
+                "replacement_wake_id": replacement_wake_id,
+                "prior_idempotency_key": str(wake["idempotency_key"]),
+                "idempotency_key": reset_key,
+                "replacement_conversation_id": route.conversation_id,
+            },
+        )
+        return (replacement_wake_id,)
 
     def abort(
         self,
