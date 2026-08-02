@@ -2614,6 +2614,24 @@ function chatHeaderLabel(conversation) {
   ].filter(Boolean).join(" | ");
 }
 
+// Admin shells stay on the rail but never chat here: they maintain main at
+// the repo root, whose single un-attributable session slot would make browser
+// turns refuse whenever anyone works anywhere in the repo. The notice hands
+// the operator the exact terminal commands instead.
+function chatAdminCliOnly(shell) {
+  return (shell?.flavor || "") === "admin";
+}
+
+function chatAdminCliOnlyNotice(shell, repoRoot) {
+  return el("div", { className: "chat-empty chat-admin-cli-only" },
+    el("b", {}, "Admin is CLI-only."),
+    el("div", {},
+      `${shell.display_name} maintains main directly at the repo root, `
+      + "so browser chats are disabled for it. Open a terminal and run:"),
+    el("pre", { className: "chat-admin-commands" },
+      `cd ${repoRoot || "<repo root>"}\nmake dos-e s=${shell.shortname}`));
+}
+
 function chatWorkingDots() {
   return el("span", { className: "chat-working-dots", ariaHidden: "true" },
     el("span", {}, "."),
@@ -4321,7 +4339,11 @@ async function renderInterface(root) {
       .then((conversation) => ({ conversation }))
       .catch((error) => ({ error }))
     : Promise.resolve({ conversation: null });
-  const [{ shells: allShells }, openPage, detailResult] = await Promise.all([
+  const [
+    { shells: allShells, repo_root: repoRoot },
+    openPage,
+    detailResult,
+  ] = await Promise.all([
     shellRequest,
     openRequest,
     detailRequest,
@@ -4439,15 +4461,19 @@ async function renderInterface(root) {
   }
 
   const side = el("aside", { className: "chat-history" });
+  const adminCliOnly = chatAdminCliOnly(shell);
   const newChat = el("button", {
     className: "act primary",
     type: "button",
     textContent: "＋ Chat",
+    disabled: adminCliOnly,
+    title: adminCliOnly ? "Admin is CLI-only — see the pane for the commands" : "",
   });
   const configure = el("button", {
     className: "chat-configure",
     type: "button",
     textContent: "Configure",
+    disabled: adminCliOnly,
   });
   newChat.onclick = async () => {
     if (!await chatCloseForSwitch(selectedConversation)) return;
@@ -4748,6 +4774,10 @@ async function renderInterface(root) {
   };
   chatHistoryPollTimer = setInterval(pollHistory, CHAT_HISTORY_POLL_MS);
 
+  if (adminCliOnly && (configuring || !selectedId)) {
+    pane.append(chatAdminCliOnlyNotice(shell, repoRoot));
+    return;
+  }
   if (configuring) {
     const loadConfiguration = async () => {
       pane.replaceChildren(

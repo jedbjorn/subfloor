@@ -38,6 +38,22 @@ def test_interface_is_a_first_class_reload_safe_view():
     assert "chatRouteConversation = decodeURIComponent(conversation)" in APP
 
 
+def test_admin_shells_stay_on_the_rail_but_chat_is_cli_only():
+    interface = APP[APP.index("async function renderInterface"):
+                    APP.index("// ── Tabs + boot")]
+    # The rail never filters admin out — the notice replaces the pane instead,
+    # and it hands over the exact terminal commands (repo_root from /api/shells).
+    assert "chatAdminCliOnly(shell)" in interface
+    assert "disabled: adminCliOnly" in interface
+    assert "chatAdminCliOnlyNotice(shell, repoRoot)" in interface
+    assert "repo_root: repoRoot" in interface
+    assert '(shell?.flavor || "") === "admin"' in APP
+    assert "cd ${repoRoot" in APP
+    assert "make dos-e s=${shell.shortname}" in APP
+    assert ".chat-admin-cli-only" in STYLE
+    assert ".chat-admin-commands" in STYLE
+
+
 def test_open_chat_restore_matches_the_flat_shell_projection():
     assert "item.shell_id === openConversation.shell.shell_id" in APP
     assert (
