@@ -98,6 +98,31 @@ class AssemblerSmokeTest(unittest.TestCase):
         out = server.get_shells(self.con)
         self.assertTrue(any(s["shell_id"] == self.ids["shell_id"] for s in out))
 
+    def test_get_shells_projects_recipient_scoped_unread_message_counts(self) -> None:
+        target = self.ids["shell_id"]
+        sender = self.ids["bespoke_shell_id"]
+        self.con.execute(
+            "INSERT INTO shell_messages "
+            "(from_shell_id,to_shell_id,kind,body) VALUES (?,?,'shell','first')",
+            (sender, target),
+        )
+        self.con.execute(
+            "INSERT INTO shell_messages "
+            "(from_shell_id,to_shell_id,kind,body) VALUES (?,?,'task','second')",
+            (sender, target),
+        )
+        self.con.execute(
+            "INSERT INTO shell_messages "
+            "(from_shell_id,to_shell_id,kind,body,read_at) "
+            "VALUES (?,?,'result','already read',datetime('now'))",
+            (sender, target),
+        )
+        self.con.commit()
+
+        by_id = {row["shell_id"]: row for row in server.get_shells(self.con)}
+        self.assertEqual(2, by_id[target]["unread_message_count"])
+        self.assertEqual(0, by_id[sender]["unread_message_count"])
+
     def test_get_shells_projects_only_live_current_sprint_conversation(self) -> None:
         shell_id = self.ids["shell_id"]
         self.con.execute(

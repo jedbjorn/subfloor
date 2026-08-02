@@ -591,6 +591,24 @@ def test_wide_and_narrow_visual_contract_keeps_five_fixed_columns_scrollable():
     assert 'root.querySelector?.(`[data-unit-id="${focusedUnitId}"]`)?.focus()' in SPRINT_BLOCK
 
 
+def test_sprint_board_is_one_compact_unified_surface():
+    assert 'className: "sprint-board-head"' in SPRINT_BLOCK
+    assert 'className: "card sprint-board-head"' not in SPRINT_BLOCK
+    assert 'className: "sprint-feed"' in SPRINT_BLOCK
+    assert 'className: "card sprint-feed"' not in SPRINT_BLOCK
+    assert ".sprint-board-view {" in STYLE
+    assert "border: 1px solid var(--line); border-radius: var(--r);" in STYLE
+    assert 'grid-template-areas: "heading heading" "context actions" "times actions";' in STYLE
+    assert ".sprint-actions { grid-area: actions; align-self: start;" in STYLE
+    assert ".sprint-board-scroll { overflow-x: auto;" in STYLE
+    assert "border-top: 1px solid var(--line); background: var(--bg);" in STYLE
+    assert ".sprint-feeds { display: grid; gap: 0; margin: 0;" in STYLE
+    assert ".sprint-feed + .sprint-feed { border-top: 1px solid var(--line); }" in STYLE
+    narrow = STYLE[STYLE.index("@media (max-width: 760px)"):]
+    assert 'grid-template-areas: "heading" "context" "times" "actions";' in narrow
+    assert ".sprint-actions { justify-content: flex-start; }" in narrow
+
+
 def test_sprint_selector_is_centered_at_the_redline_width():
     assert (
         ".sprint-toolbar { display: flex; justify-content: center; "
