@@ -588,15 +588,21 @@ class SprintLivenessMonitor:
         return tuple(outcomes)
 
     def resolve(self, message_id: int, resolution: str) -> bool:
+        with db_driver.write_transaction(self.con, "sprint.liveness.resolve"):
+            return self.resolve_in_transaction(message_id, resolution)
+
+    def resolve_in_transaction(self, message_id: int, resolution: str) -> bool:
+        """Resolve one expectation inside the caller's active transaction."""
+        if not self.con.in_transaction:
+            raise RuntimeError("liveness resolution requires an active transaction")
         resolution = resolution.strip()
         if not resolution:
             raise ValueError("liveness expectation resolution is empty")
-        with db_driver.write_transaction(self.con, "sprint.liveness.resolve"):
-            changed = self.con.execute(
-                "UPDATE sprint_liveness_expectations SET resolved_at=?,resolution=?,"
-                "next_evaluation_at=NULL WHERE message_id=? AND resolved_at IS NULL",
-                (_stamp(self.now()), resolution, message_id),
-            ).rowcount
+        changed = self.con.execute(
+            "UPDATE sprint_liveness_expectations SET resolved_at=?,resolution=?,"
+            "next_evaluation_at=NULL WHERE message_id=? AND resolved_at IS NULL",
+            (_stamp(self.now()), resolution, message_id),
+        ).rowcount
         return changed == 1
 
     def resolve_review_requests_for_work_unit_in_transaction(
