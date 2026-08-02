@@ -185,6 +185,14 @@ class WorktreeFixture(unittest.TestCase):
         shutil.copytree(ENGINE, cls.main / ".super-coder", ignore=IGNORE)
         shutil.copy2(REPO / "sc", cls.main / "sc")
         (cls.main / "sc").chmod(0o755)
+        manifest = (
+            cls.main / "tests" / "fixtures" / "sprint_removal" / "manifest.json"
+        )
+        manifest.parent.mkdir(parents=True)
+        shutil.copy2(
+            REPO / "tests" / "fixtures" / "sprint_removal" / "manifest.json",
+            manifest,
+        )
         git = ["git", "-C", str(cls.main)]
         subprocess.run([*git, "init", "-q", "-b", "main"], check=True)
         subprocess.run([*git, "config", "user.email", "t@t"], check=True)
@@ -402,6 +410,53 @@ class RootCheckoutUnchangedTest(WorktreeFixture):
         self.assertLess(
             merged.index(str(self.live_db)), merged.index("REBUILD-RAN"),
             "verify disclosed its target only after rebuild had already run")
+
+
+class MigrationScaffoldRunsCallerSourceTest(WorktreeFixture):
+    """Migration authoring writes only to the checkout where it was invoked."""
+
+    def test_new_migration_authors_the_linked_worktree_only(self):
+        slug = "linked_worktree_target"
+        wt_manifest = (
+            self.wt / "tests" / "fixtures" / "sprint_removal" / "manifest.json"
+        )
+        main_manifest = (
+            self.main / "tests" / "fixtures" / "sprint_removal" / "manifest.json"
+        )
+        wt_manifest_before = wt_manifest.read_bytes()
+        main_manifest_before = main_manifest.read_bytes()
+        wt_migrations = self.wt / ".super-coder" / "migrations"
+        main_migrations = self.main / ".super-coder" / "migrations"
+        main_names_before = {path.name for path in main_migrations.glob("*.sql")}
+
+        def restore_fixture() -> None:
+            for root in (self.wt, self.main):
+                for path in root.joinpath(".super-coder", "migrations").glob(
+                    f"*_{slug}.sql"
+                ):
+                    path.unlink(missing_ok=True)
+            wt_manifest.write_bytes(wt_manifest_before)
+            main_manifest.write_bytes(main_manifest_before)
+
+        self.addCleanup(restore_fixture)
+
+        done = run_sc(self.wt, "migration", "new", slug)
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        created = sorted(wt_migrations.glob(f"*_{slug}.sql"))
+        self.assertEqual(len(created), 1, done.stdout)
+        relative = f".super-coder/migrations/{created[0].name}"
+        self.assertIn(f"migration: created {relative}", done.stdout)
+        self.assertIn("-- Migration statements go here.", created[0].read_text())
+        allowed = json.loads(wt_manifest.read_text())["allowed_reference_files"]
+        self.assertEqual(allowed.count(relative), 1)
+
+        self.assertEqual(list(main_migrations.glob(f"*_{slug}.sql")), [])
+        self.assertEqual(
+            {path.name for path in main_migrations.glob("*.sql")},
+            main_names_before,
+        )
+        self.assertEqual(main_manifest.read_bytes(), main_manifest_before)
 
 
 class RenderCheckRunsCallerSourceTest(WorktreeFixture):

@@ -166,7 +166,7 @@ class MigrationScaffoldTest(unittest.TestCase):
 
 
 class MigrationCliTest(unittest.TestCase):
-    def test_help_uses_the_callers_engine_from_a_linked_worktree(self):
+    def test_help_is_available_from_the_repository_checkout(self):
         completed = subprocess.run(
             [str(ROOT / "sc"), "migration", "new", "--help"],
             cwd=ROOT,
