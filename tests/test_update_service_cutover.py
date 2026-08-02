@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import io
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,6 +19,20 @@ class Stop(Exception):
 
 
 class UpdateServiceCutoverTest(unittest.TestCase):
+    def test_update_uses_only_its_preupdate_backup_class(self):
+        with tempfile.TemporaryDirectory() as raw:
+            database = Path(raw) / "shell_db.db"
+            database.write_bytes(b"database")
+            with mock.patch.object(update, "DB_PATH", database), mock.patch.object(
+                update.rebuild_mod, "backup_existing"
+            ) as backup, mock.patch.object(
+                update.migrate_mod, "migrate"
+            ) as migrate, contextlib.redirect_stdout(io.StringIO()):
+                update.migrate_or_rebuild()
+
+        backup.assert_called_once_with(prefix="preupdate")
+        migrate.assert_called_once_with(str(database), backup=False)
+
     def test_main_routes_migration_through_the_service_cutover(self):
         with mock.patch.object(update, "is_source_repo", return_value=True), \
                 mock.patch.object(update, "repair_git_worktrees") as repair, \

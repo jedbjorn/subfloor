@@ -1,11 +1,17 @@
----
-name: migration_management
-description: Author and apply fork-specific DB schema migrations — naming, format, how to apply locally and verify.
-category: substrate
-common: false
----
+-- 0160 — route migration authors through the scaffold and document backups.
+--
+-- Full-body UPSERT converges existing installations; 0001_seed_skills.sql
+-- remains the fresh-install seed generated from the authoritative skill asset.
 
-# migration_management — fork-specific schema changes
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'migration_management',
+  'Author and apply fork-specific DB schema migrations — naming, format, how to apply locally and verify.',
+  'substrate',
+  NULL,
+  0,
+  '# migration_management — fork-specific schema changes
 
 Migrations live in `.super-coder/migrations/`, apply in numeric order, tracked
 by the `schema_migrations` ledger table. Engine updates apply pending
@@ -85,5 +91,13 @@ from you.
 
 No per-migration rollback. `sc rollback` restores the full DB + engine to the
 prior update point (`engine.ref.prev`). Use only when a migration is so broken
-the DB is corrupt or the app won't start; for logical errors, write a
-corrective migration instead.
+the DB is corrupt or the app won''t start; for logical errors, write a
+corrective migration instead.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;

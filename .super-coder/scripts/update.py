@@ -851,7 +851,9 @@ def migrate_or_rebuild() -> None:
     # current-schema DB with the previous engine.
     rebuild_mod.backup_existing(prefix="preupdate")
     print("→ migrate in place (pending migrations → the live DB; data preserved)")
-    migrate_mod.migrate(str(DB_PATH))
+    # The updater already owns the preupdate restore point above. Bare
+    # `./sc migrate` opts into its separate premigrate class at the CLI seam.
+    migrate_mod.migrate(str(DB_PATH), backup=False)
 
 
 def stop_pm2_review_server() -> tuple[str, str] | None:
