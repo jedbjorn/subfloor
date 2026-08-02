@@ -11,7 +11,9 @@ otherwise would wait for a second update.
 The bridge is needed exactly when the current engine ref contains this file but
 the previous engine ref did not. A local marker prevents manual map-setup runs
 from repeating broker restarts before the next engine update advances the
-previous ref.
+previous ref. A separate ref marker makes each newly materialized engine run
+its own managed-skill sweep once, so new tombstones are interpreted by the new
+projection code even when the parent updater was already loaded.
 """
 from __future__ import annotations
 
@@ -26,6 +28,7 @@ STATE_DIR = REPO_ROOT / ".sc-state"
 ENGINE_REF = STATE_DIR / "engine.ref"
 ENGINE_REF_PREV = STATE_DIR / "engine.ref.prev"
 MARKER = STATE_DIR / "local" / "update-compat-v1.done"
+SKILL_SWEEP_MARKER = STATE_DIR / "local" / "update-compat-skill-sweep.ref"
 BRIDGE_PATH = ".super-coder/scripts/update_compat.py"
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
@@ -87,6 +90,14 @@ def main() -> int:
         # supplies no pending ref and has already published before this bridge.
         if pending is None:
             update.reconcile_linked_dispatchers(current)
+        if _read_ref(SKILL_SWEEP_MARKER) != current:
+            print(
+                "→ update compatibility: reconcile managed skill projections "
+                f"at {current[:12]}"
+            )
+            update.reconcile_skill_projections()
+            SKILL_SWEEP_MARKER.parent.mkdir(parents=True, exist_ok=True)
+            SKILL_SWEEP_MARKER.write_text(f"{current}\n")
 
     needed, current = needs_legacy_bridge()
     if not needed:
