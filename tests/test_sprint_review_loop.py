@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -272,6 +273,13 @@ class ReviewHandoffTest(SprintReviewLoopCase):
             body="Clean on the reviewed head.",
             idempotency_key="idempotent-approval",
         )
+        resolved_once = tuple(
+            self.con.execute(
+                "SELECT resolved_at,resolution,next_evaluation_at "
+                "FROM sprint_liveness_expectations WHERE message_id=?",
+                (first.message_id,),
+            ).fetchone()
+        )
         approval_replay = self.loop.record_review(
             self.sprint_id,
             self.registered_pr_id,
@@ -285,6 +293,20 @@ class ReviewHandoffTest(SprintReviewLoopCase):
         self.assertFalse(approval_replay.created)
         self.assertEqual(approved.message_id, approval_replay.message_id)
         self.assertEqual(approved.conversation_id, approval_replay.conversation_id)
+        self.assertIsNotNone(resolved_once[0])
+        self.assertEqual(
+            ("review submitted: approved", None), resolved_once[1:]
+        )
+        self.assertEqual(
+            resolved_once,
+            tuple(
+                self.con.execute(
+                    "SELECT resolved_at,resolution,next_evaluation_at "
+                    "FROM sprint_liveness_expectations WHERE message_id=?",
+                    (first.message_id,),
+                ).fetchone()
+            ),
+        )
         self.assertEqual(
             (2, 2, 1),
             tuple(
@@ -305,6 +327,64 @@ class ReviewHandoffTest(SprintReviewLoopCase):
 
 
 class ReviewOutcomeTest(SprintReviewLoopCase):
+    def test_verdict_and_liveness_resolution_survive_post_commit_abort(self):
+        handoff = self.request_review("atomic-review-request")
+        self.accept_review(handoff.message_id)
+        real_write_transaction = sprint_review_loop.db_driver.write_transaction
+
+        @contextmanager
+        def abort_after_commit(con, operation):
+            with real_write_transaction(con, operation):
+                yield
+            raise SystemExit("simulated abort after verdict commit")
+
+        with mock.patch.object(
+            sprint_review_loop.db_driver,
+            "write_transaction",
+            abort_after_commit,
+        ), self.assertRaisesRegex(SystemExit, "after verdict commit"):
+            self.loop.record_review(
+                self.sprint_id,
+                self.registered_pr_id,
+                2,
+                verdict="approved",
+                body="Atomic verdict is clean.",
+                idempotency_key="atomic-review-verdict",
+            )
+
+        expectation = self.con.execute(
+            "SELECT resolved_at,resolution,next_evaluation_at "
+            "FROM sprint_liveness_expectations WHERE message_id=?",
+            (handoff.message_id,),
+        ).fetchone()
+        self.assertIsNotNone(expectation["resolved_at"])
+        self.assertEqual(
+            ("review submitted: approved", None),
+            (expectation["resolution"], expectation["next_evaluation_at"]),
+        )
+        self.assertEqual(
+            ("merge_ready", "decision", "Atomic verdict is clean."),
+            tuple(
+                self.con.execute(
+                    "SELECT u.disposition,j.kind,j.body "
+                    "FROM sprint_work_units u JOIN sprint_judgments j "
+                    "ON j.work_unit_id=u.work_unit_id "
+                    "WHERE u.work_unit_id=? ORDER BY j.judgment_id DESC LIMIT 1",
+                    (self.unit_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_liveness_expectations e "
+                "JOIN sprint_messages m USING(message_id) "
+                "WHERE m.work_unit_id=? AND m.message_kind='review_request' "
+                "AND e.resolved_at IS NULL",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+
     def test_changes_and_approval_select_fresh_linked_conversations(self):
         first = self.request_review()
         self.accept_review(first.message_id)

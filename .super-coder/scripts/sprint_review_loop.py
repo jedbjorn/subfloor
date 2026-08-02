@@ -215,11 +215,10 @@ class SprintReviewLoopStore:
                 outcome = self._outcome_receipt(
                     lane, conversation_id, receipt, disposition
                 )
-
-        sprint_liveness.SprintLivenessMonitor(self.con).resolve(
-            review_message_id,
-            f"review submitted: {verdict}",
-        )
+            sprint_liveness.SprintLivenessMonitor(self.con).resolve_in_transaction(
+                review_message_id,
+                f"review submitted: {verdict}",
+            )
         return outcome
 
     def authorize_merge(
