@@ -981,6 +981,240 @@ class EnginePathsAtRefTest(unittest.TestCase):
             "materialized file manifest",
         )
 
+
+class LinkedDispatcherReconciliationTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        _git(self.root, "init", "-b", "main")
+        _git(self.root, "config", "user.name", "Update Test")
+        _git(self.root, "config", "user.email", "update@example.invalid")
+
+        stale = self.root / "sc"
+        stale.write_text(
+            "#!/bin/sh\n"
+            "[ \"$1\" = deps ] && [ \"$2\" = --help ] && {\n"
+            "  : > retired-mutating-flow\n"
+            "  echo stale help\n"
+            "}\n"
+        )
+        stale.chmod(0o755)
+        old_sha = self._commit("stale dispatcher")
+        self.worktree = self.root / ".sc-worktrees" / "dev1"
+        _git(
+            self.root, "worktree", "add", "-b", "shell/dev1",
+            str(self.worktree), old_sha,
+        )
+
+        current = self.root / "sc"
+        current.write_text(
+            "#!/bin/sh\n"
+            "[ \"$1\" = deps ] && [ \"$2\" = --help ] && {\n"
+            "  echo 'Usage: ./sc deps [-h|--help]'\n"
+            "  exit 0\n"
+            "}\n"
+            "exit 2\n"
+        )
+        current.chmod(0o755)
+        self.target_sha = self._commit("current dispatcher")
+
+    def _commit(self, message: str) -> str:
+        _git(self.root, "add", "sc")
+        _git(self.root, "commit", "-m", message)
+        return _git(self.root, "rev-parse", "HEAD")
+
+    def test_clean_stale_worktree_dispatcher_runs_current_read_only_help(self):
+        with mock.patch.object(update, "REPO_ROOT", self.root), \
+                contextlib.redirect_stdout(io.StringIO()):
+            changed = update.reconcile_linked_dispatchers(
+                self.target_sha, worktrees=(self.worktree,)
+            )
+
+        done = subprocess.run(
+            [str(self.worktree / "sc"), "deps", "--help"],
+            cwd=self.worktree,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(changed, (self.worktree,))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "Usage: ./sc deps [-h|--help]\n")
+        self.assertFalse((self.worktree / "retired-mutating-flow").exists())
+        self.assertEqual(
+            (self.worktree / "sc").read_bytes(),
+            (self.root / "sc").read_bytes(),
+        )
+
+    def test_locally_edited_worktree_dispatcher_is_preserved(self):
+        custom = self.worktree / "sc"
+        custom.write_text("#!/bin/sh\necho operator-owned\n")
+        before = custom.read_bytes()
+        warning = io.StringIO()
+        with mock.patch.object(update, "REPO_ROOT", self.root), \
+                contextlib.redirect_stderr(warning):
+            changed = update.reconcile_linked_dispatchers(
+                self.target_sha, worktrees=(self.worktree,)
+            )
+
+        self.assertEqual(changed, ())
+        self.assertEqual(custom.read_bytes(), before)
+        self.assertIn(
+            f"dispatcher locally edited, left stale: {custom}",
+            warning.getvalue(),
+        )
+
+    def test_previous_managed_overlay_advances_on_the_next_update(self):
+        state = self.root / ".sc-state"
+        state.mkdir()
+        with mock.patch.object(update, "REPO_ROOT", self.root), \
+                contextlib.redirect_stdout(io.StringIO()):
+            update.reconcile_linked_dispatchers(
+                self.target_sha, worktrees=(self.worktree,)
+            )
+        (state / "engine.ref").write_text(self.target_sha + "\n")
+
+        current = self.root / "sc"
+        current.write_text("#!/bin/sh\necho next-dispatcher\n")
+        current.chmod(0o755)
+        next_sha = self._commit("next dispatcher")
+        (state / "engine.ref.prev").write_text(self.target_sha + "\n")
+        (state / "engine.ref").write_text(next_sha + "\n")
+        with mock.patch.object(update, "REPO_ROOT", self.root), \
+                contextlib.redirect_stdout(io.StringIO()):
+            changed = update.reconcile_linked_dispatchers(
+                next_sha, worktrees=(self.worktree,)
+            )
+
+        self.assertEqual(changed, (self.worktree,))
+        self.assertEqual((self.worktree / "sc").read_bytes(), current.read_bytes())
+
+
+class UpdateRefPublicationTest(unittest.TestCase):
+    OLD = "a" * 40
+    NEW = "b" * 40
+
+    def _patch_main(self, state: Path, *, fail: str | None):
+        ref = state / "engine.ref"
+        ref.write_text(self.OLD + "\n")
+        scripts = []
+        events = []
+
+        def run_script(name: str, **kwargs) -> None:
+            scripts.append((name, kwargs))
+            events.append(name)
+            if fail == name:
+                raise RuntimeError(f"{name} failed")
+
+        def materialize(sha: str, **kwargs) -> None:
+            if kwargs.get("publish_ref", True):
+                ref.write_text(sha + "\n")
+
+        def migrate() -> None:
+            events.append("migration")
+            if fail == "migration":
+                raise RuntimeError("migration failed")
+
+        def publish(sha: str) -> None:
+            events.append("publish")
+            ref.write_text(sha + "\n")
+
+        def reconcile(_sha: str, **_kwargs) -> tuple[Path, ...]:
+            events.append("reconcile")
+            if fail == "reconcile":
+                raise RuntimeError("reconcile failed")
+            return ()
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.multiple(
+            update,
+            REPO_ROOT=state.parent,
+            STATE_DIR=state,
+            ENGINE_REF=ref,
+            ENGINE_REF_PREV=state / "engine.ref.prev",
+            EJECTED_MARKER=state / "ejected",
+            is_source_repo=mock.Mock(return_value=False),
+            repair_git_worktrees=mock.Mock(return_value=()),
+            sync_repo_checkout=mock.Mock(),
+            fetch_update_ref=mock.Mock(return_value=self.NEW),
+            migrate_engine_untrack=mock.Mock(),
+            migrate_generated_artifacts_local=mock.Mock(),
+            materialize_fetched_engine=mock.Mock(side_effect=materialize),
+            publish_engine_ref=mock.Mock(side_effect=publish),
+            reconcile_linked_dispatchers=mock.Mock(side_effect=reconcile),
+            ensure_workflows=mock.Mock(return_value=("current", [])),
+            expire_sandbox_harnesses=mock.Mock(return_value=None),
+            migrate_with_service_cutover=mock.Mock(side_effect=migrate),
+            refresh_installed_brokers=mock.Mock(),
+            sync_skills=mock.Mock(),
+            regrant=mock.Mock(return_value=0),
+            reconcile_skill_projections=mock.Mock(
+                return_value={"written": [], "skipped": [], "checkouts": []}
+            ),
+            run_script=mock.Mock(side_effect=run_script),
+        ))
+        stack.enter_context(mock.patch.multiple(
+            update.install_mod,
+            ensure_gitignore=mock.Mock(return_value=False),
+            ensure_harnesses=mock.Mock(),
+            wire_make_aliases=mock.Mock(return_value=()),
+        ))
+        stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        return stack, ref, scripts, events
+
+    def test_failure_before_publication_never_overlays_linked_dispatchers(self):
+        for failed in ("migration", "snapshot.py"):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as raw:
+                state = Path(raw) / ".sc-state"
+                state.mkdir()
+                stack, ref, _scripts, events = self._patch_main(state, fail=failed)
+                with stack, self.assertRaises(RuntimeError):
+                    update.main([])
+                self.assertEqual(ref.read_text(), self.OLD + "\n")
+                self.assertNotIn("publish", events)
+                self.assertNotIn("reconcile", events)
+
+    def test_dispatcher_crash_keeps_published_target_recognizable(self):
+        with tempfile.TemporaryDirectory() as raw:
+            state = Path(raw) / ".sc-state"
+            state.mkdir()
+            stack, ref, _scripts, events = self._patch_main(
+                state, fail="reconcile"
+            )
+            with stack, self.assertRaisesRegex(RuntimeError, "reconcile failed"):
+                update.main([])
+
+            self.assertEqual(ref.read_text(), self.NEW + "\n")
+            self.assertEqual(events[-2:], ["publish", "reconcile"])
+
+    def test_ref_publishes_after_migrate_and_snapshot_before_dispatchers(self):
+        with tempfile.TemporaryDirectory() as raw:
+            state = Path(raw) / ".sc-state"
+            state.mkdir()
+            stack, ref, scripts, events = self._patch_main(state, fail=None)
+            with stack:
+                update.main([])
+            self.assertEqual(
+                scripts,
+                [
+                    ("map_setup.py", {"update_target_ref": self.NEW}),
+                    ("snapshot.py", {}),
+                ],
+            )
+            self.assertEqual(
+                events,
+                [
+                    "migration",
+                    "map_setup.py",
+                    "snapshot.py",
+                    "publish",
+                    "reconcile",
+                ],
+            )
+            self.assertEqual(ref.read_text(), self.NEW + "\n")
+
+
 class GeneratedArtifactMigrationTest(unittest.TestCase):
     def test_legacy_artifacts_are_preserved_locally_then_untracked(self):
         with tempfile.TemporaryDirectory() as td:

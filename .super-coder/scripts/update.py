@@ -22,7 +22,7 @@ Flow:
        never prevent an engine update.
     2. capture the restore point: the current `engine.ref` → `engine.ref.prev`.
     3. materialize the engine paths at the new ref into the
-       gitignored `.super-coder/` dir; write the new `engine.ref`. Per-instance
+       gitignored `.super-coder/` dir. Per-instance
        content (`.sc-state/`, the DB, instance.json) is never in the materialize
        set, so it survives untouched. --no-fetch reconciles the working tree as-is.
     4. back up the live DB (the other half of the restore point).
@@ -34,6 +34,7 @@ Flow:
        project-local skills are left intact.
     7. re-grant common skills to every flavor pack + Bespoke shell.
     8. wire the auto-remap hooks + map the repo + snapshot the (live) state.
+    9. only after every step succeeds, atomically publish the new `engine.ref`.
 
 Then review + commit (only `.sc-state/` — content.sql + engine.ref — moves; the
 engine is ignored). Restart the session to boot onto the new floor.
@@ -107,10 +108,12 @@ def git(
     return r
 
 
-def run_script(name: str) -> None:
+def run_script(name: str, *, update_target_ref: str | None = None) -> None:
     # update is an admin operation — pass SC_ADMIN so snapshot/render clear the
     # serialize guard (harmless for non-serializing scripts like map_setup.py).
     env = {**os.environ, "SC_ADMIN": "1"}
+    if update_target_ref is not None:
+        env["SC_UPDATE_TARGET_REF"] = update_target_ref
     if subprocess.run([PY, str(ENGINE / "scripts" / name)], env=env).returncode != 0:
         sys.exit(f"update: {name} failed.")
 
@@ -299,7 +302,11 @@ def super_coder_remote() -> str:
         if len(parts) < 2:
             continue
         name, url = parts[0], parts[1]
-        if any(n in url for n in install_mod.SOURCE_REPO_NAMES):
+        repo_name = (
+            url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+            .removesuffix(".git")
+        )
+        if repo_name in install_mod.SOURCE_REPO_NAMES:
             return name
         if name in install_mod.SOURCE_REPO_NAMES:
             named = name
@@ -681,7 +688,21 @@ def fetch_update_ref(branch: str, ref: str | None = None) -> str:
     return sha
 
 
-def materialize_fetched_engine(sha: str, *, force: bool = False) -> None:
+def publish_engine_ref(sha: str) -> None:
+    """Atomically record a fully successful update as the current engine pin."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    pending = STATE_DIR / "engine.ref.pending"
+    pending.write_text(sha + "\n")
+    os.replace(pending, ENGINE_REF)
+    print(f"  engine pinned at {sha[:12]} (.sc-state/engine.ref)")
+
+
+def materialize_fetched_engine(
+    sha: str,
+    *,
+    force: bool = False,
+    publish_ref: bool = True,
+) -> None:
     """Lay an already-fetched ref onto the installed floor."""
 
     check_local_edits(force, target_ref=sha)
@@ -722,7 +743,6 @@ def materialize_fetched_engine(sha: str, *, force: bool = False) -> None:
         expected_ref=sha,
         context="update",
     )
-    ENGINE_REF.write_text(sha + "\n")
     n = engine_manifest.write_manifest(
         materialized_paths,
         files=_engine_files_at(
@@ -731,7 +751,106 @@ def materialize_fetched_engine(sha: str, *, force: bool = False) -> None:
             engine_paths=materialized_paths,
         ),
     )
-    print(f"  engine pinned at {sha[:12]} (.sc-state/engine.ref) · manifest over {n} files")
+    if publish_ref:
+        publish_engine_ref(sha)
+        print(f"  manifest covers {n} files")
+    else:
+        print(
+            f"  engine materialized at {sha[:12]} · manifest over {n} files · "
+            "pin pending successful update"
+        )
+
+
+def _linked_worktree_paths() -> tuple[Path, ...]:
+    listed = git("worktree", "list", "--porcelain", check=False)
+    if listed.returncode != 0:
+        print(
+            "  WARNING: could not list linked worktrees for dispatcher repair: "
+            + listed.stderr.strip(),
+            file=sys.stderr,
+        )
+        return ()
+    root = REPO_ROOT.resolve()
+    paths = []
+    for line in listed.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        path = Path(line.removeprefix("worktree ")).resolve()
+        if path != root:
+            paths.append(path)
+    return tuple(paths)
+
+
+def reconcile_linked_dispatchers(
+    sha: str,
+    *,
+    worktrees: tuple[Path, ...] | None = None,
+) -> tuple[Path, ...]:
+    """Lay the current dispatcher into clean linked-worktree launcher copies.
+
+    A shell branch keeps the tracked ``sc`` from its branch point. Updating the
+    live engine therefore leaves direct ``./sc`` calls on retired behavior even
+    though PATH resolves the main checkout correctly. Only a dispatcher whose
+    bytes still match that worktree's own ``HEAD:sc`` is engine-managed here;
+    local edits are preserved and named rather than overwritten.
+    """
+    shown = git("show", f"{sha}:sc", check=False)
+    if shown.returncode != 0:
+        print(
+            f"  WARNING: target {sha[:12]} has no dispatcher to reconcile",
+            file=sys.stderr,
+        )
+        return ()
+    target = shown.stdout.encode()
+    canonical = REPO_ROOT / "sc"
+    try:
+        canonical_mode = canonical.stat().st_mode
+    except OSError as exc:
+        print(f"  WARNING: cannot stat canonical dispatcher: {exc}", file=sys.stderr)
+        return ()
+
+    changed = []
+    managed_dispatchers = set()
+    managed_refs = [callable_floor.read_engine_ref(REPO_ROOT)]
+    try:
+        previous = (
+            REPO_ROOT / ".sc-state" / "engine.ref.prev"
+        ).read_text().strip()
+    except OSError:
+        previous = None
+    if previous and re.fullmatch(r"[0-9a-fA-F]{40}", previous):
+        managed_refs.append(previous)
+    for managed_ref in managed_refs:
+        if managed_ref is None:
+            continue
+        prior = git("show", f"{managed_ref}:sc", check=False)
+        if prior.returncode == 0:
+            managed_dispatchers.add(prior.stdout.encode())
+    candidates = worktrees if worktrees is not None else _linked_worktree_paths()
+    for worktree in candidates:
+        dispatcher = worktree / "sc"
+        head = git("show", "HEAD:sc", check=False, repo_root=worktree)
+        try:
+            current = dispatcher.read_bytes()
+        except OSError:
+            current = None
+        managed_versions = {head.stdout.encode()} if head.returncode == 0 else set()
+        managed_versions.update(managed_dispatchers)
+        if current not in managed_versions:
+            print(
+                f"  WARNING: dispatcher locally edited, left stale: {dispatcher}",
+                file=sys.stderr,
+            )
+            continue
+        if current == target:
+            continue
+        dispatcher.write_bytes(target)
+        os.chmod(dispatcher, canonical_mode)
+        changed.append(worktree)
+
+    if changed:
+        print(f"→ reconciled current dispatcher into {len(changed)} linked worktree(s)")
+    return tuple(changed)
 
 
 def repair_callable_dispatcher(sha: str) -> bool:
@@ -1061,7 +1180,7 @@ def main(argv: list[str]) -> int:
     # Reconcile every shell worktree before any pull or engine materialization.
     # A whole fork move preserves the directories but invalidates Git's absolute
     # links; update is the one command that must heal the entire set every time.
-    repair_git_worktrees()
+    worktrees = repair_git_worktrees()
 
     # Keep the app/source checkout current before reconciling its engine. This
     # is deliberately advisory: dirty, detached, offline, or diverged checkouts
@@ -1095,7 +1214,7 @@ def main(argv: list[str]) -> int:
               "(engine + engine.ref unchanged)")
     else:
         assert target_sha is not None
-        materialize_fetched_engine(target_sha, force=force)
+        materialize_fetched_engine(target_sha, force=force, publish_ref=False)
 
     workflow_action, workflow_changes = ensure_workflows(source_repo=source)
     if workflow_action == "seeded":
@@ -1146,7 +1265,7 @@ def main(argv: list[str]) -> int:
         "retain previously loaded skill text until reboot"
     )
     print("→ wire map automation + map the repo")
-    run_script("map_setup.py")
+    run_script("map_setup.py", update_target_ref=target_sha)
     print("→ snapshot the live state")
     run_script("snapshot.py")
 
@@ -1156,6 +1275,14 @@ def main(argv: list[str]) -> int:
     if not source:
         print("→ wire make aliases (dos- command standard)")
         print(f"  {install_mod.wire_make_aliases()}")
+
+    if target_sha is not None:
+        publish_engine_ref(target_sha)
+        reconcile_linked_dispatchers(target_sha, worktrees=worktrees)
+    elif not source:
+        dispatcher_ref = callable_floor.read_engine_ref(REPO_ROOT)
+        if dispatcher_ref:
+            reconcile_linked_dispatchers(dispatcher_ref, worktrees=worktrees)
 
     print("\nupdate: done — new floor laid in place; your rows are intact.")
     if source:

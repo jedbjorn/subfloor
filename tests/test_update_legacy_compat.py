@@ -82,6 +82,8 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             ), mock.patch.object(
                 update, "repair_callable_dispatcher"
             ) as repair_dispatcher, mock.patch.object(
+                update, "reconcile_linked_dispatchers"
+            ) as reconcile_dispatchers, mock.patch.object(
                 update, "repair_git_worktrees"
             ) as repair, mock.patch.object(
                 update, "refresh_installed_brokers"
@@ -91,6 +93,10 @@ class LegacyUpdateCompatTest(unittest.TestCase):
 
             self.assertEqual(
                 repair_dispatcher.call_args_list,
+                [mock.call(new_ref), mock.call(new_ref)],
+            )
+            self.assertEqual(
+                reconcile_dispatchers.call_args_list,
                 [mock.call(new_ref), mock.call(new_ref)],
             )
             repair.assert_called_once_with()
@@ -138,6 +144,8 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             ), mock.patch.object(
                 update, "repair_callable_dispatcher"
             ) as repair_dispatcher, mock.patch.object(
+                update, "reconcile_linked_dispatchers"
+            ) as reconcile_dispatchers, mock.patch.object(
                 update, "repair_git_worktrees"
             ) as repair, mock.patch.object(
                 update, "refresh_installed_brokers"
@@ -145,6 +153,7 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 self.assertEqual(0, update_compat.main())
 
             repair_dispatcher.assert_called_once_with(current_ref)
+            reconcile_dispatchers.assert_called_once_with(current_ref)
             repair.assert_not_called()
             refresh.assert_not_called()
             self.assertFalse(marker.exists())
@@ -173,6 +182,7 @@ class LegacyUpdateCompatTest(unittest.TestCase):
                 "def repair_git_worktrees(): _record('repair')\n"
                 "def refresh_installed_brokers(): _record('brokers')\n"
                 "def repair_callable_dispatcher(ref): _record('dispatcher')\n"
+                "def reconcile_linked_dispatchers(ref): _record('worktrees')\n"
             )
             (scripts / "map_repo.py").write_text(
                 "def main(): return 0\n"
@@ -198,12 +208,37 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             )
 
             self.assertEqual(0, completed.returncode, completed.stderr)
-            self.assertEqual("dispatcher\nrepair\nbrokers\n", log.read_text())
+            self.assertEqual(
+                "dispatcher\nworktrees\nrepair\nbrokers\n", log.read_text()
+            )
             self.assertEqual(
                 current_ref + "\n",
                 (state / "local" / "update-compat-v1.done").read_text(),
             )
             self.assertIn("legacy update bridge", completed.stdout)
+
+    def test_pending_target_ref_drives_compat_before_pin_publication(self) -> None:
+        pending = "b" * 40
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td)
+            engine_ref = state / "engine.ref"
+            engine_ref.write_text("a" * 40 + "\n")
+            with mock.patch.multiple(
+                update_compat,
+                ENGINE_REF=engine_ref,
+                ENGINE_REF_PREV=state / "engine.ref.prev",
+                MARKER=state / "update-compat-v1.done",
+            ), mock.patch.dict(
+                os.environ, {"SC_UPDATE_TARGET_REF": pending}
+            ), mock.patch.object(
+                update, "repair_callable_dispatcher"
+            ) as repair_dispatcher, mock.patch.object(
+                update, "reconcile_linked_dispatchers"
+            ) as reconcile_dispatchers:
+                self.assertEqual(0, update_compat.main())
+
+        repair_dispatcher.assert_called_once_with(pending)
+        reconcile_dispatchers.assert_not_called()
 
 
 if __name__ == "__main__":

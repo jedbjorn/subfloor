@@ -15,6 +15,7 @@ previous ref.
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -35,6 +36,17 @@ def _read_ref(path: Path) -> str | None:
     except OSError:
         return None
     return value if _SHA_RE.fullmatch(value) else None
+
+
+def _pending_update_ref() -> str | None:
+    """Return a current updater's valid, not-yet-published target."""
+    pending = os.environ.get("SC_UPDATE_TARGET_REF", "").strip()
+    return pending if _SHA_RE.fullmatch(pending) else None
+
+
+def _current_update_ref() -> str | None:
+    """Prefer the not-yet-published target supplied by a current updater."""
+    return _pending_update_ref() or _read_ref(ENGINE_REF)
 
 
 def _ref_contains_bridge(ref: str) -> bool:
@@ -60,7 +72,8 @@ def needs_legacy_bridge() -> tuple[bool, str | None]:
 
 
 def main() -> int:
-    current = _read_ref(ENGINE_REF)
+    pending = _pending_update_ref()
+    current = _current_update_ref()
     if current is not None:
         # Unlike the path-repair migration below, dispatcher coherence is a
         # standing invariant. Existing forks may already carry the v1 marker
@@ -68,6 +81,12 @@ def main() -> int:
         import update
 
         update.repair_callable_dispatcher(current)
+        # A current updater publishes only after migrate + snapshot. Defer its
+        # linked-worktree overlays until then so a crash cannot leave bytes that
+        # neither the old pin nor a later target recognizes. A legacy updater
+        # supplies no pending ref and has already published before this bridge.
+        if pending is None:
+            update.reconcile_linked_dispatchers(current)
 
     needed, current = needs_legacy_bridge()
     if not needed:

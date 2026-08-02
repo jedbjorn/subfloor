@@ -74,6 +74,18 @@ class SourceRepoGuardTest(unittest.TestCase):
         finally:
             update.git = orig
 
+    def test_update_remote_matcher_rejects_fork_name_containing_source_name(self):
+        orig = update.git
+        try:
+            update.git = lambda *a, **k: SimpleNamespace(
+                stdout="origin\thttps://github.com/jedbjorn/subfloor-marketing.git (fetch)\n"
+                       "engine\tgit@github.com:jedbjorn/subfloor.git (fetch)\n",
+                returncode=0,
+            )
+            self.assertEqual(update.super_coder_remote(), "engine")
+        finally:
+            update.git = orig
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
