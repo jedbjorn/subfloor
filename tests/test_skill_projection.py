@@ -74,9 +74,12 @@ class SkillProjectionTest(unittest.TestCase):
         grant(self.con, shell_id, "query_authoring_pg")
         with tempfile.TemporaryDirectory() as tmp:
             checkout = Path(tmp)
-            stale = checkout / ".opencode/skills/stale/nested/file.txt"
+            stale = checkout / ".opencode/skills/stale/SKILL.md"
             stale.parent.mkdir(parents=True)
-            stale.write_text("old")
+            stale.write_text("rendered_by: super-coder\nold\n")
+            foreign = checkout / ".opencode/skills/operator_tool/notes.txt"
+            foreign.parent.mkdir()
+            foreign.write_text("operator-owned\n")
 
             summary = skill_projection.reconcile_shell(
                 self.con,
@@ -91,6 +94,9 @@ class SkillProjectionTest(unittest.TestCase):
                 self.assertIn("name: query_authoring_pg", rendered.read_text())
             self.assertFalse((checkout / ".opencode/skills/stale").exists())
             self.assertIn(checkout / ".opencode/skills/stale", summary["deleted"])
+            self.assertNotIn(checkout / ".opencode/skills/stale", summary["written"])
+            self.assertEqual(foreign.read_text(), "operator-owned\n")
+            self.assertNotIn(foreign.parent, summary["deleted"])
             self.assertFalse(checkout.joinpath(".agents/skills").exists())
 
     def test_revocation_deletes_exact_grant_from_every_existing_managed_root(
@@ -115,6 +121,54 @@ class SkillProjectionTest(unittest.TestCase):
                 self.assertFalse(removed.exists())
                 self.assertIn(removed, summary["deleted"])
             self.assertFalse(checkout.joinpath(".opencode/skills").exists())
+
+    def test_revocation_deletes_fork_local_skill_from_managed_roots(self) -> None:
+        shell_id = add_shell(self.con, "custom", None)
+        local_name = "fork_local_probe"
+        self.con.execute(
+            "INSERT INTO skills (name, description, content, common) "
+            "VALUES (?, 'Fork-local probe', 'local body', 0)",
+            (local_name,),
+        )
+        grant(self.con, shell_id, local_name)
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp)
+            skill_projection.reconcile_shell(
+                self.con,
+                shell_id,
+                checkout,
+                ensure_dirs=(".claude/skills", ".agents/skills"),
+            )
+            rendered = [
+                checkout / relative / local_name / "SKILL.md"
+                for relative in (".claude/skills", ".agents/skills")
+            ]
+            self.assertEqual(
+                [path.read_text() for path in rendered],
+                [
+                    (
+                        "---\nname: fork_local_probe\n"
+                        "description: Fork-local probe\n---\n\nlocal body\n"
+                    )
+                ]
+                * 2,
+            )
+
+            self.con.execute("DELETE FROM shell_skills WHERE shell_id=?", (shell_id,))
+            summary = skill_projection.reconcile_shell(self.con, shell_id, checkout)
+
+            removed = [path.parent for path in rendered]
+            self.assertEqual(summary["deleted"], removed)
+            self.assertEqual([path.exists() for path in removed], [False, False])
+            self.assertEqual(
+                tuple(
+                    self.con.execute(
+                        "SELECT name, content, is_deleted FROM skills WHERE name=?",
+                        (local_name,),
+                    ).fetchone()
+                ),
+                (local_name, "local body", 0),
+            )
 
     def test_symlink_root_is_refused_without_touching_target(self) -> None:
         shell_id = add_shell(self.con, "custom", None)
@@ -145,7 +199,7 @@ class SkillProjectionTest(unittest.TestCase):
             target = Path(out)
             sentinel = target / "sentinel.txt"
             sentinel.write_text("foreign")
-            link = root / "stale"
+            link = root / "engine_surgery"
             link.symlink_to(target, target_is_directory=True)
 
             summary = skill_projection.reconcile_shell(self.con, shell_id, checkout)
@@ -172,12 +226,19 @@ class SkillProjectionTest(unittest.TestCase):
             root_live.write_text("preserve live unowned projection\n")
             root_retired = repo / ".claude/skills/retired_upstream/SKILL.md"
             root_retired.parent.mkdir()
-            root_retired.write_text("remove retired projection\n")
+            root_retired.write_text(
+                "---\nrendered_by: super-coder\n---\nremove retired projection\n"
+            )
+            foreign_control = (
+                repo / ".claude/skills/my_custom_tool/operator-control.txt"
+            )
+            foreign_control.parent.mkdir()
+            foreign_control.write_text("operator-owned\n")
             dev1_root = repo / ".sc-worktrees/dev1/.claude/skills"
             dev1_root.mkdir(parents=True)
             stale = dev1_root / "stale/SKILL.md"
             stale.parent.mkdir()
-            stale.write_text("old")
+            stale.write_text("rendered_by: super-coder\nold\n")
 
             summary = skill_projection.reconcile_existing_checkouts(
                 self.con, repo_root=repo
@@ -190,6 +251,10 @@ class SkillProjectionTest(unittest.TestCase):
                 root_live.read_text(), "preserve live unowned projection\n"
             )
             self.assertFalse(root_retired.parent.exists())
+            self.assertIn(root_retired.parent, summary["deleted"])
+            self.assertNotIn(root_retired.parent, summary["written"])
+            self.assertEqual(foreign_control.read_text(), "operator-owned\n")
+            self.assertNotIn(foreign_control.parent, summary["deleted"])
             self.assertFalse((repo / ".sc-worktrees/dev2").exists())
             self.assertEqual(summary["checkouts"], [repo, repo / ".sc-worktrees/dev1"])
             self.assertEqual(
@@ -200,6 +265,28 @@ class SkillProjectionTest(unittest.TestCase):
                 ).fetchone()[0],
                 1,
             )
+
+    def test_admin_owned_repo_root_preserves_foreign_directory(self) -> None:
+        add_shell(self.con, "admin1", "admin")
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            foreign = repo / ".claude/skills/operator_tool/notes.txt"
+            foreign.parent.mkdir(parents=True)
+            foreign.write_text("operator-owned\n")
+            stale = repo / ".claude/skills/stale/SKILL.md"
+            stale.parent.mkdir()
+            stale.write_text("rendered_by: super-coder\nold\n")
+
+            summary = skill_projection.reconcile_existing_checkouts(
+                self.con, repo_root=repo
+            )
+
+            self.assertEqual(foreign.read_text(), "operator-owned\n")
+            self.assertNotIn(foreign.parent, summary["deleted"])
+            self.assertFalse(stale.parent.exists())
+            self.assertIn(stale.parent, summary["deleted"])
+            self.assertNotIn(stale.parent, summary["written"])
+            self.assertEqual(summary["checkouts"], [repo])
 
     def test_legacy_cleanup_removes_only_banner_owned_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
