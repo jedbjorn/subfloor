@@ -735,6 +735,60 @@ class StoreContractTest(ConversationBrokerCase):
         self.assertEqual(tuple(outbox), ("pending", None))
         self.assertEqual(run_count, 0)
 
+    def test_reopened_conversation_dispatches_despite_stale_close_request(
+        self,
+    ) -> None:
+        conversation_id = self.add_conversation()
+        message_id = self.add_message(conversation_id)
+        con = self.connect()
+        con.execute(
+            "INSERT INTO conversation_events "
+            "(conversation_id,sequence,event_type,payload) "
+            "VALUES (?,1,'conversation.close.requested','{}')",
+            (conversation_id,),
+        )
+        con.execute(
+            "INSERT INTO conversation_events "
+            "(conversation_id,sequence,event_type,payload) "
+            "VALUES (?,2,'conversation.reopened','{}')",
+            (conversation_id,),
+        )
+        con.commit()
+        con.close()
+
+        store = BrokerStore(self.db_path)
+        run = store.claim_next("broker")
+        self.assertIsNotNone(run)
+        self.assertEqual(run.message_id, message_id)
+        store.mark_starting(run.run_id, "broker")
+        store.mark_native_started(
+            run.run_id,
+            "broker",
+            NativeTurn(
+                "codex",
+                "native-session",
+                "native-run-1",
+                self.worktree,
+            ),
+        )
+        store.finish_run(
+            run.run_id,
+            "succeeded",
+            event_type="run.completed",
+        )
+
+        con = self.connect()
+        try:
+            row = con.execute(
+                "SELECT state,closed_at FROM conversations "
+                "WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertNotEqual(row["state"], "closed")
+        self.assertIsNone(row["closed_at"])
+
     def test_shell_mutation_lock_blocks_other_conversation(self) -> None:
         self.allow_legacy_duplicate_open_chats()
         first_conversation = self.add_conversation(shell_id=1)

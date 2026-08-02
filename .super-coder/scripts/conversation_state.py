@@ -15,7 +15,7 @@ CONVERSATION_TRANSITIONS = {
     "running": frozenset({"idle", "queued", "waiting", "error"}),
     "waiting": frozenset({"queued", "closed"}),
     "error": frozenset({"queued", "closed"}),
-    "closed": frozenset(),
+    "closed": frozenset({"idle"}),
 }
 
 MESSAGE_TRANSITIONS = {

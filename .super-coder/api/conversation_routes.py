@@ -360,6 +360,20 @@ def _append_event(
     return sequence
 
 
+# A close request only counts until the conversation is next reopened: every
+# reader of conversation.close.requested events pins to sequences after the
+# latest conversation.reopened event, so a pre-reopen close request cannot
+# strand or re-close a reopened chat.  The broker's claim/finish queries
+# apply the same scoping.
+_CLOSE_REQUESTED_AFTER_REOPEN = (
+    "requested.event_type='conversation.close.requested' "
+    "AND requested.sequence>COALESCE("
+    "(SELECT MAX(reopened.sequence) FROM conversation_events reopened "
+    "WHERE reopened.conversation_id=requested.conversation_id "
+    "AND reopened.event_type='conversation.reopened'),0)"
+)
+
+
 def _conversation_row(con, conversation_id: str, owner_user_id: int):
     return con.execute(
         "SELECT c.conversation_id,c.shell_id,c.owner_user_id,c.harness,"
@@ -370,7 +384,7 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
         "CASE WHEN c.state!='closed' THEN ("
         " SELECT requested.created_at FROM conversation_events requested "
         " WHERE requested.conversation_id=c.conversation_id "
-        " AND requested.event_type='conversation.close.requested' "
+        " AND " + _CLOSE_REQUESTED_AFTER_REOPEN +
         " ORDER BY requested.sequence DESC LIMIT 1"
         ") END AS close_requested_at,"
         "(SELECT COUNT(*) FROM conversation_messages queued "
@@ -447,12 +461,99 @@ def _require_conversation(con, conversation_id: str, owner_user_id: int):
 def _close_requested(con, conversation_id: str) -> bool:
     return (
         con.execute(
-            "SELECT 1 FROM conversation_events WHERE conversation_id=? "
-            "AND event_type='conversation.close.requested' LIMIT 1",
+            "SELECT 1 FROM conversation_events requested "
+            "WHERE requested.conversation_id=? "
+            "AND " + _CLOSE_REQUESTED_AFTER_REOPEN + " LIMIT 1",
             (conversation_id,),
         ).fetchone()
         is not None
     )
+
+
+def _reopen_conversation(con, operator: dict, conversation) -> list[str]:
+    """Walk a closed normal chat back to idle so the pending send resumes it.
+
+    Mirrors the create-path guards: a live CLI session blocks the shell when
+    nothing else is open, a mid-turn open chat refuses, and an idle open chat
+    auto-closes — the reopened chat becomes the shell's one open normal chat.
+    Returns the auto-closed conversation ids for post-commit notification.
+    """
+    conversation_id = conversation["conversation_id"]
+    if conversation["conversation_scope"] != "normal":
+        raise ApiError(
+            409,
+            "SPRINT_CONVERSATION_MANAGED",
+            "Sprint conversations reopen only with Sprint lifecycle control",
+        )
+    shell = con.execute(
+        "SELECT shell_id,display_name,shortname,flavor FROM shells "
+        "WHERE shell_id=? AND (user_id=? OR is_shared=1) "
+        "AND COALESCE(is_deleted,0)=0",
+        (conversation["shell_id"], operator["user_id"]),
+    ).fetchone()
+    if shell is None:
+        raise ApiError(
+            422,
+            "SHELL_NOT_LAUNCHABLE",
+            "shell is unknown, deleted, or unavailable to this operator",
+        )
+    open_conversations = con.execute(
+        "SELECT conversation_id,state FROM conversations "
+        "WHERE shell_id=? AND state!='closed' AND conversation_scope='normal'",
+        (conversation["shell_id"],),
+    ).fetchall()
+    if not open_conversations:
+        live_state = _live_shell_session(shell)
+        if live_state is not None:
+            raise ApiError(
+                409,
+                "SHELL_BUSY",
+                f"shell {shell['shortname']!r} has a live CLI session; "
+                "close it before reopening a browser chat",
+                {
+                    "shell_id": int(conversation["shell_id"]),
+                    "state": live_state,
+                },
+            )
+    running = [
+        row for row in open_conversations
+        if row["state"] in ("queued", "running")
+    ]
+    if running:
+        raise ApiError(
+            409,
+            "BROWSER_CHAT_BUSY",
+            "the open browser chat has a turn in progress",
+            {"conversation_id": running[0]["conversation_id"]},
+        )
+    auto_closed = []
+    for row in open_conversations:
+        con.execute(
+            "UPDATE conversations SET state='closed',"
+            "closed_at=datetime('now'),last_activity_at=datetime('now'),"
+            "version=version+1 WHERE conversation_id=?",
+            (row["conversation_id"],),
+        )
+        _append_event(
+            con,
+            row["conversation_id"],
+            "conversation.closed",
+            {"status": "closed", "reason": "another browser chat reopened"},
+        )
+        auto_closed.append(row["conversation_id"])
+    con.execute(
+        "UPDATE conversations SET state='idle',closed_at=NULL,"
+        "last_activity_at=datetime('now'),version=version+1 "
+        "WHERE conversation_id=?",
+        (conversation_id,),
+    )
+    _append_event(
+        con,
+        conversation_id,
+        "conversation.reopened",
+        {"state": "idle"},
+    )
+    return auto_closed
 
 
 def _cancel_queued_turns(con, conversation_id: str) -> int:
@@ -891,7 +992,7 @@ def _list_conversations(con, operator: dict, query):
         "CASE WHEN c.state!='closed' THEN ("
         " SELECT requested.created_at FROM conversation_events requested "
         " WHERE requested.conversation_id=c.conversation_id "
-        " AND requested.event_type='conversation.close.requested' "
+        " AND " + _CLOSE_REQUESTED_AFTER_REOPEN +
         " ORDER BY requested.sequence DESC LIMIT 1"
         ") END AS close_requested_at "
         "FROM conversations c JOIN shells s ON s.shell_id=c.shell_id WHERE "
@@ -1043,6 +1144,8 @@ def _create_message(con, operator: dict, conversation_id: str, headers, body: di
     normalized = {"text": text}
     request_hash = _request_hash(normalized)
 
+    auto_closed: list[str] = []
+    reopened = False
     with db_driver.write_transaction(con, "conversation.message.create"):
         conversation = _require_conversation(
             con,
@@ -1076,12 +1179,9 @@ def _create_message(con, operator: dict, conversation_id: str, headers, body: di
                 [("Location", f"/api/conversations/{conversation_id}/messages")],
             )
         if conversation["state"] == "closed":
-            raise ApiError(
-                409,
-                "CONVERSATION_CLOSED",
-                "closed conversations reject messages",
-            )
-        if _close_requested(con, conversation_id):
+            auto_closed = _reopen_conversation(con, operator, conversation)
+            reopened = True
+        elif _close_requested(con, conversation_id):
             raise ApiError(
                 409,
                 "CONVERSATION_CLOSING",
@@ -1129,7 +1229,14 @@ def _create_message(con, operator: dict, conversation_id: str, headers, body: di
             },
             message_id=message_id,
         )
+    for closed_id in auto_closed:
+        conversation_events.notify(closed_id)
     conversation_events.notify(conversation_id)
+    if reopened:
+        conversation_git_targets.safely_observe_and_persist(
+            DB_PATH,
+            conversation_id,
+        )
     conversation_broker.notify_commit()
     return _json(
         202,

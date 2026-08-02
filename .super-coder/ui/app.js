@@ -2757,6 +2757,7 @@ function chatOpenStream(
   const types = [
     "conversation.created", "conversation.updated", "conversation.renamed",
     "conversation.close.requested", "conversation.closed",
+    "conversation.reopened",
     "message.accepted", "session.started", "run.started",
     "assistant.delta", "tool.started", "tool.completed", "permission.requested",
     "input.requested", "usage", "run.completed", "run.failed",
@@ -3955,8 +3956,9 @@ async function chatRenderOpen(host, initialConversation, initialSnapshot) {
     const closed = conversation.state === "closed";
     const closing = !closed && Boolean(conversation.close_requested_at);
     const sprintManaged = conversation.scope === "sprint";
-    composer.disabled = closed || closing;
-    send.disabled = closed || closing;
+    const reopenable = closed && !sprintManaged;
+    composer.disabled = closing || (closed && !reopenable);
+    send.disabled = closing || (closed && !reopenable);
     stop.disabled = conversation.state !== "running" || closing || Boolean(stopRequest);
     stop.textContent = stopRequest ? "Stopping…" : "Stop";
     headerStop.disabled = stop.disabled;
@@ -3966,7 +3968,9 @@ async function chatRenderOpen(host, initialConversation, initialSnapshot) {
     close.disabled = sprintManaged || closed || closing;
     close.textContent = closing ? "Closing…" : "Close";
     composer.placeholder = closed
-      ? "This conversation is closed."
+      ? (reopenable
+        ? "This conversation is closed — send a message to reopen it."
+        : "This conversation is closed.")
       : closing ? "Stopping work and closing…" : "Message this shell…";
     scheduleTranscript();
   };
@@ -4061,6 +4065,8 @@ async function chatRenderOpen(host, initialConversation, initialSnapshot) {
       composer.value = "";
       pending.hidden = true;
       if (conversation.state !== "running") conversation.state = "queued";
+      conversation.closed_at = null;
+      conversation.close_requested_at = null;
       paint();
       refresh();
     } catch (error) {
@@ -4068,8 +4074,10 @@ async function chatRenderOpen(host, initialConversation, initialSnapshot) {
       pending.textContent = `${error.code} — retry keeps this exact send`;
       toast(`${error.code}: ${error.message}`);
     } finally {
-      send.disabled = conversation.state === "closed"
-        || Boolean(conversation.close_requested_at);
+      send.disabled = (conversation.state === "closed"
+        && conversation.scope !== "normal")
+        || (conversation.state !== "closed"
+          && Boolean(conversation.close_requested_at));
     }
   }
   send.onclick = submit;
@@ -4257,6 +4265,11 @@ async function chatRenderOpen(host, initialConversation, initialSnapshot) {
     if (["run.failed", "run.unknown"].includes(type))
       conversation.state = "error";
     if (type === "conversation.closed") conversation.state = "closed";
+    if (type === "conversation.reopened") {
+      conversation.state = "idle";
+      conversation.closed_at = null;
+      conversation.close_requested_at = null;
+    }
     if (["run.completed", "run.failed", "run.interrupted", "run.unknown"]
       .includes(type)) {
       stopRequest = null;
@@ -4274,7 +4287,7 @@ async function chatRenderOpen(host, initialConversation, initialSnapshot) {
          "run.interrupted", "run.unknown",
          "conversation.updated", "conversation.renamed",
          "conversation.close.requested",
-         "conversation.closed"].includes(type))
+         "conversation.closed", "conversation.reopened"].includes(type))
       refresh();
   };
   chatOpenStream(
