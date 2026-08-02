@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Stage 3 gates for dedicated Sprint messages and wake delivery."""
+
 from __future__ import annotations
 
 import hashlib
@@ -9,6 +10,7 @@ import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
@@ -87,8 +89,7 @@ class SprintMessageCase(unittest.TestCase):
         participants = {
             row["role"]: int(row["participant_id"])
             for row in self.con.execute(
-                "SELECT role,participant_id FROM sprint_participants "
-                "WHERE sprint_id=?",
+                "SELECT role,participant_id FROM sprint_participants WHERE sprint_id=?",
                 (self.sprint_id,),
             )
         }
@@ -237,15 +238,12 @@ class MessageTransactionTest(SprintMessageCase):
 
 class AcceptanceAndDeclineTest(SprintMessageCase):
     def test_actionable_read_accepts_but_informational_read_does_not(self) -> None:
-        task = self.send(
-            "accept-task", kind="review_request", actionable=True
-        )
+        task = self.send("accept-task", kind="review_request", actionable=True)
         with self.assertRaisesRegex(
             sqlite3.IntegrityError, "invalid wake message acceptance state"
         ):
             self.con.execute(
-                "UPDATE wake_message SET read_at=datetime('now') "
-                "WHERE message_id=?",
+                "UPDATE wake_message SET read_at=datetime('now') WHERE message_id=?",
                 (task.message_id,),
             )
         self.con.rollback()
@@ -437,7 +435,9 @@ class WakeDeliveryTest(SprintMessageCase):
                 (self.developer_conversation_id,),
             ).fetchone()[0],
         )
-        self.assertLess(prompt.index("body for mixed-reenter"), prompt.index("body for mixed-new"))
+        self.assertLess(
+            prompt.index("body for mixed-reenter"), prompt.index("body for mixed-new")
+        )
         self.assertEqual(
             [(first.message_id, 1), (second.message_id, 1)],
             [
@@ -496,6 +496,280 @@ class WakeDeliveryTest(SprintMessageCase):
         ).fetchone()
         self.assertEqual((None, None, 1, None, None, "re-enter"), tuple(row)[:6])
         self.assertIsNotNone(row["delivered_at"])
+
+    def test_armed_message_claims_foreign_paused_sprint_wake(self) -> None:
+        paused = self.messages.send(
+            self.sprint_id,
+            to_participant_id=self.planner_id,
+            message_kind="notification",
+            body="paused sprint backlog",
+            idempotency_key="paused-sprint-backlog",
+        )
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='paused' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        feature_id = int(
+            self.con.execute(
+                "SELECT feature_id FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        armed_sprint_id = int(
+            self.con.execute(
+                "INSERT INTO sprints "
+                "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+                "VALUES (?,3,1)",
+                (feature_id,),
+            ).lastrowid
+        )
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?",
+            (armed_sprint_id,),
+        )
+        armed_planner_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness) VALUES (?,3,'planner','codex')",
+                (armed_sprint_id,),
+            ).lastrowid
+        )
+        self.con.commit()
+
+        armed = self.messages.send(
+            armed_sprint_id,
+            to_participant_id=armed_planner_id,
+            message_kind="notification",
+            body="armed sprint work",
+            idempotency_key="armed-sprint-work",
+        )
+        self.assertEqual(paused.wake_id, armed.wake_id)
+
+        lease = delivery.SprintWakeDeliveryService(self.con).claim_next(
+            "cross-sprint-worker"
+        )
+
+        self.assertIsNotNone(lease)
+        self.assertEqual(paused.wake_id, lease.wake_id)
+        self.assertEqual((paused.message_id, armed.message_id), lease.message_ids)
+        self.assertIn("paused sprint backlog", lease.prompt)
+        self.assertIn("armed sprint work", lease.prompt)
+
+    def test_engine_new_rotates_idle_chat_and_delivers(self) -> None:
+        sent = self.messages.send_to_shell(
+            1,
+            message_kind="system",
+            body="rotate engine chat",
+            idempotency_key="engine-new-idle",
+            declared_type="new",
+        )
+        observed: list[str] = []
+
+        outcome = delivery.SprintWakeDeliveryService(self.con).deliver_once(
+            "engine-new-worker",
+            lambda conversation, _prompt, _key: (
+                observed.append(conversation) or "engine-new-run"
+            ),
+        )
+
+        self.assertEqual(sent.wake_id, outcome.wake_id)
+        self.assertNotEqual(self.developer_conversation_id, observed[0])
+        self.assertEqual(
+            "closed",
+            self.con.execute(
+                "SELECT state FROM conversations WHERE conversation_id=?",
+                (self.developer_conversation_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            observed[0],
+            self.con.execute(
+                "SELECT chat_id FROM active_shell_chats WHERE shell_id=1"
+            ).fetchone()[0],
+        )
+
+    def test_engine_new_without_registry_creates_chat(self) -> None:
+        self.con.execute("DELETE FROM active_shell_chats WHERE shell_id=1")
+        self.con.commit()
+        sent = self.messages.send_to_shell(
+            1,
+            message_kind="system",
+            body="create engine chat",
+            idempotency_key="engine-new-no-registry",
+            declared_type="new",
+        )
+        observed: list[str] = []
+
+        outcome = delivery.SprintWakeDeliveryService(self.con).deliver_once(
+            "engine-create-worker",
+            lambda conversation, _prompt, _key: (
+                observed.append(conversation) or "engine-create-run"
+            ),
+        )
+
+        self.assertEqual(sent.wake_id, outcome.wake_id)
+        self.assertNotEqual(self.developer_conversation_id, observed[0])
+        created = self.con.execute(
+            "SELECT state,conversation_scope FROM conversations "
+            "WHERE conversation_id=?",
+            (observed[0],),
+        ).fetchone()
+        self.assertEqual(("idle", "normal"), tuple(created))
+
+    def test_engine_new_preflight_failure_preserves_active_chat(self) -> None:
+        self.con.execute("UPDATE shells SET user_id=NULL WHERE shell_id=1")
+        self.con.commit()
+        sent = self.messages.send_to_shell(
+            1,
+            message_kind="system",
+            body="invalid engine route",
+            idempotency_key="engine-new-invalid-route",
+            declared_type="new",
+        )
+
+        outcome = delivery.SprintWakeDeliveryService(self.con).deliver_once(
+            "engine-invalid-worker",
+            lambda *_args: self.fail("invalid route must not enqueue"),
+        )
+
+        self.assertEqual(
+            (sent.wake_id, "pending", 1),
+            (outcome.wake_id, outcome.state, outcome.attempt_number),
+        )
+        self.assertEqual(
+            self.developer_conversation_id,
+            self.con.execute(
+                "SELECT chat_id FROM active_shell_chats WHERE shell_id=1"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            "idle",
+            self.con.execute(
+                "SELECT state FROM conversations WHERE conversation_id=?",
+                (self.developer_conversation_id,),
+            ).fetchone()[0],
+        )
+
+    def test_engine_delivery_failures_use_three_attempt_budget(self) -> None:
+        sent = self.messages.send_to_shell(
+            1,
+            message_kind="system",
+            body="bounded engine wake",
+            idempotency_key="engine-bounded-failure",
+        )
+        service = delivery.SprintWakeDeliveryService(self.con)
+
+        outcomes = [
+            service.deliver_once(
+                f"engine-failure-{attempt}",
+                lambda *_args: (_ for _ in ()).throw(RuntimeError("offline")),
+            )
+            for attempt in range(1, 4)
+        ]
+
+        self.assertEqual(
+            [
+                (sent.wake_id, "pending", 1),
+                (sent.wake_id, "pending", 2),
+                (sent.wake_id, "failed", 3),
+            ],
+            [
+                (outcome.wake_id, outcome.state, outcome.attempt_number)
+                for outcome in outcomes
+            ],
+        )
+        self.assertEqual(
+            [
+                (1, "failed", "offline"),
+                (2, "failed", "offline"),
+                (3, "failed", "offline"),
+            ],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT attempt_number,outcome,error_detail "
+                    "FROM sprint_wake_attempts WHERE wake_id=? "
+                    "ORDER BY attempt_number",
+                    (sent.wake_id,),
+                )
+            ],
+        )
+
+    def test_busy_close_race_reenters_without_failed_attempt(self) -> None:
+        sent = self.send("busy-close-race", declared_type="new")
+        service = delivery.SprintWakeDeliveryService(self.con)
+
+        with mock.patch.object(
+            active_chat_registry,
+            "close_for_wake",
+            side_effect=active_chat_registry.ActiveChatBusy("turn started"),
+        ):
+            outcome = service.deliver_once(
+                "busy-close-worker",
+                lambda conversation, _prompt, _key: conversation,
+            )
+
+        self.assertEqual(
+            (sent.wake_id, "delivered", 1),
+            (outcome.wake_id, outcome.state, outcome.attempt_number),
+        )
+        self.assertEqual(
+            [(1, "delivered")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT attempt_number,outcome FROM sprint_wake_attempts "
+                    "WHERE wake_id=?",
+                    (sent.wake_id,),
+                )
+            ],
+        )
+
+    def test_creation_race_reenters_winning_chat_without_failed_attempt(self) -> None:
+        self.con.execute("DELETE FROM active_shell_chats WHERE shell_id=1")
+        self.con.commit()
+        sent = self.messages.send_to_shell(
+            1,
+            message_kind="system",
+            body="creation race",
+            idempotency_key="engine-creation-race",
+            declared_type="new",
+        )
+
+        winner = active_chat_registry.ActiveChat(
+            1, self.developer_conversation_id, "idle", None, None
+        )
+        with (
+            mock.patch.object(
+                delivery.sprint_participant_chats,
+                "create_shell_wake_conversation",
+                side_effect=delivery.sprint_participant_chats.WakeConversationBusy(
+                    "another chat became active"
+                ),
+            ),
+            mock.patch.object(
+                active_chat_registry,
+                "get",
+                side_effect=(None, winner),
+            ),
+        ):
+            outcome = delivery.SprintWakeDeliveryService(self.con).deliver_once(
+                "creation-race-worker",
+                lambda conversation, _prompt, _key: conversation,
+            )
+
+        self.assertEqual(
+            (sent.wake_id, "delivered", 1),
+            (outcome.wake_id, outcome.state, outcome.attempt_number),
+        )
+        self.assertEqual(
+            self.developer_conversation_id,
+            self.con.execute(
+                "SELECT target_conversation_id FROM sprint_wake_attempts "
+                "WHERE wake_id=?",
+                (sent.wake_id,),
+            ).fetchone()[0],
+        )
 
     def test_claim_respects_available_at_backoff_boundary(self) -> None:
         sent = self.send("backoff-boundary")
@@ -648,7 +922,9 @@ class WakeDeliveryTest(SprintMessageCase):
             ],
         )
 
-    def test_expired_claim_retries_same_identity_without_logical_duplicate(self) -> None:
+    def test_expired_claim_retries_same_identity_without_logical_duplicate(
+        self,
+    ) -> None:
         sent = self.send("crash-retry")
         clock = [datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc)]
         service = delivery.SprintWakeDeliveryService(self.con, now=lambda: clock[0])
@@ -735,7 +1011,10 @@ class WakeDeliveryTest(SprintMessageCase):
             [(1, "pending"), (2, "pending"), (3, "failed")],
             [(item.attempt_number, item.state) for item in outcomes],
         )
-        self.assertIsNone(service.claim_next("worker-a"))
+        pause_notice = service.claim_next("worker-a")
+        self.assertIsNotNone(pause_notice)
+        self.assertIsNone(pause_notice.sprint_id)
+        self.assertIn("wake_delivery_exhausted", pause_notice.prompt)
         self.assertEqual(
             ("paused", "failed", 3, None),
             tuple(
@@ -905,9 +1184,10 @@ class ParticipantRelayTest(SprintMessageCase):
             "USING (conversation_id) WHERE c.conversation_id=?",
             (conversation_id,),
         ).fetchone()
-        self.assertEqual(before + 1, self.con.execute(
-            "SELECT COUNT(*) FROM conversations"
-        ).fetchone()[0])
+        self.assertEqual(
+            before + 1,
+            self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
+        )
         self.assertEqual(
             (3, "idle", "sprint", "work", None, None),
             tuple(route),

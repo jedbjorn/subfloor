@@ -700,7 +700,7 @@ class SprintLifecycleStore:
                     wake_id,
                 ),
             )
-            if terminal:
+            if terminal and row["sprint_id"] is not None:
                 sprint = self._sprint(int(row["sprint_id"]))
                 if sprint["lifecycle"] == "armed":
                     pause_receipt = self._pause_in_transaction(
@@ -1140,16 +1140,22 @@ class SprintLifecycleStore:
                     if row["state"] == "failed"
                     else f"sprint-recovery:{sprint_id}:delivered-unread:{old_wake_id}"
                 )
+            receiver_shell_id = _participant_shell_id(self.con, participant_id)
             deliverable = self.con.execute(
-                "SELECT wake_id,idempotency_key FROM sprint_wake_outbox "
-                "WHERE sprint_id=? AND participant_id=? "
+                "SELECT wake_id,idempotency_key FROM sprint_wake_outbox WHERE "
+                "(receiver_shell_id=? AND state='pending') "
                 + (
-                    "AND state='pending' "
+                    ""
                     if shell_busy
-                    else "AND state IN ('pending','delivering') "
+                    else "OR (sprint_id=? AND participant_id=? "
+                    "AND state='delivering') "
                 )
-                + "ORDER BY wake_id LIMIT 1",
-                (sprint_id, participant_id),
+                + "ORDER BY (state='pending') DESC,wake_id LIMIT 1",
+                (
+                    (receiver_shell_id,)
+                    if shell_busy
+                    else (receiver_shell_id, sprint_id, participant_id)
+                ),
             ).fetchone()
             if deliverable is None:
                 prior_recovery = self.con.execute(
@@ -1173,7 +1179,7 @@ class SprintLifecycleStore:
                             (
                                 sprint_id,
                                 participant_id,
-                                _participant_shell_id(self.con, participant_id),
+                                receiver_shell_id,
                                 recovery_key,
                                 f"+{backoff_seconds} seconds",
                             ),
@@ -1188,7 +1194,7 @@ class SprintLifecycleStore:
                             (
                                 sprint_id,
                                 participant_id,
-                                _participant_shell_id(self.con, participant_id),
+                                receiver_shell_id,
                                 recovery_key,
                             ),
                         ).lastrowid
@@ -1258,11 +1264,13 @@ class SprintLifecycleStore:
             participant_id = int(message["to_participant_id"])
             if self._participant_has_pickup_turn(participant_id):
                 continue
+            receiver_shell_id = _participant_shell_id(self.con, participant_id)
             deliverable = self.con.execute(
-                "SELECT wake_id FROM sprint_wake_outbox WHERE sprint_id=? "
-                "AND participant_id=? AND state IN ('pending','delivering') "
-                "ORDER BY wake_id LIMIT 1",
-                (sprint_id, participant_id),
+                "SELECT wake_id FROM sprint_wake_outbox WHERE "
+                "(receiver_shell_id=? AND state='pending') OR "
+                "(sprint_id=? AND participant_id=? AND state='delivering') "
+                "ORDER BY (state='pending') DESC,wake_id LIMIT 1",
+                (receiver_shell_id, sprint_id, participant_id),
             ).fetchone()
             created = deliverable is None
             if created:
@@ -1274,7 +1282,7 @@ class SprintLifecycleStore:
                         (
                             sprint_id,
                             participant_id,
-                            _participant_shell_id(self.con, participant_id),
+                            receiver_shell_id,
                             (
                                 f"sprint-recovery:{sprint_id}:unwoken:"
                                 f"{int(message['message_id'])}"
@@ -1561,14 +1569,13 @@ class SprintLifecycleStore:
         idempotency_key: str,
     ) -> tuple[int, tuple[str, ...]]:
         participant_id = self._planner_participant_id(sprint_id)
+        receiver_shell_id = _participant_shell_id(self.con, participant_id)
         from sprint_message_delivery import SprintMessageStore
 
-        receipt = SprintMessageStore(self.con).send_in_transaction(
-            sprint_id,
-            to_participant_id=participant_id,
+        receipt = SprintMessageStore(self.con).send_to_shell_in_transaction(
+            receiver_shell_id,
             message_kind="notification",
             body=body,
-            actionable=False,
             declared_type="re-enter",
             idempotency_key=idempotency_key,
         )

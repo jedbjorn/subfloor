@@ -1071,7 +1071,7 @@ class CarriedLowClosureTest(SprintReviewLoopCase):
             ).fetchone()[0],
         )
 
-    def test_paused_sprint_wake_cannot_be_claimed_for_delivery(self):
+    def test_paused_sprint_blocks_work_but_delivers_pause_notice(self):
         sent = self.messages.send(
             self.sprint_id,
             to_participant_id=self.developer_id,
@@ -1089,8 +1089,31 @@ class CarriedLowClosureTest(SprintReviewLoopCase):
             reason="integrity check",
         )
 
+        prompts: list[str] = []
         service = sprint_message_delivery.SprintWakeDeliveryService(self.con)
-        self.assertIsNone(service.claim_next("paused-delivery"))
+        outcome = service.deliver_once(
+            "paused-delivery",
+            lambda conversation, prompt, _key: (
+                prompts.append(prompt) or conversation
+            ),
+        )
+
+        self.assertIsNotNone(outcome)
+        self.assertNotEqual(sent.wake_id, outcome.wake_id)
+        self.assertIn("Sprint 1 paused: integrity check", prompts[0])
+        self.assertEqual(
+            (None, "pending"),
+            tuple(
+                self.con.execute(
+                    "SELECT m.delivered_at,w.state FROM wake_message m "
+                    "JOIN sprint_wake_messages joined USING(message_id) "
+                    "JOIN sprint_wake_outbox w USING(wake_id) "
+                    "WHERE m.message_id=?",
+                    (sent.message_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertIsNone(service.claim_next("paused-work-stays-gated"))
         wake = self.con.execute(
             "SELECT state,attempt_count,claim_owner FROM sprint_wake_outbox "
             "WHERE wake_id=?",

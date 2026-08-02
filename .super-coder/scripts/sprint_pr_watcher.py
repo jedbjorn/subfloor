@@ -506,31 +506,11 @@ class SprintPRWatcher:
                     "registered_pr.merged_grant_bypassed",
                 )
             )
-        recipients: dict[int, bool] = {
-            int(registered["owner_participant_id"]): state in {"red", "green"}
-        }
-        planner = self.con.execute(
-            "SELECT participant_id FROM sprint_participants "
-            "WHERE sprint_id=? AND role='planner'",
-            (sprint_id,),
-        ).fetchone()
-        if planner is None:
-            raise SprintInvariantError("registered PR has no Planner participant")
-        planner_id = int(planner["participant_id"])
-        recipients[planner_id] = recipients.get(planner_id, False) or state == "closed"
-        reviewer_shell_ids = {int(row["reviewer_shell_id"]) for row in unit_rows}
-        for shell_id in reviewer_shell_ids:
-            reviewer = self.con.execute(
-                "SELECT participant_id FROM sprint_participants "
-                "WHERE sprint_id=? AND shell_id=? AND role='reviewer'",
-                (sprint_id, shell_id),
-            ).fetchone()
-            if reviewer is None:
-                raise SprintInvariantError(
-                    "registered PR work unit has no Reviewer participant"
-                )
-            reviewer_id = int(reviewer["participant_id"])
-            recipients.setdefault(reviewer_id, False)
+        recipients = (
+            (int(registered["owner_participant_id"]),)
+            if state in {"red", "green", "closed"}
+            else ()
+        )
 
         head_changed = (
             previous_head_sha is not None

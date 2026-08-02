@@ -32,10 +32,26 @@ class SprintConversationError(ValueError):
     """The requested Sprint conversation transition violates its contract."""
 
 
+class WakeConversationBusy(SprintConversationError):
+    """A wake replacement lost the boundary race to another active chat."""
+
+
 @dataclass(frozen=True)
 class WakeConversationRoute:
     conversation_id: str
     created: bool
+
+
+@dataclass(frozen=True)
+class PreparedShellWake:
+    shell_id: int
+    owner_user_id: int
+    shortname: str
+    harness: str
+    provider: str | None
+    model: str | None
+    effort: str | None
+    worktree: str
 
 
 def wake_prompt(sprint_id: int, role: str) -> str:
@@ -687,6 +703,127 @@ def ensure_wake_conversation(
     return WakeConversationRoute(conversation_id, True)
 
 
+def prepare_shell_wake_conversation(con, shell_id: int) -> PreparedShellWake:
+    """Resolve a non-Sprint shell route before any active chat is closed."""
+    shell = con.execute(
+        "SELECT shell_id,user_id,shortname,flavor FROM shells "
+        "WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
+        (shell_id,),
+    ).fetchone()
+    if shell is None:
+        raise SprintConversationError("wake receiver shell does not exist")
+    if shell["user_id"] is None:
+        raise SprintConversationError("wake receiver shell has no browser owner")
+
+    prior = con.execute(
+        "SELECT harness,model,effort FROM conversations WHERE shell_id=? "
+        "ORDER BY created_at DESC,conversation_id DESC LIMIT 1",
+        (shell_id,),
+    ).fetchone()
+    defaults = run_mod.flavor_defaults(con).get(shell["flavor"], {})
+    harness = (
+        (str(prior["harness"]) if prior is not None else None)
+        or defaults.get("default_harness")
+        or run_mod._configured_harness()
+        or "claude"
+    )
+    model = (
+        str(prior["model"])
+        if prior is not None and prior["model"] is not None
+        else defaults.get("models", {}).get(harness)
+    )
+    adapter = run_mod.load_adapter(harness)
+    effort = (
+        str(prior["effort"])
+        if prior is not None and prior["effort"] is not None
+        else run_mod.default_headless_effort(adapter)
+    )
+    try:
+        run_mod.validate_headless_request(adapter, model, effort)
+    except ValueError as exc:
+        raise SprintConversationError(str(exc)) from exc
+    worktree = run_mod.shell_work_dir(shell["shortname"], shell["flavor"])
+    return PreparedShellWake(
+        shell_id=int(shell["shell_id"]),
+        owner_user_id=int(shell["user_id"]),
+        shortname=str(shell["shortname"]),
+        harness=harness,
+        provider=run_mod.session_provider(harness, model),
+        model=model,
+        effort=effort,
+        worktree=str(worktree.resolve(strict=False)),
+    )
+
+
+def create_shell_wake_conversation(
+    con,
+    *,
+    wake_id: int,
+    route: PreparedShellWake,
+) -> str:
+    """Create and register a prepared engine-wide wake chat."""
+    if not con.in_transaction:
+        raise RuntimeError("wake conversation creation requires a transaction")
+    if active_chat_registry.get(con, route.shell_id) is not None:
+        raise WakeConversationBusy("another chat became active before wake creation")
+
+    key = f"shell:{route.shell_id}:wake:{wake_id}"
+    request = {
+        "effort": route.effort,
+        "harness": route.harness,
+        "model": route.model,
+        "shell_id": route.shell_id,
+        "wake_id": wake_id,
+        "worktree": route.worktree,
+    }
+    existing = con.execute(
+        "SELECT conversation_id,shell_id,state,creation_request_hash "
+        "FROM conversations WHERE owner_user_id=? "
+        "AND creation_idempotency_key=?",
+        (route.owner_user_id, key),
+    ).fetchone()
+    request_hash = _request_hash(request)
+    if existing is not None:
+        if (
+            int(existing["shell_id"]) != route.shell_id
+            or existing["creation_request_hash"] != request_hash
+            or existing["state"] == "closed"
+        ):
+            raise SprintConversationError("idempotent wake chat is not reusable")
+        conversation_id = str(existing["conversation_id"])
+        active_chat_registry.register(con, route.shell_id, conversation_id)
+        return conversation_id
+
+    conversation_id = "cv_" + uuid.uuid4().hex
+    con.execute(
+        "INSERT INTO conversations "
+        "(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,"
+        "worktree,title,creation_idempotency_key,creation_request_hash) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            conversation_id,
+            route.shell_id,
+            route.owner_user_id,
+            route.harness,
+            route.provider,
+            route.model,
+            route.effort,
+            route.worktree,
+            f"Wake {wake_id} · {route.shortname}",
+            key,
+            request_hash,
+        ),
+    )
+    _append_event(
+        con,
+        conversation_id,
+        "conversation.created",
+        {"scope": "normal", "shell_id": route.shell_id, "wake_id": wake_id},
+    )
+    active_chat_registry.register(con, route.shell_id, conversation_id)
+    return conversation_id
+
+
 def create_wake_conversation(
     con,
     *,
@@ -718,7 +855,7 @@ def create_wake_conversation(
     if row["user_id"] is None:
         raise SprintConversationError("originating Planner has no browser owner")
     if active_chat_registry.get(con, int(row["shell_id"])) is not None:
-        raise SprintConversationError("another chat became active before wake creation")
+        raise WakeConversationBusy("another chat became active before wake creation")
 
     generation = _nonblank(
         row["conversation_generation"],

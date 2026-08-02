@@ -1,4 +1,5 @@
 """Stage 5 gates for registered-PR observation and routed wakes."""
+
 from __future__ import annotations
 
 import json
@@ -163,15 +164,13 @@ class RegistrationTest(SprintPRWatcherCase):
         self.assertEqual([], self.reader.get_calls)
         self.assertEqual(
             0,
-            self.con.execute(
-                "SELECT COUNT(*) FROM sprint_registered_prs"
-            ).fetchone()[0],
+            self.con.execute("SELECT COUNT(*) FROM sprint_registered_prs").fetchone()[
+                0
+            ],
         )
         self.assertEqual(
             0,
-            self.con.execute(
-                "SELECT COUNT(*) FROM sprint_pr_work_units"
-            ).fetchone()[0],
+            self.con.execute("SELECT COUNT(*) FROM sprint_pr_work_units").fetchone()[0],
         )
 
     def test_registration_rejects_non_owner_work_and_non_armed_sprint(self):
@@ -213,9 +212,9 @@ class RegistrationTest(SprintPRWatcherCase):
             )
         self.assertEqual(
             0,
-            self.con.execute(
-                "SELECT COUNT(*) FROM sprint_registered_prs"
-            ).fetchone()[0],
+            self.con.execute("SELECT COUNT(*) FROM sprint_registered_prs").fetchone()[
+                0
+            ],
         )
 
 
@@ -251,10 +250,7 @@ class TransitionRoutingTest(SprintPRWatcherCase):
             "JOIN sprint_wake_messages wm USING (message_id) "
             "WHERE m.idempotency_key LIKE 'pr-transition:%'"
         ).fetchall()
-        self.assertEqual(
-            sorted([(self.developer_id,), (self.reviewer_id,), (self.planner_id,)]),
-            sorted(tuple(row) for row in active_recipients),
-        )
+        self.assertEqual([], active_recipients)
 
         raw["statusCheckRollup"][1] = {
             "name": "pytest",
@@ -271,18 +267,14 @@ class TransitionRoutingTest(SprintPRWatcherCase):
             "WHERE m.idempotency_key LIKE 'pr-transition:%'"
         ).fetchall()
         self.assertEqual(
-            sorted(
-                [(self.developer_id,), (self.reviewer_id,), (self.planner_id,)] * 2
-            ),
-            sorted(tuple(row) for row in active_recipients),
+            [(self.developer_id,)], [tuple(row) for row in active_recipients]
         )
 
-    def test_first_red_wakes_every_message_recipient(self):
+    def test_first_red_wakes_only_the_owning_developer(self):
         self.register()
 
         transition = self.con.execute(
-            "SELECT transition_id,normalized_state,evidence "
-            "FROM sprint_pr_transitions"
+            "SELECT transition_id,normalized_state,evidence FROM sprint_pr_transitions"
         ).fetchone()
         self.assertEqual("red", transition["normalized_state"])
         self.assertEqual("registration", json.loads(transition["evidence"])["trigger"])
@@ -291,7 +283,7 @@ class TransitionRoutingTest(SprintPRWatcherCase):
             "WHERE idempotency_key LIKE 'pr-transition:%' ORDER BY to_participant_id"
         ).fetchall()
         self.assertEqual(
-            sorted([self.developer_id, self.reviewer_id, self.planner_id]),
+            [self.developer_id],
             [int(row["to_participant_id"]) for row in routed],
         )
         self.assertEqual(
@@ -305,12 +297,9 @@ class TransitionRoutingTest(SprintPRWatcherCase):
             "JOIN sprint_wake_outbox w USING (wake_id) "
             "WHERE m.idempotency_key LIKE 'pr-transition:%'"
         ).fetchall()
-        self.assertEqual(
-            sorted([self.developer_id, self.reviewer_id, self.planner_id]),
-            sorted(int(row[0]) for row in wakes),
-        )
+        self.assertEqual([self.developer_id], [int(row[0]) for row in wakes])
         self.assertEqual({"pending"}, {str(row["state"]) for row in wakes})
-        self.assertEqual(3, len({int(row["wake_id"]) for row in wakes}))
+        self.assertEqual(1, len({int(row["wake_id"]) for row in wakes}))
 
     def test_red_green_red_occurrences_wake_once_each_and_coalesce(self):
         self.register()
@@ -350,7 +339,7 @@ class TransitionRoutingTest(SprintPRWatcherCase):
             ).fetchone()[0],
         )
 
-    def test_closed_without_merge_wakes_every_message_recipient(self):
+    def test_closed_without_merge_wakes_only_the_owning_developer(self):
         self.reader.current = pull_request(
             state="CLOSED", checks=None, checks_failed=False
         )
@@ -364,19 +353,16 @@ class TransitionRoutingTest(SprintPRWatcherCase):
                 "WHERE m.idempotency_key LIKE 'pr-transition:%'"
             )
         ]
+        self.assertEqual([self.developer_id], active_recipients)
         self.assertEqual(
-            sorted([self.developer_id, self.reviewer_id, self.planner_id]),
-            sorted(active_recipients),
-        )
-        self.assertEqual(
-            sorted([self.developer_id, self.reviewer_id, self.planner_id]),
-            sorted(
+            [self.developer_id],
+            [
                 int(row[0])
                 for row in self.con.execute(
                     "SELECT to_participant_id FROM wake_message "
                     "WHERE idempotency_key LIKE 'pr-transition:%'"
                 )
-            ),
+            ],
         )
 
 
@@ -494,6 +480,7 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
             "WHERE m.idempotency_key LIKE 'pr-transition:%'"
         ).fetchone()
         self.assertEqual(self.developer_id, int(active_recipient[0]))
+
 
 class BatchAndNormalizationTest(SprintPRWatcherCase):
     def test_multiple_registered_prs_share_one_repository_list_read(self):
