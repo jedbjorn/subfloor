@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
+import tempfile
+from contextlib import closing
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".super-coder" / "scripts"
 sys.path[:0] = [str(SCRIPTS), str(ROOT / "tests")]
 
+import conversation_broker
 import sprint_domain
 import sprint_message_delivery
 import sprint_participant_chats
@@ -945,6 +949,55 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
             notify_commit=lambda: True,
         )
 
+    def add_live_run(self, sprint_id: int, shell_id: int) -> tuple[str, int]:
+        conversation_id = str(
+            self.con.execute(
+                "SELECT pc.conversation_id "
+                "FROM sprint_participant_conversations pc "
+                "JOIN sprint_participants participant "
+                "ON participant.participant_id=pc.sprint_participant_id "
+                "WHERE participant.sprint_id=? AND participant.shell_id=?",
+                (sprint_id, shell_id),
+            ).fetchone()[0]
+        )
+        token = int(
+            self.con.execute("SELECT COUNT(*)+1 FROM conversation_runs").fetchone()[0]
+        )
+        message_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'engine','test','prompt','active Sprint turn',?,?,"
+                "'running')",
+                (
+                    conversation_id,
+                    f"terminal-active:{token}",
+                    f"terminal-active:{token}",
+                ),
+            ).lastrowid
+        )
+        run_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                "lease_expires_at,started_at,heartbeat_at) "
+                "VALUES (?,?,?,'running','test-broker','2999-01-01 00:00:00',"
+                "'2026-08-02 00:00:00','2026-08-02 00:00:00')",
+                (conversation_id, shell_id, message_id),
+            ).lastrowid
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='queued' WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='running' WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        self.con.commit()
+        return conversation_id, run_id
+
     def test_prepared_abort_records_stub_report_and_preserves_plan(self):
         sprint_id, unit_id = self.create_sprint()
         coordinator = self.coordinator()
@@ -987,6 +1040,202 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
                 "SELECT COUNT(*) FROM sprint_work_units WHERE work_unit_id=?",
                 (unit_id,),
             ).fetchone()[0],
+        )
+
+    def test_completed_defers_only_owning_planner_run_until_broker_finish(self):
+        sprint_id, _ = self.create_sprint()
+        self.store.arm(sprint_id, 3)
+        planner_conversation, planner_run = self.add_live_run(sprint_id, 3)
+        _, developer_run = self.add_live_run(sprint_id, 1)
+        queued_message_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'engine','test','prompt','queued follow-up',"
+                "'terminal-follow-up','terminal-follow-up','queued')",
+                (planner_conversation,),
+            ).lastrowid
+        )
+        self.con.execute(
+            "INSERT INTO conversation_outbox (conversation_id,message_id) "
+            "VALUES (?,?)",
+            (planner_conversation, queued_message_id),
+        )
+        self.con.commit()
+        interrupts: list[int] = []
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            interrupt_run=lambda run_id: interrupts.append(run_id) or True,
+            notify_commit=lambda: True,
+        )
+
+        self.assertTrue(
+            lifecycle.transition(
+                sprint_id,
+                "completed",
+                sprint_domain.LifecycleActor("planner", 3),
+                reason="final response follows",
+                terminal_outcome="accepted",
+            )
+        )
+
+        self.assertEqual([developer_run], interrupts)
+        self.assertEqual(
+            [(developer_run,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT run_id FROM conversation_events "
+                    "WHERE event_type='run.interrupt.requested' ORDER BY run_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            [(planner_run,), (developer_run,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT run_id FROM conversation_events "
+                    "WHERE event_type='conversation.close.requested' ORDER BY run_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            ("cancelled", "cancelled"),
+            tuple(
+                self.con.execute(
+                    "SELECT message.state,outbox.state "
+                    "FROM conversation_messages message "
+                    "JOIN conversation_outbox outbox USING(message_id) "
+                    "WHERE message.message_id=?",
+                    (queued_message_id,),
+                ).fetchone()
+            ),
+        )
+        terminal_fact_counts = tuple(
+            self.con.execute(
+                "SELECT "
+                "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                " AND event_type='lifecycle.completed'),"
+                "(SELECT COUNT(*) FROM conversation_events "
+                " WHERE event_type='conversation.close.requested')",
+                (sprint_id,),
+            ).fetchone()
+        )
+        self.assertFalse(
+            lifecycle.transition(
+                sprint_id,
+                "completed",
+                sprint_domain.LifecycleActor("planner", 3),
+                reason="retry",
+                terminal_outcome="accepted",
+            )
+        )
+        self.assertEqual(
+            terminal_fact_counts,
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    " AND event_type='lifecycle.completed'),"
+                    "(SELECT COUNT(*) FROM conversation_events "
+                    " WHERE event_type='conversation.close.requested')",
+                    (sprint_id,),
+                ).fetchone()
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "terminal.db"
+            with closing(sqlite3.connect(db_path)) as target:
+                self.con.backup(target)
+            broker = conversation_broker.BrokerStore(db_path)
+            self.assertTrue(
+                broker.finish_run(
+                    planner_run,
+                    "succeeded",
+                    event_type="run.completed",
+                    payload={"final_output": "Sprint completed successfully."},
+                )
+            )
+            self.assertTrue(
+                broker.finish_run(
+                    developer_run,
+                    "cancelled",
+                    event_type="run.interrupted",
+                    payload={"interrupt_evidence": "sprint completion"},
+                )
+            )
+            with closing(sqlite3.connect(db_path)) as observed:
+                observed.row_factory = sqlite3.Row
+                self.assertEqual(
+                    [("closed", 1)] * 3,
+                    [
+                        tuple(row)
+                        for row in observed.execute(
+                            "SELECT conversation.state,"
+                            "conversation.closed_at IS NOT NULL "
+                            "FROM conversations conversation "
+                            "JOIN sprint_participant_conversations linked "
+                            "ON linked.conversation_id=conversation.conversation_id "
+                            "JOIN sprint_participants participant "
+                            "ON participant.participant_id=linked.sprint_participant_id "
+                            "WHERE participant.sprint_id=? "
+                            "ORDER BY conversation.conversation_id",
+                            (sprint_id,),
+                        )
+                    ],
+                )
+                planner_terminal = observed.execute(
+                    "SELECT event_type,payload FROM conversation_events "
+                    "WHERE conversation_id=? AND run_id=? "
+                    "AND event_type='run.completed'",
+                    (planner_conversation, planner_run),
+                ).fetchone()
+                self.assertEqual("run.completed", planner_terminal["event_type"])
+                self.assertEqual(
+                    "Sprint completed successfully.",
+                    json.loads(planner_terminal["payload"])["final_output"],
+                )
+                self.assertEqual(
+                    "cancelled",
+                    observed.execute(
+                        "SELECT state FROM conversation_runs WHERE run_id=?",
+                        (developer_run,),
+                    ).fetchone()[0],
+                )
+
+    def test_abort_interrupts_owning_planner_and_other_active_participants(self):
+        sprint_id, _ = self.create_sprint()
+        self.store.arm(sprint_id, 3)
+        _, planner_run = self.add_live_run(sprint_id, 3)
+        _, developer_run = self.add_live_run(sprint_id, 1)
+        interrupts: list[int] = []
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            interrupt_run=lambda run_id: interrupts.append(run_id) or True,
+            notify_commit=lambda: True,
+        )
+
+        receipt = lifecycle.abort(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="stop all work",
+            terminal_outcome="aborted",
+        )
+
+        self.assertEqual((planner_run, developer_run), receipt.interrupt_run_ids)
+        self.assertEqual([planner_run, developer_run], interrupts)
+        self.assertEqual(
+            [(planner_run,), (developer_run,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT run_id FROM conversation_events "
+                    "WHERE event_type='run.interrupt.requested' ORDER BY run_id"
+                )
+            ],
         )
 
     def test_terminal_lifecycle_closes_every_sprint_conversation(self):

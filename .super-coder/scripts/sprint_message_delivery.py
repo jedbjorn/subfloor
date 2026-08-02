@@ -20,7 +20,7 @@ from sprint_domain import SprintInvariantError, SprintLifecycleStore
 
 wake_prompt = sprint_participant_chats.wake_prompt
 
-ACTIONABLE_KINDS = frozenset({"work_assignment", "review_request"})
+ACTIONABLE_KINDS = frozenset({"work_assignment", "review_request", "notification"})
 
 
 @dataclass(frozen=True)
@@ -90,7 +90,8 @@ class SprintMessageStore:
             raise ValueError("Sprint message idempotency key is empty")
         if actionable and message_kind not in ACTIONABLE_KINDS:
             raise SprintInvariantError(
-                "only work assignments and review requests are actionable"
+                "only work assignments, review requests, and notifications "
+                "are actionable"
             )
         with db_driver.write_transaction(self.con, "sprint.message.send"):
             return self.send_in_transaction(
@@ -210,7 +211,8 @@ class SprintMessageStore:
             raise ValueError("Sprint message idempotency key is empty")
         if actionable and message_kind not in ACTIONABLE_KINDS:
             raise SprintInvariantError(
-                "only work assignments and review requests are actionable"
+                "only work assignments, review requests, and notifications "
+                "are actionable"
             )
         return self._send(
             sprint_id,

@@ -191,12 +191,14 @@ class MessageTransactionTest(SprintMessageCase):
             ).fetchone()[0],
         )
 
-    def test_only_task_messages_are_actionable_and_passive_has_no_wake(self) -> None:
+    def test_only_participant_handoffs_are_actionable_and_passive_has_no_wake(
+        self,
+    ) -> None:
         before = self.con.execute("SELECT COUNT(*) FROM sprint_messages").fetchone()[0]
         with self.assertRaisesRegex(
             sprint_domain.SprintInvariantError, "only work assignments"
         ):
-            self.send("bad-action", actionable=True)
+            self.send("bad-action", kind="system", actionable=True)
         self.assertEqual(
             before,
             self.con.execute("SELECT COUNT(*) FROM sprint_messages").fetchone()[0],
