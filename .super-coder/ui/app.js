@@ -5128,7 +5128,7 @@ function sprintFeedsNode(sprintId) {
     const list = el("div", { className: "sprint-feed-list" });
     const more = el("button", { className: "act", type: "button", textContent: "Load more" });
     more.onclick = () => sprintLoadFeed(kind, { more: true });
-    const detail = el("details", { className: "card sprint-feed", open: state.open },
+    const detail = el("details", { className: "sprint-feed", open: state.open },
       el("summary", {}, `${label} (${kind === "events" ? "timeline" : "judgments and reports"})`),
       list, more);
     detail.ontoggle = () => {
@@ -5375,7 +5375,7 @@ function sprintWireGraph(wrap, canvas, svg, cardById, dependencies) {
 
 function sprintBoardNode(snapshot) {
   const sprint = snapshot.sprint;
-  const header = el("div", { className: "card sprint-board-head" });
+  const header = el("div", { className: "sprint-board-head" });
   const heading = el("div", { className: "sprint-heading" },
     el("h2", {}, `Sprint ${sprint.sprint_id}`),
     el("span", { className: `pill sprint-${sprint.lifecycle}` }, sprint.lifecycle));
