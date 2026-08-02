@@ -300,6 +300,7 @@ def close_for_terminal_lifecycle(
                     },
                     run_id=run_id,
                 )
+            # Completion defers the owning Planner even when FnB called complete.
             if (
                 lifecycle == "completed"
                 and int(active["shell_id"]) == owning_planner_shell_id

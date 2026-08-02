@@ -1206,6 +1206,56 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
                     ).fetchone()[0],
                 )
 
+    def test_fnb_completion_still_defers_owning_planner_run(self):
+        sprint_id, _ = self.create_sprint()
+        self.store.arm(sprint_id, 3)
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (5,'FnB','FNB','admin','prompt',1)"
+        )
+        self.con.commit()
+        _, planner_run = self.add_live_run(sprint_id, 3)
+        _, developer_run = self.add_live_run(sprint_id, 1)
+        interrupts: list[int] = []
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            interrupt_run=lambda run_id: interrupts.append(run_id) or True,
+            notify_commit=lambda: True,
+        )
+
+        self.assertTrue(
+            lifecycle.transition(
+                sprint_id,
+                "completed",
+                sprint_domain.LifecycleActor("fnb", 5),
+                reason="FnB accepts the completed Sprint",
+                terminal_outcome="accepted",
+            )
+        )
+
+        self.assertEqual([developer_run], interrupts)
+        self.assertEqual(
+            [(developer_run,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT run_id FROM conversation_events "
+                    "WHERE event_type='run.interrupt.requested' ORDER BY run_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            [(planner_run,), (developer_run,)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT run_id FROM conversation_events "
+                    "WHERE event_type='conversation.close.requested' ORDER BY run_id"
+                )
+            ],
+        )
+
     def test_abort_interrupts_owning_planner_and_other_active_participants(self):
         sprint_id, _ = self.create_sprint()
         self.store.arm(sprint_id, 3)
