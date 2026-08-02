@@ -15,6 +15,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+import active_chat_registry
 import conversation_broker
 import run as run_mod
 
@@ -461,6 +462,39 @@ def create_and_select(
         )
         return conversation_id
 
+    try:
+        closed = active_chat_registry.close_active(
+            con,
+            int(participant["shell_id"]),
+        )
+    except active_chat_registry.ActiveChatBusy as exc:
+        active = active_chat_registry.get(con, int(participant["shell_id"]))
+        if active is not None and _linked_to_participant(
+            con,
+            participant_id,
+            active.chat_id,
+        ):
+            # Delivery-time resolution protects a live turn: a declared New
+            # re-enters the linked active chat instead of displacing it.
+            con.execute(
+                "UPDATE sprint_participants SET current_conversation_id=?,"
+                "updated_at=datetime('now') WHERE participant_id=?",
+                (active.chat_id, participant_id),
+            )
+            return active.chat_id
+        raise SprintConversationError(str(exc)) from exc
+    if closed is not None:
+        _append_event(
+            con,
+            closed.chat_id,
+            "conversation.closed",
+            {
+                "state": "closed",
+                "reason": "another chat opened",
+                "sprint_id": int(participant["sprint_id"]),
+            },
+        )
+
     conversation_id = "cv_" + uuid.uuid4().hex
     con.execute(
         "INSERT INTO conversations "
@@ -515,6 +549,11 @@ def create_and_select(
         ).rowcount
     if updated != 1:
         raise SprintConversationError("Sprint participant disappeared during creation")
+    active_chat_registry.register(
+        con,
+        int(participant["shell_id"]),
+        conversation_id,
+    )
     return conversation_id
 
 

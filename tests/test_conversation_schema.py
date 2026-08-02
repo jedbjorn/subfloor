@@ -16,6 +16,7 @@ SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
 FOUNDATION = MIGRATIONS / "0132_conversation_foundation.sql"
 GIT_TARGETS = MIGRATIONS / "0142_conversation_git_targets.sql"
+ACTIVE_REGISTRY = MIGRATIONS / "0162_active_chat_registry.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import conversation_state  # noqa: E402
@@ -344,6 +345,89 @@ class MigrationAndShapeTest(ConversationDbCase):
                     "WHERE branch_name='feature/reused'"
                 ).fetchone()[0],
                 2,
+            )
+
+    def test_active_registry_migration_converges_legacy_open_chats(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.row_factory = sqlite3.Row
+            apply_schema(
+                con,
+                through="0161_reseed_flags_output_guidance.sql",
+            )
+            con.execute(
+                "INSERT INTO users (user_id,username) VALUES (9,'legacy')"
+            )
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (9,'Legacy','legacy','dev','prompt',9)"
+            )
+            con.execute(
+                "INSERT INTO conversations "
+                "(conversation_id,shell_id,owner_user_id,harness,worktree,"
+                "conversation_scope,creation_idempotency_key,"
+                "creation_request_hash,last_activity_at) VALUES "
+                "('cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',9,9,'codex',"
+                "'/tmp/legacy','normal','legacy-normal','hash-normal',"
+                "'2026-08-02 10:00:00'),"
+                "('cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',9,9,'codex',"
+                "'/tmp/legacy','sprint','legacy-sprint','hash-sprint',"
+                "'2026-08-02 11:00:00')"
+            )
+
+            con.executescript(ACTIVE_REGISTRY.read_text())
+            con.executescript(ACTIVE_REGISTRY.read_text())
+
+            states = {
+                row["conversation_id"]: row["state"]
+                for row in con.execute(
+                    "SELECT conversation_id,state FROM conversations"
+                )
+            }
+            active = con.execute(
+                "SELECT shell_id,chat_id,process_pid,process_start_ticks "
+                "FROM active_shell_chats"
+            ).fetchall()
+            self.assertEqual(
+                states,
+                {
+                    "cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "closed",
+                    "cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": "idle",
+                },
+            )
+            self.assertEqual(
+                [tuple(row) for row in active],
+                [
+                    (
+                        9,
+                        "cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        None,
+                        None,
+                    )
+                ],
+            )
+
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "active chat must be open and belong to its shell",
+            ):
+                con.execute(
+                    "UPDATE active_shell_chats SET chat_id="
+                    "'cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE shell_id=9"
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute(
+                    "UPDATE active_shell_chats SET process_pid=123 "
+                    "WHERE shell_id=9"
+                )
+
+            con.execute(
+                "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+                "WHERE conversation_id='cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'"
+            )
+            self.assertEqual(
+                con.execute("SELECT COUNT(*) FROM active_shell_chats").fetchone()[0],
+                0,
             )
 
     def test_conversation_requires_direct_user_owner(self) -> None:
@@ -789,6 +873,7 @@ class FenceAndEventTest(ConversationDbCase):
 class SnapshotPolicyTest(ConversationDbCase):
     TABLES = (
         "conversations",
+        "active_shell_chats",
         "conversation_git_targets",
         "conversation_messages",
         "conversation_runs",
@@ -806,6 +891,10 @@ class SnapshotPolicyTest(ConversationDbCase):
     def test_snapshot_round_trip_preserves_queue_and_recovery_evidence(
             self) -> None:
         conversation = self.add_conversation()
+        self.con.execute(
+            "INSERT INTO active_shell_chats (shell_id,chat_id) VALUES (1,?)",
+            (conversation,),
+        )
         message = self.add_message(conversation, state="queued")
         run = self.add_run(
             conversation, message, state="unknown"
@@ -839,6 +928,13 @@ class SnapshotPolicyTest(ConversationDbCase):
                 "SELECT state,harness,worktree FROM conversations"
             ).fetchone(),
             ("idle", "codex", "/tmp/worktree-1"),
+        )
+        self.assertEqual(
+            target.execute(
+                "SELECT shell_id,chat_id,process_pid,process_start_ticks "
+                "FROM active_shell_chats"
+            ).fetchone(),
+            (1, conversation, None, None),
         )
         self.assertEqual(
             target.execute(

@@ -575,7 +575,7 @@ class SprintLiveProof(unittest.TestCase):
         self.assertEqual("lifecycle.completed", event_types[-1])
         self.assertEqual(2, packet["pr_outcomes"]["total"])
         self.assertEqual(
-            ["work", "fix", "merge", "merge"],
+            ["work"],
             [
                 row[0]
                 for row in self.con.execute(

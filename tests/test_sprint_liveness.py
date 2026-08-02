@@ -816,6 +816,11 @@ class MigrationGateTest(unittest.TestCase):
             (sprint_id, unit_id, task_id),
         )
         con.commit()
+        # Current runtime code reads the v2.1 active-chat authority even while
+        # this fixture isolates the older 0158 liveness migration.
+        con.executescript(
+            (MIGRATIONS / "0162_active_chat_registry.sql").read_text()
+        )
         wake_id = sprint_domain.SprintLifecycleStore(con).arm(sprint_id, 3)[0]
         assignment_message_id = int(
             con.execute(

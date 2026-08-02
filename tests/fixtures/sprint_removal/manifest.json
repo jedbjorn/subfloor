@@ -61,7 +61,8 @@
     "tests/test_update_materialize.py",
     ".super-coder/migrations/0160_reseed_migration_management.sql",
     ".super-coder/scripts/migration.py",
-    "tests/test_migration_management.py"
+    "tests/test_migration_management.py",
+    ".super-coder/migrations/0162_active_chat_registry.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,

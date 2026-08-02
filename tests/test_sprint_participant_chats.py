@@ -64,14 +64,36 @@ def substrate():
           creation_idempotency_key TEXT NOT NULL,
           creation_request_hash TEXT NOT NULL,
           conversation_scope TEXT NOT NULL DEFAULT 'normal',
+          closed_at TEXT,
+          last_activity_at TEXT NOT NULL DEFAULT (datetime('now')),
+          version INTEGER NOT NULL DEFAULT 1,
           UNIQUE(owner_user_id, creation_idempotency_key)
         );
+        CREATE TABLE active_shell_chats (
+          shell_id INTEGER PRIMARY KEY REFERENCES shells(shell_id),
+          chat_id TEXT NOT NULL UNIQUE REFERENCES conversations(conversation_id),
+          process_pid INTEGER,
+          process_start_ticks INTEGER,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          CHECK (
+            (process_pid IS NULL AND process_start_ticks IS NULL)
+            OR
+            (process_pid IS NOT NULL AND process_start_ticks IS NOT NULL)
+          )
+        );
+        CREATE TRIGGER clear_active_chat_after_close
+        AFTER UPDATE OF state ON conversations
+        WHEN NEW.state='closed' AND OLD.state<>'closed'
+        BEGIN
+          DELETE FROM active_shell_chats WHERE chat_id=NEW.conversation_id;
+        END;
         CREATE TABLE conversation_events (
           event_id INTEGER PRIMARY KEY,
           conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
           sequence INTEGER NOT NULL,
           event_type TEXT NOT NULL,
           payload TEXT NOT NULL,
+          run_id INTEGER,
           UNIQUE(conversation_id, sequence)
         );
         CREATE TABLE sprint_participants (
@@ -342,7 +364,7 @@ def test_caller_transaction_rolls_back_every_row_when_pointer_selection_fails() 
         )
 
 
-def test_fix_conversation_becomes_current_without_closing_persistent_work() -> None:
+def test_fix_conversation_closes_and_replaces_persistent_work() -> None:
     with substrate() as con:
         work = create(con, 101, "work", "s7:p101:work")
         fix = create(
@@ -360,8 +382,13 @@ def test_fix_conversation_becomes_current_without_closing_persistent_work() -> N
         ).fetchall()
         assert [tuple(row) for row in rows] == [
             (fix, "idle", "fix", work),
-            (work, "idle", "work", None),
+            (work, "closed", "work", None),
         ]
+        assert tuple(
+            con.execute(
+                "SELECT shell_id,chat_id FROM active_shell_chats"
+            ).fetchone()
+        ) == (10, fix)
         assert (
             con.execute(
                 "SELECT current_conversation_id FROM sprint_participants "
@@ -455,8 +482,13 @@ def test_fallback_replacement_retains_packet_route_and_history() -> None:
             con.execute(
                 "SELECT state FROM conversations WHERE conversation_id=?", (work,)
             ).fetchone()[0]
-            == "idle"
+            == "closed"
         )
+        assert tuple(
+            con.execute(
+                "SELECT shell_id,chat_id FROM active_shell_chats"
+            ).fetchone()
+        ) == (10, fallback)
         assert (
             con.execute(
                 "SELECT current_conversation_id FROM sprint_participants "

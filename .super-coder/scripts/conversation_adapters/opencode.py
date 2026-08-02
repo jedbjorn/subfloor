@@ -412,6 +412,12 @@ class OpenCodeAdapter(ConversationAdapter):
             session_ref=session_ref,
             run_ref=run_ref,
             worktree=worktree,
+            process_ref=(
+                str(_SERVER_PROCESS.pid)
+                if _SERVER_PROCESS is not None
+                and _SERVER_PROCESS.poll() is None
+                else None
+            ),
             metadata={
                 "context": context,
                 "event_stream": event_stream,

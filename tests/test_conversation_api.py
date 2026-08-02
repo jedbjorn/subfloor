@@ -613,12 +613,90 @@ class ConversationResourceTest(ConversationApiCase):
             rows = con.execute(
                 "SELECT conversation_id,state,closed_at FROM conversations"
             ).fetchall()
+            active = con.execute(
+                "SELECT shell_id,chat_id,process_pid,process_start_ticks "
+                "FROM active_shell_chats"
+            ).fetchall()
         finally:
             con.close()
         by_id = {row["conversation_id"]: row for row in rows}
         self.assertEqual(by_id[first["conversation_id"]]["state"], "closed")
         self.assertIsNotNone(by_id[first["conversation_id"]]["closed_at"])
         self.assertEqual(by_id[second["conversation_id"]]["state"], "idle")
+        self.assertEqual(
+            [tuple(row) for row in active],
+            [(1, second["conversation_id"], None, None)],
+        )
+
+    def test_close_failure_prevents_replacement_chat(self) -> None:
+        first = self.create(key="close-failure-first")
+        con = self.connect()
+        con.executescript(
+            "CREATE TRIGGER reject_active_close BEFORE UPDATE OF state "
+            "ON conversations WHEN OLD.conversation_id="
+            f"'{first['conversation_id']}' AND NEW.state='closed' "
+            "BEGIN SELECT RAISE(ABORT,'close rejected'); END;"
+        )
+        con.close()
+
+        status, _, error = self.request(
+            "POST",
+            "/api/conversations",
+            body={"shell_id": 1, "harness": "codex", "title": "Never created"},
+            key="close-failure-second",
+        )
+
+        self.assertEqual(status, 500, error)
+        con = self.connect()
+        durable = con.execute(
+            "SELECT c.state,a.chat_id,"
+            "(SELECT COUNT(*) FROM conversations) AS conversation_count "
+            "FROM conversations c JOIN active_shell_chats a "
+            "ON a.chat_id=c.conversation_id WHERE c.conversation_id=?",
+            (first["conversation_id"],),
+        ).fetchone()
+        con.close()
+        self.assertEqual(
+            tuple(durable),
+            ("idle", first["conversation_id"], 1),
+        )
+
+    def test_replacement_insert_failure_leaves_old_chat_closed(self) -> None:
+        first = self.create(key="insert-failure-first")
+        con = self.connect()
+        con.executescript(
+            "CREATE TRIGGER reject_replacement_insert BEFORE INSERT "
+            "ON conversations WHEN NEW.creation_idempotency_key="
+            "'insert-failure-second' BEGIN "
+            "SELECT RAISE(ABORT,'replacement rejected'); END;"
+        )
+        con.close()
+
+        status, _, error = self.request(
+            "POST",
+            "/api/conversations",
+            body={"shell_id": 1, "harness": "codex", "title": "Rejected"},
+            key="insert-failure-second",
+        )
+
+        self.assertEqual(status, 500, error)
+        con = self.connect()
+        old = con.execute(
+            "SELECT state,closed_at FROM conversations WHERE conversation_id=?",
+            (first["conversation_id"],),
+        ).fetchone()
+        active_count = con.execute(
+            "SELECT COUNT(*) FROM active_shell_chats WHERE shell_id=1"
+        ).fetchone()[0]
+        replacement_count = con.execute(
+            "SELECT COUNT(*) FROM conversations "
+            "WHERE creation_idempotency_key='insert-failure-second'"
+        ).fetchone()[0]
+        con.close()
+        self.assertEqual(old["state"], "closed")
+        self.assertIsNotNone(old["closed_at"])
+        self.assertEqual(active_count, 0)
+        self.assertEqual(replacement_count, 0)
 
     def test_each_shell_may_keep_one_browser_chat_open(self) -> None:
         first = self.create(key="first-shell-chat", title="Dev")

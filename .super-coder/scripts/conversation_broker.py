@@ -28,6 +28,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+import active_chat_registry
 import conversation_events
 import conversation_git_targets
 import db_driver
@@ -245,6 +246,9 @@ class BrokerStore:
                     "FROM conversation_outbox o "
                     "JOIN conversations c "
                     " ON c.conversation_id=o.conversation_id "
+                    "JOIN active_shell_chats active "
+                    " ON active.shell_id=c.shell_id "
+                    " AND active.chat_id=c.conversation_id "
                     "JOIN conversation_messages m ON m.message_id=o.message_id "
                     "WHERE o.state='pending' AND c.state='queued' "
                     "AND NOT EXISTS ("
@@ -478,6 +482,9 @@ class BrokerStore:
         # Filesystem normalization is external preparation, never writer-lock
         # work. Conversation creation stores an already-resolved absolute path.
         actual_worktree = Path(turn.worktree).resolve()
+        process_pid, process_start_ticks = active_chat_registry.process_identity(
+            turn.process_ref
+        )
         con = self.connect()
         now, expires = self._times()
         try:
@@ -486,7 +493,8 @@ class BrokerStore:
                 "conversation.broker.mark_native_started",
             ):
                 row = con.execute(
-                    "SELECT r.state,r.conversation_id,c.harness_session_ref,"
+                    "SELECT r.state,r.conversation_id,r.shell_id,"
+                    "c.harness_session_ref,"
                     "c.harness,c.worktree "
                     "FROM conversation_runs r JOIN conversations c "
                     "ON c.conversation_id=r.conversation_id WHERE r.run_id=?",
@@ -547,6 +555,13 @@ class BrokerStore:
                     "last_activity_at=?,version=version+1 "
                     "WHERE conversation_id=?",
                     (turn.session_ref, now, row["conversation_id"]),
+                )
+                active_chat_registry.set_process(
+                    con,
+                    shell_id=int(row["shell_id"]),
+                    chat_id=str(row["conversation_id"]),
+                    pid=process_pid,
+                    start_ticks=process_start_ticks,
                 )
         finally:
             con.close()
@@ -737,6 +752,11 @@ class BrokerStore:
                         (error_detail or "")[:16384] or None,
                         run_id,
                     ),
+                )
+                active_chat_registry.clear_process(
+                    con,
+                    shell_id=int(row["shell_id"]),
+                    chat_id=str(row["conversation_id"]),
                 )
                 con.execute(
                     "UPDATE conversation_messages SET state=?,completed_at=? "

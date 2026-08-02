@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -347,6 +348,12 @@ class ConversationBrokerCase(unittest.TestCase):
             "WHERE creation_idempotency_key=?",
             (key,),
         ).fetchone()[0]
+        if state != "closed":
+            con.execute(
+                "INSERT OR REPLACE INTO active_shell_chats (shell_id,chat_id) "
+                "VALUES (?,?)",
+                (shell_id, conversation_id),
+            )
         con.commit()
         con.close()
         return conversation_id
@@ -519,6 +526,101 @@ class StoreContractTest(ConversationBrokerCase):
             )
         finally:
             con.close()
+
+    def test_native_start_registers_process_and_finalize_clears_it(self) -> None:
+        conversation_id = self.add_conversation()
+        self.add_message(conversation_id)
+        store = BrokerStore(self.db_path)
+        run = store.claim_next("broker")
+        store.mark_starting(run.run_id, "broker")
+
+        store.mark_native_started(
+            run.run_id,
+            "broker",
+            NativeTurn(
+                "codex",
+                "native-session",
+                "native-run",
+                self.worktree,
+                process_ref=str(os.getpid()),
+            ),
+        )
+
+        con = self.connect()
+        active = con.execute(
+            "SELECT chat_id,process_pid,process_start_ticks "
+            "FROM active_shell_chats WHERE shell_id=1"
+        ).fetchone()
+        run_state = con.execute(
+            "SELECT state FROM conversation_runs WHERE run_id=?",
+            (run.run_id,),
+        ).fetchone()[0]
+        con.close()
+        self.assertEqual(active["chat_id"], conversation_id)
+        self.assertEqual(active["process_pid"], os.getpid())
+        self.assertGreater(active["process_start_ticks"], 0)
+        self.assertEqual(run_state, "running")
+
+        store.finish_run(
+            run.run_id,
+            "succeeded",
+            event_type="run.completed",
+        )
+
+        con = self.connect()
+        finalized = con.execute(
+            "SELECT r.state,a.process_pid,a.process_start_ticks "
+            "FROM conversation_runs r JOIN active_shell_chats a "
+            "ON a.shell_id=r.shell_id AND a.chat_id=r.conversation_id "
+            "WHERE r.run_id=?",
+            (run.run_id,),
+        ).fetchone()
+        con.close()
+        self.assertEqual(tuple(finalized), ("succeeded", None, None))
+
+    def test_process_registration_failure_rolls_back_run_start(self) -> None:
+        conversation_id = self.add_conversation()
+        self.add_message(conversation_id)
+        store = BrokerStore(self.db_path)
+        run = store.claim_next("broker")
+        store.mark_starting(run.run_id, "broker")
+        con = self.connect()
+        con.executescript(
+            "CREATE TRIGGER reject_process_registration "
+            "BEFORE UPDATE OF process_pid ON active_shell_chats "
+            "WHEN NEW.process_pid IS NOT NULL BEGIN "
+            "SELECT RAISE(ABORT,'process registration rejected'); END;"
+        )
+        con.close()
+
+        with self.assertRaisesRegex(
+            sqlite3.IntegrityError,
+            "process registration rejected",
+        ):
+            store.mark_native_started(
+                run.run_id,
+                "broker",
+                NativeTurn(
+                    "codex",
+                    "native-session",
+                    "native-run",
+                    self.worktree,
+                    process_ref=str(os.getpid()),
+                ),
+            )
+
+        con = self.connect()
+        durable = con.execute(
+            "SELECT r.state,r.harness_session_after,c.harness_session_ref,"
+            "a.process_pid,a.process_start_ticks "
+            "FROM conversation_runs r JOIN conversations c "
+            "ON c.conversation_id=r.conversation_id "
+            "JOIN active_shell_chats a ON a.chat_id=c.conversation_id "
+            "WHERE r.run_id=?",
+            (run.run_id,),
+        ).fetchone()
+        con.close()
+        self.assertEqual(tuple(durable), ("starting", None, None, None, None))
 
     def test_prepared_shell_archive_is_bound_while_the_run_is_leased(self) -> None:
         conversation_id = self.add_conversation()
@@ -789,7 +891,7 @@ class StoreContractTest(ConversationBrokerCase):
         self.assertNotEqual(row["state"], "closed")
         self.assertIsNone(row["closed_at"])
 
-    def test_shell_mutation_lock_blocks_other_conversation(self) -> None:
+    def test_registry_excludes_an_unlinked_legacy_conversation(self) -> None:
         self.allow_legacy_duplicate_open_chats()
         first_conversation = self.add_conversation(shell_id=1)
         second_conversation = self.add_conversation(shell_id=1)
@@ -799,6 +901,7 @@ class StoreContractTest(ConversationBrokerCase):
 
         first = store.claim_next("broker")
         self.assertIsNotNone(first)
+        self.assertEqual(first.conversation_id, second_conversation)
         self.assertIsNone(store.claim_next("broker"))
         store.finish_run(
             first.run_id,
@@ -806,9 +909,17 @@ class StoreContractTest(ConversationBrokerCase):
             event_type="run.failed",
             error_code="TEST",
         )
-        second = store.claim_next("broker")
-        self.assertIsNotNone(second)
-        self.assertEqual(second.conversation_id, second_conversation)
+        self.assertIsNone(store.claim_next("broker"))
+        con = self.connect()
+        self.assertEqual(
+            con.execute(
+                "SELECT state FROM conversation_messages "
+                "WHERE conversation_id=?",
+                (first_conversation,),
+            ).fetchone()[0],
+            "queued",
+        )
+        con.close()
 
     def test_different_shells_can_hold_live_runs(self) -> None:
         first_conversation = self.add_conversation(shell_id=1)
