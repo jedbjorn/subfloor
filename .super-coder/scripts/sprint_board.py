@@ -60,6 +60,8 @@ _EVENT_FIELDS = {
             "anomalies",
         }
     ),
+    "coordinate_mode.enabled": frozenset({"conversation_id", "reason"}),
+    "coordinate_mode.cleared": frozenset({"reason"}),
     "pause.interrupt_delivery_failed": frozenset({"run_id"}),
     "work_unit.created": frozenset(
         {

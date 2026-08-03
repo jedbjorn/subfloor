@@ -36,6 +36,7 @@ def emitted_sprint_event_types() -> set[str]:
     emitted = set()
     emitter_paths = [
         *(ENGINE / "scripts").glob("sprint_*.py"),
+        ENGINE / "api" / "conversation_routes.py",
         ENGINE / "api" / "server.py",
     ]
     for path in sorted(emitter_paths):

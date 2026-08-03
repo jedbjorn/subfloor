@@ -748,11 +748,13 @@ class BrokerStore:
                     if pending
                     else "idle"
                 )
-                require_transition(
-                    "conversation",
-                    row["conversation_state"],
-                    conversation_target,
-                )
+                already_closed = row["conversation_state"] == "closed"
+                if not already_closed:
+                    require_transition(
+                        "conversation",
+                        row["conversation_state"],
+                        conversation_target,
+                    )
                 con.execute(
                     "UPDATE conversation_runs SET state=?,ended_at=?,"
                     "exit_code=?,error_code=?,error_detail=? WHERE run_id=?",
@@ -775,11 +777,12 @@ class BrokerStore:
                     "WHERE message_id=?",
                     (message_state, now, row["trigger_message_id"]),
                 )
-                con.execute(
-                    "UPDATE conversations SET state=?,last_activity_at=?,"
-                    "version=version+1 WHERE conversation_id=?",
-                    (conversation_target, now, row["conversation_id"]),
-                )
+                if not already_closed:
+                    con.execute(
+                        "UPDATE conversations SET state=?,last_activity_at=?,"
+                        "version=version+1 WHERE conversation_id=?",
+                        (conversation_target, now, row["conversation_id"]),
+                    )
                 terminal_payload = dict(payload or {})
                 terminal_payload.setdefault("outcome", outcome)
                 self._append_event(
@@ -790,7 +793,7 @@ class BrokerStore:
                     message_id=row["trigger_message_id"],
                     run_id=run_id,
                 )
-                if close_after:
+                if close_after and not already_closed:
                     require_transition(
                         "conversation",
                         conversation_target,

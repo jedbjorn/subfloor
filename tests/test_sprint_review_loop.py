@@ -152,7 +152,8 @@ class ReviewHandoffTest(SprintReviewLoopCase):
         self.assertEqual("in_review", unit["disposition"])
         message = self.con.execute(
             "SELECT from_participant_id,to_participant_id,message_kind,body,"
-            "actionable,disposition FROM wake_message WHERE message_id=?",
+            "declared_type,actionable,disposition FROM wake_message "
+            "WHERE message_id=?",
             (handoff.message_id,),
         ).fetchone()
         self.assertEqual(
@@ -161,6 +162,7 @@ class ReviewHandoffTest(SprintReviewLoopCase):
                 self.reviewer_id,
                 "review_request",
                 "Focused and full gates are green; ready for review.",
+                "new",
                 1,
                 "pending",
             ),
@@ -407,6 +409,13 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
             verdict="changes_requested",
             body="Medium: preserve the exact reviewed head.",
             idempotency_key="changes-1",
+        )
+        self.assertEqual(
+            "re-enter",
+            self.con.execute(
+                "SELECT declared_type FROM wake_message WHERE message_id=?",
+                (changed.message_id,),
+            ).fetchone()[0],
         )
         self.assertEqual("fixing", changed.disposition)
         self.assertIsNone(changed.conversation_id)

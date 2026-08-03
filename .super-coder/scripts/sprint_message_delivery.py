@@ -759,7 +759,10 @@ class SprintWakeDeliveryService:
 
             messages = self.con.execute(
                 "SELECT m.message_id,m.sprint_id,m.to_participant_id,"
-                "m.declared_type,m.body,s.lifecycle,p.role "
+                "CASE WHEN m.declared_type='re-enter' AND p.role='planner' "
+                "AND s.lifecycle='armed' AND s.coordinate_mode=1 "
+                "THEN 'new' ELSE m.declared_type END AS declared_type,"
+                "m.body,s.lifecycle,p.role "
                 "FROM wake_message m LEFT JOIN sprints s "
                 "ON s.sprint_id=m.sprint_id LEFT JOIN sprint_participants p "
                 "ON p.sprint_id=m.sprint_id "

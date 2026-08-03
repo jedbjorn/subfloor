@@ -313,7 +313,8 @@ class AcceptanceAndDeclineTest(SprintMessageCase):
         planner_results = [
             tuple(row)
             for row in self.con.execute(
-                "SELECT message_id,to_participant_id,body FROM wake_message "
+                "SELECT message_id,to_participant_id,body,declared_type "
+                "FROM wake_message "
                 "WHERE message_id IN (?,?) ORDER BY message_id",
                 (assignment_result, review_result),
             )
@@ -325,6 +326,10 @@ class AcceptanceAndDeclineTest(SprintMessageCase):
         )
         self.assertIn("wrong editing lane", planner_results[0][2])
         self.assertIn("review capacity unavailable", planner_results[1][2])
+        self.assertEqual(
+            ["re-enter", "re-enter"],
+            [row[3] for row in planner_results],
+        )
         self.assertEqual(
             1,
             self.con.execute(
