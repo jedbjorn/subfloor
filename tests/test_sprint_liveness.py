@@ -152,9 +152,22 @@ class SprintLivenessCase(unittest.TestCase):
             ).fetchone()[0]
         )
         self.messages = sprint_message_delivery.SprintMessageStore(self.con)
-        delivered = sprint_message_delivery.SprintWakeDeliveryService(
+        delivery_service = sprint_message_delivery.SprintWakeDeliveryService(
             self.con
-        ).deliver_once(
+        )
+        planner_delivery = delivery_service.deliver_once(
+            "liveness-planner-setup",
+            lambda _conversation, _prompt, _key: "liveness-planner-run",
+        )
+        self.assertNotEqual(wake_id, planner_delivery.wake_id)
+        arming_message_id = int(
+            self.con.execute(
+                "SELECT message_id FROM wake_message WHERE idempotency_key=?",
+                (f"sprint:{self.sprint_id}:arming-model-selections",),
+            ).fetchone()[0]
+        )
+        self.assertIsNone(self.messages.mark_read(arming_message_id, 3))
+        delivered = delivery_service.deliver_once(
             "liveness-setup",
             lambda _conversation, _prompt, _key: "liveness-setup-run",
         )
@@ -612,7 +625,8 @@ class DeliveryAndActivationTest(SprintLivenessCase):
             "FROM sprint_participants WHERE participant_id=?",
             (self.planner_id,),
         ).fetchone()
-        self.assertEqual((None, None), tuple(planner))
+        self.assertIsNotNone(planner[0])
+        self.assertEqual(planner[0], planner[1])
         fallbacks = self.con.execute(
             "SELECT link.purpose,c.harness FROM sprint_participant_conversations link "
             "JOIN conversations c ON c.conversation_id=link.conversation_id "

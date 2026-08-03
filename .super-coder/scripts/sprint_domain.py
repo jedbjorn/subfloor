@@ -255,23 +255,31 @@ class SprintLifecycleStore:
                 )
             self._require_edge(sprint["lifecycle"], "armed")
             self._authorize(sprint, "armed", actor)
-            planner_participant = self._validate_arm_plan(sprint)
+            planner_participant, selections = self._validate_arm_plan(sprint)
             self._update_lifecycle(
                 sprint_id,
                 current="prepared",
                 target="armed",
                 outcome=None,
             )
-            wake_ids = self._release_initial_work(
+            planner_wake_id = self._queue_arming_planner_wake(
+                sprint_id,
+                planner_participant_id=planner_participant,
+                selections=selections,
+            )
+            work_wake_ids = self._release_initial_work(
                 sprint_id,
                 planner_participant_id=planner_participant,
             )
+            wake_ids = [*work_wake_ids, planner_wake_id]
             self._event(
                 sprint_id,
                 "lifecycle.armed",
                 actor,
                 {
                     "initial_wake_ids": wake_ids,
+                    "planner_wake_id": planner_wake_id,
+                    "work_wake_ids": work_wake_ids,
                 },
             )
         return wake_ids
@@ -1805,7 +1813,10 @@ class SprintLifecycleStore:
                     "only an assigned participant may pause this Sprint"
                 )
 
-    def _validate_arm_plan(self, sprint: sqlite3.Row) -> int:
+    def _validate_arm_plan(
+        self,
+        sprint: sqlite3.Row,
+    ) -> tuple[int, list[sqlite3.Row]]:
         sprint_id = int(sprint["sprint_id"])
         if int(sprint["merge_grant_enabled"]) != 1:
             raise SprintInvariantError("arming requires a committed merge grant")
@@ -1886,7 +1897,59 @@ class SprintLifecycleStore:
             raise SprintInvariantError(
                 "arming requires routed work units with assigned reviewers"
             )
-        return int(planner[0])
+        selections = self.con.execute(
+            "SELECT p.participant_id,p.role,p.harness,p.model,p.effort,"
+            "sh.shortname FROM sprint_participants p "
+            "JOIN shells sh ON sh.shell_id=p.shell_id "
+            "WHERE p.sprint_id=? ORDER BY "
+            "CASE p.role WHEN 'planner' THEN 0 WHEN 'developer' THEN 1 ELSE 2 END,"
+            "p.participant_id",
+            (sprint_id,),
+        ).fetchall()
+        invalid_selections = [
+            row
+            for row in selections
+            if not str(row["harness"]).strip()
+            or (row["model"] is not None and not str(row["model"]).strip())
+            or (row["effort"] is not None and not str(row["effort"]).strip())
+        ]
+        if invalid_selections:
+            raise SprintInvariantError(
+                "arming requires recorded model selections for every participant"
+            )
+        return int(planner[0]), selections
+
+    def _queue_arming_planner_wake(
+        self,
+        sprint_id: int,
+        *,
+        planner_participant_id: int,
+        selections: list[sqlite3.Row],
+    ) -> int:
+        lines = [
+            f"Sprint {sprint_id} armed. Recorded participant launch selections:"
+        ]
+        for selection in selections:
+            model = selection["model"] or "default"
+            effort = selection["effort"] or "default"
+            lines.append(
+                f"- {selection['role']} {selection['shortname']}: "
+                f"{selection['harness']} · model={model} · effort={effort}"
+            )
+        from sprint_message_delivery import SprintMessageStore
+
+        receipt = SprintMessageStore(self.con).send_in_transaction(
+            sprint_id,
+            to_participant_id=planner_participant_id,
+            message_kind="notification",
+            body="\n".join(lines),
+            actionable=False,
+            declared_type="new",
+            idempotency_key=f"sprint:{sprint_id}:arming-model-selections",
+        )
+        if receipt.wake_id is None:
+            raise SprintInvariantError("Planner arming message has no wake")
+        return receipt.wake_id
 
     def _release_initial_work(
         self,

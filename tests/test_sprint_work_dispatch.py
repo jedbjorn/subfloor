@@ -178,7 +178,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
 
         wake_ids = self.lifecycle.arm(self.sprint_id, 3)
 
-        self.assertEqual(2, len(wake_ids))
+        self.assertEqual(3, len(wake_ids))
         self.assertEqual(
             [(late_wave, "ready"), (early_wave, "ready")],
             self.dispositions(),
@@ -203,6 +203,83 @@ class DispatchGateTest(SprintWorkDispatchCase):
                     "WHERE message_kind='work_assignment' ORDER BY message_id"
                 )
             ],
+        )
+        planner_wake = self.con.execute(
+            "SELECT receiver_shell_id,message_kind,body,declared_type,actionable "
+            "FROM wake_message WHERE receiver_shell_id=3 "
+            "AND message_kind='notification'"
+        ).fetchone()
+        self.assertEqual(
+            (3, "notification", "new", 0),
+            (
+                planner_wake["receiver_shell_id"],
+                planner_wake["message_kind"],
+                planner_wake["declared_type"],
+                planner_wake["actionable"],
+            ),
+        )
+        self.assertEqual(
+            "Sprint 1 armed. Recorded participant launch selections:\n"
+            "- planner PLN1: codex · model=default · effort=default\n"
+            "- developer DEV1: codex · model=default · effort=default\n"
+            "- developer DEV2: codex · model=default · effort=default\n"
+            "- reviewer REV1: kimi · model=default · effort=default\n"
+            "- reviewer REV2: kimi · model=default · effort=default",
+            planner_wake["body"],
+        )
+
+    def test_arm_rejects_blank_model_selection_before_any_dispatch(self) -> None:
+        self.create_unit(developer=1)
+        self.con.execute(
+            "UPDATE sprint_participants SET model='' "
+            "WHERE sprint_id=? AND role='planner'",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "recorded model selections",
+        ):
+            self.lifecycle.arm(self.sprint_id, 3)
+
+        self.assertEqual(
+            ("prepared", 0, [(1, "planned")]),
+            (
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0],
+                self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
+                self.dispositions(),
+            ),
+        )
+
+    def test_arm_rejects_blank_effort_selection_before_any_dispatch(self) -> None:
+        self.create_unit(developer=1)
+        self.con.execute(
+            "UPDATE sprint_participants SET effort='  ' "
+            "WHERE sprint_id=? AND role='reviewer'",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "recorded model selections",
+        ):
+            self.lifecycle.arm(self.sprint_id, 3)
+
+        self.assertEqual(
+            ("prepared", 0, [(1, "planned")]),
+            (
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0],
+                self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
+                self.dispositions(),
+            ),
         )
 
     def test_dependencies_block_and_each_developer_gets_one_editing_lane(self) -> None:
@@ -593,12 +670,17 @@ class ProductionPulseTest(SprintWorkDispatchCase):
 
         first_conversation = self.conversation_for(1)
         second_conversation = self.conversation_for(4)
+        planner_conversation = self.conversation_for(3)
         self.assertEqual(
             [(first, "ready"), (second, "ready")],
             self.dispositions(),
         )
         self.assertEqual(
-            {first_conversation: 1, second_conversation: 1},
+            {
+                first_conversation: 1,
+                second_conversation: 1,
+                planner_conversation: 1,
+            },
             {
                 str(row[0]): int(row[1])
                 for row in self.con.execute(
@@ -608,7 +690,7 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             },
         )
         self.assertEqual(
-            [("delivered", 1), ("delivered", 1)],
+            [("delivered", 1), ("delivered", 1), ("delivered", 1)],
             [
                 tuple(row)
                 for row in self.con.execute(

@@ -470,10 +470,10 @@ class LifecycleTest(SprintDomainCase):
             "AND event_type='lifecycle.armed'",
             (sprint_id,),
         ).fetchone()
-        self.assertEqual(
-            1,
-            len(json.loads(event["payload"])["initial_wake_ids"]),
-        )
+        payload = json.loads(event["payload"])
+        self.assertEqual(2, len(payload["initial_wake_ids"]))
+        self.assertEqual(1, len(payload["work_wake_ids"]))
+        self.assertIn(payload["planner_wake_id"], payload["initial_wake_ids"])
 
         self.con.execute(
             "INSERT INTO conversations "
@@ -568,7 +568,7 @@ class LifecycleTest(SprintDomainCase):
 
         wake_ids = self.store.arm(sprint_id, 3)
 
-        self.assertEqual(1, len(wake_ids))
+        self.assertEqual(2, len(wake_ids))
         self.assertEqual(
             "armed",
             self.con.execute(
@@ -652,7 +652,7 @@ class LifecycleTest(SprintDomainCase):
 
         wake_ids = self.store.arm(sprint_id, 3)
 
-        self.assertEqual(1, len(wake_ids))
+        self.assertEqual(2, len(wake_ids))
         self.assertEqual(
             ("armed", 2),
             tuple(
@@ -675,7 +675,8 @@ class LifecycleTest(SprintDomainCase):
         )
         message = self.con.execute(
             "SELECT work_unit_id,message_kind,actionable,disposition,body "
-            "FROM wake_message WHERE sprint_id=?",
+            "FROM wake_message WHERE sprint_id=? "
+            "AND message_kind='work_assignment'",
             (sprint_id,),
         ).fetchone()
         self.assertEqual(first_unit, message["work_unit_id"])
@@ -739,7 +740,7 @@ class LifecycleTest(SprintDomainCase):
 
         wake_ids = self.store.arm(sprint_id, 3)
 
-        self.assertEqual(1, len(wake_ids))
+        self.assertEqual(2, len(wake_ids))
         self.assertEqual(
             [(first_unit,)],
             [

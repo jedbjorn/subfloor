@@ -376,7 +376,7 @@ class SprintCliApiTest(unittest.TestCase):
             str(task_id),
         )
         armed = self.run_cli(TOKENS["planner"], "arm", "--sprint", str(sprint_id))
-        self.assertEqual(1, len(armed["wake_ids"]))
+        self.assertEqual(2, len(armed["wake_ids"]))
 
         with mock.patch.object(
             server.sprint_pr_watcher,
@@ -494,10 +494,13 @@ class SprintCliApiTest(unittest.TestCase):
             wake = con.execute(
                 "SELECT wm.message_id,w.state FROM sprint_wake_outbox w "
                 "JOIN sprint_wake_messages wm ON wm.wake_id=w.wake_id "
-                "WHERE w.wake_id=?",
+                "WHERE w.wake_id=? ORDER BY wm.message_id",
                 (response["wake_id"],),
-            ).fetchone()
-            self.assertEqual((response["message_id"], "pending"), wake)
+            ).fetchall()
+            self.assertEqual(
+                [(1, "pending"), (response["message_id"], "pending")],
+                wake,
+            )
             current = con.execute(
                 "SELECT current_conversation_id FROM sprint_participants "
                 "WHERE participant_id=1",
@@ -872,7 +875,7 @@ class SprintCliApiTest(unittest.TestCase):
             str(task_id),
         )["work_unit_id"]
         armed = self.run_cli(TOKENS["admin"], "arm", "--sprint", str(sprint_id))
-        self.assertEqual(1, len(armed["wake_ids"]))
+        self.assertEqual(2, len(armed["wake_ids"]))
         aborted = self.run_cli(
             TOKENS["admin"],
             "abort",
