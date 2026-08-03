@@ -982,8 +982,9 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             "`sprint_dev`. Run `sc sprint inbox --sprint "
             f"{self.sprint_id}` now and act on the Sprint message(s) using "
             "`sprint_dev`. Confirm every Sprint write succeeds before stopping. "
-            "If the handoff is not complete, load `sprint_dev` again and run `sc "
-            f"sprint inbox --sprint {self.sprint_id}` again.\n\n"
+            "If a Sprint command failed or did not confirm its durable write, retry "
+            "that command. Do not re-check the inbox otherwise — new messages arrive "
+            "as their own wakes.\n\n"
             f"## wake_message #{wake_message_id} (declared New)\n\n"
             "Unit 1\n\nOutput 1"
         )

@@ -23,6 +23,7 @@ from sprint_message_delivery import SprintMessageStore
 EVALUATION_INTERVAL = timedelta(minutes=5)
 GRACE_WINDOW = timedelta(minutes=10)
 ESCALATION_WINDOW = timedelta(minutes=10)
+CI_STALLED_BACKSTOP = timedelta(minutes=90)
 
 _NATIVE_EVIDENCE_EVENTS = (
     "session.started",
@@ -83,6 +84,7 @@ class EvidenceSnapshot:
     strong: Evidence | None
     supporting: tuple[Evidence, ...]
     failure: Evidence | None
+    suppressors: tuple[Evidence, ...]
     unreadable: tuple[str, ...]
 
 
@@ -179,10 +181,15 @@ class SprintEvidenceCollector:
             unreadable.append(quota.unreadable)
 
         failure = max(failures, key=lambda item: item.observed_at, default=None)
+        last_strong_at = _parse(expectation["last_strong_at"])
+        if strong is not None:
+            last_strong_at = max(last_strong_at, strong.observed_at)
+        suppressors = self._suppressors(participant_id, last_strong_at)
         return EvidenceSnapshot(
             strong=strong,
             supporting=tuple(sorted(supporting, key=lambda item: item.key)),
             failure=failure,
+            suppressors=suppressors,
             unreadable=tuple(sorted(set(unreadable))),
         )
 
@@ -310,23 +317,6 @@ class SprintEvidenceCollector:
                 )
             )
 
-        row = self.con.execute(
-            "SELECT message_id,message_kind,created_at FROM wake_message "
-            "WHERE from_participant_id=? AND created_at>=? "
-            "ORDER BY created_at DESC,message_id DESC LIMIT 1",
-            (participant_id, threshold),
-        ).fetchone()
-        if row is not None:
-            candidates.append(
-                Evidence(
-                    f"sprint.message:{row['message_id']}",
-                    f"sprint_message.{row['message_kind']}",
-                    _parse(row["created_at"]),
-                    "strong",
-                    "durable Sprint message authored by the participant",
-                )
-            )
-
         participant = self.con.execute(
             "SELECT sprint_id,shell_id FROM sprint_participants WHERE participant_id=?",
             (participant_id,),
@@ -369,6 +359,56 @@ class SprintEvidenceCollector:
             )
 
         return max(candidates, key=lambda item: (item.observed_at, item.key), default=None)
+
+    def _suppressors(
+        self, participant_id: int, last_strong_at: datetime
+    ) -> tuple[Evidence, ...]:
+        suppressors: list[Evidence] = []
+        rows = self.con.execute(
+            "SELECT pr.registered_pr_id,pr.repository,pr.pr_number,"
+            "t.normalized_state,t.transition_key,t.observed_at "
+            "FROM sprint_registered_prs pr JOIN sprint_pr_transitions t "
+            "ON t.registered_pr_id=pr.registered_pr_id "
+            "WHERE pr.owner_participant_id=? "
+            "AND t.transition_id=(SELECT latest.transition_id "
+            "FROM sprint_pr_transitions latest "
+            "WHERE latest.registered_pr_id=pr.registered_pr_id "
+            "ORDER BY latest.transition_id DESC LIMIT 1) "
+            "AND t.normalized_state IN ('created','pending') "
+            "ORDER BY pr.registered_pr_id",
+            (participant_id,),
+        ).fetchall()
+        for row in rows:
+            suppressors.append(
+                Evidence(
+                    f"pr.transition:{row['transition_key']}",
+                    "pr.awaiting_transition",
+                    _parse(row["observed_at"]),
+                    "suppressor",
+                    (
+                        f"{row['repository']}#{row['pr_number']} is "
+                        f"{row['normalized_state']}"
+                    ),
+                )
+            )
+
+        row = self.con.execute(
+            "SELECT message_id,message_kind,created_at FROM wake_message "
+            "WHERE from_participant_id=? AND created_at>? "
+            "ORDER BY created_at DESC,message_id DESC LIMIT 1",
+            (participant_id, _stamp(last_strong_at)),
+        ).fetchone()
+        if row is not None:
+            suppressors.append(
+                Evidence(
+                    f"sprint.message:{row['message_id']}",
+                    "outbound.handoff",
+                    _parse(row["created_at"]),
+                    "suppressor",
+                    f"durable outbound {row['message_kind']} awaits a reply wake",
+                )
+            )
+        return tuple(sorted(suppressors, key=lambda item: item.key))
 
     def _terminal_failures(
         self, participant_id: int, accepted_at: datetime
@@ -604,6 +644,19 @@ class SprintLivenessMonitor:
             fresh_strong = self._fresh_strong(row, snapshot.strong)
             failure = snapshot.failure
 
+            current_failure = failure is None or not (
+                fresh_strong is not None
+                and fresh_strong.observed_at > failure.observed_at
+            )
+            if failure is not None and current_failure and (
+                failure.observed_at >= last_strong_at
+                or failure.kind in {"quota.exhausted", "process.missing"}
+            ) and (
+                    row["escalated_at"] is None
+                    or failure.key != row["last_failure_key"]
+            ):
+                return self._escalate(row, episode, snapshot, now, failure=failure)
+
             if fresh_strong is not None and (
                 failure is None or fresh_strong.observed_at > failure.observed_at
             ):
@@ -627,15 +680,6 @@ class SprintLivenessMonitor:
                 )
                 return EvaluationOutcome(message_id, "strong-evidence", episode)
 
-            if failure is not None and (
-                failure.observed_at >= last_strong_at
-                or failure.kind in {"quota.exhausted", "process.missing"}
-            ) and (
-                    row["escalated_at"] is None
-                    or failure.key != row["last_failure_key"]
-            ):
-                return self._escalate(row, episode, snapshot, now, failure=failure)
-
             if row["escalated_at"] is not None:
                 self._update_observation(
                     message_id,
@@ -645,6 +689,38 @@ class SprintLivenessMonitor:
                 )
                 action = "supporting-evidence" if snapshot.supporting else "observed"
                 return EvaluationOutcome(message_id, action, episode)
+
+            if snapshot.suppressors:
+                self._send_ci_stalled_backstops(row, snapshot.suppressors, now)
+                suppressor = max(
+                    snapshot.suppressors,
+                    key=lambda item: (item.observed_at, item.key),
+                )
+                event_exists = self.con.execute(
+                    "SELECT 1 FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='liveness.sanctioned_quiet' "
+                    "AND json_extract(payload,'$.expectation_message_id')=? "
+                    "AND json_extract(payload,'$.silence_episode')=? LIMIT 1",
+                    (int(row["sprint_id"]), message_id, episode),
+                ).fetchone()
+                if event_exists is None:
+                    self._event(
+                        int(row["sprint_id"]),
+                        "liveness.sanctioned_quiet",
+                        {
+                            "expectation_message_id": message_id,
+                            "silence_episode": episode,
+                            "suppressor_kind": suppressor.kind,
+                            "evidence_key": suppressor.key,
+                        },
+                    )
+                self._update_observation(
+                    message_id,
+                    now,
+                    snapshot,
+                    failure_key=failure.key if failure else None,
+                )
+                return EvaluationOutcome(message_id, "sanctioned-quiet", episode)
 
             accepted_silence = now - last_strong_at
             if row["nudge_at"] is None and accepted_silence >= GRACE_WINDOW:
@@ -697,6 +773,82 @@ class SprintLivenessMonitor:
             )
             action = "supporting-evidence" if snapshot.supporting else "observed"
             return EvaluationOutcome(message_id, action, episode)
+
+    def _send_ci_stalled_backstops(
+        self,
+        expectation: sqlite3.Row,
+        suppressors: tuple[Evidence, ...],
+        now: datetime,
+    ) -> None:
+        for suppressor in suppressors:
+            if suppressor.kind != "pr.awaiting_transition":
+                continue
+            if now - suppressor.observed_at < CI_STALLED_BACKSTOP:
+                continue
+            transition_key = suppressor.key.removeprefix("pr.transition:")
+            idempotency_key = f"liveness:ci-stalled:{transition_key}:planner"
+            if self.con.execute(
+                "SELECT 1 FROM wake_message WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone() is not None:
+                continue
+            pending = self.con.execute(
+                "SELECT pr.registered_pr_id,pr.repository,pr.pr_number,"
+                "t.normalized_state,t.transition_key,t.observed_head_sha,t.observed_at "
+                "FROM sprint_pr_transitions t JOIN sprint_registered_prs pr "
+                "ON pr.registered_pr_id=t.registered_pr_id "
+                "WHERE t.transition_key=? AND pr.sprint_id=?",
+                (transition_key, int(expectation["sprint_id"])),
+            ).fetchone()
+            if pending is None:
+                continue
+            planner_id, route = self.router.prepare(
+                int(expectation["sprint_id"]),
+                now=now,
+                reason=f"CI-stalled backstop for {pending['repository']}#{pending['pr_number']}",
+            )
+            pending_minutes = int(
+                (now - _parse(pending["observed_at"])).total_seconds() // 60
+            )
+            receipt = self.messages.send_in_transaction(
+                int(expectation["sprint_id"]),
+                to_participant_id=planner_id,
+                message_kind="escalation",
+                body=_json(
+                    {
+                        "kind": "ci_stalled",
+                        "registered_pr_id": int(pending["registered_pr_id"]),
+                        "repository": str(pending["repository"]),
+                        "pr_number": int(pending["pr_number"]),
+                        "head_sha": pending["observed_head_sha"],
+                        "normalized_state": str(pending["normalized_state"]),
+                        "transition_key": str(pending["transition_key"]),
+                        "pending_since": str(pending["observed_at"]),
+                        "pending_minutes": pending_minutes,
+                        "mandate": (
+                            "Assess the stalled CI transition and attempt repair "
+                            "by re-triggering checks, closing/reopening, or re-pushing. "
+                            "Pause the Sprint if the runner is genuinely down."
+                        ),
+                        "planner_delivery_route": route,
+                        "pause_option": True,
+                    }
+                ),
+                idempotency_key=idempotency_key,
+                actionable=False,
+                declared_type="re-enter",
+            )
+            if receipt.created:
+                self._event(
+                    int(expectation["sprint_id"]),
+                    "liveness.ci_stalled",
+                    {
+                        "expectation_message_id": int(expectation["message_id"]),
+                        "registered_pr_id": int(pending["registered_pr_id"]),
+                        "transition_key": transition_key,
+                        "backstop_message_id": receipt.message_id,
+                    },
+                )
 
     def _escalate(
         self,

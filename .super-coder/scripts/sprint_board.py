@@ -121,6 +121,22 @@ _EVENT_FIELDS = {
     "liveness.nudged": frozenset(
         {"expectation_message_id", "silence_episode", "nudge_message_id"}
     ),
+    "liveness.sanctioned_quiet": frozenset(
+        {
+            "expectation_message_id",
+            "silence_episode",
+            "suppressor_kind",
+            "evidence_key",
+        }
+    ),
+    "liveness.ci_stalled": frozenset(
+        {
+            "expectation_message_id",
+            "registered_pr_id",
+            "transition_key",
+            "backstop_message_id",
+        }
+    ),
     "liveness.escalated": frozenset(
         {
             "expectation_message_id",

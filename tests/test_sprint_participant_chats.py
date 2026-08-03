@@ -164,6 +164,31 @@ def create_wake(
     return conversation_id
 
 
+@pytest.mark.parametrize(
+    ("role", "label", "skill"),
+    (
+        ("developer", "Developer", "sprint_dev"),
+        ("reviewer", "Reviewer", "sprint_rev"),
+        ("planner", "Originating Planner", "sprint_pln"),
+    ),
+)
+def test_wake_prompt_retries_only_unconfirmed_sprint_writes(
+    role: str, label: str, skill: str
+) -> None:
+    prompt = sprint_participant_chats.wake_prompt(23, role)
+
+    assert f"Sprint 23 handoff for your {label} role. Load `{skill}`." in prompt
+    assert "If the handoff is not complete" not in prompt
+    assert "run `sc sprint inbox --sprint 23` again" not in prompt
+    assert (
+        "If a Sprint command failed or did not confirm its durable write, "
+        "retry that command."
+    ) in prompt
+    assert (
+        "Do not re-check the inbox otherwise — new messages arrive as their own wakes."
+    ) in prompt
+
+
 def test_wake_creation_registers_one_chat_and_flat_history() -> None:
     with substrate() as con:
         conversation_id = create_wake(con, wake_id=41)

@@ -233,12 +233,14 @@ class SprintSkillTest(unittest.TestCase):
 
     def test_closeout_reseed_converges_dirty_rows_and_replays_idempotently(self):
         con = sqlite3.connect(":memory:")
+        reference = sqlite3.connect(":memory:")
         try:
-            con.executescript((ENGINE / "schema.sql").read_text())
-            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
-                if migration.name >= "0171_reseed_sprint_closeout_skills.sql":
-                    break
-                con.executescript(migration.read_text())
+            for target in (con, reference):
+                target.executescript((ENGINE / "schema.sql").read_text())
+                for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                    if migration.name >= "0171_reseed_sprint_closeout_skills.sql":
+                        break
+                    target.executescript(migration.read_text())
             placeholders = ",".join("?" for _ in CLOSEOUT_ROLE_SKILLS)
             con.execute(
                 f"UPDATE skills SET content='stale pre-0171 closeout guidance', "
@@ -251,29 +253,67 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            reference.executescript(migration)
 
             for name in sorted(CLOSEOUT_ROLE_SKILLS):
                 with self.subTest(name=name):
-                    expected = seed_skills.parse_skill(
-                        ASSETS / name / "SKILL.md"
-                    )
                     rows = con.execute(
                         "SELECT description,category,command,common,content,is_deleted "
                         "FROM skills WHERE name=?",
                         (name,),
                     ).fetchall()
+                    expected = reference.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchone()
                     self.assertEqual(len(rows), 1)
-                    self.assertEqual(
-                        tuple(rows[0]),
-                        (
-                            expected["description"],
-                            expected["category"],
-                            expected["command"],
-                            expected["common"],
-                            expected["content"],
-                            0,
-                        ),
-                    )
+                    self.assertEqual(tuple(rows[0]), tuple(expected))
+        finally:
+            con.close()
+            reference.close()
+
+    def test_sanctioned_pause_reseed_converges_developer_guidance(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0172_sanctioned_pause_liveness.sql":
+                    break
+                con.executescript(migration.read_text())
+            con.execute(
+                "UPDATE skills SET content='stale pre-0172 guidance',is_deleted=1 "
+                "WHERE name='sprint_dev'"
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0172_sanctioned_pause_liveness.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            expected = seed_skills.parse_skill(
+                ASSETS / "sprint_dev" / "SKILL.md"
+            )
+            actual = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='sprint_dev'"
+            ).fetchone()
+            self.assertEqual(
+                tuple(actual),
+                (
+                    expected["description"],
+                    expected["category"],
+                    expected["command"],
+                    expected["common"],
+                    expected["content"],
+                    0,
+                ),
+            )
+            self.assertIn("This is a once-only\npre-handoff check", actual[4])
+            self.assertIn(
+                "paused awaiting a native PR-fact or verdict\nwake", actual[4]
+            )
         finally:
             con.close()
 

@@ -3939,6 +3939,12 @@ failure paths. A local exploratory number is not merge evidence. Record real CI
 failures, anomalous infrastructure failures, retries, review friction, and
 known departures for the final report.
 
+Immediately before a typed Developer handoff (`complete-unit`, `register-pr`,
+or `request-review`), re-run `sc sprint inbox --sprint <id>` once and act on
+anything new; a ruling may have arrived during the build. This is a once-only
+pre-handoff check. After the handoff confirms its durable write, stop without a
+further inbox pass.
+
 An explicitly planned report-only or no-code lane completes with its durable
 result instead of a PR. Code lanes cannot use this path; they complete only
 after merge authorization and observation.
@@ -3975,8 +3981,8 @@ registered PR.
 Complete a review handoff in this exact order:
 
 1. Finish the readiness claim and every local verification step.
-2. Re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and
-   mark every handled informational message read with `accept`.
+2. Perform the once-only typed-handoff inbox check above, act on newly arrived
+   messages, and mark every handled informational message read with `accept`.
 3. Run `wc -m < <path>`; keep the claim near 6,000 characters and below the
    8,000-character hard maximum.
 4. As the literal final action of the turn, send the typed handoff with one
@@ -4044,7 +4050,8 @@ the Reviewer decides whether to continue, re-plan, or pause and the Planner
 executes that decision.
 
 Stop when the unit is merged and reported, declined, awaiting Planner/FnB
-recovery, or returned to review. For normal review and merge handoffs, the
+recovery, returned to review, or paused awaiting a native PR-fact or verdict
+wake. For normal review and merge handoffs, the
 ordered procedures above place inbox handling before the typed handoff and make
 that handoff the turn''s last action. Ask the Planner for later work only after
 the current editing lane is terminal.',
