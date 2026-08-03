@@ -16,9 +16,9 @@ ENGINE = ROOT / ".super-coder"
 MIGRATIONS = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
-import sprint_domain  # noqa: E402
-import sprint_liveness  # noqa: E402
-import sprint_message_delivery  # noqa: E402
+import sprint_domain
+import sprint_liveness
+import sprint_message_delivery
 
 
 def apply_schema(con: sqlite3.Connection) -> None:
@@ -212,7 +212,13 @@ class SprintLivenessCase(unittest.TestCase):
             (kind,),
         ).fetchall()
 
-    def add_native_event(self, event_type: str, minutes: int) -> int:
+    def add_native_event(
+        self,
+        event_type: str,
+        minutes: int,
+        *,
+        run_id: int | None = None,
+    ) -> int:
         conversation_id = self.con.execute(
             "SELECT active.chat_id FROM sprint_participants participant "
             "JOIN active_shell_chats active ON active.shell_id=participant.shell_id "
@@ -229,18 +235,60 @@ class SprintLivenessCase(unittest.TestCase):
         event_id = int(
             self.con.execute(
                 "INSERT INTO conversation_events "
-                "(conversation_id,sequence,event_type,payload,created_at) "
-                "VALUES (?,?,?,'{}',?)",
+                "(conversation_id,sequence,event_type,payload,run_id,created_at) "
+                "VALUES (?,?,?,'{}',?,?)",
                 (
                     conversation_id,
                     sequence,
                     event_type,
+                    run_id,
                     stamp(self.started_at + timedelta(minutes=minutes)),
                 ),
             ).lastrowid
         )
         self.con.commit()
         return event_id
+
+    def add_succeeded_run(self, started_minutes: int, ended_minutes: int) -> int:
+        conversation_id = self.con.execute(
+            "SELECT active.chat_id FROM sprint_participants participant "
+            "JOIN active_shell_chats active ON active.shell_id=participant.shell_id "
+            "WHERE participant.participant_id=?",
+            (self.developer_id,),
+        ).fetchone()[0]
+        token = self.con.execute(
+            "SELECT COUNT(*)+1 FROM conversation_runs"
+        ).fetchone()[0]
+        started_at = stamp(self.started_at + timedelta(minutes=started_minutes))
+        ended_at = stamp(self.started_at + timedelta(minutes=ended_minutes))
+        message_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state,created_at,completed_at) "
+                "VALUES (?,'engine','test','notice','run fixture',?,?,"
+                "'completed',?,?)",
+                (
+                    conversation_id,
+                    f"test-success:{token}",
+                    f"test-success:{token}",
+                    started_at,
+                    ended_at,
+                ),
+            ).lastrowid
+        )
+        run_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,harness_session_after,"
+                "runner_ref,state,lease_owner,lease_expires_at,started_at,"
+                "heartbeat_at,ended_at) VALUES (?,1,?,'session','runner','succeeded',"
+                "'test','2999-01-01 00:00:00',?,?,?)",
+                (conversation_id, message_id, started_at, ended_at, ended_at),
+            ).lastrowid
+        )
+        self.con.commit()
+        return run_id
 
     def add_terminal_run(
         self, state: str, minutes: int, error_code: str | None = None
@@ -276,6 +324,410 @@ class SprintLivenessCase(unittest.TestCase):
         )
         self.con.commit()
         return run_id
+
+    def add_pr_transition(
+        self,
+        state: str,
+        minutes: int,
+        *,
+        registered_pr_id: int | None = None,
+        token: str = "first",
+    ) -> int:
+        if registered_pr_id is None:
+            registered_pr_id = int(
+                self.con.execute(
+                    "INSERT INTO sprint_registered_prs "
+                    "(sprint_id,owner_participant_id,repository,pr_number) "
+                    "VALUES (?,?,?,?)",
+                    (self.sprint_id, self.developer_id, "acme/widget", 41),
+                ).lastrowid
+            )
+        self.con.execute(
+            "INSERT INTO sprint_pr_transitions "
+            "(registered_pr_id,normalized_state,transition_key,observed_head_sha,"
+            "observed_at) VALUES (?,?,?,?,?)",
+            (
+                registered_pr_id,
+                state,
+                f"transition-{token}",
+                token[0] * 40,
+                stamp(self.started_at + timedelta(minutes=minutes)),
+            ),
+        )
+        self.con.commit()
+        return registered_pr_id
+
+    def add_outbound_handoff(self, minutes: int) -> int:
+        receipt = self.messages.send(
+            self.sprint_id,
+            to_participant_id=self.planner_id,
+            from_participant_id=self.developer_id,
+            message_kind="notification",
+            body="Question awaiting Planner reply",
+            actionable=False,
+            declared_type="re-enter",
+            idempotency_key=f"developer-question:{minutes}",
+        )
+        self.con.execute(
+            "UPDATE wake_message SET created_at=? WHERE message_id=?",
+            (
+                stamp(self.started_at + timedelta(minutes=minutes)),
+                receipt.message_id,
+            ),
+        )
+        self.con.commit()
+        return receipt.message_id
+
+
+class SuppressorCollectorTest(SprintLivenessCase):
+    def test_pending_owned_pr_suppresses_until_green_transition(self) -> None:
+        registered_pr_id = self.add_pr_transition("pending", 1)
+        snapshot = self.monitor().collector.collect(
+            self.expectation(), self.started_at + timedelta(minutes=10)
+        )
+
+        self.assertEqual(
+            [("pr.awaiting_transition", "pr.transition:transition-first")],
+            [(item.kind, item.key) for item in snapshot.suppressors],
+        )
+        self.assertEqual("acme/widget#41 is pending", snapshot.suppressors[0].detail)
+
+        self.add_pr_transition(
+            "green", 2, registered_pr_id=registered_pr_id, token="green"
+        )
+        released = self.monitor().collector.collect(
+            self.expectation(), self.started_at + timedelta(minutes=10)
+        )
+        self.assertEqual((), released.suppressors)
+        self.assertEqual("pr.green", released.strong.kind)
+
+    def test_outbound_handoff_ignores_its_turn_then_releases_on_new_run(self) -> None:
+        handoff_run_id = self.add_succeeded_run(5, 7)
+        message_id = self.add_outbound_handoff(6)
+        tool_event_id = self.add_native_event(
+            "tool.completed", 6, run_id=handoff_run_id
+        )
+        completed_event_id = self.add_native_event(
+            "run.completed", 7, run_id=handoff_run_id
+        )
+        snapshot = self.monitor().collector.collect(
+            self.expectation(), self.started_at + timedelta(minutes=10)
+        )
+
+        self.assertEqual(
+            [("outbound.handoff", f"sprint.message:{message_id}")],
+            [(item.kind, item.key) for item in snapshot.suppressors],
+        )
+        self.assertIsNone(snapshot.strong)
+        self.assertEqual(
+            [("tool.completed", handoff_run_id), ("run.completed", handoff_run_id)],
+            [
+                (row["event_type"], row["run_id"])
+                for row in self.con.execute(
+                    "SELECT event_type,run_id FROM conversation_events "
+                    "WHERE event_id IN (?,?) ORDER BY event_id",
+                    (tool_event_id, completed_event_id),
+                )
+            ],
+        )
+
+        new_run_id = self.add_succeeded_run(11, 12)
+        self.add_native_event("run.completed", 12, run_id=new_run_id)
+        released = self.monitor().collector.collect(
+            self.expectation(), self.started_at + timedelta(minutes=15)
+        )
+        self.assertEqual((), released.suppressors)
+        self.assertIsNotNone(released.strong)
+        self.assertEqual(
+            f"run.heartbeat:{new_run_id}:"
+            f"{stamp(self.started_at + timedelta(minutes=12))}",
+            released.strong.key,
+        )
+
+
+class SanctionedQuietPolicyTest(SprintLivenessCase):
+    def assert_outbound_handoff_suppresses_role(
+        self,
+        *,
+        participant_id: int,
+        shell_id: int,
+        sender_id: int,
+        reply_to_id: int,
+        token: str,
+    ) -> None:
+        self.monitor().resolve(self.assignment_message_id, "role suppressor fixture")
+        inbound = self.messages.send(
+            self.sprint_id,
+            to_participant_id=participant_id,
+            from_participant_id=sender_id,
+            message_kind="notification",
+            body=f"Actionable {token} work",
+            actionable=True,
+            declared_type="re-enter",
+            idempotency_key=f"{token}:inbound",
+        )
+        self.assertEqual(
+            "accepted", self.messages.mark_read(inbound.message_id, shell_id)
+        )
+        expectation = self.expectation(inbound.message_id)
+        role_started_at = parse(expectation["accepted_at"])
+        self.clock.at(role_started_at + timedelta(minutes=5))
+        first = self.monitor().evaluate(self.sprint_id)
+        self.assertEqual("observed", first[0].action)
+
+        outbound = self.messages.send(
+            self.sprint_id,
+            to_participant_id=reply_to_id,
+            from_participant_id=participant_id,
+            message_kind="notification",
+            body=f"{token} handoff awaiting reply",
+            actionable=False,
+            declared_type="re-enter",
+            idempotency_key=f"{token}:outbound",
+        )
+        self.con.execute(
+            "UPDATE wake_message SET created_at=? WHERE message_id=?",
+            (
+                stamp(role_started_at + timedelta(minutes=6)),
+                outbound.message_id,
+            ),
+        )
+        self.con.commit()
+        self.clock.at(role_started_at + timedelta(minutes=10))
+        outcomes = self.monitor().evaluate(self.sprint_id)
+
+        self.assertEqual(1, len(outcomes))
+        self.assertEqual(inbound.message_id, outcomes[0].message_id)
+        self.assertEqual("sanctioned-quiet", outcomes[0].action)
+        self.assertEqual([], self.message_rows("nudge"))
+        event = self.con.execute(
+            "SELECT payload FROM sprint_events "
+            "WHERE event_type='liveness.sanctioned_quiet'"
+        ).fetchone()
+        self.assertEqual(
+            {
+                "expectation_message_id": inbound.message_id,
+                "silence_episode": 1,
+                "suppressor_kind": "outbound.handoff",
+                "evidence_key": f"sprint.message:{outbound.message_id}",
+            },
+            json.loads(event["payload"]),
+        )
+        self.clock.at(role_started_at + timedelta(minutes=100))
+        repeated = self.monitor().evaluate(self.sprint_id)
+        self.assertEqual("sanctioned-quiet", repeated[0].action)
+        self.assertEqual([], self.message_rows("escalation"))
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type='liveness.sanctioned_quiet'"
+            ).fetchone()[0],
+        )
+
+    def test_reviewer_outbound_handoff_suppresses_ambiguous_silence(self) -> None:
+        self.assert_outbound_handoff_suppresses_role(
+            participant_id=self.reviewer_id,
+            shell_id=2,
+            sender_id=self.developer_id,
+            reply_to_id=self.planner_id,
+            token="reviewer",
+        )
+
+    def test_planner_outbound_handoff_suppresses_ambiguous_silence(self) -> None:
+        self.assert_outbound_handoff_suppresses_role(
+            participant_id=self.planner_id,
+            shell_id=3,
+            sender_id=self.reviewer_id,
+            reply_to_id=self.developer_id,
+            token="planner",
+        )
+
+    def test_existing_liveness_timing_is_unchanged(self) -> None:
+        self.assertEqual(timedelta(minutes=5), sprint_liveness.EVALUATION_INTERVAL)
+        self.assertEqual(timedelta(minutes=10), sprint_liveness.GRACE_WINDOW)
+        self.assertEqual(timedelta(minutes=10), sprint_liveness.ESCALATION_WINDOW)
+
+    def test_pending_pr_suppresses_nudge_once_per_episode_then_green_releases(self) -> None:
+        registered_pr_id = self.add_pr_transition("pending", 1)
+        monitor = self.monitor()
+
+        self.advance(5)
+        self.assertEqual("strong-evidence", monitor.evaluate(self.sprint_id)[0].action)
+        self.advance(10)
+        self.assertEqual(
+            "sanctioned-quiet", monitor.evaluate(self.sprint_id)[0].action
+        )
+        self.advance(15)
+        self.assertEqual(
+            "sanctioned-quiet", monitor.evaluate(self.sprint_id)[0].action
+        )
+        self.assertEqual([], self.message_rows("nudge"))
+        self.assertEqual([], self.message_rows("escalation"))
+        events = self.con.execute(
+            "SELECT payload FROM sprint_events "
+            "WHERE event_type='liveness.sanctioned_quiet'"
+        ).fetchall()
+        self.assertEqual(1, len(events))
+        self.assertEqual(
+            {
+                "expectation_message_id": self.assignment_message_id,
+                "silence_episode": 2,
+                "suppressor_kind": "pr.awaiting_transition",
+                "evidence_key": "pr.transition:transition-first",
+            },
+            json.loads(events[0]["payload"]),
+        )
+        self.assertEqual(
+            stamp(self.started_at + timedelta(minutes=20)),
+            self.expectation()["next_evaluation_at"],
+        )
+
+        self.add_pr_transition(
+            "green", 16, registered_pr_id=registered_pr_id, token="green"
+        )
+        self.advance(20)
+        self.assertEqual("strong-evidence", monitor.evaluate(self.sprint_id)[0].action)
+        self.advance(30)
+        self.assertEqual("nudged", monitor.evaluate(self.sprint_id)[0].action)
+        self.assertEqual(1, len(self.message_rows("nudge")))
+
+    def test_current_failure_escalates_before_pending_pr_suppression(self) -> None:
+        self.add_pr_transition("pending", 1)
+        failure_at = self.started_at + timedelta(minutes=2)
+
+        def failed(_participant, _accepted, _now):
+            return (
+                None,
+                sprint_liveness.Evidence(
+                    "process:missing:1",
+                    "process.missing",
+                    failure_at,
+                    "failure",
+                    "participant process is missing",
+                ),
+                None,
+            )
+
+        self.advance(5)
+        outcome = self.monitor(failed).evaluate(self.sprint_id)[0]
+        self.assertEqual("escalated", outcome.action)
+        self.assertEqual([], self.message_rows("nudge"))
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type='liveness.sanctioned_quiet'"
+            ).fetchone()[0],
+        )
+        payload = json.loads(self.message_rows("escalation")[0]["body"])
+        self.assertEqual("process:missing:1", payload["failure"]["key"])
+
+    def test_ci_stalled_backstop_wakes_planner_once_per_transition(self) -> None:
+        registered_pr_id = self.add_pr_transition("pending", 0)
+        monitor = self.monitor()
+        self.advance(5)
+        self.assertEqual("strong-evidence", monitor.evaluate(self.sprint_id)[0].action)
+
+        self.advance(90)
+        self.assertEqual(
+            "sanctioned-quiet", monitor.evaluate(self.sprint_id)[0].action
+        )
+        backstops = self.message_rows("escalation")
+        self.assertEqual(1, len(backstops))
+        self.assertEqual(self.planner_id, backstops[0]["to_participant_id"])
+        self.assertNotEqual(self.developer_id, backstops[0]["to_participant_id"])
+        payload = json.loads(backstops[0]["body"])
+        self.assertEqual(
+            {
+                "kind": "ci_stalled",
+                "registered_pr_id": registered_pr_id,
+                "repository": "acme/widget",
+                "pr_number": 41,
+                "head_sha": "f" * 40,
+                "normalized_state": "pending",
+                "transition_key": "transition-first",
+                "pending_since": stamp(self.started_at),
+                "pending_minutes": 90,
+                "mandate": (
+                    "Assess the stalled CI transition and attempt repair by "
+                    "re-triggering checks, closing/reopening, or re-pushing. "
+                    "Pause the Sprint if the runner is genuinely down."
+                ),
+                "planner_delivery_route": "delivery-time",
+                "pause_option": True,
+            },
+            payload,
+        )
+        self.assertEqual([], self.message_rows("nudge"))
+
+        self.advance(95)
+        self.assertEqual(
+            "sanctioned-quiet", monitor.evaluate(self.sprint_id)[0].action
+        )
+        self.assertEqual(1, len(self.message_rows("escalation")))
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type='liveness.ci_stalled'"
+            ).fetchone()[0],
+        )
+
+        self.add_pr_transition(
+            "green", 96, registered_pr_id=registered_pr_id, token="green"
+        )
+        self.advance(100)
+        self.assertEqual("strong-evidence", monitor.evaluate(self.sprint_id)[0].action)
+        self.add_pr_transition(
+            "pending", 105, registered_pr_id=registered_pr_id, token="second"
+        )
+        self.advance(105)
+        self.assertEqual("strong-evidence", monitor.evaluate(self.sprint_id)[0].action)
+        self.advance(195)
+        self.assertEqual(
+            "sanctioned-quiet", monitor.evaluate(self.sprint_id)[0].action
+        )
+        self.assertEqual(2, len(self.message_rows("escalation")))
+        self.assertEqual(
+            ["transition-first", "transition-second"],
+            [
+                json.loads(row["body"])["transition_key"]
+                for row in self.message_rows("escalation")
+            ],
+        )
+        self.assertEqual([], self.message_rows("nudge"))
+
+    def test_ci_stalled_backstop_does_not_require_a_live_expectation(self) -> None:
+        registered_pr_id = self.add_pr_transition("pending", 0)
+        self.assertTrue(
+            self.monitor().resolve(
+                self.assignment_message_id,
+                "owner has no remaining live expectation",
+            )
+        )
+        self.advance(90)
+
+        self.assertEqual((), self.monitor().evaluate(self.sprint_id))
+        backstops = self.message_rows("escalation")
+        self.assertEqual(1, len(backstops))
+        self.assertEqual(self.planner_id, backstops[0]["to_participant_id"])
+        self.assertEqual(
+            registered_pr_id,
+            json.loads(backstops[0]["body"])["registered_pr_id"],
+        )
+        event = self.con.execute(
+            "SELECT payload FROM sprint_events "
+            "WHERE event_type='liveness.ci_stalled'"
+        ).fetchone()
+        self.assertEqual(
+            {
+                "registered_pr_id": registered_pr_id,
+                "transition_key": "transition-first",
+                "backstop_message_id": backstops[0]["message_id"],
+            },
+            json.loads(event["payload"]),
+        )
 
 
 class FakeClockPolicyTest(SprintLivenessCase):

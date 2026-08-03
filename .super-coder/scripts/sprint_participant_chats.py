@@ -55,8 +55,9 @@ def wake_prompt(sprint_id: int, role: str) -> str:
         f"Sprint {sprint_id} handoff for your {label} role. Load `{skill}`. "
         f"Run `sc sprint inbox --sprint {sprint_id}` now and act on the Sprint "
         f"message(s) using `{skill}`. Confirm every Sprint write succeeds before "
-        f"stopping. If the handoff is not complete, load `{skill}` again and run "
-        f"`sc sprint inbox --sprint {sprint_id}` again."
+        "stopping. If a Sprint command failed or did not confirm its durable write, "
+        "retry that command. Do not re-check the inbox otherwise — new messages "
+        "arrive as their own wakes."
     )
 
 

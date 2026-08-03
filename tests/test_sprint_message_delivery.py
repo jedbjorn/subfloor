@@ -1194,9 +1194,9 @@ class WakeDeliveryTest(SprintMessageCase):
                         "Load `sprint_dev`. Run `sc sprint inbox --sprint "
                         f"{self.sprint_id}` now and act on the Sprint message(s) using "
                         "`sprint_dev`. Confirm every Sprint write succeeds before "
-                        "stopping. If the handoff is not complete, load `sprint_dev` "
-                        "again and run `sc sprint inbox --sprint "
-                        f"{self.sprint_id}` again.\n\n"
+                        "stopping. If a Sprint command failed or did not confirm its "
+                        "durable write, retry that command. Do not re-check the inbox "
+                        "otherwise — new messages arrive as their own wakes.\n\n"
                         f"## wake_message #{sent.message_id} "
                         "(declared Re-Enter)\n\nbody for deliver"
                     ),
@@ -1254,9 +1254,10 @@ class WakeDeliveryTest(SprintMessageCase):
                 f"Sprint {self.sprint_id} handoff for your {label} role. "
                 f"Load `{skill}`. Run `sc sprint inbox --sprint {self.sprint_id}` "
                 f"now and act on the Sprint message(s) using `{skill}`. Confirm "
-                "every Sprint write succeeds before stopping. If the handoff is "
-                f"not complete, load `{skill}` again and run `sc sprint inbox "
-                f"--sprint {self.sprint_id}` again.\n\n"
+                "every Sprint write succeeds before stopping. If a Sprint command "
+                "failed or did not confirm its durable write, retry that command. "
+                "Do not re-check the inbox otherwise — new messages arrive as their "
+                "own wakes.\n\n"
                 f"## wake_message #{sent.message_id} (declared Re-Enter)\n\n"
                 "PR #321, message 987, work unit 654, sha deadbeef",
             )
