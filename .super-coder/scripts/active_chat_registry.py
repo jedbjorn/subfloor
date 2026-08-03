@@ -98,12 +98,17 @@ def close_active(con, shell_id: int) -> ActiveChat | None:
     return active
 
 
-def close_for_wake(con, shell_id: int) -> ActiveChat | None:
-    """Close an idle/stale active chat for New delivery, never a live turn."""
+def close_for_displacement(
+    con,
+    shell_id: int,
+    *,
+    allow_live_process: bool,
+) -> ActiveChat | None:
+    """Cancel queued work, then close and unlink a displaced active chat."""
     active = get(con, shell_id)
     if active is None:
         return None
-    if has_live_process(active):
+    if not allow_live_process and has_live_process(active):
         raise ActiveChatBusy(f"active chat {active.chat_id} has a live turn")
     if active.state in {"queued", "running"}:
         message_ids = [
@@ -134,6 +139,21 @@ def close_for_wake(con, shell_id: int) -> ActiveChat | None:
             (target, active.chat_id, active.state),
         )
     return close_active(con, shell_id)
+
+
+def close_for_wake(con, shell_id: int) -> ActiveChat | None:
+    """Close an idle/stale active chat for New delivery, never a live turn."""
+    return close_for_displacement(con, shell_id, allow_live_process=False)
+
+
+def close_for_inactivity(con, shell_id: int) -> ActiveChat | None:
+    """Close and unlink a chat after the mechanical inactivity ceiling.
+
+    Unlike wake-driven rotation, the ceiling exists specifically to displace a
+    live but silent turn.  Its process identity remains on the run row so the
+    reaper can terminate the newly unprotected process group.
+    """
+    return close_for_displacement(con, shell_id, allow_live_process=True)
 
 
 def register(con, shell_id: int, chat_id: str) -> None:

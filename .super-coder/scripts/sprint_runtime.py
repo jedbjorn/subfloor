@@ -10,6 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import activity_monitor
 import conversation_broker
 import conversation_events
 import db_driver
@@ -157,6 +158,7 @@ class SprintRuntimeService(threading.Thread):
         deliver: Callable[[str, str, str], str | None] | None = None,
         owner: str | None = None,
         pulse_seconds: float = DEFAULT_PULSE_SECONDS,
+        activity_config: activity_monitor.ActivityMonitorConfig | None = None,
     ) -> None:
         super().__init__(name="sprint-runtime", daemon=True)
         if pulse_seconds <= 0:
@@ -164,6 +166,7 @@ class SprintRuntimeService(threading.Thread):
         self.db_path = str(db_path)
         self.owner = owner or f"sprint-runtime:{os.getpid()}"
         self.pulse_seconds = pulse_seconds
+        self.activity_config = activity_config
         self.deliver = deliver or (
             lambda conversation_id, prompt, key: enqueue_conversation_turn(
                 self.db_path,
@@ -184,9 +187,12 @@ class SprintRuntimeService(threading.Thread):
     def pulse_once(self, *, startup: bool = False) -> bool:
         con = db_driver.connect(self.db_path)
         try:
+            monitored = activity_monitor.ActivityMonitor(
+                con, config=self.activity_config
+            ).tick()
             switch = self._switch(con)
             serviced = switch.recover_on_startup() if startup else switch.tick()
-            return self._deliver_wakes(con) or serviced
+            return self._deliver_wakes(con) or serviced or monitored.changed
         finally:
             con.close()
 
@@ -225,7 +231,9 @@ class SprintRuntimeService(threading.Thread):
         con = db_driver.connect(self.db_path)
         try:
             switch = self._switch(con)
+            monitor = activity_monitor.ActivityMonitor(con, config=self.activity_config)
             try:
+                monitor.tick()
                 switch.recover_on_startup()
                 self._deliver_wakes(con)
             except Exception as exc:  # noqa: BLE001 - service faults stay visible
@@ -233,6 +241,7 @@ class SprintRuntimeService(threading.Thread):
             self._started_once.set()
             while not self._stop_event.wait(self.pulse_seconds):
                 try:
+                    monitor.tick()
                     switch.tick()
                     self._deliver_wakes(con)
                 except Exception as exc:  # noqa: BLE001 - keep inspection alive
