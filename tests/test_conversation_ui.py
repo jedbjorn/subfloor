@@ -66,12 +66,8 @@ def test_open_chat_restore_matches_the_flat_shell_projection():
 def test_sprint_badge_enters_the_current_conversation_without_a_wake():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]
-    shell_button = interface[interface.index('const button = el("button"'):
-                             interface.index("const shellRow = el(")]
     badge = interface[interface.index('className: "chat-sprint-badge"'):
-                      interface.index("shellRow.append(badge)")]
-    assert '+ (sprint ? " has-sprint" : "")' in shell_button
-    assert 'className: "chat-shell-identity"' in shell_button
+                      interface.index("if (badge || mail)")]
     assert "sprint.current_conversation_id" in badge
     assert "location.hash = chatHash(" in badge
     assert "chatApi(" not in badge
@@ -84,8 +80,32 @@ def test_sprint_badge_enters_the_current_conversation_without_a_wake():
     badge_style = STYLE[
         STYLE.index(".chat-sprint-badge {"):STYLE.index(".chat-sprint-badge:hover")
     ]
-    assert "left: 50%" in badge_style
+    assert "position: absolute" not in badge_style
+    assert "pointer-events: auto" in badge_style
     assert "color: var(--warn)" in badge_style
+
+
+def test_shell_card_orders_left_identity_and_right_status_cluster():
+    interface = APP[APP.index("async function renderInterface"):
+                    APP.index("// ── Tabs + boot")]
+    identity = interface[interface.index("const identity = el("):
+                         interface.index("const mail = chatUnreadBadge(item)")]
+    assert identity.index('className: "chat-shell-shortname"') < identity.index(
+        'className: "chat-shell-identity-separator"'
+    ) < identity.index('className: "chat-shell-name"')
+
+    status = interface[interface.index("if (badge || mail)"):
+                       interface.index("rail.append(shellRow)")]
+    assert 'className: "chat-shell-status"' in status
+    assert status.index("status.append(badge)") < status.index("status.append(mail)")
+    assert "if (badge && mail)" in status
+    assert 'className: "chat-shell-status-separator"' in status
+
+    status_style = STYLE[STYLE.index(".chat-shell-status {"):
+                         STYLE.index(".chat-sprint-badge {")]
+    assert "grid-column: 2" in status_style
+    assert "justify-self: end" in status_style
+    assert "pointer-events: none" in status_style
 
 
 def test_sprint_conversations_are_not_closed_by_normal_chat_controls():

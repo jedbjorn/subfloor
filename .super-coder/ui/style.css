@@ -177,33 +177,39 @@ body.interface-view main {
   height: 1px; margin: .65rem .55rem; background: var(--line-soft);
 }
 .chat-shell {
-  position: relative; width: 100%; display: flex; align-items: center; gap: .45rem;
+  position: relative; grid-column: 1 / -1; grid-row: 1; width: 100%;
+  display: flex; align-items: center; gap: .45rem;
   background: transparent; border: 1px solid transparent; color: var(--dim);
   border-radius: 8px; padding: .48rem .55rem; cursor: pointer; text-align: left;
   font-size: 15px;
 }
-.chat-shell-row { position: relative; display: grid; gap: .25rem; margin-bottom: .18rem; }
+.chat-shell-row {
+  position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  gap: .25rem; margin-bottom: .18rem;
+}
+.chat-shell-row.has-mail .chat-shell { padding-right: 2.2rem; }
+.chat-shell-row.has-assignment .chat-shell { padding-right: 4.35rem; }
+.chat-shell-row.has-mail.has-assignment .chat-shell { padding-right: 6rem; }
 .chat-shell-identity {
-  min-width: 0; display: flex; align-items: center; gap: .35rem;
+  min-width: 0; width: 100%; display: flex; align-items: center; gap: .35rem;
+}
+.chat-shell-identity-separator, .chat-shell-status-separator {
+  color: rgba(255,255,255,.25); flex: none;
+}
+.chat-shell-status {
+  z-index: 1; grid-column: 2; grid-row: 1; align-self: center; justify-self: end;
+  display: flex; align-items: center; gap: .28rem; margin-right: .55rem;
+  pointer-events: none;
 }
 .chat-sprint-badge {
-  position: absolute; z-index: 1; top: 50%; left: 50%;
-  width: fit-content; transform: translate(-50%, -50%);
+  width: fit-content;
   padding: .16rem .42rem; border: 1px solid rgba(212,145,74,.6);
   border-radius: 99px; background: rgba(212,145,74,.09); color: var(--warn);
   cursor: pointer; font: .58rem/1.2 ui-sans-serif, sans-serif; white-space: nowrap;
+  pointer-events: auto;
 }
 .chat-sprint-badge:hover {
   border-color: var(--warn); background: rgba(212,145,74,.16);
-}
-@media (min-width: 681px) {
-  .chat-shell.has-sprint {
-    display: grid; grid-template-columns: minmax(0, 1fr) 3.6rem minmax(0, 1fr);
-  }
-  .chat-shell.has-sprint .chat-shell-identity { grid-column: 1; }
-  .chat-shell.has-sprint .chat-shell-shortname {
-    grid-column: 3; justify-self: end;
-  }
 }
 .chat-shell:hover { color: var(--ink); background: var(--panel); }
 .chat-shell.selected { color: var(--ink); border-color: var(--line); background: var(--panel); }
@@ -750,7 +756,12 @@ body.interface-view main {
   .chat-layout { grid-template-columns: 101px minmax(0, 1fr); }
   .chat-history { display: none; }
   .chat-shell { justify-content: center; }
-  .chat-sprint-badge { position: static; justify-self: center; transform: none; }
+  .chat-shell-row.has-mail .chat-shell,
+  .chat-shell-row.has-assignment .chat-shell,
+  .chat-shell-row.has-mail.has-assignment .chat-shell { padding-right: .55rem; }
+  .chat-shell-status {
+    grid-column: 1; grid-row: 2; justify-self: center; margin-right: 0;
+  }
   .chat-shell .chat-state { display: none; }
   .chat-pane-head { grid-template-columns: minmax(0, 1fr) auto; }
   .chat-actions { grid-column: 1 / -1; justify-content: flex-start; }

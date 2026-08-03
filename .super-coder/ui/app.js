@@ -4436,25 +4436,31 @@ async function renderInterface(root) {
       rail.append(
         el("div", { className: "chat-shell-divider", role: "separator" }));
     previousFlavor = flavor;
+    const identity = el("span", { className: "chat-shell-identity" });
+    if (item.shortname) identity.append(
+      el("span", { className: "chat-shell-shortname" }, item.shortname),
+      el("span", { className: "chat-shell-identity-separator", ariaHidden: "true" }, "|"));
+    identity.append(el("span", { className: "chat-shell-name" }, item.display_name));
+    const mail = chatUnreadBadge(item);
     const button = el("button", {
       className: "chat-shell"
-        + (item.shell_id === shell.shell_id ? " selected" : "")
-        + (sprint ? " has-sprint" : ""),
+        + (item.shell_id === shell.shell_id ? " selected" : ""),
       type: "button",
-    },
-    el("span", { className: "chat-shell-identity" },
-      el("span", { className: "chat-shell-name" }, item.display_name),
-      chatUnreadBadge(item)),
-    el("span", { className: "chat-shell-shortname" }, item.shortname || ""));
+    }, identity);
     chatPaintShellState(button, openByShell.get(item.shell_id));
     shellItems.set(item.shell_id, button);
     button.onclick = () => {
       if (item.shell_id === shell.shell_id) return;
       location.hash = chatHash(item.shortname);
     };
-    const shellRow = el("div", { className: "chat-shell-row" }, button);
+    const shellRow = el("div", {
+      className: "chat-shell-row"
+        + (sprint ? " has-assignment" : "")
+        + (mail ? " has-mail" : ""),
+    }, button);
+    let badge = null;
     if (sprint) {
-      const badge = el("button", {
+      badge = el("button", {
         className: "chat-sprint-badge",
         type: "button",
         title: `Sprint ${sprint.sprint_id} · ${sprint.role} · ${sprint.disposition}`,
@@ -4466,7 +4472,14 @@ async function renderInterface(root) {
           sprint.current_conversation_id,
         );
       };
-      shellRow.append(badge);
+    }
+    if (badge || mail) {
+      const status = el("span", { className: "chat-shell-status" });
+      if (badge) status.append(badge);
+      if (badge && mail) status.append(
+        el("span", { className: "chat-shell-status-separator", ariaHidden: "true" }, "|"));
+      if (mail) status.append(mail);
+      shellRow.append(status);
     }
     rail.append(shellRow);
   }
