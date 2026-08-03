@@ -518,7 +518,7 @@ class SprintLiveProof(unittest.TestCase):
     def test_serial_sprint_runs_correction_merge_dispatch_and_close(self) -> None:
         sprint_id, document_id, units = self.prepare(((1, 2, ()), (1, 2, (0,))))
         initial_wakes = self.run_cli(3, "arm", "--sprint", str(sprint_id))["wake_ids"]
-        self.assertEqual(1, len(initial_wakes))
+        self.assertEqual(2, len(initial_wakes))
         self.assertEqual(
             [(units[0], "ready"), (units[1], "planned")],
             [
@@ -592,7 +592,7 @@ class SprintLiveProof(unittest.TestCase):
     def test_parallel_sprint_completes_out_of_order_without_lane_overlap(self) -> None:
         sprint_id, document_id, units = self.prepare(((1, 2, ()), (4, 5, ())))
         initial_wakes = self.run_cli(3, "arm", "--sprint", str(sprint_id))["wake_ids"]
-        self.assertEqual(2, len(initial_wakes))
+        self.assertEqual(3, len(initial_wakes))
         self.deliver_browser_turns()
         self.accept_assignment(units[0], 1)
         self.accept_assignment(units[1], 4)
@@ -743,12 +743,14 @@ class SprintLiveProof(unittest.TestCase):
             str(assignment_id),
         )
 
-        self.assertIsNone(
-            self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE sprint_id=? AND shell_id=3",
-                (sprint_id,),
-            ).fetchone()[0]
+        arming_planner_conversation = self.con.execute(
+            "SELECT current_conversation_id FROM sprint_participants "
+            "WHERE sprint_id=? AND shell_id=3",
+            (sprint_id,),
+        ).fetchone()[0]
+        self.assertIsNotNone(
+            arming_planner_conversation,
+            "arming opens the overseeing Planner's fresh wake chat",
         )
         question_prefix = "Which downstream compatibility fixture owns the proof? "
         question = question_prefix + "q" * (6000 - len(question_prefix))
@@ -766,7 +768,11 @@ class SprintLiveProof(unittest.TestCase):
         )
         self.assertTrue(question_receipt["message_created"])
         self.assertEqual("pending", question_receipt["wake_state"])
-        self.assertIsNone(question_receipt["conversation_id"])
+        self.assertEqual(
+            arming_planner_conversation,
+            question_receipt["conversation_id"],
+            "later Planner-bound traffic re-enters the chat opened by arming",
+        )
         self.assertEqual(
             (1, 3, 6000, question),
             tuple(

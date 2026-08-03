@@ -107,19 +107,36 @@ class SprintMessageCase(unittest.TestCase):
         self.con.commit()
         self.lifecycle = sprint_domain.SprintLifecycleStore(self.con)
         initial_wake = self.lifecycle.arm(self.sprint_id, 3)[0]
+        setup_delivery = delivery.SprintWakeDeliveryService(self.con)
+        planner_delivery: list[str] = []
+        setup_delivery.deliver_once(
+            "setup-planner-worker",
+            lambda conversation, _prompt, _key: (
+                planner_delivery.append(conversation) or "setup-planner-run"
+            ),
+        )
+        self.assertEqual(1, len(planner_delivery))
+        self.messages = delivery.SprintMessageStore(self.con)
+        arming_message_id = int(
+            self.con.execute(
+                "SELECT message_id FROM wake_message WHERE idempotency_key=?",
+                (f"sprint:{self.sprint_id}:arming-model-selections",),
+            ).fetchone()[0]
+        )
+        self.assertIsNone(self.messages.mark_read(arming_message_id, 3))
         initial_delivery: list[str] = []
-        delivery.SprintWakeDeliveryService(self.con).deliver_once(
+        delivered = setup_delivery.deliver_once(
             "setup-worker",
             lambda conversation, _prompt, _key: (
                 initial_delivery.append(conversation) or "setup-native-run"
             ),
         )
+        self.assertEqual(initial_wake, delivered.wake_id)
         self.developer_conversation_id = initial_delivery[0]
         initial_message = self.con.execute(
             "SELECT message_id FROM sprint_wake_messages WHERE wake_id=?",
             (initial_wake,),
         ).fetchone()[0]
-        self.messages = delivery.SprintMessageStore(self.con)
         self.assertEqual("accepted", self.messages.mark_read(initial_message, 1))
 
     def send(
@@ -566,7 +583,7 @@ class WakeDeliveryTest(SprintMessageCase):
         self.assertIn("armed sprint work", lease.prompt)
         conversation_id = service._resolve_conversation(lease)
         self.assertEqual(
-            armed_planner_id,
+            self.planner_id,
             self.con.execute(
                 "SELECT sprint_participant_id "
                 "FROM sprint_participant_conversations WHERE conversation_id=?",
@@ -1346,10 +1363,13 @@ class ParticipantRelayTest(SprintMessageCase):
             int(self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]),
         )
 
-    def test_relay_defers_fresh_chat_creation_until_delivery(self) -> None:
+    def test_relay_reuses_the_planner_chat_opened_by_arming(self) -> None:
         before = int(
             self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
         )
+        active_before = self.con.execute(
+            "SELECT chat_id FROM active_shell_chats WHERE shell_id=3"
+        ).fetchone()[0]
 
         receipt = self.messages.relay(
             self.sprint_id,
@@ -1358,7 +1378,7 @@ class ParticipantRelayTest(SprintMessageCase):
             body="Please answer from a fresh route.",
             idempotency_key="participant-send:new-chat",
         )
-        self.assertIsNone(receipt.conversation_id)
+        self.assertEqual(active_before, receipt.conversation_id)
         self.assertEqual(
             before,
             self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
@@ -1381,9 +1401,10 @@ class ParticipantRelayTest(SprintMessageCase):
             (conversation_id,),
         ).fetchone()
         self.assertEqual(
-            before + 1,
+            before,
             self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
         )
+        self.assertEqual(active_before, conversation_id)
         self.assertEqual(
             (3, "idle", "sprint", "work", None, None),
             tuple(route),
@@ -1404,7 +1425,15 @@ class ParticipantRelayTest(SprintMessageCase):
                     (self.sprint_id,),
                 ).fetchone()[0]
             )
-            + f":wake:{receipt.wake_id}",
+            + ":wake:"
+            + str(
+                self.con.execute(
+                    "SELECT wm.wake_id FROM sprint_wake_messages wm "
+                    "JOIN wake_message m USING (message_id) "
+                    "WHERE m.idempotency_key=?",
+                    (f"sprint:{self.sprint_id}:arming-model-selections",),
+                ).fetchone()[0]
+            ),
             self.con.execute(
                 "SELECT creation_idempotency_key FROM conversations "
                 "WHERE conversation_id=?",
