@@ -88,6 +88,17 @@ invoke the lifecycle transition. Send the durable decision to the Planner, who
 executes it. A live FnB board-level override may supersede that decision and
 must be recorded as FnB authority, not Reviewer judgment.
 
+## Sprint artifact paths
+
+Sprint working artifacts (per-unit review notes, raw diffs, evidence packets,
+report drafts, and Dev scratch proof) go to the gitignored
+`shared/sprints/sprint-<n>/` directory. They are never committed, branched, or
+PR'd in the work repo; a review-notes commit is a finding.
+
+DB rows stay the durable record: judgments via `record-review`, report bodies in
+`sprint_reports`, and decisions in the durable relay. Files in the Sprint
+artifact directory are working material only.
+
 ## Control and conclude decisions
 
 The Reviewer owns all pause, cancel, and conclude decisions and recommendations.
@@ -98,7 +109,8 @@ ratified judgment; ambiguous silence is not enough to corrupt a disposition.
 Send each decision to the Planner through the durable `send` surface above. The
 Reviewer → Planner route is Re-enter. The body must name:
 
-- `decision`: `pause`, `resume`, `replan`, `cancel`, `conclude`, or `abort`;
+- `decision`: `pause`, `resume`, `replan`, `re-enter`, `cancel`, `conclude`, or
+  `abort`;
 - the evidence and rationale owned by the Reviewer;
 - exact Sprint/work-unit ids, reason, outcome, and complete action arguments;
 - for conclude, the conformance report/follow-up ids, stable completion key,
@@ -129,8 +141,9 @@ This skill owns severity. The governing spec intentionally does not.
   does not make the delivered behavior wrong now.
 
 During a work-unit review, Critical/Major/Medium block approval; Low is a
-report note. During close-out conformance, every severity becomes a follow-up
-and none is fixed inside the Sprint.
+report note. During close-out conformance, severity does not decide timing: the
+Reviewer judges whether each finding requires in-Sprint patching or is an
+acceptable post-Sprint follow-up.
 
 ## Work-unit review
 
@@ -182,20 +195,44 @@ records judgment evidence, sends a Re-enter wake to the Developer, and
 resolves the review liveness expectation. Do not message around this surface;
 an unrecorded verdict cannot unlock merge.
 
-## Whole-Sprint conformance
+## Delivery-terminal closeout
 
-Judge integrated `main` against every governing bound revision, plus the exact
-recorded mid-Sprint revision facts and ratified judgments. Review the integrated
-system, not unit diffs. Compile the bounded evidence packet first:
+The `sprint.delivery_terminal` notification is the entry signal for
+whole-Sprint conformance. On that wake, inspect the inbox and current work-unit
+state first. If any non-terminal unit is visible, the wake is stale: mark the
+informational notification handled with `accept`, exit, and await the next
+episode's delivery-terminal wake.
+
+Compile the bounded evidence packet first and do so yourself, then judge
+integrated `main` against every governing bound revision, exact recorded
+mid-Sprint revision fact, and ratified judgment:
 
 ```text
-sc sprint compile-report --sprint <id> --limit 50 > evidence.json
+sc sprint compile-report --sprint <id> --limit 50 \
+  > shared/sprints/sprint-<n>/evidence.json
 ```
 
 Increase the bound only when truncation counters show the default omitted
 needed evidence; 200 is the maximum. The packet supplies facts, not judgment.
+If every work unit was cancelled and nothing shipped, the honest decision is
+`abort`, not `conclude`.
 
-Then classify each requirement as:
+After classifying the requirements, choose exactly one branch:
+
+- **In-Sprint patching required.** Do not run `record-conformance`. Send the
+  Planner a durable `re-enter` decision naming every blocking finding; each
+  spec task to cut against the governing spec document, with title and
+  description; and the suggested unit grouping, waves, dependencies, and
+  Developer/Reviewer routing. The durable decision is the failed-pass record.
+  After three re-entry episodes in one Sprint, escalate the non-convergence to
+  FnB instead of starting another patch round.
+- **Clean or post-Sprint-only findings.** Record conformance. Any remaining
+  findings become follow-ups for FnB disposition, then send the Planner the
+  `conclude` decision through the existing close protocol.
+
+## Whole-Sprint conformance
+
+Review the integrated system, not unit diffs. Classify each requirement as:
 
 - `as-specced`;
 - `deviated-intentionally` with its ratified judgment;
@@ -203,7 +240,8 @@ Then classify each requirement as:
 - `unimplemented`.
 
 The last two are findings. Include spec document id and work-unit id when known.
-Write the conformance report and a JSON findings array:
+For the clean or post-Sprint-only branch, write the conformance report and a
+JSON findings array:
 
 ```json
 [
@@ -217,7 +255,8 @@ Write the conformance report and a JSON findings array:
 ]
 ```
 
-Then record both atomically:
+Record both atomically only after choosing the clean or post-Sprint-only
+branch:
 
 Keep the conformance report and each finding body at about 6,000 characters or
 fewer; 8,000 is the hard maximum for each. Run `wc -m < <report>` and length-check
@@ -231,9 +270,10 @@ sc sprint record-conformance \
 ```
 
 This creates append-only conformance evidence and pending follow-ups for FnB
-disposition. It must not create a fix lane, reopen a completed work unit, or
-send findings to a Developer for in-Sprint repair — including Critical ones.
-Surface immediate safety risk to the FnB, but preserve the close-out rule.
+disposition. Never record conformance first and then reopen an editing lane;
+the re-enter branch defers the report until the added scope reaches terminal
+disposition and a fresh delivery-terminal wake starts the next episode. Surface
+any immediate safety risk to FnB.
 
 Then author the final Sprint report. Name the Reviewer as its author and answer:
 
@@ -259,19 +299,21 @@ For unit review, follow the ordered verdict procedure above: inbox handling and
 all evidence work precede `record-review`; the durable verdict is the literal
 last action, then the Reviewer stops.
 
-For conformance, require the report and findings to replay idempotently, then
-complete this final handoff order:
+For the clean or post-Sprint-only branch, require the report and findings to
+replay idempotently. For the re-enter or abort branch, confirm that the decision
+body carries the complete evidence and exact requested action. Then complete
+this final handoff order:
 
 1. Re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and
    mark every handled informational message read with `accept`.
-2. Confirm the Reviewer-authored Sprint report and conclude decision body are
+2. Confirm the Reviewer-authored re-enter, abort, or conclude decision body is
    final and below the 8,000-character hard maximum.
 3. As the literal final action of the turn, deliver that decision to the
    Planner:
 
 ```text
 sc sprint send --sprint <id> --to <planner-shortname> --body-file <path> \
-  --key <stable-conclude-handoff-key>
+  --key <stable-decision-handoff-key>
 ```
 
 4. When the command confirms the durable write and Planner wake, stop

@@ -7,8 +7,9 @@ common: false
 
 # sprint_close — synthesize and finish
 
-Use as the owning Planner when delivery work is terminal, or when abort has
-been chosen. Close-out supplies meaning; the compiler supplies facts.
+Use as the owning Planner when a Reviewer close decision arrives, or when abort
+has been chosen. The delivery-terminal wake starts closeout with the Reviewer;
+the Reviewer decides and authors, and the Planner executes.
 On entry or any wake, load `sprint_close`, run `sc sprint inbox --sprint <id>`,
 inspect the durable message, and accept or decline it only when actionable.
 
@@ -71,30 +72,42 @@ fallbacks.
 On a durable Reviewer pause decision (or live FnB override), the Planner runs
 `sc sprint pause --sprint <id> --reason <decision-reason>`.
 
-## Delivery-complete gate
+## Sprint artifact paths
 
-Before conformance, re-read work units, dependencies, registered PRs, checks,
-merge observations, task membership, pending actionable messages, and active
-native runs. Normally every planned unit is completed/cancelled with an
-explicit disposition, and code units have their real PR outcome. Close-out is
-advisory: the packet surfaces gaps but never prevents the owning Planner or FnB
-from making and reporting a completion judgment. Do not infer code completion
-from PR state alone.
+Sprint working artifacts (per-unit review notes, raw diffs, evidence packets,
+report drafts, and Dev scratch proof) go to the gitignored
+`shared/sprints/sprint-<n>/` directory. They are never committed, branched, or
+PR'd in the work repo; a review-notes commit is a finding.
 
-Request an independent Reviewer through the durable Sprint relay, using the
-`sc sprint send` command above with the bound spec revision hashes, integrated
-main SHA, ratified judgment list, and `sprint_rev` conformance mode. Confirm the
-write and wake receipt, then stop and await the native conformance-result wake.
-Give the Reviewer recorded judgments, not unit authors' narrative; conformance
-judges artifacts.
+DB rows stay the durable record: judgments via `record-review`, report bodies in
+`sprint_reports`, and decisions in the durable relay. Files in the Sprint
+artifact directory are working material only.
+
+## Delivery-terminal entry
+
+When every planned work unit becomes terminal, the engine sends the
+delivery-terminal wake directly to the participating Reviewer. That wake is the
+close protocol's entry signal; the Planner does not need to notice terminal
+state or request conformance.
+
+On entry, the Reviewer re-reads work units, dependencies, registered PRs,
+checks, merge observations, task membership, pending actionable messages, and
+active native runs. If any unit is non-terminal, the wake is stale and the
+Reviewer exits until the next delivery-terminal episode. Close-out is advisory:
+the packet surfaces gaps but never replaces Reviewer judgment or the FnB
+board-level override. Do not infer code completion from PR state alone.
 
 ## Conformance boundary
 
-The Reviewer records its report and findings with `sc sprint
-record-conformance`. Every finding becomes a pending follow-up for FnB review.
-No conformance finding is fixed inside this Sprint at any severity. A safety
-finding may demand immediate operator action, but it still remains follow-up
-evidence rather than a silently reopened editing lane.
+The Reviewer first decides whether any finding requires in-Sprint patching. If
+so, it defers `record-conformance` and sends the Planner a durable re-enter
+decision naming the new spec tasks and suggested unit projection. The added
+units run through delivery and produce a fresh delivery-terminal wake.
+
+For a clean pass or post-Sprint-only findings, the Reviewer records its report
+and findings with `sc sprint record-conformance`. Every recorded finding becomes
+a pending follow-up for FnB review; it is not also reopened as an editing lane.
+A safety finding may still demand immediate operator action.
 
 Verify report id, follow-up ids, author identity, and idempotent replay before
 synthesis.
@@ -114,10 +127,13 @@ sc sprint disposition-followup --sprint <id> --followup <id> \
 
 ## Compile bounded evidence
 
-Generate the packet through the authenticated production surface:
+The participating Reviewer generates the packet through the authenticated
+production surface by default. Planner and FnB compilation remain valid when
+FnB explicitly directs the fallback:
 
 ```text
-sc sprint compile-report --sprint <id> --limit 50 > evidence.json
+sc sprint compile-report --sprint <id> --limit 50 \
+  > shared/sprints/sprint-<n>/evidence.json
 ```
 
 Increase the per-section bound only when the default truncation counters show
@@ -139,11 +155,11 @@ The packet supplies:
 - links to the complete timeline and every participant conversation.
 
 The compiler does not decide whether a deviation was wise or an anomaly was
-acceptable. That is your synthesis.
+acceptable. That judgment remains the Reviewer's.
 
 ## Final report
 
-Write a concise report that answers:
+The Reviewer writes a concise report that answers:
 
 1. What scope and exact revisions governed the Sprint?
 2. What was planned, what actually shipped, and which PRs produced it?
@@ -155,7 +171,8 @@ Write a concise report that answers:
 
 Name discrepancies; do not smooth them into a success narrative. A recovered
 stall can be a successful Sprint when the failure stayed durable, visible, and
-contained.
+contained. Evidence packets, conformance drafts, and final report drafts belong
+under `shared/sprints/sprint-<n>/`.
 
 ## Pause and abort reports
 
@@ -171,12 +188,13 @@ nothing.
 
 ## Terminal handoff
 
-Pass the final synthesis to `complete`; the surface commits the append-only
-`final` report before attempting the lifecycle transition. Omitting the report
-is permitted under advisory close-out, but the evidence packet records the gap.
-Abort only under Planner or FnB authority. Terminal state stops Sprint services
-and removes live pills while retaining conversations, messages, events, PR
-evidence, reports, and follow-ups.
+The Planner writes the Reviewer-authored final synthesis unchanged and passes it
+to `complete`; the surface commits the append-only `final` report before
+attempting the lifecycle transition. Omitting the report is permitted under
+advisory close-out, but the evidence packet records the gap. Abort only on a
+Reviewer decision or FnB override. Terminal state stops Sprint services and
+removes live pills while retaining conversations, messages, events, PR evidence,
+reports, and follow-ups.
 
 Immediately before `complete`, re-run `sc sprint inbox --sprint <id>` to drain
 newly arrived messages, mark every handled informational message read with
