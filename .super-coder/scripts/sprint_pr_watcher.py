@@ -327,7 +327,7 @@ class SprintPRWatcher:
                 pr_number=pr_number,
             )
         row = self._subscription_row(receipt.subscription_id)
-        if receipt.created and row is not None:
+        if row is not None:
             self._observe_rows((row,), "registration", ignore_backoff=True)
         notify_commit()
         return receipt
@@ -363,7 +363,14 @@ class SprintPRWatcher:
     def poll_once(self, *, startup: bool = False) -> bool:
         self._trigger = "startup" if startup else "pulse"
         rows = self.con.execute(
-            "SELECT * FROM pr_subscriptions ORDER BY subscription_id"
+            "SELECT subscription.* FROM pr_subscriptions subscription "
+            "WHERE COALESCE(("
+            "SELECT transition.normalized_state "
+            "FROM pr_subscription_transitions transition "
+            "WHERE transition.subscription_id=subscription.subscription_id "
+            "ORDER BY transition.transition_id DESC LIMIT 1"
+            "),'') NOT IN ('merged','closed') "
+            "ORDER BY subscription.subscription_id"
         ).fetchall()
         if not rows:
             return False
@@ -589,7 +596,7 @@ class SprintPRWatcher:
         )
         registered_pr_id = registered["sprint_registered_pr_id"]
         unit_rows = self.con.execute(
-            "SELECT l.work_unit_id,u.reviewer_shell_id,u.disposition "
+            "SELECT l.work_unit_id,u.disposition "
             "FROM sprint_pr_work_units l JOIN sprint_work_units u "
             "ON u.sprint_id=l.sprint_id AND u.work_unit_id=l.work_unit_id "
             "WHERE l.registered_pr_id=? ORDER BY l.work_unit_id",

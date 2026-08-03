@@ -618,9 +618,53 @@ class EngineWideSubscriptionTest(SprintPRWatcherCase):
         self.assertEqual([], self.reader.get_calls)
         self.assertEqual([], self.repositories)
 
-    def test_terminal_subscription_stays_observed_without_duplicate_wakes(self):
+    def test_closed_subscription_quiesces_until_resubscribed_after_reopen(self):
         self.reader.current = pull_request(
             state="CLOSED", checks=None, checks_failed=False
+        )
+        first = self.watcher.subscribe(
+            owner_shell_id=1,
+            repository="acme/repo",
+            pr_number=42,
+        )
+        calls = len(self.reader.get_calls)
+
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
+        self.assertFalse(self.watcher.poll_once())
+        self.assertEqual(calls, len(self.reader.get_calls))
+
+        second = self.watcher.subscribe(
+            owner_shell_id=1,
+            repository="acme/repo",
+            pr_number=42,
+        )
+        self.assertFalse(second.created)
+        self.assertEqual(first.subscription_id, second.subscription_id)
+        self.assertEqual(calls + 1, len(self.reader.get_calls))
+        self.assertEqual(
+            [("closed", "a" * 40), ("green", "a" * 40)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT normalized_state,observed_head_sha "
+                    "FROM pr_subscription_transitions ORDER BY transition_id"
+                )
+            ],
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(calls + 2, len(self.reader.get_calls))
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE idempotency_key LIKE 'pr-transition:%'"
+            ).fetchone()[0],
+        )
+
+    def test_merged_subscription_is_quiescent_on_pulse(self):
+        self.reader.current = pull_request(
+            state="MERGED", checks=None, checks_failed=False
         )
         self.watcher.subscribe(
             owner_shell_id=1,
@@ -629,14 +673,17 @@ class EngineWideSubscriptionTest(SprintPRWatcherCase):
         )
         calls = len(self.reader.get_calls)
 
-        self.assertTrue(self.watcher.poll_once())
-        self.assertEqual(calls + 1, len(self.reader.get_calls))
+        self.assertFalse(self.watcher.poll_once())
+        self.assertEqual(calls, len(self.reader.get_calls))
         self.assertEqual(
-            1,
-            self.con.execute(
-                "SELECT COUNT(*) FROM wake_message "
-                "WHERE idempotency_key LIKE 'pr-transition:%'"
-            ).fetchone()[0],
+            [("merged", "a" * 40)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT normalized_state,observed_head_sha "
+                    "FROM pr_subscription_transitions ORDER BY transition_id"
+                )
+            ],
         )
 
     def test_non_developer_cannot_own_a_subscription(self):
