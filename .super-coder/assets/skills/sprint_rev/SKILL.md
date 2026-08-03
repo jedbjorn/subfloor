@@ -44,12 +44,20 @@ question, answer, blocker, or context message, run `accept` for that message.
 For informational messages it only marks the message read; it does not change
 Sprint or work-unit state.
 
-Review requests are declared New, but wake type resolves at delivery. A verified
-live turn is never displaced: delivery enters the active registry chat at its
-natural boundary and drains every undelivered wake message. When idle, New
-rotates to a fresh chat; Re-enter resumes the registry chat; no registry row
-behaves as New. Reviewer verdicts to Developers and decisions to Planners are
-Re-enter. Reviewers never receive PR-event subscription wakes.
+Review requests use Force-new delivery. A live turn is allowed to finish;
+then, after the receiver has stayed quiet for the configured grace interval,
+delivery atomically closes the exact registry chat and starts a fresh chat with
+the complete undelivered message bundle. Concurrent Force-new requests coalesce
+into that one rotation, and a retry resumes the chat created for its own wake
+instead of rotating again. Stop cleanly after every typed verdict or decision
+handoff so the next request can cross the quiet boundary. The inactivity ceiling
+and registry reaper remain the fallback for a silent hung turn.
+
+Plain New remains separate and is eligible immediately. It enters a verified
+live turn at its natural boundary and rotates only when the registry chat is idle. Re-enter
+resumes the registry chat; no registry row behaves as New. Reviewer verdicts to
+Developers and decisions to Planners are Re-enter. Reviewers never receive
+PR-event subscription wakes.
 
 ## Questions, answers, blockers, and failures
 
@@ -147,10 +155,19 @@ acceptable post-Sprint follow-up.
 
 ## Work-unit review
 
-Accept the actionable review request, then inspect the exact bound spec
-revision, readiness claim, PR head, diff, checks, tests, relevant runtime
-evidence, and prior judgment calls. Review code quality, edge cases/failure
-paths, and spec conformance. Trace the real path; do not trust names or PR prose.
+Accept the actionable review request. Its readiness body must be only the bare
+locator: submitting or resubmitting intent, PR URL, registered Sprint PR id,
+exact head SHA, and work-unit id. Treat scope narrative, verification evidence,
+judgment rationale, or review-focus steering in that body as a protocol defect;
+do not use it to frame the review. Neither party writes PR comments or
+annotations, and the PR body contains only the work-unit id and spec reference.
+
+Review the exact bound spec revision and the full diff at the request's exact
+head, then inspect checks, tests, relevant runtime evidence, and ratified
+judgments. Each round is clean: no prior Developer evidence or prose is input,
+and prior findings are cleared only when the code at the new head proves they
+are cleared. Review code quality, edge cases/failure paths, and spec
+conformance. Trace the real path; do not trust names or PR prose.
 
 Read resolved closure evidence through the authenticated memory surface; no SQL
 or mutation is needed. Use the exact form for a cited flag and the scoped form

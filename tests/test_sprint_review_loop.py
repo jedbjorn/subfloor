@@ -162,7 +162,7 @@ class ReviewHandoffTest(SprintReviewLoopCase):
                 self.reviewer_id,
                 "review_request",
                 "Focused and full gates are green; ready for review.",
-                "new",
+                "force-new",
                 1,
                 "pending",
             ),
@@ -403,6 +403,12 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
 
     def test_changes_and_approval_route_only_when_the_wake_is_delivered(self):
         first = self.request_review()
+        service = sprint_message_delivery.SprintWakeDeliveryService(self.con)
+        first_delivery = service.deliver_once(
+            "stage6-first-review",
+            lambda conversation, _prompt, _key: conversation,
+        )
+        self.assertEqual(first.wake_id, first_delivery.wake_id)
         self.accept_review(first.message_id)
         changed = self.loop.record_review(
             self.sprint_id,
@@ -455,7 +461,6 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
                 ).fetchone()
             ),
         )
-        service = sprint_message_delivery.SprintWakeDeliveryService(self.con)
         while service.deliver_once(
             "stage6-before-red",
             lambda conversation, _prompt, _key: conversation,
@@ -487,6 +492,12 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
             checks="SUCCESS", checks_failed=False, head_sha="b" * 40
         )
         self.watcher.poll_once()
+        first_reviewer_chat = self.con.execute(
+            "SELECT active.chat_id FROM sprint_participants participant "
+            "JOIN active_shell_chats active ON active.shell_id=participant.shell_id "
+            "WHERE participant.participant_id=?",
+            (self.reviewer_id,),
+        ).fetchone()[0]
         second = self.request_review("review-2")
         changed_expectation = self.con.execute(
             "SELECT resolution,next_evaluation_at "
@@ -497,6 +508,18 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
             ("work_unit.in_review", None),
             tuple(changed_expectation),
         )
+        second_delivery: list[str] = []
+        while True:
+            outcome = service.deliver_once(
+                "stage6-second-review",
+                lambda conversation, _prompt, _key: (
+                    second_delivery.append(conversation) or "second-review-run"
+                ),
+            )
+            self.assertIsNotNone(outcome)
+            if outcome.wake_id == second.wake_id:
+                break
+        self.assertNotEqual(first_reviewer_chat, second_delivery[-1])
         self.accept_review(second.message_id)
         approved = self.loop.record_review(
             self.sprint_id,

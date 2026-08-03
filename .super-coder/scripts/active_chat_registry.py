@@ -141,8 +141,22 @@ def close_for_displacement(
     return close_active(con, shell_id)
 
 
-def close_for_wake(con, shell_id: int) -> ActiveChat | None:
+def close_for_wake(
+    con,
+    shell_id: int,
+    *,
+    expected_chat_id: str | None = None,
+) -> ActiveChat | None:
     """Close an idle/stale active chat for New delivery, never a live turn."""
+    active = get(con, shell_id)
+    if (
+        expected_chat_id is not None
+        and active is not None
+        and active.chat_id != expected_chat_id
+    ):
+        raise ActiveChatBusy(
+            f"active chat changed from {expected_chat_id} to {active.chat_id}"
+        )
     return close_for_displacement(con, shell_id, allow_live_process=False)
 
 

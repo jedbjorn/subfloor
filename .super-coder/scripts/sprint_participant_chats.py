@@ -44,6 +44,21 @@ class PreparedShellWake:
     worktree: str
 
 
+@dataclass(frozen=True)
+class PreparedSprintWake:
+    participant_id: int
+    sprint_id: int
+    shell_id: int
+    owner_user_id: int
+    shortname: str
+    harness: str
+    provider: str | None
+    model: str | None
+    effort: str | None
+    generation: str
+    worktree: str
+
+
 def wake_prompt(sprint_id: int, role: str) -> str:
     try:
         label, skill = _WAKE_ROLES[role]
@@ -264,16 +279,13 @@ def create_shell_wake_conversation(
     return conversation_id
 
 
-def create_wake_conversation(
+def prepare_wake_conversation(
     con,
     *,
-    wake_id: int,
     sprint_id: int,
     participant_id: int,
-) -> str:
-    """Create and register one Sprint wake chat after close commits."""
-    if not con.in_transaction:
-        raise RuntimeError("wake conversation creation requires a transaction")
+) -> PreparedSprintWake:
+    """Resolve a Sprint participant route before any active chat is closed."""
     row = con.execute(
         "SELECT p.participant_id,p.sprint_id,p.shell_id,p.harness,p.model,p.effort,"
         "s.conversation_generation,sh.shortname,sh.flavor,owner.user_id "
@@ -288,41 +300,70 @@ def create_wake_conversation(
         raise SprintConversationError("wake recipient is not a Sprint participant")
     if row["user_id"] is None:
         raise SprintConversationError("originating Planner has no browser owner")
-    if active_chat_registry.get(con, int(row["shell_id"])) is not None:
-        raise WakeConversationBusy("another chat became active before wake creation")
-
     generation = _nonblank(
         row["conversation_generation"],
         "Sprint conversation generation",
         maximum=32,
     )
-    key = f"generation:{generation}:wake:{wake_id}"
+    adapter = run_mod.load_adapter(str(row["harness"]))
+    try:
+        run_mod.validate_headless_request(adapter, row["model"], row["effort"])
+    except ValueError as exc:
+        raise SprintConversationError(str(exc)) from exc
+    worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
+    return PreparedSprintWake(
+        participant_id=int(row["participant_id"]),
+        sprint_id=int(row["sprint_id"]),
+        shell_id=int(row["shell_id"]),
+        owner_user_id=int(row["user_id"]),
+        shortname=str(row["shortname"]),
+        harness=str(row["harness"]),
+        provider=run_mod.session_provider(row["harness"], row["model"]),
+        model=str(row["model"]) if row["model"] is not None else None,
+        effort=str(row["effort"]) if row["effort"] is not None else None,
+        generation=generation,
+        worktree=str(worktree.resolve(strict=False)),
+    )
+
+
+def create_prepared_wake_conversation(
+    con,
+    *,
+    wake_id: int,
+    route: PreparedSprintWake,
+) -> str:
+    """Create and register one preflighted Sprint wake chat."""
+    if not con.in_transaction:
+        raise RuntimeError("wake conversation creation requires a transaction")
+    if active_chat_registry.get(con, route.shell_id) is not None:
+        raise WakeConversationBusy("another chat became active before wake creation")
+
+    key = f"generation:{route.generation}:wake:{wake_id}"
     existing = con.execute(
         "SELECT conversation_id,state FROM conversations "
         "WHERE owner_user_id=? AND creation_idempotency_key=?",
-        (row["user_id"], key),
+        (route.owner_user_id, key),
     ).fetchone()
     if existing is not None:
         if existing["state"] == "closed":
             raise SprintConversationError("idempotent wake chat is already closed")
         conversation_id = str(existing["conversation_id"])
-        if not _linked_to_participant(con, participant_id, conversation_id):
+        if not _linked_to_participant(con, route.participant_id, conversation_id):
             raise SprintConversationError(
                 "idempotent wake chat belongs to another participant"
             )
-        active_chat_registry.register(con, int(row["shell_id"]), conversation_id)
+        active_chat_registry.register(con, route.shell_id, conversation_id)
         return conversation_id
 
-    worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
     request = {
-        "effort": row["effort"],
-        "harness": row["harness"],
-        "model": row["model"],
-        "participant_id": participant_id,
-        "provider": run_mod.session_provider(row["harness"], row["model"]),
-        "sprint_id": sprint_id,
+        "effort": route.effort,
+        "harness": route.harness,
+        "model": route.model,
+        "participant_id": route.participant_id,
+        "provider": route.provider,
+        "sprint_id": route.sprint_id,
         "wake_id": wake_id,
-        "worktree": str(worktree.resolve(strict=False)),
+        "worktree": route.worktree,
     }
     conversation_id = "cv_" + uuid.uuid4().hex
     con.execute(
@@ -332,14 +373,14 @@ def create_wake_conversation(
         "conversation_scope) VALUES (?,?,?,?,?,?,?,?,?,?,?,'sprint')",
         (
             conversation_id,
-            row["shell_id"],
-            row["user_id"],
-            row["harness"],
+            route.shell_id,
+            route.owner_user_id,
+            route.harness,
             request["provider"],
-            row["model"],
-            row["effort"],
+            route.model,
+            route.effort,
             request["worktree"],
-            f"Sprint {sprint_id} · Wake {wake_id} · {row['shortname']}",
+            f"Sprint {route.sprint_id} · Wake {wake_id} · {route.shortname}",
             key,
             _request_hash(request),
         ),
@@ -347,17 +388,33 @@ def create_wake_conversation(
     _append_created_event(
         con,
         conversation_id=conversation_id,
-        participant_id=participant_id,
-        sprint_id=sprint_id,
+        participant_id=route.participant_id,
+        sprint_id=route.sprint_id,
         wake_id=wake_id,
     )
     con.execute(
         "INSERT INTO sprint_participant_conversations "
         "(sprint_participant_id,conversation_id) VALUES (?,?)",
-        (participant_id, conversation_id),
+        (route.participant_id, conversation_id),
     )
-    active_chat_registry.register(con, int(row["shell_id"]), conversation_id)
+    active_chat_registry.register(con, route.shell_id, conversation_id)
     return conversation_id
+
+
+def create_wake_conversation(
+    con,
+    *,
+    wake_id: int,
+    sprint_id: int,
+    participant_id: int,
+) -> str:
+    """Create and register one Sprint wake chat after close commits."""
+    route = prepare_wake_conversation(
+        con,
+        sprint_id=sprint_id,
+        participant_id=participant_id,
+    )
+    return create_prepared_wake_conversation(con, wake_id=wake_id, route=route)
 
 
 def attach_live_participations(con, shells: list[dict]) -> list[dict]:

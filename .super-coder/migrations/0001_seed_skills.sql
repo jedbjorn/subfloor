@@ -3876,12 +3876,20 @@ the unit boundary, interfaces another unit consumes, deliverable cuts, or scope
 growth to the Planner.
 
 The active-chat registry, not Sprint participant pointers, owns your current
-chat. Assignments are declared New, but a verified live turn is never displaced:
-delivery enters this chat at its natural boundary and drains every undelivered
-wake message. When idle, New rotates to a fresh chat; Re-enter resumes the
-registry chat; no registry row behaves as New. A generous inactivity ceiling
-unlinks a silent hung turn so the 60-second reaper can terminate its verified
-process identity.
+chat. Assignments use Force-new delivery. A live turn is allowed to finish;
+then, after the receiver has stayed quiet for the configured grace interval,
+delivery atomically closes the exact registry chat and starts a fresh chat with
+the complete undelivered message bundle. Concurrent Force-new wakes coalesce
+into that one rotation, and a retry resumes the chat created for its own wake
+instead of rotating again. Stop cleanly after every typed handoff so the next
+assignment can cross the quiet boundary. The inactivity ceiling remains the
+fallback for a silent hung turn: it unlinks the chat so the reaper can terminate
+its verified process identity and Force-new delivery can proceed.
+
+Plain New remains a separate route: it is eligible immediately, enters a
+verified live turn at its natural boundary, and rotates only when the registry
+chat is idle. Re-enter resumes the registry chat; no registry row behaves as
+New.
 
 ## Questions, answers, blockers, and failures
 
@@ -3978,14 +3986,22 @@ registered PR.
 
 ## Review handoff
 
-Complete a review handoff in this exact order:
+Complete a review handoff in this exact order. Every review round uses
+Force-new delivery, so stop cleanly after the request confirms and let the
+Reviewer begin in a fresh chat with the full bundled request:
 
 1. Finish the readiness claim and every local verification step.
 2. Perform the once-only typed-handoff inbox check above, act on newly arrived
    messages, and mark every handled informational message read with `accept`.
-3. Run `wc -m < <path>`; keep the claim near 6,000 characters and below the
-   8,000-character hard maximum.
-4. As the literal final action of the turn, send the typed handoff with one
+3. Make the readiness body a bare one-line locator containing only the
+   submitting or resubmitting intent, PR URL, registered Sprint PR id, exact
+   head SHA, and work-unit id. Include no scope narrative, verification
+   evidence, judgment rationale, or review-focus steering. Put only the
+   work-unit id and spec reference in the PR body, and write no PR comments or
+   annotations.
+4. Run `wc -m < <path>` and confirm the locator is below the 8,000-character
+   hard maximum.
+5. As the literal final action of the turn, send the typed handoff with one
    stable retry key:
 
 ```text
@@ -3994,12 +4010,13 @@ sc sprint request-review \
   --readiness-file <path> --key <stable-key>
 ```
 
-5. When the command confirms the durable write and Reviewer wake, immediately
+6. When the command confirms the durable write and Reviewer wake, immediately
    stop and await the native verdict wake. Run no trailing command.
 
-A changes-requested verdict
-returns as Re-enter to your registry chat. Apply every blocking finding,
-re-establish green, and hand back with a new stable review key. Record
+A changes-requested verdict returns as Re-enter to your registry chat. Apply
+every blocking finding, re-establish green, and hand back with a new stable
+review key and a new bare locator. Do not narrate how prior findings were
+cleared; the Reviewer verifies that from the full diff at the new head. Record
 disagreements as judgment; the Reviewer owns scope/severity decisions and the
 Planner executes any resulting action.
 
@@ -4089,10 +4106,20 @@ transitions.
 
 The active-chat registry is the only current-chat authority; zero or one chat
 per shell is legal. Every wake message creates delivery intent and a wake turn
-drains every undelivered message for the receiver. Planner-bound messages are
-declared Re-enter. If a verified turn is live, every declared type enters that
-chat at the natural boundary. When idle, Re-enter resumes the registry chat and
-New rotates it; no registry row behaves as New.
+drains every undelivered message for the receiver. Assignments and review
+requests use Force-new delivery: a live turn finishes, the receiver remains
+quiet for the configured grace interval, then delivery atomically closes the
+exact registry chat and starts a fresh chat with the complete undelivered
+bundle. Concurrent Force-new wakes coalesce into one rotation, and retries reuse
+the chat created for their own wake. Participants must stop cleanly after typed
+handoffs so the next forced delivery can cross the quiet boundary. The
+inactivity ceiling and registry reaper remain the fallback for a silent hung
+turn.
+
+Planner-bound messages are Re-enter. Plain New remains separate and is eligible
+immediately. It enters a verified live turn at its natural boundary and rotates only when the
+registry chat is idle. Re-enter resumes the registry chat; no registry row
+behaves as New.
 
 FnB controls the Planner mode with the close button. Keeping the Planner chat
 open supervises one continuous thread. Closing it during an armed Sprint sets
@@ -4323,12 +4350,13 @@ it is terminal and deletes nothing.
 
 ## Handoffs and stop
 
-Planner → Developer assignments are declared New; Developer → Reviewer review
-requests are declared New; Developer/Reviewer → Planner results are Re-enter.
-These are idle-time guarantees under the live-turn boundary rule, not a
-parent/child chat topology. The Planner receives no PR-event wakes;
-Developer-owned subscriptions carry red, green, and externally closed facts
-directly to the owning Developer.
+Planner → Developer assignments and Developer → Reviewer review requests use
+Force-new delivery; Developer/Reviewer → Planner results are Re-enter. Forced
+delivery starts a fresh chat only after the prior live turn ends and the quiet
+grace passes, coalescing all receiver messages into the bundle. These are
+delivery guarantees, not a parent/child chat topology. The Planner receives no
+PR-event wakes; Developer-owned subscriptions carry red, green, and externally
+closed facts directly to the owning Developer.
 
 Never dispatch the next wave from a merge-observation turn. The Developer''s
 merged-work handoff wake is the only normal next-wave dispatch trigger. On that
@@ -4537,12 +4565,20 @@ question, answer, blocker, or context message, run `accept` for that message.
 For informational messages it only marks the message read; it does not change
 Sprint or work-unit state.
 
-Review requests are declared New, but wake type resolves at delivery. A verified
-live turn is never displaced: delivery enters the active registry chat at its
-natural boundary and drains every undelivered wake message. When idle, New
-rotates to a fresh chat; Re-enter resumes the registry chat; no registry row
-behaves as New. Reviewer verdicts to Developers and decisions to Planners are
-Re-enter. Reviewers never receive PR-event subscription wakes.
+Review requests use Force-new delivery. A live turn is allowed to finish;
+then, after the receiver has stayed quiet for the configured grace interval,
+delivery atomically closes the exact registry chat and starts a fresh chat with
+the complete undelivered message bundle. Concurrent Force-new requests coalesce
+into that one rotation, and a retry resumes the chat created for its own wake
+instead of rotating again. Stop cleanly after every typed verdict or decision
+handoff so the next request can cross the quiet boundary. The inactivity ceiling
+and registry reaper remain the fallback for a silent hung turn.
+
+Plain New remains separate and is eligible immediately. It enters a verified
+live turn at its natural boundary and rotates only when the registry chat is idle. Re-enter
+resumes the registry chat; no registry row behaves as New. Reviewer verdicts to
+Developers and decisions to Planners are Re-enter. Reviewers never receive
+PR-event subscription wakes.
 
 ## Questions, answers, blockers, and failures
 
@@ -4640,10 +4676,19 @@ acceptable post-Sprint follow-up.
 
 ## Work-unit review
 
-Accept the actionable review request, then inspect the exact bound spec
-revision, readiness claim, PR head, diff, checks, tests, relevant runtime
-evidence, and prior judgment calls. Review code quality, edge cases/failure
-paths, and spec conformance. Trace the real path; do not trust names or PR prose.
+Accept the actionable review request. Its readiness body must be only the bare
+locator: submitting or resubmitting intent, PR URL, registered Sprint PR id,
+exact head SHA, and work-unit id. Treat scope narrative, verification evidence,
+judgment rationale, or review-focus steering in that body as a protocol defect;
+do not use it to frame the review. Neither party writes PR comments or
+annotations, and the PR body contains only the work-unit id and spec reference.
+
+Review the exact bound spec revision and the full diff at the request''s exact
+head, then inspect checks, tests, relevant runtime evidence, and ratified
+judgments. Each round is clean: no prior Developer evidence or prose is input,
+and prior findings are cleared only when the code at the new head proves they
+are cleared. Review code quality, edge cases/failure paths, and spec
+conformance. Trace the real path; do not trust names or PR prose.
 
 Read resolved closure evidence through the authenticated memory surface; no SQL
 or mutation is needed. Use the exact form for a cited flag and the scoped form

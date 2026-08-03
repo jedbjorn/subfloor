@@ -33,11 +33,11 @@ def apply_schema(con: sqlite3.Connection) -> None:
 
 class SprintWorkDispatchCase(unittest.TestCase):
     def setUp(self) -> None:
-        delay_env = mock.patch.dict(
-            "os.environ", {"SC_WAKE_NEW_DELAY_SECONDS": "0"}
+        quiet_env = mock.patch.dict(
+            "os.environ", {"SC_SPRINT_FORCE_NEW_QUIET_SECONDS": "0"}
         )
-        delay_env.start()
-        self.addCleanup(delay_env.stop)
+        quiet_env.start()
+        self.addCleanup(quiet_env.stop)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.db_path = Path(self.temp_dir.name) / "sprint.db"
@@ -199,7 +199,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
             "one Reviewer may cover parallel units without consuming a lane",
         )
         self.assertEqual(
-            [(early_wave, "new"), (late_wave, "new")],
+            [(early_wave, "force-new"), (late_wave, "force-new")],
             [
                 tuple(row)
                 for row in self.con.execute(
@@ -985,7 +985,7 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             "If a Sprint command failed or did not confirm its durable write, retry "
             "that command. Do not re-check the inbox otherwise — new messages arrive "
             "as their own wakes.\n\n"
-            f"## wake_message #{wake_message_id} (declared New)\n\n"
+            f"## wake_message #{wake_message_id} (declared Force-New)\n\n"
             "Unit 1\n\nOutput 1"
         )
         self.assertEqual(expected_prompt, native["body"])

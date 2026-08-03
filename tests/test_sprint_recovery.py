@@ -1563,11 +1563,11 @@ class ClosedReviewRecoveryTest(SprintReviewLoopCase):
 
 class LifecycleExitAndRestartTest(SprintDomainCase):
     def setUp(self) -> None:
-        delay_env = mock.patch.dict(
-            "os.environ", {"SC_WAKE_NEW_DELAY_SECONDS": "0"}
+        quiet_env = mock.patch.dict(
+            "os.environ", {"SC_SPRINT_FORCE_NEW_QUIET_SECONDS": "0"}
         )
-        delay_env.start()
-        self.addCleanup(delay_env.stop)
+        quiet_env.start()
+        self.addCleanup(quiet_env.stop)
         super().setUp()
 
     def coordinator(self) -> sprint_recovery.SprintRecoveryCoordinator:
