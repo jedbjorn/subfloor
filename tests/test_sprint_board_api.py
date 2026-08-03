@@ -414,6 +414,15 @@ class SprintBoardApiCase(unittest.TestCase):
                 },
             ),
             (
+                "sprint.delivery_terminal",
+                {
+                    "terminal_count": 3,
+                    "completed_count": 2,
+                    "cancelled_count": 1,
+                    "secret": "hidden",
+                },
+            ),
+            (
                 "review.approved",
                 {
                     "work_unit_id": self.ids["unit"],

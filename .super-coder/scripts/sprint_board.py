@@ -33,6 +33,9 @@ _EVENT_FIELDS = {
     "sprint.declared": frozenset(
         {"feature_id", "spec_approval_ids", "participant_shell_ids"}
     ),
+    "sprint.delivery_terminal": frozenset(
+        {"terminal_count", "completed_count", "cancelled_count"}
+    ),
     "lifecycle.armed": frozenset(
         {
             "from",
