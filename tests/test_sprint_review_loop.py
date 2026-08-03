@@ -27,10 +27,10 @@ class SprintReviewLoopCase(SprintPRWatcherCase):
         self.registered_pr_id = self.register().registered_pr_id
         initial_green = self.con.execute(
             "SELECT message_id FROM wake_message "
-            "WHERE to_participant_id=? "
+            "WHERE receiver_shell_id=? "
             "AND idempotency_key LIKE 'pr-transition:%' "
             "ORDER BY message_id DESC LIMIT 1",
-            (self.developer_id,),
+            (1,),
         ).fetchone()
         self.messages.mark_read(int(initial_green["message_id"]), 1)
         self.loop = sprint_review_loop.SprintReviewLoopStore(
@@ -590,10 +590,10 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
         )
         self.watcher.poll_once()
         red = self.con.execute(
-            "SELECT message_id FROM wake_message WHERE to_participant_id=? "
+            "SELECT message_id FROM wake_message WHERE receiver_shell_id=? "
             "AND idempotency_key LIKE 'pr-transition:%' "
             "ORDER BY message_id DESC LIMIT 1",
-            (self.developer_id,),
+            (1,),
         ).fetchone()
         self.messages.mark_read(int(red["message_id"]), 1)
         self.reader.current = pull_request(
@@ -697,7 +697,7 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             ).fetchone()[0],
         )
 
-    def test_same_state_head_move_invalidates_approval_and_requests_delta_review(self):
+    def test_same_state_head_move_returns_readiness_judgment_to_developer(self):
         approved = self.approve()
         self.reader.current = pull_request(
             checks="SUCCESS", checks_failed=False, head_sha="b" * 40
@@ -716,34 +716,27 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             ],
         )
         self.assertEqual(
-            "in_review",
+            "fixing",
             self.con.execute(
                 "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
                 (self.unit_id,),
             ).fetchone()[0],
         )
-        delta = self.con.execute(
-            "SELECT message_id,to_participant_id,actionable,disposition,body "
-            "FROM wake_message WHERE idempotency_key LIKE "
-            "'pr-head-change:%:delta-review'"
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE idempotency_key LIKE 'pr-head-change:%:delta-review'"
+            ).fetchone()[0],
+        )
+        owner_event = self.con.execute(
+            "SELECT receiver_shell_id,body FROM wake_message "
+            "WHERE idempotency_key LIKE 'pr-transition:%' "
+            "ORDER BY message_id DESC LIMIT 1"
         ).fetchone()
-        self.assertEqual(
-            (self.reviewer_id, 1, "pending"),
-            (int(delta["to_participant_id"]), delta["actionable"], delta["disposition"]),
-        )
-        self.assertIn("Perform a delta review", delta["body"])
-        self.assertEqual(
-            [(self.reviewer_id, "pending")],
-            [
-                tuple(row)
-                for row in self.con.execute(
-                    "SELECT w.participant_id,w.state FROM sprint_wake_outbox w "
-                    "JOIN sprint_wake_messages wm USING (wake_id) "
-                    "WHERE wm.message_id=?",
-                    (delta["message_id"],),
-                )
-            ],
-        )
+        self.assertEqual(1, owner_event["receiver_shell_id"])
+        self.assertIn("event=green", owner_event["body"])
+        self.assertIn("judge readiness", owner_event["body"])
         invalidated = json.loads(
             self.con.execute(
                 "SELECT payload FROM sprint_events "
@@ -760,7 +753,8 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             ).fetchone()[0]
         )
 
-        self.accept_review(int(delta["message_id"]))
+        handoff = self.request_review("review-after-head-move")
+        self.accept_review(handoff.message_id)
         outcome = self.loop.record_review(
             self.sprint_id,
             self.registered_pr_id,

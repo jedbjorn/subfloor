@@ -2634,6 +2634,35 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             con.close()
 
+    def _pr_post(self, path: str, body: dict):
+        """Authenticated shell-owned PR subscription surface."""
+        shell_id = self._require_shell_auth()
+        if shell_id is None:
+            return
+        con = db()
+        try:
+            if path != "/_sc/pr/subscribe":
+                return self._send(404, {"error": "not found"})
+            try:
+                pr_number = int(body.get("pr_number"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("pr_number must be a positive integer") from exc
+            receipt = sprint_pr_watcher.SprintPRWatcher(
+                con, repo_root=REPO_ROOT
+            ).subscribe(
+                owner_shell_id=shell_id,
+                repository=body.get("repository") or "",
+                pr_number=pr_number,
+            )
+            return self._send(201 if receipt.created else 200, {
+                "subscription_id": receipt.subscription_id,
+                "created": receipt.created,
+            })
+        except Exception as exc:
+            return self._sprint_error(exc)
+        finally:
+            con.close()
+
     # -- authenticated shell CLI catalogue reads --
 
     def _shell_catalog_get(self, path: str):
@@ -3737,6 +3766,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path.startswith("/_sc/mem/"):
             return self._mem_post(path, self._body())
+        if path.startswith("/_sc/pr/"):
+            return self._pr_post(path, self._body())
         if path.startswith("/_sc/sprint/"):
             return self._sprint_post(path, self._body())
         con = db()

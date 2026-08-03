@@ -657,6 +657,24 @@ class SprintMessageStore:
                     (wake["wake_id"],),
                 )
 
+    def resolve_in_transaction(self, message_id: int) -> None:
+        """Resolve one informational message and its delivery intent.
+
+        Deterministic producers use this when later evidence makes an
+        undelivered message obsolete.  Keeping the wake cancellation here
+        prevents callers from reimplementing message-store invariants.
+        """
+        if not self.con.in_transaction:
+            raise RuntimeError("message resolution requires an active transaction")
+        changed = self.con.execute(
+            "UPDATE wake_message SET read_at=COALESCE(read_at,datetime('now')) "
+            "WHERE message_id=?",
+            (message_id,),
+        ).rowcount
+        if changed != 1:
+            raise KeyError(f"unknown wake message: {message_id}")
+        self._cancel_resolved_wakes(message_id)
+
 
 class SprintWakeDeliveryService:
     """Lease wake intents and resolve their chat placement at delivery time."""

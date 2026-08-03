@@ -230,6 +230,11 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         "VALUES (1,1,2,'jedbjorn/dos-app',54)"
     )
     con.execute(
+        "INSERT INTO pr_subscriptions "
+        "(subscription_id,owner_shell_id,repository,pr_number,"
+        "sprint_registered_pr_id) VALUES (1,1,'jedbjorn/dos-app',54,1)"
+    )
+    con.execute(
         "INSERT INTO sprint_pr_work_units "
         "(sprint_id,registered_pr_id,work_unit_id) VALUES (1,1,1)"
     )
@@ -239,6 +244,20 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         "observed_head_sha,evidence,observed_at) VALUES "
         "(1,1,'green','pr-54-green','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',"
         "'{\"checks\":\"green\"}','2026-08-01 21:05:00')"
+    )
+    con.execute(
+        "INSERT INTO pr_subscription_transitions "
+        "(transition_id,subscription_id,normalized_state,transition_key,"
+        "observed_head_sha,evidence,observed_at) VALUES "
+        "(1,1,'green','subscription-54-green',"
+        "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',"
+        "'{\"checks\":\"green\"}','2026-08-01 21:05:00')"
+    )
+    con.execute(
+        "INSERT INTO pr_subscription_poll_failures "
+        "(failure_id,subscription_id,failure_count,backoff_seconds,trigger,"
+        "error_detail,failed_at) VALUES "
+        "(1,1,1,10.0,'pulse','fixture failure','2026-08-01 21:04:00')"
     )
     con.execute(
         "INSERT INTO sprint_judgments "
@@ -504,7 +523,8 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
                 row[0]
                 for row in con.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' "
-                    "AND (name IN ('sprints','wake_message') OR name LIKE 'sprint_%')"
+                    "AND (name IN ('sprints','wake_message','pr_subscriptions') "
+                    "OR name LIKE 'sprint_%' OR name LIKE 'pr_subscription_%')"
                 )
             }
         finally:

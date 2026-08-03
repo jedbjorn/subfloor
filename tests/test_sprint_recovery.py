@@ -324,6 +324,15 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             self.con
         ).deliver_once(
             "paused-notice-worker",
+            lambda conversation, prompt, _key: (
+                "pr-event-run" if "GitHub PR event" in prompt else conversation
+            ),
+        )
+        self.assertNotEqual(pause_wake_id, pause_outcome.wake_id)
+        pause_outcome = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con
+        ).deliver_once(
+            "paused-notice-worker-2",
             lambda conversation, _prompt, _key: conversation,
         )
         self.assertEqual(pause_wake_id, pause_outcome.wake_id)
@@ -1371,7 +1380,10 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             reason="evidence reviewed",
         )
 
-        self.assertEqual((self.unit_id,), receipt.projected_work_unit_ids)
+        # The engine-wide watcher projects the merge during the resume
+        # reconciliation callback; the lifecycle projection then sees the unit
+        # already complete instead of reporting it a second time.
+        self.assertEqual((), receipt.projected_work_unit_ids)
         self.assertEqual(1, len(receipt.dispatched_wake_ids))
         self.assertEqual(
             [(self.unit_id, "completed"), (downstream, "ready")],

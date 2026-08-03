@@ -21,6 +21,7 @@ ENGINE = ROOT / ".super-coder"
 sys.path[:0] = [str(ENGINE / "scripts"), str(ENGINE / "api"), str(ROOT / "tests")]
 
 import mem  # noqa: E402
+import pr_cli  # noqa: E402
 import server  # noqa: E402
 import sprint_cli  # noqa: E402
 import sprint_domain  # noqa: E402
@@ -219,6 +220,50 @@ class SprintCliApiTest(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             self.assertEqual(0, sprint_cli.main(list(argv)))
         return json.loads(output.getvalue())
+
+    def run_pr_cli(self, token: str, *argv: str) -> dict:
+        mem.SC_API_TOKEN = token
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(0, pr_cli.main(list(argv)))
+        return json.loads(output.getvalue())
+
+    def test_engine_wide_subscription_uses_authenticated_developer_identity(self):
+        with mock.patch.object(
+            server.sprint_pr_watcher,
+            "GitHubPullRequestReader",
+            return_value=Reader(),
+        ):
+            receipt = self.run_pr_cli(
+                TOKENS["developer"],
+                "subscribe",
+                "--repository",
+                "Acme/Outside",
+                "--pr",
+                "85",
+            )
+
+        self.assertTrue(receipt["created"])
+        con = sqlite3.connect(self.db)
+        try:
+            subscription = con.execute(
+                "SELECT owner_shell_id,repository,pr_number,"
+                "sprint_registered_pr_id FROM pr_subscriptions "
+                "WHERE subscription_id=?",
+                (receipt["subscription_id"],),
+            ).fetchone()
+            message = con.execute(
+                "SELECT receiver_shell_id,sprint_id,to_participant_id,"
+                "declared_type,body FROM wake_message "
+                "WHERE idempotency_key LIKE 'pr-transition:%:shell:1' "
+                "ORDER BY message_id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual((1, "acme/outside", 85, None), subscription)
+        self.assertEqual((1, None, None, "re-enter"), message[:4])
+        self.assertIn("number=85", message[4])
+        self.assertIn("event=green", message[4])
 
     def seed_declaration(self, suffix: str) -> tuple[int, int, int]:
         con = sqlite3.connect(self.db)
