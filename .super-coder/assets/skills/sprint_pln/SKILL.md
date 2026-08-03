@@ -129,14 +129,25 @@ a decision, execute it through the protocol below. Send any needed participant
 context before pausing; an active relay is not available after the lifecycle
 becomes paused.
 
+## Sprint artifact paths
+
+Sprint working artifacts (per-unit review notes, raw diffs, evidence packets,
+report drafts, and Dev scratch proof) go to the gitignored
+`shared/sprints/sprint-<n>/` directory. They are never committed, branched, or
+PR'd in the work repo; a review-notes commit is a finding.
+
+DB rows stay the durable record: judgments via `record-review`, report bodies in
+`sprint_reports`, and decisions in the durable relay. Files in the Sprint
+artifact directory are working material only.
+
 ## Reviewer decision actions
 
-Pause, cancel, and conclude are Reviewer decisions and Planner actions. A valid
-decision arrives as a durable Reviewer → Planner Re-enter message and names the
-decision, evidence, target ids, reason, and exact requested transition. Accept
-the actionable message, verify it came from the assigned Reviewer, and execute
-that transition without re-adjudicating the decision. Record the decision
-message id and action receipt together.
+Pause, cancel, re-enter, and conclude are Reviewer decisions and Planner
+actions. A valid decision arrives as a durable Reviewer → Planner Re-enter
+message and names the decision, evidence, target ids, reason, and exact
+requested transition. Accept the actionable message, verify it came from the
+assigned Reviewer, and execute that transition without re-adjudicating the
+decision. Record the decision message id and action receipt together.
 
 The FnB board-level override from decision #46 is unaffected: a live FnB
 instruction may direct or supersede any action. Name that override in the
@@ -190,6 +201,37 @@ sc sprint replan-unit --sprint <id> --work-unit <id> \
 If a Developer or Reviewer declines, preserve the reason and ask the Reviewer
 for the replacement routing decision before issuing a fresh assignment.
 
+### Re-enter after conformance
+
+A Reviewer `re-enter` decision names the in-Sprint findings, the tasks to add
+to the governing spec document with title and description, and the suggested
+unit grouping, waves, dependencies, and routing. Preserve that projection; do
+not silently absorb extra scope or turn post-Sprint findings into delivery work.
+
+Cut every named task against the governing spec document:
+
+```text
+sc mem task add "<task-title>" --feature <feature-id> \
+  --doc <governing-spec-document-id> --seq <next-seq> \
+  --desc "<task-description>"
+```
+
+Create the requested bound work units from those task ids, wiring the Reviewer's
+waves and dependencies directly:
+
+```text
+sc sprint plan-unit --sprint <id> \
+  --developer-shell <id> --reviewer-shell <id> --title <title> \
+  --expected-output-file <path> --task <task-id> \
+  [--task <task-id>] [--wave <n>] [--depends-on <work-unit-id>] \
+  [--output-kind code|report-only|no-code]
+```
+
+After every named task is bound and the dependency graph matches the decision,
+release the new ready lanes with `sc sprint dispatch --sprint <id>`. When the
+added work reaches terminal disposition, the engine sends the Reviewer the next
+delivery-terminal wake; the Planner does not initiate the next conformance pass.
+
 ### Conclude or abort
 
 The Reviewer decides when the Sprint is done, records conformance, authors the
@@ -204,9 +246,17 @@ sc sprint complete --sprint <id> --reason <reviewer-decision-reason> \
   --key <reviewer-decision-key>
 ```
 
-Do not run `compile-report`, synthesize the final report, or editorialize the
-Reviewer body. Abort is likewise an action taken only on a Reviewer decision or
-FnB override; it is terminal and deletes nothing.
+Do not run `compile-report` by default, synthesize the final report, or
+editorialize the Reviewer body. The Reviewer compiles its own evidence. A
+Planner compile remains a valid FnB-directed fallback:
+
+```text
+sc sprint compile-report --sprint <id> --limit 50 \
+  > shared/sprints/sprint-<n>/evidence.json
+```
+
+Abort is likewise an action taken only on a Reviewer decision or FnB override;
+it is terminal and deletes nothing.
 
 ## Handoffs and stop
 
@@ -236,12 +286,6 @@ sc sprint dispatch --sprint <id>
 5. When the command confirms the durable assignment writes and New wakes, stop
    immediately. Run no trailing command. Empty dispatch is still the final
    action for that handoff turn; investigate only on a later durable wake.
-
-When all planned delivery work is terminal and merged or explicitly no-code,
-send the Reviewer the bound revisions, integrated main SHA, ratified judgments,
-and current close evidence, then stop and await its Re-enter conclude decision.
-The Reviewer writes the conformance and final Sprint reports; conformance
-findings become follow-ups rather than new editing lanes in this Sprint.
 
 On receipt, re-run `sc sprint inbox --sprint <id>`, accept the conclude message,
 execute its exact close action through the protocol above, and confirm the typed

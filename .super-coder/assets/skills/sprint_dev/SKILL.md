@@ -78,6 +78,17 @@ alternate delivery protocol. A Developer does not pause the Sprint. The
 Reviewer decides whether the evidence warrants continuing, re-planning, or
 pausing; the Planner executes that decision.
 
+## Sprint artifact paths
+
+Sprint working artifacts (per-unit review notes, raw diffs, evidence packets,
+report drafts, and Dev scratch proof) go to the gitignored
+`shared/sprints/sprint-<n>/` directory. They are never committed, branched, or
+PR'd in the work repo; a review-notes commit is a finding.
+
+DB rows stay the durable record: judgments via `record-review`, report bodies in
+`sprint_reports`, and decisions in the durable relay. Files in the Sprint
+artifact directory are working material only.
+
 ## Build and verify
 
 Sync the assigned repository, work on a feature branch, match the surrounding
