@@ -98,12 +98,17 @@ def close_active(con, shell_id: int) -> ActiveChat | None:
     return active
 
 
-def close_for_wake(con, shell_id: int) -> ActiveChat | None:
-    """Close an idle/stale active chat for New delivery, never a live turn."""
+def close_for_displacement(
+    con,
+    shell_id: int,
+    *,
+    allow_live_process: bool,
+) -> ActiveChat | None:
+    """Cancel queued work, then close and unlink a displaced active chat."""
     active = get(con, shell_id)
     if active is None:
         return None
-    if has_live_process(active):
+    if not allow_live_process and has_live_process(active):
         raise ActiveChatBusy(f"active chat {active.chat_id} has a live turn")
     if active.state in {"queued", "running"}:
         message_ids = [
@@ -136,6 +141,11 @@ def close_for_wake(con, shell_id: int) -> ActiveChat | None:
     return close_active(con, shell_id)
 
 
+def close_for_wake(con, shell_id: int) -> ActiveChat | None:
+    """Close an idle/stale active chat for New delivery, never a live turn."""
+    return close_for_displacement(con, shell_id, allow_live_process=False)
+
+
 def close_for_inactivity(con, shell_id: int) -> ActiveChat | None:
     """Close and unlink a chat after the mechanical inactivity ceiling.
 
@@ -143,38 +153,7 @@ def close_for_inactivity(con, shell_id: int) -> ActiveChat | None:
     live but silent turn.  Its process identity remains on the run row so the
     reaper can terminate the newly unprotected process group.
     """
-    active = get(con, shell_id)
-    if active is None:
-        return None
-    if active.state in {"queued", "running"}:
-        message_ids = [
-            int(row[0])
-            for row in con.execute(
-                "SELECT message_id FROM conversation_outbox "
-                "WHERE conversation_id=? AND state IN ('pending','claimed')",
-                (active.chat_id,),
-            )
-        ]
-        if message_ids:
-            marks = ",".join("?" for _ in message_ids)
-            con.execute(
-                "UPDATE conversation_messages SET state='cancelled',"
-                "completed_at=datetime('now') WHERE message_id IN (" + marks + ")",
-                message_ids,
-            )
-            con.execute(
-                "UPDATE conversation_outbox SET state='cancelled',claim_owner=NULL,"
-                "claimed_at=NULL,lease_expires_at=NULL "
-                "WHERE message_id IN (" + marks + ")",
-                message_ids,
-            )
-        target = "idle" if active.state == "queued" else "error"
-        con.execute(
-            "UPDATE conversations SET state=?,last_activity_at=datetime('now'),"
-            "version=version+1 WHERE conversation_id=? AND state=?",
-            (target, active.chat_id, active.state),
-        )
-    return close_active(con, shell_id)
+    return close_for_displacement(con, shell_id, allow_live_process=True)
 
 
 def register(con, shell_id: int, chat_id: str) -> None:

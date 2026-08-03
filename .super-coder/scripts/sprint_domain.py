@@ -666,7 +666,7 @@ class SprintLifecycleStore:
         with db_driver.write_transaction(self.con, "sprint.wake_failure"):
             row = self.con.execute(
                 "SELECT wake_id,sprint_id,receiver_shell_id,state,attempt_count,"
-                "claim_owner "
+                "claim_owner,idempotency_key "
                 "FROM sprint_wake_outbox WHERE wake_id=?",
                 (wake_id,),
             ).fetchone()
@@ -708,6 +708,10 @@ class SprintLifecycleStore:
                 ),
             )
             if terminal:
+                recovery_exhausted = (
+                    row["sprint_id"] is None
+                    and str(row["idempotency_key"]).startswith("engine-recovery:")
+                )
                 active = active_chat_registry.get(
                     self.con, int(row["receiver_shell_id"])
                 )
@@ -716,8 +720,10 @@ class SprintLifecycleStore:
                     target_conversation_id is None
                     or active.chat_id == target_conversation_id
                 ):
-                    closed = active_chat_registry.close_for_inactivity(
-                        self.con, int(row["receiver_shell_id"])
+                    closed = active_chat_registry.close_for_displacement(
+                        self.con,
+                        int(row["receiver_shell_id"]),
+                        allow_live_process=True,
                     )
                 if closed is not None:
                     sprint_participant_chats._append_event(
@@ -725,12 +731,47 @@ class SprintLifecycleStore:
                         closed.chat_id,
                         "conversation.closed",
                         {
-                            "reason": "wake delivery exhausted",
+                            "reason": (
+                                "engine wake recovery exhausted; shell unbootable"
+                                if recovery_exhausted
+                                else "wake delivery exhausted"
+                            ),
                             "state": "closed",
                             "wake_id": wake_id,
+                            **(
+                                {"unbootable_shell": True}
+                                if recovery_exhausted
+                                else {}
+                            ),
                         },
                     )
                     closed_conversation_ids.append(closed.chat_id)
+                if recovery_exhausted:
+                    shell = self.con.execute(
+                        "SELECT shortname FROM shells WHERE shell_id=?",
+                        (int(row["receiver_shell_id"]),),
+                    ).fetchone()
+                    shortname = (
+                        str(shell["shortname"])
+                        if shell is not None and shell["shortname"]
+                        else f"shell #{int(row['receiver_shell_id'])}"
+                    )
+                    self.con.execute(
+                        "INSERT INTO flags "
+                        "(display_name,priority,description,shell_id) "
+                        "VALUES (?,'High',?,?)",
+                        (
+                            f"[Engine] {shortname} unbootable after wake recovery",
+                            (
+                                "Engine wake recovery exhausted its three-attempt "
+                                f"budget (wake #{wake_id}, key "
+                                f"{row['idempotency_key']}). Undelivered messages "
+                                "remain attached to the terminal wake; manual "
+                                "operator recovery is required."
+                            ),
+                            int(row["receiver_shell_id"]),
+                        ),
+                    )
                 affected_sprints = self.con.execute(
                     "SELECT DISTINCT s.* FROM sprint_wake_messages wm "
                     "JOIN wake_message m USING (message_id) "

@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
@@ -108,7 +109,9 @@ class ActivityMonitorTest(unittest.TestCase):
         self.con.commit()
         return chat_id, message_id, run_id
 
-    def test_config_defaults_to_sixty_minutes_and_rejects_invalid_values(self) -> None:
+    def test_config_defaults_to_sixty_minutes_and_falls_back_for_invalid_values(
+        self,
+    ) -> None:
         self.assertEqual(
             3600,
             activity_monitor.ActivityMonitorConfig.from_env(
@@ -121,14 +124,42 @@ class ActivityMonitorTest(unittest.TestCase):
                 {"SC_CHAT_INACTIVITY_CEILING": "90"}
             ).inactivity_ceiling_seconds,
         )
-        for value in ("0", "-1", "later"):
-            with (
-                self.subTest(value=value),
-                self.assertRaisesRegex(ValueError, "SC_CHAT_INACTIVITY_CEILING"),
-            ):
-                activity_monitor.ActivityMonitorConfig.from_env(
+        for value in ("0", "-1", "later", "nan", "inf"):
+            with self.subTest(value=value), self.assertLogs(
+                "super_coder.activity_monitor", level="WARNING"
+            ) as logs:
+                config = activity_monitor.ActivityMonitorConfig.from_env(
                     {"SC_CHAT_INACTIVITY_CEILING": value}
                 )
+            self.assertEqual(3600, config.inactivity_ceiling_seconds)
+            self.assertEqual(1, len(logs.output))
+            self.assertIn("using default 3600 seconds", logs.output[0])
+
+    def test_malformed_ceiling_does_not_kill_runtime_thread(self) -> None:
+        runtime = sprint_runtime.SprintRuntimeService(
+            self.db_path,
+            owner="invalid-activity-config-test",
+            pulse_seconds=60,
+        )
+
+        with (
+            mock.patch.dict(
+                activity_monitor.os.environ,
+                {"SC_CHAT_INACTIVITY_CEILING": "later"},
+            ),
+            self.assertLogs("super_coder.activity_monitor", level="WARNING"),
+        ):
+            runtime.start()
+            try:
+                started = runtime.wait_started()
+                alive = runtime.is_alive()
+            finally:
+                runtime.stop()
+                runtime.join(timeout=5)
+
+        self.assertTrue(started)
+        self.assertTrue(alive)
+        self.assertFalse(runtime.is_alive())
 
     def test_stale_live_chat_closes_and_unlinks_without_finishing_run(self) -> None:
         chat_id, message_id, run_id = self.add_live_chat(idle_seconds=3601)
@@ -365,6 +396,138 @@ class ActivityMonitorTest(unittest.TestCase):
                     "FROM sprint_wake_outbox WHERE wake_id=?",
                     (replacement,),
                 ).fetchone()[0]
+            ),
+        )
+
+        delivery = sprint_message_delivery.SprintWakeDeliveryService(self.con)
+        recovery_outcomes = []
+        for attempt in range(1, 4):
+            self.con.execute(
+                "UPDATE sprint_wake_outbox SET available_at=datetime('now') "
+                "WHERE wake_id=?",
+                (replacement,),
+            )
+            self.con.commit()
+            recovery_outcomes.append(
+                delivery.deliver_once(
+                    f"recovery-failure-{attempt}",
+                    lambda *_args: (_ for _ in ()).throw(
+                        RuntimeError("shell will not boot")
+                    ),
+                )
+            )
+
+        after_recovery_failure = monitor.tick()
+        repeated_recovery_scan = monitor.tick()
+
+        self.assertEqual(
+            [
+                (replacement, "pending", 1),
+                (replacement, "pending", 2),
+                (replacement, "failed", 3),
+            ],
+            [
+                (outcome.wake_id, outcome.state, outcome.attempt_number)
+                for outcome in recovery_outcomes
+            ],
+        )
+        self.assertEqual((), after_recovery_failure.recovered_wake_ids)
+        self.assertEqual((), repeated_recovery_scan.recovered_wake_ids)
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_outbox"
+            ).fetchone()[0],
+            "a failed recovery wake must not create a recovery-of-recovery",
+        )
+        self.assertEqual(
+            (replacement, None, None),
+            tuple(
+                self.con.execute(
+                    "SELECT joined.wake_id,message.delivered_at,message.read_at "
+                    "FROM sprint_wake_messages joined JOIN wake_message message "
+                    "USING (message_id) WHERE message.message_id=?",
+                    (sent.message_id,),
+                ).fetchone()
+            ),
+        )
+        flags = self.con.execute(
+            "SELECT display_name,priority,description,shell_id,resolved "
+            "FROM flags WHERE display_name LIKE '[Engine] % unbootable%'"
+        ).fetchall()
+        self.assertEqual(1, len(flags))
+        self.assertEqual(
+            (
+                "[Engine] DEV1 unbootable after wake recovery",
+                "High",
+                (
+                    "Engine wake recovery exhausted its three-attempt budget "
+                    f"(wake #{replacement}, key "
+                    f"engine-recovery:failed-wake:{sent.wake_id}). Undelivered "
+                    "messages remain attached to the terminal wake; manual "
+                    "operator recovery is required."
+                ),
+                1,
+                0,
+            ),
+            tuple(flags[0]),
+        )
+        recovery_chat_id = self.con.execute(
+            "SELECT target_conversation_id FROM sprint_wake_attempts "
+            "WHERE wake_id=? AND attempt_number=3",
+            (replacement,),
+        ).fetchone()[0]
+        recovery_event = self.con.execute(
+            "SELECT payload FROM conversation_events "
+            "WHERE conversation_id=? AND event_type='conversation.closed' "
+            "ORDER BY sequence DESC LIMIT 1",
+            (recovery_chat_id,),
+        ).fetchone()
+        self.assertEqual(
+            {
+                "reason": "engine wake recovery exhausted; shell unbootable",
+                "state": "closed",
+                "unbootable_shell": True,
+                "wake_id": replacement,
+            },
+            json.loads(recovery_event[0]),
+        )
+
+    def test_historical_failed_engine_wake_is_not_recovered(self) -> None:
+        sent = sprint_message_delivery.SprintMessageStore(self.con).send_to_shell(
+            1,
+            message_kind="system",
+            body="historical engine wake",
+            idempotency_key="historical-engine-wake",
+        )
+        lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+        for attempt in range(1, 4):
+            self.assertEqual(
+                attempt,
+                lifecycle.record_wake_failure(sent.wake_id, f"failure {attempt}"),
+            )
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET created_at=datetime('now','-2 days') "
+            "WHERE wake_id=?",
+            (sent.wake_id,),
+        )
+        self.con.commit()
+
+        outcome = activity_monitor.ActivityMonitor(self.con).tick()
+
+        self.assertEqual((), outcome.recovered_wake_ids)
+        self.assertEqual(
+            (sent.wake_id, "failed", 3, None, None),
+            tuple(
+                self.con.execute(
+                    "SELECT joined.wake_id,wake.state,wake.attempt_count,"
+                    "message.delivered_at,message.read_at "
+                    "FROM sprint_wake_messages joined "
+                    "JOIN sprint_wake_outbox wake USING (wake_id) "
+                    "JOIN wake_message message USING (message_id) "
+                    "WHERE message.message_id=?",
+                    (sent.message_id,),
+                ).fetchone()
             ),
         )
 

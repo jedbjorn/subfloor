@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 import sqlite3
 from collections.abc import Mapping
@@ -14,18 +16,23 @@ import db_driver
 
 DEFAULT_CHAT_INACTIVITY_CEILING_SECONDS = 60 * 60
 ENGINE_WAKE_RECOVERY_BACKOFF_SECONDS = 180
+ENGINE_WAKE_RECOVERY_MAX_AGE_SECONDS = 24 * 60 * 60
+_LOG = logging.getLogger("super_coder.activity_monitor")
 
 
 def _configured_ceiling(env: Mapping[str, str]) -> float:
     raw = env.get("SC_CHAT_INACTIVITY_CEILING", "").strip()
     try:
         value = DEFAULT_CHAT_INACTIVITY_CEILING_SECONDS if not raw else float(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "SC_CHAT_INACTIVITY_CEILING must be a number of seconds"
-        ) from exc
-    if value <= 0:
-        raise ValueError("SC_CHAT_INACTIVITY_CEILING must be positive")
+    except ValueError:
+        value = 0
+    if not math.isfinite(value) or value <= 0:
+        _LOG.warning(
+            "invalid SC_CHAT_INACTIVITY_CEILING=%r; using default %s seconds",
+            raw,
+            DEFAULT_CHAT_INACTIVITY_CEILING_SECONDS,
+        )
+        return DEFAULT_CHAT_INACTIVITY_CEILING_SECONDS
     return value
 
 
@@ -135,15 +142,19 @@ class ActivityMonitor:
         return closed
 
     def _recover_engine_wakes(self) -> list[int]:
+        age_modifier = f"-{ENGINE_WAKE_RECOVERY_MAX_AGE_SECONDS} seconds"
         rows = self.con.execute(
             "SELECT w.wake_id,w.receiver_shell_id "
             "FROM sprint_wake_outbox w "
             "WHERE w.sprint_id IS NULL AND w.state='failed' "
+            "AND w.idempotency_key NOT LIKE 'engine-recovery:%' "
+            "AND w.created_at>=datetime('now', ?) "
             "AND EXISTS (SELECT 1 FROM sprint_wake_messages joined "
             "JOIN wake_message message USING (message_id) "
             "WHERE joined.wake_id=w.wake_id AND message.sprint_id IS NULL "
             "AND message.delivered_at IS NULL AND message.read_at IS NULL) "
-            "ORDER BY w.wake_id"
+            "ORDER BY w.wake_id",
+            (age_modifier,),
         ).fetchall()
         recovered: list[int] = []
         for row in rows:
