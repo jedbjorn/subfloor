@@ -845,6 +845,23 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         self.assertEqual(1, len(self.terminal_events()))
         self.assert_episode(2, 0, 2)
 
+    def test_arming_all_cancelled_sprint_wakes_reviewers(self) -> None:
+        first = self.create_unit(developer=1, title="Cancelled first")
+        second = self.create_unit(developer=4, title="Cancelled second")
+        self.units.cancel(self.sprint_id, first, 3, reason="No longer needed")
+        self.units.cancel(self.sprint_id, second, 3, reason="No work remains")
+        self.assertEqual([], self.terminal_messages())
+        self.assertEqual([], self.terminal_events())
+
+        self.lifecycle.arm(self.sprint_id, 3)
+
+        self.assertEqual(
+            [(first, "cancelled"), (second, "cancelled")], self.dispositions()
+        )
+        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_events()))
+        self.assert_episode(2, 0, 2)
+
     def test_episode_replay_dedupes_and_added_scope_refires_with_fresh_key(self) -> None:
         first = self.create_unit(developer=1, output_kind="report_only")
         self.lifecycle.arm(self.sprint_id, 3)

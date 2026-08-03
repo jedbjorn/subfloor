@@ -507,6 +507,34 @@ class ConformanceFollowupTest(SprintCloseCase):
             ).fetchone()[0],
         )
 
+    def test_participating_reviewer_cannot_record_final_report(self):
+        with self.assertRaisesRegex(
+            sprint_domain.SprintAuthorityError, "owning Planner or FnB"
+        ):
+            self.close.record_final_report(
+                self.sprint_id,
+                2,
+                body="Reviewer must not author the final synthesis.",
+                idempotency_key="reviewer-final-report",
+            )
+
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=? "
+                "AND report_kind='final'",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='final_report.recorded'",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+
     def test_only_fnb_dispositions_followup_and_only_pending_is_unresolved(self):
         self.con.execute(
             "INSERT INTO shells "
@@ -717,7 +745,7 @@ class EvidenceCompilerTest(SprintCloseCase):
         )
         self.assertGreater(packet["anomalies"]["events"]["truncated"], 0)
 
-    def test_only_planner_or_admin_compiles_and_participants_read_timeline(self):
+    def test_planner_admin_and_participating_reviewer_compile_evidence(self):
         planner_packet = self.close.compile_evidence_packet(self.sprint_id, 3)
         reviewer_packet = self.close.compile_evidence_packet(self.sprint_id, 2)
         self.assertEqual(

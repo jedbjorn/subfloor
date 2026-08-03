@@ -251,7 +251,9 @@ class SprintCloseStore:
             raise ValueError(
                 f"section limit must be between 1 and {MAX_SECTION_LIMIT}"
             )
-        sprint = self._require_close_authority(sprint_id, caller_shell_id)
+        sprint = self._require_close_authority(
+            sprint_id, caller_shell_id, allow_reviewer=True
+        )
         events = self._events(sprint_id)
         specs = self._spec_revisions(sprint_id)
         units = self._planned_vs_actual(sprint_id)
@@ -541,7 +543,11 @@ class SprintCloseStore:
         return events
 
     def _require_close_authority(
-        self, sprint_id: int, caller_shell_id: int
+        self,
+        sprint_id: int,
+        caller_shell_id: int,
+        *,
+        allow_reviewer: bool = False,
     ) -> sqlite3.Row:
         row = self.con.execute(
             "SELECT sp.*,r.title AS feature_title,s.flavor AS caller_flavor "
@@ -555,6 +561,10 @@ class SprintCloseStore:
             int(row["originating_planner_shell_id"]) != caller_shell_id
             and row["caller_flavor"] != "admin"
         ):
+            if not allow_reviewer:
+                raise SprintAuthorityError(
+                    "only the owning Planner or FnB may record the final report"
+                )
             try:
                 self._require_reviewer(sprint_id, caller_shell_id)
             except SprintAuthorityError:

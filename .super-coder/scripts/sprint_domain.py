@@ -282,6 +282,7 @@ class SprintLifecycleStore:
                     "work_wake_ids": work_wake_ids,
                 },
             )
+            SprintWorkUnitStore(self.con)._queue_delivery_terminal(sprint_id)
         return wake_ids
 
     def transition(

@@ -79,7 +79,7 @@
     {
       "scenario": "FnB authority can compile evidence when the Planner is unavailable",
       "file": "tests/test_sprint_close.py",
-      "test": "test_only_planner_or_admin_compiles_and_participants_read_timeline"
+      "test": "test_planner_admin_and_participating_reviewer_compile_evidence"
     },
     {
       "scenario": "Restart preserves every non-terminal lifecycle state",
