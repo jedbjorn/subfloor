@@ -32,6 +32,10 @@ class VerifyCleanCloneTest(unittest.TestCase):
             # test is run before their fixes have been committed.
             shutil.copy2(ROOT / "sc", checkout / "sc")
             shutil.copy2(
+                ROOT / ".super-coder" / "scripts" / "pr_cli.py",
+                checkout / ".super-coder" / "scripts" / "pr_cli.py",
+            )
+            shutil.copy2(
                 ROOT / ".super-coder" / "scripts" / "run.py",
                 checkout / ".super-coder" / "scripts" / "run.py",
             )

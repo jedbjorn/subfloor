@@ -32,9 +32,9 @@
       "test": "test_red_green_red_occurrences_wake_once_each_and_coalesce"
     },
     {
-      "scenario": "PR change while paused is reconciled once after resume",
+      "scenario": "PR change while paused is observed immediately and deduplicated",
       "file": "tests/test_sprint_pr_watcher.py",
-      "test": "test_paused_change_is_observed_once_after_resume"
+      "test": "test_paused_change_is_observed_immediately_and_deduplicated"
     },
     {
       "scenario": "Quota exhaustion after acceptance escalates immediately",

@@ -21,7 +21,7 @@ from sprint_pr_watcher import SprintPRWatcher
 
 @dataclass(frozen=True)
 class _ObservedPR:
-    registered_pr_id: int
+    subscription_id: int
     pull_request: PullRequest
 
 
@@ -102,7 +102,7 @@ class SprintRecoveryCoordinator:
         def reconcile(_con: sqlite3.Connection) -> None:
             for observation in observations:
                 receipt = self.watcher.observe_in_transaction(
-                    observation.registered_pr_id,
+                    observation.subscription_id,
                     observation.pull_request,
                     trigger="resume",
                     dispatch=False,
@@ -181,9 +181,11 @@ class SprintRecoveryCoordinator:
         sprint_id: int,
     ) -> tuple[tuple[_ObservedPR, ...], tuple[str, ...]]:
         rows = self.con.execute(
-            "SELECT registered_pr_id,repository,pr_number "
-            "FROM sprint_registered_prs WHERE sprint_id=? "
-            "ORDER BY registered_pr_id",
+            "SELECT subscription.subscription_id,registered.repository,"
+            "registered.pr_number FROM sprint_registered_prs registered "
+            "JOIN pr_subscriptions subscription ON "
+            "subscription.sprint_registered_pr_id=registered.registered_pr_id "
+            "WHERE registered.sprint_id=? ORDER BY registered.registered_pr_id",
             (sprint_id,),
         ).fetchall()
         observations: list[_ObservedPR] = []
@@ -202,6 +204,6 @@ class SprintRecoveryCoordinator:
                 )
                 continue
             observations.append(
-                _ObservedPR(int(row["registered_pr_id"]), pull_request)
+                _ObservedPR(int(row["subscription_id"]), pull_request)
             )
         return tuple(observations), tuple(anomalies)
