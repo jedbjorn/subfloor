@@ -759,8 +759,12 @@ class SprintWakeDeliveryService:
 
             messages = self.con.execute(
                 "SELECT m.message_id,m.sprint_id,m.to_participant_id,"
-                "CASE WHEN m.declared_type='re-enter' AND p.role='planner' "
-                "AND s.lifecycle='armed' AND s.coordinate_mode=1 "
+                "CASE WHEN m.declared_type='re-enter' AND EXISTS ("
+                "SELECT 1 FROM sprints coordinate_sprint "
+                "WHERE coordinate_sprint.lifecycle='armed' "
+                "AND coordinate_sprint.coordinate_mode=1 "
+                "AND coordinate_sprint.originating_planner_shell_id="
+                "m.receiver_shell_id) "
                 "THEN 'new' ELSE m.declared_type END AS declared_type,"
                 "m.body,s.lifecycle,p.role "
                 "FROM wake_message m LEFT JOIN sprints s "

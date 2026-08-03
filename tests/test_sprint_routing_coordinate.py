@@ -110,6 +110,15 @@ class SprintCoordinateModeTest(unittest.TestCase):
             idempotency_key=key,
         )
 
+    def engine_planner_notice(self, key: str):
+        return self.messages.send_to_shell(
+            3,
+            message_kind="notification",
+            body=f"Engine notice {key}",
+            declared_type="re-enter",
+            idempotency_key=key,
+        )
+
     def set_coordinate_mode(self) -> None:
         self.con.execute(
             "UPDATE sprints SET coordinate_mode=1 WHERE sprint_id=?",
@@ -157,6 +166,83 @@ class SprintCoordinateModeTest(unittest.TestCase):
                 (sent.message_id,),
             ).fetchone()[0],
             "coordinate mode is tracked separately from the sender's route literal",
+        )
+
+    def test_coordinate_mode_rotates_engine_scoped_planner_notice(self) -> None:
+        old_chat = self.open_planner_chat("engine-notice-coordinate")
+        self.set_coordinate_mode()
+        sent = self.engine_planner_notice("engine-notice-coordinate-message")
+        observed: list[tuple[str, str]] = []
+
+        outcome = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con
+        ).deliver_once(
+            "coordinate-engine-notice-worker",
+            lambda conversation, prompt, _key: (
+                observed.append((conversation, prompt)) or "native-run"
+            ),
+        )
+
+        self.assertEqual(outcome.wake_id, sent.wake_id)
+        self.assertEqual(len(observed), 1)
+        new_chat, prompt = observed[0]
+        self.assertNotEqual(new_chat, old_chat)
+        self.assertIn("(declared New)", prompt)
+        self.assertEqual(
+            {
+                (old_chat, "closed"),
+                (new_chat, "idle"),
+            },
+            {
+                (str(row["conversation_id"]), str(row["state"]))
+                for row in self.con.execute(
+                    "SELECT conversation_id,state FROM conversations WHERE shell_id=3"
+                )
+            },
+        )
+        message = self.con.execute(
+            "SELECT sprint_id,declared_type FROM wake_message WHERE message_id=?",
+            (sent.message_id,),
+        ).fetchone()
+        self.assertEqual(
+            (message["sprint_id"], message["declared_type"]),
+            (None, "re-enter"),
+        )
+
+    def test_engine_scoped_planner_notice_reenters_when_mode_is_clear(self) -> None:
+        planner_chat = self.open_planner_chat("engine-notice-supervise")
+        sent = self.engine_planner_notice("engine-notice-supervise-message")
+        observed: list[tuple[str, str]] = []
+
+        outcome = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con
+        ).deliver_once(
+            "supervise-engine-notice-worker",
+            lambda conversation, prompt, _key: (
+                observed.append((conversation, prompt)) or "native-run"
+            ),
+        )
+
+        self.assertEqual(outcome.wake_id, sent.wake_id)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0][0], planner_chat)
+        self.assertIn("(declared Re-Enter)", observed[0][1])
+        self.assertEqual(
+            [(planner_chat, "idle")],
+            [
+                (str(row["conversation_id"]), str(row["state"]))
+                for row in self.con.execute(
+                    "SELECT conversation_id,state FROM conversations WHERE shell_id=3"
+                )
+            ],
+        )
+        message = self.con.execute(
+            "SELECT sprint_id,declared_type FROM wake_message WHERE message_id=?",
+            (sent.message_id,),
+        ).fetchone()
+        self.assertEqual(
+            (message["sprint_id"], message["declared_type"]),
+            (None, "re-enter"),
         )
 
     def test_coordinate_mode_new_reenters_when_planner_is_mid_turn(self) -> None:
