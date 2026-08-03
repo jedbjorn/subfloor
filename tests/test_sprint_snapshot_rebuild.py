@@ -172,18 +172,21 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
     )
     con.executemany(
         "INSERT INTO sprint_participant_conversations "
-        "(sprint_participant_id,conversation_id,purpose) VALUES (?,?,'work')",
+        "(sprint_participant_id,conversation_id) VALUES (?,?)",
         ((1, "cv_plan"), (2, "cv_dev"), (3, "cv_rev")),
     )
     con.executemany(
-        "UPDATE sprint_participants SET persistent_conversation_id=?,"
-        "current_conversation_id=?,disposition=?,updated_at=? "
+        "UPDATE sprint_participants SET disposition=?,updated_at=? "
         "WHERE participant_id=?",
         (
-            ("cv_plan", "cv_plan", "active", "2026-08-01 21:00:00", 1),
-            ("cv_dev", "cv_dev", "active", "2026-08-01 21:00:01", 2),
-            ("cv_rev", "cv_rev", "idle", "2026-08-01 21:00:02", 3),
+            ("active", "2026-08-01 21:00:00", 1),
+            ("active", "2026-08-01 21:00:01", 2),
+            ("idle", "2026-08-01 21:00:02", 3),
         ),
+    )
+    con.executemany(
+        "INSERT INTO active_shell_chats (shell_id,chat_id) VALUES (?,?)",
+        ((3, "cv_plan"), (1, "cv_dev"), (2, "cv_rev")),
     )
     con.execute(
         "UPDATE sprints SET lifecycle='armed',armed_at='2026-08-01 21:00:00',"
@@ -395,9 +398,7 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
 
         self.assertEqual(before, rows_by_table(self.db, compared))
 
-    def test_participant_link_parent_with_higher_id_restores_before_pointers(
-        self,
-    ) -> None:
+    def test_flat_participant_links_restore_out_of_id_order(self) -> None:
         con = sqlite3.connect(self.db)
         try:
             seed_prepared(con)
@@ -405,29 +406,33 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
                 "INSERT INTO conversations "
                 "(conversation_id,shell_id,owner_user_id,harness,provider,model,"
                 "effort,worktree,title,creation_idempotency_key,"
-                "creation_request_hash,conversation_scope) VALUES "
+                "creation_request_hash,conversation_scope,state,closed_at) VALUES "
                 "(?,1,1,'codex','test','model','high','/worktree','Sprint link',"
-                "?,?,'sprint')",
+                "?,?,'sprint',?,?)",
                 (
-                    ("cv_parent", "link-parent", "link-parent-hash"),
-                    ("cv_child", "link-child", "link-child-hash"),
+                    (
+                        "cv_parent",
+                        "link-parent",
+                        "link-parent-hash",
+                        "closed",
+                        "2026-08-01 20:00:00",
+                    ),
+                    ("cv_child", "link-child", "link-child-hash", "idle", None),
                 ),
             )
             con.execute(
                 "INSERT INTO sprint_participant_conversations "
                 "(participant_conversation_id,sprint_participant_id,"
-                "conversation_id,purpose) VALUES (100,2,'cv_parent','work')"
+                "conversation_id) VALUES (100,2,'cv_parent')"
             )
             con.execute(
                 "INSERT INTO sprint_participant_conversations "
                 "(participant_conversation_id,sprint_participant_id,"
-                "conversation_id,purpose,parent_conversation_id) "
-                "VALUES (1,2,'cv_child','fix','cv_parent')"
+                "conversation_id) VALUES (1,2,'cv_child')"
             )
             con.execute(
-                "UPDATE sprint_participants SET persistent_conversation_id="
-                "'cv_parent', current_conversation_id='cv_child' "
-                "WHERE participant_id=2"
+                "INSERT INTO active_shell_chats (shell_id,chat_id) "
+                "VALUES (1,'cv_child')"
             )
             con.commit()
         finally:

@@ -211,8 +211,9 @@ class ReviewHandoffTest(SprintReviewLoopCase):
             if outcome.wake_id == handoff.wake_id:
                 break
         reviewer_chat = self.con.execute(
-            "SELECT current_conversation_id FROM sprint_participants "
-            "WHERE participant_id=?",
+            "SELECT active.chat_id FROM sprint_participants participant "
+            "JOIN active_shell_chats active ON active.shell_id=participant.shell_id "
+            "WHERE participant.participant_id=?",
             (self.reviewer_id,),
         ).fetchone()[0]
         self.assertEqual((handoff.wake_id, reviewer_chat), observed[-1])
@@ -327,8 +328,9 @@ class ReviewHandoffTest(SprintReviewLoopCase):
                 self.con.execute(
                     "SELECT COUNT(*),"
                     "(SELECT COUNT(*) FROM sprint_judgments WHERE work_unit_id=?),"
-                    "(SELECT COUNT(*) FROM sprint_participant_conversations "
-                    " WHERE purpose='merge') "
+                    "(SELECT COUNT(*) FROM pragma_table_info("
+                    "'sprint_participant_conversations') "
+                    "WHERE name IN ('purpose','parent_conversation_id')) "
                     "FROM wake_message WHERE idempotency_key IN (?,?)",
                     (
                         self.unit_id,
@@ -422,8 +424,9 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
         self.assertEqual(
             0,
             self.con.execute(
-                "SELECT COUNT(*) FROM sprint_participant_conversations "
-                "WHERE purpose='fix'"
+                "SELECT COUNT(*) FROM pragma_table_info("
+                "'sprint_participant_conversations') "
+                "WHERE name IN ('purpose','parent_conversation_id')"
             ).fetchone()[0],
         )
         self.assertEqual("accepted", self.messages.mark_read(changed.message_id, 1))
@@ -509,15 +512,18 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
         self.assertEqual(
             0,
             self.con.execute(
-                "SELECT COUNT(*) FROM sprint_participant_conversations "
-                "WHERE purpose='merge'"
+                "SELECT COUNT(*) FROM pragma_table_info("
+                "'sprint_participant_conversations') "
+                "WHERE name IN ('purpose','parent_conversation_id')"
             ).fetchone()[0],
         )
         self.assertEqual(
             self.developer_conversation_id,
             self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE participant_id=?",
+                "SELECT active.chat_id FROM sprint_participants participant "
+                "JOIN active_shell_chats active "
+                "ON active.shell_id=participant.shell_id "
+                "WHERE participant.participant_id=?",
                 (self.developer_id,),
             ).fetchone()[0],
         )
@@ -668,8 +674,10 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
         self.assertEqual(
             self.developer_conversation_id,
             self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE participant_id=?",
+                "SELECT active.chat_id FROM sprint_participants participant "
+                "JOIN active_shell_chats active "
+                "ON active.shell_id=participant.shell_id "
+                "WHERE participant.participant_id=?",
                 (self.developer_id,),
             ).fetchone()[0],
         )
@@ -988,12 +996,12 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             ],
         )
         current = self.con.execute(
-            "SELECT persistent_conversation_id,current_conversation_id "
-            "FROM sprint_participants WHERE participant_id=?",
+            "SELECT active.chat_id FROM sprint_participants participant "
+            "JOIN active_shell_chats active ON active.shell_id=participant.shell_id "
+            "WHERE participant.participant_id=?",
             (self.developer_id,),
         ).fetchone()
         self.assertEqual(self.developer_conversation_id, current[0])
-        self.assertEqual(current[0], current[1])
         assignment = self.con.execute(
             "SELECT message_id FROM wake_message WHERE work_unit_id=? "
             "AND message_kind='work_assignment'",

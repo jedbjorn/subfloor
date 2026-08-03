@@ -305,8 +305,6 @@ class SprintLifecycleStore:
                 reason=reason or terminal_outcome or "aborted",
                 terminal_outcome=terminal_outcome,
             ).changed
-        cleanup_run_ids: tuple[int, ...] = ()
-        cleanup_conversations: tuple[str, ...] = ()
         with db_driver.write_transaction(self.con, "sprint.transition"):
             sprint = self._sprint(sprint_id)
             current = str(sprint["lifecycle"])
@@ -334,24 +332,12 @@ class SprintLifecycleStore:
                     actor,
                     reason="Sprint closed by FnB",
                 )
-            if target == "completed":
-                cleanup_run_ids, cleanup_conversations = (
-                    sprint_participant_chats.close_for_terminal_lifecycle(
-                        self.con,
-                        sprint_id,
-                        lifecycle=target,
-                    )
-                )
             self._event(
                 sprint_id,
                 f"lifecycle.{target}",
                 actor,
                 {"from": current, "reason": reason},
             )
-        self._signal_terminal_conversation_cleanup(
-            cleanup_run_ids,
-            cleanup_conversations,
-        )
         return True
 
     def pause(
@@ -651,17 +637,6 @@ class SprintLifecycleStore:
                     "interrupt_run_ids": list(run_ids),
                 },
             )
-            cleanup_run_ids, cleanup_conversations = (
-                sprint_participant_chats.close_for_terminal_lifecycle(
-                    self.con,
-                    sprint_id,
-                    lifecycle="aborted",
-                )
-            )
-            if set(cleanup_run_ids) != set(run_ids):
-                raise SprintInvariantError(
-                    "terminal conversation cleanup found an untracked active run"
-                )
             receipt = AbortReceipt(
                 True,
                 report_id,
@@ -670,7 +645,6 @@ class SprintLifecycleStore:
                     sorted(
                         set(run_conversations)
                         | set(notice_conversations)
-                        | set(cleanup_conversations)
                     )
                 ),
             )
@@ -1660,9 +1634,10 @@ class SprintLifecycleStore:
                 dict(row)
                 for row in self.con.execute(
                     "SELECT p.participant_id,p.shell_id,p.role,p.disposition,"
-                    "CASE WHEN sh.is_deleted=0 AND p.current_conversation_id IS NOT NULL "
+                    "CASE WHEN sh.is_deleted=0 AND active.chat_id IS NOT NULL "
                     "THEN 1 ELSE 0 END available "
                     "FROM sprint_participants p JOIN shells sh USING (shell_id) "
+                    "LEFT JOIN active_shell_chats active ON active.shell_id=p.shell_id "
                     "WHERE p.sprint_id=? ORDER BY p.participant_id",
                     (sprint_id,),
                 )
@@ -1735,18 +1710,6 @@ class SprintLifecycleStore:
             conversation_events.notify(conversation_id)
         if tuple(conversation_ids):
             self.notify_commit()
-
-    def _signal_terminal_conversation_cleanup(
-        self,
-        run_ids: Iterable[int],
-        conversation_ids: Iterable[str],
-    ) -> None:
-        self._signal_notifications(conversation_ids)
-        for run_id in run_ids:
-            try:
-                self.interrupt_run(run_id)
-            except Exception:  # noqa: BLE001 - durable intent is already committed
-                self.notify_commit()
 
     @staticmethod
     def _required_text(value: str, label: str, limit: int) -> str:

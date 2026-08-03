@@ -18,6 +18,7 @@ FOUNDATION = MIGRATIONS / "0132_conversation_foundation.sql"
 GIT_TARGETS = MIGRATIONS / "0142_conversation_git_targets.sql"
 ACTIVE_REGISTRY = MIGRATIONS / "0162_active_chat_registry.sql"
 REAPER_IDENTITY = MIGRATIONS / "0163_conversation_run_process_identity.sql"
+TOPOLOGY_RETIREMENT = MIGRATIONS / "0168_retire_sprint_conversation_topology.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import conversation_state  # noqa: E402
@@ -549,6 +550,106 @@ class MigrationAndShapeTest(ConversationDbCase):
                 0,
             )
 
+    def test_topology_retirement_converges_dirty_links_and_universal_fence(self):
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.row_factory = sqlite3.Row
+            apply_schema(con, through="0167_reseed_sprint_authority_split.sql")
+            con.execute("INSERT INTO users (user_id,username) VALUES (9,'legacy')")
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (9,'Legacy','legacy','dev','prompt',9)"
+            )
+            feature_id = int(
+                con.execute(
+                    "INSERT INTO roadmap (title) VALUES ('Legacy Sprint')"
+                ).lastrowid
+            )
+            sprint_id = int(
+                con.execute(
+                    "INSERT INTO sprints "
+                    "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+                    "VALUES (?,9,1)",
+                    (feature_id,),
+                ).lastrowid
+            )
+            participant_id = int(
+                con.execute(
+                    "INSERT INTO sprint_participants "
+                    "(sprint_id,shell_id,role,harness) "
+                    "VALUES (?,9,'developer','codex')",
+                    (sprint_id,),
+                ).lastrowid
+            )
+            con.execute(
+                "INSERT INTO conversations "
+                "(conversation_id,shell_id,owner_user_id,harness,worktree,"
+                "creation_idempotency_key,creation_request_hash,conversation_scope) "
+                "VALUES ('cv_legacy_sprint',9,9,'codex','/tmp/legacy',"
+                "'legacy-sprint','legacy-hash','sprint')"
+            )
+            link_id = int(
+                con.execute(
+                    "INSERT INTO sprint_participant_conversations "
+                    "(sprint_participant_id,conversation_id,purpose) "
+                    "VALUES (?,'cv_legacy_sprint','work')",
+                    (participant_id,),
+                ).lastrowid
+            )
+            con.execute(
+                "UPDATE sprint_participants SET persistent_conversation_id="
+                "'cv_legacy_sprint',current_conversation_id='cv_legacy_sprint' "
+                "WHERE participant_id=?",
+                (participant_id,),
+            )
+            con.execute(
+                "INSERT INTO active_shell_chats (shell_id,chat_id) "
+                "VALUES (9,'cv_legacy_sprint')"
+            )
+
+            con.executescript(TOPOLOGY_RETIREMENT.read_text())
+
+            self.assertEqual(
+                set(),
+                {"persistent_conversation_id", "current_conversation_id"}
+                & {
+                    row[1]
+                    for row in con.execute("PRAGMA table_info(sprint_participants)")
+                },
+            )
+            self.assertEqual(
+                set(),
+                {"purpose", "parent_conversation_id", "context_packet"}
+                & {
+                    row[1]
+                    for row in con.execute(
+                        "PRAGMA table_info(sprint_participant_conversations)"
+                    )
+                },
+            )
+            self.assertEqual(
+                (link_id, participant_id, "cv_legacy_sprint"),
+                tuple(
+                    con.execute(
+                        "SELECT participant_conversation_id,"
+                        "sprint_participant_id,conversation_id "
+                        "FROM sprint_participant_conversations"
+                    ).fetchone()
+                ),
+            )
+            self.assertEqual(
+                [], [tuple(row) for row in con.execute("PRAGMA foreign_key_check")]
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute(
+                    "INSERT INTO conversations "
+                    "(conversation_id,shell_id,owner_user_id,harness,worktree,"
+                    "creation_idempotency_key,creation_request_hash,"
+                    "conversation_scope) VALUES "
+                    "('cv_second_sprint',9,9,'codex','/tmp/legacy',"
+                    "'second-sprint','second-hash','sprint')"
+                )
+
     def test_conversation_requires_direct_user_owner(self) -> None:
         with self.assertRaises(sqlite3.IntegrityError):
             self.con.execute(
@@ -866,7 +967,7 @@ class TransitionMatrixTest(ConversationDbCase):
 
 class FenceAndEventTest(ConversationDbCase):
     def test_open_chat_migration_closes_older_legacy_rows(self) -> None:
-        self.con.execute("DROP INDEX idx_conversations_live_normal_shell")
+        self.con.execute("DROP INDEX idx_conversations_one_open_shell")
         older = self.add_conversation(shell_id=1)
         self.con.execute(
             "UPDATE conversations SET last_activity_at='2026-01-01 00:00:00' "

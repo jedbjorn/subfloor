@@ -191,7 +191,8 @@ class SprintEvidenceCollector:
     ) -> QuotaState:
         row = self.con.execute(
             "SELECT c.provider FROM sprint_participants p "
-            "LEFT JOIN conversations c ON c.conversation_id=p.current_conversation_id "
+            "LEFT JOIN active_shell_chats active ON active.shell_id=p.shell_id "
+            "LEFT JOIN conversations c ON c.conversation_id=active.chat_id "
             "WHERE p.participant_id=?",
             (participant_id,),
         ).fetchone()

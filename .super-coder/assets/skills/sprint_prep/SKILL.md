@@ -19,13 +19,15 @@ Produce one editable prepared Sprint with:
 - work units made from existing spec tasks, each with one Developer and one
   assigned Reviewer;
 - dependency edges and planned waves;
-- one primary harness/model/effective effort per participant plus eligible
-  Planner fallback capacity;
+- one validated harness/model/effective effort selection per participant;
 - a committed Sprint merge grant; and
 - enough local/GitHub capacity to execute the plan.
 
-The arming transaction creates every participant conversation, the initial
-assignment messages and wake intents, and the armed transition together.
+The arming transaction validates every recorded selection (explicit null
+model/effort means the route default), records the armed transition, publishes
+the initial assignment messages, and declares a New wake to the overseeing
+Planner. Defaults satisfy the gate, but dispatch never precedes that validation.
+Participant chats are created or re-entered later by wake delivery.
 
 ## Eligibility pass
 
@@ -70,8 +72,7 @@ Prefer the smallest dependency graph that preserves correctness. Record the
 expected output in outcome language. Do not encode a shell's implementation
 steps into the durable plan when its role skill and judgment can decide them.
 
-For every participant, record role, route, model, effective effort, persistent
-conversation ownership, and fallback facts the plan actually depends on. Never
+For every participant, record role, route, model, and effective effort. Never
 pretend a native session can resume across harnesses.
 
 Declare the prepared envelope from a JSON array of participant objects, then
@@ -109,7 +110,9 @@ sc sprint arm --sprint <id>
 After `arm` succeeds, participant pickup belongs to native delivery. The armed
 runtime dispatches ready work and wake recovery reconciles unread pickup; the
 preparing Planner does not manually boot participants or create a second wake
-path.
+path. Every wake message creates delivery intent. An idle New rotates to a fresh
+registry chat, an idle Re-enter resumes the registry chat, and any type sent
+while a verified turn is live enters that same chat at its natural boundary.
 
 ## Handoff
 

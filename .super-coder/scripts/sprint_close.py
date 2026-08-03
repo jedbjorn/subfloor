@@ -512,7 +512,7 @@ class SprintCloseStore:
     def _history_links(self, sprint_id: int) -> dict[str, Any]:
         conversations = self._rows(
             "SELECT c.conversation_id,link.sprint_participant_id,p.shell_id,p.role,"
-            "link.purpose,link.parent_conversation_id,c.conversation_scope,c.state "
+            "c.conversation_scope,c.state "
             "FROM sprint_participant_conversations link "
             "JOIN sprint_participants p "
             "ON p.participant_id=link.sprint_participant_id "

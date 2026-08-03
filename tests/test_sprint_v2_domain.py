@@ -437,18 +437,20 @@ class LifecycleTest(SprintDomainCase):
         self.store.arm(sprint_id, 3)
 
         participants = self.con.execute(
-            "SELECT participant_id,persistent_conversation_id,"
-            "current_conversation_id FROM sprint_participants "
+            "SELECT participant_id FROM sprint_participants "
             "WHERE sprint_id=? ORDER BY participant_id",
             (sprint_id,),
         ).fetchall()
         self.assertEqual(3, len(participants))
-        self.assertTrue(
-            all(
-                row["persistent_conversation_id"] is None
-                and row["current_conversation_id"] is None
-                for row in participants
-            )
+        self.assertEqual(
+            set(),
+            {"persistent_conversation_id", "current_conversation_id"}
+            & {
+                row[1]
+                for row in self.con.execute(
+                    "PRAGMA table_info(sprint_participants)"
+                )
+            },
         )
         self.assertEqual(
             0,
@@ -528,16 +530,11 @@ class LifecycleTest(SprintDomainCase):
             ).fetchone()[0],
         )
         self.assertEqual(
-            [(None, None), (None, None), (None, None)],
-            [
-                tuple(row)
-                for row in self.con.execute(
-                    "SELECT persistent_conversation_id,current_conversation_id "
-                    "FROM sprint_participants WHERE sprint_id=? "
-                    "ORDER BY participant_id",
-                    (sprint_id,),
-                )
-            ],
+            3,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participants WHERE sprint_id=?",
+                (sprint_id,),
+            ).fetchone()[0],
         )
 
     def test_arm_ignores_orphan_conversation_keys_from_reused_numeric_ids(self) -> None:
@@ -582,33 +579,13 @@ class LifecycleTest(SprintDomainCase):
             "ORDER BY link.sprint_participant_id"
         ).fetchall()
         self.assertEqual(0, len(linked))
-        first_ids = sprint_domain.sprint_participant_chats.provision_at_arming(
-            self.con, sprint_id
-        )
-        linked = self.con.execute(
-            "SELECT c.conversation_id,c.creation_idempotency_key "
-            "FROM sprint_participant_conversations link "
-            "JOIN conversations c ON c.conversation_id=link.conversation_id "
-            "ORDER BY link.sprint_participant_id"
-        ).fetchall()
-        self.assertEqual(3, len(linked))
-        self.assertTrue(
-            all(
-                row["conversation_id"] not in {item[0] for item in historical}
-                and row["creation_idempotency_key"].startswith(
-                    "sprint-generation:"
-                )
-                and len(row["creation_idempotency_key"]) <= 255
-                for row in linked
-            )
-        )
-        replay_ids = sprint_domain.sprint_participant_chats.provision_at_arming(
-            self.con, sprint_id
-        )
-        self.assertEqual(first_ids, replay_ids)
         self.assertEqual(
-            6,
+            3,
             self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute("SELECT COUNT(*) FROM active_shell_chats").fetchone()[0],
         )
 
     def test_armed_sprint_merge_grant_is_immutable(self) -> None:

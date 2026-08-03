@@ -183,7 +183,7 @@ class RegistrationTest(SprintPRWatcherCase):
             self.con.execute("SELECT COUNT(*) FROM sprint_pr_work_units").fetchone()[0],
         )
 
-    def test_registration_rejects_non_owner_work_and_non_armed_sprint(self):
+    def test_registration_rejects_non_owner_work_and_allows_paused_sprint(self):
         other_unit = int(
             self.con.execute(
                 "INSERT INTO sprint_work_units "
@@ -210,20 +210,28 @@ class RegistrationTest(SprintPRWatcherCase):
             sprint_domain.LifecycleActor("participant", 1),
             reason="test",
         )
-        with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError, "only for an armed Sprint"
-        ):
-            self.watcher.registration.register(
-                self.sprint_id,
-                owner_shell_id=1,
-                repository="acme/repo",
-                pr_number=41,
-                work_unit_ids=(self.unit_id,),
-            )
+        receipt = self.watcher.registration.register(
+            self.sprint_id,
+            owner_shell_id=1,
+            repository="acme/repo",
+            pr_number=41,
+            work_unit_ids=(self.unit_id,),
+        )
+        self.assertTrue(receipt.created)
         self.assertEqual(
-            0,
+            1,
             self.con.execute("SELECT COUNT(*) FROM sprint_registered_prs").fetchone()[
                 0
+            ],
+        )
+        self.assertEqual(
+            [(1, "acme/repo", 41)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT owner_shell_id,repository,pr_number "
+                    "FROM pr_subscriptions"
+                )
             ],
         )
 

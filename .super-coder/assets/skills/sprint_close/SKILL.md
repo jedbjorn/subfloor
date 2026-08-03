@@ -22,6 +22,14 @@ question, answer, blocker, or context message, run `accept` for that message.
 For informational messages it only marks the message read; it does not change
 Sprint or work-unit state.
 
+Planner-bound close/conformance messages are Re-enter wakes resolved through
+the active-chat registry. A verified live turn is never displaced; delivery
+waits for its natural boundary and drains every undelivered message. An idle
+Re-enter resumes the registry chat, while coordinate mode makes it an idle New
+ticket chat after FnB closes the Planner chat. Automatic pause preserves that
+mode; FnB pause/resume returns to supervise. The inactivity ceiling and reaper
+own silent or unlinked processes, not this skill.
+
 ## Questions, answers, blockers, and failures
 
 Put a concrete question, answer, blocker, or context request in a short body
@@ -50,18 +58,18 @@ successfully and confirms the durable write and wake where applicable.
 If a Sprint command is rejected or transport fails, the write or handoff is
 incomplete. Correct and retry when safe. If the relay itself fails, surface the
 attempted command and durable evidence to FnB; do not invent an alternate
-delivery protocol. This skill is Planner-owned: the Planner or FnB decides
-whether an integrity threat warrants pause. Send any needed participant context
-before pausing; an active relay is not available after the lifecycle becomes
-paused.
+delivery protocol. The Reviewer decides whether evidence warrants pause,
+re-plan, cancellation, or conclusion; the Planner executes that decision. FnB
+retains the board-level override from decision #46. Send any needed participant
+context before the Planner acts; an active relay is not available after the
+lifecycle becomes paused.
 
 Treat an exhausted recovery wake as bounded manual-recovery evidence for FnB;
 preserve the unread message and failed wake, and do not create recursive
 fallbacks.
 
-```text
-sc sprint pause --sprint <id> --reason <integrity-threat>
-```
+On a durable Reviewer pause decision (or live FnB override), the Planner runs
+`sc sprint pause --sprint <id> --reason <decision-reason>`.
 
 ## Delivery-complete gate
 
@@ -187,5 +195,6 @@ sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
 
 After `complete` succeeds, emit one bounded final response from its receipt:
 final report id, follow-up list, integrated SHA, and evidence links. Run no
-further Sprint command; close intent terminalizes the owning conversation and
-Sprint-scoped authority is over.
+further Sprint command. Terminal lifecycle removes Sprint authority and live
+pills but does not close the shell's registry chat; FnB close remains the one
+unconditional chat-displacement path.

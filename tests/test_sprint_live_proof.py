@@ -575,18 +575,14 @@ class SprintLiveProof(unittest.TestCase):
         self.assertEqual("lifecycle.completed", event_types[-1])
         self.assertEqual(2, packet["pr_outcomes"]["total"])
         self.assertEqual(
-            ["work", "fallback"],
-            [
-                row[0]
-                for row in self.con.execute(
-                    "SELECT link.purpose FROM sprint_participant_conversations link "
-                    "JOIN sprint_participants p "
-                    "ON p.participant_id=link.sprint_participant_id "
-                    "WHERE p.sprint_id=? AND p.shell_id=1 "
-                    "ORDER BY link.participant_conversation_id",
-                    (sprint_id,),
-                )
-            ],
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_conversations link "
+                "JOIN sprint_participants p "
+                "ON p.participant_id=link.sprint_participant_id "
+                "WHERE p.sprint_id=? AND p.shell_id=1",
+                (sprint_id,),
+            ).fetchone()[0],
         )
 
     def test_parallel_sprint_completes_out_of_order_without_lane_overlap(self) -> None:
@@ -660,8 +656,10 @@ class SprintLiveProof(unittest.TestCase):
         self.github.set(3001, "OPEN")
         conversation_id = str(
             self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE sprint_id=? AND shell_id=1",
+                "SELECT active.chat_id FROM sprint_participants participant "
+                "JOIN active_shell_chats active "
+                "ON active.shell_id=participant.shell_id "
+                "WHERE participant.sprint_id=? AND participant.shell_id=1",
                 (sprint_id,),
             ).fetchone()[0]
         )
@@ -744,8 +742,9 @@ class SprintLiveProof(unittest.TestCase):
         )
 
         arming_planner_conversation = self.con.execute(
-            "SELECT current_conversation_id FROM sprint_participants "
-            "WHERE sprint_id=? AND shell_id=3",
+            "SELECT active.chat_id FROM sprint_participants participant "
+            "JOIN active_shell_chats active ON active.shell_id=participant.shell_id "
+            "WHERE participant.sprint_id=? AND participant.shell_id=3",
             (sprint_id,),
         ).fetchone()[0]
         self.assertIsNotNone(
@@ -791,8 +790,10 @@ class SprintLiveProof(unittest.TestCase):
         self.deliver_browser_turns()
         planner_conversation = str(
             self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE sprint_id=? AND shell_id=3",
+                "SELECT active.chat_id FROM sprint_participants participant "
+                "JOIN active_shell_chats active "
+                "ON active.shell_id=participant.shell_id "
+                "WHERE participant.sprint_id=? AND participant.shell_id=3",
                 (sprint_id,),
             ).fetchone()[0]
         )
@@ -869,8 +870,10 @@ class SprintLiveProof(unittest.TestCase):
         )
         self.assertIsNone(
             self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE sprint_id=? AND shell_id=2",
+                "SELECT (SELECT chat_id FROM active_shell_chats "
+                "WHERE shell_id=participant.shell_id) "
+                "FROM sprint_participants participant "
+                "WHERE participant.sprint_id=? AND participant.shell_id=2",
                 (sprint_id,),
             ).fetchone()[0]
         )
@@ -888,16 +891,20 @@ class SprintLiveProof(unittest.TestCase):
         )
         self.assertIsNone(
             self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE sprint_id=? AND shell_id=2",
+                "SELECT (SELECT chat_id FROM active_shell_chats "
+                "WHERE shell_id=participant.shell_id) "
+                "FROM sprint_participants participant "
+                "WHERE participant.sprint_id=? AND participant.shell_id=2",
                 (sprint_id,),
             ).fetchone()[0]
         )
         self.deliver_browser_turns()
         reviewer_new = str(
             self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE sprint_id=? AND shell_id=2",
+                "SELECT active.chat_id FROM sprint_participants participant "
+                "JOIN active_shell_chats active "
+                "ON active.shell_id=participant.shell_id "
+                "WHERE participant.sprint_id=? AND participant.shell_id=2",
                 (sprint_id,),
             ).fetchone()[0]
         )

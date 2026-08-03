@@ -44,6 +44,13 @@ question, answer, blocker, or context message, run `accept` for that message.
 For informational messages it only marks the message read; it does not change
 Sprint or work-unit state.
 
+Review requests are declared New, but wake type resolves at delivery. A verified
+live turn is never displaced: delivery enters the active registry chat at its
+natural boundary and drains every undelivered wake message. When idle, New
+rotates to a fresh chat; Re-enter resumes the registry chat; no registry row
+behaves as New. Reviewer verdicts to Developers and decisions to Planners are
+Re-enter. Reviewers never receive PR-event subscription wakes.
+
 ## Questions, answers, blockers, and failures
 
 Put a concrete question, answer, blocker, or useful context in a short body file
@@ -100,7 +107,7 @@ Reviewer → Planner route is Re-enter. The body must name:
 
 The Planner accepts the actionable message, verifies the assigned Reviewer,
 and executes exactly that transition. The Reviewer never runs the pause,
-cancel, resume, complete, or abort action. If the action is rejected, inspect
+replan, cancel, resume, complete, or abort action. If the action is rejected, inspect
 the returned durable state and issue a new decision only when the evidence
 supports one; never ask the Planner to improvise around a precondition.
 
@@ -163,7 +170,7 @@ sc sprint record-review \
 
 Use `approved` only when no Critical/Major/Medium finding remains. The engine
 checks that the request was accepted and still binds to the reviewed head,
-records judgment evidence, opens the correct fresh Developer conversation, and
+records judgment evidence, sends a Re-enter wake to the Developer, and
 resolves the review liveness expectation. Do not message around this surface;
 an unrecorded verdict cannot unlock merge.
 
@@ -171,7 +178,7 @@ an unrecorded verdict cannot unlock merge.
 
 Judge integrated `main` against every governing bound revision, plus the exact
 recorded mid-Sprint revision facts and ratified judgments. Review the integrated
-system, not unit diffs. Classify each requirement as:
+system, not unit diffs. Compile the bounded evidence packet first:
 
 ```text
 sc sprint compile-report --sprint <id> --limit 50 > evidence.json
@@ -179,6 +186,8 @@ sc sprint compile-report --sprint <id> --limit 50 > evidence.json
 
 Increase the bound only when truncation counters show the default omitted
 needed evidence; 200 is the maximum. The packet supplies facts, not judgment.
+
+Then classify each requirement as:
 
 - `as-specced`;
 - `deviated-intentionally` with its ratified judgment;

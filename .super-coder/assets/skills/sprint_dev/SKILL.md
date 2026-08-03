@@ -36,6 +36,14 @@ unit's scope, record the choice and rationale, and continue. Escalate changes to
 the unit boundary, interfaces another unit consumes, deliverable cuts, or scope
 growth to the Planner.
 
+The active-chat registry, not Sprint participant pointers, owns your current
+chat. Assignments are declared New, but a verified live turn is never displaced:
+delivery enters this chat at its natural boundary and drains every undelivered
+wake message. When idle, New rotates to a fresh chat; Re-enter resumes the
+registry chat; no registry row behaves as New. A generous inactivity ceiling
+unlinks a silent hung turn so the 60-second reaper can terminate its verified
+process identity.
+
 ## Questions, answers, blockers, and failures
 
 Write a concrete question, answer, blocker, or useful context to a short body
@@ -66,9 +74,9 @@ successfully and confirms the durable write and wake where applicable.
 If a Sprint command is rejected or transport fails, the write or handoff is
 incomplete. Correct and retry when safe. If the relay itself fails, surface the
 attempted command, evidence, impact, and recommendation to FnB; do not invent an
-alternate delivery protocol. A Developer does not pause the Sprint. The Planner
-decides whether the reported condition warrants continuing, re-planning, or
-pausing.
+alternate delivery protocol. A Developer does not pause the Sprint. The
+Reviewer decides whether the evidence warrants continuing, re-planning, or
+pausing; the Planner executes that decision.
 
 ## Build and verify
 
@@ -96,8 +104,11 @@ sc sprint complete-unit --sprint <id> --work-unit <id> \
 
 Register the PR through the authoritative Sprint surface and retain ownership
 until it is green. After `register-pr` succeeds, the native registered-PR
-watcher supplies red/green facts and their durable wakes. On red, diagnose and
-fix the PR. On green, judge readiness rather than forwarding mechanically.
+watcher creates an engine-wide subscription owned by your shell. It supplies
+self-describing red, green, and externally closed facts as Re-enter wakes even
+after chat rotation or outside an armed Sprint. On red, diagnose and fix the PR.
+On green, judge readiness rather than forwarding mechanically. Planner and
+Reviewer receive no PR-event wakes.
 
 ```text
 sc sprint register-pr --sprint <id> --repository <owner/name> \
@@ -125,10 +136,10 @@ sc sprint request-review \
 
 The assigned Reviewer receives an actionable request. After `request-review`
 succeeds, stop and await the native verdict wake. A changes-requested verdict
-opens a fresh linked fix conversation and makes it current. Apply every
-blocking finding, re-establish green, and hand back with a new stable review
-key. Record disagreements as judgment; the Planner resolves scope/severity
-disputes.
+returns as Re-enter to your registry chat. Apply every blocking finding,
+re-establish green, and hand back with a new stable review key. Record
+disagreements as judgment; the Reviewer owns scope/severity decisions and the
+Planner executes any resulting action.
 
 ## Merge boundary
 
@@ -151,7 +162,8 @@ judgments, and let automatic merge observation advance dependencies.
 Report broken bases, destructive ambiguity, unavailable GitHub, untrustworthy
 runners, provider exhaustion, or an unrecoverable environment to the Planner
 with evidence, impact, and a recommendation. Stop at the unsafe boundary while
-the Planner decides whether to continue, re-plan, or pause.
+the Reviewer decides whether to continue, re-plan, or pause and the Planner
+executes that decision.
 
 Stop when the unit is merged and reported, declined, awaiting Planner/FnB
 recovery, or returned to review. Before stopping, re-run `sc sprint inbox

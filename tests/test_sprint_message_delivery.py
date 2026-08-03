@@ -788,7 +788,11 @@ class WakeDeliveryTest(SprintMessageCase):
         )
 
     def test_engine_new_without_registry_creates_chat(self) -> None:
-        self.con.execute("DELETE FROM active_shell_chats WHERE shell_id=1")
+        self.con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+            "WHERE conversation_id=?",
+            (self.developer_conversation_id,),
+        )
         self.con.commit()
         sent = self.messages.send_to_shell(
             1,
@@ -1394,8 +1398,8 @@ class ParticipantRelayTest(SprintMessageCase):
         conversation_id = observed[0]
 
         route = self.con.execute(
-            "SELECT c.shell_id,c.state,c.conversation_scope,pc.purpose,"
-            "pc.parent_conversation_id,pc.context_packet "
+            "SELECT c.shell_id,c.state,c.conversation_scope,"
+            "pc.sprint_participant_id "
             "FROM conversations c JOIN sprint_participant_conversations pc "
             "USING (conversation_id) WHERE c.conversation_id=?",
             (conversation_id,),
@@ -1406,14 +1410,16 @@ class ParticipantRelayTest(SprintMessageCase):
         )
         self.assertEqual(active_before, conversation_id)
         self.assertEqual(
-            (3, "idle", "sprint", "work", None, None),
+            (3, "idle", "sprint", self.planner_id),
             tuple(route),
         )
         self.assertEqual(
             conversation_id,
             self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE participant_id=?",
+                "SELECT active.chat_id FROM sprint_participants participant "
+                "JOIN active_shell_chats active "
+                "ON active.shell_id=participant.shell_id "
+                "WHERE participant.participant_id=?",
                 (self.planner_id,),
             ).fetchone()[0],
         )

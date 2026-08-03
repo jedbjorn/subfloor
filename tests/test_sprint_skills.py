@@ -24,6 +24,7 @@ SKILLS = {
 }
 RESEEDED_SKILLS = set(SKILLS) | {"db_map"}
 AUTHORITY_SPLIT_SKILLS = {"sprint_pln", "sprint_rev"}
+V21_ROLE_SKILLS = set(SKILLS)
 
 
 class SprintSkillTest(unittest.TestCase):
@@ -162,6 +163,41 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(migration)
 
             for name in sorted(AUTHORITY_SPLIT_SKILLS):
+                with self.subTest(name=name):
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(0, rows[0][5])
+                    self.assertIn("Reviewer decides", rows[0][4])
+                    self.assertIn("Planner", rows[0][4])
+        finally:
+            con.close()
+
+    def test_v21_reseed_converges_dirty_rows_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0169_reseed_sprint_v21_guidance.sql":
+                    break
+                con.executescript(migration.read_text())
+            placeholders = ",".join("?" for _ in V21_ROLE_SKILLS)
+            con.execute(
+                f"UPDATE skills SET content='stale pre-0169 guidance' "
+                f"WHERE name IN ({placeholders})",
+                tuple(sorted(V21_ROLE_SKILLS)),
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0169_reseed_sprint_v21_guidance.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for name in sorted(V21_ROLE_SKILLS):
                 with self.subTest(name=name):
                     expected = seed_skills.parse_skill(
                         ASSETS / name / "SKILL.md"
@@ -363,13 +399,47 @@ class SprintSkillTest(unittest.TestCase):
         self.assertIn("does not pause the sprint", normalized)
         self.assertIn("relay itself fails", normalized)
 
-    def test_legacy_close_skill_keeps_planner_transition_safety_until_retirement(self):
+    def test_close_skill_routes_decisions_without_owning_judgment(self):
         close = (ASSETS / "sprint_close" / "SKILL.md").read_text()
         normalized = " ".join(close.lower().split())
         self.assertIn("sc sprint pause --sprint <id>", close)
-        self.assertIn("active relay is not available after", normalized)
+        self.assertIn("the reviewer decides", normalized)
+        self.assertIn("the planner executes", normalized)
+        self.assertIn("decision #46", normalized)
         self.assertIn("exhausted recovery wake", normalized)
         self.assertIn("do not create recursive", normalized)
+
+    def test_v21_delivery_contract_is_folded_into_roles_and_boot(self):
+        bodies = {
+            name: (ASSETS / name / "SKILL.md").read_text()
+            for name in SKILLS
+        }
+        combined = "\n".join(bodies.values())
+        for phrase in (
+            "active-chat registry",
+            "natural boundary",
+            "inactivity ceiling",
+            "reaper",
+            "coordinate mode",
+            "PR-event wakes",
+            "Defaults satisfy the gate",
+        ):
+            self.assertIn(phrase, combined)
+
+        developer = bodies["sprint_dev"]
+        reviewer = bodies["sprint_rev"]
+        planner = bodies["sprint_pln"]
+        self.assertIn("outside an armed Sprint", developer)
+        self.assertIn("Reviewer decides", developer)
+        self.assertIn("replan, cancel", reviewer)
+        self.assertIn("Compile the bounded evidence packet first", reviewer)
+        self.assertIn("Developer-owned subscriptions", planner)
+
+        boot = (ENGINE / "templates" / "boot.md").read_text()
+        self.assertIn("## ACTIVE CHAT DELIVERY", boot)
+        self.assertIn("Every `wake_message` creates durable delivery intent", boot)
+        self.assertIn("verified live turn", boot)
+        self.assertIn("defaults satisfy the gate", boot)
 
     def test_every_affected_file_argument_names_the_hard_ceiling(self):
         parser = sprint_cli.build_parser()

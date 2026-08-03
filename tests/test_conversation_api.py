@@ -163,18 +163,11 @@ class ConversationApiCase(unittest.TestCase):
                 "(sprint_id,shell_id,role,harness,model,effort,disposition) "
                 "VALUES (7,1,'planner','codex','gpt-test','high','active')"
             ).lastrowid
-            return sprint_participant_chats.create_and_select(
+            return sprint_participant_chats.create_wake_conversation(
                 con,
+                wake_id=1,
+                sprint_id=7,
                 participant_id=int(participant_id),
-                owner_user_id=1,
-                purpose="work",
-                harness="codex",
-                provider="openai",
-                model="gpt-test",
-                effort="high",
-                worktree=str(self.root / ".sc-worktrees" / "dev"),
-                title="Sprint 7 developer",
-                idempotency_key="sprint:7:participant:1:work",
             )
 
     def seed_conversation(

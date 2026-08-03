@@ -373,8 +373,11 @@ class SprintBoardProjection:
             for row in self.con.execute(
                 "SELECT p.participant_id,p.shell_id,sh.shortname,sh.display_name,"
                 "p.role,p.harness,p.model,p.effort,p.disposition,"
-                "p.current_conversation_id FROM sprint_participants p "
-                "JOIN shells sh ON sh.shell_id=p.shell_id WHERE p.sprint_id=? "
+                "active.chat_id AS current_conversation_id "
+                "FROM sprint_participants p "
+                "JOIN shells sh ON sh.shell_id=p.shell_id "
+                "LEFT JOIN active_shell_chats active ON active.shell_id=p.shell_id "
+                "WHERE p.sprint_id=? "
                 "ORDER BY p.participant_id",
                 (sprint_id,),
             )
