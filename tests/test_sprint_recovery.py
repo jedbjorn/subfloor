@@ -1,4 +1,5 @@
 """Stage 8 gates for Sprint pause, resume, abort, and restart recovery."""
+
 from __future__ import annotations
 
 import json
@@ -61,9 +62,9 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             (self.sprint_id, shell_id),
         ).fetchone()
         conversation_id = str(participant[0])
-        token = self.con.execute(
-            "SELECT COUNT(*)+1 FROM conversation_runs"
-        ).fetchone()[0]
+        token = self.con.execute("SELECT COUNT(*)+1 FROM conversation_runs").fetchone()[
+            0
+        ]
         message_id = int(
             self.con.execute(
                 "INSERT INTO conversation_messages "
@@ -149,13 +150,14 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             self.con.commit()
             return f"conversation-message:{message_id}"
 
-        outcome = sprint_message_delivery.SprintWakeDeliveryService(
-            self.con
-        ).deliver_once(f"delivery-{wake_id}", deliver)
-        self.assertIsNotNone(outcome)
-        self.assertEqual(wake_id, outcome.wake_id)
+        service = sprint_message_delivery.SprintWakeDeliveryService(self.con)
+        while True:
+            outcome = service.deliver_once(f"delivery-{wake_id}", deliver)
+            self.assertIsNotNone(outcome)
+            if outcome.wake_id == wake_id:
+                break
         self.assertEqual("delivered", outcome.state)
-        return prompts[0], self.con.execute(
+        return prompts[-1], self.con.execute(
             "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
             (wake_id,),
         ).fetchone()[0]
@@ -203,11 +205,25 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             self.con.commit()
             return f"conversation-run:{run_id}"
 
-        outcome = sprint_message_delivery.SprintWakeDeliveryService(
-            self.con
-        ).deliver_once(f"failed-turn-{wake_id}", deliver)
-        self.assertIsNotNone(outcome)
-        self.assertEqual((wake_id, "delivered"), (outcome.wake_id, outcome.state))
+        service = sprint_message_delivery.SprintWakeDeliveryService(self.con)
+        while True:
+            next_wake = int(
+                self.con.execute(
+                    "SELECT wake_id FROM sprint_wake_outbox "
+                    "WHERE state='pending' AND available_at<=datetime('now') "
+                    "ORDER BY wake_id LIMIT 1"
+                ).fetchone()[0]
+            )
+            callback = (
+                deliver
+                if next_wake == wake_id
+                else lambda _conversation, _prompt, _key: "drained-run"
+            )
+            outcome = service.deliver_once(f"failed-turn-{wake_id}", callback)
+            self.assertIsNotNone(outcome)
+            if outcome.wake_id == wake_id:
+                break
+        self.assertEqual("delivered", outcome.state)
 
     def test_participant_pause_atomically_persists_report_interrupt_and_notice(self):
         self.register()
@@ -244,40 +260,37 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             ).fetchone()[0]
         )
         self.assertEqual("GitHub state cannot be trusted", report["reason"])
+        self.assertEqual({"kind": "participant", "shell_id": 1}, report["actor"])
         self.assertEqual(
-            {"kind": "participant", "shell_id": 1}, report["actor"]
+            [run_id], [row["run_id"] for row in report["deterministic"]["active_turns"]]
         )
-        self.assertEqual([run_id], [row["run_id"] for row in report["deterministic"]["active_turns"]])
         self.assertEqual(
             [self.unit_id],
             [row["work_unit_id"] for row in report["deterministic"]["work_units"]],
         )
         self.assertEqual(
             ["red"],
-            [row["normalized_state"] for row in report["deterministic"]["registered_prs"]],
+            [
+                row["normalized_state"]
+                for row in report["deterministic"]["registered_prs"]
+            ],
         )
         self.assertEqual("", report["integrity_threat"])
         self.assertEqual("", report["judgment"])
         self.assertEqual("", report["recommendation"])
         self.assertEqual(
-            [(self.planner_id, 0, "Sprint 1 paused: GitHub state cannot be trusted")],
+            [(None, 3, None, 0, "Sprint 1 paused: GitHub state cannot be trusted")],
             [
                 tuple(row)
                 for row in self.con.execute(
-                    "SELECT to_participant_id,actionable,body FROM sprint_messages "
+                    "SELECT sprint_id,receiver_shell_id,to_participant_id,"
+                    "actionable,body FROM wake_message "
                     "WHERE idempotency_key LIKE 'sprint-pause:%'"
                 )
             ],
         )
         self.assertEqual(
-            [
-                (
-                    "engine",
-                    "sprint-recovery",
-                    "queued",
-                    sprint_message_delivery.wake_prompt(self.sprint_id, "planner"),
-                )
-            ],
+            [],
             [
                 tuple(row)
                 for row in self.con.execute(
@@ -287,6 +300,34 @@ class SprintRecoveryCase(SprintPRWatcherCase):
                 )
             ],
         )
+        self.assertEqual(
+            [(None, "pending")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT w.participant_id,w.state FROM sprint_wake_outbox w "
+                    "JOIN sprint_wake_messages joined USING(wake_id) "
+                    "JOIN wake_message message USING(message_id) "
+                    "WHERE message.idempotency_key LIKE 'sprint-pause:%'"
+                )
+            ],
+        )
+        pause_wake_id = int(
+            self.con.execute(
+                "SELECT w.wake_id FROM sprint_wake_outbox w "
+                "JOIN sprint_wake_messages joined USING(wake_id) "
+                "JOIN wake_message message USING(message_id) "
+                "WHERE message.idempotency_key LIKE 'sprint-pause:%'"
+            ).fetchone()[0]
+        )
+        pause_outcome = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con
+        ).deliver_once(
+            "paused-notice-worker",
+            lambda conversation, _prompt, _key: conversation,
+        )
+        self.assertEqual(pause_wake_id, pause_outcome.wake_id)
+        self.assertEqual("delivered", pause_outcome.state)
 
         replay = coordinator.pause(
             self.sprint_id,
@@ -301,7 +342,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
                     "SELECT (SELECT COUNT(*) FROM sprint_reports WHERE report_kind='pause'),"
                     "(SELECT COUNT(*) FROM conversation_events WHERE run_id=? "
                     "AND event_type='run.interrupt.requested'),"
-                    "(SELECT COUNT(*) FROM sprint_messages "
+                    "(SELECT COUNT(*) FROM wake_message "
                     "WHERE idempotency_key LIKE 'sprint-pause:%')",
                     (run_id,),
                 ).fetchone()
@@ -321,6 +362,25 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         self.assertEqual(2, store.record_wake_failure(wake_id, "two"))
         self.assertEqual(3, store.record_wake_failure(wake_id, "three"))
 
+        pause_outcome = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con
+        ).deliver_once(
+            "auto-pause-notice-worker",
+            lambda conversation, _prompt, _key: conversation,
+        )
+        self.assertIsNotNone(pause_outcome)
+        self.assertEqual("delivered", pause_outcome.state)
+        self.assertEqual(
+            "wake_delivery_exhausted",
+            json.loads(
+                self.con.execute(
+                    "SELECT body FROM sprint_reports WHERE sprint_id=? "
+                    "AND report_kind='pause'",
+                    (self.sprint_id,),
+                ).fetchone()[0]
+            )["reason"],
+        )
+
         self.assertEqual([run_id], self.interrupts)
         report = json.loads(
             self.con.execute(
@@ -334,7 +394,9 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             {"attempts": 3, "last_error": "three", "wake_id": wake_id},
             report["detail"],
         )
-        self.assertEqual([run_id], [row["run_id"] for row in report["deterministic"]["active_turns"]])
+        self.assertEqual(
+            [run_id], [row["run_id"] for row in report["deterministic"]["active_turns"]]
+        )
 
         receipt = self.coordinator().resume(
             self.sprint_id,
@@ -378,11 +440,104 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             replacement,
             [wake["wake_id"] for wake in evidence["pending_wakes"]],
         )
-        lease = sprint_message_delivery.SprintWakeDeliveryService(
+        service = sprint_message_delivery.SprintWakeDeliveryService(self.con)
+        while True:
+            outcome = service.deliver_once(
+                "requeued-wake",
+                lambda conversation, _prompt, _key: conversation,
+            )
+            self.assertIsNotNone(outcome)
+            if outcome.wake_id == replacement:
+                break
+        self.assertEqual(1, outcome.attempt_number)
+
+    def test_resume_requeue_coalesces_with_foreign_pending_receiver_wake(self):
+        original_message = self.send("cross-sprint-recovery")
+        original_wake_id = int(original_message.wake_id)
+        store = sprint_domain.SprintLifecycleStore(
+            self.con,
+            interrupt_run=lambda _run_id: True,
+            notify_commit=lambda: True,
+        )
+        for error in ("one", "two", "three"):
+            store.record_wake_failure(original_wake_id, error)
+        pause_notice = sprint_message_delivery.SprintWakeDeliveryService(
             self.con
-        ).claim_next("requeued-wake")
-        self.assertEqual(replacement, lease.wake_id)
-        self.assertEqual(1, lease.attempt_number)
+        ).deliver_once(
+            "cross-sprint-pause-notice",
+            lambda conversation, _prompt, _key: conversation,
+        )
+        self.assertIsNotNone(pause_notice)
+        self.assertEqual("delivered", pause_notice.state)
+
+        feature_id = int(
+            self.con.execute(
+                "SELECT feature_id FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        foreign_sprint_id = int(
+            self.con.execute(
+                "INSERT INTO sprints "
+                "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+                "VALUES (?,3,1)",
+                (feature_id,),
+            ).lastrowid
+        )
+        foreign_developer_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness) "
+                "VALUES (?,1,'developer','codex')",
+                (foreign_sprint_id,),
+            ).lastrowid
+        )
+        self.con.commit()
+        foreign_message = self.messages.send(
+            foreign_sprint_id,
+            to_participant_id=foreign_developer_id,
+            message_kind="notification",
+            body="foreign prepared sprint backlog",
+            idempotency_key="foreign-prepared-backlog",
+        )
+
+        receipt = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="reuse the receiver wake",
+        )
+
+        self.assertEqual((foreign_message.wake_id,), receipt.requeued_wake_ids)
+        self.assertEqual(
+            [(foreign_message.wake_id, foreign_sprint_id, "pending")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT wake_id,sprint_id,state FROM sprint_wake_outbox "
+                    "WHERE receiver_shell_id=1 AND state='pending'"
+                )
+            ],
+        )
+        self.assertEqual(
+            [original_message.message_id, foreign_message.message_id],
+            [
+                int(row[0])
+                for row in self.con.execute(
+                    "SELECT message_id FROM sprint_wake_messages "
+                    "WHERE wake_id=? ORDER BY message_id",
+                    (foreign_message.wake_id,),
+                )
+            ],
+        )
+        lease = sprint_message_delivery.SprintWakeDeliveryService(self.con).claim_next(
+            "foreign-recovery-worker"
+        )
+        self.assertIsNotNone(lease)
+        self.assertEqual(foreign_message.wake_id, lease.wake_id)
+        self.assertEqual(
+            (original_message.message_id, foreign_message.message_id),
+            lease.message_ids,
+        )
 
     def test_failed_recovery_wake_is_bounded_and_leaves_manual_evidence(self):
         message = self.send("bounded-recovery-wake")
@@ -418,7 +573,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             tuple(
                 self.con.execute(
                     "SELECT m.read_at,wm.wake_id,w.state,w.attempt_count "
-                    "FROM sprint_messages m JOIN sprint_wake_messages wm "
+                    "FROM wake_message m JOIN sprint_wake_messages wm "
                     "USING (message_id) JOIN sprint_wake_outbox w USING (wake_id) "
                     "WHERE m.message_id=?",
                     (message.message_id,),
@@ -525,7 +680,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
                 trigger="attempt-5-exhausted",
             ),
         )
-        self.assertEqual(["notified"], notifications)
+        self.assertEqual([], notifications)
         self.assertEqual(
             ("paused", 5, "DEV1", "orphan"),
             tuple(
@@ -541,9 +696,9 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             ),
         )
         notice = self.con.execute(
-            "SELECT body FROM sprint_messages WHERE sprint_id=? "
-            "AND idempotency_key LIKE 'sprint-pause:%'",
-            (self.sprint_id,),
+            "SELECT body FROM wake_message WHERE sprint_id IS NULL "
+            "AND receiver_shell_id=3 "
+            "AND idempotency_key LIKE 'sprint-pause:%'"
         ).fetchone()[0]
         self.assertIn("shell DEV1", notice)
         self.assertIn("5 attempts", notice)
@@ -632,7 +787,17 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             self.sprint_id,
             trigger="fresh-episode-attempt-2",
         )
-        self.assertEqual(1, len(fresh_retry))
+        busy_retry = [
+            wake_id
+            for wake_id in fresh_retry
+            if str(
+                self.con.execute(
+                    "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
+                    (wake_id,),
+                ).fetchone()[0]
+            ).startswith(f"sprint-recovery:{self.sprint_id}:busy:{reset_wake}:")
+        ]
+        self.assertEqual(1, len(busy_retry))
         self.assertEqual(
             (
                 "armed",
@@ -645,9 +810,8 @@ class SprintRecoveryCase(SprintPRWatcherCase):
                     (self.sprint_id,),
                 ).fetchone()[0],
                 self.con.execute(
-                    "SELECT idempotency_key FROM sprint_wake_outbox "
-                    "WHERE wake_id=?",
-                    (fresh_retry[0],),
+                    "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
+                    (busy_retry[0],),
                 ).fetchone()[0],
                 self.con.execute(
                     "SELECT COUNT(*) FROM sprint_wake_outbox "
@@ -720,9 +884,9 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         self.con.commit()
 
         self.assertIsNone(
-            sprint_message_delivery.SprintWakeDeliveryService(
-                self.con
-            ).claim_next("read-message")
+            sprint_message_delivery.SprintWakeDeliveryService(self.con).claim_next(
+                "read-message"
+            )
         )
         self.assertEqual(
             (),
@@ -833,7 +997,9 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         old_wake = int(assignment.wake_id)
         prompt, _ = self.deliver_wake_with_turn(old_wake, terminal=True)
         self.assertEqual(
-            sprint_message_delivery.wake_prompt(self.sprint_id, "developer"),
+            sprint_message_delivery.wake_prompt(self.sprint_id, "developer")
+            + f"\n\n## wake_message #{assignment.message_id} "
+            "(declared Re-Enter)\n\nbody for pickup-assignment",
             prompt,
         )
         self.lifecycle.pause(
@@ -924,14 +1090,17 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             actual_prompt: list[str] = []
             outcome = delivery.deliver_once(
                 "relay-recovery",
-                lambda _conversation, prompt, _key: actual_prompt.append(prompt)
-                or "native",
+                lambda _conversation, prompt, _key, sink=actual_prompt: (
+                    sink.append(prompt) or "native"
+                ),
             )
             self.assertIsNotNone(outcome)
             captured.append((outcome.wake_id, actual_prompt[0]))
         self.assertEqual(replacement, outcome.wake_id)
         self.assertEqual(
-            sprint_message_delivery.wake_prompt(self.sprint_id, "developer"),
+            sprint_message_delivery.wake_prompt(self.sprint_id, "developer")
+            + f"\n\n## wake_message #{relay.message_id} "
+            "(declared Re-Enter)\n\nWhich compatibility fixture should I use?",
             captured[-1][1],
         )
         self.assertEqual(
@@ -961,8 +1130,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
 
         self.messages.mark_read(queued_turn.message_id, 1)
         self.con.execute(
-            "UPDATE conversation_messages SET state='running' "
-            "WHERE idempotency_key=?",
+            "UPDATE conversation_messages SET state='running' WHERE idempotency_key=?",
             (queued_key,),
         )
         self.con.execute(
@@ -980,7 +1148,8 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         self.deliver_wake_with_turn(int(terminal.wake_id), terminal=True)
         deliverable = self.send("pickup-already-pending")
         wake_count = self.con.execute(
-            "SELECT COUNT(*) FROM sprint_wake_outbox"
+            "SELECT COUNT(*) FROM sprint_wake_outbox WHERE participant_id=?",
+            (self.developer_id,),
         ).fetchone()[0]
         self.lifecycle.pause(
             self.sprint_id,
@@ -994,7 +1163,10 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         self.assertIn(deliverable.wake_id, second.requeued_wake_ids)
         self.assertEqual(
             wake_count,
-            self.con.execute("SELECT COUNT(*) FROM sprint_wake_outbox").fetchone()[0],
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_outbox WHERE participant_id=?",
+                (self.developer_id,),
+            ).fetchone()[0],
             "resume reuses existing wakes instead of adding a pickup fallback",
         )
         self.assertEqual(
@@ -1048,7 +1220,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             ),
         )
 
-    def test_resume_attaches_wakeless_unread_planner_notice_once(self):
+    def test_paused_decline_keeps_one_planner_wake_across_resume(self):
         assignment = self.send(
             "paused-decline-recovery",
             kind="work_assignment",
@@ -1080,7 +1252,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         )
         self.con.commit()
         self.assertEqual(
-            0,
+            1,
             self.con.execute(
                 "SELECT COUNT(*) FROM sprint_wake_messages WHERE message_id=?",
                 (result_id,),
@@ -1091,8 +1263,13 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             self.sprint_id,
             sprint_domain.LifecycleActor("planner", 3),
         )
-        self.assertEqual(1, len(first.requeued_wake_ids))
-        wake_id = first.requeued_wake_ids[0]
+        self.assertEqual((), first.requeued_wake_ids)
+        wake_id = int(
+            self.con.execute(
+                "SELECT wake_id FROM sprint_wake_messages WHERE message_id=?",
+                (result_id,),
+            ).fetchone()[0]
+        )
         self.assertEqual(
             [(wake_id, result_id, "pending")],
             [
@@ -1127,9 +1304,9 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             ).fetchone()[0]
         )
         self.assertNotEqual(old_wake, replacement)
-        count = self.con.execute(
-            "SELECT COUNT(*) FROM sprint_wake_outbox"
-        ).fetchone()[0]
+        count = self.con.execute("SELECT COUNT(*) FROM sprint_wake_outbox").fetchone()[
+            0
+        ]
 
         self.assertEqual("armed", coordinator.recover_on_startup(self.sprint_id))
         self.assertEqual(
@@ -1213,7 +1390,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
                 tuple(row)
                 for row in self.con.execute(
                     "SELECT work_unit_id,message_kind,disposition "
-                    "FROM sprint_messages WHERE work_unit_id=?",
+                    "FROM wake_message WHERE work_unit_id=?",
                     (downstream,),
                 )
             ],
@@ -1268,11 +1445,12 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         self.assertEqual([str(document_id)], sorted(payload["spec_drift"]))
         self.assertEqual(list(receipt.anomalies), payload["anomalies"])
         self.assertEqual(
-            [(self.planner_id, 0)],
+            [(None, 3, 0)],
             [
                 tuple(row)
                 for row in self.con.execute(
-                    "SELECT to_participant_id,actionable FROM sprint_messages "
+                    "SELECT to_participant_id,receiver_shell_id,actionable "
+                    "FROM wake_message "
                     "WHERE idempotency_key LIKE 'sprint-resume:%'"
                 )
             ],
@@ -1314,7 +1492,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         self.assertEqual(
             1,
             self.con.execute(
-                "SELECT COUNT(*) FROM sprint_messages "
+                "SELECT COUNT(*) FROM wake_message "
                 "WHERE idempotency_key LIKE 'sprint-resume:%'",
             ).fetchone()[0],
         )
@@ -1386,17 +1564,49 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
             notify_commit=lambda: True,
         )
 
+    def ensure_wake_chat(self, sprint_id: int, shell_id: int) -> str:
+        conversation = self.con.execute(
+            "SELECT pc.conversation_id "
+            "FROM sprint_participant_conversations pc "
+            "JOIN sprint_participants participant "
+            "ON participant.participant_id=pc.sprint_participant_id "
+            "WHERE participant.sprint_id=? AND participant.shell_id=?",
+            (sprint_id, shell_id),
+        ).fetchone()
+        if conversation is None:
+            participant_id = int(
+                self.con.execute(
+                    "SELECT participant_id FROM sprint_participants "
+                    "WHERE sprint_id=? AND shell_id=?",
+                    (sprint_id, shell_id),
+                ).fetchone()[0]
+            )
+            receipt = sprint_message_delivery.SprintMessageStore(self.con).send(
+                sprint_id,
+                to_participant_id=participant_id,
+                message_kind="notification",
+                body="Create the fixture wake chat.",
+                declared_type="re-enter",
+                idempotency_key=f"fixture-live-run:{sprint_id}:{shell_id}",
+            )
+            service = sprint_message_delivery.SprintWakeDeliveryService(self.con)
+            while True:
+                outcome = service.deliver_once(
+                    "fixture-live-run",
+                    lambda target, _prompt, _key: target,
+                )
+                self.assertIsNotNone(outcome)
+                if outcome.wake_id == receipt.wake_id:
+                    break
+            conversation = self.con.execute(
+                "SELECT current_conversation_id FROM sprint_participants "
+                "WHERE participant_id=?",
+                (participant_id,),
+            ).fetchone()
+        return str(conversation[0])
+
     def add_live_run(self, sprint_id: int, shell_id: int) -> tuple[str, int]:
-        conversation_id = str(
-            self.con.execute(
-                "SELECT pc.conversation_id "
-                "FROM sprint_participant_conversations pc "
-                "JOIN sprint_participants participant "
-                "ON participant.participant_id=pc.sprint_participant_id "
-                "WHERE participant.sprint_id=? AND participant.shell_id=?",
-                (sprint_id, shell_id),
-            ).fetchone()[0]
-        )
+        conversation_id = self.ensure_wake_chat(sprint_id, shell_id)
         token = int(
             self.con.execute("SELECT COUNT(*)+1 FROM conversation_runs").fetchone()[0]
         )
@@ -1451,8 +1661,7 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
             ("aborted", "discarded before arming"),
             tuple(
                 self.con.execute(
-                    "SELECT lifecycle,terminal_outcome FROM sprints "
-                    "WHERE sprint_id=?",
+                    "SELECT lifecycle,terminal_outcome FROM sprints WHERE sprint_id=?",
                     (sprint_id,),
                 ).fetchone()
             ),
@@ -1495,8 +1704,7 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
             ).lastrowid
         )
         self.con.execute(
-            "INSERT INTO conversation_outbox (conversation_id,message_id) "
-            "VALUES (?,?)",
+            "INSERT INTO conversation_outbox (conversation_id,message_id) VALUES (?,?)",
             (planner_conversation, queued_message_id),
         )
         self.con.commit()
@@ -1607,7 +1815,7 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
             with closing(sqlite3.connect(db_path)) as observed:
                 observed.row_factory = sqlite3.Row
                 self.assertEqual(
-                    [("closed", 1)] * 3,
+                    [("closed", 1)] * 2,
                     [
                         tuple(row)
                         for row in observed.execute(
@@ -1730,6 +1938,8 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
         for target in ("completed", "aborted"):
             sprint_id, _ = self.create_sprint()
             self.store.arm(sprint_id, 3)
+            for shell_id in (1, 2, 3):
+                self.ensure_wake_chat(sprint_id, shell_id)
             conversation_ids = [
                 str(row[0])
                 for row in self.con.execute(
@@ -1846,7 +2056,7 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
             tuple(
                 self.con.execute(
                     "SELECT s.lifecycle,"
-                    "(SELECT COUNT(*) FROM sprint_messages WHERE sprint_id=s.sprint_id),"
+                    "(SELECT COUNT(*) FROM wake_message WHERE sprint_id=s.sprint_id),"
                     "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=s.sprint_id) "
                     "FROM sprints s WHERE s.sprint_id=?",
                     (sprint_id,),

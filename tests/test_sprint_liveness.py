@@ -152,6 +152,13 @@ class SprintLivenessCase(unittest.TestCase):
             ).fetchone()[0]
         )
         self.messages = sprint_message_delivery.SprintMessageStore(self.con)
+        delivered = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con
+        ).deliver_once(
+            "liveness-setup",
+            lambda _conversation, _prompt, _key: "liveness-setup-run",
+        )
+        self.assertEqual(wake_id, delivered.wake_id)
         self.assertEqual(
             "accepted", self.messages.mark_read(self.assignment_message_id, 1)
         )
@@ -182,7 +189,7 @@ class SprintLivenessCase(unittest.TestCase):
 
     def message_rows(self, kind: str) -> list[sqlite3.Row]:
         return self.con.execute(
-            "SELECT * FROM sprint_messages WHERE message_kind=? ORDER BY message_id",
+            "SELECT * FROM wake_message WHERE message_kind=? ORDER BY message_id",
             (kind,),
         ).fetchall()
 
@@ -524,7 +531,7 @@ class FakeClockPolicyTest(SprintLivenessCase):
             message_kind="review_request",
             body="Please review",
             actionable=True,
-            active=True,
+            declared_type="new",
             idempotency_key="review-request:1",
         )
         self.assertEqual("accepted", self.messages.mark_read(review.message_id, 2))
@@ -547,7 +554,7 @@ class FakeClockPolicyTest(SprintLivenessCase):
 
 
 class DeliveryAndActivationTest(SprintLivenessCase):
-    def test_planner_quota_exhaustion_routes_escalation_to_fallback_only(self) -> None:
+    def test_planner_escalations_defer_chat_routing_and_coalesce(self) -> None:
         self.con.execute("DELETE FROM flavor_defaults WHERE flavor='planner'")
         self.con.executemany(
             "INSERT INTO flavor_defaults (flavor,harness,model,is_default) "
@@ -575,7 +582,7 @@ class DeliveryAndActivationTest(SprintLivenessCase):
             message_kind="review_request",
             body="Please review",
             actionable=True,
-            active=True,
+            declared_type="new",
             idempotency_key="review-request:fallback-dedup",
         )
         self.assertEqual("accepted", self.messages.mark_read(review.message_id, 2))
@@ -605,20 +612,18 @@ class DeliveryAndActivationTest(SprintLivenessCase):
             "FROM sprint_participants WHERE participant_id=?",
             (self.planner_id,),
         ).fetchone()
-        self.assertNotEqual(
-            planner["persistent_conversation_id"], planner["current_conversation_id"]
-        )
+        self.assertEqual((None, None), tuple(planner))
         fallbacks = self.con.execute(
             "SELECT link.purpose,c.harness FROM sprint_participant_conversations link "
             "JOIN conversations c ON c.conversation_id=link.conversation_id "
             "WHERE link.sprint_participant_id=? AND link.purpose='fallback'",
             (self.planner_id,),
         ).fetchall()
-        self.assertEqual([("fallback", "claude")], [tuple(row) for row in fallbacks])
+        self.assertEqual([], [tuple(row) for row in fallbacks])
         escalations = self.message_rows("escalation")
         self.assertEqual(2, len(escalations))
         self.assertEqual(
-            ["fallback:claude", "fallback:claude"],
+            ["delivery-time", "delivery-time"],
             [json.loads(row["body"])["planner_delivery_route"] for row in escalations],
         )
         wakes = self.con.execute(
@@ -631,6 +636,19 @@ class DeliveryAndActivationTest(SprintLivenessCase):
             [(self.planner_id, "pending"), (self.planner_id, "pending")],
             [tuple(row) for row in wakes],
         )
+        self.assertEqual(
+            1,
+            len(
+                {
+                    int(row["wake_id"])
+                    for row in self.con.execute(
+                        "SELECT wake_id FROM sprint_wake_messages "
+                        "WHERE message_id IN (?,?)",
+                        (escalations[0]["message_id"], escalations[1]["message_id"]),
+                    )
+                }
+            ),
+        )
         self.assertEqual([], self.message_rows("nudge"))
 
     def test_paused_sprint_does_no_evaluation_or_delivery_work(self) -> None:
@@ -642,11 +660,11 @@ class DeliveryAndActivationTest(SprintLivenessCase):
             reason="hold",
         )
         before = self.con.execute(
-            "SELECT COUNT(*) FROM sprint_messages"
+            "SELECT COUNT(*) FROM wake_message"
         ).fetchone()[0]
         self.assertEqual((), self.monitor().evaluate(self.sprint_id))
         after = self.con.execute(
-            "SELECT COUNT(*) FROM sprint_messages"
+            "SELECT COUNT(*) FROM wake_message"
         ).fetchone()[0]
         self.assertEqual(before, after)
         self.assertIsNone(self.expectation()["last_evaluated_at"])
@@ -685,7 +703,7 @@ class DeliveryAndActivationTest(SprintLivenessCase):
             message_kind="notification",
             body="Review changes requested",
             actionable=True,
-            active=False,
+            declared_type="re-enter",
             idempotency_key="changes-requested:former-developer",
         )
         self.assertEqual("accepted", self.messages.mark_read(notification.message_id, 1))
@@ -816,20 +834,25 @@ class MigrationGateTest(unittest.TestCase):
             (sprint_id, unit_id, task_id),
         )
         con.commit()
-        # Current runtime code reads the v2.1 active-chat authority even while
-        # this fixture isolates the older 0158 liveness migration.
-        con.executescript(
-            (MIGRATIONS / "0162_active_chat_registry.sql").read_text()
-        )
-        wake_id = sprint_domain.SprintLifecycleStore(con).arm(sprint_id, 3)[0]
         assignment_message_id = int(
             con.execute(
-                "SELECT message_id FROM sprint_wake_messages WHERE wake_id=?",
-                (wake_id,),
-            ).fetchone()[0]
+                "INSERT INTO sprint_messages "
+                "(sprint_id,from_participant_id,to_participant_id,work_unit_id,"
+                "message_kind,body,actionable,disposition,idempotency_key) "
+                "VALUES (?,(SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND role='planner'),"
+                "(SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND role='developer'),?,"
+                "'work_assignment','Ship it',1,'pending','legacy-assignment')",
+                (sprint_id, sprint_id, sprint_id, unit_id),
+            ).lastrowid
         )
-        messages = sprint_message_delivery.SprintMessageStore(con)
-        self.assertEqual("accepted", messages.mark_read(assignment_message_id, 1))
+        con.execute("UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?", (sprint_id,))
+        con.execute(
+            "UPDATE sprint_messages SET disposition='accepted',"
+            "read_at='2026-08-02 00:00:00' WHERE message_id=?",
+            (assignment_message_id,),
+        )
         con.execute(
             "UPDATE sprint_work_units SET disposition='in_review',"
             "updated_at='2026-08-02 00:00:00' WHERE work_unit_id=?",

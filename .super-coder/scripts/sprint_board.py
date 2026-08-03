@@ -448,7 +448,7 @@ class SprintBoardProjection:
         for row in self.con.execute(
             "WITH ranked AS ("
             " SELECT m.*,ROW_NUMBER() OVER (PARTITION BY m.work_unit_id "
-            " ORDER BY m.message_id DESC) rank FROM sprint_messages m "
+            " ORDER BY m.message_id DESC) rank FROM wake_message m "
             " WHERE m.sprint_id=? AND m.work_unit_id IS NOT NULL) "
             "SELECT ranked.*,sender.shell_id sender_shell_id,"
             "sender_shell.shortname sender_shortname,recipient.shell_id recipient_shell_id,"

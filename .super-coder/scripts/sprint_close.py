@@ -294,7 +294,7 @@ class SprintCloseStore:
         ]
         pending_messages = self._rows(
             "SELECT message_id,to_participant_id,work_unit_id,message_kind,created_at "
-            "FROM sprint_messages WHERE sprint_id=? AND actionable=1 "
+            "FROM wake_message WHERE sprint_id=? AND actionable=1 "
             "AND disposition='pending' ORDER BY message_id",
             (sprint_id,),
         )
@@ -478,7 +478,7 @@ class SprintCloseStore:
         message_counts = {
             row[0]: int(row[1])
             for row in self.con.execute(
-                "SELECT message_kind,COUNT(*) FROM sprint_messages "
+                "SELECT message_kind,COUNT(*) FROM wake_message "
                 "WHERE sprint_id=? AND message_kind IN ('nudge','escalation') "
                 "GROUP BY message_kind ORDER BY message_kind",
                 (sprint_id,),

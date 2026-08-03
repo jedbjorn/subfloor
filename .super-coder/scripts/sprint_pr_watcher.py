@@ -506,31 +506,11 @@ class SprintPRWatcher:
                     "registered_pr.merged_grant_bypassed",
                 )
             )
-        recipients: dict[int, bool] = {
-            int(registered["owner_participant_id"]): state in {"red", "green"}
-        }
-        planner = self.con.execute(
-            "SELECT participant_id FROM sprint_participants "
-            "WHERE sprint_id=? AND role='planner'",
-            (sprint_id,),
-        ).fetchone()
-        if planner is None:
-            raise SprintInvariantError("registered PR has no Planner participant")
-        planner_id = int(planner["participant_id"])
-        recipients[planner_id] = recipients.get(planner_id, False) or state == "closed"
-        reviewer_shell_ids = {int(row["reviewer_shell_id"]) for row in unit_rows}
-        for shell_id in reviewer_shell_ids:
-            reviewer = self.con.execute(
-                "SELECT participant_id FROM sprint_participants "
-                "WHERE sprint_id=? AND shell_id=? AND role='reviewer'",
-                (sprint_id, shell_id),
-            ).fetchone()
-            if reviewer is None:
-                raise SprintInvariantError(
-                    "registered PR work unit has no Reviewer participant"
-                )
-            reviewer_id = int(reviewer["participant_id"])
-            recipients.setdefault(reviewer_id, False)
+        recipients = (
+            (int(registered["owner_participant_id"]),)
+            if state in {"red", "green", "closed"}
+            else ()
+        )
 
         head_changed = (
             previous_head_sha is not None
@@ -593,7 +573,7 @@ class SprintPRWatcher:
                     "review against the new head."
                 ),
                 actionable=True,
-                active=True,
+                declared_type="new",
                 idempotency_key=f"pr-head-change:{transition_key}:delta-review",
             )
             self.con.execute(
@@ -621,14 +601,14 @@ class SprintPRWatcher:
             f"GitHub observed {registered['repository']} PR "
             f"#{registered['pr_number']}: {state} at {head}."
         )
-        for participant_id, active in recipients.items():
+        for participant_id in recipients:
             self.messages.send_in_transaction(
                 sprint_id,
                 to_participant_id=participant_id,
                 work_unit_id=work_unit_id,
                 message_kind="notification",
                 body=body,
-                active=active,
+                declared_type="re-enter",
                 idempotency_key=(
                     f"pr-transition:{transition_key}:participant:{participant_id}"
                 ),
@@ -653,7 +633,7 @@ class SprintPRWatcher:
         if not isinstance(message_id, int):
             return None
         self.con.execute(
-            "UPDATE sprint_messages SET read_at=COALESCE(read_at,datetime('now')) "
+            "UPDATE wake_message SET read_at=COALESCE(read_at,datetime('now')) "
             "WHERE sprint_id=? AND message_id=?",
             (sprint_id, message_id),
         )
@@ -667,7 +647,7 @@ class SprintPRWatcher:
         ]
         for wake_id in wake_ids:
             unread = self.con.execute(
-                "SELECT 1 FROM sprint_wake_messages wm JOIN sprint_messages m "
+                "SELECT 1 FROM sprint_wake_messages wm JOIN wake_message m "
                 "ON m.sprint_id=wm.sprint_id AND m.message_id=wm.message_id "
                 "WHERE wm.sprint_id=? AND wm.wake_id=? AND m.read_at IS NULL LIMIT 1",
                 (sprint_id, wake_id),

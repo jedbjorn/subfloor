@@ -32,10 +32,26 @@ class SprintConversationError(ValueError):
     """The requested Sprint conversation transition violates its contract."""
 
 
+class WakeConversationBusy(SprintConversationError):
+    """A wake replacement lost the boundary race to another active chat."""
+
+
 @dataclass(frozen=True)
 class WakeConversationRoute:
     conversation_id: str
     created: bool
+
+
+@dataclass(frozen=True)
+class PreparedShellWake:
+    shell_id: int
+    owner_user_id: int
+    shortname: str
+    harness: str
+    provider: str | None
+    model: str | None
+    effort: str | None
+    worktree: str
 
 
 def wake_prompt(sprint_id: int, role: str) -> str:
@@ -685,6 +701,266 @@ def ensure_wake_conversation(
         ),
     )
     return WakeConversationRoute(conversation_id, True)
+
+
+def prepare_shell_wake_conversation(con, shell_id: int) -> PreparedShellWake:
+    """Resolve a non-Sprint shell route before any active chat is closed."""
+    shell = con.execute(
+        "SELECT shell_id,user_id,shortname,flavor FROM shells "
+        "WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
+        (shell_id,),
+    ).fetchone()
+    if shell is None:
+        raise SprintConversationError("wake receiver shell does not exist")
+    if shell["user_id"] is None:
+        raise SprintConversationError("wake receiver shell has no browser owner")
+
+    prior = con.execute(
+        "SELECT harness,model,effort FROM conversations WHERE shell_id=? "
+        "ORDER BY created_at DESC,conversation_id DESC LIMIT 1",
+        (shell_id,),
+    ).fetchone()
+    defaults = run_mod.flavor_defaults(con).get(shell["flavor"], {})
+    harness = (
+        (str(prior["harness"]) if prior is not None else None)
+        or defaults.get("default_harness")
+        or run_mod._configured_harness()
+        or "claude"
+    )
+    model = (
+        str(prior["model"])
+        if prior is not None and prior["model"] is not None
+        else defaults.get("models", {}).get(harness)
+    )
+    adapter = run_mod.load_adapter(harness)
+    effort = (
+        str(prior["effort"])
+        if prior is not None and prior["effort"] is not None
+        else run_mod.default_headless_effort(adapter)
+    )
+    try:
+        run_mod.validate_headless_request(adapter, model, effort)
+    except ValueError as exc:
+        raise SprintConversationError(str(exc)) from exc
+    worktree = run_mod.shell_work_dir(shell["shortname"], shell["flavor"])
+    return PreparedShellWake(
+        shell_id=int(shell["shell_id"]),
+        owner_user_id=int(shell["user_id"]),
+        shortname=str(shell["shortname"]),
+        harness=harness,
+        provider=run_mod.session_provider(harness, model),
+        model=model,
+        effort=effort,
+        worktree=str(worktree.resolve(strict=False)),
+    )
+
+
+def create_shell_wake_conversation(
+    con,
+    *,
+    wake_id: int,
+    route: PreparedShellWake,
+) -> str:
+    """Create and register a prepared engine-wide wake chat."""
+    if not con.in_transaction:
+        raise RuntimeError("wake conversation creation requires a transaction")
+    if active_chat_registry.get(con, route.shell_id) is not None:
+        raise WakeConversationBusy("another chat became active before wake creation")
+
+    key = f"shell:{route.shell_id}:wake:{wake_id}"
+    request = {
+        "effort": route.effort,
+        "harness": route.harness,
+        "model": route.model,
+        "shell_id": route.shell_id,
+        "wake_id": wake_id,
+        "worktree": route.worktree,
+    }
+    existing = con.execute(
+        "SELECT conversation_id,shell_id,state,creation_request_hash "
+        "FROM conversations WHERE owner_user_id=? "
+        "AND creation_idempotency_key=?",
+        (route.owner_user_id, key),
+    ).fetchone()
+    request_hash = _request_hash(request)
+    if existing is not None:
+        if (
+            int(existing["shell_id"]) != route.shell_id
+            or existing["creation_request_hash"] != request_hash
+            or existing["state"] == "closed"
+        ):
+            raise SprintConversationError("idempotent wake chat is not reusable")
+        conversation_id = str(existing["conversation_id"])
+        active_chat_registry.register(con, route.shell_id, conversation_id)
+        return conversation_id
+
+    conversation_id = "cv_" + uuid.uuid4().hex
+    con.execute(
+        "INSERT INTO conversations "
+        "(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,"
+        "worktree,title,creation_idempotency_key,creation_request_hash) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            conversation_id,
+            route.shell_id,
+            route.owner_user_id,
+            route.harness,
+            route.provider,
+            route.model,
+            route.effort,
+            route.worktree,
+            f"Wake {wake_id} · {route.shortname}",
+            key,
+            request_hash,
+        ),
+    )
+    _append_event(
+        con,
+        conversation_id,
+        "conversation.created",
+        {"scope": "normal", "shell_id": route.shell_id, "wake_id": wake_id},
+    )
+    active_chat_registry.register(con, route.shell_id, conversation_id)
+    return conversation_id
+
+
+def create_wake_conversation(
+    con,
+    *,
+    wake_id: int,
+    sprint_id: int,
+    participant_id: int,
+) -> str:
+    """Create and register one wake chat after the prior chat is committed closed.
+
+    The caller owns this insertion transaction and must have resolved rotation
+    before entering it.  Unlike ``create_and_select``, this seam never closes a
+    chat, so close and replacement cannot roll back as one unit.
+    """
+    if not con.in_transaction:
+        raise RuntimeError("wake conversation creation requires a transaction")
+    row = con.execute(
+        "SELECT p.participant_id,p.sprint_id,p.shell_id,p.harness,p.model,p.effort,"
+        "p.persistent_conversation_id,p.current_conversation_id,"
+        "s.conversation_generation,sh.shortname,sh.flavor,owner.user_id "
+        "FROM sprint_participants p "
+        "JOIN sprints s ON s.sprint_id=p.sprint_id "
+        "JOIN shells sh ON sh.shell_id=p.shell_id "
+        "JOIN shells owner ON owner.shell_id=s.originating_planner_shell_id "
+        "WHERE p.participant_id=? AND p.sprint_id=?",
+        (participant_id, sprint_id),
+    ).fetchone()
+    if row is None:
+        raise SprintConversationError("wake recipient is not a Sprint participant")
+    if row["user_id"] is None:
+        raise SprintConversationError("originating Planner has no browser owner")
+    if active_chat_registry.get(con, int(row["shell_id"])) is not None:
+        raise WakeConversationBusy("another chat became active before wake creation")
+
+    generation = _nonblank(
+        row["conversation_generation"],
+        "Sprint conversation generation",
+        maximum=32,
+    )
+    key = f"generation:{generation}:wake:{wake_id}"
+    existing = con.execute(
+        "SELECT conversation_id,state FROM conversations "
+        "WHERE owner_user_id=? AND creation_idempotency_key=?",
+        (row["user_id"], key),
+    ).fetchone()
+    if existing is not None:
+        if existing["state"] == "closed":
+            raise SprintConversationError("idempotent wake chat is already closed")
+        conversation_id = str(existing["conversation_id"])
+        if not _linked_to_participant(con, participant_id, conversation_id):
+            raise SprintConversationError(
+                "idempotent wake chat belongs to another participant"
+            )
+        active_chat_registry.register(con, int(row["shell_id"]), conversation_id)
+        con.execute(
+            "UPDATE sprint_participants SET current_conversation_id=?,"
+            "updated_at=datetime('now') WHERE participant_id=?",
+            (conversation_id, participant_id),
+        )
+        return conversation_id
+
+    parent = con.execute(
+        "SELECT link.conversation_id FROM sprint_participant_conversations link "
+        "WHERE link.sprint_participant_id=? ORDER BY "
+        "(link.conversation_id=?) DESC,link.participant_conversation_id DESC LIMIT 1",
+        (participant_id, row["current_conversation_id"]),
+    ).fetchone()
+    parent_id = str(parent["conversation_id"]) if parent is not None else None
+    purpose = "fallback" if parent_id is not None else "work"
+    context_packet = (
+        {
+            "reason": "wake delivery selected a fresh chat",
+            "sprint_id": sprint_id,
+            "participant_id": participant_id,
+            "previous_conversation_id": parent_id,
+            "wake_id": wake_id,
+        }
+        if parent_id is not None
+        else None
+    )
+    worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
+    request = {
+        "effort": row["effort"],
+        "harness": row["harness"],
+        "model": row["model"],
+        "participant_id": participant_id,
+        "provider": run_mod.session_provider(row["harness"], row["model"]),
+        "sprint_id": sprint_id,
+        "wake_id": wake_id,
+        "worktree": str(worktree.resolve(strict=False)),
+    }
+    conversation_id = "cv_" + uuid.uuid4().hex
+    con.execute(
+        "INSERT INTO conversations "
+        "(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,"
+        "worktree,title,creation_idempotency_key,creation_request_hash,"
+        "conversation_scope) VALUES (?,?,?,?,?,?,?,?,?,?,?,'sprint')",
+        (
+            conversation_id,
+            row["shell_id"],
+            row["user_id"],
+            row["harness"],
+            request["provider"],
+            row["model"],
+            row["effort"],
+            request["worktree"],
+            f"Sprint {sprint_id} · Wake {wake_id} · {row['shortname']}",
+            key,
+            _request_hash(request),
+        ),
+    )
+    _append_created_event(
+        con,
+        conversation_id=conversation_id,
+        participant_id=participant_id,
+        sprint_id=sprint_id,
+        purpose=purpose,
+    )
+    con.execute(
+        "INSERT INTO sprint_participant_conversations "
+        "(sprint_participant_id,conversation_id,purpose,parent_conversation_id,"
+        "context_packet) VALUES (?,?,?,?,?)",
+        (
+            participant_id,
+            conversation_id,
+            purpose,
+            parent_id,
+            _canonical_json(context_packet) if context_packet is not None else None,
+        ),
+    )
+    con.execute(
+        "UPDATE sprint_participants SET persistent_conversation_id="
+        "COALESCE(persistent_conversation_id,?),current_conversation_id=?,"
+        "updated_at=datetime('now') WHERE participant_id=?",
+        (conversation_id, conversation_id, participant_id),
+    )
+    active_chat_registry.register(con, int(row["shell_id"]), conversation_id)
+    return conversation_id
 
 
 def create_review_outcome(

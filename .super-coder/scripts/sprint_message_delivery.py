@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Dedicated Sprint v2 messages and retryable wake delivery.
+"""Engine-wide wake messages and retryable delivery.
 
-Sprint messages are durable collaboration facts.  An active message commits
-its wake intent in the same SQLite transaction; a later delivery worker claims
-that intent, resolves the participant's current conversation, and performs the
-external harness enqueue outside the database transaction.
+Every message commits its wake intent in the same SQLite transaction.  A later
+worker claims the coalesced receiver wake, resolves New versus Re-enter from the
+live registry, and performs the native enqueue outside database transactions.
 """
 from __future__ import annotations
 
@@ -14,6 +13,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+import active_chat_registry
+import conversation_events
 import db_driver
 import sprint_participant_chats
 from sprint_domain import SprintInvariantError, SprintLifecycleStore
@@ -39,16 +40,19 @@ class ParticipantRelayReceipt:
     wake_id: int
     message_created: bool
     wake_state: str
-    conversation_id: str
+    conversation_id: str | None
 
 
 @dataclass(frozen=True)
 class WakeLease:
     wake_id: int
-    sprint_id: int
-    participant_id: int
-    participant_role: str
-    target_conversation_id: str | None
+    sprint_id: int | None
+    participant_id: int | None
+    participant_role: str | None
+    receiver_shell_id: int
+    message_ids: tuple[int, ...]
+    declared_types: tuple[str, ...]
+    prompt: str
     idempotency_key: str
     attempt_number: int
     claim_owner: str
@@ -66,7 +70,7 @@ def _stamp(value: datetime) -> str:
 
 
 class SprintMessageStore:
-    """Transactional inbox, acceptance, decline, and wake coalescing."""
+    """One transactional producer plus Sprint acceptance conveniences."""
 
     def __init__(self, con: sqlite3.Connection) -> None:
         self.con = con
@@ -83,7 +87,7 @@ class SprintMessageStore:
         from_participant_id: int | None = None,
         work_unit_id: int | None = None,
         actionable: bool = False,
-        active: bool = True,
+        declared_type: str = "re-enter",
     ) -> MessageReceipt:
         body = body.strip()
         key = idempotency_key.strip()
@@ -103,8 +107,110 @@ class SprintMessageStore:
                 from_participant_id=from_participant_id,
                 work_unit_id=work_unit_id,
                 actionable=actionable,
-                active=active,
+                declared_type=declared_type,
             )
+
+    def send_to_shell(
+        self,
+        receiver_shell_id: int,
+        *,
+        message_kind: str,
+        body: str,
+        idempotency_key: str,
+        sender_shell_id: int | None = None,
+        declared_type: str = "re-enter",
+    ) -> MessageReceipt:
+        """Send an engine-wide wake message with no Sprint scope."""
+        with db_driver.write_transaction(self.con, "wake.message.send"):
+            return self.send_to_shell_in_transaction(
+                receiver_shell_id,
+                message_kind=message_kind,
+                body=body,
+                idempotency_key=idempotency_key,
+                sender_shell_id=sender_shell_id,
+                declared_type=declared_type,
+            )
+
+    def send_to_shell_in_transaction(
+        self,
+        receiver_shell_id: int,
+        *,
+        message_kind: str,
+        body: str,
+        idempotency_key: str,
+        sender_shell_id: int | None = None,
+        declared_type: str = "re-enter",
+    ) -> MessageReceipt:
+        """Commit an engine-wide wake through a caller-owned transaction."""
+        if not self.con.in_transaction:
+            raise RuntimeError(
+                "send_to_shell_in_transaction requires an active transaction"
+            )
+        body = body.strip()
+        key = idempotency_key.strip()
+        if not body:
+            raise ValueError("wake message body is empty")
+        if not key:
+            raise ValueError("wake message idempotency key is empty")
+        if declared_type not in {"new", "re-enter"}:
+            raise ValueError("wake message type must be new or re-enter")
+        receiver = self.con.execute(
+            "SELECT 1 FROM shells WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
+            (receiver_shell_id,),
+        ).fetchone()
+        if receiver is None:
+            raise KeyError(f"unknown wake receiver shell: {receiver_shell_id}")
+        existing = self.con.execute(
+            "SELECT * FROM wake_message WHERE idempotency_key=?", (key,)
+        ).fetchone()
+        if existing is not None:
+            actual = (
+                existing["sprint_id"],
+                existing["sender_shell_id"],
+                int(existing["receiver_shell_id"]),
+                str(existing["message_kind"]),
+                str(existing["body"]),
+                str(existing["declared_type"]),
+            )
+            expected = (
+                None,
+                sender_shell_id,
+                receiver_shell_id,
+                message_kind,
+                body,
+                declared_type,
+            )
+            if actual != expected:
+                raise SprintInvariantError(
+                    "wake message idempotency key was reused with different input"
+                )
+            wake = self.con.execute(
+                "SELECT wake_id FROM sprint_wake_messages WHERE message_id=?",
+                (existing["message_id"],),
+            ).fetchone()
+            if wake is None:
+                raise SprintInvariantError("wake message has no delivery intent")
+            return MessageReceipt(
+                int(existing["message_id"]), int(wake["wake_id"]), False
+            )
+        message_id = int(
+            self.con.execute(
+                "INSERT INTO wake_message "
+                "(sender_shell_id,receiver_shell_id,message_kind,body,"
+                "declared_type,actionable,idempotency_key) "
+                "VALUES (?,?,?,?,?,0,?)",
+                (
+                    sender_shell_id,
+                    receiver_shell_id,
+                    message_kind,
+                    body,
+                    declared_type,
+                    key,
+                ),
+            ).lastrowid
+        )
+        wake_id = self._coalesce_wake(None, None, receiver_shell_id, message_id)
+        return MessageReceipt(message_id, wake_id, True)
 
     def relay(
         self,
@@ -161,25 +267,25 @@ class SprintMessageStore:
                 from_participant_id=int(sender["participant_id"]),
                 work_unit_id=None,
                 actionable=False,
-                active=True,
+                declared_type="re-enter",
             )
             wake = self.con.execute(
                 "SELECT state FROM sprint_wake_outbox WHERE wake_id=?",
                 (receipt.wake_id,),
             ).fetchone()
             route = self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE participant_id=?",
+                "SELECT chat_id FROM active_shell_chats WHERE shell_id=("
+                "SELECT shell_id FROM sprint_participants WHERE participant_id=?)",
                 (recipient["participant_id"],),
             ).fetchone()
-            if wake is None or route is None or route["current_conversation_id"] is None:
+            if wake is None:
                 raise SprintInvariantError("Sprint relay did not produce a deliverable wake")
             return ParticipantRelayReceipt(
                 message_id=receipt.message_id,
                 wake_id=int(receipt.wake_id),
                 message_created=receipt.created,
                 wake_state=str(wake["state"]),
-                conversation_id=str(route["current_conversation_id"]),
+                conversation_id=(str(route["chat_id"]) if route is not None else None),
             )
 
     def send_in_transaction(
@@ -193,7 +299,7 @@ class SprintMessageStore:
         from_participant_id: int | None = None,
         work_unit_id: int | None = None,
         actionable: bool = False,
-        active: bool = True,
+        declared_type: str = "re-enter",
     ) -> MessageReceipt:
         """Commit through a caller-owned transaction.
 
@@ -220,15 +326,13 @@ class SprintMessageStore:
             from_participant_id=from_participant_id,
             work_unit_id=work_unit_id,
             actionable=actionable,
-            active=active,
+            declared_type=declared_type,
         )
 
     def inbox(self, sprint_id: int, shell_id: int) -> list[sqlite3.Row]:
         return self.con.execute(
-            "SELECT m.* FROM sprint_messages m "
-            "JOIN sprint_participants p "
-            "ON p.sprint_id=m.sprint_id AND p.participant_id=m.to_participant_id "
-            "WHERE m.sprint_id=? AND p.shell_id=? AND m.read_at IS NULL "
+            "SELECT m.* FROM wake_message m "
+            "WHERE m.sprint_id=? AND m.receiver_shell_id=? AND m.read_at IS NULL "
             "ORDER BY m.message_id",
             (sprint_id, shell_id),
         ).fetchall()
@@ -249,7 +353,7 @@ class SprintMessageStore:
                     return "declined"
                 if message["disposition"] == "pending":
                     self.con.execute(
-                        "UPDATE sprint_messages SET disposition='accepted',"
+                        "UPDATE wake_message SET disposition='accepted',"
                         "read_at=datetime('now') WHERE message_id=?",
                         (message_id,),
                     )
@@ -257,7 +361,7 @@ class SprintMessageStore:
                 disposition = "accepted"
             else:
                 self.con.execute(
-                    "UPDATE sprint_messages SET read_at=COALESCE(read_at,datetime('now')) "
+                    "UPDATE wake_message SET read_at=COALESCE(read_at,datetime('now')) "
                     "WHERE message_id=?",
                     (message_id,),
                 )
@@ -321,7 +425,7 @@ class SprintMessageStore:
                 raise SprintInvariantError("accepted Sprint messages cannot be declined")
             if message["disposition"] == "pending":
                 self.con.execute(
-                    "UPDATE sprint_messages SET disposition='declined',"
+                    "UPDATE wake_message SET disposition='declined',"
                     "read_at=datetime('now'),decline_reason=? WHERE message_id=?",
                     (reason, message_id),
                 )
@@ -346,10 +450,6 @@ class SprintMessageStore:
             ).fetchone()
             if planner is None:
                 raise SprintInvariantError("Sprint has no Planner participant")
-            lifecycle = self.con.execute(
-                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
-                (message["sprint_id"],),
-            ).fetchone()[0]
             routed = self._send(
                 int(message["sprint_id"]),
                 to_participant_id=int(planner["participant_id"]),
@@ -366,7 +466,7 @@ class SprintMessageStore:
                     else None
                 ),
                 actionable=False,
-                active=lifecycle == "armed",
+                declared_type="re-enter",
             )
             self._cancel_resolved_wakes(message_id)
             return routed.message_id
@@ -382,25 +482,36 @@ class SprintMessageStore:
         from_participant_id: int | None,
         work_unit_id: int | None,
         actionable: bool,
-        active: bool,
+        declared_type: str,
     ) -> MessageReceipt:
+        if declared_type not in {"new", "re-enter"}:
+            raise ValueError("wake message type must be new or re-enter")
         sprint = self.con.execute(
-            "SELECT lifecycle FROM sprints WHERE sprint_id=?", (sprint_id,)
+            "SELECT sprint_id FROM sprints WHERE sprint_id=?", (sprint_id,)
         ).fetchone()
         if sprint is None:
             raise KeyError(f"unknown Sprint: {sprint_id}")
-        if active and sprint["lifecycle"] != "armed":
-            raise SprintInvariantError("active Sprint messages require an armed Sprint")
         recipient = self.con.execute(
-            "SELECT 1 FROM sprint_participants "
+            "SELECT shell_id FROM sprint_participants "
             "WHERE sprint_id=? AND participant_id=?",
             (sprint_id, to_participant_id),
         ).fetchone()
         if recipient is None:
             raise SprintInvariantError("recipient is not a Sprint participant")
+        sender_shell_id = None
+        if from_participant_id is not None:
+            sender = self.con.execute(
+                "SELECT shell_id FROM sprint_participants "
+                "WHERE sprint_id=? AND participant_id=?",
+                (sprint_id, from_participant_id),
+            ).fetchone()
+            if sender is None:
+                raise SprintInvariantError("sender is not a Sprint participant")
+            sender_shell_id = int(sender["shell_id"])
+        receiver_shell_id = int(recipient["shell_id"])
 
         existing = self.con.execute(
-            "SELECT * FROM sprint_messages WHERE idempotency_key=?",
+            "SELECT * FROM wake_message WHERE idempotency_key=?",
             (idempotency_key,),
         ).fetchone()
         if existing is not None:
@@ -412,6 +523,7 @@ class SprintMessageStore:
                 str(existing["message_kind"]),
                 str(existing["body"]),
                 bool(existing["actionable"]),
+                str(existing["declared_type"]),
             )
             expected = (
                 sprint_id,
@@ -421,12 +533,13 @@ class SprintMessageStore:
                 message_kind,
                 body,
                 actionable,
+                declared_type,
             )
             wake = self.con.execute(
                 "SELECT wake_id FROM sprint_wake_messages WHERE message_id=?",
                 (existing["message_id"],),
             ).fetchone()
-            if actual != expected or (wake is not None) != active:
+            if actual != expected or wake is None:
                 raise SprintInvariantError(
                     "Sprint message idempotency key was reused with different input"
                 )
@@ -439,48 +552,58 @@ class SprintMessageStore:
         disposition = "pending" if actionable else None
         message_id = int(
             self.con.execute(
-                "INSERT INTO sprint_messages "
-                "(sprint_id,from_participant_id,to_participant_id,work_unit_id,"
-                "message_kind,body,actionable,disposition,idempotency_key) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO wake_message "
+                "(sprint_id,sender_shell_id,receiver_shell_id,from_participant_id,"
+                "to_participant_id,work_unit_id,message_kind,body,declared_type,"
+                "actionable,disposition,idempotency_key) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     sprint_id,
+                    sender_shell_id,
+                    receiver_shell_id,
                     from_participant_id,
                     to_participant_id,
                     work_unit_id,
                     message_kind,
                     body,
+                    declared_type,
                     1 if actionable else 0,
                     disposition,
                     idempotency_key,
                 ),
             ).lastrowid
         )
-        wake_id = (
-            self._coalesce_wake(sprint_id, to_participant_id, message_id)
-            if active
-            else None
+        wake_id = self._coalesce_wake(
+            sprint_id,
+            to_participant_id,
+            receiver_shell_id,
+            message_id,
         )
         return MessageReceipt(message_id, wake_id, True)
 
     def _coalesce_wake(
-        self, sprint_id: int, participant_id: int, message_id: int
+        self,
+        sprint_id: int | None,
+        participant_id: int | None,
+        receiver_shell_id: int,
+        message_id: int,
     ) -> int:
         wake = self.con.execute(
             "SELECT wake_id FROM sprint_wake_outbox "
-            "WHERE sprint_id=? AND participant_id=? AND state='pending'",
-            (sprint_id, participant_id),
+            "WHERE receiver_shell_id=? AND state='pending'",
+            (receiver_shell_id,),
         ).fetchone()
         if wake is None:
             wake_id = int(
                 self.con.execute(
                     "INSERT INTO sprint_wake_outbox "
-                    "(sprint_id,participant_id,idempotency_key) VALUES (?,?,?)",
+                    "(sprint_id,participant_id,receiver_shell_id,idempotency_key) "
+                    "VALUES (?,?,?,?)",
                     (
                         sprint_id,
                         participant_id,
-                        f"sprint:{sprint_id}:participant:{participant_id}:"
-                        f"wake-for-message:{message_id}",
+                        receiver_shell_id,
+                        f"receiver:{receiver_shell_id}:wake-for-message:{message_id}",
                     ),
                 ).lastrowid
             )
@@ -490,11 +613,6 @@ class SprintMessageStore:
             "INSERT INTO sprint_wake_messages (sprint_id,wake_id,message_id) "
             "VALUES (?,?,?)",
             (sprint_id, wake_id, message_id),
-        )
-        sprint_participant_chats.ensure_wake_conversation(
-            self.con,
-            participant_id,
-            idempotency_key=f"sprint:{sprint_id}:wake:{wake_id}:conversation",
         )
         return wake_id
 
@@ -511,10 +629,8 @@ class SprintMessageStore:
             else (message_id, shell_id)
         )
         row = self.con.execute(
-            "SELECT m.* FROM sprint_messages m "
-            "JOIN sprint_participants p "
-            "ON p.sprint_id=m.sprint_id AND p.participant_id=m.to_participant_id "
-            "WHERE m.message_id=? AND p.shell_id=?" + scope,
+            "SELECT m.* FROM wake_message m "
+            "WHERE m.message_id=? AND m.receiver_shell_id=?" + scope,
             params,
         ).fetchone()
         if row is None:
@@ -529,7 +645,7 @@ class SprintMessageStore:
         for wake in wake_ids:
             unresolved = self.con.execute(
                 "SELECT 1 FROM sprint_wake_messages wm "
-                "JOIN sprint_messages m USING (message_id) "
+                "JOIN wake_message m USING (message_id) "
                 "WHERE wm.wake_id=? AND m.read_at IS NULL LIMIT 1",
                 (wake["wake_id"],),
             ).fetchone()
@@ -543,7 +659,7 @@ class SprintMessageStore:
 
 
 class SprintWakeDeliveryService:
-    """Lease and deliver committed wake intents with a three-attempt budget."""
+    """Lease wake intents and resolve their chat placement at delivery time."""
 
     def __init__(
         self,
@@ -564,8 +680,8 @@ class SprintWakeDeliveryService:
                 "claimed_at=NULL,lease_expires_at=NULL "
                 "WHERE state='delivering' AND lease_expires_at<=? "
                 "AND NOT EXISTS (SELECT 1 FROM sprint_wake_outbox followup "
-                "WHERE followup.sprint_id=sprint_wake_outbox.sprint_id "
-                "AND followup.participant_id=sprint_wake_outbox.participant_id "
+                "WHERE followup.receiver_shell_id="
+                "sprint_wake_outbox.receiver_shell_id "
                 "AND followup.state='pending')",
                 (now,),
             )
@@ -586,23 +702,21 @@ class SprintWakeDeliveryService:
                 "claimed_at=NULL,lease_expires_at=NULL "
                 "WHERE state='delivering' AND lease_expires_at<=? "
                 "AND NOT EXISTS (SELECT 1 FROM sprint_wake_outbox followup "
-                "WHERE followup.sprint_id=sprint_wake_outbox.sprint_id "
-                "AND followup.participant_id=sprint_wake_outbox.participant_id "
+                "WHERE followup.receiver_shell_id="
+                "sprint_wake_outbox.receiver_shell_id "
                 "AND followup.state='pending')",
                 (now,),
             )
             row = self.con.execute(
-                "SELECT w.*,p.current_conversation_id,p.role "
-                "FROM sprint_wake_outbox w "
-                "JOIN sprints s USING (sprint_id) "
-                "JOIN sprint_participants p "
-                "ON p.sprint_id=w.sprint_id AND p.participant_id=w.participant_id "
+                "SELECT w.* FROM sprint_wake_outbox w "
                 "WHERE ((w.state='delivering' AND w.lease_expires_at<=?) "
                 "OR (w.state='pending' AND w.available_at<=?)) "
-                "AND s.lifecycle='armed' "
                 "AND EXISTS (SELECT 1 FROM sprint_wake_messages wm "
-                "JOIN sprint_messages m USING (message_id) "
-                "WHERE wm.wake_id=w.wake_id AND m.read_at IS NULL) "
+                "JOIN wake_message m USING (message_id) "
+                "LEFT JOIN sprints message_sprint "
+                "ON message_sprint.sprint_id=m.sprint_id "
+                "WHERE wm.wake_id=w.wake_id AND m.delivered_at IS NULL "
+                "AND (m.sprint_id IS NULL OR message_sprint.lifecycle='armed')) "
                 "ORDER BY w.wake_id LIMIT 1",
                 (now, now),
             ).fetchone()
@@ -624,23 +738,172 @@ class SprintWakeDeliveryService:
                 )
             if result.rowcount != 1:
                 return None
-            route = sprint_participant_chats.ensure_wake_conversation(
-                self.con,
-                int(row["participant_id"]),
-                idempotency_key=(
-                    f"sprint:{row['sprint_id']}:wake:{row['wake_id']}:conversation"
+
+            messages = self.con.execute(
+                "SELECT m.message_id,m.sprint_id,m.to_participant_id,"
+                "m.declared_type,m.body,s.lifecycle,p.role "
+                "FROM wake_message m LEFT JOIN sprints s "
+                "ON s.sprint_id=m.sprint_id LEFT JOIN sprint_participants p "
+                "ON p.sprint_id=m.sprint_id "
+                "AND p.participant_id=m.to_participant_id "
+                "WHERE m.receiver_shell_id=? AND m.delivered_at IS NULL "
+                "ORDER BY m.message_id",
+                (row["receiver_shell_id"],),
+            ).fetchall()
+            if not messages:
+                raise SprintInvariantError("claimed wake has no undelivered messages")
+            route = next(
+                (
+                    message
+                    for message in messages
+                    if message["sprint_id"] is not None
+                    and message["lifecycle"] == "armed"
                 ),
+                None,
+            )
+            if route is None:
+                route = next(
+                    (message for message in messages if message["sprint_id"] is None),
+                    None,
+                )
+            if route is None:
+                raise SprintInvariantError(
+                    "claimed wake has no message-scoped routing identity"
+                )
+            route_sprint_id = (
+                int(route["sprint_id"]) if route["sprint_id"] is not None else None
+            )
+            route_participant_id = (
+                int(route["to_participant_id"])
+                if route["to_participant_id"] is not None
+                else None
+            )
+            route_role = str(route["role"]) if route["role"] is not None else None
+            if route_sprint_id is not None and (
+                route_participant_id is None or route_role is None
+            ):
+                raise SprintInvariantError(
+                    "Sprint wake message has no participant routing identity"
+                )
+            self.con.execute(
+                "UPDATE sprint_wake_outbox SET sprint_id=?,participant_id=? "
+                "WHERE wake_id=? AND state='delivering' AND claim_owner=?",
+                (
+                    route_sprint_id,
+                    route_participant_id,
+                    row["wake_id"],
+                    owner,
+                ),
+            )
+            message_ids = tuple(int(message["message_id"]) for message in messages)
+            marks = ",".join("?" for _ in message_ids)
+            self.con.execute(
+                "UPDATE sprint_wake_messages SET wake_id=? "
+                "WHERE message_id IN (" + marks + ")",
+                (row["wake_id"], *message_ids),
+            )
+            self.con.execute(
+                "UPDATE sprint_wake_outbox SET state='cancelled',claim_owner=NULL,"
+                "claimed_at=NULL,lease_expires_at=NULL "
+                "WHERE receiver_shell_id=? AND state='pending' AND wake_id<>? "
+                "AND NOT EXISTS (SELECT 1 FROM sprint_wake_messages joined "
+                "WHERE joined.wake_id=sprint_wake_outbox.wake_id)",
+                (row["receiver_shell_id"], row["wake_id"]),
             )
             return WakeLease(
                 wake_id=int(row["wake_id"]),
-                sprint_id=int(row["sprint_id"]),
-                participant_id=int(row["participant_id"]),
-                participant_role=str(row["role"]),
-                target_conversation_id=route.conversation_id,
+                sprint_id=route_sprint_id,
+                participant_id=route_participant_id,
+                participant_role=route_role,
+                receiver_shell_id=int(row["receiver_shell_id"]),
+                message_ids=message_ids,
+                declared_types=tuple(
+                    str(message["declared_type"]) for message in messages
+                ),
+                prompt=self._delivery_prompt(route_sprint_id, route_role, messages),
                 idempotency_key=str(row["idempotency_key"]),
                 attempt_number=int(row["attempt_count"]) + 1,
                 claim_owner=owner,
             )
+
+    @staticmethod
+    def _delivery_prompt(
+        sprint_id: int | None,
+        role: str | None,
+        messages: list[sqlite3.Row],
+    ) -> str:
+        if sprint_id is not None and role is not None:
+            lead = wake_prompt(int(sprint_id), str(role))
+        else:
+            lead = "Wake-message delivery. Act on every message below."
+        rendered = []
+        for message in messages:
+            declared = str(message["declared_type"]).title()
+            rendered.append(
+                f"## wake_message #{int(message['message_id'])} "
+                f"(declared {declared})\n\n{message['body']}"
+            )
+        return lead + "\n\n" + "\n\n".join(rendered)
+
+    def _resolve_conversation(self, lease: WakeLease) -> str:
+        active = active_chat_registry.get(self.con, lease.receiver_shell_id)
+        if active is not None and active_chat_registry.has_live_process(active):
+            return active.chat_id
+        wants_new = "new" in lease.declared_types
+        if active is not None and not wants_new:
+            return active.chat_id
+
+        shell_route = None
+        if lease.sprint_id is None or lease.participant_id is None:
+            shell_route = sprint_participant_chats.prepare_shell_wake_conversation(
+                self.con, lease.receiver_shell_id
+            )
+
+        closed_id = None
+        if active is not None:
+            try:
+                with db_driver.write_transaction(self.con, "wake.route.close_active"):
+                    closed = active_chat_registry.close_for_wake(
+                        self.con, lease.receiver_shell_id
+                    )
+                    if closed is not None:
+                        closed_id = closed.chat_id
+                        sprint_participant_chats._append_event(
+                            self.con,
+                            closed.chat_id,
+                            "conversation.closed",
+                            {
+                                "reason": "New wake_message delivery",
+                                "state": "closed",
+                                "wake_id": lease.wake_id,
+                            },
+                        )
+            except active_chat_registry.ActiveChatBusy:
+                raced = active_chat_registry.get(self.con, lease.receiver_shell_id)
+                if raced is not None:
+                    return raced.chat_id
+                raise
+        if closed_id is not None:
+            conversation_events.notify(closed_id)
+        try:
+            with db_driver.write_transaction(self.con, "wake.route.create"):
+                if shell_route is not None:
+                    return sprint_participant_chats.create_shell_wake_conversation(
+                        self.con,
+                        wake_id=lease.wake_id,
+                        route=shell_route,
+                    )
+                return sprint_participant_chats.create_wake_conversation(
+                    self.con,
+                    wake_id=lease.wake_id,
+                    sprint_id=lease.sprint_id,
+                    participant_id=lease.participant_id,
+                )
+        except sprint_participant_chats.WakeConversationBusy:
+            raced = active_chat_registry.get(self.con, lease.receiver_shell_id)
+            if raced is not None:
+                return raced.chat_id
+            raise
 
     def deliver_once(
         self,
@@ -650,19 +913,19 @@ class SprintWakeDeliveryService:
         lease = self.claim_next(owner)
         if lease is None:
             return None
+        target_conversation_id = None
         try:
-            if lease.target_conversation_id is None:
-                raise RuntimeError("participant has no current Sprint conversation")
+            target_conversation_id = self._resolve_conversation(lease)
             native_run_ref = deliver(
-                lease.target_conversation_id,
-                wake_prompt(lease.sprint_id, lease.participant_role),
+                target_conversation_id,
+                lease.prompt,
                 lease.idempotency_key,
             )
         except Exception as exc:  # external delivery faults become durable evidence
             attempt = self.lifecycle.record_wake_failure(
                 lease.wake_id,
                 str(exc) or exc.__class__.__name__,
-                target_conversation_id=lease.target_conversation_id,
+                target_conversation_id=target_conversation_id,
                 expected_claim_owner=owner,
             )
             state = "failed" if attempt == 3 else "pending"
@@ -686,9 +949,15 @@ class SprintWakeDeliveryService:
                 (
                     lease.wake_id,
                     attempt,
-                    lease.target_conversation_id,
+                    target_conversation_id,
                     native_run_ref,
                 ),
+            )
+            marks = ",".join("?" for _ in lease.message_ids)
+            self.con.execute(
+                "UPDATE wake_message SET delivered_at=COALESCE(delivered_at,"
+                "datetime('now')) WHERE message_id IN (" + marks + ")",
+                lease.message_ids,
             )
             self.con.execute(
                 "UPDATE sprint_wake_outbox SET state='delivered',attempt_count=?,"

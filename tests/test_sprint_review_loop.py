@@ -26,7 +26,7 @@ class SprintReviewLoopCase(SprintPRWatcherCase):
         )
         self.registered_pr_id = self.register().registered_pr_id
         initial_green = self.con.execute(
-            "SELECT message_id FROM sprint_messages "
+            "SELECT message_id FROM wake_message "
             "WHERE to_participant_id=? "
             "AND idempotency_key LIKE 'pr-transition:%' "
             "ORDER BY message_id DESC LIMIT 1",
@@ -67,7 +67,7 @@ class SprintReviewLoopCase(SprintPRWatcherCase):
 class ReviewHandoffTest(SprintReviewLoopCase):
     def test_review_payloads_accept_8000_and_reject_8001_without_state_change(self):
         before_messages = self.con.execute(
-            "SELECT COUNT(*) FROM sprint_messages"
+            "SELECT COUNT(*) FROM wake_message"
         ).fetchone()[0]
         with self.assertRaisesRegex(
             ValueError,
@@ -84,7 +84,7 @@ class ReviewHandoffTest(SprintReviewLoopCase):
             ("active", before_messages),
             tuple(
                 self.con.execute(
-                    "SELECT u.disposition,(SELECT COUNT(*) FROM sprint_messages) "
+                    "SELECT u.disposition,(SELECT COUNT(*) FROM wake_message) "
                     "FROM sprint_work_units u WHERE u.work_unit_id=?",
                     (self.unit_id,),
                 ).fetchone()
@@ -136,7 +136,7 @@ class ReviewHandoffTest(SprintReviewLoopCase):
     def test_green_readiness_commits_judgment_and_active_reviewer_request(self):
         assignment_message_id = int(
             self.con.execute(
-                "SELECT message_id FROM sprint_messages WHERE work_unit_id=? "
+                "SELECT message_id FROM wake_message WHERE work_unit_id=? "
                 "AND message_kind='work_assignment'",
                 (self.unit_id,),
             ).fetchone()[0]
@@ -152,7 +152,7 @@ class ReviewHandoffTest(SprintReviewLoopCase):
         self.assertEqual("in_review", unit["disposition"])
         message = self.con.execute(
             "SELECT from_participant_id,to_participant_id,message_kind,body,"
-            "actionable,disposition FROM sprint_messages WHERE message_id=?",
+            "actionable,disposition FROM wake_message WHERE message_id=?",
             (handoff.message_id,),
         ).fetchone()
         self.assertEqual(
@@ -192,16 +192,28 @@ class ReviewHandoffTest(SprintReviewLoopCase):
                 assignment_expectation["next_evaluation_at"],
             ),
         )
-        lease = sprint_message_delivery.SprintWakeDeliveryService(
-            self.con
-        ).claim_next("stage6-review")
+        observed: list[tuple[int, str]] = []
+        service = sprint_message_delivery.SprintWakeDeliveryService(self.con)
+        while True:
+            outcome = service.deliver_once(
+                "stage6-review",
+                lambda conversation, _prompt, _key: conversation,
+            )
+            self.assertIsNotNone(outcome)
+            attempt = self.con.execute(
+                "SELECT target_conversation_id FROM sprint_wake_attempts "
+                "WHERE wake_id=? AND outcome='delivered'",
+                (outcome.wake_id,),
+            ).fetchone()
+            observed.append((outcome.wake_id, str(attempt[0])))
+            if outcome.wake_id == handoff.wake_id:
+                break
         reviewer_chat = self.con.execute(
             "SELECT current_conversation_id FROM sprint_participants "
             "WHERE participant_id=?",
             (self.reviewer_id,),
         ).fetchone()[0]
-        self.assertEqual(self.reviewer_id, lease.participant_id)
-        self.assertEqual(reviewer_chat, lease.target_conversation_id)
+        self.assertEqual((handoff.wake_id, reviewer_chat), observed[-1])
         self.accept_review(handoff.message_id)
         review_expectation = self.con.execute(
             "SELECT resolved_at,resolution,next_evaluation_at "
@@ -214,7 +226,7 @@ class ReviewHandoffTest(SprintReviewLoopCase):
         self.assertEqual(
             0,
             self.con.execute(
-                "SELECT COUNT(*) FROM sprint_messages "
+                "SELECT COUNT(*) FROM wake_message "
                 "WHERE message_id=? AND to_participant_id=?",
                 (handoff.message_id, self.planner_id),
             ).fetchone()[0],
@@ -227,7 +239,7 @@ class ReviewHandoffTest(SprintReviewLoopCase):
         )
         self.watcher.poll_once()
         before = self.con.execute(
-            "SELECT COUNT(*) FROM sprint_messages"
+            "SELECT COUNT(*) FROM wake_message"
         ).fetchone()[0]
 
         with self.assertRaisesRegex(
@@ -247,7 +259,7 @@ class ReviewHandoffTest(SprintReviewLoopCase):
 
         self.assertEqual(
             before,
-            self.con.execute("SELECT COUNT(*) FROM sprint_messages").fetchone()[0],
+            self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
         )
         self.assertEqual(
             "active",
@@ -308,14 +320,14 @@ class ReviewHandoffTest(SprintReviewLoopCase):
             ),
         )
         self.assertEqual(
-            (2, 2, 1),
+            (2, 2, 0),
             tuple(
                 self.con.execute(
                     "SELECT COUNT(*),"
                     "(SELECT COUNT(*) FROM sprint_judgments WHERE work_unit_id=?),"
                     "(SELECT COUNT(*) FROM sprint_participant_conversations "
                     " WHERE purpose='merge') "
-                    "FROM sprint_messages WHERE idempotency_key IN (?,?)",
+                    "FROM wake_message WHERE idempotency_key IN (?,?)",
                     (
                         self.unit_id,
                         "idempotent-request",
@@ -378,14 +390,14 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
             0,
             self.con.execute(
                 "SELECT COUNT(*) FROM sprint_liveness_expectations e "
-                "JOIN sprint_messages m USING(message_id) "
+                "JOIN wake_message m USING(message_id) "
                 "WHERE m.work_unit_id=? AND m.message_kind='review_request' "
                 "AND e.resolved_at IS NULL",
                 (self.unit_id,),
             ).fetchone()[0],
         )
 
-    def test_changes_and_approval_select_fresh_linked_conversations(self):
+    def test_changes_and_approval_route_only_when_the_wake_is_delivered(self):
         first = self.request_review()
         self.accept_review(first.message_id)
         changed = self.loop.record_review(
@@ -397,13 +409,14 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
             idempotency_key="changes-1",
         )
         self.assertEqual("fixing", changed.disposition)
-        self.assertNotEqual(self.developer_conversation_id, changed.conversation_id)
-        fix_link = self.con.execute(
-            "SELECT purpose,parent_conversation_id FROM "
-            "sprint_participant_conversations WHERE conversation_id=?",
-            (changed.conversation_id,),
-        ).fetchone()
-        self.assertEqual(("fix", self.developer_conversation_id), tuple(fix_link))
+        self.assertIsNone(changed.conversation_id)
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_conversations "
+                "WHERE purpose='fix'"
+            ).fetchone()[0],
+        )
         self.assertEqual("accepted", self.messages.mark_read(changed.message_id, 1))
         changed_expectation = self.con.execute(
             "SELECT resolved_at,resolution,next_evaluation_at "
@@ -415,7 +428,7 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
         self.assertIsNotNone(changed_expectation["next_evaluation_at"])
         assignment_expectation = self.con.execute(
             "SELECT resolution FROM sprint_liveness_expectations expectation "
-            "JOIN sprint_messages message USING(message_id) "
+            "JOIN wake_message message USING(message_id) "
             "WHERE message.work_unit_id=? AND message.message_kind='work_assignment'",
             (self.unit_id,),
         ).fetchone()
@@ -430,20 +443,30 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
                 ).fetchone()
             ),
         )
+        service = sprint_message_delivery.SprintWakeDeliveryService(self.con)
+        while service.deliver_once(
+            "stage6-before-red",
+            lambda conversation, _prompt, _key: conversation,
+        ) is not None:
+            pass
 
         self.reader.current = pull_request(
             checks="FAILURE", checks_failed=True, head_sha="b" * 40
         )
         self.watcher.poll_once()
-        red_lease = sprint_message_delivery.SprintWakeDeliveryService(
-            self.con
-        ).claim_next("stage6-fix-red")
-        self.assertEqual(changed.conversation_id, red_lease.target_conversation_id)
+        red_delivery: list[str] = []
+        red_outcome = service.deliver_once(
+            "stage6-fix-red",
+            lambda conversation, _prompt, _key: (
+                red_delivery.append(conversation) or "red-run"
+            ),
+        )
+        self.assertEqual(self.developer_conversation_id, red_delivery[0])
         red_messages = self.con.execute(
-            "SELECT m.message_id FROM sprint_messages m "
+            "SELECT m.message_id FROM wake_message m "
             "JOIN sprint_wake_messages wm USING(message_id) "
             "WHERE wm.wake_id=?",
-            (red_lease.wake_id,),
+            (red_outcome.wake_id,),
         ).fetchall()
         for message in red_messages:
             self.messages.mark_read(int(message["message_id"]), 1)
@@ -473,18 +496,16 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
         )
 
         self.assertEqual("merge_ready", approved.disposition)
-        self.assertNotIn(
-            approved.conversation_id,
-            {self.developer_conversation_id, changed.conversation_id},
-        )
-        merge_link = self.con.execute(
-            "SELECT purpose,parent_conversation_id FROM "
-            "sprint_participant_conversations WHERE conversation_id=?",
-            (approved.conversation_id,),
-        ).fetchone()
-        self.assertEqual(("merge", changed.conversation_id), tuple(merge_link))
+        self.assertIsNone(approved.conversation_id)
         self.assertEqual(
-            approved.conversation_id,
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_conversations "
+                "WHERE purpose='merge'"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            self.developer_conversation_id,
             self.con.execute(
                 "SELECT current_conversation_id FROM sprint_participants "
                 "WHERE participant_id=?",
@@ -548,7 +569,7 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
             ).fetchone()[0],
         )
         self.assertEqual("pending", self.con.execute(
-            "SELECT disposition FROM sprint_messages WHERE message_id=?",
+            "SELECT disposition FROM wake_message WHERE message_id=?",
             (handoff.message_id,),
         ).fetchone()[0])
 
@@ -569,7 +590,7 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
         )
         self.watcher.poll_once()
         red = self.con.execute(
-            "SELECT message_id FROM sprint_messages WHERE to_participant_id=? "
+            "SELECT message_id FROM wake_message WHERE to_participant_id=? "
             "AND idempotency_key LIKE 'pr-transition:%' "
             "ORDER BY message_id DESC LIMIT 1",
             (self.developer_id,),
@@ -596,7 +617,7 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
         self.assertEqual(
             "pending",
             self.con.execute(
-                "SELECT disposition FROM sprint_messages WHERE message_id=?",
+                "SELECT disposition FROM wake_message WHERE message_id=?",
                 (pending.message_id,),
             ).fetchone()[0],
         )
@@ -631,7 +652,7 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
         self.assertEqual(
             0,
             self.con.execute(
-                "SELECT COUNT(*) FROM sprint_messages "
+                "SELECT COUNT(*) FROM wake_message "
                 "WHERE idempotency_key='stale-review-head'"
             ).fetchone()[0],
         )
@@ -703,7 +724,7 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
         )
         delta = self.con.execute(
             "SELECT message_id,to_participant_id,actionable,disposition,body "
-            "FROM sprint_messages WHERE idempotency_key LIKE "
+            "FROM wake_message WHERE idempotency_key LIKE "
             "'pr-head-change:%:delta-review'"
         ).fetchone()
         self.assertEqual(
@@ -734,7 +755,7 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
         self.assertEqual(approved.message_id, invalidated["invalidated_message_id"])
         self.assertIsNotNone(
             self.con.execute(
-                "SELECT read_at FROM sprint_messages WHERE message_id=?",
+                "SELECT read_at FROM wake_message WHERE message_id=?",
                 (approved.message_id,),
             ).fetchone()[0]
         )
@@ -781,7 +802,7 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
                     "SELECT "
                     "(SELECT COUNT(*) FROM sprint_events "
                     "WHERE event_type='review.approval_invalidated'),"
-                    "(SELECT COUNT(*) FROM sprint_messages "
+                    "(SELECT COUNT(*) FROM wake_message "
                     "WHERE idempotency_key LIKE 'pr-head-change:%:delta-review'),"
                     "(SELECT COUNT(*) FROM sprint_events "
                     "WHERE event_type='merge.grant_bypassed')"
@@ -814,10 +835,10 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
                     "SELECT "
                     "(SELECT COUNT(*) FROM sprint_events "
                     "WHERE event_type='review.approval_invalidated'),"
-                    "(SELECT COUNT(*) FROM sprint_messages "
+                    "(SELECT COUNT(*) FROM wake_message "
                     "WHERE idempotency_key LIKE 'pr-head-change:%:delta-review'),"
                     "(SELECT COUNT(*) FROM sprint_liveness_expectations e "
-                    "JOIN sprint_messages m USING (message_id) "
+                    "JOIN wake_message m USING (message_id) "
                     "WHERE m.message_kind='review_request' "
                     "AND e.resolved_at IS NULL)"
                 ).fetchone()
@@ -852,7 +873,7 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
         )
         notice = self.con.execute(
             "SELECT m.to_participant_id,m.work_unit_id,m.body,w.state "
-            "FROM sprint_messages m JOIN sprint_wake_messages wm USING (message_id) "
+            "FROM wake_message m JOIN sprint_wake_messages wm USING (message_id) "
             "JOIN sprint_wake_outbox w USING (wake_id) "
             "WHERE m.idempotency_key LIKE 'merge-grant-bypassed:%'"
         ).fetchone()
@@ -879,7 +900,7 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
                     "SELECT "
                     "(SELECT COUNT(*) FROM sprint_events "
                     "WHERE event_type='merge.grant_bypassed'),"
-                    "(SELECT COUNT(*) FROM sprint_messages "
+                    "(SELECT COUNT(*) FROM wake_message "
                     "WHERE idempotency_key LIKE 'merge-grant-bypassed:%')"
                 ).fetchone()
             ),
@@ -971,17 +992,32 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
         self.assertEqual(self.developer_conversation_id, current[0])
         self.assertEqual(current[0], current[1])
         assignment = self.con.execute(
-            "SELECT message_id FROM sprint_messages WHERE work_unit_id=? "
+            "SELECT message_id FROM wake_message WHERE work_unit_id=? "
             "AND message_kind='work_assignment'",
             (next_unit,),
         ).fetchone()
         self.assertIsNotNone(assignment)
-        lease = sprint_message_delivery.SprintWakeDeliveryService(
-            self.con
-        ).claim_next("stage6-next")
+        assignment_wake_id = int(
+            self.con.execute(
+                "SELECT wake_id FROM sprint_wake_messages WHERE message_id=?",
+                (assignment["message_id"],),
+            ).fetchone()[0]
+        )
+        delivered: list[str] = []
+        service = sprint_message_delivery.SprintWakeDeliveryService(self.con)
+        while True:
+            outcome = service.deliver_once(
+                "stage6-next",
+                lambda conversation, _prompt, _key: (
+                    delivered.append(conversation) or "next-run"
+                ),
+            )
+            self.assertIsNotNone(outcome)
+            if outcome.wake_id == assignment_wake_id:
+                break
         self.assertNotEqual(
             self.developer_conversation_id,
-            lease.target_conversation_id,
+            delivered[-1],
         )
         active = self.con.execute(
             "SELECT chat_id,process_pid,process_start_ticks "
@@ -989,7 +1025,7 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
         ).fetchone()
         self.assertEqual(
             tuple(active),
-            (lease.target_conversation_id, None, None),
+            (delivered[-1], None, None),
         )
         self.assertEqual(
             ["work_unit.completed", "work_unit.ready", "pr.transition"],
@@ -1035,7 +1071,7 @@ class CarriedLowClosureTest(SprintReviewLoopCase):
             ).fetchone()[0],
         )
 
-    def test_paused_sprint_wake_cannot_be_claimed_for_delivery(self):
+    def test_paused_sprint_blocks_work_but_delivers_pause_notice(self):
         sent = self.messages.send(
             self.sprint_id,
             to_participant_id=self.developer_id,
@@ -1044,7 +1080,7 @@ class CarriedLowClosureTest(SprintReviewLoopCase):
             message_kind="notification",
             body="active before pause",
             idempotency_key="pause-race",
-            active=True,
+            declared_type="re-enter",
         )
         self.lifecycle.transition(
             self.sprint_id,
@@ -1053,8 +1089,31 @@ class CarriedLowClosureTest(SprintReviewLoopCase):
             reason="integrity check",
         )
 
+        prompts: list[str] = []
         service = sprint_message_delivery.SprintWakeDeliveryService(self.con)
-        self.assertIsNone(service.claim_next("paused-delivery"))
+        outcome = service.deliver_once(
+            "paused-delivery",
+            lambda conversation, prompt, _key: (
+                prompts.append(prompt) or conversation
+            ),
+        )
+
+        self.assertIsNotNone(outcome)
+        self.assertNotEqual(sent.wake_id, outcome.wake_id)
+        self.assertIn("Sprint 1 paused: integrity check", prompts[0])
+        self.assertEqual(
+            (None, "pending"),
+            tuple(
+                self.con.execute(
+                    "SELECT m.delivered_at,w.state FROM wake_message m "
+                    "JOIN sprint_wake_messages joined USING(message_id) "
+                    "JOIN sprint_wake_outbox w USING(wake_id) "
+                    "WHERE m.message_id=?",
+                    (sent.message_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertIsNone(service.claim_next("paused-work-stays-gated"))
         wake = self.con.execute(
             "SELECT state,attempt_count,claim_owner FROM sprint_wake_outbox "
             "WHERE wake_id=?",

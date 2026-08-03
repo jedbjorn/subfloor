@@ -63,7 +63,8 @@
     ".super-coder/scripts/migration.py",
     "tests/test_migration_management.py",
     ".super-coder/migrations/0162_active_chat_registry.sql",
-    ".super-coder/migrations/0163_conversation_run_process_identity.sql"
+    ".super-coder/migrations/0163_conversation_run_process_identity.sql",
+    ".super-coder/migrations/0164_wake_message_delivery.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
