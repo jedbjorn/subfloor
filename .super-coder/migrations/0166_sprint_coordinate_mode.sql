@@ -1,4 +1,4 @@
--- 0165 — tracked Sprint coordinate mode.
+-- 0166 — tracked Sprint coordinate mode.
 --
 -- Coordinate mode is an operator choice, not a property derived from whether
 -- the Planner currently has an open chat.  It therefore lives on the Sprint
