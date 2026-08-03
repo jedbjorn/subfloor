@@ -267,6 +267,7 @@
     "tests/test_sprint_decoupling.py",
     "tests/test_sprint_eventing.py",
     "tests/test_sprint_no_render_read.py",
+    "tests/test_sprint_routing_coordinate.py",
     "tests/test_sprints_ui_contract.py",
     "tests/test_style_spinner.py",
     "tests/test_supervision_sc.py",
