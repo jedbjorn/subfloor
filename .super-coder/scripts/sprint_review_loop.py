@@ -93,7 +93,7 @@ class SprintReviewLoopStore:
                 message_kind="review_request",
                 body=readiness,
                 actionable=True,
-                declared_type="new",
+                declared_type="force-new",
                 idempotency_key=idempotency_key,
             )
             if receipt.wake_id is None:

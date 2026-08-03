@@ -26,10 +26,20 @@ transitions.
 
 The active-chat registry is the only current-chat authority; zero or one chat
 per shell is legal. Every wake message creates delivery intent and a wake turn
-drains every undelivered message for the receiver. Planner-bound messages are
-declared Re-enter. If a verified turn is live, every declared type enters that
-chat at the natural boundary. When idle, Re-enter resumes the registry chat and
-New rotates it; no registry row behaves as New.
+drains every undelivered message for the receiver. Assignments and review
+requests use Force-new delivery: a live turn finishes, the receiver remains
+quiet for the configured grace interval, then delivery atomically closes the
+exact registry chat and starts a fresh chat with the complete undelivered
+bundle. Concurrent Force-new wakes coalesce into one rotation, and retries reuse
+the chat created for their own wake. Participants must stop cleanly after typed
+handoffs so the next forced delivery can cross the quiet boundary. The
+inactivity ceiling and registry reaper remain the fallback for a silent hung
+turn.
+
+Planner-bound messages are Re-enter. Plain New remains separate and is eligible
+immediately. It enters a verified live turn at its natural boundary and rotates only when the
+registry chat is idle. Re-enter resumes the registry chat; no registry row
+behaves as New.
 
 FnB controls the Planner mode with the close button. Keeping the Planner chat
 open supervises one continuous thread. Closing it during an armed Sprint sets
@@ -260,12 +270,13 @@ it is terminal and deletes nothing.
 
 ## Handoffs and stop
 
-Planner → Developer assignments are declared New; Developer → Reviewer review
-requests are declared New; Developer/Reviewer → Planner results are Re-enter.
-These are idle-time guarantees under the live-turn boundary rule, not a
-parent/child chat topology. The Planner receives no PR-event wakes;
-Developer-owned subscriptions carry red, green, and externally closed facts
-directly to the owning Developer.
+Planner → Developer assignments and Developer → Reviewer review requests use
+Force-new delivery; Developer/Reviewer → Planner results are Re-enter. Forced
+delivery starts a fresh chat only after the prior live turn ends and the quiet
+grace passes, coalescing all receiver messages into the bundle. These are
+delivery guarantees, not a parent/child chat topology. The Planner receives no
+PR-event wakes; Developer-owned subscriptions carry red, green, and externally
+closed facts directly to the owning Developer.
 
 Never dispatch the next wave from a merge-observation turn. The Developer's
 merged-work handoff wake is the only normal next-wave dispatch trigger. On that

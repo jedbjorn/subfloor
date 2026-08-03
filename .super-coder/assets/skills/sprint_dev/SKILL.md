@@ -37,12 +37,20 @@ the unit boundary, interfaces another unit consumes, deliverable cuts, or scope
 growth to the Planner.
 
 The active-chat registry, not Sprint participant pointers, owns your current
-chat. Assignments are declared New, but a verified live turn is never displaced:
-delivery enters this chat at its natural boundary and drains every undelivered
-wake message. When idle, New rotates to a fresh chat; Re-enter resumes the
-registry chat; no registry row behaves as New. A generous inactivity ceiling
-unlinks a silent hung turn so the 60-second reaper can terminate its verified
-process identity.
+chat. Assignments use Force-new delivery. A live turn is allowed to finish;
+then, after the receiver has stayed quiet for the configured grace interval,
+delivery atomically closes the exact registry chat and starts a fresh chat with
+the complete undelivered message bundle. Concurrent Force-new wakes coalesce
+into that one rotation, and a retry resumes the chat created for its own wake
+instead of rotating again. Stop cleanly after every typed handoff so the next
+assignment can cross the quiet boundary. The inactivity ceiling remains the
+fallback for a silent hung turn: it unlinks the chat so the reaper can terminate
+its verified process identity and Force-new delivery can proceed.
+
+Plain New remains a separate route: it is eligible immediately, enters a
+verified live turn at its natural boundary, and rotates only when the registry
+chat is idle. Re-enter resumes the registry chat; no registry row behaves as
+New.
 
 ## Questions, answers, blockers, and failures
 
@@ -139,14 +147,22 @@ registered PR.
 
 ## Review handoff
 
-Complete a review handoff in this exact order:
+Complete a review handoff in this exact order. Every review round uses
+Force-new delivery, so stop cleanly after the request confirms and let the
+Reviewer begin in a fresh chat with the full bundled request:
 
 1. Finish the readiness claim and every local verification step.
 2. Perform the once-only typed-handoff inbox check above, act on newly arrived
    messages, and mark every handled informational message read with `accept`.
-3. Run `wc -m < <path>`; keep the claim near 6,000 characters and below the
-   8,000-character hard maximum.
-4. As the literal final action of the turn, send the typed handoff with one
+3. Make the readiness body a bare one-line locator containing only the
+   submitting or resubmitting intent, PR URL, registered Sprint PR id, exact
+   head SHA, and work-unit id. Include no scope narrative, verification
+   evidence, judgment rationale, or review-focus steering. Put only the
+   work-unit id and spec reference in the PR body, and write no PR comments or
+   annotations.
+4. Run `wc -m < <path>` and confirm the locator is below the 8,000-character
+   hard maximum.
+5. As the literal final action of the turn, send the typed handoff with one
    stable retry key:
 
 ```text
@@ -155,12 +171,13 @@ sc sprint request-review \
   --readiness-file <path> --key <stable-key>
 ```
 
-5. When the command confirms the durable write and Reviewer wake, immediately
+6. When the command confirms the durable write and Reviewer wake, immediately
    stop and await the native verdict wake. Run no trailing command.
 
-A changes-requested verdict
-returns as Re-enter to your registry chat. Apply every blocking finding,
-re-establish green, and hand back with a new stable review key. Record
+A changes-requested verdict returns as Re-enter to your registry chat. Apply
+every blocking finding, re-establish green, and hand back with a new stable
+review key and a new bare locator. Do not narrate how prior findings were
+cleared; the Reviewer verifies that from the full diff at the new head. Record
 disagreements as judgment; the Reviewer owns scope/severity decisions and the
 Planner executes any resulting action.
 

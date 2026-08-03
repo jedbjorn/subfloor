@@ -49,11 +49,11 @@ class FakeClock:
 
 class SprintLivenessCase(unittest.TestCase):
     def setUp(self) -> None:
-        delay_env = mock.patch.dict(
-            "os.environ", {"SC_WAKE_NEW_DELAY_SECONDS": "0"}
+        quiet_env = mock.patch.dict(
+            "os.environ", {"SC_SPRINT_FORCE_NEW_QUIET_SECONDS": "0"}
         )
-        delay_env.start()
-        self.addCleanup(delay_env.stop)
+        quiet_env.start()
+        self.addCleanup(quiet_env.stop)
         self.con = sqlite3.connect(":memory:")
         self.addCleanup(self.con.close)
         self.con.row_factory = sqlite3.Row
@@ -1025,6 +1025,120 @@ class FakeClockPolicyTest(SprintLivenessCase):
         nudges = self.message_rows("nudge")
         self.assertEqual(1, len(nudges))
         self.assertEqual(self.reviewer_id, nudges[0]["to_participant_id"])
+
+
+class ForceNewLivenessGateTest(SprintLivenessCase):
+    def queue_force_new(self, key: str = "liveness-force-new"):
+        return self.messages.send(
+            self.sprint_id,
+            to_participant_id=self.developer_id,
+            from_participant_id=self.planner_id,
+            work_unit_id=self.unit_id,
+            message_kind="notification",
+            body="next assignment waits for a fresh chat",
+            actionable=False,
+            declared_type="force-new",
+            idempotency_key=key,
+        )
+
+    def test_pending_force_new_suppresses_immediate_failure_then_releases(self) -> None:
+        force = self.queue_force_new()
+        failure = sprint_liveness.Evidence(
+            "run:failed:during-handoff",
+            "run.failed",
+            self.started_at + timedelta(minutes=1),
+            "failure",
+            "prior turn failed while the next assignment is pending",
+        )
+
+        self.advance(5)
+        monitor = self.monitor(
+            lambda _participant, _accepted, _now: (None, failure, None)
+        )
+        outcome = monitor.evaluate(self.sprint_id)[0]
+
+        self.assertEqual("force-new-pending", outcome.action)
+        self.assertEqual([], self.message_rows("escalation"))
+        observed = self.expectation()
+        self.assertEqual(failure.key, observed["last_failure_key"])
+        self.assertEqual(stamp(self.clock.value), observed["last_evaluated_at"])
+
+        self.assertIsNone(self.messages.mark_read(force.message_id, 1))
+        self.advance(10)
+        released = monitor.evaluate(self.sprint_id)[0]
+        self.assertEqual("escalated", released.action)
+        self.assertEqual(1, len(self.message_rows("escalation")))
+
+    def test_delivering_force_new_suppresses_nudge_until_terminal(self) -> None:
+        force = self.queue_force_new("liveness-force-delivering")
+        lease = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con, force_new_quiet_seconds=0
+        ).claim_next("liveness-force-worker")
+        self.assertEqual(force.wake_id, lease.wake_id)
+
+        monitor = self.monitor()
+        self.advance(5)
+        self.assertEqual("strong-evidence", monitor.evaluate(self.sprint_id)[0].action)
+        self.advance(20)
+        self.assertEqual(
+            "force-new-pending", monitor.evaluate(self.sprint_id)[0].action
+        )
+        self.assertEqual([], self.message_rows("nudge"))
+        self.assertEqual([], self.message_rows("escalation"))
+
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET state='cancelled',claim_owner=NULL,"
+            "claimed_at=NULL,lease_expires_at=NULL,quiet_since=NULL "
+            "WHERE wake_id=?",
+            (force.wake_id,),
+        )
+        self.con.commit()
+        self.advance(25)
+        released = monitor.evaluate(self.sprint_id)[0]
+        self.assertEqual("nudged", released.action)
+        self.assertEqual(1, len(self.message_rows("nudge")))
+
+    def test_receiver_gate_covers_all_expectations_without_blocking_peer(self) -> None:
+        second = self.messages.send(
+            self.sprint_id,
+            to_participant_id=self.developer_id,
+            from_participant_id=self.planner_id,
+            work_unit_id=self.unit_id,
+            message_kind="notification",
+            body="second developer expectation",
+            actionable=True,
+            declared_type="re-enter",
+            idempotency_key="developer-second-expectation",
+        )
+        reviewer = self.messages.send(
+            self.sprint_id,
+            to_participant_id=self.reviewer_id,
+            from_participant_id=self.developer_id,
+            work_unit_id=self.unit_id,
+            message_kind="review_request",
+            body="reviewer expectation",
+            actionable=True,
+            declared_type="re-enter",
+            idempotency_key="reviewer-peer-expectation",
+        )
+        self.assertEqual("accepted", self.messages.mark_read(second.message_id, 1))
+        self.assertEqual("accepted", self.messages.mark_read(reviewer.message_id, 2))
+        self.queue_force_new("receiver-wide-force")
+
+        self.advance(10)
+        outcomes = self.monitor().evaluate(self.sprint_id)
+        self.assertEqual(
+            [
+                (self.assignment_message_id, "force-new-pending"),
+                (second.message_id, "force-new-pending"),
+                (reviewer.message_id, "nudged"),
+            ],
+            [(outcome.message_id, outcome.action) for outcome in outcomes],
+        )
+        self.assertEqual(
+            [self.reviewer_id],
+            [int(row["to_participant_id"]) for row in self.message_rows("nudge")],
+        )
 
 
 class DeliveryAndActivationTest(SprintLivenessCase):

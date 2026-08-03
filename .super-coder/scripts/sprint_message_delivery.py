@@ -26,6 +26,12 @@ ACTIONABLE_KINDS = frozenset({"work_assignment", "review_request", "notification
 ACTIONABLE_KIND_ERROR = (
     "only work assignments, review requests, and notifications are actionable"
 )
+DECLARED_TYPES = frozenset({"force-new", "new", "re-enter"})
+DECLARED_TYPE_ERROR = "wake message type must be force-new, new, or re-enter"
+
+
+class ForceNewDeferred(RuntimeError):
+    """A force-new lease lost a live-chat boundary race without an attempt."""
 
 
 @dataclass(frozen=True)
@@ -70,27 +76,21 @@ def _stamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _parse_stamp(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(
+        tzinfo=timezone.utc
+    )
+
+
 class SprintMessageStore:
     """One transactional producer plus Sprint acceptance conveniences."""
 
     def __init__(
         self,
         con: sqlite3.Connection,
-        *,
-        now: Callable[[], datetime] | None = None,
-        new_wake_delay_seconds: int | None = None,
     ) -> None:
         self.con = con
         self.con.row_factory = sqlite3.Row
-        self.now = now or (lambda: datetime.now(timezone.utc))
-        delay = (
-            int(os.environ.get("SC_WAKE_NEW_DELAY_SECONDS", "15"))
-            if new_wake_delay_seconds is None
-            else new_wake_delay_seconds
-        )
-        if delay < 0:
-            raise ValueError("SC_WAKE_NEW_DELAY_SECONDS must be non-negative")
-        self.new_wake_delay_seconds = delay
 
     def send(
         self,
@@ -168,8 +168,8 @@ class SprintMessageStore:
             raise ValueError("wake message body is empty")
         if not key:
             raise ValueError("wake message idempotency key is empty")
-        if declared_type not in {"new", "re-enter"}:
-            raise ValueError("wake message type must be new or re-enter")
+        if declared_type not in DECLARED_TYPES:
+            raise ValueError(DECLARED_TYPE_ERROR)
         receiver = self.con.execute(
             "SELECT 1 FROM shells WHERE shell_id=? AND COALESCE(is_deleted,0)=0",
             (receiver_shell_id,),
@@ -230,7 +230,6 @@ class SprintMessageStore:
             None,
             receiver_shell_id,
             message_id,
-            declared_type,
         )
         return MessageReceipt(message_id, wake_id, True)
 
@@ -506,8 +505,8 @@ class SprintMessageStore:
         actionable: bool,
         declared_type: str,
     ) -> MessageReceipt:
-        if declared_type not in {"new", "re-enter"}:
-            raise ValueError("wake message type must be new or re-enter")
+        if declared_type not in DECLARED_TYPES:
+            raise ValueError(DECLARED_TYPE_ERROR)
         sprint = self.con.execute(
             "SELECT sprint_id FROM sprints WHERE sprint_id=?", (sprint_id,)
         ).fetchone()
@@ -600,7 +599,6 @@ class SprintMessageStore:
             to_participant_id,
             receiver_shell_id,
             message_id,
-            declared_type,
         )
         return MessageReceipt(message_id, wake_id, True)
 
@@ -610,48 +608,28 @@ class SprintMessageStore:
         participant_id: int | None,
         receiver_shell_id: int,
         message_id: int,
-        declared_type: str,
     ) -> int:
-        available_at = None
-        if declared_type == "new" and self.new_wake_delay_seconds:
-            available_at = _stamp(
-                self.now() + timedelta(seconds=self.new_wake_delay_seconds)
-            )
         wake = self.con.execute(
             "SELECT wake_id FROM sprint_wake_outbox "
             "WHERE receiver_shell_id=? AND state='pending'",
             (receiver_shell_id,),
         ).fetchone()
         if wake is None:
-            columns = (
-                "sprint_id,participant_id,receiver_shell_id,idempotency_key"
-            )
-            values: tuple[object, ...] = (
-                sprint_id,
-                participant_id,
-                receiver_shell_id,
-                f"receiver:{receiver_shell_id}:wake-for-message:{message_id}",
-            )
-            placeholders = "?,?,?,?"
-            if available_at is not None:
-                columns += ",available_at"
-                values += (available_at,)
-                placeholders += ",?"
             wake_id = int(
                 self.con.execute(
-                    f"INSERT INTO sprint_wake_outbox ({columns}) "
-                    f"VALUES ({placeholders})",
-                    values,
+                    "INSERT INTO sprint_wake_outbox "
+                    "(sprint_id,participant_id,receiver_shell_id,idempotency_key) "
+                    "VALUES (?,?,?,?)",
+                    (
+                        sprint_id,
+                        participant_id,
+                        receiver_shell_id,
+                        f"receiver:{receiver_shell_id}:wake-for-message:{message_id}",
+                    ),
                 ).lastrowid
             )
         else:
             wake_id = int(wake["wake_id"])
-            if available_at is not None:
-                self.con.execute(
-                    "UPDATE sprint_wake_outbox "
-                    "SET available_at=MAX(available_at,?) WHERE wake_id=?",
-                    (available_at, wake_id),
-                )
         self.con.execute(
             "INSERT INTO sprint_wake_messages (sprint_id,wake_id,message_id) "
             "VALUES (?,?,?)",
@@ -695,7 +673,8 @@ class SprintMessageStore:
             if unresolved is None:
                 self.con.execute(
                     "UPDATE sprint_wake_outbox SET state='cancelled',"
-                    "claim_owner=NULL,claimed_at=NULL,lease_expires_at=NULL "
+                    "claim_owner=NULL,claimed_at=NULL,lease_expires_at=NULL,"
+                    "quiet_since=NULL "
                     "WHERE wake_id=? AND state='pending'",
                     (wake["wake_id"],),
                 )
@@ -727,11 +706,31 @@ class SprintWakeDeliveryService:
         con: sqlite3.Connection,
         *,
         now: Callable[[], datetime] | None = None,
+        force_new_quiet_seconds: int | None = None,
     ) -> None:
         self.con = con
         self.con.row_factory = sqlite3.Row
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.lifecycle = SprintLifecycleStore(con)
+        if force_new_quiet_seconds is None:
+            raw_quiet_seconds: str | int = os.environ.get(
+                "SC_SPRINT_FORCE_NEW_QUIET_SECONDS", "10"
+            )
+        else:
+            raw_quiet_seconds = force_new_quiet_seconds
+        try:
+            quiet_seconds = int(raw_quiet_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "SC_SPRINT_FORCE_NEW_QUIET_SECONDS must be a non-negative "
+                "whole second value"
+            ) from exc
+        if quiet_seconds < 0:
+            raise ValueError(
+                "SC_SPRINT_FORCE_NEW_QUIET_SECONDS must be a non-negative "
+                "whole second value"
+            )
+        self.force_new_quiet_seconds = quiet_seconds
 
     def requeue_expired(self) -> int:
         now = _stamp(self.now())
@@ -747,6 +746,31 @@ class SprintWakeDeliveryService:
                 (now,),
             )
         return int(result.rowcount)
+
+    def _active_belongs_to_wake(
+        self,
+        active: active_chat_registry.ActiveChat,
+        wake_id: int,
+    ) -> bool:
+        row = self.con.execute(
+            "SELECT creation_idempotency_key FROM conversations "
+            "WHERE conversation_id=?",
+            (active.chat_id,),
+        ).fetchone()
+        if row is None or row["creation_idempotency_key"] is None:
+            return False
+        return str(row["creation_idempotency_key"]).endswith(f":wake:{wake_id}")
+
+    def _receiver_has_force_new(self, receiver_shell_id: int) -> bool:
+        return (
+            self.con.execute(
+                "SELECT 1 FROM wake_message "
+                "WHERE receiver_shell_id=? AND delivered_at IS NULL "
+                "AND declared_type='force-new' LIMIT 1",
+                (receiver_shell_id,),
+            ).fetchone()
+            is not None
+        )
 
     def claim_next(self, owner: str, *, lease_seconds: int = 60) -> WakeLease | None:
         owner = owner.strip()
@@ -768,7 +792,7 @@ class SprintWakeDeliveryService:
                 "AND followup.state='pending')",
                 (now,),
             )
-            row = self.con.execute(
+            candidates = self.con.execute(
                 "SELECT w.* FROM sprint_wake_outbox w "
                 "WHERE ((w.state='delivering' AND w.lease_expires_at<=?) "
                 "OR (w.state='pending' AND w.available_at<=?)) "
@@ -778,9 +802,45 @@ class SprintWakeDeliveryService:
                 "ON message_sprint.sprint_id=m.sprint_id "
                 "WHERE wm.wake_id=w.wake_id AND m.delivered_at IS NULL "
                 "AND (m.sprint_id IS NULL OR message_sprint.lifecycle='armed')) "
-                "ORDER BY w.wake_id LIMIT 1",
+                "ORDER BY w.wake_id",
                 (now, now),
-            ).fetchone()
+            ).fetchall()
+            row = None
+            for candidate in candidates:
+                receiver_shell_id = int(candidate["receiver_shell_id"])
+                if not self._receiver_has_force_new(receiver_shell_id):
+                    row = candidate
+                    break
+                active = active_chat_registry.get(self.con, receiver_shell_id)
+                if active is not None and self._active_belongs_to_wake(
+                    active, int(candidate["wake_id"])
+                ):
+                    row = candidate
+                    break
+                if active is not None and active_chat_registry.has_live_process(active):
+                    self.con.execute(
+                        "UPDATE sprint_wake_outbox SET quiet_since=NULL "
+                        "WHERE wake_id=? AND quiet_since IS NOT NULL",
+                        (candidate["wake_id"],),
+                    )
+                    continue
+                quiet_since = candidate["quiet_since"]
+                if quiet_since is None:
+                    self.con.execute(
+                        "UPDATE sprint_wake_outbox SET quiet_since=? WHERE wake_id=?",
+                        (now, candidate["wake_id"]),
+                    )
+                    if self.force_new_quiet_seconds > 0:
+                        continue
+                elif (
+                    now_value - _parse_stamp(str(quiet_since))
+                ).total_seconds() < self.force_new_quiet_seconds:
+                    continue
+                row = self.con.execute(
+                    "SELECT * FROM sprint_wake_outbox WHERE wake_id=?",
+                    (candidate["wake_id"],),
+                ).fetchone()
+                break
             if row is None:
                 return None
             if row["state"] == "pending":
@@ -872,7 +932,7 @@ class SprintWakeDeliveryService:
             )
             self.con.execute(
                 "UPDATE sprint_wake_outbox SET state='cancelled',claim_owner=NULL,"
-                "claimed_at=NULL,lease_expires_at=NULL "
+                "claimed_at=NULL,lease_expires_at=NULL,quiet_since=NULL "
                 "WHERE receiver_shell_id=? AND state='pending' AND wake_id<>? "
                 "AND NOT EXISTS (SELECT 1 FROM sprint_wake_messages joined "
                 "WHERE joined.wake_id=sprint_wake_outbox.wake_id)",
@@ -915,24 +975,58 @@ class SprintWakeDeliveryService:
 
     def _resolve_conversation(self, lease: WakeLease) -> str:
         active = active_chat_registry.get(self.con, lease.receiver_shell_id)
-        if active is not None and active_chat_registry.has_live_process(active):
+        wants_force_new = "force-new" in lease.declared_types
+        if active is not None and self._active_belongs_to_wake(
+            active, lease.wake_id
+        ):
             return active.chat_id
-        wants_new = "new" in lease.declared_types
+        if active is not None and active_chat_registry.has_live_process(active):
+            if wants_force_new:
+                raise ForceNewDeferred("a live chat appeared after force-new claim")
+            return active.chat_id
+        wants_new = wants_force_new or "new" in lease.declared_types
         if active is not None and not wants_new:
             return active.chat_id
 
         shell_route = None
+        sprint_route = None
         if lease.sprint_id is None or lease.participant_id is None:
             shell_route = sprint_participant_chats.prepare_shell_wake_conversation(
                 self.con, lease.receiver_shell_id
             )
+        else:
+            sprint_route = sprint_participant_chats.prepare_wake_conversation(
+                self.con,
+                sprint_id=lease.sprint_id,
+                participant_id=lease.participant_id,
+            )
+
+        if wants_force_new:
+            current = active_chat_registry.get(self.con, lease.receiver_shell_id)
+            if current is not None and self._active_belongs_to_wake(
+                current, lease.wake_id
+            ):
+                return current.chat_id
+            if current is not None and active_chat_registry.has_live_process(current):
+                raise ForceNewDeferred(
+                    "a live chat appeared before force-new rotation"
+                )
+            if current is not None and (
+                active is None or active.chat_id != current.chat_id
+            ):
+                raise ForceNewDeferred(
+                    "the active chat changed before force-new rotation"
+                )
+            active = current
 
         closed_id = None
         if active is not None:
             try:
                 with db_driver.write_transaction(self.con, "wake.route.close_active"):
                     closed = active_chat_registry.close_for_wake(
-                        self.con, lease.receiver_shell_id
+                        self.con,
+                        lease.receiver_shell_id,
+                        expected_chat_id=(active.chat_id if wants_force_new else None),
                     )
                     if closed is not None:
                         closed_id = closed.chat_id
@@ -941,12 +1035,20 @@ class SprintWakeDeliveryService:
                             closed.chat_id,
                             "conversation.closed",
                             {
-                                "reason": "New wake_message delivery",
+                                "reason": (
+                                    "force-new wake delivery"
+                                    if wants_force_new
+                                    else "New wake_message delivery"
+                                ),
                                 "state": "closed",
                                 "wake_id": lease.wake_id,
                             },
                         )
             except active_chat_registry.ActiveChatBusy:
+                if wants_force_new:
+                    raise ForceNewDeferred(
+                        "the active chat changed at force-new close"
+                    )
                 raced = active_chat_registry.get(self.con, lease.receiver_shell_id)
                 if raced is not None:
                     return raced.chat_id
@@ -961,17 +1063,60 @@ class SprintWakeDeliveryService:
                         wake_id=lease.wake_id,
                         route=shell_route,
                     )
-                return sprint_participant_chats.create_wake_conversation(
+                if sprint_route is None:
+                    raise SprintInvariantError("Sprint wake route was not prepared")
+                return sprint_participant_chats.create_prepared_wake_conversation(
                     self.con,
                     wake_id=lease.wake_id,
-                    sprint_id=lease.sprint_id,
-                    participant_id=lease.participant_id,
+                    route=sprint_route,
                 )
         except sprint_participant_chats.WakeConversationBusy:
+            if wants_force_new:
+                raise ForceNewDeferred(
+                    "another chat won the force-new creation boundary"
+                )
             raced = active_chat_registry.get(self.con, lease.receiver_shell_id)
             if raced is not None:
                 return raced.chat_id
             raise
+
+    def _defer_force_new(self, lease: WakeLease) -> None:
+        with db_driver.write_transaction(self.con, "wake.force_new.defer"):
+            row = self.con.execute(
+                "SELECT state,claim_owner FROM sprint_wake_outbox WHERE wake_id=?",
+                (lease.wake_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] != "delivering"
+                or row["claim_owner"] != lease.claim_owner
+            ):
+                raise SprintInvariantError("force-new wake lease is not owned")
+            followups = self.con.execute(
+                "SELECT wake_id FROM sprint_wake_outbox "
+                "WHERE receiver_shell_id=? AND state='pending' AND wake_id<>? "
+                "ORDER BY wake_id",
+                (lease.receiver_shell_id, lease.wake_id),
+            ).fetchall()
+            for followup in followups:
+                self.con.execute(
+                    "UPDATE sprint_wake_messages SET wake_id=? WHERE wake_id=?",
+                    (lease.wake_id, followup["wake_id"]),
+                )
+                self.con.execute(
+                    "UPDATE sprint_wake_outbox SET state='cancelled',"
+                    "claim_owner=NULL,claimed_at=NULL,lease_expires_at=NULL,"
+                    "quiet_since=NULL WHERE wake_id=? AND state='pending'",
+                    (followup["wake_id"],),
+                )
+            changed = self.con.execute(
+                "UPDATE sprint_wake_outbox SET state='pending',claim_owner=NULL,"
+                "claimed_at=NULL,lease_expires_at=NULL,quiet_since=NULL "
+                "WHERE wake_id=? AND state='delivering' AND claim_owner=?",
+                (lease.wake_id, lease.claim_owner),
+            ).rowcount
+            if changed != 1:
+                raise SprintInvariantError("force-new wake deferral lost its lease")
 
     def deliver_once(
         self,
@@ -988,6 +1133,13 @@ class SprintWakeDeliveryService:
                 target_conversation_id,
                 lease.prompt,
                 lease.idempotency_key,
+            )
+        except ForceNewDeferred:
+            self._defer_force_new(lease)
+            return DeliveryOutcome(
+                lease.wake_id,
+                "pending",
+                lease.attempt_number - 1,
             )
         except Exception as exc:  # external delivery faults become durable evidence
             attempt = self.lifecycle.record_wake_failure(
@@ -1030,7 +1182,8 @@ class SprintWakeDeliveryService:
             self.con.execute(
                 "UPDATE sprint_wake_outbox SET state='delivered',attempt_count=?,"
                 "delivered_at=datetime('now'),claim_owner=NULL,claimed_at=NULL,"
-                "lease_expires_at=NULL,last_error=NULL WHERE wake_id=?",
+                "lease_expires_at=NULL,last_error=NULL,quiet_since=NULL "
+                "WHERE wake_id=?",
                 (attempt, lease.wake_id),
             )
         return DeliveryOutcome(lease.wake_id, "delivered", attempt)

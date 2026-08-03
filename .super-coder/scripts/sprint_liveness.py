@@ -677,6 +677,27 @@ class SprintLivenessMonitor:
             fresh_strong = self._fresh_strong(row, snapshot.strong)
             failure = snapshot.failure
 
+            if self._receiver_has_pending_force_new(int(row["participant_id"])):
+                if fresh_strong is not None and (
+                    failure is None or fresh_strong.observed_at > failure.observed_at
+                ):
+                    return self._record_strong_evidence(
+                        row,
+                        episode,
+                        snapshot,
+                        now,
+                        fresh_strong,
+                    )
+                self._update_observation(
+                    message_id,
+                    now,
+                    snapshot,
+                    failure_key=failure.key if failure else None,
+                )
+                return EvaluationOutcome(
+                    message_id, "force-new-pending", episode
+                )
+
             current_failure = failure is None or not (
                 fresh_strong is not None
                 and fresh_strong.observed_at > failure.observed_at
@@ -693,25 +714,13 @@ class SprintLivenessMonitor:
             if fresh_strong is not None and (
                 failure is None or fresh_strong.observed_at > failure.observed_at
             ):
-                episode += 1
-                self.con.execute(
-                    "UPDATE sprint_liveness_expectations SET last_strong_at=?,"
-                    "last_strong_key=?,silence_episode=?,nudge_at=NULL,"
-                    "escalated_at=NULL,last_failure_key=NULL,last_evaluated_at=?,"
-                    "next_evaluation_at=?,last_supporting=?,last_unreadable=? "
-                    "WHERE message_id=?",
-                    (
-                        _stamp(fresh_strong.observed_at),
-                        fresh_strong.key,
-                        episode,
-                        _stamp(now),
-                        _stamp(now + EVALUATION_INTERVAL),
-                        _json([item.summary() for item in snapshot.supporting]),
-                        _json(list(snapshot.unreadable)),
-                        message_id,
-                    ),
+                return self._record_strong_evidence(
+                    row,
+                    episode,
+                    snapshot,
+                    now,
+                    fresh_strong,
                 )
-                return EvaluationOutcome(message_id, "strong-evidence", episode)
 
             if row["escalated_at"] is not None:
                 self._update_observation(
@@ -805,6 +814,52 @@ class SprintLivenessMonitor:
             )
             action = "supporting-evidence" if snapshot.supporting else "observed"
             return EvaluationOutcome(message_id, action, episode)
+
+    def _receiver_has_pending_force_new(self, participant_id: int) -> bool:
+        return (
+            self.con.execute(
+                "SELECT 1 FROM sprint_participants participant "
+                "JOIN sprint_wake_outbox wake "
+                "ON wake.receiver_shell_id=participant.shell_id "
+                "JOIN sprint_wake_messages joined ON joined.wake_id=wake.wake_id "
+                "JOIN wake_message message ON message.message_id=joined.message_id "
+                "WHERE participant.participant_id=? "
+                "AND wake.state IN ('pending','delivering') "
+                "AND message.declared_type='force-new' "
+                "AND message.delivered_at IS NULL LIMIT 1",
+                (participant_id,),
+            ).fetchone()
+            is not None
+        )
+
+    def _record_strong_evidence(
+        self,
+        row: sqlite3.Row,
+        episode: int,
+        snapshot: EvidenceSnapshot,
+        now: datetime,
+        fresh_strong: Evidence,
+    ) -> EvaluationOutcome:
+        episode += 1
+        message_id = int(row["message_id"])
+        self.con.execute(
+            "UPDATE sprint_liveness_expectations SET last_strong_at=?,"
+            "last_strong_key=?,silence_episode=?,nudge_at=NULL,"
+            "escalated_at=NULL,last_failure_key=NULL,last_evaluated_at=?,"
+            "next_evaluation_at=?,last_supporting=?,last_unreadable=? "
+            "WHERE message_id=?",
+            (
+                _stamp(fresh_strong.observed_at),
+                fresh_strong.key,
+                episode,
+                _stamp(now),
+                _stamp(now + EVALUATION_INTERVAL),
+                _json([item.summary() for item in snapshot.supporting]),
+                _json(list(snapshot.unreadable)),
+                message_id,
+            ),
+        )
+        return EvaluationOutcome(message_id, "strong-evidence", episode)
 
     def _send_ci_stalled_backstops(
         self,

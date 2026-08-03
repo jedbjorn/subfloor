@@ -304,6 +304,101 @@ class ActivityMonitorTest(unittest.TestCase):
             tuple(native),
         )
 
+    def test_force_new_waits_for_ceiling_reaper_and_quiet_before_delivery(self) -> None:
+        chat_id, _message_id, run_id = self.add_live_chat(idle_seconds=3601)
+        sent = sprint_message_delivery.SprintMessageStore(self.con).send_to_shell(
+            1,
+            message_kind="system",
+            body="fresh chat after the hung turn",
+            idempotency_key="hung-turn-force-new",
+            declared_type="force-new",
+        )
+        runtime = sprint_runtime.SprintRuntimeService(
+            self.db_path,
+            owner="force-new-ceiling-test",
+            activity_config=activity_monitor.ActivityMonitorConfig(3600),
+        )
+
+        with mock.patch.dict(
+            sprint_message_delivery.os.environ,
+            {"SC_SPRINT_FORCE_NEW_QUIET_SECONDS": "10"},
+        ):
+            self.assertTrue(runtime.pulse_once())
+
+        first = self.con.execute(
+            "SELECT state,attempt_count,quiet_since FROM sprint_wake_outbox "
+            "WHERE wake_id=?",
+            (sent.wake_id,),
+        ).fetchone()
+        self.assertEqual(("pending", 0), tuple(first[:2]))
+        self.assertIsNotNone(first["quiet_since"])
+        self.assertEqual(
+            ("closed", 0),
+            tuple(
+                self.con.execute(
+                    "SELECT state,(SELECT COUNT(*) FROM active_shell_chats "
+                    "WHERE shell_id=1) FROM conversations WHERE conversation_id=?",
+                    (chat_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_attempts WHERE wake_id=?",
+                (sent.wake_id,),
+            ).fetchone()[0],
+        )
+
+        interrupted: list[int] = []
+        reaper = conversation_reaper.ConversationReaper(
+            self.db_path,
+            config=conversation_reaper.ReaperConfig(
+                heartbeat_seconds=60,
+                term_grace_seconds=15,
+                kill_grace_seconds=15,
+                young_grace_seconds=0,
+            ),
+            process_reader=lambda _pid: conversation_reaper.ProcessSnapshot(
+                4242, 9001, 4242
+            ),
+            native_interrupt=interrupted.append,
+        )
+        self.assertEqual(1, reaper.sweep_once())
+        self.assertEqual([run_id], interrupted)
+
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET quiet_since=datetime('now','-10 seconds') "
+            "WHERE wake_id=?",
+            (sent.wake_id,),
+        )
+        self.con.commit()
+        with mock.patch.dict(
+            sprint_message_delivery.os.environ,
+            {"SC_SPRINT_FORCE_NEW_QUIET_SECONDS": "10"},
+        ):
+            self.assertTrue(runtime.pulse_once())
+
+        delivered = self.con.execute(
+            "SELECT state,attempt_count,quiet_since FROM sprint_wake_outbox "
+            "WHERE wake_id=?",
+            (sent.wake_id,),
+        ).fetchone()
+        active = self.con.execute(
+            "SELECT chat_id,process_pid FROM active_shell_chats WHERE shell_id=1"
+        ).fetchone()
+        self.assertEqual(("delivered", 1, None), tuple(delivered))
+        self.assertNotEqual(chat_id, active["chat_id"])
+        self.assertIsNone(active["process_pid"])
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversation_messages "
+                "WHERE conversation_id=? AND sender_ref='sprint-runtime'",
+                (active["chat_id"],),
+            ).fetchone()[0],
+        )
+
     def test_failed_engine_wake_is_recovered_once_after_terminal_backoff(self) -> None:
         chat_id, _message_id, _run_id = self.add_live_chat(idle_seconds=1)
         sent = sprint_message_delivery.SprintMessageStore(self.con).send_to_shell(

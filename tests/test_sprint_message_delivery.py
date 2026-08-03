@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import sys
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -22,20 +24,237 @@ import sprint_domain  # noqa: E402
 import sprint_message_delivery as delivery  # noqa: E402
 
 
-def apply_schema(con: sqlite3.Connection) -> None:
+def apply_schema(con: sqlite3.Connection, *, through: str | None = None) -> None:
     con.executescript((ENGINE / "schema.sql").read_text())
     for migration in sorted(MIGRATIONS.glob("*.sql")):
+        if through is not None and migration.name > through:
+            break
         con.executescript(migration.read_text())
     con.execute("PRAGMA foreign_keys=ON")
 
 
+class ForceNewMigrationTest(unittest.TestCase):
+    def test_upgrade_preserves_wake_rows_shape_guards_and_identity(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.row_factory = sqlite3.Row
+            apply_schema(con, through="0172_sanctioned_pause_liveness.sql")
+            con.execute(
+                "INSERT INTO users (user_id,username) VALUES (1,'operator')"
+            )
+            con.executemany(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (?,?,?,?,?,1)",
+                tuple(
+                    (shell_id, f"Shell {shell_id}", f"SH{shell_id}", "dev", "prompt")
+                    for shell_id in range(1, 7)
+                ),
+            )
+            states = (
+                (21, 1, "pending", 0, None, None, None, None, "2099-07-31 12:00:01"),
+                (
+                    22,
+                    2,
+                    "delivering",
+                    1,
+                    "worker-a",
+                    "2099-07-31 12:00:02",
+                    None,
+                    None,
+                    "2099-07-31 12:00:02",
+                ),
+                (
+                    23,
+                    3,
+                    "delivered",
+                    1,
+                    None,
+                    None,
+                    "2099-07-31 12:00:03",
+                    None,
+                    "2099-07-31 12:00:03",
+                ),
+                (
+                    24,
+                    4,
+                    "failed",
+                    3,
+                    None,
+                    None,
+                    None,
+                    "2099-07-31 12:00:04",
+                    "2099-07-31 12:00:04",
+                ),
+                (
+                    25,
+                    5,
+                    "cancelled",
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "2099-07-31 12:00:05",
+                ),
+            )
+            for (
+                wake_id,
+                shell_id,
+                state,
+                attempts,
+                owner,
+                claimed,
+                delivered,
+                failed,
+                available,
+            ) in states:
+                message_id = wake_id - 10
+                con.execute(
+                    "INSERT INTO wake_message "
+                    "(message_id,receiver_shell_id,message_kind,body,declared_type,"
+                    "idempotency_key,delivered_at) "
+                    "VALUES (?,?,'notification',?,?,?,?)",
+                    (
+                        message_id,
+                        shell_id,
+                        f"body-{state}",
+                        "new" if wake_id % 2 else "re-enter",
+                        f"message-{state}",
+                        delivered,
+                    ),
+                )
+                con.execute(
+                    "INSERT INTO sprint_wake_outbox "
+                    "(wake_id,receiver_shell_id,state,attempt_count,idempotency_key,"
+                    "available_at,delivered_at,failed_at,claim_owner,claimed_at,"
+                    "lease_expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        wake_id,
+                        shell_id,
+                        state,
+                        attempts,
+                        f"wake-{state}",
+                        available,
+                        delivered,
+                        failed,
+                        owner,
+                        claimed,
+                        "2099-07-31 12:01:02" if owner else None,
+                    ),
+                )
+                con.execute(
+                    "INSERT INTO sprint_wake_messages (wake_id,message_id) VALUES (?,?)",
+                    (wake_id, message_id),
+                )
+            con.commit()
+
+            con.executescript(
+                (MIGRATIONS / "0173_force_new_wake_delivery.sql").read_text()
+            )
+
+            self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
+            self.assertEqual(
+                [
+                    "message_id",
+                    "sprint_id",
+                    "sender_shell_id",
+                    "receiver_shell_id",
+                    "from_participant_id",
+                    "to_participant_id",
+                    "work_unit_id",
+                    "message_kind",
+                    "body",
+                    "declared_type",
+                    "actionable",
+                    "disposition",
+                    "read_at",
+                    "delivered_at",
+                    "decline_reason",
+                    "idempotency_key",
+                    "created_at",
+                ],
+                [row[1] for row in con.execute("PRAGMA table_info(wake_message)")],
+            )
+            self.assertEqual(
+                "quiet_since",
+                con.execute("PRAGMA table_info(sprint_wake_outbox)").fetchall()[-1][1],
+            )
+            self.assertEqual(
+                [
+                    "idx_wake_message_delivery",
+                    "idx_wake_message_inbox",
+                    "sqlite_autoindex_wake_message_1",
+                    "sqlite_autoindex_wake_message_2",
+                ],
+                sorted(row[1] for row in con.execute("PRAGMA index_list(wake_message)")),
+            )
+            self.assertEqual(
+                [
+                    "trg_sprint_liveness_acceptance",
+                    "trg_wake_message_acceptance_insert",
+                    "trg_wake_message_acceptance_update",
+                ],
+                sorted(
+                    row[0]
+                    for row in con.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type='trigger' AND tbl_name='wake_message'"
+                    )
+                ),
+            )
+            self.assertEqual(
+                tuple((row[2], row[3], row[4], row[8]) for row in states),
+                tuple(
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT state,attempt_count,claim_owner,available_at "
+                        "FROM sprint_wake_outbox ORDER BY wake_id"
+                    )
+                ),
+            )
+            self.assertEqual(
+                {"wake_message": 15, "sprint_wake_outbox": 25},
+                dict(
+                    con.execute(
+                        "SELECT name,seq FROM sqlite_sequence "
+                        "WHERE name IN ('wake_message','sprint_wake_outbox')"
+                    )
+                ),
+            )
+            con.execute(
+                "INSERT INTO wake_message "
+                "(receiver_shell_id,message_kind,body,declared_type,idempotency_key) "
+                "VALUES (6,'notification','force body','force-new','message-force')"
+            )
+            self.assertEqual(
+                16,
+                con.execute(
+                    "SELECT message_id FROM wake_message "
+                    "WHERE idempotency_key='message-force'"
+                ).fetchone()[0],
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute(
+                    "INSERT INTO wake_message "
+                    "(receiver_shell_id,message_kind,body,declared_type,idempotency_key) "
+                    "VALUES (6,'notification','bad body','other','message-bad')"
+                )
+            self.assertEqual(
+                0,
+                con.execute(
+                    "SELECT COUNT(*) FROM wake_message "
+                    "WHERE idempotency_key='message-bad'"
+                ).fetchone()[0],
+            )
+
+
 class SprintMessageCase(unittest.TestCase):
     def setUp(self) -> None:
-        delay_env = mock.patch.dict(
-            os.environ, {"SC_WAKE_NEW_DELAY_SECONDS": "0"}
+        quiet_env = mock.patch.dict(
+            os.environ, {"SC_SPRINT_FORCE_NEW_QUIET_SECONDS": "0"}
         )
-        delay_env.start()
-        self.addCleanup(delay_env.stop)
+        quiet_env.start()
+        self.addCleanup(quiet_env.stop)
         self.con = sqlite3.connect(":memory:")
         self.addCleanup(self.con.close)
         self.con.row_factory = sqlite3.Row
@@ -404,116 +623,26 @@ class AcceptanceAndDeclineTest(SprintMessageCase):
         )
 
 
-class WakeDelayTest(SprintMessageCase):
-    def test_declared_new_uses_constructor_time_env_delay_and_claim_boundary(
-        self,
-    ) -> None:
-        clock = [datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc)]
-        with mock.patch.dict(os.environ, {"SC_WAKE_NEW_DELAY_SECONDS": "15"}):
-            messages = delivery.SprintMessageStore(
-                self.con,
-                now=lambda: clock[0],
-            )
-
-        sent = messages.send(
-            self.sprint_id,
-            to_participant_id=self.developer_id,
-            from_participant_id=self.planner_id,
-            work_unit_id=self.unit_id,
-            message_kind="notification",
-            body="delayed new wake",
-            declared_type="new",
-            idempotency_key="delayed-new",
-        )
-
-        row = self.con.execute(
-            "SELECT created_at,available_at FROM sprint_wake_outbox WHERE wake_id=?",
-            (sent.wake_id,),
-        ).fetchone()
-        self.assertEqual("2099-07-31 12:00:15", row["available_at"])
-        self.assertNotEqual(row["created_at"], row["available_at"])
-        service = delivery.SprintWakeDeliveryService(
-            self.con,
-            now=lambda: clock[0],
-        )
-        self.assertIsNone(service.claim_next("before-new-delay"))
-        clock[0] += timedelta(seconds=15)
-        lease = service.claim_next("at-new-delay")
-        self.assertIsNotNone(lease)
-        self.assertEqual(sent.wake_id, lease.wake_id)
-
-    def test_reenter_wake_keeps_immediate_database_availability(self) -> None:
-        messages = delivery.SprintMessageStore(
-            self.con,
-            now=lambda: datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc),
-            new_wake_delay_seconds=15,
-        )
-
-        sent = messages.send(
-            self.sprint_id,
-            to_participant_id=self.developer_id,
-            from_participant_id=self.planner_id,
-            work_unit_id=self.unit_id,
-            message_kind="notification",
-            body="immediate reenter wake",
-            declared_type="re-enter",
-            idempotency_key="immediate-reenter",
-        )
-
+class WakeAvailabilityTest(SprintMessageCase):
+    def test_plain_new_uses_normal_immediate_availability(self) -> None:
+        sent = self.send("immediate-new", declared_type="new")
         row = self.con.execute(
             "SELECT created_at,available_at FROM sprint_wake_outbox WHERE wake_id=?",
             (sent.wake_id,),
         ).fetchone()
         self.assertEqual(row["created_at"], row["available_at"])
-        self.assertNotEqual("2099-07-31 12:00:15", row["available_at"])
 
-    def test_zero_delay_disables_hold_for_declared_new(self) -> None:
-        messages = delivery.SprintMessageStore(
-            self.con,
-            now=lambda: datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc),
-            new_wake_delay_seconds=0,
-        )
-
-        sent = messages.send(
-            self.sprint_id,
-            to_participant_id=self.developer_id,
-            from_participant_id=self.planner_id,
-            work_unit_id=self.unit_id,
-            message_kind="notification",
-            body="disabled new wake hold",
-            declared_type="new",
-            idempotency_key="zero-delay-new",
-        )
-
-        row = self.con.execute(
-            "SELECT created_at,available_at FROM sprint_wake_outbox WHERE wake_id=?",
-            (sent.wake_id,),
-        ).fetchone()
-        self.assertEqual(row["created_at"], row["available_at"])
-        self.assertNotEqual("2099-07-31 12:00:00", row["available_at"])
-
-    def test_new_message_extends_a_pending_reenter_wake(self) -> None:
+    def test_plain_new_coalescing_does_not_rewrite_available_at(self) -> None:
         first = self.send("pending-reenter", declared_type="re-enter")
-        messages = delivery.SprintMessageStore(
-            self.con,
-            now=lambda: datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc),
-            new_wake_delay_seconds=15,
-        )
-
-        second = messages.send(
-            self.sprint_id,
-            to_participant_id=self.developer_id,
-            from_participant_id=self.planner_id,
-            work_unit_id=self.unit_id,
-            message_kind="notification",
-            body="coalesced new wake",
-            declared_type="new",
-            idempotency_key="coalesced-new",
-        )
+        available_before = self.con.execute(
+            "SELECT available_at FROM sprint_wake_outbox WHERE wake_id=?",
+            (first.wake_id,),
+        ).fetchone()[0]
+        second = self.send("coalesced-new", declared_type="new")
 
         self.assertEqual(first.wake_id, second.wake_id)
         self.assertEqual(
-            "2099-07-31 12:00:15",
+            available_before,
             self.con.execute(
                 "SELECT available_at FROM sprint_wake_outbox WHERE wake_id=?",
                 (first.wake_id,),
@@ -531,29 +660,604 @@ class WakeDelayTest(SprintMessageCase):
             ],
         )
 
-    def test_shell_scoped_new_wake_uses_the_same_delay(self) -> None:
-        messages = delivery.SprintMessageStore(
-            self.con,
-            now=lambda: datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc),
-            new_wake_delay_seconds=8,
-        )
-
-        sent = messages.send_to_shell(
+    def test_shell_scoped_plain_new_is_immediately_available(self) -> None:
+        sent = self.messages.send_to_shell(
             2,
             message_kind="system",
-            body="delayed shell-scoped wake",
-            idempotency_key="shell-scoped-new-delay",
+            body="immediate shell-scoped wake",
+            idempotency_key="shell-scoped-immediate-new",
             declared_type="new",
         )
 
         row = self.con.execute(
-            "SELECT sprint_id,participant_id,receiver_shell_id,available_at "
+            "SELECT sprint_id,participant_id,receiver_shell_id,"
+            "created_at,available_at "
             "FROM sprint_wake_outbox WHERE wake_id=?",
             (sent.wake_id,),
         ).fetchone()
+        self.assertEqual((None, None, 2), tuple(row[:3]))
+        self.assertEqual(row["created_at"], row["available_at"])
+
+
+class ForceNewDeliveryTest(SprintMessageCase):
+    def test_setting_accepts_zero_and_rejects_invalid_values_by_name(self) -> None:
+        service = delivery.SprintWakeDeliveryService(
+            self.con, force_new_quiet_seconds=0
+        )
+        self.assertEqual(0, service.force_new_quiet_seconds)
+
+        for invalid in ("1.5", "not-a-number", "-1"):
+            with (
+                self.subTest(invalid=invalid),
+                mock.patch.dict(
+                    os.environ,
+                    {"SC_SPRINT_FORCE_NEW_QUIET_SECONDS": invalid},
+                ),
+                self.assertRaisesRegex(
+                    ValueError, "SC_SPRINT_FORCE_NEW_QUIET_SECONDS"
+                ),
+            ):
+                delivery.SprintWakeDeliveryService(self.con)
+
+    def test_python_boundaries_accept_force_new_and_reject_other_types(self) -> None:
+        sprint = self.send("force-sprint", declared_type="force-new")
+        shell = self.messages.send_to_shell(
+            2,
+            message_kind="system",
+            body="force shell",
+            idempotency_key="force-shell",
+            declared_type="force-new",
+        )
         self.assertEqual(
-            (None, None, 2, "2099-07-31 12:00:08"),
-            tuple(row),
+            [(sprint.message_id, "force-new"), (shell.message_id, "force-new")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT message_id,declared_type FROM wake_message "
+                    "WHERE message_id IN (?,?) ORDER BY message_id",
+                    (sprint.message_id, shell.message_id),
+                )
+            ],
+        )
+
+        with self.assertRaisesRegex(ValueError, delivery.DECLARED_TYPE_ERROR):
+            self.send("invalid-sprint", declared_type="other")
+        with self.assertRaisesRegex(ValueError, delivery.DECLARED_TYPE_ERROR):
+            self.messages.send_to_shell(
+                2,
+                message_kind="system",
+                body="invalid shell",
+                idempotency_key="invalid-shell",
+                declared_type="other",
+            )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE idempotency_key IN ('invalid-sprint','invalid-shell')"
+            ).fetchone()[0],
+        )
+
+    def test_live_process_clears_quiet_then_boundary_claims_without_sliding(
+        self,
+    ) -> None:
+        pid, start_ticks = active_chat_registry.process_identity(str(os.getpid()))
+        self.con.execute(
+            "UPDATE active_shell_chats SET process_pid=?,process_start_ticks=? "
+            "WHERE shell_id=1",
+            (pid, start_ticks),
+        )
+        self.con.commit()
+        sent = self.send("force-quiet-boundary", declared_type="force-new")
+        clock = [datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc)]
+        service = delivery.SprintWakeDeliveryService(
+            self.con,
+            now=lambda: clock[0],
+            force_new_quiet_seconds=10,
+        )
+
+        self.assertIsNone(service.claim_next("live-pulse-one"))
+        clock[0] += timedelta(seconds=5)
+        self.assertIsNone(service.claim_next("live-pulse-two"))
+        self.assertEqual(
+            (None, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT quiet_since,attempt_count FROM sprint_wake_outbox "
+                    "WHERE wake_id=?",
+                    (sent.wake_id,),
+                ).fetchone()
+            ),
+        )
+
+        self.con.execute(
+            "UPDATE active_shell_chats SET process_pid=NULL,"
+            "process_start_ticks=NULL WHERE shell_id=1"
+        )
+        self.con.commit()
+        self.assertIsNone(service.claim_next("first-quiet-pulse"))
+        self.assertEqual(
+            "2099-07-31 12:00:05",
+            self.con.execute(
+                "SELECT quiet_since FROM sprint_wake_outbox WHERE wake_id=?",
+                (sent.wake_id,),
+            ).fetchone()[0],
+        )
+        clock[0] += timedelta(seconds=9)
+        self.assertIsNone(service.claim_next("before-boundary"))
+        self.assertEqual(
+            "2099-07-31 12:00:05",
+            self.con.execute(
+                "SELECT quiet_since FROM sprint_wake_outbox WHERE wake_id=?",
+                (sent.wake_id,),
+            ).fetchone()[0],
+        )
+        clock[0] += timedelta(seconds=1)
+        lease = service.claim_next("at-boundary")
+        self.assertEqual(sent.wake_id, lease.wake_id)
+        self.assertEqual(("force-new",), lease.declared_types)
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_attempts WHERE wake_id=?",
+                (sent.wake_id,),
+            ).fetchone()[0],
+        )
+
+    def test_zero_second_gate_claims_no_chat_on_first_quiet_observation(self) -> None:
+        self.con.execute("DELETE FROM active_shell_chats WHERE shell_id=1")
+        self.con.commit()
+        sent = self.send("force-zero", declared_type="force-new")
+        clock = datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc)
+        lease = delivery.SprintWakeDeliveryService(
+            self.con,
+            now=lambda: clock,
+            force_new_quiet_seconds=0,
+        ).claim_next("zero-gate")
+
+        self.assertEqual(sent.wake_id, lease.wake_id)
+        self.assertEqual(
+            ("delivering", "2099-07-31 12:00:00", 0),
+            tuple(
+                self.con.execute(
+                    "SELECT state,quiet_since,attempt_count "
+                    "FROM sprint_wake_outbox WHERE wake_id=?",
+                    (sent.wake_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_stale_pid_and_service_restart_preserve_quiet_observation(self) -> None:
+        self.con.execute(
+            "UPDATE active_shell_chats SET process_pid=2147483647,"
+            "process_start_ticks=1 WHERE shell_id=1"
+        )
+        self.con.commit()
+        sent = self.send("force-stale-restart", declared_type="force-new")
+        clock = [datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc)]
+        first = delivery.SprintWakeDeliveryService(
+            self.con,
+            now=lambda: clock[0],
+            force_new_quiet_seconds=5,
+        )
+        self.assertIsNone(first.claim_next("stale-first-pulse"))
+        clock[0] += timedelta(seconds=4)
+        restarted = delivery.SprintWakeDeliveryService(
+            self.con,
+            now=lambda: clock[0],
+            force_new_quiet_seconds=5,
+        )
+        self.assertIsNone(restarted.claim_next("stale-after-restart"))
+        clock[0] += timedelta(seconds=1)
+        lease = restarted.claim_next("stale-boundary")
+        self.assertEqual(sent.wake_id, lease.wake_id)
+        self.assertEqual(
+            "2099-07-31 12:00:00",
+            self.con.execute(
+                "SELECT quiet_since FROM sprint_wake_outbox WHERE wake_id=?",
+                (sent.wake_id,),
+            ).fetchone()[0],
+        )
+
+    def test_force_precedence_preserves_available_at_and_quiet_stamp(self) -> None:
+        first = self.send("plain-before-force", declared_type="new")
+        available_at = self.con.execute(
+            "SELECT available_at FROM sprint_wake_outbox WHERE wake_id=?",
+            (first.wake_id,),
+        ).fetchone()[0]
+        force = self.send("force-after-plain", declared_type="force-new")
+        self.assertEqual(first.wake_id, force.wake_id)
+        service = delivery.SprintWakeDeliveryService(
+            self.con,
+            now=lambda: datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc),
+            force_new_quiet_seconds=10,
+        )
+        self.assertIsNone(service.claim_next("stamp-force-bundle"))
+        quiet_since = self.con.execute(
+            "SELECT quiet_since FROM sprint_wake_outbox WHERE wake_id=?",
+            (first.wake_id,),
+        ).fetchone()[0]
+        plain = self.send("plain-joins-force", declared_type="re-enter")
+        self.assertEqual(first.wake_id, plain.wake_id)
+        self.assertEqual(
+            (available_at, quiet_since),
+            tuple(
+                self.con.execute(
+                    "SELECT available_at,quiet_since FROM sprint_wake_outbox "
+                    "WHERE wake_id=?",
+                    (first.wake_id,),
+                ).fetchone()
+            ),
+        )
+
+        reverse_force = self.messages.send(
+            self.sprint_id,
+            to_participant_id=self.reviewer_id,
+            from_participant_id=self.planner_id,
+            message_kind="notification",
+            body="force first",
+            idempotency_key="force-before-plain",
+            declared_type="force-new",
+        )
+        reverse_plain = self.messages.send(
+            self.sprint_id,
+            to_participant_id=self.reviewer_id,
+            from_participant_id=self.planner_id,
+            message_kind="notification",
+            body="plain second",
+            idempotency_key="plain-after-force",
+            declared_type="new",
+        )
+        self.assertEqual(reverse_force.wake_id, reverse_plain.wake_id)
+
+    def test_deferred_low_id_force_does_not_starve_ready_receiver(self) -> None:
+        pid, start_ticks = active_chat_registry.process_identity(str(os.getpid()))
+        self.con.execute(
+            "UPDATE active_shell_chats SET process_pid=?,process_start_ticks=? "
+            "WHERE shell_id=1",
+            (pid, start_ticks),
+        )
+        self.con.commit()
+        blocked = self.send("blocked-force", declared_type="force-new")
+        ready = self.messages.send(
+            self.sprint_id,
+            to_participant_id=self.reviewer_id,
+            from_participant_id=self.planner_id,
+            message_kind="notification",
+            body="ready reviewer wake",
+            idempotency_key="ready-reviewer",
+            declared_type="re-enter",
+        )
+
+        lease = delivery.SprintWakeDeliveryService(
+            self.con, force_new_quiet_seconds=0
+        ).claim_next("starvation-scan")
+
+        self.assertEqual(ready.wake_id, lease.wake_id)
+        self.assertEqual(2, lease.receiver_shell_id)
+        self.assertEqual(
+            ("pending", None, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT state,quiet_since,attempt_count "
+                    "FROM sprint_wake_outbox WHERE wake_id=?",
+                    (blocked.wake_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_coordinate_mode_promotes_only_to_new(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET coordinate_mode=1 WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        sent = self.messages.send(
+            self.sprint_id,
+            to_participant_id=self.planner_id,
+            from_participant_id=self.developer_id,
+            message_kind="notification",
+            body="coordinate wake",
+            idempotency_key="coordinate-reenter",
+            declared_type="re-enter",
+        )
+        lease = delivery.SprintWakeDeliveryService(
+            self.con, force_new_quiet_seconds=0
+        ).claim_next("coordinate-worker")
+        self.assertEqual(sent.wake_id, lease.wake_id)
+        self.assertEqual(("new",), lease.declared_types)
+
+    def test_rotation_closes_exact_chat_and_delivers_full_snapshot_once(self) -> None:
+        force = self.send("rotation-force", declared_type="force-new")
+        plain = self.send("rotation-plain", declared_type="re-enter")
+        observed: list[tuple[str, str]] = []
+
+        outcome = delivery.SprintWakeDeliveryService(
+            self.con, force_new_quiet_seconds=0
+        ).deliver_once(
+            "rotation-worker",
+            lambda conversation, prompt, _key: (
+                observed.append((conversation, prompt)) or "rotation-run"
+            ),
+        )
+
+        self.assertEqual(force.wake_id, outcome.wake_id)
+        self.assertNotEqual(self.developer_conversation_id, observed[0][0])
+        self.assertIn(f"wake_message #{force.message_id}", observed[0][1])
+        self.assertIn(f"wake_message #{plain.message_id}", observed[0][1])
+        self.assertEqual(
+            ("closed", observed[0][0]),
+            (
+                self.con.execute(
+                    "SELECT state FROM conversations WHERE conversation_id=?",
+                    (self.developer_conversation_id,),
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT chat_id FROM active_shell_chats WHERE shell_id=1"
+                ).fetchone()[0],
+            ),
+        )
+        closed = self.con.execute(
+            "SELECT payload FROM conversation_events "
+            "WHERE conversation_id=? AND event_type='conversation.closed'",
+            (self.developer_conversation_id,),
+        ).fetchone()
+        self.assertEqual(
+            {
+                "reason": "force-new wake delivery",
+                "state": "closed",
+                "wake_id": force.wake_id,
+            },
+            json.loads(closed[0]),
+        )
+        self.assertEqual(
+            [(force.message_id, 1), (plain.message_id, 1)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT message_id,delivered_at IS NOT NULL FROM wake_message "
+                    "WHERE message_id IN (?,?) ORDER BY message_id",
+                    (force.message_id, plain.message_id),
+                )
+            ],
+        )
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT quiet_since FROM sprint_wake_outbox WHERE wake_id=?",
+                (force.wake_id,),
+            ).fetchone()[0]
+        )
+
+    def test_sprint_route_preflight_failure_preserves_active_chat(self) -> None:
+        self.con.execute("UPDATE shells SET user_id=NULL WHERE shell_id=3")
+        self.con.commit()
+        sent = self.send("force-invalid-route", declared_type="force-new")
+
+        outcome = delivery.SprintWakeDeliveryService(
+            self.con, force_new_quiet_seconds=0
+        ).deliver_once(
+            "route-preflight-worker",
+            lambda *_args: self.fail("invalid route must not enqueue"),
+        )
+
+        self.assertEqual(
+            (sent.wake_id, "pending", 1),
+            (outcome.wake_id, outcome.state, outcome.attempt_number),
+        )
+        self.assertEqual(
+            (self.developer_conversation_id, "idle"),
+            tuple(
+                self.con.execute(
+                    "SELECT active.chat_id,c.state FROM active_shell_chats active "
+                    "JOIN conversations c ON c.conversation_id=active.chat_id "
+                    "WHERE active.shell_id=1"
+                ).fetchone()
+            ),
+        )
+
+    def test_live_race_after_claim_defers_without_attempt_or_enqueue(self) -> None:
+        sent = self.send("force-live-race", declared_type="force-new")
+        native = mock.Mock(return_value="must-not-run")
+        service = delivery.SprintWakeDeliveryService(
+            self.con, force_new_quiet_seconds=0
+        )
+        with mock.patch.object(
+            active_chat_registry,
+            "has_live_process",
+            side_effect=(False, True),
+        ):
+            outcome = service.deliver_once("live-race-worker", native)
+
+        self.assertEqual(
+            (sent.wake_id, "pending", 0),
+            (outcome.wake_id, outcome.state, outcome.attempt_number),
+        )
+        native.assert_not_called()
+        self.assertEqual(
+            ("pending", 0, None, None),
+            tuple(
+                self.con.execute(
+                    "SELECT state,attempt_count,claim_owner,quiet_since "
+                    "FROM sprint_wake_outbox WHERE wake_id=?",
+                    (sent.wake_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_attempts WHERE wake_id=?",
+                (sent.wake_id,),
+            ).fetchone()[0],
+        )
+
+    def test_close_race_defers_instead_of_absorbing_winner(self) -> None:
+        sent = self.send("force-close-race", declared_type="force-new")
+        service = delivery.SprintWakeDeliveryService(
+            self.con, force_new_quiet_seconds=0
+        )
+        with mock.patch.object(
+            active_chat_registry,
+            "close_for_wake",
+            side_effect=active_chat_registry.ActiveChatBusy("replacement won"),
+        ):
+            outcome = service.deliver_once(
+                "close-race-worker",
+                lambda *_args: self.fail("raced force-new must not enqueue"),
+            )
+        self.assertEqual(
+            (sent.wake_id, "pending", 0),
+            (outcome.wake_id, outcome.state, outcome.attempt_number),
+        )
+        self.assertEqual(
+            [],
+            self.con.execute(
+                "SELECT attempt_number FROM sprint_wake_attempts WHERE wake_id=?",
+                (sent.wake_id,),
+            ).fetchall(),
+        )
+
+    def test_creation_deferral_merges_followup_into_claimed_survivor(self) -> None:
+        self.con.execute("DELETE FROM active_shell_chats WHERE shell_id=1")
+        self.con.commit()
+        first = self.send("force-create-race", declared_type="force-new")
+        service = delivery.SprintWakeDeliveryService(
+            self.con, force_new_quiet_seconds=0
+        )
+        lease = service.claim_next("create-race-worker")
+        followup = self.send("followup-during-claim", declared_type="new")
+        self.assertNotEqual(first.wake_id, followup.wake_id)
+
+        with (
+            mock.patch.object(
+                delivery.sprint_participant_chats,
+                "create_prepared_wake_conversation",
+                side_effect=delivery.sprint_participant_chats.WakeConversationBusy(
+                    "winner created"
+                ),
+            ),
+            self.assertRaises(delivery.ForceNewDeferred),
+        ):
+            service._resolve_conversation(lease)
+        service._defer_force_new(lease)
+
+        self.assertEqual(
+            [(first.wake_id, "pending", None, None), (followup.wake_id, "cancelled", None, None)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT wake_id,state,claim_owner,quiet_since "
+                    "FROM sprint_wake_outbox WHERE wake_id IN (?,?) ORDER BY wake_id",
+                    (first.wake_id, followup.wake_id),
+                )
+            ],
+        )
+        self.assertEqual(
+            [(first.wake_id, first.message_id), (first.wake_id, followup.message_id)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT wake_id,message_id FROM sprint_wake_messages "
+                    "WHERE message_id IN (?,?) ORDER BY message_id",
+                    (first.message_id, followup.message_id),
+                )
+            ],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_attempts WHERE wake_id=?",
+                (first.wake_id,),
+            ).fetchone()[0],
+        )
+
+    def test_crash_after_native_enqueue_reuses_wake_chat_and_logical_turn(self) -> None:
+        sent = self.send("force-crash-retry", declared_type="force-new")
+        clock = [datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc)]
+        service = delivery.SprintWakeDeliveryService(
+            self.con,
+            now=lambda: clock[0],
+            force_new_quiet_seconds=0,
+        )
+        lease = service.claim_next("crashing-worker", lease_seconds=60)
+        first_target = service._resolve_conversation(lease)
+        invocations: list[tuple[str, str]] = []
+
+        def native(conversation: str, prompt: str, key: str) -> str:
+            invocations.append((conversation, key))
+            existing = self.con.execute(
+                "SELECT message_id FROM conversation_messages "
+                "WHERE conversation_id=? AND idempotency_key=?",
+                (conversation, key),
+            ).fetchone()
+            if existing is not None:
+                run_id = self.con.execute(
+                    "SELECT run_id FROM conversation_runs "
+                    "WHERE trigger_message_id=?",
+                    (existing["message_id"],),
+                ).fetchone()[0]
+                return f"conversation-run:{run_id}"
+            message_id = int(
+                self.con.execute(
+                    "INSERT INTO conversation_messages "
+                    "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                    "idempotency_key,request_hash,state,completed_at) "
+                    "VALUES (?,'engine','test','prompt',?,?,?,'completed',"
+                    "datetime('now'))",
+                    (conversation, prompt, key, key),
+                ).lastrowid
+            )
+            run_id = int(
+                self.con.execute(
+                    "INSERT INTO conversation_runs "
+                    "(conversation_id,shell_id,trigger_message_id,state,"
+                    "lease_owner,lease_expires_at,started_at,ended_at,exit_code) "
+                    "VALUES (?,1,?,'succeeded','test','2999-01-01 00:00:00',"
+                    "datetime('now'),datetime('now'),0)",
+                    (conversation, message_id),
+                ).lastrowid
+            )
+            self.con.commit()
+            return f"conversation-run:{run_id}"
+
+        first_run = native(first_target, lease.prompt, lease.idempotency_key)
+        pid, start_ticks = active_chat_registry.process_identity(str(os.getpid()))
+        self.con.execute(
+            "UPDATE active_shell_chats SET process_pid=?,process_start_ticks=? "
+            "WHERE shell_id=1 AND chat_id=?",
+            (pid, start_ticks, first_target),
+        )
+        self.con.commit()
+        clock[0] += timedelta(seconds=61)
+
+        outcome = service.deliver_once("recovery-worker", native)
+
+        self.assertEqual("delivered", outcome.state)
+        self.assertEqual([(first_target, lease.idempotency_key)] * 2, invocations)
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversation_messages "
+                "WHERE conversation_id=? AND idempotency_key=?",
+                (first_target, lease.idempotency_key),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            [(first_run, 1, first_target)],
+            [
+                (
+                    f"conversation-run:{row['run_id']}",
+                    row["attempt_number"],
+                    row["target_conversation_id"],
+                )
+                for row in self.con.execute(
+                    "SELECT r.run_id,a.attempt_number,a.target_conversation_id "
+                    "FROM conversation_runs r JOIN sprint_wake_attempts a "
+                    "ON a.native_run_ref='conversation-run:' || r.run_id "
+                    "WHERE a.wake_id=?",
+                    (sent.wake_id,),
+                )
+            ],
         )
 
 

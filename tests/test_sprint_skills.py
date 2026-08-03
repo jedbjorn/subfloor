@@ -27,6 +27,7 @@ AUTHORITY_SPLIT_SKILLS = {"sprint_pln", "sprint_rev"}
 V21_ROLE_SKILLS = set(SKILLS)
 HANDOFF_ROLE_SKILLS = {"sprint_dev", "sprint_rev", "sprint_pln"}
 CLOSEOUT_ROLE_SKILLS = {"sprint_close", "sprint_dev", "sprint_pln", "sprint_rev"}
+FORCE_NEW_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
 
 ARTIFACT_PATH_RULE = """## Sprint artifact paths
 
@@ -292,28 +293,60 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(migration)
             con.executescript(migration)
 
-            expected = seed_skills.parse_skill(
-                ASSETS / "sprint_dev" / "SKILL.md"
-            )
             actual = con.execute(
                 "SELECT description,category,command,common,content,is_deleted "
                 "FROM skills WHERE name='sprint_dev'"
             ).fetchone()
-            self.assertEqual(
-                tuple(actual),
-                (
-                    expected["description"],
-                    expected["category"],
-                    expected["command"],
-                    expected["common"],
-                    expected["content"],
-                    0,
-                ),
-            )
+            self.assertEqual(0, actual[5])
             self.assertIn("This is a once-only\npre-handoff check", actual[4])
             self.assertIn(
                 "paused awaiting a native PR-fact or verdict\nwake", actual[4]
             )
+        finally:
+            con.close()
+
+    def test_force_new_reseed_matches_assets_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0174_reseed_force_new_wake_skills.sql":
+                    break
+                con.executescript(migration.read_text())
+            placeholders = ",".join("?" for _ in FORCE_NEW_ROLE_SKILLS)
+            con.execute(
+                f"UPDATE skills SET description='stale', category='stale', "
+                f"command='stale', common=1, content='stale pre-0174 guidance', "
+                f"is_deleted=1 WHERE name IN ({placeholders})",
+                tuple(sorted(FORCE_NEW_ROLE_SKILLS)),
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0174_reseed_force_new_wake_skills.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for name in sorted(FORCE_NEW_ROLE_SKILLS):
+                with self.subTest(name=name):
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(
+                        tuple(rows[0]),
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                    )
         finally:
             con.close()
 
@@ -594,6 +627,46 @@ class SprintSkillTest(unittest.TestCase):
         self.assertIn("Every `wake_message` creates durable delivery intent", boot)
         self.assertIn("verified live turn", boot)
         self.assertIn("defaults satisfy the gate", boot)
+
+    def test_force_new_and_blind_review_contracts_are_folded_into_roles(self):
+        bodies = {
+            name: (ASSETS / name / "SKILL.md").read_text()
+            for name in FORCE_NEW_ROLE_SKILLS
+        }
+        for name, body in bodies.items():
+            with self.subTest(name=name):
+                normalized = " ".join(body.lower().split())
+                for guidance in (
+                    "force-new delivery",
+                    "quiet",
+                    "coalesce",
+                    "stop cleanly",
+                    "inactivity ceiling",
+                    "reaper",
+                    "plain new",
+                    "eligible immediately",
+                ):
+                    self.assertIn(guidance, normalized)
+
+        developer = " ".join(bodies["sprint_dev"].lower().split())
+        reviewer = " ".join(bodies["sprint_rev"].lower().split())
+        for guidance in (
+            "bare one-line locator",
+            "no scope narrative",
+            "verification evidence",
+            "review-focus steering",
+            "work-unit id and spec reference",
+            "write no pr comments or annotations",
+        ):
+            self.assertIn(guidance, developer)
+        for guidance in (
+            "bare locator",
+            "full diff",
+            "each round is clean",
+            "prior findings",
+            "no prior developer evidence",
+        ):
+            self.assertIn(guidance, reviewer)
 
     def test_every_affected_file_argument_names_the_hard_ceiling(self):
         parser = sprint_cli.build_parser()

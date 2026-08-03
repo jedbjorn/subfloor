@@ -701,7 +701,8 @@ class SprintLifecycleStore:
                 "UPDATE sprint_wake_outbox SET attempt_count=?,state=?,"
                 "last_error=?,failed_at=CASE WHEN ? THEN datetime('now') "
                 "ELSE NULL END,claim_owner=NULL,claimed_at=NULL,"
-                "lease_expires_at=NULL,available_at=datetime('now', ?) "
+                "lease_expires_at=NULL,available_at=datetime('now', ?),"
+                "quiet_since=CASE WHEN ? THEN NULL ELSE quiet_since END "
                 "WHERE wake_id=?",
                 (
                     attempt,
@@ -709,6 +710,7 @@ class SprintLifecycleStore:
                     error,
                     1 if terminal else 0,
                     f"+{backoff_seconds} seconds",
+                    1 if terminal else 0,
                     wake_id,
                 ),
             )
@@ -2559,7 +2561,7 @@ class SprintWorkUnitStore:
             message_kind="work_assignment",
             body=f"{unit['title']}\n\n{unit['expected_output']}",
             actionable=True,
-            declared_type="new",
+            declared_type="force-new",
             idempotency_key=key,
         )
         if receipt.wake_id is None:
