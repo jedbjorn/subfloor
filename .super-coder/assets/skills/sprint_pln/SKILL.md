@@ -1,6 +1,6 @@
 ---
 name: sprint_pln
-description: Run an armed Sprints v2 collaboration loop as Planner — dispatch ready lanes, respond to durable evidence and escalations, re-plan honestly, and coordinate pause/resume without becoming a transition bottleneck.
+description: Run an armed Sprints v2 collaboration loop as Planner — dispatch ready lanes and execute Reviewer decisions through durable re-plan, pause, cancel, resume, and close protocols.
 category: workflow
 common: false
 ---
@@ -8,7 +8,10 @@ common: false
 # sprint_pln — govern the armed Sprint
 
 Use as the originating Planner after `sprint_prep` arms the Sprint. The system
-captures deterministic facts; you decide scope, sequencing, and recovery.
+captures deterministic facts; the Reviewer decides and documents, and the
+Planner acts. Execute Reviewer decisions without taking over their judgment or
+report authorship. The FnB retains the board-level override established by
+decision #46.
 On every wake or re-entry, load `sprint_pln`, run the exact inbox command below,
 and inspect the durable message before deciding what to do.
 
@@ -16,7 +19,10 @@ and inspect the durable message before deciding what to do.
 
 The armed runtime owns scheduled dispatch, unread wake recovery, liveness
 evaluation, and registered-PR observation. React to its durable inbox and wake
-facts; use the Planner turn for decisions, re-plans, escalation, and close-out.
+facts; use the Planner turn for dispatch and exact execution of durable Reviewer
+decisions. The Reviewer owns pause, cancel, and conclude decisions plus the
+conformance and final Sprint reports. The Planner owns the corresponding state
+transitions.
 
 Read the Sprint inbox, lifecycle, bound spec revisions, work-unit graph,
 participant routes, active conversations, registered PRs, unresolved
@@ -46,17 +52,21 @@ not change Sprint or work-unit state.
 
 ## Running loop
 
-- Keep dependencies as the only hard sequence. Re-plan assignments, waves, or
-  dependencies when reality changes, but never rewrite completed history.
+- Keep dependencies as the only hard sequence. When reality requires a re-plan,
+  give the Reviewer the current projection and evidence, then execute the exact
+  decision it returns; never rewrite completed history.
 - Let Developers own their PRs through green, review, correction, and merge.
-  Let Reviewers own verdicts. Do not proxy routine handoffs.
+  Let Reviewers own verdicts and Sprint decisions. Do not proxy routine
+  handoffs or substitute Planner judgment for a Reviewer decision.
 - Consume passive system facts without waking yourself into every transition.
-  Act on decisions, escalations, re-plans, pauses, and terminal synthesis.
-- Record scope calls, spec edits, ratified deviations, and their rationale as
-  judgment evidence while context is live.
+  Route a decision boundary to the Reviewer; act when its Re-enter decision
+  message arrives.
+- Record the Reviewer decision identity, the exact action taken, and the action
+  receipt. Do not rewrite its rationale as Planner-authored judgment evidence.
 - A mid-Sprint spec edit is allowed only by the owning Planner or FnB. Record
-  the prior and new exact revision hashes. The running Sprint remains bound to
-  its approved revision unless an explicit recorded judgment says otherwise.
+  the prior and new exact revision hashes. When acting as Planner, require a
+  durable Reviewer decision before the edit. The running Sprint remains bound
+  to its approved revision unless that decision explicitly says otherwise.
 
 The armed runtime evaluates liveness on its five-second pulse. A one-shot
 diagnostic/evaluation is available when evidence requires it:
@@ -99,59 +109,90 @@ successfully and confirms the durable write and wake where applicable.
 If a Sprint command is rejected or transport fails, the write or handoff is
 incomplete. Correct and retry when safe. If the relay itself fails, surface the
 attempted command and durable evidence to FnB; do not invent an alternate
-delivery protocol. When a Developer or Reviewer reports an integrity concern,
-evaluate its evidence, impact, and recommendation. Decide whether to continue,
-re-plan, or pause. Send any needed participant context before pausing; an active
-relay is not available after the lifecycle becomes paused.
+delivery protocol. When a Developer reports an integrity concern, relay its
+evidence, impact, and recommendation to the Reviewer. When the Reviewer returns
+a decision, execute it through the protocol below. Send any needed participant
+context before pausing; an active relay is not available after the lifecycle
+becomes paused.
+
+## Reviewer decision actions
+
+Pause, cancel, and conclude are Reviewer decisions and Planner actions. A valid
+decision arrives as a durable Reviewer → Planner Re-enter message and names the
+decision, evidence, target ids, reason, and exact requested transition. Accept
+the actionable message, verify it came from the assigned Reviewer, and execute
+that transition without re-adjudicating the decision. Record the decision
+message id and action receipt together.
+
+The FnB board-level override from decision #46 is unaffected: a live FnB
+instruction may direct or supersede any action. Name that override in the
+evidence instead of attributing it to the Reviewer.
+
+If a requested action fails a lifecycle, authority, or disposition precondition,
+do not substitute a different action. Send the refusal and current durable state
+back to the Reviewer (or surface it directly to FnB for an FnB override), then
+stop at that decision boundary.
+
+### Pause or resume
+
+On a Reviewer pause decision, transition durably, stop external Sprint services,
+persist interrupt intent, preserve every partial artifact, and retain the
+Reviewer judgment and evidence for recovery:
 
 ```text
-sc sprint pause --sprint <id> --reason <integrity-threat>
+sc sprint pause --sprint <id> --reason <reviewer-decision-reason>
 ```
 
-Revise only a still-planned lane; name its complete new projection so the
-before/after event is reviewable. Cancel only an unreleased lane, with the
-reason retained as its terminal result:
+Resume only on a later Reviewer decision or an FnB override. Reconcile native
+runs, unread messages, pending wakes, work units, registered PRs, capacity, and
+spec drift, then act with the supplied reason:
+
+```text
+sc sprint resume --sprint <id> [--reason <reviewer-reconciliation-decision>]
+```
+
+An exhausted recovery wake is bounded manual-recovery evidence, not a retry
+loop. Preserve the unread message and failed wake, involve FnB, and do not create
+recursive fallbacks. Drift informs; it never silently blocks resume.
+
+### Cancel or re-plan
+
+A Reviewer cancel decision must name one unreleased work unit and its retained
+terminal reason. Execute exactly that cancellation:
+
+```text
+sc sprint cancel-unit --sprint <id> --work-unit <id> --reason <reviewer-decision-reason>
+```
+
+For a Reviewer re-plan decision, apply its complete projection; never infer
+omitted fields or alter a released or completed lane:
 
 ```text
 sc sprint replan-unit --sprint <id> --work-unit <id> \
   --developer-shell <id> --reviewer-shell <id> --wave <n> \
   [--depends-on <work-unit-id>] [--output-kind code|report-only|no-code]
-sc sprint cancel-unit --sprint <id> --work-unit <id> --reason <reason>
 ```
 
-## Escalation judgment
+If a Developer or Reviewer declines, preserve the reason and ask the Reviewer
+for the replacement routing decision before issuing a fresh assignment.
 
-Read the evidence packet before acting: last strong evidence, supporting
-signals, unreadable signals, failure identity, nudge history, route/quota state,
-and current work facts. A proven failure may justify re-plan, route recovery, or
-pause. Ambiguous silence does not justify corrupting a work-unit disposition.
+### Conclude or abort
 
-If a Developer or Reviewer declines, preserve the reason, return the lane or
-review request to the eligible pool, and issue a fresh assignment identity.
-Never edit the declined message into a different instruction.
-
-## Pause and resume
-
-Developer and Reviewer participants report integrity concerns; the Planner or
-FnB decides whether to pause. When pause is warranted, transition durably, stop
-external Sprint services, persist interrupt intent, preserve every partial
-artifact, and retain the judgment and evidence for FnB recovery.
-
-Only Planner or FnB resumes. Review reconciliation for native runs, unread
-messages, pending wakes, work units, registered PRs, capacity, and spec drift.
-An exhausted recovery wake is one bounded fallback, not a retry loop. Preserve
-the unread message and failed wake as evidence, involve FnB for manual recovery,
-and do not create recursive fallbacks.
-Drift informs; it never silently blocks resume. Record the exact revision facts
-and choose continue, re-plan, or abort.
+The Reviewer decides when the Sprint is done, records conformance, authors the
+final Sprint report, and sends a conclude decision containing the conformance
+receipt, follow-up ids, exact reason/outcome, stable key, and full report body.
+Write that Reviewer-authored body to `<reviewer-report>` unchanged, then perform
+the close action:
 
 ```text
-sc sprint pause --sprint <id> --reason <integrity-threat>
-sc sprint resume --sprint <id> [--reason <reconciliation-judgment>]
+sc sprint complete --sprint <id> --reason <reviewer-decision-reason> \
+  --outcome <reviewer-decision-outcome> --report-file <reviewer-report> \
+  --key <reviewer-decision-key>
 ```
 
-Abort only when continuing would be dishonest or unsafe. It is terminal and
-deletes nothing.
+Do not run `compile-report`, synthesize the final report, or editorialize the
+Reviewer body. Abort is likewise an action taken only on a Reviewer decision or
+FnB override; it is terminal and deletes nothing.
 
 ## Handoffs and stop
 
@@ -160,8 +201,12 @@ outcomes move the Developer to fresh fix/merge conversations automatically;
 the next work assignment returns it to the persistent lane.
 
 When all planned delivery work is terminal and merged or explicitly no-code,
-re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message, confirm
-every handled informational message is marked read with `accept`, confirm the
-final typed transition succeeded, stop dispatching, and hand control to
-`sprint_close`. Close-out conformance findings become follow-ups rather than
-new editing lanes in this Sprint.
+send the Reviewer the bound revisions, integrated main SHA, ratified judgments,
+and current close evidence, then stop and await its Re-enter conclude decision.
+The Reviewer writes the conformance and final Sprint reports; conformance
+findings become follow-ups rather than new editing lanes in this Sprint.
+
+On receipt, re-run `sc sprint inbox --sprint <id>`, accept the conclude message,
+execute its exact close action through the protocol above, and confirm the typed
+transition succeeded. After `complete` succeeds, emit its bounded receipt and
+run no further Sprint command. The Planner does not author a second report.

@@ -12,8 +12,8 @@ ENGINE = ROOT / ".super-coder"
 ASSETS = ENGINE / "assets" / "skills"
 sys.path.insert(0, str(ENGINE / "scripts"))
 
-import seed_skills  # noqa: E402
-import sprint_cli  # noqa: E402
+import seed_skills
+import sprint_cli
 
 SKILLS = {
     "sprint_prep": "planner",
@@ -23,6 +23,7 @@ SKILLS = {
     "sprint_close": "planner",
 }
 RESEEDED_SKILLS = set(SKILLS) | {"db_map"}
+AUTHORITY_SPLIT_SKILLS = {"sprint_pln", "sprint_rev"}
 
 
 class SprintSkillTest(unittest.TestCase):
@@ -103,12 +104,14 @@ class SprintSkillTest(unittest.TestCase):
 
     def test_native_wake_reseed_converges_dirty_rows_and_replays_idempotently(self):
         con = sqlite3.connect(":memory:")
+        reference = sqlite3.connect(":memory:")
         try:
-            con.executescript((ENGINE / "schema.sql").read_text())
-            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
-                if migration.name >= "0159_reseed_sprint_native_wake_skills.sql":
-                    break
-                con.executescript(migration.read_text())
+            for target in (con, reference):
+                target.executescript((ENGINE / "schema.sql").read_text())
+                for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                    if migration.name >= "0159_reseed_sprint_native_wake_skills.sql":
+                        break
+                    target.executescript(migration.read_text())
             placeholders = ",".join("?" for _ in RESEEDED_SKILLS)
             con.execute(
                 f"UPDATE skills SET content='stale pre-0159 body' "
@@ -121,17 +124,65 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            reference.executescript(migration)
 
             for name in sorted(RESEEDED_SKILLS):
                 with self.subTest(name=name):
-                    expected = seed_skills.parse_skill(
-                        ASSETS / name / "SKILL.md"
-                    )["content"]
                     rows = con.execute(
                         "SELECT content, is_deleted FROM skills WHERE name=?", (name,)
                     ).fetchall()
+                    expected = reference.execute(
+                        "SELECT content, is_deleted FROM skills WHERE name=?", (name,)
+                    ).fetchone()
                     self.assertEqual(len(rows), 1)
-                    self.assertEqual(tuple(rows[0]), (expected, 0))
+                    self.assertEqual(tuple(rows[0]), tuple(expected))
+        finally:
+            con.close()
+            reference.close()
+
+    def test_authority_split_reseed_converges_dirty_rows_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0167_reseed_sprint_authority_split.sql":
+                    break
+                con.executescript(migration.read_text())
+            placeholders = ",".join("?" for _ in AUTHORITY_SPLIT_SKILLS)
+            con.execute(
+                f"UPDATE skills SET content='stale pre-0167 authority' "
+                f"WHERE name IN ({placeholders})",
+                tuple(sorted(AUTHORITY_SPLIT_SKILLS)),
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0167_reseed_sprint_authority_split.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for name in sorted(AUTHORITY_SPLIT_SKILLS):
+                with self.subTest(name=name):
+                    expected = seed_skills.parse_skill(
+                        ASSETS / name / "SKILL.md"
+                    )
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(
+                        tuple(rows[0]),
+                        (
+                            expected["description"],
+                            expected["category"],
+                            expected["command"],
+                            expected["common"],
+                            expected["content"],
+                            0,
+                        ),
+                    )
         finally:
             con.close()
 
@@ -267,30 +318,58 @@ class SprintSkillTest(unittest.TestCase):
                 for invented in ("ASK:", "ANSWER:", "BLOCKED:"):
                     self.assertNotIn(invented, body)
 
-    def test_pause_guidance_is_planner_owned_and_workers_report_before_stopping(self):
-        pause = "sc sprint pause --sprint <id> --reason <integrity-threat>"
-        for name in ("sprint_dev", "sprint_rev"):
-            with self.subTest(worker=name):
-                body = (ASSETS / name / "SKILL.md").read_text()
-                normalized = " ".join(body.lower().split())
-                self.assertNotIn(pause, body)
-                self.assertIn("evidence, impact", normalized)
-                self.assertIn("recommendation", normalized)
-                self.assertIn("does not pause the sprint", normalized)
-                self.assertIn("planner decides", normalized)
-                self.assertIn("relay itself fails", normalized)
-                self.assertIn("fnb", normalized)
+    def test_authority_split_assigns_reviewer_decisions_and_planner_actions(self):
+        planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()
+        reviewer = (ASSETS / "sprint_rev" / "SKILL.md").read_text()
+        normalized_planner = " ".join(planner.lower().split())
+        normalized_reviewer = " ".join(reviewer.lower().split())
 
-        for name in ("sprint_pln", "sprint_close"):
-            with self.subTest(planner=name):
-                body = (ASSETS / name / "SKILL.md").read_text()
-                normalized = " ".join(body.lower().split())
-                self.assertIn(pause, body)
-                self.assertIn("planner or fnb decides", normalized)
-                self.assertIn("relay itself fails", normalized)
-                self.assertIn("active relay is not available after", normalized)
-                self.assertIn("exhausted recovery wake", normalized)
-                self.assertIn("do not create recursive", normalized)
+        self.assertIn("## Reviewer decision actions", planner)
+        self.assertIn(
+            "pause, cancel, and conclude are reviewer decisions", normalized_planner
+        )
+        self.assertIn("planner actions", normalized_planner)
+        for command in (
+            "sc sprint pause --sprint <id>",
+            "sc sprint cancel-unit --sprint <id>",
+            "sc sprint complete --sprint <id>",
+        ):
+            self.assertIn(command, planner)
+        self.assertIn("reviewer-authored body", normalized_planner)
+        self.assertIn("does not author a second report", normalized_planner)
+        self.assertNotIn("you decide scope, sequencing, and recovery", normalized_planner)
+
+        self.assertIn("## Control and conclude decisions", reviewer)
+        self.assertIn(
+            "owns all pause, cancel, and conclude decisions", normalized_reviewer
+        )
+        self.assertIn("author the final Sprint report", reviewer)
+        self.assertIn("sc sprint record-conformance", reviewer)
+        self.assertIn("sc sprint compile-report", reviewer)
+        self.assertNotIn("the planner decides whether", normalized_reviewer)
+        self.assertNotIn("sc sprint pause --sprint <id>", reviewer)
+
+        for body in (planner, reviewer):
+            normalized = " ".join(body.lower().split())
+            self.assertIn("fnb board-level override", normalized)
+            self.assertIn("decision #46", normalized)
+
+    def test_developer_reports_integrity_concerns_without_taking_pause_action(self):
+        developer = (ASSETS / "sprint_dev" / "SKILL.md").read_text()
+        normalized = " ".join(developer.lower().split())
+        self.assertNotIn("sc sprint pause --sprint <id>", developer)
+        self.assertIn("evidence, impact", normalized)
+        self.assertIn("recommendation", normalized)
+        self.assertIn("does not pause the sprint", normalized)
+        self.assertIn("relay itself fails", normalized)
+
+    def test_legacy_close_skill_keeps_planner_transition_safety_until_retirement(self):
+        close = (ASSETS / "sprint_close" / "SKILL.md").read_text()
+        normalized = " ".join(close.lower().split())
+        self.assertIn("sc sprint pause --sprint <id>", close)
+        self.assertIn("active relay is not available after", normalized)
+        self.assertIn("exhausted recovery wake", normalized)
+        self.assertIn("do not create recursive", normalized)
 
     def test_every_affected_file_argument_names_the_hard_ceiling(self):
         parser = sprint_cli.build_parser()
