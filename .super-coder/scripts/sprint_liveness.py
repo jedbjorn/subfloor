@@ -126,6 +126,14 @@ class SprintEvidenceCollector:
         accepted_at = _parse(expectation["accepted_at"])
         participant_id = int(expectation["participant_id"])
         strong = self._latest_strong(participant_id, accepted_at)
+        outbound_handoff = self._outbound_handoff(
+            participant_id,
+            accepted_at,
+            int(expectation["message_id"]),
+            strong,
+        )
+        if outbound_handoff is not None:
+            strong = None
         failures = list(self._terminal_failures(participant_id, accepted_at))
         supporting: list[Evidence] = []
         unreadable: list[str] = []
@@ -181,10 +189,7 @@ class SprintEvidenceCollector:
             unreadable.append(quota.unreadable)
 
         failure = max(failures, key=lambda item: item.observed_at, default=None)
-        last_strong_at = _parse(expectation["last_strong_at"])
-        if strong is not None:
-            last_strong_at = max(last_strong_at, strong.observed_at)
-        suppressors = self._suppressors(participant_id, last_strong_at)
+        suppressors = self._suppressors(participant_id, outbound_handoff)
         return EvidenceSnapshot(
             strong=strong,
             supporting=tuple(sorted(supporting, key=lambda item: item.key)),
@@ -361,8 +366,11 @@ class SprintEvidenceCollector:
         return max(candidates, key=lambda item: (item.observed_at, item.key), default=None)
 
     def _suppressors(
-        self, participant_id: int, last_strong_at: datetime
+        self,
+        participant_id: int,
+        outbound_handoff: Evidence | None,
     ) -> tuple[Evidence, ...]:
+        """Collect participant-scoped suppressors; decision #85(3) makes quiet per-shell."""
         suppressors: list[Evidence] = []
         rows = self.con.execute(
             "SELECT pr.registered_pr_id,pr.repository,pr.pr_number,"
@@ -392,23 +400,47 @@ class SprintEvidenceCollector:
                 )
             )
 
+        if outbound_handoff is not None:
+            suppressors.append(outbound_handoff)
+        return tuple(sorted(suppressors, key=lambda item: item.key))
+
+    def _outbound_handoff(
+        self,
+        participant_id: int,
+        accepted_at: datetime,
+        expectation_message_id: int,
+        strong: Evidence | None,
+    ) -> Evidence | None:
         row = self.con.execute(
             "SELECT message_id,message_kind,created_at FROM wake_message "
-            "WHERE from_participant_id=? AND created_at>? "
+            "WHERE from_participant_id=? AND created_at>=? AND message_id>? "
             "ORDER BY created_at DESC,message_id DESC LIMIT 1",
-            (participant_id, _stamp(last_strong_at)),
+            (participant_id, _stamp(accepted_at), expectation_message_id),
         ).fetchone()
-        if row is not None:
-            suppressors.append(
-                Evidence(
-                    f"sprint.message:{row['message_id']}",
-                    "outbound.handoff",
-                    _parse(row["created_at"]),
-                    "suppressor",
-                    f"durable outbound {row['message_kind']} awaits a reply wake",
-                )
-            )
-        return tuple(sorted(suppressors, key=lambda item: item.key))
+        if row is None:
+            return None
+        sent_at = _parse(row["created_at"])
+        turn = self.con.execute(
+            "SELECT r.run_id,r.ended_at FROM conversation_runs r "
+            "JOIN sprint_participant_conversations pc "
+            "ON pc.conversation_id=r.conversation_id "
+            "WHERE pc.sprint_participant_id=? AND r.started_at IS NOT NULL "
+            "AND r.started_at<=? AND (r.ended_at IS NULL OR r.ended_at>=?) "
+            "ORDER BY r.started_at DESC,r.run_id DESC LIMIT 1",
+            (participant_id, _stamp(sent_at), _stamp(sent_at)),
+        ).fetchone()
+        if turn is not None and turn["ended_at"] is None:
+            return None
+        turn_ended_at = _parse(turn["ended_at"]) if turn is not None else sent_at
+        if strong is not None and strong.observed_at > turn_ended_at:
+            return None
+        return Evidence(
+            f"sprint.message:{row['message_id']}",
+            "outbound.handoff",
+            sent_at,
+            "suppressor",
+            f"durable outbound {row['message_kind']} awaits a reply wake",
+        )
 
     def _terminal_failures(
         self, participant_id: int, accepted_at: datetime
@@ -561,6 +593,7 @@ class SprintLivenessMonitor:
         now = self.now().astimezone(timezone.utc)
         if not self._armed(sprint_id):
             return ()
+        self._send_ci_stalled_backstops(sprint_id, now)
         due = self.con.execute(
             "SELECT e.* FROM sprint_liveness_expectations e "
             "JOIN wake_message m ON m.message_id=e.message_id "
@@ -691,7 +724,6 @@ class SprintLivenessMonitor:
                 return EvaluationOutcome(message_id, action, episode)
 
             if snapshot.suppressors:
-                self._send_ci_stalled_backstops(row, snapshot.suppressors, now)
                 suppressor = max(
                     snapshot.suppressors,
                     key=lambda item: (item.observed_at, item.key),
@@ -776,79 +808,85 @@ class SprintLivenessMonitor:
 
     def _send_ci_stalled_backstops(
         self,
-        expectation: sqlite3.Row,
-        suppressors: tuple[Evidence, ...],
+        sprint_id: int,
         now: datetime,
     ) -> None:
-        for suppressor in suppressors:
-            if suppressor.kind != "pr.awaiting_transition":
-                continue
-            if now - suppressor.observed_at < CI_STALLED_BACKSTOP:
-                continue
-            transition_key = suppressor.key.removeprefix("pr.transition:")
-            idempotency_key = f"liveness:ci-stalled:{transition_key}:planner"
-            if self.con.execute(
-                "SELECT 1 FROM wake_message WHERE idempotency_key=?",
-                (idempotency_key,),
-            ).fetchone() is not None:
-                continue
-            pending = self.con.execute(
+        with db_driver.write_transaction(self.con, "sprint.liveness.ci_backstop"):
+            pending_rows = self.con.execute(
                 "SELECT pr.registered_pr_id,pr.repository,pr.pr_number,"
                 "t.normalized_state,t.transition_key,t.observed_head_sha,t.observed_at "
-                "FROM sprint_pr_transitions t JOIN sprint_registered_prs pr "
-                "ON pr.registered_pr_id=t.registered_pr_id "
-                "WHERE t.transition_key=? AND pr.sprint_id=?",
-                (transition_key, int(expectation["sprint_id"])),
-            ).fetchone()
-            if pending is None:
-                continue
-            planner_id, route = self.router.prepare(
-                int(expectation["sprint_id"]),
-                now=now,
-                reason=f"CI-stalled backstop for {pending['repository']}#{pending['pr_number']}",
+                "FROM sprint_registered_prs pr JOIN sprint_pr_transitions t "
+                "ON t.registered_pr_id=pr.registered_pr_id "
+                "WHERE pr.sprint_id=? AND t.transition_id=("
+                "SELECT latest.transition_id FROM sprint_pr_transitions latest "
+                "WHERE latest.registered_pr_id=pr.registered_pr_id "
+                "ORDER BY latest.transition_id DESC LIMIT 1) "
+                "AND t.normalized_state IN ('created','pending') "
+                "AND t.observed_at<=? ORDER BY pr.registered_pr_id",
+                (sprint_id, _stamp(now - CI_STALLED_BACKSTOP)),
+            ).fetchall()
+            for pending in pending_rows:
+                self._send_ci_stalled_backstop(sprint_id, pending, now)
+
+    def _send_ci_stalled_backstop(
+        self,
+        sprint_id: int,
+        pending: sqlite3.Row,
+        now: datetime,
+    ) -> None:
+        transition_key = str(pending["transition_key"])
+        idempotency_key = f"liveness:ci-stalled:{transition_key}:planner"
+        if self.con.execute(
+            "SELECT 1 FROM wake_message WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone() is not None:
+            return
+        planner_id, route = self.router.prepare(
+            sprint_id,
+            now=now,
+            reason=f"CI-stalled backstop for {pending['repository']}#{pending['pr_number']}",
+        )
+        pending_minutes = int(
+            (now - _parse(pending["observed_at"])).total_seconds() // 60
+        )
+        receipt = self.messages.send_in_transaction(
+            sprint_id,
+            to_participant_id=planner_id,
+            message_kind="escalation",
+            body=_json(
+                {
+                    "kind": "ci_stalled",
+                    "registered_pr_id": int(pending["registered_pr_id"]),
+                    "repository": str(pending["repository"]),
+                    "pr_number": int(pending["pr_number"]),
+                    "head_sha": pending["observed_head_sha"],
+                    "normalized_state": str(pending["normalized_state"]),
+                    "transition_key": str(pending["transition_key"]),
+                    "pending_since": str(pending["observed_at"]),
+                    "pending_minutes": pending_minutes,
+                    "mandate": (
+                        "Assess the stalled CI transition and attempt repair "
+                        "by re-triggering checks, closing/reopening, or re-pushing. "
+                        "Pause the Sprint if the runner is genuinely down."
+                    ),
+                    "planner_delivery_route": route,
+                    "pause_option": True,
+                }
+            ),
+            idempotency_key=idempotency_key,
+            actionable=False,
+            declared_type="re-enter",
+        )
+        if receipt.created:
+            self._event(
+                sprint_id,
+                "liveness.ci_stalled",
+                {
+                    "registered_pr_id": int(pending["registered_pr_id"]),
+                    "transition_key": transition_key,
+                    "backstop_message_id": receipt.message_id,
+                },
             )
-            pending_minutes = int(
-                (now - _parse(pending["observed_at"])).total_seconds() // 60
-            )
-            receipt = self.messages.send_in_transaction(
-                int(expectation["sprint_id"]),
-                to_participant_id=planner_id,
-                message_kind="escalation",
-                body=_json(
-                    {
-                        "kind": "ci_stalled",
-                        "registered_pr_id": int(pending["registered_pr_id"]),
-                        "repository": str(pending["repository"]),
-                        "pr_number": int(pending["pr_number"]),
-                        "head_sha": pending["observed_head_sha"],
-                        "normalized_state": str(pending["normalized_state"]),
-                        "transition_key": str(pending["transition_key"]),
-                        "pending_since": str(pending["observed_at"]),
-                        "pending_minutes": pending_minutes,
-                        "mandate": (
-                            "Assess the stalled CI transition and attempt repair "
-                            "by re-triggering checks, closing/reopening, or re-pushing. "
-                            "Pause the Sprint if the runner is genuinely down."
-                        ),
-                        "planner_delivery_route": route,
-                        "pause_option": True,
-                    }
-                ),
-                idempotency_key=idempotency_key,
-                actionable=False,
-                declared_type="re-enter",
-            )
-            if receipt.created:
-                self._event(
-                    int(expectation["sprint_id"]),
-                    "liveness.ci_stalled",
-                    {
-                        "expectation_message_id": int(expectation["message_id"]),
-                        "registered_pr_id": int(pending["registered_pr_id"]),
-                        "transition_key": transition_key,
-                        "backstop_message_id": receipt.message_id,
-                    },
-                )
 
     def _escalate(
         self,

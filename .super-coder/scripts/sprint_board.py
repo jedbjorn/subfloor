@@ -131,7 +131,6 @@ _EVENT_FIELDS = {
     ),
     "liveness.ci_stalled": frozenset(
         {
-            "expectation_message_id",
             "registered_pr_id",
             "transition_key",
             "backstop_message_id",
