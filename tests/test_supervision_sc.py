@@ -78,6 +78,7 @@ class SupervisionFixture:
                 "NO_COLOR": "1",
             }
         )
+        self.env.pop("SC_DB_BACKUP_DIR", None)
         self._sockets: list[socket.socket] = []
 
     def close(self) -> None:

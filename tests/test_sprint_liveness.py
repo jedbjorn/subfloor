@@ -208,8 +208,9 @@ class SprintLivenessCase(unittest.TestCase):
 
     def add_native_event(self, event_type: str, minutes: int) -> int:
         conversation_id = self.con.execute(
-            "SELECT current_conversation_id FROM sprint_participants "
-            "WHERE participant_id=?",
+            "SELECT active.chat_id FROM sprint_participants participant "
+            "JOIN active_shell_chats active ON active.shell_id=participant.shell_id "
+            "WHERE participant.participant_id=?",
             (self.developer_id,),
         ).fetchone()[0]
         sequence = int(
@@ -239,8 +240,9 @@ class SprintLivenessCase(unittest.TestCase):
         self, state: str, minutes: int, error_code: str | None = None
     ) -> int:
         conversation_id = self.con.execute(
-            "SELECT current_conversation_id FROM sprint_participants "
-            "WHERE participant_id=?",
+            "SELECT active.chat_id FROM sprint_participants participant "
+            "JOIN active_shell_chats active ON active.shell_id=participant.shell_id "
+            "WHERE participant.participant_id=?",
             (self.developer_id,),
         ).fetchone()[0]
         token = self.con.execute(
@@ -439,8 +441,9 @@ class FakeClockPolicyTest(SprintLivenessCase):
         run_id = self.add_terminal_run("failed", 1, "BROKER_RUN_ERROR")
         self.add_native_event("run.failed", 2)
         conversation_id = self.con.execute(
-            "SELECT current_conversation_id FROM sprint_participants "
-            "WHERE participant_id=?",
+            "SELECT active.chat_id FROM sprint_participants participant "
+            "JOIN active_shell_chats active ON active.shell_id=participant.shell_id "
+            "WHERE participant.participant_id=?",
             (self.developer_id,),
         ).fetchone()[0]
         head = "a" * 40
@@ -621,19 +624,23 @@ class DeliveryAndActivationTest(SprintLivenessCase):
             ["escalated", "escalated"], [outcome.action for outcome in outcomes]
         )
         planner = self.con.execute(
-            "SELECT persistent_conversation_id,current_conversation_id "
-            "FROM sprint_participants WHERE participant_id=?",
+            "SELECT active.chat_id FROM sprint_participants participant "
+            "LEFT JOIN active_shell_chats active "
+            "ON active.shell_id=participant.shell_id "
+            "WHERE participant.participant_id=?",
             (self.planner_id,),
         ).fetchone()
         self.assertIsNotNone(planner[0])
-        self.assertEqual(planner[0], planner[1])
-        fallbacks = self.con.execute(
-            "SELECT link.purpose,c.harness FROM sprint_participant_conversations link "
-            "JOIN conversations c ON c.conversation_id=link.conversation_id "
-            "WHERE link.sprint_participant_id=? AND link.purpose='fallback'",
-            (self.planner_id,),
-        ).fetchall()
-        self.assertEqual([], [tuple(row) for row in fallbacks])
+        self.assertEqual(
+            set(),
+            {"purpose", "parent_conversation_id", "context_packet"}
+            & {
+                row[1]
+                for row in self.con.execute(
+                    "PRAGMA table_info(sprint_participant_conversations)"
+                )
+            },
+        )
         escalations = self.message_rows("escalation")
         self.assertEqual(2, len(escalations))
         self.assertEqual(

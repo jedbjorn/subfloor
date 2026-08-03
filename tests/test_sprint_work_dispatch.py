@@ -164,9 +164,8 @@ class SprintWorkDispatchCase(unittest.TestCase):
     def conversation_for(self, shell_id: int) -> str:
         return str(
             self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE sprint_id=? AND shell_id=?",
-                (self.sprint_id, shell_id),
+                "SELECT chat_id FROM active_shell_chats WHERE shell_id=?",
+                (shell_id,),
             ).fetchone()[0]
         )
 

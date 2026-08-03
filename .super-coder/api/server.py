@@ -73,7 +73,7 @@ import sprint_liveness  # noqa: E402  (Sprints v2 one-shot monitor surface)
 import sprint_message_delivery  # noqa: E402  (Sprints v2 inbox acceptance)
 import sprint_recovery  # noqa: E402  (Sprints v2 pause/resume reconciliation)
 import sprint_review_loop  # noqa: E402  (Sprints v2 Dev/Review command surface)
-import sprint_runtime  # noqa: E402  (armed-only Sprint dispatch + wake delivery)
+import sprint_runtime  # noqa: E402  (Sprint dispatch + engine wake delivery)
 import sprint_board  # noqa: E402  (read-only Sprints v2 FnB board projections)
 import skill_projection  # noqa: E402  (exact bounded grant mirrors)
 sys.path.insert(0, str(ENGINE / "api"))
@@ -83,8 +83,8 @@ import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
-import sprint_participant_chats  # noqa: E402  (Sprints v2 participant chat topology)
-import sprint_pr_watcher  # noqa: E402  (Sprints v2 armed GitHub observation)
+import sprint_participant_chats  # noqa: E402  (registry-backed Sprint wake chats)
+import sprint_pr_watcher  # noqa: E402  (engine-wide PR subscription observation)
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
 import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
@@ -4294,7 +4294,7 @@ def require_loopback_bind(bind: str) -> None:
 
 
 def start_runtime_services() -> None:
-    """Start commit-woken conversations and the armed Sprint services."""
+    """Start commit-woken conversations and Sprint/engine services."""
     broker = conversation_broker.start_service(
         DB_PATH,
         launch_preparer=conversation_launch.ConversationLaunchPreparer(DB_PATH),

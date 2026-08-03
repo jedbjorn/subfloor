@@ -94,6 +94,47 @@ class AssemblerSmokeTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.con.close()
 
+    def create_sprint_chat(
+        self,
+        participant_id: int,
+        *,
+        conversation_id: str,
+        harness: str,
+        key: str,
+    ) -> str:
+        shell_id = int(
+            self.con.execute(
+                "SELECT shell_id FROM sprint_participants WHERE participant_id=?",
+                (participant_id,),
+            ).fetchone()[0]
+        )
+        active = self.con.execute(
+            "SELECT chat_id FROM active_shell_chats WHERE shell_id=?", (shell_id,)
+        ).fetchone()
+        if active is not None:
+            self.con.execute(
+                "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+                "WHERE conversation_id=?",
+                (active[0],),
+            )
+        self.con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,worktree,title,"
+            "creation_idempotency_key,creation_request_hash,conversation_scope) "
+            "VALUES (?,?,1,?,'/fixture','Sprint fixture',?,?,'sprint')",
+            (conversation_id, shell_id, harness, key, f"hash:{key}"),
+        )
+        self.con.execute(
+            "INSERT INTO sprint_participant_conversations "
+            "(sprint_participant_id,conversation_id) VALUES (?,?)",
+            (participant_id, conversation_id),
+        )
+        self.con.execute(
+            "INSERT INTO active_shell_chats (shell_id,chat_id) VALUES (?,?)",
+            (shell_id, conversation_id),
+        )
+        return conversation_id
+
     def test_get_shells(self) -> None:
         out = server.get_shells(self.con)
         self.assertTrue(any(s["shell_id"] == self.ids["shell_id"] for s in out))
@@ -146,18 +187,11 @@ class AssemblerSmokeTest(unittest.TestCase):
             "VALUES (?,?,'developer','codex','active')",
             (sprint_id, shell_id),
         ).lastrowid
-        conversation_id = server.sprint_participant_chats.create_and_select(
-            self.con,
-            participant_id=int(participant_id),
-            owner_user_id=1,
-            purpose="work",
+        conversation_id = self.create_sprint_chat(
+            int(participant_id),
+            conversation_id="cv_fixture_live",
             harness="codex",
-            provider="openai",
-            model=None,
-            effort="high",
-            worktree="/fixture/dev",
-            title="Sprint participant",
-            idempotency_key="fixture:sprint:participant:work",
+            key="fixture:sprint:participant:wake",
         )
         self.con.commit()
 
@@ -203,18 +237,11 @@ class AssemblerSmokeTest(unittest.TestCase):
             "VALUES (?,?,'developer','codex','active')",
             (paused_id, shell_id),
         ).lastrowid
-        paused_conversation_id = server.sprint_participant_chats.create_and_select(
-            self.con,
-            participant_id=int(paused_participant_id),
-            owner_user_id=1,
-            purpose="work",
+        self.create_sprint_chat(
+            int(paused_participant_id),
+            conversation_id="cv_fixture_paused",
             harness="codex",
-            provider="openai",
-            model=None,
-            effort="high",
-            worktree="/fixture/paused",
-            title="Paused Sprint participant",
-            idempotency_key="fixture:sprint:paused:participant:work",
+            key="fixture:sprint:paused:participant:wake",
         )
         self.con.execute(
             "UPDATE sprints SET lifecycle='armed',armed_at='2026-07-31 08:00:00' "
@@ -239,18 +266,11 @@ class AssemblerSmokeTest(unittest.TestCase):
             "VALUES (?,?,'reviewer','kimi','idle')",
             (armed_id, shell_id),
         ).lastrowid
-        armed_conversation_id = server.sprint_participant_chats.create_and_select(
-            self.con,
-            participant_id=int(armed_participant_id),
-            owner_user_id=1,
-            purpose="work",
+        armed_conversation_id = self.create_sprint_chat(
+            int(armed_participant_id),
+            conversation_id="cv_fixture_armed",
             harness="kimi",
-            provider="kimi",
-            model=None,
-            effort="high",
-            worktree="/fixture/armed",
-            title="Armed Sprint participant",
-            idempotency_key="fixture:sprint:armed:participant:work",
+            key="fixture:sprint:armed:participant:wake",
         )
         self.con.execute(
             "UPDATE sprints SET lifecycle='armed',armed_at='2026-07-31 11:00:00' "
@@ -284,7 +304,7 @@ class AssemblerSmokeTest(unittest.TestCase):
                 "lifecycle": "paused",
                 "role": "developer",
                 "disposition": "active",
-                "current_conversation_id": paused_conversation_id,
+                "current_conversation_id": armed_conversation_id,
             },
             by_id[shell_id]["sprint"],
         )

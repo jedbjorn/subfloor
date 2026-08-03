@@ -180,14 +180,10 @@ class SprintPRRegistrationStore:
 
         with db_driver.write_transaction(self.con, "sprint.pr.register"):
             sprint = self.con.execute(
-                "SELECT lifecycle FROM sprints WHERE sprint_id=?", (sprint_id,)
+                "SELECT sprint_id FROM sprints WHERE sprint_id=?", (sprint_id,)
             ).fetchone()
             if sprint is None:
                 raise KeyError(f"unknown Sprint: {sprint_id}")
-            if sprint["lifecycle"] != "armed":
-                raise SprintInvariantError(
-                    "pull requests may be registered only for an armed Sprint"
-                )
             owner = self.con.execute(
                 "SELECT participant_id FROM sprint_participants "
                 "WHERE sprint_id=? AND shell_id=? AND role='developer'",

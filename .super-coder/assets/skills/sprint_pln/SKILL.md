@@ -24,6 +24,20 @@ decisions. The Reviewer owns pause, cancel, and conclude decisions plus the
 conformance and final Sprint reports. The Planner owns the corresponding state
 transitions.
 
+The active-chat registry is the only current-chat authority; zero or one chat
+per shell is legal. Every wake message creates delivery intent and a wake turn
+drains every undelivered message for the receiver. Planner-bound messages are
+declared Re-enter. If a verified turn is live, every declared type enters that
+chat at the natural boundary. When idle, Re-enter resumes the registry chat and
+New rotates it; no registry row behaves as New.
+
+FnB controls the Planner mode with the close button. Keeping the Planner chat
+open supervises one continuous thread. Closing it during an armed Sprint sets
+coordinate mode, so later idle Planner-bound Re-enters open fresh ticket chats;
+FnB pause/resume returns to supervise. Automatic pauses preserve that choice.
+Neither mode displaces a live turn. The inactivity ceiling closes a silent hung
+chat, and the registry reaper terminates its now-unlinked process.
+
 Read the Sprint inbox, lifecycle, bound spec revisions, work-unit graph,
 participant routes, active conversations, registered PRs, unresolved
 expectations, and recent anomalies. Viewing a participant conversation is
@@ -196,9 +210,12 @@ FnB override; it is terminal and deletes nothing.
 
 ## Handoffs and stop
 
-Assign ready work in the Developer's persistent Sprint conversation. Review
-outcomes move the Developer to fresh fix/merge conversations automatically;
-the next work assignment returns it to the persistent lane.
+Assign ready work through the durable dispatcher. Planner → Developer
+assignments are declared New; Developer → Reviewer review requests are declared
+New; Developer/Reviewer → Planner results are Re-enter. These are idle-time
+guarantees under the live-turn boundary rule, not a parent/child chat topology.
+The Planner receives no PR-event wakes; Developer-owned subscriptions carry
+red, green, and externally closed facts directly to the owning Developer.
 
 When all planned delivery work is terminal and merged or explicitly no-code,
 send the Reviewer the bound revisions, integrated main SHA, ratified judgments,

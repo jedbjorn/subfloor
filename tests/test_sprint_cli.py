@@ -502,8 +502,10 @@ class SprintCliApiTest(unittest.TestCase):
                 wake,
             )
             current = con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE participant_id=1",
+                "SELECT active.chat_id FROM sprint_participants participant "
+                "LEFT JOIN active_shell_chats active "
+                "ON active.shell_id=participant.shell_id "
+                "WHERE participant.participant_id=1",
             ).fetchone()
             self.assertEqual((response["conversation_id"],), current)
 

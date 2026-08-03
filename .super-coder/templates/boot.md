@@ -140,6 +140,37 @@ shell, `--message send <shortname> <body>`; mark an item read with
 
 ---
 
+## ACTIVE CHAT DELIVERY
+
+The engine tracks at most one active chat per shell in the active-chat registry;
+zero is legal. The registry is the sole current-chat authority and carries the
+verified pid/start-ticks identity only while a turn runs. Closing or rotating a
+chat unlinks its process. A 60-second reaper verifies process identity before
+interrupt/TERM/KILL escalation, and a generous inactivity ceiling closes silent
+hung turns so they become reapable.
+
+Every `wake_message` creates durable delivery intent. Pending wakes coalesce per
+receiver, and one wake turn drains every undelivered message for that shell.
+Acceptance is still an explicit shell act. Wake type resolves at delivery:
+
+| Registry state | Delivery |
+|---|---|
+| verified live turn | every declared type Re-enters the active chat at its natural boundary |
+| idle registry chat | any coalesced New rotates; all-Re-enter resumes the chat |
+| no registry row | create a chat and deliver as New |
+
+Sprint routing uses those literals: Planner→Developer and Developer→Reviewer
+are New; Developer/Reviewer→Planner and Reviewer→Developer are Re-enter. FnB can
+close the Planner chat during an armed Sprint to set coordinate mode (idle
+Planner Re-enters become fresh ticket chats); FnB pause/resume returns to
+supervise, while automatic pauses preserve the dial. Developer-owned PR
+subscriptions emit self-describing red/green/closed Re-enter wakes even outside
+an armed Sprint; Planner and Reviewer receive no PR-event wakes. Arming validates
+all recorded role harness/model/effort selections before publishing work;
+defaults satisfy the gate.
+
+---
+
 ## CURATION
 
 On boot, if the `## STATUS` `L&S:` line says **curation due**, run the `curate`
