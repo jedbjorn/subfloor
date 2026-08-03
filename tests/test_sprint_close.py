@@ -718,10 +718,35 @@ class EvidenceCompilerTest(SprintCloseCase):
         self.assertGreater(packet["anomalies"]["events"]["truncated"], 0)
 
     def test_only_planner_or_admin_compiles_and_participants_read_timeline(self):
+        planner_packet = self.close.compile_evidence_packet(self.sprint_id, 3)
+        reviewer_packet = self.close.compile_evidence_packet(self.sprint_id, 2)
+        self.assertEqual(
+            (self.sprint_id, self.sprint_id),
+            (
+                planner_packet["scope"]["sprint_id"],
+                reviewer_packet["scope"]["sprint_id"],
+            ),
+        )
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (5,'FnB','FNB','admin','prompt',1)"
+        )
+        self.con.commit()
+        self.assertEqual(
+            self.sprint_id,
+            self.close.compile_evidence_packet(self.sprint_id, 5)["scope"][
+                "sprint_id"
+            ],
+        )
         with self.assertRaisesRegex(
-            sprint_domain.SprintAuthorityError, "owning Planner"
+            sprint_domain.SprintAuthorityError, "participating Reviewer"
         ):
             self.close.compile_evidence_packet(self.sprint_id, 1)
+        with self.assertRaisesRegex(
+            sprint_domain.SprintAuthorityError, "participating Reviewer"
+        ):
+            self.close.compile_evidence_packet(self.sprint_id, 4)
         timeline = self.close.timeline(self.sprint_id, 2)
         self.assertEqual(self.sprint_id, timeline["sprint_id"])
         self.assertEqual(

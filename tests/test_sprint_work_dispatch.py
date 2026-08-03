@@ -660,6 +660,229 @@ class DispatchGateTest(SprintWorkDispatchCase):
         )
 
 
+class DeliveryTerminalTest(SprintWorkDispatchCase):
+    def terminal_messages(self) -> list[sqlite3.Row]:
+        return self.con.execute(
+            "SELECT p.shell_id,m.message_kind,m.body,m.declared_type,"
+            "m.actionable,m.disposition,m.idempotency_key "
+            "FROM wake_message m JOIN sprint_participants p "
+            "ON p.participant_id=m.to_participant_id "
+            "WHERE m.sprint_id=? AND m.idempotency_key LIKE ? "
+            "ORDER BY p.shell_id",
+            (self.sprint_id, f"sprint:{self.sprint_id}:delivery-terminal:%"),
+        ).fetchall()
+
+    def terminal_events(self) -> list[sqlite3.Row]:
+        return self.con.execute(
+            "SELECT actor_kind,actor_shell_id,payload FROM sprint_events "
+            "WHERE sprint_id=? AND event_type='sprint.delivery_terminal' "
+            "ORDER BY event_id",
+            (self.sprint_id,),
+        ).fetchall()
+
+    def mark_merge_ready(self, unit_id: int, shell_id: int) -> None:
+        self.assertEqual(
+            "accepted",
+            self.messages.mark_read(self.assignment_message(unit_id), shell_id),
+        )
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='merge_ready' "
+            "WHERE work_unit_id=?",
+            (unit_id,),
+        )
+        self.con.commit()
+
+    def complete_merge(self, unit_id: int, key: str) -> None:
+        with db_driver.write_transaction(self.con, "test.merge_observed"):
+            self.units.complete_from_merge_in_transaction(
+                self.sprint_id,
+                (unit_id,),
+                transition_key=key,
+            )
+
+    def assert_episode(self, terminal_count: int, completed: int, cancelled: int):
+        base = f"sprint:{self.sprint_id}:delivery-terminal:{terminal_count}"
+        messages = [
+            row
+            for row in self.terminal_messages()
+            if row["idempotency_key"] == base
+            or str(row["idempotency_key"]).startswith(f"{base}:")
+        ]
+        self.assertEqual([2, 5], [int(row["shell_id"]) for row in messages])
+        participant_ids = {
+            int(row["shell_id"]): int(row["participant_id"])
+            for row in self.con.execute(
+                "SELECT shell_id,participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND role='reviewer'",
+                (self.sprint_id,),
+            )
+        }
+        self.assertEqual(
+            [
+                f"{base}:reviewer:{participant_ids[2]}",
+                f"{base}:reviewer:{participant_ids[5]}",
+            ],
+            [str(row["idempotency_key"]) for row in messages],
+        )
+        expected_body = (
+            f"All planned delivery work for Sprint {self.sprint_id} is terminal "
+            f"({terminal_count} units: {completed} completed, {cancelled} "
+            "cancelled). Begin whole-Sprint conformance per sprint_rev — compile "
+            "the evidence packet, judge integrated main, then send the Planner "
+            "either a re-enter decision or your conclude decision."
+        )
+        self.assertEqual(
+            [
+                ("notification", expected_body, "new", 0, None),
+                ("notification", expected_body, "new", 0, None),
+            ],
+            [
+                (
+                    row["message_kind"],
+                    row["body"],
+                    row["declared_type"],
+                    int(row["actionable"]),
+                    row["disposition"],
+                )
+                for row in messages
+            ],
+        )
+        event = self.terminal_events()[-1]
+        self.assertEqual(("system", None), (event["actor_kind"], event["actor_shell_id"]))
+        self.assertEqual(
+            {
+                "terminal_count": terminal_count,
+                "completed_count": completed,
+                "cancelled_count": cancelled,
+            },
+            json.loads(event["payload"]),
+        )
+
+    def test_pause_resume_serial_units_wake_reviewers_on_final_merge(self) -> None:
+        first = self.create_unit(developer=1, title="First")
+        second = self.create_unit(
+            developer=1, dependencies=(first,), title="Final"
+        )
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="Reference pause",
+        )
+        self.lifecycle.resume(
+            self.sprint_id, sprint_domain.LifecycleActor("planner", 3)
+        )
+
+        self.mark_merge_ready(first, 1)
+        self.complete_merge(first, "merged-first")
+        self.assertEqual([], self.terminal_messages())
+        self.assertEqual([], self.terminal_events())
+
+        self.mark_merge_ready(second, 1)
+        self.complete_merge(second, "merged-final")
+
+        self.assertEqual([(first, "completed"), (second, "completed")], self.dispositions())
+        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_events()))
+        self.assert_episode(2, 2, 0)
+
+    def test_paused_report_completion_wakes_only_on_resume(self) -> None:
+        report = self.create_unit(developer=1, output_kind="report_only")
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.messages.mark_read(self.assignment_message(report), 1)
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="Inspect report",
+        )
+
+        self.units.complete(self.sprint_id, report, 1, result="Report #1")
+
+        self.assertEqual([], self.terminal_messages())
+        self.assertEqual([], self.terminal_events())
+        self.lifecycle.resume(
+            self.sprint_id, sprint_domain.LifecycleActor("planner", 3)
+        )
+        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_events()))
+        self.assert_episode(1, 1, 0)
+
+    def test_single_reviewer_uses_the_canonical_episode_key(self) -> None:
+        self.con.execute(
+            "DELETE FROM sprint_participants WHERE sprint_id=? AND shell_id=5",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        report = self.create_unit(developer=1, output_kind="report_only")
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.messages.mark_read(self.assignment_message(report), 1)
+
+        self.units.complete(self.sprint_id, report, 1, result="Only report")
+
+        messages = self.terminal_messages()
+        self.assertEqual(1, len(messages))
+        self.assertEqual(2, int(messages[0]["shell_id"]))
+        self.assertEqual(
+            f"sprint:{self.sprint_id}:delivery-terminal:1",
+            messages[0]["idempotency_key"],
+        )
+        self.assertEqual(1, len(self.terminal_events()))
+
+    def test_cancelling_the_last_planned_unit_wakes_reviewers(self) -> None:
+        upstream = self.create_unit(developer=1, title="Cancelled upstream")
+        downstream = self.create_unit(
+            developer=4,
+            dependencies=(upstream,),
+            title="Cancelled downstream",
+        )
+        self.units.cancel(self.sprint_id, upstream, 3, reason="No longer needed")
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.assertEqual([(upstream, "cancelled"), (downstream, "planned")], self.dispositions())
+
+        self.units.cancel(self.sprint_id, downstream, 3, reason="No work remains")
+
+        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_events()))
+        self.assert_episode(2, 0, 2)
+
+    def test_episode_replay_dedupes_and_added_scope_refires_with_fresh_key(self) -> None:
+        first = self.create_unit(developer=1, output_kind="report_only")
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.messages.mark_read(self.assignment_message(first), 1)
+        self.units.complete(self.sprint_id, first, 1, result="First report")
+        self.assert_episode(1, 1, 0)
+
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="Replay episode",
+        )
+        self.lifecycle.resume(
+            self.sprint_id, sprint_domain.LifecycleActor("planner", 3)
+        )
+        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_events()))
+
+        second = self.create_unit(developer=1, output_kind="no_code")
+        self.units.dispatch_ready(self.sprint_id)
+        self.messages.mark_read(self.assignment_message(second), 1)
+        self.units.complete(self.sprint_id, second, 1, result="Second result")
+        self.assertEqual(4, len(self.terminal_messages()))
+        self.assertEqual(2, len(self.terminal_events()))
+        self.assert_episode(2, 2, 0)
+
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="Replay expanded episode",
+        )
+        self.lifecycle.resume(
+            self.sprint_id, sprint_domain.LifecycleActor("planner", 3)
+        )
+        self.assertEqual(4, len(self.terminal_messages()))
+        self.assertEqual(2, len(self.terminal_events()))
+
+
 class ProductionPulseTest(SprintWorkDispatchCase):
     def test_armed_pulse_enqueues_every_parallel_ready_lane(self) -> None:
         first = self.create_unit(developer=1, wave=4)

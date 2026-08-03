@@ -882,6 +882,18 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
                 "WHERE event_type='work_unit.completed'"
             ).fetchone()[0],
         )
+        self.assertEqual(
+            (0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='sprint.delivery_terminal'),"
+                    "(SELECT COUNT(*) FROM wake_message "
+                    "WHERE idempotency_key LIKE 'sprint:%:delivery-terminal:%')"
+                ).fetchone()
+            ),
+        )
         notice = self.con.execute(
             "SELECT m.to_participant_id,m.work_unit_id,m.body,w.state "
             "FROM wake_message m JOIN sprint_wake_messages wm USING (message_id) "

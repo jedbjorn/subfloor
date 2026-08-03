@@ -555,7 +555,13 @@ class SprintCloseStore:
             int(row["originating_planner_shell_id"]) != caller_shell_id
             and row["caller_flavor"] != "admin"
         ):
-            raise SprintAuthorityError("only the owning Planner or FnB may compile")
+            try:
+                self._require_reviewer(sprint_id, caller_shell_id)
+            except SprintAuthorityError:
+                raise SprintAuthorityError(
+                    "only the owning Planner, FnB, or a participating Reviewer "
+                    "may compile"
+                ) from None
         return row
 
     def _require_participant_or_admin(

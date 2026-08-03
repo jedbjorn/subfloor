@@ -467,6 +467,7 @@ class SprintLifecycleStore:
                 )
             dispatched: tuple[int, ...] = ()
             if pause_receipt is None:
+                SprintWorkUnitStore(self.con)._queue_delivery_terminal(sprint_id)
                 planner = self._planner_participant_id(sprint_id)
                 dispatched = tuple(
                     SprintWorkUnitStore(self.con)._dispatch_ready_locked(
@@ -2225,6 +2226,7 @@ class SprintWorkUnitStore:
                 "WHERE sprint_id=?",
                 (sprint_id,),
             ).fetchone()
+            self._queue_delivery_terminal(sprint_id)
             if sprint["lifecycle"] != "armed":
                 return []
             planner = self._require_participant(
@@ -2277,6 +2279,7 @@ class SprintWorkUnitStore:
                 planner_shell_id,
                 {"work_unit_id": work_unit_id, "reason": reason},
             )
+            self._queue_delivery_terminal(sprint_id)
         return True
 
     def complete_from_merge_in_transaction(
@@ -2362,6 +2365,8 @@ class SprintWorkUnitStore:
                 },
                 actor_kind="system",
             )
+        if changed:
+            self._queue_delivery_terminal(sprint_id)
         if not changed or not dispatch or sprint["lifecycle"] != "armed":
             return []
         planner = self._require_participant(
@@ -2372,6 +2377,75 @@ class SprintWorkUnitStore:
         return self._dispatch_ready_locked(
             sprint_id,
             planner_participant_id=planner,
+        )
+
+    def _queue_delivery_terminal(self, sprint_id: int) -> None:
+        state = self.con.execute(
+            "SELECT s.lifecycle,COUNT(u.work_unit_id) AS total,"
+            "COALESCE(SUM(u.disposition='completed'),0) AS completed,"
+            "COALESCE(SUM(u.disposition='cancelled'),0) AS cancelled "
+            "FROM sprints s LEFT JOIN sprint_work_units u USING (sprint_id) "
+            "WHERE s.sprint_id=? GROUP BY s.lifecycle",
+            (sprint_id,),
+        ).fetchone()
+        if (
+            state is None
+            or state["lifecycle"] != "armed"
+            or not state["total"]
+            or state["total"] != state["completed"] + state["cancelled"]
+        ):
+            return
+        total = int(state["total"])
+        if self.con.execute(
+            "SELECT 1 FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='sprint.delivery_terminal' "
+            "AND json_extract(payload,'$.terminal_count')=?",
+            (sprint_id, total),
+        ).fetchone():
+            return
+        reviewers = self.con.execute(
+            "SELECT participant_id FROM sprint_participants "
+            "WHERE sprint_id=? AND role='reviewer' ORDER BY participant_id",
+            (sprint_id,),
+        ).fetchall()
+        base_key = f"sprint:{sprint_id}:delivery-terminal:{total}"
+        body = (
+            f"All planned delivery work for Sprint {sprint_id} is terminal "
+            f"({total} units: {int(state['completed'])} completed, "
+            f"{int(state['cancelled'])} cancelled). Begin whole-Sprint "
+            "conformance per sprint_rev — compile the evidence packet, judge "
+            "integrated main, then send the Planner either a re-enter decision "
+            "or your conclude decision."
+        )
+        from sprint_message_delivery import SprintMessageStore
+
+        messages = SprintMessageStore(self.con)
+        for reviewer in reviewers:
+            participant_id = int(reviewer["participant_id"])
+            key = (
+                base_key
+                if len(reviewers) == 1
+                else f"{base_key}:reviewer:{participant_id}"
+            )
+            messages.send_in_transaction(
+                sprint_id,
+                to_participant_id=participant_id,
+                message_kind="notification",
+                body=body,
+                actionable=False,
+                declared_type="new",
+                idempotency_key=key,
+            )
+        self._event(
+            sprint_id,
+            "sprint.delivery_terminal",
+            None,
+            {
+                "terminal_count": total,
+                "completed_count": int(state["completed"]),
+                "cancelled_count": int(state["cancelled"]),
+            },
+            actor_kind="system",
         )
 
     def _queue_planner_merge_bypass(
