@@ -659,7 +659,7 @@ class SprintLifecycleStore:
         if not error:
             raise ValueError("wake failure requires an error")
         error = error[:16384]
-        pause_receipt: PauseReceipt | None = None
+        pause_receipts: list[PauseReceipt] = []
         with db_driver.write_transaction(self.con, "sprint.wake_failure"):
             row = self.con.execute(
                 "SELECT wake_id,sprint_id,state,attempt_count,claim_owner "
@@ -700,20 +700,29 @@ class SprintLifecycleStore:
                     wake_id,
                 ),
             )
-            if terminal and row["sprint_id"] is not None:
-                sprint = self._sprint(int(row["sprint_id"]))
-                if sprint["lifecycle"] == "armed":
-                    pause_receipt = self._pause_in_transaction(
-                        sprint,
-                        LifecycleActor("system"),
-                        reason="wake_delivery_exhausted",
-                        detail={
-                            "wake_id": wake_id,
-                            "attempts": 3,
-                            "last_error": error,
-                        },
+            if terminal:
+                affected_sprints = self.con.execute(
+                    "SELECT DISTINCT s.* FROM sprint_wake_messages wm "
+                    "JOIN wake_message m USING (message_id) "
+                    "JOIN sprints s ON s.sprint_id=m.sprint_id "
+                    "WHERE wm.wake_id=? AND m.delivered_at IS NULL "
+                    "AND s.lifecycle='armed' ORDER BY s.sprint_id",
+                    (wake_id,),
+                ).fetchall()
+                for sprint in affected_sprints:
+                    pause_receipts.append(
+                        self._pause_in_transaction(
+                            sprint,
+                            LifecycleActor("system"),
+                            reason="wake_delivery_exhausted",
+                            detail={
+                                "wake_id": wake_id,
+                                "attempts": 3,
+                                "last_error": error,
+                            },
+                        )
                     )
-        if pause_receipt is not None:
+        for pause_receipt in pause_receipts:
             self._signal_interrupts_and_notifications(pause_receipt)
         return attempt
 
@@ -1044,13 +1053,18 @@ class SprintLifecycleStore:
         if not self.con.in_transaction:
             raise RuntimeError("wake reconciliation requires an active transaction")
         rows = self.con.execute(
-            "SELECT DISTINCT w.wake_id,w.participant_id,w.state,w.idempotency_key "
+            "SELECT w.wake_id,w.sprint_id AS wake_sprint_id,"
+            "m.to_participant_id AS participant_id,w.state,w.idempotency_key,"
+            "CASE WHEN COUNT(*)=COUNT(m.delivered_at) "
+            "THEN MIN(m.delivered_at) END AS delivered_at "
             "FROM sprint_wake_outbox w "
-            "JOIN sprint_wake_messages wm ON wm.sprint_id=w.sprint_id "
-            "AND wm.wake_id=w.wake_id JOIN wake_message m "
-            "ON m.sprint_id=wm.sprint_id AND m.message_id=wm.message_id "
-            "WHERE w.sprint_id=? AND w.state IN ('failed','delivered') "
+            "JOIN sprint_wake_messages wm ON wm.wake_id=w.wake_id "
+            "JOIN wake_message m ON m.message_id=wm.message_id "
+            "WHERE m.sprint_id=? AND wm.sprint_id=m.sprint_id "
+            "AND w.state IN ('failed','delivered') "
             "AND m.read_at IS NULL "
+            "GROUP BY w.wake_id,w.sprint_id,m.to_participant_id,"
+            "w.state,w.idempotency_key "
             "ORDER BY w.wake_id",
             (sprint_id,),
         ).fetchall()
@@ -1060,6 +1074,12 @@ class SprintLifecycleStore:
             participant_id = int(row["participant_id"])
             wake_key = str(row["idempotency_key"])
             turn = self._wake_turn_evidence(old_wake_id)
+            if (
+                row["delivered_at"] is not None
+                and row["wake_sprint_id"] != sprint_id
+                and turn["run_state"] == "succeeded"
+            ):
+                continue
             shell_busy = (
                 turn["run_state"] == "failed"
                 and turn["error_code"] == "SHELL_BUSY"

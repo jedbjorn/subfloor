@@ -545,15 +545,186 @@ class WakeDeliveryTest(SprintMessageCase):
         )
         self.assertEqual(paused.wake_id, armed.wake_id)
 
-        lease = delivery.SprintWakeDeliveryService(self.con).claim_next(
-            "cross-sprint-worker"
-        )
+        service = delivery.SprintWakeDeliveryService(self.con)
+        lease = service.claim_next("cross-sprint-worker")
 
         self.assertIsNotNone(lease)
         self.assertEqual(paused.wake_id, lease.wake_id)
+        self.assertEqual(armed_sprint_id, lease.sprint_id)
+        self.assertEqual(armed_planner_id, lease.participant_id)
+        self.assertEqual("planner", lease.participant_role)
         self.assertEqual((paused.message_id, armed.message_id), lease.message_ids)
+        self.assertTrue(
+            lease.prompt.startswith(delivery.wake_prompt(armed_sprint_id, "planner"))
+        )
         self.assertIn("paused sprint backlog", lease.prompt)
         self.assertIn("armed sprint work", lease.prompt)
+        conversation_id = service._resolve_conversation(lease)
+        self.assertEqual(
+            armed_planner_id,
+            self.con.execute(
+                "SELECT sprint_participant_id "
+                "FROM sprint_participant_conversations WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()[0],
+        )
+
+    def test_mixed_scope_terminal_failure_pauses_armed_message_sprint(self) -> None:
+        engine = self.messages.send_to_shell(
+            3,
+            message_kind="system",
+            body="engine notice before armed work",
+            idempotency_key="mixed-failure-engine",
+        )
+        sprint = self.messages.send(
+            self.sprint_id,
+            to_participant_id=self.planner_id,
+            message_kind="notification",
+            body="armed sprint work on engine wake",
+            idempotency_key="mixed-failure-sprint",
+        )
+        self.assertEqual(engine.wake_id, sprint.wake_id)
+
+        def fail(_conversation: str, _prompt: str, _key: str) -> str:
+            raise RuntimeError("broker unavailable")
+
+        service = delivery.SprintWakeDeliveryService(self.con)
+        for attempt in range(1, 4):
+            outcome = service.deliver_once(
+                f"mixed-failure-{attempt}",
+                fail,
+            )
+            self.assertIsNotNone(outcome)
+            self.assertEqual(attempt, outcome.attempt_number)
+
+        self.assertEqual(
+            ("paused", "failed", 3),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,w.state,w.attempt_count FROM sprints s "
+                    "JOIN wake_message m ON m.sprint_id=s.sprint_id "
+                    "JOIN sprint_wake_messages wm USING (message_id) "
+                    "JOIN sprint_wake_outbox w USING (wake_id) "
+                    "WHERE s.sprint_id=? AND m.message_id=?",
+                    (self.sprint_id, sprint.message_id),
+                ).fetchone()
+            ),
+        )
+        pending = self.con.execute(
+            "SELECT w.wake_id,m.body FROM sprint_wake_outbox w "
+            "JOIN sprint_wake_messages wm USING (wake_id) "
+            "JOIN wake_message m USING (message_id) "
+            "WHERE w.receiver_shell_id=3 AND w.state='pending'"
+        ).fetchall()
+        self.assertEqual(1, len(pending))
+        self.assertIn("wake_delivery_exhausted", pending[0]["body"])
+
+    def test_resume_does_not_redeliver_paused_ride_along_message(self) -> None:
+        paused = self.messages.send(
+            self.sprint_id,
+            to_participant_id=self.planner_id,
+            message_kind="notification",
+            body="paused ride-along body",
+            idempotency_key="paused-ride-along",
+        )
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='paused' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        feature_id = int(
+            self.con.execute(
+                "SELECT feature_id FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        armed_sprint_id = int(
+            self.con.execute(
+                "INSERT INTO sprints "
+                "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+                "VALUES (?,3,1)",
+                (feature_id,),
+            ).lastrowid
+        )
+        armed_planner_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness) VALUES (?,3,'planner','codex')",
+                (armed_sprint_id,),
+            ).lastrowid
+        )
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?",
+            (armed_sprint_id,),
+        )
+        self.con.commit()
+        armed = self.messages.send(
+            armed_sprint_id,
+            to_participant_id=armed_planner_id,
+            message_kind="notification",
+            body="armed delivery trigger",
+            idempotency_key="ride-along-trigger",
+        )
+        self.assertEqual(paused.wake_id, armed.wake_id)
+
+        def succeed(conversation: str, prompt: str, key: str) -> str:
+            message_id = int(
+                self.con.execute(
+                    "INSERT INTO conversation_messages "
+                    "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                    "idempotency_key,request_hash,state,completed_at) "
+                    "VALUES (?,'engine','test','prompt',?,?,?,'completed',"
+                    "datetime('now'))",
+                    (conversation, prompt, key, key),
+                ).lastrowid
+            )
+            run_id = int(
+                self.con.execute(
+                    "INSERT INTO conversation_runs "
+                    "(conversation_id,shell_id,trigger_message_id,state,"
+                    "lease_owner,lease_expires_at,started_at,ended_at,exit_code) "
+                    "VALUES (?,3,?,'succeeded','test','2999-01-01 00:00:00',"
+                    "datetime('now'),datetime('now'),0)",
+                    (conversation, message_id),
+                ).lastrowid
+            )
+            self.con.commit()
+            return f"conversation-run:{run_id}"
+
+        outcome = delivery.SprintWakeDeliveryService(self.con).deliver_once(
+            "ride-along-worker",
+            succeed,
+        )
+        self.assertEqual("delivered", outcome.state)
+        delivered_at = self.con.execute(
+            "SELECT delivered_at FROM wake_message WHERE message_id=?",
+            (paused.message_id,),
+        ).fetchone()[0]
+        self.assertIsNotNone(delivered_at)
+        self.lifecycle.pause(
+            armed_sprint_id,
+            sprint_domain.LifecycleActor("fnb"),
+            reason="resume the ride-along sprint",
+        )
+
+        receipt = self.lifecycle.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("fnb"),
+            reason="body already delivered",
+        )
+
+        self.assertEqual((), receipt.requeued_wake_ids)
+        self.assertEqual(
+            (delivered_at, paused.wake_id, "delivered"),
+            tuple(
+                self.con.execute(
+                    "SELECT m.delivered_at,wm.wake_id,w.state "
+                    "FROM wake_message m JOIN sprint_wake_messages wm "
+                    "USING (message_id) JOIN sprint_wake_outbox w USING (wake_id) "
+                    "WHERE m.message_id=?",
+                    (paused.message_id,),
+                ).fetchone()
+            ),
+        )
 
     def test_engine_new_rotates_idle_chat_and_delivers(self) -> None:
         sent = self.messages.send_to_shell(

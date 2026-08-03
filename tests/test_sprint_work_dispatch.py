@@ -727,6 +727,37 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             ),
         )
 
+    def test_engine_wake_delivery_pulses_without_an_armed_sprint(self) -> None:
+        sent = self.messages.send_to_shell(
+            1,
+            message_kind="system",
+            body="armed-independent engine notice",
+            idempotency_key="engine-pulse-without-armed-sprint",
+        )
+        delivered: list[tuple[str, str]] = []
+        runtime = sprint_runtime.SprintRuntimeService(
+            self.db_path,
+            owner="engine-only-runtime-test",
+            deliver=lambda conversation, prompt, _key: (
+                delivered.append((conversation, prompt)) or "engine-only-run"
+            ),
+        )
+
+        self.assertTrue(runtime.pulse_once())
+
+        self.assertEqual(1, len(delivered))
+        self.assertIn("armed-independent engine notice", delivered[0][1])
+        self.assertEqual(
+            ("delivered", 1),
+            tuple(
+                self.con.execute(
+                    "SELECT state,attempt_count FROM sprint_wake_outbox "
+                    "WHERE wake_id=?",
+                    (sent.wake_id,),
+                ).fetchone()
+            ),
+        )
+
     def test_server_startup_wires_broker_before_sprint_runtime(self) -> None:
         order: list[str] = []
         preparer = object()

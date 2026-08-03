@@ -708,10 +708,7 @@ class SprintWakeDeliveryService:
                 (now,),
             )
             row = self.con.execute(
-                "SELECT w.*,p.role "
-                "FROM sprint_wake_outbox w "
-                "LEFT JOIN sprint_participants p "
-                "ON p.sprint_id=w.sprint_id AND p.participant_id=w.participant_id "
+                "SELECT w.* FROM sprint_wake_outbox w "
                 "WHERE ((w.state='delivering' AND w.lease_expires_at<=?) "
                 "OR (w.state='pending' AND w.available_at<=?)) "
                 "AND EXISTS (SELECT 1 FROM sprint_wake_messages wm "
@@ -743,13 +740,61 @@ class SprintWakeDeliveryService:
                 return None
 
             messages = self.con.execute(
-                "SELECT message_id,sprint_id,declared_type,body "
-                "FROM wake_message WHERE receiver_shell_id=? "
-                "AND delivered_at IS NULL ORDER BY message_id",
+                "SELECT m.message_id,m.sprint_id,m.to_participant_id,"
+                "m.declared_type,m.body,s.lifecycle,p.role "
+                "FROM wake_message m LEFT JOIN sprints s "
+                "ON s.sprint_id=m.sprint_id LEFT JOIN sprint_participants p "
+                "ON p.sprint_id=m.sprint_id "
+                "AND p.participant_id=m.to_participant_id "
+                "WHERE m.receiver_shell_id=? AND m.delivered_at IS NULL "
+                "ORDER BY m.message_id",
                 (row["receiver_shell_id"],),
             ).fetchall()
             if not messages:
                 raise SprintInvariantError("claimed wake has no undelivered messages")
+            route = next(
+                (
+                    message
+                    for message in messages
+                    if message["sprint_id"] is not None
+                    and message["lifecycle"] == "armed"
+                ),
+                None,
+            )
+            if route is None:
+                route = next(
+                    (message for message in messages if message["sprint_id"] is None),
+                    None,
+                )
+            if route is None:
+                raise SprintInvariantError(
+                    "claimed wake has no message-scoped routing identity"
+                )
+            route_sprint_id = (
+                int(route["sprint_id"]) if route["sprint_id"] is not None else None
+            )
+            route_participant_id = (
+                int(route["to_participant_id"])
+                if route["to_participant_id"] is not None
+                else None
+            )
+            route_role = str(route["role"]) if route["role"] is not None else None
+            if route_sprint_id is not None and (
+                route_participant_id is None or route_role is None
+            ):
+                raise SprintInvariantError(
+                    "Sprint wake message has no participant routing identity"
+                )
+            self.con.execute(
+                "UPDATE sprint_wake_outbox SET sprint_id=?,participant_id=? "
+                "WHERE wake_id=? AND state='delivering' AND claim_owner=?",
+                (
+                    route_sprint_id,
+                    route_participant_id,
+                    row["wake_id"],
+                    owner,
+                ),
+            )
             message_ids = tuple(int(message["message_id"]) for message in messages)
             marks = ",".join("?" for _ in message_ids)
             self.con.execute(
@@ -767,30 +812,26 @@ class SprintWakeDeliveryService:
             )
             return WakeLease(
                 wake_id=int(row["wake_id"]),
-                sprint_id=(
-                    int(row["sprint_id"]) if row["sprint_id"] is not None else None
-                ),
-                participant_id=(
-                    int(row["participant_id"])
-                    if row["participant_id"] is not None
-                    else None
-                ),
-                participant_role=(str(row["role"]) if row["role"] else None),
+                sprint_id=route_sprint_id,
+                participant_id=route_participant_id,
+                participant_role=route_role,
                 receiver_shell_id=int(row["receiver_shell_id"]),
                 message_ids=message_ids,
                 declared_types=tuple(
                     str(message["declared_type"]) for message in messages
                 ),
-                prompt=self._delivery_prompt(row, messages),
+                prompt=self._delivery_prompt(route_sprint_id, route_role, messages),
                 idempotency_key=str(row["idempotency_key"]),
                 attempt_number=int(row["attempt_count"]) + 1,
                 claim_owner=owner,
             )
 
     @staticmethod
-    def _delivery_prompt(row: sqlite3.Row, messages: list[sqlite3.Row]) -> str:
-        sprint_id = row["sprint_id"]
-        role = row["role"]
+    def _delivery_prompt(
+        sprint_id: int | None,
+        role: str | None,
+        messages: list[sqlite3.Row],
+    ) -> str:
         if sprint_id is not None and role is not None:
             lead = wake_prompt(int(sprint_id), str(role))
         else:

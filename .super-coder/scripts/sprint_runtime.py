@@ -1,4 +1,4 @@
-"""Armed-only Sprint work dispatch and native wake-turn delivery."""
+"""Armed-only Sprint work dispatch plus engine-wide wake-turn delivery."""
 from __future__ import annotations
 
 import hashlib
@@ -19,8 +19,8 @@ from sprint_domain import (
     SprintLifecycleStore,
     SprintWorkUnitStore,
 )
-from sprint_message_delivery import SprintWakeDeliveryService
 from sprint_liveness import SprintLivenessMonitor
+from sprint_message_delivery import SprintWakeDeliveryService
 
 DEFAULT_PULSE_SECONDS = 5.0
 
@@ -185,14 +185,14 @@ class SprintRuntimeService(threading.Thread):
         con = db_driver.connect(self.db_path)
         try:
             switch = self._switch(con)
-            return switch.recover_on_startup() if startup else switch.tick()
+            serviced = switch.recover_on_startup() if startup else switch.tick()
+            return self._deliver_wakes(con) or serviced
         finally:
             con.close()
 
     def _switch(self, con: sqlite3.Connection) -> ArmedServiceSwitch:
         lifecycle = SprintLifecycleStore(con)
         units = SprintWorkUnitStore(con)
-        wakes = SprintWakeDeliveryService(con)
         liveness = SprintLivenessMonitor(con)
 
         def recover_pickup(sprint_id: int, trigger: str) -> None:
@@ -201,19 +201,25 @@ class SprintRuntimeService(threading.Thread):
         def dispatch(sprint_id: int, _trigger: str) -> None:
             units.dispatch_ready(sprint_id)
 
-        def deliver(_sprint_id: int, _trigger: str) -> None:
-            while not self._stop_event.is_set():
-                outcome = wakes.deliver_once(self.owner, self.deliver)
-                if outcome is None or outcome.state != "delivered":
-                    return
-
         def evaluate_liveness(sprint_id: int, _trigger: str) -> None:
             liveness.evaluate(sprint_id)
 
         return ArmedServiceSwitch(
             lifecycle,
-            (recover_pickup, dispatch, evaluate_liveness, deliver),
+            (recover_pickup, dispatch, evaluate_liveness),
         )
+
+    def _deliver_wakes(self, con: sqlite3.Connection) -> bool:
+        wakes = SprintWakeDeliveryService(con)
+        delivered = False
+        while not self._stop_event.is_set():
+            outcome = wakes.deliver_once(self.owner, self.deliver)
+            if outcome is None:
+                return delivered
+            if outcome.state != "delivered":
+                return True
+            delivered = True
+        return delivered
 
     def run(self) -> None:  # pragma: no cover - loop tested through pulse_once
         con = db_driver.connect(self.db_path)
@@ -221,12 +227,14 @@ class SprintRuntimeService(threading.Thread):
             switch = self._switch(con)
             try:
                 switch.recover_on_startup()
+                self._deliver_wakes(con)
             except Exception as exc:  # noqa: BLE001 - service faults stay visible
                 print(f"sprint-runtime: startup error ({exc})", flush=True)
             self._started_once.set()
             while not self._stop_event.wait(self.pulse_seconds):
                 try:
                     switch.tick()
+                    self._deliver_wakes(con)
                 except Exception as exc:  # noqa: BLE001 - keep inspection alive
                     print(f"sprint-runtime: pulse error ({exc})", flush=True)
         finally:
