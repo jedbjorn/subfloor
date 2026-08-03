@@ -13,6 +13,7 @@ import sqlite3
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
+import active_chat_registry
 import conversation_broker
 import conversation_events
 import db_driver
@@ -32,6 +33,7 @@ EDITING_UNIT_DISPOSITIONS = frozenset(
 WORK_UNIT_OUTPUT_KINDS = frozenset({"code", "report_only", "no_code"})
 WAKE_CONTENTION_BACKOFF_SECONDS = (15, 60, 180, 300)
 WAKE_CONTENTION_ATTEMPTS = 5
+WAKE_DELIVERY_BACKOFF_SECONDS = (15, 60, 180)
 
 
 def _participant_shell_id(con: sqlite3.Connection, participant_id: int) -> int:
@@ -660,9 +662,11 @@ class SprintLifecycleStore:
             raise ValueError("wake failure requires an error")
         error = error[:16384]
         pause_receipts: list[PauseReceipt] = []
+        closed_conversation_ids: list[str] = []
         with db_driver.write_transaction(self.con, "sprint.wake_failure"):
             row = self.con.execute(
-                "SELECT wake_id,sprint_id,state,attempt_count,claim_owner "
+                "SELECT wake_id,sprint_id,receiver_shell_id,state,attempt_count,"
+                "claim_owner "
                 "FROM sprint_wake_outbox WHERE wake_id=?",
                 (wake_id,),
             ).fetchone()
@@ -687,20 +691,46 @@ class SprintLifecycleStore:
                 (wake_id, attempt, target_conversation_id, error),
             )
             terminal = attempt == 3
+            backoff_seconds = WAKE_DELIVERY_BACKOFF_SECONDS[attempt - 1]
             self.con.execute(
                 "UPDATE sprint_wake_outbox SET attempt_count=?,state=?,"
                 "last_error=?,failed_at=CASE WHEN ? THEN datetime('now') "
                 "ELSE NULL END,claim_owner=NULL,claimed_at=NULL,"
-                "lease_expires_at=NULL WHERE wake_id=?",
+                "lease_expires_at=NULL,available_at=datetime('now', ?) "
+                "WHERE wake_id=?",
                 (
                     attempt,
                     "failed" if terminal else "pending",
                     error,
                     1 if terminal else 0,
+                    f"+{backoff_seconds} seconds",
                     wake_id,
                 ),
             )
             if terminal:
+                active = active_chat_registry.get(
+                    self.con, int(row["receiver_shell_id"])
+                )
+                closed = None
+                if active is not None and (
+                    target_conversation_id is None
+                    or active.chat_id == target_conversation_id
+                ):
+                    closed = active_chat_registry.close_for_inactivity(
+                        self.con, int(row["receiver_shell_id"])
+                    )
+                if closed is not None:
+                    sprint_participant_chats._append_event(
+                        self.con,
+                        closed.chat_id,
+                        "conversation.closed",
+                        {
+                            "reason": "wake delivery exhausted",
+                            "state": "closed",
+                            "wake_id": wake_id,
+                        },
+                    )
+                    closed_conversation_ids.append(closed.chat_id)
                 affected_sprints = self.con.execute(
                     "SELECT DISTINCT s.* FROM sprint_wake_messages wm "
                     "JOIN wake_message m USING (message_id) "
@@ -724,6 +754,8 @@ class SprintLifecycleStore:
                     )
         for pause_receipt in pause_receipts:
             self._signal_interrupts_and_notifications(pause_receipt)
+        for conversation_id in closed_conversation_ids:
+            conversation_events.notify(conversation_id)
         return attempt
 
     def recover_on_startup(

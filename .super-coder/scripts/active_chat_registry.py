@@ -136,6 +136,47 @@ def close_for_wake(con, shell_id: int) -> ActiveChat | None:
     return close_active(con, shell_id)
 
 
+def close_for_inactivity(con, shell_id: int) -> ActiveChat | None:
+    """Close and unlink a chat after the mechanical inactivity ceiling.
+
+    Unlike wake-driven rotation, the ceiling exists specifically to displace a
+    live but silent turn.  Its process identity remains on the run row so the
+    reaper can terminate the newly unprotected process group.
+    """
+    active = get(con, shell_id)
+    if active is None:
+        return None
+    if active.state in {"queued", "running"}:
+        message_ids = [
+            int(row[0])
+            for row in con.execute(
+                "SELECT message_id FROM conversation_outbox "
+                "WHERE conversation_id=? AND state IN ('pending','claimed')",
+                (active.chat_id,),
+            )
+        ]
+        if message_ids:
+            marks = ",".join("?" for _ in message_ids)
+            con.execute(
+                "UPDATE conversation_messages SET state='cancelled',"
+                "completed_at=datetime('now') WHERE message_id IN (" + marks + ")",
+                message_ids,
+            )
+            con.execute(
+                "UPDATE conversation_outbox SET state='cancelled',claim_owner=NULL,"
+                "claimed_at=NULL,lease_expires_at=NULL "
+                "WHERE message_id IN (" + marks + ")",
+                message_ids,
+            )
+        target = "idle" if active.state == "queued" else "error"
+        con.execute(
+            "UPDATE conversations SET state=?,last_activity_at=datetime('now'),"
+            "version=version+1 WHERE conversation_id=? AND state=?",
+            (target, active.chat_id, active.state),
+        )
+    return close_active(con, shell_id)
+
+
 def register(con, shell_id: int, chat_id: str) -> None:
     con.execute(
         "INSERT INTO active_shell_chats (shell_id,chat_id) VALUES (?,?)",

@@ -596,6 +596,12 @@ class WakeDeliveryTest(SprintMessageCase):
             )
             self.assertIsNotNone(outcome)
             self.assertEqual(attempt, outcome.attempt_number)
+            self.con.execute(
+                "UPDATE sprint_wake_outbox SET available_at=datetime('now') "
+                "WHERE wake_id=? AND state='pending'",
+                (engine.wake_id,),
+            )
+            self.con.commit()
 
         self.assertEqual(
             ("paused", "failed", 3),
@@ -830,13 +836,20 @@ class WakeDeliveryTest(SprintMessageCase):
         )
         service = delivery.SprintWakeDeliveryService(self.con)
 
-        outcomes = [
-            service.deliver_once(
-                f"engine-failure-{attempt}",
-                lambda *_args: (_ for _ in ()).throw(RuntimeError("offline")),
+        outcomes = []
+        for attempt in range(1, 4):
+            outcomes.append(
+                service.deliver_once(
+                    f"engine-failure-{attempt}",
+                    lambda *_args: (_ for _ in ()).throw(RuntimeError("offline")),
+                )
             )
-            for attempt in range(1, 4)
-        ]
+            self.con.execute(
+                "UPDATE sprint_wake_outbox SET available_at=datetime('now') "
+                "WHERE wake_id=? AND state='pending'",
+                (sent.wake_id,),
+            )
+            self.con.commit()
 
         self.assertEqual(
             [
@@ -1168,15 +1181,22 @@ class WakeDeliveryTest(SprintMessageCase):
         sent = self.send("always-fails")
         service = delivery.SprintWakeDeliveryService(self.con)
 
-        outcomes = [
-            service.deliver_once(
-                "worker-a",
-                lambda _conversation, _prompt, _key: (_ for _ in ()).throw(
-                    RuntimeError("provider unavailable")
-                ),
+        outcomes = []
+        for _ in range(3):
+            outcomes.append(
+                service.deliver_once(
+                    "worker-a",
+                    lambda _conversation, _prompt, _key: (_ for _ in ()).throw(
+                        RuntimeError("provider unavailable")
+                    ),
+                )
             )
-            for _ in range(3)
-        ]
+            self.con.execute(
+                "UPDATE sprint_wake_outbox SET available_at=datetime('now') "
+                "WHERE wake_id=? AND state='pending'",
+                (sent.wake_id,),
+            )
+            self.con.commit()
 
         self.assertEqual(
             [(1, "pending"), (2, "pending"), (3, "failed")],
