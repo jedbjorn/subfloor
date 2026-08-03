@@ -68,7 +68,8 @@
     ".super-coder/migrations/0163_conversation_run_process_identity.sql",
     ".super-coder/migrations/0164_wake_message_delivery.sql",
     ".super-coder/migrations/0165_pr_subscriptions.sql",
-    ".super-coder/migrations/0166_sprint_coordinate_mode.sql"
+    ".super-coder/migrations/0166_sprint_coordinate_mode.sql",
+    ".super-coder/migrations/0167_reseed_sprint_authority_split.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
