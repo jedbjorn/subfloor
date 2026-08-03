@@ -319,6 +319,12 @@ class SprintLifecycleStore:
                 outcome=terminal_outcome,
             )
             if target == "completed":
+                self._clear_coordinate_mode(
+                    sprint_id,
+                    actor,
+                    reason="Sprint closed by FnB",
+                )
+            if target == "completed":
                 cleanup_run_ids, cleanup_conversations = (
                     sprint_participant_chats.close_for_terminal_lifecycle(
                         self.con,
@@ -352,7 +358,12 @@ class SprintLifecycleStore:
             sprint = self._sprint(sprint_id)
             current = str(sprint["lifecycle"])
             if current == "paused":
-                return PauseReceipt(False, None, (), ())
+                cleared = self._clear_coordinate_mode(
+                    sprint_id,
+                    actor,
+                    reason="Sprint pause confirmed by FnB",
+                )
+                return PauseReceipt(cleared, None, (), ())
             self._require_edge(current, "paused")
             self._authorize(sprint, "paused", actor)
             receipt = self._pause_in_transaction(
@@ -360,6 +371,11 @@ class SprintLifecycleStore:
                 actor,
                 reason=reason,
                 detail=detail or {},
+            )
+            self._clear_coordinate_mode(
+                sprint_id,
+                actor,
+                reason="Sprint paused by FnB",
             )
         self._signal_interrupts_and_notifications(receipt)
         return receipt
@@ -586,6 +602,11 @@ class SprintLifecycleStore:
                 current=current,
                 target="aborted",
                 outcome=outcome,
+            )
+            self._clear_coordinate_mode(
+                sprint_id,
+                actor,
+                reason="Sprint cancelled by FnB",
             )
             report_id = int(
                 self.con.execute(
@@ -1827,6 +1848,30 @@ class SprintLifecycleStore:
         )
         if result.rowcount != 1:
             raise SprintStateError("Sprint lifecycle changed concurrently")
+
+    def _clear_coordinate_mode(
+        self,
+        sprint_id: int,
+        actor: LifecycleActor,
+        *,
+        reason: str,
+    ) -> bool:
+        """Clear an operator-selected mode only for an FnB lifecycle action."""
+        if actor.kind != "fnb":
+            return False
+        changed = self.con.execute(
+            "UPDATE sprints SET coordinate_mode=0,updated_at=datetime('now'),"
+            "version=version+1 WHERE sprint_id=? AND coordinate_mode=1",
+            (sprint_id,),
+        ).rowcount
+        if changed:
+            self._event(
+                sprint_id,
+                "coordinate_mode.cleared",
+                actor,
+                {"reason": reason},
+            )
+        return bool(changed)
 
     def _event(
         self,

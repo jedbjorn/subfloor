@@ -195,11 +195,11 @@ class DispatchGateTest(SprintWorkDispatchCase):
             "one Reviewer may cover parallel units without consuming a lane",
         )
         self.assertEqual(
-            [early_wave, late_wave],
+            [(early_wave, "new"), (late_wave, "new")],
             [
-                row[0]
+                tuple(row)
                 for row in self.con.execute(
-                    "SELECT work_unit_id FROM wake_message "
+                    "SELECT work_unit_id,declared_type FROM wake_message "
                     "WHERE message_kind='work_assignment' ORDER BY message_id"
                 )
             ],

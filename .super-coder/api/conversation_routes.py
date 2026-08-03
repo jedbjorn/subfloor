@@ -586,7 +586,46 @@ def _cancel_queued_turns(con, conversation_id: str) -> int:
     return int(cancelled)
 
 
-def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
+def _enable_planner_coordinate_mode(
+    con,
+    *,
+    shell_id: int,
+    conversation_id: str,
+) -> int | None:
+    sprint = con.execute(
+        "SELECT sprint_id FROM sprints WHERE lifecycle='armed' "
+        "AND originating_planner_shell_id=? AND coordinate_mode=0",
+        (shell_id,),
+    ).fetchone()
+    if sprint is None:
+        return None
+    sprint_id = int(sprint["sprint_id"])
+    changed = con.execute(
+        "UPDATE sprints SET coordinate_mode=1,updated_at=datetime('now'),"
+        "version=version+1 WHERE sprint_id=? AND lifecycle='armed' "
+        "AND coordinate_mode=0",
+        (sprint_id,),
+    ).rowcount
+    if changed != 1:
+        return None
+    con.execute(
+        "INSERT INTO sprint_events "
+        "(sprint_id,event_type,actor_kind,payload) VALUES "
+        "(?,'coordinate_mode.enabled','fnb',?)",
+        (
+            sprint_id,
+            json.dumps(
+                {"conversation_id": conversation_id, "reason": "Planner chat closed"},
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        ),
+    )
+    return sprint_id
+
+
+def _begin_close(con, conversation_id: str, current_state: str) -> None:
+    """Unconditionally close and unlink a chat selected by the FnB."""
     active = con.execute(
         "SELECT run_id,trigger_message_id FROM conversation_runs "
         "WHERE conversation_id=? AND state IN ('leased','starting','running') "
@@ -604,26 +643,6 @@ def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
                 {"cancelled_queued_turns": cancelled},
                 run_id=run_id,
             )
-        interrupt_exists = con.execute(
-            "SELECT 1 FROM conversation_events WHERE run_id=? "
-            "AND event_type='run.interrupt.requested' LIMIT 1",
-            (run_id,),
-        ).fetchone()
-        if interrupt_exists is None:
-            _append_event(
-                con,
-                conversation_id,
-                "run.interrupt.requested",
-                {"reason": "conversation.close"},
-                message_id=int(active["trigger_message_id"]),
-                run_id=run_id,
-            )
-        con.execute(
-            "UPDATE conversations SET last_activity_at=datetime('now'),"
-            "version=version+1 WHERE conversation_id=?",
-            (conversation_id,),
-        )
-        return run_id
 
     recovered_state = None
     if current_state == "queued":
@@ -632,7 +651,8 @@ def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
             (conversation_id,),
         )
     elif current_state == "running":
-        recovered_state = current_state
+        if active is None:
+            recovered_state = current_state
         con.execute(
             "UPDATE conversations SET state='error' WHERE conversation_id=?",
             (conversation_id,),
@@ -641,6 +661,10 @@ def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
         "UPDATE conversations SET state='closed',closed_at=datetime('now'),"
         "last_activity_at=datetime('now'),version=version+1 "
         "WHERE conversation_id=?",
+        (conversation_id,),
+    )
+    con.execute(
+        "DELETE FROM active_shell_chats WHERE chat_id=?",
         (conversation_id,),
     )
     _append_event(
@@ -655,9 +679,14 @@ def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
                 if recovered_state
                 else {}
             ),
+            **(
+                {"displaced_run_id": int(active["run_id"])}
+                if active is not None
+                else {}
+            ),
         },
+        run_id=int(active["run_id"]) if active is not None else None,
     )
-    return None
 
 
 def _deliver_close_interrupt(run_id: int) -> None:
@@ -1097,12 +1126,6 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
                 {"expected": int(row["version"]), "received": version},
             )
         closing = body.get("state") == "closed"
-        if closing and row["conversation_scope"] == "sprint":
-            raise ApiError(
-                409,
-                "SPRINT_CONVERSATION_MANAGED",
-                "Sprint conversations close only with Sprint lifecycle cleanup",
-            )
         if row["state"] == "closed" and {"title", "state"}.intersection(body):
             raise ApiError(
                 409,
@@ -1137,7 +1160,12 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
                         ),
                     },
                 )
-            active_run_id = _begin_close(con, conversation_id, row["state"])
+            _begin_close(con, conversation_id, row["state"])
+            _enable_planner_coordinate_mode(
+                con,
+                shell_id=int(row["shell_id"]),
+                conversation_id=conversation_id,
+            )
         else:
             sets.insert(0, "version=version+1")
             if "title" in body:
