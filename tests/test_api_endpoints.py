@@ -164,6 +164,39 @@ class AssemblerSmokeTest(unittest.TestCase):
         self.assertEqual(2, by_id[target]["unread_message_count"])
         self.assertEqual(0, by_id[sender]["unread_message_count"])
 
+    def test_get_shells_projects_only_future_pending_wake_availability(self) -> None:
+        target = self.ids["shell_id"]
+        other = self.ids["bespoke_shell_id"]
+        future_wake = self.con.execute(
+            "INSERT INTO sprint_wake_outbox "
+            "(receiver_shell_id,idempotency_key,available_at) "
+            "VALUES (?,?,'2099-07-31 12:00:15')",
+            (target, "future-pending-wake"),
+        ).lastrowid
+        self.con.execute(
+            "INSERT INTO sprint_wake_outbox "
+            "(receiver_shell_id,idempotency_key,available_at) "
+            "VALUES (?,?,'2000-07-31 12:00:15')",
+            (other, "past-pending-wake"),
+        )
+        self.con.commit()
+
+        by_id = {row["shell_id"]: row for row in server.get_shells(self.con)}
+        self.assertEqual(
+            "2099-07-31 12:00:15",
+            by_id[target]["pending_wake_available_at"],
+        )
+        self.assertIsNone(by_id[other]["pending_wake_available_at"])
+
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET state='delivered',"
+            "delivered_at=datetime('now') WHERE wake_id=?",
+            (future_wake,),
+        )
+        self.con.commit()
+        by_id = {row["shell_id"]: row for row in server.get_shells(self.con)}
+        self.assertIsNone(by_id[target]["pending_wake_available_at"])
+
     def test_get_shells_projects_only_live_current_sprint_conversation(self) -> None:
         shell_id = self.ids["shell_id"]
         self.con.execute(

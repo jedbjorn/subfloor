@@ -33,6 +33,11 @@ def apply_schema(con: sqlite3.Connection) -> None:
 
 class SprintWorkDispatchCase(unittest.TestCase):
     def setUp(self) -> None:
+        delay_env = mock.patch.dict(
+            "os.environ", {"SC_WAKE_NEW_DELAY_SECONDS": "0"}
+        )
+        delay_env.start()
+        self.addCleanup(delay_env.stop)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.db_path = Path(self.temp_dir.name) / "sprint.db"

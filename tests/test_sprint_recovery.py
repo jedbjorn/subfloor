@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".super-coder" / "scripts"
@@ -1561,6 +1562,14 @@ class ClosedReviewRecoveryTest(SprintReviewLoopCase):
 
 
 class LifecycleExitAndRestartTest(SprintDomainCase):
+    def setUp(self) -> None:
+        delay_env = mock.patch.dict(
+            "os.environ", {"SC_WAKE_NEW_DELAY_SECONDS": "0"}
+        )
+        delay_env.start()
+        self.addCleanup(delay_env.stop)
+        super().setUp()
+
     def coordinator(self) -> sprint_recovery.SprintRecoveryCoordinator:
         def no_reader(_repository: str):
             raise AssertionError("non-armed restart performed GitHub egress")

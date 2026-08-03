@@ -122,11 +122,15 @@ registered PR.
 
 ## Review handoff
 
-Put the readiness claim in a file, then use one stable retry key:
+Complete a review handoff in this exact order:
 
-Keep the readiness claim at about 6,000 characters or fewer; 8,000 is the hard
-maximum. Run `wc -m < <path>` and condense before the typed handoff. The handoff
-exists only after the command succeeds and confirms its durable write and wake.
+1. Finish the readiness claim and every local verification step.
+2. Re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and
+   mark every handled informational message read with `accept`.
+3. Run `wc -m < <path>`; keep the claim near 6,000 characters and below the
+   8,000-character hard maximum.
+4. As the literal final action of the turn, send the typed handoff with one
+   stable retry key:
 
 ```text
 sc sprint request-review \
@@ -134,8 +138,10 @@ sc sprint request-review \
   --readiness-file <path> --key <stable-key>
 ```
 
-The assigned Reviewer receives an actionable request. After `request-review`
-succeeds, stop and await the native verdict wake. A changes-requested verdict
+5. When the command confirms the durable write and Reviewer wake, immediately
+   stop and await the native verdict wake. Run no trailing command.
+
+A changes-requested verdict
 returns as Re-enter to your registry chat. Apply every blocking finding,
 re-establish green, and hand back with a new stable review key. Record
 disagreements as judgment; the Reviewer owns scope/severity decisions and the
@@ -154,8 +160,30 @@ sc sprint authorize-merge \
 
 Merge only the exact repository, PR number, and head SHA returned. If the
 command refuses, do not work around it; wait for the watcher or return to the
-appropriate loop. After merge, clean the worktree, submit the unit result and
-judgments, and let automatic merge observation advance dependencies.
+appropriate loop.
+
+## Post-merge handoff
+
+After the exact authorized merge succeeds, complete close-out in this order:
+
+1. Clean the worktree and collect the merged PR identity, merge SHA, unit
+   result, verification evidence, and judgments in the handoff body file.
+2. Re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and
+   mark every handled informational message read with `accept`.
+3. Run `wc -m < <path>`; keep the report near 6,000 characters and below the
+   8,000-character hard maximum.
+4. As the literal final action of the turn, send the merged-work handoff to the
+   Planner:
+
+```text
+sc sprint send --sprint <id> --to <planner-shortname> --body-file <path> \
+  --key <stable-merged-handoff-key>
+```
+
+5. When the command confirms the durable write and Planner wake, stop
+   immediately. Run no trailing Git, Sprint, inbox, cleanup, or status command.
+   Automatic merge observation records the durable PR transition; the Planner
+   uses this handoff wake to release the next wave.
 
 ## Report and stop
 
@@ -166,7 +194,7 @@ the Reviewer decides whether to continue, re-plan, or pause and the Planner
 executes that decision.
 
 Stop when the unit is merged and reported, declined, awaiting Planner/FnB
-recovery, or returned to review. Before stopping, re-run `sc sprint inbox
---sprint <id>`, act on newly arrived messages, mark every handled informational
-message read with `accept`, and confirm the final typed handoff succeeded. Ask
-the Planner for later work only after the current editing lane is terminal.
+recovery, or returned to review. For normal review and merge handoffs, the
+ordered procedures above place inbox handling before the typed handoff and make
+that handoff the turn's last action. Ask the Planner for later work only after
+the current editing lane is terminal.
