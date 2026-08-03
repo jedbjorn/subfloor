@@ -156,17 +156,25 @@ Findings must state:
 - a reproducible consequence; and
 - the fix boundary, without prescribing unnecessary architecture.
 
-Put the verdict body in a file and record it through the authenticated surface:
+Complete a unit verdict in this exact order:
 
-Keep the verdict at about 6,000 characters or fewer; 8,000 is the hard maximum.
-Run `wc -m < <path>` before submission. The typed review handoff exists only
-after the command succeeds and confirms its durable write and Developer wake.
+1. Finish the review, findings, and verdict body; no inspection remains after
+   this step.
+2. Re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and
+   mark every handled informational message read with `accept`.
+3. Run `wc -m < <path>`; keep the verdict near 6,000 characters and below the
+   8,000-character hard maximum.
+4. As the literal final action of the turn, record the typed verdict through
+   the authenticated surface:
 
 ```text
 sc sprint record-review \
   --sprint <id> --registered-pr <registered-id> \
   --verdict changes_requested --body-file <path> --key <stable-key>
 ```
+
+5. When the command confirms the durable write and Developer wake, stop
+   immediately. Run no trailing command.
 
 Use `approved` only when no Critical/Major/Medium finding remains. The engine
 checks that the request was accepted and still binds to the reviewed head,
@@ -247,11 +255,24 @@ pause, re-plan, cancel, or abort decision instead.
 
 ## Stop
 
-For either mode, re-run `sc sprint inbox --sprint <id>` and act on newly arrived
-messages before stopping. For unit review, stop after the durable verdict is
-recorded and every handled informational message is marked read with `accept`.
-For conformance, also require the report and all findings to replay
-idempotently, then require successful delivery of the Reviewer-authored Sprint
-report and conclude decision to the Planner. The conformance receipt plus the
-durable decision handoff completes Reviewer work; stop until another native
-wake arrives.
+For unit review, follow the ordered verdict procedure above: inbox handling and
+all evidence work precede `record-review`; the durable verdict is the literal
+last action, then the Reviewer stops.
+
+For conformance, require the report and findings to replay idempotently, then
+complete this final handoff order:
+
+1. Re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and
+   mark every handled informational message read with `accept`.
+2. Confirm the Reviewer-authored Sprint report and conclude decision body are
+   final and below the 8,000-character hard maximum.
+3. As the literal final action of the turn, deliver that decision to the
+   Planner:
+
+```text
+sc sprint send --sprint <id> --to <planner-shortname> --body-file <path> \
+  --key <stable-conclude-handoff-key>
+```
+
+4. When the command confirms the durable write and Planner wake, stop
+   immediately. Run no trailing command until another native wake arrives.

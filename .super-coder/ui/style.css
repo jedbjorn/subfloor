@@ -188,8 +188,12 @@ body.interface-view main {
   gap: .25rem; margin-bottom: .18rem;
 }
 .chat-shell-row.has-mail .chat-shell { padding-right: 2.2rem; }
+.chat-shell-row.has-wake .chat-shell { padding-right: 2.2rem; }
+.chat-shell-row.has-mail.has-wake .chat-shell { padding-right: 3.85rem; }
 .chat-shell-row.has-assignment .chat-shell { padding-right: 4.35rem; }
 .chat-shell-row.has-mail.has-assignment .chat-shell { padding-right: 6rem; }
+.chat-shell-row.has-wake.has-assignment .chat-shell { padding-right: 6rem; }
+.chat-shell-row.has-mail.has-wake.has-assignment .chat-shell { padding-right: 7.65rem; }
 .chat-shell-identity {
   min-width: 0; width: 100%; display: flex; align-items: center; gap: .35rem;
 }
@@ -225,6 +229,9 @@ body.interface-view main {
 .chat-shell-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .chat-shell-mail {
   color: var(--accent); flex: none; font: .8rem/1 ui-sans-serif, sans-serif;
+}
+.chat-shell-wake {
+  color: #ef545f; flex: none; font: 1rem/1 ui-sans-serif, sans-serif;
 }
 .chat-shell-shortname {
   color: rgba(255,255,255,.46); font: .68rem ui-monospace, monospace;
@@ -757,8 +764,13 @@ body.interface-view main {
   .chat-history { display: none; }
   .chat-shell { justify-content: center; }
   .chat-shell-row.has-mail .chat-shell,
+  .chat-shell-row.has-wake .chat-shell,
   .chat-shell-row.has-assignment .chat-shell,
-  .chat-shell-row.has-mail.has-assignment .chat-shell { padding-right: .55rem; }
+  .chat-shell-row.has-mail.has-assignment .chat-shell,
+  .chat-shell-row.has-wake.has-assignment .chat-shell,
+  .chat-shell-row.has-mail.has-wake.has-assignment .chat-shell {
+    padding-right: .55rem;
+  }
   .chat-shell-status {
     grid-column: 1; grid-row: 2; justify-self: center; margin-right: 0;
   }

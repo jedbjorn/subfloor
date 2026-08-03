@@ -210,12 +210,32 @@ FnB override; it is terminal and deletes nothing.
 
 ## Handoffs and stop
 
-Assign ready work through the durable dispatcher. Planner → Developer
-assignments are declared New; Developer → Reviewer review requests are declared
-New; Developer/Reviewer → Planner results are Re-enter. These are idle-time
-guarantees under the live-turn boundary rule, not a parent/child chat topology.
-The Planner receives no PR-event wakes; Developer-owned subscriptions carry
-red, green, and externally closed facts directly to the owning Developer.
+Planner → Developer assignments are declared New; Developer → Reviewer review
+requests are declared New; Developer/Reviewer → Planner results are Re-enter.
+These are idle-time guarantees under the live-turn boundary rule, not a
+parent/child chat topology. The Planner receives no PR-event wakes;
+Developer-owned subscriptions carry red, green, and externally closed facts
+directly to the owning Developer.
+
+Never dispatch the next wave from a merge-observation turn. The Developer's
+merged-work handoff wake is the only normal next-wave dispatch trigger. On that
+wake, complete the turn in this exact order:
+
+1. Run `sc sprint inbox --sprint <id>` and inspect the durable merged-work
+   handoff plus current work-unit and dependency state.
+2. Act on every earlier informational item and mark each handled item read with
+   `accept`, including the Developer handoff.
+3. Finish all reconciliation, judgment recording, and other Planner
+   bookkeeping. No work remains after this step.
+4. As the literal final action of the turn, release dependency-ready lanes:
+
+```text
+sc sprint dispatch --sprint <id>
+```
+
+5. When the command confirms the durable assignment writes and New wakes, stop
+   immediately. Run no trailing command. Empty dispatch is still the final
+   action for that handoff turn; investigate only on a later durable wake.
 
 When all planned delivery work is terminal and merged or explicitly no-code,
 send the Reviewer the bound revisions, integrated main SHA, ratified judgments,

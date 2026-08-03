@@ -31,6 +31,11 @@ def apply_schema(con: sqlite3.Connection) -> None:
 
 class SprintMessageCase(unittest.TestCase):
     def setUp(self) -> None:
+        delay_env = mock.patch.dict(
+            os.environ, {"SC_WAKE_NEW_DELAY_SECONDS": "0"}
+        )
+        delay_env.start()
+        self.addCleanup(delay_env.stop)
         self.con = sqlite3.connect(":memory:")
         self.addCleanup(self.con.close)
         self.con.row_factory = sqlite3.Row
@@ -396,6 +401,159 @@ class AcceptanceAndDeclineTest(SprintMessageCase):
                 "SELECT COUNT(*) FROM sprint_wake_messages WHERE message_id=?",
                 (result_id,),
             ).fetchone()[0],
+        )
+
+
+class WakeDelayTest(SprintMessageCase):
+    def test_declared_new_uses_constructor_time_env_delay_and_claim_boundary(
+        self,
+    ) -> None:
+        clock = [datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc)]
+        with mock.patch.dict(os.environ, {"SC_WAKE_NEW_DELAY_SECONDS": "15"}):
+            messages = delivery.SprintMessageStore(
+                self.con,
+                now=lambda: clock[0],
+            )
+
+        sent = messages.send(
+            self.sprint_id,
+            to_participant_id=self.developer_id,
+            from_participant_id=self.planner_id,
+            work_unit_id=self.unit_id,
+            message_kind="notification",
+            body="delayed new wake",
+            declared_type="new",
+            idempotency_key="delayed-new",
+        )
+
+        row = self.con.execute(
+            "SELECT created_at,available_at FROM sprint_wake_outbox WHERE wake_id=?",
+            (sent.wake_id,),
+        ).fetchone()
+        self.assertEqual("2099-07-31 12:00:15", row["available_at"])
+        self.assertNotEqual(row["created_at"], row["available_at"])
+        service = delivery.SprintWakeDeliveryService(
+            self.con,
+            now=lambda: clock[0],
+        )
+        self.assertIsNone(service.claim_next("before-new-delay"))
+        clock[0] += timedelta(seconds=15)
+        lease = service.claim_next("at-new-delay")
+        self.assertIsNotNone(lease)
+        self.assertEqual(sent.wake_id, lease.wake_id)
+
+    def test_reenter_wake_keeps_immediate_database_availability(self) -> None:
+        messages = delivery.SprintMessageStore(
+            self.con,
+            now=lambda: datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc),
+            new_wake_delay_seconds=15,
+        )
+
+        sent = messages.send(
+            self.sprint_id,
+            to_participant_id=self.developer_id,
+            from_participant_id=self.planner_id,
+            work_unit_id=self.unit_id,
+            message_kind="notification",
+            body="immediate reenter wake",
+            declared_type="re-enter",
+            idempotency_key="immediate-reenter",
+        )
+
+        row = self.con.execute(
+            "SELECT created_at,available_at FROM sprint_wake_outbox WHERE wake_id=?",
+            (sent.wake_id,),
+        ).fetchone()
+        self.assertEqual(row["created_at"], row["available_at"])
+        self.assertNotEqual("2099-07-31 12:00:15", row["available_at"])
+
+    def test_zero_delay_disables_hold_for_declared_new(self) -> None:
+        messages = delivery.SprintMessageStore(
+            self.con,
+            now=lambda: datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc),
+            new_wake_delay_seconds=0,
+        )
+
+        sent = messages.send(
+            self.sprint_id,
+            to_participant_id=self.developer_id,
+            from_participant_id=self.planner_id,
+            work_unit_id=self.unit_id,
+            message_kind="notification",
+            body="disabled new wake hold",
+            declared_type="new",
+            idempotency_key="zero-delay-new",
+        )
+
+        row = self.con.execute(
+            "SELECT created_at,available_at FROM sprint_wake_outbox WHERE wake_id=?",
+            (sent.wake_id,),
+        ).fetchone()
+        self.assertEqual(row["created_at"], row["available_at"])
+        self.assertNotEqual("2099-07-31 12:00:00", row["available_at"])
+
+    def test_new_message_extends_a_pending_reenter_wake(self) -> None:
+        first = self.send("pending-reenter", declared_type="re-enter")
+        messages = delivery.SprintMessageStore(
+            self.con,
+            now=lambda: datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc),
+            new_wake_delay_seconds=15,
+        )
+
+        second = messages.send(
+            self.sprint_id,
+            to_participant_id=self.developer_id,
+            from_participant_id=self.planner_id,
+            work_unit_id=self.unit_id,
+            message_kind="notification",
+            body="coalesced new wake",
+            declared_type="new",
+            idempotency_key="coalesced-new",
+        )
+
+        self.assertEqual(first.wake_id, second.wake_id)
+        self.assertEqual(
+            "2099-07-31 12:00:15",
+            self.con.execute(
+                "SELECT available_at FROM sprint_wake_outbox WHERE wake_id=?",
+                (first.wake_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            [first.message_id, second.message_id],
+            [
+                int(row[0])
+                for row in self.con.execute(
+                    "SELECT message_id FROM sprint_wake_messages "
+                    "WHERE wake_id=? ORDER BY message_id",
+                    (first.wake_id,),
+                )
+            ],
+        )
+
+    def test_shell_scoped_new_wake_uses_the_same_delay(self) -> None:
+        messages = delivery.SprintMessageStore(
+            self.con,
+            now=lambda: datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc),
+            new_wake_delay_seconds=8,
+        )
+
+        sent = messages.send_to_shell(
+            2,
+            message_kind="system",
+            body="delayed shell-scoped wake",
+            idempotency_key="shell-scoped-new-delay",
+            declared_type="new",
+        )
+
+        row = self.con.execute(
+            "SELECT sprint_id,participant_id,receiver_shell_id,available_at "
+            "FROM sprint_wake_outbox WHERE wake_id=?",
+            (sent.wake_id,),
+        ).fetchone()
+        self.assertEqual(
+            (None, None, 2, "2099-07-31 12:00:08"),
+            tuple(row),
         )
 
 

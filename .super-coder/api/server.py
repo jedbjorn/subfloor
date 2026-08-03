@@ -346,7 +346,10 @@ def get_shells(con) -> list[dict]:
         "s.mandate, s.is_shared, "
         "(SELECT COUNT(*) FROM shell_messages m "
         " WHERE m.to_shell_id=s.shell_id AND m.read_at IS NULL "
-        " AND m.kind IN ('shell','task','result')) AS unread_message_count "
+        " AND m.kind IN ('shell','task','result')) AS unread_message_count, "
+        "(SELECT w.available_at FROM sprint_wake_outbox w "
+        " WHERE w.receiver_shell_id=s.shell_id AND w.state='pending' "
+        " AND w.available_at>datetime('now')) AS pending_wake_available_at "
         "FROM shells s WHERE COALESCE(s.is_deleted,0)=0 ORDER BY s.shell_id"))
     return sprint_participant_chats.attach_live_participations(con, shells)
 

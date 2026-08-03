@@ -72,6 +72,7 @@
     ".super-coder/migrations/0167_reseed_sprint_authority_split.sql",
     ".super-coder/migrations/0168_retire_sprint_conversation_topology.sql",
     ".super-coder/migrations/0169_reseed_sprint_v21_guidance.sql",
+    ".super-coder/migrations/0170_reseed_sprint_handoff_order.sql",
     ".super-coder/templates/boot.md"
   ],
   "baseline_migration_ledger": {

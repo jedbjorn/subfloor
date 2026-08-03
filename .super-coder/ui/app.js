@@ -2617,6 +2617,36 @@ function chatUnreadBadge(shell) {
   }, "📩");
 }
 
+function chatWakePendingIndicator(shell, now = Date.now()) {
+  const raw = String(shell.pending_wake_available_at || "");
+  if (!raw) return null;
+  const timestamp = /(?:Z|[+-]\d\d:\d\d)$/.test(raw)
+    ? raw
+    : `${raw.replace(" ", "T")}Z`;
+  const available = new Date(timestamp);
+  const seconds = Math.ceil((available.getTime() - now) / 1000);
+  if (!Number.isFinite(seconds) || seconds < 1) return null;
+  const label = `wake message pending — delivering in ~${seconds}s`;
+  return el("span", {
+    className: "chat-shell-wake",
+    title: label,
+    ariaLabel: label,
+  }, "◷");
+}
+
+function chatPaintShellStatus(status, ...items) {
+  const visible = items.filter(Boolean);
+  status.replaceChildren();
+  visible.forEach((item, index) => {
+    if (index) status.append(el("span", {
+      className: "chat-shell-status-separator",
+      ariaHidden: "true",
+    }, "|"));
+    status.append(item);
+  });
+  status.hidden = visible.length === 0;
+}
+
 function chatHeaderLabel(conversation) {
   return [
     conversation.shell?.shortname,
@@ -3746,7 +3776,9 @@ function chatFlushTranscript(
   onPosition();
 }
 
-async function chatRenderOpen(host, initialConversation, initialSnapshot) {
+async function chatRenderOpen(
+  host, initialConversation, initialSnapshot, onWakeDelivered = null,
+) {
   const generation = chatRenderGeneration;
   let conversation = initialConversation;
   let transcriptState = chatCreateTranscriptState(initialSnapshot);
@@ -4282,6 +4314,7 @@ async function chatRenderOpen(host, initialConversation, initialSnapshot) {
       conversation.active_run_id = event.run_id;
       if (event.run_id != null)
         transcriptState.assistantAnchors.set(event.run_id, 0);
+      if (onWakeDelivered) onWakeDelivered(conversation.shell.shell_id);
     }
     if (type === "conversation.updated" || type === "conversation.renamed")
       Object.assign(conversation, event.payload || {});
@@ -4420,6 +4453,7 @@ async function renderInterface(root) {
   const orderedShells = orderedFlavors.flatMap((flavor) =>
     shells.filter((item) => (item.flavor || "bespoke") === flavor));
   const shellItems = new Map();
+  const shellStatusItems = new Map();
   const openByShell = new Map();
   for (const conversation of openPage.items) {
     if (conversation.state !== "closed")
@@ -4442,6 +4476,7 @@ async function renderInterface(root) {
       el("span", { className: "chat-shell-identity-separator", ariaHidden: "true" }, "|"));
     identity.append(el("span", { className: "chat-shell-name" }, item.display_name));
     const mail = chatUnreadBadge(item);
+    const wake = chatWakePendingIndicator(item);
     const button = el("button", {
       className: "chat-shell"
         + (item.shell_id === shell.shell_id ? " selected" : ""),
@@ -4456,7 +4491,8 @@ async function renderInterface(root) {
     const shellRow = el("div", {
       className: "chat-shell-row"
         + (sprint ? " has-assignment" : "")
-        + (mail ? " has-mail" : ""),
+        + (mail ? " has-mail" : "")
+        + (wake ? " has-wake" : ""),
     }, button);
     let badge = null;
     if (sprint) {
@@ -4473,16 +4509,28 @@ async function renderInterface(root) {
         );
       };
     }
-    if (badge || mail) {
-      const status = el("span", { className: "chat-shell-status" });
-      if (badge) status.append(badge);
-      if (badge && mail) status.append(
-        el("span", { className: "chat-shell-status-separator", ariaHidden: "true" }, "|"));
-      if (mail) status.append(mail);
-      shellRow.append(status);
-    }
+    const status = el("span", { className: "chat-shell-status" });
+    chatPaintShellStatus(status, badge, mail, wake);
+    shellStatusItems.set(item.shell_id, { row: shellRow, status, badge, mail });
+    shellRow.append(status);
     rail.append(shellRow);
   }
+
+  const paintWakeIndicators = (nextShells) => {
+    for (const next of nextShells) {
+      const target = shellStatusItems.get(next.shell_id);
+      if (!target) continue;
+      const wake = chatWakePendingIndicator(next);
+      target.row.classList.toggle("has-wake", Boolean(wake));
+      chatPaintShellStatus(target.status, target.badge, target.mail, wake);
+    }
+  };
+  const refreshWakeIndicators = async () => {
+    try {
+      const { shells: nextShells } = await api("/shells");
+      if (generation === chatRenderGeneration) paintWakeIndicators(nextShells);
+    } catch { /* The next shell refresh or SSE event retries. */ }
+  };
 
   const side = el("aside", { className: "chat-history" });
   const adminCliOnly = chatAdminCliOnly(shell);
@@ -4751,6 +4799,8 @@ async function renderInterface(root) {
     if (document.hidden || historyPollInFlight) return;
     historyPollInFlight = true;
     try {
+      const shellProjectionRequest = api("/shells")
+        .catch(() => ({ shells: [] }));
       let cursor = null;
       let selectedSeen = false;
       const nextOpenByShell = new Map();
@@ -4790,9 +4840,11 @@ async function renderInterface(root) {
         if (item) chatPaintHistoryItem(item, accepted);
         selectedConversation = accepted;
       }
+      const { shells: nextShells } = await shellProjectionRequest;
       if (generation !== chatRenderGeneration || !chatHistoryPollTimer) return;
       for (const [shellId, button] of shellItems)
         chatPaintShellState(button, nextOpenByShell.get(shellId));
+      paintWakeIndicators(nextShells);
     } catch { /* The next poll retries without disrupting the open chat. */ }
     finally { historyPollInFlight = false; }
   };
@@ -4858,7 +4910,12 @@ async function renderInterface(root) {
       const snapshot = await chatApi(
         `/conversations/${selectedId}/transcript`);
       if (generation !== chatRenderGeneration) return;
-      await chatRenderOpen(pane, conversation, snapshot);
+      await chatRenderOpen(
+        pane,
+        conversation,
+        snapshot,
+        refreshWakeIndicators,
+      );
     } catch (error) {
       if (generation !== chatRenderGeneration) return;
       const retry = el("button", {

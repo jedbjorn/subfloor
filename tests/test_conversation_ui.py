@@ -19,6 +19,10 @@ POLL_BLOCK = APP[
         "  chatHistoryPollTimer = setInterval(pollHistory, CHAT_HISTORY_POLL_MS);"
     ) + len("  chatHistoryPollTimer = setInterval(pollHistory, CHAT_HISTORY_POLL_MS);")
 ]
+WAKE_INDICATOR = APP[
+    APP.index("function chatWakePendingIndicator"):
+    APP.index("function chatPaintShellStatus")
+]
 
 
 def run_js(script: str) -> dict:
@@ -67,7 +71,7 @@ def test_sprint_badge_enters_the_current_conversation_without_a_wake():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]
     badge = interface[interface.index('className: "chat-sprint-badge"'):
-                      interface.index("if (badge || mail)")]
+                      interface.index('const status = el("span"')]
     assert "sprint.current_conversation_id" in badge
     assert "location.hash = chatHash(" in badge
     assert "chatApi(" not in badge
@@ -94,18 +98,62 @@ def test_shell_card_orders_left_identity_and_right_status_cluster():
         'className: "chat-shell-identity-separator"'
     ) < identity.index('className: "chat-shell-name"')
 
-    status = interface[interface.index("if (badge || mail)"):
+    status = interface[interface.index('const status = el("span"'):
                        interface.index("rail.append(shellRow)")]
     assert 'className: "chat-shell-status"' in status
-    assert status.index("status.append(badge)") < status.index("status.append(mail)")
-    assert "if (badge && mail)" in status
-    assert 'className: "chat-shell-status-separator"' in status
+    assert "chatPaintShellStatus(status, badge, mail, wake)" in status
+    assert "shellStatusItems.set" in status
 
     status_style = STYLE[STYLE.index(".chat-shell-status {"):
                          STYLE.index(".chat-sprint-badge {")]
     assert "grid-column: 2" in status_style
     assert "justify-self: end" in status_style
     assert "pointer-events: none" in status_style
+
+
+def test_future_pending_wake_renders_a_red_clock_with_approximate_tooltip():
+    script = r"""
+function el(tag, props = {}, ...children) {
+  return { tag, ...props, text: children.join("") };
+}
+""" + WAKE_INDICATOR + r"""
+const now = Date.parse("2099-07-31T12:00:00Z");
+const future = chatWakePendingIndicator(
+  { pending_wake_available_at: "2099-07-31 12:00:15" }, now);
+const expired = chatWakePendingIndicator(
+  { pending_wake_available_at: "2099-07-31 11:59:59" }, now);
+const malformed = chatWakePendingIndicator(
+  { pending_wake_available_at: "not-a-date" }, now);
+console.log(JSON.stringify({ future, expired, malformed }));
+"""
+    result = run_js(script)
+    assert result == {
+        "future": {
+            "tag": "span",
+            "className": "chat-shell-wake",
+            "title": "wake message pending — delivering in ~15s",
+            "ariaLabel": "wake message pending — delivering in ~15s",
+            "text": "◷",
+        },
+        "expired": None,
+        "malformed": None,
+    }
+    wake_style = STYLE[
+        STYLE.index(".chat-shell-wake {"):
+        STYLE.index("}", STYLE.index(".chat-shell-wake {")) + 1
+    ]
+    assert "color: #ef545f" in wake_style
+
+
+def test_pending_wake_indicator_refreshes_without_a_new_polling_loop():
+    interface = APP[APP.index("async function renderInterface"):
+                    APP.index("// ── Tabs + boot")]
+    assert 'const shellProjectionRequest = api("/shells")' in POLL_BLOCK
+    assert "const { shells: nextShells } = await shellProjectionRequest" in POLL_BLOCK
+    assert "paintWakeIndicators(nextShells)" in POLL_BLOCK
+    assert "refreshWakeIndicators" in interface
+    assert "onWakeDelivered(conversation.shell.shell_id)" in APP
+    assert APP.count("setInterval(pollHistory, CHAT_HISTORY_POLL_MS)") == 1
 
 
 def test_sprint_conversations_are_not_closed_by_normal_chat_controls():
@@ -567,6 +615,7 @@ globalThis.document = {hidden: false};
 let scheduled = null;
 globalThis.setInterval = (callback) => { scheduled = callback; return 1; };
 const calls = [];
+const shellCalls = [];
 const painted = [];
 let openPoll = 0;
 async function chatApi(path) {
@@ -583,6 +632,11 @@ async function chatApi(path) {
       shell: {shell_id: 7}};
   throw new Error(`unexpected request: ${path}`);
 }
+async function api(path) {
+  shellCalls.push(path);
+  if (path === "/shells") return {shells: []};
+  throw new Error(`unexpected API request: ${path}`);
+}
 const historyItems = new Map([["cv1", {id: "selected"}]]);
 const shellItems = new Map([[7, {}]]);
 const acceptSummary = (conversation) => conversation;
@@ -590,6 +644,7 @@ const chatPaintHistoryItem = (item, conversation) => {
   painted.push([item.id, conversation.state, conversation.version]);
 };
 const chatPaintShellState = () => {};
+const paintWakeIndicators = () => {};
 let selectedConversation = {
   conversation_id: "cv1", state: "idle", version: 1, shell: {shell_id: 7},
 };
@@ -602,7 +657,9 @@ const CHAT_HISTORY_POLL_MS = 2000;
   await scheduled();
   await scheduled();
   await scheduled();
-  console.log(JSON.stringify({calls, painted, selected: selectedConversation}));
+  console.log(JSON.stringify({
+    calls, shellCalls, painted, selected: selectedConversation,
+  }));
 })().catch((error) => {
   console.error(error.stack || error);
   process.exit(1);
@@ -615,6 +672,7 @@ const CHAT_HISTORY_POLL_MS = 2000;
         "/conversations/cv1",
         "/conversations?open=true&limit=100",
     ]
+    assert result["shellCalls"] == ["/shells", "/shells", "/shells"]
     assert result["painted"] == [
         ["selected", "running", 2],
         ["selected", "closed", 3],

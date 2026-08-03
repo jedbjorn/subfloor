@@ -9,6 +9,7 @@ import unittest
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
@@ -48,6 +49,11 @@ class FakeClock:
 
 class SprintLivenessCase(unittest.TestCase):
     def setUp(self) -> None:
+        delay_env = mock.patch.dict(
+            "os.environ", {"SC_WAKE_NEW_DELAY_SECONDS": "0"}
+        )
+        delay_env.start()
+        self.addCleanup(delay_env.stop)
         self.con = sqlite3.connect(":memory:")
         self.addCleanup(self.con.close)
         self.con.row_factory = sqlite3.Row

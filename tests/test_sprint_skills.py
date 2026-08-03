@@ -25,6 +25,7 @@ SKILLS = {
 RESEEDED_SKILLS = set(SKILLS) | {"db_map"}
 AUTHORITY_SPLIT_SKILLS = {"sprint_pln", "sprint_rev"}
 V21_ROLE_SKILLS = set(SKILLS)
+HANDOFF_ROLE_SKILLS = {"sprint_dev", "sprint_rev", "sprint_pln"}
 
 
 class SprintSkillTest(unittest.TestCase):
@@ -176,28 +177,28 @@ class SprintSkillTest(unittest.TestCase):
         finally:
             con.close()
 
-    def test_v21_reseed_converges_dirty_rows_and_replays_idempotently(self):
+    def test_terminal_handoff_reseed_converges_dirty_rows_and_replays_idempotently(self):
         con = sqlite3.connect(":memory:")
         try:
             con.executescript((ENGINE / "schema.sql").read_text())
             for migration in sorted((ENGINE / "migrations").glob("*.sql")):
-                if migration.name >= "0169_reseed_sprint_v21_guidance.sql":
+                if migration.name >= "0170_reseed_sprint_handoff_order.sql":
                     break
                 con.executescript(migration.read_text())
-            placeholders = ",".join("?" for _ in V21_ROLE_SKILLS)
+            placeholders = ",".join("?" for _ in HANDOFF_ROLE_SKILLS)
             con.execute(
-                f"UPDATE skills SET content='stale pre-0169 guidance' "
+                f"UPDATE skills SET content='stale pre-0170 guidance' "
                 f"WHERE name IN ({placeholders})",
-                tuple(sorted(V21_ROLE_SKILLS)),
+                tuple(sorted(HANDOFF_ROLE_SKILLS)),
             )
 
             migration = (
-                ENGINE / "migrations" / "0169_reseed_sprint_v21_guidance.sql"
+                ENGINE / "migrations" / "0170_reseed_sprint_handoff_order.sql"
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
 
-            for name in sorted(V21_ROLE_SKILLS):
+            for name in sorted(HANDOFF_ROLE_SKILLS):
                 with self.subTest(name=name):
                     expected = seed_skills.parse_skill(
                         ASSETS / name / "SKILL.md"
@@ -504,6 +505,57 @@ class SprintSkillTest(unittest.TestCase):
             "sc job start",
         ):
             self.assertNotIn(shell_owned_loop, combined)
+
+    def test_role_handoffs_are_explicitly_ordered_and_message_last(self):
+        developer = (ASSETS / "sprint_dev" / "SKILL.md").read_text()
+        post_merge = developer[
+            developer.index("## Post-merge handoff"):
+            developer.index("## Report and stop")
+        ]
+        self.assertLess(
+            post_merge.index("Clean the worktree"),
+            post_merge.index("Re-run `sc sprint inbox"),
+        )
+        self.assertLess(
+            post_merge.index("Re-run `sc sprint inbox"),
+            post_merge.index("sc sprint send --sprint <id>"),
+        )
+        self.assertLess(
+            post_merge.index("sc sprint send --sprint <id>"),
+            post_merge.index("Run no trailing Git"),
+        )
+
+        reviewer = (ASSETS / "sprint_rev" / "SKILL.md").read_text()
+        unit_verdict = reviewer[
+            reviewer.index("Complete a unit verdict in this exact order"):
+            reviewer.index("## Whole-Sprint conformance")
+        ]
+        self.assertLess(
+            unit_verdict.index("Re-run `sc sprint inbox"),
+            unit_verdict.index("sc sprint record-review"),
+        )
+        self.assertLess(
+            unit_verdict.index("sc sprint record-review"),
+            unit_verdict.index("Run no trailing command"),
+        )
+
+        planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()
+        wave_handoff = planner[
+            planner.index("Never dispatch the next wave"):
+            planner.index("When all planned delivery work is terminal")
+        ]
+        self.assertIn(
+            "merged-work handoff wake is the only normal next-wave dispatch trigger",
+            wave_handoff,
+        )
+        self.assertLess(
+            wave_handoff.index("Run `sc sprint inbox"),
+            wave_handoff.index("sc sprint dispatch --sprint <id>"),
+        )
+        self.assertLess(
+            wave_handoff.index("sc sprint dispatch --sprint <id>"),
+            wave_handoff.index("Run no trailing command"),
+        )
 
     def test_reviewer_entry_separates_predeclaration_qaqc_from_armed_inbox(self):
         reviewer = (ASSETS / "sprint_rev" / "SKILL.md").read_text()

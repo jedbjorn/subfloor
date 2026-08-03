@@ -8,6 +8,7 @@ live registry, and performs the native enqueue outside database transactions.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -72,9 +73,24 @@ def _stamp(value: datetime) -> str:
 class SprintMessageStore:
     """One transactional producer plus Sprint acceptance conveniences."""
 
-    def __init__(self, con: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        con: sqlite3.Connection,
+        *,
+        now: Callable[[], datetime] | None = None,
+        new_wake_delay_seconds: int | None = None,
+    ) -> None:
         self.con = con
         self.con.row_factory = sqlite3.Row
+        self.now = now or (lambda: datetime.now(timezone.utc))
+        delay = (
+            int(os.environ.get("SC_WAKE_NEW_DELAY_SECONDS", "15"))
+            if new_wake_delay_seconds is None
+            else new_wake_delay_seconds
+        )
+        if delay < 0:
+            raise ValueError("SC_WAKE_NEW_DELAY_SECONDS must be non-negative")
+        self.new_wake_delay_seconds = delay
 
     def send(
         self,
@@ -209,7 +225,13 @@ class SprintMessageStore:
                 ),
             ).lastrowid
         )
-        wake_id = self._coalesce_wake(None, None, receiver_shell_id, message_id)
+        wake_id = self._coalesce_wake(
+            None,
+            None,
+            receiver_shell_id,
+            message_id,
+            declared_type,
+        )
         return MessageReceipt(message_id, wake_id, True)
 
     def relay(
@@ -578,6 +600,7 @@ class SprintMessageStore:
             to_participant_id,
             receiver_shell_id,
             message_id,
+            declared_type,
         )
         return MessageReceipt(message_id, wake_id, True)
 
@@ -587,28 +610,48 @@ class SprintMessageStore:
         participant_id: int | None,
         receiver_shell_id: int,
         message_id: int,
+        declared_type: str,
     ) -> int:
+        available_at = None
+        if declared_type == "new" and self.new_wake_delay_seconds:
+            available_at = _stamp(
+                self.now() + timedelta(seconds=self.new_wake_delay_seconds)
+            )
         wake = self.con.execute(
             "SELECT wake_id FROM sprint_wake_outbox "
             "WHERE receiver_shell_id=? AND state='pending'",
             (receiver_shell_id,),
         ).fetchone()
         if wake is None:
+            columns = (
+                "sprint_id,participant_id,receiver_shell_id,idempotency_key"
+            )
+            values: tuple[object, ...] = (
+                sprint_id,
+                participant_id,
+                receiver_shell_id,
+                f"receiver:{receiver_shell_id}:wake-for-message:{message_id}",
+            )
+            placeholders = "?,?,?,?"
+            if available_at is not None:
+                columns += ",available_at"
+                values += (available_at,)
+                placeholders += ",?"
             wake_id = int(
                 self.con.execute(
-                    "INSERT INTO sprint_wake_outbox "
-                    "(sprint_id,participant_id,receiver_shell_id,idempotency_key) "
-                    "VALUES (?,?,?,?)",
-                    (
-                        sprint_id,
-                        participant_id,
-                        receiver_shell_id,
-                        f"receiver:{receiver_shell_id}:wake-for-message:{message_id}",
-                    ),
+                    f"INSERT INTO sprint_wake_outbox ({columns}) "
+                    f"VALUES ({placeholders})",
+                    values,
                 ).lastrowid
             )
         else:
             wake_id = int(wake["wake_id"])
+            if available_at is not None:
+                self.con.execute(
+                    "UPDATE sprint_wake_outbox "
+                    "SET available_at=MAX(available_at,?) WHERE wake_id=?",
+                    (available_at, wake_id),
+                )
         self.con.execute(
             "INSERT INTO sprint_wake_messages (sprint_id,wake_id,message_id) "
             "VALUES (?,?,?)",
