@@ -1985,6 +1985,14 @@ class SprintLifecycleStore:
         )
         if result.rowcount != 1:
             raise SprintStateError("Sprint lifecycle changed concurrently")
+        if target in {"completed", "aborted"}:
+            self.con.execute(
+                "UPDATE sprint_liveness_expectations "
+                "SET resolved_at=datetime('now'),resolution=?,"
+                "next_evaluation_at=NULL "
+                "WHERE sprint_id=? AND resolved_at IS NULL",
+                (f"sprint.{target}", sprint_id),
+            )
 
     def _clear_coordinate_mode(
         self,

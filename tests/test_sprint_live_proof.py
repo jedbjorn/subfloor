@@ -493,6 +493,10 @@ class SprintLiveProof(unittest.TestCase):
             self.write_input("Integrated live proof matches its bound contract."),
             "--findings-file",
             self.write_input("[]"),
+            "--planner-handoff-file",
+            self.write_input(
+                "decision: conclude\nComplete from the recorded conformance."
+            ),
             "--key",
             f"proof:{sprint_id}:conformance",
         )

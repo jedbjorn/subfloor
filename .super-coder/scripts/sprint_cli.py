@@ -329,6 +329,9 @@ def cmd_record_conformance(args: argparse.Namespace) -> int:
             "sprint_id": args.sprint,
             "body": _text(args.body_file, "conformance body"),
             "findings": _json_array(args.findings_file),
+            "planner_handoff": _text(
+                args.planner_handoff_file, "Planner handoff"
+            ),
             "idempotency_key": args.key,
         },
         idempotent=True,
@@ -566,6 +569,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     conformance.add_argument(
         "--findings-file", required=True, help=FINDINGS_FILE_HELP
+    )
+    conformance.add_argument(
+        "--planner-handoff-file", required=True, help=PAYLOAD_FILE_HELP
     )
     conformance.add_argument("--key", required=True, help="stable retry identity")
     conformance.set_defaults(fn=cmd_record_conformance)

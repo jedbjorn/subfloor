@@ -14,10 +14,20 @@ ENGINE = ROOT / ".super-coder"
 MIGRATIONS = ENGINE / "migrations"
 MIGRATION = MIGRATIONS / "0150_sprint_close_reports.sql"
 SURFACE_MIGRATION = MIGRATIONS / "0152_sprint_surface_completion.sql"
+PLANNER_HANDOFF = "decision: conclude\nComplete the Sprint with the attached report."
+
+
+def rendered_handoff(report_id: int, followup_ids: tuple[int, ...]) -> str:
+    followups = ",".join(str(value) for value in followup_ids) or "none"
+    return (
+        f"Conformance recorded: report_id={report_id}; "
+        f"followup_ids={followups}.\n\n{PLANNER_HANDOFF}"
+    )
 
 sys.path[:0] = [str(ENGINE / "scripts"), str(ROOT / "tests")]
 import sprint_close  # noqa: E402
 import sprint_domain  # noqa: E402
+import sprint_message_delivery  # noqa: E402
 from test_sprint_v2_domain import SprintDomainCase, apply_schema  # noqa: E402
 
 
@@ -175,6 +185,7 @@ class ConformanceFollowupTest(SprintCloseCase):
                 2,
                 body="x" * 8001,
                 findings=[],
+                planner_handoff=PLANNER_HANDOFF,
                 idempotency_key="oversize-conformance",
             )
         with self.assertRaisesRegex(
@@ -186,7 +197,17 @@ class ConformanceFollowupTest(SprintCloseCase):
                 2,
                 body="bounded",
                 findings=[self.finding(body="x" * 8001)],
+                planner_handoff=PLANNER_HANDOFF,
                 idempotency_key="oversize-finding",
+            )
+        with self.assertRaisesRegex(ValueError, "Planner handoff is required"):
+            self.close.record_conformance(
+                self.sprint_id,
+                2,
+                body="bounded",
+                findings=[],
+                planner_handoff=" ",
+                idempotency_key="empty-planner-handoff",
             )
         self.assertEqual(
             (0, 0),
@@ -204,6 +225,7 @@ class ConformanceFollowupTest(SprintCloseCase):
             2,
             body="x" * 8000,
             findings=[self.finding(body="x" * 8000)],
+            planner_handoff=PLANNER_HANDOFF,
             idempotency_key="bounded-conformance",
         )
         self.assertTrue(conformance.created)
@@ -310,6 +332,7 @@ class ConformanceFollowupTest(SprintCloseCase):
             2,
             body="Conformance found one integrated departure.",
             findings=[self.finding()],
+            planner_handoff=PLANNER_HANDOFF,
             idempotency_key="conformance-pass-1",
         )
 
@@ -354,6 +377,124 @@ class ConformanceFollowupTest(SprintCloseCase):
         self.assertEqual(
             [receipt.followup_ids[0]], json.loads(event["payload"])["followup_ids"]
         )
+        payload = json.loads(event["payload"])
+        self.assertEqual(receipt.planner_message_id, payload["planner_message_id"])
+        self.assertEqual(receipt.planner_wake_id, payload["planner_wake_id"])
+        handoff = self.con.execute(
+            "SELECT sender.shell_id,receiver.shell_id,message.work_unit_id,"
+            "message.message_kind,message.body,message.declared_type,"
+            "message.actionable,message.idempotency_key "
+            "FROM wake_message message "
+            "JOIN sprint_participants sender "
+            "ON sender.participant_id=message.from_participant_id "
+            "JOIN sprint_participants receiver "
+            "ON receiver.participant_id=message.to_participant_id "
+            "WHERE message.message_id=?",
+            (receipt.planner_message_id,),
+        ).fetchone()
+        self.assertEqual(
+            (
+                2,
+                3,
+                None,
+                "notification",
+                rendered_handoff(receipt.report_id, receipt.followup_ids),
+                "re-enter",
+                1,
+                "conformance-pass-1:planner-handoff",
+            ),
+            tuple(handoff),
+        )
+        self.assertEqual(
+            [(receipt.planner_wake_id, receipt.planner_message_id)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT wake_id,message_id FROM sprint_wake_messages "
+                    "WHERE message_id=?",
+                    (receipt.planner_message_id,),
+                )
+            ],
+        )
+
+    def test_accepted_planner_handoff_is_live_until_sprint_completion(self):
+        receipt = self.close.record_conformance(
+            self.sprint_id,
+            2,
+            body="Integrated conformance is complete.",
+            findings=[],
+            planner_handoff=PLANNER_HANDOFF,
+            idempotency_key="liveness-pass",
+        )
+        self.assertEqual(
+            "accepted",
+            sprint_message_delivery.SprintMessageStore(self.con).mark_read(
+                receipt.planner_message_id,
+                3,
+                sprint_id=self.sprint_id,
+            ),
+        )
+        self.assertEqual(
+            (None, None),
+            tuple(
+                self.con.execute(
+                    "SELECT resolved_at,resolution "
+                    "FROM sprint_liveness_expectations WHERE message_id=?",
+                    (receipt.planner_message_id,),
+                ).fetchone()
+            ),
+        )
+
+        sprint_domain.SprintLifecycleStore(self.con).transition(
+            self.sprint_id,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="Reviewer concluded",
+            terminal_outcome="accepted",
+        )
+
+        resolved = self.con.execute(
+            "SELECT resolved_at,resolution,next_evaluation_at "
+            "FROM sprint_liveness_expectations WHERE message_id=?",
+            (receipt.planner_message_id,),
+        ).fetchone()
+        self.assertIsNotNone(resolved["resolved_at"])
+        self.assertEqual("sprint.completed", resolved["resolution"])
+        self.assertIsNone(resolved["next_evaluation_at"])
+
+    def test_planner_handoff_failure_rolls_back_every_closeout_write(self):
+        self.con.execute(
+            "CREATE TRIGGER reject_planner_handoff BEFORE INSERT ON wake_message "
+            "WHEN NEW.idempotency_key='rollback-pass:planner-handoff' "
+            "BEGIN SELECT RAISE(ABORT,'reject Planner handoff'); END"
+        )
+        self.con.commit()
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "reject Planner handoff"):
+            self.close.record_conformance(
+                self.sprint_id,
+                2,
+                body="This report must roll back.",
+                findings=[self.finding()],
+                planner_handoff=PLANNER_HANDOFF,
+                idempotency_key="rollback-pass",
+            )
+
+        self.assertEqual(
+            (0, 0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=?),"
+                    "(SELECT COUNT(*) FROM sprint_followups WHERE sprint_id=?),"
+                    "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    " AND event_type='conformance.recorded'),"
+                    "(SELECT COUNT(*) FROM wake_message WHERE sprint_id=? "
+                    " AND idempotency_key='rollback-pass:planner-handoff')",
+                    (self.sprint_id,) * 4,
+                ).fetchone()
+            ),
+        )
 
     def test_retry_replays_exactly_and_conflicting_input_is_rejected(self):
         first = self.close.record_conformance(
@@ -361,6 +502,7 @@ class ConformanceFollowupTest(SprintCloseCase):
             2,
             body="Review body",
             findings=[self.finding(severity="Low")],
+            planner_handoff=PLANNER_HANDOFF,
             idempotency_key="same-pass",
         )
         replay = self.close.record_conformance(
@@ -368,11 +510,14 @@ class ConformanceFollowupTest(SprintCloseCase):
             2,
             body="Review body",
             findings=[self.finding(severity="Low")],
+            planner_handoff=PLANNER_HANDOFF,
             idempotency_key="same-pass",
         )
         self.assertFalse(replay.created)
         self.assertEqual(first.report_id, replay.report_id)
         self.assertEqual(first.followup_ids, replay.followup_ids)
+        self.assertEqual(first.planner_message_id, replay.planner_message_id)
+        self.assertEqual(first.planner_wake_id, replay.planner_wake_id)
 
         with self.assertRaisesRegex(
             sprint_domain.SprintInvariantError, "different findings"
@@ -382,14 +527,34 @@ class ConformanceFollowupTest(SprintCloseCase):
                 2,
                 body="Review body",
                 findings=[self.finding(severity="Critical")],
+                planner_handoff=PLANNER_HANDOFF,
+                idempotency_key="same-pass",
+            )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "idempotency key was reused with different input",
+        ):
+            self.close.record_conformance(
+                self.sprint_id,
+                2,
+                body="Review body",
+                findings=[self.finding(severity="Low")],
+                planner_handoff="decision: conclude\nChanged final report.",
                 idempotency_key="same-pass",
             )
         self.assertEqual(
-            1,
-            self.con.execute(
-                "SELECT COUNT(*) FROM sprint_followups WHERE sprint_id=?",
-                (self.sprint_id,),
-            ).fetchone()[0],
+            (1, 1, 1),
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=? "
+                    " AND report_kind='conformance'),"
+                    "(SELECT COUNT(*) FROM sprint_followups WHERE sprint_id=?),"
+                    "(SELECT COUNT(*) FROM wake_message WHERE sprint_id=? "
+                    " AND idempotency_key='same-pass:planner-handoff')",
+                    (self.sprint_id,) * 3,
+                ).fetchone()
+            ),
         )
 
     def test_non_object_finding_is_rejected_before_any_report_write(self):
@@ -399,6 +564,7 @@ class ConformanceFollowupTest(SprintCloseCase):
                 2,
                 body="Malformed findings",
                 findings=["not an object"],
+                planner_handoff=PLANNER_HANDOFF,
                 idempotency_key="malformed-findings",
             )
         self.assertEqual(
@@ -423,6 +589,7 @@ class ConformanceFollowupTest(SprintCloseCase):
                 1,
                 body="Not a review",
                 findings=[],
+                planner_handoff=PLANNER_HANDOFF,
                 idempotency_key="wrong-role",
             )
         with self.assertRaisesRegex(
@@ -433,6 +600,7 @@ class ConformanceFollowupTest(SprintCloseCase):
                 2,
                 body="Bad link",
                 findings=[self.finding(spec_document_id=999)],
+                planner_handoff=PLANNER_HANDOFF,
                 idempotency_key="bad-link",
             )
         self.assertEqual(
@@ -550,6 +718,7 @@ class ConformanceFollowupTest(SprintCloseCase):
                 self.finding(title="Accepted"),
                 self.finding(title="Resolved"),
             ],
+            planner_handoff=PLANNER_HANDOFF,
             idempotency_key="disposition-pass",
         )
         with self.assertRaisesRegex(
@@ -682,6 +851,7 @@ class EvidenceCompilerTest(SprintCloseCase):
             2,
             body="Integrated review",
             findings=[self.finding(severity="Low")],
+            planner_handoff=PLANNER_HANDOFF,
             idempotency_key="compiler-review",
         )
 

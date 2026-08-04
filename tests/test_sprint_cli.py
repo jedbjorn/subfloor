@@ -1019,6 +1019,8 @@ class SprintCliApiTest(unittest.TestCase):
                     [{"severity": "Low", "title": "Note", "body": "Track it"}]
                 )
             ),
+            "--planner-handoff-file",
+            self.write("decision: conclude\nComplete the Sprint."),
             "--key",
             "surface-conformance",
         )
@@ -1414,6 +1416,8 @@ class SprintCliApiTest(unittest.TestCase):
             self.write("Integrated conformance complete."),
             "--findings-file",
             findings,
+            "--planner-handoff-file",
+            self.write("decision: conclude\nComplete the Sprint."),
             "--key",
             "cli-conformance",
         )

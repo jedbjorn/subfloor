@@ -22,6 +22,8 @@ MAX_SECTION_LIMIT = 200
 class ConformanceReceipt:
     report_id: int
     followup_ids: tuple[int, ...]
+    planner_message_id: int
+    planner_wake_id: int
     created: bool
 
 
@@ -45,16 +47,21 @@ class SprintCloseStore:
         *,
         body: str,
         findings: Iterable[dict[str, Any]],
+        planner_handoff: str,
         idempotency_key: str,
     ) -> ConformanceReceipt:
-        """Commit one conformance report and its post-Sprint follow-ups."""
+        """Commit conformance evidence and its Planner handoff atomically."""
         body = self._required(body, "conformance body")
+        planner_handoff = self._required(planner_handoff, "Planner handoff")
         idempotency_key = self._required(
             idempotency_key, "idempotency key", maximum=220
         )
         normalized = tuple(self._normalize_finding(item) for item in findings)
         with db_driver.write_transaction(self.con, "sprint.close.conformance"):
-            self._require_reviewer(sprint_id, reviewer_shell_id)
+            reviewer_participant_id = self._require_reviewer(
+                sprint_id, reviewer_shell_id
+            )
+            planner_participant_id = self._planner_participant_id(sprint_id)
             lifecycle = self._lifecycle(sprint_id)
             if lifecycle != "armed":
                 raise SprintInvariantError(
@@ -67,7 +74,25 @@ class SprintCloseStore:
                 (sprint_id, idempotency_key),
             ).fetchone()
             if existing is not None:
-                return self._replay_receipt(existing, body, normalized, idempotency_key)
+                report_id, followup_ids = self._replay_evidence(
+                    existing, body, normalized, idempotency_key
+                )
+                handoff = self._send_planner_handoff(
+                    sprint_id,
+                    reviewer_participant_id=reviewer_participant_id,
+                    planner_participant_id=planner_participant_id,
+                    report_id=report_id,
+                    followup_ids=followup_ids,
+                    body=planner_handoff,
+                    idempotency_key=idempotency_key,
+                )
+                return ConformanceReceipt(
+                    report_id,
+                    followup_ids,
+                    handoff.message_id,
+                    self._required_wake_id(handoff.wake_id),
+                    False,
+                )
 
             report_id = int(
                 self.con.execute(
@@ -100,6 +125,16 @@ class SprintCloseStore:
                         ).lastrowid
                     )
                 )
+            handoff = self._send_planner_handoff(
+                sprint_id,
+                reviewer_participant_id=reviewer_participant_id,
+                planner_participant_id=planner_participant_id,
+                report_id=report_id,
+                followup_ids=tuple(followup_ids),
+                body=planner_handoff,
+                idempotency_key=idempotency_key,
+            )
+            planner_wake_id = self._required_wake_id(handoff.wake_id)
             self._event(
                 sprint_id,
                 "conformance.recorded",
@@ -108,9 +143,17 @@ class SprintCloseStore:
                     "report_id": report_id,
                     "followup_count": len(followup_ids),
                     "followup_ids": followup_ids,
+                    "planner_message_id": handoff.message_id,
+                    "planner_wake_id": planner_wake_id,
                 },
             )
-        return ConformanceReceipt(report_id, tuple(followup_ids), True)
+        return ConformanceReceipt(
+            report_id,
+            tuple(followup_ids),
+            handoff.message_id,
+            planner_wake_id,
+            True,
+        )
 
     def record_final_report(
         self,
@@ -588,15 +631,67 @@ class SprintCloseStore:
                 "only Sprint participants or FnB may read the timeline"
             )
 
-    def _require_reviewer(self, sprint_id: int, shell_id: int) -> None:
+    def _require_reviewer(self, sprint_id: int, shell_id: int) -> int:
         role = self.con.execute(
-            "SELECT role FROM sprint_participants WHERE sprint_id=? AND shell_id=?",
+            "SELECT participant_id,role FROM sprint_participants "
+            "WHERE sprint_id=? AND shell_id=?",
             (sprint_id, shell_id),
         ).fetchone()
         if role is None or role["role"] != "reviewer":
             raise SprintAuthorityError(
                 "only a participating Reviewer may record conformance"
             )
+        return int(role["participant_id"])
+
+    def _planner_participant_id(self, sprint_id: int) -> int:
+        planner = self.con.execute(
+            "SELECT participant.participant_id FROM sprints sprint "
+            "JOIN sprint_participants participant "
+            "ON participant.sprint_id=sprint.sprint_id "
+            "AND participant.shell_id=sprint.originating_planner_shell_id "
+            "WHERE sprint.sprint_id=? AND participant.role='planner'",
+            (sprint_id,),
+        ).fetchone()
+        if planner is None:
+            raise SprintInvariantError(
+                "Sprint has no originating Planner participant"
+            )
+        return int(planner["participant_id"])
+
+    def _send_planner_handoff(
+        self,
+        sprint_id: int,
+        *,
+        reviewer_participant_id: int,
+        planner_participant_id: int,
+        report_id: int,
+        followup_ids: tuple[int, ...],
+        body: str,
+        idempotency_key: str,
+    ) -> Any:
+        from sprint_message_delivery import SprintMessageStore
+
+        followups = ",".join(str(value) for value in followup_ids) or "none"
+        rendered_body = (
+            f"Conformance recorded: report_id={report_id}; "
+            f"followup_ids={followups}.\n\n{body}"
+        )
+        return SprintMessageStore(self.con).send_in_transaction(
+            sprint_id,
+            to_participant_id=planner_participant_id,
+            message_kind="notification",
+            body=rendered_body,
+            idempotency_key=f"{idempotency_key}:planner-handoff",
+            from_participant_id=reviewer_participant_id,
+            actionable=True,
+            declared_type="re-enter",
+        )
+
+    @staticmethod
+    def _required_wake_id(wake_id: int | None) -> int:
+        if wake_id is None:
+            raise SprintInvariantError("Planner handoff has no delivery intent")
+        return int(wake_id)
 
     def _lifecycle(self, sprint_id: int) -> str:
         row = self.con.execute(
@@ -624,13 +719,13 @@ class SprintCloseStore:
                 f"work unit {work_unit_id} does not belong to Sprint {sprint_id}"
             )
 
-    def _replay_receipt(
+    def _replay_evidence(
         self,
         report: sqlite3.Row,
         body: str,
         findings: tuple[dict[str, Any], ...],
         key: str,
-    ) -> ConformanceReceipt:
+    ) -> tuple[int, tuple[int, ...]]:
         if report["body"] != body:
             raise SprintInvariantError(
                 "conformance idempotency key was reused with different input"
@@ -654,10 +749,9 @@ class SprintCloseStore:
             raise SprintInvariantError(
                 f"conformance idempotency key {key!r} was reused with different findings"
             )
-        return ConformanceReceipt(
+        return (
             int(report["report_id"]),
             tuple(int(row["followup_id"]) for row in rows),
-            False,
         )
 
     @classmethod
