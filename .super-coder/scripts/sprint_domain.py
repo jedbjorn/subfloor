@@ -341,6 +341,55 @@ class SprintLifecycleStore:
             )
         return True
 
+    def complete_from_conformance_in_transaction(
+        self,
+        sprint_id: int,
+        reviewer_shell_id: int,
+        *,
+        reason: str,
+        terminal_outcome: str,
+        idempotency_key: str,
+    ) -> None:
+        """Project Reviewer conformance approval as an atomic terminal edge."""
+        if not self.con.in_transaction:
+            raise RuntimeError("conformance completion requires an active transaction")
+        reason = self._required_text(reason, "completion reason", 2000)
+        terminal_outcome = self._required_text(
+            terminal_outcome, "terminal outcome", 2000
+        )
+        idempotency_key = self._required_text(
+            idempotency_key, "conformance idempotency key", 220
+        )
+        sprint = self._sprint(sprint_id)
+        current = str(sprint["lifecycle"])
+        self._require_edge(current, "completed")
+        reviewer = self.con.execute(
+            "SELECT 1 FROM sprint_participants WHERE sprint_id=? AND shell_id=? "
+            "AND role='reviewer'",
+            (sprint_id, reviewer_shell_id),
+        ).fetchone()
+        if reviewer is None:
+            raise SprintAuthorityError(
+                "only a participating Reviewer may complete through conformance"
+            )
+        self._update_lifecycle(
+            sprint_id,
+            current=current,
+            target="completed",
+            outcome=terminal_outcome,
+        )
+        self._event(
+            sprint_id,
+            "lifecycle.completed",
+            LifecycleActor("participant", reviewer_shell_id),
+            {
+                "from": current,
+                "reason": reason,
+                "via": "conformance",
+                "idempotency_key": idempotency_key,
+            },
+        )
+
     def pause(
         self,
         sprint_id: int,
@@ -1985,6 +2034,14 @@ class SprintLifecycleStore:
         )
         if result.rowcount != 1:
             raise SprintStateError("Sprint lifecycle changed concurrently")
+        if target in {"completed", "aborted"}:
+            self.con.execute(
+                "UPDATE sprint_liveness_expectations "
+                "SET resolved_at=datetime('now'),resolution=?,"
+                "next_evaluation_at=NULL "
+                "WHERE sprint_id=? AND resolved_at IS NULL",
+                (f"sprint.{target}", sprint_id),
+            )
 
     def _clear_coordinate_mode(
         self,

@@ -1019,9 +1019,17 @@ class SprintCliApiTest(unittest.TestCase):
                     [{"severity": "Low", "title": "Note", "body": "Track it"}]
                 )
             ),
+            "--final-report-file",
+            self.write("Final Sprint report"),
+            "--reason",
+            "Reviewer approved integrated conformance",
+            "--outcome",
+            "accepted",
             "--key",
             "surface-conformance",
         )
+        self.assertTrue(conformance["completed"])
+        self.assertIsInstance(conformance["final_report_id"], int)
         followup_id = conformance["followup_ids"][0]
         with self.assertRaisesRegex(SystemExit, "HTTP 403.*only FnB"):
             self.run_cli(
@@ -1045,23 +1053,6 @@ class SprintCliApiTest(unittest.TestCase):
             "accepted",
         )
         self.assertTrue(disposition["changed"])
-
-        completed = self.run_cli(
-            TOKENS["planner"],
-            "complete",
-            "--sprint",
-            str(sprint_id),
-            "--reason",
-            "close",
-            "--outcome",
-            "accepted",
-            "--report-file",
-            self.write("Final Sprint report"),
-            "--key",
-            "surface-final-report",
-        )
-        self.assertTrue(completed["changed"])
-        self.assertIsInstance(completed["report_id"], int)
 
         con = sqlite3.connect(self.db)
         try:
@@ -1414,10 +1405,17 @@ class SprintCliApiTest(unittest.TestCase):
             self.write("Integrated conformance complete."),
             "--findings-file",
             findings,
+            "--final-report-file",
+            self.write("Reviewer-authored final Sprint report."),
+            "--reason",
+            "Reviewer approved integrated conformance",
+            "--outcome",
+            "accepted",
             "--key",
             "cli-conformance",
         )
         self.assertEqual(1, len(conformance["followup_ids"]))
+        self.assertTrue(conformance["completed"])
         report = self.run_cli(
             TOKENS["planner"],
             "compile-report",

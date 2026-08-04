@@ -12,6 +12,7 @@ import db_driver
 from sprint_domain import (
     SprintAuthorityError,
     SprintInvariantError,
+    SprintLifecycleStore,
 )
 
 DEFAULT_SECTION_LIMIT = 50
@@ -22,6 +23,10 @@ MAX_SECTION_LIMIT = 200
 class ConformanceReceipt:
     report_id: int
     followup_ids: tuple[int, ...]
+    final_report_id: int
+    planner_message_id: int
+    planner_wake_id: int
+    completed: bool
     created: bool
 
 
@@ -45,21 +50,25 @@ class SprintCloseStore:
         *,
         body: str,
         findings: Iterable[dict[str, Any]],
+        final_report: str,
+        reason: str,
+        terminal_outcome: str,
         idempotency_key: str,
     ) -> ConformanceReceipt:
-        """Commit one conformance report and its post-Sprint follow-ups."""
+        """Commit conformance, terminal close, and Planner receipt atomically."""
         body = self._required(body, "conformance body")
+        final_report = self._required(final_report, "final report body")
+        reason = self._required(reason, "completion reason", maximum=2000)
+        terminal_outcome = self._required(
+            terminal_outcome, "terminal outcome", maximum=2000
+        )
         idempotency_key = self._required(
             idempotency_key, "idempotency key", maximum=220
         )
         normalized = tuple(self._normalize_finding(item) for item in findings)
         with db_driver.write_transaction(self.con, "sprint.close.conformance"):
             self._require_reviewer(sprint_id, reviewer_shell_id)
-            lifecycle = self._lifecycle(sprint_id)
-            if lifecycle != "armed":
-                raise SprintInvariantError(
-                    f"conformance requires an armed Sprint, not {lifecycle}"
-                )
+            planner_shell_id = self._planner_shell_id(sprint_id)
             existing = self.con.execute(
                 "SELECT report_id,body FROM sprint_reports "
                 "WHERE sprint_id=? AND report_kind='conformance' "
@@ -67,7 +76,48 @@ class SprintCloseStore:
                 (sprint_id, idempotency_key),
             ).fetchone()
             if existing is not None:
-                return self._replay_receipt(existing, body, normalized, idempotency_key)
+                report_id, followup_ids = self._replay_evidence(
+                    existing, body, normalized, idempotency_key
+                )
+                final_report_id = self._replay_final_report(
+                    sprint_id,
+                    reviewer_shell_id=reviewer_shell_id,
+                    body=final_report,
+                    idempotency_key=idempotency_key,
+                )
+                self._replay_completion(
+                    sprint_id,
+                    reviewer_shell_id=reviewer_shell_id,
+                    reason=reason,
+                    terminal_outcome=terminal_outcome,
+                    idempotency_key=idempotency_key,
+                )
+                notification = self._send_planner_notification(
+                    sprint_id,
+                    reviewer_shell_id=reviewer_shell_id,
+                    planner_shell_id=planner_shell_id,
+                    report_id=report_id,
+                    followup_ids=followup_ids,
+                    final_report_id=final_report_id,
+                    reason=reason,
+                    terminal_outcome=terminal_outcome,
+                    idempotency_key=idempotency_key,
+                )
+                return ConformanceReceipt(
+                    report_id,
+                    followup_ids,
+                    final_report_id,
+                    notification.message_id,
+                    self._required_wake_id(notification.wake_id),
+                    True,
+                    False,
+                )
+
+            lifecycle = self._lifecycle(sprint_id)
+            if lifecycle != "armed":
+                raise SprintInvariantError(
+                    f"conformance requires an armed Sprint, not {lifecycle}"
+                )
 
             report_id = int(
                 self.con.execute(
@@ -100,17 +150,53 @@ class SprintCloseStore:
                         ).lastrowid
                     )
                 )
+            final_report_id = self._insert_final_report(
+                sprint_id,
+                reviewer_shell_id=reviewer_shell_id,
+                body=final_report,
+                idempotency_key=idempotency_key,
+            )
+            notification = self._send_planner_notification(
+                sprint_id,
+                reviewer_shell_id=reviewer_shell_id,
+                planner_shell_id=planner_shell_id,
+                report_id=report_id,
+                followup_ids=tuple(followup_ids),
+                final_report_id=final_report_id,
+                reason=reason,
+                terminal_outcome=terminal_outcome,
+                idempotency_key=idempotency_key,
+            )
+            planner_wake_id = self._required_wake_id(notification.wake_id)
             self._event(
                 sprint_id,
                 "conformance.recorded",
                 reviewer_shell_id,
                 {
                     "report_id": report_id,
+                    "final_report_id": final_report_id,
                     "followup_count": len(followup_ids),
                     "followup_ids": followup_ids,
+                    "planner_message_id": notification.message_id,
+                    "planner_wake_id": planner_wake_id,
                 },
             )
-        return ConformanceReceipt(report_id, tuple(followup_ids), True)
+            SprintLifecycleStore(self.con).complete_from_conformance_in_transaction(
+                sprint_id,
+                reviewer_shell_id,
+                reason=reason,
+                terminal_outcome=terminal_outcome,
+                idempotency_key=idempotency_key,
+            )
+        return ConformanceReceipt(
+            report_id,
+            tuple(followup_ids),
+            final_report_id,
+            notification.message_id,
+            planner_wake_id,
+            True,
+            True,
+        )
 
     def record_final_report(
         self,
@@ -588,15 +674,69 @@ class SprintCloseStore:
                 "only Sprint participants or FnB may read the timeline"
             )
 
-    def _require_reviewer(self, sprint_id: int, shell_id: int) -> None:
+    def _require_reviewer(self, sprint_id: int, shell_id: int) -> int:
         role = self.con.execute(
-            "SELECT role FROM sprint_participants WHERE sprint_id=? AND shell_id=?",
+            "SELECT participant_id,role FROM sprint_participants "
+            "WHERE sprint_id=? AND shell_id=?",
             (sprint_id, shell_id),
         ).fetchone()
         if role is None or role["role"] != "reviewer":
             raise SprintAuthorityError(
                 "only a participating Reviewer may record conformance"
             )
+        return int(role["participant_id"])
+
+    def _planner_shell_id(self, sprint_id: int) -> int:
+        planner = self.con.execute(
+            "SELECT sprint.originating_planner_shell_id FROM sprints sprint "
+            "JOIN sprint_participants participant "
+            "ON participant.sprint_id=sprint.sprint_id "
+            "AND participant.shell_id=sprint.originating_planner_shell_id "
+            "WHERE sprint.sprint_id=? AND participant.role='planner'",
+            (sprint_id,),
+        ).fetchone()
+        if planner is None:
+            raise SprintInvariantError(
+                "Sprint has no originating Planner participant"
+            )
+        return int(planner["originating_planner_shell_id"])
+
+    def _send_planner_notification(
+        self,
+        sprint_id: int,
+        *,
+        reviewer_shell_id: int,
+        planner_shell_id: int,
+        report_id: int,
+        followup_ids: tuple[int, ...],
+        final_report_id: int,
+        reason: str,
+        terminal_outcome: str,
+        idempotency_key: str,
+    ) -> Any:
+        from sprint_message_delivery import SprintMessageStore
+
+        followups = ",".join(str(value) for value in followup_ids) or "none"
+        rendered_body = (
+            f"Sprint {sprint_id} completed by Reviewer conformance. "
+            f"conformance_report_id={report_id}; final_report_id={final_report_id}; "
+            f"followup_ids={followups}; outcome={terminal_outcome}.\n\n"
+            f"Reason: {reason}"
+        )
+        return SprintMessageStore(self.con).send_to_shell_in_transaction(
+            planner_shell_id,
+            message_kind="notification",
+            body=rendered_body,
+            idempotency_key=f"{idempotency_key}:planner-completed",
+            sender_shell_id=reviewer_shell_id,
+            declared_type="re-enter",
+        )
+
+    @staticmethod
+    def _required_wake_id(wake_id: int | None) -> int:
+        if wake_id is None:
+            raise SprintInvariantError("Planner completion notice has no delivery intent")
+        return int(wake_id)
 
     def _lifecycle(self, sprint_id: int) -> str:
         row = self.con.execute(
@@ -624,13 +764,13 @@ class SprintCloseStore:
                 f"work unit {work_unit_id} does not belong to Sprint {sprint_id}"
             )
 
-    def _replay_receipt(
+    def _replay_evidence(
         self,
         report: sqlite3.Row,
         body: str,
         findings: tuple[dict[str, Any], ...],
         key: str,
-    ) -> ConformanceReceipt:
+    ) -> tuple[int, tuple[int, ...]]:
         if report["body"] != body:
             raise SprintInvariantError(
                 "conformance idempotency key was reused with different input"
@@ -654,11 +794,89 @@ class SprintCloseStore:
             raise SprintInvariantError(
                 f"conformance idempotency key {key!r} was reused with different findings"
             )
-        return ConformanceReceipt(
+        return (
             int(report["report_id"]),
             tuple(int(row["followup_id"]) for row in rows),
-            False,
         )
+
+    def _insert_final_report(
+        self,
+        sprint_id: int,
+        *,
+        reviewer_shell_id: int,
+        body: str,
+        idempotency_key: str,
+    ) -> int:
+        return int(
+            self.con.execute(
+                "INSERT INTO sprint_reports "
+                "(sprint_id,report_kind,author_shell_id,body,idempotency_key) "
+                "VALUES (?,'final',?,?,?)",
+                (
+                    sprint_id,
+                    reviewer_shell_id,
+                    body,
+                    f"{idempotency_key}:final-report",
+                ),
+            ).lastrowid
+        )
+
+    def _replay_final_report(
+        self,
+        sprint_id: int,
+        *,
+        reviewer_shell_id: int,
+        body: str,
+        idempotency_key: str,
+    ) -> int:
+        row = self.con.execute(
+            "SELECT report_id,author_shell_id,body FROM sprint_reports "
+            "WHERE sprint_id=? AND report_kind='final' AND idempotency_key=?",
+            (sprint_id, f"{idempotency_key}:final-report"),
+        ).fetchone()
+        if row is None or (
+            int(row["author_shell_id"]) != reviewer_shell_id or row["body"] != body
+        ):
+            raise SprintInvariantError(
+                "conformance idempotency key was reused with a different final report"
+            )
+        return int(row["report_id"])
+
+    def _replay_completion(
+        self,
+        sprint_id: int,
+        *,
+        reviewer_shell_id: int,
+        reason: str,
+        terminal_outcome: str,
+        idempotency_key: str,
+    ) -> None:
+        sprint = self.con.execute(
+            "SELECT lifecycle,terminal_outcome FROM sprints WHERE sprint_id=?",
+            (sprint_id,),
+        ).fetchone()
+        event = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='lifecycle.completed' AND actor_kind='participant' "
+            "AND actor_shell_id=? ORDER BY event_id DESC LIMIT 1",
+            (sprint_id, reviewer_shell_id),
+        ).fetchone()
+        expected = {
+            "from": "armed",
+            "reason": reason,
+            "via": "conformance",
+            "idempotency_key": idempotency_key,
+        }
+        if (
+            sprint is None
+            or sprint["lifecycle"] != "completed"
+            or sprint["terminal_outcome"] != terminal_outcome
+            or event is None
+            or json.loads(event["payload"]) != expected
+        ):
+            raise SprintInvariantError(
+                "conformance idempotency key was reused with different completion"
+            )
 
     @classmethod
     def _normalize_finding(cls, finding: Any) -> dict[str, Any]:
