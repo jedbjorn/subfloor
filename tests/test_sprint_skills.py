@@ -753,6 +753,11 @@ class SprintSkillTest(unittest.TestCase):
         self.assertIn("author the final Sprint report", reviewer)
         self.assertIn("sc sprint record-conformance", reviewer)
         self.assertIn("sc sprint compile-report", reviewer)
+        self.assertIn(
+            "`decision`: `pause`, `resume`, `replan`, `re-enter`, `cancel`, or `abort`",
+            reviewer,
+        )
+        self.assertNotIn("`cancel`, `conclude`", reviewer)
         self.assertNotIn("the planner decides whether", normalized_reviewer)
         self.assertNotIn("sc sprint pause --sprint <id>", reviewer)
 

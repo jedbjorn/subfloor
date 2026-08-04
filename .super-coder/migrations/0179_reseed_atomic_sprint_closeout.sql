@@ -677,8 +677,7 @@ durable `send` surface above. A clean conclude instead runs the atomic
 `record-conformance` close below. Every Reviewer → Planner route is Re-enter.
 The Reviewer-authored body must name:
 
-- `decision`: `pause`, `resume`, `replan`, `re-enter`, `cancel`, `conclude`, or
-  `abort`;
+- `decision`: `pause`, `resume`, `replan`, `re-enter`, `cancel`, or `abort`;
 - the evidence and rationale owned by the Reviewer;
 - exact Sprint/work-unit ids, reason, outcome, and complete action arguments;
 - any immediate safety impact that the FnB must see.
