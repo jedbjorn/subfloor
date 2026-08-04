@@ -41,6 +41,7 @@ class SupervisionFixture:
             "db_backup.py",
             "cli_entry.py",
             "engine_manifest.py",
+            "global_pointer.py",
             "install.py",
         ):
             shutil.copy2(
