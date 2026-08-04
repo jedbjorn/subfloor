@@ -2,6 +2,7 @@
   "harness": "codex",
   "launch": ["codex", "--dangerously-bypass-hook-trust"],
   "boot_artifact": "AGENTS.md",
+  "global_pointer": ".codex/AGENTS.md",
   "emit": [".codex/hooks.json"],
   "skill_dirs": [".claude/skills", ".agents/skills"],
   "env": {},

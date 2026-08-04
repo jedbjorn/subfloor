@@ -2,6 +2,7 @@
   "harness": "claude",
   "launch": ["claude"],
   "boot_artifact": "CLAUDE.md",
+  "global_pointer": ".claude/CLAUDE.md",
   "emit": [],
   "env": {},
   "model": { "flag": "--model" },
