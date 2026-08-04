@@ -5,6 +5,7 @@
 -- lanes or carry parent/context topology.  The one-open-chat invariant is now
 -- universal instead of exempting conversation_scope='sprint'.
 
+-- migrate: foreign-keys-off
 PRAGMA foreign_keys=OFF;
 
 BEGIN;
