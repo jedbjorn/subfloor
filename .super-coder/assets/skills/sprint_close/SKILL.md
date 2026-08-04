@@ -104,13 +104,18 @@ so, it defers `record-conformance` and sends the Planner a durable re-enter
 decision naming the new spec tasks and suggested unit projection. The added
 units run through delivery and produce a fresh delivery-terminal wake.
 
-For a clean pass or post-Sprint-only findings, the Reviewer records its report
-and findings with `sc sprint record-conformance`. Every recorded finding becomes
-a pending follow-up for FnB review; it is not also reopened as an editing lane.
-A safety finding may still demand immediate operator action.
+For a clean pass or post-Sprint-only findings, the Reviewer prepares its report,
+findings, final Sprint report, and full conclude handoff before calling
+`sc sprint record-conformance`. That one transaction records the report and
+follow-ups and publishes an actionable Re-enter message plus wake to the
+originating Planner. Every recorded finding becomes a pending follow-up for FnB
+review; it is not also reopened as an editing lane. A safety finding may still
+demand immediate operator action.
 
-Verify report id, follow-up ids, author identity, and idempotent replay before
-synthesis.
+Verify report id, follow-up ids, Planner message id, Planner wake id, author
+identity, and idempotent replay. The engine prepends the generated report and
+follow-up ids to the Reviewer-authored handoff; no second conclude message is
+sent.
 
 FnB records one terminal disposition per follow-up. `accepted` acknowledges
 ship-as-is; `resolved` and `dismissed` require a resolution file.
@@ -172,7 +177,8 @@ The Reviewer writes a concise report that answers:
 Name discrepancies; do not smooth them into a success narrative. A recovered
 stall can be a successful Sprint when the failure stayed durable, visible, and
 contained. Evidence packets, conformance drafts, and final report drafts belong
-under `shared/sprints/sprint-<n>/`.
+under `shared/sprints/sprint-<n>/`. The Reviewer finishes this report before
+the atomic conformance write and includes it unchanged in the Planner handoff.
 
 ## Pause and abort reports
 
@@ -188,13 +194,15 @@ nothing.
 
 ## Terminal handoff
 
-The Planner writes the Reviewer-authored final synthesis unchanged and passes it
-to `complete`; the surface commits the append-only `final` report before
-attempting the lifecycle transition. Omitting the report is permitted under
-advisory close-out, but the evidence packet records the gap. Abort only on a
-Reviewer decision or FnB override. Terminal state stops Sprint services and
-removes live pills while retaining conversations, messages, events, PR evidence,
-reports, and follow-ups.
+The Planner receives the actionable conclude handoff created atomically with
+conformance, accepts it, writes the Reviewer-authored final synthesis unchanged,
+and passes it to `complete`; the surface commits the append-only `final` report
+before attempting the lifecycle transition. Omitting the report is permitted
+under advisory close-out, but the evidence packet records the gap. Abort only
+on a Reviewer decision or FnB override. Terminal state resolves the accepted
+close-handoff liveness expectation, stops Sprint services, and removes live
+pills while retaining conversations, messages, events, PR evidence, reports,
+and follow-ups.
 
 Immediately before `complete`, re-run `sc sprint inbox --sprint <id>` to drain
 newly arrived messages, mark every handled informational message read with

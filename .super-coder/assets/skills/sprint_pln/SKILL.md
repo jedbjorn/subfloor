@@ -166,9 +166,11 @@ artifact directory are working material only.
 Pause, cancel, re-enter, and conclude are Reviewer decisions and Planner
 actions. A valid decision arrives as a durable Reviewer → Planner Re-enter
 message and names the decision, evidence, target ids, reason, and exact
-requested transition. Accept the actionable message, verify it came from the
-assigned Reviewer, and execute that transition without re-adjudicating the
-decision. Record the decision message id and action receipt together.
+requested transition. The clean conclude handoff is actionable and is created
+atomically with conformance; other freeform decisions are informational. Mark
+each handled message through `accept`, verify it came from the assigned
+Reviewer, and execute that transition without re-adjudicating the decision.
+Record the decision message id and action receipt together.
 
 The FnB board-level override from decision #46 is unaffected: a live FnB
 instruction may direct or supersede any action. Name that override in the
@@ -255,11 +257,12 @@ delivery-terminal wake; the Planner does not initiate the next conformance pass.
 
 ### Conclude or abort
 
-The Reviewer decides when the Sprint is done, records conformance, authors the
-final Sprint report, and sends a conclude decision containing the conformance
-receipt, follow-up ids, exact reason/outcome, stable key, and full report body.
-Write that Reviewer-authored body to `<reviewer-report>` unchanged, then perform
-the close action:
+The Reviewer decides when the Sprint is done and atomically records conformance,
+follow-ups, the actionable conclude message, and its wake. The engine prepends
+the conformance report and follow-up ids to the Reviewer-authored decision,
+which carries the exact reason/outcome, stable completion key, and full final
+report body. Accept that message before acting, write the Reviewer-authored body
+to `<reviewer-report>` unchanged, then perform the close action:
 
 ```text
 sc sprint complete --sprint <id> --reason <reviewer-decision-reason> \
@@ -276,6 +279,7 @@ sc sprint compile-report --sprint <id> --limit 50 \
   > shared/sprints/sprint-<n>/evidence.json
 ```
 
+Do not wait for or request a second conclude message after the atomic receipt.
 Abort is likewise an action taken only on a Reviewer decision or FnB override;
 it is terminal and deletes nothing.
 
@@ -309,7 +313,9 @@ sc sprint dispatch --sprint <id>
    immediately. Run no trailing command. Empty dispatch is still the final
    action for that handoff turn; investigate only on a later durable wake.
 
-On receipt, re-run `sc sprint inbox --sprint <id>`, accept the conclude message,
-execute its exact close action through the protocol above, and confirm the typed
-transition succeeded. After `complete` succeeds, emit its bounded receipt and
-run no further Sprint command. The Planner does not author a second report.
+On receipt, re-run `sc sprint inbox --sprint <id>`, accept the actionable
+conclude message, execute its exact close action through the protocol above,
+and confirm the typed transition succeeded. Completion resolves the accepted
+handoff liveness expectation. After `complete` succeeds, emit its bounded
+receipt and run no further Sprint command. The Planner does not author a second
+report or wait for a second handoff.

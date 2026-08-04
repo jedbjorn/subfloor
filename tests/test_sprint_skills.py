@@ -28,6 +28,7 @@ V21_ROLE_SKILLS = set(SKILLS)
 HANDOFF_ROLE_SKILLS = {"sprint_dev", "sprint_rev", "sprint_pln"}
 CLOSEOUT_ROLE_SKILLS = {"sprint_close", "sprint_dev", "sprint_pln", "sprint_rev"}
 FORCE_NEW_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
+ATOMIC_CLOSEOUT_SKILLS = {"sprint_close", "sprint_pln", "sprint_rev"}
 
 ARTIFACT_PATH_RULE = """## Sprint artifact paths
 
@@ -376,6 +377,11 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0176_reseed_sprint_red_check_doctrine.sql":
+                    con.executescript(later_migration.read_text())
 
             parsed = seed_skills.parse_skill(ASSETS / "sprint_rev" / "SKILL.md")
             rows = con.execute(
@@ -416,6 +422,11 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0178_reseed_sprint_watcher_state_skills.sql":
+                    con.executescript(later_migration.read_text())
 
             for name in ("sprint_dev", "sprint_pln"):
                 with self.subTest(name=name):
@@ -443,6 +454,51 @@ class SprintSkillTest(unittest.TestCase):
                         "carries no evidence about the PR watcher", normalized
                     )
                     self.assertIn("Do not repeat", normalized)
+        finally:
+            con.close()
+
+    def test_atomic_closeout_reseed_matches_assets_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0179_reseed_atomic_sprint_closeout.sql":
+                    break
+                con.executescript(migration.read_text())
+            placeholders = ",".join("?" for _ in ATOMIC_CLOSEOUT_SKILLS)
+            con.execute(
+                f"UPDATE skills SET description='stale',category='stale',"
+                f"command='stale',common=1,content='two separate writes',"
+                f"is_deleted=1 WHERE name IN ({placeholders})",
+                tuple(sorted(ATOMIC_CLOSEOUT_SKILLS)),
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0179_reseed_atomic_sprint_closeout.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for name in sorted(ATOMIC_CLOSEOUT_SKILLS):
+                with self.subTest(name=name):
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(
+                        tuple(rows[0]),
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                    )
         finally:
             con.close()
 
@@ -551,6 +607,34 @@ class SprintSkillTest(unittest.TestCase):
         self.assertIn("The participating Reviewer generates the packet", close)
         self.assertIn("Planner and FnB compilation remain valid", close)
         self.assertIn("shared/sprints/sprint-<n>/evidence.json", close)
+
+    def test_clean_closeout_records_and_notifies_planner_in_one_command(self):
+        reviewer = (ASSETS / "sprint_rev" / "SKILL.md").read_text()
+        planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()
+        close = (ASSETS / "sprint_close" / "SKILL.md").read_text()
+        clean = reviewer[
+            reviewer.index("## Whole-Sprint conformance"):
+            reviewer.index("## Stop")
+        ]
+        for guidance in (
+            "--planner-handoff-file <conclude-handoff>",
+            "Planner message id",
+            "Planner wake id",
+            "one actionable Planner Re-enter",
+            "send no second conclude message",
+        ):
+            self.assertIn(guidance, clean)
+        self.assertLess(
+            clean.index("Before recording conformance, author the final Sprint report"),
+            clean.index("sc sprint record-conformance"),
+        )
+        normalized_planner = " ".join(planner.split())
+        self.assertIn("created atomically with conformance", normalized_planner)
+        self.assertIn("Do not wait for or request a second conclude message", planner)
+        self.assertIn("Completion resolves the accepted handoff", normalized_planner)
+        normalized_close = " ".join(close.split())
+        self.assertIn("publishes an actionable Re-enter message", normalized_close)
+        self.assertIn("no second conclude message is sent", normalized_close)
 
     def test_skills_use_only_the_shipped_shell_command_surface(self):
         expected = {
@@ -796,7 +880,11 @@ class SprintSkillTest(unittest.TestCase):
             "complete-unit": ("--result-file",),
             "request-review": ("--readiness-file",),
             "record-review": ("--body-file",),
-            "record-conformance": ("--body-file", "--findings-file"),
+            "record-conformance": (
+                "--body-file",
+                "--findings-file",
+                "--planner-handoff-file",
+            ),
             "disposition-followup": ("--resolution-file",),
             "complete": ("--report-file",),
         }.items():
