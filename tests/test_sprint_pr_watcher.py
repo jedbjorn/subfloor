@@ -322,6 +322,48 @@ class RegistrationTest(SprintPRWatcherCase):
             ],
         )
 
+    def test_registration_without_checks_records_one_diagnostic_event(self):
+        self.reader.current = pull_request(checks=None, checks_failed=False)
+
+        receipt = self.register()
+        replay = self.register()
+
+        self.assertFalse(replay.created)
+        self.assertEqual(receipt.registered_pr_id, replay.registered_pr_id)
+        transition = self.con.execute(
+            "SELECT transition_id,normalized_state,observed_head_sha "
+            "FROM sprint_pr_transitions"
+        ).fetchone()
+        event = self.con.execute(
+            "SELECT actor_kind,payload FROM sprint_events "
+            "WHERE event_type='pr.no_checks_observed'"
+        ).fetchone()
+        self.assertEqual(("created", "a" * 40), tuple(transition)[1:])
+        self.assertEqual("system", event["actor_kind"])
+        self.assertEqual(
+            {
+                "observed_head_sha": "a" * 40,
+                "registered_pr_id": receipt.registered_pr_id,
+                "subscription_id": 1,
+                "transition_id": int(transition["transition_id"]),
+            },
+            json.loads(event["payload"]),
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type='pr.no_checks_observed'"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE idempotency_key LIKE 'pr-transition:%'"
+            ).fetchone()[0],
+        )
+
     def test_registration_rejects_multiple_work_units_without_side_effects(self):
         other_unit = int(
             self.con.execute(

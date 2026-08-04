@@ -272,6 +272,118 @@ class ReviewHandoffTest(SprintReviewLoopCase):
             ).fetchone()[0],
         )
 
+    def test_pending_rejection_reports_latest_observation_and_live_watcher(self):
+        self.con.execute(
+            "INSERT INTO sprint_pr_transitions "
+            "(registered_pr_id,normalized_state,transition_key,"
+            "observed_head_sha,evidence,observed_at) "
+            "VALUES (?,'pending','test-pending-observation',?,?,"
+            "datetime('now','-3 hours'))",
+            (
+                self.registered_pr_id,
+                "b" * 40,
+                json.dumps({"checks": "PENDING"}),
+            ),
+        )
+        self.con.execute(
+            "INSERT INTO daemon_heartbeats (name,beat_at,interval_s) "
+            "VALUES ('sprint-pr-watcher',datetime('now'),5) "
+            "ON CONFLICT(name) DO UPDATE SET beat_at=excluded.beat_at,"
+            "interval_s=excluded.interval_s"
+        )
+        self.con.commit()
+        reads_before = list(self.reader.get_calls)
+        messages_before = self.con.execute(
+            "SELECT COUNT(*) FROM wake_message"
+        ).fetchone()[0]
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            r"review handoff requires observed green checks "
+            r"\(latest observation: pending @ bbbbbbb, 3h ago; "
+            r"watcher beat \d+s ago\)",
+        ):
+            self.request_review()
+
+        self.assertEqual(reads_before, self.reader.get_calls)
+        self.assertEqual(
+            ("active", messages_before),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,(SELECT COUNT(*) FROM wake_message) "
+                    "FROM sprint_work_units WHERE work_unit_id=?",
+                    (self.unit_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_absent_observation_rejection_reports_stale_watcher(self):
+        unobserved = self.watcher.registration.register(
+            self.sprint_id,
+            owner_shell_id=1,
+            repository="Acme/Repo",
+            pr_number=43,
+            work_unit_ids=(self.unit_id,),
+            notify_service=False,
+        )
+        self.con.execute(
+            "INSERT INTO daemon_heartbeats (name,beat_at,interval_s) "
+            "VALUES ('sprint-pr-watcher',datetime('now','-2 days'),5) "
+            "ON CONFLICT(name) DO UPDATE SET beat_at=excluded.beat_at,"
+            "interval_s=excluded.interval_s"
+        )
+        self.con.commit()
+        reads_before = list(self.reader.get_calls)
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "review handoff requires observed green checks "
+            r"\(no observation recorded for this PR; "
+            r"watcher last beat 2d ago — stale\)",
+        ):
+            self.loop.request_review(
+                self.sprint_id,
+                unobserved.registered_pr_id,
+                1,
+                readiness="ready",
+                idempotency_key="unobserved-review",
+            )
+
+        self.assertEqual(reads_before, self.reader.get_calls)
+        self.assertEqual(
+            "active",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+
+    def test_created_rejection_reports_persistent_no_checks_and_absent_watcher(self):
+        self.reader.current = pull_request(checks=None, checks_failed=False)
+        self.watcher.poll_once()
+        self.con.execute(
+            "DELETE FROM daemon_heartbeats WHERE name='sprint-pr-watcher'"
+        )
+        self.con.commit()
+        reads_before = list(self.reader.get_calls)
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "review handoff requires observed green checks "
+            r"\(latest observation: created @ aaaaaaa — "
+            r"no checks reported on this repository; watcher never started\)",
+        ):
+            self.request_review()
+
+        self.assertEqual(reads_before, self.reader.get_calls)
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE idempotency_key='review-1'"
+            ).fetchone()[0],
+        )
+
     def test_handoff_and_outcome_replay_without_duplicate_durable_facts(self):
         first = self.request_review("idempotent-request")
         replay = self.request_review("idempotent-request")

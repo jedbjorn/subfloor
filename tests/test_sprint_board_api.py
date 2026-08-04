@@ -453,6 +453,16 @@ class SprintBoardApiCase(unittest.TestCase):
                     "secret": "hidden",
                 },
             ),
+            (
+                "pr.no_checks_observed",
+                {
+                    "registered_pr_id": 1,
+                    "subscription_id": 2,
+                    "transition_id": 3,
+                    "observed_head_sha": "a" * 40,
+                    "secret": "hidden",
+                },
+            ),
         )
         with self.connect() as con:
             con.executemany(
