@@ -606,6 +606,31 @@ def check_local_edits(force: bool, *, target_ref: str | None = None) -> None:
                 f"{len(already_target)} manifest mismatch(es) already match "
                 f"target {target_ref[:12]}"
             )
+    if edits:
+        # Two owners, one file: tracked engine files (`sc`) are re-installed by
+        # every branch checkout, so a manifest mismatch can be an OLDER
+        # COMMITTED engine copy rather than a fork patch (#581). A copy
+        # byte-equal to HEAD's or the pinned ref's committed version is
+        # engine-owned either way — safe to overwrite, wrong to block on.
+        refs = ["HEAD"]
+        pin = callable_floor.read_engine_ref(REPO_ROOT)
+        if pin:
+            refs.append(pin)
+        committed = {
+            rel
+            for rel, kind in edits.items()
+            if kind == "modified"
+            and any(_path_matches_ref(rel, ref) for ref in refs)
+        }
+        if committed:
+            edits = {
+                rel: kind for rel, kind in edits.items() if rel not in committed
+            }
+            print(
+                f"→ {len(committed)} manifest mismatch(es) match a committed "
+                "engine copy (HEAD or the pinned ref) — a stale checkout, "
+                "not a fork edit"
+            )
     if not edits:
         return
     print(f"✗ {len(edits)} engine file(s) locally modified since the last materialize:")
@@ -782,9 +807,10 @@ def _linked_worktree_paths() -> tuple[Path, ...]:
 
 
 def reconcile_linked_dispatchers(
-    sha: str,
+    sha: str | None,
     *,
     worktrees: tuple[Path, ...] | None = None,
+    target_bytes: bytes | None = None,
 ) -> tuple[Path, ...]:
     """Lay the current dispatcher into clean linked-worktree launcher copies.
 
@@ -793,15 +819,22 @@ def reconcile_linked_dispatchers(
     though PATH resolves the main checkout correctly. Only a dispatcher whose
     bytes still match that worktree's own ``HEAD:sc`` is engine-managed here;
     local edits are preserved and named rather than overwritten.
+
+    ``target_bytes`` supplies the current dispatcher directly for source repos,
+    where there is no fetched pin to show it from — the working tree's tracked
+    ``sc`` IS the current dispatcher there.
     """
-    shown = git("show", f"{sha}:sc", check=False)
-    if shown.returncode != 0:
-        print(
-            f"  WARNING: target {sha[:12]} has no dispatcher to reconcile",
-            file=sys.stderr,
-        )
-        return ()
-    target = shown.stdout.encode()
+    if target_bytes is None:
+        shown = git("show", f"{sha}:sc", check=False)
+        if shown.returncode != 0:
+            print(
+                f"  WARNING: target {sha[:12]} has no dispatcher to reconcile",
+                file=sys.stderr,
+            )
+            return ()
+        target = shown.stdout.encode()
+    else:
+        target = target_bytes
     canonical = REPO_ROOT / "sc"
     try:
         canonical_mode = canonical.stat().st_mode
@@ -1279,7 +1312,20 @@ def main(argv: list[str]) -> int:
     if target_sha is not None:
         publish_engine_ref(target_sha)
         reconcile_linked_dispatchers(target_sha, worktrees=worktrees)
-    elif not source:
+    elif source:
+        # A source repo tracks the engine in its working tree — the canonical
+        # `sc` IS the current dispatcher, and there is no fetched pin to show
+        # it from. Skipping reconciliation here left source-repo shell
+        # worktrees on stale launchers forever (flag #166: skills documented
+        # `sc sprint` while worktree dispatchers predated the verb).
+        canonical = REPO_ROOT / "sc"
+        if canonical.is_file():
+            reconcile_linked_dispatchers(
+                None,
+                worktrees=worktrees,
+                target_bytes=canonical.read_bytes(),
+            )
+    else:
         dispatcher_ref = callable_floor.read_engine_ref(REPO_ROOT)
         if dispatcher_ref:
             reconcile_linked_dispatchers(dispatcher_ref, worktrees=worktrees)
@@ -1303,8 +1349,9 @@ def main(argv: list[str]) -> int:
         branch_hint = f"repin-{pin}" if pin else "repin-<sha>"
         print("  This edited tracked files in place but did NOT touch git. Recommended flow:")
         print(f"    git checkout -b {branch_hint}")
-        print("    git add .sc-state/engine.ref .gitignore   "
-              "# + Makefile/workflow changes when reported")
+        print("    git add sc .sc-state/engine.ref .gitignore   "
+              "# sc when the materialize changed it; + Makefile/workflow "
+              "changes when reported")
         print("    git commit -m 'chore(engine): repin' && git push -u origin HEAD")
         print("    gh pr create")
         print("    git checkout main        # return to main — don't stay stranded on the repin branch")

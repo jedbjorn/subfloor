@@ -191,6 +191,7 @@
     ".super-coder/scripts/conversation_broker.py",
     ".super-coder/scripts/conversation_launch.py",
     ".super-coder/scripts/conversation_state.py",
+    ".super-coder/scripts/dispatch.sh",
     ".super-coder/scripts/init_fork.py",
     ".super-coder/scripts/install.py",
     ".super-coder/scripts/job.py",
@@ -469,9 +470,6 @@
   },
   "guidance_removal": {
     "authored_scan_paths": [
-      "README.md",
-      "docs/README.md",
-      "docs/quick-start.md",
       ".super-coder/Dockerfile",
       ".super-coder/adapters/claude/README.md",
       ".super-coder/adapters/codex/README.md",
@@ -481,12 +479,16 @@
       ".super-coder/assets/skills/messaging/SKILL.md",
       ".super-coder/assets/skills/test_authoring/SKILL.md",
       ".super-coder/migrations/0145_reseed_generic_guidance.sql",
+      ".super-coder/scripts/dispatch.sh",
       ".super-coder/scripts/live_model/__init__.py",
       ".super-coder/scripts/models.py",
       ".super-coder/scripts/shell_liveness.py",
       ".super-coder/ui/app.js",
       ".super-coder/ui/index.html",
       ".super-coder/ui/style.css",
+      "README.md",
+      "docs/README.md",
+      "docs/quick-start.md",
       "sc"
     ],
     "allowed_v2_authored_lines": {
@@ -495,7 +497,7 @@
         "\"No Sprints yet\",",
         "\"Prepared Sprints appear here after declaration.\",",
         "\"Sprint unavailable\",",
-        "// ── Sprints v2 FnB board ────────────────────────────────────────────────────",
+        "// \u2500\u2500 Sprints v2 FnB board \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
         ": el(\"div\", { className: \"muted sprint-feed-detail\" }, \"No display details.\"));",
         "? `Sprint ${sprintSelectedId}` : label;",
         "? el(\"pre\", { className: \"sprint-feed-detail\" }, JSON.stringify(item.details, null, 2))",
@@ -546,9 +548,9 @@
         "const wrap = el(\"div\", { className: \"sprint-feeds\" });",
         "detail.append(el(\"div\", { className: \"sprint-feed-detail\" },",
         "disabled: conversation.scope === \"sprint\" || conversation.state === \"closed\",",
-        "el(\"div\", { className: \"muted sprint-feed-empty\" }, state.loading ? \"Loading…\" : \"No entries.\"));",
+        "el(\"div\", { className: \"muted sprint-feed-empty\" }, state.loading ? \"Loading\u2026\" : \"No entries.\"));",
         "el(\"div\", { className: \"sprint-audit-row\" },",
-        "el(\"div\", { className: \"sprint-cancelled-note\" }, \"Cancelled — not completed\"));",
+        "el(\"div\", { className: \"sprint-cancelled-note\" }, \"Cancelled \u2014 not completed\"));",
         "el(\"div\", { className: \"sprint-header-context\" },",
         "el(\"div\", { className: \"sprint-header-times\" },",
         "el(\"div\", { className: \"sprint-long-text\" }, item.body)));",
@@ -568,7 +570,7 @@
         "el(\"span\", { className: `pill sprint-${sprint.lifecycle}` }, sprint.lifecycle));",
         "el(\"span\", {}, `Elapsed: ${sprintElapsed(sprint)}`)),",
         "el(\"span\", {}, `Planner: ${sprint.planner.shortname}`), specs),",
-        "el(\"span\", {}, `Showing the last good Sprint snapshot — refresh failed: ${error.message}`),",
+        "el(\"span\", {}, `Showing the last good Sprint snapshot \u2014 refresh failed: ${error.message}`),",
         "}, `Sprint ${sprint.sprint_id}`);",
         "else if (activeTab === \"sprints\") load(\"sprints\");",
         "feature: board.sprint.feature,",
@@ -581,7 +583,7 @@
         "hidden: conversation.scope === \"sprint\",",
         "history.replaceState(null, \"\", `#sprints/${selectedId}`);",
         "href: `#roadmap-feature-${sprint.feature.feature_id}`,",
-        "if (!refresh || !root.firstChild) root.replaceChildren(el(\"div\", { className: \"muted\" }, \"Loading Sprints…\"));",
+        "if (!refresh || !root.firstChild) root.replaceChildren(el(\"div\", { className: \"muted\" }, \"Loading Sprints\u2026\"));",
         "if (!units.length) cards.append(el(\"div\", { className: \"sprint-column-empty\" }, \"No work units\"));",
         "if ([\"prepared\", \"armed\", \"paused\"].includes(sprint.lifecycle))",
         "if (activeTab !== \"sprints\" || document.hidden) return;",
@@ -614,11 +616,11 @@
         "sprints: [\"#view-sprints\", renderSprints],",
         "svg.setAttribute(\"class\", \"sprint-wires\");",
         "target === \"aborted\" ? el(\"div\", { className: \"sprint-abort-note\" },",
-        "const label = `Sprint ${item.sprint_id} · ${item.lifecycle} · ${item.feature.title}`;",
+        "const label = `Sprint ${item.sprint_id} \u00b7 ${item.lifecycle} \u00b7 ${item.feature.title}`;",
         "textContent: sprint.feature.title,",
         "title: \"Select Sprint\",",
-        "title: `${label} · Sprint ${sprint.sprint_id}`,",
-        "title: `Sprint ${sprint.sprint_id} · ${sprint.role} · ${sprint.disposition}`,",
+        "title: `${label} \u00b7 Sprint ${sprint.sprint_id}`,",
+        "title: `Sprint ${sprint.sprint_id} \u00b7 ${sprint.role} \u00b7 ${sprint.disposition}`,",
         "wrap.classList.toggle(\"sprint-wire-focus\", on);"
       ],
       ".super-coder/ui/index.html": [
@@ -691,7 +693,7 @@
         ".sprint-wire-focus .sprint-wire.lit { opacity: 1; stroke: var(--accent); stroke-width: 2.5; }",
         ".sprint-wires { position: absolute; inset: 0; z-index: 1; pointer-events: none; overflow: visible; }"
       ],
-      "sc": [
+      ".super-coder/scripts/dispatch.sh": [
         "./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)",
         "sprint)       exec \"$PY\" \"$S/sprint_cli.py\" \"$@\" ;;"
       ]

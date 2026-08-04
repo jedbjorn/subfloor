@@ -85,11 +85,28 @@ def inspect_callable_floor(
                     f"engine ref {expected_ref[:12]}"
                 )
 
+    # Single-owner dispatcher (spec #105): the tracked `sc` may be a thin
+    # bootstrap whose whole verb table lives in the engine-owned body. A
+    # bootstrap over a floor without its body (a half-finished update or an
+    # unpaired rollback) is not callable, and the body's routes need the same
+    # missing-script scan the fat dispatcher always got.
     text = dispatcher_bytes.decode(errors="replace")
+    body = repo_root / ".super-coder" / "scripts" / "dispatch.sh"
+    route_texts = [text]
+    if "scripts/dispatch.sh" in text and not body.is_file():
+        issues.append(
+            "dispatcher bootstrap routes to a missing engine body: "
+            ".super-coder/scripts/dispatch.sh"
+        )
+    try:
+        route_texts.append(body.read_text(errors="replace"))
+    except OSError:
+        pass
     missing = sorted(
         {
             script
-            for script in _SCRIPT_REF_RE.findall(text)
+            for routed in route_texts
+            for script in _SCRIPT_REF_RE.findall(routed)
             if not (repo_root / ".super-coder" / "scripts" / script).is_file()
         }
     )

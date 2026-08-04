@@ -36,6 +36,7 @@ class SupervisionFixture:
         # cli_entry.py rides along with every script copied here: each one
         # imports it from its __main__ block (SIGPIPE hygiene, #384).
         for script in (
+            "dispatch.sh",
             "artifact_policy.py",
             "callable_floor.py",
             "db_backup.py",
