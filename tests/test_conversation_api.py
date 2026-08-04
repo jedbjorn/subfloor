@@ -1158,6 +1158,67 @@ class ConversationResourceTest(ConversationApiCase):
         finally:
             con.close()
 
+    def test_sprint_managed_tracks_lifecycle_and_frees_close_after_terminal(
+        self,
+    ) -> None:
+        conversation_id = self.seed_sprint_conversation()
+
+        status, _, armed = self.request(
+            "GET", f"/api/conversations/{conversation_id}"
+        )
+        self.assertEqual(status, 200, armed)
+        self.assertTrue(armed["sprint_managed"])
+
+        with self.connect() as con:
+            con.execute(
+                "UPDATE sprints SET lifecycle='paused',"
+                "paused_at=datetime('now') WHERE sprint_id=7"
+            )
+        status, _, paused = self.request(
+            "GET", f"/api/conversations/{conversation_id}"
+        )
+        self.assertEqual(status, 200, paused)
+        self.assertTrue(paused["sprint_managed"])
+
+        with self.connect() as con:
+            con.execute(
+                "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=7"
+            )
+            con.execute(
+                "UPDATE sprints SET lifecycle='completed',"
+                "terminal_outcome='success',completed_at=datetime('now') "
+                "WHERE sprint_id=7"
+            )
+        status, _, done = self.request(
+            "GET", f"/api/conversations/{conversation_id}"
+        )
+        self.assertEqual(status, 200, done)
+        self.assertFalse(done["sprint_managed"])
+
+        status, _, listed = self.request(
+            "GET", "/api/conversations?shell_id=1&open=true"
+        )
+        self.assertEqual(status, 200, listed)
+        listed_item = next(
+            item
+            for item in listed["items"]
+            if item["conversation_id"] == conversation_id
+        )
+        self.assertFalse(listed_item["sprint_managed"])
+
+        status, _, closed = self.request(
+            "PATCH",
+            f"/api/conversations/{conversation_id}",
+            body={"version": done["version"], "state": "closed"},
+        )
+        self.assertEqual(status, 200, closed)
+        self.assertEqual(closed["state"], "closed")
+        self.assertFalse(closed["sprint_managed"])
+
+    def test_normal_conversation_is_never_sprint_managed(self) -> None:
+        created = self.create()
+        self.assertFalse(created["sprint_managed"])
+
     def test_operator_boundary_rejects_tokens_and_cross_site_mutations(self) -> None:
         status, _, obj = self.request(
             "POST",

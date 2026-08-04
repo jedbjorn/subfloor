@@ -164,9 +164,12 @@ def test_sprint_conversations_are_not_closed_by_normal_chat_controls():
         interface.index("function chatBubble")
     ]
     assert 'if (conversation.scope === "sprint") return true' in close_for_switch
-    assert 'const sprintManaged = conversation.scope === "sprint"' in interface
+    assert 'const sprintScoped = conversation.scope === "sprint"' in interface
+    assert (
+        "const sprintManaged = Boolean(conversation.sprint_managed)" in interface
+    )
     assert "close.hidden = sprintManaged" in interface
-    assert 'hidden: conversation.scope === "sprint"' in interface
+    assert "hidden: Boolean(conversation.sprint_managed)" in interface
 
 
 def test_start_chat_has_default_and_configured_paths_without_terminal_controls():
@@ -385,7 +388,7 @@ def test_composer_is_retry_safe_and_has_turn_controls():
 def test_closed_chat_composer_offers_reopen():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
-    assert "const reopenable = closed && !sprintManaged" in interface
+    assert "const reopenable = closed && !sprintScoped" in interface
     assert "composer.disabled = closing || (closed && !reopenable)" in interface
     assert "send.disabled = closing || (closed && !reopenable)" in interface
     assert (

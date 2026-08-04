@@ -4016,8 +4016,11 @@ async function chatRenderOpen(
     updateStreamStatus();
     const closed = conversation.state === "closed";
     const closing = !closed && Boolean(conversation.close_requested_at);
-    const sprintManaged = conversation.scope === "sprint";
-    const reopenable = closed && !sprintManaged;
+    const sprintScoped = conversation.scope === "sprint";
+    // Managed = the owning sprint is still armed/paused; close stays engine-
+    // owned only for that window. Reopen is scope-blocked server-side forever.
+    const sprintManaged = Boolean(conversation.sprint_managed);
+    const reopenable = closed && !sprintScoped;
     composer.disabled = closing || (closed && !reopenable);
     send.disabled = closing || (closed && !reopenable);
     stop.disabled = conversation.state !== "running" || closing || Boolean(stopRequest);
@@ -4928,8 +4931,9 @@ async function renderInterface(root) {
         className: "act danger",
         type: "button",
         textContent: "Close",
-        disabled: conversation.scope === "sprint" || conversation.state === "closed",
-        hidden: conversation.scope === "sprint",
+        disabled: Boolean(conversation.sprint_managed)
+          || conversation.state === "closed",
+        hidden: Boolean(conversation.sprint_managed),
       });
       close.onclick = async () => {
         close.disabled = true;
