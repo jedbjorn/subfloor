@@ -16,6 +16,9 @@ SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
 FOUNDATION = MIGRATIONS / "0132_conversation_foundation.sql"
 GIT_TARGETS = MIGRATIONS / "0142_conversation_git_targets.sql"
+ACTIVE_REGISTRY = MIGRATIONS / "0162_active_chat_registry.sql"
+REAPER_IDENTITY = MIGRATIONS / "0163_conversation_run_process_identity.sql"
+TOPOLOGY_RETIREMENT = MIGRATIONS / "0168_retire_sprint_conversation_topology.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import conversation_state  # noqa: E402
@@ -210,6 +213,54 @@ class MigrationAndShapeTest(ConversationDbCase):
         }.issubset(tables))
         con.close()
 
+    def test_reaper_identity_migration_preserves_legacy_live_run(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            apply_schema(con, through="0162_active_chat_registry.sql")
+            con.execute("INSERT INTO users (user_id,username) VALUES (9,'legacy')")
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (9,'Legacy','legacy','dev','prompt',9)"
+            )
+            con.execute(
+                "INSERT INTO conversations "
+                "(shell_id,owner_user_id,harness,worktree,state,"
+                "creation_idempotency_key,creation_request_hash) "
+                "VALUES (9,9,'codex','/tmp/legacy','running','legacy','hash')"
+            )
+            conversation_id = con.execute(
+                "SELECT conversation_id FROM conversations "
+                "WHERE creation_idempotency_key='legacy'"
+            ).fetchone()[0]
+            message_id = con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'user','9','prompt','live','message','hash','running')",
+                (conversation_id,),
+            ).lastrowid
+            run_id = con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                "lease_expires_at,started_at) VALUES "
+                "(?,9,?,'running','legacy-broker','2999-01-01 00:00:00',"
+                "'2026-08-02 00:00:00')",
+                (conversation_id, message_id),
+            ).lastrowid
+
+            con.executescript(REAPER_IDENTITY.read_text())
+
+            row = con.execute(
+                "SELECT state,process_pid,process_start_ticks,process_group_id,"
+                "reaper_last_signal,reaper_signaled_at FROM conversation_runs "
+                "WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            self.assertEqual(
+                row,
+                ("running", None, None, None, None, None),
+            )
+
     def test_star_migration_defaults_legacy_rows_and_enforces_boolean_values(self) -> None:
         with closing(sqlite3.connect(":memory:")) as con:
             apply_schema(
@@ -345,6 +396,259 @@ class MigrationAndShapeTest(ConversationDbCase):
                 ).fetchone()[0],
                 2,
             )
+
+    def test_active_registry_migration_converges_legacy_open_chats(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.row_factory = sqlite3.Row
+            apply_schema(
+                con,
+                through="0161_reseed_flags_output_guidance.sql",
+            )
+            con.execute(
+                "INSERT INTO users (user_id,username) VALUES (9,'legacy')"
+            )
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (9,'Legacy','legacy','dev','prompt',9)"
+            )
+            con.execute(
+                "INSERT INTO conversations "
+                "(conversation_id,shell_id,owner_user_id,harness,worktree,"
+                "conversation_scope,creation_idempotency_key,"
+                "creation_request_hash,state,last_activity_at) VALUES "
+                "('cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',9,9,'codex',"
+                "'/tmp/legacy','normal','legacy-normal','hash-normal','queued',"
+                "'2026-08-02 10:00:00'),"
+                "('cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',9,9,'codex',"
+                "'/tmp/legacy','sprint','legacy-running','hash-running','running',"
+                "'2026-08-02 11:00:00'),"
+                "('cv_cccccccccccccccccccccccccccccccc',9,9,'codex',"
+                "'/tmp/legacy','sprint','legacy-newest','hash-newest','idle',"
+                "'2026-08-02 12:00:00')"
+            )
+            con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) VALUES "
+                "('cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','user','9','prompt',"
+                "'queued','queued-message','hash-queued','queued'),"
+                "('cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','user','9','prompt',"
+                "'running','running-message','hash-running','running'),"
+                "('cv_cccccccccccccccccccccccccccccccc','user','9','prompt',"
+                "'active','active-message','hash-active','queued')"
+            )
+            con.execute(
+                "INSERT INTO conversation_outbox "
+                "(conversation_id,message_id,state,claim_owner,claimed_at,"
+                "lease_expires_at) "
+                "SELECT conversation_id,message_id,'pending',NULL,NULL,NULL "
+                "FROM conversation_messages "
+                "WHERE conversation_id IN ("
+                "'cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',"
+                "'cv_cccccccccccccccccccccccccccccccc')"
+            )
+            con.execute(
+                "INSERT INTO conversation_outbox "
+                "(conversation_id,message_id,state,claim_owner,claimed_at,"
+                "lease_expires_at) "
+                "SELECT conversation_id,message_id,'claimed','broker',"
+                "'2026-08-02 11:01:00','2026-08-02 11:06:00' "
+                "FROM conversation_messages WHERE conversation_id="
+                "'cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'"
+            )
+
+            con.executescript(ACTIVE_REGISTRY.read_text())
+            con.executescript(ACTIVE_REGISTRY.read_text())
+
+            states = {
+                row["conversation_id"]: row["state"]
+                for row in con.execute(
+                    "SELECT conversation_id,state FROM conversations"
+                )
+            }
+            active = con.execute(
+                "SELECT shell_id,chat_id,process_pid,process_start_ticks "
+                "FROM active_shell_chats"
+            ).fetchall()
+            self.assertEqual(
+                states,
+                {
+                    "cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "closed",
+                    "cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": "closed",
+                    "cv_cccccccccccccccccccccccccccccccc": "idle",
+                },
+            )
+            self.assertEqual(
+                [tuple(row) for row in active],
+                [
+                    (
+                        9,
+                        "cv_cccccccccccccccccccccccccccccccc",
+                        None,
+                        None,
+                    )
+                ],
+            )
+            queued_work = [
+                tuple(row)
+                for row in con.execute(
+                    "SELECT m.conversation_id,m.state,o.state,"
+                    "m.completed_at IS NOT NULL,o.claim_owner "
+                    "FROM conversation_messages m "
+                    "JOIN conversation_outbox o USING (message_id) "
+                    "ORDER BY m.conversation_id"
+                )
+            ]
+            self.assertEqual(
+                queued_work,
+                [
+                    (
+                        "cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "cancelled",
+                        "cancelled",
+                        1,
+                        None,
+                    ),
+                    (
+                        "cv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "cancelled",
+                        "cancelled",
+                        1,
+                        None,
+                    ),
+                    (
+                        "cv_cccccccccccccccccccccccccccccccc",
+                        "queued",
+                        "pending",
+                        0,
+                        None,
+                    ),
+                ],
+            )
+
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "active chat must be open and belong to its shell",
+            ):
+                con.execute(
+                    "UPDATE active_shell_chats SET chat_id="
+                    "'cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' WHERE shell_id=9"
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute(
+                    "UPDATE active_shell_chats SET process_pid=123 "
+                    "WHERE shell_id=9"
+                )
+
+            con.execute(
+                "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+                "WHERE conversation_id='cv_cccccccccccccccccccccccccccccccc'"
+            )
+            self.assertEqual(
+                con.execute("SELECT COUNT(*) FROM active_shell_chats").fetchone()[0],
+                0,
+            )
+
+    def test_topology_retirement_converges_dirty_links_and_universal_fence(self):
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.row_factory = sqlite3.Row
+            apply_schema(con, through="0167_reseed_sprint_authority_split.sql")
+            con.execute("INSERT INTO users (user_id,username) VALUES (9,'legacy')")
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (9,'Legacy','legacy','dev','prompt',9)"
+            )
+            feature_id = int(
+                con.execute(
+                    "INSERT INTO roadmap (title) VALUES ('Legacy Sprint')"
+                ).lastrowid
+            )
+            sprint_id = int(
+                con.execute(
+                    "INSERT INTO sprints "
+                    "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+                    "VALUES (?,9,1)",
+                    (feature_id,),
+                ).lastrowid
+            )
+            participant_id = int(
+                con.execute(
+                    "INSERT INTO sprint_participants "
+                    "(sprint_id,shell_id,role,harness) "
+                    "VALUES (?,9,'developer','codex')",
+                    (sprint_id,),
+                ).lastrowid
+            )
+            con.execute(
+                "INSERT INTO conversations "
+                "(conversation_id,shell_id,owner_user_id,harness,worktree,"
+                "creation_idempotency_key,creation_request_hash,conversation_scope) "
+                "VALUES ('cv_legacy_sprint',9,9,'codex','/tmp/legacy',"
+                "'legacy-sprint','legacy-hash','sprint')"
+            )
+            link_id = int(
+                con.execute(
+                    "INSERT INTO sprint_participant_conversations "
+                    "(sprint_participant_id,conversation_id,purpose) "
+                    "VALUES (?,'cv_legacy_sprint','work')",
+                    (participant_id,),
+                ).lastrowid
+            )
+            con.execute(
+                "UPDATE sprint_participants SET persistent_conversation_id="
+                "'cv_legacy_sprint',current_conversation_id='cv_legacy_sprint' "
+                "WHERE participant_id=?",
+                (participant_id,),
+            )
+            con.execute(
+                "INSERT INTO active_shell_chats (shell_id,chat_id) "
+                "VALUES (9,'cv_legacy_sprint')"
+            )
+
+            con.executescript(TOPOLOGY_RETIREMENT.read_text())
+
+            self.assertEqual(
+                set(),
+                {"persistent_conversation_id", "current_conversation_id"}
+                & {
+                    row[1]
+                    for row in con.execute("PRAGMA table_info(sprint_participants)")
+                },
+            )
+            self.assertEqual(
+                set(),
+                {"purpose", "parent_conversation_id", "context_packet"}
+                & {
+                    row[1]
+                    for row in con.execute(
+                        "PRAGMA table_info(sprint_participant_conversations)"
+                    )
+                },
+            )
+            self.assertEqual(
+                (link_id, participant_id, "cv_legacy_sprint"),
+                tuple(
+                    con.execute(
+                        "SELECT participant_conversation_id,"
+                        "sprint_participant_id,conversation_id "
+                        "FROM sprint_participant_conversations"
+                    ).fetchone()
+                ),
+            )
+            self.assertEqual(
+                [], [tuple(row) for row in con.execute("PRAGMA foreign_key_check")]
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute(
+                    "INSERT INTO conversations "
+                    "(conversation_id,shell_id,owner_user_id,harness,worktree,"
+                    "creation_idempotency_key,creation_request_hash,"
+                    "conversation_scope) VALUES "
+                    "('cv_second_sprint',9,9,'codex','/tmp/legacy',"
+                    "'second-sprint','second-hash','sprint')"
+                )
 
     def test_conversation_requires_direct_user_owner(self) -> None:
         with self.assertRaises(sqlite3.IntegrityError):
@@ -663,7 +967,7 @@ class TransitionMatrixTest(ConversationDbCase):
 
 class FenceAndEventTest(ConversationDbCase):
     def test_open_chat_migration_closes_older_legacy_rows(self) -> None:
-        self.con.execute("DROP INDEX idx_conversations_live_normal_shell")
+        self.con.execute("DROP INDEX idx_conversations_one_open_shell")
         older = self.add_conversation(shell_id=1)
         self.con.execute(
             "UPDATE conversations SET last_activity_at='2026-01-01 00:00:00' "
@@ -789,6 +1093,7 @@ class FenceAndEventTest(ConversationDbCase):
 class SnapshotPolicyTest(ConversationDbCase):
     TABLES = (
         "conversations",
+        "active_shell_chats",
         "conversation_git_targets",
         "conversation_messages",
         "conversation_runs",
@@ -806,6 +1111,10 @@ class SnapshotPolicyTest(ConversationDbCase):
     def test_snapshot_round_trip_preserves_queue_and_recovery_evidence(
             self) -> None:
         conversation = self.add_conversation()
+        self.con.execute(
+            "INSERT INTO active_shell_chats (shell_id,chat_id) VALUES (1,?)",
+            (conversation,),
+        )
         message = self.add_message(conversation, state="queued")
         run = self.add_run(
             conversation, message, state="unknown"
@@ -839,6 +1148,13 @@ class SnapshotPolicyTest(ConversationDbCase):
                 "SELECT state,harness,worktree FROM conversations"
             ).fetchone(),
             ("idle", "codex", "/tmp/worktree-1"),
+        )
+        self.assertEqual(
+            target.execute(
+                "SELECT shell_id,chat_id,process_pid,process_start_ticks "
+                "FROM active_shell_chats"
+            ).fetchone(),
+            (1, conversation, None, None),
         )
         self.assertEqual(
             target.execute(

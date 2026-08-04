@@ -161,20 +161,13 @@ class ConversationApiCase(unittest.TestCase):
             participant_id = con.execute(
                 "INSERT INTO sprint_participants "
                 "(sprint_id,shell_id,role,harness,model,effort,disposition) "
-                "VALUES (7,1,'developer','codex','gpt-test','high','active')"
+                "VALUES (7,1,'planner','codex','gpt-test','high','active')"
             ).lastrowid
-            return sprint_participant_chats.create_and_select(
+            return sprint_participant_chats.create_wake_conversation(
                 con,
+                wake_id=1,
+                sprint_id=7,
                 participant_id=int(participant_id),
-                owner_user_id=1,
-                purpose="work",
-                harness="codex",
-                provider="openai",
-                model="gpt-test",
-                effort="high",
-                worktree=str(self.root / ".sc-worktrees" / "dev"),
-                title="Sprint 7 developer",
-                idempotency_key="sprint:7:participant:1:work",
             )
 
     def seed_conversation(
@@ -613,12 +606,90 @@ class ConversationResourceTest(ConversationApiCase):
             rows = con.execute(
                 "SELECT conversation_id,state,closed_at FROM conversations"
             ).fetchall()
+            active = con.execute(
+                "SELECT shell_id,chat_id,process_pid,process_start_ticks "
+                "FROM active_shell_chats"
+            ).fetchall()
         finally:
             con.close()
         by_id = {row["conversation_id"]: row for row in rows}
         self.assertEqual(by_id[first["conversation_id"]]["state"], "closed")
         self.assertIsNotNone(by_id[first["conversation_id"]]["closed_at"])
         self.assertEqual(by_id[second["conversation_id"]]["state"], "idle")
+        self.assertEqual(
+            [tuple(row) for row in active],
+            [(1, second["conversation_id"], None, None)],
+        )
+
+    def test_close_failure_prevents_replacement_chat(self) -> None:
+        first = self.create(key="close-failure-first")
+        con = self.connect()
+        con.executescript(
+            "CREATE TRIGGER reject_active_close BEFORE UPDATE OF state "
+            "ON conversations WHEN OLD.conversation_id="
+            f"'{first['conversation_id']}' AND NEW.state='closed' "
+            "BEGIN SELECT RAISE(ABORT,'close rejected'); END;"
+        )
+        con.close()
+
+        status, _, error = self.request(
+            "POST",
+            "/api/conversations",
+            body={"shell_id": 1, "harness": "codex", "title": "Never created"},
+            key="close-failure-second",
+        )
+
+        self.assertEqual(status, 500, error)
+        con = self.connect()
+        durable = con.execute(
+            "SELECT c.state,a.chat_id,"
+            "(SELECT COUNT(*) FROM conversations) AS conversation_count "
+            "FROM conversations c JOIN active_shell_chats a "
+            "ON a.chat_id=c.conversation_id WHERE c.conversation_id=?",
+            (first["conversation_id"],),
+        ).fetchone()
+        con.close()
+        self.assertEqual(
+            tuple(durable),
+            ("idle", first["conversation_id"], 1),
+        )
+
+    def test_replacement_insert_failure_leaves_old_chat_closed(self) -> None:
+        first = self.create(key="insert-failure-first")
+        con = self.connect()
+        con.executescript(
+            "CREATE TRIGGER reject_replacement_insert BEFORE INSERT "
+            "ON conversations WHEN NEW.creation_idempotency_key="
+            "'insert-failure-second' BEGIN "
+            "SELECT RAISE(ABORT,'replacement rejected'); END;"
+        )
+        con.close()
+
+        status, _, error = self.request(
+            "POST",
+            "/api/conversations",
+            body={"shell_id": 1, "harness": "codex", "title": "Rejected"},
+            key="insert-failure-second",
+        )
+
+        self.assertEqual(status, 500, error)
+        con = self.connect()
+        old = con.execute(
+            "SELECT state,closed_at FROM conversations WHERE conversation_id=?",
+            (first["conversation_id"],),
+        ).fetchone()
+        active_count = con.execute(
+            "SELECT COUNT(*) FROM active_shell_chats WHERE shell_id=1"
+        ).fetchone()[0]
+        replacement_count = con.execute(
+            "SELECT COUNT(*) FROM conversations "
+            "WHERE creation_idempotency_key='insert-failure-second'"
+        ).fetchone()[0]
+        con.close()
+        self.assertEqual(old["state"], "closed")
+        self.assertIsNotNone(old["closed_at"])
+        self.assertEqual(active_count, 0)
+        self.assertEqual(replacement_count, 0)
 
     def test_each_shell_may_keep_one_browser_chat_open(self) -> None:
         first = self.create(key="first-shell-chat", title="Dev")
@@ -767,7 +838,7 @@ class ConversationResourceTest(ConversationApiCase):
         )
         self.assertEqual(live_runs, 0)
 
-    def test_close_interrupts_active_run_and_closes_after_terminal_proof(self) -> None:
+    def test_fnb_close_unlinks_active_run_immediately(self) -> None:
         conversation = self.create(key="active-close")
         message_ids = []
         for number in range(2):
@@ -799,17 +870,9 @@ class ConversationResourceTest(ConversationApiCase):
             )
 
         self.assertEqual(status, 200, closing)
-        self.assertEqual(closing["state"], "running")
-        self.assertIsNotNone(closing["close_requested_at"])
-        interrupt.assert_called_once_with(run.run_id)
-        rejected_status, _, rejected = self.request(
-            "POST",
-            f"/api/conversations/{conversation['conversation_id']}/messages",
-            body={"text": "must not queue"},
-            key="active-close-rejected",
-        )
-        self.assertEqual(rejected_status, 409)
-        self.assertEqual(rejected["error"]["code"], "CONVERSATION_CLOSING")
+        self.assertEqual(closing["state"], "closed")
+        self.assertIsNone(closing["close_requested_at"])
+        interrupt.assert_not_called()
 
         con = self.connect()
         try:
@@ -827,10 +890,18 @@ class ConversationResourceTest(ConversationApiCase):
             request_events = con.execute(
                 "SELECT event_type,run_id FROM conversation_events "
                 "WHERE conversation_id=? AND event_type IN "
-                "('conversation.close.requested','run.interrupt.requested') "
+                "('conversation.close.requested','conversation.closed',"
+                "'run.interrupt.requested') "
                 "ORDER BY sequence",
                 (conversation["conversation_id"],),
             ).fetchall()
+            active_registry = con.execute(
+                "SELECT COUNT(*) FROM active_shell_chats WHERE shell_id=1"
+            ).fetchone()[0]
+            run_state = con.execute(
+                "SELECT state FROM conversation_runs WHERE run_id=?",
+                (run.run_id,),
+            ).fetchone()[0]
         finally:
             con.close()
         self.assertEqual(
@@ -845,9 +916,11 @@ class ConversationResourceTest(ConversationApiCase):
             [(row["event_type"], row["run_id"]) for row in request_events],
             [
                 ("conversation.close.requested", run.run_id),
-                ("run.interrupt.requested", run.run_id),
+                ("conversation.closed", run.run_id),
             ],
         )
+        self.assertEqual(active_registry, 0)
+        self.assertEqual(run_state, "leased")
 
         self.assertTrue(
             store.finish_run(
@@ -883,12 +956,11 @@ class ConversationResourceTest(ConversationApiCase):
             [(message_ids[0], "cancelled"), (message_ids[1], "cancelled")],
         )
         self.assertEqual(
-            [row["event_type"] for row in final_events][-4:],
+            [row["event_type"] for row in final_events][-3:],
             [
                 "conversation.close.requested",
-                "run.interrupt.requested",
-                "run.interrupted",
                 "conversation.closed",
+                "run.interrupted",
             ],
         )
 
@@ -997,7 +1069,7 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(count, 1)
         self.assertEqual(tuple(event), (1, "conversation.created"))
 
-    def test_sprint_entry_is_read_only_and_normal_close_cannot_break_pointer(
+    def test_fnb_close_closes_sprint_chat_and_enables_coordinate_mode(
         self,
     ) -> None:
         conversation_id = self.seed_sprint_conversation()
@@ -1052,26 +1124,36 @@ class ConversationResourceTest(ConversationApiCase):
         finally:
             con.close()
 
-        status, _, error = self.request(
+        status, _, closed = self.request(
             "PATCH",
             f"/api/conversations/{conversation_id}",
             body={"version": viewed["version"], "state": "closed"},
         )
-        self.assertEqual(status, 409)
-        self.assertEqual(error["error"]["code"], "SPRINT_CONVERSATION_MANAGED")
+        self.assertEqual(status, 200, closed)
+        self.assertEqual(closed["state"], "closed")
         con = self.connect()
         try:
             self.assertEqual(
-                ("idle", conversation_id),
+                ("closed", 0, 1),
                 tuple(
                     con.execute(
-                        "SELECT c.state,p.current_conversation_id "
-                        "FROM conversations c JOIN sprint_participants p "
-                        "ON p.current_conversation_id=c.conversation_id "
+                        "SELECT c.state,"
+                        "(SELECT COUNT(*) FROM active_shell_chats a "
+                        " WHERE a.chat_id=c.conversation_id),s.coordinate_mode "
+                        "FROM conversations c JOIN sprints s ON s.sprint_id=7 "
                         "WHERE c.conversation_id=?",
                         (conversation_id,),
                     ).fetchone()
                 ),
+            )
+            event = con.execute(
+                "SELECT actor_kind,payload FROM sprint_events "
+                "WHERE sprint_id=7 AND event_type='coordinate_mode.enabled'"
+            ).fetchone()
+            self.assertEqual(event["actor_kind"], "fnb")
+            self.assertEqual(
+                json.loads(event["payload"])["conversation_id"],
+                conversation_id,
             )
         finally:
             con.close()

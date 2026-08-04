@@ -10,7 +10,6 @@ from typing import Any
 
 import db_driver
 import sprint_liveness
-import sprint_participant_chats
 from github_pull_requests import GitHubPullRequestReader, PullRequest
 from sprint_domain import (
     SprintAuthorityError,
@@ -31,7 +30,7 @@ class ReviewHandoffReceipt:
 @dataclass(frozen=True)
 class ReviewOutcomeReceipt:
     work_unit_id: int
-    conversation_id: str
+    conversation_id: str | None
     message_id: int
     wake_id: int
     disposition: str
@@ -94,7 +93,7 @@ class SprintReviewLoopStore:
                 message_kind="review_request",
                 body=readiness,
                 actionable=True,
-                active=True,
+                declared_type="force-new",
                 idempotency_key=idempotency_key,
             )
             if receipt.wake_id is None:
@@ -134,7 +133,7 @@ class SprintReviewLoopStore:
         body: str,
         idempotency_key: str,
     ) -> ReviewOutcomeReceipt:
-        """Route a Review verdict onto a fresh fix or merge conversation."""
+        """Record a Review verdict and enqueue its delivery-time wake."""
         if verdict not in {"changes_requested", "approved"}:
             raise ValueError("review verdict must be changes_requested or approved")
         body = self._required(body, "review body")
@@ -145,7 +144,6 @@ class SprintReviewLoopStore:
             if int(lane["reviewer_shell_id"]) != reviewer_shell_id:
                 raise SprintAuthorityError("only the assigned Reviewer owns the verdict")
             review_message_id, requested_head = self._accepted_review_request(lane)
-            purpose = "fix" if verdict == "changes_requested" else "merge"
             disposition = "fixing" if verdict == "changes_requested" else "merge_ready"
             notification = (
                 f"Review changes requested for PR #{lane['pr_number']}: {body}"
@@ -160,20 +158,14 @@ class SprintReviewLoopStore:
                 message_kind="notification",
                 body=notification,
                 actionable=verdict == "changes_requested",
-                active=True,
+                declared_type="re-enter",
                 idempotency_key=idempotency_key,
             )
             if receipt.wake_id is None:
                 raise SprintInvariantError("active review outcome has no wake")
-            conversation_key = f"{idempotency_key}:conversation"
             if not receipt.created:
-                conversation_id = self._conversation_for_key(
-                    int(lane["developer_participant_id"]),
-                    purpose,
-                    conversation_key,
-                )
                 outcome = self._outcome_receipt(
-                    lane, conversation_id, receipt, disposition
+                    lane, receipt, disposition
                 )
             else:
                 if lane["disposition"] != "in_review":
@@ -183,12 +175,6 @@ class SprintReviewLoopStore:
                 transition = self._latest_transition(registered_pr_id)
                 if transition["observed_head_sha"] != requested_head:
                     raise SprintInvariantError("review request is stale for the PR head")
-                conversation_id = sprint_participant_chats.create_review_outcome(
-                    self.con,
-                    participant_id=int(lane["developer_participant_id"]),
-                    purpose=purpose,
-                    idempotency_key=conversation_key,
-                )
                 self._record_judgment(
                     lane,
                     reviewer_shell_id,
@@ -205,7 +191,6 @@ class SprintReviewLoopStore:
                     f"review.{verdict}",
                     reviewer_shell_id,
                     {
-                        "conversation_id": conversation_id,
                         "head_sha": requested_head,
                         "message_id": receipt.message_id,
                         "registered_pr_id": registered_pr_id,
@@ -213,7 +198,7 @@ class SprintReviewLoopStore:
                     },
                 )
                 outcome = self._outcome_receipt(
-                    lane, conversation_id, receipt, disposition
+                    lane, receipt, disposition
                 )
             sprint_liveness.SprintLivenessMonitor(self.con).resolve_in_transaction(
                 review_message_id,
@@ -363,7 +348,7 @@ class SprintReviewLoopStore:
 
     def _accepted_review_request(self, lane: sqlite3.Row) -> tuple[int, str]:
         latest = self.con.execute(
-            "SELECT message_id,disposition FROM sprint_messages WHERE sprint_id=? "
+            "SELECT message_id,disposition FROM wake_message WHERE sprint_id=? "
             "AND work_unit_id=? AND to_participant_id=? "
             "AND message_kind='review_request' "
             "ORDER BY message_id DESC LIMIT 1",
@@ -423,16 +408,6 @@ class SprintReviewLoopStore:
         ).fetchone()
         return json.loads(row["payload"]).get("head_sha") if row is not None else None
 
-    def _conversation_for_key(
-        self, participant_id: int, purpose: str, key: str
-    ) -> str:
-        conversation_id = sprint_participant_chats.linked_conversation_for_key(
-            self.con, participant_id, purpose, key
-        )
-        if conversation_id is None:
-            raise SprintInvariantError("review outcome replay lost its conversation")
-        return conversation_id
-
     @staticmethod
     def _require_live_green(identity: sqlite3.Row, live: PullRequest) -> None:
         if live.number != int(identity["pr_number"]):
@@ -460,13 +435,12 @@ class SprintReviewLoopStore:
     @staticmethod
     def _outcome_receipt(
         lane: sqlite3.Row,
-        conversation_id: str,
         receipt: MessageReceipt,
         disposition: str,
     ) -> ReviewOutcomeReceipt:
         return ReviewOutcomeReceipt(
             int(lane["work_unit_id"]),
-            conversation_id,
+            None,
             receipt.message_id,
             int(receipt.wake_id),
             disposition,

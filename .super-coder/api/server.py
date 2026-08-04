@@ -63,6 +63,7 @@ import artifact_policy  # noqa: E402
 import backfill_shell_api_keys  # noqa: E402  (startup key provisioning)
 import conversation_broker  # noqa: E402  (Feature #24 durable turn service)
 import conversation_launch  # noqa: E402  (canonical shell launch preparation)
+import conversation_reaper  # noqa: E402  (Feature #31 orphan process ladder)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
@@ -72,7 +73,7 @@ import sprint_liveness  # noqa: E402  (Sprints v2 one-shot monitor surface)
 import sprint_message_delivery  # noqa: E402  (Sprints v2 inbox acceptance)
 import sprint_recovery  # noqa: E402  (Sprints v2 pause/resume reconciliation)
 import sprint_review_loop  # noqa: E402  (Sprints v2 Dev/Review command surface)
-import sprint_runtime  # noqa: E402  (armed-only Sprint dispatch + wake delivery)
+import sprint_runtime  # noqa: E402  (Sprint dispatch + engine wake delivery)
 import sprint_board  # noqa: E402  (read-only Sprints v2 FnB board projections)
 import skill_projection  # noqa: E402  (exact bounded grant mirrors)
 sys.path.insert(0, str(ENGINE / "api"))
@@ -82,8 +83,8 @@ import map_db  # noqa: E402  (read-only handle to the dr_* catalogue in map.db)
 import ports as ports_mod  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin rule)
-import sprint_participant_chats  # noqa: E402  (Sprints v2 participant chat topology)
-import sprint_pr_watcher  # noqa: E402  (Sprints v2 armed GitHub observation)
+import sprint_participant_chats  # noqa: E402  (registry-backed Sprint wake chats)
+import sprint_pr_watcher  # noqa: E402  (engine-wide PR subscription observation)
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
 import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
@@ -345,7 +346,10 @@ def get_shells(con) -> list[dict]:
         "s.mandate, s.is_shared, "
         "(SELECT COUNT(*) FROM shell_messages m "
         " WHERE m.to_shell_id=s.shell_id AND m.read_at IS NULL "
-        " AND m.kind IN ('shell','task','result')) AS unread_message_count "
+        " AND m.kind IN ('shell','task','result')) AS unread_message_count, "
+        "(SELECT w.available_at FROM sprint_wake_outbox w "
+        " WHERE w.receiver_shell_id=s.shell_id AND w.state='pending' "
+        " AND w.available_at>datetime('now')) AS pending_wake_available_at "
         "FROM shells s WHERE COALESCE(s.is_deleted,0)=0 ORDER BY s.shell_id"))
     return sprint_participant_chats.attach_live_participations(con, shells)
 
@@ -2638,6 +2642,35 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             con.close()
 
+    def _pr_post(self, path: str, body: dict):
+        """Authenticated shell-owned PR subscription surface."""
+        shell_id = self._require_shell_auth()
+        if shell_id is None:
+            return
+        con = db()
+        try:
+            if path != "/_sc/pr/subscribe":
+                return self._send(404, {"error": "not found"})
+            try:
+                pr_number = int(body.get("pr_number"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("pr_number must be a positive integer") from exc
+            receipt = sprint_pr_watcher.SprintPRWatcher(
+                con, repo_root=REPO_ROOT
+            ).subscribe(
+                owner_shell_id=shell_id,
+                repository=body.get("repository") or "",
+                pr_number=pr_number,
+            )
+            return self._send(201 if receipt.created else 200, {
+                "subscription_id": receipt.subscription_id,
+                "created": receipt.created,
+            })
+        except Exception as exc:
+            return self._sprint_error(exc)
+        finally:
+            con.close()
+
     # -- authenticated shell CLI catalogue reads --
 
     def _shell_catalog_get(self, path: str):
@@ -3741,6 +3774,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path.startswith("/_sc/mem/"):
             return self._mem_post(path, self._body())
+        if path.startswith("/_sc/pr/"):
+            return self._pr_post(path, self._body())
         if path.startswith("/_sc/sprint/"):
             return self._sprint_post(path, self._body())
         con = db()
@@ -4267,11 +4302,12 @@ def require_loopback_bind(bind: str) -> None:
 
 
 def start_runtime_services() -> None:
-    """Start commit-woken conversations and the armed Sprint services."""
-    conversation_broker.start_service(
+    """Start commit-woken conversations and Sprint/engine services."""
+    broker = conversation_broker.start_service(
         DB_PATH,
         launch_preparer=conversation_launch.ConversationLaunchPreparer(DB_PATH),
     )
+    conversation_reaper.start_service(DB_PATH, native_interrupt=broker.interrupt)
     sprint_runtime.start_service(DB_PATH)
     sprint_pr_watcher.start_service(DB_PATH, repo_root=REPO_ROOT)
 
@@ -4327,14 +4363,17 @@ def main(argv):
             )
             sprint_pr_watcher.start_service(DB_PATH, repo_root=REPO_ROOT)
 
-        await transport.serve(
-            bind,
-            port,
-            dispatch_http,
-            _ws_unavailable,
-            on_started=start_runtime_services,
-            stream_handler=conversation_routes.stream_events,
-        )
+        try:
+            await transport.serve(
+                bind,
+                port,
+                dispatch_http,
+                _ws_unavailable,
+                on_started=start_runtime_services,
+                stream_handler=conversation_routes.stream_events,
+            )
+        finally:
+            conversation_reaper.stop_service()
 
     print(f"super-coder review layer → http://127.0.0.1:{port}  (bind {bind}, DB: {DB_PATH.name})")
     try:

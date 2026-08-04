@@ -507,6 +507,34 @@ class ConformanceFollowupTest(SprintCloseCase):
             ).fetchone()[0],
         )
 
+    def test_participating_reviewer_cannot_record_final_report(self):
+        with self.assertRaisesRegex(
+            sprint_domain.SprintAuthorityError, "owning Planner or FnB"
+        ):
+            self.close.record_final_report(
+                self.sprint_id,
+                2,
+                body="Reviewer must not author the final synthesis.",
+                idempotency_key="reviewer-final-report",
+            )
+
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=? "
+                "AND report_kind='final'",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='final_report.recorded'",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+
     def test_only_fnb_dispositions_followup_and_only_pending_is_unresolved(self):
         self.con.execute(
             "INSERT INTO shells "
@@ -712,16 +740,41 @@ class EvidenceCompilerTest(SprintCloseCase):
             f"/_sc/sprint/{self.sprint_id}/timeline",
             packet["full_history_links"]["timeline"],
         )
-        self.assertGreaterEqual(
-            len(packet["full_history_links"]["participant_conversations"]), 3
+        self.assertEqual(
+            [], packet["full_history_links"]["participant_conversations"]
         )
         self.assertGreater(packet["anomalies"]["events"]["truncated"], 0)
 
-    def test_only_planner_or_admin_compiles_and_participants_read_timeline(self):
+    def test_planner_admin_and_participating_reviewer_compile_evidence(self):
+        planner_packet = self.close.compile_evidence_packet(self.sprint_id, 3)
+        reviewer_packet = self.close.compile_evidence_packet(self.sprint_id, 2)
+        self.assertEqual(
+            (self.sprint_id, self.sprint_id),
+            (
+                planner_packet["scope"]["sprint_id"],
+                reviewer_packet["scope"]["sprint_id"],
+            ),
+        )
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (5,'FnB','FNB','admin','prompt',1)"
+        )
+        self.con.commit()
+        self.assertEqual(
+            self.sprint_id,
+            self.close.compile_evidence_packet(self.sprint_id, 5)["scope"][
+                "sprint_id"
+            ],
+        )
         with self.assertRaisesRegex(
-            sprint_domain.SprintAuthorityError, "owning Planner"
+            sprint_domain.SprintAuthorityError, "participating Reviewer"
         ):
             self.close.compile_evidence_packet(self.sprint_id, 1)
+        with self.assertRaisesRegex(
+            sprint_domain.SprintAuthorityError, "participating Reviewer"
+        ):
+            self.close.compile_evidence_packet(self.sprint_id, 4)
         timeline = self.close.timeline(self.sprint_id, 2)
         self.assertEqual(self.sprint_id, timeline["sprint_id"])
         self.assertEqual(

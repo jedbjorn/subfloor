@@ -33,6 +33,11 @@ def apply_schema(con: sqlite3.Connection) -> None:
 
 class SprintWorkDispatchCase(unittest.TestCase):
     def setUp(self) -> None:
+        quiet_env = mock.patch.dict(
+            "os.environ", {"SC_SPRINT_FORCE_NEW_QUIET_SECONDS": "0"}
+        )
+        quiet_env.start()
+        self.addCleanup(quiet_env.stop)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.db_path = Path(self.temp_dir.name) / "sprint.db"
@@ -144,7 +149,7 @@ class SprintWorkDispatchCase(unittest.TestCase):
     def assignment_message(self, unit_id: int) -> int:
         return int(
             self.con.execute(
-                "SELECT message_id FROM sprint_messages "
+                "SELECT message_id FROM wake_message "
                 "WHERE work_unit_id=? AND message_kind='work_assignment' "
                 "ORDER BY message_id DESC LIMIT 1",
                 (unit_id,),
@@ -164,9 +169,8 @@ class SprintWorkDispatchCase(unittest.TestCase):
     def conversation_for(self, shell_id: int) -> str:
         return str(
             self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE sprint_id=? AND shell_id=?",
-                (self.sprint_id, shell_id),
+                "SELECT chat_id FROM active_shell_chats WHERE shell_id=?",
+                (shell_id,),
             ).fetchone()[0]
         )
 
@@ -178,7 +182,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
 
         wake_ids = self.lifecycle.arm(self.sprint_id, 3)
 
-        self.assertEqual(2, len(wake_ids))
+        self.assertEqual(3, len(wake_ids))
         self.assertEqual(
             [(late_wave, "ready"), (early_wave, "ready")],
             self.dispositions(),
@@ -195,14 +199,91 @@ class DispatchGateTest(SprintWorkDispatchCase):
             "one Reviewer may cover parallel units without consuming a lane",
         )
         self.assertEqual(
-            [early_wave, late_wave],
+            [(early_wave, "force-new"), (late_wave, "force-new")],
             [
-                row[0]
+                tuple(row)
                 for row in self.con.execute(
-                    "SELECT work_unit_id FROM sprint_messages "
+                    "SELECT work_unit_id,declared_type FROM wake_message "
                     "WHERE message_kind='work_assignment' ORDER BY message_id"
                 )
             ],
+        )
+        planner_wake = self.con.execute(
+            "SELECT receiver_shell_id,message_kind,body,declared_type,actionable "
+            "FROM wake_message WHERE receiver_shell_id=3 "
+            "AND message_kind='notification'"
+        ).fetchone()
+        self.assertEqual(
+            (3, "notification", "new", 0),
+            (
+                planner_wake["receiver_shell_id"],
+                planner_wake["message_kind"],
+                planner_wake["declared_type"],
+                planner_wake["actionable"],
+            ),
+        )
+        self.assertEqual(
+            "Sprint 1 armed. Recorded participant launch selections:\n"
+            "- planner PLN1: codex · model=default · effort=default\n"
+            "- developer DEV1: codex · model=default · effort=default\n"
+            "- developer DEV2: codex · model=default · effort=default\n"
+            "- reviewer REV1: kimi · model=default · effort=default\n"
+            "- reviewer REV2: kimi · model=default · effort=default",
+            planner_wake["body"],
+        )
+
+    def test_arm_rejects_blank_model_selection_before_any_dispatch(self) -> None:
+        self.create_unit(developer=1)
+        self.con.execute(
+            "UPDATE sprint_participants SET model='' "
+            "WHERE sprint_id=? AND role='planner'",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "recorded model selections",
+        ):
+            self.lifecycle.arm(self.sprint_id, 3)
+
+        self.assertEqual(
+            ("prepared", 0, [(1, "planned")]),
+            (
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0],
+                self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
+                self.dispositions(),
+            ),
+        )
+
+    def test_arm_rejects_blank_effort_selection_before_any_dispatch(self) -> None:
+        self.create_unit(developer=1)
+        self.con.execute(
+            "UPDATE sprint_participants SET effort='  ' "
+            "WHERE sprint_id=? AND role='reviewer'",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "recorded model selections",
+        ):
+            self.lifecycle.arm(self.sprint_id, 3)
+
+        self.assertEqual(
+            ("prepared", 0, [(1, "planned")]),
+            (
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0],
+                self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
+                self.dispositions(),
+            ),
         )
 
     def test_dependencies_block_and_each_developer_gets_one_editing_lane(self) -> None:
@@ -242,7 +323,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
             [
                 row[0]
                 for row in self.con.execute(
-                    "SELECT work_unit_id FROM sprint_messages "
+                    "SELECT work_unit_id FROM wake_message "
                     "WHERE message_kind='work_assignment' AND work_unit_id<>? "
                     "ORDER BY message_id",
                     (first,),
@@ -418,7 +499,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
         self.lifecycle.arm(self.sprint_id, 3)
         first_message = self.assignment_message(unit)
         first_key = self.con.execute(
-            "SELECT idempotency_key FROM sprint_messages WHERE message_id=?",
+            "SELECT idempotency_key FROM wake_message WHERE message_id=?",
             (first_message,),
         ).fetchone()[0]
 
@@ -427,7 +508,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
 
         second_message = self.assignment_message(unit)
         second_key = self.con.execute(
-            "SELECT idempotency_key FROM sprint_messages WHERE message_id=?",
+            "SELECT idempotency_key FROM wake_message WHERE message_id=?",
             (second_message,),
         ).fetchone()[0]
         self.assertEqual(1, len(released))
@@ -438,7 +519,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
             [
                 tuple(row)
                 for row in self.con.execute(
-                    "SELECT disposition,decline_reason FROM sprint_messages "
+                    "SELECT disposition,decline_reason FROM wake_message "
                     "WHERE work_unit_id=? AND message_kind='work_assignment' "
                     "ORDER BY message_id",
                     (unit,),
@@ -579,6 +660,246 @@ class DispatchGateTest(SprintWorkDispatchCase):
         )
 
 
+class DeliveryTerminalTest(SprintWorkDispatchCase):
+    def terminal_messages(self) -> list[sqlite3.Row]:
+        return self.con.execute(
+            "SELECT p.shell_id,m.message_kind,m.body,m.declared_type,"
+            "m.actionable,m.disposition,m.idempotency_key "
+            "FROM wake_message m JOIN sprint_participants p "
+            "ON p.participant_id=m.to_participant_id "
+            "WHERE m.sprint_id=? AND m.idempotency_key LIKE ? "
+            "ORDER BY p.shell_id",
+            (self.sprint_id, f"sprint:{self.sprint_id}:delivery-terminal:%"),
+        ).fetchall()
+
+    def terminal_events(self) -> list[sqlite3.Row]:
+        return self.con.execute(
+            "SELECT actor_kind,actor_shell_id,payload FROM sprint_events "
+            "WHERE sprint_id=? AND event_type='sprint.delivery_terminal' "
+            "ORDER BY event_id",
+            (self.sprint_id,),
+        ).fetchall()
+
+    def mark_merge_ready(self, unit_id: int, shell_id: int) -> None:
+        self.assertEqual(
+            "accepted",
+            self.messages.mark_read(self.assignment_message(unit_id), shell_id),
+        )
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='merge_ready' "
+            "WHERE work_unit_id=?",
+            (unit_id,),
+        )
+        self.con.commit()
+
+    def complete_merge(self, unit_id: int, key: str) -> None:
+        with db_driver.write_transaction(self.con, "test.merge_observed"):
+            self.units.complete_from_merge_in_transaction(
+                self.sprint_id,
+                (unit_id,),
+                transition_key=key,
+            )
+
+    def assert_episode(self, terminal_count: int, completed: int, cancelled: int):
+        base = f"sprint:{self.sprint_id}:delivery-terminal:{terminal_count}"
+        messages = [
+            row
+            for row in self.terminal_messages()
+            if row["idempotency_key"] == base
+            or str(row["idempotency_key"]).startswith(f"{base}:")
+        ]
+        self.assertEqual([2, 5], [int(row["shell_id"]) for row in messages])
+        participant_ids = {
+            int(row["shell_id"]): int(row["participant_id"])
+            for row in self.con.execute(
+                "SELECT shell_id,participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND role='reviewer'",
+                (self.sprint_id,),
+            )
+        }
+        self.assertEqual(
+            [
+                f"{base}:reviewer:{participant_ids[2]}",
+                f"{base}:reviewer:{participant_ids[5]}",
+            ],
+            [str(row["idempotency_key"]) for row in messages],
+        )
+        expected_body = (
+            f"All planned delivery work for Sprint {self.sprint_id} is terminal "
+            f"({terminal_count} units: {completed} completed, {cancelled} "
+            "cancelled). Begin whole-Sprint conformance per sprint_rev — compile "
+            "the evidence packet, judge integrated main, then send the Planner "
+            "either a re-enter decision or your conclude decision."
+        )
+        self.assertEqual(
+            [
+                ("notification", expected_body, "new", 0, None),
+                ("notification", expected_body, "new", 0, None),
+            ],
+            [
+                (
+                    row["message_kind"],
+                    row["body"],
+                    row["declared_type"],
+                    int(row["actionable"]),
+                    row["disposition"],
+                )
+                for row in messages
+            ],
+        )
+        event = self.terminal_events()[-1]
+        self.assertEqual(("system", None), (event["actor_kind"], event["actor_shell_id"]))
+        self.assertEqual(
+            {
+                "terminal_count": terminal_count,
+                "completed_count": completed,
+                "cancelled_count": cancelled,
+            },
+            json.loads(event["payload"]),
+        )
+
+    def test_pause_resume_serial_units_wake_reviewers_on_final_merge(self) -> None:
+        first = self.create_unit(developer=1, title="First")
+        second = self.create_unit(
+            developer=1, dependencies=(first,), title="Final"
+        )
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="Reference pause",
+        )
+        self.lifecycle.resume(
+            self.sprint_id, sprint_domain.LifecycleActor("planner", 3)
+        )
+
+        self.mark_merge_ready(first, 1)
+        self.complete_merge(first, "merged-first")
+        self.assertEqual([], self.terminal_messages())
+        self.assertEqual([], self.terminal_events())
+
+        self.mark_merge_ready(second, 1)
+        self.complete_merge(second, "merged-final")
+
+        self.assertEqual([(first, "completed"), (second, "completed")], self.dispositions())
+        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_events()))
+        self.assert_episode(2, 2, 0)
+
+    def test_paused_report_completion_wakes_only_on_resume(self) -> None:
+        report = self.create_unit(developer=1, output_kind="report_only")
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.messages.mark_read(self.assignment_message(report), 1)
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="Inspect report",
+        )
+
+        self.units.complete(self.sprint_id, report, 1, result="Report #1")
+
+        self.assertEqual([], self.terminal_messages())
+        self.assertEqual([], self.terminal_events())
+        self.lifecycle.resume(
+            self.sprint_id, sprint_domain.LifecycleActor("planner", 3)
+        )
+        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_events()))
+        self.assert_episode(1, 1, 0)
+
+    def test_single_reviewer_uses_the_canonical_episode_key(self) -> None:
+        self.con.execute(
+            "DELETE FROM sprint_participants WHERE sprint_id=? AND shell_id=5",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        report = self.create_unit(developer=1, output_kind="report_only")
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.messages.mark_read(self.assignment_message(report), 1)
+
+        self.units.complete(self.sprint_id, report, 1, result="Only report")
+
+        messages = self.terminal_messages()
+        self.assertEqual(1, len(messages))
+        self.assertEqual(2, int(messages[0]["shell_id"]))
+        self.assertEqual(
+            f"sprint:{self.sprint_id}:delivery-terminal:1",
+            messages[0]["idempotency_key"],
+        )
+        self.assertEqual(1, len(self.terminal_events()))
+
+    def test_cancelling_the_last_planned_unit_wakes_reviewers(self) -> None:
+        upstream = self.create_unit(developer=1, title="Cancelled upstream")
+        downstream = self.create_unit(
+            developer=4,
+            dependencies=(upstream,),
+            title="Cancelled downstream",
+        )
+        self.units.cancel(self.sprint_id, upstream, 3, reason="No longer needed")
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.assertEqual([(upstream, "cancelled"), (downstream, "planned")], self.dispositions())
+
+        self.units.cancel(self.sprint_id, downstream, 3, reason="No work remains")
+
+        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_events()))
+        self.assert_episode(2, 0, 2)
+
+    def test_arming_all_cancelled_sprint_wakes_reviewers(self) -> None:
+        first = self.create_unit(developer=1, title="Cancelled first")
+        second = self.create_unit(developer=4, title="Cancelled second")
+        self.units.cancel(self.sprint_id, first, 3, reason="No longer needed")
+        self.units.cancel(self.sprint_id, second, 3, reason="No work remains")
+        self.assertEqual([], self.terminal_messages())
+        self.assertEqual([], self.terminal_events())
+
+        self.lifecycle.arm(self.sprint_id, 3)
+
+        self.assertEqual(
+            [(first, "cancelled"), (second, "cancelled")], self.dispositions()
+        )
+        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_events()))
+        self.assert_episode(2, 0, 2)
+
+    def test_episode_replay_dedupes_and_added_scope_refires_with_fresh_key(self) -> None:
+        first = self.create_unit(developer=1, output_kind="report_only")
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.messages.mark_read(self.assignment_message(first), 1)
+        self.units.complete(self.sprint_id, first, 1, result="First report")
+        self.assert_episode(1, 1, 0)
+
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="Replay episode",
+        )
+        self.lifecycle.resume(
+            self.sprint_id, sprint_domain.LifecycleActor("planner", 3)
+        )
+        self.assertEqual(2, len(self.terminal_messages()))
+        self.assertEqual(1, len(self.terminal_events()))
+
+        second = self.create_unit(developer=1, output_kind="no_code")
+        self.units.dispatch_ready(self.sprint_id)
+        self.messages.mark_read(self.assignment_message(second), 1)
+        self.units.complete(self.sprint_id, second, 1, result="Second result")
+        self.assertEqual(4, len(self.terminal_messages()))
+        self.assertEqual(2, len(self.terminal_events()))
+        self.assert_episode(2, 2, 0)
+
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="Replay expanded episode",
+        )
+        self.lifecycle.resume(
+            self.sprint_id, sprint_domain.LifecycleActor("planner", 3)
+        )
+        self.assertEqual(4, len(self.terminal_messages()))
+        self.assertEqual(2, len(self.terminal_events()))
+
+
 class ProductionPulseTest(SprintWorkDispatchCase):
     def test_armed_pulse_enqueues_every_parallel_ready_lane(self) -> None:
         first = self.create_unit(developer=1, wave=4)
@@ -593,12 +914,17 @@ class ProductionPulseTest(SprintWorkDispatchCase):
 
         first_conversation = self.conversation_for(1)
         second_conversation = self.conversation_for(4)
+        planner_conversation = self.conversation_for(3)
         self.assertEqual(
             [(first, "ready"), (second, "ready")],
             self.dispositions(),
         )
         self.assertEqual(
-            {first_conversation: 1, second_conversation: 1},
+            {
+                first_conversation: 1,
+                second_conversation: 1,
+                planner_conversation: 1,
+            },
             {
                 str(row[0]): int(row[1])
                 for row in self.con.execute(
@@ -608,7 +934,7 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             },
         )
         self.assertEqual(
-            [("delivered", 1), ("delivered", 1)],
+            [("delivered", 1), ("delivered", 1), ("delivered", 1)],
             [
                 tuple(row)
                 for row in self.con.execute(
@@ -625,7 +951,6 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
             (wake_id,),
         ).fetchone()[0]
-        conversation_id = self.conversation_for(1)
         runtime = sprint_runtime.SprintRuntimeService(
             self.db_path,
             owner="runtime-test",
@@ -633,6 +958,14 @@ class ProductionPulseTest(SprintWorkDispatchCase):
 
         self.assertTrue(runtime.pulse_once(startup=True))
         self.assertTrue(runtime.pulse_once())
+        conversation_id = self.conversation_for(1)
+        wake_message_id = int(
+            self.con.execute(
+                "SELECT message_id FROM wake_message WHERE work_unit_id=? "
+                "AND message_kind='work_assignment'",
+                (unit,),
+            ).fetchone()[0]
+        )
 
         wake = self.con.execute(
             "SELECT state,attempt_count FROM sprint_wake_outbox WHERE wake_id=?",
@@ -649,8 +982,11 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             "`sprint_dev`. Run `sc sprint inbox --sprint "
             f"{self.sprint_id}` now and act on the Sprint message(s) using "
             "`sprint_dev`. Confirm every Sprint write succeeds before stopping. "
-            "If the handoff is not complete, load `sprint_dev` again and run `sc "
-            f"sprint inbox --sprint {self.sprint_id}` again."
+            "If a Sprint command failed or did not confirm its durable write, retry "
+            "that command. Do not re-check the inbox otherwise — new messages arrive "
+            "as their own wakes.\n\n"
+            f"## wake_message #{wake_message_id} (declared Force-New)\n\n"
+            "Unit 1\n\nOutput 1"
         )
         self.assertEqual(expected_prompt, native["body"])
         self.assertEqual(wake_key, native["idempotency_key"])
@@ -711,9 +1047,40 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             tuple(
                 self.con.execute(
                     "SELECT "
-                    "(SELECT COUNT(*) FROM sprint_messages),"
+                    "(SELECT COUNT(*) FROM wake_message),"
                     "(SELECT COUNT(*) FROM sprint_wake_outbox),"
                     "(SELECT COUNT(*) FROM conversation_outbox)"
+                ).fetchone()
+            ),
+        )
+
+    def test_engine_wake_delivery_pulses_without_an_armed_sprint(self) -> None:
+        sent = self.messages.send_to_shell(
+            1,
+            message_kind="system",
+            body="armed-independent engine notice",
+            idempotency_key="engine-pulse-without-armed-sprint",
+        )
+        delivered: list[tuple[str, str]] = []
+        runtime = sprint_runtime.SprintRuntimeService(
+            self.db_path,
+            owner="engine-only-runtime-test",
+            deliver=lambda conversation, prompt, _key: (
+                delivered.append((conversation, prompt)) or "engine-only-run"
+            ),
+        )
+
+        self.assertTrue(runtime.pulse_once())
+
+        self.assertEqual(1, len(delivered))
+        self.assertIn("armed-independent engine notice", delivered[0][1])
+        self.assertEqual(
+            ("delivered", 1),
+            tuple(
+                self.con.execute(
+                    "SELECT state,attempt_count FROM sprint_wake_outbox "
+                    "WHERE wake_id=?",
+                    (sent.wake_id,),
                 ).fetchone()
             ),
         )
@@ -721,6 +1088,7 @@ class ProductionPulseTest(SprintWorkDispatchCase):
     def test_server_startup_wires_broker_before_sprint_runtime(self) -> None:
         order: list[str] = []
         preparer = object()
+        broker = mock.Mock()
         with (
             mock.patch.object(
                 server.conversation_launch,
@@ -730,8 +1098,15 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             mock.patch.object(
                 server.conversation_broker,
                 "start_service",
-                side_effect=lambda *_args, **_kwargs: order.append("broker"),
+                side_effect=lambda *_args, **_kwargs: (
+                    order.append("broker") or broker
+                ),
             ) as broker_start,
+            mock.patch.object(
+                server.conversation_reaper,
+                "start_service",
+                side_effect=lambda *_args, **_kwargs: order.append("reaper"),
+            ) as reaper_start,
             mock.patch.object(
                 server.sprint_runtime,
                 "start_service",
@@ -740,10 +1115,14 @@ class ProductionPulseTest(SprintWorkDispatchCase):
         ):
             server.start_runtime_services()
 
-        self.assertEqual(["broker", "sprint"], order)
+        self.assertEqual(["broker", "reaper", "sprint"], order)
         broker_start.assert_called_once_with(
             server.DB_PATH,
             launch_preparer=preparer,
+        )
+        reaper_start.assert_called_once_with(
+            server.DB_PATH,
+            native_interrupt=broker.interrupt,
         )
         sprint_start.assert_called_once_with(server.DB_PATH)
         self.assertIn(

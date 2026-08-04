@@ -33,6 +33,9 @@ _EVENT_FIELDS = {
     "sprint.declared": frozenset(
         {"feature_id", "spec_approval_ids", "participant_shell_ids"}
     ),
+    "sprint.delivery_terminal": frozenset(
+        {"terminal_count", "completed_count", "cancelled_count"}
+    ),
     "lifecycle.armed": frozenset(
         {
             "from",
@@ -60,6 +63,8 @@ _EVENT_FIELDS = {
             "anomalies",
         }
     ),
+    "coordinate_mode.enabled": frozenset({"conversation_id", "reason"}),
+    "coordinate_mode.cleared": frozenset({"reason"}),
     "pause.interrupt_delivery_failed": frozenset({"run_id"}),
     "work_unit.created": frozenset(
         {
@@ -115,6 +120,21 @@ _EVENT_FIELDS = {
     "wake.requeued": frozenset({"failed_wake_id", "replacement_wake_id"}),
     "liveness.nudged": frozenset(
         {"expectation_message_id", "silence_episode", "nudge_message_id"}
+    ),
+    "liveness.sanctioned_quiet": frozenset(
+        {
+            "expectation_message_id",
+            "silence_episode",
+            "suppressor_kind",
+            "evidence_key",
+        }
+    ),
+    "liveness.ci_stalled": frozenset(
+        {
+            "registered_pr_id",
+            "transition_key",
+            "backstop_message_id",
+        }
     ),
     "liveness.escalated": frozenset(
         {
@@ -371,8 +391,11 @@ class SprintBoardProjection:
             for row in self.con.execute(
                 "SELECT p.participant_id,p.shell_id,sh.shortname,sh.display_name,"
                 "p.role,p.harness,p.model,p.effort,p.disposition,"
-                "p.current_conversation_id FROM sprint_participants p "
-                "JOIN shells sh ON sh.shell_id=p.shell_id WHERE p.sprint_id=? "
+                "active.chat_id AS current_conversation_id "
+                "FROM sprint_participants p "
+                "JOIN shells sh ON sh.shell_id=p.shell_id "
+                "LEFT JOIN active_shell_chats active ON active.shell_id=p.shell_id "
+                "WHERE p.sprint_id=? "
                 "ORDER BY p.participant_id",
                 (sprint_id,),
             )
@@ -448,7 +471,7 @@ class SprintBoardProjection:
         for row in self.con.execute(
             "WITH ranked AS ("
             " SELECT m.*,ROW_NUMBER() OVER (PARTITION BY m.work_unit_id "
-            " ORDER BY m.message_id DESC) rank FROM sprint_messages m "
+            " ORDER BY m.message_id DESC) rank FROM wake_message m "
             " WHERE m.sprint_id=? AND m.work_unit_id IS NOT NULL) "
             "SELECT ranked.*,sender.shell_id sender_shell_id,"
             "sender_shell.shortname sender_shortname,recipient.shell_id recipient_shell_id,"

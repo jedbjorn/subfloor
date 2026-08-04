@@ -54,6 +54,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
 import callable_floor  # noqa: E402
 import db_driver  # noqa: E402
+import global_pointer  # noqa: E402
 import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
 import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
@@ -1020,6 +1021,8 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     this seam (open_db, authenticate, ensure_worktree) still sys.exit, so
     callers must also treat SystemExit as a refusal."""
     headless = headless_prompt is not None
+    if not os.environ.get("RENDER_ONLY"):
+        global_pointer.write_global_pointers()
     con = open_db()
     # Same best-effort skill heal as main() — compose's SKILLS block reads
     # what this repairs. RENDER_ONLY never mutates, here as there.
@@ -1251,6 +1254,8 @@ def main() -> None:
         allow_unpinned=owns_engine,
         context="session launch",
     )
+    if not os.environ.get("RENDER_ONLY"):
+        global_pointer.write_global_pointers()
     args = sys.argv[1:]
     first = "--first" in args
     headless = "--headless" in args

@@ -44,7 +44,12 @@ GRANTS_DDL = (
     "CREATE TABLE shell_skills (shell_skill_id INTEGER PRIMARY KEY, "
     "shell_id INTEGER NOT NULL, skill_id INTEGER NOT NULL, UNIQUE(shell_id, skill_id));"
     "CREATE TABLE flavor_skills (flavor TEXT NOT NULL, skill_id INTEGER NOT NULL, "
-    "UNIQUE(flavor, skill_id))")
+    "UNIQUE(flavor, skill_id));"
+    "CREATE VIEW resolved_shell_skills AS "
+    "SELECT sh.shell_id, fs.skill_id FROM shells sh "
+    "JOIN flavor_skills fs ON fs.flavor=sh.flavor WHERE sh.flavor IS NOT NULL "
+    "UNION ALL SELECT ss.shell_id, ss.skill_id FROM shell_skills ss "
+    "JOIN shells sh ON sh.shell_id=ss.shell_id WHERE sh.flavor IS NULL")
 
 
 def write_asset(root: Path, name: str, body: str) -> None:

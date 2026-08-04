@@ -25,6 +25,7 @@ from conversation_adapters import (  # noqa: E402
     ClaudeAdapter,
     CodexAdapter,
     ConversationContext,
+    JsonLineRpcProcess,
     KimiAdapter,
     NativeTurn,
     NormalizedEvent,
@@ -32,6 +33,8 @@ from conversation_adapters import (  # noqa: E402
     ReconcileResult,
     adapter_for,
 )
+from conversation_adapters import opencode as opencode_adapter
+from conversation_adapters.base import SubprocessRunner
 
 KIMI_FIXTURES = ROOT / "tests" / "fixtures" / "conversations" / "kimi"
 
@@ -928,6 +931,21 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertEqual(recovered.outcome, "unknown")
         self.assertFalse(recovered.proven)
 
+    def test_opencode_shared_server_is_not_the_turn_process(self) -> None:
+        adapter, _native = self.build("opencode")
+        shared_server = mock.Mock(pid=4242)
+        shared_server.poll.return_value = None
+
+        with mock.patch.object(
+            opencode_adapter,
+            "_SERVER_PROCESS",
+            shared_server,
+        ):
+            turn = adapter.start(self.context, "hello")
+
+        self.assertIsNone(turn.process_ref)
+        self.assertEqual(shared_server.poll.call_count, 0)
+
     def test_opencode_shell_tools_use_the_conversation_launch_identity(
         self,
     ) -> None:
@@ -1515,11 +1533,12 @@ class ConversationAdapterTest(unittest.TestCase):
     def test_kimi_default_runner_owns_and_cleans_up_process_group(self) -> None:
         adapter = KimiAdapter()
         self.assertTrue(adapter.runner.start_new_session)
+        self.assertTrue(ClaudeAdapter().runner.start_new_session)
         process = FakeKimiProcess([])
         process._sc_conversation_process_group = 4321
 
         with mock.patch(
-            "conversation_adapters.kimi.os.killpg"
+            "conversation_adapters.base.os.killpg"
         ) as kill_process_group:
             adapter._cleanup_process(process, 0.1)
 
@@ -1531,6 +1550,56 @@ class ConversationAdapterTest(unittest.TestCase):
                 mock.call(4321, signal.SIGKILL),
             ],
         )
+
+    def test_codex_app_server_owns_a_process_group(self) -> None:
+        process = mock.Mock()
+        process.pid = 4321
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO()
+        process.stderr = io.StringIO()
+        with (
+            mock.patch(
+                "conversation_adapters.codex.subprocess.Popen",
+                return_value=process,
+            ) as spawn,
+            mock.patch.object(JsonLineRpcProcess, "request", return_value={}),
+            mock.patch.object(JsonLineRpcProcess, "notify"),
+        ):
+            rpc = JsonLineRpcProcess(cwd=self.root, env={})
+
+        self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+        self.assertEqual(
+            rpc.process._sc_conversation_process_group,
+            process.pid,
+        )
+
+    def test_shared_runner_reaps_group_after_leader_exit(self) -> None:
+        process = mock.Mock()
+        process.pid = 4321
+        process.stderr = io.StringIO()
+        process.wait.return_value = 0
+        cleaned = threading.Event()
+        with (
+            mock.patch(
+                "conversation_adapters.base.subprocess.Popen",
+                return_value=process,
+            ) as spawn,
+            mock.patch(
+                "conversation_adapters.base.cleanup_owned_process",
+                side_effect=lambda _process, _timeout: cleaned.set(),
+            ) as cleanup,
+        ):
+            returned = SubprocessRunner().spawn(
+                ["harness"],
+                cwd=self.root,
+                env={},
+            )
+            self.assertTrue(cleaned.wait(1))
+
+        self.assertIs(returned, process)
+        self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+        self.assertEqual(process._sc_conversation_process_group, process.pid)
+        cleanup.assert_called_once_with(process, 1.0)
 
     def test_kimi_identity_mismatch_blocks_usage_reconciliation(self) -> None:
         adapter, runner = self.build("kimi")

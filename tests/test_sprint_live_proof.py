@@ -104,6 +104,11 @@ class SprintLiveProof(unittest.TestCase):
         cls.httpd.server_close()
 
     def setUp(self) -> None:
+        quiet_env = mock.patch.dict(
+            "os.environ", {"SC_SPRINT_FORCE_NEW_QUIET_SECONDS": "0"}
+        )
+        quiet_env.start()
+        self.addCleanup(quiet_env.stop)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.db_path = Path(self.temp_dir.name) / "sprint-live-proof.db"
@@ -338,7 +343,7 @@ class SprintLiveProof(unittest.TestCase):
 
     def assignment_message(self, unit_id: int) -> int:
         row = self.con.execute(
-            "SELECT message_id FROM sprint_messages "
+            "SELECT message_id FROM wake_message "
             "WHERE work_unit_id=? AND message_kind='work_assignment' "
             "ORDER BY message_id DESC LIMIT 1",
             (unit_id,),
@@ -518,7 +523,7 @@ class SprintLiveProof(unittest.TestCase):
     def test_serial_sprint_runs_correction_merge_dispatch_and_close(self) -> None:
         sprint_id, document_id, units = self.prepare(((1, 2, ()), (1, 2, (0,))))
         initial_wakes = self.run_cli(3, "arm", "--sprint", str(sprint_id))["wake_ids"]
-        self.assertEqual(1, len(initial_wakes))
+        self.assertEqual(2, len(initial_wakes))
         self.assertEqual(
             [(units[0], "ready"), (units[1], "planned")],
             [
@@ -575,24 +580,20 @@ class SprintLiveProof(unittest.TestCase):
         self.assertEqual("lifecycle.completed", event_types[-1])
         self.assertEqual(2, packet["pr_outcomes"]["total"])
         self.assertEqual(
-            ["work", "fix", "merge", "merge"],
-            [
-                row[0]
-                for row in self.con.execute(
-                    "SELECT link.purpose FROM sprint_participant_conversations link "
-                    "JOIN sprint_participants p "
-                    "ON p.participant_id=link.sprint_participant_id "
-                    "WHERE p.sprint_id=? AND p.shell_id=1 "
-                    "ORDER BY link.participant_conversation_id",
-                    (sprint_id,),
-                )
-            ],
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_conversations link "
+                "JOIN sprint_participants p "
+                "ON p.participant_id=link.sprint_participant_id "
+                "WHERE p.sprint_id=? AND p.shell_id=1",
+                (sprint_id,),
+            ).fetchone()[0],
         )
 
     def test_parallel_sprint_completes_out_of_order_without_lane_overlap(self) -> None:
         sprint_id, document_id, units = self.prepare(((1, 2, ()), (4, 5, ())))
         initial_wakes = self.run_cli(3, "arm", "--sprint", str(sprint_id))["wake_ids"]
-        self.assertEqual(2, len(initial_wakes))
+        self.assertEqual(3, len(initial_wakes))
         self.deliver_browser_turns()
         self.accept_assignment(units[0], 1)
         self.accept_assignment(units[1], 4)
@@ -646,6 +647,7 @@ class SprintLiveProof(unittest.TestCase):
     def test_conversation_and_watcher_writes_share_wal_without_lock_loss(self) -> None:
         sprint_id, _document_id, units = self.prepare(((1, 2, ()),))
         sprint_domain.SprintLifecycleStore(self.con).arm(sprint_id, 3)
+        self.deliver_browser_turns()
         self.accept_assignment(units[0], 1)
         self.github.set(3001, "OPEN", checks="PENDING")
         watcher = self.watcher()
@@ -659,8 +661,10 @@ class SprintLiveProof(unittest.TestCase):
         self.github.set(3001, "OPEN")
         conversation_id = str(
             self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE sprint_id=? AND shell_id=1",
+                "SELECT active.chat_id FROM sprint_participants participant "
+                "JOIN active_shell_chats active "
+                "ON active.shell_id=participant.shell_id "
+                "WHERE participant.sprint_id=? AND participant.shell_id=1",
                 (sprint_id,),
             ).fetchone()[0]
         )
@@ -742,12 +746,15 @@ class SprintLiveProof(unittest.TestCase):
             str(assignment_id),
         )
 
-        planner_conversation = str(
-            self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE sprint_id=? AND shell_id=3",
-                (sprint_id,),
-            ).fetchone()[0]
+        arming_planner_conversation = self.con.execute(
+            "SELECT active.chat_id FROM sprint_participants participant "
+            "JOIN active_shell_chats active ON active.shell_id=participant.shell_id "
+            "WHERE participant.sprint_id=? AND participant.shell_id=3",
+            (sprint_id,),
+        ).fetchone()[0]
+        self.assertIsNotNone(
+            arming_planner_conversation,
+            "arming opens the overseeing Planner's fresh wake chat",
         )
         question_prefix = "Which downstream compatibility fixture owns the proof? "
         question = question_prefix + "q" * (6000 - len(question_prefix))
@@ -765,13 +772,17 @@ class SprintLiveProof(unittest.TestCase):
         )
         self.assertTrue(question_receipt["message_created"])
         self.assertEqual("pending", question_receipt["wake_state"])
-        self.assertEqual(planner_conversation, question_receipt["conversation_id"])
+        self.assertEqual(
+            arming_planner_conversation,
+            question_receipt["conversation_id"],
+            "later Planner-bound traffic re-enters the chat opened by arming",
+        )
         self.assertEqual(
             (1, 3, 6000, question),
             tuple(
                 self.con.execute(
                     "SELECT sender.shell_id,recipient.shell_id,length(m.body),m.body "
-                    "FROM sprint_messages m "
+                    "FROM wake_message m "
                     "JOIN sprint_participants sender "
                     "ON sender.participant_id=m.from_participant_id "
                     "JOIN sprint_participants recipient "
@@ -782,6 +793,16 @@ class SprintLiveProof(unittest.TestCase):
             ),
         )
         self.deliver_browser_turns()
+        planner_conversation = str(
+            self.con.execute(
+                "SELECT active.chat_id FROM sprint_participants participant "
+                "JOIN active_shell_chats active "
+                "ON active.shell_id=participant.shell_id "
+                "WHERE participant.sprint_id=? AND participant.shell_id=3",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertNotEqual("None", planner_conversation)
         planner_inbox = self.run_cli(3, "inbox", "--sprint", str(sprint_id))
         self.assertIn(
             (question_receipt["message_id"], question),
@@ -790,15 +811,17 @@ class SprintLiveProof(unittest.TestCase):
                 for message in planner_inbox["messages"]
             ],
         )
-        self.assertEqual(
-            sprint_message_delivery.wake_prompt(sprint_id, "planner"),
-            self.con.execute(
+        delivered_prompt = self.con.execute(
                 "SELECT cm.body FROM sprint_wake_outbox w "
                 "JOIN conversation_messages cm "
                 "ON cm.idempotency_key=w.idempotency_key WHERE w.wake_id=?",
                 (question_receipt["wake_id"],),
-            ).fetchone()[0],
+            ).fetchone()[0]
+        self.assertIn(
+            sprint_message_delivery.wake_prompt(sprint_id, "planner"),
+            delivered_prompt,
         )
+        self.assertIn(question, delivered_prompt)
         self.run_cli(
             3,
             "accept",
@@ -850,19 +873,15 @@ class SprintLiveProof(unittest.TestCase):
             "--work-unit",
             str(units[0]),
         )
-        reviewer_old = str(
+        self.assertIsNone(
             self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE sprint_id=? AND shell_id=2",
+                "SELECT (SELECT chat_id FROM active_shell_chats "
+                "WHERE shell_id=participant.shell_id) "
+                "FROM sprint_participants participant "
+                "WHERE participant.sprint_id=? AND participant.shell_id=2",
                 (sprint_id,),
             ).fetchone()[0]
         )
-        self.con.execute(
-            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
-            "WHERE conversation_id=?",
-            (reviewer_old,),
-        )
-        self.con.commit()
         review_request = self.run_cli(
             1,
             "request-review",
@@ -875,26 +894,26 @@ class SprintLiveProof(unittest.TestCase):
             "--key",
             "proof:68:dev-to-review",
         )
-        reviewer_new = str(
+        self.assertIsNone(
             self.con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE sprint_id=? AND shell_id=2",
+                "SELECT (SELECT chat_id FROM active_shell_chats "
+                "WHERE shell_id=participant.shell_id) "
+                "FROM sprint_participants participant "
+                "WHERE participant.sprint_id=? AND participant.shell_id=2",
                 (sprint_id,),
             ).fetchone()[0]
         )
-        self.assertNotEqual(reviewer_old, reviewer_new)
-        self.assertEqual(
-            ("fallback", reviewer_old),
-            tuple(
-                self.con.execute(
-                    "SELECT purpose,parent_conversation_id "
-                    "FROM sprint_participant_conversations "
-                    "WHERE conversation_id=?",
-                    (reviewer_new,),
-                ).fetchone()
-            ),
-        )
         self.deliver_browser_turns()
+        reviewer_new = str(
+            self.con.execute(
+                "SELECT active.chat_id FROM sprint_participants participant "
+                "JOIN active_shell_chats active "
+                "ON active.shell_id=participant.shell_id "
+                "WHERE participant.sprint_id=? AND participant.shell_id=2",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertNotEqual("None", reviewer_new)
         reviewer_inbox = self.run_cli(2, "inbox", "--sprint", str(sprint_id))
         self.assertIn(
             review_request["message_id"],
@@ -954,13 +973,17 @@ class SprintLiveProof(unittest.TestCase):
             recovery_message["wake_id"]
         )
         self.assertEqual(recovery_message["conversation_id"], terminal_conversation)
-        self.assertEqual(
+        self.assertIn(
             sprint_message_delivery.wake_prompt(sprint_id, "developer"),
+            terminal_prompt,
+        )
+        self.assertIn(
+            "Preserve this separate delivered-unread recovery proof.",
             terminal_prompt,
         )
         self.assertIsNone(
             self.con.execute(
-                "SELECT read_at FROM sprint_messages WHERE message_id=?",
+                "SELECT read_at FROM wake_message WHERE message_id=?",
                 (recovery_message["message_id"],),
             ).fetchone()[0]
         )

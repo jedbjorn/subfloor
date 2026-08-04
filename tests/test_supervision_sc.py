@@ -41,6 +41,7 @@ class SupervisionFixture:
             "db_backup.py",
             "cli_entry.py",
             "engine_manifest.py",
+            "global_pointer.py",
             "install.py",
         ):
             shutil.copy2(
@@ -78,6 +79,7 @@ class SupervisionFixture:
                 "NO_COLOR": "1",
             }
         )
+        self.env.pop("SC_DB_BACKUP_DIR", None)
         self._sockets: list[socket.socket] = []
 
     def close(self) -> None:

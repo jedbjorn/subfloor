@@ -431,46 +431,36 @@ class LifecycleTest(SprintDomainCase):
             ],
         )
 
-    def test_arm_atomically_provisions_every_participant_conversation(self) -> None:
+    def test_arm_defers_participant_conversations_until_delivery(self) -> None:
         sprint_id, _ = self.create_sprint()
 
         self.store.arm(sprint_id, 3)
 
         participants = self.con.execute(
-            "SELECT participant_id,persistent_conversation_id,"
-            "current_conversation_id FROM sprint_participants "
+            "SELECT participant_id FROM sprint_participants "
             "WHERE sprint_id=? ORDER BY participant_id",
             (sprint_id,),
         ).fetchall()
         self.assertEqual(3, len(participants))
-        self.assertTrue(
-            all(
-                row["persistent_conversation_id"] == row["current_conversation_id"]
-                for row in participants
-            )
-        )
-        conversation_ids = {row["current_conversation_id"] for row in participants}
         self.assertEqual(
-            [("sprint", "idle", 3)],
-            [
-                tuple(row)
+            set(),
+            {"persistent_conversation_id", "current_conversation_id"}
+            & {
+                row[1]
                 for row in self.con.execute(
-                    "SELECT conversation_scope,state,COUNT(*) "
-                    "FROM conversations WHERE conversation_id IN (?,?,?) "
-                    "GROUP BY conversation_scope,state",
-                    tuple(sorted(conversation_ids)),
+                    "PRAGMA table_info(sprint_participants)"
                 )
-            ],
+            },
         )
         self.assertEqual(
-            [("work", 3)],
-            [
-                tuple(row)
-                for row in self.con.execute(
-                    "SELECT purpose,COUNT(*) FROM sprint_participant_conversations "
-                    "GROUP BY purpose"
-                )
-            ],
+            0,
+            self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_conversations"
+            ).fetchone()[0],
         )
         self.assertEqual(
             0,
@@ -482,10 +472,10 @@ class LifecycleTest(SprintDomainCase):
             "AND event_type='lifecycle.armed'",
             (sprint_id,),
         ).fetchone()
-        self.assertEqual(
-            conversation_ids,
-            set(json.loads(event["payload"])["initial_conversation_ids"]),
-        )
+        payload = json.loads(event["payload"])
+        self.assertEqual(2, len(payload["initial_wake_ids"]))
+        self.assertEqual(1, len(payload["work_wake_ids"]))
+        self.assertIn(payload["planner_wake_id"], payload["initial_wake_ids"])
 
         self.con.execute(
             "INSERT INTO conversations "
@@ -494,7 +484,7 @@ class LifecycleTest(SprintDomainCase):
             "VALUES (1,1,'codex','/normal','Normal chat','normal-1','hash')"
         )
         self.assertEqual(
-            [("normal", 1), ("sprint", 3)],
+            [("normal", 1)],
             [
                 tuple(row)
                 for row in self.con.execute(
@@ -512,10 +502,10 @@ class LifecycleTest(SprintDomainCase):
                 "'normal-2','hash')"
             )
 
-    def test_arm_rolls_back_conversations_when_initial_release_fails(self) -> None:
+    def test_arm_rolls_back_when_initial_release_fails(self) -> None:
         sprint_id, _ = self.create_sprint()
         self.con.execute(
-            "CREATE TRIGGER reject_initial_message BEFORE INSERT ON sprint_messages "
+            "CREATE TRIGGER reject_initial_message BEFORE INSERT ON wake_message "
             "BEGIN SELECT RAISE(ABORT,'release fault'); END"
         )
         self.con.commit()
@@ -540,16 +530,11 @@ class LifecycleTest(SprintDomainCase):
             ).fetchone()[0],
         )
         self.assertEqual(
-            [(None, None), (None, None), (None, None)],
-            [
-                tuple(row)
-                for row in self.con.execute(
-                    "SELECT persistent_conversation_id,current_conversation_id "
-                    "FROM sprint_participants WHERE sprint_id=? "
-                    "ORDER BY participant_id",
-                    (sprint_id,),
-                )
-            ],
+            3,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participants WHERE sprint_id=?",
+                (sprint_id,),
+            ).fetchone()[0],
         )
 
     def test_arm_ignores_orphan_conversation_keys_from_reused_numeric_ids(self) -> None:
@@ -580,7 +565,7 @@ class LifecycleTest(SprintDomainCase):
 
         wake_ids = self.store.arm(sprint_id, 3)
 
-        self.assertEqual(1, len(wake_ids))
+        self.assertEqual(2, len(wake_ids))
         self.assertEqual(
             "armed",
             self.con.execute(
@@ -593,25 +578,14 @@ class LifecycleTest(SprintDomainCase):
             "JOIN conversations c ON c.conversation_id=link.conversation_id "
             "ORDER BY link.sprint_participant_id"
         ).fetchall()
-        self.assertEqual(3, len(linked))
-        self.assertTrue(
-            all(
-                row["conversation_id"] not in {item[0] for item in historical}
-                and row["creation_idempotency_key"].startswith(
-                    "sprint-generation:"
-                )
-                and len(row["creation_idempotency_key"]) <= 255
-                for row in linked
-            )
-        )
-        first_ids = [row["conversation_id"] for row in linked]
-        replay_ids = sprint_domain.sprint_participant_chats.provision_at_arming(
-            self.con, sprint_id
-        )
-        self.assertEqual(first_ids, replay_ids)
+        self.assertEqual(0, len(linked))
         self.assertEqual(
-            6,
+            3,
             self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute("SELECT COUNT(*) FROM active_shell_chats").fetchone()[0],
         )
 
     def test_armed_sprint_merge_grant_is_immutable(self) -> None:
@@ -655,7 +629,7 @@ class LifecycleTest(SprintDomainCase):
 
         wake_ids = self.store.arm(sprint_id, 3)
 
-        self.assertEqual(1, len(wake_ids))
+        self.assertEqual(2, len(wake_ids))
         self.assertEqual(
             ("armed", 2),
             tuple(
@@ -678,7 +652,8 @@ class LifecycleTest(SprintDomainCase):
         )
         message = self.con.execute(
             "SELECT work_unit_id,message_kind,actionable,disposition,body "
-            "FROM sprint_messages WHERE sprint_id=?",
+            "FROM wake_message WHERE sprint_id=? "
+            "AND message_kind='work_assignment'",
             (sprint_id,),
         ).fetchone()
         self.assertEqual(first_unit, message["work_unit_id"])
@@ -695,7 +670,7 @@ class LifecycleTest(SprintDomainCase):
                 for row in self.con.execute(
                     "SELECT w.wake_id FROM sprint_wake_outbox w "
                     "JOIN sprint_wake_messages wm USING (wake_id) "
-                    "JOIN sprint_messages m USING (message_id) "
+                    "JOIN wake_message m USING (message_id) "
                     "WHERE w.sprint_id=? AND m.work_unit_id=?",
                     (sprint_id, first_unit),
                 )
@@ -726,7 +701,7 @@ class LifecycleTest(SprintDomainCase):
         self.assertEqual(
             0,
             self.con.execute(
-                "SELECT COUNT(*) FROM sprint_messages WHERE sprint_id=?", (second,)
+                "SELECT COUNT(*) FROM wake_message WHERE sprint_id=?", (second,)
             ).fetchone()[0],
         )
 
@@ -742,14 +717,14 @@ class LifecycleTest(SprintDomainCase):
 
         wake_ids = self.store.arm(sprint_id, 3)
 
-        self.assertEqual(1, len(wake_ids))
+        self.assertEqual(2, len(wake_ids))
         self.assertEqual(
             [(first_unit,)],
             [
                 tuple(row)
                 for row in self.con.execute(
                     "SELECT m.work_unit_id FROM sprint_wake_messages wm "
-                    "JOIN sprint_messages m USING (message_id) "
+                    "JOIN wake_message m USING (message_id) "
                     "WHERE wm.wake_id=? ORDER BY m.message_id",
                     (wake_ids[0],),
                 )
@@ -816,7 +791,7 @@ class LifecycleTest(SprintDomainCase):
                     (unit_id,),
                 ).fetchone()[0],
                 self.con.execute(
-                    "SELECT COUNT(*) FROM sprint_messages WHERE sprint_id=?",
+                    "SELECT COUNT(*) FROM wake_message WHERE sprint_id=?",
                     (sprint_id,),
                 ).fetchone()[0],
             ),

@@ -21,6 +21,7 @@ ENGINE = ROOT / ".super-coder"
 sys.path[:0] = [str(ENGINE / "scripts"), str(ENGINE / "api"), str(ROOT / "tests")]
 
 import mem  # noqa: E402
+import pr_cli  # noqa: E402
 import server  # noqa: E402
 import sprint_cli  # noqa: E402
 import sprint_domain  # noqa: E402
@@ -220,6 +221,50 @@ class SprintCliApiTest(unittest.TestCase):
             self.assertEqual(0, sprint_cli.main(list(argv)))
         return json.loads(output.getvalue())
 
+    def run_pr_cli(self, token: str, *argv: str) -> dict:
+        mem.SC_API_TOKEN = token
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(0, pr_cli.main(list(argv)))
+        return json.loads(output.getvalue())
+
+    def test_engine_wide_subscription_uses_authenticated_developer_identity(self):
+        with mock.patch.object(
+            server.sprint_pr_watcher,
+            "GitHubPullRequestReader",
+            return_value=Reader(),
+        ):
+            receipt = self.run_pr_cli(
+                TOKENS["developer"],
+                "subscribe",
+                "--repository",
+                "Acme/Outside",
+                "--pr",
+                "85",
+            )
+
+        self.assertTrue(receipt["created"])
+        con = sqlite3.connect(self.db)
+        try:
+            subscription = con.execute(
+                "SELECT owner_shell_id,repository,pr_number,"
+                "sprint_registered_pr_id FROM pr_subscriptions "
+                "WHERE subscription_id=?",
+                (receipt["subscription_id"],),
+            ).fetchone()
+            message = con.execute(
+                "SELECT receiver_shell_id,sprint_id,to_participant_id,"
+                "declared_type,body FROM wake_message "
+                "WHERE idempotency_key LIKE 'pr-transition:%:shell:1' "
+                "ORDER BY message_id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual((1, "acme/outside", 85, None), subscription)
+        self.assertEqual((1, None, None, "re-enter"), message[:4])
+        self.assertIn("number=85", message[4])
+        self.assertIn("event=green", message[4])
+
     def seed_declaration(self, suffix: str) -> tuple[int, int, int]:
         con = sqlite3.connect(self.db)
         try:
@@ -331,7 +376,7 @@ class SprintCliApiTest(unittest.TestCase):
             str(task_id),
         )
         armed = self.run_cli(TOKENS["planner"], "arm", "--sprint", str(sprint_id))
-        self.assertEqual(1, len(armed["wake_ids"]))
+        self.assertEqual(2, len(armed["wake_ids"]))
 
         with mock.patch.object(
             server.sprint_pr_watcher,
@@ -439,7 +484,7 @@ class SprintCliApiTest(unittest.TestCase):
             message = con.execute(
                 "SELECT from_participant_id,to_participant_id,"
                 "message_kind,body,actionable,work_unit_id,disposition "
-                "FROM sprint_messages WHERE message_id=?",
+                "FROM wake_message WHERE message_id=?",
                 (response["message_id"],),
             ).fetchone()
             self.assertEqual(
@@ -449,13 +494,18 @@ class SprintCliApiTest(unittest.TestCase):
             wake = con.execute(
                 "SELECT wm.message_id,w.state FROM sprint_wake_outbox w "
                 "JOIN sprint_wake_messages wm ON wm.wake_id=w.wake_id "
-                "WHERE w.wake_id=?",
+                "WHERE w.wake_id=? ORDER BY wm.message_id",
                 (response["wake_id"],),
-            ).fetchone()
-            self.assertEqual((response["message_id"], "pending"), wake)
+            ).fetchall()
+            self.assertEqual(
+                [(1, "pending"), (response["message_id"], "pending")],
+                wake,
+            )
             current = con.execute(
-                "SELECT current_conversation_id FROM sprint_participants "
-                "WHERE participant_id=1",
+                "SELECT active.chat_id FROM sprint_participants participant "
+                "LEFT JOIN active_shell_chats active "
+                "ON active.shell_id=participant.shell_id "
+                "WHERE participant.participant_id=1",
             ).fetchone()
             self.assertEqual((response["conversation_id"],), current)
 
@@ -827,7 +877,7 @@ class SprintCliApiTest(unittest.TestCase):
             str(task_id),
         )["work_unit_id"]
         armed = self.run_cli(TOKENS["admin"], "arm", "--sprint", str(sprint_id))
-        self.assertEqual(1, len(armed["wake_ids"]))
+        self.assertEqual(2, len(armed["wake_ids"]))
         aborted = self.run_cli(
             TOKENS["admin"],
             "abort",
@@ -897,7 +947,7 @@ class SprintCliApiTest(unittest.TestCase):
                 ("prepared", "planned", 0),
                 con.execute(
                     "SELECT s.lifecycle,u.disposition,"
-                    "(SELECT COUNT(*) FROM sprint_messages WHERE sprint_id=s.sprint_id) "
+                    "(SELECT COUNT(*) FROM wake_message WHERE sprint_id=s.sprint_id) "
                     "FROM sprints s JOIN sprint_work_units u USING(sprint_id) "
                     "WHERE s.sprint_id=? AND u.work_unit_id=?",
                     (sprint_id, unit_id),
@@ -1075,7 +1125,7 @@ class SprintCliApiTest(unittest.TestCase):
                 dispatch["wake_ids"][0],
                 con.execute(
                     "SELECT wm.wake_id FROM sprint_wake_messages wm "
-                    "JOIN sprint_messages m USING(message_id) "
+                    "JOIN wake_message m USING(message_id) "
                     "WHERE m.work_unit_id=? ORDER BY m.message_id DESC LIMIT 1",
                     (self.dispatch_unit_id,),
                 ).fetchone()[0],

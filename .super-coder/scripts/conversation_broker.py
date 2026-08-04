@@ -28,6 +28,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+import active_chat_registry
 import conversation_events
 import conversation_git_targets
 import db_driver
@@ -245,6 +246,9 @@ class BrokerStore:
                     "FROM conversation_outbox o "
                     "JOIN conversations c "
                     " ON c.conversation_id=o.conversation_id "
+                    "JOIN active_shell_chats active "
+                    " ON active.shell_id=c.shell_id "
+                    " AND active.chat_id=c.conversation_id "
                     "JOIN conversation_messages m ON m.message_id=o.message_id "
                     "WHERE o.state='pending' AND c.state='queued' "
                     "AND NOT EXISTS ("
@@ -380,6 +384,11 @@ class BrokerStore:
                 selected = con.execute(
                     self._run_select()
                     + "WHERE r.state IN ('leased','starting','running') "
+                    "AND (r.process_pid IS NULL OR EXISTS ("
+                    " SELECT 1 FROM active_shell_chats active "
+                    " WHERE active.process_pid=r.process_pid "
+                    " AND active.process_start_ticks=r.process_start_ticks"
+                    ")) "
                     "AND r.lease_expires_at<=? ORDER BY r.run_id LIMIT ?",
                     (now, limit),
                 ).fetchall()
@@ -478,6 +487,12 @@ class BrokerStore:
         # Filesystem normalization is external preparation, never writer-lock
         # work. Conversation creation stores an already-resolved absolute path.
         actual_worktree = Path(turn.worktree).resolve()
+        process = active_chat_registry.process_details(turn.process_ref)
+        process_pid = process.pid if process is not None else None
+        process_start_ticks = process.start_ticks if process is not None else None
+        process_group_id = (
+            process.process_group_id if process is not None else None
+        )
         con = self.connect()
         now, expires = self._times()
         try:
@@ -486,7 +501,8 @@ class BrokerStore:
                 "conversation.broker.mark_native_started",
             ):
                 row = con.execute(
-                    "SELECT r.state,r.conversation_id,c.harness_session_ref,"
+                    "SELECT r.state,r.conversation_id,r.shell_id,"
+                    "c.harness_session_ref,"
                     "c.harness,c.worktree "
                     "FROM conversation_runs r JOIN conversations c "
                     "ON c.conversation_id=r.conversation_id WHERE r.run_id=?",
@@ -526,13 +542,17 @@ class BrokerStore:
                 changed = con.execute(
                     "UPDATE conversation_runs SET state='running',"
                     "harness_session_after=?,runner_ref=?,heartbeat_at=?,"
-                    "lease_expires_at=? WHERE run_id=? AND lease_owner=? "
+                    "lease_expires_at=?,process_pid=?,process_start_ticks=?,"
+                    "process_group_id=? WHERE run_id=? AND lease_owner=? "
                     "AND state='starting'",
                     (
                         turn.session_ref,
                         turn.run_ref,
                         now,
                         expires,
+                        process_pid,
+                        process_start_ticks,
+                        process_group_id,
                         run_id,
                         owner,
                     ),
@@ -547,6 +567,13 @@ class BrokerStore:
                     "last_activity_at=?,version=version+1 "
                     "WHERE conversation_id=?",
                     (turn.session_ref, now, row["conversation_id"]),
+                )
+                active_chat_registry.set_process(
+                    con,
+                    shell_id=int(row["shell_id"]),
+                    chat_id=str(row["conversation_id"]),
+                    pid=process_pid,
+                    start_ticks=process_start_ticks,
                 )
         finally:
             con.close()
@@ -721,11 +748,13 @@ class BrokerStore:
                     if pending
                     else "idle"
                 )
-                require_transition(
-                    "conversation",
-                    row["conversation_state"],
-                    conversation_target,
-                )
+                already_closed = row["conversation_state"] == "closed"
+                if not already_closed:
+                    require_transition(
+                        "conversation",
+                        row["conversation_state"],
+                        conversation_target,
+                    )
                 con.execute(
                     "UPDATE conversation_runs SET state=?,ended_at=?,"
                     "exit_code=?,error_code=?,error_detail=? WHERE run_id=?",
@@ -738,16 +767,22 @@ class BrokerStore:
                         run_id,
                     ),
                 )
+                active_chat_registry.clear_process(
+                    con,
+                    shell_id=int(row["shell_id"]),
+                    chat_id=str(row["conversation_id"]),
+                )
                 con.execute(
                     "UPDATE conversation_messages SET state=?,completed_at=? "
                     "WHERE message_id=?",
                     (message_state, now, row["trigger_message_id"]),
                 )
-                con.execute(
-                    "UPDATE conversations SET state=?,last_activity_at=?,"
-                    "version=version+1 WHERE conversation_id=?",
-                    (conversation_target, now, row["conversation_id"]),
-                )
+                if not already_closed:
+                    con.execute(
+                        "UPDATE conversations SET state=?,last_activity_at=?,"
+                        "version=version+1 WHERE conversation_id=?",
+                        (conversation_target, now, row["conversation_id"]),
+                    )
                 terminal_payload = dict(payload or {})
                 terminal_payload.setdefault("outcome", outcome)
                 self._append_event(
@@ -758,7 +793,7 @@ class BrokerStore:
                     message_id=row["trigger_message_id"],
                     run_id=run_id,
                 )
-                if close_after:
+                if close_after and not already_closed:
                     require_transition(
                         "conversation",
                         conversation_target,

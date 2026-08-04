@@ -52,6 +52,7 @@ IS_MAC = platform.system() == "Darwin"  # guidance arms differ (colima/brew vs s
 sys.path.insert(0, str(ENGINE / "scripts"))
 import callable_floor  # noqa: E402
 import engine_manifest  # noqa: E402
+import global_pointer  # noqa: E402
 import ports as ports_mod  # noqa: E402
 
 
@@ -427,6 +428,7 @@ def update_harnesses() -> dict[str, str]:
         ok = rc == 0
         _report_install(name, ok, rc, out, elapsed, done, cmd)
         status[name] = done if ok else "failed"
+    global_pointer.write_global_pointers()
     return status
 
 
@@ -455,6 +457,7 @@ def ensure_harnesses() -> dict[str, str]:
         dirs = sorted({str(HARNESS_BIN[n].parent) for n in fresh})
         print(f"  ↪ new CLIs live in {', '.join(dirs)} — open a NEW shell (or update "
               f"PATH) before `./sc launch`, since this shell's PATH predates them.")
+    global_pointer.write_global_pointers()
     return status
 
 
@@ -789,6 +792,7 @@ def main(argv: list[str]) -> int:
         print("  --skip-harness-install set — detecting only, not installing")
         for n in HARNESS_INSTALL:
             print(f"  {n:9} {'✓ present' if _harness_installed(n) else 'absent'}")
+        global_pointer.write_global_pointers()
     else:
         ensure_harnesses()
     harness = detect_harness() or "claude"  # claude preferred; both should be present

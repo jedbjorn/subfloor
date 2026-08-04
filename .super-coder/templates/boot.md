@@ -130,6 +130,64 @@ shell, `--message send <shortname> <body>`; mark an item read with
 
 ---
 
+## ACTIVE CHAT DELIVERY
+
+The engine tracks at most one active chat per shell in the active-chat registry;
+zero is legal. The registry is the sole current-chat authority and carries the
+verified pid/start-ticks identity only while a turn runs. Closing or rotating a
+chat unlinks its process. A 60-second reaper verifies process identity before
+interrupt/TERM/KILL escalation, and a generous inactivity ceiling closes silent
+hung turns so they become reapable.
+
+Every `wake_message` creates durable delivery intent. Pending wakes coalesce per
+receiver, and one wake turn drains every undelivered message for that shell.
+Acceptance is still an explicit shell act. Wake type resolves at delivery:
+
+| Registry state | Delivery |
+|---|---|
+| verified live turn | every declared type Re-enters the active chat at its natural boundary |
+| idle registry chat | any coalesced New rotates; all-Re-enter resumes the chat |
+| no registry row | create a chat and deliver as New |
+
+Sprint routing uses those literals: Planner→Developer and Developer→Reviewer
+are New; Developer/Reviewer→Planner and Reviewer→Developer are Re-enter. FnB can
+close the Planner chat during an armed Sprint to set coordinate mode (idle
+Planner Re-enters become fresh ticket chats); FnB pause/resume returns to
+supervise, while automatic pauses preserve the dial. Developer-owned PR
+subscriptions emit self-describing red/green/closed Re-enter wakes even outside
+an armed Sprint; Planner and Reviewer receive no PR-event wakes. Arming validates
+all recorded role harness/model/effort selections before publishing work;
+defaults satisfy the gate.
+
+---
+
+## CURATION
+
+On boot, if the `## STATUS` `L&S:` line says **curation due**, run the `curate`
+skill before the session's work — it is a short pass over your own active set:
+resolve contradictions, merge entries that state one rule, and turn a recurring
+process into a deduplicated upstream recommendation issue. Keep one compressed
+L&S entry until the reviewed upstream skill ships and is granted — filing an
+issue is not grounds to retire the knowledge. Curation never creates a local
+skill or asset; deliberate fork-specific skill authoring remains an
+administrator-owned asset → seed → grant → snapshot → render workflow under
+`local_skill_management`. Curation is yours alone (Law 3, Law 7) — never
+delegate it to a subagent, and never let another shell do it for you. Finish by
+stamping `sc mem curated`, even if you retired nothing: an honest clean sweep
+must clear the counter, or the advisory stands forever.
+
+The recommendation route is the one authorized exception to the ordinary
+"enhancement ideas go to the FnB first" gate in `issue_reporting`. Search all
+upstream issues before opening `skills: recommend <topic>`; add evidence to an
+existing issue when one matches. If search or creation is unavailable, surface
+the failure to the FnB, keep the L&S, and create no local skill or asset.
+
+This is an advisory, not a block. If the line is quiet, there is nothing to do.
+If it fires every few sessions, that is the signal reporting on itself —
+entries are being written faster than they are reconciled.
+
+---
+
 ## VERSION CONTROL
 
 Sync before you touch code. Before the first edit of any unit of work, reconcile

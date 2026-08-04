@@ -172,18 +172,21 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
     )
     con.executemany(
         "INSERT INTO sprint_participant_conversations "
-        "(sprint_participant_id,conversation_id,purpose) VALUES (?,?,'work')",
+        "(sprint_participant_id,conversation_id) VALUES (?,?)",
         ((1, "cv_plan"), (2, "cv_dev"), (3, "cv_rev")),
     )
     con.executemany(
-        "UPDATE sprint_participants SET persistent_conversation_id=?,"
-        "current_conversation_id=?,disposition=?,updated_at=? "
+        "UPDATE sprint_participants SET disposition=?,updated_at=? "
         "WHERE participant_id=?",
         (
-            ("cv_plan", "cv_plan", "active", "2026-08-01 21:00:00", 1),
-            ("cv_dev", "cv_dev", "active", "2026-08-01 21:00:01", 2),
-            ("cv_rev", "cv_rev", "idle", "2026-08-01 21:00:02", 3),
+            ("active", "2026-08-01 21:00:00", 1),
+            ("active", "2026-08-01 21:00:01", 2),
+            ("idle", "2026-08-01 21:00:02", 3),
         ),
+    )
+    con.executemany(
+        "INSERT INTO active_shell_chats (shell_id,chat_id) VALUES (?,?)",
+        ((3, "cv_plan"), (1, "cv_dev"), (2, "cv_rev")),
     )
     con.execute(
         "UPDATE sprints SET lifecycle='armed',armed_at='2026-08-01 21:00:00',"
@@ -194,16 +197,17 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         "updated_at='2026-08-01 21:01:00' WHERE work_unit_id=1"
     )
     con.execute(
-        "INSERT INTO sprint_messages "
-        "(message_id,sprint_id,from_participant_id,to_participant_id,work_unit_id,"
-        "message_kind,body,actionable,disposition,read_at,idempotency_key) "
-        "VALUES (1,1,1,2,1,'work_assignment','Implement now',1,'accepted',"
-        "'2026-08-01 21:01:00','assignment-1')"
+        "INSERT INTO wake_message "
+        "(message_id,sprint_id,sender_shell_id,receiver_shell_id,"
+        "from_participant_id,to_participant_id,work_unit_id,message_kind,body,"
+        "declared_type,actionable,disposition,read_at,delivered_at,idempotency_key) "
+        "VALUES (1,1,3,1,1,2,1,'work_assignment','Implement now','new',1,"
+        "'accepted','2026-08-01 21:01:00','2026-08-01 21:01:01','assignment-1')"
     )
     con.execute(
         "INSERT INTO sprint_wake_outbox "
-        "(wake_id,sprint_id,participant_id,state,attempt_count,idempotency_key,"
-        "delivered_at) VALUES (1,1,2,'delivered',1,'wake-1',"
+        "(wake_id,sprint_id,participant_id,receiver_shell_id,state,attempt_count,"
+        "idempotency_key,delivered_at) VALUES (1,1,2,1,'delivered',1,'wake-1',"
         "'2026-08-01 21:01:01')"
     )
     con.execute(
@@ -229,6 +233,11 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         "VALUES (1,1,2,'jedbjorn/dos-app',54)"
     )
     con.execute(
+        "INSERT INTO pr_subscriptions "
+        "(subscription_id,owner_shell_id,repository,pr_number,"
+        "sprint_registered_pr_id) VALUES (1,1,'jedbjorn/dos-app',54,1)"
+    )
+    con.execute(
         "INSERT INTO sprint_pr_work_units "
         "(sprint_id,registered_pr_id,work_unit_id) VALUES (1,1,1)"
     )
@@ -238,6 +247,20 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         "observed_head_sha,evidence,observed_at) VALUES "
         "(1,1,'green','pr-54-green','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',"
         "'{\"checks\":\"green\"}','2026-08-01 21:05:00')"
+    )
+    con.execute(
+        "INSERT INTO pr_subscription_transitions "
+        "(transition_id,subscription_id,normalized_state,transition_key,"
+        "observed_head_sha,evidence,observed_at) VALUES "
+        "(1,1,'green','subscription-54-green',"
+        "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',"
+        "'{\"checks\":\"green\"}','2026-08-01 21:05:00')"
+    )
+    con.execute(
+        "INSERT INTO pr_subscription_poll_failures "
+        "(failure_id,subscription_id,failure_count,backoff_seconds,trigger,"
+        "error_detail,failed_at) VALUES "
+        "(1,1,1,10.0,'pulse','fixture failure','2026-08-01 21:04:00')"
     )
     con.execute(
         "INSERT INTO sprint_judgments "
@@ -375,9 +398,7 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
 
         self.assertEqual(before, rows_by_table(self.db, compared))
 
-    def test_participant_link_parent_with_higher_id_restores_before_pointers(
-        self,
-    ) -> None:
+    def test_flat_participant_links_restore_out_of_id_order(self) -> None:
         con = sqlite3.connect(self.db)
         try:
             seed_prepared(con)
@@ -385,29 +406,33 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
                 "INSERT INTO conversations "
                 "(conversation_id,shell_id,owner_user_id,harness,provider,model,"
                 "effort,worktree,title,creation_idempotency_key,"
-                "creation_request_hash,conversation_scope) VALUES "
+                "creation_request_hash,conversation_scope,state,closed_at) VALUES "
                 "(?,1,1,'codex','test','model','high','/worktree','Sprint link',"
-                "?,?,'sprint')",
+                "?,?,'sprint',?,?)",
                 (
-                    ("cv_parent", "link-parent", "link-parent-hash"),
-                    ("cv_child", "link-child", "link-child-hash"),
+                    (
+                        "cv_parent",
+                        "link-parent",
+                        "link-parent-hash",
+                        "closed",
+                        "2026-08-01 20:00:00",
+                    ),
+                    ("cv_child", "link-child", "link-child-hash", "idle", None),
                 ),
             )
             con.execute(
                 "INSERT INTO sprint_participant_conversations "
                 "(participant_conversation_id,sprint_participant_id,"
-                "conversation_id,purpose) VALUES (100,2,'cv_parent','work')"
+                "conversation_id) VALUES (100,2,'cv_parent')"
             )
             con.execute(
                 "INSERT INTO sprint_participant_conversations "
                 "(participant_conversation_id,sprint_participant_id,"
-                "conversation_id,purpose,parent_conversation_id) "
-                "VALUES (1,2,'cv_child','fix','cv_parent')"
+                "conversation_id) VALUES (1,2,'cv_child')"
             )
             con.execute(
-                "UPDATE sprint_participants SET persistent_conversation_id="
-                "'cv_parent', current_conversation_id='cv_child' "
-                "WHERE participant_id=2"
+                "INSERT INTO active_shell_chats (shell_id,chat_id) "
+                "VALUES (1,'cv_child')"
             )
             con.commit()
         finally:
@@ -503,7 +528,8 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
                 row[0]
                 for row in con.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' "
-                    "AND (name='sprints' OR name LIKE 'sprint_%')"
+                    "AND (name IN ('sprints','wake_message','pr_subscriptions') "
+                    "OR name LIKE 'sprint_%' OR name LIKE 'pr_subscription_%')"
                 )
             }
         finally:

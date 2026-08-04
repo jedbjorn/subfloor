@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import signal
-import subprocess
 import threading
 import time
 from collections.abc import Iterator, Mapping
@@ -26,10 +24,12 @@ from .base import (
     ReconcileResult,
     SessionInspection,
     SubprocessRunner,
+    cleanup_owned_process,
     command_version,
     ensure_nonempty_message,
     load_manifest,
     merged_env,
+    signal_owned_process,
     terminal_outcome,
 )
 
@@ -267,77 +267,7 @@ class KimiAdapter(ConversationAdapter):
                 matches.append(marker)
         return matches
 
-    @staticmethod
-    def _signal_owned_process(process: Any, value: signal.Signals) -> None:
-        process_group = getattr(
-            process,
-            "_sc_conversation_process_group",
-            None,
-        )
-        if isinstance(process_group, int):
-            try:
-                os.killpg(process_group, value)
-                return
-            except ProcessLookupError:
-                return
-            except OSError:
-                pass
-        if value == signal.SIGTERM:
-            terminate = getattr(process, "terminate", None)
-            if callable(terminate):
-                terminate()
-                return
-        if value == signal.SIGKILL:
-            kill = getattr(process, "kill", None)
-            if callable(kill):
-                kill()
-                return
-        send_signal = getattr(process, "send_signal", None)
-        if callable(send_signal):
-            send_signal(value)
-
-    @staticmethod
-    def _process_group_alive(process: Any) -> bool:
-        process_group = getattr(
-            process,
-            "_sc_conversation_process_group",
-            None,
-        )
-        if not isinstance(process_group, int):
-            return False
-        try:
-            os.killpg(process_group, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        return True
-
-    @classmethod
-    def _cleanup_process(cls, process: Any, timeout: float) -> None:
-        poll = getattr(process, "poll", None)
-        running = callable(poll) and poll() is None
-        if running:
-            cls._signal_owned_process(process, signal.SIGTERM)
-        wait = getattr(process, "wait", None)
-        if not callable(wait):
-            return
-        try:
-            wait(timeout=min(timeout, 1.0))
-        except TypeError:
-            wait()
-        except subprocess.TimeoutExpired:
-            pass
-        if cls._process_group_alive(process):
-            cls._signal_owned_process(process, signal.SIGKILL)
-        elif callable(poll) and poll() is None:
-            kill = getattr(process, "kill", None)
-            if callable(kill):
-                kill()
-        try:
-            wait(timeout=1.0)
-        except (TypeError, subprocess.TimeoutExpired):
-            pass
+    _cleanup_process = staticmethod(cleanup_owned_process)
 
     def _watch_native_completion(
         self,
@@ -979,7 +909,7 @@ class KimiAdapter(ConversationAdapter):
         process = turn.opaque
         if process is None or process.poll() is not None:
             return InterruptResult(False, "Kimi process is not running")
-        self._signal_owned_process(process, signal.SIGINT)
+        signal_owned_process(process, signal.SIGINT)
         turn.metadata["interrupt_acknowledged"] = True
         return InterruptResult(True)
 

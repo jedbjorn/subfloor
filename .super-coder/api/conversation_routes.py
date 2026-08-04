@@ -28,6 +28,7 @@ DB_PATH = ENGINE / "shell_db.db"
 SCRIPTS = ENGINE / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import active_chat_registry
 import conversation_broker
 import conversation_events
 import conversation_git_targets
@@ -498,12 +499,8 @@ def _reopen_conversation(con, operator: dict, conversation) -> list[str]:
             "shell is unknown, deleted, or unavailable to this operator",
         )
     _refuse_admin_browser_chat(shell)
-    open_conversations = con.execute(
-        "SELECT conversation_id,state FROM conversations "
-        "WHERE shell_id=? AND state!='closed' AND conversation_scope='normal'",
-        (conversation["shell_id"],),
-    ).fetchall()
-    if not open_conversations:
+    active = active_chat_registry.get(con, int(conversation["shell_id"]))
+    if active is None:
         live_state = _live_shell_session(shell)
         if live_state is not None:
             raise ApiError(
@@ -516,32 +513,31 @@ def _reopen_conversation(con, operator: dict, conversation) -> list[str]:
                     "state": live_state,
                 },
             )
-    running = [
-        row for row in open_conversations
-        if row["state"] in ("queued", "running")
-    ]
-    if running:
+    try:
+        closed = active_chat_registry.close_active(
+            con,
+            int(conversation["shell_id"]),
+        )
+    except active_chat_registry.ActiveChatBusy as exc:
         raise ApiError(
             409,
             "BROWSER_CHAT_BUSY",
-            "the open browser chat has a turn in progress",
-            {"conversation_id": running[0]["conversation_id"]},
-        )
+            "the active chat has a turn in progress",
+            {
+                "conversation_id": (
+                    active.chat_id if active is not None else None
+                )
+            },
+        ) from exc
     auto_closed = []
-    for row in open_conversations:
-        con.execute(
-            "UPDATE conversations SET state='closed',"
-            "closed_at=datetime('now'),last_activity_at=datetime('now'),"
-            "version=version+1 WHERE conversation_id=?",
-            (row["conversation_id"],),
-        )
+    if closed is not None:
         _append_event(
             con,
-            row["conversation_id"],
+            closed.chat_id,
             "conversation.closed",
             {"status": "closed", "reason": "another browser chat reopened"},
         )
-        auto_closed.append(row["conversation_id"])
+        auto_closed.append(closed.chat_id)
     con.execute(
         "UPDATE conversations SET state='idle',closed_at=NULL,"
         "last_activity_at=datetime('now'),version=version+1 "
@@ -553,6 +549,11 @@ def _reopen_conversation(con, operator: dict, conversation) -> list[str]:
         conversation_id,
         "conversation.reopened",
         {"state": "idle"},
+    )
+    active_chat_registry.register(
+        con,
+        int(conversation["shell_id"]),
+        str(conversation_id),
     )
     return auto_closed
 
@@ -585,7 +586,46 @@ def _cancel_queued_turns(con, conversation_id: str) -> int:
     return int(cancelled)
 
 
-def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
+def _enable_planner_coordinate_mode(
+    con,
+    *,
+    shell_id: int,
+    conversation_id: str,
+) -> int | None:
+    sprint = con.execute(
+        "SELECT sprint_id FROM sprints WHERE lifecycle='armed' "
+        "AND originating_planner_shell_id=? AND coordinate_mode=0",
+        (shell_id,),
+    ).fetchone()
+    if sprint is None:
+        return None
+    sprint_id = int(sprint["sprint_id"])
+    changed = con.execute(
+        "UPDATE sprints SET coordinate_mode=1,updated_at=datetime('now'),"
+        "version=version+1 WHERE sprint_id=? AND lifecycle='armed' "
+        "AND coordinate_mode=0",
+        (sprint_id,),
+    ).rowcount
+    if changed != 1:
+        return None
+    con.execute(
+        "INSERT INTO sprint_events "
+        "(sprint_id,event_type,actor_kind,payload) VALUES "
+        "(?,'coordinate_mode.enabled','fnb',?)",
+        (
+            sprint_id,
+            json.dumps(
+                {"conversation_id": conversation_id, "reason": "Planner chat closed"},
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        ),
+    )
+    return sprint_id
+
+
+def _begin_close(con, conversation_id: str, current_state: str) -> None:
+    """Unconditionally close and unlink a chat selected by the FnB."""
     active = con.execute(
         "SELECT run_id,trigger_message_id FROM conversation_runs "
         "WHERE conversation_id=? AND state IN ('leased','starting','running') "
@@ -603,26 +643,6 @@ def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
                 {"cancelled_queued_turns": cancelled},
                 run_id=run_id,
             )
-        interrupt_exists = con.execute(
-            "SELECT 1 FROM conversation_events WHERE run_id=? "
-            "AND event_type='run.interrupt.requested' LIMIT 1",
-            (run_id,),
-        ).fetchone()
-        if interrupt_exists is None:
-            _append_event(
-                con,
-                conversation_id,
-                "run.interrupt.requested",
-                {"reason": "conversation.close"},
-                message_id=int(active["trigger_message_id"]),
-                run_id=run_id,
-            )
-        con.execute(
-            "UPDATE conversations SET last_activity_at=datetime('now'),"
-            "version=version+1 WHERE conversation_id=?",
-            (conversation_id,),
-        )
-        return run_id
 
     recovered_state = None
     if current_state == "queued":
@@ -631,7 +651,8 @@ def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
             (conversation_id,),
         )
     elif current_state == "running":
-        recovered_state = current_state
+        if active is None:
+            recovered_state = current_state
         con.execute(
             "UPDATE conversations SET state='error' WHERE conversation_id=?",
             (conversation_id,),
@@ -640,6 +661,10 @@ def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
         "UPDATE conversations SET state='closed',closed_at=datetime('now'),"
         "last_activity_at=datetime('now'),version=version+1 "
         "WHERE conversation_id=?",
+        (conversation_id,),
+    )
+    con.execute(
+        "DELETE FROM active_shell_chats WHERE chat_id=?",
         (conversation_id,),
     )
     _append_event(
@@ -654,9 +679,14 @@ def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
                 if recovered_state
                 else {}
             ),
+            **(
+                {"displaced_run_id": int(active["run_id"])}
+                if active is not None
+                else {}
+            ),
         },
+        run_id=int(active["run_id"]) if active is not None else None,
     )
-    return None
 
 
 def _deliver_close_interrupt(run_id: int) -> None:
@@ -754,12 +784,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             "shell is unknown, deleted, or unavailable to this operator",
         )
     _refuse_admin_browser_chat(shell)
-    open_conversations = con.execute(
-        "SELECT conversation_id,state FROM conversations "
-        "WHERE shell_id=? AND state!='closed' AND conversation_scope='normal'",
-        (shell_id,),
-    ).fetchall()
-    if not open_conversations:
+    if active_chat_registry.get(con, shell_id) is None:
         live_state = _wait_for_cli_release(shell)
         if live_state is not None:
             raise ApiError(
@@ -817,8 +842,8 @@ def _create_conversation(con, operator: dict, headers, body: dict):
 
     conversation_id = "cv_" + uuid.uuid4().hex
     provider = run_mod.session_provider(harness, model)
-    auto_closed = []
-    with db_driver.write_transaction(con, "conversation.create"):
+    closed_id = None
+    with db_driver.write_transaction(con, "conversation.create.close_active"):
         existing = con.execute(
             "SELECT conversation_id,creation_request_hash FROM conversations "
             "WHERE owner_user_id=? "
@@ -864,13 +889,7 @@ def _create_conversation(con, operator: dict, headers, body: dict):
                 {"shell_id": shell_id},
             )
 
-        open_conversations = con.execute(
-            "SELECT conversation_id,state FROM conversations "
-            "WHERE shell_id=? AND state!='closed' "
-            "AND conversation_scope='normal'",
-            (shell_id,),
-        ).fetchall()
-        if not open_conversations:
+        if active_chat_registry.get(con, shell_id) is None:
             live_state = _live_shell_session(current_shell)
             if live_state is not None:
                 raise ApiError(
@@ -881,31 +900,62 @@ def _create_conversation(con, operator: dict, headers, body: dict):
                     {"shell_id": shell_id, "state": live_state},
                 )
 
-        running = [
-            row for row in open_conversations
-            if row["state"] in ("queued", "running")
-        ]
-        if running:
+        active = active_chat_registry.get(con, shell_id)
+        try:
+            closed = active_chat_registry.close_active(con, shell_id)
+        except active_chat_registry.ActiveChatBusy as exc:
             raise ApiError(
                 409,
                 "BROWSER_CHAT_BUSY",
-                "the open browser chat has a turn in progress",
-                {"conversation_id": running[0]["conversation_id"]},
-            )
-        for row in open_conversations:
-            con.execute(
-                "UPDATE conversations SET state='closed',"
-                "closed_at=datetime('now'),last_activity_at=datetime('now'),"
-                "version=version+1 WHERE conversation_id=?",
-                (row["conversation_id"],),
-            )
+                "the active chat has a turn in progress",
+                {
+                    "conversation_id": (
+                        active.chat_id if active is not None else None
+                    )
+                },
+            ) from exc
+        if closed is not None:
             _append_event(
                 con,
-                row["conversation_id"],
+                closed.chat_id,
                 "conversation.closed",
-                {"status": "closed", "reason": "another browser chat opened"},
+                {"status": "closed", "reason": "another chat opened"},
             )
-            auto_closed.append(row["conversation_id"])
+            closed_id = closed.chat_id
+
+    # Closing is intentionally its own committed step.  If replacement
+    # creation fails, the old chat stays closed and no second chat exists.
+    if closed_id is not None:
+        conversation_events.notify(closed_id)
+
+    with db_driver.write_transaction(con, "conversation.create.register"):
+        existing = con.execute(
+            "SELECT conversation_id,creation_request_hash FROM conversations "
+            "WHERE owner_user_id=? AND creation_idempotency_key=?",
+            (operator["user_id"], key),
+        ).fetchone()
+        if existing is not None:
+            if existing["creation_request_hash"] != request_hash:
+                raise ApiError(
+                    409,
+                    "CONVERSATION_IDEMPOTENCY_CONFLICT",
+                    "Idempotency-Key was reused with a different request",
+                )
+            row = _require_conversation(
+                con, existing["conversation_id"], operator["user_id"]
+            )
+            return _json(
+                201,
+                _conversation_projection(row),
+                [("Location", f"/api/conversations/{row['conversation_id']}")],
+            )
+        if active_chat_registry.get(con, shell_id) is not None:
+            raise ApiError(
+                409,
+                "ACTIVE_CHAT_CHANGED",
+                "another chat became active while the replacement was prepared; retry",
+                {"shell_id": shell_id},
+            )
         con.execute(
             "INSERT INTO conversations "
             "(conversation_id,shell_id,owner_user_id,harness,provider,model,"
@@ -936,9 +986,8 @@ def _create_conversation(con, operator: dict, headers, body: dict):
                 "effort": effort,
             },
         )
+        active_chat_registry.register(con, shell_id, conversation_id)
 
-    for closed_id in auto_closed:
-        conversation_events.notify(closed_id)
     conversation_events.notify(conversation_id)
     conversation_git_targets.safely_observe_and_persist(
         DB_PATH,
@@ -1077,12 +1126,6 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
                 {"expected": int(row["version"]), "received": version},
             )
         closing = body.get("state") == "closed"
-        if closing and row["conversation_scope"] == "sprint":
-            raise ApiError(
-                409,
-                "SPRINT_CONVERSATION_MANAGED",
-                "Sprint conversations close only with Sprint lifecycle cleanup",
-            )
         if row["state"] == "closed" and {"title", "state"}.intersection(body):
             raise ApiError(
                 409,
@@ -1117,7 +1160,12 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
                         ),
                     },
                 )
-            active_run_id = _begin_close(con, conversation_id, row["state"])
+            _begin_close(con, conversation_id, row["state"])
+            _enable_planner_coordinate_mode(
+                con,
+                shell_id=int(row["shell_id"]),
+                conversation_id=conversation_id,
+            )
         else:
             sets.insert(0, "version=version+1")
             if "title" in body:

@@ -54,14 +54,17 @@ SPRINT_INSTANCE_TABLES = [
     "sprint_work_units",
     "sprint_work_unit_tasks",
     "sprint_work_unit_dependencies",
-    "sprint_messages",
+    "wake_message",
     "sprint_wake_outbox",
     "sprint_wake_messages",
     "sprint_wake_attempts",
     "sprint_liveness_expectations",
     "sprint_registered_prs",
+    "pr_subscriptions",
     "sprint_pr_work_units",
     "sprint_pr_transitions",
+    "pr_subscription_transitions",
+    "pr_subscription_poll_failures",
     "sprint_judgments",
     "sprint_reports",
     "sprint_followups",
@@ -108,6 +111,7 @@ PER_INSTANCE_TABLES = [
     # outbox work must all survive update/rebuild. Parents precede
     # children so a snapshot stays readable and foreign-key-valid when loaded.
     "conversations",
+    "active_shell_chats",
     "conversation_git_targets",
     "conversation_messages",
     "conversation_runs",
@@ -409,55 +413,6 @@ def dump_sprints(con) -> list[str]:
     return lines
 
 
-def dump_sprint_participants(con) -> list[str]:
-    """Insert participants before immutable links, with pointers deferred."""
-    table = "sprint_participants"
-    cols = _table_columns(con, table)
-    rows = con.execute(
-        f"SELECT {', '.join(cols)} FROM {table} ORDER BY rowid"
-    ).fetchall()
-    pointer_indexes = (
-        cols.index("persistent_conversation_id"),
-        cols.index("current_conversation_id"),
-    )
-    lines = [f"DELETE FROM {table};"]
-    for original in rows:
-        row = list(original)
-        for index in pointer_indexes:
-            row[index] = None
-        lines.append(_insert_line(table, cols, row))
-    lines.append("")
-    return lines
-
-
-def dump_sprint_participant_conversations(con) -> list[str]:
-    """Restore immutable links, then select the participants' exact pointers."""
-    lines = dump_dependency_ordered_table(
-        con,
-        "sprint_participant_conversations",
-        identity="conversation_id",
-        parent="parent_conversation_id",
-        scope=("sprint_participant_id",),
-    )
-    pointers = con.execute(
-        "SELECT participant_id,persistent_conversation_id,current_conversation_id "
-        "FROM sprint_participants "
-        "WHERE persistent_conversation_id IS NOT NULL "
-        "OR current_conversation_id IS NOT NULL ORDER BY participant_id"
-    ).fetchall()
-    if pointers:
-        lines.pop()  # keep pointer selection in the same readable table block
-    for participant_id, persistent, current in pointers:
-        lines.append(
-            "UPDATE sprint_participants SET persistent_conversation_id="
-            f"{quote(persistent)}, current_conversation_id={quote(current)} "
-            f"WHERE participant_id={quote(participant_id)};"
-        )
-    if pointers:
-        lines.append("")
-    return lines
-
-
 def dump_plain_table(con, table: str) -> list[str]:
     cols = _table_columns(con, table)
     cols = [c for c in cols if c not in SENSITIVE_COLUMNS.get(table, ())]
@@ -492,10 +447,6 @@ def dump_table(con, table: str) -> list[str]:
         )
     if table == "sprints":
         return dump_sprints(con)
-    if table == "sprint_participants":
-        return dump_sprint_participants(con)
-    if table == "sprint_participant_conversations":
-        return dump_sprint_participant_conversations(con)
     return dump_plain_table(con, table)
 
 

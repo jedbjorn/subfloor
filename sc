@@ -1273,6 +1273,7 @@ case "$cmd" in
                 fi
                 exec "$PY" "$S/snapshot.py" ;;
   mem)          exec "$PY" "$S/mem.py" "$@" ;;
+  pr)           exec "$PY" "$S/pr_cli.py" "$@" ;;
   sprint)       exec "$PY" "$S/sprint_cli.py" "$@" ;;
   token)        exec "$PY" "$S/operator_token.py" "$@" ;;
   engine-ref)   sc_engine_ref_path="$LIVE_ROOT/.sc-state/engine.ref"
@@ -1709,6 +1710,8 @@ super-coder — forkable shell substrate
                              source-pure one: it verifies the CALLER's engine sources and local artifacts, and names the checkout it read.
   ./sc mem <cmd> [args]    a shell's own memory, over the engine API (get/state/seed/lns/decision/flag/roadmap/doc/narrative);
                              already wired to this launched shell, identity resolved by the engine — no DB path, no direct-DB fallback. `./sc mem which` to orient
+  ./sc pr subscribe --repository <owner/name> --pr <number>
+                           subscribe the authenticated Developer shell to engine-wide PR event wakes
   ./sc sprint <cmd>        authenticated Sprints v2 actions (run without a command for the full verb list)
                              caller identity is resolved by the engine; report and review bodies use files, and mutating retries carry stable keys where required
   ./sc token               print the browser sign-in operator token (an operator capability: the Admin runtime

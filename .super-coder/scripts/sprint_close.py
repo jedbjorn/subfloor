@@ -251,7 +251,9 @@ class SprintCloseStore:
             raise ValueError(
                 f"section limit must be between 1 and {MAX_SECTION_LIMIT}"
             )
-        sprint = self._require_close_authority(sprint_id, caller_shell_id)
+        sprint = self._require_close_authority(
+            sprint_id, caller_shell_id, allow_reviewer=True
+        )
         events = self._events(sprint_id)
         specs = self._spec_revisions(sprint_id)
         units = self._planned_vs_actual(sprint_id)
@@ -294,7 +296,7 @@ class SprintCloseStore:
         ]
         pending_messages = self._rows(
             "SELECT message_id,to_participant_id,work_unit_id,message_kind,created_at "
-            "FROM sprint_messages WHERE sprint_id=? AND actionable=1 "
+            "FROM wake_message WHERE sprint_id=? AND actionable=1 "
             "AND disposition='pending' ORDER BY message_id",
             (sprint_id,),
         )
@@ -478,7 +480,7 @@ class SprintCloseStore:
         message_counts = {
             row[0]: int(row[1])
             for row in self.con.execute(
-                "SELECT message_kind,COUNT(*) FROM sprint_messages "
+                "SELECT message_kind,COUNT(*) FROM wake_message "
                 "WHERE sprint_id=? AND message_kind IN ('nudge','escalation') "
                 "GROUP BY message_kind ORDER BY message_kind",
                 (sprint_id,),
@@ -512,7 +514,7 @@ class SprintCloseStore:
     def _history_links(self, sprint_id: int) -> dict[str, Any]:
         conversations = self._rows(
             "SELECT c.conversation_id,link.sprint_participant_id,p.shell_id,p.role,"
-            "link.purpose,link.parent_conversation_id,c.conversation_scope,c.state "
+            "c.conversation_scope,c.state "
             "FROM sprint_participant_conversations link "
             "JOIN sprint_participants p "
             "ON p.participant_id=link.sprint_participant_id "
@@ -541,7 +543,11 @@ class SprintCloseStore:
         return events
 
     def _require_close_authority(
-        self, sprint_id: int, caller_shell_id: int
+        self,
+        sprint_id: int,
+        caller_shell_id: int,
+        *,
+        allow_reviewer: bool = False,
     ) -> sqlite3.Row:
         row = self.con.execute(
             "SELECT sp.*,r.title AS feature_title,s.flavor AS caller_flavor "
@@ -555,7 +561,17 @@ class SprintCloseStore:
             int(row["originating_planner_shell_id"]) != caller_shell_id
             and row["caller_flavor"] != "admin"
         ):
-            raise SprintAuthorityError("only the owning Planner or FnB may compile")
+            if not allow_reviewer:
+                raise SprintAuthorityError(
+                    "only the owning Planner or FnB may record the final report"
+                )
+            try:
+                self._require_reviewer(sprint_id, caller_shell_id)
+            except SprintAuthorityError:
+                raise SprintAuthorityError(
+                    "only the owning Planner, FnB, or a participating Reviewer "
+                    "may compile"
+                ) from None
         return row
 
     def _require_participant_or_admin(

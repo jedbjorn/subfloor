@@ -32,9 +32,9 @@
       "test": "test_red_green_red_occurrences_wake_once_each_and_coalesce"
     },
     {
-      "scenario": "PR change while paused is reconciled once after resume",
+      "scenario": "PR change while paused is observed immediately and deduplicated",
       "file": "tests/test_sprint_pr_watcher.py",
-      "test": "test_paused_change_is_observed_once_after_resume"
+      "test": "test_paused_change_is_observed_immediately_and_deduplicated"
     },
     {
       "scenario": "Quota exhaustion after acceptance escalates immediately",
@@ -79,7 +79,7 @@
     {
       "scenario": "FnB authority can compile evidence when the Planner is unavailable",
       "file": "tests/test_sprint_close.py",
-      "test": "test_only_planner_or_admin_compiles_and_participants_read_timeline"
+      "test": "test_planner_admin_and_participating_reviewer_compile_evidence"
     },
     {
       "scenario": "Restart preserves every non-terminal lifecycle state",

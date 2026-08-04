@@ -18,7 +18,9 @@ class FreshForkInstallTest(unittest.TestCase):
     def test_noninteractive_install_reaches_durable_completion_marker(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repo = Path(raw) / "host-project"
+            home = Path(raw) / "home"
             repo.mkdir()
+            home.mkdir()
             shutil.copytree(
                 ROOT / ".super-coder",
                 repo / ".super-coder",
@@ -72,7 +74,7 @@ class FreshForkInstallTest(unittest.TestCase):
                     "Gate",
                 ],
                 cwd=repo,
-                env={**os.environ, "NO_COLOR": "1"},
+                env={**os.environ, "HOME": str(home), "NO_COLOR": "1"},
                 capture_output=True,
                 text=True,
                 timeout=60,
