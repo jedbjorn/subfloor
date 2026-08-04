@@ -93,7 +93,7 @@ class RegistryIntegrityTest(unittest.TestCase):
         # `./sc pg-init` (in the sc dispatcher) and `feature enable pg` write the
         # same instance.json key — if this drifts, launch won't see the sidecar.
         self.assertEqual(feature.FEATURES["pg"]["block"], "pg")
-        sc = (ROOT / "sc").read_text()
+        sc = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
         self.assertIn("d['pg']={}", sc.replace(" ", ""),
                       "sc pg-init no longer writes the `pg` key feature.py expects")
 

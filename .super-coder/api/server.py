@@ -2261,6 +2261,16 @@ class Handler(BaseHTTPRequestHandler):
         parts = path.strip("/").split("/")
         con = db()
         try:
+            if path == "/_sc/sprint/watcher-state":
+                values = parse_qs(urlparse(self.path).query).get("sprint_id", [])
+                if len(values) != 1:
+                    raise ValueError("sprint_id query parameter is required once")
+                try:
+                    sprint_id = int(values[0])
+                except ValueError as exc:
+                    raise ValueError("sprint_id must be a positive integer") from exc
+                state = sprint_pr_watcher.WatcherStateStore(con).for_sprint(sprint_id)
+                return self._send(200, state)
             if len(parts) != 4:
                 return self._send(404, {"error": "not found"})
             if parts[2] == "approvals":

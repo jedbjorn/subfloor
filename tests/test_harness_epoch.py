@@ -178,7 +178,7 @@ class HarnessEpochDockerfile(unittest.TestCase):
         )
         self.assertIn(
             '-v "$HOME/.codex:$HOME/.codex"',
-            (ROOT / "sc").read_text(),
+            (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text(),
             "durable Codex state stays mounted; isolate its executable",
         )
 
@@ -202,6 +202,7 @@ class ScFixture:
         # cli_entry.py is not optional in a synthetic fork: every entrypoint
         # imports it from its __main__ block (SIGPIPE hygiene, #384).
         for script in (
+            "dispatch.sh",
             "install.py",
             "callable_floor.py",
             "engine_manifest.py",

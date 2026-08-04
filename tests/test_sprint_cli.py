@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -20,14 +21,14 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 sys.path[:0] = [str(ENGINE / "scripts"), str(ENGINE / "api"), str(ROOT / "tests")]
 
-import mem  # noqa: E402
-import pr_cli  # noqa: E402
-import server  # noqa: E402
-import sprint_cli  # noqa: E402
-import sprint_domain  # noqa: E402
-import sprint_message_delivery  # noqa: E402
-from github_pull_requests import PullRequest  # noqa: E402
-from test_sprint_v2_domain import apply_schema  # noqa: E402
+import mem
+import pr_cli
+import server
+import sprint_cli
+import sprint_domain
+import sprint_message_delivery
+from github_pull_requests import PullRequest
+from test_sprint_v2_domain import apply_schema
 
 TOKENS = {
     "admin": "admin-token",
@@ -51,6 +52,7 @@ class SprintCliDispatcherTest(unittest.TestCase):
         self.assertIn("Authenticated Sprints v2 actions", completed.stdout)
         self.assertIn("record-qaqc", completed.stdout)
         self.assertIn("compile-report", completed.stdout)
+        self.assertIn("watcher-state", completed.stdout)
 
 
 class Reader:
@@ -68,6 +70,7 @@ class Reader:
             review_decision="APPROVED",
             checks="SUCCESS",
             checks_failed=False,
+            base_sha="c" * 40,
         )
 
 
@@ -163,6 +166,20 @@ class SprintCliApiTest(unittest.TestCase):
                 (initial_wake,),
             ).fetchone()[0]
         )
+        # Stamp only the assignment wake delivered (the arming wake must stay
+        # pending for the surfaces below): reading a force-new assignment
+        # requires confirmed delivery.
+        con.execute(
+            "UPDATE wake_message SET delivered_at=datetime('now') "
+            "WHERE message_id=?",
+            (initial_message,),
+        )
+        con.execute(
+            "UPDATE sprint_wake_outbox SET state='delivered',"
+            "delivered_at=datetime('now') WHERE wake_id=?",
+            (initial_wake,),
+        )
+        con.commit()
         sprint_message_delivery.SprintMessageStore(con).mark_read(initial_message, 1)
         cls.registered_pr_id = int(
             con.execute(
@@ -179,9 +196,13 @@ class SprintCliApiTest(unittest.TestCase):
         )
         con.execute(
             "INSERT INTO sprint_pr_transitions "
-            "(registered_pr_id,normalized_state,transition_key,observed_head_sha) "
-            "VALUES (?,'green','green-42',?)",
-            (cls.registered_pr_id, "a" * 40),
+            "(registered_pr_id,normalized_state,transition_key,observed_head_sha,"
+            "evidence) VALUES (?,'green','green-42',?,?)",
+            (
+                cls.registered_pr_id,
+                "a" * 40,
+                json.dumps({"base_sha": "c" * 40}),
+            ),
         )
         cls.dispatch_unit_id = int(
             con.execute(
@@ -265,6 +286,46 @@ class SprintCliApiTest(unittest.TestCase):
         self.assertIn("number=85", message[4])
         self.assertIn("event=green", message[4])
 
+    def deliver_message(self, message_id: int) -> None:
+        # The delivery worker is out of frame in these surface tests: stamp
+        # the one queued message delivered so its recipient may read it.
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute(
+                "UPDATE sprint_wake_outbox SET state='delivered',"
+                "delivered_at=datetime('now') WHERE state='pending' "
+                "AND wake_id IN (SELECT wake_id FROM sprint_wake_messages "
+                "WHERE message_id=?)",
+                (message_id,),
+            )
+            con.execute(
+                "UPDATE wake_message SET delivered_at=datetime('now') "
+                "WHERE message_id=? AND delivered_at IS NULL",
+                (message_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def deliver_sprint_messages(self, sprint_id: int) -> None:
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute(
+                "UPDATE sprint_wake_outbox SET state='delivered',"
+                "delivered_at=datetime('now') WHERE state='pending' "
+                "AND wake_id IN (SELECT wm.wake_id FROM sprint_wake_messages wm "
+                "JOIN wake_message m USING (message_id) WHERE m.sprint_id=?)",
+                (sprint_id,),
+            )
+            con.execute(
+                "UPDATE wake_message SET delivered_at=datetime('now') "
+                "WHERE sprint_id=? AND delivered_at IS NULL",
+                (sprint_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
+
     def seed_declaration(self, suffix: str) -> tuple[int, int, int]:
         con = sqlite3.connect(self.db)
         try:
@@ -343,6 +404,200 @@ class SprintCliApiTest(unittest.TestCase):
         server.DB_PATH = isolated
         self.addCleanup(setattr, self, "db", original_db)
         self.addCleanup(setattr, server, "DB_PATH", original_server_db)
+
+    def test_watcher_state_is_authenticated_bounded_and_diagnostic(self):
+        self.use_isolated_db()
+        con = sqlite3.connect(self.db)
+        con.row_factory = sqlite3.Row
+        try:
+            feature_id = int(
+                con.execute(
+                    "INSERT INTO roadmap (title,roadmap_status) "
+                    "VALUES ('Watcher diagnosis','in_progress')"
+                ).lastrowid
+            )
+            sprint_id = int(
+                con.execute(
+                    "INSERT INTO sprints "
+                    "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+                    "VALUES (?,3,1)",
+                    (feature_id,),
+                ).lastrowid
+            )
+            con.execute(
+                "UPDATE sprints SET lifecycle='armed',armed_at=? WHERE sprint_id=?",
+                ("2026-08-04 11:00:00", sprint_id),
+            )
+            participant_id = int(
+                con.execute(
+                    "INSERT INTO sprint_participants "
+                    "(sprint_id,shell_id,role,harness) VALUES (?,1,'developer','codex')",
+                    (sprint_id,),
+                ).lastrowid
+            )
+            subscription_ids = []
+            registered_ids = []
+            for pr_number in (41, 42, 43):
+                registered_id = int(
+                    con.execute(
+                        "INSERT INTO sprint_registered_prs "
+                        "(sprint_id,owner_participant_id,repository,pr_number) "
+                        "VALUES (?,?,'acme/diagnosis',?)",
+                        (sprint_id, participant_id, pr_number),
+                    ).lastrowid
+                )
+                subscription_id = int(
+                    con.execute(
+                        "INSERT INTO pr_subscriptions "
+                        "(owner_shell_id,repository,pr_number,sprint_registered_pr_id) "
+                        "VALUES (1,'acme/diagnosis',?,?)",
+                        (pr_number, registered_id),
+                    ).lastrowid
+                )
+                registered_ids.append(registered_id)
+                subscription_ids.append(subscription_id)
+            con.executemany(
+                "INSERT INTO pr_subscription_transitions "
+                "(subscription_id,normalized_state,transition_key,"
+                "observed_head_sha,observed_at) VALUES (?,?,?,?,?)",
+                (
+                    (
+                        subscription_ids[0],
+                        "red",
+                        "diagnosis-red",
+                        "a" * 40,
+                        "2026-08-04 11:59:00",
+                    ),
+                    (
+                        subscription_ids[1],
+                        "pending",
+                        "diagnosis-pending",
+                        "b" * 40,
+                        "2026-08-04 11:59:30",
+                    ),
+                ),
+            )
+            for index in range(1, 26):
+                con.execute(
+                    "INSERT INTO pr_subscription_poll_failures "
+                    "(subscription_id,failure_count,backoff_seconds,trigger,"
+                    "error_detail,failed_at,last_seen_at) VALUES (?,?,?,'pulse',?,?,?)",
+                    (
+                        subscription_ids[0],
+                        index,
+                        float(index),
+                        f"failure-{index}",
+                        f"2026-08-04 11:{index:02d}:00",
+                        f"2026-08-04 11:{index:02d}:00",
+                    ),
+                )
+            con.commit()
+
+            changes_before_read = con.total_changes
+            never_started = server.sprint_pr_watcher.WatcherStateStore(con).for_sprint(
+                sprint_id,
+                now=datetime(2026, 8, 4, 12, 2, tzinfo=timezone.utc),
+            )
+            self.assertEqual(changes_before_read, con.total_changes)
+            self.assertEqual("never-started", never_started["watcher"]["status"])
+            self.assertEqual([], never_started["watcher"]["history"])
+
+            con.execute(
+                "INSERT INTO daemon_heartbeats (name,beat_at,interval_s) "
+                "VALUES ('sprint-pr-watcher','2026-08-04 11:00:00',5)"
+            )
+            for index in range(1, 56):
+                con.execute(
+                    "INSERT INTO daemon_heartbeat_history "
+                    "(name,beat_at,subscriptions_scanned) VALUES (?,?,?)",
+                    ("sprint-pr-watcher", f"2026-08-04 11:{index % 60:02d}:00", index),
+                )
+            con.commit()
+
+            state = server.sprint_pr_watcher.WatcherStateStore(con).for_sprint(
+                sprint_id,
+                now=datetime(2026, 8, 4, 12, 2, tzinfo=timezone.utc),
+            )
+            self.assertEqual("stale", state["watcher"]["status"])
+            self.assertEqual(3720, state["watcher"]["age_seconds"])
+            self.assertEqual(
+                list(range(55, 5, -1)),
+                [row["heartbeat_id"] for row in state["watcher"]["history"]],
+            )
+            self.assertEqual(
+                ["red", "pending", None],
+                [
+                    item["latest_transition"]["normalized_state"]
+                    if item["latest_transition"] is not None
+                    else None
+                    for item in state["registered_prs"]
+                ],
+            )
+            self.assertEqual(
+                [True, True, False],
+                [item["has_observation"] for item in state["registered_prs"]],
+            )
+            self.assertEqual(
+                [180, 150, None],
+                [
+                    item["latest_transition"]["age_seconds"]
+                    if item["latest_transition"] is not None
+                    else None
+                    for item in state["registered_prs"]
+                ],
+            )
+            self.assertEqual(
+                list(range(25, 5, -1)),
+                [row["failure_id"] for row in state["poll_failures"]],
+            )
+            self.assertEqual(
+                registered_ids[0], state["poll_failures"][0]["registered_pr_id"]
+            )
+            self.assertEqual("failure-25", state["poll_failures"][0]["error_detail"])
+
+            con.execute(
+                "UPDATE daemon_heartbeats SET beat_at=datetime('now') "
+                "WHERE name='sprint-pr-watcher'"
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        def unauthenticated(path: str) -> tuple[int, dict]:
+            status, _headers, raw = server.dispatch_http(
+                "GET",
+                path,
+                "Host: 127.0.0.1:8800\r\nContent-Length: 0\r\n",
+                b"",
+            )
+            return status, json.loads(raw)
+
+        expected_auth = unauthenticated(f"/_sc/sprint/{sprint_id}/inbox")
+        self.assertEqual(
+            expected_auth,
+            unauthenticated(f"/_sc/sprint/watcher-state?sprint_id={sprint_id}"),
+        )
+        self.assertEqual(
+            (401, {"error": "Authorization: Bearer <token> required"}),
+            expected_auth,
+        )
+
+        cli_state = self.run_cli(
+            TOKENS["planner"], "watcher-state", "--sprint", str(sprint_id)
+        )
+        self.assertEqual(sprint_id, cli_state["sprint_id"])
+        self.assertEqual("live", cli_state["watcher"]["status"])
+        self.assertEqual(50, len(cli_state["watcher"]["history"]))
+        self.assertEqual(20, len(cli_state["poll_failures"]))
+        self.assertEqual(
+            ["red", "pending", None],
+            [
+                item["latest_transition"]["normalized_state"]
+                if item["latest_transition"] is not None
+                else None
+                for item in cli_state["registered_prs"]
+            ],
+        )
 
     def test_declare_plan_lifecycle_and_registration_surfaces(self):
         self.use_isolated_db()
@@ -697,6 +952,7 @@ class SprintCliApiTest(unittest.TestCase):
         )
         self.assertTrue(replanned["changed"])
         self.run_cli(TOKENS["planner"], "arm", "--sprint", str(sprint_id))
+        self.deliver_sprint_messages(sprint_id)
 
         inbox = self.run_cli(
             TOKENS["developer"], "inbox", "--sprint", str(sprint_id)
@@ -1064,6 +1320,7 @@ class SprintCliApiTest(unittest.TestCase):
             "cli-review-request",
         )
         self.assertTrue(request["created"])
+        self.deliver_message(request["message_id"])
 
         con = sqlite3.connect(self.db)
         con.row_factory = sqlite3.Row

@@ -16,12 +16,14 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import db_driver
 import sprint_liveness
 from github_pull_requests import (
+    GITHUB_TIMEOUT_SECONDS,
     GitHubPullRequestReader,
     GitHubReadError,
     PullRequest,
@@ -31,9 +33,251 @@ from sprint_message_delivery import SprintMessageStore
 from sprint_review_loop import SprintReviewLoopStore
 
 PULSE_SECONDS = 5.0
+HEARTBEAT_HISTORY_SECONDS = 60.0
+WATCHER_DAEMON_NAME = "sprint-pr-watcher"
 MAX_BACKOFF_SECONDS = 300.0
 RATE_BACKOFF_SECONDS = 60.0
 _REPOSITORY = re.compile(r"^[^/\s]+/[^/\s]+$")
+
+
+def _parse_stamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _next_db_stamp(con: sqlite3.Connection, floor: str | None) -> str:
+    """Return a DB timestamp strictly newer than the supplied durable floor."""
+    row = con.execute(
+        "SELECT CASE "
+        "WHEN ? IS NOT NULL "
+        "AND ?>=strftime('%Y-%m-%d %H:%M:%f','now') "
+        "THEN strftime('%Y-%m-%d %H:%M:%f',?,'+0.001 seconds') "
+        "ELSE strftime('%Y-%m-%d %H:%M:%f','now') END",
+        (floor, floor, floor),
+    ).fetchone()
+    return str(row[0])
+
+
+def derive_watcher_status(
+    heartbeat: sqlite3.Row | dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Project the watcher's current heartbeat as live, stale, or absent."""
+    if heartbeat is None:
+        return "never-started"
+    observed_at = _parse_stamp(str(heartbeat["beat_at"]))
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    threshold = 3 * (float(heartbeat["interval_s"]) + GITHUB_TIMEOUT_SECONDS)
+    return "live" if (current - observed_at).total_seconds() <= threshold else "stale"
+
+
+def _age_seconds(value: str, now: datetime) -> int:
+    return max(0, int((now - _parse_stamp(value)).total_seconds()))
+
+
+class WatcherHeartbeat:
+    """Persist current watcher liveness and a coarse, bounded history."""
+
+    def __init__(
+        self,
+        con: sqlite3.Connection,
+        *,
+        interval_seconds: float,
+        history_seconds: float = HEARTBEAT_HISTORY_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("watcher heartbeat interval must be positive")
+        if history_seconds <= 0:
+            raise ValueError("watcher heartbeat history interval must be positive")
+        self.con = con
+        self.interval_seconds = interval_seconds
+        self.history_seconds = history_seconds
+        self.monotonic = monotonic
+        self._last_history_at: float | None = None
+
+    def beat(
+        self,
+        subscriptions_scanned: int,
+        *,
+        force_history: bool = False,
+        history_eligible: bool = True,
+    ) -> None:
+        if subscriptions_scanned < 0:
+            raise ValueError("subscriptions_scanned must be non-negative")
+        observed = self.monotonic()
+        history_due = history_eligible and (
+            force_history
+            or (
+                self._last_history_at is not None
+                and observed - self._last_history_at >= self.history_seconds
+            )
+        )
+        with db_driver.write_transaction(self.con, "sprint.pr.watcher.heartbeat"):
+            self.con.execute(
+                "INSERT INTO daemon_heartbeats (name,beat_at,interval_s) "
+                "VALUES (?,datetime('now'),?) "
+                "ON CONFLICT(name) DO UPDATE SET beat_at=excluded.beat_at,"
+                "interval_s=excluded.interval_s",
+                (WATCHER_DAEMON_NAME, self.interval_seconds),
+            )
+            if history_due:
+                self.con.execute(
+                    "INSERT INTO daemon_heartbeat_history "
+                    "(name,subscriptions_scanned) VALUES (?,?)",
+                    (WATCHER_DAEMON_NAME, subscriptions_scanned),
+                )
+        if history_due or self._last_history_at is None:
+            self._last_history_at = observed
+
+
+class WatcherStateStore:
+    """Project bounded watcher evidence for one Sprint without side effects."""
+
+    HISTORY_LIMIT = 50
+    FAILURE_LIMIT = 20
+
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+        self.con.row_factory = sqlite3.Row
+
+    def for_sprint(
+        self,
+        sprint_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(sprint_id, int) or sprint_id < 1:
+            raise ValueError("sprint_id must be a positive integer")
+        sprint = self.con.execute(
+            "SELECT sprint_id FROM sprints WHERE sprint_id=?", (sprint_id,)
+        ).fetchone()
+        if sprint is None:
+            raise KeyError(f"unknown Sprint: {sprint_id}")
+
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        heartbeat = self.con.execute(
+            "SELECT name,beat_at,interval_s FROM daemon_heartbeats WHERE name=?",
+            (WATCHER_DAEMON_NAME,),
+        ).fetchone()
+        history = self.con.execute(
+            "SELECT heartbeat_id,beat_at,subscriptions_scanned "
+            "FROM daemon_heartbeat_history WHERE name=? "
+            "ORDER BY heartbeat_id DESC LIMIT ?",
+            (WATCHER_DAEMON_NAME, self.HISTORY_LIMIT),
+        ).fetchall()
+
+        registered = self.con.execute(
+            "SELECT registered.registered_pr_id,registered.repository,"
+            "registered.pr_number,subscription.subscription_id,"
+            "transition.transition_id,transition.normalized_state,"
+            "transition.observed_head_sha,transition.observed_at "
+            "FROM sprint_registered_prs registered "
+            "LEFT JOIN pr_subscriptions subscription "
+            "ON subscription.sprint_registered_pr_id=registered.registered_pr_id "
+            "LEFT JOIN pr_subscription_transitions transition "
+            "ON transition.transition_id=("
+            "SELECT candidate.transition_id FROM pr_subscription_transitions candidate "
+            "WHERE candidate.subscription_id=subscription.subscription_id "
+            "ORDER BY candidate.transition_id DESC LIMIT 1) "
+            "WHERE registered.sprint_id=? ORDER BY registered.registered_pr_id",
+            (sprint_id,),
+        ).fetchall()
+        registered_prs = []
+        for row in registered:
+            latest = None
+            if row["transition_id"] is not None:
+                observed_at = str(row["observed_at"])
+                latest = {
+                    "transition_id": int(row["transition_id"]),
+                    "normalized_state": str(row["normalized_state"]),
+                    "observed_head_sha": row["observed_head_sha"],
+                    "observed_at": observed_at,
+                    "age_seconds": _age_seconds(observed_at, current),
+                }
+            registered_prs.append(
+                {
+                    "registered_pr_id": int(row["registered_pr_id"]),
+                    "repository": str(row["repository"]),
+                    "pr_number": int(row["pr_number"]),
+                    "subscription_id": (
+                        int(row["subscription_id"])
+                        if row["subscription_id"] is not None
+                        else None
+                    ),
+                    "has_observation": latest is not None,
+                    "latest_transition": latest,
+                }
+            )
+
+        failures = self.con.execute(
+            "SELECT failure.failure_id,registered.registered_pr_id,"
+            "subscription.subscription_id,registered.repository,"
+            "registered.pr_number,failure.failure_count,failure.repeat_count,"
+            "failure.backoff_seconds,failure.trigger,failure.error_detail,"
+            "failure.failed_at,failure.last_seen_at "
+            "FROM pr_subscription_poll_failures failure "
+            "JOIN pr_subscriptions subscription "
+            "ON subscription.subscription_id=failure.subscription_id "
+            "JOIN sprint_registered_prs registered "
+            "ON registered.registered_pr_id=subscription.sprint_registered_pr_id "
+            "WHERE registered.sprint_id=? "
+            "ORDER BY failure.failure_id DESC LIMIT ?",
+            (sprint_id, self.FAILURE_LIMIT),
+        ).fetchall()
+
+        watcher = {
+            "status": derive_watcher_status(heartbeat, now=current),
+            "last_beat_at": None,
+            "interval_seconds": None,
+            "age_seconds": None,
+            "history": [
+                {
+                    "heartbeat_id": int(row["heartbeat_id"]),
+                    "beat_at": str(row["beat_at"]),
+                    "subscriptions_scanned": int(row["subscriptions_scanned"]),
+                }
+                for row in history
+            ],
+        }
+        if heartbeat is not None:
+            watcher.update(
+                {
+                    "last_beat_at": str(heartbeat["beat_at"]),
+                    "interval_seconds": int(heartbeat["interval_s"]),
+                    "age_seconds": _age_seconds(str(heartbeat["beat_at"]), current),
+                }
+            )
+
+        return {
+            "sprint_id": sprint_id,
+            "watcher": watcher,
+            "registered_prs": registered_prs,
+            "poll_failures": [
+                {
+                    "failure_id": int(row["failure_id"]),
+                    "registered_pr_id": int(row["registered_pr_id"]),
+                    "subscription_id": int(row["subscription_id"]),
+                    "repository": str(row["repository"]),
+                    "pr_number": int(row["pr_number"]),
+                    "failure_count": int(row["failure_count"]),
+                    "repeat_count": int(row["repeat_count"]),
+                    "backoff_seconds": float(row["backoff_seconds"]),
+                    "trigger": str(row["trigger"]),
+                    "error_detail": str(row["error_detail"]),
+                    "failed_at": str(row["failed_at"]),
+                    "last_seen_at": (
+                        str(row["last_seen_at"])
+                        if row["last_seen_at"] is not None
+                        else None
+                    ),
+                }
+                for row in failures
+            ],
+        }
 
 
 @dataclass(frozen=True)
@@ -356,7 +600,12 @@ class SprintPRWatcher:
         notify_commit()
         return receipt
 
-    def poll_once(self, *, startup: bool = False) -> bool:
+    def poll_once(
+        self,
+        *,
+        startup: bool = False,
+        repository_complete: Callable[[int], None] | None = None,
+    ) -> bool:
         self._trigger = "startup" if startup else "pulse"
         rows = self.con.execute(
             "SELECT subscription.* FROM pr_subscriptions subscription "
@@ -370,7 +619,11 @@ class SprintPRWatcher:
         ).fetchall()
         if not rows:
             return False
-        self._observe_rows(rows, self._trigger)
+        self._observe_rows(
+            rows,
+            self._trigger,
+            repository_complete=repository_complete,
+        )
         return True
 
     def _subscription_row(self, subscription_id: int) -> sqlite3.Row | None:
@@ -385,6 +638,7 @@ class SprintPRWatcher:
         trigger: str,
         *,
         ignore_backoff: bool = False,
+        repository_complete: Callable[[int], None] | None = None,
     ) -> None:
         now = self.monotonic()
         due = [
@@ -397,23 +651,29 @@ class SprintPRWatcher:
         grouped: dict[str, list[sqlite3.Row]] = defaultdict(list)
         for row in due:
             grouped[str(row["repository"])].append(row)
+        subscriptions_scanned = 0
         for repository, repo_rows in grouped.items():
-            reader = self.reader_factory(repository)
-            if len(repo_rows) == 1:
-                self._read_exact(reader, repo_rows[0], trigger)
-                continue
             try:
-                listed = {item.number: item for item in reader.list()}
-            except GitHubReadError as exc:
-                for row in repo_rows:
-                    self._poll_failed(row, trigger, exc)
-                continue
-            for row in repo_rows:
-                pull_request = listed.get(int(row["pr_number"]))
-                if pull_request is None:
-                    self._read_exact(reader, row, trigger)
+                reader = self.reader_factory(repository)
+                if len(repo_rows) == 1:
+                    self._read_exact(reader, repo_rows[0], trigger)
                     continue
-                self._observe(row, pull_request, trigger)
+                try:
+                    listed = {item.number: item for item in reader.list()}
+                except GitHubReadError as exc:
+                    for row in repo_rows:
+                        self._poll_failed(row, trigger, exc)
+                    continue
+                for row in repo_rows:
+                    pull_request = listed.get(int(row["pr_number"]))
+                    if pull_request is None:
+                        self._read_exact(reader, row, trigger)
+                        continue
+                    self._observe(row, pull_request, trigger)
+            finally:
+                subscriptions_scanned += len(repo_rows)
+                if repository_complete is not None:
+                    repository_complete(subscriptions_scanned)
 
     def _read_exact(self, reader: Any, row: sqlite3.Row, trigger: str) -> None:
         try:
@@ -442,8 +702,7 @@ class SprintPRWatcher:
                 pull_request,
                 trigger=trigger,
             )
-        if receipt is not None:
-            self._backoff.pop(int(registered["subscription_id"]), None)
+        self._backoff.pop(int(registered["subscription_id"]), None)
         return receipt
 
     def observe_in_transaction(
@@ -468,6 +727,7 @@ class SprintPRWatcher:
         state = normalize_state(pull_request)
         evidence = {
             "base_ref": pull_request.base_ref,
+            "base_sha": pull_request.base_sha,
             "checks": pull_request.checks,
             "checks_failed": pull_request.checks_failed,
             "head_ref": pull_request.head_ref,
@@ -490,6 +750,21 @@ class SprintPRWatcher:
         ).fetchone()
         if current is None:
             raise KeyError(f"unknown active PR subscription: {subscription_id}")
+        latest_failure = self.con.execute(
+            "SELECT last_seen_at FROM pr_subscription_poll_failures "
+            "WHERE subscription_id=? ORDER BY failure_id DESC LIMIT 1",
+            (subscription_id,),
+        ).fetchone()
+        success_floor = (
+            str(latest_failure["last_seen_at"])
+            if latest_failure is not None
+            and latest_failure["last_seen_at"] is not None
+            else None
+        )
+        self.con.execute(
+            "UPDATE pr_subscriptions SET updated_at=? WHERE subscription_id=?",
+            (_next_db_stamp(self.con, success_floor), subscription_id),
+        )
         latest = self.con.execute(
             "SELECT transition_key,normalized_state,observed_head_sha "
             "FROM pr_subscription_transitions WHERE subscription_id=? "
@@ -501,7 +776,6 @@ class SprintPRWatcher:
             and latest["normalized_state"] == state
             and latest["observed_head_sha"] == pull_request.head_sha
         ):
-            self._backoff.pop(subscription_id, None)
             return None
         parent_key = latest["transition_key"] if latest is not None else "root"
         transition_key = hashlib.sha256(
@@ -570,6 +844,28 @@ class SprintPRWatcher:
                     ),
                 ),
             )
+            if (
+                trigger == "registration"
+                and state == "created"
+                and pull_request.checks is None
+            ):
+                self.con.execute(
+                    "INSERT INTO sprint_events "
+                    "(sprint_id,event_type,actor_kind,payload) "
+                    "VALUES (?,'pr.no_checks_observed','system',?)",
+                    (
+                        current["sprint_id"],
+                        json.dumps(
+                            {
+                                "observed_head_sha": pull_request.head_sha,
+                                "registered_pr_id": registered_pr_id,
+                                "subscription_id": subscription_id,
+                                "transition_id": transition_id,
+                            },
+                            sort_keys=True,
+                        ),
+                    ),
+                )
         return TransitionReceipt(
             transition_id,
             state,
@@ -716,18 +1012,11 @@ class SprintPRWatcher:
         error: GitHubReadError,
     ) -> None:
         subscription_id = int(registered["subscription_id"])
-        previous = self._backoff.get(subscription_id)
-        failures = 1 if previous is None else previous.failures + 1
         detail = (str(error).strip() or error.__class__.__name__)[:500]
-        delay = min(MAX_BACKOFF_SECONDS, PULSE_SECONDS * (2 ** failures))
-        if "rate" in detail.lower():
-            delay = max(delay, RATE_BACKOFF_SECONDS)
-        self._backoff[subscription_id] = _FailureBackoff(
-            failures, self.monotonic() + delay
-        )
         with db_driver.write_transaction(self.con, "sprint.pr.poll_failure"):
             current = self.con.execute(
-                "SELECT subscription.subscription_id,registered.sprint_id "
+                "SELECT subscription.subscription_id,subscription.updated_at,"
+                "registered.sprint_id "
                 "FROM pr_subscriptions subscription "
                 "LEFT JOIN sprint_registered_prs registered "
                 "ON registered.registered_pr_id="
@@ -737,19 +1026,60 @@ class SprintPRWatcher:
             ).fetchone()
             if current is None:
                 return
-            self.con.execute(
-                "INSERT INTO pr_subscription_poll_failures "
-                "(subscription_id,failure_count,backoff_seconds,trigger,error_detail) "
-                "VALUES (?,?,?,?,?)",
-                (
-                    subscription_id,
-                    failures,
-                    delay,
-                    trigger,
-                    detail,
-                ),
+            latest_failure = self.con.execute(
+                "SELECT failure_id,failure_count,backoff_seconds,trigger,"
+                "error_detail,last_seen_at "
+                "FROM pr_subscription_poll_failures WHERE subscription_id=? "
+                "ORDER BY failure_id DESC LIMIT 1",
+                (subscription_id,),
+            ).fetchone()
+            same_streak = (
+                latest_failure is not None
+                and latest_failure["last_seen_at"] is not None
+                and str(current["updated_at"])
+                <= str(latest_failure["last_seen_at"])
             )
-            if current["sprint_id"] is not None:
+            failures = (
+                int(latest_failure["failure_count"]) + 1 if same_streak else 1
+            )
+            delay = min(MAX_BACKOFF_SECONDS, PULSE_SECONDS * (2 ** failures))
+            if "rate" in detail.lower():
+                delay = max(delay, RATE_BACKOFF_SECONDS)
+            if same_streak:
+                delay = max(delay, float(latest_failure["backoff_seconds"]))
+            coalesced = (
+                same_streak
+                and latest_failure["trigger"] == trigger
+                and latest_failure["error_detail"] == detail
+            )
+            stamp_floor = str(current["updated_at"])
+            if latest_failure is not None and latest_failure["last_seen_at"] is not None:
+                stamp_floor = max(stamp_floor, str(latest_failure["last_seen_at"]))
+            failure_stamp = _next_db_stamp(self.con, stamp_floor)
+            if coalesced:
+                self.con.execute(
+                    "UPDATE pr_subscription_poll_failures "
+                    "SET failure_count=failure_count+1,backoff_seconds=?,"
+                    "repeat_count=repeat_count+1,last_seen_at=? "
+                    "WHERE failure_id=?",
+                    (delay, failure_stamp, latest_failure["failure_id"]),
+                )
+            else:
+                self.con.execute(
+                    "INSERT INTO pr_subscription_poll_failures "
+                    "(subscription_id,failure_count,backoff_seconds,trigger,"
+                    "error_detail,failed_at,last_seen_at) VALUES (?,?,?,?,?,?,?)",
+                    (
+                        subscription_id,
+                        failures,
+                        delay,
+                        trigger,
+                        detail,
+                        failure_stamp,
+                        failure_stamp,
+                    ),
+                )
+            if current["sprint_id"] is not None and not coalesced:
                 self.con.execute(
                     "INSERT INTO sprint_events "
                     "(sprint_id,event_type,actor_kind,payload) "
@@ -773,6 +1103,9 @@ class SprintPRWatcher:
                         ),
                     ),
                 )
+        self._backoff[subscription_id] = _FailureBackoff(
+            failures, self.monotonic() + delay
+        )
 
 
 class SprintPRWatcherService(threading.Thread):
@@ -784,14 +1117,18 @@ class SprintPRWatcherService(threading.Thread):
         *,
         repo_root: str | Path,
         pulse_seconds: float = PULSE_SECONDS,
+        history_seconds: float = HEARTBEAT_HISTORY_SECONDS,
         reader_factory: Callable[[str], Any] | None = None,
     ) -> None:
         super().__init__(name="sprint-pr-watcher", daemon=True)
         if pulse_seconds <= 0:
             raise ValueError("watcher pulse must be positive")
+        if history_seconds <= 0:
+            raise ValueError("watcher heartbeat history interval must be positive")
         self.db_path = Path(db_path)
         self.repo_root = Path(repo_root)
         self.pulse_seconds = pulse_seconds
+        self.history_seconds = history_seconds
         self.reader_factory = reader_factory
         self._wake = threading.Event()
         self._stop_event = threading.Event()
@@ -803,9 +1140,34 @@ class SprintPRWatcherService(threading.Thread):
         self._stop_event.set()
         self._wake.set()
 
+    def _pulse(
+        self,
+        watcher: SprintPRWatcher,
+        heartbeat: WatcherHeartbeat,
+        *,
+        startup: bool,
+    ) -> bool:
+        heartbeat.beat(
+            0,
+            force_history=startup,
+            history_eligible=startup,
+        )
+        observed = watcher.poll_once(
+            startup=startup,
+            repository_complete=heartbeat.beat,
+        )
+        if not observed and not startup:
+            heartbeat.beat(0)
+        return observed
+
     def run(self) -> None:
         try:
             with closing(db_driver.connect(self.db_path)) as con:
+                heartbeat = WatcherHeartbeat(
+                    con,
+                    interval_seconds=self.pulse_seconds,
+                    history_seconds=self.history_seconds,
+                )
                 watcher = SprintPRWatcher(
                     con,
                     repo_root=self.repo_root,
@@ -814,7 +1176,7 @@ class SprintPRWatcherService(threading.Thread):
                 startup = True
                 while not self._stop_event.is_set():
                     try:
-                        watcher.poll_once(startup=startup)
+                        self._pulse(watcher, heartbeat, startup=startup)
                     except Exception as exc:  # noqa: BLE001 - keep service alive
                         print(f"sprint-pr-watcher: pulse failed ({exc})", flush=True)
                     startup = False

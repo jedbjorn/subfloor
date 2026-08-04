@@ -326,6 +326,11 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0174_reseed_force_new_wake_skills.sql":
+                    con.executescript(later_migration.read_text())
 
             for name in sorted(FORCE_NEW_ROLE_SKILLS):
                 with self.subTest(name=name):
@@ -347,6 +352,97 @@ class SprintSkillTest(unittest.TestCase):
                             0,
                         ),
                     )
+        finally:
+            con.close()
+
+    def test_red_check_doctrine_reseed_matches_asset_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0176_reseed_sprint_red_check_doctrine.sql":
+                    break
+                con.executescript(migration.read_text())
+            con.execute(
+                "UPDATE skills SET description='stale', category='stale', "
+                "command='stale', common=1, content='accepted-red is okay', "
+                "is_deleted=1 WHERE name='sprint_rev'"
+            )
+
+            migration = (
+                ENGINE
+                / "migrations"
+                / "0176_reseed_sprint_red_check_doctrine.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            parsed = seed_skills.parse_skill(ASSETS / "sprint_rev" / "SKILL.md")
+            rows = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='sprint_rev'"
+            ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(
+                tuple(rows[0]),
+                (
+                    parsed["description"],
+                    parsed["category"],
+                    parsed["command"],
+                    parsed["common"],
+                    parsed["content"],
+                    0,
+                ),
+            )
+        finally:
+            con.close()
+
+    def test_watcher_state_reseed_matches_assets_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0178_reseed_sprint_watcher_state_skills.sql":
+                    break
+                con.executescript(migration.read_text())
+            con.execute(
+                "UPDATE skills SET description='stale',category='stale',"
+                "command='stale',common=1,content='wait blindly',is_deleted=1 "
+                "WHERE name IN ('sprint_dev','sprint_pln')"
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0178_reseed_sprint_watcher_state_skills.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for name in ("sprint_dev", "sprint_pln"):
+                with self.subTest(name=name):
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(
+                        tuple(rows[0]),
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                    )
+                    normalized = " ".join(parsed["content"].split())
+                    self.assertIn("sc sprint watcher-state --sprint <id>", normalized)
+                    self.assertIn(
+                        "carries no evidence about the PR watcher", normalized
+                    )
+                    self.assertIn("Do not repeat", normalized)
         finally:
             con.close()
 
@@ -479,6 +575,7 @@ class SprintSkillTest(unittest.TestCase):
             "authorize-merge",
             "dispatch",
             "monitor",
+            "watcher-state",
             "record-conformance",
             "disposition-followup",
             "compile-report",
@@ -488,7 +585,7 @@ class SprintSkillTest(unittest.TestCase):
         )
         for command in expected:
             self.assertIn(f"sc sprint {command}", combined)
-        dispatcher = (ROOT / "sc").read_text()
+        dispatcher = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
         self.assertIn('sprint)       exec "$PY" "$S/sprint_cli.py" "$@" ;;', dispatcher)
         parser = sprint_cli.build_parser()
         commands = next(
@@ -667,6 +764,25 @@ class SprintSkillTest(unittest.TestCase):
             "no prior developer evidence",
         ):
             self.assertIn(guidance, reviewer)
+
+    def test_reviewer_forbids_accepted_red_and_routes_failures(self):
+        reviewer = " ".join(
+            (ASSETS / "sprint_rev" / "SKILL.md").read_text().split()
+        )
+        for guidance in (
+            "Accepted-red is not a legal review outcome",
+            "A departure that leaves checks failing is never acceptable",
+            "record `changes_requested` so the Developer fixes them",
+            "send the Planner a `replan` decision",
+            "remains green-only, without exception or waiver",
+            "do not note the failure and approve anyway",
+            "`Note it and pass anyway` is the acceptance-shaped anti-pattern",
+            "In the dos-arch incident",
+            "created a deadlock: the green-only handoff gate could never pass",
+            "Decision #93 records why this no-waiver rule exists",
+        ):
+            with self.subTest(guidance=guidance):
+                self.assertIn(guidance, reviewer)
 
     def test_every_affected_file_argument_names_the_hard_ceiling(self):
         parser = sprint_cli.build_parser()

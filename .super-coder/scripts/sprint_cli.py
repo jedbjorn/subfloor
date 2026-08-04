@@ -316,6 +316,12 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_watcher_state(args: argparse.Namespace) -> int:
+    result = mem._api("GET", f"/_sc/sprint/watcher-state?sprint_id={args.sprint}")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_record_conformance(args: argparse.Namespace) -> int:
     result = _post(
         "/_sc/sprint/conformance",
@@ -544,6 +550,12 @@ def build_parser() -> argparse.ArgumentParser:
     monitor = sub.add_parser("monitor", help="Planner evaluates due liveness evidence")
     monitor.add_argument("--sprint", type=int, required=True)
     monitor.set_defaults(fn=cmd_monitor)
+
+    watcher_state = sub.add_parser(
+        "watcher-state", help="Read bounded durable PR-watcher evidence"
+    )
+    watcher_state.add_argument("--sprint", type=int, required=True)
+    watcher_state.set_defaults(fn=cmd_watcher_state)
 
     conformance = sub.add_parser(
         "record-conformance", help="Reviewer records a report and follow-ups"

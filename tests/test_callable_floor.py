@@ -129,6 +129,58 @@ class CallableFloorTest(unittest.TestCase):
             f"    cd {self.root} && ./sc update",
         )
 
+    def test_bootstrap_missing_body_is_reported(self) -> None:
+        bootstrap = self.root / "sc"
+        bootstrap.write_text(
+            "#!/bin/sh\n"
+            'exec sh "$LIVE_ROOT/.super-coder/scripts/dispatch.sh" "$@"\n'
+        )
+        bootstrap.chmod(0o755)
+        ref = self.commit_floor()
+
+        self.assertEqual(
+            callable_floor.inspect_callable_floor(
+                self.root,
+                expected_ref=ref,
+            ),
+            (
+                "dispatcher bootstrap routes to a missing engine body: "
+                ".super-coder/scripts/dispatch.sh",
+            ),
+        )
+
+    def test_body_routes_get_the_missing_script_scan(self) -> None:
+        bootstrap = self.root / "sc"
+        bootstrap.write_text(
+            "#!/bin/sh\n"
+            'exec sh "$LIVE_ROOT/.super-coder/scripts/dispatch.sh" "$@"\n'
+        )
+        bootstrap.chmod(0o755)
+        body = self.scripts / "dispatch.sh"
+        body.write_text(
+            "#!/bin/sh\n"
+            "S=\"$PWD/.super-coder/scripts\"\n"
+            'exec "$PY" "$S/sprint_cli.py" "$@"\n'
+        )
+        body.chmod(0o755)
+        ref = self.commit_floor()
+
+        self.assertEqual(
+            callable_floor.inspect_callable_floor(
+                self.root,
+                expected_ref=ref,
+            ),
+            ("dispatcher routes to missing engine script(s): sprint_cli.py",),
+        )
+        (self.scripts / "sprint_cli.py").write_text("print('help')\n")
+        self.assertEqual(
+            callable_floor.inspect_callable_floor(
+                self.root,
+                expected_ref=ref,
+            ),
+            (),
+        )
+
     def test_malformed_pin_is_not_accepted_as_a_manifest_authority(self) -> None:
         state = self.root / ".sc-state"
         state.mkdir()

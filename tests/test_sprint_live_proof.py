@@ -62,6 +62,7 @@ class ScenarioGitHub:
         *,
         checks: str | None = "SUCCESS",
         head_sha: str | None = None,
+        base_sha: str = "e" * 40,
     ) -> PullRequest:
         head = head_sha or f"{number:040x}"
         pull_request = PullRequest(
@@ -77,6 +78,7 @@ class ScenarioGitHub:
             review_decision="APPROVED" if state in {"OPEN", "MERGED"} else None,
             checks=checks,
             checks_failed=checks == "FAILURE",
+            base_sha=base_sha,
         )
         self.pull_requests[number] = pull_request
         return pull_request
@@ -405,6 +407,7 @@ class SprintLiveProof(unittest.TestCase):
             "--key",
             f"proof:{pr_number}:review:1",
         )
+        self.deliver_browser_turns()
         self.assertEqual(
             "accepted", messages.mark_read(handoff["message_id"], reviewer)
         )
@@ -440,6 +443,7 @@ class SprintLiveProof(unittest.TestCase):
                 "--key",
                 f"proof:{pr_number}:review:2",
             )
+            self.deliver_browser_turns()
             self.assertEqual(
                 "accepted", messages.mark_read(handoff["message_id"], reviewer)
             )

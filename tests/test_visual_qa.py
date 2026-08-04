@@ -819,7 +819,7 @@ class ModeTest(unittest.TestCase):
             calls[1],
             [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
         )
-        dispatcher = (ROOT / "sc").read_text()
+        dispatcher = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
         self.assertIn(
             'visual-qa)         exec "$PY" "$S/visual_qa.py" "$@" ;;', dispatcher
         )

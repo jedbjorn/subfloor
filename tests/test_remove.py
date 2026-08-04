@@ -350,7 +350,7 @@ class RuntimeQuiescenceTest(unittest.TestCase):
 
 class WiringTest(unittest.TestCase):
     def test_dispatcher_and_make_alias_are_public(self) -> None:
-        dispatcher = (ROOT / "sc").read_text()
+        dispatcher = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
         aliases = (ROOT / ".super-coder/aliases.mk").read_text()
         self.assertIn('remove)       if sc_help_form "$@"; then', dispatcher)
         self.assertIn('exec "$PY" "$S/remove.py" "$@"', dispatcher)

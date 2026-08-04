@@ -158,6 +158,14 @@ _EVENT_FIELDS = {
     "pr.transition": frozenset(
         {"registered_pr_id", "transition_id", "normalized_state"}
     ),
+    "pr.no_checks_observed": frozenset(
+        {
+            "registered_pr_id",
+            "subscription_id",
+            "transition_id",
+            "observed_head_sha",
+        }
+    ),
     "pr.poll_failed": frozenset(
         {"registered_pr_id", "pr_number", "failure_count", "backoff_seconds", "trigger"}
     ),

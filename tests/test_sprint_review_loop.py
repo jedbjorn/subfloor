@@ -48,7 +48,23 @@ class SprintReviewLoopCase(SprintPRWatcherCase):
             idempotency_key=key,
         )
 
+    def deliver_message(self, message_id: int) -> None:
+        """Stamp one message delivered, mimicking wake delivery finalize."""
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET state='delivered',"
+            "delivered_at=datetime('now') WHERE state='pending' AND wake_id IN "
+            "(SELECT wake_id FROM sprint_wake_messages WHERE message_id=?)",
+            (message_id,),
+        )
+        self.con.execute(
+            "UPDATE wake_message SET delivered_at=datetime('now') "
+            "WHERE message_id=? AND delivered_at IS NULL",
+            (message_id,),
+        )
+        self.con.commit()
+
     def accept_review(self, message_id: int) -> None:
+        self.deliver_message(message_id)
         self.assertEqual("accepted", self.messages.mark_read(message_id, 2))
 
     def approve(self, key: str = "approved-1"):
@@ -269,6 +285,118 @@ class ReviewHandoffTest(SprintReviewLoopCase):
             self.con.execute(
                 "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
                 (self.unit_id,),
+            ).fetchone()[0],
+        )
+
+    def test_pending_rejection_reports_latest_observation_and_live_watcher(self):
+        self.con.execute(
+            "INSERT INTO sprint_pr_transitions "
+            "(registered_pr_id,normalized_state,transition_key,"
+            "observed_head_sha,evidence,observed_at) "
+            "VALUES (?,'pending','test-pending-observation',?,?,"
+            "datetime('now','-3 hours'))",
+            (
+                self.registered_pr_id,
+                "b" * 40,
+                json.dumps({"checks": "PENDING"}),
+            ),
+        )
+        self.con.execute(
+            "INSERT INTO daemon_heartbeats (name,beat_at,interval_s) "
+            "VALUES ('sprint-pr-watcher',datetime('now'),5) "
+            "ON CONFLICT(name) DO UPDATE SET beat_at=excluded.beat_at,"
+            "interval_s=excluded.interval_s"
+        )
+        self.con.commit()
+        reads_before = list(self.reader.get_calls)
+        messages_before = self.con.execute(
+            "SELECT COUNT(*) FROM wake_message"
+        ).fetchone()[0]
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            r"review handoff requires observed green checks "
+            r"\(latest observation: pending @ bbbbbbb, 3h ago; "
+            r"watcher beat \d+s ago\)",
+        ):
+            self.request_review()
+
+        self.assertEqual(reads_before, self.reader.get_calls)
+        self.assertEqual(
+            ("active", messages_before),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,(SELECT COUNT(*) FROM wake_message) "
+                    "FROM sprint_work_units WHERE work_unit_id=?",
+                    (self.unit_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_absent_observation_rejection_reports_stale_watcher(self):
+        unobserved = self.watcher.registration.register(
+            self.sprint_id,
+            owner_shell_id=1,
+            repository="Acme/Repo",
+            pr_number=43,
+            work_unit_ids=(self.unit_id,),
+            notify_service=False,
+        )
+        self.con.execute(
+            "INSERT INTO daemon_heartbeats (name,beat_at,interval_s) "
+            "VALUES ('sprint-pr-watcher',datetime('now','-2 days'),5) "
+            "ON CONFLICT(name) DO UPDATE SET beat_at=excluded.beat_at,"
+            "interval_s=excluded.interval_s"
+        )
+        self.con.commit()
+        reads_before = list(self.reader.get_calls)
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "review handoff requires observed green checks "
+            r"\(no observation recorded for this PR; "
+            r"watcher last beat 2d ago — stale\)",
+        ):
+            self.loop.request_review(
+                self.sprint_id,
+                unobserved.registered_pr_id,
+                1,
+                readiness="ready",
+                idempotency_key="unobserved-review",
+            )
+
+        self.assertEqual(reads_before, self.reader.get_calls)
+        self.assertEqual(
+            "active",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+
+    def test_created_rejection_reports_persistent_no_checks_and_absent_watcher(self):
+        self.reader.current = pull_request(checks=None, checks_failed=False)
+        self.watcher.poll_once()
+        self.con.execute(
+            "DELETE FROM daemon_heartbeats WHERE name='sprint-pr-watcher'"
+        )
+        self.con.commit()
+        reads_before = list(self.reader.get_calls)
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "review handoff requires observed green checks "
+            r"\(latest observation: created @ aaaaaaa — "
+            r"no checks reported on this repository; watcher never started\)",
+        ):
+            self.request_review()
+
+        self.assertEqual(reads_before, self.reader.get_calls)
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE idempotency_key='review-1'"
             ).fetchone()[0],
         )
 
@@ -713,6 +841,13 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             self.sprint_id, self.registered_pr_id, 1
         )
         self.assertEqual((42, "a" * 40), (authorization.pr_number, authorization.head_sha))
+        authorized = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events "
+                "WHERE event_type='merge.authorized'"
+            ).fetchone()[0]
+        )
+        self.assertEqual("c" * 40, authorized["base_sha"])
 
         self.reader.current = pull_request(
             checks="PENDING", checks_failed=False, head_sha="a" * 40
@@ -736,6 +871,133 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
                 (approved.work_unit_id,),
             ).fetchone()[0],
         )
+
+    def test_moved_base_refuses_authorization_and_wakes_developer_once(self):
+        approved = self.approve()
+        self.reader.current = pull_request(
+            checks="SUCCESS",
+            checks_failed=False,
+            head_sha="a" * 40,
+            base_sha="d" * 40,
+        )
+
+        for _ in range(2):
+            with self.assertRaisesRegex(
+                sprint_domain.SprintInvariantError,
+                "approved base .* differs from live base",
+            ):
+                self.loop.authorize_merge(self.sprint_id, self.registered_pr_id, 1)
+
+        wake = self.con.execute(
+            "SELECT sprint_id,to_participant_id,work_unit_id,message_kind,body,"
+            "actionable,disposition,declared_type FROM wake_message "
+            "WHERE idempotency_key LIKE 'merge-base-stale:%'"
+        ).fetchall()
+        self.assertEqual(1, len(wake))
+        self.assertEqual(
+            (
+                self.sprint_id,
+                self.developer_id,
+                self.unit_id,
+                "notification",
+                "Merge authorization refused for PR #42: approved base "
+                + "c" * 40
+                + " differs from live base "
+                + "d" * 40
+                + "; sync with base and return through green review.",
+                1,
+                "pending",
+                "re-enter",
+            ),
+            tuple(wake[0]),
+        )
+        self.assertEqual(
+            ("merge_ready", 0),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='merge.authorized') "
+                    "FROM sprint_work_units WHERE work_unit_id=?",
+                    (approved.work_unit_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_legacy_missing_base_evidence_refuses_then_converges_after_rebase(self):
+        self.reader.current = pull_request(
+            checks="FAILURE", checks_failed=True, base_sha=None
+        )
+        self.assertTrue(self.watcher.poll_once())
+        self.reader.current = pull_request(
+            checks="SUCCESS", checks_failed=False, base_sha=None
+        )
+        self.assertTrue(self.watcher.poll_once())
+        self.approve()
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "approval predates base-tracking"
+        ):
+            self.loop.authorize_merge(self.sprint_id, self.registered_pr_id, 1)
+
+        legacy_wake = self.con.execute(
+            "SELECT message_id,body FROM wake_message "
+            "WHERE idempotency_key LIKE 'merge-base-stale:%:legacy:%'"
+        ).fetchone()
+        self.assertEqual(
+            "Merge authorization refused for PR #42: approval predates "
+            "base-tracking; sync with base to mint current evidence.",
+            legacy_wake["body"],
+        )
+        self.assertEqual("accepted", self.messages.mark_read(legacy_wake["message_id"], 1))
+
+        self.reader.current = pull_request(
+            checks="SUCCESS",
+            checks_failed=False,
+            head_sha="b" * 40,
+            base_sha="d" * 40,
+        )
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(
+            "fixing",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+        invalidation = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events "
+                "WHERE event_type='review.approval_invalidated'"
+            ).fetchone()[0]
+        )
+        self.assertEqual(("a" * 40, "b" * 40), (
+            invalidation["previous_head_sha"], invalidation["head_sha"]
+        ))
+
+        handoff = self.request_review("legacy-base-review")
+        self.accept_review(handoff.message_id)
+        outcome = self.loop.record_review(
+            self.sprint_id,
+            self.registered_pr_id,
+            2,
+            verdict="approved",
+            body="Rebased head and current base evidence are clean.",
+            idempotency_key="legacy-base-approved",
+        )
+        self.assertEqual("merge_ready", outcome.disposition)
+        authorization = self.loop.authorize_merge(
+            self.sprint_id, self.registered_pr_id, 1
+        )
+        self.assertEqual("b" * 40, authorization.head_sha)
+        evidence = json.loads(
+            self.con.execute(
+                "SELECT evidence FROM sprint_pr_transitions "
+                "WHERE registered_pr_id=? ORDER BY transition_id DESC LIMIT 1",
+                (self.registered_pr_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual("d" * 40, evidence["base_sha"])
 
     def test_same_state_head_move_returns_readiness_judgment_to_developer(self):
         approved = self.approve()

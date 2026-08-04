@@ -82,9 +82,11 @@ class SprintReviewLoopStore:
             lane = self._lane(sprint_id, registered_pr_id)
             self._require_armed(lane)
             self._require_developer(lane, developer_shell_id)
-            transition = self._latest_transition(registered_pr_id)
-            if transition["normalized_state"] != "green":
-                raise SprintInvariantError("review handoff requires observed green checks")
+            transition = self._latest_transition_row(registered_pr_id)
+            if transition is None or transition["normalized_state"] != "green":
+                raise SprintInvariantError(self._review_gate_error(transition))
+            if transition["observed_head_sha"] is None:
+                raise SprintInvariantError("registered PR has no exact observed head")
             receipt = self.messages.send_in_transaction(
                 sprint_id,
                 to_participant_id=int(lane["reviewer_participant_id"]),
@@ -118,6 +120,7 @@ class SprintReviewLoopStore:
                     "head_sha": transition["observed_head_sha"],
                     "message_id": receipt.message_id,
                     "registered_pr_id": registered_pr_id,
+                    "transition_id": int(transition["transition_id"]),
                     "work_unit_id": int(lane["work_unit_id"]),
                 },
             )
@@ -143,7 +146,11 @@ class SprintReviewLoopStore:
             self._require_armed(lane)
             if int(lane["reviewer_shell_id"]) != reviewer_shell_id:
                 raise SprintAuthorityError("only the assigned Reviewer owns the verdict")
-            review_message_id, requested_head = self._accepted_review_request(lane)
+            (
+                review_message_id,
+                requested_head,
+                requested_transition_id,
+            ) = self._accepted_review_request(lane)
             disposition = "fixing" if verdict == "changes_requested" else "merge_ready"
             notification = (
                 f"Review changes requested for PR #{lane['pr_number']}: {body}"
@@ -194,6 +201,7 @@ class SprintReviewLoopStore:
                         "head_sha": requested_head,
                         "message_id": receipt.message_id,
                         "registered_pr_id": registered_pr_id,
+                        "transition_id": requested_transition_id,
                         "work_unit_id": int(lane["work_unit_id"]),
                     },
                 )
@@ -224,6 +232,7 @@ class SprintReviewLoopStore:
             int(identity["pr_number"])
         )
         self._require_live_green(identity, live)
+        refusal: str | None = None
         with db_driver.write_transaction(self.con, "sprint.merge.authorize"):
             lane = self._lane(sprint_id, registered_pr_id)
             self._require_armed(lane)
@@ -237,17 +246,39 @@ class SprintReviewLoopStore:
                 raise SprintInvariantError(
                     "review approval is stale for the live PR head"
                 )
-            self._event(
-                sprint_id,
-                "merge.authorized",
-                developer_shell_id,
-                {
-                    "head_sha": live.head_sha,
-                    "pr_number": live.number,
-                    "registered_pr_id": registered_pr_id,
-                    "work_unit_id": int(lane["work_unit_id"]),
-                },
-            )
+            approved_base = self._approved_base_sha(lane)
+            refusal = self._base_refusal(approved_base, live.base_sha, live.number)
+            if refusal is not None:
+                approved_key = approved_base or "legacy"
+                live_key = live.base_sha or "missing"
+                self.messages.send_in_transaction(
+                    sprint_id,
+                    to_participant_id=int(lane["developer_participant_id"]),
+                    work_unit_id=int(lane["work_unit_id"]),
+                    message_kind="notification",
+                    body=refusal,
+                    actionable=True,
+                    declared_type="re-enter",
+                    idempotency_key=(
+                        f"merge-base-stale:{registered_pr_id}:"
+                        f"{approved_key}:{live_key}"
+                    ),
+                )
+            else:
+                self._event(
+                    sprint_id,
+                    "merge.authorized",
+                    developer_shell_id,
+                    {
+                        "base_sha": live.base_sha,
+                        "head_sha": live.head_sha,
+                        "pr_number": live.number,
+                        "registered_pr_id": registered_pr_id,
+                        "work_unit_id": int(lane["work_unit_id"]),
+                    },
+                )
+        if refusal is not None:
+            raise SprintInvariantError(refusal)
         return MergeAuthorization(
             registered_pr_id,
             str(identity["repository"]),
@@ -335,18 +366,79 @@ class SprintReviewLoopStore:
             raise SprintAuthorityError("only the owning Developer controls the PR")
 
     def _latest_transition(self, registered_pr_id: int) -> sqlite3.Row:
-        row = self.con.execute(
-            "SELECT normalized_state,observed_head_sha FROM sprint_pr_transitions "
-            "WHERE registered_pr_id=? ORDER BY transition_id DESC LIMIT 1",
-            (registered_pr_id,),
-        ).fetchone()
+        row = self._latest_transition_row(registered_pr_id)
         if row is None:
             raise SprintInvariantError("registered PR has no observed state")
         if row["observed_head_sha"] is None:
             raise SprintInvariantError("registered PR has no exact observed head")
         return row
 
-    def _accepted_review_request(self, lane: sqlite3.Row) -> tuple[int, str]:
+    def _latest_transition_row(self, registered_pr_id: int) -> sqlite3.Row | None:
+        row = self.con.execute(
+            "SELECT transition_id,normalized_state,observed_head_sha,evidence,"
+            "observed_at,MAX(0,CAST((julianday('now')-julianday(observed_at))"
+            "*86400 AS INTEGER)) AS age_seconds "
+            "FROM sprint_pr_transitions "
+            "WHERE registered_pr_id=? ORDER BY transition_id DESC LIMIT 1",
+            (registered_pr_id,),
+        ).fetchone()
+        return row
+
+    def _review_gate_error(self, transition: sqlite3.Row | None) -> str:
+        if transition is None:
+            observation = "no observation recorded for this PR"
+        else:
+            state = str(transition["normalized_state"])
+            head_sha = transition["observed_head_sha"]
+            short_sha = str(head_sha)[:7] if head_sha is not None else "unknown head"
+            evidence = json.loads(str(transition["evidence"]))
+            if state == "created" and evidence.get("checks") is None:
+                observation = (
+                    f"latest observation: {state} @ {short_sha} — "
+                    "no checks reported on this repository"
+                )
+            else:
+                observation = (
+                    f"latest observation: {state} @ {short_sha}, "
+                    f"{self._brief_age(int(transition['age_seconds']))} ago"
+                )
+        return (
+            "review handoff requires observed green checks "
+            f"({observation}; {self._watcher_diagnostic()})"
+        )
+
+    def _watcher_diagnostic(self) -> str:
+        heartbeat = self.con.execute(
+            "SELECT beat_at,interval_s,"
+            "MAX(0,CAST((julianday('now')-julianday(beat_at))*86400 AS INTEGER)) "
+            "AS age_seconds FROM daemon_heartbeats "
+            "WHERE name='sprint-pr-watcher'"
+        ).fetchone()
+        if heartbeat is None:
+            return "watcher never started"
+
+        # Local import avoids the watcher -> review-loop module cycle while
+        # keeping U1's liveness threshold as the single source of truth.
+        from sprint_pr_watcher import derive_watcher_status
+
+        age = self._brief_age(int(heartbeat["age_seconds"]))
+        if derive_watcher_status(heartbeat) == "stale":
+            return f"watcher last beat {age} ago — stale"
+        return f"watcher beat {age} ago"
+
+    @staticmethod
+    def _brief_age(seconds: int) -> str:
+        if seconds < 60:
+            return f"{seconds}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m"
+        if seconds < 86400:
+            return f"{seconds // 3600}h"
+        return f"{seconds // 86400}d"
+
+    def _accepted_review_request(
+        self, lane: sqlite3.Row
+    ) -> tuple[int, str, int | None]:
         latest = self.con.execute(
             "SELECT message_id,disposition FROM wake_message WHERE sprint_id=? "
             "AND work_unit_id=? AND to_participant_id=? "
@@ -372,7 +464,12 @@ class SprintReviewLoopStore:
         head_sha = json.loads(event["payload"]).get("head_sha")
         if not isinstance(head_sha, str) or not head_sha:
             raise SprintInvariantError("accepted review request has no exact head")
-        return int(latest["message_id"]), head_sha
+        transition_id = json.loads(event["payload"]).get("transition_id")
+        return (
+            int(latest["message_id"]),
+            head_sha,
+            transition_id if isinstance(transition_id, int) else None,
+        )
 
     def _record_judgment(
         self,
@@ -407,6 +504,50 @@ class SprintReviewLoopStore:
             (self._sprint_id(lane), lane["work_unit_id"]),
         ).fetchone()
         return json.loads(row["payload"]).get("head_sha") if row is not None else None
+
+    def _approved_base_sha(self, lane: sqlite3.Row) -> str | None:
+        approval = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='review.approved' "
+            "AND json_extract(payload,'$.work_unit_id')=? "
+            "ORDER BY event_id DESC LIMIT 1",
+            (self._sprint_id(lane), lane["work_unit_id"]),
+        ).fetchone()
+        if approval is None:
+            return None
+        transition_id = json.loads(approval["payload"]).get("transition_id")
+        if not isinstance(transition_id, int):
+            return None
+        transition = self.con.execute(
+            "SELECT evidence FROM sprint_pr_transitions "
+            "WHERE registered_pr_id=? AND transition_id=?",
+            (lane["registered_pr_id"], transition_id),
+        ).fetchone()
+        if transition is None:
+            return None
+        evidence = json.loads(transition["evidence"])
+        base_sha = evidence.get("base_sha") if isinstance(evidence, dict) else None
+        return base_sha if isinstance(base_sha, str) and base_sha else None
+
+    @staticmethod
+    def _base_refusal(
+        approved_base: str | None,
+        live_base: str | None,
+        pr_number: int,
+    ) -> str | None:
+        if approved_base is None:
+            return (
+                f"Merge authorization refused for PR #{pr_number}: approval "
+                "predates base-tracking; sync with base to mint current evidence."
+            )
+        if live_base != approved_base:
+            live_detail = live_base or "missing"
+            return (
+                f"Merge authorization refused for PR #{pr_number}: approved base "
+                f"{approved_base} differs from live base {live_detail}; sync with "
+                "base and return through green review."
+            )
+        return None
 
     @staticmethod
     def _require_live_green(identity: sqlite3.Row, live: PullRequest) -> None:

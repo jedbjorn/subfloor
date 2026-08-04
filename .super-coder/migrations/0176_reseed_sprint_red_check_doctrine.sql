@@ -1,11 +1,15 @@
----
-name: sprint_rev
-description: Review Sprints v2 work and whole-Sprint conformance — own pause, cancel, and conclude decisions, author the conformance and Sprint reports, and direct Planner actions through durable messages.
-category: workflow
-common: false
----
+-- 0176 — reseed Sprint Reviewer red-check doctrine.
+-- Full-body UPSERT converges existing installations to decision #93.
 
-# sprint_rev — independent review and conformance
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_rev',
+  'Review Sprints v2 work and whole-Sprint conformance — own pause, cancel, and conclude decisions, author the conformance and Sprint reports, and direct Planner actions through durable messages.',
+  'workflow',
+  NULL,
+  0,
+  '# sprint_rev — independent review and conformance
 
 Use in one of two modes: a work-unit PR review during the loop, or the final
 whole-Sprint conformance pass. Pre-declaration QAQC is a third entry condition,
@@ -101,7 +105,7 @@ must be recorded as FnB authority, not Reviewer judgment.
 Sprint working artifacts (per-unit review notes, raw diffs, evidence packets,
 report drafts, and Dev scratch proof) go to the gitignored
 `shared/sprints/sprint-<n>/` directory. They are never committed, branched, or
-PR'd in the work repo; a review-notes commit is a finding.
+PR''d in the work repo; a review-notes commit is a finding.
 
 DB rows stay the durable record: judgments via `record-review`, report bodies in
 `sprint_reports`, and decisions in the durable relay. Files in the Sprint
@@ -162,7 +166,7 @@ judgment rationale, or review-focus steering in that body as a protocol defect;
 do not use it to frame the review. Neither party writes PR comments or
 annotations, and the PR body contains only the work-unit id and spec reference.
 
-Review the exact bound spec revision and the full diff at the request's exact
+Review the exact bound spec revision and the full diff at the request''s exact
 head, then inspect checks, tests, relevant runtime evidence, and ratified
 judgments. Each round is clean: no prior Developer evidence or prose is input,
 and prior findings are cleared only when the code at the new head proves they
@@ -180,7 +184,7 @@ dos-arch incident, a Reviewer accepted known-failing tests as a scoped
 departure and created a deadlock: the green-only handoff gate could never pass.
 Decision #93 records why this no-waiver rule exists.
 
-When failing checks are within the lane's ratified scope, record
+When failing checks are within the lane''s ratified scope, record
 `changes_requested` so the Developer fixes them and re-establishes green. When
 the failures are outside that scope, name the blocking failures in the finding
 and send the Planner a `replan` decision through the control protocol. The
@@ -236,7 +240,7 @@ The `sprint.delivery_terminal` notification is the entry signal for
 whole-Sprint conformance. On that wake, inspect the inbox and current work-unit
 state first. If any non-terminal unit is visible, the wake is stale: mark the
 informational notification handled with `accept`, exit, and await the next
-episode's delivery-terminal wake.
+episode''s delivery-terminal wake.
 
 Compile the bounded evidence packet first and do so yourself, then judge
 integrated `main` against every governing bound revision, exact recorded
@@ -352,4 +356,12 @@ sc sprint send --sprint <id> --to <planner-shortname> --body-file <path> \
 ```
 
 4. When the command confirms the durable write and Planner wake, stop
-   immediately. Run no trailing command until another native wake arrives.
+   immediately. Run no trailing command until another native wake arrives.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;
