@@ -565,6 +565,7 @@ class SprintPRWatcher:
         state = normalize_state(pull_request)
         evidence = {
             "base_ref": pull_request.base_ref,
+            "base_sha": pull_request.base_sha,
             "checks": pull_request.checks,
             "checks_failed": pull_request.checks_failed,
             "head_ref": pull_request.head_ref,

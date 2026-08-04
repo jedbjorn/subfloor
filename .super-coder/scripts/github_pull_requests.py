@@ -21,7 +21,7 @@ LIST_LIMIT = 300
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 GITHUB_TIMEOUT_SECONDS = 20.0
 _FIELDS = (
-    "number,headRefName,baseRefName,headRefOid,state,mergedAt,mergeCommit,"
+    "number,headRefName,baseRefName,baseRefOid,headRefOid,state,mergedAt,mergeCommit,"
     "title,url,reviewDecision,statusCheckRollup"
 )
 _STATES = frozenset({"OPEN", "MERGED", "CLOSED"})
@@ -112,6 +112,7 @@ class PullRequest:
     review_decision: str | None
     checks: str | None
     checks_failed: bool
+    base_sha: str | None = None
 
     def hygiene_dict(self) -> dict[str, int | str]:
         """The deliberately small projection consumed by git hygiene."""
@@ -189,6 +190,7 @@ def normalize_pull_request(raw: dict[str, Any]) -> PullRequest:
         review_decision=_bounded_text(raw.get("reviewDecision"), 64),
         checks=checks,
         checks_failed=checks_failed,
+        base_sha=_sha_value(raw.get("baseRefOid")),
     )
 
 

@@ -28,6 +28,7 @@ def pull_request(
     checks: str | None = "FAILURE",
     checks_failed: bool = True,
     head_sha: str = "a" * 40,
+    base_sha: str | None = "c" * 40,
 ) -> PullRequest:
     return PullRequest(
         number=number,
@@ -42,6 +43,7 @@ def pull_request(
         review_decision=None,
         checks=checks,
         checks_failed=checks_failed,
+        base_sha=base_sha,
     )
 
 
@@ -335,6 +337,7 @@ class TransitionRoutingTest(SprintPRWatcherCase):
             "number": 42,
             "headRefName": "feature/pr-42",
             "baseRefName": "main",
+            "baseRefOid": "c" * 40,
             "headRefOid": "a" * 40,
             "state": "OPEN",
             "mergedAt": None,
@@ -386,7 +389,9 @@ class TransitionRoutingTest(SprintPRWatcherCase):
             "SELECT transition_id,normalized_state,evidence FROM sprint_pr_transitions"
         ).fetchone()
         self.assertEqual("red", transition["normalized_state"])
-        self.assertEqual("registration", json.loads(transition["evidence"])["trigger"])
+        evidence = json.loads(transition["evidence"])
+        self.assertEqual("registration", evidence["trigger"])
+        self.assertEqual("c" * 40, evidence["base_sha"])
         routed = self.con.execute(
             "SELECT message_id,receiver_shell_id,sprint_id,to_participant_id,"
             "declared_type,body FROM wake_message "
