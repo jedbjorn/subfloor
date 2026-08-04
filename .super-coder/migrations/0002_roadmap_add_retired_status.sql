@@ -19,6 +19,7 @@
 -- defensively in case a future caller has it enabled; it must toggle outside
 -- a transaction, hence the placement around BEGIN/COMMIT.
 
+-- migrate: foreign-keys-off
 PRAGMA foreign_keys=OFF;
 
 BEGIN;

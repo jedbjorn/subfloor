@@ -18,6 +18,7 @@
 --                              only where connections is still empty. workspace is
 --                              left in place (retired, unrendered) — see schema.sql.
 
+-- migrate: foreign-keys-off
 PRAGMA foreign_keys=OFF;
 
 BEGIN;
