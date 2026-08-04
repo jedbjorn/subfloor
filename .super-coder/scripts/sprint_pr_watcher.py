@@ -16,12 +16,14 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import db_driver
 import sprint_liveness
 from github_pull_requests import (
+    GITHUB_TIMEOUT_SECONDS,
     GitHubPullRequestReader,
     GitHubReadError,
     PullRequest,
@@ -31,9 +33,88 @@ from sprint_message_delivery import SprintMessageStore
 from sprint_review_loop import SprintReviewLoopStore
 
 PULSE_SECONDS = 5.0
+HEARTBEAT_HISTORY_SECONDS = 60.0
+WATCHER_DAEMON_NAME = "sprint-pr-watcher"
 MAX_BACKOFF_SECONDS = 300.0
 RATE_BACKOFF_SECONDS = 60.0
 _REPOSITORY = re.compile(r"^[^/\s]+/[^/\s]+$")
+
+
+def _parse_stamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def derive_watcher_status(
+    heartbeat: sqlite3.Row | dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Project the watcher's current heartbeat as live, stale, or absent."""
+    if heartbeat is None:
+        return "never-started"
+    observed_at = _parse_stamp(str(heartbeat["beat_at"]))
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    threshold = 3 * (float(heartbeat["interval_s"]) + GITHUB_TIMEOUT_SECONDS)
+    return "live" if (current - observed_at).total_seconds() <= threshold else "stale"
+
+
+class WatcherHeartbeat:
+    """Persist current watcher liveness and a coarse, bounded history."""
+
+    def __init__(
+        self,
+        con: sqlite3.Connection,
+        *,
+        interval_seconds: float,
+        history_seconds: float = HEARTBEAT_HISTORY_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("watcher heartbeat interval must be positive")
+        if history_seconds <= 0:
+            raise ValueError("watcher heartbeat history interval must be positive")
+        self.con = con
+        self.interval_seconds = interval_seconds
+        self.history_seconds = history_seconds
+        self.monotonic = monotonic
+        self._last_history_at: float | None = None
+
+    def beat(
+        self,
+        subscriptions_scanned: int,
+        *,
+        force_history: bool = False,
+        history_eligible: bool = True,
+    ) -> None:
+        if subscriptions_scanned < 0:
+            raise ValueError("subscriptions_scanned must be non-negative")
+        observed = self.monotonic()
+        history_due = history_eligible and (
+            force_history
+            or (
+                self._last_history_at is not None
+                and observed - self._last_history_at >= self.history_seconds
+            )
+        )
+        with db_driver.write_transaction(self.con, "sprint.pr.watcher.heartbeat"):
+            self.con.execute(
+                "INSERT INTO daemon_heartbeats (name,beat_at,interval_s) "
+                "VALUES (?,datetime('now'),?) "
+                "ON CONFLICT(name) DO UPDATE SET beat_at=excluded.beat_at,"
+                "interval_s=excluded.interval_s",
+                (WATCHER_DAEMON_NAME, self.interval_seconds),
+            )
+            if history_due:
+                self.con.execute(
+                    "INSERT INTO daemon_heartbeat_history "
+                    "(name,subscriptions_scanned) VALUES (?,?)",
+                    (WATCHER_DAEMON_NAME, subscriptions_scanned),
+                )
+        if history_due or self._last_history_at is None:
+            self._last_history_at = observed
 
 
 @dataclass(frozen=True)
@@ -356,7 +437,12 @@ class SprintPRWatcher:
         notify_commit()
         return receipt
 
-    def poll_once(self, *, startup: bool = False) -> bool:
+    def poll_once(
+        self,
+        *,
+        startup: bool = False,
+        repository_complete: Callable[[int], None] | None = None,
+    ) -> bool:
         self._trigger = "startup" if startup else "pulse"
         rows = self.con.execute(
             "SELECT subscription.* FROM pr_subscriptions subscription "
@@ -370,7 +456,11 @@ class SprintPRWatcher:
         ).fetchall()
         if not rows:
             return False
-        self._observe_rows(rows, self._trigger)
+        self._observe_rows(
+            rows,
+            self._trigger,
+            repository_complete=repository_complete,
+        )
         return True
 
     def _subscription_row(self, subscription_id: int) -> sqlite3.Row | None:
@@ -385,6 +475,7 @@ class SprintPRWatcher:
         trigger: str,
         *,
         ignore_backoff: bool = False,
+        repository_complete: Callable[[int], None] | None = None,
     ) -> None:
         now = self.monotonic()
         due = [
@@ -397,23 +488,29 @@ class SprintPRWatcher:
         grouped: dict[str, list[sqlite3.Row]] = defaultdict(list)
         for row in due:
             grouped[str(row["repository"])].append(row)
+        subscriptions_scanned = 0
         for repository, repo_rows in grouped.items():
-            reader = self.reader_factory(repository)
-            if len(repo_rows) == 1:
-                self._read_exact(reader, repo_rows[0], trigger)
-                continue
             try:
-                listed = {item.number: item for item in reader.list()}
-            except GitHubReadError as exc:
-                for row in repo_rows:
-                    self._poll_failed(row, trigger, exc)
-                continue
-            for row in repo_rows:
-                pull_request = listed.get(int(row["pr_number"]))
-                if pull_request is None:
-                    self._read_exact(reader, row, trigger)
+                reader = self.reader_factory(repository)
+                if len(repo_rows) == 1:
+                    self._read_exact(reader, repo_rows[0], trigger)
                     continue
-                self._observe(row, pull_request, trigger)
+                try:
+                    listed = {item.number: item for item in reader.list()}
+                except GitHubReadError as exc:
+                    for row in repo_rows:
+                        self._poll_failed(row, trigger, exc)
+                    continue
+                for row in repo_rows:
+                    pull_request = listed.get(int(row["pr_number"]))
+                    if pull_request is None:
+                        self._read_exact(reader, row, trigger)
+                        continue
+                    self._observe(row, pull_request, trigger)
+            finally:
+                subscriptions_scanned += len(repo_rows)
+                if repository_complete is not None:
+                    repository_complete(subscriptions_scanned)
 
     def _read_exact(self, reader: Any, row: sqlite3.Row, trigger: str) -> None:
         try:
@@ -784,14 +881,18 @@ class SprintPRWatcherService(threading.Thread):
         *,
         repo_root: str | Path,
         pulse_seconds: float = PULSE_SECONDS,
+        history_seconds: float = HEARTBEAT_HISTORY_SECONDS,
         reader_factory: Callable[[str], Any] | None = None,
     ) -> None:
         super().__init__(name="sprint-pr-watcher", daemon=True)
         if pulse_seconds <= 0:
             raise ValueError("watcher pulse must be positive")
+        if history_seconds <= 0:
+            raise ValueError("watcher heartbeat history interval must be positive")
         self.db_path = Path(db_path)
         self.repo_root = Path(repo_root)
         self.pulse_seconds = pulse_seconds
+        self.history_seconds = history_seconds
         self.reader_factory = reader_factory
         self._wake = threading.Event()
         self._stop_event = threading.Event()
@@ -803,9 +904,34 @@ class SprintPRWatcherService(threading.Thread):
         self._stop_event.set()
         self._wake.set()
 
+    def _pulse(
+        self,
+        watcher: SprintPRWatcher,
+        heartbeat: WatcherHeartbeat,
+        *,
+        startup: bool,
+    ) -> bool:
+        heartbeat.beat(
+            0,
+            force_history=startup,
+            history_eligible=startup,
+        )
+        observed = watcher.poll_once(
+            startup=startup,
+            repository_complete=heartbeat.beat,
+        )
+        if not observed and not startup:
+            heartbeat.beat(0)
+        return observed
+
     def run(self) -> None:
         try:
             with closing(db_driver.connect(self.db_path)) as con:
+                heartbeat = WatcherHeartbeat(
+                    con,
+                    interval_seconds=self.pulse_seconds,
+                    history_seconds=self.history_seconds,
+                )
                 watcher = SprintPRWatcher(
                     con,
                     repo_root=self.repo_root,
@@ -814,7 +940,7 @@ class SprintPRWatcherService(threading.Thread):
                 startup = True
                 while not self._stop_event.is_set():
                     try:
-                        watcher.poll_once(startup=startup)
+                        self._pulse(watcher, heartbeat, startup=startup)
                     except Exception as exc:  # noqa: BLE001 - keep service alive
                         print(f"sprint-pr-watcher: pulse failed ({exc})", flush=True)
                     startup = False

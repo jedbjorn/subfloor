@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import unittest
+from contextlib import closing
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +18,7 @@ sys.path[:0] = [str(SCRIPTS), str(ROOT / "tests")]
 import sprint_domain
 import sprint_pr_watcher
 from github_pull_requests import GitHubReadError, PullRequest, normalize_pull_request
-from test_sprint_message_delivery import SprintMessageCase
+from test_sprint_message_delivery import SprintMessageCase, apply_schema
 
 
 def pull_request(
@@ -60,6 +63,96 @@ class FakeReader:
         if isinstance(self.current, Exception):
             raise self.current
         return list(self.by_number.values()) or [self.current]
+
+
+class WatcherHeartbeatMigrationTest(unittest.TestCase):
+    def test_history_is_capped_to_newest_fifty_rows_per_daemon(self):
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.row_factory = sqlite3.Row
+            apply_schema(con, through="0174_reseed_force_new_wake_skills.sql")
+            con.execute(
+                "INSERT INTO daemon_heartbeats (name,beat_at,interval_s) "
+                "VALUES ('existing-daemon','2026-08-01 00:00:00',30)"
+            )
+            con.executescript(
+                (
+                    ROOT
+                    / ".super-coder"
+                    / "migrations"
+                    / "0175_daemon_heartbeat_history.sql"
+                ).read_text()
+            )
+            con.executemany(
+                "INSERT INTO daemon_heartbeat_history "
+                "(name,subscriptions_scanned) VALUES ('sprint-pr-watcher',?)",
+                ((value,) for value in range(75)),
+            )
+            con.executemany(
+                "INSERT INTO daemon_heartbeat_history "
+                "(name,subscriptions_scanned) VALUES ('another-daemon',?)",
+                ((value,) for value in range(55)),
+            )
+
+            watcher_rows = con.execute(
+                "SELECT subscriptions_scanned FROM daemon_heartbeat_history "
+                "WHERE name='sprint-pr-watcher' ORDER BY heartbeat_id"
+            ).fetchall()
+            other_rows = con.execute(
+                "SELECT subscriptions_scanned FROM daemon_heartbeat_history "
+                "WHERE name='another-daemon' ORDER BY heartbeat_id"
+            ).fetchall()
+
+            self.assertEqual(list(range(25, 75)), [row[0] for row in watcher_rows])
+            self.assertEqual(list(range(5, 55)), [row[0] for row in other_rows])
+            self.assertEqual(
+                ("existing-daemon", "2026-08-01 00:00:00", 30),
+                tuple(
+                    con.execute(
+                        "SELECT name,beat_at,interval_s FROM daemon_heartbeats "
+                        "WHERE name='existing-daemon'"
+                    ).fetchone()
+                ),
+            )
+            self.assertEqual(
+                0,
+                con.execute(
+                    "SELECT COUNT(*) FROM daemon_heartbeat_history "
+                    "WHERE (name='sprint-pr-watcher' AND subscriptions_scanned < 25) "
+                    "OR (name='another-daemon' AND subscriptions_scanned < 5)"
+                ).fetchone()[0],
+            )
+
+
+class WatcherStatusTest(unittest.TestCase):
+    def test_status_distinguishes_never_started_live_and_stale(self):
+        now = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+        threshold = 3 * (
+            5 + sprint_pr_watcher.GITHUB_TIMEOUT_SECONDS
+        )
+
+        self.assertEqual("never-started", sprint_pr_watcher.derive_watcher_status(None))
+        self.assertEqual(
+            "live",
+            sprint_pr_watcher.derive_watcher_status(
+                {
+                    "beat_at": (now - timedelta(seconds=threshold)).isoformat(),
+                    "interval_s": 5,
+                },
+                now=now,
+            ),
+        )
+        self.assertEqual(
+            "stale",
+            sprint_pr_watcher.derive_watcher_status(
+                {
+                    "beat_at": (
+                        now - timedelta(seconds=threshold + 1)
+                    ).isoformat(),
+                    "interval_s": 5,
+                },
+                now=now,
+            ),
+        )
 
 
 class SprintPRWatcherCase(SprintMessageCase):
@@ -732,6 +825,129 @@ class EngineWideSubscriptionTest(SprintPRWatcherCase):
         self.assertEqual([42], self.reader.get_calls)
 
 
+class WatcherHeartbeatTest(SprintPRWatcherCase):
+    def service(self) -> sprint_pr_watcher.SprintPRWatcherService:
+        return sprint_pr_watcher.SprintPRWatcherService(
+            ROOT / "unused.db",
+            repo_root=ROOT,
+        )
+
+    def test_zero_subscription_start_pulse_records_current_and_history(self):
+        heartbeat = sprint_pr_watcher.WatcherHeartbeat(
+            self.con,
+            interval_seconds=5,
+        )
+
+        self.assertFalse(
+            self.service()._pulse(self.watcher, heartbeat, startup=True)
+        )
+
+        current = self.con.execute(
+            "SELECT name,interval_s FROM daemon_heartbeats "
+            "WHERE name='sprint-pr-watcher'"
+        ).fetchone()
+        history = self.con.execute(
+            "SELECT name,subscriptions_scanned FROM daemon_heartbeat_history "
+            "ORDER BY heartbeat_id"
+        ).fetchall()
+        self.assertEqual(("sprint-pr-watcher", 5), tuple(current))
+        self.assertEqual([("sprint-pr-watcher", 0)], [tuple(row) for row in history])
+        self.assertEqual([], self.reader.get_calls)
+        self.assertEqual([], self.repositories)
+
+    def test_each_repository_group_beats_with_cumulative_scan_count(self):
+        with sprint_pr_watcher.db_driver.write_transaction(
+            self.con, "test.heartbeat-subscriptions"
+        ):
+            self.watcher.subscriptions.subscribe(
+                owner_shell_id=1,
+                repository="acme/one",
+                pr_number=42,
+            )
+            self.watcher.subscriptions.subscribe(
+                owner_shell_id=1,
+                repository="acme/two",
+                pr_number=43,
+            )
+        self.reader.by_number = {
+            42: pull_request(number=42),
+            43: pull_request(number=43),
+        }
+        ticks = iter((0.0, 61.0, 122.0))
+        heartbeat = sprint_pr_watcher.WatcherHeartbeat(
+            self.con,
+            interval_seconds=5,
+            monotonic=lambda: next(ticks),
+        )
+
+        self.assertTrue(
+            self.service()._pulse(self.watcher, heartbeat, startup=True)
+        )
+
+        history = self.con.execute(
+            "SELECT subscriptions_scanned FROM daemon_heartbeat_history "
+            "WHERE name='sprint-pr-watcher' ORDER BY heartbeat_id"
+        ).fetchall()
+        self.assertEqual([0, 1, 2], [row[0] for row in history])
+        self.assertEqual(["acme/one", "acme/two"], self.repositories)
+
+    def test_history_uses_sixty_second_cadence_between_start_rows(self):
+        ticks = iter((0.0, 5.0, 5.0, 60.0, 60.0))
+        heartbeat = sprint_pr_watcher.WatcherHeartbeat(
+            self.con,
+            interval_seconds=5,
+            monotonic=lambda: next(ticks),
+        )
+        service = self.service()
+
+        service._pulse(self.watcher, heartbeat, startup=True)
+        service._pulse(self.watcher, heartbeat, startup=False)
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM daemon_heartbeat_history "
+                "WHERE name='sprint-pr-watcher'"
+            ).fetchone()[0],
+        )
+
+        service._pulse(self.watcher, heartbeat, startup=False)
+        self.assertEqual(
+            [0, 0],
+            [
+                row[0]
+                for row in self.con.execute(
+                    "SELECT subscriptions_scanned "
+                    "FROM daemon_heartbeat_history "
+                    "WHERE name='sprint-pr-watcher' ORDER BY heartbeat_id"
+                )
+            ],
+        )
+
+    def test_service_restart_appends_history_without_erasing_prior_gap(self):
+        with sprint_pr_watcher.db_driver.write_transaction(
+            self.con, "test.prior-heartbeat"
+        ):
+            self.con.execute(
+                "INSERT INTO daemon_heartbeat_history "
+                "(name,beat_at,subscriptions_scanned) "
+                "VALUES ('sprint-pr-watcher','2026-08-01 00:00:00',9)"
+            )
+        heartbeat = sprint_pr_watcher.WatcherHeartbeat(
+            self.con,
+            interval_seconds=5,
+        )
+
+        self.service()._pulse(self.watcher, heartbeat, startup=True)
+
+        history = self.con.execute(
+            "SELECT beat_at,subscriptions_scanned FROM daemon_heartbeat_history "
+            "WHERE name='sprint-pr-watcher' ORDER BY heartbeat_id"
+        ).fetchall()
+        self.assertEqual(("2026-08-01 00:00:00", 9), tuple(history[0]))
+        self.assertEqual(0, history[1]["subscriptions_scanned"])
+        self.assertNotEqual(history[0]["beat_at"], history[1]["beat_at"])
+
+
 class BatchAndNormalizationTest(SprintPRWatcherCase):
     def test_multiple_registered_prs_share_one_repository_list_read(self):
         self.reader.by_number = {42: pull_request(number=42)}
@@ -781,6 +997,7 @@ class BatchAndNormalizationTest(SprintPRWatcherCase):
             ROOT / "unused.db", repo_root=ROOT
         )
         self.assertEqual(5.0, service.pulse_seconds)
+        self.assertEqual(60.0, service.history_seconds)
 
 
 if __name__ == "__main__":
