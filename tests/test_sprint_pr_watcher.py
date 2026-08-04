@@ -6,10 +6,11 @@ import json
 import sqlite3
 import sys
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".super-coder" / "scripts"
@@ -198,7 +199,9 @@ class PollFailureCoalescingMigrationTest(unittest.TestCase):
     def test_upgrade_backfills_existing_failure_and_preserves_its_identity(self):
         with closing(sqlite3.connect(":memory:")) as con:
             con.row_factory = sqlite3.Row
-            apply_schema(con, through="0174_reseed_force_new_wake_skills.sql")
+            apply_schema(
+                con, through="0176_reseed_sprint_red_check_doctrine.sql"
+            )
             con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
             con.execute(
                 "INSERT INTO shells "
@@ -898,6 +901,149 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
                 "SELECT COUNT(*) FROM sprint_events WHERE event_type='pr.poll_failed'"
             ).fetchone()[0],
         )
+
+    def test_failed_failure_write_does_not_desync_the_next_coalesce(self):
+        registration = self.register()
+        subscription_id = int(
+            self.con.execute(
+                "SELECT subscription_id FROM pr_subscriptions "
+                "WHERE sprint_registered_pr_id=?",
+                (registration.registered_pr_id,),
+            ).fetchone()[0]
+        )
+        self.reader.current = GitHubReadError("network down")
+        self.assertTrue(self.watcher.poll_once())
+        original_write_transaction = sprint_pr_watcher.db_driver.write_transaction
+        fail_once = [True]
+
+        @contextmanager
+        def flaky_write_transaction(con, label):
+            if label == "sprint.pr.poll_failure" and fail_once[0]:
+                fail_once[0] = False
+                raise sqlite3.OperationalError("database is locked")
+            with original_write_transaction(con, label):
+                yield
+
+        self.clock[0] = 10.0
+        with mock.patch.object(
+            sprint_pr_watcher.db_driver,
+            "write_transaction",
+            flaky_write_transaction,
+        ):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+                self.watcher.poll_once()
+            self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(
+            [(subscription_id, 2, 20.0, "network down", 2)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT subscription_id,failure_count,backoff_seconds,"
+                    "error_detail,repeat_count FROM pr_subscription_poll_failures"
+                )
+            ],
+        )
+        events = self.con.execute(
+            "SELECT payload FROM sprint_events "
+            "WHERE event_type='pr.poll_failed' ORDER BY event_id"
+        ).fetchall()
+        self.assertEqual(1, len(events))
+        self.assertEqual("network down", json.loads(events[0]["payload"])["error"])
+        self.assertEqual(2, self.watcher._backoff[subscription_id].failures)
+
+    def test_success_from_another_watcher_instance_splits_the_failure_episode(self):
+        registration = self.register()
+        subscription_id = int(
+            self.con.execute(
+                "SELECT subscription_id FROM pr_subscriptions "
+                "WHERE sprint_registered_pr_id=?",
+                (registration.registered_pr_id,),
+            ).fetchone()[0]
+        )
+        self.reader.current = GitHubReadError("network down")
+        self.assertTrue(self.watcher.poll_once())
+        first_failure = self.con.execute(
+            "SELECT last_seen_at FROM pr_subscription_poll_failures"
+        ).fetchone()
+        recovery_watcher = sprint_pr_watcher.SprintPRWatcher(
+            self.con,
+            repo_root=ROOT,
+            reader_factory=lambda _repository: self.reader,
+            monotonic=lambda: self.clock[0],
+        )
+
+        with sprint_pr_watcher.db_driver.write_transaction(
+            self.con, "test.resume_observation"
+        ):
+            receipt = recovery_watcher.observe_in_transaction(
+                subscription_id,
+                pull_request(checks="SUCCESS", checks_failed=False),
+                trigger="resume",
+                dispatch=False,
+            )
+        success_at = self.con.execute(
+            "SELECT updated_at FROM pr_subscriptions WHERE subscription_id=?",
+            (subscription_id,),
+        ).fetchone()[0]
+        self.assertEqual("green", receipt.normalized_state)
+        self.assertGreater(success_at, first_failure["last_seen_at"])
+
+        self.clock[0] = 10.0
+        self.reader.current = GitHubReadError("network down")
+        self.assertTrue(self.watcher.poll_once())
+
+        failures = self.con.execute(
+            "SELECT failure_count,repeat_count,failed_at,last_seen_at "
+            "FROM pr_subscription_poll_failures ORDER BY failure_id"
+        ).fetchall()
+        self.assertEqual([(1, 1), (1, 1)], [(row[0], row[1]) for row in failures])
+        self.assertGreater(failures[1]["failed_at"], success_at)
+        self.assertEqual(failures[1]["failed_at"], failures[1]["last_seen_at"])
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events WHERE event_type='pr.poll_failed'"
+            ).fetchone()[0],
+        )
+
+    def test_restart_during_failure_streak_keeps_one_row_and_event(self):
+        registration = self.register()
+        subscription_id = int(
+            self.con.execute(
+                "SELECT subscription_id FROM pr_subscriptions "
+                "WHERE sprint_registered_pr_id=?",
+                (registration.registered_pr_id,),
+            ).fetchone()[0]
+        )
+        self.reader.current = GitHubReadError("network down")
+        self.assertTrue(self.watcher.poll_once())
+        restarted = sprint_pr_watcher.SprintPRWatcher(
+            self.con,
+            repo_root=ROOT,
+            reader_factory=lambda _repository: self.reader,
+            monotonic=lambda: self.clock[0],
+        )
+
+        self.assertTrue(restarted.poll_once())
+
+        self.assertEqual(
+            [(subscription_id, 2, 20.0, 2)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT subscription_id,failure_count,backoff_seconds,"
+                    "repeat_count FROM pr_subscription_poll_failures"
+                )
+            ],
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events WHERE event_type='pr.poll_failed'"
+            ).fetchone()[0],
+        )
+        self.assertEqual(2, restarted._backoff[subscription_id].failures)
 
 
 class EngineWideSubscriptionTest(SprintPRWatcherCase):

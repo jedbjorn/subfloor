@@ -47,6 +47,19 @@ def _parse_stamp(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _next_db_stamp(con: sqlite3.Connection, floor: str | None) -> str:
+    """Return a DB timestamp strictly newer than the supplied durable floor."""
+    row = con.execute(
+        "SELECT CASE "
+        "WHEN ? IS NOT NULL "
+        "AND ?>=strftime('%Y-%m-%d %H:%M:%f','now') "
+        "THEN strftime('%Y-%m-%d %H:%M:%f',?,'+0.001 seconds') "
+        "ELSE strftime('%Y-%m-%d %H:%M:%f','now') END",
+        (floor, floor, floor),
+    ).fetchone()
+    return str(row[0])
+
+
 def derive_watcher_status(
     heartbeat: sqlite3.Row | dict[str, Any] | None,
     *,
@@ -539,8 +552,7 @@ class SprintPRWatcher:
                 pull_request,
                 trigger=trigger,
             )
-        if receipt is not None:
-            self._backoff.pop(int(registered["subscription_id"]), None)
+        self._backoff.pop(int(registered["subscription_id"]), None)
         return receipt
 
     def observe_in_transaction(
@@ -588,6 +600,21 @@ class SprintPRWatcher:
         ).fetchone()
         if current is None:
             raise KeyError(f"unknown active PR subscription: {subscription_id}")
+        latest_failure = self.con.execute(
+            "SELECT last_seen_at FROM pr_subscription_poll_failures "
+            "WHERE subscription_id=? ORDER BY failure_id DESC LIMIT 1",
+            (subscription_id,),
+        ).fetchone()
+        success_floor = (
+            str(latest_failure["last_seen_at"])
+            if latest_failure is not None
+            and latest_failure["last_seen_at"] is not None
+            else None
+        )
+        self.con.execute(
+            "UPDATE pr_subscriptions SET updated_at=? WHERE subscription_id=?",
+            (_next_db_stamp(self.con, success_floor), subscription_id),
+        )
         latest = self.con.execute(
             "SELECT transition_key,normalized_state,observed_head_sha "
             "FROM pr_subscription_transitions WHERE subscription_id=? "
@@ -599,7 +626,6 @@ class SprintPRWatcher:
             and latest["normalized_state"] == state
             and latest["observed_head_sha"] == pull_request.head_sha
         ):
-            self._backoff.pop(subscription_id, None)
             return None
         parent_key = latest["transition_key"] if latest is not None else "root"
         transition_key = hashlib.sha256(
@@ -814,18 +840,11 @@ class SprintPRWatcher:
         error: GitHubReadError,
     ) -> None:
         subscription_id = int(registered["subscription_id"])
-        previous = self._backoff.get(subscription_id)
-        failures = 1 if previous is None else previous.failures + 1
         detail = (str(error).strip() or error.__class__.__name__)[:500]
-        delay = min(MAX_BACKOFF_SECONDS, PULSE_SECONDS * (2 ** failures))
-        if "rate" in detail.lower():
-            delay = max(delay, RATE_BACKOFF_SECONDS)
-        self._backoff[subscription_id] = _FailureBackoff(
-            failures, self.monotonic() + delay
-        )
         with db_driver.write_transaction(self.con, "sprint.pr.poll_failure"):
             current = self.con.execute(
-                "SELECT subscription.subscription_id,registered.sprint_id "
+                "SELECT subscription.subscription_id,subscription.updated_at,"
+                "registered.sprint_id "
                 "FROM pr_subscriptions subscription "
                 "LEFT JOIN sprint_registered_prs registered "
                 "ON registered.registered_pr_id="
@@ -836,36 +855,56 @@ class SprintPRWatcher:
             if current is None:
                 return
             latest_failure = self.con.execute(
-                "SELECT failure_id,trigger,error_detail "
+                "SELECT failure_id,failure_count,backoff_seconds,trigger,"
+                "error_detail,last_seen_at "
                 "FROM pr_subscription_poll_failures WHERE subscription_id=? "
                 "ORDER BY failure_id DESC LIMIT 1",
                 (subscription_id,),
             ).fetchone()
+            same_streak = (
+                latest_failure is not None
+                and latest_failure["last_seen_at"] is not None
+                and str(current["updated_at"])
+                <= str(latest_failure["last_seen_at"])
+            )
+            failures = (
+                int(latest_failure["failure_count"]) + 1 if same_streak else 1
+            )
+            delay = min(MAX_BACKOFF_SECONDS, PULSE_SECONDS * (2 ** failures))
+            if "rate" in detail.lower():
+                delay = max(delay, RATE_BACKOFF_SECONDS)
+            if same_streak:
+                delay = max(delay, float(latest_failure["backoff_seconds"]))
             coalesced = (
-                previous is not None
-                and latest_failure is not None
+                same_streak
                 and latest_failure["trigger"] == trigger
                 and latest_failure["error_detail"] == detail
             )
+            stamp_floor = str(current["updated_at"])
+            if latest_failure is not None and latest_failure["last_seen_at"] is not None:
+                stamp_floor = max(stamp_floor, str(latest_failure["last_seen_at"]))
+            failure_stamp = _next_db_stamp(self.con, stamp_floor)
             if coalesced:
                 self.con.execute(
                     "UPDATE pr_subscription_poll_failures "
-                    "SET failure_count=?,backoff_seconds=?,"
-                    "repeat_count=repeat_count+1,last_seen_at=datetime('now') "
+                    "SET failure_count=failure_count+1,backoff_seconds=?,"
+                    "repeat_count=repeat_count+1,last_seen_at=? "
                     "WHERE failure_id=?",
-                    (failures, delay, latest_failure["failure_id"]),
+                    (delay, failure_stamp, latest_failure["failure_id"]),
                 )
             else:
                 self.con.execute(
                     "INSERT INTO pr_subscription_poll_failures "
                     "(subscription_id,failure_count,backoff_seconds,trigger,"
-                    "error_detail,last_seen_at) VALUES (?,?,?,?,?,datetime('now'))",
+                    "error_detail,failed_at,last_seen_at) VALUES (?,?,?,?,?,?,?)",
                     (
                         subscription_id,
                         failures,
                         delay,
                         trigger,
                         detail,
+                        failure_stamp,
+                        failure_stamp,
                     ),
                 )
             if current["sprint_id"] is not None and not coalesced:
@@ -892,6 +931,9 @@ class SprintPRWatcher:
                         ),
                     ),
                 )
+        self._backoff[subscription_id] = _FailureBackoff(
+            failures, self.monotonic() + delay
+        )
 
 
 class SprintPRWatcherService(threading.Thread):
