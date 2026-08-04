@@ -25,7 +25,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SC = (ROOT / "sc").read_text()
+SC = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
 DOCKERFILE = (ROOT / ".super-coder" / "Dockerfile").read_text()
 
 

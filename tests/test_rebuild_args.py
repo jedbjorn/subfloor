@@ -269,7 +269,7 @@ class RebuildDispatchParityTest(unittest.TestCase):
         # dispatcher adds nothing to argv and removes nothing from it. The first
         # line is pinned too because ORDER is the contract: the help question is
         # asked before the refusal, which is asked before the exec.
-        lines = [ln.strip() for ln in (REPO / "sc").read_text().splitlines()]
+        lines = [ln.strip() for ln in (REPO / ".super-coder" / "scripts" / "dispatch.sh").read_text().splitlines()]
         start = next(i for i, ln in enumerate(lines) if ln.startswith("rebuild)"))
         self.assertEqual(
             lines[start],

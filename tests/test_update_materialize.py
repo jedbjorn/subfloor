@@ -20,6 +20,7 @@ Run:
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -1089,6 +1090,178 @@ class LinkedDispatcherReconciliationTest(unittest.TestCase):
 
         self.assertEqual(changed, (self.worktree,))
         self.assertEqual((self.worktree / "sc").read_bytes(), current.read_bytes())
+
+
+class SourceRepoDispatcherReconciliationTest(unittest.TestCase):
+    """Source repos have no fetched pin — reconcile from the working tree.
+
+    Skipping them left source-repo shell worktrees on stale launchers forever
+    (flag #166: skills documented `sc sprint` while every worktree dispatcher
+    predated the verb)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        _git(self.root, "init", "-b", "main")
+        _git(self.root, "config", "user.name", "Update Test")
+        _git(self.root, "config", "user.email", "update@example.invalid")
+
+        stale = self.root / "sc"
+        stale.write_text("#!/bin/sh\necho stale\n")
+        stale.chmod(0o755)
+        _git(self.root, "add", "sc")
+        _git(self.root, "commit", "-m", "stale dispatcher")
+        old_sha = _git(self.root, "rev-parse", "HEAD")
+        self.worktree = self.root / ".sc-worktrees" / "dev1"
+        _git(
+            self.root, "worktree", "add", "-b", "shell/dev1",
+            str(self.worktree), old_sha,
+        )
+
+        current = self.root / "sc"
+        current.write_text("#!/bin/sh\necho current\n")
+        current.chmod(0o755)
+        _git(self.root, "add", "sc")
+        _git(self.root, "commit", "-m", "current dispatcher")
+
+    def test_worktree_heals_from_working_tree_bytes(self):
+        with mock.patch.object(update, "REPO_ROOT", self.root), \
+                contextlib.redirect_stdout(io.StringIO()):
+            changed = update.reconcile_linked_dispatchers(
+                None,
+                worktrees=(self.worktree,),
+                target_bytes=(self.root / "sc").read_bytes(),
+            )
+
+        self.assertEqual(changed, (self.worktree,))
+        self.assertEqual(
+            (self.worktree / "sc").read_bytes(),
+            (self.root / "sc").read_bytes(),
+        )
+
+    def test_update_main_reconciles_source_repos_from_the_tree(self):
+        source = inspect.getsource(update.main)
+        self.assertIn("elif source:", source)
+        self.assertIn("target_bytes=canonical.read_bytes()", source)
+
+
+class StaleBootstrapExecutesLiveFloorTest(unittest.TestCase):
+    """The single-owner regression (spec #105): a worktree's committed
+    launcher, however old, execs the LIVE engine's dispatcher body — a verb
+    added after the branch point is reachable without reconcile or rebase."""
+
+    def test_worktree_bootstrap_reaches_verb_added_after_branch_point(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        _git(root, "init", "-b", "main")
+        _git(root, "config", "user.name", "Update Test")
+        _git(root, "config", "user.email", "update@example.invalid")
+
+        # The real bootstrap under test, committed at the branch point.
+        bootstrap = root / "sc"
+        bootstrap.write_bytes((ROOT / "sc").read_bytes())
+        bootstrap.chmod(0o755)
+        _git(root, "add", "sc")
+        _git(root, "commit", "-m", "bootstrap at branch point")
+        old_sha = _git(root, "rev-parse", "HEAD")
+        worktree = root / ".sc-worktrees" / "dev1"
+        _git(root, "worktree", "add", "-b", "shell/dev1", str(worktree), old_sha)
+
+        # A NEW floor lands at the main root only — the worktree branch never
+        # sees it, and holds no engine of its own.
+        scripts = root / ".super-coder" / "scripts"
+        scripts.mkdir(parents=True)
+        body = scripts / "dispatch.sh"
+        body.write_text(
+            "#!/bin/sh\n"
+            "[ \"$1\" = newverb ] && { echo post-branch-verb; exit 0; }\n"
+            "exit 2\n"
+        )
+        body.chmod(0o755)
+        self.assertFalse((worktree / ".super-coder").exists())
+
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("SC_DISPATCH", "SC_CALLER_ROOT")
+        }
+        done = subprocess.run(
+            [str(worktree / "sc"), "newverb"],
+            cwd=worktree,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "post-branch-verb\n")
+
+    def test_bootstrap_names_a_floor_without_its_body(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        bootstrap = root / "sc"
+        bootstrap.write_bytes((ROOT / "sc").read_bytes())
+        bootstrap.chmod(0o755)
+        # An engine dir exists, but the floor predates the body: the paired
+        # rollback/update has not finished. The error must name the miss.
+        (root / ".super-coder").mkdir()
+
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("SC_DISPATCH", "SC_CALLER_ROOT")
+        }
+        done = subprocess.run(
+            [str(bootstrap), "help"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("engine floor predates this launcher", done.stderr)
+        self.assertIn("scripts/dispatch.sh", done.stderr)
+
+
+class GuardCommittedCopyTest(unittest.TestCase):
+    """A manifest mismatch that matches a COMMITTED engine copy is a stale
+    checkout, not a fork patch — it must not wedge the update (#581)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        _git(self.root, "init", "-b", "main")
+        _git(self.root, "config", "user.name", "Update Test")
+        _git(self.root, "config", "user.email", "update@example.invalid")
+        dispatcher = self.root / "sc"
+        dispatcher.write_text("#!/bin/sh\necho committed\n")
+        dispatcher.chmod(0o755)
+        _git(self.root, "add", "sc")
+        _git(self.root, "commit", "-m", "committed dispatcher")
+
+    def _check(self):
+        with mock.patch.object(update, "REPO_ROOT", self.root), \
+                mock.patch.object(
+                    update.engine_manifest,
+                    "local_edits",
+                    return_value={"sc": "modified"},
+                ):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                update.check_local_edits(False)
+            return out.getvalue()
+
+    def test_committed_copy_is_not_a_fork_edit(self):
+        output = self._check()
+        self.assertIn("match a committed engine copy", output)
+
+    def test_uncommitted_edit_still_blocks(self):
+        (self.root / "sc").write_text("#!/bin/sh\necho fork-patched\n")
+        with self.assertRaises(SystemExit):
+            self._check()
 
 
 class UpdateRefPublicationTest(unittest.TestCase):

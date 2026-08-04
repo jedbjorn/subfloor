@@ -54,7 +54,7 @@ def dispatch_verbs() -> list[str]:
     """Every top-level verb `sc` dispatches. Read from the dispatcher, not
     restated here — a list maintained alongside the case statement is a list
     that drifts away from it."""
-    lines = (ROOT / "sc").read_text().splitlines()
+    lines = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text().splitlines()
     start = next(i for i, l in enumerate(lines) if 'case "$cmd" in' in l)
     labels: list[str] = []
     for line in lines[start:]:
@@ -80,7 +80,7 @@ class ScUrlTest(unittest.TestCase):
         printer is right for exactly one fork and silently wrong for the
         rest — the failure `./sc url` exists to prevent."""
         body = re.search(r"^sc_urls\(\) \{.*?^\}",
-                         (ROOT / "sc").read_text(),
+                         (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text(),
                          re.DOTALL | re.MULTILINE)
         self.assertIsNotNone(body, "sc_urls() not found in ./sc")
         self.assertNotRegex(body.group(0), r"127\.0\.0\.1:\d",
