@@ -694,6 +694,28 @@ class SprintPRWatcher:
                     ),
                 ),
             )
+            if (
+                trigger == "registration"
+                and state == "created"
+                and pull_request.checks is None
+            ):
+                self.con.execute(
+                    "INSERT INTO sprint_events "
+                    "(sprint_id,event_type,actor_kind,payload) "
+                    "VALUES (?,'pr.no_checks_observed','system',?)",
+                    (
+                        current["sprint_id"],
+                        json.dumps(
+                            {
+                                "observed_head_sha": pull_request.head_sha,
+                                "registered_pr_id": registered_pr_id,
+                                "subscription_id": subscription_id,
+                                "transition_id": transition_id,
+                            },
+                            sort_keys=True,
+                        ),
+                    ),
+                )
         return TransitionReceipt(
             transition_id,
             state,

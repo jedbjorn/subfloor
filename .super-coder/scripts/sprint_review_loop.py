@@ -82,9 +82,11 @@ class SprintReviewLoopStore:
             lane = self._lane(sprint_id, registered_pr_id)
             self._require_armed(lane)
             self._require_developer(lane, developer_shell_id)
-            transition = self._latest_transition(registered_pr_id)
-            if transition["normalized_state"] != "green":
-                raise SprintInvariantError("review handoff requires observed green checks")
+            transition = self._latest_transition_row(registered_pr_id)
+            if transition is None or transition["normalized_state"] != "green":
+                raise SprintInvariantError(self._review_gate_error(transition))
+            if transition["observed_head_sha"] is None:
+                raise SprintInvariantError("registered PR has no exact observed head")
             receipt = self.messages.send_in_transaction(
                 sprint_id,
                 to_participant_id=int(lane["reviewer_participant_id"]),
@@ -364,17 +366,75 @@ class SprintReviewLoopStore:
             raise SprintAuthorityError("only the owning Developer controls the PR")
 
     def _latest_transition(self, registered_pr_id: int) -> sqlite3.Row:
-        row = self.con.execute(
-            "SELECT transition_id,normalized_state,observed_head_sha,evidence "
-            "FROM sprint_pr_transitions "
-            "WHERE registered_pr_id=? ORDER BY transition_id DESC LIMIT 1",
-            (registered_pr_id,),
-        ).fetchone()
+        row = self._latest_transition_row(registered_pr_id)
         if row is None:
             raise SprintInvariantError("registered PR has no observed state")
         if row["observed_head_sha"] is None:
             raise SprintInvariantError("registered PR has no exact observed head")
         return row
+
+    def _latest_transition_row(self, registered_pr_id: int) -> sqlite3.Row | None:
+        row = self.con.execute(
+            "SELECT transition_id,normalized_state,observed_head_sha,evidence,"
+            "observed_at,MAX(0,CAST((julianday('now')-julianday(observed_at))"
+            "*86400 AS INTEGER)) AS age_seconds "
+            "FROM sprint_pr_transitions "
+            "WHERE registered_pr_id=? ORDER BY transition_id DESC LIMIT 1",
+            (registered_pr_id,),
+        ).fetchone()
+        return row
+
+    def _review_gate_error(self, transition: sqlite3.Row | None) -> str:
+        if transition is None:
+            observation = "no observation recorded for this PR"
+        else:
+            state = str(transition["normalized_state"])
+            head_sha = transition["observed_head_sha"]
+            short_sha = str(head_sha)[:7] if head_sha is not None else "unknown head"
+            evidence = json.loads(str(transition["evidence"]))
+            if state == "created" and evidence.get("checks") is None:
+                observation = (
+                    f"latest observation: {state} @ {short_sha} — "
+                    "no checks reported on this repository"
+                )
+            else:
+                observation = (
+                    f"latest observation: {state} @ {short_sha}, "
+                    f"{self._brief_age(int(transition['age_seconds']))} ago"
+                )
+        return (
+            "review handoff requires observed green checks "
+            f"({observation}; {self._watcher_diagnostic()})"
+        )
+
+    def _watcher_diagnostic(self) -> str:
+        heartbeat = self.con.execute(
+            "SELECT beat_at,interval_s,"
+            "MAX(0,CAST((julianday('now')-julianday(beat_at))*86400 AS INTEGER)) "
+            "AS age_seconds FROM daemon_heartbeats "
+            "WHERE name='sprint-pr-watcher'"
+        ).fetchone()
+        if heartbeat is None:
+            return "watcher never started"
+
+        # Local import avoids the watcher -> review-loop module cycle while
+        # keeping U1's liveness threshold as the single source of truth.
+        from sprint_pr_watcher import derive_watcher_status
+
+        age = self._brief_age(int(heartbeat["age_seconds"]))
+        if derive_watcher_status(heartbeat) == "stale":
+            return f"watcher last beat {age} ago — stale"
+        return f"watcher beat {age} ago"
+
+    @staticmethod
+    def _brief_age(seconds: int) -> str:
+        if seconds < 60:
+            return f"{seconds}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m"
+        if seconds < 86400:
+            return f"{seconds // 3600}h"
+        return f"{seconds // 86400}d"
 
     def _accepted_review_request(
         self, lane: sqlite3.Row
