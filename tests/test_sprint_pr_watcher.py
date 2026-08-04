@@ -194,6 +194,82 @@ class SprintPRWatcherCase(SprintMessageCase):
         ]
 
 
+class PollFailureCoalescingMigrationTest(unittest.TestCase):
+    def test_upgrade_backfills_existing_failure_and_preserves_its_identity(self):
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.row_factory = sqlite3.Row
+            apply_schema(con, through="0174_reseed_force_new_wake_skills.sql")
+            con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (1,'Developer','DEV','dev','prompt',1)"
+            )
+            subscription_id = int(
+                con.execute(
+                    "INSERT INTO pr_subscriptions "
+                    "(owner_shell_id,repository,pr_number) VALUES (1,'acme/repo',42)"
+                ).lastrowid
+            )
+            con.execute(
+                "INSERT INTO pr_subscription_poll_failures "
+                "(subscription_id,failure_count,backoff_seconds,trigger,"
+                "error_detail,failed_at) VALUES (?,?,?,?,?,?)",
+                (
+                    subscription_id,
+                    3,
+                    40.0,
+                    "pulse",
+                    "network down",
+                    "2026-08-04 10:00:00",
+                ),
+            )
+            con.commit()
+
+            con.executescript(
+                (
+                    ROOT
+                    / ".super-coder"
+                    / "migrations"
+                    / "0177_pr_poll_failure_coalescing.sql"
+                ).read_text()
+            )
+
+            expected = (
+                subscription_id,
+                3,
+                40.0,
+                "pulse",
+                "network down",
+                "2026-08-04 10:00:00",
+                1,
+                "2026-08-04 10:00:00",
+            )
+            select = (
+                "SELECT subscription_id,failure_count,backoff_seconds,trigger,"
+                "error_detail,failed_at,repeat_count,last_seen_at "
+                "FROM pr_subscription_poll_failures"
+            )
+            self.assertEqual(expected, tuple(con.execute(select).fetchone()))
+
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "monotonic"):
+                con.execute(
+                    "UPDATE pr_subscription_poll_failures SET error_detail='tampered'"
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "monotonic"):
+                con.execute(
+                    "UPDATE pr_subscription_poll_failures "
+                    "SET failure_count=failure_count+1,"
+                    "backoff_seconds=backoff_seconds+1,"
+                    "repeat_count=repeat_count+2,"
+                    "last_seen_at='2026-08-04 10:01:00'"
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                con.execute("DELETE FROM pr_subscription_poll_failures")
+
+            self.assertEqual(expected, tuple(con.execute(select).fetchone()))
+
+
 class RegistrationTest(SprintPRWatcherCase):
     def test_registration_is_exactly_idempotent_and_takes_initial_snapshot(self):
         first = self.register()
@@ -681,6 +757,147 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
             "WHERE m.idempotency_key LIKE 'pr-transition:%'"
         ).fetchone()
         self.assertEqual(1, int(active_recipient[0]))
+
+    def test_consecutive_identical_poll_failures_coalesce_row_and_event(self):
+        registration = self.register()
+        subscription_id = int(
+            self.con.execute(
+                "SELECT subscription_id FROM pr_subscriptions "
+                "WHERE sprint_registered_pr_id=?",
+                (registration.registered_pr_id,),
+            ).fetchone()[0]
+        )
+        self.reader.current = GitHubReadError("network down")
+
+        self.assertTrue(self.watcher.poll_once())
+        self.clock[0] = 10.0
+        self.assertTrue(self.watcher.poll_once())
+
+        failure = self.con.execute(
+            "SELECT subscription_id,failure_count,backoff_seconds,trigger,"
+            "error_detail,failed_at,repeat_count,last_seen_at "
+            "FROM pr_subscription_poll_failures"
+        ).fetchone()
+        self.assertEqual(
+            (subscription_id, 2, 20.0, "pulse", "network down", 2),
+            (
+                failure["subscription_id"],
+                failure["failure_count"],
+                failure["backoff_seconds"],
+                failure["trigger"],
+                failure["error_detail"],
+                failure["repeat_count"],
+            ),
+        )
+        self.assertGreaterEqual(failure["last_seen_at"], failure["failed_at"])
+        events = self.con.execute(
+            "SELECT payload FROM sprint_events "
+            "WHERE event_type='pr.poll_failed' ORDER BY event_id"
+        ).fetchall()
+        self.assertEqual(1, len(events))
+        self.assertEqual(
+            {
+                "backoff_seconds": 10.0,
+                "error": "network down",
+                "failure_count": 1,
+                "pr_number": 42,
+                "registered_pr_id": registration.registered_pr_id,
+                "repository": "acme/repo",
+                "subscription_id": subscription_id,
+                "trigger": "pulse",
+            },
+            json.loads(events[0]["payload"]),
+        )
+
+    def test_error_detail_change_starts_new_failure_row_and_event(self):
+        self.register()
+        self.reader.current = GitHubReadError("network down")
+        self.assertTrue(self.watcher.poll_once())
+
+        self.clock[0] = 10.0
+        self.reader.current = GitHubReadError("credentials expired")
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(
+            [("network down", 1), ("credentials expired", 1)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT error_detail,repeat_count "
+                    "FROM pr_subscription_poll_failures ORDER BY failure_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            [("network down", "pulse"), ("credentials expired", "pulse")],
+            [
+                (payload["error"], payload["trigger"])
+                for payload in (
+                    json.loads(row[0])
+                    for row in self.con.execute(
+                        "SELECT payload FROM sprint_events "
+                        "WHERE event_type='pr.poll_failed' ORDER BY event_id"
+                    )
+                )
+            ],
+        )
+
+    def test_trigger_change_starts_new_failure_row_and_event(self):
+        self.reader.current = GitHubReadError("network down")
+        self.register()
+
+        self.clock[0] = 10.0
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(
+            [("registration", 1), ("pulse", 1)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT trigger,repeat_count "
+                    "FROM pr_subscription_poll_failures ORDER BY failure_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            ["registration", "pulse"],
+            [
+                json.loads(row[0])["trigger"]
+                for row in self.con.execute(
+                    "SELECT payload FROM sprint_events "
+                    "WHERE event_type='pr.poll_failed' ORDER BY event_id"
+                )
+            ],
+        )
+
+    def test_success_between_identical_failures_starts_new_row_and_event(self):
+        self.register()
+        self.reader.current = GitHubReadError("network down")
+        self.assertTrue(self.watcher.poll_once())
+
+        self.clock[0] = 10.0
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
+        self.assertTrue(self.watcher.poll_once())
+        self.reader.current = GitHubReadError("network down")
+        self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(["red", "green"], self._states())
+        self.assertEqual(
+            [(1, 1), (1, 1)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT failure_count,repeat_count "
+                    "FROM pr_subscription_poll_failures ORDER BY failure_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events WHERE event_type='pr.poll_failed'"
+            ).fetchone()[0],
+        )
 
 
 class EngineWideSubscriptionTest(SprintPRWatcherCase):

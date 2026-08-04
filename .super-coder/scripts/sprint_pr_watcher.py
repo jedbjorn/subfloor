@@ -835,19 +835,40 @@ class SprintPRWatcher:
             ).fetchone()
             if current is None:
                 return
-            self.con.execute(
-                "INSERT INTO pr_subscription_poll_failures "
-                "(subscription_id,failure_count,backoff_seconds,trigger,error_detail) "
-                "VALUES (?,?,?,?,?)",
-                (
-                    subscription_id,
-                    failures,
-                    delay,
-                    trigger,
-                    detail,
-                ),
+            latest_failure = self.con.execute(
+                "SELECT failure_id,trigger,error_detail "
+                "FROM pr_subscription_poll_failures WHERE subscription_id=? "
+                "ORDER BY failure_id DESC LIMIT 1",
+                (subscription_id,),
+            ).fetchone()
+            coalesced = (
+                previous is not None
+                and latest_failure is not None
+                and latest_failure["trigger"] == trigger
+                and latest_failure["error_detail"] == detail
             )
-            if current["sprint_id"] is not None:
+            if coalesced:
+                self.con.execute(
+                    "UPDATE pr_subscription_poll_failures "
+                    "SET failure_count=?,backoff_seconds=?,"
+                    "repeat_count=repeat_count+1,last_seen_at=datetime('now') "
+                    "WHERE failure_id=?",
+                    (failures, delay, latest_failure["failure_id"]),
+                )
+            else:
+                self.con.execute(
+                    "INSERT INTO pr_subscription_poll_failures "
+                    "(subscription_id,failure_count,backoff_seconds,trigger,"
+                    "error_detail,last_seen_at) VALUES (?,?,?,?,?,datetime('now'))",
+                    (
+                        subscription_id,
+                        failures,
+                        delay,
+                        trigger,
+                        detail,
+                    ),
+                )
+            if current["sprint_id"] is not None and not coalesced:
                 self.con.execute(
                     "INSERT INTO sprint_events "
                     "(sprint_id,event_type,actor_kind,payload) "
