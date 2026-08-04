@@ -351,9 +351,15 @@ class SprintMessageStore:
         )
 
     def inbox(self, sprint_id: int, shell_id: int) -> list[sqlite3.Row]:
+        # An undelivered force-new message stays invisible: its wake must
+        # rotate the chat and launch a fresh run, so an older turn polling
+        # the inbox ahead of delivery must not see (and then resolve) it.
+        # Other declared types may be read early by a live turn — that is the
+        # coalescing design their wakes exist to make unnecessary.
         return self.con.execute(
             "SELECT m.* FROM wake_message m "
             "WHERE m.sprint_id=? AND m.receiver_shell_id=? AND m.read_at IS NULL "
+            "AND (m.delivered_at IS NOT NULL OR m.declared_type<>'force-new') "
             "ORDER BY m.message_id",
             (sprint_id, shell_id),
         ).fetchall()
@@ -656,6 +662,13 @@ class SprintMessageStore:
         ).fetchone()
         if row is None:
             raise KeyError(f"Sprint message {message_id} is not addressed to shell")
+        if row["delivered_at"] is None and row["declared_type"] == "force-new":
+            # Resolving a force-new message ahead of delivery would cancel
+            # its pending wake and swallow the rotation it exists to force;
+            # the recipient acts on it only once its wake has delivered.
+            raise SprintInvariantError(
+                f"Sprint message {message_id} has not been delivered yet"
+            )
         return row
 
     def _cancel_resolved_wakes(self, message_id: int) -> None:

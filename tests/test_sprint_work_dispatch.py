@@ -156,6 +156,15 @@ class SprintWorkDispatchCase(unittest.TestCase):
             ).fetchone()[0]
         )
 
+    def deliver_pending_wakes(self) -> None:
+        service = delivery.SprintWakeDeliveryService(
+            self.con, force_new_quiet_seconds=0
+        )
+        while service.deliver_once(
+            "test-wake-worker", lambda _conversation, _prompt, _key: "run-ref"
+        ):
+            pass
+
     def dispositions(self) -> list[tuple[int, str]]:
         return [
             tuple(row)
@@ -303,6 +312,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
             [(first, "ready"), (same_shell, "planned"), (blocked, "planned")],
             self.dispositions(),
         )
+        self.deliver_pending_wakes()
         self.assertEqual(
             "accepted",
             self.messages.mark_read(self.assignment_message(first), 1),
@@ -347,6 +357,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
             developer=4, title="Report", output_kind="report_only"
         )
         self.lifecycle.arm(self.sprint_id, 3)
+        self.deliver_pending_wakes()
         self.messages.mark_read(self.assignment_message(code), 1)
         self.messages.mark_read(self.assignment_message(report), 4)
 
@@ -390,6 +401,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
             output_kind="report_only",
         )
         self.lifecycle.arm(self.sprint_id, 3)
+        self.deliver_pending_wakes()
         self.messages.mark_read(self.assignment_message(report), 1)
 
         with self.assertRaisesRegex(
@@ -503,6 +515,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
             (first_message,),
         ).fetchone()[0]
 
+        self.deliver_pending_wakes()
         self.messages.decline(first_message, 1, "capacity changed")
         released = self.units.dispatch_ready(self.sprint_id)
 
@@ -598,6 +611,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
         )
 
         self.lifecycle.arm(self.sprint_id, 3)
+        self.deliver_pending_wakes()
         self.messages.mark_read(self.assignment_message(upstream), 1)
         self.units.complete(
             self.sprint_id, upstream, 1, result="Upstream planning result"
@@ -681,6 +695,7 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         ).fetchall()
 
     def mark_merge_ready(self, unit_id: int, shell_id: int) -> None:
+        self.deliver_pending_wakes()
         self.assertEqual(
             "accepted",
             self.messages.mark_read(self.assignment_message(unit_id), shell_id),
@@ -789,6 +804,7 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
     def test_paused_report_completion_wakes_only_on_resume(self) -> None:
         report = self.create_unit(developer=1, output_kind="report_only")
         self.lifecycle.arm(self.sprint_id, 3)
+        self.deliver_pending_wakes()
         self.messages.mark_read(self.assignment_message(report), 1)
         self.lifecycle.pause(
             self.sprint_id,
@@ -815,6 +831,7 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         self.con.commit()
         report = self.create_unit(developer=1, output_kind="report_only")
         self.lifecycle.arm(self.sprint_id, 3)
+        self.deliver_pending_wakes()
         self.messages.mark_read(self.assignment_message(report), 1)
 
         self.units.complete(self.sprint_id, report, 1, result="Only report")
@@ -865,6 +882,7 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
     def test_episode_replay_dedupes_and_added_scope_refires_with_fresh_key(self) -> None:
         first = self.create_unit(developer=1, output_kind="report_only")
         self.lifecycle.arm(self.sprint_id, 3)
+        self.deliver_pending_wakes()
         self.messages.mark_read(self.assignment_message(first), 1)
         self.units.complete(self.sprint_id, first, 1, result="First report")
         self.assert_episode(1, 1, 0)
@@ -882,6 +900,7 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
 
         second = self.create_unit(developer=1, output_kind="no_code")
         self.units.dispatch_ready(self.sprint_id)
+        self.deliver_pending_wakes()
         self.messages.mark_read(self.assignment_message(second), 1)
         self.units.complete(self.sprint_id, second, 1, result="Second result")
         self.assertEqual(4, len(self.terminal_messages()))

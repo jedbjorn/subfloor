@@ -48,7 +48,23 @@ class SprintReviewLoopCase(SprintPRWatcherCase):
             idempotency_key=key,
         )
 
+    def deliver_message(self, message_id: int) -> None:
+        """Stamp one message delivered, mimicking wake delivery finalize."""
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET state='delivered',"
+            "delivered_at=datetime('now') WHERE state='pending' AND wake_id IN "
+            "(SELECT wake_id FROM sprint_wake_messages WHERE message_id=?)",
+            (message_id,),
+        )
+        self.con.execute(
+            "UPDATE wake_message SET delivered_at=datetime('now') "
+            "WHERE message_id=? AND delivered_at IS NULL",
+            (message_id,),
+        )
+        self.con.commit()
+
     def accept_review(self, message_id: int) -> None:
+        self.deliver_message(message_id)
         self.assertEqual("accepted", self.messages.mark_read(message_id, 2))
 
     def approve(self, key: str = "approved-1"):
