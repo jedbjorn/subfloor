@@ -397,6 +397,55 @@ class SprintSkillTest(unittest.TestCase):
         finally:
             con.close()
 
+    def test_watcher_state_reseed_matches_assets_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0178_reseed_sprint_watcher_state_skills.sql":
+                    break
+                con.executescript(migration.read_text())
+            con.execute(
+                "UPDATE skills SET description='stale',category='stale',"
+                "command='stale',common=1,content='wait blindly',is_deleted=1 "
+                "WHERE name IN ('sprint_dev','sprint_pln')"
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0178_reseed_sprint_watcher_state_skills.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for name in ("sprint_dev", "sprint_pln"):
+                with self.subTest(name=name):
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(
+                        tuple(rows[0]),
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                    )
+                    normalized = " ".join(parsed["content"].split())
+                    self.assertIn("sc sprint watcher-state --sprint <id>", normalized)
+                    self.assertIn(
+                        "carries no evidence about the PR watcher", normalized
+                    )
+                    self.assertIn("Do not repeat", normalized)
+        finally:
+            con.close()
+
     def test_flags_output_reseed_matches_fresh_seed_and_replays_idempotently(self):
         upgraded = sqlite3.connect(":memory:")
         fresh = sqlite3.connect(":memory:")
@@ -526,6 +575,7 @@ class SprintSkillTest(unittest.TestCase):
             "authorize-merge",
             "dispatch",
             "monitor",
+            "watcher-state",
             "record-conformance",
             "disposition-followup",
             "compile-report",

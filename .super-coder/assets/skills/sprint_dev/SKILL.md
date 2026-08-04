@@ -145,6 +145,17 @@ wake. Use Sprint-native wakes for coordination. Do not start a recurring shell
 loop, scheduled job, manual watcher daemon, or external PR watcher to track the
 registered PR.
 
+If a watcher-dependent gate has stalled, one bounded inspection is sanctioned:
+
+```text
+sc sprint watcher-state --sprint <id>
+```
+
+Run it once to distinguish a stale or never-started watcher from red, pending,
+or absent PR observation, then stop or return the evidence to the Planner. Do
+not repeat the read as a polling loop. `sc sprint monitor` evaluates accepted
+liveness expectations and carries no evidence about the PR watcher.
+
 ## Review handoff
 
 Complete a review handoff in this exact order. Every review round uses

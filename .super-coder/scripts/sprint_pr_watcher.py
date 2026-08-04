@@ -74,6 +74,10 @@ def derive_watcher_status(
     return "live" if (current - observed_at).total_seconds() <= threshold else "stale"
 
 
+def _age_seconds(value: str, now: datetime) -> int:
+    return max(0, int((now - _parse_stamp(value)).total_seconds()))
+
+
 class WatcherHeartbeat:
     """Persist current watcher liveness and a coarse, bounded history."""
 
@@ -128,6 +132,152 @@ class WatcherHeartbeat:
                 )
         if history_due or self._last_history_at is None:
             self._last_history_at = observed
+
+
+class WatcherStateStore:
+    """Project bounded watcher evidence for one Sprint without side effects."""
+
+    HISTORY_LIMIT = 50
+    FAILURE_LIMIT = 20
+
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+        self.con.row_factory = sqlite3.Row
+
+    def for_sprint(
+        self,
+        sprint_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(sprint_id, int) or sprint_id < 1:
+            raise ValueError("sprint_id must be a positive integer")
+        sprint = self.con.execute(
+            "SELECT sprint_id FROM sprints WHERE sprint_id=?", (sprint_id,)
+        ).fetchone()
+        if sprint is None:
+            raise KeyError(f"unknown Sprint: {sprint_id}")
+
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        heartbeat = self.con.execute(
+            "SELECT name,beat_at,interval_s FROM daemon_heartbeats WHERE name=?",
+            (WATCHER_DAEMON_NAME,),
+        ).fetchone()
+        history = self.con.execute(
+            "SELECT heartbeat_id,beat_at,subscriptions_scanned "
+            "FROM daemon_heartbeat_history WHERE name=? "
+            "ORDER BY heartbeat_id DESC LIMIT ?",
+            (WATCHER_DAEMON_NAME, self.HISTORY_LIMIT),
+        ).fetchall()
+
+        registered = self.con.execute(
+            "SELECT registered.registered_pr_id,registered.repository,"
+            "registered.pr_number,subscription.subscription_id,"
+            "transition.transition_id,transition.normalized_state,"
+            "transition.observed_head_sha,transition.observed_at "
+            "FROM sprint_registered_prs registered "
+            "LEFT JOIN pr_subscriptions subscription "
+            "ON subscription.sprint_registered_pr_id=registered.registered_pr_id "
+            "LEFT JOIN pr_subscription_transitions transition "
+            "ON transition.transition_id=("
+            "SELECT candidate.transition_id FROM pr_subscription_transitions candidate "
+            "WHERE candidate.subscription_id=subscription.subscription_id "
+            "ORDER BY candidate.transition_id DESC LIMIT 1) "
+            "WHERE registered.sprint_id=? ORDER BY registered.registered_pr_id",
+            (sprint_id,),
+        ).fetchall()
+        registered_prs = []
+        for row in registered:
+            latest = None
+            if row["transition_id"] is not None:
+                observed_at = str(row["observed_at"])
+                latest = {
+                    "transition_id": int(row["transition_id"]),
+                    "normalized_state": str(row["normalized_state"]),
+                    "observed_head_sha": row["observed_head_sha"],
+                    "observed_at": observed_at,
+                    "age_seconds": _age_seconds(observed_at, current),
+                }
+            registered_prs.append(
+                {
+                    "registered_pr_id": int(row["registered_pr_id"]),
+                    "repository": str(row["repository"]),
+                    "pr_number": int(row["pr_number"]),
+                    "subscription_id": (
+                        int(row["subscription_id"])
+                        if row["subscription_id"] is not None
+                        else None
+                    ),
+                    "has_observation": latest is not None,
+                    "latest_transition": latest,
+                }
+            )
+
+        failures = self.con.execute(
+            "SELECT failure.failure_id,registered.registered_pr_id,"
+            "subscription.subscription_id,registered.repository,"
+            "registered.pr_number,failure.failure_count,failure.repeat_count,"
+            "failure.backoff_seconds,failure.trigger,failure.error_detail,"
+            "failure.failed_at,failure.last_seen_at "
+            "FROM pr_subscription_poll_failures failure "
+            "JOIN pr_subscriptions subscription "
+            "ON subscription.subscription_id=failure.subscription_id "
+            "JOIN sprint_registered_prs registered "
+            "ON registered.registered_pr_id=subscription.sprint_registered_pr_id "
+            "WHERE registered.sprint_id=? "
+            "ORDER BY failure.failure_id DESC LIMIT ?",
+            (sprint_id, self.FAILURE_LIMIT),
+        ).fetchall()
+
+        watcher = {
+            "status": derive_watcher_status(heartbeat, now=current),
+            "last_beat_at": None,
+            "interval_seconds": None,
+            "age_seconds": None,
+            "history": [
+                {
+                    "heartbeat_id": int(row["heartbeat_id"]),
+                    "beat_at": str(row["beat_at"]),
+                    "subscriptions_scanned": int(row["subscriptions_scanned"]),
+                }
+                for row in history
+            ],
+        }
+        if heartbeat is not None:
+            watcher.update(
+                {
+                    "last_beat_at": str(heartbeat["beat_at"]),
+                    "interval_seconds": int(heartbeat["interval_s"]),
+                    "age_seconds": _age_seconds(str(heartbeat["beat_at"]), current),
+                }
+            )
+
+        return {
+            "sprint_id": sprint_id,
+            "watcher": watcher,
+            "registered_prs": registered_prs,
+            "poll_failures": [
+                {
+                    "failure_id": int(row["failure_id"]),
+                    "registered_pr_id": int(row["registered_pr_id"]),
+                    "subscription_id": int(row["subscription_id"]),
+                    "repository": str(row["repository"]),
+                    "pr_number": int(row["pr_number"]),
+                    "failure_count": int(row["failure_count"]),
+                    "repeat_count": int(row["repeat_count"]),
+                    "backoff_seconds": float(row["backoff_seconds"]),
+                    "trigger": str(row["trigger"]),
+                    "error_detail": str(row["error_detail"]),
+                    "failed_at": str(row["failed_at"]),
+                    "last_seen_at": (
+                        str(row["last_seen_at"])
+                        if row["last_seen_at"] is not None
+                        else None
+                    ),
+                }
+                for row in failures
+            ],
+        }
 
 
 @dataclass(frozen=True)
