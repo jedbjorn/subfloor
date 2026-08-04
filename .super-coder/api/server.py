@@ -2625,14 +2625,18 @@ class Handler(BaseHTTPRequestHandler):
                     shell_id,
                     body=body.get("body") or "",
                     findings=findings,
-                    planner_handoff=body.get("planner_handoff") or "",
+                    final_report=body.get("final_report") or "",
+                    reason=body.get("reason") or "",
+                    terminal_outcome=body.get("terminal_outcome") or "",
                     idempotency_key=body.get("idempotency_key") or "",
                 )
                 return self._send(201 if receipt.created else 200, {
                     "report_id": receipt.report_id,
                     "followup_ids": list(receipt.followup_ids),
+                    "final_report_id": receipt.final_report_id,
                     "planner_message_id": receipt.planner_message_id,
                     "planner_wake_id": receipt.planner_wake_id,
+                    "completed": receipt.completed,
                     "created": receipt.created,
                 })
             if path == "/_sc/sprint/followup-disposition":

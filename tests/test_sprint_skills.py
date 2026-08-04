@@ -617,11 +617,14 @@ class SprintSkillTest(unittest.TestCase):
             reviewer.index("## Stop")
         ]
         for guidance in (
-            "--planner-handoff-file <conclude-handoff>",
+            "--final-report-file <final-report>",
+            "--reason <reason> --outcome <outcome>",
+            "final report id",
+            "completed state",
             "Planner message id",
             "Planner wake id",
-            "one actionable Planner Re-enter",
-            "send no second conclude message",
+            "informational engine-wide Planner Re-enter",
+            "send no conclude message",
         ):
             self.assertIn(guidance, clean)
         self.assertLess(
@@ -629,12 +632,12 @@ class SprintSkillTest(unittest.TestCase):
             clean.index("sc sprint record-conformance"),
         )
         normalized_planner = " ".join(planner.split())
-        self.assertIn("created atomically with conformance", normalized_planner)
-        self.assertIn("Do not wait for or request a second conclude message", planner)
-        self.assertIn("Completion resolves the accepted handoff", normalized_planner)
+        self.assertIn("clean `record-conformance` command atomically", normalized_planner)
+        self.assertIn("Do not run `complete`", planner)
+        self.assertIn("notification has no actionable liveness expectation", planner)
         normalized_close = " ".join(close.split())
-        self.assertIn("publishes an actionable Re-enter message", normalized_close)
-        self.assertIn("no second conclude message is sent", normalized_close)
+        self.assertIn("completes the Sprint", normalized_close)
+        self.assertIn("informational engine-wide Re-enter receipt", normalized_close)
 
     def test_skills_use_only_the_shipped_shell_command_surface(self):
         expected = {
@@ -729,18 +732,18 @@ class SprintSkillTest(unittest.TestCase):
 
         self.assertIn("## Reviewer decision actions", planner)
         self.assertIn(
-            "pause, cancel, re-enter, and conclude are reviewer decisions",
+            "pause, cancel, re-enter, and abort are reviewer decisions",
             normalized_planner,
         )
         self.assertIn("planner actions", normalized_planner)
         for command in (
             "sc sprint pause --sprint <id>",
             "sc sprint cancel-unit --sprint <id>",
-            "sc sprint complete --sprint <id>",
         ):
             self.assertIn(command, planner)
-        self.assertIn("reviewer-authored body", normalized_planner)
+        self.assertIn("reviewer-authored final report", normalized_planner)
         self.assertIn("does not author a second report", normalized_planner)
+        self.assertIn("do not run `complete`", normalized_planner)
         self.assertNotIn("you decide scope, sequencing, and recovery", normalized_planner)
 
         self.assertIn("## Control and conclude decisions", reviewer)
@@ -883,7 +886,7 @@ class SprintSkillTest(unittest.TestCase):
             "record-conformance": (
                 "--body-file",
                 "--findings-file",
-                "--planner-handoff-file",
+                "--final-report-file",
             ),
             "disposition-followup": ("--resolution-file",),
             "complete": ("--report-file",),
@@ -971,7 +974,7 @@ class SprintSkillTest(unittest.TestCase):
         planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()
         wave_handoff = planner[
             planner.index("Never dispatch the next wave"):
-            planner.index("On receipt, re-run `sc sprint inbox")
+            planner.index("On a clean completion receipt")
         ]
         self.assertIn(
             "merged-work handoff wake is the only normal next-wave dispatch trigger",
@@ -1000,12 +1003,15 @@ class SprintSkillTest(unittest.TestCase):
             "sc mem get flags --feature <feature-id> --resolved", reviewer
         )
 
-    def test_close_drains_before_complete_and_runs_nothing_after_success(self):
+    def test_close_drains_before_atomic_completion_and_stops_after_success(self):
         close = (ASSETS / "sprint_close" / "SKILL.md").read_text()
-        drain = close.index("Immediately before `complete`, re-run")
-        complete = close.index("sc sprint complete --sprint <id>")
-        self.assertLess(drain, complete)
-        after_success = close.split("After `complete` succeeds", 1)[1]
+        normalized_close = " ".join(close.split())
+        drain = normalized_close.index("Immediately before `record-conformance`")
+        terminal = normalized_close.index(
+            "performs the atomic command as the literal last action"
+        )
+        self.assertLess(drain, terminal)
+        after_success = close.split("After `record-conformance` succeeds", 1)[1]
         normalized = " ".join(after_success.lower().split())
         self.assertIn("run no further sprint command", normalized)
         self.assertNotIn("sc sprint ", after_success.lower())

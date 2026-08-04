@@ -110,28 +110,28 @@ artifact directory are working material only.
 ## Control and conclude decisions
 
 The Reviewer owns all pause, cancel, and conclude decisions and recommendations.
-The Planner owns all resulting actions. Base a decision on durable Sprint state,
+The Planner owns control actions; clean conformance approval atomically performs
+its own close. Base a decision on durable Sprint state,
 the exact bound revisions, current work/PR facts, liveness evidence, and any
 ratified judgment; ambiguous silence is not enough to corrupt a disposition.
 
 Send pause, resume, replan, re-enter, cancel, and abort decisions through the
-durable `send` surface above. A clean conclude instead rides the atomic
-`record-conformance` handoff below. Every Reviewer → Planner route is Re-enter.
+durable `send` surface above. A clean conclude instead runs the atomic
+`record-conformance` close below. Every Reviewer → Planner route is Re-enter.
 The Reviewer-authored body must name:
 
 - `decision`: `pause`, `resume`, `replan`, `re-enter`, `cancel`, `conclude`, or
   `abort`;
 - the evidence and rationale owned by the Reviewer;
 - exact Sprint/work-unit ids, reason, outcome, and complete action arguments;
-- for conclude, the stable completion key and full Reviewer-authored final
-  Sprint report body — the engine prepends the committed conformance report and
-  follow-up ids; and
 - any immediate safety impact that the FnB must see.
 
 The Planner marks the message handled, verifies the assigned Reviewer, and
-executes exactly that transition; the atomic conclude handoff is actionable.
-The Reviewer never runs the pause, replan, cancel, resume, complete, or abort
-action. If the action is rejected, inspect the returned durable state and issue
+executes exactly that control transition. The clean completion receipt is
+informational because the Sprint is already terminal. The Reviewer never runs
+the standalone pause, replan, cancel, resume, complete, or abort action; its
+clean `record-conformance` command owns the narrow automatic close. If a control
+action is rejected, inspect the returned durable state and issue
 a new decision only when the evidence supports one; never ask the Planner to
 improvise around a precondition.
 
@@ -266,10 +266,10 @@ After classifying the requirements, choose exactly one branch:
   After three re-entry episodes in one Sprint, escalate the non-convergence to
   FnB instead of starting another patch round.
 - **Clean or post-Sprint-only findings.** Prepare the conformance report,
-  findings, final Sprint report, and full `conclude` handoff. Submit them
-  through the atomic `record-conformance` protocol below: the engine commits
-  the evidence, Planner message, and wake together. Do not send a second
-  conclude message.
+  findings, final Sprint report, reason, and outcome. Submit them through the
+  atomic `record-conformance` protocol below: the engine commits the evidence,
+  completed lifecycle, informational Planner receipt, and wake together. Do not
+  send a separate conclude message.
 
 ## Whole-Sprint conformance
 
@@ -313,25 +313,25 @@ as its author and answer:
 
 Keep the final report at about 6,000 characters or fewer and below the 8,000
 hard maximum; run `wc -m < <report>`. Do not smooth discrepancies into a
-success narrative. Write one Planner handoff file containing the `conclude`
-decision, evidence and rationale, exact reason/outcome and stable completion
-key, and the full final report body. Keep the complete handoff below 8,000
-characters. The engine prepends the committed conformance report id and
-follow-up ids; the Planner submits the report body unchanged and owns only the
-close action.
+success narrative. Keep the final report below 8,000 characters, then choose
+the exact completion reason, terminal outcome, and stable completion key. The
+engine stores the final report unchanged and generates the Planner receipt from
+the committed report and follow-up identities.
 
 Record the clean branch as one atomic final write:
 
 ```text
 sc sprint record-conformance \
   --sprint <id> --body-file <report> --findings-file <json> \
-  --planner-handoff-file <conclude-handoff> --key <stable-pass-key>
+  --final-report-file <final-report> --reason <reason> --outcome <outcome> \
+  --key <stable-pass-key>
 ```
 
-The receipt must name the report id, follow-up ids, Planner message id, and
-Planner wake id. This creates append-only conformance evidence, pending
-follow-ups, and one actionable Planner Re-enter in the same transaction. Never
-record conformance first and then send around it; send no second conclude message.
+The receipt must name the conformance report id, final report id, follow-up ids,
+completed state, Planner message id, and Planner wake id. This creates
+append-only evidence, pending follow-ups, terminal lifecycle, and one
+informational engine-wide Planner Re-enter in the same transaction. Never
+record conformance first and then close around it; send no conclude message.
 Never reopen an editing
 lane after recording; the re-enter branch defers the report until added scope
 reaches terminal disposition and a fresh delivery-terminal wake starts the next
@@ -343,8 +343,8 @@ For unit review, follow the ordered verdict procedure above: inbox handling and
 all evidence work precede `record-review`; the durable verdict is the literal
 last action, then the Reviewer stops.
 
-For the clean or post-Sprint-only branch, require the report, findings, and
-Planner handoff to replay idempotently. For the re-enter or abort branch,
+For the clean or post-Sprint-only branch, require both reports, findings,
+reason, and outcome to replay idempotently. For the re-enter or abort branch,
 confirm that the decision body carries the complete evidence and exact
 requested action. Then complete this final handoff order:
 
@@ -353,8 +353,8 @@ requested action. Then complete this final handoff order:
 2. Confirm every Reviewer-authored artifact and decision body is final and
    below its 8,000-character hard maximum.
 3. For a clean conclude, run the atomic `record-conformance` command above as
-   the literal final action. When it confirms all four receipt identities,
-   stop immediately; send no second conclude message.
+   the literal final action. When it confirms completed state and all receipt
+   identities, stop immediately; the Planner is already notified.
 4. For re-enter or abort, deliver the decision to the Planner as the literal
    final action:
 

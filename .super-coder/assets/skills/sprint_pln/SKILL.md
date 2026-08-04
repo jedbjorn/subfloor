@@ -21,8 +21,8 @@ The armed runtime owns scheduled dispatch, unread wake recovery, liveness
 evaluation, and registered-PR observation. React to its durable inbox and wake
 facts; use the Planner turn for dispatch and exact execution of durable Reviewer
 decisions. The Reviewer owns pause, cancel, and conclude decisions plus the
-conformance and final Sprint reports. The Planner owns the corresponding state
-transitions.
+conformance and final Sprint reports. The Planner owns control transitions;
+clean conformance approval performs its own atomic terminal transition.
 
 The active-chat registry is the only current-chat authority; zero or one chat
 per shell is legal. Every wake message creates delivery intent and a wake turn
@@ -163,14 +163,17 @@ artifact directory are working material only.
 
 ## Reviewer decision actions
 
-Pause, cancel, re-enter, and conclude are Reviewer decisions and Planner
-actions. A valid decision arrives as a durable Reviewer → Planner Re-enter
+Pause, cancel, re-enter, and abort are Reviewer decisions and Planner actions.
+A valid control decision arrives as a durable Reviewer → Planner Re-enter
 message and names the decision, evidence, target ids, reason, and exact
-requested transition. The clean conclude handoff is actionable and is created
-atomically with conformance; other freeform decisions are informational. Mark
-each handled message through `accept`, verify it came from the assigned
+requested transition. Clean conformance instead closes atomically and sends an
+informational engine-wide completion receipt. Mark each handled Sprint message
+through `accept`, verify it came from the assigned
 Reviewer, and execute that transition without re-adjudicating the decision.
 Record the decision message id and action receipt together.
+Re-run `sc sprint inbox --sprint <id>` before acting on any Sprint-scoped
+control decision; the engine-wide completion receipt requires no Sprint inbox
+acceptance.
 
 The FnB board-level override from decision #46 is unaffected: a live FnB
 instruction may direct or supersede any action. Name that override in the
@@ -257,18 +260,12 @@ delivery-terminal wake; the Planner does not initiate the next conformance pass.
 
 ### Conclude or abort
 
-The Reviewer decides when the Sprint is done and atomically records conformance,
-follow-ups, the actionable conclude message, and its wake. The engine prepends
-the conformance report and follow-up ids to the Reviewer-authored decision,
-which carries the exact reason/outcome, stable completion key, and full final
-report body. Accept that message before acting, write the Reviewer-authored body
-to `<reviewer-report>` unchanged, then perform the close action:
-
-```text
-sc sprint complete --sprint <id> --reason <reviewer-decision-reason> \
-  --outcome <reviewer-decision-outcome> --report-file <reviewer-report> \
-  --key <reviewer-decision-key>
-```
+The Reviewer decides when the Sprint is done. A clean `record-conformance`
+command atomically stores conformance, follow-ups, the Reviewer-authored final
+report, completed lifecycle, and an informational engine-wide Planner receipt.
+When that Re-enter arrives, confirm the receipt names the expected Sprint,
+reports, outcome, and completed state. Do not run `complete`; closure is already
+durable and the notification has no actionable liveness expectation.
 
 Do not run `compile-report` by default, synthesize the final report, or
 editorialize the Reviewer body. The Reviewer compiles its own evidence. A
@@ -279,7 +276,7 @@ sc sprint compile-report --sprint <id> --limit 50 \
   > shared/sprints/sprint-<n>/evidence.json
 ```
 
-Do not wait for or request a second conclude message after the atomic receipt.
+Do not wait for or request a conclude action message after the completion receipt.
 Abort is likewise an action taken only on a Reviewer decision or FnB override;
 it is terminal and deletes nothing.
 
@@ -313,9 +310,7 @@ sc sprint dispatch --sprint <id>
    immediately. Run no trailing command. Empty dispatch is still the final
    action for that handoff turn; investigate only on a later durable wake.
 
-On receipt, re-run `sc sprint inbox --sprint <id>`, accept the actionable
-conclude message, execute its exact close action through the protocol above,
-and confirm the typed transition succeeded. Completion resolves the accepted
-handoff liveness expectation. After `complete` succeeds, emit its bounded
-receipt and run no further Sprint command. The Planner does not author a second
-report or wait for a second handoff.
+On a clean completion receipt, verify the named Sprint is terminal and record
+the bounded receipt; run no close command. The Planner does not author a second
+report, accept an actionable handoff, or wait for another actor to finish the
+Sprint.
