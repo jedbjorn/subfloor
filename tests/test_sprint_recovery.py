@@ -1227,6 +1227,149 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             ),
         )
 
+    def _activate_unregistered_chat(self, key: str, shell_id: int = 1) -> str:
+        """Give the shell an active chat the Sprint never registered.
+
+        This is the Originating Planner's normal shape: its chat predates the
+        Sprint, so re-enter wakes resolve into a conversation with no
+        sprint_participant_conversations row.
+        """
+        self.con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+            "WHERE shell_id=? AND state<>'closed'",
+            (shell_id,),
+        )
+        conversation_id = str(
+            self.con.execute(
+                "INSERT INTO conversations "
+                "(shell_id,owner_user_id,harness,worktree,state,"
+                "creation_idempotency_key,creation_request_hash) "
+                "SELECT shell_id,owner_user_id,harness,worktree,'idle',?,? "
+                "FROM conversations WHERE shell_id=? LIMIT 1 "
+                "RETURNING conversation_id",
+                (key, key, shell_id),
+            ).fetchone()[0]
+        )
+        self.con.execute(
+            "INSERT INTO active_shell_chats (shell_id,chat_id) VALUES (?,?) "
+            "ON CONFLICT(shell_id) DO UPDATE SET chat_id=excluded.chat_id",
+            (shell_id, conversation_id),
+        )
+        self.con.commit()
+        return conversation_id
+
+    def test_unregistered_conversation_queued_turn_suppresses_recovery(self):
+        target = self._activate_unregistered_chat("gui-chat-queued")
+        message = self.send("pickup-unregistered-queued")
+        old_wake = int(message.wake_id)
+        _, wake_key = self.deliver_wake_with_turn(old_wake, terminal=False)
+        self.assertEqual(
+            target,
+            self.con.execute(
+                "SELECT target_conversation_id FROM sprint_wake_attempts "
+                "WHERE wake_id=? ORDER BY attempt_number DESC LIMIT 1",
+                (old_wake,),
+            ).fetchone()[0],
+        )
+
+        self.assertEqual(
+            (),
+            self.lifecycle.reconcile_unread_pickup(
+                self.sprint_id,
+                trigger="unregistered-queued-turn",
+            ),
+        )
+
+        self.con.execute(
+            "UPDATE conversation_messages SET state='running' "
+            "WHERE idempotency_key=?",
+            (wake_key,),
+        )
+        self.con.execute(
+            "UPDATE conversation_messages SET state='completed',"
+            "completed_at=datetime('now') WHERE idempotency_key=?",
+            (wake_key,),
+        )
+        self.con.commit()
+
+        replacements = self.lifecycle.reconcile_unread_pickup(
+            self.sprint_id,
+            trigger="unregistered-turn-finished-unread",
+        )
+        self.assertEqual(1, len(replacements))
+        self.assertEqual(
+            f"sprint-recovery:{self.sprint_id}:delivered-unread:{old_wake}",
+            self.con.execute(
+                "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
+                (replacements[0],),
+            ).fetchone()[0],
+        )
+
+    def test_unregistered_conversation_running_turn_suppresses_recovery(self):
+        target = self._activate_unregistered_chat("gui-chat-running")
+        message = self.send("pickup-unregistered-running")
+        old_wake = int(message.wake_id)
+        _, wake_key = self.deliver_wake_with_turn(old_wake, terminal=False)
+        trigger_message_id = int(
+            self.con.execute(
+                "SELECT message_id FROM conversation_messages "
+                "WHERE idempotency_key=?",
+                (wake_key,),
+            ).fetchone()[0]
+        )
+        self.con.execute(
+            "UPDATE conversation_messages SET state='running' "
+            "WHERE message_id=?",
+            (trigger_message_id,),
+        )
+        run_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                "lease_expires_at,started_at,heartbeat_at) "
+                "SELECT ?,shell_id,?,'running','test-broker',"
+                "'2999-01-01 00:00:00','2026-08-01 00:00:00',"
+                "'2026-08-01 00:00:00' FROM conversations "
+                "WHERE conversation_id=?",
+                (target, trigger_message_id, target),
+            ).lastrowid
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='running' WHERE conversation_id=?",
+            (target,),
+        )
+        self.con.commit()
+
+        self.assertEqual(
+            (),
+            self.lifecycle.reconcile_unread_pickup(
+                self.sprint_id,
+                trigger="unregistered-running-turn",
+            ),
+        )
+
+        self.con.execute(
+            "UPDATE conversation_runs SET state='succeeded',"
+            "ended_at=datetime('now'),exit_code=0 WHERE run_id=?",
+            (run_id,),
+        )
+        self.con.execute(
+            "UPDATE conversation_messages SET state='completed',"
+            "completed_at=datetime('now') WHERE message_id=?",
+            (trigger_message_id,),
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='waiting' WHERE conversation_id=?",
+            (target,),
+        )
+        self.con.commit()
+
+        replacements = self.lifecycle.reconcile_unread_pickup(
+            self.sprint_id,
+            trigger="unregistered-running-finished-unread",
+        )
+        self.assertEqual(1, len(replacements))
+
     def test_paused_decline_keeps_one_planner_wake_across_resume(self):
         assignment = self.send(
             "paused-decline-recovery",

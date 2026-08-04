@@ -1160,6 +1160,11 @@ class SprintLifecycleStore:
                 and turn["run_state"] == "succeeded"
             ):
                 continue
+            # The delivered turn is still queued or actively running: the
+            # receiver has not had its chance to read yet.  Requeuing now
+            # duplicates the wake into the same chat under a fresh key.
+            if turn["turn_live"]:
+                continue
             shell_busy = (
                 turn["run_state"] == "failed"
                 and turn["error_code"] == "SHELL_BUSY"
@@ -1463,7 +1468,9 @@ class SprintLifecycleStore:
             (participant_id,),
         ).fetchone() is not None
 
-    def _wake_turn_evidence(self, wake_id: int) -> dict[str, str | int | None]:
+    def _wake_turn_evidence(
+        self, wake_id: int
+    ) -> dict[str, str | int | bool | None]:
         wake = self.con.execute(
             "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
             (wake_id,),
@@ -1484,18 +1491,22 @@ class SprintLifecycleStore:
                 "run_state": None,
                 "error_code": None,
                 "error_detail": None,
+                "turn_live": False,
             }
         message = self.con.execute(
-            "SELECT message_id,state FROM conversation_messages "
-            "WHERE conversation_id=? AND idempotency_key=?",
+            "SELECT m.message_id,m.state,"
+            "c.state AS conversation_state FROM conversation_messages m "
+            "JOIN conversations c ON c.conversation_id=m.conversation_id "
+            "WHERE m.conversation_id=? AND m.idempotency_key=?",
             (attempt["target_conversation_id"], wake["idempotency_key"]),
         ).fetchone()
         run_state = None
         error_code = None
         error_detail = None
+        turn_live = False
         if message is not None:
             run = self.con.execute(
-                "SELECT state,error_code,error_detail FROM conversation_runs "
+                "SELECT run_id,state,error_code,error_detail FROM conversation_runs "
                 "WHERE trigger_message_id=? "
                 "ORDER BY attempt DESC LIMIT 1",
                 (message["message_id"],),
@@ -1504,6 +1515,28 @@ class SprintLifecycleStore:
                 run_state = str(run["state"])
                 error_code = run["error_code"]
                 error_detail = run["error_detail"]
+            if str(message["conversation_state"]) in {
+                "idle",
+                "queued",
+                "running",
+                "waiting",
+            }:
+                if str(message["state"]) == "queued":
+                    turn_live = True
+                elif (
+                    str(message["state"]) == "running"
+                    and run is not None
+                    and run_state in {"leased", "starting", "running"}
+                ):
+                    turn_live = (
+                        self.con.execute(
+                            "SELECT 1 FROM conversation_events "
+                            "WHERE run_id=? "
+                            "AND event_type='run.interrupt.requested' LIMIT 1",
+                            (run["run_id"],),
+                        ).fetchone()
+                        is None
+                    )
         return {
             "attempt_number": int(attempt["attempt_number"]),
             "target_conversation_id": attempt["target_conversation_id"],
@@ -1513,6 +1546,7 @@ class SprintLifecycleStore:
             "run_state": run_state,
             "error_code": error_code,
             "error_detail": error_detail,
+            "turn_live": turn_live,
         }
 
     def _resolve_review_expectations_in_transaction(
