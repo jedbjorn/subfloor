@@ -713,6 +713,13 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             self.sprint_id, self.registered_pr_id, 1
         )
         self.assertEqual((42, "a" * 40), (authorization.pr_number, authorization.head_sha))
+        authorized = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events "
+                "WHERE event_type='merge.authorized'"
+            ).fetchone()[0]
+        )
+        self.assertEqual("c" * 40, authorized["base_sha"])
 
         self.reader.current = pull_request(
             checks="PENDING", checks_failed=False, head_sha="a" * 40
@@ -736,6 +743,133 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
                 (approved.work_unit_id,),
             ).fetchone()[0],
         )
+
+    def test_moved_base_refuses_authorization_and_wakes_developer_once(self):
+        approved = self.approve()
+        self.reader.current = pull_request(
+            checks="SUCCESS",
+            checks_failed=False,
+            head_sha="a" * 40,
+            base_sha="d" * 40,
+        )
+
+        for _ in range(2):
+            with self.assertRaisesRegex(
+                sprint_domain.SprintInvariantError,
+                "approved base .* differs from live base",
+            ):
+                self.loop.authorize_merge(self.sprint_id, self.registered_pr_id, 1)
+
+        wake = self.con.execute(
+            "SELECT sprint_id,to_participant_id,work_unit_id,message_kind,body,"
+            "actionable,disposition,declared_type FROM wake_message "
+            "WHERE idempotency_key LIKE 'merge-base-stale:%'"
+        ).fetchall()
+        self.assertEqual(1, len(wake))
+        self.assertEqual(
+            (
+                self.sprint_id,
+                self.developer_id,
+                self.unit_id,
+                "notification",
+                "Merge authorization refused for PR #42: approved base "
+                + "c" * 40
+                + " differs from live base "
+                + "d" * 40
+                + "; sync with base and return through green review.",
+                1,
+                "pending",
+                "re-enter",
+            ),
+            tuple(wake[0]),
+        )
+        self.assertEqual(
+            ("merge_ready", 0),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='merge.authorized') "
+                    "FROM sprint_work_units WHERE work_unit_id=?",
+                    (approved.work_unit_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_legacy_missing_base_evidence_refuses_then_converges_after_rebase(self):
+        self.reader.current = pull_request(
+            checks="FAILURE", checks_failed=True, base_sha=None
+        )
+        self.assertTrue(self.watcher.poll_once())
+        self.reader.current = pull_request(
+            checks="SUCCESS", checks_failed=False, base_sha=None
+        )
+        self.assertTrue(self.watcher.poll_once())
+        self.approve()
+        self.reader.current = pull_request(checks="SUCCESS", checks_failed=False)
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "approval predates base-tracking"
+        ):
+            self.loop.authorize_merge(self.sprint_id, self.registered_pr_id, 1)
+
+        legacy_wake = self.con.execute(
+            "SELECT message_id,body FROM wake_message "
+            "WHERE idempotency_key LIKE 'merge-base-stale:%:legacy:%'"
+        ).fetchone()
+        self.assertEqual(
+            "Merge authorization refused for PR #42: approval predates "
+            "base-tracking; sync with base to mint current evidence.",
+            legacy_wake["body"],
+        )
+        self.assertEqual("accepted", self.messages.mark_read(legacy_wake["message_id"], 1))
+
+        self.reader.current = pull_request(
+            checks="SUCCESS",
+            checks_failed=False,
+            head_sha="b" * 40,
+            base_sha="d" * 40,
+        )
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(
+            "fixing",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+        invalidation = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events "
+                "WHERE event_type='review.approval_invalidated'"
+            ).fetchone()[0]
+        )
+        self.assertEqual(("a" * 40, "b" * 40), (
+            invalidation["previous_head_sha"], invalidation["head_sha"]
+        ))
+
+        handoff = self.request_review("legacy-base-review")
+        self.accept_review(handoff.message_id)
+        outcome = self.loop.record_review(
+            self.sprint_id,
+            self.registered_pr_id,
+            2,
+            verdict="approved",
+            body="Rebased head and current base evidence are clean.",
+            idempotency_key="legacy-base-approved",
+        )
+        self.assertEqual("merge_ready", outcome.disposition)
+        authorization = self.loop.authorize_merge(
+            self.sprint_id, self.registered_pr_id, 1
+        )
+        self.assertEqual("b" * 40, authorization.head_sha)
+        evidence = json.loads(
+            self.con.execute(
+                "SELECT evidence FROM sprint_pr_transitions "
+                "WHERE registered_pr_id=? ORDER BY transition_id DESC LIMIT 1",
+                (self.registered_pr_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual("d" * 40, evidence["base_sha"])
 
     def test_same_state_head_move_returns_readiness_judgment_to_developer(self):
         approved = self.approve()

@@ -20,14 +20,14 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 sys.path[:0] = [str(ENGINE / "scripts"), str(ENGINE / "api"), str(ROOT / "tests")]
 
-import mem  # noqa: E402
-import pr_cli  # noqa: E402
-import server  # noqa: E402
-import sprint_cli  # noqa: E402
-import sprint_domain  # noqa: E402
-import sprint_message_delivery  # noqa: E402
-from github_pull_requests import PullRequest  # noqa: E402
-from test_sprint_v2_domain import apply_schema  # noqa: E402
+import mem
+import pr_cli
+import server
+import sprint_cli
+import sprint_domain
+import sprint_message_delivery
+from github_pull_requests import PullRequest
+from test_sprint_v2_domain import apply_schema
 
 TOKENS = {
     "admin": "admin-token",
@@ -68,6 +68,7 @@ class Reader:
             review_decision="APPROVED",
             checks="SUCCESS",
             checks_failed=False,
+            base_sha="c" * 40,
         )
 
 
@@ -179,9 +180,13 @@ class SprintCliApiTest(unittest.TestCase):
         )
         con.execute(
             "INSERT INTO sprint_pr_transitions "
-            "(registered_pr_id,normalized_state,transition_key,observed_head_sha) "
-            "VALUES (?,'green','green-42',?)",
-            (cls.registered_pr_id, "a" * 40),
+            "(registered_pr_id,normalized_state,transition_key,observed_head_sha,"
+            "evidence) VALUES (?,'green','green-42',?,?)",
+            (
+                cls.registered_pr_id,
+                "a" * 40,
+                json.dumps({"base_sha": "c" * 40}),
+            ),
         )
         cls.dispatch_unit_id = int(
             con.execute(
