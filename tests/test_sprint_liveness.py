@@ -1063,6 +1063,13 @@ class ForceNewLivenessGateTest(SprintLivenessCase):
         self.assertEqual(failure.key, observed["last_failure_key"])
         self.assertEqual(stamp(self.clock.value), observed["last_evaluated_at"])
 
+        delivered = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con
+        ).deliver_once(
+            "liveness-force-release",
+            lambda _conversation, _prompt, _key: "liveness-force-release-run",
+        )
+        self.assertEqual(force.wake_id, delivered.wake_id)
         self.assertIsNone(self.messages.mark_read(force.message_id, 1))
         self.advance(10)
         released = monitor.evaluate(self.sprint_id)[0]

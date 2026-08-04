@@ -623,6 +623,118 @@ class AcceptanceAndDeclineTest(SprintMessageCase):
         )
 
 
+class ForceNewInboxDeliveryGateTest(SprintMessageCase):
+    def test_undelivered_force_new_stays_unavailable_until_rotation(self) -> None:
+        # The Developer's previous turn is still live and its lane is done;
+        # the Planner queues the next lane as a Force-new assignment.
+        pid, start_ticks = active_chat_registry.process_identity(str(os.getpid()))
+        self.con.execute(
+            "UPDATE active_shell_chats SET process_pid=?,process_start_ticks=? "
+            "WHERE shell_id=1",
+            (pid, start_ticks),
+        )
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now'),updated_at=datetime('now') "
+            "WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        next_unit_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_work_units "
+                "(sprint_id,assigned_shell_id,reviewer_shell_id,title,"
+                "expected_output,disposition) "
+                "VALUES (?,1,2,'Next unit','Ship it','ready')",
+                (self.sprint_id,),
+            ).lastrowid
+        )
+        self.con.commit()
+        assignment = self.messages.send(
+            self.sprint_id,
+            to_participant_id=self.developer_id,
+            from_participant_id=self.planner_id,
+            work_unit_id=next_unit_id,
+            message_kind="work_assignment",
+            body="next lane",
+            actionable=True,
+            declared_type="force-new",
+            idempotency_key="force-next-lane",
+        )
+
+        # The old live turn polls its inbox: the undelivered force-new stays
+        # invisible, and acting on it by id is refused outright.
+        self.assertEqual([], list(self.messages.inbox(self.sprint_id, 1)))
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "not been delivered"
+        ):
+            self.messages.mark_read(assignment.message_id, 1)
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "not been delivered"
+        ):
+            self.messages.decline(assignment.message_id, 1, "wrong lane")
+        self.assertEqual(
+            "ready",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (next_unit_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            "pending",
+            self.con.execute(
+                "SELECT state FROM sprint_wake_outbox WHERE wake_id=?",
+                (assignment.wake_id,),
+            ).fetchone()[0],
+        )
+
+        # Live process defers the wake; the old turn ending starts the quiet
+        # gate, and the boundary rotates delivery into a fresh chat.
+        clock = [datetime(2099, 7, 31, 12, 0, tzinfo=timezone.utc)]
+        service = delivery.SprintWakeDeliveryService(
+            self.con,
+            now=lambda: clock[0],
+            force_new_quiet_seconds=5,
+        )
+        self.assertIsNone(service.claim_next("live-turn-pulse"))
+        self.con.execute(
+            "UPDATE active_shell_chats SET process_pid=NULL,"
+            "process_start_ticks=NULL WHERE shell_id=1"
+        )
+        self.con.commit()
+        self.assertIsNone(service.claim_next("first-quiet-pulse"))
+        clock[0] += timedelta(seconds=5)
+        conversations: list[str] = []
+        outcome = service.deliver_once(
+            "rotation-worker",
+            lambda conversation, _prompt, _key: (
+                conversations.append(conversation) or "rotation-run"
+            ),
+        )
+        self.assertEqual(assignment.wake_id, outcome.wake_id)
+        self.assertEqual("delivered", outcome.state)
+        self.assertEqual(1, len(conversations))
+        self.assertNotEqual(self.developer_conversation_id, conversations[0])
+
+        # Only the new run sees and accepts the assignment.
+        self.assertEqual(
+            [assignment.message_id],
+            [
+                row["message_id"]
+                for row in self.messages.inbox(self.sprint_id, 1)
+            ],
+        )
+        self.assertEqual(
+            "accepted", self.messages.mark_read(assignment.message_id, 1)
+        )
+        self.assertEqual(
+            "active",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (next_unit_id,),
+            ).fetchone()[0],
+        )
+
+
 class WakeAvailabilityTest(SprintMessageCase):
     def test_plain_new_uses_normal_immediate_availability(self) -> None:
         sent = self.send("immediate-new", declared_type="new")

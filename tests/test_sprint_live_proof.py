@@ -407,6 +407,7 @@ class SprintLiveProof(unittest.TestCase):
             "--key",
             f"proof:{pr_number}:review:1",
         )
+        self.deliver_browser_turns()
         self.assertEqual(
             "accepted", messages.mark_read(handoff["message_id"], reviewer)
         )
@@ -442,6 +443,7 @@ class SprintLiveProof(unittest.TestCase):
                 "--key",
                 f"proof:{pr_number}:review:2",
             )
+            self.deliver_browser_turns()
             self.assertEqual(
                 "accepted", messages.mark_read(handoff["message_id"], reviewer)
             )

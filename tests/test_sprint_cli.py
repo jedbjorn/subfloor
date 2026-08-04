@@ -164,6 +164,20 @@ class SprintCliApiTest(unittest.TestCase):
                 (initial_wake,),
             ).fetchone()[0]
         )
+        # Stamp only the assignment wake delivered (the arming wake must stay
+        # pending for the surfaces below): reading a force-new assignment
+        # requires confirmed delivery.
+        con.execute(
+            "UPDATE wake_message SET delivered_at=datetime('now') "
+            "WHERE message_id=?",
+            (initial_message,),
+        )
+        con.execute(
+            "UPDATE sprint_wake_outbox SET state='delivered',"
+            "delivered_at=datetime('now') WHERE wake_id=?",
+            (initial_wake,),
+        )
+        con.commit()
         sprint_message_delivery.SprintMessageStore(con).mark_read(initial_message, 1)
         cls.registered_pr_id = int(
             con.execute(
@@ -269,6 +283,46 @@ class SprintCliApiTest(unittest.TestCase):
         self.assertEqual((1, None, None, "re-enter"), message[:4])
         self.assertIn("number=85", message[4])
         self.assertIn("event=green", message[4])
+
+    def deliver_message(self, message_id: int) -> None:
+        # The delivery worker is out of frame in these surface tests: stamp
+        # the one queued message delivered so its recipient may read it.
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute(
+                "UPDATE sprint_wake_outbox SET state='delivered',"
+                "delivered_at=datetime('now') WHERE state='pending' "
+                "AND wake_id IN (SELECT wake_id FROM sprint_wake_messages "
+                "WHERE message_id=?)",
+                (message_id,),
+            )
+            con.execute(
+                "UPDATE wake_message SET delivered_at=datetime('now') "
+                "WHERE message_id=? AND delivered_at IS NULL",
+                (message_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def deliver_sprint_messages(self, sprint_id: int) -> None:
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute(
+                "UPDATE sprint_wake_outbox SET state='delivered',"
+                "delivered_at=datetime('now') WHERE state='pending' "
+                "AND wake_id IN (SELECT wm.wake_id FROM sprint_wake_messages wm "
+                "JOIN wake_message m USING (message_id) WHERE m.sprint_id=?)",
+                (sprint_id,),
+            )
+            con.execute(
+                "UPDATE wake_message SET delivered_at=datetime('now') "
+                "WHERE sprint_id=? AND delivered_at IS NULL",
+                (sprint_id,),
+            )
+            con.commit()
+        finally:
+            con.close()
 
     def seed_declaration(self, suffix: str) -> tuple[int, int, int]:
         con = sqlite3.connect(self.db)
@@ -702,6 +756,7 @@ class SprintCliApiTest(unittest.TestCase):
         )
         self.assertTrue(replanned["changed"])
         self.run_cli(TOKENS["planner"], "arm", "--sprint", str(sprint_id))
+        self.deliver_sprint_messages(sprint_id)
 
         inbox = self.run_cli(
             TOKENS["developer"], "inbox", "--sprint", str(sprint_id)
@@ -1069,6 +1124,7 @@ class SprintCliApiTest(unittest.TestCase):
             "cli-review-request",
         )
         self.assertTrue(request["created"])
+        self.deliver_message(request["message_id"])
 
         con = sqlite3.connect(self.db)
         con.row_factory = sqlite3.Row
