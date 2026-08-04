@@ -77,7 +77,8 @@
     ".super-coder/migrations/0171_reseed_sprint_closeout_skills.sql",
     ".super-coder/migrations/0172_sanctioned_pause_liveness.sql",
     ".super-coder/migrations/0173_force_new_wake_delivery.sql",
-    ".super-coder/migrations/0174_reseed_force_new_wake_skills.sql"
+    ".super-coder/migrations/0174_reseed_force_new_wake_skills.sql",
+    ".super-coder/migrations/0176_reseed_sprint_red_check_doctrine.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
