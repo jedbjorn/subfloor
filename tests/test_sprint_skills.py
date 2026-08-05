@@ -915,7 +915,7 @@ class SprintSkillTest(unittest.TestCase):
             "participant pickup belongs to native delivery", prep
         )
         self.assertIn(
-            "moderate share of eligible shells", prep
+            "Neither minimum headcount nor maximum shell occupancy is a goal", prep
         )
         self.assertIn(
             "one Developer and one Reviewer", prep
@@ -927,6 +927,17 @@ class SprintSkillTest(unittest.TestCase):
             "ready reviews can run alongside ongoing independent development",
             prep,
         )
+        self.assertIn(
+            "Add a Developer only when another independent lane", prep
+        )
+        self.assertIn(
+            "Add Reviewer capacity when expected concurrent review demand", prep
+        )
+        self.assertIn(
+            "Use every eligible shell only when the work graph and review demand",
+            prep,
+        )
+        self.assertIn("capacity rationale and reserve", prep)
         planner = " ".join(bodies["sprint_pln"].split())
         for fact in (
             "scheduled dispatch",

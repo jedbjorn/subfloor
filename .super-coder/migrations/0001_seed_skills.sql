@@ -4411,7 +4411,8 @@ Produce one editable prepared Sprint with:
 - dependency edges and planned waves;
 - one validated harness/model/effective effort selection per participant;
 - a committed Sprint merge grant; and
-- enough local/GitHub capacity to execute the plan.
+- a capacity plan sized to justified parallel work and review demand, with the
+  local/GitHub capacity to execute it.
 
 The arming transaction validates every recorded selection (explicit null
 model/effort means the route default), records the armed transition, publishes
@@ -4462,18 +4463,34 @@ Prefer the smallest dependency graph that preserves correctness. Record the
 expected output in outcome language. Do not encode a shell''s implementation
 steps into the durable plan when its role skill and judgment can decide them.
 
-Before choosing participants, analyze the task ledger and dependency graph for
-work that can proceed concurrently. Put dependency-free Developer lanes in the
-same wave. Assign Reviewer capacity so ready reviews can run alongside ongoing
-independent development. Do not serialize work merely because it appears in
-task order, but do not split coherent work or start a review before its unit is
-ready just to create concurrency.
+### Balance capacity and parallelism
 
-Match participant count to the actual independent work, not the available
-roster. Use a moderate share of eligible shells by default and leave capacity
-unassigned; expand only when the change size and dependency graph expose more
-genuinely parallel editing and review lanes. A small change should normally use
-one Developer and one Reviewer, not every available shell.
+Optimize for the smallest participant set that keeps justified critical-path
+development and review moving without avoidable queues. Neither minimum
+headcount nor maximum shell occupancy is a goal.
+
+Before choosing participants, analyze the task ledger and dependency graph for
+coherent non-overlapping editing lanes, expected readiness, critical-path work,
+and likely review demand. Put dependency-free Developer lanes in the same wave
+and plan Reviewer capacity so ready reviews can run alongside ongoing
+independent development. Do not serialize work merely because it appears in
+task order, split coherent work, or start a review before its unit is ready just
+to create concurrency.
+
+- For one coherent small lane, normally use one Developer and one Reviewer.
+- Add a Developer only when another independent lane can start or make useful
+  progress without conflicting ownership and has enough review capacity.
+- Add Reviewer capacity when expected concurrent review demand would otherwise
+  queue critical-path work. Reuse a Reviewer across units when their review
+  readiness is unlikely to overlap.
+- Leave eligible capacity unassigned when the roster allows, preserving room
+  for correction, re-plan, or urgent work. Use every eligible shell only when
+  the work graph and review demand justify simultaneous work and coordination
+  cost does not erase the expected time-to-completion gain.
+
+Record the capacity rationale: chosen participants, parallel lanes, expected
+review overlap, retained reserve, and why another shell would or would not
+shorten the critical path.
 
 For every participant, record role, route, model, and effective effort. Never
 pretend a native session can resume across harnesses.
@@ -4522,7 +4539,8 @@ while a verified turn is live enters that same chat at its natural boundary.
 Once armed, hand control to `sprint_pln` and stop preparation work. Give the FnB
 a compact declaration:
 Sprint id, feature, exact spec revisions, participants/routes, work-unit graph,
-planned waves, merge-grant state, and known accepted risks.
+planned waves, capacity rationale and reserve, merge-grant state, and known
+accepted risks.
 
 Stop when the Sprint is armed or when one concrete eligibility blocker has been
 surfaced. Do not dispatch from a partially prepared plan.',
