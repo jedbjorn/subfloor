@@ -714,16 +714,56 @@ def do_reset(running: bool = True) -> dict:
     if running:
         argv.append("--running")
     ok, out = _run(argv, timeout=RESET_COMMAND_TIMEOUT)
-    state = "running" if running else "powered off"
     state_ok, observed = _domain_state(cfg)
     expected = "running" if running else "powered_off"
-    confirmed = ok and state_ok and observed == expected
+    domain_state = observed if state_ok else "unknown"
+
+    if not ok:
+        timed_out = out == f"timed out (>{RESET_COMMAND_TIMEOUT}s)"
+        return {
+            "ok": False,
+            "output": (
+                f"the snapshot reset could not be confirmed before the "
+                f"{RESET_COMMAND_TIMEOUT}s command timeout"
+                if timed_out else out or "the snapshot revert was rejected"
+            ),
+            "domain": str(cfg["domain"]),
+            "snapshot": str(cfg["snapshot"]),
+            "domain_state": domain_state,
+            "reset_outcome": "unknown" if timed_out else "rejected",
+        }
+    if not state_ok:
+        return {
+            "ok": False,
+            "output": (
+                "the snapshot reset result could not be confirmed because "
+                "the final domain state could not be observed"
+            ),
+            "domain": str(cfg["domain"]),
+            "snapshot": str(cfg["snapshot"]),
+            "domain_state": "unknown",
+            "reset_outcome": "unknown",
+        }
+    if observed != expected:
+        return {
+            "ok": False,
+            "output": (
+                f"snapshot reset did not reach the expected domain state; "
+                f"observed {observed}, expected {expected}"
+            ),
+            "domain": str(cfg["domain"]),
+            "snapshot": str(cfg["snapshot"]),
+            "domain_state": observed,
+            "reset_outcome": "state_mismatch",
+        }
+    state = "running" if running else "powered off"
     return {
-        "ok": confirmed,
+        "ok": True,
         "output": out or f"reverted '{cfg['domain']}' to '{cfg['snapshot']}' ({state})",
         "domain": str(cfg["domain"]),
         "snapshot": str(cfg["snapshot"]),
-        "domain_state": observed if state_ok else "unknown",
+        "domain_state": observed,
+        "reset_outcome": "confirmed",
     }
 
 
@@ -1228,6 +1268,16 @@ def _broker_failure(operation: str, response: dict) -> dict:
             str(response.get("output") or "another VM mutation is still running"),
             {"wait_seconds": response.get("wait_seconds")},
         )
+    if operation == "reset" and response.get("reset_outcome") == "unknown":
+        return operation_error(
+            operation,
+            "reset_result_unknown",
+            str(
+                response.get("output")
+                or "the snapshot reset could not be confirmed"
+            ),
+            {"domain_state": response.get("domain_state", "unknown")},
+        )
     details: dict = {}
     for key in ("domain_state", "attempts", "last_readiness_error"):
         if key in response:
@@ -1317,12 +1367,11 @@ def run_operation(operation: str) -> dict:
                     "last_error": response.get("ssh_error"),
                 },
                 "mcp": {"tunnel_running": bool(response["mcp_tunnel_running"])},
-                # Relay/endpoint observation lands in work unit 7; adapter
-                # observation lands in work unit 10. Pin the fields now so the
-                # partial contract is explicit rather than silently narrowed.
-                "relay": {"state": "deferred", "work_unit": 7},
-                "endpoint": {"state": "deferred", "work_unit": 7},
-                "adapter": {"state": "deferred", "work_unit": 10},
+                # Keep the deferred fields stable without exposing this repo's
+                # local planning identifiers in the public result.
+                "relay": {"state": "deferred"},
+                "endpoint": {"state": "deferred"},
+                "adapter": {"state": "deferred"},
             })
         if operation == "start":
             return operation_success(operation, {

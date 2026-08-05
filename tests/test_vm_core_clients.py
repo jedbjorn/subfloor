@@ -117,6 +117,7 @@ class BrokerReadinessTests(unittest.TestCase):
             "domain": "win-test",
             "snapshot": "clean",
             "domain_state": "powered_off",
+            "reset_outcome": "confirmed",
         })
         run.assert_called_once_with(
             ["virsh", "snapshot-revert", "win-test", "--snapshotname", "clean"],
@@ -128,8 +129,69 @@ class BrokerReadinessTests(unittest.TestCase):
              mock.patch.object(vm, "_run", return_value=(True, "reverted")), \
              mock.patch.object(vm, "_domain_state", return_value=(True, "running")):
             result = vm.do_reset(running=False)
-        self.assertEqual(result["ok"], False)
-        self.assertEqual(result["domain_state"], "running")
+        self.assertEqual(result, {
+            "ok": False,
+            "output": (
+                "snapshot reset did not reach the expected domain state; "
+                "observed running, expected powered_off"
+            ),
+            "domain": "win-test",
+            "snapshot": "clean",
+            "domain_state": "running",
+            "reset_outcome": "state_mismatch",
+        })
+
+    def test_reset_timeout_is_unknown_even_when_final_state_matches(self):
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(
+                 vm, "_run", return_value=(False, "timed out (>60s)")
+             ), \
+             mock.patch.object(vm, "_domain_state", return_value=(True, "powered_off")):
+            result = vm.do_reset(running=False)
+        self.assertEqual(result, {
+            "ok": False,
+            "output": (
+                "the snapshot reset could not be confirmed before the 60s "
+                "command timeout"
+            ),
+            "domain": "win-test",
+            "snapshot": "clean",
+            "domain_state": "powered_off",
+            "reset_outcome": "unknown",
+        })
+
+    def test_reset_with_unobservable_final_state_is_unknown(self):
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run", return_value=(True, "reverted")), \
+             mock.patch.object(
+                 vm, "_domain_state", return_value=(False, "timed out (>15s)")
+             ):
+            result = vm.do_reset(running=False)
+        self.assertEqual(result, {
+            "ok": False,
+            "output": (
+                "the snapshot reset result could not be confirmed because "
+                "the final domain state could not be observed"
+            ),
+            "domain": "win-test",
+            "snapshot": "clean",
+            "domain_state": "unknown",
+            "reset_outcome": "unknown",
+        })
+
+    def test_reset_rejection_remains_a_confirmed_failure(self):
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_run", return_value=(False, "snapshot not found")), \
+             mock.patch.object(vm, "_domain_state", return_value=(True, "powered_off")):
+            result = vm.do_reset(running=False)
+        self.assertEqual(result, {
+            "ok": False,
+            "output": "snapshot not found",
+            "domain": "win-test",
+            "snapshot": "clean",
+            "domain_state": "powered_off",
+            "reset_outcome": "rejected",
+        })
 
 
 class SingleResponseTests(unittest.TestCase):
@@ -343,6 +405,46 @@ class PublicClientTests(unittest.TestCase):
             },
         })
         self.assertEqual(call.call_count, 1)
+
+    def test_broker_reset_timeout_is_unknown_and_never_retried(self):
+        response = {
+            "ok": False,
+            "output": (
+                "the snapshot reset could not be confirmed before the 60s "
+                "command timeout"
+            ),
+            "domain_state": "powered_off",
+            "reset_outcome": "unknown",
+        }
+        with mock.patch.object(vm, "broker_call", return_value=response) as call:
+            result = vm.run_operation("reset")
+        self.assertEqual(result, {
+            "schema_version": 1,
+            "ok": False,
+            "operation": "reset",
+            "result": None,
+            "error": {
+                "code": "reset_result_unknown",
+                "message": response["output"],
+                "details": {"domain_state": "powered_off"},
+            },
+        })
+        self.assertEqual(call.call_count, 1)
+
+    def test_rejected_reset_remains_reset_failed(self):
+        response = {
+            "ok": False,
+            "output": "snapshot not found",
+            "domain_state": "powered_off",
+            "reset_outcome": "rejected",
+        }
+        with mock.patch.object(vm, "broker_call", return_value=response):
+            result = vm.run_operation("reset")
+        self.assertEqual(result["error"], {
+            "code": "reset_failed",
+            "message": "snapshot not found",
+            "details": {"domain_state": "powered_off"},
+        })
 
     def test_reset_malformed_response_is_unknown_and_never_retried(self):
         with mock.patch.object(
