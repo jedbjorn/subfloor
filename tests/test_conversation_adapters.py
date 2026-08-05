@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -35,6 +36,7 @@ from conversation_adapters import (  # noqa: E402
 )
 from conversation_adapters import codex as codex_adapter
 from conversation_adapters import opencode as opencode_adapter
+from conversation_adapters import base as base_adapter
 from conversation_adapters.base import SubprocessRunner
 
 KIMI_FIXTURES = ROOT / "tests" / "fixtures" / "conversations" / "kimi"
@@ -664,6 +666,88 @@ class ConversationAdapterTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.linked_vm.stop()
         self.temp.cleanup()
+
+    def test_declared_compatibility_ranges_enforce_closed_open_boundaries(self) -> None:
+        cases = {
+            "claude": ("2.1.219", "2.1.220", "2.1.222", "2.2.0"),
+            "codex": ("0.144.999", "0.145.0", "0.146.1", "0.147.0"),
+            "opencode": ("1.18.8", "1.18.9", "1.18.13", "1.19.0"),
+            "kimi": ("0.29.999", "0.30.0", "0.33.0", "0.34.0"),
+        }
+        for harness, (below, lower, current, upper) in cases.items():
+            with self.subTest(harness=harness):
+                adapter, _native = self.build(harness)
+                lower_result = adapter._probe_result(lower)
+                current_result = adapter._probe_result(current)
+                self.assertEqual(lower_result.minimum_version, lower)
+                self.assertEqual(current_result.version, current)
+                self.assertEqual(
+                    current_result.compatibility,
+                    (
+                        "verified"
+                        if current
+                        == adapter.manifest["conversation"]["verified_cli_version"]
+                        else "supported"
+                    ),
+                )
+                self.assertEqual(current_result.maximum_version_exclusive, upper)
+                with self.assertRaisesRegex(
+                    AdapterError,
+                    rf"{harness} {re.escape(below)} is older than required {re.escape(lower)}",
+                ):
+                    adapter._probe_result(below)
+                with self.assertRaisesRegex(
+                    AdapterError,
+                    rf"{harness} {re.escape(upper)} is outside supported range",
+                ):
+                    adapter._probe_result(upper)
+
+    def test_verified_probe_result_names_missing_manifest_keys(self) -> None:
+        adapter, _native = self.build("claude")
+        result = adapter._probe_result("2.1.222")
+        self.assertEqual(result.compatibility, "verified")
+        self.assertEqual(result.verified_version, "2.1.222")
+        self.assertEqual(result.maximum_version_exclusive, "2.2.0")
+
+        manifest = json.loads(
+            (ROOT / ".super-coder" / "adapters" / "claude" / "adapter.json").read_text()
+        )
+        del manifest["conversation"]["maximum_cli_version_exclusive"]
+        invalid = ClaudeAdapter(runner=FakeClaudeRunner(), manifest=manifest)
+        with self.assertRaisesRegex(
+            AdapterError,
+            "HARNESS_MANIFEST_INVALID: harness compatibility manifest is missing "
+            "maximum_cli_version_exclusive: claude",
+        ):
+            invalid._probe_result("2.1.222")
+
+        missing_verified = json.loads(json.dumps(manifest))
+        missing_verified["conversation"]["maximum_cli_version_exclusive"] = "2.2.0"
+        del missing_verified["conversation"]["verified_cli_version"]
+        invalid = ClaudeAdapter(
+            runner=FakeClaudeRunner(), manifest=missing_verified
+        )
+        with self.assertRaisesRegex(
+            AdapterError,
+            "HARNESS_MANIFEST_INVALID: harness compatibility manifest is missing "
+            "verified_cli_version: claude",
+        ):
+            invalid._probe_result("2.1.222")
+
+        manifest_root = self.root / "adapters"
+        (manifest_root / "claude").mkdir(parents=True)
+        (manifest_root / "claude" / "adapter.json").write_text(
+            json.dumps(manifest)
+        )
+        with (
+            mock.patch.object(base_adapter, "ADAPTERS", manifest_root),
+            self.assertRaisesRegex(
+                AdapterError,
+                "HARNESS_MANIFEST_INVALID: harness compatibility manifest is missing "
+                "maximum_cli_version_exclusive: claude",
+            ),
+        ):
+            base_adapter.load_manifest("claude")
 
     def write_claude_session(
         self,

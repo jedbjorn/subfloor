@@ -73,15 +73,6 @@ DEFAULT_HEADLESS_PROMPT = "Check your inbox and act on your unread messages."
 SESSION_OPEN_RETRY_DELAYS_S = (0.1, 0.3)
 
 
-def resolve_headless_model(flag_model: "str | None", fdef: "dict | None",
-                           harness: str) -> "str | None":
-    """Headless model resolution: an explicit -m wins; else the shell's
-    (flavor, harness) default; else None — the harness picks its own."""
-    if flag_model:
-        return flag_model
-    return fdef["models"].get(harness) if fdef else None
-
-
 def _headless_effort_args(hcfg: dict, effort: "str | None",
                           harness: str = "?") -> list[str]:
     if not effort:
@@ -105,6 +96,51 @@ def headless_effort_env(adapter: dict, effort: "str | None") -> dict[str, str]:
 def default_headless_effort(adapter: dict) -> "str | None":
     """Use high only when the adapter has an effort transport."""
     return "high" if ((adapter.get("headless") or {}).get("effort")) else None
+
+
+class ResolvedHeadlessRoute(NamedTuple):
+    harness: str
+    provider: str | None
+    model: str
+    effort: str | None
+
+
+def resolve_headless_route(
+    *,
+    harness: str,
+    adapter: dict,
+    flavor_model: "str | None",
+    model: "str | None",
+    effort: "str | None",
+) -> ResolvedHeadlessRoute:
+    """Resolve and validate the immutable route stored for a headless turn.
+
+    Explicit model and effort strings are validated without normalization so
+    the caller's selected bytes remain part of the durable route.  Defaults
+    are applied here, before any request is hashed or conversation is stored.
+    """
+    if not isinstance(harness, str) or not harness.strip():
+        raise ValueError("harness must be a non-empty string")
+    resolved_model = model if model is not None else flavor_model
+    if not isinstance(resolved_model, str) or not resolved_model.strip():
+        raise ValueError(
+            f"harness '{harness}' cannot resolve a model: no model was supplied "
+            "and no flavor default exists for it; supply an explicit model"
+        )
+    if effort is not None and (
+        not isinstance(effort, str) or not effort.strip()
+    ):
+        raise ValueError("effort must be a non-empty string when supplied")
+    resolved_effort = (
+        effort if effort is not None else default_headless_effort(adapter)
+    )
+    validate_headless_request(adapter, resolved_model, resolved_effort)
+    return ResolvedHeadlessRoute(
+        harness=harness,
+        provider=session_provider(harness, resolved_model),
+        model=resolved_model,
+        effort=resolved_effort,
+    )
 
 
 def validate_headless_request(adapter: dict, model: "str | None",
@@ -1097,17 +1133,23 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     # headless plan defaults to high only when the adapter can transport it;
     # OpenCode's no-effort seam stays unset instead of failing before launch.
     flavor_model = fdef["models"].get(harness) if fdef else None
-    session_model = model or flavor_model
-    session_effort = (
-        effort if effort is not None
-        else (default_headless_effort(adapter) if headless else None)
-    )
     if headless:
         try:
-            validate_headless_request(adapter, session_model, session_effort)
+            resolved_route = resolve_headless_route(
+                harness=harness,
+                adapter=adapter,
+                flavor_model=flavor_model,
+                model=model,
+                effort=effort,
+            )
         except ValueError as e:
             con.close()
             raise LaunchError(str(e)) from e
+        session_model = resolved_route.model
+        session_effort = resolved_route.effort
+    else:
+        session_model = model or flavor_model
+        session_effort = effort
 
     # Pre-session analytics sweep — same correctness dependency as main():
     # open_session's stub-reuse check relies on the previous boot's usage
@@ -1440,17 +1482,22 @@ def main() -> None:
     # OpenCode exposes none and keeps the model's own default.
     flavor_model = fdef["models"].get(harness) if fdef else None
     adapter = load_adapter(harness)
-    session_model = (resolve_headless_model(flag_model, fdef, harness)
-                     if headless else flavor_model)
-    session_effort = (
-        flag_effort if flag_effort is not None
-        else (default_headless_effort(adapter) if headless else None)
-    )
     if headless:
         try:
-            validate_headless_request(adapter, session_model, session_effort)
+            resolved_route = resolve_headless_route(
+                harness=harness,
+                adapter=adapter,
+                flavor_model=flavor_model,
+                model=flag_model,
+                effort=flag_effort,
+            )
         except ValueError as e:
             sys.exit(f"sc run: {e}")
+        session_model = resolved_route.model
+        session_effort = resolved_route.effort
+    else:
+        session_model = flavor_model
+        session_effort = None
 
     feedback = not headless and not os.environ.get("RENDER_ONLY")
     map_note = None

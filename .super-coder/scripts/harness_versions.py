@@ -18,6 +18,8 @@ be able to hang a launch banner — and a missing harness is reported, not fatal
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -46,13 +48,96 @@ def versions() -> dict[str, str | None]:
     return {name: probe(name) for name in HARNESSES}
 
 
+def compatibility_status() -> dict[str, dict[str, str | None]]:
+    """Report runtime binaries through the adapters' shared range contract."""
+    from conversation_adapters import ADAPTER_TYPES, AdapterError
+    from conversation_adapters.base import (
+        AdapterCapabilities,
+        checked_probe_result,
+        load_manifest,
+    )
+
+    found: dict[str, dict[str, str | None]] = {}
+    for name in HARNESSES:
+        raw_version = probe(name)
+        match = re.search(r"\d+\.\d+\.\d+", raw_version or "")
+        version = match.group(0) if match else None
+        if name not in ADAPTER_TYPES:
+            found[name] = {
+                "version": raw_version,
+                "compatibility": None,
+                "minimum_version": None,
+                "maximum_version_exclusive": None,
+                "verified_version": None,
+                "error": None,
+            }
+            continue
+        if version is None:
+            found[name] = {
+                "version": None,
+                "compatibility": None,
+                "minimum_version": None,
+                "maximum_version_exclusive": None,
+                "verified_version": None,
+                "error": "HARNESS_UNAVAILABLE",
+            }
+            continue
+        manifest = {}
+        try:
+            manifest = load_manifest(name)
+            result = checked_probe_result(
+                harness=name,
+                manifest=manifest,
+                capabilities=AdapterCapabilities.from_manifest(manifest),
+                version=version,
+            )
+        except AdapterError as exc:
+            conversation = manifest.get("conversation", {})
+            found[name] = {
+                "version": version,
+                "compatibility": None,
+                "minimum_version": conversation.get("minimum_cli_version"),
+                "maximum_version_exclusive": conversation.get(
+                    "maximum_cli_version_exclusive"
+                ),
+                "verified_version": conversation.get("verified_cli_version"),
+                "error": exc.code,
+            }
+            continue
+        found[name] = {
+            "version": result.version,
+            "compatibility": result.compatibility,
+            "minimum_version": result.minimum_version,
+            "maximum_version_exclusive": result.maximum_version_exclusive,
+            "verified_version": result.verified_version,
+            "error": None,
+        }
+    return found
+
+
 def main(argv: list[str]) -> int:
-    found = versions()
+    provenance = "sandbox" if os.environ.get("SC_SANDBOX") else "host"
+    found = compatibility_status()
     if "--json" in argv:
-        print(json.dumps(found, indent=2))
+        print(json.dumps({"runtime": provenance, "harnesses": found}, indent=2))
         return 0
-    for name, version in found.items():
-        print(f"  {name:9} {version or '— not installed'}")
+    print(f"  runtime:   {provenance}")
+    for name, status in found.items():
+        version = status["version"]
+        compatibility = status["compatibility"]
+        if status["error"]:
+            detail = f"{version or '—'} · {status['error']}"
+        elif version and compatibility:
+            detail = (
+                f"{version} · {compatibility} · supported "
+                f"[{status['minimum_version']}, "
+                f"{status['maximum_version_exclusive']})"
+            )
+        elif version:
+            detail = version
+        else:
+            detail = "— not installed"
+        print(f"  {name:9} {detail}")
     return 0
 
 
