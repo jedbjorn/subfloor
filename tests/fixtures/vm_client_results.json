@@ -22,7 +22,13 @@
         "url": "http://127.0.0.1:18000/mcp",
         "ready": false,
         "http_status": null,
-        "error": "tunnel and relay are not both verified"
+        "error": "tunnel and relay are not both verified",
+        "session_cleanup": {
+          "attempted": false,
+          "confirmed": false,
+          "http_status": null,
+          "error": "initialization did not complete"
+        }
       },
       "adapter": {
         "harness": "codex",
@@ -65,5 +71,106 @@
       "message": "the broker connection closed before reset could be confirmed",
       "details": {"domain_state": "unknown"}
     }
+  },
+  "mcp_status_success": {
+    "schema_version": 1,
+    "ok": true,
+    "operation": "mcp_status",
+    "result": {
+      "adapter": {
+        "harness": "codex",
+        "state": "supported",
+        "supported": true,
+        "reason": null,
+        "server_name": "windows-mcp"
+      },
+      "tunnel": {
+        "running": true,
+        "listening": true,
+        "unverified": true
+      },
+      "relay": {
+        "running": true,
+        "listening": true,
+        "unverified": false,
+        "port": 18000
+      },
+      "endpoint": {
+        "url": "http://127.0.0.1:18000/mcp",
+        "ready": false,
+        "http_status": null,
+        "error": "tunnel and relay are not both verified",
+        "session_cleanup": {
+          "attempted": false,
+          "confirmed": false,
+          "http_status": null,
+          "error": "initialization did not complete"
+        }
+      }
+    },
+    "error": null
+  },
+  "mcp_up_success": {
+    "schema_version": 1,
+    "ok": true,
+    "operation": "mcp_up",
+    "result": {
+      "adapter": {
+        "harness": "codex",
+        "state": "supported",
+        "supported": true,
+        "reason": null,
+        "server_name": "windows-mcp"
+      },
+      "tunnel": {
+        "running": true,
+        "listening": true,
+        "unverified": false
+      },
+      "relay": {
+        "running": true,
+        "listening": true,
+        "unverified": false,
+        "port": 18000
+      },
+      "endpoint": {
+        "url": "http://127.0.0.1:18000/mcp",
+        "ready": true,
+        "http_status": 200,
+        "error": null,
+        "session_cleanup": {
+          "attempted": true,
+          "confirmed": true,
+          "http_status": 204,
+          "error": null
+        },
+        "attempts": 2,
+        "timeout_seconds": 15.0
+      }
+    },
+    "error": null
+  },
+  "mcp_down_success": {
+    "schema_version": 1,
+    "ok": true,
+    "operation": "mcp_down",
+    "result": {
+      "adapter": {
+        "harness": "codex",
+        "state": "supported",
+        "supported": true,
+        "reason": null,
+        "server_name": "windows-mcp"
+      },
+      "relay_cleanup": {"ok": true, "output": "relay stopped"},
+      "tunnel_cleanup": {"ok": true, "output": "tunnel stopped"},
+      "endpoint": {
+        "url": "http://127.0.0.1:18000/mcp",
+        "ready": false,
+        "http_status": null,
+        "error": "transport stopped"
+      }
+    },
+    "error": null
   }
 }

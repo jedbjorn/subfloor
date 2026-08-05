@@ -391,6 +391,12 @@ class PublicClientTests(unittest.TestCase):
                 "ready": False,
                 "http_status": None,
                 "error": "tunnel and relay are not both verified",
+                "session_cleanup": {
+                    "attempted": False,
+                    "confirmed": False,
+                    "http_status": None,
+                    "error": "initialization did not complete",
+                },
             },
             "adapter": {
                 "harness": "codex",
@@ -767,13 +773,45 @@ class PublicClientTests(unittest.TestCase):
             for field in expected:
                 self.assertIn(field, help_text)
 
-    def test_mcp_up_help_documents_total_endpoint_wait(self):
-        with mock.patch.object(sys, "stdout", new_callable=io.StringIO) as output, \
-             self.assertRaises(SystemExit) as raised:
-            vm.client_main(["mcp", "up", "--help"])
+    def test_mcp_subcommand_help_documents_json_result_fields(self):
+        cases = {
+            "status": (
+                "adapter.server_name",
+                "tunnel.unverified",
+                "relay.port",
+                "endpoint.error",
+                "endpoint.session_cleanup.confirmed",
+            ),
+            "up": (
+                "pace endpoint probes for up to 15s",
+                "adapter.server_name",
+                "tunnel.unverified",
+                "relay.port",
+                "endpoint.attempts",
+                "endpoint.timeout_seconds",
+                "endpoint.session_cleanup.confirmed",
+            ),
+            "down": (
+                "adapter.server_name",
+                "relay_cleanup.ok",
+                "relay_cleanup.output",
+                "tunnel_cleanup.ok",
+                "tunnel_cleanup.output",
+                "endpoint.error",
+            ),
+        }
+        for action, expected in cases.items():
+            with self.subTest(action=action), \
+                 mock.patch.object(
+                     sys, "stdout", new_callable=io.StringIO
+                 ) as output, \
+                 self.assertRaises(SystemExit) as raised:
+                vm.client_main(["mcp", action, "--help"])
 
-        self.assertEqual(raised.exception.code, 0)
-        self.assertIn("pace endpoint probes for up to 15s", output.getvalue())
+            self.assertEqual(raised.exception.code, 0)
+            help_text = " ".join(output.getvalue().split())
+            for field in expected:
+                self.assertIn(field, help_text)
 
 
 class PublicMcpClientTests(unittest.TestCase):
@@ -1033,6 +1071,14 @@ class PublicMcpClientTests(unittest.TestCase):
             "ready": True,
             "http_status": 200,
             "error": None,
+            "session_cleanup": {
+                "attempted": True,
+                "confirmed": True,
+                "http_status": 204,
+                "error": None,
+            },
+            "attempts": 2,
+            "timeout_seconds": 15.0,
         }
         relay = mock.Mock()
         relay.up.return_value = relay_result
@@ -1042,22 +1088,7 @@ class PublicMcpClientTests(unittest.TestCase):
              mock.patch.object(vm, "wait_for_mcp_endpoint", return_value=endpoint):
             result = vm.run_mcp_operation("up")
 
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["result"], {
-            "adapter": self.SUPPORTED,
-            "tunnel": {
-                "running": True,
-                "listening": True,
-                "unverified": False,
-            },
-            "relay": {
-                "running": True,
-                "listening": True,
-                "unverified": False,
-                "port": 18000,
-            },
-            "endpoint": endpoint,
-        })
+        self.assertEqual(result, GOLDEN["mcp_up_success"])
         broker.assert_called_once_with("POST", "/mcp/up")
         relay.up.assert_called_once_with(18000)
         relay.down.assert_not_called()
@@ -1211,6 +1242,12 @@ class PublicMcpClientTests(unittest.TestCase):
             "ready": True,
             "http_status": 200,
             "error": None,
+            "session_cleanup": {
+                "attempted": True,
+                "confirmed": True,
+                "http_status": 204,
+                "error": None,
+            },
         }
         with mock.patch.object(vm, "active_mcp_adapter", return_value=self.SUPPORTED), \
              mock.patch.object(vm, "_mcp_broker_call", return_value=(tunnel, None)), \
@@ -1245,11 +1282,7 @@ class PublicMcpClientTests(unittest.TestCase):
              mock.patch.object(vm, "mcp_endpoint_status") as probe:
             result = vm.run_mcp_operation("status")
 
-        self.assertFalse(result["result"]["endpoint"]["ready"])
-        self.assertEqual(
-            result["result"]["endpoint"]["error"],
-            "tunnel and relay are not both verified",
-        )
+        self.assertEqual(result, GOLDEN["mcp_status_success"])
         probe.assert_not_called()
 
     def test_down_reports_both_cleanup_results(self):
@@ -1261,9 +1294,7 @@ class PublicMcpClientTests(unittest.TestCase):
              mock.patch.object(vm, "_relay_module", return_value=relay):
             result = vm.run_mcp_operation("down")
 
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["result"]["relay_cleanup"], relay.down.return_value)
-        self.assertEqual(result["result"]["tunnel_cleanup"], tunnel)
+        self.assertEqual(result, GOLDEN["mcp_down_success"])
         relay.down.assert_called_once_with(18000)
         broker.assert_called_once_with("POST", "/mcp/down")
 

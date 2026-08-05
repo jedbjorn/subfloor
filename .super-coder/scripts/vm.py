@@ -1705,6 +1705,12 @@ def _mcp_snapshot(tunnel_response: dict) -> dict:
             "ready": False,
             "http_status": None,
             "error": "tunnel and relay are not both verified",
+            "session_cleanup": {
+                "attempted": False,
+                "confirmed": False,
+                "http_status": None,
+                "error": "initialization did not complete",
+            },
         }
     )
     return {
@@ -2276,19 +2282,52 @@ def client_main(argv: list[str]) -> int:
         ),
     )
     mcp_commands = mcp.add_subparsers(dest="mcp_action", required=True)
-    for action, help_text in (
-        ("status", "inspect adapter, tunnel, relay, and endpoint"),
+    for action, help_text, description in (
+        (
+            "status",
+            "inspect adapter, tunnel, relay, and endpoint",
+            "Read-only MCP status. JSON result fields: adapter.harness, "
+            "adapter.state, adapter.supported, adapter.reason, "
+            "adapter.server_name; tunnel.running, tunnel.listening, "
+            "tunnel.unverified; relay.running, relay.listening, "
+            "relay.unverified, relay.port; endpoint.url, endpoint.ready, "
+            "endpoint.http_status, endpoint.error, "
+            "endpoint.session_cleanup.attempted, "
+            "endpoint.session_cleanup.confirmed, "
+            "endpoint.session_cleanup.http_status, "
+            "endpoint.session_cleanup.error.",
+        ),
         (
             "up",
             f"start tunnel and relay, then pace endpoint probes for up to "
             f"{MCP_ENDPOINT_WAIT_TIMEOUT:g}s",
+            f"Start tunnel and relay, then pace endpoint probes for up to "
+            f"{MCP_ENDPOINT_WAIT_TIMEOUT:g}s. JSON result fields: "
+            "adapter.harness, "
+            "adapter.state, adapter.supported, adapter.reason, "
+            "adapter.server_name; tunnel.running, tunnel.listening, "
+            "tunnel.unverified; relay.running, relay.listening, "
+            "relay.unverified, relay.port; endpoint.url, endpoint.ready, "
+            "endpoint.http_status, endpoint.error, endpoint.attempts, "
+            "endpoint.timeout_seconds, endpoint.session_cleanup.attempted, "
+            "endpoint.session_cleanup.confirmed, "
+            "endpoint.session_cleanup.http_status, "
+            "endpoint.session_cleanup.error.",
         ),
-        ("down", "stop verified relay and tunnel instances"),
+        (
+            "down",
+            "stop verified relay and tunnel instances",
+            "Verified MCP shutdown. JSON result fields: adapter.harness, "
+            "adapter.state, adapter.supported, adapter.reason, "
+            "adapter.server_name; relay_cleanup.ok, relay_cleanup.output; "
+            "tunnel_cleanup.ok, tunnel_cleanup.output; endpoint.url, "
+            "endpoint.ready, endpoint.http_status, endpoint.error.",
+        ),
     ):
         command = mcp_commands.add_parser(
             action,
             help=help_text,
-            description=help_text,
+            description=description,
         )
         command.add_argument(
             "--json", action="store_true", help="print one JSON result object"
