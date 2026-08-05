@@ -579,6 +579,14 @@ def load_manifest(harness: str) -> dict[str, Any]:
     return manifest
 
 
+def managed_mcp_launch_args(manifest: Mapping[str, Any]) -> list[str]:
+    """Resolve browser-native argv through the canonical launch MCP seam."""
+    from run import managed_mcp_injection
+
+    managed = managed_mcp_injection(dict(manifest))
+    return list((managed or {}).get("launch_args") or [])
+
+
 def command_version(argv: list[str]) -> str:
     try:
         result = subprocess.run(

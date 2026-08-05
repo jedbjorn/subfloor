@@ -300,6 +300,10 @@ class McpTunnelTests(unittest.TestCase):
              }):
             r = vm.do_mcp_up(wait=5)
         self.assertTrue(r["ok"], r)
+        self.assertEqual(
+            (r["running"], r["listening"], r["unverified"]),
+            (True, True, False),
+        )
         self.assertEqual(r["pid"], 4242)
         self.assertEqual(r["port"], 9000)
         argv = popen.call_args[0][0]
@@ -343,6 +347,9 @@ class McpTunnelTests(unittest.TestCase):
             r,
             {
                 "ok": True,
+                "running": True,
+                "listening": True,
+                "unverified": False,
                 "output": "tunnel already up (pid 4242)",
                 "socket": str(vm.MCP_SOCKET),
                 "pid": 4242,
@@ -456,7 +463,7 @@ class McpTunnelTests(unittest.TestCase):
             },
         )
 
-    def test_mcp_status_requires_a_listening_socket_not_a_stale_path(self):
+    def test_mcp_status_separates_owned_process_from_listener_readiness(self):
         vm.MCP_SOCKET.touch()
         with mock.patch.object(vm, "_tunnel_process", return_value={"pid": 4242}):
             r = vm.mcp_status()
@@ -464,7 +471,7 @@ class McpTunnelTests(unittest.TestCase):
             r,
             {
                 "ok": True,
-                "running": False,
+                "running": True,
                 "pid": 4242,
                 "socket": None,
                 "listening": False,

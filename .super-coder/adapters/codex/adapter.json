@@ -6,6 +6,19 @@
   "emit": [".codex/hooks.json"],
   "skill_dirs": [".claude/skills", ".agents/skills"],
   "env": {},
+  "mcp": {
+    "streamable_http": {
+      "supported": true,
+      "managed_server": {
+        "name": "windows-mcp",
+        "url": "http://127.0.0.1:18000/mcp",
+        "launch_args": [
+          "-c",
+          "mcp_servers.windows-mcp.url=\"http://127.0.0.1:18000/mcp\""
+        ]
+      }
+    }
+  },
   "model": { "flag": "--model" },
   "headless": {
     "launch": ["codex", "exec"],
