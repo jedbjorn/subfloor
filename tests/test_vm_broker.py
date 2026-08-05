@@ -186,6 +186,7 @@ class McpTunnelTests(unittest.TestCase):
         self._patches = [
             mock.patch.object(vm, "MCP_SOCKET", d / "vm-mcp.sock"),
             mock.patch.object(vm, "MCP_PIDFILE", d / "vm-mcp-tunnel.pid"),
+            mock.patch.object(vm, "MCP_LOCKFILE", d / "vm-mcp-tunnel.lock"),
             mock.patch.object(vm, "MCP_LOG", d / "vm-mcp-tunnel.log"),
         ]
         for p in self._patches:
@@ -210,7 +211,12 @@ class McpTunnelTests(unittest.TestCase):
             return mock.Mock(pid=4242, poll=mock.Mock(return_value=None))
         cfg = dict(SAVED, mcp_port=9000)
         with mock.patch.object(vm, "read", return_value=cfg), \
-             mock.patch("subprocess.Popen", side_effect=fake_popen) as popen:
+             mock.patch("subprocess.Popen", side_effect=fake_popen) as popen, \
+             mock.patch.object(vm, "_tunnel_ready", return_value=True), \
+             mock.patch.object(vm, "_new_process_state", return_value={
+                 "schema_version": 1, "kind": "vm-mcp-tunnel", "pid": 4242,
+                 "start_ticks": 123, "executable": "/usr/bin/ssh", "port": 9000,
+             }):
             r = vm.do_mcp_up(wait=5)
         self.assertTrue(r["ok"], r)
         self.assertEqual(r["pid"], 4242)
@@ -229,19 +235,27 @@ class McpTunnelTests(unittest.TestCase):
             vm.MCP_SOCKET.touch()
             return mock.Mock(pid=4242, poll=mock.Mock(return_value=None))
         with mock.patch.object(vm, "read", return_value=SAVED), \
-             mock.patch("subprocess.Popen", side_effect=fake_popen) as popen:
+             mock.patch("subprocess.Popen", side_effect=fake_popen) as popen, \
+             mock.patch.object(vm, "_tunnel_ready", return_value=True), \
+             mock.patch.object(vm, "_new_process_state", return_value={
+                 "schema_version": 1, "kind": "vm-mcp-tunnel", "pid": 4242,
+                 "start_ticks": 123, "executable": "/usr/bin/ssh", "port": 8000,
+             }):
             r = vm.do_mcp_up(wait=5)
         self.assertTrue(r["ok"], r)
         self.assertIn(f"{vm.MCP_SOCKET}:127.0.0.1:8000", popen.call_args[0][0])
 
     def test_mcp_up_is_idempotent_when_already_live(self):
-        # A live pid + present socket → report it, never stack a second ssh.
-        vm.MCP_PIDFILE.write_text(str(os.getpid()))  # this test process: alive
+        # A verified identity + present socket → report it, never stack ssh.
+        state = {"pid": 4242}
         vm.MCP_SOCKET.touch()
         with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_tunnel_process", return_value=state), \
+             mock.patch.object(vm, "_tunnel_ready", return_value=True), \
              mock.patch("subprocess.Popen") as popen:
             r = vm.do_mcp_up()
         self.assertTrue(r["ok"])
+        self.assertEqual(r["pid"], 4242)
         self.assertIn("already up", r["output"])
         popen.assert_not_called()
 
@@ -251,11 +265,53 @@ class McpTunnelTests(unittest.TestCase):
             return mock.Mock(pid=4242, returncode=255,
                              poll=mock.Mock(return_value=255))
         with mock.patch.object(vm, "read", return_value=SAVED), \
-             mock.patch("subprocess.Popen", side_effect=fake_popen):
+             mock.patch("subprocess.Popen", side_effect=fake_popen), \
+             mock.patch.object(vm, "_new_process_state", return_value={
+                 "schema_version": 1, "kind": "vm-mcp-tunnel", "pid": 4242,
+                 "start_ticks": 123, "executable": "/usr/bin/ssh", "port": 8000,
+             }):
             r = vm.do_mcp_up(wait=5)
         self.assertFalse(r["ok"])
         self.assertIn("Permission denied", r["output"])
         self.assertIsNone(vm._tunnel_pid())  # no stale pidfile left behind
+
+    def test_mcp_up_timeout_is_paced_reports_log_and_cleans_state(self):
+        state = {
+            "schema_version": 1, "kind": "vm-mcp-tunnel", "pid": 4242,
+            "start_ticks": 123, "executable": "/usr/bin/ssh", "port": 8000,
+        }
+        process = mock.Mock(pid=4242, poll=mock.Mock(return_value=None))
+        clock = iter((0.0, 0.0, 0.2, 0.4))
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_tunnel_ready", return_value=False), \
+             mock.patch.object(vm, "_new_process_state", return_value=state), \
+             mock.patch.object(vm, "_terminate_owned_process", return_value=True), \
+             mock.patch.object(vm, "_bounded_log_tail", return_value="forward pending"), \
+             mock.patch.object(vm.time, "monotonic", side_effect=clock), \
+             mock.patch.object(vm.time, "sleep") as sleep, \
+             mock.patch("subprocess.Popen", return_value=process):
+            r = vm.do_mcp_up(wait=0.4)
+        self.assertEqual(
+            r,
+            {"ok": False,
+             "output": "tunnel socket did not appear within 0.4s: forward pending"},
+        )
+        self.assertEqual(sleep.call_args_list, [mock.call(0.2)] * 2)
+        self.assertFalse(vm.MCP_PIDFILE.exists())
+        self.assertFalse(vm.MCP_SOCKET.exists())
+
+    def test_mcp_down_removes_legacy_state_without_signaling_recycled_pid(self):
+        vm.MCP_PIDFILE.write_text("4242")
+        vm.MCP_SOCKET.touch()
+        with mock.patch.object(vm, "_terminate_owned_process") as terminate:
+            r = vm.do_mcp_down()
+        self.assertEqual(
+            r,
+            {"ok": True, "output": "tunnel not running (stale state removed)"},
+        )
+        terminate.assert_not_called()
+        self.assertFalse(vm.MCP_PIDFILE.exists())
+        self.assertFalse(vm.MCP_SOCKET.exists())
 
     def test_mcp_down_is_idempotent(self):
         r = vm.do_mcp_down()
@@ -267,6 +323,15 @@ class McpTunnelTests(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertFalse(r["running"])
         self.assertIsNone(r["socket"])
+
+    def test_mcp_status_requires_a_listening_socket_not_a_stale_path(self):
+        vm.MCP_SOCKET.touch()
+        with mock.patch.object(vm, "_tunnel_process", return_value={"pid": 4242}):
+            r = vm.mcp_status()
+        self.assertEqual(
+            r,
+            {"ok": True, "running": False, "pid": 4242, "socket": None},
+        )
 
 
 class McpRelayTests(unittest.TestCase):
@@ -332,6 +397,177 @@ class McpRelayTests(unittest.TestCase):
             c.settimeout(5)
             self.assertEqual(c.recv(1), b"")  # clean close
             c.close()
+
+
+class ProcessOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        self.state_file = Path(tempfile.mkdtemp(prefix="sc_process_state_")) / "state"
+        self.expected = os.path.realpath(sys.executable)
+
+    def _state(self, *, start_ticks=100, executable=None):
+        state = {
+            "schema_version": 1,
+            "kind": "relay",
+            "pid": 77,
+            "start_ticks": start_ticks,
+            "executable": executable or self.expected,
+        }
+        vm._atomic_write_process_state(self.state_file, state)
+        return state
+
+    def test_atomic_state_is_mode_0600_and_complete_json(self):
+        state = self._state()
+        self.assertEqual(self.state_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(vm._read_process_state(self.state_file), state)
+        self.assertEqual(list(self.state_file.parent.glob(".state.*")), [])
+
+    def test_recycled_container_pid_fails_start_identity_check(self):
+        self._state(start_ticks=100)
+        recycled = {
+            "pid": 77,
+            "start_ticks": 101,
+            "executable": self.expected,
+            "cmdline": [self.expected, "relay-token"],
+        }
+        with mock.patch.object(vm, "_process_snapshot", return_value=recycled):
+            owned = vm._owned_process(
+                self.state_file,
+                kind="relay",
+                expected_executable=sys.executable,
+                required_token="relay-token",
+            )
+        self.assertIsNone(owned)
+
+    def test_matching_pid_and_ticks_with_wrong_executable_is_not_owned(self):
+        self._state(start_ticks=100)
+        unrelated = {
+            "pid": 77,
+            "start_ticks": 100,
+            "executable": "/usr/bin/sleep",
+            "cmdline": ["/usr/bin/sleep", "relay-token"],
+        }
+        with mock.patch.object(vm, "_process_snapshot", return_value=unrelated):
+            owned = vm._owned_process(
+                self.state_file,
+                kind="relay",
+                expected_executable=sys.executable,
+                required_token="relay-token",
+            )
+        self.assertIsNone(owned)
+
+    def test_mismatched_record_is_never_signaled(self):
+        state = self._state(start_ticks=100)
+        recycled = {
+            "pid": 77,
+            "start_ticks": 101,
+            "executable": self.expected,
+            "cmdline": [self.expected, "relay-token"],
+        }
+        with mock.patch.object(vm, "_process_snapshot", return_value=recycled), \
+             mock.patch.object(vm.os, "kill") as kill:
+            stopped = vm._terminate_owned_process(
+                state,
+                expected_executable=sys.executable,
+                required_token="relay-token",
+            )
+        self.assertTrue(stopped)
+        kill.assert_not_called()
+
+
+class McpRelayLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        d = Path(tempfile.mkdtemp(prefix="sc_relay_lifecycle_"))
+        self._patches = [
+            mock.patch.object(vm_mcp_relay, "PIDFILE", d / "relay.pid"),
+            mock.patch.object(vm_mcp_relay, "PORTFILE", d / "relay.port"),
+            mock.patch.object(vm_mcp_relay, "LOCKFILE", d / "relay.lock"),
+            mock.patch.object(vm_mcp_relay, "LOG", d / "relay.log"),
+        ]
+        for patcher in self._patches:
+            patcher.start()
+        self.state = {
+            "schema_version": 1,
+            "kind": "vm-mcp-relay",
+            "pid": 4242,
+            "start_ticks": 123,
+            "executable": os.path.realpath(sys.executable),
+            "port": 18000,
+        }
+
+    def tearDown(self):
+        for patcher in self._patches:
+            patcher.stop()
+
+    def test_up_is_idempotent_only_for_verified_listening_relay(self):
+        with mock.patch.object(vm_mcp_relay, "_relay_process", return_value=self.state), \
+             mock.patch.object(vm_mcp_relay, "_listener_ready", return_value=True), \
+             mock.patch("subprocess.Popen") as popen:
+            r = vm_mcp_relay.up(18000)
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["running"])
+        self.assertTrue(r["listening"])
+        self.assertEqual(r["pid"], 4242)
+        popen.assert_not_called()
+
+    def test_bind_exit_returns_bounded_log_and_cleans_all_state(self):
+        def fake_popen(*args, **kwargs):
+            vm_mcp_relay.LOG.write_text("prefix\nOSError: Address already in use")
+            return mock.Mock(pid=4242, returncode=98,
+                             poll=mock.Mock(return_value=98))
+
+        vm_mcp_relay.PORTFILE.write_text("18000")
+        with mock.patch.object(vm_mcp_relay, "_relay_process", return_value=None), \
+             mock.patch.object(vm, "_new_process_state", return_value=self.state), \
+             mock.patch("subprocess.Popen", side_effect=fake_popen):
+            r = vm_mcp_relay.up(18000)
+        self.assertFalse(r["ok"])
+        self.assertEqual(
+            r["output"],
+            "relay exited (rc 98): prefix\nOSError: Address already in use",
+        )
+        self.assertFalse(vm_mcp_relay.PIDFILE.exists())
+        self.assertFalse(vm_mcp_relay.PORTFILE.exists())
+
+    def test_readiness_timeout_is_paced_reports_log_and_cleans_state(self):
+        process = mock.Mock(pid=4242, poll=mock.Mock(return_value=None))
+        clock = iter((0.0, 0.0, 0.1, 0.2, 0.3))
+        with mock.patch.object(vm_mcp_relay, "_relay_process", return_value=None), \
+             mock.patch.object(vm_mcp_relay, "_listener_ready", return_value=False), \
+             mock.patch.object(vm, "_new_process_state", return_value=self.state), \
+             mock.patch.object(vm, "_terminate_owned_process", return_value=True), \
+             mock.patch.object(vm, "_bounded_log_tail", return_value="startup pending"), \
+             mock.patch.object(vm_mcp_relay.time, "monotonic", side_effect=clock), \
+             mock.patch.object(vm_mcp_relay.time, "sleep") as sleep, \
+             mock.patch("subprocess.Popen", return_value=process):
+            r = vm_mcp_relay.up(18000, wait=0.3)
+        self.assertFalse(r["ok"])
+        self.assertEqual(
+            r["output"],
+            "relay did not start listening on 127.0.0.1:18000 within 0.3s: startup pending",
+        )
+        self.assertEqual(sleep.call_args_list, [mock.call(0.2)] * 3)
+        self.assertFalse(vm_mcp_relay.PIDFILE.exists())
+        self.assertFalse(vm_mcp_relay.PORTFILE.exists())
+
+    def test_down_removes_namespace_stale_state_without_signaling(self):
+        vm._atomic_write_process_state(vm_mcp_relay.PIDFILE, self.state)
+        vm_mcp_relay.PORTFILE.write_text("18000")
+        recycled = {
+            "pid": 4242,
+            "start_ticks": 124,
+            "executable": os.path.realpath(sys.executable),
+            "cmdline": [sys.executable, vm_mcp_relay._relay_token()],
+        }
+        with mock.patch.object(vm, "_process_snapshot", return_value=recycled), \
+             mock.patch.object(vm.os, "kill") as kill:
+            r = vm_mcp_relay.down()
+        self.assertEqual(
+            r,
+            {"ok": True, "output": "relay not running (stale state removed)"},
+        )
+        kill.assert_not_called()
+        self.assertFalse(vm_mcp_relay.PIDFILE.exists())
+        self.assertFalse(vm_mcp_relay.PORTFILE.exists())
 
 
 class SocketTransportTests(unittest.TestCase):

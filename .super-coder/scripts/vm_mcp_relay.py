@@ -28,20 +28,23 @@ The broker never touches it.
 from __future__ import annotations
 
 import json
-import os
-import signal
 import socket
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import vm  # single source for RUN_DIR / MCP_SOCKET
 
 DEFAULT_PORT = 18000
 PIDFILE = vm.RUN_DIR / "vm-mcp-relay.pid"
+# Kept only so new commands remove pre-hardening split state safely.
 PORTFILE = vm.RUN_DIR / "vm-mcp-relay.port"
+LOCKFILE = vm.RUN_DIR / "vm-mcp-relay.lock"
 LOG = vm.RUN_DIR / "vm-mcp-relay.log"
+READY_TIMEOUT = 5.0
+READY_INTERVAL = 0.2
 
 
 # -- the pipe -----------------------------------------------------------------
@@ -104,71 +107,153 @@ def run(srv: socket.socket) -> None:
 
 # -- supervision (nohup-style, mirroring the sc broker pattern) ---------------
 
-def _pid_alive() -> int | None:
+def _relay_executable() -> str:
+    return sys.executable
+
+
+def _relay_token() -> str:
+    return str(Path(__file__).resolve())
+
+
+def _relay_process() -> dict | None:
+    return vm._owned_process(
+        PIDFILE,
+        kind="vm-mcp-relay",
+        expected_executable=_relay_executable(),
+        required_token=_relay_token(),
+    )
+
+
+def _listener_ready(port: int) -> bool:
     try:
-        pid = int(PIDFILE.read_text().strip())
-        os.kill(pid, 0)
-    except (OSError, ValueError):
-        return None
-    return pid
+        socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+        return True
+    except OSError:
+        return False
+
+
+def _cleanup_state() -> None:
+    PIDFILE.unlink(missing_ok=True)
+    PORTFILE.unlink(missing_ok=True)
 
 
 def status() -> dict:
-    pid = _pid_alive()
-    port = None
-    try:
-        port = int(PORTFILE.read_text().strip())
-    except (OSError, ValueError):
-        pass
-    return {"ok": True, "running": pid is not None, "pid": pid, "port": port,
+    state = _relay_process()
+    port = state.get("port") if state else None
+    listening = isinstance(port, int) and _listener_ready(port)
+    return {"ok": True, "running": state is not None and listening,
+            "pid": state["pid"] if state else None, "port": port,
+            "listening": listening,
             # upstream = the broker's tunnel socket; the relay works only when
             # both halves are up, so surface the other half here too
             "upstream": vm.MCP_SOCKET.exists()}
 
 
-def up(port: int) -> dict:
-    if pid := _pid_alive():
-        return {"ok": True, "output": f"relay already up (pid {pid})", **status()}
-    vm.RUN_DIR.mkdir(parents=True, exist_ok=True)
-    with open(LOG, "wb") as log:
-        p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "fg", str(port)],
-                             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                             start_new_session=True)
-    PIDFILE.write_text(str(p.pid))
-    PORTFILE.write_text(str(port))
-    # verify the listener answers before reporting success
-    for _ in range(25):
-        if p.poll() is not None:
-            err = LOG.read_text(errors="replace").strip()[-500:]
-            PIDFILE.unlink(missing_ok=True)
-            return {"ok": False, "output": f"relay exited (rc {p.returncode}): {err or '(no output)'}"}
-        try:
-            socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
-            r = {"ok": True, "pid": p.pid, "port": port,
-                 "url": f"http://127.0.0.1:{port}/mcp",
-                 "upstream": vm.MCP_SOCKET.exists()}
-            if not r["upstream"]:
-                r["output"] = ("relay up, but the broker tunnel socket is absent — "
-                               "connections will fail until POST /mcp/up on the vm-broker")
-            return r
-        except OSError:
-            pass
-    p.terminate()
-    PIDFILE.unlink(missing_ok=True)
-    return {"ok": False, "output": f"relay did not start listening on 127.0.0.1:{port}"}
+def up(port: int, wait: float = READY_TIMEOUT) -> dict:
+    with vm._process_state_lock(LOCKFILE):
+        state = _relay_process()
+        if state and state.get("port") == port and _listener_ready(port):
+            return {
+                "ok": True,
+                "output": f"relay already up (pid {state['pid']})",
+                **status(),
+            }
+        if state and not vm._terminate_owned_process(
+            state,
+            expected_executable=_relay_executable(),
+            required_token=_relay_token(),
+        ):
+            return {
+                "ok": False,
+                "output": f"verified stale relay did not stop (pid {state['pid']})",
+            }
+        _cleanup_state()
+        vm.RUN_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG, "wb") as log:
+            p = subprocess.Popen(
+                [sys.executable, _relay_token(), "fg", str(port)],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+            )
+        state = vm._new_process_state(
+            p.pid,
+            kind="vm-mcp-relay",
+            expected_executable=_relay_executable(),
+            required_token=_relay_token(),
+            port=port,
+        )
+        if state is None:
+            if p.poll() is None:
+                p.terminate()
+            return {"ok": False, "output": "could not verify the new relay process"}
+        vm._atomic_write_process_state(PIDFILE, state)
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if p.poll() is not None:
+                err = vm._bounded_log_tail(LOG)
+                _cleanup_state()
+                return {
+                    "ok": False,
+                    "output": f"relay exited (rc {p.returncode}): {err or '(no output)'}",
+                }
+            if _listener_ready(port):
+                result = {
+                    "ok": True,
+                    "running": True,
+                    "listening": True,
+                    "pid": p.pid,
+                    "port": port,
+                    "url": f"http://127.0.0.1:{port}/mcp",
+                    "upstream": vm.MCP_SOCKET.exists(),
+                }
+                if not result["upstream"]:
+                    result["output"] = (
+                        "relay up, but the broker tunnel socket is absent — "
+                        "connections will fail until POST /mcp/up on the vm-broker"
+                    )
+                return result
+            time.sleep(READY_INTERVAL)
+        stopped = vm._terminate_owned_process(
+            state,
+            expected_executable=_relay_executable(),
+            required_token=_relay_token(),
+        )
+        err = vm._bounded_log_tail(LOG)
+        if stopped:
+            _cleanup_state()
+        detail = f": {err}" if err else ""
+        return {
+            "ok": False,
+            "output": (
+                f"relay did not start listening on 127.0.0.1:{port} "
+                f"within {wait}s{detail}"
+            ),
+        }
 
 
 def down() -> dict:
-    pid = _pid_alive()
-    if pid:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-    PIDFILE.unlink(missing_ok=True)
-    PORTFILE.unlink(missing_ok=True)
-    return {"ok": True,
-            "output": f"relay stopped (pid {pid})" if pid else "relay not running"}
+    with vm._process_state_lock(LOCKFILE):
+        state = _relay_process()
+        stale = (PIDFILE.exists() or PORTFILE.exists()) and state is None
+        if state and not vm._terminate_owned_process(
+            state,
+            expected_executable=_relay_executable(),
+            required_token=_relay_token(),
+        ):
+            return {
+                "ok": False,
+                "output": f"verified relay did not stop (pid {state['pid']})",
+            }
+        _cleanup_state()
+        if state:
+            output = f"relay stopped (pid {state['pid']})"
+        elif stale:
+            output = "relay not running (stale state removed)"
+        else:
+            output = "relay not running"
+        return {"ok": True, "output": output}
 
 
 def main(argv: list[str]) -> int:
