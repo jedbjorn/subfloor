@@ -17,6 +17,8 @@ guaranteed rather than left to docker's arg-cache heuristics.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import re
 import shutil
@@ -430,6 +432,16 @@ class UpdateExpiresSandboxHarnesses(unittest.TestCase):
         self.docker = {"state": "absent"}
         self.assertIsNone(self.update_mod.expire_sandbox_harnesses())
         self.assertRegex(self.epoch_file.read_text().strip(), EPOCH_RE)
+
+    def test_unwritable_epoch_is_advisory_for_host_native_update(self):
+        warning = io.StringIO()
+        with mock.patch.object(
+            self.update_mod.install_mod,
+            "roll_harness_epoch",
+            side_effect=OSError("read-only machine config"),
+        ), contextlib.redirect_stdout(warning):
+            self.assertIsNone(self.update_mod.expire_sandbox_harnesses())
+        self.assertIn("sandbox harness epoch not updated", warning.getvalue())
 
 
 if __name__ == "__main__":

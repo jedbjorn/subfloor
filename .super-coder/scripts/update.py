@@ -1178,7 +1178,14 @@ def expire_sandbox_harnesses() -> str | None:
     Returns None when docker is absent — the roll is harmless (there is no image
     to expire) but announcing it would describe a runtime this host does not have.
     """
-    epoch = install_mod.roll_harness_epoch()
+    try:
+        epoch = install_mod.roll_harness_epoch()
+    except OSError as exc:
+        # The epoch is only a cache-bust hint for the optional sandbox image.
+        # A read-only or otherwise unavailable machine config directory must
+        # not block engine/DB reconciliation for the host-native lifecycle.
+        print(f"  ⚠ sandbox harness epoch not updated ({exc})")
+        return None
     if install_mod.docker_status().get("state") == "absent":
         return None
     return epoch
