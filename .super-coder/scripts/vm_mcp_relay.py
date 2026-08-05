@@ -45,6 +45,8 @@ LOCKFILE = vm.RUN_DIR / "vm-mcp-relay.lock"
 LOG = vm.RUN_DIR / "vm-mcp-relay.log"
 READY_TIMEOUT = 5.0
 READY_INTERVAL = 0.2
+STOP_TIMEOUT = 1.0
+STOP_INTERVAL = 0.05
 
 
 # -- the pipe -----------------------------------------------------------------
@@ -132,18 +134,49 @@ def _listener_ready(port: int) -> bool:
         return False
 
 
+def _listener_stopped(port: int, wait: float = STOP_TIMEOUT) -> bool:
+    deadline = time.monotonic() + wait
+    while _listener_ready(port):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(STOP_INTERVAL)
+    return True
+
+
 def _cleanup_state() -> None:
     PIDFILE.unlink(missing_ok=True)
     PORTFILE.unlink(missing_ok=True)
 
 
-def status() -> dict:
+def _last_known_port(fallback: int) -> int:
+    raw_state = vm._read_process_state(PIDFILE)
+    try:
+        legacy_port = PORTFILE.read_text().strip()
+    except OSError:
+        legacy_port = None
+    candidates = [
+        raw_state.get("port") if raw_state else None,
+        legacy_port,
+        fallback,
+    ]
+    for candidate in candidates:
+        try:
+            port = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= port <= 65535:
+            return port
+    return fallback
+
+
+def status(port: int = DEFAULT_PORT) -> dict:
     state = _relay_process()
-    port = state.get("port") if state else None
+    port = state.get("port") if state else _last_known_port(port)
     listening = isinstance(port, int) and _listener_ready(port)
     return {"ok": True, "running": state is not None and listening,
             "pid": state["pid"] if state else None, "port": port,
             "listening": listening,
+            "unverified": state is None and listening,
             # upstream = the broker's tunnel socket; the relay works only when
             # both halves are up, so surface the other half here too
             "upstream": vm.MCP_SOCKET.exists()}
@@ -153,10 +186,32 @@ def up(port: int, wait: float = READY_TIMEOUT) -> dict:
     with vm._process_state_lock(LOCKFILE):
         state = _relay_process()
         if state and state.get("port") == port and _listener_ready(port):
+            if vm._process_record_matches(
+                state,
+                expected_executable=_relay_executable(),
+                required_token=_relay_token(),
+            ):
+                return {
+                    "ok": True,
+                    "output": f"relay already up (pid {state['pid']})",
+                    **status(port),
+                }
             return {
-                "ok": True,
-                "output": f"relay already up (pid {state['pid']})",
-                **status(),
+                "ok": False,
+                "running": True,
+                "listening": True,
+                "unverified": True,
+                "port": port,
+                "output": f"port 127.0.0.1:{port} is held by an unverified process; refusing to start relay",
+            }
+        if _listener_ready(port):
+            return {
+                "ok": False,
+                "running": True,
+                "listening": True,
+                "unverified": True,
+                "port": port,
+                "output": f"port 127.0.0.1:{port} is held by an unverified process; refusing to start relay",
             }
         if state and not vm._terminate_owned_process(
             state,
@@ -185,9 +240,15 @@ def up(port: int, wait: float = READY_TIMEOUT) -> dict:
             port=port,
         )
         if state is None:
-            if p.poll() is None:
-                p.terminate()
-            return {"ok": False, "output": "could not verify the new relay process"}
+            return {
+                "ok": False,
+                "output": vm._unverified_process_error(
+                    p,
+                    label="relay",
+                    expected_executable=_relay_executable(),
+                    log_path=LOG,
+                ),
+            }
         vm._atomic_write_process_state(PIDFILE, state)
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
@@ -199,6 +260,30 @@ def up(port: int, wait: float = READY_TIMEOUT) -> dict:
                     "output": f"relay exited (rc {p.returncode}): {err or '(no output)'}",
                 }
             if _listener_ready(port):
+                if not vm._process_record_matches(
+                    state,
+                    expected_executable=_relay_executable(),
+                    required_token=_relay_token(),
+                ):
+                    error = vm._unverified_process_error(
+                        p,
+                        label="relay",
+                        expected_executable=_relay_executable(),
+                        log_path=LOG,
+                    )
+                    _cleanup_state()
+                    listening = _listener_ready(port)
+                    return {
+                        "ok": False,
+                        "running": listening,
+                        "listening": listening,
+                        "unverified": listening,
+                        "port": port,
+                        "output": (
+                            f"{error}; port remains held by an unverified process"
+                            if listening else error
+                        ),
+                    }
                 result = {
                     "ok": True,
                     "running": True,
@@ -233,10 +318,11 @@ def up(port: int, wait: float = READY_TIMEOUT) -> dict:
         }
 
 
-def down() -> dict:
+def down(port: int = DEFAULT_PORT) -> dict:
     with vm._process_state_lock(LOCKFILE):
         state = _relay_process()
         stale = (PIDFILE.exists() or PORTFILE.exists()) and state is None
+        port = state.get("port") if state else _last_known_port(port)
         if state and not vm._terminate_owned_process(
             state,
             expected_executable=_relay_executable(),
@@ -247,6 +333,21 @@ def down() -> dict:
                 "output": f"verified relay did not stop (pid {state['pid']})",
             }
         _cleanup_state()
+        listening = (
+            not _listener_stopped(port) if state else _listener_ready(port)
+        )
+        if listening:
+            return {
+                "ok": False,
+                "running": True,
+                "listening": True,
+                "unverified": True,
+                "port": port,
+                "output": (
+                    f"unverified relay is still listening on 127.0.0.1:{port}; "
+                    "state removed, process not signaled"
+                ),
+            }
         if state:
             output = f"relay stopped (pid {state['pid']})"
         elif stale:
@@ -268,9 +369,11 @@ def main(argv: list[str]) -> int:
         print(json.dumps(r))
         return 0 if r["ok"] else 1
     elif mode == "down":
-        print(json.dumps(down()))
+        r = down(port)
+        print(json.dumps(r))
+        return 0 if r["ok"] else 1
     elif mode == "status":
-        print(json.dumps(status()))
+        print(json.dumps(status(port)))
     else:
         sys.exit("usage: vm_mcp_relay.py [up [port]|down|status|fg [port]]")
     return 0

@@ -61,6 +61,8 @@ PROCESS_STATE_VERSION = 1
 PROCESS_STOP_TIMEOUT = 2.0
 PROCESS_KILL_TIMEOUT = 1.0
 PROCESS_POLL_INTERVAL = 0.05
+PROCESS_VERIFY_TIMEOUT = 0.2
+PROCESS_VERIFY_INTERVAL = 0.01
 
 
 def _process_snapshot(pid: int) -> dict | None:
@@ -101,12 +103,18 @@ def _new_process_state(
     required_token: str,
     **details,
 ) -> dict | None:
-    snapshot = _process_snapshot(pid)
-    if not _snapshot_matches(
-        snapshot,
-        expected_executable=expected_executable,
-        required_token=required_token,
-    ):
+    deadline = time.monotonic() + PROCESS_VERIFY_TIMEOUT
+    snapshot = None
+    while time.monotonic() < deadline:
+        snapshot = _process_snapshot(pid)
+        if _snapshot_matches(
+            snapshot,
+            expected_executable=expected_executable,
+            required_token=required_token,
+        ):
+            break
+        time.sleep(PROCESS_VERIFY_INTERVAL)
+    else:
         return None
     return {
         "schema_version": PROCESS_STATE_VERSION,
@@ -279,6 +287,33 @@ def _bounded_log_tail(path: Path, limit: int = 1000) -> str:
         return path.read_text(errors="replace").strip()[-limit:]
     except OSError:
         return ""
+
+
+def _unverified_process_error(
+    process: subprocess.Popen,
+    *,
+    label: str,
+    expected_executable: str,
+    log_path: Path,
+) -> str:
+    """Capture verification evidence and reap the exact child we just spawned."""
+    snapshot = _process_snapshot(process.pid)
+    observed = snapshot["executable"] if snapshot else "(unavailable)"
+    returncode = process.poll()
+    if returncode is None:
+        process.terminate()
+    try:
+        waited = process.wait(timeout=PROCESS_STOP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        waited = process.wait(timeout=PROCESS_KILL_TIMEOUT)
+    returncode = waited if waited is not None else process.returncode
+    tail = _bounded_log_tail(log_path) or "(no output)"
+    return (
+        f"could not verify the new {label} process "
+        f"(expected executable {os.path.realpath(expected_executable)}, "
+        f"observed {observed}, rc {returncode}): {tail}"
+    )
 
 
 # -- config (instance.json `vm` block) ---------------------------------------
@@ -649,12 +684,34 @@ def do_mcp_up(wait: float = 15) -> dict:
     if m := _missing(cfg, "ssh_host", "ssh_user", "ssh_key_path"):
         return {"ok": False, "output": m}
     with _process_state_lock(MCP_LOCKFILE):
-        if (state := _tunnel_process()) and _tunnel_ready():
+        state = _tunnel_process()
+        ready = _tunnel_ready()
+        if state and ready:
+            if _process_record_matches(
+                state,
+                expected_executable=_ssh_executable(),
+                required_token=str(MCP_SOCKET),
+            ):
+                return {
+                    "ok": True,
+                    "output": f"tunnel already up (pid {state['pid']})",
+                    "socket": str(MCP_SOCKET),
+                    "pid": state["pid"],
+                }
             return {
-                "ok": True,
-                "output": f"tunnel already up (pid {state['pid']})",
+                "ok": False,
+                "running": True,
+                "unverified": True,
                 "socket": str(MCP_SOCKET),
-                "pid": state["pid"],
+                "output": "tunnel socket is held by an unverified process; refusing to start",
+            }
+        if state is None and ready:
+            return {
+                "ok": False,
+                "running": True,
+                "unverified": True,
+                "socket": str(MCP_SOCKET),
+                "output": "tunnel socket is held by an unverified process; refusing to start",
             }
         if state and not _terminate_owned_process(
             state,
@@ -703,9 +760,15 @@ def do_mcp_up(wait: float = 15) -> dict:
             port=port,
         )
         if state is None:
-            if p.poll() is None:
-                p.terminate()
-            return {"ok": False, "output": "could not verify the new ssh tunnel process"}
+            return {
+                "ok": False,
+                "output": _unverified_process_error(
+                    p,
+                    label="ssh tunnel",
+                    expected_executable=_ssh_executable(),
+                    log_path=MCP_LOG,
+                ),
+            }
         _atomic_write_process_state(MCP_PIDFILE, state)
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
@@ -718,12 +781,37 @@ def do_mcp_up(wait: float = 15) -> dict:
                     "output": f"ssh tunnel exited (rc {p.returncode}): {err or '(no output)'}",
                 }
             if _tunnel_ready():
+                if _process_record_matches(
+                    state,
+                    expected_executable=_ssh_executable(),
+                    required_token=str(MCP_SOCKET),
+                ):
+                    return {
+                        "ok": True,
+                        "output": f"tunnel up — {MCP_SOCKET} -> guest 127.0.0.1:{port}",
+                        "socket": str(MCP_SOCKET),
+                        "pid": p.pid,
+                        "port": port,
+                    }
+                error = _unverified_process_error(
+                    p,
+                    label="ssh tunnel",
+                    expected_executable=_ssh_executable(),
+                    log_path=MCP_LOG,
+                )
+                MCP_PIDFILE.unlink(missing_ok=True)
+                remaining = _tunnel_ready()
+                if not remaining:
+                    MCP_SOCKET.unlink(missing_ok=True)
                 return {
-                    "ok": True,
-                    "output": f"tunnel up — {MCP_SOCKET} -> guest 127.0.0.1:{port}",
-                    "socket": str(MCP_SOCKET),
-                    "pid": p.pid,
-                    "port": port,
+                    "ok": False,
+                    "running": remaining,
+                    "unverified": remaining,
+                    "socket": str(MCP_SOCKET) if remaining else None,
+                    "output": (
+                        f"{error}; tunnel socket remains live and unverified"
+                        if remaining else error
+                    ),
                 }
             time.sleep(0.2)
         stopped = _terminate_owned_process(
@@ -747,6 +835,7 @@ def do_mcp_down() -> dict:
     with _process_state_lock(MCP_LOCKFILE):
         state = _tunnel_process()
         stale = MCP_PIDFILE.exists() and state is None
+        ready = _tunnel_ready()
         if state and not _terminate_owned_process(
             state,
             expected_executable=_ssh_executable(),
@@ -757,6 +846,14 @@ def do_mcp_down() -> dict:
                 "output": f"verified tunnel did not stop (pid {state['pid']})",
             }
         MCP_PIDFILE.unlink(missing_ok=True)
+        if state is None and ready:
+            return {
+                "ok": False,
+                "running": True,
+                "unverified": True,
+                "socket": str(MCP_SOCKET),
+                "output": "unverified tunnel is still listening; state removed, process not signaled",
+            }
         MCP_SOCKET.unlink(missing_ok=True)
         if state:
             output = f"tunnel stopped (pid {state['pid']})"
