@@ -14,6 +14,7 @@ Run:
 """
 from __future__ import annotations
 
+import io
 import os
 import signal
 import socket
@@ -72,14 +73,16 @@ class VerbDispatchTests(unittest.TestCase):
     def test_virsh_calls_honor_libvirt_uri(self):
         cfg = dict(SAVED, libvirt_uri="qemu:///system")
         with mock.patch.object(vm, "read", return_value=cfg), \
-             mock.patch.object(vm, "_run", return_value=(True, "")) as run:
+             mock.patch.object(vm, "_run", return_value=(True, "")) as run, \
+             mock.patch.object(vm, "_domain_state", return_value=(True, "running")):
             vm.do_reset()
         argv = run.call_args[0][0]
         self.assertEqual(argv[:3], ["virsh", "--connect", "qemu:///system"])
 
     def test_virsh_omits_connect_when_no_uri(self):
         with mock.patch.object(vm, "read", return_value=SAVED), \
-             mock.patch.object(vm, "_run", return_value=(True, "")) as run:
+             mock.patch.object(vm, "_run", return_value=(True, "")) as run, \
+             mock.patch.object(vm, "_domain_state", return_value=(True, "running")):
             vm.do_reset()
         argv = run.call_args[0][0]
         self.assertEqual(argv[0], "virsh")
@@ -87,7 +90,8 @@ class VerbDispatchTests(unittest.TestCase):
 
     def test_reset_passes_running_for_the_offline_clean_snapshot(self):
         with mock.patch.object(vm, "read", return_value=SAVED), \
-             mock.patch.object(vm, "_run", return_value=(True, "")) as run:
+             mock.patch.object(vm, "_run", return_value=(True, "")) as run, \
+             mock.patch.object(vm, "_domain_state", return_value=(True, "running")):
             r = vm.do_reset()
         self.assertTrue(r["ok"])
         argv = run.call_args[0][0]
@@ -98,7 +102,10 @@ class VerbDispatchTests(unittest.TestCase):
         # End-of-loop: revert to the offline clean snapshot WITHOUT --running, so
         # the box returns clean *and* powered off (frees the host's ~12 GB).
         with mock.patch.object(vm, "read", return_value=SAVED), \
-             mock.patch.object(vm, "_run", return_value=(True, "")) as run:
+             mock.patch.object(vm, "_run", return_value=(True, "")) as run, \
+             mock.patch.object(
+                 vm, "_domain_state", return_value=(True, "powered_off")
+             ):
             r = vm.do_reset(running=False)
         self.assertTrue(r["ok"])
         argv = run.call_args[0][0]
@@ -987,6 +994,15 @@ class SocketTransportTests(unittest.TestCase):
         r = vm.broker_call("GET", "/nope")
         self.assertFalse(r["ok"])
 
+    def test_status_fault_returns_sanitized_json_instead_of_dropping_response(self):
+        with mock.patch.object(vm, "do_status", side_effect=ValueError("SECRET")), \
+             mock.patch.object(vm_broker.sys, "stderr", new_callable=io.StringIO) as log:
+            r = vm.broker_call("GET", "/status")
+        self.assertEqual(r, {"ok": False, "error": "broker request failed"})
+        self.assertIn("event=handler_error", log.getvalue())
+        self.assertIn("error=ValueError", log.getvalue())
+        self.assertNotIn("SECRET", log.getvalue())
+
     def test_validate_proxies_the_candidate_cfg_in_the_body(self):
         # The in-sandbox server proxies validate through exactly this path.
         with mock.patch.object(vm, "_run", return_value=(True, "Id: 3")):
@@ -1001,6 +1017,24 @@ class SocketTransportTests(unittest.TestCase):
             r = vm.broker_call("POST", "/exec", {"command": "exit 2"})
         self.assertEqual(r["exit"], 2)
         self.assertEqual(r["stdout"], "out")
+
+    def test_busy_reset_returns_without_attempting_reset(self):
+        self.srv.vm_mutation_lock.acquire()
+        try:
+            with mock.patch.object(vm, "MUTATION_LOCK_TIMEOUT", 0.01), \
+                 mock.patch.object(vm, "do_reset") as reset:
+                r = vm.broker_call(
+                    "POST", "/reset", {"running": False}, timeout=1
+                )
+        finally:
+            self.srv.vm_mutation_lock.release()
+        self.assertEqual(r, {
+            "ok": False,
+            "error": "vm_busy",
+            "output": "another VM mutation is still running",
+            "wait_seconds": 0.01,
+        })
+        reset.assert_not_called()
 
     def test_mcp_routes_dispatch_over_the_socket(self):
         # The sandbox drives the GUI seam through exactly these routes.

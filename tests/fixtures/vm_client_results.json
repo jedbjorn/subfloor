@@ -1,0 +1,49 @@
+{
+  "status_success": {
+    "schema_version": 1,
+    "ok": true,
+    "operation": "status",
+    "result": {
+      "broker": {"ready": true},
+      "domain": {"name": "win-test", "state": "running"},
+      "ssh": {"ready": true, "last_error": null},
+      "mcp": {"tunnel_running": false, "unverified": false},
+      "relay": {"state": "deferred"},
+      "endpoint": {"state": "deferred"},
+      "adapter": {"state": "deferred"}
+    },
+    "error": null
+  },
+  "start_success": {
+    "schema_version": 1,
+    "ok": true,
+    "operation": "start",
+    "result": {
+      "domain": {"name": "win-test", "state": "running"},
+      "started": false,
+      "ssh": {"ready": true, "attempts": 1, "last_error": null}
+    },
+    "error": null
+  },
+  "reset_success": {
+    "schema_version": 1,
+    "ok": true,
+    "operation": "reset",
+    "result": {
+      "domain": {"name": "win-test", "state": "powered_off"},
+      "snapshot": "clean"
+    },
+    "error": null
+  },
+  "reset_unknown": {
+    "schema_version": 1,
+    "ok": false,
+    "operation": "reset",
+    "result": null,
+    "error": {
+      "code": "reset_result_unknown",
+      "message": "the broker connection closed before reset could be confirmed",
+      "details": {"domain_state": "unknown"}
+    }
+  }
+}
