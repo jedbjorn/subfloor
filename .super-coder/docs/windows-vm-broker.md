@@ -180,7 +180,7 @@ The seam stays on the socket posture, and the broker never parses a byte of
 MCP traffic:
 
 ```linear
-claude mcp add (TCP 127.0.0.1:18000) :::class1 -> vm_mcp_relay.py (in-sandbox) :::class1 -> run/vm-mcp.sock (bind mount) :::class2 -> ssh -N -L (broker-owned, host) :::class2 -> guest 127.0.0.1:8000 Windows-MCP :::class3
+adapter-injected windows-mcp (TCP 127.0.0.1:18000) :::class1 -> vm_mcp_relay.py (in-sandbox) :::class1 -> run/vm-mcp.sock (bind mount) :::class2 -> ssh -N -L (broker-owned, host) :::class2 -> guest 127.0.0.1:8000 Windows-MCP :::class3
 ```
 
 - **`POST /mcp/up`** — the broker spawns one `ssh -N -L run/vm-mcp.sock:127.0.0.1:<mcp_port>`
@@ -189,10 +189,10 @@ claude mcp add (TCP 127.0.0.1:18000) :::class1 -> vm_mcp_relay.py (in-sandbox) :
   live pid). The socket sits next to `vm-broker.sock` in the bind mount — no
   network surface, no auth token, exactly the transport decision above. SSE /
   chunked streaming is free: it is a byte pipe, not an HTTP proxy.
-- **`./sc vm-mcp-relay up`** — in-sandbox, stdlib-only TCP→socket relay on
-  `127.0.0.1:18000`, because `claude mcp add --transport http` only speaks TCP
-  URLs. The TCP listener exists *inside the container's own namespace*; nothing
-  is exposed on `sc-net` or the docker bridge.
+- **`./sc vm mcp up`** — the model-facing command starts the broker tunnel and
+  stdlib-only TCP→socket relay, then verifies the adapter-injected HTTP endpoint.
+  The relay listens on `127.0.0.1:18000` inside the container's own namespace;
+  nothing is exposed on `sc-net` or the docker bridge.
 - **Port comes from the saved block** (`vm.mcp_port`, default 8000), never the
   caller — the sandbox names an action, not a destination, same as every verb.
 - **Trust class:** raw access to guest UIA ≈ `/exec` (arbitrary commands in the

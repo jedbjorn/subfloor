@@ -56,16 +56,19 @@ a reset after a timeout, disconnect, malformed response, or
 ./sc vm status --json
 ./sc vm start --json
 ./sc vm push <repo-file> [destination] --json
-./sc vm exec --json -- <guest command and arguments>
-./sc vm exec --command-file <utf8-file> --json
+./sc vm exec --json -- <simple guest command and arguments>
+./sc vm exec --command-file <utf8-command-file> --json
 ./sc vm capture [--output .sc-state/local/vm-captures/<name>] --json
 ./sc vm mcp status|up|down --json
 ./sc vm reset --off --json
 ```
 
 - `exec` accepts arguments after `--` or one UTF-8 command file, never both.
-  Preserve PowerShell quotes, dollar variables, pipes, backticks, paths,
-  multiline input, and Unicode instead of adding JSON or shell escape layers.
+  Arguments after `--` are re-joined with single spaces; local shell token
+  boundaries are not preserved. Use that form for simple commands, or pass the
+  entire guest command as one locally quoted argument. For complex, quoted, or
+  multiline PowerShell, use `--command-file` so quotes, dollar variables,
+  pipes, backticks, paths with spaces, and Unicode reach the broker unchanged.
 - `capture` writes an atomic mode-0600 artifact under
   `.sc-state/local/vm-captures/`; use the returned path for visual inspection.
 - `mcp up` verifies the tunnel, relay, and HTTP endpoint before success.
