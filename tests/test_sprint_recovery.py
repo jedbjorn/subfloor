@@ -959,6 +959,54 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             ),
         )
 
+    def test_busy_recovery_with_non_busy_terminal_enters_pickup_episode(self):
+        message = self.send("busy-chain-non-busy-terminal")
+        original = int(message.wake_id)
+        self.fail_wake_turn(original, error_code="SHELL_BUSY")
+        busy_recovery = self.lifecycle.reconcile_unread_pickup(
+            self.sprint_id,
+            trigger="busy-chain-entry",
+        )[0]
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET available_at="
+            "datetime('now','-1 second') WHERE wake_id=?",
+            (busy_recovery,),
+        )
+        self.con.commit()
+        self.fail_wake_turn(
+            busy_recovery,
+            error_code="HARNESS_ROUTE_MISMATCH",
+        )
+
+        replacements = self.lifecycle.reconcile_unread_pickup(
+            self.sprint_id,
+            trigger="busy-chain-non-busy-terminal",
+        )
+
+        self.assertEqual(1, len(replacements))
+        pickup_recovery = replacements[0]
+        self.assertEqual(
+            (
+                "armed",
+                pickup_recovery,
+                f"sprint-recovery:{self.sprint_id}:delivered-unread:{busy_recovery}",
+                "pending",
+                0,
+            ),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,wm.wake_id,w.idempotency_key,w.state,"
+                    "(SELECT COUNT(*) FROM sprint_events e "
+                    "WHERE e.sprint_id=s.sprint_id "
+                    "AND e.event_type='wake.pickup_exhausted') "
+                    "FROM sprints s JOIN sprint_wake_messages wm "
+                    "ON wm.message_id=? JOIN sprint_wake_outbox w "
+                    "ON w.wake_id=wm.wake_id WHERE s.sprint_id=?",
+                    (message.message_id, self.sprint_id),
+                ).fetchone()
+            ),
+        )
+
     def test_unknown_first_turn_pauses_without_replacement(self):
         message = self.send("unknown-first-turn")
         original = int(message.wake_id)
@@ -1249,6 +1297,346 @@ class SprintRecoveryCase(SprintPRWatcherCase):
                     (self.sprint_id,),
                 ).fetchone()[0]
             )["reason"],
+        )
+
+    def test_resume_resets_exhausted_pickup_as_one_fresh_bounded_episode(self):
+        first = self.send(
+            "resume-exhausted-first",
+            declared_type="re-enter",
+        )
+        second = self.send(
+            "resume-exhausted-second",
+            declared_type="new",
+        )
+        handled = self.send(
+            "resume-exhausted-handled",
+            declared_type="re-enter",
+        )
+        terminal = int(first.wake_id)
+        self.assertEqual(terminal, second.wake_id)
+        self.assertEqual(terminal, handled.wake_id)
+        self.fail_wake_turn(terminal, error_code="HARNESS_ROUTE_MISMATCH")
+        exhausted = self.lifecycle.reconcile_unread_pickup(
+            self.sprint_id,
+            trigger="resume-exhausted-first-failure",
+        )[0]
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET available_at="
+            "datetime('now','-1 second') WHERE wake_id=?",
+            (exhausted,),
+        )
+        self.con.commit()
+        self.fail_wake_turn(exhausted, error_code="HARNESS_ROUTE_MISMATCH")
+        self.assertEqual(
+            (),
+            self.lifecycle.reconcile_unread_pickup(
+                self.sprint_id,
+                trigger="resume-exhausted-second-failure",
+            ),
+        )
+        self.assertEqual(
+            "paused",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+        self.assertIsNone(self.messages.mark_read(handled.message_id, 1))
+        old_evidence = tuple(
+            self.con.execute(
+                "SELECT w.state,w.attempt_count,w.idempotency_key,"
+                "(SELECT COUNT(*) FROM sprint_wake_attempts a "
+                "WHERE a.wake_id=w.wake_id) "
+                "FROM sprint_wake_outbox w WHERE w.wake_id=?",
+                (exhausted,),
+            ).fetchone()
+        )
+        exhausted_conversation = str(
+            self.con.execute(
+                "SELECT target_conversation_id FROM sprint_wake_attempts "
+                "WHERE wake_id=? ORDER BY attempt_number DESC LIMIT 1",
+                (exhausted,),
+            ).fetchone()[0]
+        )
+        old_conversation_evidence = tuple(
+            self.con.execute(
+                "SELECT c.state,"
+                "(SELECT COUNT(*) FROM conversation_runs r "
+                "WHERE r.conversation_id=c.conversation_id),"
+                "(SELECT COUNT(*) FROM conversation_messages m "
+                "WHERE m.conversation_id=c.conversation_id),"
+                "(SELECT COUNT(*) FROM conversation_events e "
+                "WHERE e.conversation_id=c.conversation_id) "
+                "FROM conversations c WHERE c.conversation_id=?",
+                (exhausted_conversation,),
+            ).fetchone()
+        )
+        wake_count_before_resume = int(
+            self.con.execute("SELECT COUNT(*) FROM sprint_wake_outbox").fetchone()[0]
+        )
+
+        receipt = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="the participant route was repaired",
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual(1, len(receipt.requeued_wake_ids))
+        reset_wake = receipt.requeued_wake_ids[0]
+        self.assertEqual(
+            wake_count_before_resume + 1,
+            self.con.execute("SELECT COUNT(*) FROM sprint_wake_outbox").fetchone()[0],
+        )
+        self.assertEqual(
+            (
+                "pending",
+                f"sprint-resume:{self.sprint_id}:pickup-episode:{exhausted}",
+                0,
+                None,
+                None,
+            ),
+            tuple(
+                self.con.execute(
+                    "SELECT state,idempotency_key,attempt_count,delivered_at,failed_at "
+                    "FROM sprint_wake_outbox WHERE wake_id=?",
+                    (reset_wake,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            [
+                (first.message_id, reset_wake, 0, 0),
+                (second.message_id, reset_wake, 0, 0),
+                (handled.message_id, exhausted, 1, 1),
+            ],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT m.message_id,wm.wake_id,m.read_at IS NOT NULL,"
+                    "m.delivered_at IS NOT NULL FROM wake_message m "
+                    "JOIN sprint_wake_messages wm USING (message_id) "
+                    "WHERE m.message_id IN (?,?,?) ORDER BY m.message_id",
+                    (first.message_id, second.message_id, handled.message_id),
+                )
+            ],
+        )
+        self.assertEqual(
+            old_evidence,
+            tuple(
+                self.con.execute(
+                    "SELECT w.state,w.attempt_count,w.idempotency_key,"
+                    "(SELECT COUNT(*) FROM sprint_wake_attempts a "
+                    "WHERE a.wake_id=w.wake_id) "
+                    "FROM sprint_wake_outbox w WHERE w.wake_id=?",
+                    (exhausted,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            old_conversation_evidence,
+            tuple(
+                self.con.execute(
+                    "SELECT c.state,"
+                    "(SELECT COUNT(*) FROM conversation_runs r "
+                    "WHERE r.conversation_id=c.conversation_id),"
+                    "(SELECT COUNT(*) FROM conversation_messages m "
+                    "WHERE m.conversation_id=c.conversation_id),"
+                    "(SELECT COUNT(*) FROM conversation_events e "
+                    "WHERE e.conversation_id=c.conversation_id) "
+                    "FROM conversations c WHERE c.conversation_id=?",
+                    (exhausted_conversation,),
+                ).fetchone()
+            ),
+        )
+        reset_events = [
+            json.loads(row[0])
+            for row in self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='wake.requeued' "
+                "AND json_extract(payload,'$.classification')="
+                "'pickup_episode_reset'",
+                (self.sprint_id,),
+            )
+        ]
+        self.assertEqual(1, len(reset_events))
+        self.assertEqual(
+            (exhausted, reset_wake, "resume"),
+            (
+                reset_events[0]["prior_wake_id"],
+                reset_events[0]["replacement_wake_id"],
+                reset_events[0]["trigger"],
+            ),
+        )
+        reconciliation = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='lifecycle.reconciled' "
+                "ORDER BY event_id DESC LIMIT 1",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual([reset_wake], reconciliation["requeued_wake_ids"])
+        self.assertEqual(
+            [first.message_id, second.message_id],
+            reconciliation["unread_message_ids"],
+        )
+
+        wake_count = int(
+            self.con.execute("SELECT COUNT(*) FROM sprint_wake_outbox").fetchone()[0]
+        )
+        replay = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="duplicate authorized resume",
+        )
+        self.assertFalse(replay.changed)
+        self.assertEqual((), replay.requeued_wake_ids)
+        self.assertEqual(
+            (),
+            self.lifecycle.reconcile_unread_pickup(
+                self.sprint_id,
+                trigger="duplicate-pulse-before-delivery",
+            ),
+        )
+        self.assertEqual(
+            wake_count,
+            self.con.execute("SELECT COUNT(*) FROM sprint_wake_outbox").fetchone()[0],
+        )
+
+        idle_conversation = self._activate_unregistered_chat(
+            "resume-exhausted-existing-idle"
+        )
+        self.fail_wake_turn(reset_wake, error_code="HARNESS_ROUTE_MISMATCH")
+        reset_conversation = str(
+            self.con.execute(
+                "SELECT target_conversation_id FROM sprint_wake_attempts "
+                "WHERE wake_id=? ORDER BY attempt_number DESC LIMIT 1",
+                (reset_wake,),
+            ).fetchone()[0]
+        )
+        self.assertNotEqual(
+            idle_conversation,
+            reset_conversation,
+            "the coalesced declared New message must rotate at delivery",
+        )
+        next_episode = self.lifecycle.reconcile_unread_pickup(
+            self.sprint_id,
+            trigger="resumed-episode-first-failure",
+        )
+        self.assertEqual(1, len(next_episode))
+        bounded_recovery = next_episode[0]
+        self.assertEqual(
+            f"sprint-recovery:{self.sprint_id}:delivered-unread:{reset_wake}",
+            self.con.execute(
+                "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
+                (bounded_recovery,),
+            ).fetchone()[0],
+        )
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET available_at="
+            "datetime('now','-1 second') WHERE wake_id=?",
+            (bounded_recovery,),
+        )
+        self.con.commit()
+        self.fail_wake_turn(
+            bounded_recovery,
+            error_code="HARNESS_ROUTE_MISMATCH",
+        )
+        self.assertEqual(
+            (),
+            self.lifecycle.reconcile_unread_pickup(
+                self.sprint_id,
+                trigger="resumed-episode-second-failure",
+            ),
+        )
+        self.assertEqual(
+            ("paused", bounded_recovery, 2, 1),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,"
+                    "json_extract(r.body,'$.detail.wake_id'),"
+                    "json_extract(r.body,'$.detail.attempt_count'),"
+                    "(SELECT COUNT(*) FROM sprint_wake_outbox recovery "
+                    "WHERE recovery.idempotency_key=?) "
+                    "FROM sprints s JOIN sprint_reports r USING (sprint_id) "
+                    "WHERE s.sprint_id=? AND r.report_kind='pause' "
+                    "ORDER BY r.report_id DESC LIMIT 1",
+                    (
+                        (
+                            f"sprint-recovery:{self.sprint_id}:"
+                            f"delivered-unread:{reset_wake}"
+                        ),
+                        self.sprint_id,
+                    ),
+                ).fetchone()
+            ),
+        )
+
+    def test_resume_adopts_one_pending_receiver_wake_for_pickup_reset(self):
+        message = self.send("resume-adopt-exhausted")
+        original = int(message.wake_id)
+        self.fail_wake_turn(original, error_code="HARNESS_ROUTE_MISMATCH")
+        exhausted = self.lifecycle.reconcile_unread_pickup(
+            self.sprint_id,
+            trigger="resume-adopt-first-failure",
+        )[0]
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET available_at="
+            "datetime('now','-1 second') WHERE wake_id=?",
+            (exhausted,),
+        )
+        self.con.commit()
+        self.fail_wake_turn(exhausted, error_code="HARNESS_ROUTE_MISMATCH")
+        self.assertEqual(
+            (),
+            self.lifecycle.reconcile_unread_pickup(
+                self.sprint_id,
+                trigger="resume-adopt-second-failure",
+            ),
+        )
+        followup = self.send("resume-adopt-pending")
+        adopted_wake = int(followup.wake_id)
+        wake_count = int(
+            self.con.execute("SELECT COUNT(*) FROM sprint_wake_outbox").fetchone()[0]
+        )
+
+        receipt = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="adopt the paused receiver backlog",
+        )
+
+        self.assertEqual((adopted_wake,), receipt.requeued_wake_ids)
+        self.assertEqual(
+            wake_count,
+            self.con.execute("SELECT COUNT(*) FROM sprint_wake_outbox").fetchone()[0],
+        )
+        self.assertEqual(
+            (
+                f"sprint-resume:{self.sprint_id}:pickup-episode:{exhausted}",
+                "pending",
+                2,
+            ),
+            tuple(
+                self.con.execute(
+                    "SELECT w.idempotency_key,w.state,COUNT(wm.message_id) "
+                    "FROM sprint_wake_outbox w JOIN sprint_wake_messages wm "
+                    "USING (wake_id) WHERE w.wake_id=? GROUP BY w.wake_id",
+                    (adopted_wake,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            [(message.message_id, adopted_wake), (followup.message_id, adopted_wake)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT message_id,wake_id FROM sprint_wake_messages "
+                    "WHERE message_id IN (?,?) ORDER BY message_id",
+                    (message.message_id, followup.message_id),
+                )
+            ],
         )
 
     def test_resume_repairs_delivered_unread_assignment_once(self):
@@ -1735,6 +2123,73 @@ class SprintRecoveryCase(SprintPRWatcherCase):
                 ).fetchone()
             ),
         )
+
+    def test_startup_converts_legacy_generic_recovery_stall_to_atomic_pause(self):
+        message = self.send("legacy-generic-recovery-stall")
+        original = int(message.wake_id)
+        self.fail_wake_turn(original, error_code="HARNESS_ROUTE_MISMATCH")
+        generic_recovery = self.lifecycle.reconcile_unread_pickup(
+            self.sprint_id,
+            trigger="legacy-current-floor-first-failure",
+        )[0]
+        self.assertEqual(
+            f"sprint-recovery:{self.sprint_id}:delivered-unread:{original}",
+            self.con.execute(
+                "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
+                (generic_recovery,),
+            ).fetchone()[0],
+        )
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET available_at="
+            "datetime('now','-1 second') WHERE wake_id=?",
+            (generic_recovery,),
+        )
+        self.con.commit()
+        self.fail_wake_turn(
+            generic_recovery,
+            error_code="HARNESS_SESSION_DISCOVERY_FAILED",
+        )
+        self.assertEqual(
+            "armed",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+
+        coordinator = self.coordinator()
+        self.assertEqual("armed", coordinator.recover_on_startup(self.sprint_id))
+
+        self.assertEqual(
+            (
+                "paused",
+                None,
+                generic_recovery,
+                "wake_pickup_failed",
+                "HARNESS_SESSION_DISCOVERY_FAILED",
+                1,
+            ),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,m.read_at,wm.wake_id,"
+                    "json_extract(r.body,'$.reason'),"
+                    "json_extract(r.body,'$.detail.error_code'),"
+                    "(SELECT COUNT(*) FROM sprint_events e "
+                    "WHERE e.sprint_id=s.sprint_id "
+                    "AND e.event_type='wake.pickup_exhausted') "
+                    "FROM sprints s JOIN wake_message m "
+                    "ON m.message_id=? JOIN sprint_wake_messages wm "
+                    "USING (message_id) JOIN sprint_reports r "
+                    "ON r.sprint_id=s.sprint_id "
+                    "WHERE s.sprint_id=? AND r.report_kind='pause' "
+                    "ORDER BY r.report_id DESC LIMIT 1",
+                    (message.message_id, self.sprint_id),
+                ).fetchone()
+            ),
+        )
+        before_repeat = self.con.total_changes
+        self.assertEqual("paused", coordinator.recover_on_startup(self.sprint_id))
+        self.assertEqual(before_repeat, self.con.total_changes)
 
     def test_resume_projects_observed_merge_before_releasing_downstream(self):
         registered = self.register()
