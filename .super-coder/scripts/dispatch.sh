@@ -1281,9 +1281,9 @@ case "$cmd" in
   vm-broker-up)      sc_vm_broker_up ;;
   vm-broker-down)    sc_vm_broker_down ;;
   vm-broker-sock)    exec "$PY" "$S/vm.py" sock ;;
-  # In-sandbox half of the GUI seam (#263): TCP→unix relay so `claude mcp add
-  # --transport http` can reach the broker's vm-mcp.sock tunnel. Runs IN the
-  # container; the broker-side half is `POST /mcp/up` on the vm-broker socket.
+  # In-sandbox half of the GUI seam (#263): TCP→unix relay used by managed
+  # adapter injection after `./sc vm mcp up` brings the endpoint online. Runs
+  # IN the container; the broker-side half is `POST /mcp/up` on vm-broker.
   vm-mcp-relay)      exec "$PY" "$S/vm_mcp_relay.py" "$@" ;;
   vm-broker-install)   sc_vm_broker_install ;;
   vm-broker-uninstall) sc_vm_broker_uninstall ;;
@@ -1680,6 +1680,12 @@ super-coder — forkable shell substrate
   ./sc vm status [--json] read broker, VM, SSH, and MCP-tunnel state without mutation;
                            includes relay, endpoint, and active-adapter state
   ./sc vm start [--json]  start only when off, then wait within a bounded SSH-readiness budget
+  ./sc vm push SRC [DEST] [--json]
+                           stage a permitted local artifact through the configured transfer directory
+  ./sc vm exec [--command-file FILE] [--json] -- COMMAND...
+                           execute one guest command through SSH without caller-built JSON
+  ./sc vm capture [--output PATH] [--json]
+                           save a validated screenshot artifact and return viewable metadata
   ./sc vm mcp status|up|down [--json]
                            inspect, start+verify, or stop the managed MCP tunnel and relay
   ./sc vm reset --off [--json]
@@ -1693,9 +1699,9 @@ super-coder — forkable shell substrate
   ./sc vm-broker-install   supervise via a systemd --user unit (survives logout/reboot)
   ./sc vm-broker-uninstall remove the systemd unit
   ./sc vm-mcp-relay        in-SANDBOX half of the GUI seam: up [port] / down / status —
-                             TCP 127.0.0.1:18000 → the broker's vm-mcp.sock tunnel, so
-                             `claude mcp add --transport http` reaches the guest's Windows-MCP
-                             (broker half: POST /mcp/up on the vm-broker socket)
+                             TCP 127.0.0.1:18000 → the broker's vm-mcp.sock tunnel;
+                             managed adapter injection supplies the harness definition and
+                             `./sc vm mcp up` brings the endpoint online
 
   Tailnet broker (run on the HOST — drives the tailnet for sandboxed forks; holds
   the already-`tailscale up` node so the fork never holds a tailnet credential.

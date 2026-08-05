@@ -2,13 +2,14 @@
 """In-sandbox TCP→unix relay — the last inch of the Windows-MCP GUI seam (#263).
 
 The broker's `/mcp/up` forwards `run/vm-mcp.sock` (visible in the sandbox via
-the bind mount) to the guest's localhost-bound Windows-MCP server. But
-`claude mcp add --transport http` only speaks TCP URLs, and a host-side TCP
+the bind mount) to the guest's localhost-bound Windows-MCP server. Managed
+adapter injection supplies the harness definition before launch, and
+`./sc vm mcp up` brings this relay and the endpoint online. A host-side TCP
 tunnel would be invisible to the container (and was rejected by the broker
-spec as a network surface). So this relay runs INSIDE the container: it
-listens on 127.0.0.1:<port> (default 18000) and pipes each connection's bytes
-to the socket, both directions. A raw byte pipe — SSE/chunked streaming pass
-through untouched, no HTTP parsing anywhere.
+spec as a network surface), so this relay runs INSIDE the container: it listens
+on 127.0.0.1:<port> (default 18000) and pipes each connection's bytes to the
+socket, both directions. A raw byte pipe — SSE/chunked streaming pass through
+untouched, no HTTP parsing anywhere.
 
 Stdlib only (the sandbox has python3 and nothing else). Run IN the sandbox:
 
@@ -16,10 +17,6 @@ Stdlib only (the sandbox has python3 and nothing else). Run IN the sandbox:
     ./sc vm-mcp-relay down          stop it
     ./sc vm-mcp-relay status        {ok, running, pid, port, upstream}
     ./sc vm-mcp-relay fg [port]     foreground (what `up` daemonizes)
-
-Then connect the harness:
-
-    claude mcp add --transport http windows-mcp http://127.0.0.1:18000/mcp
 
 The pidfile lives in run/ next to the sockets, but pids are namespace-local:
 this relay is started, inspected, and stopped from inside the container only.
