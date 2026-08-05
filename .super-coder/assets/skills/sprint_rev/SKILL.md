@@ -13,20 +13,34 @@ before a Sprint exists. The evidence differs; independence does not. The
 Reviewer decides and documents; the Planner acts. The FnB retains the
 board-level override established by decision #46.
 
-## Entry and durable state
+Use the simplest path supported by current durable state. Treat independence,
+authority, lifecycle preconditions, durable writes, and typed handoffs as hard
+boundaries; use judgment for investigation and review within them. Repeat a
+read only when later activity could have changed it or the next command
+requires live revalidation.
 
-Pre-declaration QAQC begins from an explicit Planner or FnB request. Read the
-exact current spec document and sign that body directly; there is no Sprint id
-or Sprint inbox to inspect yet:
+## Route the entry
+
+Classify the entry before reading an inbox:
+
+- Pre-declaration QAQC begins from an explicit Planner or FnB request through
+  the ordinary shell-to-shell channel. Read and sign the exact current spec
+  body directly; there is no Sprint id or Sprint inbox to inspect yet.
+- A work-unit review request or delivery-terminal notification is Sprint-scoped.
+  Inspect the Sprint inbox once and accept the actionable request before work.
+- For a live FnB instruction, preserve its board-level authority distinctly and
+  inspect only the durable state needed for an independent decision.
+
+Record pre-declaration QAQC through the authenticated surface:
 
 ```text
 sc sprint record-qaqc --document <spec-document-id> \
   --verdict pass [--findings-document <document-id>]
 ```
 
-Once a Sprint is armed, every review or conformance entry arrives through its
-durable wake/inbox. On every wake or re-entry, load `sprint_rev`, inspect the
-message, and accept the actionable request before beginning:
+Once a Sprint is armed, review and conformance entries arrive through durable
+wakes. Load `sprint_rev` on every entry, then use the Sprint inbox for the
+Sprint-scoped cases above:
 
 ```text
 sc sprint inbox --sprint <id>
@@ -44,57 +58,45 @@ question, answer, blocker, or context message, run `accept` for that message.
 For informational messages it only marks the message read; it does not change
 Sprint or work-unit state.
 
-Review requests use Force-new delivery. A live turn is allowed to finish;
-then, after the receiver has stayed quiet for the configured grace interval,
-delivery atomically closes the exact registry chat and starts a fresh chat with
-the complete undelivered message bundle. Concurrent Force-new requests coalesce
-into that one rotation, and a retry resumes the chat created for its own wake
-instead of rotating again. Stop cleanly after every typed verdict or decision
-handoff so the next request can cross the quiet boundary. The inactivity ceiling
-and registry reaper remain the fallback for a silent hung turn.
-
-Plain New remains separate and is eligible immediately. It enters a verified
-live turn at its natural boundary and rotates only when the registry chat is idle. Re-enter
-resumes the registry chat; no registry row behaves as New. Reviewer verdicts to
-Developers and decisions to Planners are Re-enter. Reviewers never receive
+Review requests use Force-new delivery. Reviewer verdicts to Developers and
+decisions to Planners use Re-enter. Neither displaces a live turn; delivery
+waits for its natural boundary, and the runtime owns bundling, rotation, and
+recovery. Stop after a successful typed handoff. Reviewers never receive
 PR-event subscription wakes.
 
 ## Questions, answers, blockers, and failures
 
-Put a concrete question, answer, blocker, or useful context in a short body file
-and send it to the participant who can act. Ask the Developer for missing PR
-evidence and the Planner for durable state or action-feasibility facts. Do not
-delegate Reviewer judgment to the Planner:
+Put one concrete question, answer, blocker, or useful context item in a short
+body file and send it to the participant who owns the next fact or action. Ask
+the Developer for missing PR evidence and the Planner for durable state or
+action-feasibility facts. Do not delegate Reviewer judgment to the Planner:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
   --key <stable-key>
 ```
 
-Answer incoming questions through `send` so the answer is durable and wakes the
-asker, confirm that write, then mark the handled question read with `accept`. A
-blocker or integrity concern is evidence for your decision. If action is needed,
-send the Planner the decision, impact, exact action, and recommendation through
-the protocol below. Continue independent safe review, but stop when missing
-facts prevent an honest decision at the decision boundary. Do not send duplicate
-reminders; unread recovery owns re-waking.
+Answer an incoming question through `send`, confirm the write, then mark the
+handled message read with `accept`. A blocker or integrity concern is evidence
+for your decision. If action is needed, send the Planner the decision, impact,
+exact action, and recommendation. Continue safe independent review, but stop at
+the decision boundary when missing facts prevent an honest decision. Unread
+recovery owns re-waking; do not send duplicate reminders.
 
 Choose one stable key for the intended recipient and exact body. Reuse it only
 when retrying that same write; use a new key when the recipient or body changes.
 
-Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
-characters is the hard maximum. Before submitting, run `wc -m < <path>` and
-condense if needed. The handoff is complete only when the Sprint command exits
-successfully and confirms the durable write and wake where applicable.
+Keep the body near 6,000 characters and below the 8,000 hard maximum; run
+`wc -m < <path>`. A handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake.
 
-If a Sprint command is rejected or transport fails, the verdict or handoff is
+If a command is rejected or transport fails, the verdict or handoff is
 incomplete. Correct and retry when safe. If the relay itself fails, surface the
 attempted command, evidence, impact, and recommendation to FnB; do not invent an
-alternate delivery protocol. A Reviewer decides whether the condition warrants
-continuing, re-planning, pausing, cancellation, or conclusion, but does not
-invoke the lifecycle transition. Send the durable decision to the Planner, who
-executes it. A live FnB board-level override may supersede that decision and
-must be recorded as FnB authority, not Reviewer judgment.
+alternate protocol. A Reviewer decides whether the condition warrants
+continuing, re-planning, pausing, cancellation, or conclusion; the Planner
+executes the durable decision. Record a live FnB override as FnB authority, not
+Reviewer judgment.
 
 ## Sprint artifact paths
 
@@ -260,8 +262,11 @@ After classifying the requirements, choose exactly one branch:
 - **In-Sprint patching required.** Do not run `record-conformance`. Send the
   Planner a durable `re-enter` decision naming every blocking finding; each
   spec task to cut against the governing spec document, with title and
-  description; and the suggested unit grouping, waves, dependencies, and
-  Developer/Reviewer routing. The durable decision is the failed-pass record.
+  description; and the suggested unit grouping, waves, dependencies,
+  Developer/Reviewer routing, and capacity rationale. Identify independent
+  lanes, expected review overlap, useful reserve, and why additional capacity
+  would or would not shorten the critical path. The durable decision is the
+  failed-pass record.
   After three re-entry episodes in one Sprint, escalate the non-convergence to
   FnB instead of starting another patch round.
 - **Clean or post-Sprint-only findings.** Prepare the conformance report,

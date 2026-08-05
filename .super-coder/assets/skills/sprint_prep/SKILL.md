@@ -10,6 +10,12 @@ common: false
 Use as the owning Planner while a Sprint is `prepared`. Preparation ends at one
 atomic arming decision; it does not launch participants piecemeal.
 
+Use the simplest path supported by current durable state. Treat authority,
+lifecycle preconditions, durable writes, and typed handoffs as hard boundaries;
+use judgment for planning and evidence gathering within them. Repeat a read only
+when later activity could have changed it or the final command requires live
+revalidation.
+
 ## Outcome
 
 Produce one editable prepared Sprint with:
@@ -21,7 +27,8 @@ Produce one editable prepared Sprint with:
 - dependency edges and planned waves;
 - one validated harness/model/effective effort selection per participant;
 - a committed Sprint merge grant; and
-- enough local/GitHub capacity to execute the plan.
+- a capacity plan sized to justified parallel work and review demand, with the
+  local/GitHub capacity to execute it.
 
 The arming transaction validates every recorded selection (explicit null
 model/effort means the route default), records the armed transition, publishes
@@ -45,6 +52,11 @@ sc sprint record-qaqc --document <spec-document-id> --verdict pass \
 
 Use `fail` until every blocking finding is resolved. A body edit changes the
 revision hash and therefore needs a fresh signed record.
+
+Request pre-Sprint QAQC explicitly from the Review shell through the ordinary
+shell-to-shell channel. No Sprint relay or inbox exists yet. Once the signed
+approval id is available, continue preparation here; after arming, switch to
+`sprint_pln`.
 
 Refuse arming when any of these is true:
 
@@ -71,6 +83,35 @@ editing lanes.
 Prefer the smallest dependency graph that preserves correctness. Record the
 expected output in outcome language. Do not encode a shell's implementation
 steps into the durable plan when its role skill and judgment can decide them.
+
+### Balance capacity and parallelism
+
+Optimize for the smallest participant set that keeps justified critical-path
+development and review moving without avoidable queues. Neither minimum
+headcount nor maximum shell occupancy is a goal.
+
+Before choosing participants, analyze the task ledger and dependency graph for
+coherent non-overlapping editing lanes, expected readiness, critical-path work,
+and likely review demand. Put dependency-free Developer lanes in the same wave
+and plan Reviewer capacity so ready reviews can run alongside ongoing
+independent development. Do not serialize work merely because it appears in
+task order, split coherent work, or start a review before its unit is ready just
+to create concurrency.
+
+- For one coherent small lane, normally use one Developer and one Reviewer.
+- Add a Developer only when another independent lane can start or make useful
+  progress without conflicting ownership and has enough review capacity.
+- Add Reviewer capacity when expected concurrent review demand would otherwise
+  queue critical-path work. Reuse a Reviewer across units when their review
+  readiness is unlikely to overlap.
+- Leave eligible capacity unassigned when the roster allows, preserving room
+  for correction, re-plan, or urgent work. Use every eligible shell only when
+  the work graph and review demand justify simultaneous work and coordination
+  cost does not erase the expected time-to-completion gain.
+
+Record the capacity rationale: chosen participants, parallel lanes, expected
+review overlap, retained reserve, and why another shell would or would not
+shorten the critical path.
 
 For every participant, record role, route, model, and effective effort. Never
 pretend a native session can resume across harnesses.
@@ -110,16 +151,16 @@ sc sprint arm --sprint <id>
 After `arm` succeeds, participant pickup belongs to native delivery. The armed
 runtime dispatches ready work and wake recovery reconciles unread pickup; the
 preparing Planner does not manually boot participants or create a second wake
-path. Every wake message creates delivery intent. An idle New rotates to a fresh
-registry chat, an idle Re-enter resumes the registry chat, and any type sent
-while a verified turn is live enters that same chat at its natural boundary.
+path. Initial assignments use Force-new delivery; a live turn reaches its
+natural boundary before delivery and the runtime owns rotation and recovery.
 
 ## Handoff
 
 Once armed, hand control to `sprint_pln` and stop preparation work. Give the FnB
 a compact declaration:
 Sprint id, feature, exact spec revisions, participants/routes, work-unit graph,
-planned waves, merge-grant state, and known accepted risks.
+planned waves, capacity rationale and reserve, merge-grant state, and known
+accepted risks.
 
 Stop when the Sprint is armed or when one concrete eligibility blocker has been
 surfaced. Do not dispatch from a partially prepared plan.
