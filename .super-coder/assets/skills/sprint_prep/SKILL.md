@@ -10,6 +10,12 @@ common: false
 Use as the owning Planner while a Sprint is `prepared`. Preparation ends at one
 atomic arming decision; it does not launch participants piecemeal.
 
+Use the simplest path supported by current durable state. Treat authority,
+lifecycle preconditions, durable writes, and typed handoffs as hard boundaries;
+use judgment for planning and evidence gathering within them. Repeat a read only
+when later activity could have changed it or the final command requires live
+revalidation.
+
 ## Outcome
 
 Produce one editable prepared Sprint with:
@@ -46,6 +52,11 @@ sc sprint record-qaqc --document <spec-document-id> --verdict pass \
 
 Use `fail` until every blocking finding is resolved. A body edit changes the
 revision hash and therefore needs a fresh signed record.
+
+Request pre-Sprint QAQC explicitly from the Review shell through the ordinary
+shell-to-shell channel. No Sprint relay or inbox exists yet. Once the signed
+approval id is available, continue preparation here; after arming, switch to
+`sprint_pln`.
 
 Refuse arming when any of these is true:
 
@@ -140,9 +151,8 @@ sc sprint arm --sprint <id>
 After `arm` succeeds, participant pickup belongs to native delivery. The armed
 runtime dispatches ready work and wake recovery reconciles unread pickup; the
 preparing Planner does not manually boot participants or create a second wake
-path. Every wake message creates delivery intent. An idle New rotates to a fresh
-registry chat, an idle Re-enter resumes the registry chat, and any type sent
-while a verified turn is live enters that same chat at its natural boundary.
+path. Initial assignments use Force-new delivery; a live turn reaches its
+natural boundary before delivery and the runtime owns rotation and recovery.
 
 ## Handoff
 
