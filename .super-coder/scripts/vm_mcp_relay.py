@@ -190,10 +190,11 @@ def up(port: int, wait: float = READY_TIMEOUT) -> dict:
                 state,
                 expected_executable=_relay_executable(),
                 required_token=_relay_token(),
-            ):
+            ) and vm._process_owns_tcp_listener(state["pid"], port):
                 return {
                     "ok": True,
                     "output": f"relay already up (pid {state['pid']})",
+                    "url": f"http://127.0.0.1:{port}/mcp",
                     **status(port),
                 }
             return {
@@ -284,21 +285,24 @@ def up(port: int, wait: float = READY_TIMEOUT) -> dict:
                             if listening else error
                         ),
                     }
-                result = {
-                    "ok": True,
-                    "running": True,
-                    "listening": True,
-                    "pid": p.pid,
-                    "port": port,
-                    "url": f"http://127.0.0.1:{port}/mcp",
-                    "upstream": vm.MCP_SOCKET.exists(),
-                }
-                if not result["upstream"]:
-                    result["output"] = (
-                        "relay up, but the broker tunnel socket is absent — "
-                        "connections will fail until POST /mcp/up on the vm-broker"
-                    )
-                return result
+                if vm._process_owns_tcp_listener(p.pid, port):
+                    result = {
+                        "ok": True,
+                        "running": True,
+                        "listening": True,
+                        "unverified": False,
+                        "pid": p.pid,
+                        "port": port,
+                        "url": f"http://127.0.0.1:{port}/mcp",
+                        "upstream": vm.MCP_SOCKET.exists(),
+                        "output": f"relay up (pid {p.pid})",
+                    }
+                    if not result["upstream"]:
+                        result["output"] = (
+                            "relay up, but the broker tunnel socket is absent — "
+                            "connections will fail until POST /mcp/up on the vm-broker"
+                        )
+                    return result
             time.sleep(READY_INTERVAL)
         stopped = vm._terminate_owned_process(
             state,

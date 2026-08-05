@@ -95,6 +95,65 @@ def _process_snapshot(pid: int) -> dict | None:
     }
 
 
+def _process_socket_inodes(pid: int) -> set[str]:
+    """Return kernel socket inodes currently held by a Linux process."""
+    inodes = set()
+    try:
+        descriptors = Path(f"/proc/{pid}/fd").iterdir()
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor)
+            except OSError:
+                continue
+            if target.startswith("socket:[") and target.endswith("]"):
+                inodes.add(target[8:-1])
+    except OSError:
+        return set()
+    return inodes
+
+
+def _process_owns_tcp_listener(pid: int, port: int) -> bool:
+    """Whether pid owns the loopback TCP listener for port."""
+    inodes = _process_socket_inodes(pid)
+    if not inodes:
+        return False
+    local = f"0100007F:{port:04X}"
+    try:
+        rows = Path("/proc/net/tcp").read_text().splitlines()[1:]
+    except OSError:
+        return False
+    return any(
+        len(fields) > 9
+        and fields[1] == local
+        and fields[3] == "0A"
+        and fields[9] in inodes
+        for fields in (row.split() for row in rows)
+    )
+
+
+def _process_owns_unix_listener(pid: int, path: Path) -> bool:
+    """Whether pid owns the listening Unix socket at path."""
+    inodes = _process_socket_inodes(pid)
+    if not inodes:
+        return False
+    try:
+        rows = Path("/proc/net/unix").read_text().splitlines()[1:]
+    except OSError:
+        return False
+    expected_path = str(path)
+    for row in rows:
+        fields = row.split(maxsplit=7)
+        if (
+            len(fields) == 8
+            and fields[3] == "00010000"
+            and fields[4] == "0001"
+            and fields[6] in inodes
+            and fields[7] == expected_path
+        ):
+            return True
+    return False
+
+
 def _new_process_state(
     pid: int,
     *,
@@ -691,12 +750,13 @@ def do_mcp_up(wait: float = 15) -> dict:
                 state,
                 expected_executable=_ssh_executable(),
                 required_token=str(MCP_SOCKET),
-            ):
+            ) and _process_owns_unix_listener(state["pid"], MCP_SOCKET):
                 return {
                     "ok": True,
                     "output": f"tunnel already up (pid {state['pid']})",
                     "socket": str(MCP_SOCKET),
                     "pid": state["pid"],
+                    "port": int(state.get("port", cfg.get("mcp_port", 8000))),
                 }
             return {
                 "ok": False,
@@ -781,11 +841,32 @@ def do_mcp_up(wait: float = 15) -> dict:
                     "output": f"ssh tunnel exited (rc {p.returncode}): {err or '(no output)'}",
                 }
             if _tunnel_ready():
-                if _process_record_matches(
+                if not _process_record_matches(
                     state,
                     expected_executable=_ssh_executable(),
                     required_token=str(MCP_SOCKET),
                 ):
+                    error = _unverified_process_error(
+                        p,
+                        label="ssh tunnel",
+                        expected_executable=_ssh_executable(),
+                        log_path=MCP_LOG,
+                    )
+                    MCP_PIDFILE.unlink(missing_ok=True)
+                    remaining = _tunnel_ready()
+                    if not remaining:
+                        MCP_SOCKET.unlink(missing_ok=True)
+                    return {
+                        "ok": False,
+                        "running": remaining,
+                        "unverified": remaining,
+                        "socket": str(MCP_SOCKET) if remaining else None,
+                        "output": (
+                            f"{error}; tunnel socket remains live and unverified"
+                            if remaining else error
+                        ),
+                    }
+                if _process_owns_unix_listener(p.pid, MCP_SOCKET):
                     return {
                         "ok": True,
                         "output": f"tunnel up — {MCP_SOCKET} -> guest 127.0.0.1:{port}",
@@ -793,26 +874,6 @@ def do_mcp_up(wait: float = 15) -> dict:
                         "pid": p.pid,
                         "port": port,
                     }
-                error = _unverified_process_error(
-                    p,
-                    label="ssh tunnel",
-                    expected_executable=_ssh_executable(),
-                    log_path=MCP_LOG,
-                )
-                MCP_PIDFILE.unlink(missing_ok=True)
-                remaining = _tunnel_ready()
-                if not remaining:
-                    MCP_SOCKET.unlink(missing_ok=True)
-                return {
-                    "ok": False,
-                    "running": remaining,
-                    "unverified": remaining,
-                    "socket": str(MCP_SOCKET) if remaining else None,
-                    "output": (
-                        f"{error}; tunnel socket remains live and unverified"
-                        if remaining else error
-                    ),
-                }
             time.sleep(0.2)
         stopped = _terminate_owned_process(
             state,
