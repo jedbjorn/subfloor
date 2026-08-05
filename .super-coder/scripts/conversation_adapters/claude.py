@@ -405,10 +405,9 @@ class ClaudeAdapter(ConversationAdapter):
                         ensure_exact_session(session_ref, native_session)
                         seen_session = True
                     stored_cwd = raw.get("cwd")
-                    if (
-                        stored_cwd is not None
-                        and Path(str(stored_cwd)).resolve() != worktree
-                    ):
+                    if stored_cwd is not None and not Path(
+                        str(stored_cwd)
+                    ).resolve().is_relative_to(worktree):
                         raise AdapterError(
                             "HARNESS_WORKTREE_MISMATCH",
                             "Claude session belongs to a different worktree",
