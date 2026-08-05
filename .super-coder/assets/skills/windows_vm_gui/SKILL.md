@@ -57,11 +57,13 @@ unless the server itself runs elevated.
 3. If the VM is off, run `./sc vm start --json`. For a running VM whose SSH is
    not ready, the same command performs bounded readiness checks without a
    restart. Do not invent sleeps.
-4. If the application is absent, open it through `./sc vm exec` or the
-   harness-provided Windows MCP tools.
-5. Run `./sc vm mcp up --json`. Success means the broker tunnel, verified local
+4. Run `./sc vm mcp up --json`. Success means the broker tunnel, verified local
    relay, and MCP HTTP endpoint are ready. Then use the already-provided
    Windows MCP tools; do not register them from inside the skill.
+5. `./sc vm exec` runs in the SSH session context and cannot open a GUI
+   application on the interactive desktop. If the application is absent, open
+   it with the injected Windows MCP `App` tool and visually confirm that it is
+   open before proceeding.
 6. Perform the GUI test. A test failure does not skip cleanup.
 7. When all testing is finished and you still have control, run
    `./sc vm mcp down --json`, then `./sc vm reset --off --json` once. Report MCP

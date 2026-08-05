@@ -752,7 +752,16 @@ class PublicClientTests(unittest.TestCase):
             ),
             "start": ("started", "ssh.attempts", "ssh.last_error"),
             "push": ("source", "destination"),
-            "exec": ("--command-file", "exit_code", "stdout", "stderr"),
+            "exec": (
+                "--command-file",
+                "guest default shell, cmd.exe",
+                "invoke PowerShell explicitly",
+                "stdout is decoded lossily",
+                "base64-encode output guest-side",
+                "exit_code",
+                "stdout",
+                "stderr",
+            ),
             "capture": (
                 "--output",
                 ".sc-state/local/vm-captures",

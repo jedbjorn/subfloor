@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -11,9 +13,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SKILLS = ENGINE / "assets" / "skills"
-MIGRATION = ENGINE / "migrations" / "0182_reseed_windows_guest_shell_output.sql"
+MIGRATION = ENGINE / "migrations" / "0183_reseed_windows_gui_app_help.sql"
 README = ROOT / "docs" / "README.md"
 BROKER_DOC = ENGINE / "docs" / "windows-vm-broker.md"
+DISPATCH = ENGINE / "scripts" / "dispatch.sh"
+RELAY = ENGINE / "scripts" / "vm_mcp_relay.py"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import seed_skills
@@ -74,6 +78,21 @@ class WindowsSkillWorkflowTest(unittest.TestCase):
             content,
         )
         self.assertIn("For byte-exact output, base64-encode\n  it guest-side", content)
+
+    def test_both_skills_route_gui_app_open_through_injected_app_tool(self):
+        for name in ("windows_devkit", "windows_vm_gui"):
+            with self.subTest(skill=name):
+                content = skill(name)["content"]
+                normalized = " ".join(content.split())
+                self.assertIn(
+                    "`./sc vm exec` runs in the SSH session context and cannot open "
+                    "a GUI application on the interactive desktop.",
+                    normalized,
+                )
+                self.assertIn("injected Windows MCP `App` tool", normalized)
+                self.assertIn(
+                    "visually confirm that it is open before proceeding", normalized
+                )
 
     def test_gui_uses_adapter_tools_and_ordered_mcp_cleanup(self):
         content = skill("windows_vm_gui")["content"]
@@ -146,6 +165,27 @@ class WindowsSkillWorkflowTest(unittest.TestCase):
             ):
                 self.assertNotIn("curl --unix-socket", line)
         self.assertIn("through typed `./sc vm` commands", broker)
+
+    def test_delivered_relay_guidance_uses_managed_adapter_injection(self):
+        combined = f"{DISPATCH.read_text()}\n{RELAY.read_text()}".lower()
+
+        self.assertNotIn("claude mcp add", combined)
+        self.assertIn("managed adapter injection", combined)
+        self.assertIn("./sc vm mcp up", combined)
+
+    def test_top_level_help_catalogues_public_guest_commands(self):
+        completed = subprocess.run(
+            [str(ROOT / "sc"), "help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "SC_DISPATCH": str(DISPATCH)},
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        for command in ("vm push", "vm exec", "vm capture"):
+            self.assertIn(f"./sc {command}", completed.stdout)
 
 
 class WindowsSkillReseedTest(unittest.TestCase):

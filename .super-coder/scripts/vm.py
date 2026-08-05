@@ -2250,7 +2250,10 @@ def client_main(argv: list[str]) -> int:
         help="execute one exact guest command",
         description=(
             "Execute arguments after -- or the exact UTF-8 contents of one "
-            "--command-file. JSON result fields: exit_code, stdout, stderr."
+            "--command-file. Commands run through SSH under the guest default "
+            "shell, cmd.exe; invoke PowerShell explicitly. Guest console stdout "
+            "is decoded lossily; base64-encode output guest-side when byte-exact "
+            "output is required. JSON result fields: exit_code, stdout, stderr."
         ),
     )
     execute.add_argument(

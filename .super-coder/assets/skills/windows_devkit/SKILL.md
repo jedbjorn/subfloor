@@ -36,8 +36,10 @@ testing snapshot, credentials, and guest toolchain.
 3. If the domain is off, run `./sc vm start --json`. If it is already running
    but SSH is not ready, the same command waits for readiness without restarting
    it. Do not invent sleeps.
-4. If the testing application is absent, open it through `./sc vm exec` or the
-   Windows GUI tools, according to the test.
+4. `./sc vm exec` runs in the SSH session context and cannot open a GUI
+   application on the interactive desktop. If the testing application is
+   absent, run `./sc vm mcp up --json`, open it with the injected Windows MCP
+   `App` tool, and visually confirm that it is open before proceeding.
 5. Use `push`, `exec`, and `capture` as needed, then perform the test.
 6. A test failure does not skip cleanup. When testing is finished and you still
    have control, run `./sc vm mcp down --json` if GUI transport was used, then
