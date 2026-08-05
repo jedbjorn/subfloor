@@ -20,7 +20,8 @@
   "conversation": {
     "contract_version": 1,
     "minimum_cli_version": "0.30.0",
-    "verified_cli_version": "0.30.0",
+    "verified_cli_version": "0.33.0",
+    "maximum_cli_version_exclusive": "0.34.0",
     "driver": "kimi-print",
     "session_ref": {
       "source": "native-session-store",

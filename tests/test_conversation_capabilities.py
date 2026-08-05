@@ -71,11 +71,12 @@ class ConversationCapabilityContractTest(unittest.TestCase):
                     conversation["verified_cli_version"],
                     probe["verified_cli_version"],
                 )
-                self.assertEqual(
-                    conversation["minimum_cli_version"],
-                    conversation["verified_cli_version"],
-                    "the spike uses the conservative live-probed version as its floor",
-                )
+                if harness != "kimi":
+                    self.assertEqual(
+                        conversation["minimum_cli_version"],
+                        conversation["verified_cli_version"],
+                        "the spike uses the live-probed version as its floor",
+                    )
                 self.assertEqual(conversation["driver"], probe["driver"])
                 self.assertEqual(
                     set(conversation["capabilities"]),
@@ -138,6 +139,36 @@ class ConversationCapabilityContractTest(unittest.TestCase):
     def test_kimi_uses_prompt_mode_and_native_store_identity(self) -> None:
         conversation = self.adapter("kimi")["conversation"]
         probe = self.probes["required_harnesses"]["kimi"]
+        self.assertEqual(
+            {
+                key: conversation[key]
+                for key in (
+                    "minimum_cli_version",
+                    "verified_cli_version",
+                    "maximum_cli_version_exclusive",
+                )
+            },
+            {
+                "minimum_cli_version": "0.30.0",
+                "verified_cli_version": "0.33.0",
+                "maximum_cli_version_exclusive": "0.34.0",
+            },
+        )
+        self.assertEqual(
+            {
+                key: probe[key]
+                for key in (
+                    "minimum_cli_version",
+                    "verified_cli_version",
+                    "maximum_cli_version_exclusive",
+                )
+            },
+            {
+                "minimum_cli_version": "0.30.0",
+                "verified_cli_version": "0.33.0",
+                "maximum_cli_version_exclusive": "0.34.0",
+            },
+        )
         self.assertEqual(conversation["driver"], "kimi-print")
         self.assertEqual(conversation["session_ref"], {
             "source": "native-session-store",
