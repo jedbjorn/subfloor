@@ -63,6 +63,10 @@ class SprintInvariantError(SprintLifecycleError):
     """The durable Sprint plan is not eligible for the requested transition."""
 
 
+class SprintPreflightError(SprintInvariantError):
+    """The selected participant route is incompatible with this runtime."""
+
+
 @dataclass(frozen=True)
 class LifecycleActor:
     kind: str
@@ -326,13 +330,13 @@ class SprintLifecycleStore:
                 sprint_id,
             )
         except sprint_participant_chats.SprintConversationError as exc:
-            raise SprintInvariantError(str(exc)) from exc
+            raise SprintPreflightError(str(exc)) from exc
         fingerprint = self._route_fingerprint(routes)
         for harness in dict.fromkeys(route.harness for route in routes):
             try:
                 self.probe_harness(harness)
             except AdapterError as exc:
-                raise SprintInvariantError(str(exc)) from exc
+                raise SprintPreflightError(str(exc)) from exc
         return fingerprint
 
     def _participant_selection_fingerprint(self, sprint_id: int) -> str:

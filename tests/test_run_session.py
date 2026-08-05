@@ -374,6 +374,59 @@ class HeadlessSessionFailureTest(unittest.TestCase):
         atomic_write.assert_not_called()
         execvpe.assert_not_called()
 
+    def test_sc_run_headless_refuses_missing_model_before_session_creation(self) -> None:
+        con = mock.Mock()
+        con.execute.return_value.fetchall.return_value = []
+        chosen = {"shell_id": 1, "shortname": "DEV1", "flavor": "dev"}
+        fdefaults = {
+            "dev": {"default_harness": "kimi", "models": {}}
+        }
+        open_session = mock.Mock()
+        ensure_worktree = mock.Mock()
+        execvpe = mock.Mock()
+
+        with mock.patch.dict(run.os.environ, {}, clear=True), \
+                mock.patch.object(
+                    run.sys, "argv",
+                    ["run.py", "--headless", "DEV1", "--harness", "kimi"]), \
+                mock.patch.object(run, "open_db", return_value=con), \
+                mock.patch.object(
+                    run.seed_skills, "sync_engine_skills", return_value=[]), \
+                mock.patch.object(
+                    run, "authenticate", return_value={"user_id": 1}), \
+                mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
+                mock.patch.object(run, "list_shells", return_value=[chosen]), \
+                mock.patch.object(run, "pick_shell", return_value=chosen), \
+                mock.patch.object(
+                    run.shell_liveness, "compute",
+                    return_value={"supported": False, "indeterminate": 0}), \
+                mock.patch.object(run, "ensure_harness_path"), \
+                mock.patch.object(
+                    run, "load_adapter",
+                    return_value={
+                        "harness": "kimi",
+                        "headless": {
+                            "launch": ["kimi", "--prompt", "{prompt}"],
+                            "model_flag": "--model",
+                            "effort": {"flag": "--effort"},
+                        },
+                    },
+                ), \
+                mock.patch.object(run, "open_session", open_session), \
+                mock.patch.object(run, "ensure_worktree", ensure_worktree), \
+                mock.patch.object(run.os, "execvpe", execvpe), \
+                self.assertRaises(SystemExit) as raised:
+            run.main()
+
+        self.assertEqual(
+            str(raised.exception),
+            "sc run: harness 'kimi' cannot resolve a model: no model was "
+            "supplied and no flavor default exists for it; supply an explicit model",
+        )
+        open_session.assert_not_called()
+        ensure_worktree.assert_not_called()
+        execvpe.assert_not_called()
+
 
 LAUNCH_RECORDS = """
 CREATE TABLE shell_launch_records (

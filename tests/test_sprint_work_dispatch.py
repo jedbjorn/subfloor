@@ -259,12 +259,18 @@ class DispatchGateTest(SprintWorkDispatchCase):
         with self.assertRaisesRegex(
             sprint_domain.SprintInvariantError,
             "HARNESS_UNAVAILABLE",
-        ):
+        ) as caught:
             sprint_domain.SprintLifecycleStore(
                 self.con, probe_harness=unavailable
             ).arm(self.sprint_id, 3)
 
         self.assert_arm_left_no_writes()
+        handler = object.__new__(server.Handler)
+        handler._send = lambda status, body: (status, body)
+        self.assertEqual(
+            (422, {"error": "HARNESS_UNAVAILABLE: cannot probe codex"}),
+            handler._sprint_error(caught.exception),
+        )
 
     def test_arm_rejects_unknown_adapter_before_any_write(self) -> None:
         self.create_unit(developer=1)
@@ -278,9 +284,10 @@ class DispatchGateTest(SprintWorkDispatchCase):
         with self.assertRaisesRegex(
             sprint_domain.SprintInvariantError,
             "unknown-harness.*no browser conversation adapter",
-        ):
+        ) as caught:
             self.lifecycle.arm(self.sprint_id, 3)
 
+        self.assertIsInstance(caught.exception, sprint_domain.SprintPreflightError)
         self.assert_arm_left_no_writes()
 
     def test_arm_rejects_out_of_range_harness_before_any_write(self) -> None:
@@ -295,11 +302,12 @@ class DispatchGateTest(SprintWorkDispatchCase):
         with self.assertRaisesRegex(
             sprint_domain.SprintInvariantError,
             "HARNESS_VERSION_UNSUPPORTED",
-        ):
+        ) as caught:
             sprint_domain.SprintLifecycleStore(
                 self.con, probe_harness=unsupported
             ).arm(self.sprint_id, 3)
 
+        self.assertIsInstance(caught.exception, sprint_domain.SprintPreflightError)
         self.assert_arm_left_no_writes()
 
     def test_arm_selection_race_returns_retryable_conflict_without_lifecycle_writes(

@@ -1995,6 +1995,8 @@ class Handler(BaseHTTPRequestHandler):
     def _sprint_error(self, exc: Exception):
         if isinstance(exc, sprint_domain.SprintAuthorityError):
             return self._send(403, {"error": str(exc)})
+        if isinstance(exc, sprint_domain.SprintPreflightError):
+            return self._send(422, {"error": str(exc)})
         if isinstance(exc, sprint_domain.SprintInvariantError):
             return self._send(409, {"error": str(exc)})
         if isinstance(exc, KeyError):

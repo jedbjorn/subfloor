@@ -412,7 +412,10 @@ def test_unresolvable_participant_route_creates_no_chat() -> None:
 
         with pytest.raises(
             sprint_participant_chats.SprintConversationError,
-            match="has no model selected or flavor default",
+            match=(
+                "no model was supplied and no flavor default exists for it; "
+                "supply an explicit model"
+            ),
         ):
             create_wake(con, wake_id=48, participant_id=103)
 

@@ -124,7 +124,8 @@ def resolve_headless_route(
     resolved_model = model if model is not None else flavor_model
     if not isinstance(resolved_model, str) or not resolved_model.strip():
         raise ValueError(
-            f"harness '{harness}' has no model selected or flavor default"
+            f"harness '{harness}' cannot resolve a model: no model was supplied "
+            "and no flavor default exists for it; supply an explicit model"
         )
     if effort is not None and (
         not isinstance(effort, str) or not effort.strip()

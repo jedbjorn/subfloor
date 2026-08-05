@@ -105,12 +105,21 @@ def checked_probe_result(
     minimum = conversation.get("minimum_cli_version")
     maximum = conversation.get("maximum_cli_version_exclusive")
     verified = conversation.get("verified_cli_version")
-    if not all(
-        isinstance(item, str) and item for item in (minimum, maximum, verified)
-    ):
+    compatibility = {
+        "minimum_cli_version": minimum,
+        "maximum_cli_version_exclusive": maximum,
+        "verified_cli_version": verified,
+    }
+    missing = [
+        key
+        for key, value in compatibility.items()
+        if not isinstance(value, str) or not value
+    ]
+    if missing:
         raise AdapterError(
             "HARNESS_MANIFEST_INVALID",
-            f"harness compatibility range is incomplete: {harness}",
+            f"harness compatibility manifest is missing "
+            f"{', '.join(missing)}: {harness}",
         )
     if version_tuple(version) < version_tuple(minimum):
         raise AdapterError(
@@ -602,10 +611,23 @@ def load_manifest(harness: str) -> dict[str, Any]:
             "HARNESS_MANIFEST_INVALID",
             f"harness has no supported conversation contract: {harness}",
         )
-    if not conversation.get("maximum_cli_version_exclusive"):
+    compatibility = {
+        "minimum_cli_version": conversation.get("minimum_cli_version"),
+        "maximum_cli_version_exclusive": conversation.get(
+            "maximum_cli_version_exclusive"
+        ),
+        "verified_cli_version": conversation.get("verified_cli_version"),
+    }
+    missing = [
+        key
+        for key, value in compatibility.items()
+        if not isinstance(value, str) or not value
+    ]
+    if missing:
         raise AdapterError(
             "HARNESS_MANIFEST_INVALID",
-            f"harness compatibility range is incomplete: {harness}",
+            f"harness compatibility manifest is missing "
+            f"{', '.join(missing)}: {harness}",
         )
     declared_events = frozenset(conversation.get("normalized_events") or ())
     if declared_events != NORMALIZED_EVENTS:

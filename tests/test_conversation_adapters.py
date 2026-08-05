@@ -702,7 +702,7 @@ class ConversationAdapterTest(unittest.TestCase):
                 ):
                     adapter._probe_result(upper)
 
-    def test_verified_probe_result_and_missing_upper_manifest_contract(self) -> None:
+    def test_verified_probe_result_names_missing_manifest_keys(self) -> None:
         adapter, _native = self.build("claude")
         result = adapter._probe_result("2.1.222")
         self.assertEqual(result.compatibility, "verified")
@@ -716,7 +716,21 @@ class ConversationAdapterTest(unittest.TestCase):
         invalid = ClaudeAdapter(runner=FakeClaudeRunner(), manifest=manifest)
         with self.assertRaisesRegex(
             AdapterError,
-            "HARNESS_MANIFEST_INVALID: harness compatibility range is incomplete",
+            "HARNESS_MANIFEST_INVALID: harness compatibility manifest is missing "
+            "maximum_cli_version_exclusive: claude",
+        ):
+            invalid._probe_result("2.1.222")
+
+        missing_verified = json.loads(json.dumps(manifest))
+        missing_verified["conversation"]["maximum_cli_version_exclusive"] = "2.2.0"
+        del missing_verified["conversation"]["verified_cli_version"]
+        invalid = ClaudeAdapter(
+            runner=FakeClaudeRunner(), manifest=missing_verified
+        )
+        with self.assertRaisesRegex(
+            AdapterError,
+            "HARNESS_MANIFEST_INVALID: harness compatibility manifest is missing "
+            "verified_cli_version: claude",
         ):
             invalid._probe_result("2.1.222")
 
@@ -729,7 +743,8 @@ class ConversationAdapterTest(unittest.TestCase):
             mock.patch.object(base_adapter, "ADAPTERS", manifest_root),
             self.assertRaisesRegex(
                 AdapterError,
-                "HARNESS_MANIFEST_INVALID: harness compatibility range is incomplete",
+                "HARNESS_MANIFEST_INVALID: harness compatibility manifest is missing "
+                "maximum_cli_version_exclusive: claude",
             ),
         ):
             base_adapter.load_manifest("claude")
