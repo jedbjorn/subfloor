@@ -767,6 +767,14 @@ class PublicClientTests(unittest.TestCase):
             for field in expected:
                 self.assertIn(field, help_text)
 
+    def test_mcp_up_help_documents_total_endpoint_wait(self):
+        with mock.patch.object(sys, "stdout", new_callable=io.StringIO) as output, \
+             self.assertRaises(SystemExit) as raised:
+            vm.client_main(["mcp", "up", "--help"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("pace endpoint probes for up to 15s", output.getvalue())
+
 
 class PublicMcpClientTests(unittest.TestCase):
     SUPPORTED: ClassVar[dict[str, object]] = {
@@ -777,14 +785,17 @@ class PublicMcpClientTests(unittest.TestCase):
         "server_name": "windows-mcp",
     }
 
-    def test_active_adapter_falls_back_to_instance_harness(self):
-        with mock.patch.dict(vm.os.environ, {}, clear=True), \
-             mock.patch.object(
-                 vm.ports, "resolve", return_value={"harness": "codex"}
-             ):
+    def test_active_adapter_is_unknown_without_launched_harness_identity(self):
+        with mock.patch.dict(vm.os.environ, {}, clear=True):
             result = vm.active_mcp_adapter()
 
-        self.assertEqual(result, self.SUPPORTED)
+        self.assertEqual(result, {
+            "harness": None,
+            "state": "unknown",
+            "supported": False,
+            "reason": "SC_HARNESS is not set",
+            "server_name": None,
+        })
 
     def test_endpoint_probe_performs_mcp_initialize_and_closes_session(self):
         initialize = mock.Mock(status=200)
@@ -817,6 +828,12 @@ class PublicMcpClientTests(unittest.TestCase):
             "ready": True,
             "http_status": 200,
             "error": None,
+            "session_cleanup": {
+                "attempted": True,
+                "confirmed": True,
+                "http_status": 204,
+                "error": None,
+            },
         })
         method, path = connections[0].request.call_args.args[:2]
         self.assertEqual((method, path), ("POST", "/mcp"))
@@ -836,6 +853,35 @@ class PublicMcpClientTests(unittest.TestCase):
         )
         for connection in connections:
             connection.close.assert_called_once_with()
+
+    def test_endpoint_probe_keeps_initialize_ready_when_delete_resets(self):
+        initialize = mock.Mock(status=200)
+        initialize.read.return_value = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"protocolVersion": "2025-06-18"},
+        }).encode()
+        initialize.getheader.side_effect = lambda name: {
+            "Content-Type": "application/json",
+            "Mcp-Session-Id": "probe-session",
+        }.get(name)
+        connections = [mock.Mock(), mock.Mock()]
+        connections[0].getresponse.return_value = initialize
+        connections[1].request.side_effect = ConnectionResetError("peer closed")
+
+        with mock.patch.object(
+            vm.http.client, "HTTPConnection", side_effect=connections
+        ):
+            result = vm.mcp_endpoint_status()
+
+        self.assertTrue(result["ready"])
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["session_cleanup"], {
+            "attempted": True,
+            "confirmed": False,
+            "http_status": None,
+            "error": "peer closed",
+        })
 
     def test_endpoint_probe_accepts_sse_initialize_result(self):
         response = mock.Mock(status=200)
@@ -857,6 +903,12 @@ class PublicMcpClientTests(unittest.TestCase):
 
         self.assertTrue(result["ready"])
         self.assertIsNone(result["error"])
+        self.assertEqual(result["session_cleanup"], {
+            "attempted": False,
+            "confirmed": True,
+            "http_status": None,
+            "error": None,
+        })
 
     def test_endpoint_probe_rejects_an_http_only_response(self):
         response = mock.Mock(status=200)
@@ -875,6 +927,71 @@ class PublicMcpClientTests(unittest.TestCase):
             result["error"],
             "response did not contain an MCP initialization result",
         )
+
+    def test_endpoint_wait_retries_with_pacing_until_ready(self):
+        unavailable = {
+            "url": "http://127.0.0.1:18000/mcp",
+            "ready": False,
+            "http_status": None,
+            "error": "connection refused",
+        }
+        ready = {
+            "url": "http://127.0.0.1:18000/mcp",
+            "ready": True,
+            "http_status": 200,
+            "error": None,
+        }
+        clock = iter((0.0, 0.1, 0.2, 0.3, 0.4))
+        sleeps = []
+        with mock.patch.object(
+            vm,
+            "mcp_endpoint_status",
+            side_effect=[unavailable, ready],
+        ) as probe:
+            result = vm.wait_for_mcp_endpoint(
+                timeout=1.0,
+                interval=0.25,
+                clock=lambda: next(clock),
+                sleep=sleeps.append,
+            )
+
+        self.assertEqual(result, {
+            **ready,
+            "attempts": 2,
+            "timeout_seconds": 1.0,
+        })
+        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(sleeps, [0.25])
+
+    def test_endpoint_wait_returns_last_failure_at_total_timeout(self):
+        unavailable = {
+            "url": "http://127.0.0.1:18000/mcp",
+            "ready": False,
+            "http_status": None,
+            "error": "connection refused",
+        }
+        clock = iter((0.0, 0.1, 0.2, 0.3, 1.0))
+        sleeps = []
+        with mock.patch.object(
+            vm,
+            "mcp_endpoint_status",
+            return_value=unavailable,
+        ) as probe:
+            result = vm.wait_for_mcp_endpoint(
+                timeout=1.0,
+                interval=0.5,
+                clock=lambda: next(clock),
+                sleep=sleeps.append,
+            )
+
+        self.assertEqual(result, {
+            **unavailable,
+            "attempts": 2,
+            "timeout_seconds": 1.0,
+        })
+        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(len(sleeps), 1)
+        self.assertAlmostEqual(sleeps[0], 0.5)
 
     def test_up_refuses_unsupported_adapter_without_transport_mutation(self):
         unsupported = {
@@ -922,7 +1039,7 @@ class PublicMcpClientTests(unittest.TestCase):
         with mock.patch.object(vm, "active_mcp_adapter", return_value=self.SUPPORTED), \
              mock.patch.object(vm, "_mcp_broker_call", return_value=(tunnel, None)) as broker, \
              mock.patch.object(vm, "_relay_module", return_value=relay), \
-             mock.patch.object(vm, "mcp_endpoint_status", return_value=endpoint):
+             mock.patch.object(vm, "wait_for_mcp_endpoint", return_value=endpoint):
             result = vm.run_mcp_operation("up")
 
         self.assertTrue(result["ok"])
@@ -975,20 +1092,165 @@ class PublicMcpClientTests(unittest.TestCase):
                  side_effect=[(tunnel_up, None), (tunnel_down, None)],
              ) as broker, \
              mock.patch.object(vm, "_relay_module", return_value=relay), \
-             mock.patch.object(vm, "mcp_endpoint_status", return_value=endpoint):
+             mock.patch.object(vm, "wait_for_mcp_endpoint", return_value=endpoint):
             result = vm.run_mcp_operation("up")
 
         self.assertEqual(result["error"]["code"], "mcp_endpoint_unavailable")
         self.assertEqual(result["error"]["details"], {
             "endpoint": endpoint,
             "relay_cleanup": {"ok": True, "output": "relay stopped"},
-            "tunnel_cleanup": {"ok": True, "output": "tunnel stopped"},
+            "tunnel_cleanup": {
+                "ok": True,
+                "uncertain": False,
+                "result": {"ok": True, "output": "tunnel stopped"},
+                "error": None,
+            },
         })
         self.assertEqual(broker.call_args_list, [
             mock.call("POST", "/mcp/up"),
             mock.call("POST", "/mcp/down"),
         ])
         relay.down.assert_called_once_with(18000)
+
+    def test_endpoint_failure_preserves_uncertain_tunnel_rollback(self):
+        tunnel_up = {
+            "ok": True,
+            "running": True,
+            "listening": True,
+            "unverified": False,
+        }
+        cleanup_error = vm.operation_error(
+            "mcp", "mcp_timeout", "the MCP broker operation timed out"
+        )
+        relay = mock.Mock()
+        relay.up.return_value = {
+            "ok": True,
+            "running": True,
+            "listening": True,
+            "unverified": False,
+            "port": 18000,
+        }
+        relay.down.return_value = {"ok": True, "output": "relay stopped"}
+        endpoint = {
+            "url": "http://127.0.0.1:18000/mcp",
+            "ready": False,
+            "http_status": None,
+            "error": "connection refused",
+        }
+        with mock.patch.object(vm, "active_mcp_adapter", return_value=self.SUPPORTED), \
+             mock.patch.object(
+                 vm,
+                 "_mcp_broker_call",
+                 side_effect=[(tunnel_up, None), (None, cleanup_error)],
+             ), \
+             mock.patch.object(vm, "_relay_module", return_value=relay), \
+             mock.patch.object(vm, "wait_for_mcp_endpoint", return_value=endpoint):
+            result = vm.run_mcp_operation("up")
+
+        self.assertEqual(
+            result["error"]["details"]["tunnel_cleanup"],
+            {
+                "ok": False,
+                "uncertain": True,
+                "result": None,
+                "error": {
+                    "code": "mcp_timeout",
+                    "message": "the MCP broker operation timed out",
+                    "details": {},
+                },
+            },
+        )
+
+    def test_relay_failure_preserves_uncertain_tunnel_rollback(self):
+        tunnel_up = {
+            "ok": True,
+            "running": True,
+            "listening": True,
+            "unverified": False,
+        }
+        cleanup_error = vm.operation_error(
+            "mcp", "broker_unreachable", "the VM broker is not reachable"
+        )
+        relay = mock.Mock()
+        relay.up.return_value = {"ok": False, "output": "relay bind failed"}
+        with mock.patch.object(vm, "active_mcp_adapter", return_value=self.SUPPORTED), \
+             mock.patch.object(
+                 vm,
+                 "_mcp_broker_call",
+                 side_effect=[(tunnel_up, None), (None, cleanup_error)],
+             ), \
+             mock.patch.object(vm, "_relay_module", return_value=relay):
+            result = vm.run_mcp_operation("up")
+
+        self.assertEqual(result["error"]["code"], "mcp_relay_failed")
+        self.assertEqual(
+            result["error"]["details"]["tunnel_cleanup"]["error"]["code"],
+            "broker_unreachable",
+        )
+        self.assertTrue(
+            result["error"]["details"]["tunnel_cleanup"]["uncertain"]
+        )
+
+    def test_status_probes_endpoint_only_for_verified_tunnel_and_relay(self):
+        tunnel = {
+            "ok": True,
+            "running": True,
+            "listening": True,
+            "unverified": False,
+        }
+        relay = mock.Mock()
+        relay.status.return_value = {
+            "ok": True,
+            "running": True,
+            "listening": True,
+            "unverified": False,
+            "port": 18000,
+        }
+        endpoint = {
+            "url": "http://127.0.0.1:18000/mcp",
+            "ready": True,
+            "http_status": 200,
+            "error": None,
+        }
+        with mock.patch.object(vm, "active_mcp_adapter", return_value=self.SUPPORTED), \
+             mock.patch.object(vm, "_mcp_broker_call", return_value=(tunnel, None)), \
+             mock.patch.object(vm, "_relay_module", return_value=relay), \
+             mock.patch.object(
+                 vm, "mcp_endpoint_status", return_value=endpoint
+             ) as probe:
+            result = vm.run_mcp_operation("status")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"]["endpoint"], endpoint)
+        probe.assert_called_once_with(18000)
+
+    def test_status_does_not_probe_an_unverified_tunnel(self):
+        tunnel = {
+            "ok": True,
+            "running": True,
+            "listening": True,
+            "unverified": True,
+        }
+        relay = mock.Mock()
+        relay.status.return_value = {
+            "ok": True,
+            "running": True,
+            "listening": True,
+            "unverified": False,
+            "port": 18000,
+        }
+        with mock.patch.object(vm, "active_mcp_adapter", return_value=self.SUPPORTED), \
+             mock.patch.object(vm, "_mcp_broker_call", return_value=(tunnel, None)), \
+             mock.patch.object(vm, "_relay_module", return_value=relay), \
+             mock.patch.object(vm, "mcp_endpoint_status") as probe:
+            result = vm.run_mcp_operation("status")
+
+        self.assertFalse(result["result"]["endpoint"]["ready"])
+        self.assertEqual(
+            result["result"]["endpoint"]["error"],
+            "tunnel and relay are not both verified",
+        )
+        probe.assert_not_called()
 
     def test_down_reports_both_cleanup_results(self):
         relay = mock.Mock()

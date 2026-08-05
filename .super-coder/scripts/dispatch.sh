@@ -1678,8 +1678,10 @@ super-coder — forkable shell substrate
   holds the ssh key + virsh so the fork never does. See .super-coder/docs/windows-vm-broker.md).
   `launch` brings it up automatically when a VM is linked; `down` stops it:
   ./sc vm status [--json] read broker, VM, SSH, and MCP-tunnel state without mutation;
-                           relay/endpoint state follows in work unit 7, adapter state in work unit 10
+                           includes relay, endpoint, and active-adapter state
   ./sc vm start [--json]  start only when off, then wait within a bounded SSH-readiness budget
+  ./sc vm mcp status|up|down [--json]
+                           inspect, start+verify, or stop the managed MCP tunnel and relay
   ./sc vm reset --off [--json]
                            restore the testing snapshot and confirm the VM is powered off
   ./sc vm-broker           run the broker in the foreground (unix socket)

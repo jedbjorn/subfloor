@@ -33,6 +33,7 @@ from conversation_adapters import (  # noqa: E402
     ReconcileResult,
     adapter_for,
 )
+from conversation_adapters import codex as codex_adapter
 from conversation_adapters import opencode as opencode_adapter
 from conversation_adapters.base import SubprocessRunner
 
@@ -1063,6 +1064,15 @@ class ConversationAdapterTest(unittest.TestCase):
         adapter, runner = self.build("claude")
         turn = adapter.start(self.context, "hello")
         argv = runner.calls[-1][0]
+        injection = [
+            "--mcp-config",
+            (
+                '{"mcpServers":{"windows-mcp":{"type":"http",'
+                '"url":"http://127.0.0.1:18000/mcp"}}}'
+            ),
+        ]
+        self.assertEqual(argv[1:3], injection)
+        self.assertEqual(argv.count("--mcp-config"), 1)
         self.assertIn("--session-id", argv)
         self.assertNotIn("--resume", argv)
         self.assertIn("--include-partial-messages", argv)
@@ -1073,6 +1083,28 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertNotIn("--session-id", argv)
         self.assertTrue(adapter.interrupt(resumed).acknowledged)
         self.assertEqual(runner.processes[-1].signals, [signal.SIGINT])
+
+    def test_codex_app_server_receives_managed_mcp_before_subcommand(self) -> None:
+        native = FakeCodexRpc()
+        with mock.patch.object(
+            codex_adapter,
+            "JsonLineRpcProcess",
+            return_value=native,
+        ) as process:
+            adapter = CodexAdapter()
+            adapter.start(self.context, "hello")
+
+        self.assertEqual(
+            process.call_args.kwargs["argv"],
+            [
+                "codex",
+                "-c",
+                'mcp_servers.windows-mcp.url="http://127.0.0.1:18000/mcp"',
+                "app-server",
+                "--stdio",
+            ],
+        )
+        self.assertEqual(process.call_args.kwargs["cwd"], self.root)
 
     def test_kimi_discovers_native_identity_before_stream_and_resumes_exactly(
         self,

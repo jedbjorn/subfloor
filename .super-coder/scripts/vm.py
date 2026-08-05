@@ -63,6 +63,9 @@ MCP_RELAY_PORT = 18000
 MCP_ENDPOINT_PATH = "/mcp"
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_PROBE_LIMIT = 8192
+MCP_ENDPOINT_PROBE_TIMEOUT = 2.0
+MCP_ENDPOINT_WAIT_TIMEOUT = 15.0
+MCP_ENDPOINT_WAIT_INTERVAL = 0.5
 
 PROCESS_STATE_VERSION = 1
 PROCESS_STOP_TIMEOUT = 2.0
@@ -1452,9 +1455,7 @@ def _materialize_capture(response: dict, output: str | None,
 
 def active_mcp_adapter() -> dict:
     """Describe the launched harness's declared Windows MCP capability."""
-    harness = os.environ.get("SC_HARNESS") or ports.resolve(persist=False).get(
-        "harness"
-    )
+    harness = os.environ.get("SC_HARNESS")
     if not harness:
         return {
             "harness": None,
@@ -1507,8 +1508,13 @@ def _mcp_response_message(raw: bytes, content_type: str) -> dict | None:
     return None
 
 
-def _close_mcp_probe_session(port: int, session_id: str, protocol: str) -> bool:
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+def _close_mcp_probe_session(
+    port: int,
+    session_id: str,
+    protocol: str,
+    timeout: float,
+) -> dict:
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         connection.request(
             "DELETE",
@@ -1521,16 +1527,32 @@ def _close_mcp_probe_session(port: int, session_id: str, protocol: str) -> bool:
         )
         response = connection.getresponse()
         response.read(1024)
-        return int(response.status) in {200, 202, 204, 404, 405}
-    except (OSError, TimeoutError, http.client.HTTPException):
-        return False
+        status = int(response.status)
+        confirmed = status in {200, 202, 204, 404, 405}
+        return {
+            "attempted": True,
+            "confirmed": confirmed,
+            "http_status": status,
+            "error": None if confirmed else f"unexpected HTTP status {status}",
+        }
+    except (OSError, TimeoutError, http.client.HTTPException) as exc:
+        return {
+            "attempted": True,
+            "confirmed": False,
+            "http_status": None,
+            "error": str(exc)[:500],
+        }
     finally:
         connection.close()
 
 
-def mcp_endpoint_status(port: int = MCP_RELAY_PORT) -> dict:
+def mcp_endpoint_status(
+    port: int = MCP_RELAY_PORT,
+    *,
+    timeout: float = MCP_ENDPOINT_PROBE_TIMEOUT,
+) -> dict:
     """Verify the managed endpoint with a bounded MCP initialization handshake."""
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         payload = json.dumps({
             "jsonrpc": "2.0",
@@ -1565,13 +1587,17 @@ def mcp_endpoint_status(port: int = MCP_RELAY_PORT) -> dict:
         protocol = result.get("protocolVersion") if isinstance(result, dict) else None
         ready = status == 200 and isinstance(protocol, str) and bool(protocol)
         session_id = response.getheader("Mcp-Session-Id")
+        session_cleanup = {
+            "attempted": False,
+            "confirmed": True,
+            "http_status": None,
+            "error": None,
+        }
         if ready and session_id:
-            ready = _close_mcp_probe_session(port, session_id, protocol)
-            if not ready:
-                error = "MCP initialized but its probe session did not close"
-            else:
-                error = None
-        elif ready:
+            session_cleanup = _close_mcp_probe_session(
+                port, session_id, protocol, timeout
+            )
+        if ready:
             error = None
         elif message and isinstance(message.get("error"), dict):
             error = str(message["error"].get("message") or "MCP initialization failed")
@@ -1584,6 +1610,7 @@ def mcp_endpoint_status(port: int = MCP_RELAY_PORT) -> dict:
             "ready": ready,
             "http_status": status,
             "error": None if ready else error[:500],
+            "session_cleanup": session_cleanup,
         }
     except (OSError, TimeoutError, http.client.HTTPException) as exc:
         return {
@@ -1591,6 +1618,12 @@ def mcp_endpoint_status(port: int = MCP_RELAY_PORT) -> dict:
             "ready": False,
             "http_status": None,
             "error": str(exc)[:500],
+            "session_cleanup": {
+                "attempted": False,
+                "confirmed": False,
+                "http_status": None,
+                "error": "initialization did not complete",
+            },
         }
     finally:
         connection.close()
@@ -1617,6 +1650,42 @@ def _public_relay(response: dict) -> dict:
         "unverified": bool(response.get("unverified")),
         "port": response.get("port", MCP_RELAY_PORT),
     }
+
+
+def wait_for_mcp_endpoint(
+    port: int = MCP_RELAY_PORT,
+    *,
+    timeout: float = MCP_ENDPOINT_WAIT_TIMEOUT,
+    interval: float = MCP_ENDPOINT_WAIT_INTERVAL,
+    clock=time.monotonic,
+    sleep=time.sleep,
+) -> dict:
+    """Pace MCP initialize probes within one documented total wait budget."""
+    deadline = clock() + timeout
+    attempts = 0
+    endpoint = None
+    while True:
+        remaining = deadline - clock()
+        if endpoint is not None and remaining <= 0:
+            return {
+                **endpoint,
+                "attempts": attempts,
+                "timeout_seconds": timeout,
+            }
+        probe_timeout = max(
+            0.05,
+            min(MCP_ENDPOINT_PROBE_TIMEOUT, remaining),
+        )
+        endpoint = mcp_endpoint_status(port, timeout=probe_timeout)
+        attempts += 1
+        remaining = deadline - clock()
+        if endpoint["ready"] or remaining <= 0:
+            return {
+                **endpoint,
+                "attempts": attempts,
+                "timeout_seconds": timeout,
+            }
+        sleep(min(interval, remaining))
 
 
 def _mcp_snapshot(tunnel_response: dict) -> dict:
@@ -1667,6 +1736,23 @@ def _mcp_broker_call(method: str, path: str) -> tuple[dict | None, dict | None]:
         )
 
 
+def _rollback_mcp_tunnel() -> dict:
+    response, error = _mcp_broker_call("POST", "/mcp/down")
+    if error:
+        return {
+            "ok": False,
+            "uncertain": True,
+            "result": None,
+            "error": _bounded(error["error"]),
+        }
+    return {
+        "ok": bool(response and response.get("ok")),
+        "uncertain": not bool(response),
+        "result": _bounded(response or {}),
+        "error": None,
+    }
+
+
 def run_mcp_operation(action: str) -> dict:
     """Inspect or control the complete managed Windows MCP transport."""
     operation = f"mcp_{action}"
@@ -1704,21 +1790,21 @@ def run_mcp_operation(action: str) -> dict:
 
         relay_response = relay_module.up(MCP_RELAY_PORT)
         if not relay_response.get("ok"):
-            tunnel_cleanup, _ = _mcp_broker_call("POST", "/mcp/down")
+            tunnel_cleanup = _rollback_mcp_tunnel()
             return operation_error(
                 operation,
                 "mcp_relay_failed",
                 str(relay_response.get("output") or "the MCP relay did not start"),
                 {
                     "relay": _public_relay(relay_response),
-                    "tunnel_cleanup": _public_tunnel(tunnel_cleanup or {}),
+                    "tunnel_cleanup": tunnel_cleanup,
                 },
             )
 
-        endpoint = mcp_endpoint_status(MCP_RELAY_PORT)
+        endpoint = wait_for_mcp_endpoint(MCP_RELAY_PORT)
         if not endpoint["ready"]:
             relay_cleanup = relay_module.down(MCP_RELAY_PORT)
-            tunnel_cleanup, _ = _mcp_broker_call("POST", "/mcp/down")
+            tunnel_cleanup = _rollback_mcp_tunnel()
             return operation_error(
                 operation,
                 "mcp_endpoint_unavailable",
@@ -1726,7 +1812,7 @@ def run_mcp_operation(action: str) -> dict:
                 {
                     "endpoint": endpoint,
                     "relay_cleanup": relay_cleanup,
-                    "tunnel_cleanup": tunnel_cleanup or {},
+                    "tunnel_cleanup": tunnel_cleanup,
                 },
             )
 
@@ -2192,10 +2278,18 @@ def client_main(argv: list[str]) -> int:
     mcp_commands = mcp.add_subparsers(dest="mcp_action", required=True)
     for action, help_text in (
         ("status", "inspect adapter, tunnel, relay, and endpoint"),
-        ("up", "start verified tunnel and relay, then probe the endpoint"),
+        (
+            "up",
+            f"start tunnel and relay, then pace endpoint probes for up to "
+            f"{MCP_ENDPOINT_WAIT_TIMEOUT:g}s",
+        ),
         ("down", "stop verified relay and tunnel instances"),
     ):
-        command = mcp_commands.add_parser(action, help=help_text)
+        command = mcp_commands.add_parser(
+            action,
+            help=help_text,
+            description=help_text,
+        )
         command.add_argument(
             "--json", action="store_true", help="print one JSON result object"
         )
