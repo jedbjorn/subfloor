@@ -553,7 +553,10 @@ def do_exec(command: str, timeout: int = 120) -> dict:
         # OEM codepages). A strict decode turned the whole exec into a 500 with
         # no exit code or partial output (#261) — lossy beats fatal here; callers
         # needing byte-exact output base64 it guest-side.
-        p = subprocess.run(_ssh_argv(cfg, command), capture_output=True,
+        # The broker's exec verb deliberately accepts an arbitrary guest command;
+        # _ssh_argv builds a fixed host-side ssh argv and never invokes a host shell.
+        p = subprocess.run(_ssh_argv(cfg, command),  # codeql[py/command-line-injection]
+                           capture_output=True,
                            text=True, encoding="utf-8", errors="replace",
                            timeout=timeout)
         return {"ok": p.returncode == 0, "exit": p.returncode,
@@ -795,19 +798,21 @@ def do_push(src: str, dest: str | None = None) -> dict:
     src_p = Path(os.path.expanduser(str(src)))
     if not src_p.is_absolute():
         src_p = repo_root / src_p
-    src_p = src_p.resolve()
+    # The following filesystem operations use paths proven to remain within the
+    # repo/transfer roots. CodeQL does not model Path.is_relative_to as a guard.
+    src_p = src_p.resolve()  # codeql[py/path-injection]
     if not src_p.is_relative_to(repo_root):
         return {"ok": False, "output": f"push: src must be inside the repo: {src}"}
-    if not src_p.is_file():
+    if not src_p.is_file():  # codeql[py/path-injection]
         return {"ok": False, "output": f"push: source not found: {src_p}"}
     d = Path(os.path.expanduser(str(cfg["transfer_dir"]))).resolve()
     if not d.is_dir():
         return {"ok": False, "output": f"transfer_dir does not exist: {d}"}
-    target = (d / (dest or src_p.name)).resolve()
+    target = (d / (dest or src_p.name)).resolve()  # codeql[py/path-injection]
     if not target.is_relative_to(d):
         return {"ok": False, "output": f"push: dest escapes transfer_dir: {dest}"}
     try:
-        shutil.copy2(src_p, target)
+        shutil.copy2(src_p, target)  # codeql[py/path-injection]
     except OSError as e:
         return {"ok": False, "output": f"push failed: {e}"}
     return {"ok": True, "output": f"staged {src_p.name} -> {target} (guest sees it via the share)"}
