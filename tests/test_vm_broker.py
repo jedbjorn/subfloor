@@ -1018,6 +1018,24 @@ class SocketTransportTests(unittest.TestCase):
         self.assertEqual(r["exit"], 2)
         self.assertEqual(r["stdout"], "out")
 
+    def test_busy_reset_returns_without_attempting_reset(self):
+        self.srv.vm_mutation_lock.acquire()
+        try:
+            with mock.patch.object(vm, "MUTATION_LOCK_TIMEOUT", 0.01), \
+                 mock.patch.object(vm, "do_reset") as reset:
+                r = vm.broker_call(
+                    "POST", "/reset", {"running": False}, timeout=1
+                )
+        finally:
+            self.srv.vm_mutation_lock.release()
+        self.assertEqual(r, {
+            "ok": False,
+            "error": "vm_busy",
+            "output": "another VM mutation is still running",
+            "wait_seconds": 0.01,
+        })
+        reset.assert_not_called()
+
     def test_mcp_routes_dispatch_over_the_socket(self):
         # The sandbox drives the GUI seam through exactly these routes.
         with mock.patch.object(vm, "mcp_status",

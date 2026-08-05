@@ -379,9 +379,16 @@ DOMAIN_START_TIMEOUT = 30
 RESET_COMMAND_TIMEOUT = 60
 START_READINESS_TIMEOUT = 90
 START_READINESS_INTERVAL = 2
+MUTATION_LOCK_TIMEOUT = 5
+RESET_BROKER_BUDGET = (
+    MUTATION_LOCK_TIMEOUT + RESET_COMMAND_TIMEOUT + DOMAIN_STATE_TIMEOUT
+)
 RESET_CLIENT_TIMEOUT = 130
 START_BROKER_BUDGET = (
-    DOMAIN_STATE_TIMEOUT + DOMAIN_START_TIMEOUT + START_READINESS_TIMEOUT
+    MUTATION_LOCK_TIMEOUT
+    + DOMAIN_STATE_TIMEOUT
+    + DOMAIN_START_TIMEOUT
+    + START_READINESS_TIMEOUT
 )
 START_CLIENT_TIMEOUT = START_BROKER_BUDGET + 15
 DEFAULT_CLIENT_TIMEOUT = 30
@@ -1102,7 +1109,11 @@ class BrokerConnectionError(ConnectionError):
         self.request_sent = request_sent
 
 
-class BrokerResponseError(ValueError):
+class BrokerTimeoutError(BrokerConnectionError):
+    """The broker transport exceeded its deadline."""
+
+
+class BrokerResponseError(ConnectionError):
     """The broker returned an empty, partial, or malformed HTTP/JSON response."""
 
 def broker_call(method: str, path: str, body: dict | None = None,
@@ -1132,7 +1143,10 @@ def broker_call(method: str, path: str, body: dict | None = None,
                 break
             chunks.append(b)
     except TimeoutError as e:
-        raise TimeoutError(f"vm-broker timed out after {timeout}s") from e
+        raise BrokerTimeoutError(
+            f"vm-broker timed out after {timeout}s",
+            request_sent=request_sent,
+        ) from e
     except (FileNotFoundError, ConnectionRefusedError, OSError) as e:
         raise BrokerConnectionError(
             f"vm-broker not reachable at {SOCKET}: {e}",
@@ -1207,6 +1221,13 @@ def operation_error(operation: str, code: str, message: str,
 
 
 def _broker_failure(operation: str, response: dict) -> dict:
+    if response.get("error") == "vm_busy":
+        return operation_error(
+            operation,
+            "vm_busy",
+            str(response.get("output") or "another VM mutation is still running"),
+            {"wait_seconds": response.get("wait_seconds")},
+        )
     details: dict = {}
     for key in ("domain_state", "attempts", "last_readiness_error"):
         if key in response:
@@ -1231,6 +1252,27 @@ def run_operation(operation: str) -> dict:
     method, path, body, timeout = calls[operation]
     try:
         response = broker_call(method, path, body, timeout=timeout)
+    except BrokerTimeoutError as exc:
+        if operation == "reset" and exc.request_sent:
+            return operation_error(
+                operation,
+                "reset_result_unknown",
+                "the broker connection closed before reset could be confirmed",
+                {"domain_state": "unknown"},
+            )
+        if operation == "reset":
+            return operation_error(
+                operation,
+                "broker_unreachable",
+                "the VM broker is not reachable",
+                {},
+            )
+        return operation_error(
+            operation,
+            f"{operation}_timeout",
+            f"the VM {operation} operation timed out after {timeout}s",
+            {"timeout_seconds": timeout},
+        )
     except BrokerConnectionError as exc:
         if operation == "reset" and exc.request_sent:
             return operation_error(
@@ -1244,20 +1286,6 @@ def run_operation(operation: str) -> dict:
             "broker_unreachable",
             "the VM broker is not reachable",
             {},
-        )
-    except TimeoutError:
-        if operation == "reset":
-            return operation_error(
-                operation,
-                "reset_result_unknown",
-                "the broker connection closed before reset could be confirmed",
-                {"domain_state": "unknown"},
-            )
-        return operation_error(
-            operation,
-            f"{operation}_timeout",
-            f"the VM {operation} operation timed out after {timeout}s",
-            {"timeout_seconds": timeout},
         )
     except BrokerResponseError:
         if operation == "reset":
@@ -1289,6 +1317,12 @@ def run_operation(operation: str) -> dict:
                     "last_error": response.get("ssh_error"),
                 },
                 "mcp": {"tunnel_running": bool(response["mcp_tunnel_running"])},
+                # Relay/endpoint observation lands in work unit 7; adapter
+                # observation lands in work unit 10. Pin the fields now so the
+                # partial contract is explicit rather than silently narrowed.
+                "relay": {"state": "deferred", "work_unit": 7},
+                "endpoint": {"state": "deferred", "work_unit": 7},
+                "adapter": {"state": "deferred", "work_unit": 10},
             })
         if operation == "start":
             return operation_success(operation, {
@@ -1334,7 +1368,10 @@ def _human_result(value: dict) -> str:
     result = value["result"]
     if operation == "status":
         ssh = "ready" if result["ssh"]["ready"] else "not ready"
-        return f"VM {result['domain']['state']} · SSH {ssh} · broker ready"
+        return (
+            f"VM {result['domain']['state']} · SSH {ssh} · broker ready · "
+            "relay/endpoint deferred to WU7 · adapter deferred to WU10"
+        )
     if operation == "start":
         action = "started" if result["started"] else "already running"
         return f"VM {action} · SSH ready after {result['ssh']['attempts']} attempt(s)"
@@ -1352,7 +1389,9 @@ def client_main(argv: list[str]) -> int:
         help="observe VM readiness without mutation",
         description=(
             "Read-only status. JSON result fields: broker.ready; domain.name, "
-            "domain.state; ssh.ready, ssh.last_error; mcp.tunnel_running."
+            "domain.state; ssh.ready, ssh.last_error; mcp.tunnel_running; "
+            "relay.state and endpoint.state (deferred to work unit 7); "
+            "adapter.state (deferred to work unit 10)."
         ),
     )
     status.add_argument(

@@ -217,6 +217,8 @@ class SingleResponseTests(unittest.TestCase):
     def test_guest_mutating_routes_hold_the_shared_lock(self):
         cases = (
             ("/exec", "do_exec", {"command": "echo ok"}),
+            ("/start", "do_start", {}),
+            ("/reset", "do_reset", {"running": False}),
             ("/push", "do_push", {"src": "artifact", "dest": "staged"}),
             ("/capture", "do_capture", {"command": None}),
         )
@@ -224,8 +226,10 @@ class SingleResponseTests(unittest.TestCase):
             with self.subTest(path=path):
                 events = []
                 lock = mock.MagicMock()
-                lock.__enter__.side_effect = lambda: events.append("lock_enter")
-                lock.__exit__.side_effect = lambda *args: events.append("lock_exit")
+                lock.acquire.side_effect = lambda **kwargs: (
+                    events.append(("lock_acquire", kwargs)) or True
+                )
+                lock.release.side_effect = lambda: events.append(("lock_release", {}))
                 handler = self._handler()
                 handler.path = path
                 handler.server = mock.Mock(vm_mutation_lock=lock)
@@ -239,8 +243,31 @@ class SingleResponseTests(unittest.TestCase):
                     ),
                 ):
                     handler.do_POST()
-                self.assertEqual(events, ["lock_enter", "verb", "lock_exit"])
+                self.assertEqual(events, [
+                    ("lock_acquire", {"timeout": 5}),
+                    "verb",
+                    ("lock_release", {}),
+                ])
                 handler._send.assert_called_once_with(200, {"ok": True})
+
+    def test_busy_reset_returns_before_the_reset_is_attempted(self):
+        handler = self._handler()
+        handler.path = "/reset"
+        handler.server = mock.Mock()
+        handler.server.vm_mutation_lock.acquire.return_value = False
+        handler._body = mock.Mock(return_value={"running": False})
+        handler._send = mock.Mock()
+        with mock.patch.object(vm, "do_reset") as reset:
+            handler.do_POST()
+        reset.assert_not_called()
+        handler.server.vm_mutation_lock.acquire.assert_called_once_with(timeout=5)
+        handler.server.vm_mutation_lock.release.assert_not_called()
+        handler._send.assert_called_once_with(409, {
+            "ok": False,
+            "error": "vm_busy",
+            "output": "another VM mutation is still running",
+            "wait_seconds": 5,
+        })
 
 
 class PublicClientTests(unittest.TestCase):
@@ -273,10 +300,10 @@ class PublicClientTests(unittest.TestCase):
             result = vm.run_operation("start")
         self.assertEqual(result, GOLDEN["start_success"])
         call.assert_called_once_with(
-            "POST", "/start", None, timeout=150
+            "POST", "/start", None, timeout=155
         )
-        self.assertEqual(vm.START_BROKER_BUDGET, 135)
-        self.assertEqual(vm.START_CLIENT_TIMEOUT, 150)
+        self.assertEqual(vm.START_BROKER_BUDGET, 140)
+        self.assertEqual(vm.START_CLIENT_TIMEOUT, 155)
 
     def test_reset_json_matches_golden_shape_and_exceeds_broker_budget(self):
         response = {
@@ -292,7 +319,30 @@ class PublicClientTests(unittest.TestCase):
             "POST", "/reset", {"running": False}, timeout=130
         )
         self.assertEqual(vm.RESET_CLIENT_TIMEOUT, 130)
+        self.assertEqual(vm.RESET_BROKER_BUDGET, 80)
         self.assertEqual(vm.RESET_COMMAND_TIMEOUT, 60)
+
+    def test_busy_reset_is_distinct_and_known_not_to_have_run(self):
+        response = {
+            "ok": False,
+            "error": "vm_busy",
+            "output": "another VM mutation is still running",
+            "wait_seconds": 5,
+        }
+        with mock.patch.object(vm, "broker_call", return_value=response) as call:
+            result = vm.run_operation("reset")
+        self.assertEqual(result, {
+            "schema_version": 1,
+            "ok": False,
+            "operation": "reset",
+            "result": None,
+            "error": {
+                "code": "vm_busy",
+                "message": "another VM mutation is still running",
+                "details": {"wait_seconds": 5},
+            },
+        })
+        self.assertEqual(call.call_count, 1)
 
     def test_reset_malformed_response_is_unknown_and_never_retried(self):
         with mock.patch.object(
@@ -303,13 +353,21 @@ class PublicClientTests(unittest.TestCase):
         self.assertEqual(call.call_count, 1)
 
     def test_reset_transport_timeout_is_unknown_and_never_retried(self):
-        with mock.patch.object(vm, "broker_call", side_effect=TimeoutError) as call:
+        with mock.patch.object(
+            vm,
+            "broker_call",
+            side_effect=vm.BrokerTimeoutError("slow", request_sent=True),
+        ) as call:
             result = vm.run_operation("reset")
         self.assertEqual(result, GOLDEN["reset_unknown"])
         self.assertEqual(call.call_count, 1)
 
     def test_start_transport_timeout_has_distinct_code_and_deadline(self):
-        with mock.patch.object(vm, "broker_call", side_effect=TimeoutError):
+        with mock.patch.object(
+            vm,
+            "broker_call",
+            side_effect=vm.BrokerTimeoutError("slow", request_sent=True),
+        ):
             result = vm.run_operation("start")
         self.assertEqual(result, {
             "schema_version": 1,
@@ -318,8 +376,8 @@ class PublicClientTests(unittest.TestCase):
             "result": None,
             "error": {
                 "code": "start_timeout",
-                "message": "the VM start operation timed out after 150s",
-                "details": {"timeout_seconds": 150},
+                "message": "the VM start operation timed out after 155s",
+                "details": {"timeout_seconds": 155},
             },
         })
 
@@ -333,6 +391,17 @@ class PublicClientTests(unittest.TestCase):
             vm,
             "broker_call",
             side_effect=vm.BrokerConnectionError("absent", request_sent=False),
+        ):
+            result = vm.run_operation("reset")
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"]["code"], "broker_unreachable")
+        self.assertEqual(result["error"]["details"], {})
+
+    def test_reset_timeout_before_send_is_not_uncertain(self):
+        with mock.patch.object(
+            vm,
+            "broker_call",
+            side_effect=vm.BrokerTimeoutError("slow", request_sent=False),
         ):
             result = vm.run_operation("reset")
         self.assertEqual(result["ok"], False)
@@ -390,15 +459,33 @@ class PublicClientTests(unittest.TestCase):
         transport = mock.Mock()
         transport.recv.side_effect = TimeoutError
         with mock.patch.object(vm.socket, "socket", return_value=transport), \
-             self.assertRaisesRegex(TimeoutError, "timed out after 130s"):
+             self.assertRaisesRegex(
+                 vm.BrokerTimeoutError, "timed out after 130s"
+             ) as raised:
             vm.broker_call("POST", "/reset", {"running": False})
+        self.assertIsInstance(raised.exception, ConnectionError)
+        self.assertEqual(raised.exception.request_sent, True)
         transport.connect.assert_called_once_with(str(vm.SOCKET))
         self.assertEqual(transport.sendall.call_count, 1)
         transport.close.assert_called_once_with()
 
+    def test_all_broker_transport_failures_share_connection_error_hierarchy(self):
+        self.assertTrue(issubclass(vm.BrokerConnectionError, ConnectionError))
+        self.assertTrue(issubclass(vm.BrokerTimeoutError, ConnectionError))
+        self.assertTrue(issubclass(vm.BrokerResponseError, ConnectionError))
+
     def test_subcommand_help_documents_json_result_fields(self):
         cases = {
-            "status": ("broker.ready", "ssh.last_error", "mcp.tunnel_running"),
+            "status": (
+                "broker.ready",
+                "ssh.last_error",
+                "mcp.tunnel_running",
+                "relay.state",
+                "endpoint.state",
+                "adapter.state",
+                "work unit 7",
+                "work unit 10",
+            ),
             "start": ("started", "ssh.attempts", "ssh.last_error"),
             "reset": ("domain.state", "snapshot", "--off"),
         }

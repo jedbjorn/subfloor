@@ -111,6 +111,21 @@ class Handler(BaseHTTPRequestHandler):
             self._log("handler_error", error=type(exc).__name__)
             self._send(500, {"ok": False, "error": "broker request failed"})
 
+    def _mutate(self, action) -> None:
+        lock = self.server.vm_mutation_lock
+        if not lock.acquire(timeout=vm.MUTATION_LOCK_TIMEOUT):
+            return self._send(409, {
+                "ok": False,
+                "error": "vm_busy",
+                "output": "another VM mutation is still running",
+                "wait_seconds": vm.MUTATION_LOCK_TIMEOUT,
+            })
+        try:
+            result = action()
+        finally:
+            lock.release()
+        return self._send(200, result)
+
     def do_GET(self) -> None:
         self._guard(self._do_get)
 
@@ -142,24 +157,24 @@ class Handler(BaseHTTPRequestHandler):
     def _do_post(self) -> None:
         if self.path == "/exec":
             b = self._body()
-            with self.server.vm_mutation_lock:
-                return self._send(200, vm.do_exec(b.get("command", ""),
-                                                  int(b.get("timeout", 120))))
+            return self._mutate(
+                lambda: vm.do_exec(b.get("command", ""), int(b.get("timeout", 120)))
+            )
         if self.path == "/start":
-            with self.server.vm_mutation_lock:
-                return self._send(200, vm.do_start())
+            return self._mutate(vm.do_start)
         if self.path == "/reset":
             # {"running": false} ends a run clean + powered OFF (frees host
             # RAM); default true boots a clean box to START a run.
-            with self.server.vm_mutation_lock:
-                return self._send(200, vm.do_reset(self._body().get("running", True)))
+            running = self._body().get("running", True)
+            return self._mutate(lambda: vm.do_reset(running))
         if self.path == "/push":
             b = self._body()
-            with self.server.vm_mutation_lock:
-                return self._send(200, vm.do_push(b.get("src", ""), b.get("dest")))
+            return self._mutate(
+                lambda: vm.do_push(b.get("src", ""), b.get("dest"))
+            )
         if self.path == "/capture":
-            with self.server.vm_mutation_lock:
-                return self._send(200, vm.do_capture(self._body().get("command")))
+            command = self._body().get("command")
+            return self._mutate(lambda: vm.do_capture(command))
         if self.path == "/mcp/up":
             # The GUI seam (#263): forward run/vm-mcp.sock to the guest's
             # Windows-MCP. Target port comes from the SAVED block, never
