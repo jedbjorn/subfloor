@@ -91,8 +91,9 @@ graph LR
   LV --> VM
 ```
 
-- **Container side** — `windows_devkit` makes local socket calls. No key, no
-  `ssh`, no `virsh`, no route to the VM. Nothing changes about its isolation.
+- **Container side** — `windows_devkit` uses the typed `./sc vm` client over the
+  local broker socket. No key, no `ssh`, no `virsh`, no route to the VM.
+  Nothing changes about its isolation.
 - **Host side** — the broker reads `instance.json.vm`, holds the key path, and
   is the only thing that touches the guest or the hypervisor.
 
@@ -104,7 +105,8 @@ Two options, both grounded in the measured facts. Recommend the socket.
 > **Unix socket in the bind-mounted repo (recommended).** The broker listens on
 > e.g. `.super-coder/run/vm-broker.sock` inside the fork repo, which is mounted
 > into the container at the same path. No network surface, no firewall, gated by
-> filesystem permissions. `windows_devkit` calls it with `curl --unix-socket`.
+> filesystem permissions. `windows_devkit` reaches it through typed `./sc vm`
+> commands.
 
 The TCP fallback: bind the broker on the docker-bridge gateway (`172.19.0.1`) or
 `0.0.0.0`. The container *can* reach that (refused, not dropped — a listener is
@@ -270,7 +272,7 @@ Built per the architecture above:
 | MCP seam | `vm.py` — `do_mcp_up` / `do_mcp_down` / `mcp_status` (broker-owned ssh socket-forward); `.super-coder/scripts/vm_mcp_relay.py` — in-sandbox TCP→socket relay (`./sc vm-mcp-relay`) |
 | Supervision | `./sc vm-broker` (foreground), `./sc vm-broker-up` / `-down` (nohup + pidfile), `./sc vm-broker-sock` |
 | Server proxy | `.super-coder/api/server.py` — `/api/vm/validate/{check}` proxies to the broker in-sandbox |
-| Skill | `windows_devkit` — drives the four verbs via `curl --unix-socket`, holds no key |
+| Skill | `windows_devkit` — drives the four verbs through typed `./sc vm` commands, holds no key |
 | Tests | `tests/test_vm_broker.py` — verb dispatch + live unix-socket transport |
 
 ## Open questions

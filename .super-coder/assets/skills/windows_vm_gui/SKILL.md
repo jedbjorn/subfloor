@@ -24,9 +24,26 @@ do not run persistent registration commands or edit user/project harness
 configuration. Report the adapter state from `./sc vm status --json`; an
 unsupported adapter is an honest stop, not a reason to fabricate GUI access.
 
-Windows-MCP runs inside the prepared guest. A missing guest server or toolchain
-requires the operator's `configure_winbox` and re-bake flow. Never install it
-ad hoc during testing.
+## Missing guest Windows-MCP
+
+Windows-MCP is baked guest toolchain, never an ad-hoc test dependency. If it is
+missing, the operator must use the `configure_winbox` flow to:
+
+1. Add Python 3.13+ (for example, `Python.Python.3.13`) to the fork's committed
+   winget manifest and import it into the guest.
+2. Run `pip install uv`, verify `uvx windows-mcp serve --help` exits zero, and
+   register the auto-start task with:
+
+   ```text
+   windows-mcp install --transport streamable-http --host 127.0.0.1 --port 8000
+   ```
+
+   The server must be bound to localhost ONLY (never expose it on the VM network).
+3. Run `./sc vm-bake` so resets restore the prepared server.
+
+The guest requires Python 3.13+ and `uv`. Prefer English-language Windows due
+to the App-tool limitation. UAC prompts and elevated windows are inaccessible
+unless the server itself runs elevated.
 
 ## Canonical workflow
 

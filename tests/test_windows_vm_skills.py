@@ -44,6 +44,10 @@ class WindowsSkillWorkflowTest(unittest.TestCase):
         self.assertIn("There is no reset at the beginning or during a test.", content)
         self.assertIn("Do not automatically retry", content)
         self.assertIn("Report the test result and cleanup result separately.", content)
+        self.assertIn("ask the operator to run `./sc vm-broker-up`", content)
+        self.assertIn(
+            "run `./sc vm mcp down --json` if GUI transport was used", content
+        )
         self.assertIn("are re-joined with single spaces", content)
         self.assertIn("local shell token\n  boundaries are not preserved", content)
         self.assertIn("multiline PowerShell, use `--command-file`", content)
@@ -71,6 +75,20 @@ class WindowsSkillWorkflowTest(unittest.TestCase):
         self.assertIn("The harness tool list may be fixed at launch.", content)
         self.assertIn("Call `Snapshot` first.", content)
         self.assertIn("There is no opening or mid-test reset.", content)
+        self.assertIn("Python 3.13+", content)
+        self.assertIn("`pip install uv`", content)
+        self.assertIn("`uvx windows-mcp serve --help` exits zero", content)
+        self.assertIn(
+            "windows-mcp install --transport streamable-http --host "
+            "127.0.0.1 --port 8000",
+            content,
+        )
+        self.assertIn(
+            "bound to localhost ONLY (never expose it on the VM network)", content
+        )
+        self.assertIn("`./sc vm-bake`", content)
+        self.assertIn("English-language Windows", content)
+        self.assertIn("unless the server itself runs elevated", content)
 
         self.assertEqual(
             reset_invocations(content), ["./sc vm reset --off --json"]
@@ -101,6 +119,13 @@ class WindowsSkillWorkflowTest(unittest.TestCase):
         self.assertIn("./sc vm mcp up", readme)
         self.assertIn("adapter-injected windows-mcp", broker)
         self.assertIn("**`./sc vm mcp up`**", broker)
+        for line in broker.splitlines():
+            if any(
+                f"`{name}`" in line
+                for name in ("windows_devkit", "windows_vm_gui")
+            ):
+                self.assertNotIn("curl --unix-socket", line)
+        self.assertIn("through typed `./sc vm` commands", broker)
 
 
 class WindowsSkillReseedTest(unittest.TestCase):

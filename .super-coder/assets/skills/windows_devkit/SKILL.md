@@ -19,8 +19,8 @@ testing snapshot, credentials, and guest toolchain.
 
 - No `vm` block: stop and ask the operator to link the VM.
 - Invalid configuration or missing broker: report the structured `./sc vm`
-  error. Do not read key material, use `ssh` or `virsh` directly, or build raw
-  broker requests.
+  error and ask the operator to run `./sc vm-broker-up`. Do not read key
+  material, use `ssh` or `virsh` directly, or build raw broker requests.
 - Missing guest toolchain: ask the operator to run `configure_winbox` and
   re-bake. Never install tools during the test and poison the testing snapshot.
 
@@ -36,8 +36,8 @@ testing snapshot, credentials, and guest toolchain.
    Windows GUI tools, according to the test.
 5. Use `push`, `exec`, and `capture` as needed, then perform the test.
 6. A test failure does not skip cleanup. When testing is finished and you still
-   have control, stop GUI transport if it was used, then run
-   `./sc vm reset --off --json` once. This restores the configured testing
+   have control, run `./sc vm mcp down --json` if GUI transport was used, then
+   run `./sc vm reset --off --json` once. This restores the configured testing
    snapshot and leaves the domain powered off.
 7. Report the test result and cleanup result separately. Include any structured
    error and never claim an unconfirmed operation succeeded.
