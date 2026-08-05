@@ -18,6 +18,7 @@ import conversation_broker
 import conversation_events
 import db_driver
 import sprint_participant_chats
+from conversation_adapters import AdapterError, ProbeResult, adapter_for
 
 SPRINT_TRANSITIONS = {
     "prepared": frozenset({"armed", "aborted"}),
@@ -227,11 +228,15 @@ class SprintLifecycleStore:
         *,
         interrupt_run: Callable[[int], bool] | None = None,
         notify_commit: Callable[[], bool] | None = None,
+        probe_harness: Callable[[str], ProbeResult] | None = None,
     ) -> None:
         self.con = con
         self.con.row_factory = sqlite3.Row
         self.interrupt_run = interrupt_run or conversation_broker.interrupt_run
         self.notify_commit = notify_commit or conversation_broker.notify_commit
+        self.probe_harness = probe_harness or (
+            lambda harness: adapter_for(harness).probe()
+        )
 
     def armed_sprint_id(self) -> int | None:
         row = self.con.execute(
@@ -247,6 +252,10 @@ class SprintLifecycleStore:
         and work-unit dispositions together.
         """
         actor = LifecycleActor("planner", planner_shell_id)
+        preflight_fingerprint = self._preflight_arm(
+            sprint_id,
+            actor,
+        )
         with db_driver.write_transaction(self.con, "sprint.arm"):
             sprint = self._sprint(sprint_id)
             if sprint["lifecycle"] != "prepared":
@@ -256,6 +265,14 @@ class SprintLifecycleStore:
             self._require_edge(sprint["lifecycle"], "armed")
             self._authorize(sprint, "armed", actor)
             planner_participant, selections = self._validate_arm_plan(sprint)
+            current_fingerprint = self._participant_selection_fingerprint(
+                sprint_id
+            )
+            if current_fingerprint != preflight_fingerprint:
+                raise SprintInvariantError(
+                    "participant launch selections changed during harness "
+                    "preflight; retry arm"
+                )
             self._update_lifecycle(
                 sprint_id,
                 current="prepared",
@@ -284,6 +301,70 @@ class SprintLifecycleStore:
             )
             SprintWorkUnitStore(self.con)._queue_delivery_terminal(sprint_id)
         return wake_ids
+
+    def _preflight_arm(
+        self,
+        sprint_id: int,
+        actor: LifecycleActor,
+    ) -> str:
+        """Probe one immutable route snapshot before arm takes a write lock."""
+        if self.con.in_transaction:
+            raise SprintInvariantError(
+                "arm harness preflight requires a connection outside a transaction"
+            )
+        sprint = self._sprint(sprint_id)
+        if sprint["lifecycle"] != "prepared":
+            raise SprintStateError(
+                f"arm() requires prepared; found {sprint['lifecycle']}"
+            )
+        self._require_edge(sprint["lifecycle"], "armed")
+        self._authorize(sprint, "armed", actor)
+        self._validate_arm_plan(sprint)
+        try:
+            routes = sprint_participant_chats.prepare_sprint_participant_routes(
+                self.con,
+                sprint_id,
+            )
+        except sprint_participant_chats.SprintConversationError as exc:
+            raise SprintInvariantError(str(exc)) from exc
+        fingerprint = self._route_fingerprint(routes)
+        for harness in dict.fromkeys(route.harness for route in routes):
+            try:
+                self.probe_harness(harness)
+            except AdapterError as exc:
+                raise SprintInvariantError(str(exc)) from exc
+        return fingerprint
+
+    def _participant_selection_fingerprint(self, sprint_id: int) -> str:
+        try:
+            routes = sprint_participant_chats.prepare_sprint_participant_routes(
+                self.con,
+                sprint_id,
+            )
+        except sprint_participant_chats.SprintConversationError as exc:
+            raise SprintInvariantError(str(exc)) from exc
+        return self._route_fingerprint(routes)
+
+    @staticmethod
+    def _route_fingerprint(
+        routes: tuple[sprint_participant_chats.PreparedParticipantRoute, ...],
+    ) -> str:
+        snapshot = [
+            {
+                "participant_id": route.participant_id,
+                "shell_id": route.shell_id,
+                "role": route.role,
+                "shortname": route.shortname,
+                "harness": route.harness,
+                "provider": route.provider,
+                "model": route.model,
+                "effort": route.effort,
+                "worktree": route.worktree,
+            }
+            for route in routes
+        ]
+        payload = json.dumps(snapshot, separators=(",", ":"), sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()
 
     def transition(
         self,

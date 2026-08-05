@@ -329,7 +329,9 @@ class SprintMessageCase(unittest.TestCase):
             ).lastrowid
         )
         self.con.commit()
-        self.lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+        self.lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con, probe_harness=lambda _harness: None
+        )
         initial_wake = self.lifecycle.arm(self.sprint_id, 3)[0]
         setup_delivery = delivery.SprintWakeDeliveryService(self.con)
         planner_delivery: list[str] = []
@@ -2420,6 +2422,53 @@ class ParticipantRelayTest(SprintMessageCase):
                 "WHERE conversation_id=?",
                 (conversation_id,),
             ).fetchone()[0],
+        )
+
+    def test_closed_planner_reenter_uses_the_open_chat_canonical_route(self) -> None:
+        original = self.con.execute(
+            "SELECT c.conversation_id,c.harness,c.provider,c.model,c.effort,"
+            "c.worktree FROM active_shell_chats active "
+            "JOIN conversations c ON c.conversation_id=active.chat_id "
+            "WHERE active.shell_id=3"
+        ).fetchone()
+        self.assertEqual("codex", original["harness"])
+        self.assertEqual("openai", original["provider"])
+        self.assertIsInstance(original["model"], str)
+        self.assertNotEqual("", original["model"])
+        self.assertEqual("high", original["effort"])
+
+        with self.con:
+            closed = active_chat_registry.close_for_wake(self.con, 3)
+        self.assertEqual(original["conversation_id"], closed.chat_id)
+
+        receipt = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="PLN1",
+            body="Planner re-entry after the originating chat closed.",
+            idempotency_key="participant-send:closed-planner-reenter",
+        )
+        observed: list[str] = []
+        outcome = delivery.SprintWakeDeliveryService(self.con).deliver_once(
+            "closed-planner-reenter",
+            lambda conversation, _prompt, _key: (
+                observed.append(conversation) or "closed-planner-run"
+            ),
+        )
+
+        self.assertEqual(receipt.wake_id, outcome.wake_id)
+        self.assertEqual(1, len(observed))
+        self.assertNotEqual(original["conversation_id"], observed[0])
+        replacement = self.con.execute(
+            "SELECT harness,provider,model,effort,worktree "
+            "FROM conversations WHERE conversation_id=?",
+            (observed[0],),
+        ).fetchone()
+        self.assertEqual(
+            tuple(original[field] for field in (
+                "harness", "provider", "model", "effort", "worktree"
+            )),
+            tuple(replacement),
         )
 
     def test_delivery_reroutes_when_the_created_wake_chat_closes(self) -> None:

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,11 +17,13 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 
 import active_chat_registry
 import sprint_participant_chats
+from conversation_broker import BrokerRun
+from conversation_launch import ConversationLaunchPreparer
 
 
 @contextmanager
-def substrate():
-    con = sqlite3.connect(":memory:")
+def substrate(database: str = ":memory:"):
+    con = sqlite3.connect(database)
     con.row_factory = sqlite3.Row
     con.executescript(
         """
@@ -29,7 +33,15 @@ def substrate():
           shell_id INTEGER PRIMARY KEY,
           shortname TEXT NOT NULL,
           flavor TEXT,
-          user_id INTEGER REFERENCES users(user_id)
+          user_id INTEGER REFERENCES users(user_id),
+          is_deleted INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE flavor_defaults (
+          flavor TEXT NOT NULL,
+          harness TEXT NOT NULL,
+          model TEXT NOT NULL,
+          is_default INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (flavor, harness)
         );
         CREATE TABLE roadmap (feature_id INTEGER PRIMARY KEY, title TEXT NOT NULL);
         CREATE TABLE sprints (
@@ -127,7 +139,12 @@ def substrate():
         INSERT INTO users VALUES (1);
         INSERT INTO roadmap VALUES (31,'Collaborative orchestration');
         INSERT INTO shells VALUES
-          (10,'DEV1','dev',1),(20,'REV1','reviewer',1),(30,'PLN1','planner',1);
+          (10,'DEV1','dev',1,0),(20,'REV1','reviewer',1,0),
+          (30,'PLN1','planner',1,0);
+        INSERT INTO flavor_defaults VALUES
+          ('dev','codex','gpt-test',1),
+          ('reviewer','kimi','kimi-test',1),
+          ('planner','codex','planner-test',1);
         INSERT INTO sprints VALUES
           (7,31,30,'0123456789abcdef0123456789abcdef','armed',NULL);
         INSERT INTO sprint_participants
@@ -281,6 +298,126 @@ def test_new_wake_requires_committed_close_then_preserves_history() -> None:
                 "ORDER BY participant_conversation_id"
             )
         ] == [(first,), (second,)]
+
+
+def test_closed_planner_reenter_persists_canonical_default_route(tmp_path) -> None:
+    db_path = tmp_path / "shell.db"
+    with substrate(str(db_path)) as con:
+        first = create_wake(con, wake_id=45, participant_id=103)
+        con.execute("BEGIN")
+        closed = active_chat_registry.close_for_wake(con, 30)
+        con.execute(
+            "UPDATE sprint_participants SET model=NULL,effort=NULL "
+            "WHERE participant_id=103"
+        )
+        con.commit()
+        assert closed is not None and closed.chat_id == first
+
+        replacement = create_wake(con, wake_id=46, participant_id=103)
+        stored = con.execute(
+            "SELECT harness,provider,model,effort,worktree,title,"
+            "creation_request_hash "
+            "FROM conversations WHERE conversation_id=?",
+            (replacement,),
+        ).fetchone()
+
+    broker_run = BrokerRun(
+        run_id=7,
+        conversation_id=replacement,
+        message_id=8,
+        shell_id=30,
+        harness=stored["harness"],
+        provider=stored["provider"],
+        model=stored["model"],
+        effort=stored["effort"],
+        worktree=Path(stored["worktree"]),
+        title=stored["title"],
+        body="Pick up the Planner handoff",
+        session_before=None,
+        session_after=None,
+        runner_ref=None,
+        state="leased",
+    )
+    preparer = ConversationLaunchPreparer(
+        db_path,
+        prepare_launch=lambda **_: SimpleNamespace(
+            cwd=stored["worktree"],
+            archive_id=42,
+            harness="codex",
+            model="planner-test",
+            effort="high",
+            env={},
+        ),
+        liveness=lambda: {"supported": True, "processes": []},
+    )
+
+    context, archive_id = preparer(broker_run)
+
+    assert archive_id == 42
+    assert context.model == "planner-test"
+    assert context.effort == "high"
+    assert tuple(
+        stored[field] for field in ("harness", "provider", "model", "effort")
+    ) == (
+        "codex",
+        "openai",
+        "planner-test",
+        "high",
+    )
+    expected_request = {
+        "effort": "high",
+        "harness": "codex",
+        "model": "planner-test",
+        "participant_id": 103,
+        "provider": "openai",
+        "sprint_id": 7,
+        "wake_id": 46,
+        "worktree": stored["worktree"],
+    }
+    assert stored["creation_request_hash"] == hashlib.sha256(
+        json.dumps(expected_request, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+
+
+def test_explicit_participant_route_is_preserved_byte_for_byte() -> None:
+    with substrate() as con:
+        exact_model = "GPT-Test@Exact/Case"
+        exact_effort = "xHigh"
+        con.execute(
+            "UPDATE sprint_participants SET model=?,effort=? "
+            "WHERE participant_id=101",
+            (exact_model, exact_effort),
+        )
+        con.commit()
+
+        conversation_id = create_wake(con, wake_id=47)
+        stored = con.execute(
+            "SELECT model,effort FROM conversations WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+
+        assert tuple(stored) == (exact_model, exact_effort)
+
+
+def test_unresolvable_participant_route_creates_no_chat() -> None:
+    with substrate() as con:
+        con.execute(
+            "UPDATE sprint_participants SET model=NULL,effort=NULL "
+            "WHERE participant_id=103"
+        )
+        con.execute(
+            "DELETE FROM flavor_defaults WHERE flavor='planner' AND harness='codex'"
+        )
+        con.commit()
+
+        with pytest.raises(
+            sprint_participant_chats.SprintConversationError,
+            match="has no model selected or flavor default",
+        ):
+            create_wake(con, wake_id=48, participant_id=103)
+
+        assert con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 0
+        assert con.execute("SELECT COUNT(*) FROM active_shell_chats").fetchone()[0] == 0
 
 
 def test_flat_link_rejects_cross_shell_and_is_immutable() -> None:

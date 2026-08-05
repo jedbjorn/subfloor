@@ -32,6 +32,7 @@
   "conversation": {
     "contract_version": 1,
     "minimum_cli_version": "1.18.9",
+    "maximum_cli_version_exclusive": "1.19.0",
     "verified_cli_version": "1.18.9",
     "driver": "opencode-server",
     "session_ref": { "source": "session.create", "field": "id" },

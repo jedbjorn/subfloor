@@ -67,16 +67,30 @@ class ConversationCapabilityContractTest(unittest.TestCase):
                 )
                 self.assertFalse(execution["sandbox_flag_required"])
                 self.assertRegex(conversation["minimum_cli_version"], VERSION)
+                self.assertRegex(
+                    conversation["maximum_cli_version_exclusive"], VERSION
+                )
                 self.assertEqual(
                     conversation["verified_cli_version"],
                     probe["verified_cli_version"],
                 )
-                if harness != "kimi":
-                    self.assertEqual(
-                        conversation["minimum_cli_version"],
-                        conversation["verified_cli_version"],
-                        "the spike uses the live-probed version as its floor",
-                    )
+                self.assertEqual(
+                    conversation["maximum_cli_version_exclusive"],
+                    probe["maximum_cli_version_exclusive"],
+                )
+                self.assertLessEqual(
+                    tuple(map(int, conversation["minimum_cli_version"].split("."))),
+                    tuple(map(int, conversation["verified_cli_version"].split("."))),
+                )
+                self.assertLess(
+                    tuple(map(int, conversation["verified_cli_version"].split("."))),
+                    tuple(
+                        map(
+                            int,
+                            conversation["maximum_cli_version_exclusive"].split("."),
+                        )
+                    ),
+                )
                 self.assertEqual(conversation["driver"], probe["driver"])
                 self.assertEqual(
                     set(conversation["capabilities"]),

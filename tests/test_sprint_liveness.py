@@ -148,9 +148,9 @@ class SprintLivenessCase(unittest.TestCase):
             (self.sprint_id, self.unit_id, task_id),
         )
         self.con.commit()
-        wake_id = sprint_domain.SprintLifecycleStore(self.con).arm(
-            self.sprint_id, 3
-        )[0]
+        wake_id = sprint_domain.SprintLifecycleStore(
+            self.con, probe_harness=lambda _harness: None
+        ).arm(self.sprint_id, 3)[0]
         self.assignment_message_id = int(
             self.con.execute(
                 "SELECT message_id FROM sprint_wake_messages WHERE wake_id=?",

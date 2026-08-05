@@ -22,6 +22,7 @@ import server
 import sprint_domain
 import sprint_message_delivery as delivery
 import sprint_runtime
+from conversation_adapters import AdapterError
 
 
 def apply_schema(con: sqlite3.Connection) -> None:
@@ -117,7 +118,9 @@ class SprintWorkDispatchCase(unittest.TestCase):
         ]
         self.con.commit()
         self.units = sprint_domain.SprintWorkUnitStore(self.con)
-        self.lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+        self.lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con, probe_harness=lambda _harness: None
+        )
         self.messages = delivery.SprintMessageStore(self.con)
         self.next_task = 0
 
@@ -185,6 +188,163 @@ class SprintWorkDispatchCase(unittest.TestCase):
 
 
 class DispatchGateTest(SprintWorkDispatchCase):
+    def assert_arm_left_no_writes(self) -> None:
+        self.assertEqual(
+            ("prepared", 0, 0, 0),
+            (
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0],
+                self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_wake_outbox"
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='lifecycle.armed'",
+                    (self.sprint_id,),
+                ).fetchone()[0],
+            ),
+        )
+
+    def test_arm_probes_each_distinct_harness_once_outside_write_transaction(self) -> None:
+        self.create_unit(developer=1)
+        observed: list[tuple[str, bool]] = []
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            probe_harness=lambda harness: observed.append(
+                (harness, self.con.in_transaction)
+            ),
+        )
+
+        lifecycle.arm(self.sprint_id, 3)
+
+        self.assertEqual([("codex", False), ("kimi", False)], observed)
+
+    def test_arm_default_preflight_uses_the_conversation_adapter_probe(self) -> None:
+        self.create_unit(developer=1)
+        adapters = {
+            harness: mock.Mock(
+                probe=mock.Mock(
+                    side_effect=lambda: self.assertFalse(self.con.in_transaction)
+                )
+            )
+            for harness in ("codex", "kimi")
+        }
+        with mock.patch.object(
+            sprint_domain,
+            "adapter_for",
+            side_effect=lambda harness: adapters[harness],
+        ) as adapter_factory:
+            sprint_domain.SprintLifecycleStore(self.con).arm(self.sprint_id, 3)
+
+        self.assertEqual(
+            [mock.call("codex"), mock.call("kimi")],
+            adapter_factory.call_args_list,
+        )
+        adapters["codex"].probe.assert_called_once_with()
+        adapters["kimi"].probe.assert_called_once_with()
+
+    def test_arm_rejects_missing_binary_before_any_write(self) -> None:
+        self.create_unit(developer=1)
+
+        def unavailable(harness: str):
+            raise AdapterError(
+                "HARNESS_UNAVAILABLE",
+                f"cannot probe {harness}",
+                retryable=True,
+            )
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "HARNESS_UNAVAILABLE",
+        ):
+            sprint_domain.SprintLifecycleStore(
+                self.con, probe_harness=unavailable
+            ).arm(self.sprint_id, 3)
+
+        self.assert_arm_left_no_writes()
+
+    def test_arm_rejects_unknown_adapter_before_any_write(self) -> None:
+        self.create_unit(developer=1)
+        self.con.execute(
+            "UPDATE sprint_participants SET harness='unknown-harness' "
+            "WHERE sprint_id=? AND role='planner'",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "unknown-harness.*no browser conversation adapter",
+        ):
+            self.lifecycle.arm(self.sprint_id, 3)
+
+        self.assert_arm_left_no_writes()
+
+    def test_arm_rejects_out_of_range_harness_before_any_write(self) -> None:
+        self.create_unit(developer=1)
+
+        def unsupported(harness: str):
+            raise AdapterError(
+                "HARNESS_VERSION_UNSUPPORTED",
+                f"{harness} 99.0.0 is outside supported range [1.0.0, 2.0.0)",
+            )
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "HARNESS_VERSION_UNSUPPORTED",
+        ):
+            sprint_domain.SprintLifecycleStore(
+                self.con, probe_harness=unsupported
+            ).arm(self.sprint_id, 3)
+
+        self.assert_arm_left_no_writes()
+
+    def test_arm_selection_race_returns_retryable_conflict_without_lifecycle_writes(
+        self,
+    ) -> None:
+        self.create_unit(developer=1)
+        raced = False
+
+        def mutate_once(_harness: str):
+            nonlocal raced
+            if raced:
+                return None
+            raced = True
+            self.con.execute(
+                "UPDATE sprint_participants SET model='raced-model' "
+                "WHERE sprint_id=? AND role='planner'",
+                (self.sprint_id,),
+            )
+            self.con.commit()
+            return None
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "changed during harness preflight; retry arm",
+        ) as caught:
+            sprint_domain.SprintLifecycleStore(
+                self.con, probe_harness=mutate_once
+            ).arm(self.sprint_id, 3)
+
+        self.assert_arm_left_no_writes()
+        handler = object.__new__(server.Handler)
+        handler._send = lambda status, body: (status, body)
+        self.assertEqual(
+            (
+                409,
+                {
+                    "error": (
+                        "participant launch selections changed during harness "
+                        "preflight; retry arm"
+                    )
+                },
+            ),
+            handler._sprint_error(caught.exception),
+        )
+
     def test_ready_units_launch_in_parallel_regardless_of_wave_or_reviewer(self) -> None:
         late_wave = self.create_unit(developer=1, wave=9, title="Late wave")
         early_wave = self.create_unit(developer=4, wave=0, title="Early wave")

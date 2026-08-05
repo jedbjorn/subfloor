@@ -52,7 +52,9 @@ class SprintDomainCase(unittest.TestCase):
             ),
         )
         self.con.commit()
-        self.store = sprint_domain.SprintLifecycleStore(self.con)
+        self.store = sprint_domain.SprintLifecycleStore(
+            self.con, probe_harness=lambda _harness: None
+        )
         self.serial = 0
 
     def create_sprint(
@@ -975,7 +977,9 @@ class ArmedServiceSwitchTest(SprintDomainCase):
                     "VALUES (1,1,2,'Unit','Output')"
                 )
                 seed.commit()
-                sprint_domain.SprintLifecycleStore(seed).arm(1, 3)
+                sprint_domain.SprintLifecycleStore(
+                    seed, probe_harness=lambda _harness: None
+                ).arm(1, 3)
 
             calls: list[tuple[int, str]] = []
             with closing(db_driver.connect(path)) as restarted:
