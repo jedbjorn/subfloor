@@ -1461,7 +1461,10 @@ def active_mcp_adapter() -> dict:
             "harness": None,
             "state": "unknown",
             "supported": False,
-            "reason": "SC_HARNESS is not set",
+            "reason": (
+                "SC_HARNESS is not set; this session predates the adapter "
+                "identity contract — relaunch through the engine"
+            ),
             "server_name": None,
         }
     path = ports.ENGINE / "adapters" / harness / "adapter.json"
@@ -1769,11 +1772,17 @@ def run_mcp_operation(action: str) -> dict:
 
     adapter = active_mcp_adapter()
     if action == "up" and not adapter["supported"]:
+        details = {
+            "harness": adapter["harness"],
+            "adapter_state": adapter["state"],
+        }
+        if adapter["state"] == "unknown" and adapter["harness"] is None:
+            details["recovery"] = "relaunch_through_engine"
         return operation_error(
             operation,
             "mcp_adapter_unsupported",
             adapter["reason"] or "the active harness does not support Windows MCP",
-            {"harness": adapter["harness"], "adapter_state": adapter["state"]},
+            details,
         )
 
     if action == "status":

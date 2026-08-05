@@ -156,6 +156,11 @@ def load_adapter(harness: str) -> dict:
             "emit": [], "env": {}}
 
 
+def linked_vm_configured() -> bool:
+    """Match ``sc_vm_broker_configured``: a truthy persisted vm block."""
+    return bool(ports_mod.resolve(persist=False).get("vm"))
+
+
 def managed_mcp_injection(adapter: dict) -> dict | None:
     """Return one adapter's validated managed streamable-HTTP MCP recipe.
 
@@ -163,6 +168,8 @@ def managed_mcp_injection(adapter: dict) -> dict | None:
     consumes optional argv and JSON-merge fragments, so adding a harness never
     grows a harness-name switch here.
     """
+    if not linked_vm_configured():
+        return None
     streamable = (adapter.get("mcp") or {}).get("streamable_http") or {}
     if not streamable.get("supported"):
         return None

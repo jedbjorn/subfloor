@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SKILLS = ENGINE / "assets" / "skills"
-MIGRATION = ENGINE / "migrations" / "0180_reseed_windows_vm_skills.sql"
+MIGRATION = ENGINE / "migrations" / "0181_reseed_windows_vm_adapter_recovery.sql"
 README = ROOT / "docs" / "README.md"
 BROKER_DOC = ENGINE / "docs" / "windows-vm-broker.md"
 
@@ -52,6 +52,9 @@ class WindowsSkillWorkflowTest(unittest.TestCase):
         self.assertIn("local shell token\n  boundaries are not preserved", content)
         self.assertIn("multiline PowerShell, use `--command-file`", content)
         self.assertIn("paths with spaces, and Unicode reach the broker unchanged", content)
+        self.assertIn("adapter state `unknown` because `SC_HARNESS` is absent", content)
+        self.assertIn("Relaunch the shell through\n  the engine", content)
+        self.assertIn("declared\n  `unsupported` adapter is a capability stop", content)
 
         self.assertEqual(
             reset_invocations(content),
@@ -89,6 +92,9 @@ class WindowsSkillWorkflowTest(unittest.TestCase):
         self.assertIn("`./sc vm-bake`", content)
         self.assertIn("English-language Windows", content)
         self.assertIn("unless the server itself runs elevated", content)
+        self.assertIn("State\n`unknown` with no `SC_HARNESS`", content)
+        self.assertIn("relaunch through the engine", content)
+        self.assertIn("State `unsupported`", content)
 
         self.assertEqual(
             reset_invocations(content), ["./sc vm reset --off --json"]

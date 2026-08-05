@@ -831,7 +831,10 @@ class PublicMcpClientTests(unittest.TestCase):
             "harness": None,
             "state": "unknown",
             "supported": False,
-            "reason": "SC_HARNESS is not set",
+            "reason": (
+                "SC_HARNESS is not set; this session predates the adapter "
+                "identity contract — relaunch through the engine"
+            ),
             "server_name": None,
         })
 
@@ -1048,6 +1051,34 @@ class PublicMcpClientTests(unittest.TestCase):
             "code": "mcp_adapter_unsupported",
             "message": "no managed injection",
             "details": {"harness": "kimi", "adapter_state": "unsupported"},
+        })
+        broker.assert_not_called()
+        relay.assert_not_called()
+
+    def test_up_reports_unknown_adapter_recovery_without_transport_mutation(self):
+        unknown = {
+            "harness": None,
+            "state": "unknown",
+            "supported": False,
+            "reason": (
+                "SC_HARNESS is not set; this session predates the adapter "
+                "identity contract — relaunch through the engine"
+            ),
+            "server_name": None,
+        }
+        with mock.patch.object(vm, "active_mcp_adapter", return_value=unknown), \
+             mock.patch.object(vm, "_mcp_broker_call") as broker, \
+             mock.patch.object(vm, "_relay_module") as relay:
+            result = vm.run_mcp_operation("up")
+
+        self.assertEqual(result["error"], {
+            "code": "mcp_adapter_unsupported",
+            "message": unknown["reason"],
+            "details": {
+                "harness": None,
+                "adapter_state": "unknown",
+                "recovery": "relaunch_through_engine",
+            },
         })
         broker.assert_not_called()
         relay.assert_not_called()

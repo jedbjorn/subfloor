@@ -633,6 +633,10 @@ class ConversationAdapterTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name).resolve()
+        self.linked_vm = mock.patch(
+            "run.linked_vm_configured", return_value=True
+        )
+        self.linked_vm.start()
         global WORKTREE
         WORKTREE = self.root
         self.context = ConversationContext(
@@ -646,6 +650,7 @@ class ConversationAdapterTest(unittest.TestCase):
         self.kimi_runner_serial = 0
 
     def tearDown(self) -> None:
+        self.linked_vm.stop()
         self.temp.cleanup()
 
     def write_claude_session(
