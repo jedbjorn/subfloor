@@ -21,8 +21,12 @@ adapters gain an equivalent injection mechanism.
 
 The harness tool list may be fixed at launch. If Windows MCP tools are absent,
 do not run persistent registration commands or edit user/project harness
-configuration. Report the adapter state from `./sc vm status --json`; an
-unsupported adapter is an honest stop, not a reason to fabricate GUI access.
+configuration. Report the adapter state from `./sc vm status --json`. State
+`unknown` with no `SC_HARNESS` means this session predates the adapter identity
+contract: relaunch through the engine so it can inject the active harness
+identity. State `unsupported` means the active adapter declares no injection
+mechanism; it is an honest capability stop, not a reason to fabricate GUI
+access or relaunch repeatedly.
 
 ## Missing guest Windows-MCP
 

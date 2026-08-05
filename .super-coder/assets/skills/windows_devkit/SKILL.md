@@ -23,6 +23,10 @@ testing snapshot, credentials, and guest toolchain.
   material, use `ssh` or `virsh` directly, or build raw broker requests.
 - Missing guest toolchain: ask the operator to run `configure_winbox` and
   re-bake. Never install tools during the test and poison the testing snapshot.
+- If GUI work reports adapter state `unknown` because `SC_HARNESS` is absent,
+  the session predates the adapter identity contract. Relaunch the shell through
+  the engine; do not add persistent harness configuration. A declared
+  `unsupported` adapter is a capability stop, not a relaunch prompt.
 
 ## Canonical workflow
 
