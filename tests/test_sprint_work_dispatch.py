@@ -675,6 +675,28 @@ class DispatchGateTest(SprintWorkDispatchCase):
 
 
 class DeliveryTerminalTest(SprintWorkDispatchCase):
+    def accept_arming_notification(self) -> None:
+        message_id = int(
+            self.con.execute(
+                "SELECT m.message_id FROM wake_message m "
+                "JOIN sprint_participants p ON p.participant_id=m.to_participant_id "
+                "WHERE m.sprint_id=? AND p.shell_id=3 "
+                "AND m.message_kind='notification' ORDER BY m.message_id LIMIT 1",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertIsNone(self.messages.mark_read(message_id, 3))
+        self.assertEqual(
+            (1, None),
+            tuple(
+                self.con.execute(
+                    "SELECT read_at IS NOT NULL,disposition "
+                    "FROM wake_message WHERE message_id=?",
+                    (message_id,),
+                ).fetchone()
+            ),
+        )
+
     def terminal_messages(self) -> list[sqlite3.Row]:
         return self.con.execute(
             "SELECT p.shell_id,m.message_kind,m.body,m.declared_type,"
@@ -805,6 +827,7 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         report = self.create_unit(developer=1, output_kind="report_only")
         self.lifecycle.arm(self.sprint_id, 3)
         self.deliver_pending_wakes()
+        self.accept_arming_notification()
         self.messages.mark_read(self.assignment_message(report), 1)
         self.lifecycle.pause(
             self.sprint_id,
@@ -883,6 +906,7 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         first = self.create_unit(developer=1, output_kind="report_only")
         self.lifecycle.arm(self.sprint_id, 3)
         self.deliver_pending_wakes()
+        self.accept_arming_notification()
         self.messages.mark_read(self.assignment_message(first), 1)
         self.units.complete(self.sprint_id, first, 1, result="First report")
         self.assert_episode(1, 1, 0)

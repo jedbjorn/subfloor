@@ -117,6 +117,22 @@ _EVENT_FIELDS = {
     "conformance.recorded": frozenset({"report_id", "followup_count", "followup_ids"}),
     "final_report.recorded": frozenset({"report_id"}),
     "followup.dispositioned": frozenset({"followup_id", "disposition", "resolution"}),
+    "wake.pickup_exhausted": frozenset(
+        {
+            "sprint_id",
+            "participant_id",
+            "shell",
+            "role",
+            "work_unit_id",
+            "message_id",
+            "wake_id",
+            "conversation_id",
+            "run_state",
+            "error_code",
+            "failure_class",
+            "attempt_count",
+        }
+    ),
     "wake.requeued": frozenset({"failed_wake_id", "replacement_wake_id"}),
     "liveness.nudged": frozenset(
         {"expectation_message_id", "silence_episode", "nudge_message_id"}

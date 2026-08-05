@@ -1184,6 +1184,12 @@ class SprintLifecycleStore:
         rows = self.con.execute(
             "SELECT w.wake_id,w.sprint_id AS wake_sprint_id,"
             "m.to_participant_id AS participant_id,w.state,w.idempotency_key,"
+            "w.attempt_count AS wake_attempt_count,MIN(m.message_id) AS message_id,"
+            "(SELECT detail.work_unit_id FROM wake_message detail "
+            "JOIN sprint_wake_messages detail_wm "
+            "ON detail_wm.message_id=detail.message_id "
+            "WHERE detail_wm.wake_id=w.wake_id AND detail.read_at IS NULL "
+            "ORDER BY detail.message_id LIMIT 1) AS work_unit_id,"
             "CASE WHEN COUNT(*)=COUNT(m.delivered_at) "
             "THEN MIN(m.delivered_at) END AS delivered_at "
             "FROM sprint_wake_outbox w "
@@ -1220,12 +1226,7 @@ class SprintLifecycleStore:
             )
             busy_prefix = f"sprint-recovery:{sprint_id}:busy:"
             busy_recovery = wake_key.startswith(busy_prefix)
-            if (
-                (wake_key.startswith("sprint-recovery:") and not busy_recovery)
-                or ":failed-wake:" in wake_key
-            ):
-                continue
-            if busy_recovery and not shell_busy:
+            if ":failed-wake:" in wake_key:
                 continue
             if self._participant_has_pickup_turn(participant_id):
                 continue
@@ -1289,6 +1290,53 @@ class SprintLifecycleStore:
                     "backoff_seconds": backoff_seconds,
                 }
             else:
+                if row["state"] == "delivered":
+                    episode_attempt, lineage_valid = self._pickup_episode_attempt(
+                        sprint_id,
+                        old_wake_id,
+                    )
+                    evidence_valid = self._pickup_turn_evidence_valid(row, turn)
+                    run_state = turn["run_state"]
+                    if not evidence_valid or not lineage_valid:
+                        pause_reason = "wake_pickup_evidence_invalid"
+                        failure_class = "evidence_invalid"
+                        error_code = "WAKE_PICKUP_EVIDENCE_INVALID"
+                    elif run_state == "unknown":
+                        pause_reason = "wake_pickup_unknown"
+                        failure_class = "native_unknown"
+                        error_code = str(turn["error_code"])
+                    elif episode_attempt >= 2 and run_state == "failed":
+                        pause_reason = "wake_pickup_failed"
+                        failure_class = "native_failed"
+                        error_code = str(turn["error_code"])
+                    elif episode_attempt >= 2 and run_state == "succeeded":
+                        pause_reason = "wake_pickup_unread"
+                        failure_class = "terminal_unread"
+                        error_code = "WAKE_PICKUP_UNREAD"
+                    else:
+                        pause_reason = None
+
+                    if pause_reason is not None:
+                        pause_receipt = self._exhaust_pickup_in_transaction(
+                            sprint_id=sprint_id,
+                            participant_id=participant_id,
+                            wake_id=old_wake_id,
+                            message_id=int(row["message_id"]),
+                            work_unit_id=(
+                                int(row["work_unit_id"])
+                                if row["work_unit_id"] is not None
+                                else None
+                            ),
+                            turn=turn,
+                            pause_reason=pause_reason,
+                            error_code=error_code,
+                            failure_class=failure_class,
+                            attempt_count=episode_attempt,
+                        )
+                        return _WakeReconcileResult(
+                            tuple(sorted(set(replacements))),
+                            pause_receipt,
+                        )
                 recovery_key = (
                     f"sprint-resume:{sprint_id}:failed-wake:{old_wake_id}"
                     if row["state"] == "failed"
@@ -1468,6 +1516,203 @@ class SprintLifecycleStore:
             )
             replacements.append(new_wake_id)
         return _WakeReconcileResult(tuple(sorted(set(replacements))))
+
+    def _pickup_episode_attempt(
+        self,
+        sprint_id: int,
+        wake_id: int,
+    ) -> tuple[int, bool]:
+        rows = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='wake.requeued' "
+            "AND json_extract(payload,'$.replacement_wake_id')=? "
+            "ORDER BY event_id",
+            (sprint_id, wake_id),
+        ).fetchall()
+        pickup_rows = []
+        for row in rows:
+            payload = json.loads(row["payload"])
+            if payload.get("classification") in {
+                "shell_busy",
+                "contention_episode_reset",
+            }:
+                continue
+            if payload.get("prior_wake_id") is not None:
+                pickup_rows.append(payload)
+        if not pickup_rows:
+            return 1, True
+        valid = all(
+            isinstance(payload.get("prior_wake_id"), int)
+            and self.con.execute(
+                "SELECT 1 FROM sprint_wake_outbox WHERE wake_id=?",
+                (payload["prior_wake_id"],),
+            ).fetchone()
+            is not None
+            for payload in pickup_rows
+        )
+        return 2, valid
+
+    @staticmethod
+    def _pickup_turn_evidence_valid(
+        wake: sqlite3.Row,
+        turn: dict[str, str | int | bool | None],
+    ) -> bool:
+        if turn["turn_live"]:
+            return True
+        if (
+            turn["attempt_number"] is None
+            or turn["target_conversation_id"] is None
+            or turn["attempt_outcome"] != "delivered"
+            or int(turn["attempt_number"]) != int(wake["wake_attempt_count"])
+        ):
+            return False
+        run_state = turn["run_state"]
+        message_state = turn["message_state"]
+        error_code = turn["error_code"]
+        if run_state == "succeeded":
+            return message_state == "completed" and error_code is None
+        if run_state in {"failed", "unknown"}:
+            return (
+                message_state == "failed"
+                and isinstance(error_code, str)
+                and bool(error_code.strip())
+            )
+        return False
+
+    def _exhaust_pickup_in_transaction(
+        self,
+        *,
+        sprint_id: int,
+        participant_id: int,
+        wake_id: int,
+        message_id: int,
+        work_unit_id: int | None,
+        turn: dict[str, str | int | bool | None],
+        pause_reason: str,
+        error_code: str,
+        failure_class: str,
+        attempt_count: int,
+    ) -> PauseReceipt:
+        participant = self.con.execute(
+            "SELECT p.role,sh.shortname,sh.shell_id "
+            "FROM sprint_participants p JOIN shells sh USING (shell_id) "
+            "WHERE p.sprint_id=? AND p.participant_id=?",
+            (sprint_id, participant_id),
+        ).fetchone()
+        if participant is None:
+            raise SprintInvariantError("Sprint participant does not exist")
+        conversation_id = (
+            str(turn["target_conversation_id"])
+            if turn["target_conversation_id"] is not None
+            else None
+        )
+        facts = {
+            "sprint_id": sprint_id,
+            "participant_id": participant_id,
+            "shell": str(participant["shortname"]),
+            "role": str(participant["role"]),
+            "work_unit_id": work_unit_id,
+            "message_id": message_id,
+            "wake_id": wake_id,
+            "conversation_id": conversation_id,
+            "run_state": turn["run_state"],
+            "error_code": error_code,
+            "failure_class": failure_class,
+            "attempt_count": attempt_count,
+        }
+        self._event(
+            sprint_id,
+            "wake.pickup_exhausted",
+            LifecycleActor("system"),
+            facts,
+        )
+        closed_conversation_id = self._close_exhausted_pickup_conversation(
+            participant_id=participant_id,
+            wake_id=wake_id,
+            conversation_id=conversation_id,
+            run_state=turn["run_state"],
+        )
+        detail = {
+            **facts,
+            "error_detail": str(turn["error_detail"] or "")[:2000] or None,
+        }
+        receipt = self._pause_in_transaction(
+            self._sprint(sprint_id),
+            LifecycleActor("system"),
+            reason=pause_reason,
+            detail=detail,
+            notice_body=(
+                f"Sprint {sprint_id} paused: pickup {failure_class} for "
+                f"{participant['role']} shell {participant['shortname']} "
+                f"(work unit {work_unit_id}, message {message_id}, wake {wake_id}, "
+                f"{error_code}). Inspect the pause report, repair the named route "
+                "or service, then use an authorized resume."
+            ),
+        )
+        if closed_conversation_id is None:
+            return receipt
+        return PauseReceipt(
+            receipt.changed,
+            receipt.report_id,
+            receipt.interrupt_run_ids,
+            tuple(
+                sorted(
+                    set(receipt.notification_conversation_ids)
+                    | {closed_conversation_id}
+                )
+            ),
+        )
+
+    def _close_exhausted_pickup_conversation(
+        self,
+        *,
+        participant_id: int,
+        wake_id: int,
+        conversation_id: str | None,
+        run_state: str | int | bool | None,
+    ) -> str | None:
+        if conversation_id is None or run_state not in {"failed", "unknown"}:
+            return None
+        row = self.con.execute(
+            "SELECT c.state,c.shell_id FROM conversations c "
+            "JOIN sprint_participants p ON p.shell_id=c.shell_id "
+            "WHERE c.conversation_id=? AND p.participant_id=?",
+            (conversation_id, participant_id),
+        ).fetchone()
+        if row is None or row["state"] != "error":
+            return None
+        shell_id = int(row["shell_id"])
+        active = active_chat_registry.get(self.con, shell_id)
+        if active is not None and active.chat_id == conversation_id:
+            if active_chat_registry.has_live_process(active):
+                return None
+            closed = active_chat_registry.close_for_displacement(
+                self.con,
+                shell_id,
+                allow_live_process=False,
+            )
+            if closed is None:
+                return None
+        else:
+            changed = self.con.execute(
+                "UPDATE conversations SET state='closed',closed_at=datetime('now'),"
+                "last_activity_at=datetime('now'),version=version+1 "
+                "WHERE conversation_id=? AND state='error'",
+                (conversation_id,),
+            ).rowcount
+            if changed != 1:
+                return None
+        sprint_participant_chats._append_event(
+            self.con,
+            conversation_id,
+            "conversation.closed",
+            {
+                "reason": "wake pickup exhausted",
+                "state": "closed",
+                "wake_id": wake_id,
+            },
+        )
+        return conversation_id
 
     @staticmethod
     def _busy_recovery_origin(wake_key: str, sprint_id: int) -> int:
