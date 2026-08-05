@@ -729,9 +729,12 @@ def _tunnel_pid() -> int | None:
 def mcp_status() -> dict:
     state = _tunnel_process()
     pid = state["pid"] if state else None
-    running = state is not None and _tunnel_ready()
+    listening = _tunnel_ready()
+    running = state is not None and listening
     return {"ok": True, "running": running, "pid": pid,
-            "socket": str(MCP_SOCKET) if running else None}
+            "socket": str(MCP_SOCKET) if listening else None,
+            "listening": listening,
+            "unverified": state is None and listening}
 
 
 def do_mcp_up(wait: float = 15) -> dict:

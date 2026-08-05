@@ -384,9 +384,17 @@ class McpTunnelTests(unittest.TestCase):
 
     def test_mcp_status_reports_not_running_without_a_tunnel(self):
         r = vm.mcp_status()
-        self.assertTrue(r["ok"])
-        self.assertFalse(r["running"])
-        self.assertIsNone(r["socket"])
+        self.assertEqual(
+            r,
+            {
+                "ok": True,
+                "running": False,
+                "pid": None,
+                "socket": None,
+                "listening": False,
+                "unverified": False,
+            },
+        )
 
     def test_mcp_status_requires_a_listening_socket_not_a_stale_path(self):
         vm.MCP_SOCKET.touch()
@@ -394,7 +402,14 @@ class McpTunnelTests(unittest.TestCase):
             r = vm.mcp_status()
         self.assertEqual(
             r,
-            {"ok": True, "running": False, "pid": 4242, "socket": None},
+            {
+                "ok": True,
+                "running": False,
+                "pid": 4242,
+                "socket": None,
+                "listening": False,
+                "unverified": False,
+            },
         )
 
     def test_unverified_live_unix_listener_is_refused_and_preserved(self):
@@ -403,6 +418,20 @@ class McpTunnelTests(unittest.TestCase):
         listener.bind(str(vm.MCP_SOCKET))
         listener.listen(8)
         vm.MCP_PIDFILE.write_text("4242")
+
+        status = vm.mcp_status()
+        self.assertEqual(
+            status,
+            {
+                "ok": True,
+                "running": False,
+                "pid": None,
+                "socket": str(vm.MCP_SOCKET),
+                "listening": True,
+                "unverified": True,
+            },
+        )
+        self.assertTrue(vm.MCP_PIDFILE.exists())
 
         with mock.patch.object(vm, "read", return_value=SAVED), \
              mock.patch("subprocess.Popen") as popen:
@@ -435,6 +464,7 @@ class McpTunnelTests(unittest.TestCase):
         self.assertTrue(vm._tunnel_ready())
         self.assertTrue(vm.MCP_SOCKET.exists())
         self.assertFalse(vm.MCP_PIDFILE.exists())
+        self.assertEqual(vm.mcp_status(), status)
 
     def test_unverified_ssh_wrapper_reports_identity_log_and_reaps_child(self):
         wrapper = self.temp_dir / "ssh"
