@@ -60,8 +60,41 @@ class VerbDispatchTests(unittest.TestCase):
     def test_exec_missing_config_is_a_clean_error_not_a_crash(self):
         with mock.patch.object(vm, "read", return_value={}):
             r = vm.do_exec("whoami")
-        self.assertFalse(r["ok"])
-        self.assertIn("missing required field", r["stderr"])
+        self.assertEqual(r, {
+            "ok": False,
+            "error": "exec_validation_failed",
+            "exit": -1,
+            "stdout": "",
+            "stderr": (
+                "missing required field(s): ssh_host, ssh_user, ssh_key_path"
+            ),
+        })
+
+    def test_exec_missing_host_ssh_has_a_distinct_error(self):
+        failure = FileNotFoundError(2, "No such file or directory", "ssh")
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm.subprocess, "run", side_effect=failure):
+            r = vm.do_exec("whoami")
+        self.assertEqual(r, {
+            "ok": False,
+            "error": "exec_unavailable",
+            "exit": 127,
+            "stdout": "",
+            "stderr": "command not found: ssh — is ssh installed on the host?",
+        })
+
+    def test_exec_timeout_has_a_distinct_error(self):
+        failure = subprocess.TimeoutExpired(["ssh"], 120)
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm.subprocess, "run", side_effect=failure):
+            r = vm.do_exec("whoami")
+        self.assertEqual(r, {
+            "ok": False,
+            "error": "exec_timeout",
+            "exit": 124,
+            "stdout": "",
+            "stderr": "timed out (>120s)",
+        })
 
     def test_configured_cli_reflects_a_linked_vm(self):
         # `./sc vm-broker-up` calls `vm.py configured` to self-skip when unlinked.
@@ -1026,8 +1059,10 @@ class SocketTransportTests(unittest.TestCase):
         with mock.patch.object(vm, "read", return_value=SAVED), \
              mock.patch("subprocess.run", return_value=fake):
             r = vm.broker_call("POST", "/exec", {"command": "exit 2"})
-        self.assertEqual(r["exit"], 2)
-        self.assertEqual(r["stdout"], "out")
+        self.assertEqual(
+            r,
+            {"ok": False, "exit": 2, "stdout": "out", "stderr": "err"},
+        )
 
     def test_busy_reset_returns_without_attempting_reset(self):
         self.srv.vm_mutation_lock.acquire()

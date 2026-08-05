@@ -397,7 +397,9 @@ EXEC_CLIENT_TIMEOUT = 130
 CAPTURE_CLIENT_TIMEOUT = 45
 RESULT_SCHEMA_VERSION = 1
 MAX_CAPTURE_BYTES = 16 * 1024 * 1024
-LOCAL_ARTIFACT_ROOT = ports.ENGINE.parent / ".sc-state" / "local"
+CAPTURE_ARTIFACT_ROOT = (
+    ports.ENGINE.parent / ".sc-state" / "local" / "vm-captures"
+)
 CAPTURE_MIME_TYPES = {
     "jpeg": "image/jpeg",
     "jpg": "image/jpeg",
@@ -563,9 +565,21 @@ def do_exec(command: str, timeout: int = 120) -> dict:
     """Run one command in the guest over SSH. Returns {ok, exit, stdout, stderr}."""
     cfg = read() or {}
     if m := _missing(cfg, "ssh_host", "ssh_user", "ssh_key_path"):
-        return {"ok": False, "exit": -1, "stdout": "", "stderr": m}
+        return {
+            "ok": False,
+            "error": "exec_validation_failed",
+            "exit": -1,
+            "stdout": "",
+            "stderr": m,
+        }
     if not str(command).strip():
-        return {"ok": False, "exit": -1, "stdout": "", "stderr": "exec: empty command"}
+        return {
+            "ok": False,
+            "error": "exec_validation_failed",
+            "exit": -1,
+            "stdout": "",
+            "stderr": "exec: empty command",
+        }
     try:
         # errors="replace": guest output is routinely non-UTF-8 (UTF-16 files,
         # OEM codepages). A strict decode turned the whole exec into a 500 with
@@ -580,10 +594,23 @@ def do_exec(command: str, timeout: int = 120) -> dict:
         return {"ok": p.returncode == 0, "exit": p.returncode,
                 "stdout": p.stdout, "stderr": p.stderr}
     except FileNotFoundError as e:
-        return {"ok": False, "exit": 127, "stdout": "",
-                "stderr": f"command not found: {e.filename} — is ssh installed on the host?"}
+        return {
+            "ok": False,
+            "error": "exec_unavailable",
+            "exit": 127,
+            "stdout": "",
+            "stderr": (
+                f"command not found: {e.filename} — is ssh installed on the host?"
+            ),
+        }
     except subprocess.TimeoutExpired:
-        return {"ok": False, "exit": 124, "stdout": "", "stderr": f"timed out (>{timeout}s)"}
+        return {
+            "ok": False,
+            "error": "exec_timeout",
+            "exit": 124,
+            "stdout": "",
+            "stderr": f"timed out (>{timeout}s)",
+        }
 
 
 def _domain_state(cfg: dict) -> tuple[bool, str]:
@@ -1288,11 +1315,9 @@ class CaptureArtifactError(ValueError):
 
 
 def _capture_target(output: str | None, screenshot_format: str) -> Path:
-    root = LOCAL_ARTIFACT_ROOT.resolve()
+    root = CAPTURE_ARTIFACT_ROOT.resolve()
     if output is None:
-        target = root / "vm-captures" / (
-            f"capture-{time.time_ns()}.{screenshot_format}"
-        )
+        target = root / f"capture-{time.time_ns()}.{screenshot_format}"
     else:
         target = Path(os.path.expanduser(output))
         if not target.is_absolute():
@@ -1308,7 +1333,7 @@ def _capture_target(output: str | None, screenshot_format: str) -> Path:
     if target == root or not target.is_relative_to(root):
         raise CaptureArtifactError(
             "capture_output_not_allowed",
-            "the capture output must stay inside the local artifact area",
+            "the capture output must stay inside the capture artifact area",
             {"allowed_root": str(root)},
         )
     return target
@@ -1428,20 +1453,28 @@ def _broker_failure(operation: str, response: dict) -> dict:
         )
     if operation == "exec":
         exit_code = response.get("exit")
-        stdout = response.get("stdout")
         stderr = response.get("stderr")
+        error_code = response.get("error")
+        if error_code not in {
+            "exec_validation_failed",
+            "exec_unavailable",
+            "exec_timeout",
+        }:
+            error_code = "exec_failed"
         return operation_error(
             operation,
-            "exec_failed",
-            "the guest command failed",
+            error_code,
+            (
+                stderr
+                if isinstance(stderr, str) and stderr
+                else "the exec operation failed"
+            ),
             {
                 "exit_code": (
                     exit_code
                     if isinstance(exit_code, int) and not isinstance(exit_code, bool)
                     else -1
                 ),
-                "stdout_bytes": len(stdout.encode()) if isinstance(stdout, str) else 0,
-                "stderr_bytes": len(stderr.encode()) if isinstance(stderr, str) else 0,
             },
         )
     details: dict = {}
@@ -1544,6 +1577,27 @@ def run_operation(operation: str, *, command: str | None = None,
             {},
         )
 
+    if response.get("error") == "vm_busy":
+        return _broker_failure(operation, response)
+    if operation == "exec" and response.get("error") is None:
+        exit_code = response.get("exit")
+        stdout = response.get("stdout")
+        stderr = response.get("stderr")
+        if (
+            isinstance(exit_code, bool)
+            or not isinstance(exit_code, int)
+            or not isinstance(stdout, str)
+            or not isinstance(stderr, str)
+        ):
+            return operation_error(
+                operation,
+                "broker_response_invalid",
+                "the VM broker did not return a complete response",
+            )
+        return operation_success(
+            operation,
+            {"exit_code": exit_code, "stdout": stdout, "stderr": stderr},
+        )
     if not response.get("ok"):
         return _broker_failure(operation, response)
     try:
@@ -1580,22 +1634,6 @@ def run_operation(operation: str, *, command: str | None = None,
                     "attempts": int(response["attempts"]),
                     "last_error": None,
                 },
-            })
-        if operation == "exec":
-            exit_code = response["exit"]
-            stdout = response["stdout"]
-            stderr = response["stderr"]
-            if (
-                isinstance(exit_code, bool)
-                or not isinstance(exit_code, int)
-                or not isinstance(stdout, str)
-                or not isinstance(stderr, str)
-            ):
-                raise TypeError
-            return operation_success(operation, {
-                "exit_code": exit_code,
-                "stdout": stdout,
-                "stderr": stderr,
             })
         if operation == "push":
             source = response["source"]
@@ -1758,12 +1796,12 @@ def client_main(argv: list[str]) -> int:
         description=(
             "Atomically save a mode-0600 screenshot under "
             ".sc-state/local/vm-captures by default. An explicit --output must "
-            "stay under .sc-state/local. JSON result fields: path, bytes, "
-            "format, mime_type."
+            "stay under .sc-state/local/vm-captures. JSON result fields: path, "
+            "bytes, format, mime_type."
         ),
     )
     capture.add_argument(
-        "--output", help="artifact path under .sc-state/local"
+        "--output", help="artifact path under .sc-state/local/vm-captures"
     )
     capture.add_argument(
         "--json", action="store_true", help="print one JSON result object"

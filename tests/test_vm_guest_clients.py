@@ -163,28 +163,75 @@ class ExecClientTests(unittest.TestCase):
             json.loads(stdout.getvalue())["error"]["code"], "exec_command_file_invalid"
         )
 
-    def test_failed_guest_command_does_not_copy_output_into_error_details(self):
+    def test_nonzero_guest_exit_is_a_result_with_diagnostic_output(self):
         response = {
             "ok": False,
             "exit": 7,
-            "stdout": "SECRET FILE CONTENT",
-            "stderr": "SECRET STACK TRACE",
+            "stdout": "partial result\n",
+            "stderr": "Get-Item: path not found\n",
         }
-        with mock.patch.object(vm, "broker_call", return_value=response):
-            result = vm.run_operation("exec", command="exit 7")
+        with (
+            mock.patch.object(vm, "broker_call", return_value=response),
+            mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
+        ):
+            code = vm.client_main(["exec", "--json", "--", "exit 7"])
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(code, 0)
         self.assertEqual(
-            result["error"],
+            result,
             {
-                "code": "exec_failed",
-                "message": "the guest command failed",
-                "details": {
+                "schema_version": 1,
+                "ok": True,
+                "operation": "exec",
+                "result": {
                     "exit_code": 7,
-                    "stdout_bytes": len("SECRET FILE CONTENT"),
-                    "stderr_bytes": len("SECRET STACK TRACE"),
+                    "stdout": "partial result\n",
+                    "stderr": "Get-Item: path not found\n",
                 },
+                "error": None,
             },
         )
-        self.assertNotIn("SECRET", json.dumps(result))
+        self.assertEqual(
+            vm._human_result(result),
+            "Guest command exited 7\nstdout:\npartial result\n"
+            "stderr:\nGet-Item: path not found",
+        )
+
+    def test_pre_exec_failures_preserve_distinct_code_and_message(self):
+        cases = (
+            (
+                "exec_validation_failed",
+                -1,
+                "missing required field(s): ssh_key_path",
+            ),
+            (
+                "exec_unavailable",
+                127,
+                "command not found: ssh — is ssh installed on the host?",
+            ),
+            ("exec_timeout", 124, "timed out (>120s)"),
+        )
+        for error_code, exit_code, message in cases:
+            response = {
+                "ok": False,
+                "error": error_code,
+                "exit": exit_code,
+                "stdout": "",
+                "stderr": message,
+            }
+            with (
+                self.subTest(error_code=error_code),
+                mock.patch.object(vm, "broker_call", return_value=response),
+            ):
+                result = vm.run_operation("exec", command="whoami")
+            self.assertEqual(
+                result["error"],
+                {
+                    "code": error_code,
+                    "message": message,
+                    "details": {"exit_code": exit_code},
+                },
+            )
 
 
 class PushClientTests(unittest.TestCase):
@@ -229,8 +276,8 @@ class CaptureClientTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name) / ".sc-state" / "local"
-        patcher = mock.patch.object(vm, "LOCAL_ARTIFACT_ROOT", self.root)
+        self.root = Path(self.tmp.name) / ".sc-state" / "local" / "vm-captures"
+        patcher = mock.patch.object(vm, "CAPTURE_ARTIFACT_ROOT", self.root)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -248,7 +295,7 @@ class CaptureClientTests(unittest.TestCase):
             mock.patch.object(vm, "broker_call", return_value=self.response()) as call,
         ):
             result = vm.run_operation("capture")
-        target = self.root / "vm-captures" / "capture-123456.ppm"
+        target = self.root / "capture-123456.ppm"
         self.assertEqual(
             result,
             {
@@ -279,7 +326,7 @@ class CaptureClientTests(unittest.TestCase):
             result["error"],
             {
                 "code": "capture_output_not_allowed",
-                "message": "the capture output must stay inside the local artifact area",
+                "message": "the capture output must stay inside the capture artifact area",
                 "details": {"allowed_root": str(self.root.resolve())},
             },
         )
@@ -294,6 +341,23 @@ class CaptureClientTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), self.IMAGE)
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
 
+    def test_explicit_output_cannot_overwrite_engine_local_state(self):
+        state_file = self.root.parent / "content.sql"
+        state_file.parent.mkdir(parents=True)
+        state_file.write_bytes(b"-- local memory snapshot\n")
+        with mock.patch.object(vm, "broker_call") as call:
+            result = vm.run_operation("capture", output=str(state_file))
+        self.assertEqual(
+            result["error"],
+            {
+                "code": "capture_output_not_allowed",
+                "message": "the capture output must stay inside the capture artifact area",
+                "details": {"allowed_root": str(self.root.resolve())},
+            },
+        )
+        call.assert_not_called()
+        self.assertEqual(state_file.read_bytes(), b"-- local memory snapshot\n")
+
     def test_symlinked_output_outside_local_artifacts_is_rejected_without_capture(self):
         outside = Path(self.tmp.name) / "outside"
         outside.mkdir()
@@ -307,7 +371,7 @@ class CaptureClientTests(unittest.TestCase):
         self.assertFalse((outside / "frame.ppm").exists())
 
     def test_invalid_base64_creates_neither_target_nor_partial_file(self):
-        target = self.root / "vm-captures" / "invalid.ppm"
+        target = self.root / "invalid.ppm"
         response = self.response()
         response["screenshot_b64"] = "not base64!"
         with mock.patch.object(vm, "broker_call", return_value=response):
@@ -317,7 +381,7 @@ class CaptureClientTests(unittest.TestCase):
         self.assertEqual(list(target.parent.glob(".*.tmp")), [])
 
     def test_encoded_payload_over_limit_is_rejected_even_when_metadata_lies(self):
-        target = self.root / "vm-captures" / "encoded-too-large.ppm"
+        target = self.root / "encoded-too-large.ppm"
         response = self.response()
         response["screenshot_b64"] = base64.b64encode(b"0123456789").decode()
         response["screenshot_bytes"] = 1
@@ -338,7 +402,7 @@ class CaptureClientTests(unittest.TestCase):
         self.assertEqual(list(target.parent.glob(".*.tmp")), [])
 
     def test_byte_count_mismatch_creates_neither_target_nor_partial_file(self):
-        target = self.root / "vm-captures" / "mismatch.ppm"
+        target = self.root / "mismatch.ppm"
         response = self.response()
         response["screenshot_bytes"] -= 1
         with mock.patch.object(vm, "broker_call", return_value=response):
@@ -358,7 +422,7 @@ class CaptureClientTests(unittest.TestCase):
         self.assertEqual(list(target.parent.glob(".*.tmp")), [])
 
     def test_oversized_capture_preserves_existing_target_and_creates_no_partial(self):
-        target = self.root / "vm-captures" / "existing.ppm"
+        target = self.root / "existing.ppm"
         target.parent.mkdir(parents=True)
         target.write_bytes(b"existing")
         response = self.response()
@@ -380,7 +444,7 @@ class CaptureClientTests(unittest.TestCase):
         self.assertEqual(list(target.parent.glob(f".{target.name}.*.tmp")), [])
 
     def test_failed_atomic_replace_removes_partial_and_preserves_existing_target(self):
-        target = self.root / "vm-captures" / "existing.ppm"
+        target = self.root / "existing.ppm"
         target.parent.mkdir(parents=True)
         target.write_bytes(b"existing")
         with (
@@ -407,6 +471,10 @@ class CaptureClientTests(unittest.TestCase):
             vm.client_main(["capture", "--help"])
         self.assertEqual(raised.exception.code, 0)
         help_text = " ".join(output.getvalue().split())
+        self.assertIn(
+            "An explicit --output must stay under .sc-state/local/vm-captures",
+            help_text,
+        )
         for expected in (
             ".sc-state/local/vm-captures",
             "--output",

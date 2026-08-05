@@ -658,7 +658,7 @@ class PublicClientTests(unittest.TestCase):
             "exec": ("--command-file", "exit_code", "stdout", "stderr"),
             "capture": (
                 "--output",
-                ".sc-state/local",
+                ".sc-state/local/vm-captures",
                 "path",
                 "bytes",
                 "format",
