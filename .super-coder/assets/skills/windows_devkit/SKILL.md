@@ -69,6 +69,12 @@ a reset after a timeout, disconnect, malformed response, or
   entire guest command as one locally quoted argument. For complex, quoted, or
   multiline PowerShell, use `--command-file` so quotes, dollar variables,
   pipes, backticks, paths with spaces, and Unicode reach the broker unchanged.
+- `cmd.exe` is the guest default SSH shell. Invoke PowerShell syntax explicitly,
+  for example with
+  `powershell -NoProfile -Command "Get-ChildItem Env:"`.
+- Client-to-broker command content remains unchanged, but guest console stdout
+  may transliterate non-ASCII on return. For byte-exact output, base64-encode
+  it guest-side and decode it locally.
 - `capture` writes an atomic mode-0600 artifact under
   `.sc-state/local/vm-captures/`; use the returned path for visual inspection.
 - `mcp up` verifies the tunnel, relay, and HTTP endpoint before success.
