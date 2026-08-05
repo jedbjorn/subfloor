@@ -159,19 +159,47 @@ class KimiAdapter(ConversationAdapter):
                 f"cannot read Kimi session state: {state_path}",
                 retryable=True,
             ) from exc
-        stored = state.get("workDir") if isinstance(state, dict) else None
-        if not isinstance(stored, str) or not stored:
+        if not isinstance(state, dict):
             raise AdapterError(
                 "HARNESS_SESSION_INSPECTION_FAILED",
-                f"Kimi session state has no workDir: {state_path}",
+                f"Kimi session state has no workDir or cwd: {state_path}",
             )
-        stored_path = Path(stored)
-        if not stored_path.is_absolute():
+        stored_paths: dict[str, Path] = {}
+        for field in ("workDir", "cwd"):
+            if field not in state:
+                continue
+            stored = state[field]
+            if not isinstance(stored, str) or not stored:
+                raise AdapterError(
+                    "HARNESS_SESSION_INSPECTION_FAILED",
+                    f"Kimi session {field} is invalid: {state_path}",
+                )
+            stored_path = Path(stored)
+            if not stored_path.is_absolute():
+                raise AdapterError(
+                    "HARNESS_SESSION_INSPECTION_FAILED",
+                    f"Kimi session {field} is not absolute: {state_path}",
+                )
+            try:
+                stored_paths[field] = stored_path.resolve()
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise AdapterError(
+                    "HARNESS_SESSION_INSPECTION_FAILED",
+                    f"cannot resolve Kimi session {field}: {state_path}",
+                    retryable=True,
+                ) from exc
+        if not stored_paths:
             raise AdapterError(
                 "HARNESS_SESSION_INSPECTION_FAILED",
-                f"Kimi session workDir is not absolute: {state_path}",
+                f"Kimi session state has no workDir or cwd: {state_path}",
             )
-        return stored_path.resolve()
+        resolved = set(stored_paths.values())
+        if len(resolved) != 1:
+            raise AdapterError(
+                "HARNESS_SESSION_INSPECTION_FAILED",
+                f"Kimi session workDir and cwd conflict: {state_path}",
+            )
+        return next(iter(resolved))
 
     @staticmethod
     def _wire_path(session_dir: Path) -> Path:
