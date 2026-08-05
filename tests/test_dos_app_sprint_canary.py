@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import ast
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import cast
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from maintainer import dos_app_sprint_canary as canary
 
@@ -372,8 +377,11 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                     },
                 }
 
-        projected = backend._create_conversation(  # type: ignore[arg-type]
-            FakeApi(), shell_id=1, harness="codex", key="nested-route"
+        projected = backend._create_conversation(
+            cast(canary.JsonHttp, FakeApi()),
+            shell_id=1,
+            harness="codex",
+            key="nested-route",
         )
 
         self.assertNotIn("model", projected)
