@@ -7,10 +7,30 @@
       "broker": {"ready": true},
       "domain": {"name": "win-test", "state": "running"},
       "ssh": {"ready": true, "last_error": null},
-      "mcp": {"tunnel_running": false, "unverified": false},
-      "relay": {"state": "deferred"},
-      "endpoint": {"state": "deferred"},
-      "adapter": {"state": "deferred"}
+      "mcp": {
+        "tunnel_running": false,
+        "tunnel_listening": false,
+        "unverified": false
+      },
+      "relay": {
+        "running": false,
+        "listening": false,
+        "unverified": false,
+        "port": 18000
+      },
+      "endpoint": {
+        "url": "http://127.0.0.1:18000/mcp",
+        "ready": false,
+        "http_status": null,
+        "error": "tunnel and relay are not both verified"
+      },
+      "adapter": {
+        "harness": "codex",
+        "state": "supported",
+        "supported": true,
+        "reason": null,
+        "server_name": "windows-mcp"
+      }
     },
     "error": null
   },

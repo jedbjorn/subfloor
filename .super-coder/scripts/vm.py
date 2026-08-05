@@ -29,6 +29,7 @@ import argparse
 import base64
 import binascii
 import fcntl
+import http.client
 import json
 import os
 import shutil
@@ -58,6 +59,10 @@ MCP_SOCKET = RUN_DIR / "vm-mcp.sock"
 MCP_PIDFILE = RUN_DIR / "vm-mcp-tunnel.pid"
 MCP_LOCKFILE = RUN_DIR / "vm-mcp-tunnel.lock"
 MCP_LOG = RUN_DIR / "vm-mcp-tunnel.log"
+MCP_RELAY_PORT = 18000
+MCP_ENDPOINT_PATH = "/mcp"
+MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_PROBE_LIMIT = 8192
 
 PROCESS_STATE_VERSION = 1
 PROCESS_STOP_TIMEOUT = 2.0
@@ -683,6 +688,7 @@ def do_status() -> dict:
         "ssh_ready": ssh_ready,
         "ssh_error": ssh_error,
         "mcp_tunnel_running": bool(tunnel["running"]),
+        "mcp_tunnel_listening": bool(tunnel.get("listening")),
         "mcp_tunnel_unverified": bool(tunnel.get("unverified")),
     }
 
@@ -985,11 +991,16 @@ def mcp_status() -> dict:
     state = _tunnel_process()
     pid = state["pid"] if state else None
     listening = _tunnel_ready()
-    running = state is not None and listening
+    running = state is not None
+    owns_listener = bool(
+        state
+        and listening
+        and _process_owns_unix_listener(state["pid"], MCP_SOCKET)
+    )
     return {"ok": True, "running": running, "pid": pid,
             "socket": str(MCP_SOCKET) if listening else None,
             "listening": listening,
-            "unverified": state is None and listening}
+            "unverified": listening and not owns_listener}
 
 
 def do_mcp_up(wait: float = 15) -> dict:
@@ -1011,6 +1022,9 @@ def do_mcp_up(wait: float = 15) -> dict:
             ) and _process_owns_unix_listener(state["pid"], MCP_SOCKET):
                 return {
                     "ok": True,
+                    "running": True,
+                    "listening": True,
+                    "unverified": False,
                     "output": f"tunnel already up (pid {state['pid']})",
                     "socket": str(MCP_SOCKET),
                     "pid": state["pid"],
@@ -1127,6 +1141,9 @@ def do_mcp_up(wait: float = 15) -> dict:
                 if _process_owns_unix_listener(p.pid, MCP_SOCKET):
                     return {
                         "ok": True,
+                        "running": True,
+                        "listening": True,
+                        "unverified": False,
                         "output": f"tunnel up — {MCP_SOCKET} -> guest 127.0.0.1:{port}",
                         "socket": str(MCP_SOCKET),
                         "pid": p.pid,
@@ -1433,6 +1450,324 @@ def _materialize_capture(response: dict, output: str | None,
     })
 
 
+def active_mcp_adapter() -> dict:
+    """Describe the launched harness's declared Windows MCP capability."""
+    harness = os.environ.get("SC_HARNESS") or ports.resolve(persist=False).get(
+        "harness"
+    )
+    if not harness:
+        return {
+            "harness": None,
+            "state": "unknown",
+            "supported": False,
+            "reason": "SC_HARNESS is not set",
+            "server_name": None,
+        }
+    path = ports.ENGINE / "adapters" / harness / "adapter.json"
+    try:
+        adapter = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {
+            "harness": harness,
+            "state": "unknown",
+            "supported": False,
+            "reason": "the active harness adapter could not be read",
+            "server_name": None,
+        }
+    streamable = (adapter.get("mcp") or {}).get("streamable_http") or {}
+    supported = streamable.get("supported") is True
+    managed = streamable.get("managed_server") or {}
+    return {
+        "harness": harness,
+        "state": "supported" if supported else "unsupported",
+        "supported": supported,
+        "reason": None if supported else str(
+            streamable.get("reason") or "streamable HTTP MCP is unsupported"
+        ),
+        "server_name": managed.get("name") if supported else None,
+    }
+
+
+def _mcp_response_message(raw: bytes, content_type: str) -> dict | None:
+    """Extract one bounded JSON-RPC response from JSON or SSE transport output."""
+    candidates = [raw]
+    if content_type.split(";", 1)[0].strip().lower() == "text/event-stream":
+        candidates = [
+            line.removeprefix(b"data:").strip()
+            for line in raw.splitlines()
+            if line.startswith(b"data:")
+        ]
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict) and value.get("id") == 1:
+            return value
+    return None
+
+
+def _close_mcp_probe_session(port: int, session_id: str, protocol: str) -> bool:
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    try:
+        connection.request(
+            "DELETE",
+            MCP_ENDPOINT_PATH,
+            headers={
+                "Mcp-Session-Id": session_id,
+                "MCP-Protocol-Version": protocol,
+                "Connection": "close",
+            },
+        )
+        response = connection.getresponse()
+        response.read(1024)
+        return int(response.status) in {200, 202, 204, 404, 405}
+    except (OSError, TimeoutError, http.client.HTTPException):
+        return False
+    finally:
+        connection.close()
+
+
+def mcp_endpoint_status(port: int = MCP_RELAY_PORT) -> dict:
+    """Verify the managed endpoint with a bounded MCP initialization handshake."""
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    try:
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "super-coder-endpoint-probe",
+                    "version": "1",
+                },
+            },
+        }).encode()
+        connection.request(
+            "POST",
+            MCP_ENDPOINT_PATH,
+            body=payload,
+            headers={
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+                "Connection": "close",
+            },
+        )
+        response = connection.getresponse()
+        raw = response.read(MCP_PROBE_LIMIT)
+        status = int(response.status)
+        message = _mcp_response_message(
+            raw, str(response.getheader("Content-Type") or "")
+        )
+        result = message.get("result") if message else None
+        protocol = result.get("protocolVersion") if isinstance(result, dict) else None
+        ready = status == 200 and isinstance(protocol, str) and bool(protocol)
+        session_id = response.getheader("Mcp-Session-Id")
+        if ready and session_id:
+            ready = _close_mcp_probe_session(port, session_id, protocol)
+            if not ready:
+                error = "MCP initialized but its probe session did not close"
+            else:
+                error = None
+        elif ready:
+            error = None
+        elif message and isinstance(message.get("error"), dict):
+            error = str(message["error"].get("message") or "MCP initialization failed")
+        elif status != 200:
+            error = f"unexpected HTTP status {status}"
+        else:
+            error = "response did not contain an MCP initialization result"
+        return {
+            "url": f"http://127.0.0.1:{port}{MCP_ENDPOINT_PATH}",
+            "ready": ready,
+            "http_status": status,
+            "error": None if ready else error[:500],
+        }
+    except (OSError, TimeoutError, http.client.HTTPException) as exc:
+        return {
+            "url": f"http://127.0.0.1:{port}{MCP_ENDPOINT_PATH}",
+            "ready": False,
+            "http_status": None,
+            "error": str(exc)[:500],
+        }
+    finally:
+        connection.close()
+
+
+def _relay_module():
+    import vm_mcp_relay
+
+    return vm_mcp_relay
+
+
+def _public_tunnel(response: dict) -> dict:
+    return {
+        "running": bool(response.get("running")),
+        "listening": bool(response.get("listening")),
+        "unverified": bool(response.get("unverified")),
+    }
+
+
+def _public_relay(response: dict) -> dict:
+    return {
+        "running": bool(response.get("running")),
+        "listening": bool(response.get("listening")),
+        "unverified": bool(response.get("unverified")),
+        "port": response.get("port", MCP_RELAY_PORT),
+    }
+
+
+def _mcp_snapshot(tunnel_response: dict) -> dict:
+    relay = _relay_module().status(MCP_RELAY_PORT)
+    tunnel = _public_tunnel(tunnel_response)
+    public_relay = _public_relay(relay)
+    endpoint = (
+        mcp_endpoint_status(MCP_RELAY_PORT)
+        if tunnel["running"]
+        and tunnel["listening"]
+        and not tunnel["unverified"]
+        and public_relay["running"]
+        and public_relay["listening"]
+        and not public_relay["unverified"]
+        else {
+            "url": f"http://127.0.0.1:{MCP_RELAY_PORT}{MCP_ENDPOINT_PATH}",
+            "ready": False,
+            "http_status": None,
+            "error": "tunnel and relay are not both verified",
+        }
+    )
+    return {
+        "adapter": active_mcp_adapter(),
+        "tunnel": tunnel,
+        "relay": public_relay,
+        "endpoint": endpoint,
+    }
+
+
+def _mcp_broker_call(method: str, path: str) -> tuple[dict | None, dict | None]:
+    try:
+        return (
+            broker_call(method, path, None, timeout=DEFAULT_CLIENT_TIMEOUT),
+            None,
+        )
+    except BrokerTimeoutError:
+        return None, operation_error(
+            "mcp", "mcp_timeout", "the MCP broker operation timed out"
+        )
+    except BrokerConnectionError:
+        return None, operation_error(
+            "mcp", "broker_unreachable", "the VM broker is not reachable"
+        )
+    except BrokerResponseError:
+        return None, operation_error(
+            "mcp", "broker_response_invalid",
+            "the VM broker did not return a complete response",
+        )
+
+
+def run_mcp_operation(action: str) -> dict:
+    """Inspect or control the complete managed Windows MCP transport."""
+    operation = f"mcp_{action}"
+    if action not in {"status", "up", "down"}:
+        return operation_error(
+            operation, "operation_unknown", "unknown MCP operation"
+        )
+
+    adapter = active_mcp_adapter()
+    if action == "up" and not adapter["supported"]:
+        return operation_error(
+            operation,
+            "mcp_adapter_unsupported",
+            adapter["reason"] or "the active harness does not support Windows MCP",
+            {"harness": adapter["harness"], "adapter_state": adapter["state"]},
+        )
+
+    if action == "status":
+        tunnel_response, error = _mcp_broker_call("GET", "/mcp/status")
+        if error:
+            error["operation"] = operation
+            return error
+        if not tunnel_response or not tunnel_response.get("ok"):
+            return _broker_failure(operation, tunnel_response or {})
+        return operation_success(operation, _mcp_snapshot(tunnel_response))
+
+    relay_module = _relay_module()
+    if action == "up":
+        tunnel_response, error = _mcp_broker_call("POST", "/mcp/up")
+        if error:
+            error["operation"] = operation
+            return error
+        if not tunnel_response or not tunnel_response.get("ok"):
+            return _broker_failure(operation, tunnel_response or {})
+
+        relay_response = relay_module.up(MCP_RELAY_PORT)
+        if not relay_response.get("ok"):
+            tunnel_cleanup, _ = _mcp_broker_call("POST", "/mcp/down")
+            return operation_error(
+                operation,
+                "mcp_relay_failed",
+                str(relay_response.get("output") or "the MCP relay did not start"),
+                {
+                    "relay": _public_relay(relay_response),
+                    "tunnel_cleanup": _public_tunnel(tunnel_cleanup or {}),
+                },
+            )
+
+        endpoint = mcp_endpoint_status(MCP_RELAY_PORT)
+        if not endpoint["ready"]:
+            relay_cleanup = relay_module.down(MCP_RELAY_PORT)
+            tunnel_cleanup, _ = _mcp_broker_call("POST", "/mcp/down")
+            return operation_error(
+                operation,
+                "mcp_endpoint_unavailable",
+                "the managed Windows MCP endpoint did not answer a verification probe",
+                {
+                    "endpoint": endpoint,
+                    "relay_cleanup": relay_cleanup,
+                    "tunnel_cleanup": tunnel_cleanup or {},
+                },
+            )
+
+        return operation_success(operation, {
+            "adapter": adapter,
+            "tunnel": _public_tunnel(tunnel_response),
+            "relay": _public_relay(relay_response),
+            "endpoint": endpoint,
+        })
+
+    relay_response = relay_module.down(MCP_RELAY_PORT)
+    tunnel_response, error = _mcp_broker_call("POST", "/mcp/down")
+    if error:
+        error["operation"] = operation
+        error["error"]["details"] = {
+            "relay_cleanup": _bounded(relay_response),
+        }
+        return error
+    if not relay_response.get("ok") or not (tunnel_response or {}).get("ok"):
+        return operation_error(
+            operation,
+            "mcp_down_incomplete",
+            "the MCP relay and tunnel did not both confirm shutdown",
+            {
+                "relay_cleanup": relay_response,
+                "tunnel_cleanup": tunnel_response or {},
+            },
+        )
+    return operation_success(operation, {
+        "adapter": adapter,
+        "relay_cleanup": relay_response,
+        "tunnel_cleanup": tunnel_response,
+        "endpoint": {
+            "url": f"http://127.0.0.1:{MCP_RELAY_PORT}{MCP_ENDPOINT_PATH}",
+            "ready": False,
+            "http_status": None,
+            "error": "transport stopped",
+        },
+    })
+
+
 def _broker_failure(operation: str, response: dict) -> dict:
     if response.get("error") == "vm_busy":
         return operation_error(
@@ -1602,6 +1937,15 @@ def run_operation(operation: str, *, command: str | None = None,
         return _broker_failure(operation, response)
     try:
         if operation == "status":
+            mcp = _mcp_snapshot({
+                "running": response["mcp_tunnel_running"],
+                "listening": response.get(
+                    "mcp_tunnel_listening",
+                    response["mcp_tunnel_running"]
+                    or response.get("mcp_tunnel_unverified", False),
+                ),
+                "unverified": response.get("mcp_tunnel_unverified", False),
+            })
             return operation_success(operation, {
                 "broker": {"ready": True},
                 "domain": {
@@ -1613,14 +1957,13 @@ def run_operation(operation: str, *, command: str | None = None,
                     "last_error": response.get("ssh_error"),
                 },
                 "mcp": {
-                    "tunnel_running": bool(response["mcp_tunnel_running"]),
-                    "unverified": bool(response.get("mcp_tunnel_unverified")),
+                    "tunnel_running": mcp["tunnel"]["running"],
+                    "tunnel_listening": mcp["tunnel"]["listening"],
+                    "unverified": mcp["tunnel"]["unverified"],
                 },
-                # Keep the deferred fields stable without exposing this repo's
-                # local planning identifiers in the public result.
-                "relay": {"state": "deferred"},
-                "endpoint": {"state": "deferred"},
-                "adapter": {"state": "deferred"},
+                "relay": mcp["relay"],
+                "endpoint": mcp["endpoint"],
+                "adapter": mcp["adapter"],
             })
         if operation == "start":
             return operation_success(operation, {
@@ -1686,10 +2029,40 @@ def _human_result(value: dict) -> str:
                 else "MCP tunnel not running"
             )
         )
+        relay = (
+            "relay unverified"
+            if result["relay"]["unverified"]
+            else ("relay running" if result["relay"]["running"] else "relay stopped")
+        )
+        endpoint = (
+            "endpoint ready" if result["endpoint"]["ready"] else "endpoint unavailable"
+        )
+        adapter = result["adapter"]
+        adapter_text = (
+            f"{adapter['harness']} adapter supported"
+            if adapter["supported"]
+            else f"{adapter['harness'] or 'unknown'} adapter {adapter['state']}"
+        )
         return (
             f"VM {result['domain']['state']} · SSH {ssh} · broker ready · "
-            f"{mcp} · relay/endpoint deferred to WU7 · adapter deferred to WU10"
+            f"{mcp} · {relay} · {endpoint} · {adapter_text}"
         )
+    if operation == "mcp_status":
+        tunnel = result["tunnel"]
+        relay = result["relay"]
+        return (
+            f"MCP tunnel {'unverified' if tunnel['unverified'] else ('running' if tunnel['running'] else 'stopped')} · "
+            f"relay {'unverified' if relay['unverified'] else ('running' if relay['running'] else 'stopped')} · "
+            f"endpoint {'ready' if result['endpoint']['ready'] else 'unavailable'} · "
+            f"adapter {result['adapter']['state']}"
+        )
+    if operation == "mcp_up":
+        return (
+            f"Windows MCP ready at {result['endpoint']['url']} · "
+            f"adapter {result['adapter']['harness']}"
+        )
+    if operation == "mcp_down":
+        return "Windows MCP relay stopped · tunnel stopped"
     if operation == "start":
         action = "started" if result["started"] else "already running"
         return f"VM {action} · SSH ready after {result['ssh']['attempts']} attempt(s)"
@@ -1722,9 +2095,9 @@ def client_main(argv: list[str]) -> int:
         description=(
             "Read-only status. JSON result fields: broker.ready; domain.name, "
             "domain.state; ssh.ready, ssh.last_error; mcp.tunnel_running, "
-            "mcp.unverified; "
-            "relay.state and endpoint.state (deferred to work unit 7); "
-            "adapter.state (deferred to work unit 10)."
+            "mcp.tunnel_listening, mcp.unverified; relay.running, "
+            "relay.listening, relay.unverified; endpoint.ready, "
+            "endpoint.http_status; adapter.state, adapter.supported."
         ),
     )
     status.add_argument(
@@ -1806,8 +2179,30 @@ def client_main(argv: list[str]) -> int:
     capture.add_argument(
         "--json", action="store_true", help="print one JSON result object"
     )
+    mcp = commands.add_parser(
+        "mcp",
+        help="inspect or control the managed Windows MCP transport",
+        description=(
+            "Manage the adapter-declared Windows MCP endpoint without starting "
+            "or resetting the VM. status is read-only; up verifies tunnel, "
+            "relay, and HTTP endpoint; down reports relay and tunnel cleanup "
+            "separately."
+        ),
+    )
+    mcp_commands = mcp.add_subparsers(dest="mcp_action", required=True)
+    for action, help_text in (
+        ("status", "inspect adapter, tunnel, relay, and endpoint"),
+        ("up", "start verified tunnel and relay, then probe the endpoint"),
+        ("down", "stop verified relay and tunnel instances"),
+    ):
+        command = mcp_commands.add_parser(action, help=help_text)
+        command.add_argument(
+            "--json", action="store_true", help="print one JSON result object"
+        )
     args = parser.parse_args(argv)
-    if args.operation == "exec":
+    if args.operation == "mcp":
+        value = run_mcp_operation(args.mcp_action)
+    elif args.operation == "exec":
         command_parts = args.command
         if command_parts[:1] == ["--"]:
             command_parts = command_parts[1:]
