@@ -27,6 +27,7 @@ class ExecClientTests(unittest.TestCase):
         )
         response = {
             "ok": True,
+            "ran": True,
             "exit": 0,
             "stdout": "München 東京 :: ready\n",
             "stderr": "",
@@ -86,7 +87,13 @@ class ExecClientTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             command_file = Path(tmp) / "command.ps1"
             command_file.write_text(command, encoding="utf-8")
-            response = {"ok": True, "exit": 0, "stdout": "ok\n", "stderr": ""}
+            response = {
+                "ok": True,
+                "ran": True,
+                "exit": 0,
+                "stdout": "ok\n",
+                "stderr": "",
+            }
             with (
                 mock.patch.object(vm, "broker_call", return_value=response) as call,
                 mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
@@ -166,6 +173,7 @@ class ExecClientTests(unittest.TestCase):
     def test_nonzero_guest_exit_is_a_result_with_diagnostic_output(self):
         response = {
             "ok": False,
+            "ran": True,
             "exit": 7,
             "stdout": "partial result\n",
             "stderr": "Get-Item: path not found\n",
@@ -232,6 +240,57 @@ class ExecClientTests(unittest.TestCase):
                     "details": {"exit_code": exit_code},
                 },
             )
+
+    def test_legacy_broker_failures_do_not_look_like_guest_results(self):
+        cases = (
+            (-1, "missing required field(s): ssh_key_path"),
+            (127, "command not found: ssh"),
+            (124, "timed out (>120s)"),
+        )
+        for exit_code, message in cases:
+            response = {
+                "ok": False,
+                "exit": exit_code,
+                "stdout": "",
+                "stderr": message,
+            }
+            with (
+                self.subTest(exit_code=exit_code),
+                mock.patch.object(vm, "broker_call", return_value=response),
+                mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
+            ):
+                code = vm.client_main(["exec", "--json", "--", "whoami"])
+            self.assertEqual(code, 1)
+            self.assertEqual(
+                json.loads(stdout.getvalue())["error"],
+                {
+                    "code": "exec_failed",
+                    "message": message,
+                    "details": {"exit_code": exit_code},
+                },
+            )
+
+    def test_legacy_broker_success_without_ran_evidence_is_not_trusted(self):
+        response = {
+            "ok": True,
+            "exit": 0,
+            "stdout": "unconfirmed",
+            "stderr": "",
+        }
+        with (
+            mock.patch.object(vm, "broker_call", return_value=response),
+            mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
+        ):
+            code = vm.client_main(["exec", "--json", "--", "whoami"])
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            json.loads(stdout.getvalue())["error"],
+            {
+                "code": "broker_response_invalid",
+                "message": "the VM broker did not return the required result fields",
+                "details": {},
+            },
+        )
 
 
 class PushClientTests(unittest.TestCase):

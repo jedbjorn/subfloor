@@ -50,7 +50,16 @@ class VerbDispatchTests(unittest.TestCase):
         with mock.patch.object(vm, "read", return_value=SAVED), \
              mock.patch("subprocess.run", return_value=fake) as run:
             r = vm.do_exec("echo hello")
-        self.assertEqual(r, {"ok": True, "exit": 0, "stdout": "hello\n", "stderr": ""})
+        self.assertEqual(
+            r,
+            {
+                "ok": True,
+                "ran": True,
+                "exit": 0,
+                "stdout": "hello\n",
+                "stderr": "",
+            },
+        )
         # SSH non-interactive + targets the saved guest, not a caller-named host.
         argv = run.call_args[0][0]
         self.assertEqual(argv[0], "ssh")
@@ -1061,7 +1070,13 @@ class SocketTransportTests(unittest.TestCase):
             r = vm.broker_call("POST", "/exec", {"command": "exit 2"})
         self.assertEqual(
             r,
-            {"ok": False, "exit": 2, "stdout": "out", "stderr": "err"},
+            {
+                "ok": False,
+                "ran": True,
+                "exit": 2,
+                "stdout": "out",
+                "stderr": "err",
+            },
         )
 
     def test_busy_reset_returns_without_attempting_reset(self):

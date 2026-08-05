@@ -562,7 +562,7 @@ def validate(check: str, cfg: dict) -> dict | None:
 # wizard passes in, before it is saved.)
 
 def do_exec(command: str, timeout: int = 120) -> dict:
-    """Run one command in the guest over SSH. Returns {ok, exit, stdout, stderr}."""
+    """Run one command in the guest over SSH. Returns {ok, ran, exit, stdout, stderr}."""
     cfg = read() or {}
     if m := _missing(cfg, "ssh_host", "ssh_user", "ssh_key_path"):
         return {
@@ -591,7 +591,7 @@ def do_exec(command: str, timeout: int = 120) -> dict:
                            capture_output=True,
                            text=True, encoding="utf-8", errors="replace",
                            timeout=timeout)
-        return {"ok": p.returncode == 0, "exit": p.returncode,
+        return {"ok": p.returncode == 0, "ran": True, "exit": p.returncode,
                 "stdout": p.stdout, "stderr": p.stderr}
     except FileNotFoundError as e:
         return {
@@ -1579,7 +1579,7 @@ def run_operation(operation: str, *, command: str | None = None,
 
     if response.get("error") == "vm_busy":
         return _broker_failure(operation, response)
-    if operation == "exec" and response.get("error") is None:
+    if operation == "exec" and response.get("ran") is True:
         exit_code = response.get("exit")
         stdout = response.get("stdout")
         stderr = response.get("stderr")
