@@ -1,85 +1,84 @@
 ---
 name: windows_devkit
-description: Drive the linked Windows Test VM — push a build artifact, exec the installer/test over SSH, capture output + a screenshot, then reset to the clean snapshot. High-fidelity installer/system-level testing where Wine is useless. Use when building or verifying Windows software in a fork that has a configured VM.
+description: Drive the linked Windows Test VM from its supplied state with typed status, start, push, exec, capture, and end-only reset commands. Use for Windows installer, service, registry, and system-level verification that Wine cannot represent.
 category: substrate
 common: false
 ---
 
-# windows_devkit — driving the Windows Test VM
+# windows_devkit — drive the supplied Windows test VM
 
-Real Windows, for the testing Wine can't fake: MSI installers, services, the
-registry, system-level behavior. Opt-in + link-only — the operator runs the
-VM; you drive a verified loop against it. Devs build + test; the reviewer
-independently verifies the dev's candidate artifact with exec → capture →
-reset. Grant is explicit, per-fork (`common=0`).
+Use the operator-supplied VM and application state. Inspect first, start or open
+only what is absent, perform the test, and reset once at the end. Planning,
+probing, skill review, and static verification never reset the VM.
 
-## Precondition — the link is configured
+## Preflight
 
-VM config = `vm` key in `.super-coder/instance.json` (set via the GUI Scripts
-→ **Windows Test VM** wizard, which live-tests every field before save):
+The linked fork must have a `vm` block in `.super-coder/instance.json`, created
+and validated through Scripts → **Windows Test VM**. The operator owns the VM,
+testing snapshot, credentials, and guest toolchain.
 
-```json
-"vm": { "domain": "win-test", "ssh_host": "127.0.0.1", "ssh_port": 22,
-        "ssh_user": "tester", "ssh_key_path": "~/.ssh/sc_win_test",
-        "transfer_dir": "/var/sc/win-xfer", "snapshot": "clean",
-        "libvirt_uri": "qemu:///system" }
+- No `vm` block: stop and ask the operator to link the VM.
+- Invalid configuration or missing broker: report the structured `./sc vm`
+  error and ask the operator to run `./sc vm-broker-up`. Do not read key
+  material, use `ssh` or `virsh` directly, or build raw broker requests.
+- Missing guest toolchain: ask the operator to run `configure_winbox` and
+  re-bake. Never install tools during the test and poison the testing snapshot.
+
+## Canonical workflow
+
+1. Assume the operator supplied a running VM with the testing application open.
+2. Run `./sc vm status --json`. This is read-only: it never starts, restarts, or
+   resets the VM.
+3. If the domain is off, run `./sc vm start --json`. If it is already running
+   but SSH is not ready, the same command waits for readiness without restarting
+   it. Do not invent sleeps.
+4. If the testing application is absent, open it through `./sc vm exec` or the
+   Windows GUI tools, according to the test.
+5. Use `push`, `exec`, and `capture` as needed, then perform the test.
+6. A test failure does not skip cleanup. When testing is finished and you still
+   have control, run `./sc vm mcp down --json` if GUI transport was used, then
+   run `./sc vm reset --off --json` once. This restores the configured testing
+   snapshot and leaves the domain powered off.
+7. Report the test result and cleanup result separately. Include any structured
+   error and never claim an unconfirmed operation succeeded.
+
+There is no reset at the beginning or during a test. Do not automatically retry
+a reset after a timeout, disconnect, malformed response, or
+`reset_result_unknown`; its effect may already have occurred.
+
+## Typed commands
+
+```text
+./sc vm status --json
+./sc vm start --json
+./sc vm push <repo-file> [destination] --json
+./sc vm exec --json -- <simple guest command and arguments>
+./sc vm exec --command-file <utf8-command-file> --json
+./sc vm capture [--output .sc-state/local/vm-captures/<name>] --json
+./sc vm mcp status|up|down --json
+./sc vm reset --off --json
 ```
 
-`libvirt_uri` optional — set it when the domain is system-scope (the default
-`qemu:///session` can't see it); omit otherwise.
-
-- No `vm` block → no VM linked: stop + ask the operator to run the wizard.
-- `configure_winbox` must also have run, or the box has no toolchain — the
-  wizard's `toolchain` check confirms it did.
-- A wrong field → fix it in the wizard (it re-validates); NEVER hand-edit
-  secrets into config.
-- `ssh_key_path` = a path, never key material. Never read it — the key lives
-  host-side with the broker (below).
-
-## Drive through the host broker — never ssh/virsh directly
-
-You run inside the sandbox; the VM lives on the host's libvirt NAT,
-unreachable from here, and the container has no `ssh`, no `virsh`, no key.
-Call the host-side **vm-broker** over its unix socket in the bind-mounted
-repo; the broker holds the key + libvirt. (Detail:
-`.super-coder/docs/windows-vm-broker.md`.)
-
-```bash
-SOCK="$(sc vm-broker-sock)"
-curl -s --unix-socket "$SOCK" http://vm/health      # liveness check first
-```
-
-curl fails "not reachable" → broker down → ask the operator to run
-`sc vm-broker-up` on the host. You cannot start it yourself (host process,
-not sandbox).
-
-## The loop — push → exec → capture → reset
-
-Every run starts from the clean snapshot — without the reset, installer
-side-effects leak between runs and the next result is a lie.
-
-| Verb | Call |
-|---|---|
-| **push** | `curl -s --unix-socket "$SOCK" http://vm/push -d '{"src":"<repo path to artifact>"}'` — stages into `transfer_dir` (the guest's share) |
-| **exec** | `curl -s --unix-socket "$SOCK" http://vm/exec -d '{"command":"<installer / test cmd>"}'` → `{ok, exit, stdout, stderr}` |
-| **capture** | `curl -s --unix-socket "$SOCK" http://vm/capture -d '{"command":"<optional cmd>"}'` → stdout + a base64 `virsh screenshot` for GUI state |
-| **reset** (start) | `curl -s --unix-socket "$SOCK" http://vm/reset -X POST` — revert to clean + **boot** |
-| **reset** (done) | `curl -s --unix-socket "$SOCK" http://vm/reset -d '{"running":false}'` — revert to clean, leave **powered OFF** |
-
-The broker runs ssh non-interactively from the saved `vm` block — name a
-command, never a host or a key.
-
-**Bracket every run with reset.** Start with `/reset` (boots a clean box);
-end — even on failure — with `/reset {"running":false}` (clean + powered off:
-an idle running VM pins ~12 GB of host RAM). The clean snapshot is OFFLINE
-(this CPU's non-migratable `invtsc` flag refuses a live snapshot), so a bare
-revert lands powered-off; `{"running":true}` (the default) boots it —
-`{"running":false}` gets clean **and** off in a single op.
+- `exec` accepts arguments after `--` or one UTF-8 command file, never both.
+  Arguments after `--` are re-joined with single spaces; local shell token
+  boundaries are not preserved. Use that form for simple commands, or pass the
+  entire guest command as one locally quoted argument. For complex, quoted, or
+  multiline PowerShell, use `--command-file` so quotes, dollar variables,
+  pipes, backticks, paths with spaces, and Unicode reach the broker unchanged.
+- `capture` writes an atomic mode-0600 artifact under
+  `.sc-state/local/vm-captures/`; use the returned path for visual inspection.
+- `mcp up` verifies the tunnel, relay, and HTTP endpoint before success.
+  `mcp down` reports relay and tunnel cleanup separately.
+- Every command exits nonzero on an operation failure. With `--json`, inspect
+  the single object containing `schema_version`, `ok`, `operation`, `result`,
+  and `error`.
 
 ## Stance
 
-- **You drive, you don't provision.** Missing toolchain → admin's
-  `configure_winbox` + re-bake. NEVER `winget install` from this loop — it
-  poisons the clean snapshot.
-- **The reviewer verifies, doesn't build.** Reviewer runs exec → capture →
-  reset on the dev's candidate artifact to confirm the claim independently.
+- Observe before changing state. Retain a supplied running domain and open app.
+- Drive through `./sc vm`; never assemble broker HTTP, socket curl, JSON, SSH,
+  PowerShell transport quoting, screenshot decoding, or relay process control.
+- Reset is end-only cleanup, not test setup. Attempt it once while you still
+  have control, and report its observed final state honestly.
+- Guest output, screenshots, configuration, and credentials remain local to the
+  linked repo and operator.
