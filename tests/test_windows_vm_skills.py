@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SKILLS = ENGINE / "assets" / "skills"
-MIGRATION = ENGINE / "migrations" / "0181_reseed_windows_vm_adapter_recovery.sql"
+MIGRATION = ENGINE / "migrations" / "0182_reseed_windows_guest_shell_output.sql"
 README = ROOT / "docs" / "README.md"
 BROKER_DOC = ENGINE / "docs" / "windows-vm-broker.md"
 
@@ -60,6 +60,20 @@ class WindowsSkillWorkflowTest(unittest.TestCase):
             reset_invocations(content),
             ["./sc vm reset --off --json", "./sc vm reset --off --json"],
         )
+
+    def test_devkit_documents_guest_shell_and_stdout_encoding(self):
+        content = skill("windows_devkit")["content"]
+
+        self.assertIn("`cmd.exe` is the guest default SSH shell", content)
+        self.assertIn(
+            '`powershell -NoProfile -Command "Get-ChildItem Env:"`', content
+        )
+        self.assertIn(
+            "Client-to-broker command content remains unchanged, but guest "
+            "console stdout\n  may transliterate non-ASCII on return.",
+            content,
+        )
+        self.assertIn("For byte-exact output, base64-encode\n  it guest-side", content)
 
     def test_gui_uses_adapter_tools_and_ordered_mcp_cleanup(self):
         content = skill("windows_vm_gui")["content"]
