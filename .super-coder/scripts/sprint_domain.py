@@ -18,6 +18,7 @@ import conversation_broker
 import conversation_events
 import db_driver
 import sprint_participant_chats
+from conversation_adapters import AdapterError, ProbeResult, adapter_for
 
 SPRINT_TRANSITIONS = {
     "prepared": frozenset({"armed", "aborted"}),
@@ -34,6 +35,14 @@ WORK_UNIT_OUTPUT_KINDS = frozenset({"code", "report_only", "no_code"})
 WAKE_CONTENTION_BACKOFF_SECONDS = (15, 60, 180, 300)
 WAKE_CONTENTION_ATTEMPTS = 5
 WAKE_DELIVERY_BACKOFF_SECONDS = (15, 60, 180)
+WAKE_PICKUP_PAUSE_REASONS = frozenset(
+    {
+        "wake_pickup_unknown",
+        "wake_pickup_failed",
+        "wake_pickup_unread",
+        "wake_pickup_evidence_invalid",
+    }
+)
 
 
 def _participant_shell_id(con: sqlite3.Connection, participant_id: int) -> int:
@@ -60,6 +69,10 @@ class SprintAuthorityError(SprintLifecycleError):
 
 class SprintInvariantError(SprintLifecycleError):
     """The durable Sprint plan is not eligible for the requested transition."""
+
+
+class SprintPreflightError(SprintInvariantError):
+    """The selected participant route is incompatible with this runtime."""
 
 
 @dataclass(frozen=True)
@@ -227,11 +240,15 @@ class SprintLifecycleStore:
         *,
         interrupt_run: Callable[[int], bool] | None = None,
         notify_commit: Callable[[], bool] | None = None,
+        probe_harness: Callable[[str], ProbeResult] | None = None,
     ) -> None:
         self.con = con
         self.con.row_factory = sqlite3.Row
         self.interrupt_run = interrupt_run or conversation_broker.interrupt_run
         self.notify_commit = notify_commit or conversation_broker.notify_commit
+        self.probe_harness = probe_harness or (
+            lambda harness: adapter_for(harness).probe()
+        )
 
     def armed_sprint_id(self) -> int | None:
         row = self.con.execute(
@@ -247,6 +264,10 @@ class SprintLifecycleStore:
         and work-unit dispositions together.
         """
         actor = LifecycleActor("planner", planner_shell_id)
+        preflight_fingerprint = self._preflight_arm(
+            sprint_id,
+            actor,
+        )
         with db_driver.write_transaction(self.con, "sprint.arm"):
             sprint = self._sprint(sprint_id)
             if sprint["lifecycle"] != "prepared":
@@ -256,6 +277,14 @@ class SprintLifecycleStore:
             self._require_edge(sprint["lifecycle"], "armed")
             self._authorize(sprint, "armed", actor)
             planner_participant, selections = self._validate_arm_plan(sprint)
+            current_fingerprint = self._participant_selection_fingerprint(
+                sprint_id
+            )
+            if current_fingerprint != preflight_fingerprint:
+                raise SprintInvariantError(
+                    "participant launch selections changed during harness "
+                    "preflight; retry arm"
+                )
             self._update_lifecycle(
                 sprint_id,
                 current="prepared",
@@ -284,6 +313,70 @@ class SprintLifecycleStore:
             )
             SprintWorkUnitStore(self.con)._queue_delivery_terminal(sprint_id)
         return wake_ids
+
+    def _preflight_arm(
+        self,
+        sprint_id: int,
+        actor: LifecycleActor,
+    ) -> str:
+        """Probe one immutable route snapshot before arm takes a write lock."""
+        if self.con.in_transaction:
+            raise SprintInvariantError(
+                "arm harness preflight requires a connection outside a transaction"
+            )
+        sprint = self._sprint(sprint_id)
+        if sprint["lifecycle"] != "prepared":
+            raise SprintStateError(
+                f"arm() requires prepared; found {sprint['lifecycle']}"
+            )
+        self._require_edge(sprint["lifecycle"], "armed")
+        self._authorize(sprint, "armed", actor)
+        self._validate_arm_plan(sprint)
+        try:
+            routes = sprint_participant_chats.prepare_sprint_participant_routes(
+                self.con,
+                sprint_id,
+            )
+        except sprint_participant_chats.SprintConversationError as exc:
+            raise SprintPreflightError(str(exc)) from exc
+        fingerprint = self._route_fingerprint(routes)
+        for harness in dict.fromkeys(route.harness for route in routes):
+            try:
+                self.probe_harness(harness)
+            except AdapterError as exc:
+                raise SprintPreflightError(str(exc)) from exc
+        return fingerprint
+
+    def _participant_selection_fingerprint(self, sprint_id: int) -> str:
+        try:
+            routes = sprint_participant_chats.prepare_sprint_participant_routes(
+                self.con,
+                sprint_id,
+            )
+        except sprint_participant_chats.SprintConversationError as exc:
+            raise SprintInvariantError(str(exc)) from exc
+        return self._route_fingerprint(routes)
+
+    @staticmethod
+    def _route_fingerprint(
+        routes: tuple[sprint_participant_chats.PreparedParticipantRoute, ...],
+    ) -> str:
+        snapshot = [
+            {
+                "participant_id": route.participant_id,
+                "shell_id": route.shell_id,
+                "role": route.role,
+                "shortname": route.shortname,
+                "harness": route.harness,
+                "provider": route.provider,
+                "model": route.model,
+                "effort": route.effort,
+                "worktree": route.worktree,
+            }
+            for route in routes
+        ]
+        payload = json.dumps(snapshot, separators=(",", ":"), sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()
 
     def transition(
         self,
@@ -464,7 +557,7 @@ class SprintLifecycleStore:
                 target="armed",
                 outcome=None,
             )
-            reset_wake_ids = self._reset_contention_episode_in_transaction(
+            reset_wake_ids = self._reset_pickup_episodes_in_transaction(
                 sprint_id,
                 actor,
             )
@@ -550,12 +643,12 @@ class SprintLifecycleStore:
             all_anomalies,
         )
 
-    def _reset_contention_episode_in_transaction(
+    def _reset_pickup_episodes_in_transaction(
         self,
         sprint_id: int,
         actor: LifecycleActor,
     ) -> tuple[int, ...]:
-        """Make a human resume the durable anchor of a fresh busy episode."""
+        """Make an authorized resume the anchor of fresh bounded pickup work."""
         report = self.con.execute(
             "SELECT body FROM sprint_reports WHERE sprint_id=? "
             "AND report_kind='pause' ORDER BY report_id DESC LIMIT 1",
@@ -564,62 +657,132 @@ class SprintLifecycleStore:
         if report is None:
             return ()
         pause = json.loads(str(report["body"]))
-        if pause.get("reason") != "wake_contention_exhausted":
+        pause_reason = pause.get("reason")
+        if pause_reason == "wake_contention_exhausted":
+            wake_ids = (int(pause["detail"]["wake_id"]),)
+            classification = "contention_episode_reset"
+            episode_name = "contention-episode"
+        elif pause_reason in WAKE_PICKUP_PAUSE_REASONS:
+            wake_ids = tuple(
+                int(row[0])
+                for row in self.con.execute(
+                    "SELECT DISTINCT "
+                    "CAST(json_extract(e.payload,'$.wake_id') AS INTEGER) wake_id "
+                    "FROM sprint_events e JOIN sprint_wake_outbox w "
+                    "ON w.wake_id=json_extract(e.payload,'$.wake_id') "
+                    "WHERE e.sprint_id=? AND e.event_type='wake.pickup_exhausted' "
+                    "AND w.sprint_id=e.sprint_id "
+                    "AND w.state IN ('delivered','failed') AND EXISTS ("
+                    "SELECT 1 FROM sprint_wake_messages wm "
+                    "JOIN wake_message m USING (message_id) "
+                    "WHERE wm.wake_id=w.wake_id AND wm.sprint_id=e.sprint_id "
+                    "AND m.read_at IS NULL) ORDER BY wake_id",
+                    (sprint_id,),
+                )
+            )
+            classification = "pickup_episode_reset"
+            episode_name = "pickup-episode"
+        else:
             return ()
-        wake_id = int(pause["detail"]["wake_id"])
-        wake = self.con.execute(
-            "SELECT w.participant_id,w.idempotency_key "
-            "FROM sprint_wake_outbox w "
-            "WHERE w.sprint_id=? AND w.wake_id=? "
+        if not wake_ids:
+            return ()
+
+        placeholders = ",".join("?" for _ in wake_ids)
+        wakes = self.con.execute(
+            "SELECT w.wake_id,w.participant_id,w.receiver_shell_id,"
+            "w.idempotency_key FROM sprint_wake_outbox w "
+            f"WHERE w.sprint_id=? AND w.wake_id IN ({placeholders}) "
             "AND w.state IN ('delivered','failed') AND EXISTS ("
             "SELECT 1 FROM sprint_wake_messages wm "
             "JOIN wake_message m USING (message_id) "
             "WHERE wm.sprint_id=w.sprint_id AND wm.wake_id=w.wake_id "
-            "AND m.read_at IS NULL)",
-            (sprint_id, wake_id),
-        ).fetchone()
-        if wake is None:
-            return ()
-        reset_key = f"sprint-resume:{sprint_id}:contention-episode:{wake_id}"
-        replacement_wake_id = int(
+            "AND m.read_at IS NULL) ORDER BY w.wake_id",
+            (sprint_id, *wake_ids),
+        ).fetchall()
+        grouped: dict[int, list[sqlite3.Row]] = {}
+        for wake in wakes:
+            grouped.setdefault(int(wake["participant_id"]), []).append(wake)
+
+        replacements: list[int] = []
+        for participant_id, participant_wakes in grouped.items():
+            receiver_shell_id = int(participant_wakes[0]["receiver_shell_id"])
+            anchor_wake_id = max(int(wake["wake_id"]) for wake in participant_wakes)
+            reset_key = (
+                f"sprint-resume:{sprint_id}:{episode_name}:{anchor_wake_id}"
+            )
+            deliverable = self.con.execute(
+                "SELECT wake_id,idempotency_key FROM sprint_wake_outbox "
+                "WHERE receiver_shell_id=? AND state='pending'",
+                (receiver_shell_id,),
+            ).fetchone()
+            if deliverable is None:
+                replacement_wake_id = int(
+                    self.con.execute(
+                        "INSERT INTO sprint_wake_outbox "
+                        "(sprint_id,participant_id,receiver_shell_id,idempotency_key,"
+                        "available_at) VALUES (?,?,?,?,datetime('now'))",
+                        (
+                            sprint_id,
+                            participant_id,
+                            receiver_shell_id,
+                            reset_key,
+                        ),
+                    ).lastrowid
+                )
+            else:
+                replacement_wake_id = int(deliverable["wake_id"])
+                if str(deliverable["idempotency_key"]) != reset_key:
+                    self.con.execute(
+                        "UPDATE sprint_wake_outbox SET idempotency_key=?,"
+                        "available_at=datetime('now') WHERE wake_id=? "
+                        "AND state='pending'",
+                        (reset_key, replacement_wake_id),
+                    )
+
+            source_wake_ids = tuple(
+                int(wake["wake_id"]) for wake in participant_wakes
+            )
+            source_placeholders = ",".join("?" for _ in source_wake_ids)
+            unread_message_ids = tuple(
+                int(row[0])
+                for row in self.con.execute(
+                    "SELECT m.message_id FROM sprint_wake_messages wm "
+                    "JOIN wake_message m USING (message_id) "
+                    f"WHERE wm.sprint_id=? AND wm.wake_id IN ({source_placeholders}) "
+                    "AND m.read_at IS NULL ORDER BY m.message_id",
+                    (sprint_id, *source_wake_ids),
+                )
+            )
+            if not unread_message_ids:
+                continue
+            message_placeholders = ",".join("?" for _ in unread_message_ids)
             self.con.execute(
-                "INSERT INTO sprint_wake_outbox "
-                "(sprint_id,participant_id,receiver_shell_id,idempotency_key,"
-                "available_at) VALUES (?,?,?,?,datetime('now'))",
-                (
+                "UPDATE wake_message SET delivered_at=NULL "
+                f"WHERE message_id IN ({message_placeholders})",
+                unread_message_ids,
+            )
+            self.con.execute(
+                "UPDATE sprint_wake_messages SET wake_id=? "
+                f"WHERE message_id IN ({message_placeholders})",
+                (replacement_wake_id, *unread_message_ids),
+            )
+            for wake in participant_wakes:
+                self._event(
                     sprint_id,
-                    int(wake["participant_id"]),
-                    _participant_shell_id(self.con, int(wake["participant_id"])),
-                    reset_key,
-                ),
-            ).lastrowid
-        )
-        self.con.execute(
-            "UPDATE wake_message SET delivered_at=NULL WHERE message_id IN ("
-            "SELECT message_id FROM sprint_wake_messages "
-            "WHERE sprint_id=? AND wake_id=?)",
-            (sprint_id, wake_id),
-        )
-        self.con.execute(
-            "UPDATE sprint_wake_messages SET wake_id=? "
-            "WHERE sprint_id=? AND wake_id=?",
-            (replacement_wake_id, sprint_id, wake_id),
-        )
-        self._event(
-            sprint_id,
-            "wake.requeued",
-            actor,
-            {
-                "trigger": "resume",
-                "classification": "contention_episode_reset",
-                "prior_wake_id": wake_id,
-                "replacement_wake_id": replacement_wake_id,
-                "prior_idempotency_key": str(wake["idempotency_key"]),
-                "idempotency_key": reset_key,
-                "replacement_conversation_id": None,
-            },
-        )
-        return (replacement_wake_id,)
+                    "wake.requeued",
+                    actor,
+                    {
+                        "trigger": "resume",
+                        "classification": classification,
+                        "prior_wake_id": int(wake["wake_id"]),
+                        "replacement_wake_id": replacement_wake_id,
+                        "prior_idempotency_key": str(wake["idempotency_key"]),
+                        "idempotency_key": reset_key,
+                        "replacement_conversation_id": None,
+                    },
+                )
+            replacements.append(replacement_wake_id)
+        return tuple(sorted(set(replacements)))
 
     def abort(
         self,
@@ -1184,6 +1347,12 @@ class SprintLifecycleStore:
         rows = self.con.execute(
             "SELECT w.wake_id,w.sprint_id AS wake_sprint_id,"
             "m.to_participant_id AS participant_id,w.state,w.idempotency_key,"
+            "w.attempt_count AS wake_attempt_count,MIN(m.message_id) AS message_id,"
+            "(SELECT detail.work_unit_id FROM wake_message detail "
+            "JOIN sprint_wake_messages detail_wm "
+            "ON detail_wm.message_id=detail.message_id "
+            "WHERE detail_wm.wake_id=w.wake_id AND detail.read_at IS NULL "
+            "ORDER BY detail.message_id LIMIT 1) AS work_unit_id,"
             "CASE WHEN COUNT(*)=COUNT(m.delivered_at) "
             "THEN MIN(m.delivered_at) END AS delivered_at "
             "FROM sprint_wake_outbox w "
@@ -1220,12 +1389,7 @@ class SprintLifecycleStore:
             )
             busy_prefix = f"sprint-recovery:{sprint_id}:busy:"
             busy_recovery = wake_key.startswith(busy_prefix)
-            if (
-                (wake_key.startswith("sprint-recovery:") and not busy_recovery)
-                or ":failed-wake:" in wake_key
-            ):
-                continue
-            if busy_recovery and not shell_busy:
+            if ":failed-wake:" in wake_key:
                 continue
             if self._participant_has_pickup_turn(participant_id):
                 continue
@@ -1289,6 +1453,53 @@ class SprintLifecycleStore:
                     "backoff_seconds": backoff_seconds,
                 }
             else:
+                if row["state"] == "delivered":
+                    episode_attempt, lineage_valid = self._pickup_episode_attempt(
+                        sprint_id,
+                        old_wake_id,
+                    )
+                    evidence_valid = self._pickup_turn_evidence_valid(row, turn)
+                    run_state = turn["run_state"]
+                    if not evidence_valid or not lineage_valid:
+                        pause_reason = "wake_pickup_evidence_invalid"
+                        failure_class = "evidence_invalid"
+                        error_code = "WAKE_PICKUP_EVIDENCE_INVALID"
+                    elif run_state == "unknown":
+                        pause_reason = "wake_pickup_unknown"
+                        failure_class = "native_unknown"
+                        error_code = str(turn["error_code"])
+                    elif episode_attempt >= 2 and run_state == "failed":
+                        pause_reason = "wake_pickup_failed"
+                        failure_class = "native_failed"
+                        error_code = str(turn["error_code"])
+                    elif episode_attempt >= 2 and run_state == "succeeded":
+                        pause_reason = "wake_pickup_unread"
+                        failure_class = "terminal_unread"
+                        error_code = "WAKE_PICKUP_UNREAD"
+                    else:
+                        pause_reason = None
+
+                    if pause_reason is not None:
+                        pause_receipt = self._exhaust_pickup_in_transaction(
+                            sprint_id=sprint_id,
+                            participant_id=participant_id,
+                            wake_id=old_wake_id,
+                            message_id=int(row["message_id"]),
+                            work_unit_id=(
+                                int(row["work_unit_id"])
+                                if row["work_unit_id"] is not None
+                                else None
+                            ),
+                            turn=turn,
+                            pause_reason=pause_reason,
+                            error_code=error_code,
+                            failure_class=failure_class,
+                            attempt_count=episode_attempt,
+                        )
+                        return _WakeReconcileResult(
+                            tuple(sorted(set(replacements))),
+                            pause_receipt,
+                        )
                 recovery_key = (
                     f"sprint-resume:{sprint_id}:failed-wake:{old_wake_id}"
                     if row["state"] == "failed"
@@ -1468,6 +1679,204 @@ class SprintLifecycleStore:
             )
             replacements.append(new_wake_id)
         return _WakeReconcileResult(tuple(sorted(set(replacements))))
+
+    def _pickup_episode_attempt(
+        self,
+        sprint_id: int,
+        wake_id: int,
+    ) -> tuple[int, bool]:
+        rows = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='wake.requeued' "
+            "AND json_extract(payload,'$.replacement_wake_id')=? "
+            "ORDER BY event_id",
+            (sprint_id, wake_id),
+        ).fetchall()
+        pickup_rows = []
+        for row in rows:
+            payload = json.loads(row["payload"])
+            if payload.get("classification") in {
+                "shell_busy",
+                "contention_episode_reset",
+                "pickup_episode_reset",
+            }:
+                continue
+            if payload.get("prior_wake_id") is not None:
+                pickup_rows.append(payload)
+        if not pickup_rows:
+            return 1, True
+        valid = all(
+            isinstance(payload.get("prior_wake_id"), int)
+            and self.con.execute(
+                "SELECT 1 FROM sprint_wake_outbox WHERE wake_id=?",
+                (payload["prior_wake_id"],),
+            ).fetchone()
+            is not None
+            for payload in pickup_rows
+        )
+        return 2, valid
+
+    @staticmethod
+    def _pickup_turn_evidence_valid(
+        wake: sqlite3.Row,
+        turn: dict[str, str | int | bool | None],
+    ) -> bool:
+        if turn["turn_live"]:
+            return True
+        if (
+            turn["attempt_number"] is None
+            or turn["target_conversation_id"] is None
+            or turn["attempt_outcome"] != "delivered"
+            or int(turn["attempt_number"]) != int(wake["wake_attempt_count"])
+        ):
+            return False
+        run_state = turn["run_state"]
+        message_state = turn["message_state"]
+        error_code = turn["error_code"]
+        if run_state == "succeeded":
+            return message_state == "completed" and error_code is None
+        if run_state in {"failed", "unknown"}:
+            return (
+                message_state == "failed"
+                and isinstance(error_code, str)
+                and bool(error_code.strip())
+            )
+        return False
+
+    def _exhaust_pickup_in_transaction(
+        self,
+        *,
+        sprint_id: int,
+        participant_id: int,
+        wake_id: int,
+        message_id: int,
+        work_unit_id: int | None,
+        turn: dict[str, str | int | bool | None],
+        pause_reason: str,
+        error_code: str,
+        failure_class: str,
+        attempt_count: int,
+    ) -> PauseReceipt:
+        participant = self.con.execute(
+            "SELECT p.role,sh.shortname,sh.shell_id "
+            "FROM sprint_participants p JOIN shells sh USING (shell_id) "
+            "WHERE p.sprint_id=? AND p.participant_id=?",
+            (sprint_id, participant_id),
+        ).fetchone()
+        if participant is None:
+            raise SprintInvariantError("Sprint participant does not exist")
+        conversation_id = (
+            str(turn["target_conversation_id"])
+            if turn["target_conversation_id"] is not None
+            else None
+        )
+        facts = {
+            "sprint_id": sprint_id,
+            "participant_id": participant_id,
+            "shell": str(participant["shortname"]),
+            "role": str(participant["role"]),
+            "work_unit_id": work_unit_id,
+            "message_id": message_id,
+            "wake_id": wake_id,
+            "conversation_id": conversation_id,
+            "run_state": turn["run_state"],
+            "error_code": error_code,
+            "failure_class": failure_class,
+            "attempt_count": attempt_count,
+        }
+        self._event(
+            sprint_id,
+            "wake.pickup_exhausted",
+            LifecycleActor("system"),
+            facts,
+        )
+        closed_conversation_id = self._close_exhausted_pickup_conversation(
+            participant_id=participant_id,
+            wake_id=wake_id,
+            conversation_id=conversation_id,
+            run_state=turn["run_state"],
+        )
+        detail = {
+            **facts,
+            "error_detail": str(turn["error_detail"] or "")[:2000] or None,
+        }
+        receipt = self._pause_in_transaction(
+            self._sprint(sprint_id),
+            LifecycleActor("system"),
+            reason=pause_reason,
+            detail=detail,
+            notice_body=(
+                f"Sprint {sprint_id} paused: pickup {failure_class} for "
+                f"{participant['role']} shell {participant['shortname']} "
+                f"(work unit {work_unit_id}, message {message_id}, wake {wake_id}, "
+                f"{error_code}). Inspect the pause report, repair the named route "
+                "or service, then use an authorized resume."
+            ),
+        )
+        if closed_conversation_id is None:
+            return receipt
+        return PauseReceipt(
+            receipt.changed,
+            receipt.report_id,
+            receipt.interrupt_run_ids,
+            tuple(
+                sorted(
+                    set(receipt.notification_conversation_ids)
+                    | {closed_conversation_id}
+                )
+            ),
+        )
+
+    def _close_exhausted_pickup_conversation(
+        self,
+        *,
+        participant_id: int,
+        wake_id: int,
+        conversation_id: str | None,
+        run_state: str | int | bool | None,
+    ) -> str | None:
+        if conversation_id is None or run_state not in {"failed", "unknown"}:
+            return None
+        row = self.con.execute(
+            "SELECT c.state,c.shell_id FROM conversations c "
+            "JOIN sprint_participants p ON p.shell_id=c.shell_id "
+            "WHERE c.conversation_id=? AND p.participant_id=?",
+            (conversation_id, participant_id),
+        ).fetchone()
+        if row is None or row["state"] != "error":
+            return None
+        shell_id = int(row["shell_id"])
+        active = active_chat_registry.get(self.con, shell_id)
+        if active is not None and active.chat_id == conversation_id:
+            if active_chat_registry.has_live_process(active):
+                return None
+            closed = active_chat_registry.close_for_displacement(
+                self.con,
+                shell_id,
+                allow_live_process=False,
+            )
+            if closed is None:
+                return None
+        else:
+            changed = self.con.execute(
+                "UPDATE conversations SET state='closed',closed_at=datetime('now'),"
+                "last_activity_at=datetime('now'),version=version+1 "
+                "WHERE conversation_id=? AND state='error'",
+                (conversation_id,),
+            ).rowcount
+            if changed != 1:
+                return None
+        sprint_participant_chats._append_event(
+            self.con,
+            conversation_id,
+            "conversation.closed",
+            {
+                "reason": "wake pickup exhausted",
+                "state": "closed",
+                "wake_id": wake_id,
+            },
+        )
+        return conversation_id
 
     @staticmethod
     def _busy_recovery_origin(wake_key: str, sprint_id: int) -> int:

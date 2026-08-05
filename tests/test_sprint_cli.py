@@ -159,7 +159,9 @@ class SprintCliApiTest(unittest.TestCase):
             ).lastrowid
         )
         con.commit()
-        initial_wake = sprint_domain.SprintLifecycleStore(con).arm(cls.sprint_id, 3)[0]
+        initial_wake = sprint_domain.SprintLifecycleStore(
+            con, probe_harness=lambda _harness: None
+        ).arm(cls.sprint_id, 3)[0]
         initial_message = int(
             con.execute(
                 "SELECT message_id FROM sprint_wake_messages WHERE wake_id=?",
@@ -238,7 +240,16 @@ class SprintCliApiTest(unittest.TestCase):
     def run_cli(self, token: str, *argv: str) -> dict:
         mem.SC_API_TOKEN = token
         output = io.StringIO()
-        with contextlib.redirect_stdout(output):
+        adapter = mock.Mock()
+        adapter.probe.return_value = None
+        with (
+            mock.patch.object(
+                server.sprint_domain,
+                "adapter_for",
+                return_value=adapter,
+            ),
+            contextlib.redirect_stdout(output),
+        ):
             self.assertEqual(0, sprint_cli.main(list(argv)))
         return json.loads(output.getvalue())
 
@@ -1384,6 +1395,18 @@ class SprintCliApiTest(unittest.TestCase):
             TOKENS["planner"], "monitor", "--sprint", str(self.sprint_id)
         )
         self.assertEqual([], monitor["outcomes"])
+        self.assertEqual(
+            {
+                "action": "none",
+                "requeued_wake_ids": [],
+                "pause_reason": None,
+            },
+            monitor["pickup"],
+        )
+        self.assertEqual(
+            {"state": "missing", "beat_at": None, "interval_seconds": 5},
+            monitor["runtime"],
+        )
 
         findings = self.write(
             json.dumps(

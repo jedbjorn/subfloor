@@ -268,6 +268,81 @@ console.log(JSON.stringify({
     assert result["focusParity"] is True
 
 
+def test_board_surfaces_runtime_failure_and_bounded_pickup_recovery_without_transcript():
+    harness = r"""
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag; this.nodeType = 1; this.children = []; this._text = "";
+    this.className = ""; this.dataset = {}; this.attributes = {}; this.isConnected = false;
+    this.scrollWidth = 1200; this.scrollHeight = 500;
+    this.classList = {toggle() {}};
+  }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = [...nodes]; this._text = ""; }
+  set textContent(value) { this._text = String(value ?? ""); this.children = []; }
+  get textContent() { return this._text + this.children.map(
+    (x) => typeof x === "string" ? x : (x.textContent || "")).join(""); }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  querySelectorAll() { return []; }
+  getBoundingClientRect() { return {left: 0, right: 100, top: 0, height: 50}; }
+}
+globalThis.document = {
+  hidden: false,
+  createElement: (tag) => new FakeElement(tag),
+  createTextNode: (text) => ({nodeType: 3, textContent: String(text ?? "")}),
+  createElementNS: (_ns, tag) => new FakeElement(tag),
+};
+globalThis.window = {addEventListener() {}, removeEventListener() {}};
+globalThis.requestAnimationFrame = () => {};
+globalThis.SVGNS = "svg";
+const el = (tag, props = {}, ...kids) => {
+  const node = Object.assign(new FakeElement(tag), props);
+  for (const kid of kids) node.append(kid?.nodeType ? kid : document.createTextNode(kid ?? ""));
+  return node;
+};
+function openModal() { return () => {}; }
+"""
+    script = harness + SPRINT_BLOCK + r"""
+const person = (shortname) => ({shell_id: 1, shortname, current_conversation_id: null});
+const recovery = {
+  sprint_id: 9, participant_id: 3, shell: "DEV1", role: "developer",
+  work_unit_id: 4, message_id: 71, wake_id: 81, conversation_id: "cv_dead",
+  run_state: "unknown", error_code: "HARNESS_SESSION_DISCOVERY_FAILED",
+  failure_class: "native_unknown", attempt_count: 1,
+  recovery_instruction: "Inspect the pause report, repair the named route or service, then use an authorized resume.",
+};
+const unit = {
+  work_unit_id: 4, title: "Pickup", expected_output: "Output", output_kind: "code",
+  completion_result: null, planned_wave: 1, disposition: "ready", column: "waiting",
+  created_at: "2026-08-01 10:00:00", updated_at: "2026-08-01 10:00:00",
+  completed_at: null, developer: person("DEV1"), reviewer: person("REV1"),
+  task_ids: [], tasks: [], prerequisite_ids: [], dependent_ids: [], pull_requests: [],
+  messages: [], pickup: recovery,
+  delivery: {state: "runtime_unavailable", runtime_state: "stale", wake_id: 81, attempt_count: 0},
+};
+const snapshot = {
+  sprint: {sprint_id: 9, feature: {feature_id: 31, title: "Board"},
+    planner: {shortname: "PLN1"}, lifecycle: "paused", created_at: "2026-08-01 10:00:00",
+    armed_at: "2026-08-01 10:01:00", paused_at: "2026-08-01 10:02:00",
+    completed_at: null, aborted_at: null, terminal_outcome: null},
+  specs: [], work_units: [unit], dependencies: [],
+  runtime: {state: "stale", beat_at: "2026-08-01 10:00:00", interval_seconds: 5},
+  pickup: {action: "paused", requeued_wake_ids: [], pause_reason: "wake_pickup_unknown", exhausted: recovery},
+};
+const root = sprintBoardNode(snapshot);
+console.log(JSON.stringify({text: root.textContent}));
+"""
+    text = run_js(script)["text"]
+    assert "Runtime stale" in text
+    assert "HARNESS_SESSION_DISCOVERY_FAILED" in text
+    assert "DEV1" in text and "developer" in text
+    assert "U4" in text and "message 71" in text and "wake 81" in text
+    assert "attempt 1" in text
+    assert "authorized resume" in text
+    assert "Runtime stale — wake 81 has 0 delivery attempts" in text
+    assert "Traceback" not in text
+
+
 def test_participant_conversation_link_uses_existing_interface_route():
     script = r"""
 class FakeElement { constructor(tag) { this.tagName = tag; this.nodeType = 1; } }

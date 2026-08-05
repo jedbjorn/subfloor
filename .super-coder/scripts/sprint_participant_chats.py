@@ -59,6 +59,19 @@ class PreparedSprintWake:
     worktree: str
 
 
+@dataclass(frozen=True)
+class PreparedParticipantRoute:
+    participant_id: int
+    shell_id: int
+    role: str
+    shortname: str
+    harness: str
+    provider: str | None
+    model: str
+    effort: str | None
+    worktree: str
+
+
 def wake_prompt(sprint_id: int, role: str) -> str:
     try:
         label, skill = _WAKE_ROLES[role]
@@ -91,6 +104,15 @@ def _nonblank(value: str | None, field: str, *, maximum: int) -> str:
     if len(value) > maximum:
         raise SprintConversationError(f"{field} exceeds {maximum} characters")
     return value
+
+
+def _browser_adapter(harness: str) -> dict:
+    adapter = run_mod.load_adapter(harness)
+    if not adapter.get("conversation"):
+        raise SprintConversationError(
+            f"harness '{harness}' has no browser conversation adapter"
+        )
+    return adapter
 
 
 def _linked_to_participant(con, participant_id: int, conversation_id: str) -> bool:
@@ -182,19 +204,25 @@ def prepare_shell_wake_conversation(con, shell_id: int) -> PreparedShellWake:
         or run_mod._configured_harness()
         or "claude"
     )
-    model = (
+    selected_model = (
         str(prior["model"])
         if prior is not None and prior["model"] is not None
-        else defaults.get("models", {}).get(harness)
+        else None
     )
-    adapter = run_mod.load_adapter(harness)
-    effort = (
+    adapter = _browser_adapter(harness)
+    selected_effort = (
         str(prior["effort"])
         if prior is not None and prior["effort"] is not None
-        else run_mod.default_headless_effort(adapter)
+        else None
     )
     try:
-        run_mod.validate_headless_request(adapter, model, effort)
+        resolved = run_mod.resolve_headless_route(
+            harness=harness,
+            adapter=adapter,
+            flavor_model=defaults.get("models", {}).get(harness),
+            model=selected_model,
+            effort=selected_effort,
+        )
     except ValueError as exc:
         raise SprintConversationError(str(exc)) from exc
     worktree = run_mod.shell_work_dir(shell["shortname"], shell["flavor"])
@@ -202,12 +230,60 @@ def prepare_shell_wake_conversation(con, shell_id: int) -> PreparedShellWake:
         shell_id=int(shell["shell_id"]),
         owner_user_id=int(shell["user_id"]),
         shortname=str(shell["shortname"]),
-        harness=harness,
-        provider=run_mod.session_provider(harness, model),
-        model=model,
-        effort=effort,
+        harness=resolved.harness,
+        provider=resolved.provider,
+        model=resolved.model,
+        effort=resolved.effort,
         worktree=str(worktree.resolve(strict=False)),
     )
+
+
+def prepare_sprint_participant_routes(
+    con,
+    sprint_id: int,
+) -> tuple[PreparedParticipantRoute, ...]:
+    """Read and canonicalize one ordered snapshot of participant routes."""
+    rows = con.execute(
+        "SELECT p.participant_id,p.shell_id,p.role,p.harness,p.model,p.effort,"
+        "sh.shortname,sh.flavor,fd.model AS flavor_model "
+        "FROM sprint_participants p "
+        "JOIN shells sh ON sh.shell_id=p.shell_id "
+        "LEFT JOIN flavor_defaults fd "
+        "ON fd.flavor=sh.flavor AND fd.harness=p.harness "
+        "WHERE p.sprint_id=? ORDER BY "
+        "CASE p.role WHEN 'planner' THEN 0 WHEN 'developer' THEN 1 ELSE 2 END,"
+        "p.participant_id",
+        (sprint_id,),
+    ).fetchall()
+    prepared: list[PreparedParticipantRoute] = []
+    for row in rows:
+        harness = str(row["harness"])
+        adapter = _browser_adapter(harness)
+        try:
+            resolved = run_mod.resolve_headless_route(
+                harness=harness,
+                adapter=adapter,
+                flavor_model=row["flavor_model"],
+                model=row["model"],
+                effort=row["effort"],
+            )
+        except ValueError as exc:
+            raise SprintConversationError(str(exc)) from exc
+        worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
+        prepared.append(
+            PreparedParticipantRoute(
+                participant_id=int(row["participant_id"]),
+                shell_id=int(row["shell_id"]),
+                role=str(row["role"]),
+                shortname=str(row["shortname"]),
+                harness=resolved.harness,
+                provider=resolved.provider,
+                model=resolved.model,
+                effort=resolved.effort,
+                worktree=str(worktree.resolve(strict=False)),
+            )
+        )
+    return tuple(prepared)
 
 
 def create_shell_wake_conversation(
@@ -227,6 +303,7 @@ def create_shell_wake_conversation(
         "effort": route.effort,
         "harness": route.harness,
         "model": route.model,
+        "provider": route.provider,
         "shell_id": route.shell_id,
         "wake_id": wake_id,
         "worktree": route.worktree,
@@ -288,11 +365,14 @@ def prepare_wake_conversation(
     """Resolve a Sprint participant route before any active chat is closed."""
     row = con.execute(
         "SELECT p.participant_id,p.sprint_id,p.shell_id,p.harness,p.model,p.effort,"
-        "s.conversation_generation,sh.shortname,sh.flavor,owner.user_id "
+        "s.conversation_generation,sh.shortname,sh.flavor,owner.user_id,"
+        "fd.model AS flavor_model "
         "FROM sprint_participants p "
         "JOIN sprints s ON s.sprint_id=p.sprint_id "
         "JOIN shells sh ON sh.shell_id=p.shell_id "
         "JOIN shells owner ON owner.shell_id=s.originating_planner_shell_id "
+        "LEFT JOIN flavor_defaults fd "
+        "ON fd.flavor=sh.flavor AND fd.harness=p.harness "
         "WHERE p.participant_id=? AND p.sprint_id=?",
         (participant_id, sprint_id),
     ).fetchone()
@@ -305,9 +385,16 @@ def prepare_wake_conversation(
         "Sprint conversation generation",
         maximum=32,
     )
-    adapter = run_mod.load_adapter(str(row["harness"]))
+    harness = str(row["harness"])
+    adapter = _browser_adapter(harness)
     try:
-        run_mod.validate_headless_request(adapter, row["model"], row["effort"])
+        resolved = run_mod.resolve_headless_route(
+            harness=harness,
+            adapter=adapter,
+            flavor_model=row["flavor_model"],
+            model=row["model"],
+            effort=row["effort"],
+        )
     except ValueError as exc:
         raise SprintConversationError(str(exc)) from exc
     worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
@@ -317,10 +404,10 @@ def prepare_wake_conversation(
         shell_id=int(row["shell_id"]),
         owner_user_id=int(row["user_id"]),
         shortname=str(row["shortname"]),
-        harness=str(row["harness"]),
-        provider=run_mod.session_provider(row["harness"], row["model"]),
-        model=str(row["model"]) if row["model"] is not None else None,
-        effort=str(row["effort"]) if row["effort"] is not None else None,
+        harness=resolved.harness,
+        provider=resolved.provider,
+        model=resolved.model,
+        effort=resolved.effort,
         generation=generation,
         worktree=str(worktree.resolve(strict=False)),
     )
@@ -339,22 +426,6 @@ def create_prepared_wake_conversation(
         raise WakeConversationBusy("another chat became active before wake creation")
 
     key = f"generation:{route.generation}:wake:{wake_id}"
-    existing = con.execute(
-        "SELECT conversation_id,state FROM conversations "
-        "WHERE owner_user_id=? AND creation_idempotency_key=?",
-        (route.owner_user_id, key),
-    ).fetchone()
-    if existing is not None:
-        if existing["state"] == "closed":
-            raise SprintConversationError("idempotent wake chat is already closed")
-        conversation_id = str(existing["conversation_id"])
-        if not _linked_to_participant(con, route.participant_id, conversation_id):
-            raise SprintConversationError(
-                "idempotent wake chat belongs to another participant"
-            )
-        active_chat_registry.register(con, route.shell_id, conversation_id)
-        return conversation_id
-
     request = {
         "effort": route.effort,
         "harness": route.harness,
@@ -365,6 +436,27 @@ def create_prepared_wake_conversation(
         "wake_id": wake_id,
         "worktree": route.worktree,
     }
+    request_hash = _request_hash(request)
+    existing = con.execute(
+        "SELECT conversation_id,state,creation_request_hash FROM conversations "
+        "WHERE owner_user_id=? AND creation_idempotency_key=?",
+        (route.owner_user_id, key),
+    ).fetchone()
+    if existing is not None:
+        if existing["state"] == "closed":
+            raise SprintConversationError("idempotent wake chat is already closed")
+        if existing["creation_request_hash"] != request_hash:
+            raise SprintConversationError(
+                "idempotent wake chat route no longer matches its request"
+            )
+        conversation_id = str(existing["conversation_id"])
+        if not _linked_to_participant(con, route.participant_id, conversation_id):
+            raise SprintConversationError(
+                "idempotent wake chat belongs to another participant"
+            )
+        active_chat_registry.register(con, route.shell_id, conversation_id)
+        return conversation_id
+
     conversation_id = "cv_" + uuid.uuid4().hex
     con.execute(
         "INSERT INTO conversations "
@@ -382,7 +474,7 @@ def create_prepared_wake_conversation(
             request["worktree"],
             f"Sprint {route.sprint_id} · Wake {wake_id} · {route.shortname}",
             key,
-            _request_hash(request),
+            request_hash,
         ),
     )
     _append_created_event(

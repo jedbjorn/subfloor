@@ -2000,6 +2000,8 @@ class Handler(BaseHTTPRequestHandler):
     def _sprint_error(self, exc: Exception):
         if isinstance(exc, sprint_domain.SprintAuthorityError):
             return self._send(403, {"error": str(exc)})
+        if isinstance(exc, sprint_domain.SprintPreflightError):
+            return self._send(422, {"error": str(exc)})
         if isinstance(exc, sprint_domain.SprintInvariantError):
             return self._send(409, {"error": str(exc)})
         if isinstance(exc, KeyError):
@@ -2604,23 +2606,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"wake_ids": released})
             if path == "/_sc/sprint/monitor":
                 self._require_sprint_planner(con, sprint_id, shell_id)
-                sprint_domain.SprintLifecycleStore(con).reconcile_unread_pickup(
-                    sprint_id,
-                    trigger="monitor",
-                )
-                outcomes = sprint_liveness.SprintLivenessMonitor(con).evaluate(
-                    sprint_id
-                )
-                return self._send(200, {
-                    "outcomes": [
-                        {
-                            "message_id": outcome.message_id,
-                            "action": outcome.action,
-                            "silence_episode": outcome.silence_episode,
-                        }
-                        for outcome in outcomes
-                    ]
-                })
+                return self._send(200, sprint_monitor_response(con, sprint_id))
             if path == "/_sc/sprint/conformance":
                 findings = body.get("findings")
                 if not isinstance(findings, list):
@@ -4325,8 +4311,45 @@ def start_runtime_services() -> None:
         launch_preparer=conversation_launch.ConversationLaunchPreparer(DB_PATH),
     )
     conversation_reaper.start_service(DB_PATH, native_interrupt=broker.interrupt)
-    sprint_runtime.start_service(DB_PATH)
+    runtime = sprint_runtime.start_service(DB_PATH)
+    if not runtime.wait_ready():
+        runtime.stop()
+        raise RuntimeError(
+            "Sprint runtime did not complete its first successful cycle"
+        )
+    if not runtime.is_alive():
+        runtime.stop()
+        raise RuntimeError("Sprint runtime died during startup")
     sprint_pr_watcher.start_service(DB_PATH, repo_root=REPO_ROOT)
+
+
+def sprint_monitor_response(
+    con: sqlite3.Connection,
+    sprint_id: int,
+) -> dict[str, object]:
+    """Run one idempotent pickup/liveness evaluation without wake delivery."""
+    requeued = sprint_domain.SprintLifecycleStore(con).reconcile_unread_pickup(
+        sprint_id,
+        trigger="monitor",
+    )
+    outcomes = sprint_liveness.SprintLivenessMonitor(con).evaluate(sprint_id)
+    return {
+        "outcomes": [
+            {
+                "message_id": outcome.message_id,
+                "action": outcome.action,
+                "silence_episode": outcome.silence_episode,
+            }
+            for outcome in outcomes
+        ],
+        "pickup": sprint_board.pickup_projection(
+            con,
+            sprint_id,
+            requeued_wake_ids=requeued,
+            include_exhausted=False,
+        ),
+        "runtime": sprint_runtime.runtime_status(con),
+    }
 
 
 def main(argv):
@@ -4392,7 +4415,10 @@ def main(argv):
         finally:
             conversation_reaper.stop_service()
 
-    print(f"super-coder review layer → http://127.0.0.1:{port}  (bind {bind}, DB: {DB_PATH.name})")
+    print(
+        f"super-coder review layer starting on 127.0.0.1:{port} "
+        f"(bind {bind}, DB: {DB_PATH.name})"
+    )
     try:
         asyncio.run(_serve())
     except KeyboardInterrupt:

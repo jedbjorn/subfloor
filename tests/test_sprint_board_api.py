@@ -295,7 +295,9 @@ class SprintBoardApiCase(unittest.TestCase):
             "second_sprint_id": second,
             "third_sprint_id": third,
             "unit": unit_ids[2],
+            "ready_unit": unit_ids[7],
             "other_unit": unit_ids[0],
+            "developer_participant_id": participant_ids["developer"],
         }
 
     def connect(self) -> sqlite3.Connection:
@@ -368,6 +370,10 @@ class SprintBoardApiCase(unittest.TestCase):
         status, _, board = self.request("GET", f"/api/sprints/{self.ids['sprint_id']}")
         self.assertEqual(status, 200, board)
         self.assertEqual("Board feature", board["sprint"]["feature"]["title"])
+        self.assertEqual(
+            {"state": "missing", "beat_at": None, "interval_seconds": 5},
+            board["runtime"],
+        )
         self.assertEqual("Board spec", board["specs"][0]["title"])
         units = {row["work_unit_id"]: row for row in board["work_units"]}
         review = units[self.ids["unit"]]
@@ -379,6 +385,169 @@ class SprintBoardApiCase(unittest.TestCase):
         cancelled = next(row for row in units.values() if row["disposition"] == "cancelled")
         self.assertEqual("done", cancelled["column"])
         self.assertEqual("cancelled cleanly", cancelled["completion_result"])
+
+    def test_board_projects_stale_runtime_and_bounded_pickup_exhaustion(self):
+        exhausted = {
+            "sprint_id": self.ids["sprint_id"],
+            "participant_id": self.ids["developer_participant_id"],
+            "shell": "DEV1",
+            "role": "developer",
+            "work_unit_id": self.ids["unit"],
+            "message_id": 71,
+            "wake_id": 81,
+            "conversation_id": "cv_dead",
+            "run_state": "unknown",
+            "error_code": "HARNESS_SESSION_DISCOVERY_FAILED",
+            "failure_class": "native_unknown",
+            "attempt_count": 1,
+            "error_detail": "Traceback: private adapter detail",
+            "stack_trace": "private stack",
+        }
+        with self.connect() as con:
+            con.execute(
+                "INSERT INTO daemon_heartbeats (name,beat_at,interval_s) "
+                "VALUES ('sprint-runtime','2000-01-01 00:00:00',5)"
+            )
+            con.execute(
+                "UPDATE sprints SET lifecycle='paused',"
+                "paused_at='2026-08-01 14:00:00' WHERE sprint_id=?",
+                (self.ids["sprint_id"],),
+            )
+            con.executemany(
+                "INSERT INTO sprint_events "
+                "(sprint_id,event_type,actor_kind,payload,created_at) "
+                "VALUES (?,?,'system',?,'2026-08-01 14:00:00')",
+                (
+                    (
+                        self.ids["sprint_id"],
+                        "wake.pickup_exhausted",
+                        json.dumps(exhausted),
+                    ),
+                    (
+                        self.ids["sprint_id"],
+                        "lifecycle.paused",
+                        json.dumps({"from": "armed", "reason": "wake_pickup_unknown"}),
+                    ),
+                ),
+            )
+
+        status, _, board = self.request(
+            "GET", f"/api/sprints/{self.ids['sprint_id']}"
+        )
+        self.assertEqual(200, status, board)
+        self.assertEqual(
+            {
+                "state": "stale",
+                "beat_at": "2000-01-01 00:00:00",
+                "interval_seconds": 5,
+            },
+            board["runtime"],
+        )
+        self.assertEqual("paused", board["pickup"]["action"])
+        self.assertEqual("wake_pickup_unknown", board["pickup"]["pause_reason"])
+        self.assertEqual(
+            {
+                key: value
+                for key, value in exhausted.items()
+                if key not in {"error_detail", "stack_trace"}
+            },
+            {
+                key: value
+                for key, value in board["pickup"]["exhausted"].items()
+                if key != "recovery_instruction"
+            },
+        )
+        self.assertEqual(
+            "Inspect the pause report, repair the named route or service, "
+            "then use an authorized resume.",
+            board["pickup"]["exhausted"]["recovery_instruction"],
+        )
+        affected = next(
+            unit
+            for unit in board["work_units"]
+            if unit["work_unit_id"] == self.ids["unit"]
+        )
+        self.assertEqual(
+            "HARNESS_SESSION_DISCOVERY_FAILED",
+            affected["pickup"]["error_code"],
+        )
+        rendered = json.dumps(board)
+        self.assertNotIn("Traceback", rendered)
+        self.assertNotIn("private stack", rendered)
+
+        status, _, timeline = self.request(
+            "GET", f"/api/sprints/{self.ids['sprint_id']}/events?limit=100"
+        )
+        self.assertEqual(200, status, timeline)
+        event = next(
+            item
+            for item in timeline["items"]
+            if item["type"] == "wake.pickup_exhausted"
+        )
+        self.assertEqual(
+            "HARNESS_SESSION_DISCOVERY_FAILED",
+            event["details"]["error_code"],
+        )
+        self.assertNotIn("error_detail", event["details"])
+        self.assertNotIn("stack_trace", event["details"])
+
+    def test_stale_runtime_marks_zero_attempt_pending_wake_as_unhealthy(self):
+        with self.connect() as con:
+            con.execute(
+                "INSERT INTO daemon_heartbeats (name,beat_at,interval_s) "
+                "VALUES ('sprint-runtime','2000-01-01 00:00:00',5)"
+            )
+            wake_id = int(
+                con.execute(
+                    "INSERT INTO sprint_wake_outbox "
+                    "(sprint_id,participant_id,receiver_shell_id,idempotency_key) "
+                    "VALUES (?,?,3,'runtime-stale-zero-attempt')",
+                    (
+                        self.ids["sprint_id"],
+                        self.ids["developer_participant_id"],
+                    ),
+                ).lastrowid
+            )
+            message_id = int(
+                con.execute(
+                    "INSERT INTO wake_message "
+                    "(sprint_id,receiver_shell_id,to_participant_id,work_unit_id,"
+                    "message_kind,body,declared_type,actionable,disposition,"
+                    "idempotency_key) VALUES (?,?,?,?,'work_assignment',"
+                    "'pending assignment','new',1,'pending','runtime-stale-message')",
+                    (
+                        self.ids["sprint_id"],
+                        3,
+                        self.ids["developer_participant_id"],
+                        self.ids["ready_unit"],
+                    ),
+                ).lastrowid
+            )
+            con.execute(
+                "INSERT INTO sprint_wake_messages (sprint_id,wake_id,message_id) "
+                "VALUES (?,?,?)",
+                (self.ids["sprint_id"], wake_id, message_id),
+            )
+
+        status, _, board = self.request(
+            "GET", f"/api/sprints/{self.ids['sprint_id']}"
+        )
+        self.assertEqual(200, status, board)
+        ready = next(
+            unit
+            for unit in board["work_units"]
+            if unit["work_unit_id"] == self.ids["ready_unit"]
+        )
+        self.assertEqual("waiting", ready["column"])
+        self.assertEqual(
+            {
+                "state": "runtime_unavailable",
+                "runtime_state": "stale",
+                "wake_id": wake_id,
+                "attempt_count": 0,
+            },
+            ready["delivery"],
+        )
 
     def test_events_are_cursor_stable_and_never_return_unknown_payload_fields(self):
         status, _, first = self.request(

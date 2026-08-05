@@ -347,7 +347,9 @@ sc_harness_status() {
     docker exec "$CNAME" python3 "$S/harness_versions.py" 2>/dev/null \
       || echo "  (could not probe $CNAME)"
   else
-    echo "harness CLIs: sandbox '$CNAME' is not running — ./sc launch to start it."
+    echo "harness CLIs (runtime and compatibility):"
+    echo "  runtime:   sandbox '$CNAME' · not running"
+    echo "  adapters:  unavailable until ./sc launch starts that runtime"
   fi
   echo "harness epoch: image built with ${built:-<none — predates the epoch seam>} · stored ${stored}"
   # A rolled-but-unbuilt epoch is the actionable state: the operator asked for

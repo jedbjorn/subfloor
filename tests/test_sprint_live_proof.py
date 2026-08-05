@@ -151,6 +151,11 @@ class SprintLiveProof(unittest.TestCase):
         output = io.StringIO()
         with (
             mock.patch.object(
+                server.sprint_domain,
+                "adapter_for",
+                return_value=mock.Mock(probe=mock.Mock(return_value=None)),
+            ),
+            mock.patch.object(
                 server.sprint_pr_watcher,
                 "GitHubPullRequestReader",
                 return_value=self.github,
@@ -648,7 +653,9 @@ class SprintLiveProof(unittest.TestCase):
 
     def test_conversation_and_watcher_writes_share_wal_without_lock_loss(self) -> None:
         sprint_id, _document_id, units = self.prepare(((1, 2, ()),))
-        sprint_domain.SprintLifecycleStore(self.con).arm(sprint_id, 3)
+        sprint_domain.SprintLifecycleStore(
+            self.con, probe_harness=lambda _harness: None
+        ).arm(sprint_id, 3)
         self.deliver_browser_turns()
         self.accept_assignment(units[0], 1)
         self.github.set(3001, "OPEN", checks="PENDING")

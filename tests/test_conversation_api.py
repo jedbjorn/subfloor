@@ -964,7 +964,7 @@ class ConversationResourceTest(ConversationApiCase):
             ],
         )
 
-    def test_opencode_requires_an_exact_resolved_model(self) -> None:
+    def test_opencode_uses_the_common_unresolved_model_refusal(self) -> None:
         with mock.patch.object(
             conversation_routes.run_mod,
             "flavor_defaults",
@@ -982,9 +982,12 @@ class ConversationResourceTest(ConversationApiCase):
                 key="opencode-no-model",
             )
         self.assertEqual(status, 422)
-        self.assertEqual(error["error"]["code"], "HARNESS_MODEL_REQUIRED")
-        self.assertIn("provider connected in OpenCode",
-                      error["error"]["message"])
+        self.assertEqual(error["error"]["code"], "HARNESS_ROUTE_INVALID")
+        self.assertEqual(
+            error["error"]["message"],
+            "harness 'opencode' cannot resolve a model: no model was supplied "
+            "and no flavor default exists for it; supply an explicit model",
+        )
 
         status, _, created = self.request(
             "POST",
@@ -999,9 +1002,10 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertEqual(status, 201, created)
         self.assertEqual(created["route"]["model"], "openai/gpt-connected")
 
-    def test_kimi_create_allows_native_default_model_and_resolves_route(
+    def test_kimi_create_refuses_unresolved_model_before_writing_a_chat(
         self,
     ) -> None:
+        resolver = conversation_routes.run_mod.resolve_headless_route
         with mock.patch.object(
             conversation_routes.run_mod,
             "flavor_defaults",
@@ -1011,36 +1015,39 @@ class ConversationResourceTest(ConversationApiCase):
                     "models": {},
                 }
             },
-        ):
-            status, _, created = self.request(
+        ), mock.patch.object(
+            conversation_routes.run_mod,
+            "resolve_headless_route",
+            wraps=resolver,
+        ) as resolve:
+            status, _, error = self.request(
                 "POST",
                 "/api/conversations",
                 body={"shell_id": 1, "harness": "kimi"},
-                key="kimi-native-default",
+                key="kimi-unresolved-model",
             )
-        self.assertEqual(status, 201, created)
+        self.assertEqual(status, 422, error)
         self.assertEqual(
-            created["route"],
-            {
-                "harness": "kimi",
-                "provider": "kimi",
-                "model": None,
-                "effort": "high",
-            },
+            error["error"]["code"],
+            "HARNESS_ROUTE_INVALID",
         )
-        con = self.connect()
-        try:
-            row = con.execute(
-                "SELECT harness,provider,model,effort FROM conversations "
-                "WHERE conversation_id=?",
-                (created["conversation_id"],),
-            ).fetchone()
-        finally:
-            con.close()
         self.assertEqual(
-            tuple(row),
-            ("kimi", "kimi", None, "high"),
+            error["error"]["message"],
+            "harness 'kimi' cannot resolve a model: no model was supplied and "
+            "no flavor default exists for it; supply an explicit model",
         )
+        resolve.assert_called_once_with(
+            harness="kimi",
+            adapter=mock.ANY,
+            flavor_model=None,
+            model=None,
+            effort=None,
+        )
+        with closing(self.connect()) as con:
+            self.assertEqual(
+                con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
+                0,
+            )
 
     def test_create_is_idempotent_and_never_exposes_native_identity(self) -> None:
         first = self.create(title="API")

@@ -33,7 +33,7 @@ def make_run(
     *,
     conversation_id: str = "cv_" + "a" * 32,
     harness: str = "codex",
-    model: str = "gpt-test",
+    model: str | None = "gpt-test",
     session_before: str | None = None,
 ) -> BrokerRun:
     return BrokerRun(
@@ -119,6 +119,74 @@ def test_preparer_returns_canonical_environment_and_archive(launch_case):
         "effort": "high",
         "headless_prompt": "Do the work",
     }]
+
+
+def test_preexisting_null_model_chat_refuses_turn_and_preserves_row(launch_case):
+    db_path, worktree = launch_case
+    conversation_id = "cv_" + "a" * 32
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "DELETE FROM conversations WHERE conversation_id=?", (conversation_id,)
+    )
+    con.execute(
+        "INSERT INTO conversations "
+        "(conversation_id,shell_id,owner_user_id,harness,provider,model,"
+        "effort,worktree,state,creation_idempotency_key,creation_request_hash) "
+        "VALUES (?,1,1,'kimi','kimi',NULL,'high',?,'idle',"
+        "'legacy-null-create','legacy-null-hash')",
+        (conversation_id, str(worktree)),
+    )
+    con.commit()
+    con.close()
+
+    adapter = {
+        "harness": "kimi",
+        "headless": {
+            "launch": ["kimi", "--prompt", "{prompt}"],
+            "model_flag": "--model",
+            "effort": {"flag": "--effort"},
+        },
+    }
+
+    def prepare(**kwargs):
+        try:
+            run_mod.resolve_headless_route(
+                harness=kwargs["harness"],
+                adapter=adapter,
+                flavor_model=None,
+                model=kwargs["model"],
+                effort=kwargs["effort"],
+            )
+        except ValueError as exc:
+            raise run_mod.LaunchError(str(exc)) from exc
+        raise AssertionError("a legacy NULL route must not become dispatchable")
+
+    preparer = ConversationLaunchPreparer(
+        db_path,
+        prepare_launch=prepare,
+        liveness=lambda: {"supported": True, "processes": []},
+    )
+    with pytest.raises(ConversationLaunchError) as caught:
+        preparer(make_run(worktree, harness="kimi", model=None))
+
+    assert caught.value.code == "CONVERSATION_LAUNCH_REFUSED"
+    assert caught.value.detail == (
+        "harness 'kimi' cannot resolve a model: no model was supplied and no "
+        "flavor default exists for it; supply an explicit model"
+    )
+    con = sqlite3.connect(db_path)
+    try:
+        assert con.execute(
+            "SELECT harness,provider,model,state FROM conversations "
+            "WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone() == ("kimi", "kimi", None, "idle")
+        assert con.execute(
+            "SELECT COUNT(*) FROM conversation_runs WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()[0] == 0
+    finally:
+        con.close()
 
 
 def test_preparer_refuses_a_cli_process_holding_the_shell(launch_case):

@@ -22,6 +22,7 @@ import server
 import sprint_domain
 import sprint_message_delivery as delivery
 import sprint_runtime
+from conversation_adapters import AdapterError
 
 
 def apply_schema(con: sqlite3.Connection) -> None:
@@ -117,7 +118,9 @@ class SprintWorkDispatchCase(unittest.TestCase):
         ]
         self.con.commit()
         self.units = sprint_domain.SprintWorkUnitStore(self.con)
-        self.lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+        self.lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con, probe_harness=lambda _harness: None
+        )
         self.messages = delivery.SprintMessageStore(self.con)
         self.next_task = 0
 
@@ -185,6 +188,171 @@ class SprintWorkDispatchCase(unittest.TestCase):
 
 
 class DispatchGateTest(SprintWorkDispatchCase):
+    def assert_arm_left_no_writes(self) -> None:
+        self.assertEqual(
+            ("prepared", 0, 0, 0),
+            (
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0],
+                self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_wake_outbox"
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='lifecycle.armed'",
+                    (self.sprint_id,),
+                ).fetchone()[0],
+            ),
+        )
+
+    def test_arm_probes_each_distinct_harness_once_outside_write_transaction(self) -> None:
+        self.create_unit(developer=1)
+        observed: list[tuple[str, bool]] = []
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            probe_harness=lambda harness: observed.append(
+                (harness, self.con.in_transaction)
+            ),
+        )
+
+        lifecycle.arm(self.sprint_id, 3)
+
+        self.assertEqual([("codex", False), ("kimi", False)], observed)
+
+    def test_arm_default_preflight_uses_the_conversation_adapter_probe(self) -> None:
+        self.create_unit(developer=1)
+        adapters = {
+            harness: mock.Mock(
+                probe=mock.Mock(
+                    side_effect=lambda: self.assertFalse(self.con.in_transaction)
+                )
+            )
+            for harness in ("codex", "kimi")
+        }
+        with mock.patch.object(
+            sprint_domain,
+            "adapter_for",
+            side_effect=lambda harness: adapters[harness],
+        ) as adapter_factory:
+            sprint_domain.SprintLifecycleStore(self.con).arm(self.sprint_id, 3)
+
+        self.assertEqual(
+            [mock.call("codex"), mock.call("kimi")],
+            adapter_factory.call_args_list,
+        )
+        adapters["codex"].probe.assert_called_once_with()
+        adapters["kimi"].probe.assert_called_once_with()
+
+    def test_arm_rejects_missing_binary_before_any_write(self) -> None:
+        self.create_unit(developer=1)
+
+        def unavailable(harness: str):
+            raise AdapterError(
+                "HARNESS_UNAVAILABLE",
+                f"cannot probe {harness}",
+                retryable=True,
+            )
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "HARNESS_UNAVAILABLE",
+        ) as caught:
+            sprint_domain.SprintLifecycleStore(
+                self.con, probe_harness=unavailable
+            ).arm(self.sprint_id, 3)
+
+        self.assert_arm_left_no_writes()
+        handler = object.__new__(server.Handler)
+        handler._send = lambda status, body: (status, body)
+        self.assertEqual(
+            (422, {"error": "HARNESS_UNAVAILABLE: cannot probe codex"}),
+            handler._sprint_error(caught.exception),
+        )
+
+    def test_arm_rejects_unknown_adapter_before_any_write(self) -> None:
+        self.create_unit(developer=1)
+        self.con.execute(
+            "UPDATE sprint_participants SET harness='unknown-harness' "
+            "WHERE sprint_id=? AND role='planner'",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "unknown-harness.*no browser conversation adapter",
+        ) as caught:
+            self.lifecycle.arm(self.sprint_id, 3)
+
+        self.assertIsInstance(caught.exception, sprint_domain.SprintPreflightError)
+        self.assert_arm_left_no_writes()
+
+    def test_arm_rejects_out_of_range_harness_before_any_write(self) -> None:
+        self.create_unit(developer=1)
+
+        def unsupported(harness: str):
+            raise AdapterError(
+                "HARNESS_VERSION_UNSUPPORTED",
+                f"{harness} 99.0.0 is outside supported range [1.0.0, 2.0.0)",
+            )
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "HARNESS_VERSION_UNSUPPORTED",
+        ) as caught:
+            sprint_domain.SprintLifecycleStore(
+                self.con, probe_harness=unsupported
+            ).arm(self.sprint_id, 3)
+
+        self.assertIsInstance(caught.exception, sprint_domain.SprintPreflightError)
+        self.assert_arm_left_no_writes()
+
+    def test_arm_selection_race_returns_retryable_conflict_without_lifecycle_writes(
+        self,
+    ) -> None:
+        self.create_unit(developer=1)
+        raced = False
+
+        def mutate_once(_harness: str):
+            nonlocal raced
+            if raced:
+                return None
+            raced = True
+            self.con.execute(
+                "UPDATE sprint_participants SET model='raced-model' "
+                "WHERE sprint_id=? AND role='planner'",
+                (self.sprint_id,),
+            )
+            self.con.commit()
+            return None
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "changed during harness preflight; retry arm",
+        ) as caught:
+            sprint_domain.SprintLifecycleStore(
+                self.con, probe_harness=mutate_once
+            ).arm(self.sprint_id, 3)
+
+        self.assert_arm_left_no_writes()
+        handler = object.__new__(server.Handler)
+        handler._send = lambda status, body: (status, body)
+        self.assertEqual(
+            (
+                409,
+                {
+                    "error": (
+                        "participant launch selections changed during harness "
+                        "preflight; retry arm"
+                    )
+                },
+            ),
+            handler._sprint_error(caught.exception),
+        )
+
     def test_ready_units_launch_in_parallel_regardless_of_wave_or_reviewer(self) -> None:
         late_wave = self.create_unit(developer=1, wave=9, title="Late wave")
         early_wave = self.create_unit(developer=4, wave=0, title="Early wave")
@@ -675,6 +843,28 @@ class DispatchGateTest(SprintWorkDispatchCase):
 
 
 class DeliveryTerminalTest(SprintWorkDispatchCase):
+    def accept_arming_notification(self) -> None:
+        message_id = int(
+            self.con.execute(
+                "SELECT m.message_id FROM wake_message m "
+                "JOIN sprint_participants p ON p.participant_id=m.to_participant_id "
+                "WHERE m.sprint_id=? AND p.shell_id=3 "
+                "AND m.message_kind='notification' ORDER BY m.message_id LIMIT 1",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertIsNone(self.messages.mark_read(message_id, 3))
+        self.assertEqual(
+            (1, None),
+            tuple(
+                self.con.execute(
+                    "SELECT read_at IS NOT NULL,disposition "
+                    "FROM wake_message WHERE message_id=?",
+                    (message_id,),
+                ).fetchone()
+            ),
+        )
+
     def terminal_messages(self) -> list[sqlite3.Row]:
         return self.con.execute(
             "SELECT p.shell_id,m.message_kind,m.body,m.declared_type,"
@@ -805,6 +995,7 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         report = self.create_unit(developer=1, output_kind="report_only")
         self.lifecycle.arm(self.sprint_id, 3)
         self.deliver_pending_wakes()
+        self.accept_arming_notification()
         self.messages.mark_read(self.assignment_message(report), 1)
         self.lifecycle.pause(
             self.sprint_id,
@@ -883,6 +1074,7 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
         first = self.create_unit(developer=1, output_kind="report_only")
         self.lifecycle.arm(self.sprint_id, 3)
         self.deliver_pending_wakes()
+        self.accept_arming_notification()
         self.messages.mark_read(self.assignment_message(first), 1)
         self.units.complete(self.sprint_id, first, 1, result="First report")
         self.assert_episode(1, 1, 0)
@@ -920,6 +1112,69 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
 
 
 class ProductionPulseTest(SprintWorkDispatchCase):
+    def test_successful_pulses_advance_runtime_heartbeat_but_failure_does_not(self) -> None:
+        runtime = sprint_runtime.SprintRuntimeService(
+            self.db_path,
+            owner="heartbeat-runtime-test",
+        )
+
+        self.assertFalse(runtime.pulse_once())
+        first = self.con.execute(
+            "SELECT beat_at,interval_s FROM daemon_heartbeats "
+            "WHERE name='sprint-runtime'"
+        ).fetchone()
+        self.assertEqual(5, first["interval_s"])
+        self.assertEqual(
+            {
+                "state": "live",
+                "beat_at": first["beat_at"],
+                "interval_seconds": 5,
+            },
+            sprint_runtime.runtime_status(self.con),
+        )
+
+        with mock.patch.object(
+            runtime,
+            "_deliver_wakes",
+            side_effect=RuntimeError("injected delivery failure"),
+        ), self.assertRaisesRegex(RuntimeError, "injected delivery failure"):
+            runtime.pulse_once()
+
+        after_failure = self.con.execute(
+            "SELECT beat_at,interval_s FROM daemon_heartbeats "
+            "WHERE name='sprint-runtime'"
+        ).fetchone()
+        self.assertEqual(tuple(first), tuple(after_failure))
+
+        self.assertFalse(runtime.pulse_once())
+        after_success = self.con.execute(
+            "SELECT beat_at,interval_s FROM daemon_heartbeats "
+            "WHERE name='sprint-runtime'"
+        ).fetchone()
+        self.assertGreater(after_success["beat_at"], first["beat_at"])
+        self.assertEqual(5, after_success["interval_s"])
+
+    def test_initial_failing_pulse_does_not_create_runtime_heartbeat(self) -> None:
+        runtime = sprint_runtime.SprintRuntimeService(
+            self.db_path,
+            owner="initial-failure-runtime-test",
+        )
+
+        with mock.patch.object(
+            runtime,
+            "_deliver_wakes",
+            side_effect=RuntimeError("startup delivery failed"),
+        ), self.assertRaisesRegex(RuntimeError, "startup delivery failed"):
+            runtime.pulse_once(startup=True)
+
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM daemon_heartbeats "
+                "WHERE name='sprint-runtime'"
+            ).fetchone()[0],
+        )
+
     def test_armed_pulse_enqueues_every_parallel_ready_lane(self) -> None:
         first = self.create_unit(developer=1, wave=4)
         second = self.create_unit(developer=4, wave=0)
@@ -1108,6 +1363,9 @@ class ProductionPulseTest(SprintWorkDispatchCase):
         order: list[str] = []
         preparer = object()
         broker = mock.Mock()
+        runtime = mock.Mock()
+        runtime.wait_ready.return_value = True
+        runtime.is_alive.return_value = True
         with (
             mock.patch.object(
                 server.conversation_launch,
@@ -1129,12 +1387,19 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             mock.patch.object(
                 server.sprint_runtime,
                 "start_service",
-                side_effect=lambda *_args, **_kwargs: order.append("sprint"),
+                side_effect=lambda *_args, **_kwargs: (
+                    order.append("sprint") or runtime
+                ),
             ) as sprint_start,
+            mock.patch.object(
+                server.sprint_pr_watcher,
+                "start_service",
+                side_effect=lambda *_args, **_kwargs: order.append("watcher"),
+            ) as watcher_start,
         ):
             server.start_runtime_services()
 
-        self.assertEqual(["broker", "reaper", "sprint"], order)
+        self.assertEqual(["broker", "reaper", "sprint", "watcher"], order)
         broker_start.assert_called_once_with(
             server.DB_PATH,
             launch_preparer=preparer,
@@ -1144,11 +1409,46 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             native_interrupt=broker.interrupt,
         )
         sprint_start.assert_called_once_with(server.DB_PATH)
+        runtime.wait_ready.assert_called_once()
+        runtime.is_alive.assert_called_once_with()
+        watcher_start.assert_called_once_with(server.DB_PATH, repo_root=server.REPO_ROOT)
         self.assertIn(
             "on_started=start_runtime_services",
             inspect.getsource(server.main),
             "the combined startup function must remain the production callback",
         )
+
+    def test_server_startup_refuses_runtime_that_never_becomes_ready_or_dies(self) -> None:
+        for ready, alive, expected in (
+            (False, True, "did not complete its first successful cycle"),
+            (True, False, "died during startup"),
+        ):
+            with self.subTest(ready=ready, alive=alive):
+                runtime = mock.Mock()
+                runtime.wait_ready.return_value = ready
+                runtime.is_alive.return_value = alive
+                with (
+                    mock.patch.object(
+                        server.conversation_broker,
+                        "start_service",
+                        return_value=mock.Mock(interrupt=mock.Mock()),
+                    ),
+                    mock.patch.object(server.conversation_reaper, "start_service"),
+                    mock.patch.object(
+                        server.sprint_runtime,
+                        "start_service",
+                        return_value=runtime,
+                    ),
+                    mock.patch.object(
+                        server.sprint_pr_watcher,
+                        "start_service",
+                    ) as watcher_start,
+                    self.assertRaisesRegex(RuntimeError, expected),
+                ):
+                    server.start_runtime_services()
+
+                runtime.stop.assert_called_once_with()
+                watcher_start.assert_not_called()
 
 
 if __name__ == "__main__":

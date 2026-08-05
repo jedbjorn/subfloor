@@ -89,6 +89,58 @@ class ProbeResult:
     version: str
     minimum_version: str
     capabilities: AdapterCapabilities
+    maximum_version_exclusive: str
+    verified_version: str
+    compatibility: str
+
+
+def checked_probe_result(
+    *,
+    harness: str,
+    manifest: Mapping[str, Any],
+    capabilities: AdapterCapabilities,
+    version: str,
+) -> ProbeResult:
+    conversation = manifest.get("conversation") or {}
+    minimum = conversation.get("minimum_cli_version")
+    maximum = conversation.get("maximum_cli_version_exclusive")
+    verified = conversation.get("verified_cli_version")
+    compatibility = {
+        "minimum_cli_version": minimum,
+        "maximum_cli_version_exclusive": maximum,
+        "verified_cli_version": verified,
+    }
+    missing = [
+        key
+        for key, value in compatibility.items()
+        if not isinstance(value, str) or not value
+    ]
+    if missing:
+        raise AdapterError(
+            "HARNESS_MANIFEST_INVALID",
+            f"harness compatibility manifest is missing "
+            f"{', '.join(missing)}: {harness}",
+        )
+    if version_tuple(version) < version_tuple(minimum):
+        raise AdapterError(
+            "HARNESS_VERSION_UNSUPPORTED",
+            f"{harness} {version} is older than required {minimum}",
+        )
+    if version_tuple(version) >= version_tuple(maximum):
+        raise AdapterError(
+            "HARNESS_VERSION_UNSUPPORTED",
+            f"{harness} {version} is outside supported range "
+            f"[{minimum}, {maximum})",
+        )
+    return ProbeResult(
+        harness=harness,
+        version=version,
+        minimum_version=minimum,
+        capabilities=capabilities,
+        maximum_version_exclusive=maximum,
+        verified_version=verified,
+        compatibility=("verified" if version == verified else "supported"),
+    )
 
 
 @dataclass(frozen=True)
@@ -252,17 +304,11 @@ class ConversationAdapter(abc.ABC):
         raise NotImplementedError
 
     def _probe_result(self, version: str) -> ProbeResult:
-        minimum = self.manifest["conversation"]["minimum_cli_version"]
-        if version_tuple(version) < version_tuple(minimum):
-            raise AdapterError(
-                "HARNESS_VERSION_UNSUPPORTED",
-                f"{self.harness} {version} is older than required {minimum}",
-            )
-        return ProbeResult(
+        return checked_probe_result(
             harness=self.harness,
-            version=version,
-            minimum_version=minimum,
+            manifest=self.manifest,
             capabilities=self.capabilities,
+            version=version,
         )
 
 
@@ -564,6 +610,24 @@ def load_manifest(harness: str) -> dict[str, Any]:
         raise AdapterError(
             "HARNESS_MANIFEST_INVALID",
             f"harness has no supported conversation contract: {harness}",
+        )
+    compatibility = {
+        "minimum_cli_version": conversation.get("minimum_cli_version"),
+        "maximum_cli_version_exclusive": conversation.get(
+            "maximum_cli_version_exclusive"
+        ),
+        "verified_cli_version": conversation.get("verified_cli_version"),
+    }
+    missing = [
+        key
+        for key, value in compatibility.items()
+        if not isinstance(value, str) or not value
+    ]
+    if missing:
+        raise AdapterError(
+            "HARNESS_MANIFEST_INVALID",
+            f"harness compatibility manifest is missing "
+            f"{', '.join(missing)}: {harness}",
         )
     declared_events = frozenset(conversation.get("normalized_events") or ())
     if declared_events != NORMALIZED_EVENTS:

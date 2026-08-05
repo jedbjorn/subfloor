@@ -207,9 +207,10 @@ async def serve(host: str, port: int, http_handler, ws_handler,
     bound port after start for callers that passed port=0 — via `log` line and
     the Transport object; this coroutine simply runs until shutdown.
 
-    ``on_started`` runs only after the socket bind succeeds. Background workers
-    that can cause external side effects belong behind that boundary: a second
-    process must lose the bind race before it can dispatch work.
+    ``on_started`` runs only after the socket bind succeeds and before the
+    listening service is advertised. Background workers that can cause external
+    side effects belong behind that boundary: a second process must lose the
+    bind race before it can dispatch work, and failed readiness must stay quiet.
     """
     transport = Transport(
         host,
@@ -221,9 +222,9 @@ async def serve(host: str, port: int, http_handler, ws_handler,
     )
     await transport.start()
     try:
-        log(f"transport: listening on {host}:{transport.port}")
         if on_started is not None:
             on_started()
+        log(f"transport: listening on {host}:{transport.port}")
         await asyncio.Event().wait()
     finally:
         await transport.stop()

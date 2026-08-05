@@ -384,6 +384,19 @@ class ScHarnessCommands(unittest.TestCase):
              f"{self.fx.scripts / 'harness_versions.py'}"],
         )
 
+    def test_harness_status_keeps_stopped_runtime_provenance_with_compatibility(self):
+        result = self.fx.run("harness-status", SC_TEST_RUNNING="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "runtime:   sandbox 'sc-fork' · not running",
+            result.stdout,
+        )
+        self.assertIn(
+            "adapters:  unavailable until ./sc launch starts that runtime",
+            result.stdout,
+        )
+        self.assertNotIn("9.9.9", result.stdout)
+
     def test_harness_status_flags_an_image_that_owes_a_rebuild(self):
         self.fx.run("build", "--harnesses")
         result = self.fx.run("harness-status", SC_TEST_LABEL="2020-01-01")

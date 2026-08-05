@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -35,9 +36,11 @@ from conversation_adapters import (  # noqa: E402
 )
 from conversation_adapters import codex as codex_adapter
 from conversation_adapters import opencode as opencode_adapter
+from conversation_adapters import base as base_adapter
 from conversation_adapters.base import SubprocessRunner
 
 KIMI_FIXTURES = ROOT / "tests" / "fixtures" / "conversations" / "kimi"
+KIMI_V2_STATE = KIMI_FIXTURES / "state-v2.json"
 
 
 def kimi_step_event(
@@ -404,12 +407,22 @@ class FakeKimiRunner:
         after_prompt: list[dict[str, Any]] | None = None,
         directory: str = "wd_test",
         append: bool = False,
+        state_schema: str = "legacy",
     ) -> tuple[Path, Path]:
         session = root / directory / session_ref
         wire = session / "agents" / "main" / "wire.jsonl"
         wire.parent.mkdir(parents=True, exist_ok=True)
+        if state_schema == "legacy":
+            state = {"workDir": str(worktree)}
+        elif state_schema == "v2":
+            state = json.loads(KIMI_V2_STATE.read_text())
+            state["id"] = session_ref
+            state["cwd"] = str(worktree)
+            state["agents"]["main"]["homedir"] = str(wire.parent)
+        else:
+            raise AssertionError(f"unsupported Kimi state schema: {state_schema}")
         (session / "state.json").write_text(
-            json.dumps({"workDir": str(worktree)}),
+            json.dumps(state),
             encoding="utf-8",
         )
         prompt = (
@@ -462,6 +475,7 @@ class FakeKimiRunner:
                     after_prompt=plan.get("after_prompt"),
                     directory=f"wd_test_{index}",
                     append=resume and index == 0,
+                    state_schema=plan.get("state_schema", "legacy"),
                 )
                 if index == 0:
                     wire = candidate_wire
@@ -652,6 +666,88 @@ class ConversationAdapterTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.linked_vm.stop()
         self.temp.cleanup()
+
+    def test_declared_compatibility_ranges_enforce_closed_open_boundaries(self) -> None:
+        cases = {
+            "claude": ("2.1.219", "2.1.220", "2.1.222", "2.2.0"),
+            "codex": ("0.144.999", "0.145.0", "0.146.1", "0.147.0"),
+            "opencode": ("1.18.8", "1.18.9", "1.18.13", "1.19.0"),
+            "kimi": ("0.29.999", "0.30.0", "0.33.0", "0.34.0"),
+        }
+        for harness, (below, lower, current, upper) in cases.items():
+            with self.subTest(harness=harness):
+                adapter, _native = self.build(harness)
+                lower_result = adapter._probe_result(lower)
+                current_result = adapter._probe_result(current)
+                self.assertEqual(lower_result.minimum_version, lower)
+                self.assertEqual(current_result.version, current)
+                self.assertEqual(
+                    current_result.compatibility,
+                    (
+                        "verified"
+                        if current
+                        == adapter.manifest["conversation"]["verified_cli_version"]
+                        else "supported"
+                    ),
+                )
+                self.assertEqual(current_result.maximum_version_exclusive, upper)
+                with self.assertRaisesRegex(
+                    AdapterError,
+                    rf"{harness} {re.escape(below)} is older than required {re.escape(lower)}",
+                ):
+                    adapter._probe_result(below)
+                with self.assertRaisesRegex(
+                    AdapterError,
+                    rf"{harness} {re.escape(upper)} is outside supported range",
+                ):
+                    adapter._probe_result(upper)
+
+    def test_verified_probe_result_names_missing_manifest_keys(self) -> None:
+        adapter, _native = self.build("claude")
+        result = adapter._probe_result("2.1.222")
+        self.assertEqual(result.compatibility, "verified")
+        self.assertEqual(result.verified_version, "2.1.222")
+        self.assertEqual(result.maximum_version_exclusive, "2.2.0")
+
+        manifest = json.loads(
+            (ROOT / ".super-coder" / "adapters" / "claude" / "adapter.json").read_text()
+        )
+        del manifest["conversation"]["maximum_cli_version_exclusive"]
+        invalid = ClaudeAdapter(runner=FakeClaudeRunner(), manifest=manifest)
+        with self.assertRaisesRegex(
+            AdapterError,
+            "HARNESS_MANIFEST_INVALID: harness compatibility manifest is missing "
+            "maximum_cli_version_exclusive: claude",
+        ):
+            invalid._probe_result("2.1.222")
+
+        missing_verified = json.loads(json.dumps(manifest))
+        missing_verified["conversation"]["maximum_cli_version_exclusive"] = "2.2.0"
+        del missing_verified["conversation"]["verified_cli_version"]
+        invalid = ClaudeAdapter(
+            runner=FakeClaudeRunner(), manifest=missing_verified
+        )
+        with self.assertRaisesRegex(
+            AdapterError,
+            "HARNESS_MANIFEST_INVALID: harness compatibility manifest is missing "
+            "verified_cli_version: claude",
+        ):
+            invalid._probe_result("2.1.222")
+
+        manifest_root = self.root / "adapters"
+        (manifest_root / "claude").mkdir(parents=True)
+        (manifest_root / "claude" / "adapter.json").write_text(
+            json.dumps(manifest)
+        )
+        with (
+            mock.patch.object(base_adapter, "ADAPTERS", manifest_root),
+            self.assertRaisesRegex(
+                AdapterError,
+                "HARNESS_MANIFEST_INVALID: harness compatibility manifest is missing "
+                "maximum_cli_version_exclusive: claude",
+            ),
+        ):
+            base_adapter.load_manifest("claude")
 
     def write_claude_session(
         self,
@@ -1243,6 +1339,169 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertEqual(
             list(adapter.stream(resumed))[-1].type,
             "run.completed",
+        )
+
+    def test_kimi_state_accepts_legacy_v2_and_equal_dual_fields(self) -> None:
+        session = self.root / "kimi-state-valid"
+        session.mkdir()
+        state_path = session / "state.json"
+        v2_state = json.loads(KIMI_V2_STATE.read_text())
+        v2_state["cwd"] = str(self.root)
+        valid_states = {
+            "legacy": {"workDir": str(self.root)},
+            "v2": v2_state,
+            "equal dual": {
+                "workDir": str(self.root),
+                "cwd": str(self.root / "synthetic" / ".."),
+            },
+        }
+
+        for label, state in valid_states.items():
+            with self.subTest(label=label):
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                self.assertEqual(
+                    KimiAdapter._state_worktree(session),
+                    self.root,
+                )
+
+    def test_kimi_state_rejects_invalid_or_conflicting_fields(self) -> None:
+        session = self.root / "kimi-state-invalid"
+        session.mkdir()
+        state_path = session / "state.json"
+        invalid_states = {
+            "missing": {},
+            "legacy non-string": {"workDir": 7},
+            "v2 empty": {"cwd": ""},
+            "v2 relative": {"cwd": "relative/worktree"},
+            "legacy invalid alongside v2": {
+                "workDir": None,
+                "cwd": str(self.root),
+            },
+            "v2 invalid alongside legacy": {
+                "workDir": str(self.root),
+                "cwd": [],
+            },
+            "conflicting": {
+                "workDir": str(self.root),
+                "cwd": str(self.root / "other"),
+            },
+            "unresolvable": {"cwd": "/\0"},
+        }
+
+        for label, state in invalid_states.items():
+            with self.subTest(label=label):
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                with self.assertRaises(AdapterError) as raised:
+                    KimiAdapter._state_worktree(session)
+                self.assertEqual(
+                    raised.exception.code,
+                    "HARNESS_SESSION_INSPECTION_FAILED",
+                )
+
+    def test_kimi_state_rejects_malformed_or_unreadable_json(self) -> None:
+        malformed = self.root / "kimi-state-malformed"
+        malformed.mkdir()
+        (malformed / "state.json").write_text("{", encoding="utf-8")
+        with self.assertRaises(AdapterError) as malformed_error:
+            KimiAdapter._state_worktree(malformed)
+        self.assertEqual(
+            malformed_error.exception.code,
+            "HARNESS_SESSION_INSPECTION_FAILED",
+        )
+
+        unreadable = self.root / "kimi-state-unreadable"
+        (unreadable / "state.json").mkdir(parents=True)
+        with self.assertRaises(AdapterError) as unreadable_error:
+            KimiAdapter._state_worktree(unreadable)
+        self.assertEqual(
+            unreadable_error.exception.code,
+            "HARNESS_SESSION_INSPECTION_FAILED",
+        )
+
+    def test_kimi_v2_state_supports_full_turn_lifecycle_and_exact_slice(
+        self,
+    ) -> None:
+        adapter, runner = self.build("kimi")
+        runner.queue(
+            state_schema="v2",
+            prompt_time=6000,
+            after_prompt=[
+                kimi_step_event("step.end", finish_reason="end_turn"),
+                {
+                    "type": "usage.record",
+                    "usageScope": "turn",
+                    "usage": {"inputOther": 4, "output": 2},
+                },
+                {
+                    "type": "turn.prompt",
+                    "input": [{"type": "text", "text": "later"}],
+                    "origin": {"kind": "user"},
+                    "time": 6001,
+                },
+                {"type": "turn.cancel", "time": 6002},
+            ],
+        )
+
+        turn = adapter.start(self.context, "v2 session")
+
+        state = json.loads(
+            (Path(turn.metadata["session_path"]) / "state.json").read_text()
+        )
+        self.assertEqual(
+            set(state),
+            {
+                "id",
+                "version",
+                "cwd",
+                "createdAt",
+                "updatedAt",
+                "archived",
+                "agents",
+                "custom",
+            },
+        )
+        self.assertEqual(state["version"], 2)
+        self.assertEqual(state["cwd"], str(self.root))
+        self.assertNotIn("workDir", state)
+        self.assertEqual(turn.worktree, self.root)
+        self.assertEqual(
+            Path(turn.metadata["wire_path"]),
+            Path(turn.metadata["session_path"])
+            / "agents"
+            / "main"
+            / "wire.jsonl",
+        )
+
+        turn.opaque.returncode = 0
+        result = adapter.reconcile(turn, self.context)
+        self.assertEqual(result.outcome, "succeeded")
+        self.assertTrue(result.proven)
+        self.assertNotEqual(
+            result.outcome,
+            "cancelled",
+            "a later prompt's cancellation must not enter the exact run slice",
+        )
+        inspection = adapter.inspect(turn.session_ref, self.context)
+        self.assertTrue(inspection.exists)
+        self.assertEqual(inspection.state, "idle")
+        self.assertEqual(inspection.metadata["last_prompt"], "later")
+
+        runner.queue(state_schema="v2", prompt_time=6003)
+        resumed = adapter.resume(turn.session_ref, self.context, "resume v2")
+        self.assertEqual(resumed.session_ref, turn.session_ref)
+        self.assertGreater(
+            resumed.metadata["prompt_offset"],
+            turn.metadata["prompt_offset"],
+        )
+        acknowledged = adapter.interrupt(resumed)
+        self.assertTrue(acknowledged.acknowledged)
+        self.assertEqual(resumed.opaque.signals, [signal.SIGINT])
+        interrupted = adapter.reconcile(resumed, self.context)
+        self.assertEqual(interrupted.outcome, "cancelled")
+        self.assertTrue(interrupted.proven)
+        self.assertEqual(
+            adapter.inspect(resumed.session_ref, self.context).state,
+            "idle",
         )
 
     def test_kimi_new_session_discovery_filters_and_reaps_failures(

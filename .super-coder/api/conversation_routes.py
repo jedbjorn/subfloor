@@ -760,32 +760,17 @@ def _wait_for_cli_release(shell) -> str | None:
 def _create_conversation(con, operator: dict, headers, body: dict):
     _only_fields(body, {"shell_id", "title", "harness", "model", "effort"})
     key = _idempotency_key(headers)
-    request_hash = _request_hash(body)
     shell_id = _integer(body.get("shell_id"), "shell_id")
 
-    # Cheap idempotent replay and all external preparation happen before the
-    # write reservation. The transaction repeats every authoritative DB read.
+    # Read a possible replay before preparation, but compare it only after the
+    # request has been resolved to the same canonical route stored for a new
+    # conversation. The transaction repeats every authoritative DB read.
     existing = con.execute(
         "SELECT conversation_id,creation_request_hash FROM conversations "
         "WHERE owner_user_id=? "
         "AND creation_idempotency_key=?",
         (operator["user_id"], key),
     ).fetchone()
-    if existing is not None:
-        if existing["creation_request_hash"] != request_hash:
-            raise ApiError(
-                409,
-                "CONVERSATION_IDEMPOTENCY_CONFLICT",
-                "Idempotency-Key was reused with a different request",
-            )
-        row = _require_conversation(
-            con, existing["conversation_id"], operator["user_id"]
-        )
-        return _json(
-            201,
-            _conversation_projection(row),
-            [("Location", f"/api/conversations/{row['conversation_id']}")],
-        )
 
     shell = con.execute(
         "SELECT shell_id,display_name,shortname,flavor FROM shells "
@@ -800,16 +785,6 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             "shell is unknown, deleted, or unavailable to this operator",
         )
     _refuse_admin_browser_chat(shell)
-    if active_chat_registry.get(con, shell_id) is None:
-        live_state = _wait_for_cli_release(shell)
-        if live_state is not None:
-            raise ApiError(
-                409,
-                "SHELL_BUSY",
-                f"shell {shell['shortname']!r} has a live CLI session; "
-                "close it before opening a browser chat",
-                {"shell_id": shell_id, "state": live_state},
-            )
 
     defaults = run_mod.flavor_defaults(con).get(shell["flavor"])
     harness = body.get("harness")
@@ -826,25 +801,29 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             "HARNESS_CONVERSATION_UNSUPPORTED",
             f"harness {harness!r} has no browser conversation adapter",
         )
-    model = body.get("model")
-    if model is None and defaults:
-        model = defaults["models"].get(harness)
-    model = _nonblank(model, "model", maximum=255, optional=True)
-    if harness == "opencode" and model is None:
-        raise ApiError(
-            422,
-            "HARNESS_MODEL_REQUIRED",
-            "OpenCode browser conversations require an exact model from a "
-            "provider connected in OpenCode",
-        )
+    selected_model = _nonblank(
+        body.get("model"), "model", maximum=255, optional=True
+    )
     effort = _nonblank(body.get("effort"), "effort", maximum=64, optional=True)
     adapter = run_mod.load_adapter(harness)
-    if effort is None:
-        effort = run_mod.default_headless_effort(adapter)
     try:
-        run_mod.validate_headless_request(adapter, model, effort)
+        resolved = run_mod.resolve_headless_route(
+            harness=harness,
+            adapter=adapter,
+            flavor_model=(
+                (defaults.get("models") or {}).get(harness)
+                if defaults
+                else None
+            ),
+            model=selected_model,
+            effort=effort,
+        )
     except ValueError as exc:
         raise ApiError(422, "HARNESS_ROUTE_INVALID", str(exc)) from exc
+    harness = resolved.harness
+    provider = resolved.provider
+    model = resolved.model
+    effort = resolved.effort
     title = _nonblank(body.get("title"), "title", maximum=200, optional=True)
     worktree = run_mod.shell_work_dir(shell["shortname"], shell["flavor"])
     worktree = worktree.resolve(strict=False)
@@ -855,9 +834,45 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             "the shell worktree path exists but is not a directory",
             {"shell_id": shell_id},
         )
+    request_hash = _request_hash(
+        {
+            "shell_id": shell_id,
+            "title": title,
+            "harness": harness,
+            "provider": provider,
+            "model": model,
+            "effort": effort,
+            "worktree": str(worktree),
+        }
+    )
+    if existing is not None:
+        if existing["creation_request_hash"] != request_hash:
+            raise ApiError(
+                409,
+                "CONVERSATION_IDEMPOTENCY_CONFLICT",
+                "Idempotency-Key was reused with a different request",
+            )
+        row = _require_conversation(
+            con, existing["conversation_id"], operator["user_id"]
+        )
+        return _json(
+            201,
+            _conversation_projection(row),
+            [("Location", f"/api/conversations/{row['conversation_id']}")],
+        )
+
+    if active_chat_registry.get(con, shell_id) is None:
+        live_state = _wait_for_cli_release(shell)
+        if live_state is not None:
+            raise ApiError(
+                409,
+                "SHELL_BUSY",
+                f"shell {shell['shortname']!r} has a live CLI session; "
+                "close it before opening a browser chat",
+                {"shell_id": shell_id, "state": live_state},
+            )
 
     conversation_id = "cv_" + uuid.uuid4().hex
-    provider = run_mod.session_provider(harness, model)
     closed_id = None
     with db_driver.write_transaction(con, "conversation.create.close_active"):
         existing = con.execute(

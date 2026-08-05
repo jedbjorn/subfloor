@@ -7,6 +7,7 @@ import os
 import sqlite3
 import threading
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,46 @@ from sprint_liveness import SprintLivenessMonitor
 from sprint_message_delivery import SprintWakeDeliveryService
 
 DEFAULT_PULSE_SECONDS = 5.0
+RUNTIME_DAEMON_NAME = "sprint-runtime"
+# A runtime is stale after three missed recorded pulse intervals.  The
+# threshold follows the durable interval rather than assuming the default.
+RUNTIME_STALE_INTERVALS = 3
+
+
+def _parse_stamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def runtime_status(
+    con: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+) -> dict[str, str | int | float | None]:
+    """Project live/stale/missing state from the durable runtime heartbeat."""
+    heartbeat = con.execute(
+        "SELECT beat_at,interval_s FROM daemon_heartbeats WHERE name=?",
+        (RUNTIME_DAEMON_NAME,),
+    ).fetchone()
+    if heartbeat is None:
+        return {
+            "state": "missing",
+            "beat_at": None,
+            "interval_seconds": int(DEFAULT_PULSE_SECONDS),
+        }
+    beat_at = str(heartbeat["beat_at"])
+    interval = float(heartbeat["interval_s"])
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    age = (current - _parse_stamp(beat_at)).total_seconds()
+    state = "live" if age <= RUNTIME_STALE_INTERVALS * interval else "stale"
+    interval_value: int | float = int(interval) if interval.is_integer() else interval
+    return {
+        "state": state,
+        "beat_at": beat_at,
+        "interval_seconds": interval_value,
+    }
 
 
 def _request_hash(prompt: str) -> str:
@@ -177,6 +218,7 @@ class SprintRuntimeService(threading.Thread):
         )
         self._stop_event = threading.Event()
         self._started_once = threading.Event()
+        self._ready = threading.Event()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -184,17 +226,49 @@ class SprintRuntimeService(threading.Thread):
     def wait_started(self, timeout: float = 5.0) -> bool:
         return self._started_once.wait(timeout)
 
+    def wait_ready(self, timeout: float = 5.0) -> bool:
+        """Wait until the first complete successful cycle is durable."""
+        return self._ready.wait(timeout)
+
     def pulse_once(self, *, startup: bool = False) -> bool:
         con = db_driver.connect(self.db_path)
         try:
-            monitored = activity_monitor.ActivityMonitor(
-                con, config=self.activity_config
-            ).tick()
-            switch = self._switch(con)
-            serviced = switch.recover_on_startup() if startup else switch.tick()
-            return self._deliver_wakes(con) or serviced or monitored.changed
+            return self._pulse(con, startup=startup)
         finally:
             con.close()
+
+    def _pulse(self, con: sqlite3.Connection, *, startup: bool) -> bool:
+        monitored = activity_monitor.ActivityMonitor(
+            con, config=self.activity_config
+        ).tick()
+        switch = self._switch(con)
+        serviced = switch.recover_on_startup() if startup else switch.tick()
+        delivered = self._deliver_wakes(con)
+        self._record_heartbeat(con)
+        return delivered or serviced or monitored.changed
+
+    def _record_heartbeat(self, con: sqlite3.Connection) -> None:
+        prior = con.execute(
+            "SELECT beat_at FROM daemon_heartbeats WHERE name=?",
+            (RUNTIME_DAEMON_NAME,),
+        ).fetchone()
+        floor = str(prior[0]) if prior is not None else None
+        stamp = str(
+            con.execute(
+                "SELECT CASE WHEN ? IS NOT NULL "
+                "AND ?>=strftime('%Y-%m-%d %H:%M:%f','now') "
+                "THEN strftime('%Y-%m-%d %H:%M:%f',?,'+0.001 seconds') "
+                "ELSE strftime('%Y-%m-%d %H:%M:%f','now') END",
+                (floor, floor, floor),
+            ).fetchone()[0]
+        )
+        with db_driver.write_transaction(con, "sprint.runtime.heartbeat"):
+            con.execute(
+                "INSERT INTO daemon_heartbeats (name,beat_at,interval_s) "
+                "VALUES (?,?,?) ON CONFLICT(name) DO UPDATE SET "
+                "beat_at=excluded.beat_at,interval_s=excluded.interval_s",
+                (RUNTIME_DAEMON_NAME, stamp, self.pulse_seconds),
+            )
 
     def _switch(self, con: sqlite3.Connection) -> ArmedServiceSwitch:
         lifecycle = SprintLifecycleStore(con)
@@ -228,27 +302,29 @@ class SprintRuntimeService(threading.Thread):
         return delivered
 
     def run(self) -> None:  # pragma: no cover - loop tested through pulse_once
-        con = db_driver.connect(self.db_path)
         try:
-            switch = self._switch(con)
-            monitor = activity_monitor.ActivityMonitor(con, config=self.activity_config)
+            con = db_driver.connect(self.db_path)
             try:
-                monitor.tick()
-                switch.recover_on_startup()
-                self._deliver_wakes(con)
-            except Exception as exc:  # noqa: BLE001 - service faults stay visible
-                print(f"sprint-runtime: startup error ({exc})", flush=True)
-            self._started_once.set()
-            while not self._stop_event.wait(self.pulse_seconds):
+                self._started_once.set()
+                if self._stop_event.is_set():
+                    return
                 try:
-                    monitor.tick()
-                    switch.tick()
-                    self._deliver_wakes(con)
-                except Exception as exc:  # noqa: BLE001 - keep inspection alive
-                    print(f"sprint-runtime: pulse error ({exc})", flush=True)
+                    self._pulse(con, startup=True)
+                except Exception as exc:  # noqa: BLE001 - startup must fail closed
+                    print(f"sprint-runtime: startup error ({exc})", flush=True)
+                    return
+                self._ready.set()
+                while not self._stop_event.wait(self.pulse_seconds):
+                    try:
+                        self._pulse(con, startup=False)
+                    except Exception as exc:  # noqa: BLE001 - keep inspection alive
+                        print(f"sprint-runtime: pulse error ({exc})", flush=True)
+            except Exception as exc:  # noqa: BLE001 - service faults stay visible
+                print(f"sprint-runtime: service error ({exc})", flush=True)
+            finally:
+                con.close()
         finally:
             self._started_once.set()
-            con.close()
 
 
 _SERVICE_LOCK = threading.Lock()

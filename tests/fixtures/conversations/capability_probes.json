@@ -1,8 +1,9 @@
 {
-  "probe_date": "2026-07-29",
+  "probe_date": "2026-08-05",
   "required_harnesses": {
     "opencode": {
       "verified_cli_version": "1.18.9",
+      "maximum_cli_version_exclusive": "1.19.0",
       "driver": "opencode-server",
       "native_ref_shape": "ses_<opaque>",
       "observed_events": [
@@ -23,7 +24,8 @@
       }
     },
     "claude": {
-      "verified_cli_version": "2.1.220",
+      "verified_cli_version": "2.1.222",
+      "maximum_cli_version_exclusive": "2.2.0",
       "driver": "claude-print",
       "native_ref_shape": "uuid",
       "observed_events": [
@@ -43,6 +45,7 @@
     },
     "codex": {
       "verified_cli_version": "0.145.0",
+      "maximum_cli_version_exclusive": "0.147.0",
       "driver": "codex-app-server",
       "native_ref_shape": "uuid",
       "observed_events": [
@@ -64,7 +67,9 @@
       }
     },
     "kimi": {
-      "verified_cli_version": "0.30.0",
+      "minimum_cli_version": "0.30.0",
+      "verified_cli_version": "0.33.0",
+      "maximum_cli_version_exclusive": "0.34.0",
       "driver": "kimi-print",
       "native_ref_shape": "session_<uuid>",
       "observed_events": [
