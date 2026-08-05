@@ -462,7 +462,7 @@ class SprintSkillTest(unittest.TestCase):
         try:
             con.executescript((ENGINE / "schema.sql").read_text())
             for migration in sorted((ENGINE / "migrations").glob("*.sql")):
-                if migration.name >= "0180_reseed_sprint_skill_polish.sql":
+                if migration.name >= "0184_reseed_sprint_skill_polish.sql":
                     break
                 con.executescript(migration.read_text())
             placeholders = ",".join("?" for _ in POLISHED_SPRINT_SKILLS)
@@ -474,7 +474,7 @@ class SprintSkillTest(unittest.TestCase):
             )
 
             migration = (
-                ENGINE / "migrations" / "0180_reseed_sprint_skill_polish.sql"
+                ENGINE / "migrations" / "0184_reseed_sprint_skill_polish.sql"
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
