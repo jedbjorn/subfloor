@@ -1,122 +1,79 @@
 ---
 name: windows_vm_gui
-description: Drive the Windows Test VM's GUI — Windows-MCP in the guest, UIA-tree clicking by element ID (never blind coordinates), screenshot verification between actions, and mouse-free in-process test paths for anything repeatable. Exploratory GUI QAQC where windows_devkit's exec loop can't see the UI.
+description: Drive the linked Windows Test VM through adapter-provided Windows MCP tools, using UI Automation element IDs, visual verification, managed MCP lifecycle, and one end-only powered-off reset.
 category: substrate
 common: false
 ---
 
-# windows_vm_gui — GUI-driving the Windows Test VM
+# windows_vm_gui — drive the supplied Windows GUI
 
-Drive the guest GUI via **Windows UI Automation**: pull the UIA tree, act on
-elements by ID. NEVER click by screenshot pixel coordinates when an element ID
-exists — pixel targets break on DPI scaling / window position / theme / dense
-UIs (a CAD ribbon, a settings tree).
+Use this for exploratory GUI QA/QC and visual verification that cannot be
+expressed through `windows_devkit` commands alone. The operator supplies the VM
+and application state. Observe first, start or open only what is absent, and
+reset once when all testing is finished.
 
-Tooling = **Windows-MCP** (`windows-mcp` on PyPI), running inside the guest,
-reached over HTTP. Tools: `Snapshot` (UIA tree + element IDs),
-`Click`/`Type`/`Scroll` (act on IDs), `Screenshot` (visual verify), plus
-`App`, `PowerShell`, `Clipboard`. Expect 0.2–0.5 s per action.
+## Preflight and tool availability
 
-## Where this sits
+The harness adapter declares the managed streamable-HTTP `windows-mcp` server
+before the harness launches. Claude, Codex, and OpenCode expose it where their
+active adapter supports Windows MCP. Kimi and Vibe are unsupported until their
+adapters gain an equivalent injection mechanism.
 
-| Skill | Loop | Use for |
-|---|---|---|
-| `windows_devkit` | push → exec → capture → reset | installers, services, anything scriptable |
-| **this** | connect → Snapshot → click/type → verify | exploratory GUI QAQC, visual verification |
-| `configure_winbox` | provision → verify → bake | the admin prep both of the above assume |
+The harness tool list may be fixed at launch. If Windows MCP tools are absent,
+do not run persistent registration commands or edit user/project harness
+configuration. Report the adapter state from `./sc vm status --json`; an
+unsupported adapter is an honest stop, not a reason to fabricate GUI access.
 
-GUI driving = exploratory QAQC + visual verification ONLY. A check that will
-run more than twice does not belong in a click sequence — see the last section.
+Windows-MCP runs inside the prepared guest. A missing guest server or toolchain
+requires the operator's `configure_winbox` and re-bake flow. Never install it
+ad hoc during testing.
 
-## One-time guest prep (admin — via the configure_winbox flow)
+## Canonical workflow
 
-Every `windows_devkit` run reverts to the `clean` snapshot → anything installed
-but not baked evaporates on the next reset. Windows-MCP is therefore
-**toolchain**: a missing piece = manifest PR + re-bake, NEVER an ad-hoc install
-from a test loop.
+1. Assume the operator supplied a running VM with the testing application open.
+2. Run `./sc vm status --json`. It is read-only and must not reset, restart, or
+   otherwise mutate the VM.
+3. If the VM is off, run `./sc vm start --json`. For a running VM whose SSH is
+   not ready, the same command performs bounded readiness checks without a
+   restart. Do not invent sleeps.
+4. If the application is absent, open it through `./sc vm exec` or the
+   harness-provided Windows MCP tools.
+5. Run `./sc vm mcp up --json`. Success means the broker tunnel, verified local
+   relay, and MCP HTTP endpoint are ready. Then use the already-provided
+   Windows MCP tools; do not register them from inside the skill.
+6. Perform the GUI test. A test failure does not skip cleanup.
+7. When all testing is finished and you still have control, run
+   `./sc vm mcp down --json`, then `./sc vm reset --off --json` once. Report MCP
+   cleanup and reset results separately from the test result.
 
-1. Add Python 3.13+ (e.g. `Python.Python.3.13`) to the fork's committed winget
-   manifest → `configure_winbox` pushes + imports it.
-2. Via the broker (`/exec`, like every `configure_winbox` step):
-   `pip install uv` → `uvx windows-mcp serve --help` exits 0 → register the
-   auto-start scheduled task, bound to localhost ONLY (never expose it on the
-   VM network):
-
-   ```
-   windows-mcp install --transport streamable-http --host 127.0.0.1 --port 8000
-   ```
-
-3. Operator runs `./sc vm-bake` (host-side — the snapshot is the trust
-   anchor) → every subsequent reset boots with the server already listening.
-
-Constraints: Python 3.13+ and `uv` in the guest; English-language Windows
-preferred (App-tool limitation); UAC prompts + elevated windows unreachable
-unless the server itself runs elevated.
-
-## Per-session connect — seat-dependent
-
-**Host-run seat** (a shell booted with `./sc boot` on the host, no sandbox):
-
-1. `windows_devkit` `/reset` → wait until SSH answers.
-2. Tunnel: `ssh -f -N -L 18000:127.0.0.1:8000 <ssh_user>@<ssh_host>` (values
-   from the `vm` block in `.super-coder/instance.json`).
-3. `curl -s http://127.0.0.1:18000/mcp` answers → endpoint live.
-4. Connect the harness:
-   `claude mcp add --transport http windows-mcp http://127.0.0.1:18000/mcp`
-5. Endpoint dead → check the tunnel first, then the guest task
-   (`schtasks /run /tn windows-mcp-server` over SSH); task missing = snapshot
-   was baked without the prep above.
-
-**Sandboxed seat** (the engine default): the sandbox has no `ssh`, no key, no
-route to the VM — broker design — so the connection is brokered in two halves:
-the vm-broker (host-side, holds the key) ssh-forwards a unix socket in the
-bind-mounted `run/` dir to the guest's Windows-MCP; an in-sandbox relay gives
-that socket the TCP URL `claude mcp add` needs.
-
-1. `windows_devkit` `/reset` → wait until SSH answers.
-2. Broker tunnel:
-   `curl --unix-socket $(./sc vm-broker-sock) -X POST http://vm/mcp/up`
-   (idempotent; forwards `run/vm-mcp.sock` to the guest's `mcp_port`,
-   default 8000).
-3. Relay: `./sc vm-mcp-relay up` (listens on `127.0.0.1:18000`, pipes to the
-   tunnel socket; idempotent).
-4. `curl -s http://127.0.0.1:18000/mcp` answers → endpoint live.
-5. Connect the harness:
-   `claude mcp add --transport http windows-mcp http://127.0.0.1:18000/mcp`
-6. Endpoint dead → `./sc vm-mcp-relay status` first: `upstream: false` =
-   broker tunnel down → redo step 2 (every `/reset` drops the tunnel —
-   reconnect after each). Still dead → guest task via broker `/exec`:
-   `schtasks /run /tn windows-mcp-server`; task missing = snapshot was baked
-   without the prep above.
-7. Done driving: `./sc vm-mcp-relay down` +
-   `curl --unix-socket $(./sc vm-broker-sock) -X POST http://vm/mcp/down`.
-
-NEVER fake GUI driving by guessing pixel coordinates off `/capture`
-screenshots.
+There is no opening or mid-test reset. If MCP setup or teardown returns a
+structured failure, include it for the operator and do not claim success. Never
+automatically repeat an uncertain reset.
 
 ## Driving rules
 
-- `Snapshot` first, always → act on element IDs.
-- Standard chrome (ribbons, dialogs, palettes — WPF/WinForms/WinUI) is
-  UIA-visible → click by element.
-- Custom-rendered surfaces (drawing canvases, game views, embedded GL) have no
-  UIA elements — the ONE legitimate coordinate fallback: `Screenshot` → pick
-  the pixel target → `Click(x, y)` → `Screenshot` again to verify. NEVER chain
-  canvas clicks without verifying between them.
-- Re-`Snapshot` after anything that changes the window set — stale element IDs
-  misclick.
-- Verify state visually after each meaningful action.
-- Batch reads; don't spam single-element queries.
+- Call `Snapshot` first. Act on UI Automation element IDs, not screenshot
+  coordinates.
+- Re-run `Snapshot` after a window-set change; stale element IDs can misclick.
+- Use `Click`, `Type`, and `Scroll` on element IDs, and verify meaningful state
+  changes with `Screenshot`.
+- Standard WPF, WinForms, and WinUI chrome is normally UIA-visible. A
+  custom-rendered canvas with no UIA element is the only coordinate fallback:
+  take a screenshot, perform one coordinate action, then take another
+  screenshot before continuing.
+- Batch reads instead of issuing repeated single-element queries.
+- Keep application state and screenshots local; never expose the relay beyond
+  its configured loopback endpoint.
 
-## Prefer no mouse at all
+## Prefer a scripted path when repeatable
 
-Anything repeatable belongs in an in-process test path driven over the exec
-loop, not a click sequence. Most GUI platforms have one — Revit add-ins:
-RevitTestFramework, ricaun.RevitTest, Revit.TestRunner (NUnit in-process via
-journal, no UI). Hierarchy, in order:
+Anything likely to run more than twice belongs in an in-process framework or a
+typed `./sc vm exec` test, not a click sequence:
 
+```text
+in-process test framework  →  UIA by element ID  →  coordinates only when UIA is blind
 ```
-in-process test framework  →  UIA by element ID  →  coordinates (only where the tree is blind)
-```
 
-A check that will run more than twice goes to the top of that list.
+Use `./sc vm capture --json` when the result needs a durable local screenshot
+artifact. Use `windows_devkit` for push, exact guest commands, and the shared
+end-only cleanup contract.
