@@ -30,6 +30,23 @@ GOLDEN = json.loads(
 
 
 class BrokerReadinessTests(unittest.TestCase):
+    def test_domain_state_uses_stdout_and_ignores_benign_stderr(self):
+        process = mock.Mock(
+            returncode=0,
+            stdout="shut off\n",
+            stderr="libvirt: error : Failed to find user record for uid\n",
+        )
+        with mock.patch.object(vm.subprocess, "run", return_value=process) as run:
+            result = vm._domain_state(SAVED)
+        self.assertEqual(result, (True, "powered_off"))
+        self.assertEqual(run.call_args.kwargs["timeout"], 15)
+
+    def test_domain_state_normalizes_unrecognized_stdout_to_unknown(self):
+        process = mock.Mock(returncode=0, stdout="future state\n", stderr="")
+        with mock.patch.object(vm.subprocess, "run", return_value=process):
+            result = vm._domain_state(SAVED)
+        self.assertEqual(result, (True, "unknown"))
+
     def test_status_observes_domain_ssh_and_tunnel_without_mutation(self):
         with mock.patch.object(vm, "read", return_value=SAVED), \
              mock.patch.object(vm, "_domain_state", return_value=(True, "running")), \
@@ -156,6 +173,34 @@ class SingleResponseTests(unittest.TestCase):
         self.assertIn("error=ValueError", log.getvalue())
         self.assertNotIn("guest command SECRET", log.getvalue())
 
+    def test_get_exception_returns_sanitized_error_without_payload_log(self):
+        handler = self._handler()
+        handler.command = "GET"
+        handler.path = "/status"
+        handler._send = mock.Mock()
+        with mock.patch.object(vm, "do_status", side_effect=ValueError("SECRET")), \
+             mock.patch.object(vm_broker.sys, "stderr", new_callable=io.StringIO) as log:
+            handler.do_GET()
+        handler._send.assert_called_once_with(
+            500, {"ok": False, "error": "broker request failed"}
+        )
+        self.assertIn("error=ValueError", log.getvalue())
+        self.assertNotIn("SECRET", log.getvalue())
+
+    def test_put_exception_returns_sanitized_error_without_payload_log(self):
+        handler = self._handler()
+        handler.command = "PUT"
+        handler.path = "/vm"
+        handler._body = mock.Mock(side_effect=ValueError("SECRET"))
+        handler._send = mock.Mock()
+        with mock.patch.object(vm_broker.sys, "stderr", new_callable=io.StringIO) as log:
+            handler.do_PUT()
+        handler._send.assert_called_once_with(
+            500, {"ok": False, "error": "broker request failed"}
+        )
+        self.assertIn("error=ValueError", log.getvalue())
+        self.assertNotIn("SECRET", log.getvalue())
+
     def test_malformed_reset_body_cannot_trigger_the_default_running_reset(self):
         handler = self._handler()
         handler.headers = {"Content-Length": "1"}
@@ -168,6 +213,34 @@ class SingleResponseTests(unittest.TestCase):
         handler._send.assert_called_once_with(
             500, {"ok": False, "error": "broker request failed"}
         )
+
+    def test_guest_mutating_routes_hold_the_shared_lock(self):
+        cases = (
+            ("/exec", "do_exec", {"command": "echo ok"}),
+            ("/push", "do_push", {"src": "artifact", "dest": "staged"}),
+            ("/capture", "do_capture", {"command": None}),
+        )
+        for path, verb_name, body in cases:
+            with self.subTest(path=path):
+                events = []
+                lock = mock.MagicMock()
+                lock.__enter__.side_effect = lambda: events.append("lock_enter")
+                lock.__exit__.side_effect = lambda *args: events.append("lock_exit")
+                handler = self._handler()
+                handler.path = path
+                handler.server = mock.Mock(vm_mutation_lock=lock)
+                handler._body = mock.Mock(return_value=body)
+                handler._send = mock.Mock()
+                with mock.patch.object(
+                    vm,
+                    verb_name,
+                    side_effect=lambda *args, **kwargs: (
+                        events.append("verb") or {"ok": True}
+                    ),
+                ):
+                    handler.do_POST()
+                self.assertEqual(events, ["lock_enter", "verb", "lock_exit"])
+                handler._send.assert_called_once_with(200, {"ok": True})
 
 
 class PublicClientTests(unittest.TestCase):
@@ -200,9 +273,10 @@ class PublicClientTests(unittest.TestCase):
             result = vm.run_operation("start")
         self.assertEqual(result, GOLDEN["start_success"])
         call.assert_called_once_with(
-            "POST", "/start", None, timeout=vm.START_CLIENT_TIMEOUT
+            "POST", "/start", None, timeout=150
         )
-        self.assertGreater(vm.START_CLIENT_TIMEOUT, vm.START_READINESS_TIMEOUT)
+        self.assertEqual(vm.START_BROKER_BUDGET, 135)
+        self.assertEqual(vm.START_CLIENT_TIMEOUT, 150)
 
     def test_reset_json_matches_golden_shape_and_exceeds_broker_budget(self):
         response = {
@@ -215,9 +289,10 @@ class PublicClientTests(unittest.TestCase):
             result = vm.run_operation("reset")
         self.assertEqual(result, GOLDEN["reset_success"])
         call.assert_called_once_with(
-            "POST", "/reset", {"running": False}, timeout=vm.RESET_CLIENT_TIMEOUT
+            "POST", "/reset", {"running": False}, timeout=130
         )
-        self.assertGreater(vm.RESET_CLIENT_TIMEOUT, vm.RESET_COMMAND_TIMEOUT)
+        self.assertEqual(vm.RESET_CLIENT_TIMEOUT, 130)
+        self.assertEqual(vm.RESET_COMMAND_TIMEOUT, 60)
 
     def test_reset_malformed_response_is_unknown_and_never_retried(self):
         with mock.patch.object(
@@ -226,6 +301,27 @@ class PublicClientTests(unittest.TestCase):
             result = vm.run_operation("reset")
         self.assertEqual(result, GOLDEN["reset_unknown"])
         self.assertEqual(call.call_count, 1)
+
+    def test_reset_transport_timeout_is_unknown_and_never_retried(self):
+        with mock.patch.object(vm, "broker_call", side_effect=TimeoutError) as call:
+            result = vm.run_operation("reset")
+        self.assertEqual(result, GOLDEN["reset_unknown"])
+        self.assertEqual(call.call_count, 1)
+
+    def test_start_transport_timeout_has_distinct_code_and_deadline(self):
+        with mock.patch.object(vm, "broker_call", side_effect=TimeoutError):
+            result = vm.run_operation("start")
+        self.assertEqual(result, {
+            "schema_version": 1,
+            "ok": False,
+            "operation": "start",
+            "result": None,
+            "error": {
+                "code": "start_timeout",
+                "message": "the VM start operation timed out after 150s",
+                "details": {"timeout_seconds": 150},
+            },
+        })
 
     def test_reset_success_missing_required_fields_is_unknown(self):
         with mock.patch.object(vm, "broker_call", return_value={"ok": True}):
@@ -289,6 +385,31 @@ class PublicClientTests(unittest.TestCase):
         transport.connect.assert_called_once_with(str(vm.SOCKET))
         self.assertEqual(transport.sendall.call_count, 1)
         transport.close.assert_called_once_with()
+
+    def test_broker_call_timeout_occurs_after_one_request_send(self):
+        transport = mock.Mock()
+        transport.recv.side_effect = TimeoutError
+        with mock.patch.object(vm.socket, "socket", return_value=transport), \
+             self.assertRaisesRegex(TimeoutError, "timed out after 130s"):
+            vm.broker_call("POST", "/reset", {"running": False})
+        transport.connect.assert_called_once_with(str(vm.SOCKET))
+        self.assertEqual(transport.sendall.call_count, 1)
+        transport.close.assert_called_once_with()
+
+    def test_subcommand_help_documents_json_result_fields(self):
+        cases = {
+            "status": ("broker.ready", "ssh.last_error", "mcp.tunnel_running"),
+            "start": ("started", "ssh.attempts", "ssh.last_error"),
+            "reset": ("domain.state", "snapshot", "--off"),
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command), \
+                 mock.patch.object(sys, "stdout", new_callable=io.StringIO) as output, \
+                 self.assertRaises(SystemExit) as raised:
+                vm.client_main([command, "--help"])
+            self.assertEqual(raised.exception.code, 0)
+            for field in expected:
+                self.assertIn(field, output.getvalue())
 
 
 if __name__ == "__main__":

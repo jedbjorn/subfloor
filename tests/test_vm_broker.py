@@ -14,6 +14,7 @@ Run:
 """
 from __future__ import annotations
 
+import io
 import os
 import signal
 import socket
@@ -72,14 +73,16 @@ class VerbDispatchTests(unittest.TestCase):
     def test_virsh_calls_honor_libvirt_uri(self):
         cfg = dict(SAVED, libvirt_uri="qemu:///system")
         with mock.patch.object(vm, "read", return_value=cfg), \
-             mock.patch.object(vm, "_run", return_value=(True, "")) as run:
+             mock.patch.object(vm, "_run", return_value=(True, "")) as run, \
+             mock.patch.object(vm, "_domain_state", return_value=(True, "running")):
             vm.do_reset()
         argv = run.call_args[0][0]
         self.assertEqual(argv[:3], ["virsh", "--connect", "qemu:///system"])
 
     def test_virsh_omits_connect_when_no_uri(self):
         with mock.patch.object(vm, "read", return_value=SAVED), \
-             mock.patch.object(vm, "_run", return_value=(True, "")) as run:
+             mock.patch.object(vm, "_run", return_value=(True, "")) as run, \
+             mock.patch.object(vm, "_domain_state", return_value=(True, "running")):
             vm.do_reset()
         argv = run.call_args[0][0]
         self.assertEqual(argv[0], "virsh")
@@ -990,6 +993,15 @@ class SocketTransportTests(unittest.TestCase):
     def test_unknown_route_is_404_shaped(self):
         r = vm.broker_call("GET", "/nope")
         self.assertFalse(r["ok"])
+
+    def test_status_fault_returns_sanitized_json_instead_of_dropping_response(self):
+        with mock.patch.object(vm, "do_status", side_effect=ValueError("SECRET")), \
+             mock.patch.object(vm_broker.sys, "stderr", new_callable=io.StringIO) as log:
+            r = vm.broker_call("GET", "/status")
+        self.assertEqual(r, {"ok": False, "error": "broker request failed"})
+        self.assertIn("event=handler_error", log.getvalue())
+        self.assertIn("error=ValueError", log.getvalue())
+        self.assertNotIn("SECRET", log.getvalue())
 
     def test_validate_proxies_the_candidate_cfg_in_the_body(self):
         # The in-sandbox server proxies validate through exactly this path.

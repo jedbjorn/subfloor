@@ -62,7 +62,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # AF_UNIX peers have no address — the default logger would IndexError on it.
     def log_message(self, fmt: str, *args) -> None:
-        sys.stderr.write("[vm-broker] " + (fmt % args) + "\n")
+        return
 
     def _send(self, code: int, payload: dict) -> None:
         if self._response_started:
@@ -104,7 +104,17 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("request body must be a JSON object")
         return value
 
+    def _guard(self, action) -> None:
+        try:
+            action()
+        except Exception as exc:  # noqa: BLE001 — broker boundary survives verb faults
+            self._log("handler_error", error=type(exc).__name__)
+            self._send(500, {"ok": False, "error": "broker request failed"})
+
     def do_GET(self) -> None:
+        self._guard(self._do_get)
+
+    def _do_get(self) -> None:
         if self.path == "/health":
             return self._send(200, {"ok": True, "service": "vm-broker"})
         if self.path == "/status":
@@ -116,6 +126,9 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"ok": False, "error": "no such route"})
 
     def do_PUT(self) -> None:
+        self._guard(self._do_put)
+
+    def _do_put(self) -> None:
         if self.path == "/vm":
             block = self._body().get("vm")
             if block is not None and not isinstance(block, dict):
@@ -124,39 +137,41 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"ok": False, "error": "no such route"})
 
     def do_POST(self) -> None:
-        try:
-            if self.path == "/exec":
-                b = self._body()
+        self._guard(self._do_post)
+
+    def _do_post(self) -> None:
+        if self.path == "/exec":
+            b = self._body()
+            with self.server.vm_mutation_lock:
                 return self._send(200, vm.do_exec(b.get("command", ""),
                                                   int(b.get("timeout", 120))))
-            if self.path == "/start":
-                with self.server.vm_mutation_lock:
-                    return self._send(200, vm.do_start())
-            if self.path == "/reset":
-                # {"running": false} ends a run clean + powered OFF (frees host
-                # RAM); default true boots a clean box to START a run.
-                with self.server.vm_mutation_lock:
-                    return self._send(200, vm.do_reset(self._body().get("running", True)))
-            if self.path == "/push":
-                b = self._body()
+        if self.path == "/start":
+            with self.server.vm_mutation_lock:
+                return self._send(200, vm.do_start())
+        if self.path == "/reset":
+            # {"running": false} ends a run clean + powered OFF (frees host
+            # RAM); default true boots a clean box to START a run.
+            with self.server.vm_mutation_lock:
+                return self._send(200, vm.do_reset(self._body().get("running", True)))
+        if self.path == "/push":
+            b = self._body()
+            with self.server.vm_mutation_lock:
                 return self._send(200, vm.do_push(b.get("src", ""), b.get("dest")))
-            if self.path == "/capture":
+        if self.path == "/capture":
+            with self.server.vm_mutation_lock:
                 return self._send(200, vm.do_capture(self._body().get("command")))
-            if self.path == "/mcp/up":
-                # The GUI seam (#263): forward run/vm-mcp.sock to the guest's
-                # Windows-MCP. Target port comes from the SAVED block, never
-                # the caller — the sandbox names an action, not a destination.
-                return self._send(200, vm.do_mcp_up())
-            if self.path == "/mcp/down":
-                return self._send(200, vm.do_mcp_down())
-            if self.path.startswith("/validate/"):
-                r = vm.validate(self.path.rsplit("/", 1)[1], self._body().get("vm") or {})
-                if r is None:
-                    return self._send(404, {"ok": False, "error": "no such check"})
-                return self._send(200, r)
-        except Exception as e:  # noqa: BLE001 — broker boundary must survive verb faults
-            self._log("handler_error", error=type(e).__name__)
-            return self._send(500, {"ok": False, "error": "broker request failed"})
+        if self.path == "/mcp/up":
+            # The GUI seam (#263): forward run/vm-mcp.sock to the guest's
+            # Windows-MCP. Target port comes from the SAVED block, never
+            # the caller — the sandbox names an action, not a destination.
+            return self._send(200, vm.do_mcp_up())
+        if self.path == "/mcp/down":
+            return self._send(200, vm.do_mcp_down())
+        if self.path.startswith("/validate/"):
+            r = vm.validate(self.path.rsplit("/", 1)[1], self._body().get("vm") or {})
+            if r is None:
+                return self._send(404, {"ok": False, "error": "no such check"})
+            return self._send(200, r)
         return self._send(404, {"ok": False, "error": "no such route"})
 
 

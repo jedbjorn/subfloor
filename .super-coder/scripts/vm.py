@@ -374,13 +374,29 @@ def _unverified_process_error(
         f"(expected executable {os.path.realpath(expected_executable)}, "
         f"observed {observed}, rc {returncode}): {tail}"
     )
+DOMAIN_STATE_TIMEOUT = 15
+DOMAIN_START_TIMEOUT = 30
 RESET_COMMAND_TIMEOUT = 60
 START_READINESS_TIMEOUT = 90
 START_READINESS_INTERVAL = 2
 RESET_CLIENT_TIMEOUT = 130
-START_CLIENT_TIMEOUT = START_READINESS_TIMEOUT + 25
+START_BROKER_BUDGET = (
+    DOMAIN_STATE_TIMEOUT + DOMAIN_START_TIMEOUT + START_READINESS_TIMEOUT
+)
+START_CLIENT_TIMEOUT = START_BROKER_BUDGET + 15
 DEFAULT_CLIENT_TIMEOUT = 30
 RESULT_SCHEMA_VERSION = 1
+
+DOMAIN_STATES = {
+    "blocked": "blocked",
+    "crashed": "crashed",
+    "in shutdown": "shutting_down",
+    "no state": "unknown",
+    "paused": "paused",
+    "pmsuspended": "suspended",
+    "running": "running",
+    "shut off": "powered_off",
+}
 
 
 # -- config (instance.json `vm` block) ---------------------------------------
@@ -550,14 +566,31 @@ def do_exec(command: str, timeout: int = 120) -> dict:
 
 
 def _domain_state(cfg: dict) -> tuple[bool, str]:
-    """Return a stable domain-state name without mutating the guest."""
-    ok, output = _run(_virsh(cfg, "domstate", str(cfg["domain"])), timeout=15)
-    if not ok:
-        return False, output
-    state = output.strip().lower()
-    if state == "shut off":
-        state = "powered_off"
-    return True, state.replace(" ", "_")
+    """Return a stable state from virsh stdout; stderr diagnostics are not state."""
+    try:
+        process = subprocess.run(
+            _virsh(cfg, "domstate", str(cfg["domain"])),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=DOMAIN_STATE_TIMEOUT,
+        )
+    except FileNotFoundError as exc:
+        return (
+            False,
+            f"command not found: {exc.filename} — is it installed on the host?",
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"timed out (>{DOMAIN_STATE_TIMEOUT}s)"
+    if process.returncode != 0:
+        return False, (process.stdout + process.stderr).strip()
+    lines = [
+        line.strip().lower()
+        for line in process.stdout.splitlines()
+        if line.strip()
+    ]
+    return True, DOMAIN_STATES.get(lines[0], "unknown") if lines else "unknown"
 
 
 def _ssh_ready(cfg: dict, timeout: int = 10) -> tuple[bool, str | None]:
@@ -616,7 +649,9 @@ def do_start(wait: int = START_READINESS_TIMEOUT) -> dict:
 
     started = False
     if state == "powered_off":
-        ok, output = _run(_virsh(cfg, "start", str(cfg["domain"])), timeout=30)
+        ok, output = _run(
+            _virsh(cfg, "start", str(cfg["domain"])), timeout=DOMAIN_START_TIMEOUT
+        )
         if not ok:
             return {
                 "ok": False,
@@ -1205,7 +1240,21 @@ def run_operation(operation: str) -> dict:
             "the VM broker is not reachable",
             {},
         )
-    except (TimeoutError, BrokerResponseError):
+    except TimeoutError:
+        if operation == "reset":
+            return operation_error(
+                operation,
+                "reset_result_unknown",
+                "the broker connection closed before reset could be confirmed",
+                {"domain_state": "unknown"},
+            )
+        return operation_error(
+            operation,
+            f"{operation}_timeout",
+            f"the VM {operation} operation timed out after {timeout}s",
+            {"timeout_seconds": timeout},
+        )
+    except BrokerResponseError:
         if operation == "reset":
             return operation_error(
                 operation,
@@ -1288,14 +1337,50 @@ def _human_result(value: dict) -> str:
 
 
 def client_main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="./sc vm")
+    parser = argparse.ArgumentParser(
+        prog="./sc vm",
+        description="Observe and control the configured Windows test VM.",
+    )
     commands = parser.add_subparsers(dest="operation", required=True)
-    for name in ("status", "start"):
-        command = commands.add_parser(name)
-        command.add_argument("--json", action="store_true")
-    reset = commands.add_parser("reset")
-    reset.add_argument("--off", action="store_true", required=True)
-    reset.add_argument("--json", action="store_true")
+    status = commands.add_parser(
+        "status",
+        help="observe VM readiness without mutation",
+        description=(
+            "Read-only status. JSON result fields: broker.ready; domain.name, "
+            "domain.state; ssh.ready, ssh.last_error; mcp.tunnel_running."
+        ),
+    )
+    status.add_argument(
+        "--json", action="store_true", help="print one JSON result object"
+    )
+    start = commands.add_parser(
+        "start",
+        help="start only when off and wait for SSH",
+        description=(
+            "Non-resetting start. JSON result fields: domain.name, domain.state; "
+            "started; ssh.ready, ssh.attempts, ssh.last_error."
+        ),
+    )
+    start.add_argument(
+        "--json", action="store_true", help="print one JSON result object"
+    )
+    reset = commands.add_parser(
+        "reset",
+        help="restore the testing snapshot and leave the VM off",
+        description=(
+            "Powered-off reset. JSON result fields: domain.name, domain.state; "
+            "snapshot."
+        ),
+    )
+    reset.add_argument(
+        "--off",
+        action="store_true",
+        required=True,
+        help="required: leave the restored VM powered off",
+    )
+    reset.add_argument(
+        "--json", action="store_true", help="print one JSON result object"
+    )
     args = parser.parse_args(argv)
     value = run_operation(args.operation)
     if args.json:
