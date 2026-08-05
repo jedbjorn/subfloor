@@ -6,8 +6,8 @@
 # local-path fetch from the subfloor sibling clone. This script encodes the
 # proven update procedure so `make dos-u` is one determinate chain:
 #
-#   make dos-u   →  backup DB → fast-forward sibling subfloor main from GitHub
-#                   → fetch + merge into this repo → ./sc update
+#   make dos-u   →  backup DB → refresh sibling subfloor origin/main
+#                   → fetch that ref + merge into this repo → ./sc update
 #                   (the merge runs here; ./sc update is the make recipe)
 #   make dos-r   →  ./sc restart (its own DB backup → down → launch)
 #
@@ -42,17 +42,17 @@ mkdir -p "$BACKUP_DIR"
 cp "$DB" "$BACKUP_DIR/shell_db.pre-pull.$ts.db"
 echo "→ DB backed up -> db_backups/sc-cachy/shell_db.pre-pull.$ts.db"
 
-# 2. Fast-forward the sibling's main from GitHub (ff-only: a diverged sibling
-#    main is an error to look at, never something to silently rewrite).
-echo "→ fast-forwarding $SUBFLOOR main from origin"
-git -C "$SUBFLOOR" fetch origin main:main || {
-  echo "✗ could not fast-forward subfloor main (diverged or offline)." >&2
-  echo "  Inspect: git -C $SUBFLOOR log --oneline main..origin/main" >&2
+# 2. Refresh the sibling's remote-tracking ref. Do not fetch directly into its
+#    local main: Git refuses that operation when main is checked out, and this
+#    updater has no reason to modify the sibling worktree in the first place.
+echo "→ refreshing $SUBFLOOR origin/main"
+git -C "$SUBFLOOR" fetch origin main || {
+  echo "✗ could not refresh subfloor origin/main (offline or fetch failed)." >&2
   exit 1
 }
 
-# 3. Fetch + merge into this repo.
-git -C "$ROOT" fetch "$SUBFLOOR" main
+# 3. Fetch the exact upstream ref through the sibling clone, then merge it here.
+git -C "$ROOT" fetch "$SUBFLOOR" refs/remotes/origin/main
 if git -C "$ROOT" merge-base --is-ancestor FETCH_HEAD HEAD; then
   echo "→ already up to date with subfloor main ($(git -C "$ROOT" rev-parse --short FETCH_HEAD))"
   exit 0

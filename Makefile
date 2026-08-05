@@ -20,7 +20,7 @@ include .super-coder/aliases.mk
 # ── bare-metal layer (this fork only) ─────────────────────────────────────────
 # sc-cachy is a remote-less fork of subfloor itself; upstream arrives by
 # local-path fetch from the sibling clone. dos-pull runs the deterministic
-# pull: DB backup → ff sibling subfloor main from GitHub → fetch + merge here
+# pull: DB backup → refresh sibling origin/main from GitHub → fetch + merge here
 # (conflict guidance printed, make stops before update). Hooking it as a
 # prerequisite makes `make dos-u` the whole procedure:
 #   make dos-u   pull + merge upstream, then ./sc update (aliases.mk recipe)
