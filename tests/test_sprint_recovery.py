@@ -9,8 +9,10 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".super-coder" / "scripts"
-sys.path[:0] = [str(SCRIPTS), str(ROOT / "tests")]
+API = ROOT / ".super-coder" / "api"
+sys.path[:0] = [str(SCRIPTS), str(API), str(ROOT / "tests")]
 
+import server
 import sprint_domain
 import sprint_message_delivery
 import sprint_participant_chats
@@ -1069,6 +1071,101 @@ class SprintRecoveryCase(SprintPRWatcherCase):
                 "work_unit_id": self.unit_id,
             },
             exhausted,
+        )
+
+    def test_monitor_reports_pause_with_empty_liveness_outcomes(self):
+        message = self.send("monitor-unknown-first-turn")
+        original = int(message.wake_id)
+        self.fail_wake_turn(
+            original,
+            error_code="HARNESS_SESSION_DISCOVERY_FAILED",
+            run_state="unknown",
+        )
+
+        with mock.patch.object(
+            server.sprint_liveness.SprintLivenessMonitor,
+            "evaluate",
+            return_value=(),
+        ):
+            response = server.sprint_monitor_response(self.con, self.sprint_id)
+
+        self.assertEqual([], response["outcomes"])
+        self.assertEqual(
+            {
+                "action": "paused",
+                "requeued_wake_ids": [],
+                "pause_reason": "wake_pickup_unknown",
+            },
+            response["pickup"],
+        )
+        self.assertEqual("missing", response["runtime"]["state"])
+        self.assertEqual(None, response["runtime"]["beat_at"])
+        self.assertEqual(5, response["runtime"]["interval_seconds"])
+
+    def test_monitor_requeue_is_idempotent_and_never_delivers_a_second_copy(self):
+        message = self.send("monitor-requeue")
+        original = int(message.wake_id)
+        self.fail_wake_turn(original, error_code="HARNESS_ROUTE_MISMATCH")
+        self.con.execute(
+            "INSERT INTO daemon_heartbeats (name,beat_at,interval_s) "
+            "VALUES ('sprint-runtime','2000-01-01 00:00:00',5)"
+        )
+        self.con.commit()
+
+        with mock.patch.object(
+            server.sprint_liveness.SprintLivenessMonitor,
+            "evaluate",
+            return_value=(),
+        ):
+            first = server.sprint_monitor_response(self.con, self.sprint_id)
+            native_before = self.con.execute(
+                "SELECT COUNT(*) FROM conversation_messages"
+            ).fetchone()[0]
+            wakes_before = self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_outbox"
+            ).fetchone()[0]
+            second = server.sprint_monitor_response(self.con, self.sprint_id)
+
+        replacement = first["pickup"]["requeued_wake_ids"]
+        self.assertEqual(1, len(replacement))
+        self.assertNotEqual(original, replacement[0])
+        self.assertEqual("requeued", first["pickup"]["action"])
+        self.assertEqual([], first["outcomes"])
+        self.assertEqual(
+            {
+                "state": "stale",
+                "beat_at": "2000-01-01 00:00:00",
+                "interval_seconds": 5,
+            },
+            first["runtime"],
+        )
+        self.assertEqual(
+            {
+                "action": "none",
+                "requeued_wake_ids": [],
+                "pause_reason": None,
+            },
+            second["pickup"],
+        )
+        self.assertEqual([], second["outcomes"])
+        self.assertEqual(
+            native_before,
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversation_messages"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            wakes_before,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_outbox"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            "pending",
+            self.con.execute(
+                "SELECT state FROM sprint_wake_outbox WHERE wake_id=?",
+                (replacement[0],),
+            ).fetchone()[0],
         )
 
     def test_non_busy_failed_turn_replaces_once_then_exhausts_atomically(self):

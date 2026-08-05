@@ -1395,6 +1395,18 @@ class SprintCliApiTest(unittest.TestCase):
             TOKENS["planner"], "monitor", "--sprint", str(self.sprint_id)
         )
         self.assertEqual([], monitor["outcomes"])
+        self.assertEqual(
+            {
+                "action": "none",
+                "requeued_wake_ids": [],
+                "pause_reason": None,
+            },
+            monitor["pickup"],
+        )
+        self.assertEqual(
+            {"state": "missing", "beat_at": None, "interval_seconds": 5},
+            monitor["runtime"],
+        )
 
         findings = self.write(
             json.dumps(

@@ -5391,6 +5391,15 @@ function sprintWorkUnitCard(unit, snapshot) {
       el("span", {}, pr ? `PR #${pr.pr_number} · ${pr.normalized_state || "registered"}` : "No PR")));
   if (unit.disposition === "cancelled") card.append(
     el("div", { className: "sprint-cancelled-note" }, "Cancelled — not completed"));
+  if (unit.pickup) card.append(
+    el("div", { className: "workflow-recovery-note" },
+      `Pickup exhausted · ${unit.pickup.error_code} · ${unit.pickup.role} ${unit.pickup.shell} · `,
+      `message ${unit.pickup.message_id} · wake ${unit.pickup.wake_id} · `,
+      `attempt ${unit.pickup.attempt_count}`));
+  if (unit.delivery?.state === "runtime_unavailable") card.append(
+    el("div", { className: "workflow-health-note" },
+      `Runtime ${unit.delivery.runtime_state} — wake ${unit.delivery.wake_id} has `,
+      `${unit.delivery.attempt_count} delivery attempts`));
   card.onclick = () => openSprintUnitModal(unit, snapshot);
   return card;
 }
@@ -5476,6 +5485,20 @@ function sprintBoardNode(snapshot) {
     sprintActionButtons(sprint));
   if (sprint.terminal_outcome) header.append(
     el("div", { className: "sprint-terminal-outcome" }, `Outcome: ${sprint.terminal_outcome}`));
+  if (snapshot.runtime?.state !== "live") {
+    const runtime = snapshot.runtime || {state: "missing", beat_at: null, interval_seconds: 5};
+    header.append(el("div", { className: "workflow-health-alert" },
+      `Runtime ${runtime.state}`,
+      runtime.beat_at ? ` · last beat ${sprintTimestamp(runtime.beat_at)}` : " · no successful cycle recorded",
+      ` · interval ${runtime.interval_seconds}s`));
+  }
+  const exhausted = snapshot.pickup?.exhausted;
+  if (exhausted) header.append(el("div", { className: "workflow-recovery-alert" },
+    el("strong", {}, `Pickup exhausted · ${exhausted.error_code}`),
+    el("span", {}, `${exhausted.role} ${exhausted.shell} · U${exhausted.work_unit_id} · `,
+      `message ${exhausted.message_id} · wake ${exhausted.wake_id} · `,
+      `attempt ${exhausted.attempt_count}`),
+    el("span", {}, exhausted.recovery_instruction)));
 
   const scroll = el("div", { className: "sprint-board-scroll" });
   const canvas = el("div", { className: "sprint-board-canvas" });

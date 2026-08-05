@@ -13,6 +13,8 @@ import sqlite3
 from collections import defaultdict
 from typing import Any
 
+import sprint_runtime
+
 LIFECYCLES = frozenset({"prepared", "armed", "paused", "completed", "aborted"})
 UNIT_COLUMNS = {
     "completed": "done",
@@ -26,6 +28,18 @@ UNIT_COLUMNS = {
     "blocked": "blocked",
 }
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_PICKUP_PAUSE_REASONS = frozenset(
+    {
+        "wake_pickup_unknown",
+        "wake_pickup_failed",
+        "wake_pickup_unread",
+        "wake_pickup_evidence_invalid",
+    }
+)
+_RECOVERY_INSTRUCTION = (
+    "Inspect the pause report, repair the named route or service, then use an "
+    "authorized resume."
+)
 
 # Payloads are internal evidence.  Only fields with an explicit browser use
 # are projected; an unknown event remains visible with an empty detail object.
@@ -205,6 +219,81 @@ class ProjectionError(ValueError):
         super().__init__(message)
 
 
+def pickup_projection(
+    con: sqlite3.Connection,
+    sprint_id: int,
+    *,
+    requeued_wake_ids: tuple[int, ...] = (),
+    include_current_requeue: bool = False,
+    include_exhausted: bool = True,
+) -> dict[str, Any]:
+    """Project monitor action or the board's current bounded pickup state."""
+    sprint = con.execute(
+        "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+        (sprint_id,),
+    ).fetchone()
+    if sprint is None:
+        raise ProjectionError(404, "sprint_not_found", "Sprint not found")
+    pause_reason = None
+    exhausted = None
+    if str(sprint["lifecycle"]) == "paused":
+        paused = con.execute(
+            "SELECT json_extract(payload,'$.reason') reason "
+            "FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='lifecycle.paused' ORDER BY event_id DESC LIMIT 1",
+            (sprint_id,),
+        ).fetchone()
+        candidate = str(paused["reason"]) if paused and paused["reason"] else None
+        if candidate in _PICKUP_PAUSE_REASONS:
+            pause_reason = candidate
+            event = con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='wake.pickup_exhausted' "
+                "ORDER BY event_id DESC LIMIT 1",
+                (sprint_id,),
+            ).fetchone()
+            if event is not None:
+                try:
+                    payload = json.loads(event["payload"])
+                except (TypeError, ValueError):
+                    payload = {}
+                allowed = _EVENT_FIELDS["wake.pickup_exhausted"]
+                exhausted = {
+                    key: payload[key]
+                    for key in allowed
+                    if key in payload
+                }
+                exhausted["recovery_instruction"] = _RECOVERY_INSTRUCTION
+
+    current_requeues = tuple(sorted(set(requeued_wake_ids)))
+    if include_current_requeue and pause_reason is None and not current_requeues:
+        current_requeues = tuple(
+            int(row[0])
+            for row in con.execute(
+                "SELECT DISTINCT CAST(json_extract(e.payload,'$.replacement_wake_id') "
+                "AS INTEGER) replacement_wake_id FROM sprint_events e "
+                "JOIN sprint_wake_outbox w ON w.wake_id=CAST("
+                "json_extract(e.payload,'$.replacement_wake_id') AS INTEGER) "
+                "WHERE e.sprint_id=? AND e.event_type='wake.requeued' "
+                "AND w.state IN ('pending','delivering') "
+                "AND EXISTS (SELECT 1 FROM sprint_wake_messages wm "
+                "JOIN wake_message m ON m.message_id=wm.message_id "
+                "WHERE wm.wake_id=w.wake_id AND m.read_at IS NULL) "
+                "ORDER BY replacement_wake_id LIMIT 100",
+                (sprint_id,),
+            )
+        )
+    action = "paused" if pause_reason else "requeued" if current_requeues else "none"
+    result = {
+        "action": action,
+        "requeued_wake_ids": list(current_requeues),
+        "pause_reason": pause_reason,
+    }
+    if include_exhausted and exhausted is not None:
+        result["exhausted"] = exhausted
+    return result
+
+
 def _cursor_encode(kind: str, values: list[Any]) -> str:
     raw = json.dumps(
         {"v": 1, "kind": kind, "values": values},
@@ -381,6 +470,40 @@ class SprintBoardProjection:
         ).fetchone()
         if sprint is None:
             raise ProjectionError(404, "sprint_not_found", "Sprint not found")
+
+        runtime = sprint_runtime.runtime_status(self.con)
+        pickup = pickup_projection(
+            self.con,
+            sprint_id,
+            include_current_requeue=True,
+        )
+        exhausted = pickup.get("exhausted")
+        exhausted_unit_id = (
+            int(exhausted["work_unit_id"])
+            if exhausted and exhausted.get("work_unit_id") is not None
+            else None
+        )
+        unavailable_delivery: dict[int, dict[str, Any]] = {}
+        if runtime["state"] != "live":
+            for row in self.con.execute(
+                "SELECT m.work_unit_id,w.wake_id,w.attempt_count "
+                "FROM sprint_wake_outbox w "
+                "JOIN sprint_wake_messages wm ON wm.wake_id=w.wake_id "
+                "JOIN wake_message m ON m.message_id=wm.message_id "
+                "WHERE m.sprint_id=? AND m.work_unit_id IS NOT NULL "
+                "AND m.read_at IS NULL AND w.state='pending' "
+                "AND w.attempt_count=0 ORDER BY w.wake_id",
+                (sprint_id,),
+            ):
+                unavailable_delivery.setdefault(
+                    int(row["work_unit_id"]),
+                    {
+                        "state": "runtime_unavailable",
+                        "runtime_state": runtime["state"],
+                        "wake_id": int(row["wake_id"]),
+                        "attempt_count": int(row["attempt_count"]),
+                    },
+                )
 
         specs = [
             {
@@ -578,6 +701,16 @@ class SprintBoardProjection:
                     "dependent_ids": dependents[unit_id],
                     "pull_requests": prs[unit_id],
                     "messages": messages[unit_id],
+                    **(
+                        {"pickup": exhausted}
+                        if unit_id == exhausted_unit_id
+                        else {}
+                    ),
+                    **(
+                        {"delivery": unavailable_delivery[unit_id]}
+                        if unit_id in unavailable_delivery
+                        else {}
+                    ),
                 }
             )
 
@@ -612,6 +745,8 @@ class SprintBoardProjection:
             "work_units": units,
             "dependencies": dependencies,
             "column_counts": counts,
+            "runtime": runtime,
+            "pickup": pickup,
             "feed_counts": {
                 "events": int(feed_counts["event_count"]),
                 "summaries": int(feed_counts["judgment_count"])

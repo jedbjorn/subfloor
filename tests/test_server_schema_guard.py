@@ -3,6 +3,7 @@
 non-loopback bind (spec #26)."""
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import os
@@ -38,6 +39,43 @@ def build_pre_acknowledgement_db(path: Path) -> None:
         con.commit()
     finally:
         con.close()
+
+
+class TransportReadinessTest(unittest.TestCase):
+    def test_failed_start_callback_is_never_advertised_as_listening(self):
+        events = []
+
+        class FakeTransport:
+            port = 8844
+
+            async def start(self):
+                events.append("bound")
+
+            async def stop(self):
+                events.append("stopped")
+
+        def fail_readiness():
+            events.append("readiness")
+            raise RuntimeError("runtime unavailable")
+
+        logs = []
+        with (
+            mock.patch.object(transport, "Transport", return_value=FakeTransport()),
+            self.assertRaisesRegex(RuntimeError, "runtime unavailable"),
+        ):
+            asyncio.run(
+                transport.serve(
+                    "127.0.0.1",
+                    8844,
+                    object(),
+                    object(),
+                    log=logs.append,
+                    on_started=fail_readiness,
+                )
+            )
+
+        self.assertEqual(["bound", "readiness", "stopped"], events)
+        self.assertEqual([], logs)
 
 
 class ServerSchemaGuardTest(unittest.TestCase):

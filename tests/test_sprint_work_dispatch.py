@@ -1112,6 +1112,69 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
 
 
 class ProductionPulseTest(SprintWorkDispatchCase):
+    def test_successful_pulses_advance_runtime_heartbeat_but_failure_does_not(self) -> None:
+        runtime = sprint_runtime.SprintRuntimeService(
+            self.db_path,
+            owner="heartbeat-runtime-test",
+        )
+
+        self.assertFalse(runtime.pulse_once())
+        first = self.con.execute(
+            "SELECT beat_at,interval_s FROM daemon_heartbeats "
+            "WHERE name='sprint-runtime'"
+        ).fetchone()
+        self.assertEqual(5, first["interval_s"])
+        self.assertEqual(
+            {
+                "state": "live",
+                "beat_at": first["beat_at"],
+                "interval_seconds": 5,
+            },
+            sprint_runtime.runtime_status(self.con),
+        )
+
+        with mock.patch.object(
+            runtime,
+            "_deliver_wakes",
+            side_effect=RuntimeError("injected delivery failure"),
+        ), self.assertRaisesRegex(RuntimeError, "injected delivery failure"):
+            runtime.pulse_once()
+
+        after_failure = self.con.execute(
+            "SELECT beat_at,interval_s FROM daemon_heartbeats "
+            "WHERE name='sprint-runtime'"
+        ).fetchone()
+        self.assertEqual(tuple(first), tuple(after_failure))
+
+        self.assertFalse(runtime.pulse_once())
+        after_success = self.con.execute(
+            "SELECT beat_at,interval_s FROM daemon_heartbeats "
+            "WHERE name='sprint-runtime'"
+        ).fetchone()
+        self.assertGreater(after_success["beat_at"], first["beat_at"])
+        self.assertEqual(5, after_success["interval_s"])
+
+    def test_initial_failing_pulse_does_not_create_runtime_heartbeat(self) -> None:
+        runtime = sprint_runtime.SprintRuntimeService(
+            self.db_path,
+            owner="initial-failure-runtime-test",
+        )
+
+        with mock.patch.object(
+            runtime,
+            "_deliver_wakes",
+            side_effect=RuntimeError("startup delivery failed"),
+        ), self.assertRaisesRegex(RuntimeError, "startup delivery failed"):
+            runtime.pulse_once(startup=True)
+
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM daemon_heartbeats "
+                "WHERE name='sprint-runtime'"
+            ).fetchone()[0],
+        )
+
     def test_armed_pulse_enqueues_every_parallel_ready_lane(self) -> None:
         first = self.create_unit(developer=1, wave=4)
         second = self.create_unit(developer=4, wave=0)
@@ -1300,6 +1363,9 @@ class ProductionPulseTest(SprintWorkDispatchCase):
         order: list[str] = []
         preparer = object()
         broker = mock.Mock()
+        runtime = mock.Mock()
+        runtime.wait_ready.return_value = True
+        runtime.is_alive.return_value = True
         with (
             mock.patch.object(
                 server.conversation_launch,
@@ -1321,12 +1387,19 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             mock.patch.object(
                 server.sprint_runtime,
                 "start_service",
-                side_effect=lambda *_args, **_kwargs: order.append("sprint"),
+                side_effect=lambda *_args, **_kwargs: (
+                    order.append("sprint") or runtime
+                ),
             ) as sprint_start,
+            mock.patch.object(
+                server.sprint_pr_watcher,
+                "start_service",
+                side_effect=lambda *_args, **_kwargs: order.append("watcher"),
+            ) as watcher_start,
         ):
             server.start_runtime_services()
 
-        self.assertEqual(["broker", "reaper", "sprint"], order)
+        self.assertEqual(["broker", "reaper", "sprint", "watcher"], order)
         broker_start.assert_called_once_with(
             server.DB_PATH,
             launch_preparer=preparer,
@@ -1336,11 +1409,46 @@ class ProductionPulseTest(SprintWorkDispatchCase):
             native_interrupt=broker.interrupt,
         )
         sprint_start.assert_called_once_with(server.DB_PATH)
+        runtime.wait_ready.assert_called_once()
+        runtime.is_alive.assert_called_once_with()
+        watcher_start.assert_called_once_with(server.DB_PATH, repo_root=server.REPO_ROOT)
         self.assertIn(
             "on_started=start_runtime_services",
             inspect.getsource(server.main),
             "the combined startup function must remain the production callback",
         )
+
+    def test_server_startup_refuses_runtime_that_never_becomes_ready_or_dies(self) -> None:
+        for ready, alive, expected in (
+            (False, True, "did not complete its first successful cycle"),
+            (True, False, "died during startup"),
+        ):
+            with self.subTest(ready=ready, alive=alive):
+                runtime = mock.Mock()
+                runtime.wait_ready.return_value = ready
+                runtime.is_alive.return_value = alive
+                with (
+                    mock.patch.object(
+                        server.conversation_broker,
+                        "start_service",
+                        return_value=mock.Mock(interrupt=mock.Mock()),
+                    ),
+                    mock.patch.object(server.conversation_reaper, "start_service"),
+                    mock.patch.object(
+                        server.sprint_runtime,
+                        "start_service",
+                        return_value=runtime,
+                    ),
+                    mock.patch.object(
+                        server.sprint_pr_watcher,
+                        "start_service",
+                    ) as watcher_start,
+                    self.assertRaisesRegex(RuntimeError, expected),
+                ):
+                    server.start_runtime_services()
+
+                runtime.stop.assert_called_once_with()
+                watcher_start.assert_not_called()
 
 
 if __name__ == "__main__":
