@@ -26,6 +26,7 @@ it never installs anything.
 from __future__ import annotations
 
 import base64
+import fcntl
 import json
 import os
 import shutil
@@ -35,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import ports
@@ -52,7 +54,325 @@ SOCKET = RUN_DIR / "vm-broker.sock"
 # socket — lives in the bind mount, fs-perm gated (0600), no network surface.
 MCP_SOCKET = RUN_DIR / "vm-mcp.sock"
 MCP_PIDFILE = RUN_DIR / "vm-mcp-tunnel.pid"
+MCP_LOCKFILE = RUN_DIR / "vm-mcp-tunnel.lock"
 MCP_LOG = RUN_DIR / "vm-mcp-tunnel.log"
+
+PROCESS_STATE_VERSION = 1
+PROCESS_STOP_TIMEOUT = 2.0
+PROCESS_KILL_TIMEOUT = 1.0
+PROCESS_POLL_INTERVAL = 0.05
+PROCESS_VERIFY_TIMEOUT = 0.2
+PROCESS_VERIFY_INTERVAL = 0.01
+
+
+def _process_snapshot(pid: int) -> dict | None:
+    """Return the current Linux process identity needed before signaling.
+
+    PID values alone are unsafe across container restarts because a new PID
+    namespace can recycle the number recorded on the shared bind mount.
+    Field-22 start ticks make that identity stable; executable and command-line
+    checks keep a valid-but-unrelated process from satisfying the record.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        fields_after_comm = stat.rsplit(")", 1)[1].split()
+        start_ticks = int(fields_after_comm[19])
+        executable = os.path.realpath(os.readlink(f"/proc/{pid}/exe"))
+        cmdline = [
+            os.fsdecode(part)
+            for part in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if part
+        ]
+    except (IndexError, OSError, ValueError):
+        return None
+    if pid <= 0 or start_ticks < 0 or not executable or not cmdline:
+        return None
+    return {
+        "pid": pid,
+        "start_ticks": start_ticks,
+        "executable": executable,
+        "cmdline": cmdline,
+    }
+
+
+def _process_socket_inodes(pid: int) -> set[str]:
+    """Return kernel socket inodes currently held by a Linux process."""
+    inodes = set()
+    try:
+        descriptors = Path(f"/proc/{pid}/fd").iterdir()
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor)
+            except OSError:
+                continue
+            if target.startswith("socket:[") and target.endswith("]"):
+                inodes.add(target[8:-1])
+    except OSError:
+        return set()
+    return inodes
+
+
+def _process_owns_tcp_listener(pid: int, port: int) -> bool:
+    """Whether pid owns the loopback TCP listener for port."""
+    inodes = _process_socket_inodes(pid)
+    if not inodes:
+        return False
+    local = f"0100007F:{port:04X}"
+    try:
+        rows = Path("/proc/net/tcp").read_text().splitlines()[1:]
+    except OSError:
+        return False
+    return any(
+        len(fields) > 9
+        and fields[1] == local
+        and fields[3] == "0A"
+        and fields[9] in inodes
+        for fields in (row.split() for row in rows)
+    )
+
+
+def _process_owns_unix_listener(pid: int, path: Path) -> bool:
+    """Whether pid owns the listening Unix socket at path."""
+    inodes = _process_socket_inodes(pid)
+    if not inodes:
+        return False
+    try:
+        rows = Path("/proc/net/unix").read_text().splitlines()[1:]
+    except OSError:
+        return False
+    expected_path = str(path)
+    for row in rows:
+        fields = row.split(maxsplit=7)
+        if (
+            len(fields) == 8
+            and fields[3] == "00010000"
+            and fields[4] == "0001"
+            and fields[6] in inodes
+            and fields[7] == expected_path
+        ):
+            return True
+    return False
+
+
+def _new_process_state(
+    pid: int,
+    *,
+    kind: str,
+    expected_executable: str,
+    required_token: str,
+    **details,
+) -> dict | None:
+    deadline = time.monotonic() + PROCESS_VERIFY_TIMEOUT
+    snapshot = None
+    while time.monotonic() < deadline:
+        snapshot = _process_snapshot(pid)
+        if _snapshot_matches(
+            snapshot,
+            expected_executable=expected_executable,
+            required_token=required_token,
+        ):
+            break
+        time.sleep(PROCESS_VERIFY_INTERVAL)
+    else:
+        return None
+    return {
+        "schema_version": PROCESS_STATE_VERSION,
+        "kind": kind,
+        "pid": snapshot["pid"],
+        "start_ticks": snapshot["start_ticks"],
+        "executable": snapshot["executable"],
+        **details,
+    }
+
+
+def _snapshot_matches(
+    snapshot: dict | None,
+    *,
+    expected_executable: str,
+    required_token: str,
+) -> bool:
+    if snapshot is None:
+        return False
+    expected = os.path.realpath(expected_executable)
+    return (
+        snapshot["executable"] == expected
+        and any(required_token in arg for arg in snapshot["cmdline"])
+    )
+
+
+def _read_process_state(path: Path) -> dict | None:
+    try:
+        state = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    return state
+
+
+def _owned_process(
+    path: Path,
+    *,
+    kind: str,
+    expected_executable: str,
+    required_token: str,
+) -> dict | None:
+    state = _read_process_state(path)
+    if (
+        state is None
+        or state.get("schema_version") != PROCESS_STATE_VERSION
+        or state.get("kind") != kind
+        or not isinstance(state.get("pid"), int)
+        or not isinstance(state.get("start_ticks"), int)
+        or not isinstance(state.get("executable"), str)
+    ):
+        return None
+    snapshot = _process_snapshot(state["pid"])
+    if not _snapshot_matches(
+        snapshot,
+        expected_executable=expected_executable,
+        required_token=required_token,
+    ):
+        return None
+    if (
+        snapshot["start_ticks"] != state["start_ticks"]
+        or snapshot["executable"] != state["executable"]
+    ):
+        return None
+    return state
+
+
+def _atomic_write_process_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(raw_tmp)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(state, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@contextmanager
+def _process_state_lock(path: Path):
+    """Serialize status-changing commands across host/container processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "r+") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+
+
+def _process_record_matches(
+    state: dict,
+    *,
+    expected_executable: str,
+    required_token: str,
+) -> bool:
+    snapshot = _process_snapshot(state["pid"])
+    return bool(
+        _snapshot_matches(
+            snapshot,
+            expected_executable=expected_executable,
+            required_token=required_token,
+        )
+        and snapshot["start_ticks"] == state["start_ticks"]
+        and snapshot["executable"] == state["executable"]
+    )
+
+
+def _terminate_owned_process(
+    state: dict,
+    *,
+    expected_executable: str,
+    required_token: str,
+) -> bool:
+    """Stop only the exact recorded process, with a bounded TERM/KILL ladder."""
+    if not _process_record_matches(
+        state,
+        expected_executable=expected_executable,
+        required_token=required_token,
+    ):
+        return True
+    try:
+        os.kill(state["pid"], signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    deadline = time.monotonic() + PROCESS_STOP_TIMEOUT
+    while time.monotonic() < deadline:
+        if not _process_record_matches(
+            state,
+            expected_executable=expected_executable,
+            required_token=required_token,
+        ):
+            return True
+        time.sleep(PROCESS_POLL_INTERVAL)
+    if not _process_record_matches(
+        state,
+        expected_executable=expected_executable,
+        required_token=required_token,
+    ):
+        return True
+    try:
+        os.kill(state["pid"], signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    deadline = time.monotonic() + PROCESS_KILL_TIMEOUT
+    while time.monotonic() < deadline:
+        if not _process_record_matches(
+            state,
+            expected_executable=expected_executable,
+            required_token=required_token,
+        ):
+            return True
+        time.sleep(PROCESS_POLL_INTERVAL)
+    return False
+
+
+def _bounded_log_tail(path: Path, limit: int = 1000) -> str:
+    try:
+        return path.read_text(errors="replace").strip()[-limit:]
+    except OSError:
+        return ""
+
+
+def _unverified_process_error(
+    process: subprocess.Popen,
+    *,
+    label: str,
+    expected_executable: str,
+    log_path: Path,
+) -> str:
+    """Capture verification evidence and reap the exact child we just spawned."""
+    snapshot = _process_snapshot(process.pid)
+    observed = snapshot["executable"] if snapshot else "(unavailable)"
+    returncode = process.poll()
+    if returncode is None:
+        process.terminate()
+    try:
+        waited = process.wait(timeout=PROCESS_STOP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        waited = process.wait(timeout=PROCESS_KILL_TIMEOUT)
+    returncode = waited if waited is not None else process.returncode
+    tail = _bounded_log_tail(log_path) or "(no output)"
+    return (
+        f"could not verify the new {label} process "
+        f"(expected executable {os.path.realpath(expected_executable)}, "
+        f"observed {observed}, rc {returncode}): {tail}"
+    )
 
 
 # -- config (instance.json `vm` block) ---------------------------------------
@@ -375,24 +695,46 @@ def do_capture(command: str | None = None) -> dict:
 # SSE/chunked streaming passes through untouched. In-sandbox, vm_mcp_relay.py
 # bridges TCP→socket because `claude mcp add --transport http` only speaks TCP.
 
+def _ssh_executable() -> str:
+    return shutil.which("ssh") or "ssh"
+
+
+def _tunnel_process() -> dict | None:
+    return _owned_process(
+        MCP_PIDFILE,
+        kind="vm-mcp-tunnel",
+        expected_executable=_ssh_executable(),
+        required_token=str(MCP_SOCKET),
+    )
+
+
+def _tunnel_ready() -> bool:
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(0.2)
+    try:
+        client.connect(str(MCP_SOCKET))
+        return True
+    except OSError:
+        return False
+    finally:
+        client.close()
+
+
 def _tunnel_pid() -> int | None:
-    """The live tunnel's pid, or None (no pidfile / stale pidfile)."""
-    try:
-        pid = int(MCP_PIDFILE.read_text().strip())
-    except (OSError, ValueError):
-        return None
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
-        return None
-    return pid
+    """The verified tunnel pid, or None for absent/legacy/recycled state."""
+    state = _tunnel_process()
+    return state["pid"] if state else None
 
 
 def mcp_status() -> dict:
-    pid = _tunnel_pid()
-    running = pid is not None and MCP_SOCKET.exists()
+    state = _tunnel_process()
+    pid = state["pid"] if state else None
+    listening = _tunnel_ready()
+    running = state is not None and listening
     return {"ok": True, "running": running, "pid": pid,
-            "socket": str(MCP_SOCKET) if running else None}
+            "socket": str(MCP_SOCKET) if listening else None,
+            "listening": listening,
+            "unverified": state is None and listening}
 
 
 def do_mcp_up(wait: float = 15) -> dict:
@@ -403,63 +745,187 @@ def do_mcp_up(wait: float = 15) -> dict:
     cfg = read() or {}
     if m := _missing(cfg, "ssh_host", "ssh_user", "ssh_key_path"):
         return {"ok": False, "output": m}
-    if (pid := _tunnel_pid()) and MCP_SOCKET.exists():
-        return {"ok": True, "output": f"tunnel already up (pid {pid})",
-                "socket": str(MCP_SOCKET), "pid": pid}
-    do_mcp_down()  # clear any half-dead remnant (stale pid or orphaned socket)
-    port = int(cfg.get("mcp_port", 8000))
-    key = os.path.expanduser(str(cfg.get("ssh_key_path", "")))
-    argv = [
-        "ssh", "-i", key,
-        "-p", str(cfg.get("ssh_port", 22)),
-        "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=10",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "ExitOnForwardFailure=yes",   # a dead forward must not linger as a live pid
-        "-o", "ServerAliveInterval=30",     # drop (and surface) a hung guest, don't wedge
-        "-o", "StreamLocalBindUnlink=yes",  # replace a stale socket file on reopen
-        "-o", "StreamLocalBindMask=0177",   # socket lands 0600, matching the broker's
-        "-N", "-L", f"{MCP_SOCKET}:127.0.0.1:{port}",
-        f"{cfg.get('ssh_user')}@{cfg.get('ssh_host')}",
-    ]
-    RUN_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(MCP_LOG, "wb") as log:
-            p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log,
-                                 stderr=log, start_new_session=True)
-    except FileNotFoundError as e:
-        return {"ok": False,
-                "output": f"command not found: {e.filename} — is ssh installed on the host?"}
-    MCP_PIDFILE.write_text(str(p.pid))
-    deadline = time.monotonic() + wait
-    while time.monotonic() < deadline:
-        if p.poll() is not None:  # ssh died — auth/route/forward failure
-            err = MCP_LOG.read_text(errors="replace").strip()[-500:]
+    with _process_state_lock(MCP_LOCKFILE):
+        state = _tunnel_process()
+        ready = _tunnel_ready()
+        if state and ready:
+            if _process_record_matches(
+                state,
+                expected_executable=_ssh_executable(),
+                required_token=str(MCP_SOCKET),
+            ) and _process_owns_unix_listener(state["pid"], MCP_SOCKET):
+                return {
+                    "ok": True,
+                    "output": f"tunnel already up (pid {state['pid']})",
+                    "socket": str(MCP_SOCKET),
+                    "pid": state["pid"],
+                    "port": int(state.get("port", cfg.get("mcp_port", 8000))),
+                }
+            return {
+                "ok": False,
+                "running": True,
+                "unverified": True,
+                "socket": str(MCP_SOCKET),
+                "output": "tunnel socket is held by an unverified process; refusing to start",
+            }
+        if state is None and ready:
+            return {
+                "ok": False,
+                "running": True,
+                "unverified": True,
+                "socket": str(MCP_SOCKET),
+                "output": "tunnel socket is held by an unverified process; refusing to start",
+            }
+        if state and not _terminate_owned_process(
+            state,
+            expected_executable=_ssh_executable(),
+            required_token=str(MCP_SOCKET),
+        ):
+            return {"ok": False, "output": "verified stale tunnel did not stop"}
+        MCP_PIDFILE.unlink(missing_ok=True)
+        MCP_SOCKET.unlink(missing_ok=True)
+
+        port = int(cfg.get("mcp_port", 8000))
+        key = os.path.expanduser(str(cfg.get("ssh_key_path", "")))
+        argv = [
+            "ssh", "-i", key,
+            "-p", str(cfg.get("ssh_port", 22)),
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=30",
+            "-o", "StreamLocalBindUnlink=yes",
+            "-o", "StreamLocalBindMask=0177",
+            "-N", "-L", f"{MCP_SOCKET}:127.0.0.1:{port}",
+            f"{cfg.get('ssh_user')}@{cfg.get('ssh_host')}",
+        ]
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(MCP_LOG, "wb") as log:
+                p = subprocess.Popen(
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=log,
+                    start_new_session=True,
+                )
+        except FileNotFoundError as e:
+            return {
+                "ok": False,
+                "output": f"command not found: {e.filename} — is ssh installed on the host?",
+            }
+        state = _new_process_state(
+            p.pid,
+            kind="vm-mcp-tunnel",
+            expected_executable=_ssh_executable(),
+            required_token=str(MCP_SOCKET),
+            port=port,
+        )
+        if state is None:
+            return {
+                "ok": False,
+                "output": _unverified_process_error(
+                    p,
+                    label="ssh tunnel",
+                    expected_executable=_ssh_executable(),
+                    log_path=MCP_LOG,
+                ),
+            }
+        _atomic_write_process_state(MCP_PIDFILE, state)
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if p.poll() is not None:
+                err = _bounded_log_tail(MCP_LOG)
+                MCP_PIDFILE.unlink(missing_ok=True)
+                MCP_SOCKET.unlink(missing_ok=True)
+                return {
+                    "ok": False,
+                    "output": f"ssh tunnel exited (rc {p.returncode}): {err or '(no output)'}",
+                }
+            if _tunnel_ready():
+                if not _process_record_matches(
+                    state,
+                    expected_executable=_ssh_executable(),
+                    required_token=str(MCP_SOCKET),
+                ):
+                    error = _unverified_process_error(
+                        p,
+                        label="ssh tunnel",
+                        expected_executable=_ssh_executable(),
+                        log_path=MCP_LOG,
+                    )
+                    MCP_PIDFILE.unlink(missing_ok=True)
+                    remaining = _tunnel_ready()
+                    if not remaining:
+                        MCP_SOCKET.unlink(missing_ok=True)
+                    return {
+                        "ok": False,
+                        "running": remaining,
+                        "unverified": remaining,
+                        "socket": str(MCP_SOCKET) if remaining else None,
+                        "output": (
+                            f"{error}; tunnel socket remains live and unverified"
+                            if remaining else error
+                        ),
+                    }
+                if _process_owns_unix_listener(p.pid, MCP_SOCKET):
+                    return {
+                        "ok": True,
+                        "output": f"tunnel up — {MCP_SOCKET} -> guest 127.0.0.1:{port}",
+                        "socket": str(MCP_SOCKET),
+                        "pid": p.pid,
+                        "port": port,
+                    }
+            time.sleep(0.2)
+        stopped = _terminate_owned_process(
+            state,
+            expected_executable=_ssh_executable(),
+            required_token=str(MCP_SOCKET),
+        )
+        err = _bounded_log_tail(MCP_LOG)
+        if stopped:
             MCP_PIDFILE.unlink(missing_ok=True)
-            return {"ok": False,
-                    "output": f"ssh tunnel exited (rc {p.returncode}): {err or '(no output)'}"}
-        if MCP_SOCKET.exists():
-            return {"ok": True,
-                    "output": f"tunnel up — {MCP_SOCKET} -> guest 127.0.0.1:{port}",
-                    "socket": str(MCP_SOCKET), "pid": p.pid, "port": port}
-        time.sleep(0.2)
-    p.terminate()
-    MCP_PIDFILE.unlink(missing_ok=True)
-    return {"ok": False, "output": f"tunnel socket did not appear within {wait}s"}
+            MCP_SOCKET.unlink(missing_ok=True)
+        detail = f": {err}" if err else ""
+        return {
+            "ok": False,
+            "output": f"tunnel socket did not appear within {wait}s{detail}",
+        }
 
 
 def do_mcp_down() -> dict:
     """Close the MCP tunnel. Idempotent — safe to call with nothing running."""
-    pid = _tunnel_pid()
-    if pid:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-    MCP_PIDFILE.unlink(missing_ok=True)
-    MCP_SOCKET.unlink(missing_ok=True)
-    return {"ok": True,
-            "output": f"tunnel stopped (pid {pid})" if pid else "tunnel not running"}
+    with _process_state_lock(MCP_LOCKFILE):
+        state = _tunnel_process()
+        stale = MCP_PIDFILE.exists() and state is None
+        ready = _tunnel_ready()
+        if state and not _terminate_owned_process(
+            state,
+            expected_executable=_ssh_executable(),
+            required_token=str(MCP_SOCKET),
+        ):
+            return {
+                "ok": False,
+                "output": f"verified tunnel did not stop (pid {state['pid']})",
+            }
+        MCP_PIDFILE.unlink(missing_ok=True)
+        if state is None and ready:
+            return {
+                "ok": False,
+                "running": True,
+                "unverified": True,
+                "socket": str(MCP_SOCKET),
+                "output": "unverified tunnel is still listening; state removed, process not signaled",
+            }
+        MCP_SOCKET.unlink(missing_ok=True)
+        if state:
+            output = f"tunnel stopped (pid {state['pid']})"
+        elif stale:
+            output = "tunnel not running (stale state removed)"
+        else:
+            output = "tunnel not running"
+        return {"ok": True, "output": output}
 
 
 # -- client: HTTP over the broker's unix socket ------------------------------
