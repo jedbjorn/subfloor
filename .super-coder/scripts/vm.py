@@ -25,6 +25,7 @@ it never installs anything.
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import fcntl
 import json
@@ -373,6 +374,13 @@ def _unverified_process_error(
         f"(expected executable {os.path.realpath(expected_executable)}, "
         f"observed {observed}, rc {returncode}): {tail}"
     )
+RESET_COMMAND_TIMEOUT = 60
+START_READINESS_TIMEOUT = 90
+START_READINESS_INTERVAL = 2
+RESET_CLIENT_TIMEOUT = 130
+START_CLIENT_TIMEOUT = START_READINESS_TIMEOUT + 25
+DEFAULT_CLIENT_TIMEOUT = 30
+RESULT_SCHEMA_VERSION = 1
 
 
 # -- config (instance.json `vm` block) ---------------------------------------
@@ -541,6 +549,112 @@ def do_exec(command: str, timeout: int = 120) -> dict:
         return {"ok": False, "exit": 124, "stdout": "", "stderr": f"timed out (>{timeout}s)"}
 
 
+def _domain_state(cfg: dict) -> tuple[bool, str]:
+    """Return a stable domain-state name without mutating the guest."""
+    ok, output = _run(_virsh(cfg, "domstate", str(cfg["domain"])), timeout=15)
+    if not ok:
+        return False, output
+    state = output.strip().lower()
+    if state == "shut off":
+        state = "powered_off"
+    return True, state.replace(" ", "_")
+
+
+def _ssh_ready(cfg: dict, timeout: int = 10) -> tuple[bool, str | None]:
+    ok, output = _run(_ssh_argv(cfg, "echo ok"), timeout=timeout)
+    return ok, None if ok else (output or "SSH readiness probe failed")
+
+
+def _wait_for_ssh(cfg: dict, wait: int = START_READINESS_TIMEOUT,
+                  interval: int = START_READINESS_INTERVAL) -> tuple[bool, int, str | None]:
+    """Paced, bounded readiness loop owned by the non-resetting start verb."""
+    deadline = time.monotonic() + max(1, wait)
+    attempts = 0
+    last_error: str | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, attempts, last_error
+        attempts += 1
+        ready, last_error = _ssh_ready(cfg, timeout=max(1, min(10, int(remaining))))
+        if ready:
+            return True, attempts, None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, attempts, last_error
+        time.sleep(min(interval, remaining))
+
+
+def do_status() -> dict:
+    """Observe broker-owned VM state without starting, restarting, or resetting."""
+    cfg = read() or {}
+    if m := _missing(cfg, "domain", "ssh_host", "ssh_user", "ssh_key_path"):
+        return {"ok": False, "output": m}
+    state_ok, state = _domain_state(cfg)
+    if not state_ok:
+        return {"ok": False, "output": state, "domain_state": "unknown"}
+    ssh_ready, ssh_error = _ssh_ready(cfg)
+    tunnel = mcp_status()
+    return {
+        "ok": True,
+        "domain": str(cfg["domain"]),
+        "domain_state": state,
+        "ssh_ready": ssh_ready,
+        "ssh_error": ssh_error,
+        "mcp_tunnel_running": bool(tunnel["running"]),
+    }
+
+
+def do_start(wait: int = START_READINESS_TIMEOUT) -> dict:
+    """Start only an off domain, then own the bounded SSH-readiness wait."""
+    cfg = read() or {}
+    if m := _missing(cfg, "domain", "ssh_host", "ssh_user", "ssh_key_path"):
+        return {"ok": False, "output": m, "domain_state": "unknown", "attempts": 0}
+    state_ok, state = _domain_state(cfg)
+    if not state_ok:
+        return {"ok": False, "output": state, "domain_state": "unknown", "attempts": 0}
+
+    started = False
+    if state == "powered_off":
+        ok, output = _run(_virsh(cfg, "start", str(cfg["domain"])), timeout=30)
+        if not ok:
+            return {
+                "ok": False,
+                "output": output or "failed to start the VM",
+                "domain": str(cfg["domain"]),
+                "domain_state": state,
+                "started": False,
+                "attempts": 0,
+                "last_readiness_error": None,
+            }
+        started = True
+        state = "running"
+    elif state != "running":
+        return {
+            "ok": False,
+            "output": f"domain is {state}; start only handles powered_off or running",
+            "domain": str(cfg["domain"]),
+            "domain_state": state,
+            "started": False,
+            "attempts": 0,
+            "last_readiness_error": None,
+        }
+
+    ready, attempts, last_error = _wait_for_ssh(cfg, wait=wait)
+    return {
+        "ok": ready,
+        "output": (
+            f"SSH ready after {attempts} attempt(s)"
+            if ready else f"SSH was not ready within {wait}s"
+        ),
+        "domain": str(cfg["domain"]),
+        "domain_state": state,
+        "started": started,
+        "attempts": attempts,
+        "last_readiness_error": last_error,
+    }
+
+
 def do_reset(running: bool = True) -> dict:
     """Revert to the clean snapshot. The clean snapshot is OFFLINE (this CPU's
     non-migratable invtsc flag refuses a live snapshot), so a bare revert lands
@@ -554,9 +668,18 @@ def do_reset(running: bool = True) -> dict:
                   "--snapshotname", str(cfg["snapshot"]))
     if running:
         argv.append("--running")
-    ok, out = _run(argv, timeout=60)
+    ok, out = _run(argv, timeout=RESET_COMMAND_TIMEOUT)
     state = "running" if running else "powered off"
-    return {"ok": ok, "output": out or f"reverted '{cfg['domain']}' to '{cfg['snapshot']}' ({state})"}
+    state_ok, observed = _domain_state(cfg)
+    expected = "running" if running else "powered_off"
+    confirmed = ok and state_ok and observed == expected
+    return {
+        "ok": confirmed,
+        "output": out or f"reverted '{cfg['domain']}' to '{cfg['snapshot']}' ({state})",
+        "domain": str(cfg["domain"]),
+        "snapshot": str(cfg["snapshot"]),
+        "domain_state": observed if state_ok else "unknown",
+    }
 
 
 def do_bake(shutdown_timeout: int = 180) -> dict:
@@ -930,6 +1053,18 @@ def do_mcp_down() -> dict:
 
 # -- client: HTTP over the broker's unix socket ------------------------------
 
+
+class BrokerConnectionError(ConnectionError):
+    """The broker transport failed; request_sent marks uncertain mutations."""
+
+    def __init__(self, message: str, *, request_sent: bool) -> None:
+        super().__init__(message)
+        self.request_sent = request_sent
+
+
+class BrokerResponseError(ValueError):
+    """The broker returned an empty, partial, or malformed HTTP/JSON response."""
+
 def broker_call(method: str, path: str, body: dict | None = None,
                 timeout: int = 130) -> dict:
     """Speak HTTP/1.1 to the broker over its unix socket and return parsed JSON.
@@ -944,30 +1079,238 @@ def broker_call(method: str, path: str, body: dict | None = None,
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     chunks: list[bytes] = []
+    request_sent = False
     try:
         s.connect(str(SOCKET))
+        # Once send begins, a state-changing request may have reached the
+        # broker even if the connection fails before sendall returns.
+        request_sent = True
         s.sendall(req)
         while True:
             b = s.recv(65536)
             if not b:
                 break
             chunks.append(b)
+    except TimeoutError as e:
+        raise TimeoutError(f"vm-broker timed out after {timeout}s") from e
     except (FileNotFoundError, ConnectionRefusedError, OSError) as e:
-        raise ConnectionError(f"vm-broker not reachable at {SOCKET}: {e}") from e
+        raise BrokerConnectionError(
+            f"vm-broker not reachable at {SOCKET}: {e}",
+            request_sent=request_sent,
+        ) from e
     finally:
         s.close()
-    _, _, raw_body = b"".join(chunks).partition(b"\r\n\r\n")
+
+    raw = b"".join(chunks)
+    raw_head, separator, raw_body = raw.partition(b"\r\n\r\n")
+    if not separator:
+        raise BrokerResponseError("broker response did not contain HTTP headers")
+    content_length: int | None = None
+    for line in raw_head.split(b"\r\n")[1:]:
+        name, colon, value = line.partition(b":")
+        if colon and name.strip().lower() == b"content-length":
+            try:
+                content_length = int(value.strip())
+            except ValueError as exc:
+                raise BrokerResponseError("broker response had invalid Content-Length") from exc
+    if content_length is not None and len(raw_body) != content_length:
+        raise BrokerResponseError("broker response body was incomplete")
+    if not raw_body:
+        raise BrokerResponseError("broker response body was empty")
     try:
-        return json.loads(raw_body.decode() or "{}")
-    except json.JSONDecodeError:
-        return {"ok": False, "error": "bad broker response",
-                "raw": raw_body[:200].decode("latin1")}
+        decoded = json.loads(raw_body.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BrokerResponseError("broker response was not valid JSON") from exc
+    if not isinstance(decoded, dict):
+        raise BrokerResponseError("broker response JSON was not an object")
+    return decoded
+
+
+def _bounded(value: object) -> object:
+    """Bound public error details and exclude accidental unbounded structures."""
+    if isinstance(value, str):
+        return value[:500]
+    if isinstance(value, dict):
+        return {str(key)[:80]: _bounded(item) for key, item in list(value.items())[:12]}
+    if isinstance(value, list):
+        return [_bounded(item) for item in value[:20]]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)[:500]
+
+
+def operation_success(operation: str, result: dict) -> dict:
+    """Stable public success envelope shared by every model-facing VM client."""
+    return {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "ok": True,
+        "operation": operation,
+        "result": result,
+        "error": None,
+    }
+
+
+def operation_error(operation: str, code: str, message: str,
+                    details: dict | None = None) -> dict:
+    """Stable public error envelope with bounded, credential-free details."""
+    return {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "ok": False,
+        "operation": operation,
+        "result": None,
+        "error": {
+            "code": code,
+            "message": message[:500],
+            "details": _bounded(details or {}),
+        },
+    }
+
+
+def _broker_failure(operation: str, response: dict) -> dict:
+    details: dict = {}
+    for key in ("domain_state", "attempts", "last_readiness_error"):
+        if key in response:
+            details[key] = response[key]
+    return operation_error(
+        operation,
+        f"{operation}_failed",
+        str(response.get("output") or response.get("error") or f"{operation} failed"),
+        details,
+    )
+
+
+def run_operation(operation: str) -> dict:
+    """Call one core broker operation once and normalize its public result."""
+    calls = {
+        "status": ("GET", "/status", None, DEFAULT_CLIENT_TIMEOUT),
+        "start": ("POST", "/start", None, START_CLIENT_TIMEOUT),
+        "reset": ("POST", "/reset", {"running": False}, RESET_CLIENT_TIMEOUT),
+    }
+    if operation not in calls:
+        return operation_error(operation, "operation_unknown", "unknown VM operation")
+    method, path, body, timeout = calls[operation]
+    try:
+        response = broker_call(method, path, body, timeout=timeout)
+    except BrokerConnectionError as exc:
+        if operation == "reset" and exc.request_sent:
+            return operation_error(
+                operation,
+                "reset_result_unknown",
+                "the broker connection closed before reset could be confirmed",
+                {"domain_state": "unknown"},
+            )
+        return operation_error(
+            operation,
+            "broker_unreachable",
+            "the VM broker is not reachable",
+            {},
+        )
+    except (TimeoutError, BrokerResponseError):
+        if operation == "reset":
+            return operation_error(
+                operation,
+                "reset_result_unknown",
+                "the broker connection closed before reset could be confirmed",
+                {"domain_state": "unknown"},
+            )
+        return operation_error(
+            operation,
+            "broker_response_invalid",
+            "the VM broker did not return a complete response",
+            {},
+        )
+
+    if not response.get("ok"):
+        return _broker_failure(operation, response)
+    try:
+        if operation == "status":
+            return operation_success(operation, {
+                "broker": {"ready": True},
+                "domain": {
+                    "name": response["domain"],
+                    "state": response["domain_state"],
+                },
+                "ssh": {
+                    "ready": bool(response["ssh_ready"]),
+                    "last_error": response.get("ssh_error"),
+                },
+                "mcp": {"tunnel_running": bool(response["mcp_tunnel_running"])},
+            })
+        if operation == "start":
+            return operation_success(operation, {
+                "domain": {
+                    "name": response["domain"],
+                    "state": response["domain_state"],
+                },
+                "started": bool(response["started"]),
+                "ssh": {
+                    "ready": True,
+                    "attempts": int(response["attempts"]),
+                    "last_error": None,
+                },
+            })
+        return operation_success(operation, {
+            "domain": {
+                "name": response["domain"],
+                "state": response["domain_state"],
+            },
+            "snapshot": response["snapshot"],
+        })
+    except (KeyError, TypeError, ValueError):
+        if operation == "reset":
+            return operation_error(
+                operation,
+                "reset_result_unknown",
+                "the broker connection closed before reset could be confirmed",
+                {"domain_state": "unknown"},
+            )
+        return operation_error(
+            operation,
+            "broker_response_invalid",
+            "the VM broker did not return the required result fields",
+            {},
+        )
+
+
+def _human_result(value: dict) -> str:
+    if not value["ok"]:
+        error = value["error"]
+        return f"✗ {value['operation']} [{error['code']}]: {error['message']}"
+    operation = value["operation"]
+    result = value["result"]
+    if operation == "status":
+        ssh = "ready" if result["ssh"]["ready"] else "not ready"
+        return f"VM {result['domain']['state']} · SSH {ssh} · broker ready"
+    if operation == "start":
+        action = "started" if result["started"] else "already running"
+        return f"VM {action} · SSH ready after {result['ssh']['attempts']} attempt(s)"
+    return f"VM reset to '{result['snapshot']}' · {result['domain']['state']}"
+
+
+def client_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="./sc vm")
+    commands = parser.add_subparsers(dest="operation", required=True)
+    for name in ("status", "start"):
+        command = commands.add_parser(name)
+        command.add_argument("--json", action="store_true")
+    reset = commands.add_parser("reset")
+    reset.add_argument("--off", action="store_true", required=True)
+    reset.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    value = run_operation(args.operation)
+    if args.json:
+        print(json.dumps(value, separators=(",", ":")))
+    else:
+        print(_human_result(value), file=sys.stdout if value["ok"] else sys.stderr)
+    return 0 if value["ok"] else 1
 
 
 # -- host CLI (path lookup for `sc`; verbs for manual no-broker testing) ------
 
 def main(argv: list[str]) -> int:
     mode = argv[0] if argv else "sock"
+    if mode == "client":
+        return client_main(argv[1:])
     if mode == "sock":
         print(SOCKET)
     elif mode == "configured":
@@ -1000,7 +1343,7 @@ def main(argv: list[str]) -> int:
     elif mode == "validate":
         print(json.dumps(validate(argv[1] if len(argv) > 1 else "", read() or {})))
     else:
-        sys.exit("usage: vm.py [sock|exec <cmd>|reset|bake|push <src> [dest]|capture [cmd]"
+        sys.exit("usage: vm.py [client <status|start|reset --off>|sock|exec <cmd>|reset|bake|push <src> [dest]|capture [cmd]"
                  "|mcp-sock|mcp-up|mcp-down|mcp-status|validate <check>]")
     return 0
 

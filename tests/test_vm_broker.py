@@ -87,7 +87,8 @@ class VerbDispatchTests(unittest.TestCase):
 
     def test_reset_passes_running_for_the_offline_clean_snapshot(self):
         with mock.patch.object(vm, "read", return_value=SAVED), \
-             mock.patch.object(vm, "_run", return_value=(True, "")) as run:
+             mock.patch.object(vm, "_run", return_value=(True, "")) as run, \
+             mock.patch.object(vm, "_domain_state", return_value=(True, "running")):
             r = vm.do_reset()
         self.assertTrue(r["ok"])
         argv = run.call_args[0][0]
@@ -98,7 +99,10 @@ class VerbDispatchTests(unittest.TestCase):
         # End-of-loop: revert to the offline clean snapshot WITHOUT --running, so
         # the box returns clean *and* powered off (frees the host's ~12 GB).
         with mock.patch.object(vm, "read", return_value=SAVED), \
-             mock.patch.object(vm, "_run", return_value=(True, "")) as run:
+             mock.patch.object(vm, "_run", return_value=(True, "")) as run, \
+             mock.patch.object(
+                 vm, "_domain_state", return_value=(True, "powered_off")
+             ):
             r = vm.do_reset(running=False)
         self.assertTrue(r["ok"])
         argv = run.call_args[0][0]

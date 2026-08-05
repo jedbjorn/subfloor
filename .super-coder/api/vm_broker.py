@@ -13,9 +13,11 @@ process holds the secret so nothing downstream needs it. Spec:
 Routes (all JSON `{ok, ...}`):
 
     GET  /health               liveness
+    GET  /status               read-only domain, SSH, and tunnel state
     GET  /vm                   read the saved vm block
     PUT  /vm        {vm}        write the vm block
     POST /exec      {command}   ssh the guest -> {ok, exit, stdout, stderr}
+    POST /start                 start only if off, then wait for SSH readiness
     POST /reset                 virsh snapshot-revert <dom> <snap> --running
     POST /push      {src,dest?} stage a host-visible artifact into transfer_dir
     POST /capture   {command?}  optional exec + a virsh screenshot (base64)
@@ -39,6 +41,9 @@ import json
 import os
 import socketserver
 import sys
+import threading
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -49,30 +54,61 @@ import vm  # noqa: E402  (config + checks + loop verbs + socket path)
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def handle_one_request(self) -> None:
+        self._response_started = False
+        self._request_id = uuid.uuid4().hex[:12]
+        self._request_started = time.monotonic()
+        super().handle_one_request()
+
     # AF_UNIX peers have no address — the default logger would IndexError on it.
     def log_message(self, fmt: str, *args) -> None:
         sys.stderr.write("[vm-broker] " + (fmt % args) + "\n")
 
     def _send(self, code: int, payload: dict) -> None:
+        if self._response_started:
+            self._log("response_suppressed", code=code)
+            return
         body = json.dumps(payload).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._response_started = True
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            self._log("response", code=code, bytes=len(body))
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError) as exc:
+            # The VM operation may already have completed. A disconnected caller
+            # gets one attempted response and one bounded server-side fact; never
+            # retry a write on the same socket or leak request payloads to logs.
+            self._log("response_lost", code=code, error=type(exc).__name__)
+
+    def _log(self, event: str, **fields: object) -> None:
+        elapsed_ms = int((time.monotonic() - self._request_started) * 1000)
+        safe = " ".join(f"{key}={str(value)[:120]}" for key, value in fields.items())
+        suffix = f" {safe}" if safe else ""
+        sys.stderr.write(
+            f"[vm-broker] request_id={self._request_id} method={self.command} "
+            f"path={self.path[:160]} event={event} elapsed_ms={elapsed_ms}{suffix}\n"
+        )
 
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
         if not n:
             return {}
         try:
-            return json.loads(self.rfile.read(n).decode() or "{}")
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return {}
+            value = json.loads(self.rfile.read(n).decode())
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError("request body must be valid JSON") from exc
+        if not isinstance(value, dict):
+            raise ValueError("request body must be a JSON object")
+        return value
 
     def do_GET(self) -> None:
         if self.path == "/health":
             return self._send(200, {"ok": True, "service": "vm-broker"})
+        if self.path == "/status":
+            return self._send(200, vm.do_status())
         if self.path == "/vm":
             return self._send(200, {"vm": vm.read()})
         if self.path == "/mcp/status":
@@ -93,10 +129,14 @@ class Handler(BaseHTTPRequestHandler):
                 b = self._body()
                 return self._send(200, vm.do_exec(b.get("command", ""),
                                                   int(b.get("timeout", 120))))
+            if self.path == "/start":
+                with self.server.vm_mutation_lock:
+                    return self._send(200, vm.do_start())
             if self.path == "/reset":
                 # {"running": false} ends a run clean + powered OFF (frees host
                 # RAM); default true boots a clean box to START a run.
-                return self._send(200, vm.do_reset(self._body().get("running", True)))
+                with self.server.vm_mutation_lock:
+                    return self._send(200, vm.do_reset(self._body().get("running", True)))
             if self.path == "/push":
                 b = self._body()
                 return self._send(200, vm.do_push(b.get("src", ""), b.get("dest")))
@@ -114,8 +154,9 @@ class Handler(BaseHTTPRequestHandler):
                 if r is None:
                     return self._send(404, {"ok": False, "error": "no such check"})
                 return self._send(200, r)
-        except Exception as e:  # never let one bad call kill a worker thread
-            return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+        except Exception as e:  # noqa: BLE001 — broker boundary must survive verb faults
+            self._log("handler_error", error=type(e).__name__)
+            return self._send(500, {"ok": False, "error": "broker request failed"})
         return self._send(404, {"ok": False, "error": "no such route"})
 
 
@@ -123,6 +164,10 @@ class UnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer)
     """HTTP over a unix socket. Clears a stale socket from a crashed prior run
     (else bind fails EADDRINUSE) and locks the socket to the owner (0600)."""
     daemon_threads = True
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.vm_mutation_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
 
     def server_bind(self) -> None:
         try:
