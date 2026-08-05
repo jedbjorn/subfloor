@@ -50,7 +50,16 @@ class VerbDispatchTests(unittest.TestCase):
         with mock.patch.object(vm, "read", return_value=SAVED), \
              mock.patch("subprocess.run", return_value=fake) as run:
             r = vm.do_exec("echo hello")
-        self.assertEqual(r, {"ok": True, "exit": 0, "stdout": "hello\n", "stderr": ""})
+        self.assertEqual(
+            r,
+            {
+                "ok": True,
+                "ran": True,
+                "exit": 0,
+                "stdout": "hello\n",
+                "stderr": "",
+            },
+        )
         # SSH non-interactive + targets the saved guest, not a caller-named host.
         argv = run.call_args[0][0]
         self.assertEqual(argv[0], "ssh")
@@ -60,8 +69,41 @@ class VerbDispatchTests(unittest.TestCase):
     def test_exec_missing_config_is_a_clean_error_not_a_crash(self):
         with mock.patch.object(vm, "read", return_value={}):
             r = vm.do_exec("whoami")
-        self.assertFalse(r["ok"])
-        self.assertIn("missing required field", r["stderr"])
+        self.assertEqual(r, {
+            "ok": False,
+            "error": "exec_validation_failed",
+            "exit": -1,
+            "stdout": "",
+            "stderr": (
+                "missing required field(s): ssh_host, ssh_user, ssh_key_path"
+            ),
+        })
+
+    def test_exec_missing_host_ssh_has_a_distinct_error(self):
+        failure = FileNotFoundError(2, "No such file or directory", "ssh")
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm.subprocess, "run", side_effect=failure):
+            r = vm.do_exec("whoami")
+        self.assertEqual(r, {
+            "ok": False,
+            "error": "exec_unavailable",
+            "exit": 127,
+            "stdout": "",
+            "stderr": "command not found: ssh — is ssh installed on the host?",
+        })
+
+    def test_exec_timeout_has_a_distinct_error(self):
+        failure = subprocess.TimeoutExpired(["ssh"], 120)
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm.subprocess, "run", side_effect=failure):
+            r = vm.do_exec("whoami")
+        self.assertEqual(r, {
+            "ok": False,
+            "error": "exec_timeout",
+            "exit": 124,
+            "stdout": "",
+            "stderr": "timed out (>120s)",
+        })
 
     def test_configured_cli_reflects_a_linked_vm(self):
         # `./sc vm-broker-up` calls `vm.py configured` to self-skip when unlinked.
@@ -147,7 +189,18 @@ class VerbDispatchTests(unittest.TestCase):
         with mock.patch.object(vm, "read", return_value=cfg):
             r = vm.do_push(src, "staged.py")
         self.assertTrue(r["ok"], r)
-        self.assertTrue((Path(share) / "staged.py").is_file())
+        target = Path(share) / "staged.py"
+        self.assertTrue(target.is_file())
+        self.assertEqual(r["source"], str(Path(src).resolve()))
+        self.assertEqual(r["destination"], str(target.resolve()))
+
+    def test_capture_missing_domain_is_a_failure_without_screenshot_data(self):
+        with mock.patch.object(vm, "read", return_value={}):
+            r = vm.do_capture()
+        self.assertEqual(r, {
+            "ok": False,
+            "screenshot_error": "missing required field(s): domain",
+        })
 
     def test_exec_survives_non_utf8_guest_output(self):
         # #261: Windows guests routinely emit non-UTF-8 (UTF-16 files, OEM
@@ -1015,8 +1068,16 @@ class SocketTransportTests(unittest.TestCase):
         with mock.patch.object(vm, "read", return_value=SAVED), \
              mock.patch("subprocess.run", return_value=fake):
             r = vm.broker_call("POST", "/exec", {"command": "exit 2"})
-        self.assertEqual(r["exit"], 2)
-        self.assertEqual(r["stdout"], "out")
+        self.assertEqual(
+            r,
+            {
+                "ok": False,
+                "ran": True,
+                "exit": 2,
+                "stdout": "out",
+                "stderr": "err",
+            },
+        )
 
     def test_busy_reset_returns_without_attempting_reset(self):
         self.srv.vm_mutation_lock.acquire()

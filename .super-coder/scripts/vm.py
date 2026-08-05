@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import fcntl
 import json
 import os
@@ -392,7 +393,19 @@ START_BROKER_BUDGET = (
 )
 START_CLIENT_TIMEOUT = START_BROKER_BUDGET + 15
 DEFAULT_CLIENT_TIMEOUT = 30
+EXEC_CLIENT_TIMEOUT = 130
+CAPTURE_CLIENT_TIMEOUT = 45
 RESULT_SCHEMA_VERSION = 1
+MAX_CAPTURE_BYTES = 16 * 1024 * 1024
+CAPTURE_ARTIFACT_ROOT = (
+    ports.ENGINE.parent / ".sc-state" / "local" / "vm-captures"
+)
+CAPTURE_MIME_TYPES = {
+    "jpeg": "image/jpeg",
+    "jpg": "image/jpeg",
+    "png": "image/png",
+    "ppm": "image/x-portable-pixmap",
+}
 
 DOMAIN_STATES = {
     "blocked": "blocked",
@@ -549,12 +562,24 @@ def validate(check: str, cfg: dict) -> dict | None:
 # wizard passes in, before it is saved.)
 
 def do_exec(command: str, timeout: int = 120) -> dict:
-    """Run one command in the guest over SSH. Returns {ok, exit, stdout, stderr}."""
+    """Run one command in the guest over SSH. Returns {ok, ran, exit, stdout, stderr}."""
     cfg = read() or {}
     if m := _missing(cfg, "ssh_host", "ssh_user", "ssh_key_path"):
-        return {"ok": False, "exit": -1, "stdout": "", "stderr": m}
+        return {
+            "ok": False,
+            "error": "exec_validation_failed",
+            "exit": -1,
+            "stdout": "",
+            "stderr": m,
+        }
     if not str(command).strip():
-        return {"ok": False, "exit": -1, "stdout": "", "stderr": "exec: empty command"}
+        return {
+            "ok": False,
+            "error": "exec_validation_failed",
+            "exit": -1,
+            "stdout": "",
+            "stderr": "exec: empty command",
+        }
     try:
         # errors="replace": guest output is routinely non-UTF-8 (UTF-16 files,
         # OEM codepages). A strict decode turned the whole exec into a 500 with
@@ -566,13 +591,26 @@ def do_exec(command: str, timeout: int = 120) -> dict:
                            capture_output=True,
                            text=True, encoding="utf-8", errors="replace",
                            timeout=timeout)
-        return {"ok": p.returncode == 0, "exit": p.returncode,
+        return {"ok": p.returncode == 0, "ran": True, "exit": p.returncode,
                 "stdout": p.stdout, "stderr": p.stderr}
     except FileNotFoundError as e:
-        return {"ok": False, "exit": 127, "stdout": "",
-                "stderr": f"command not found: {e.filename} — is ssh installed on the host?"}
+        return {
+            "ok": False,
+            "error": "exec_unavailable",
+            "exit": 127,
+            "stdout": "",
+            "stderr": (
+                f"command not found: {e.filename} — is ssh installed on the host?"
+            ),
+        }
     except subprocess.TimeoutExpired:
-        return {"ok": False, "exit": 124, "stdout": "", "stderr": f"timed out (>{timeout}s)"}
+        return {
+            "ok": False,
+            "error": "exec_timeout",
+            "exit": 124,
+            "stdout": "",
+            "stderr": f"timed out (>{timeout}s)",
+        }
 
 
 def _domain_state(cfg: dict) -> tuple[bool, str]:
@@ -863,7 +901,12 @@ def do_push(src: str, dest: str | None = None) -> dict:
         shutil.copy2(src_p, target)  # codeql[py/path-injection]
     except OSError as e:
         return {"ok": False, "output": f"push failed: {e}"}
-    return {"ok": True, "output": f"staged {src_p.name} -> {target} (guest sees it via the share)"}
+    return {
+        "ok": True,
+        "output": f"staged {src_p.name} -> {target} (guest sees it via the share)",
+        "source": str(src_p),
+        "destination": str(target),
+    }
 
 
 def do_capture(command: str | None = None) -> dict:
@@ -876,6 +919,7 @@ def do_capture(command: str | None = None) -> dict:
         result["exec"] = do_exec(command)
         result["ok"] = bool(result["exec"].get("ok"))
     if m := _missing(cfg, "domain"):
+        result["ok"] = False
         result["screenshot_error"] = m
         return result
     shot = Path(tempfile.gettempdir()) / f"sc_vm_{cfg['domain']}.ppm"
@@ -1261,6 +1305,134 @@ def operation_error(operation: str, code: str, message: str,
     }
 
 
+class CaptureArtifactError(ValueError):
+    """A safe, structured capture validation or materialization failure."""
+
+    def __init__(self, code: str, message: str, details: dict | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+
+
+def _capture_target(output: str | None, screenshot_format: str) -> Path:
+    root = CAPTURE_ARTIFACT_ROOT.resolve()
+    if output is None:
+        target = root / f"capture-{time.time_ns()}.{screenshot_format}"
+    else:
+        target = Path(os.path.expanduser(output))
+        if not target.is_absolute():
+            target = ports.ENGINE.parent / target
+    try:
+        target = target.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise CaptureArtifactError(
+            "capture_output_invalid",
+            "the capture output path is invalid",
+            {"allowed_root": str(root)},
+        ) from exc
+    if target == root or not target.is_relative_to(root):
+        raise CaptureArtifactError(
+            "capture_output_not_allowed",
+            "the capture output must stay inside the capture artifact area",
+            {"allowed_root": str(root)},
+        )
+    return target
+
+
+def _decode_capture(response: dict) -> tuple[bytes, str, str]:
+    encoded = response.get("screenshot_b64")
+    declared_bytes = response.get("screenshot_bytes")
+    screenshot_format = response.get("screenshot_format")
+    if (
+        not isinstance(encoded, str)
+        or isinstance(declared_bytes, bool)
+        or not isinstance(declared_bytes, int)
+        or not isinstance(screenshot_format, str)
+    ):
+        raise CaptureArtifactError(
+            "capture_response_invalid",
+            "the broker did not return complete capture metadata",
+        )
+    screenshot_format = screenshot_format.lower()
+    mime_type = CAPTURE_MIME_TYPES.get(screenshot_format)
+    if mime_type is None or declared_bytes <= 0:
+        raise CaptureArtifactError(
+            "capture_response_invalid",
+            "the broker returned invalid capture metadata",
+        )
+    encoded_limit = 4 * ((MAX_CAPTURE_BYTES + 2) // 3)
+    if declared_bytes > MAX_CAPTURE_BYTES or len(encoded) > encoded_limit:
+        raise CaptureArtifactError(
+            "capture_too_large",
+            f"the capture exceeds the {MAX_CAPTURE_BYTES}-byte limit",
+            {"max_bytes": MAX_CAPTURE_BYTES, "reported_bytes": declared_bytes},
+        )
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise CaptureArtifactError(
+            "capture_response_invalid",
+            "the broker returned invalid capture data",
+        ) from exc
+    if len(data) > MAX_CAPTURE_BYTES:
+        raise CaptureArtifactError(
+            "capture_too_large",
+            f"the capture exceeds the {MAX_CAPTURE_BYTES}-byte limit",
+            {"max_bytes": MAX_CAPTURE_BYTES, "reported_bytes": declared_bytes},
+        )
+    if len(data) != declared_bytes:
+        raise CaptureArtifactError(
+            "capture_response_invalid",
+            "the capture byte count did not match the broker metadata",
+            {"reported_bytes": declared_bytes, "decoded_bytes": len(data)},
+        )
+    return data, screenshot_format, mime_type
+
+
+def _atomic_write_capture(target: Path, data: bytes) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_tmp = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    tmp = Path(raw_tmp)
+    try:
+        os.fchmod(fd, 0o600)
+        handle = os.fdopen(fd, "wb")
+        fd = -1
+        with handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _materialize_capture(response: dict, output: str | None,
+                         validated_target: Path | None) -> dict:
+    try:
+        data, screenshot_format, mime_type = _decode_capture(response)
+        target = validated_target or _capture_target(output, screenshot_format)
+        _atomic_write_capture(target, data)
+    except CaptureArtifactError as exc:
+        return operation_error("capture", exc.code, str(exc), exc.details)
+    except OSError:
+        return operation_error(
+            "capture",
+            "capture_write_failed",
+            "the capture artifact could not be saved",
+        )
+    return operation_success("capture", {
+        "path": str(target),
+        "bytes": len(data),
+        "format": screenshot_format,
+        "mime_type": mime_type,
+    })
+
+
 def _broker_failure(operation: str, response: dict) -> dict:
     if response.get("error") == "vm_busy":
         return operation_error(
@@ -1279,6 +1451,32 @@ def _broker_failure(operation: str, response: dict) -> dict:
             ),
             {"domain_state": response.get("domain_state", "unknown")},
         )
+    if operation == "exec":
+        exit_code = response.get("exit")
+        stderr = response.get("stderr")
+        error_code = response.get("error")
+        if error_code not in {
+            "exec_validation_failed",
+            "exec_unavailable",
+            "exec_timeout",
+        }:
+            error_code = "exec_failed"
+        return operation_error(
+            operation,
+            error_code,
+            (
+                stderr
+                if isinstance(stderr, str) and stderr
+                else "the exec operation failed"
+            ),
+            {
+                "exit_code": (
+                    exit_code
+                    if isinstance(exit_code, int) and not isinstance(exit_code, bool)
+                    else -1
+                ),
+            },
+        )
     details: dict = {}
     for key in ("domain_state", "attempts", "last_readiness_error"):
         if key in response:
@@ -1286,17 +1484,43 @@ def _broker_failure(operation: str, response: dict) -> dict:
     return operation_error(
         operation,
         f"{operation}_failed",
-        str(response.get("output") or response.get("error") or f"{operation} failed"),
+        str(
+            response.get("output")
+            or response.get("screenshot_error")
+            or response.get("error")
+            or f"{operation} failed"
+        ),
         details,
     )
 
 
-def run_operation(operation: str) -> dict:
+def run_operation(operation: str, *, command: str | None = None,
+                  src: str | None = None, dest: str | None = None,
+                  output: str | None = None) -> dict:
     """Call one core broker operation once and normalize its public result."""
+    validated_target: Path | None = None
+    if operation == "exec" and (not isinstance(command, str) or not command.strip()):
+        return operation_error(
+            operation, "exec_command_invalid", "the guest command is empty"
+        )
+    if operation == "push" and (not isinstance(src, str) or not src):
+        return operation_error(
+            operation, "push_source_invalid", "the push source is empty"
+        )
+    if operation == "capture" and output is not None:
+        try:
+            validated_target = _capture_target(output, "ppm")
+        except CaptureArtifactError as exc:
+            return operation_error(operation, exc.code, str(exc), exc.details)
     calls = {
         "status": ("GET", "/status", None, DEFAULT_CLIENT_TIMEOUT),
         "start": ("POST", "/start", None, START_CLIENT_TIMEOUT),
         "reset": ("POST", "/reset", {"running": False}, RESET_CLIENT_TIMEOUT),
+        "exec": ("POST", "/exec", {"command": command}, EXEC_CLIENT_TIMEOUT),
+        "push": (
+            "POST", "/push", {"src": src, "dest": dest}, DEFAULT_CLIENT_TIMEOUT
+        ),
+        "capture": ("POST", "/capture", {}, CAPTURE_CLIENT_TIMEOUT),
     }
     if operation not in calls:
         return operation_error(operation, "operation_unknown", "unknown VM operation")
@@ -1353,6 +1577,27 @@ def run_operation(operation: str) -> dict:
             {},
         )
 
+    if response.get("error") == "vm_busy":
+        return _broker_failure(operation, response)
+    if operation == "exec" and response.get("ran") is True:
+        exit_code = response.get("exit")
+        stdout = response.get("stdout")
+        stderr = response.get("stderr")
+        if (
+            isinstance(exit_code, bool)
+            or not isinstance(exit_code, int)
+            or not isinstance(stdout, str)
+            or not isinstance(stderr, str)
+        ):
+            return operation_error(
+                operation,
+                "broker_response_invalid",
+                "the VM broker did not return a complete response",
+            )
+        return operation_success(
+            operation,
+            {"exit_code": exit_code, "stdout": stdout, "stderr": stderr},
+        )
     if not response.get("ok"):
         return _broker_failure(operation, response)
     try:
@@ -1390,6 +1635,17 @@ def run_operation(operation: str) -> dict:
                     "last_error": None,
                 },
             })
+        if operation == "push":
+            source = response["source"]
+            destination = response["destination"]
+            if not isinstance(source, str) or not isinstance(destination, str):
+                raise TypeError
+            return operation_success(operation, {
+                "source": source,
+                "destination": destination,
+            })
+        if operation == "capture":
+            return _materialize_capture(response, output, validated_target)
         return operation_success(operation, {
             "domain": {
                 "name": response["domain"],
@@ -1437,6 +1693,20 @@ def _human_result(value: dict) -> str:
     if operation == "start":
         action = "started" if result["started"] else "already running"
         return f"VM {action} · SSH ready after {result['ssh']['attempts']} attempt(s)"
+    if operation == "exec":
+        lines = [f"Guest command exited {result['exit_code']}"]
+        if result["stdout"]:
+            lines.append(f"stdout:\n{result['stdout'].rstrip()}")
+        if result["stderr"]:
+            lines.append(f"stderr:\n{result['stderr'].rstrip()}")
+        return "\n".join(lines)
+    if operation == "push":
+        return f"Staged {result['source']} -> {result['destination']}"
+    if operation == "capture":
+        return (
+            f"Capture saved to {result['path']} "
+            f"({result['bytes']} bytes, {result['mime_type']})"
+        )
     return f"VM reset to '{result['snapshot']}' · {result['domain']['state']}"
 
 
@@ -1488,8 +1758,84 @@ def client_main(argv: list[str]) -> int:
     reset.add_argument(
         "--json", action="store_true", help="print one JSON result object"
     )
+    push = commands.add_parser(
+        "push",
+        help="stage a permitted local artifact for the guest",
+        description=(
+            "Stage a file from this repo through the configured transfer area. "
+            "JSON result fields: source, destination."
+        ),
+    )
+    push.add_argument("src", help="source file inside the repo")
+    push.add_argument("dest", nargs="?", help="optional path inside transfer_dir")
+    push.add_argument(
+        "--json", action="store_true", help="print one JSON result object"
+    )
+    execute = commands.add_parser(
+        "exec",
+        help="execute one exact guest command",
+        description=(
+            "Execute arguments after -- or the exact UTF-8 contents of one "
+            "--command-file. JSON result fields: exit_code, stdout, stderr."
+        ),
+    )
+    execute.add_argument(
+        "--command-file",
+        help="read the exact guest command from this UTF-8 file",
+    )
+    execute.add_argument(
+        "--json", action="store_true", help="print one JSON result object"
+    )
+    execute.add_argument(
+        "command", nargs=argparse.REMAINDER, metavar="COMMAND",
+        help="guest command arguments following --",
+    )
+    capture = commands.add_parser(
+        "capture",
+        help="save a bounded screenshot as a local artifact",
+        description=(
+            "Atomically save a mode-0600 screenshot under "
+            ".sc-state/local/vm-captures by default. An explicit --output must "
+            "stay under .sc-state/local/vm-captures. JSON result fields: path, "
+            "bytes, format, mime_type."
+        ),
+    )
+    capture.add_argument(
+        "--output", help="artifact path under .sc-state/local/vm-captures"
+    )
+    capture.add_argument(
+        "--json", action="store_true", help="print one JSON result object"
+    )
     args = parser.parse_args(argv)
-    value = run_operation(args.operation)
+    if args.operation == "exec":
+        command_parts = args.command
+        if command_parts[:1] == ["--"]:
+            command_parts = command_parts[1:]
+        if args.command_file and command_parts:
+            value = operation_error(
+                "exec",
+                "exec_arguments_invalid",
+                "use either arguments after -- or --command-file, not both",
+            )
+        elif args.command_file:
+            try:
+                command = Path(args.command_file).read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                value = operation_error(
+                    "exec",
+                    "exec_command_file_invalid",
+                    "the command file could not be read as UTF-8",
+                )
+            else:
+                value = run_operation("exec", command=command)
+        else:
+            value = run_operation("exec", command=" ".join(command_parts))
+    elif args.operation == "push":
+        value = run_operation("push", src=args.src, dest=args.dest)
+    elif args.operation == "capture":
+        value = run_operation("capture", output=args.output)
+    else:
+        value = run_operation(args.operation)
     if args.json:
         print(json.dumps(value, separators=(",", ":")))
     else:
@@ -1535,7 +1881,7 @@ def main(argv: list[str]) -> int:
     elif mode == "validate":
         print(json.dumps(validate(argv[1] if len(argv) > 1 else "", read() or {})))
     else:
-        sys.exit("usage: vm.py [client <status|start|reset --off>|sock|exec <cmd>|reset|bake|push <src> [dest]|capture [cmd]"
+        sys.exit("usage: vm.py [client <status|start|push|exec|capture|reset --off>|sock|exec <cmd>|reset|bake|push <src> [dest]|capture [cmd]"
                  "|mcp-sock|mcp-up|mcp-down|mcp-status|validate <check>]")
     return 0
 
