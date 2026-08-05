@@ -910,14 +910,22 @@ class SprintSkillTest(unittest.TestCase):
             name: (ASSETS / name / "SKILL.md").read_text()
             for name in SKILLS
         }
+        prep = " ".join(bodies["sprint_prep"].split())
         self.assertIn(
-            "participant pickup belongs to native delivery", bodies["sprint_prep"]
+            "participant pickup belongs to native delivery", prep
         )
         self.assertIn(
-            "moderate share of eligible shells", bodies["sprint_prep"]
+            "moderate share of eligible shells", prep
         )
         self.assertIn(
-            "one Developer and one Reviewer", bodies["sprint_prep"]
+            "one Developer and one Reviewer", prep
+        )
+        self.assertIn(
+            "analyze the task ledger and dependency graph", prep
+        )
+        self.assertIn(
+            "ready reviews can run alongside ongoing independent development",
+            prep,
         )
         planner = " ".join(bodies["sprint_pln"].split())
         for fact in (
