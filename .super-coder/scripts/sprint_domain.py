@@ -35,6 +35,14 @@ WORK_UNIT_OUTPUT_KINDS = frozenset({"code", "report_only", "no_code"})
 WAKE_CONTENTION_BACKOFF_SECONDS = (15, 60, 180, 300)
 WAKE_CONTENTION_ATTEMPTS = 5
 WAKE_DELIVERY_BACKOFF_SECONDS = (15, 60, 180)
+WAKE_PICKUP_PAUSE_REASONS = frozenset(
+    {
+        "wake_pickup_unknown",
+        "wake_pickup_failed",
+        "wake_pickup_unread",
+        "wake_pickup_evidence_invalid",
+    }
+)
 
 
 def _participant_shell_id(con: sqlite3.Connection, participant_id: int) -> int:
@@ -549,7 +557,7 @@ class SprintLifecycleStore:
                 target="armed",
                 outcome=None,
             )
-            reset_wake_ids = self._reset_contention_episode_in_transaction(
+            reset_wake_ids = self._reset_pickup_episodes_in_transaction(
                 sprint_id,
                 actor,
             )
@@ -635,12 +643,12 @@ class SprintLifecycleStore:
             all_anomalies,
         )
 
-    def _reset_contention_episode_in_transaction(
+    def _reset_pickup_episodes_in_transaction(
         self,
         sprint_id: int,
         actor: LifecycleActor,
     ) -> tuple[int, ...]:
-        """Make a human resume the durable anchor of a fresh busy episode."""
+        """Make an authorized resume the anchor of fresh bounded pickup work."""
         report = self.con.execute(
             "SELECT body FROM sprint_reports WHERE sprint_id=? "
             "AND report_kind='pause' ORDER BY report_id DESC LIMIT 1",
@@ -649,62 +657,132 @@ class SprintLifecycleStore:
         if report is None:
             return ()
         pause = json.loads(str(report["body"]))
-        if pause.get("reason") != "wake_contention_exhausted":
+        pause_reason = pause.get("reason")
+        if pause_reason == "wake_contention_exhausted":
+            wake_ids = (int(pause["detail"]["wake_id"]),)
+            classification = "contention_episode_reset"
+            episode_name = "contention-episode"
+        elif pause_reason in WAKE_PICKUP_PAUSE_REASONS:
+            wake_ids = tuple(
+                int(row[0])
+                for row in self.con.execute(
+                    "SELECT DISTINCT "
+                    "CAST(json_extract(e.payload,'$.wake_id') AS INTEGER) wake_id "
+                    "FROM sprint_events e JOIN sprint_wake_outbox w "
+                    "ON w.wake_id=json_extract(e.payload,'$.wake_id') "
+                    "WHERE e.sprint_id=? AND e.event_type='wake.pickup_exhausted' "
+                    "AND w.sprint_id=e.sprint_id "
+                    "AND w.state IN ('delivered','failed') AND EXISTS ("
+                    "SELECT 1 FROM sprint_wake_messages wm "
+                    "JOIN wake_message m USING (message_id) "
+                    "WHERE wm.wake_id=w.wake_id AND wm.sprint_id=e.sprint_id "
+                    "AND m.read_at IS NULL) ORDER BY wake_id",
+                    (sprint_id,),
+                )
+            )
+            classification = "pickup_episode_reset"
+            episode_name = "pickup-episode"
+        else:
             return ()
-        wake_id = int(pause["detail"]["wake_id"])
-        wake = self.con.execute(
-            "SELECT w.participant_id,w.idempotency_key "
-            "FROM sprint_wake_outbox w "
-            "WHERE w.sprint_id=? AND w.wake_id=? "
+        if not wake_ids:
+            return ()
+
+        placeholders = ",".join("?" for _ in wake_ids)
+        wakes = self.con.execute(
+            "SELECT w.wake_id,w.participant_id,w.receiver_shell_id,"
+            "w.idempotency_key FROM sprint_wake_outbox w "
+            f"WHERE w.sprint_id=? AND w.wake_id IN ({placeholders}) "
             "AND w.state IN ('delivered','failed') AND EXISTS ("
             "SELECT 1 FROM sprint_wake_messages wm "
             "JOIN wake_message m USING (message_id) "
             "WHERE wm.sprint_id=w.sprint_id AND wm.wake_id=w.wake_id "
-            "AND m.read_at IS NULL)",
-            (sprint_id, wake_id),
-        ).fetchone()
-        if wake is None:
-            return ()
-        reset_key = f"sprint-resume:{sprint_id}:contention-episode:{wake_id}"
-        replacement_wake_id = int(
+            "AND m.read_at IS NULL) ORDER BY w.wake_id",
+            (sprint_id, *wake_ids),
+        ).fetchall()
+        grouped: dict[int, list[sqlite3.Row]] = {}
+        for wake in wakes:
+            grouped.setdefault(int(wake["participant_id"]), []).append(wake)
+
+        replacements: list[int] = []
+        for participant_id, participant_wakes in grouped.items():
+            receiver_shell_id = int(participant_wakes[0]["receiver_shell_id"])
+            anchor_wake_id = max(int(wake["wake_id"]) for wake in participant_wakes)
+            reset_key = (
+                f"sprint-resume:{sprint_id}:{episode_name}:{anchor_wake_id}"
+            )
+            deliverable = self.con.execute(
+                "SELECT wake_id,idempotency_key FROM sprint_wake_outbox "
+                "WHERE receiver_shell_id=? AND state='pending'",
+                (receiver_shell_id,),
+            ).fetchone()
+            if deliverable is None:
+                replacement_wake_id = int(
+                    self.con.execute(
+                        "INSERT INTO sprint_wake_outbox "
+                        "(sprint_id,participant_id,receiver_shell_id,idempotency_key,"
+                        "available_at) VALUES (?,?,?,?,datetime('now'))",
+                        (
+                            sprint_id,
+                            participant_id,
+                            receiver_shell_id,
+                            reset_key,
+                        ),
+                    ).lastrowid
+                )
+            else:
+                replacement_wake_id = int(deliverable["wake_id"])
+                if str(deliverable["idempotency_key"]) != reset_key:
+                    self.con.execute(
+                        "UPDATE sprint_wake_outbox SET idempotency_key=?,"
+                        "available_at=datetime('now') WHERE wake_id=? "
+                        "AND state='pending'",
+                        (reset_key, replacement_wake_id),
+                    )
+
+            source_wake_ids = tuple(
+                int(wake["wake_id"]) for wake in participant_wakes
+            )
+            source_placeholders = ",".join("?" for _ in source_wake_ids)
+            unread_message_ids = tuple(
+                int(row[0])
+                for row in self.con.execute(
+                    "SELECT m.message_id FROM sprint_wake_messages wm "
+                    "JOIN wake_message m USING (message_id) "
+                    f"WHERE wm.sprint_id=? AND wm.wake_id IN ({source_placeholders}) "
+                    "AND m.read_at IS NULL ORDER BY m.message_id",
+                    (sprint_id, *source_wake_ids),
+                )
+            )
+            if not unread_message_ids:
+                continue
+            message_placeholders = ",".join("?" for _ in unread_message_ids)
             self.con.execute(
-                "INSERT INTO sprint_wake_outbox "
-                "(sprint_id,participant_id,receiver_shell_id,idempotency_key,"
-                "available_at) VALUES (?,?,?,?,datetime('now'))",
-                (
+                "UPDATE wake_message SET delivered_at=NULL "
+                f"WHERE message_id IN ({message_placeholders})",
+                unread_message_ids,
+            )
+            self.con.execute(
+                "UPDATE sprint_wake_messages SET wake_id=? "
+                f"WHERE message_id IN ({message_placeholders})",
+                (replacement_wake_id, *unread_message_ids),
+            )
+            for wake in participant_wakes:
+                self._event(
                     sprint_id,
-                    int(wake["participant_id"]),
-                    _participant_shell_id(self.con, int(wake["participant_id"])),
-                    reset_key,
-                ),
-            ).lastrowid
-        )
-        self.con.execute(
-            "UPDATE wake_message SET delivered_at=NULL WHERE message_id IN ("
-            "SELECT message_id FROM sprint_wake_messages "
-            "WHERE sprint_id=? AND wake_id=?)",
-            (sprint_id, wake_id),
-        )
-        self.con.execute(
-            "UPDATE sprint_wake_messages SET wake_id=? "
-            "WHERE sprint_id=? AND wake_id=?",
-            (replacement_wake_id, sprint_id, wake_id),
-        )
-        self._event(
-            sprint_id,
-            "wake.requeued",
-            actor,
-            {
-                "trigger": "resume",
-                "classification": "contention_episode_reset",
-                "prior_wake_id": wake_id,
-                "replacement_wake_id": replacement_wake_id,
-                "prior_idempotency_key": str(wake["idempotency_key"]),
-                "idempotency_key": reset_key,
-                "replacement_conversation_id": None,
-            },
-        )
-        return (replacement_wake_id,)
+                    "wake.requeued",
+                    actor,
+                    {
+                        "trigger": "resume",
+                        "classification": classification,
+                        "prior_wake_id": int(wake["wake_id"]),
+                        "replacement_wake_id": replacement_wake_id,
+                        "prior_idempotency_key": str(wake["idempotency_key"]),
+                        "idempotency_key": reset_key,
+                        "replacement_conversation_id": None,
+                    },
+                )
+            replacements.append(replacement_wake_id)
+        return tuple(sorted(set(replacements)))
 
     def abort(
         self,
@@ -1620,6 +1698,7 @@ class SprintLifecycleStore:
             if payload.get("classification") in {
                 "shell_busy",
                 "contention_episode_reset",
+                "pickup_episode_reset",
             }:
                 continue
             if payload.get("prior_wake_id") is not None:
