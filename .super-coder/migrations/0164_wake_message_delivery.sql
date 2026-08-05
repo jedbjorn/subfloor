@@ -4,6 +4,7 @@
 -- participant columns remain as optional workflow context, while delivery and
 -- coalescing are keyed directly to the receiving shell.
 
+-- migrate: foreign-keys-off
 PRAGMA foreign_keys=OFF;
 
 BEGIN;

@@ -131,6 +131,9 @@ def headless_command(adapter: dict, prompt: str, model: "str | None" = None,
         return None
     validate_headless_request(adapter, model, effort)
     cmd = list(hcfg["launch"])
+    managed_mcp = managed_mcp_injection(adapter)
+    if managed_mcp:
+        cmd += list(managed_mcp.get("launch_args") or [])
     if model:
         cmd += [hcfg["model_flag"], model]
     cmd += _headless_effort_args(hcfg, effort, adapter.get("harness", "?"))
@@ -151,6 +154,41 @@ def load_adapter(harness: str) -> dict:
         return json.loads(path.read_text())
     return {"harness": harness, "launch": [harness], "boot_artifact": "AGENTS.md",
             "emit": [], "env": {}}
+
+
+def linked_vm_configured() -> bool:
+    """Match ``sc_vm_broker_configured``: a truthy persisted vm block."""
+    return bool(ports_mod.resolve(persist=False).get("vm"))
+
+
+def managed_mcp_injection(adapter: dict) -> dict | None:
+    """Return one adapter's validated managed streamable-HTTP MCP recipe.
+
+    The adapter owns the harness-specific representation. The launcher only
+    consumes optional argv and JSON-merge fragments, so adding a harness never
+    grows a harness-name switch here.
+    """
+    if not linked_vm_configured():
+        return None
+    streamable = (adapter.get("mcp") or {}).get("streamable_http") or {}
+    if not streamable.get("supported"):
+        return None
+    managed = streamable.get("managed_server")
+    if not isinstance(managed, dict):
+        raise ValueError(
+            f"harness '{adapter.get('harness', '?')}' declares streamable HTTP MCP "
+            "support without a managed_server recipe"
+        )
+    if not managed.get("name") or not managed.get("url"):
+        raise ValueError(
+            f"harness '{adapter.get('harness', '?')}' has an incomplete managed "
+            "streamable HTTP MCP recipe"
+        )
+    if not managed.get("launch_args") and not managed.get("merge_json"):
+        raise ValueError(
+            f"harness '{adapter.get('harness', '?')}' has no managed MCP injection"
+        )
+    return managed
 
 
 def emit_adapter(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
@@ -258,6 +296,12 @@ def apply_merge_json(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
     PreToolUse branch-guard hook in .claude/settings.local.json (kept out of the
     fork's tracked .claude/settings.json so fork-owned config is never clobbered)."""
     return _merge_json_spec(adapter.get("merge_json") or {}, root)
+
+
+def apply_managed_mcp(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
+    """Apply the supported adapter's generated JSON MCP fragment, if any."""
+    managed = managed_mcp_injection(adapter)
+    return _merge_json_spec((managed or {}).get("merge_json") or {}, root)
 
 
 def apply_sandbox(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
@@ -1140,6 +1184,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     emit_adapter(adapter, work_dir)
     resolve_opencode_plugins(work_dir)
     apply_merge_json(adapter, work_dir)
+    apply_managed_mcp(adapter, work_dir)
     apply_sandbox(adapter, work_dir)
 
     # Interactive model routing (main()'s non-headless block): the adapter
@@ -1181,7 +1226,12 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
         if argv is None:
             raise LaunchError(f"harness '{harness}' has no headless adapter")
     else:
-        argv = list(adapter.get("launch") or [harness]) + name_args + model_args + sandbox_flags
+        managed = managed_mcp_injection(adapter)
+        argv = (
+            list(adapter.get("launch") or [harness])
+            + list((managed or {}).get("launch_args") or [])
+            + name_args + model_args + sandbox_flags
+        )
 
     # Env injection, verbatim from main()'s exec block: adapter env, sandbox
     # env, effort env, then the engine's own SC_* contract + PATH prepend.
@@ -1192,6 +1242,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     env["SC_API_TOKEN"] = full["api_key"] or ""
     env["SC_API_BASE"] = f"http://127.0.0.1:{api_port}" if api_port else ""
     env["SC_ENGINE_DIR"] = str(ENGINE)
+    env["SC_HARNESS"] = harness
     env["SC_SHELL_WORKTREE"] = str(work_dir)
     env["SC_ROOT"] = str(REPO_ROOT)
     env["PATH"] = os.pathsep.join([str(REPO_ROOT), env.get("PATH", "")])
@@ -1586,6 +1637,9 @@ def main() -> None:
     merged = apply_merge_json(adapter, work_dir)
     if merged:
         print(f"→ harness config → {', '.join(merged)}")
+    managed_files = apply_managed_mcp(adapter, work_dir)
+    if managed_files:
+        print(f"→ managed MCP → {', '.join(managed_files)}")
     sandboxed = apply_sandbox(adapter, work_dir)
     if sandboxed:
         print(f"→ sandbox: allow-all permissions → {', '.join(sandboxed)}")
@@ -1662,8 +1716,16 @@ def main() -> None:
     if not headless and ncfg.get("flag") and full["display_name"]:
         name_args = [ncfg["flag"], full["display_name"]]
 
-    cmd = (headless_cmd if headless else
-           (adapter.get("launch") or [harness]) + name_args + model_args + mode_flags)
+    managed = managed_mcp_injection(adapter)
+    cmd = (
+        headless_cmd
+        if headless
+        else (
+            (adapter.get("launch") or [harness])
+            + list((managed or {}).get("launch_args") or [])
+            + name_args + model_args + mode_flags
+        )
+    )
     effort_env = headless_effort_env(adapter, session_effort) if headless else {}
     env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()},
            **mode_env, **effort_env}
@@ -1679,6 +1741,7 @@ def main() -> None:
     # so it is absent from worktrees; a worktree-relative path failed open). This
     # just saves a subshell per edit on the normal launch path.
     env["SC_ENGINE_DIR"] = str(ENGINE)
+    env["SC_HARNESS"] = harness
     # The shell's HOME worktree — the dir we exec the harness from (below). The
     # branch-guard reads it to judge "outside your worktree" against the assigned
     # tree, not the live cwd: a shell whose cwd has drifted to the repo root (to

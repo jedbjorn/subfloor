@@ -6,6 +6,27 @@
   "emit": ["opencode.json"],
   "skill_dirs": [".claude/skills", ".opencode/skills"],
   "env": { "OPENCODE_DISABLE_CLAUDE_CODE": "1" },
+  "mcp": {
+    "streamable_http": {
+      "supported": true,
+      "managed_server": {
+        "name": "windows-mcp",
+        "url": "http://127.0.0.1:18000/mcp",
+        "merge_json": {
+          "opencode.json": {
+            "mcp": {
+              "windows-mcp": {
+                "type": "remote",
+                "url": "http://127.0.0.1:18000/mcp",
+                "enabled": true,
+                "oauth": false
+              }
+            }
+          }
+        }
+      }
+    }
+  },
   "model": { "file": "opencode.json", "key": "model" },
   "headless": { "launch": ["opencode", "run"], "model_flag": "-m" },
   "conversation": {

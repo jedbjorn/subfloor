@@ -91,8 +91,9 @@ graph LR
   LV --> VM
 ```
 
-- **Container side** — `windows_devkit` makes local socket calls. No key, no
-  `ssh`, no `virsh`, no route to the VM. Nothing changes about its isolation.
+- **Container side** — `windows_devkit` uses the typed `./sc vm` client over the
+  local broker socket. No key, no `ssh`, no `virsh`, no route to the VM.
+  Nothing changes about its isolation.
 - **Host side** — the broker reads `instance.json.vm`, holds the key path, and
   is the only thing that touches the guest or the hypervisor.
 
@@ -104,7 +105,8 @@ Two options, both grounded in the measured facts. Recommend the socket.
 > **Unix socket in the bind-mounted repo (recommended).** The broker listens on
 > e.g. `.super-coder/run/vm-broker.sock` inside the fork repo, which is mounted
 > into the container at the same path. No network surface, no firewall, gated by
-> filesystem permissions. `windows_devkit` calls it with `curl --unix-socket`.
+> filesystem permissions. `windows_devkit` reaches it through typed `./sc vm`
+> commands.
 
 The TCP fallback: bind the broker on the docker-bridge gateway (`172.19.0.1`) or
 `0.0.0.0`. The container *can* reach that (refused, not dropped — a listener is
@@ -180,7 +182,7 @@ The seam stays on the socket posture, and the broker never parses a byte of
 MCP traffic:
 
 ```linear
-claude mcp add (TCP 127.0.0.1:18000) :::class1 -> vm_mcp_relay.py (in-sandbox) :::class1 -> run/vm-mcp.sock (bind mount) :::class2 -> ssh -N -L (broker-owned, host) :::class2 -> guest 127.0.0.1:8000 Windows-MCP :::class3
+adapter-injected windows-mcp (TCP 127.0.0.1:18000) :::class1 -> vm_mcp_relay.py (in-sandbox) :::class1 -> run/vm-mcp.sock (bind mount) :::class2 -> ssh -N -L (broker-owned, host) :::class2 -> guest 127.0.0.1:8000 Windows-MCP :::class3
 ```
 
 - **`POST /mcp/up`** — the broker spawns one `ssh -N -L run/vm-mcp.sock:127.0.0.1:<mcp_port>`
@@ -189,10 +191,10 @@ claude mcp add (TCP 127.0.0.1:18000) :::class1 -> vm_mcp_relay.py (in-sandbox) :
   live pid). The socket sits next to `vm-broker.sock` in the bind mount — no
   network surface, no auth token, exactly the transport decision above. SSE /
   chunked streaming is free: it is a byte pipe, not an HTTP proxy.
-- **`./sc vm-mcp-relay up`** — in-sandbox, stdlib-only TCP→socket relay on
-  `127.0.0.1:18000`, because `claude mcp add --transport http` only speaks TCP
-  URLs. The TCP listener exists *inside the container's own namespace*; nothing
-  is exposed on `sc-net` or the docker bridge.
+- **`./sc vm mcp up`** — the model-facing command starts the broker tunnel and
+  stdlib-only TCP→socket relay, then verifies the adapter-injected HTTP endpoint.
+  The relay listens on `127.0.0.1:18000` inside the container's own namespace;
+  nothing is exposed on `sc-net` or the docker bridge.
 - **Port comes from the saved block** (`vm.mcp_port`, default 8000), never the
   caller — the sandbox names an action, not a destination, same as every verb.
 - **Trust class:** raw access to guest UIA ≈ `/exec` (arbitrary commands in the
@@ -270,7 +272,7 @@ Built per the architecture above:
 | MCP seam | `vm.py` — `do_mcp_up` / `do_mcp_down` / `mcp_status` (broker-owned ssh socket-forward); `.super-coder/scripts/vm_mcp_relay.py` — in-sandbox TCP→socket relay (`./sc vm-mcp-relay`) |
 | Supervision | `./sc vm-broker` (foreground), `./sc vm-broker-up` / `-down` (nohup + pidfile), `./sc vm-broker-sock` |
 | Server proxy | `.super-coder/api/server.py` — `/api/vm/validate/{check}` proxies to the broker in-sandbox |
-| Skill | `windows_devkit` — drives the four verbs via `curl --unix-socket`, holds no key |
+| Skill | `windows_devkit` — drives the four verbs through typed `./sc vm` commands, holds no key |
 | Tests | `tests/test_vm_broker.py` — verb dispatch + live unix-socket transport |
 
 ## Open questions

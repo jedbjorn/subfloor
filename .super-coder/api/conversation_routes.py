@@ -366,6 +366,20 @@ def _append_event(
 # latest conversation.reopened event, so a pre-reopen close request cannot
 # strand or re-close a reopened chat.  The broker's claim/finish queries
 # apply the same scoping.
+# A Sprint chat is "managed" only while its sprint can still deliver into it:
+# armed and paused lifecycles route wakes and hold resumable context, so the
+# GUI keeps chat lifecycle in engine hands.  Once the sprint reaches a
+# terminal lifecycle the chat is an ordinary leftover the operator may close
+# (reopen stays scope-blocked — see SPRINT_CONVERSATION_MANAGED).
+_SPRINT_MANAGED_COLUMN = (
+    "EXISTS(SELECT 1 FROM sprint_participant_conversations link"
+    " JOIN sprint_participants p"
+    " ON p.participant_id=link.sprint_participant_id"
+    " JOIN sprints sp ON sp.sprint_id=p.sprint_id"
+    " WHERE link.conversation_id=c.conversation_id"
+    " AND sp.lifecycle IN ('armed','paused')) AS sprint_managed"
+)
+
 _CLOSE_REQUESTED_AFTER_REOPEN = (
     "requested.event_type='conversation.close.requested' "
     "AND requested.sequence>COALESCE("
@@ -395,8 +409,9 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
         "(SELECT active.run_id FROM conversation_runs active "
         " WHERE active.conversation_id=c.conversation_id "
         " AND active.state IN ('leased','starting','running') "
-        " ORDER BY active.run_id DESC LIMIT 1) AS active_run_id "
-        "FROM conversations c JOIN shells s ON s.shell_id=c.shell_id "
+        " ORDER BY active.run_id DESC LIMIT 1) AS active_run_id,"
+        + _SPRINT_MANAGED_COLUMN
+        + " FROM conversations c JOIN shells s ON s.shell_id=c.shell_id "
         "WHERE c.conversation_id=? AND c.owner_user_id=?",
         (conversation_id, owner_user_id),
     ).fetchone()
@@ -424,6 +439,7 @@ def _conversation_projection(row) -> dict:
         "last_activity_at": row["last_activity_at"],
         "closed_at": row["closed_at"],
         "close_requested_at": row["close_requested_at"],
+        "sprint_managed": bool(row["sprint_managed"]),
         "version": int(row["version"]),
     }
 
@@ -1067,8 +1083,9 @@ def _list_conversations(con, operator: dict, query):
         " WHERE requested.conversation_id=c.conversation_id "
         " AND " + _CLOSE_REQUESTED_AFTER_REOPEN +
         " ORDER BY requested.sequence DESC LIMIT 1"
-        ") END AS close_requested_at "
-        "FROM conversations c JOIN shells s ON s.shell_id=c.shell_id WHERE "
+        ") END AS close_requested_at,"
+        + _SPRINT_MANAGED_COLUMN
+        + " FROM conversations c JOIN shells s ON s.shell_id=c.shell_id WHERE "
         + " AND ".join(clauses)
         + " ORDER BY c.last_activity_at DESC,c.conversation_id DESC LIMIT ?",
         (*params, limit + 1),

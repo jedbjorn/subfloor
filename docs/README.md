@@ -1020,14 +1020,13 @@ graph LR
   listener *through the shared mount*. No published port, no route across the NAT, no
   firewall hole, no token: the socket is `chmod 0600`, reachable only by processes
   that share the mount.
-- `windows_devkit` simply `curl --unix-socket`s the four verbs. The key never enters
-  the fork and `virsh` runs only on the host — a compromised sandbox can *ask* for a
-  reset, but cannot script libvirt or read the credential.
-- **GUI driving rides the same seam.** `./sc vm-mcp-relay up` opens an
-  in-sandbox TCP relay (`127.0.0.1:18000`) tunneled through the broker's
-  socket to the guest's Windows-MCP, so `claude mcp add --transport http`
-  reaches it from a sandboxed seat — the `windows_vm_gui` skill's UIA-based
-  exploratory QAQC runs over this.
+- `windows_devkit` uses the typed `./sc vm` status, start, push, exec, capture,
+  and end-only reset commands. The client reaches the broker without exposing
+  the key; `virsh` remains host-only.
+- **GUI driving rides the same seam.** Supported harness adapters inject the
+  managed `windows-mcp` definition before launch. `./sc vm mcp up` starts and
+  verifies the broker tunnel, local relay, and HTTP endpoint used by the
+  `windows_vm_gui` skill — no persistent harness registration is required.
 
 Full design: [`.super-coder/docs/windows-test-vm.md`](../.super-coder/docs/windows-test-vm.md) ·
 [`.super-coder/docs/windows-vm-broker.md`](../.super-coder/docs/windows-vm-broker.md).

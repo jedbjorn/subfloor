@@ -10,8 +10,24 @@ common: false
 Use for an actionable work-unit assignment in an armed Sprint. Marking that
 Sprint message read is acceptance and starts work immediately. If you cannot
 accept, decline with a concrete reason; never leave it unread and waking.
-On every wake or re-entry, load `sprint_dev`, run the exact inbox command below,
-and inspect the durable message before deciding what to do.
+
+Use the simplest path supported by current durable state. Treat ownership,
+lifecycle preconditions, durable writes, and typed handoffs as hard boundaries;
+use judgment for implementation and verification within them. Repeat a read
+only when later activity could have changed it or the next command requires
+live revalidation.
+
+## Route the entry
+
+Load `sprint_dev` on every entry, then classify the trigger:
+
+- For a Sprint assignment, verdict, question, blocker, or other relay message,
+  inspect the Sprint inbox once and handle the relevant message.
+- For a self-describing engine-wide PR fact, inspect that fact and the
+  registered PR directly. Do not manufacture a Sprint inbox item; perform the
+  once-only inbox check immediately before the next typed handoff.
+- For a live FnB instruction, preserve its authority distinctly and inspect
+  only the durable state needed to act safely.
 
 ```text
 sc sprint inbox --sprint <id>
@@ -36,55 +52,42 @@ unit's scope, record the choice and rationale, and continue. Escalate changes to
 the unit boundary, interfaces another unit consumes, deliverable cuts, or scope
 growth to the Planner.
 
-The active-chat registry, not Sprint participant pointers, owns your current
-chat. Assignments use Force-new delivery. A live turn is allowed to finish;
-then, after the receiver has stayed quiet for the configured grace interval,
-delivery atomically closes the exact registry chat and starts a fresh chat with
-the complete undelivered message bundle. Concurrent Force-new wakes coalesce
-into that one rotation, and a retry resumes the chat created for its own wake
-instead of rotating again. Stop cleanly after every typed handoff so the next
-assignment can cross the quiet boundary. The inactivity ceiling remains the
-fallback for a silent hung turn: it unlinks the chat so the reaper can terminate
-its verified process identity and Force-new delivery can proceed.
-
-Plain New remains a separate route: it is eligible immediately, enters a
-verified live turn at its natural boundary, and rotates only when the registry
-chat is idle. Re-enter resumes the registry chat; no registry row behaves as
-New.
+Assignments use Force-new delivery; Reviewer verdicts and engine-wide PR facts
+use Re-enter. Neither displaces a live turn; delivery waits for its natural
+boundary, and the runtime owns bundling, rotation, and recovery. Stop after a
+successful typed handoff so the next delivery can proceed cleanly.
 
 ## Questions, answers, blockers, and failures
 
-Write a concrete question, answer, blocker, or useful context to a short body
-file, then send it durably to the participant who can act:
+Put one concrete question, answer, blocker, or useful context item in a short
+body file, then send it to the participant who owns the next fact or action:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
   --key <stable-key>
 ```
 
-Ask the Planner about scope, priority, or cross-unit decisions; ask the assigned
-Reviewer about review evidence. Answer an incoming question through `send` so it
-wakes the asker, confirm that write, then mark the handled question read with
-`accept`. For a blocker or integrity concern, send the Planner concise evidence,
-impact, the exact action needed, and your recommendation. Continue safe
-independent work, but stop at a decision boundary when the answer is required.
-No immediate response is not a reason to send duplicates: the durable message
-and recovery reconciler own re-waking.
+Ask the Planner about scope, priority, or cross-unit decisions and the Reviewer
+about review evidence. Answer an incoming question through `send`, confirm the
+write, then mark the handled message read with `accept`. For a blocker or
+integrity concern, send the Planner evidence, impact, the exact action needed,
+and your recommendation. Continue safe independent work, but stop at a decision
+boundary when an answer is required. Unread recovery owns re-waking; do not send
+duplicate reminders.
 
 Choose one stable key for the intended recipient and exact body. Reuse it only
 when retrying that same write; use a new key when the recipient or body changes.
 
-Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
-characters is the hard maximum. Before submitting, run `wc -m < <path>` and
-condense if needed. The handoff is complete only when the Sprint command exits
-successfully and confirms the durable write and wake where applicable.
+Keep the body near 6,000 characters and below the 8,000 hard maximum; run
+`wc -m < <path>`. A handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake.
 
-If a Sprint command is rejected or transport fails, the write or handoff is
-incomplete. Correct and retry when safe. If the relay itself fails, surface the
-attempted command, evidence, impact, and recommendation to FnB; do not invent an
-alternate delivery protocol. A Developer does not pause the Sprint. The
-Reviewer decides whether the evidence warrants continuing, re-planning, or
-pausing; the Planner executes that decision.
+If a command is rejected or transport fails, the handoff is incomplete. Correct
+and retry when safe. If the relay itself fails, surface the attempted command,
+evidence, impact, and recommendation to FnB; do not invent an alternate
+protocol. A Developer does not pause the Sprint. The Reviewer decides whether
+the evidence warrants continuing, re-planning, or pausing; the Planner executes
+that decision.
 
 ## Sprint artifact paths
 
@@ -113,6 +116,8 @@ or `request-review`), re-run `sc sprint inbox --sprint <id>` once and act on
 anything new; a ruling may have arrived during the build. This is a once-only
 pre-handoff check. After the handoff confirms its durable write, stop without a
 further inbox pass.
+
+## Report-only or no-code completion
 
 An explicitly planned report-only or no-code lane completes with its durable
 result instead of a PR. Code lanes cannot use this path; they complete only

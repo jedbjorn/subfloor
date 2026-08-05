@@ -13,20 +13,34 @@ before a Sprint exists. The evidence differs; independence does not. The
 Reviewer decides and documents; the Planner acts. The FnB retains the
 board-level override established by decision #46.
 
-## Entry and durable state
+Use the simplest path supported by current durable state. Treat independence,
+authority, lifecycle preconditions, durable writes, and typed handoffs as hard
+boundaries; use judgment for investigation and review within them. Repeat a
+read only when later activity could have changed it or the next command
+requires live revalidation.
 
-Pre-declaration QAQC begins from an explicit Planner or FnB request. Read the
-exact current spec document and sign that body directly; there is no Sprint id
-or Sprint inbox to inspect yet:
+## Route the entry
+
+Classify the entry before reading an inbox:
+
+- Pre-declaration QAQC begins from an explicit Planner or FnB request through
+  the ordinary shell-to-shell channel. Read and sign the exact current spec
+  body directly; there is no Sprint id or Sprint inbox to inspect yet.
+- A work-unit review request or delivery-terminal notification is Sprint-scoped.
+  Inspect the Sprint inbox once and accept the actionable request before work.
+- For a live FnB instruction, preserve its board-level authority distinctly and
+  inspect only the durable state needed for an independent decision.
+
+Record pre-declaration QAQC through the authenticated surface:
 
 ```text
 sc sprint record-qaqc --document <spec-document-id> \
   --verdict pass [--findings-document <document-id>]
 ```
 
-Once a Sprint is armed, every review or conformance entry arrives through its
-durable wake/inbox. On every wake or re-entry, load `sprint_rev`, inspect the
-message, and accept the actionable request before beginning:
+Once a Sprint is armed, review and conformance entries arrive through durable
+wakes. Load `sprint_rev` on every entry, then use the Sprint inbox for the
+Sprint-scoped cases above:
 
 ```text
 sc sprint inbox --sprint <id>
@@ -44,57 +58,45 @@ question, answer, blocker, or context message, run `accept` for that message.
 For informational messages it only marks the message read; it does not change
 Sprint or work-unit state.
 
-Review requests use Force-new delivery. A live turn is allowed to finish;
-then, after the receiver has stayed quiet for the configured grace interval,
-delivery atomically closes the exact registry chat and starts a fresh chat with
-the complete undelivered message bundle. Concurrent Force-new requests coalesce
-into that one rotation, and a retry resumes the chat created for its own wake
-instead of rotating again. Stop cleanly after every typed verdict or decision
-handoff so the next request can cross the quiet boundary. The inactivity ceiling
-and registry reaper remain the fallback for a silent hung turn.
-
-Plain New remains separate and is eligible immediately. It enters a verified
-live turn at its natural boundary and rotates only when the registry chat is idle. Re-enter
-resumes the registry chat; no registry row behaves as New. Reviewer verdicts to
-Developers and decisions to Planners are Re-enter. Reviewers never receive
+Review requests use Force-new delivery. Reviewer verdicts to Developers and
+decisions to Planners use Re-enter. Neither displaces a live turn; delivery
+waits for its natural boundary, and the runtime owns bundling, rotation, and
+recovery. Stop after a successful typed handoff. Reviewers never receive
 PR-event subscription wakes.
 
 ## Questions, answers, blockers, and failures
 
-Put a concrete question, answer, blocker, or useful context in a short body file
-and send it to the participant who can act. Ask the Developer for missing PR
-evidence and the Planner for durable state or action-feasibility facts. Do not
-delegate Reviewer judgment to the Planner:
+Put one concrete question, answer, blocker, or useful context item in a short
+body file and send it to the participant who owns the next fact or action. Ask
+the Developer for missing PR evidence and the Planner for durable state or
+action-feasibility facts. Do not delegate Reviewer judgment to the Planner:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
   --key <stable-key>
 ```
 
-Answer incoming questions through `send` so the answer is durable and wakes the
-asker, confirm that write, then mark the handled question read with `accept`. A
-blocker or integrity concern is evidence for your decision. If action is needed,
-send the Planner the decision, impact, exact action, and recommendation through
-the protocol below. Continue independent safe review, but stop when missing
-facts prevent an honest decision at the decision boundary. Do not send duplicate
-reminders; unread recovery owns re-waking.
+Answer an incoming question through `send`, confirm the write, then mark the
+handled message read with `accept`. A blocker or integrity concern is evidence
+for your decision. If action is needed, send the Planner the decision, impact,
+exact action, and recommendation. Continue safe independent review, but stop at
+the decision boundary when missing facts prevent an honest decision. Unread
+recovery owns re-waking; do not send duplicate reminders.
 
 Choose one stable key for the intended recipient and exact body. Reuse it only
 when retrying that same write; use a new key when the recipient or body changes.
 
-Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
-characters is the hard maximum. Before submitting, run `wc -m < <path>` and
-condense if needed. The handoff is complete only when the Sprint command exits
-successfully and confirms the durable write and wake where applicable.
+Keep the body near 6,000 characters and below the 8,000 hard maximum; run
+`wc -m < <path>`. A handoff is complete only when the Sprint command exits
+successfully and confirms the durable write and wake.
 
-If a Sprint command is rejected or transport fails, the verdict or handoff is
+If a command is rejected or transport fails, the verdict or handoff is
 incomplete. Correct and retry when safe. If the relay itself fails, surface the
 attempted command, evidence, impact, and recommendation to FnB; do not invent an
-alternate delivery protocol. A Reviewer decides whether the condition warrants
-continuing, re-planning, pausing, cancellation, or conclusion, but does not
-invoke the lifecycle transition. Send the durable decision to the Planner, who
-executes it. A live FnB board-level override may supersede that decision and
-must be recorded as FnB authority, not Reviewer judgment.
+alternate protocol. A Reviewer decides whether the condition warrants
+continuing, re-planning, pausing, cancellation, or conclusion; the Planner
+executes the durable decision. Record a live FnB override as FnB authority, not
+Reviewer judgment.
 
 ## Sprint artifact paths
 
@@ -110,26 +112,29 @@ artifact directory are working material only.
 ## Control and conclude decisions
 
 The Reviewer owns all pause, cancel, and conclude decisions and recommendations.
-The Planner owns all resulting actions. Base a decision on durable Sprint state,
+The Planner owns control actions; clean conformance approval atomically performs
+its own close. Base a decision on durable Sprint state,
 the exact bound revisions, current work/PR facts, liveness evidence, and any
 ratified judgment; ambiguous silence is not enough to corrupt a disposition.
 
-Send each decision to the Planner through the durable `send` surface above. The
-Reviewer → Planner route is Re-enter. The body must name:
+Send pause, resume, replan, re-enter, cancel, and abort decisions through the
+durable `send` surface above. A clean conclude instead runs the atomic
+`record-conformance` close below. Every Reviewer → Planner route is Re-enter.
+The Reviewer-authored body must name:
 
-- `decision`: `pause`, `resume`, `replan`, `re-enter`, `cancel`, `conclude`, or
-  `abort`;
+- `decision`: `pause`, `resume`, `replan`, `re-enter`, `cancel`, or `abort`;
 - the evidence and rationale owned by the Reviewer;
 - exact Sprint/work-unit ids, reason, outcome, and complete action arguments;
-- for conclude, the conformance report/follow-up ids, stable completion key,
-  and full Reviewer-authored final Sprint report body; and
 - any immediate safety impact that the FnB must see.
 
-The Planner accepts the actionable message, verifies the assigned Reviewer,
-and executes exactly that transition. The Reviewer never runs the pause,
-replan, cancel, resume, complete, or abort action. If the action is rejected, inspect
-the returned durable state and issue a new decision only when the evidence
-supports one; never ask the Planner to improvise around a precondition.
+The Planner marks the message handled, verifies the assigned Reviewer, and
+executes exactly that control transition. The clean completion receipt is
+informational because the Sprint is already terminal. The Reviewer never runs
+the standalone pause, replan, cancel, resume, complete, or abort action; its
+clean `record-conformance` command owns the narrow automatic close. If a control
+action is rejected, inspect the returned durable state and issue
+a new decision only when the evidence supports one; never ask the Planner to
+improvise around a precondition.
 
 The FnB board-level override from decision #46 is unaffected. A live FnB
 instruction can direct or supersede any decision; preserve it as a distinct
@@ -257,13 +262,18 @@ After classifying the requirements, choose exactly one branch:
 - **In-Sprint patching required.** Do not run `record-conformance`. Send the
   Planner a durable `re-enter` decision naming every blocking finding; each
   spec task to cut against the governing spec document, with title and
-  description; and the suggested unit grouping, waves, dependencies, and
-  Developer/Reviewer routing. The durable decision is the failed-pass record.
+  description; and the suggested unit grouping, waves, dependencies,
+  Developer/Reviewer routing, and capacity rationale. Identify independent
+  lanes, expected review overlap, useful reserve, and why additional capacity
+  would or would not shorten the critical path. The durable decision is the
+  failed-pass record.
   After three re-entry episodes in one Sprint, escalate the non-convergence to
   FnB instead of starting another patch round.
-- **Clean or post-Sprint-only findings.** Record conformance. Any remaining
-  findings become follow-ups for FnB disposition, then send the Planner the
-  `conclude` decision through the existing close protocol.
+- **Clean or post-Sprint-only findings.** Prepare the conformance report,
+  findings, final Sprint report, reason, and outcome. Submit them through the
+  atomic `record-conformance` protocol below: the engine commits the evidence,
+  completed lifecycle, informational Planner receipt, and wake together. Do not
+  send a separate conclude message.
 
 ## Whole-Sprint conformance
 
@@ -290,27 +300,12 @@ JSON findings array:
 ]
 ```
 
-Record both atomically only after choosing the clean or post-Sprint-only
-branch:
-
 Keep the conformance report and each finding body at about 6,000 characters or
 fewer; 8,000 is the hard maximum for each. Run `wc -m < <report>` and length-check
-each finding body before submission. Require the successful report and
-follow-up receipt before stopping.
+each finding body before submission.
 
-```text
-sc sprint record-conformance \
-  --sprint <id> --body-file <report> --findings-file <json> \
-  --key <stable-pass-key>
-```
-
-This creates append-only conformance evidence and pending follow-ups for FnB
-disposition. Never record conformance first and then reopen an editing lane;
-the re-enter branch defers the report until the added scope reaches terminal
-disposition and a fresh delivery-terminal wake starts the next episode. Surface
-any immediate safety risk to FnB.
-
-Then author the final Sprint report. Name the Reviewer as its author and answer:
+Before recording conformance, author the final Sprint report. Name the Reviewer
+as its author and answer:
 
 1. Which exact scope and revisions governed?
 2. What shipped, through which work units and PRs?
@@ -322,11 +317,29 @@ Then author the final Sprint report. Name the Reviewer as its author and answer:
 
 Keep the final report at about 6,000 characters or fewer and below the 8,000
 hard maximum; run `wc -m < <report>`. Do not smooth discrepancies into a
-success narrative. If the Sprint is done, send the Planner a `conclude`
-decision containing the full report body and the exact completion arguments
-defined in the control protocol. The Planner submits that body unchanged and
-owns only the close action. If the Sprint is not done, send the appropriate
-pause, re-plan, cancel, or abort decision instead.
+success narrative. Keep the final report below 8,000 characters, then choose
+the exact completion reason, terminal outcome, and stable completion key. The
+engine stores the final report unchanged and generates the Planner receipt from
+the committed report and follow-up identities.
+
+Record the clean branch as one atomic final write:
+
+```text
+sc sprint record-conformance \
+  --sprint <id> --body-file <report> --findings-file <json> \
+  --final-report-file <final-report> --reason <reason> --outcome <outcome> \
+  --key <stable-pass-key>
+```
+
+The receipt must name the conformance report id, final report id, follow-up ids,
+completed state, Planner message id, and Planner wake id. This creates
+append-only evidence, pending follow-ups, terminal lifecycle, and one
+informational engine-wide Planner Re-enter in the same transaction. Never
+record conformance first and then close around it; send no conclude message.
+Never reopen an editing
+lane after recording; the re-enter branch defers the report until added scope
+reaches terminal disposition and a fresh delivery-terminal wake starts the next
+episode. Surface any immediate safety risk to FnB.
 
 ## Stop
 
@@ -334,22 +347,25 @@ For unit review, follow the ordered verdict procedure above: inbox handling and
 all evidence work precede `record-review`; the durable verdict is the literal
 last action, then the Reviewer stops.
 
-For the clean or post-Sprint-only branch, require the report and findings to
-replay idempotently. For the re-enter or abort branch, confirm that the decision
-body carries the complete evidence and exact requested action. Then complete
-this final handoff order:
+For the clean or post-Sprint-only branch, require both reports, findings,
+reason, and outcome to replay idempotently. For the re-enter or abort branch,
+confirm that the decision body carries the complete evidence and exact
+requested action. Then complete this final handoff order:
 
 1. Re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and
    mark every handled informational message read with `accept`.
-2. Confirm the Reviewer-authored re-enter, abort, or conclude decision body is
-   final and below the 8,000-character hard maximum.
-3. As the literal final action of the turn, deliver that decision to the
-   Planner:
+2. Confirm every Reviewer-authored artifact and decision body is final and
+   below its 8,000-character hard maximum.
+3. For a clean conclude, run the atomic `record-conformance` command above as
+   the literal final action. When it confirms completed state and all receipt
+   identities, stop immediately; the Planner is already notified.
+4. For re-enter or abort, deliver the decision to the Planner as the literal
+   final action:
 
 ```text
 sc sprint send --sprint <id> --to <planner-shortname> --body-file <path> \
   --key <stable-decision-handoff-key>
 ```
 
-4. When the command confirms the durable write and Planner wake, stop
+5. When the command confirms the durable write and Planner wake, stop
    immediately. Run no trailing command until another native wake arrives.

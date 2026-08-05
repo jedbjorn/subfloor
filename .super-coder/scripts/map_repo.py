@@ -159,13 +159,22 @@ def git(*args: str) -> str | None:
 
 
 def is_source_repo() -> bool:
-    """In a fork, .super-coder is infrastructure (skip it). In the SOURCE repo
-    the engine IS the project, so map it too. Names canonical in
-    install.SOURCE_REPO_NAMES (super-coder → subfloor rename: both valid)."""
-    from install import SOURCE_REPO_NAMES
-    url = git("remote", "get-url", "origin")
-    return bool(url) and (url.rstrip("/").split("/")[-1].removesuffix(".git")
-                          in SOURCE_REPO_NAMES)
+    """Answer whether the mapped repo owns the engine source it contains.
+
+    For the home repo, reuse install's canonical remote-or-tracked detection so
+    a remote-less source checkout such as sc-cachy remains a source repo. For an
+    external work repo, inspect that mapped tree directly; the home repo's
+    identity must not leak into the answer.
+    """
+    import install
+    if MAP_ROOT == REPO_ROOT:
+        return install.is_source_repo()
+    tracked = subprocess.run(
+        ["git", "-C", str(MAP_ROOT), "ls-files", "--",
+         ".super-coder/schema.sql"],
+        capture_output=True, text=True,
+    )
+    return tracked.returncode == 0 and bool(tracked.stdout.strip())
 
 
 # ── Dependency parsers (best-effort; each guarded) ───────────────────────────

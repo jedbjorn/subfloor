@@ -3,6 +3,12 @@
 -- Preserve the generalized 0164 wake schema while accepting the third declared
 -- type.  Quiet observation is receiver-wake state, separate from available_at,
 -- which remains the retry/recovery scheduling boundary.
+--
+-- migrate: foreign-keys-off
+-- (The bare PRAGMA below is a no-op inside the runner's transaction; the
+-- marker is what actually disables enforcement. Without it the DROP TABLE
+-- wake_message fails on any install whose sprint_wake_messages /
+-- sprint_liveness_expectations tables are non-empty.)
 
 PRAGMA foreign_keys=OFF;
 

@@ -5,6 +5,12 @@
   "boot_artifact": "AGENTS.md",
   "emit": [],
   "env": {},
+  "mcp": {
+    "streamable_http": {
+      "supported": false,
+      "reason": "the Kimi adapter has no managed streamable-HTTP MCP injection"
+    }
+  },
   "headless": {
     "launch": ["kimi"],
     "prompt_flag": "-p",

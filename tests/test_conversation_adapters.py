@@ -33,6 +33,7 @@ from conversation_adapters import (  # noqa: E402
     ReconcileResult,
     adapter_for,
 )
+from conversation_adapters import codex as codex_adapter
 from conversation_adapters import opencode as opencode_adapter
 from conversation_adapters.base import SubprocessRunner
 
@@ -632,6 +633,10 @@ class ConversationAdapterTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name).resolve()
+        self.linked_vm = mock.patch(
+            "run.linked_vm_configured", return_value=True
+        )
+        self.linked_vm.start()
         global WORKTREE
         WORKTREE = self.root
         self.context = ConversationContext(
@@ -645,6 +650,7 @@ class ConversationAdapterTest(unittest.TestCase):
         self.kimi_runner_serial = 0
 
     def tearDown(self) -> None:
+        self.linked_vm.stop()
         self.temp.cleanup()
 
     def write_claude_session(
@@ -653,24 +659,36 @@ class ConversationAdapterTest(unittest.TestCase):
         session_ref: str,
         *,
         terminal: bool = True,
+        stored_cwds: list[Path] | None = None,
     ) -> None:
         path = adapter._session_path(session_ref, self.root)
-        path.parent.mkdir(parents=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cwd_rows = stored_cwds or [self.root]
         rows = [
             {
                 "type": "system",
                 "subtype": "init",
                 "session_id": session_ref,
-                "cwd": str(self.root),
+                "cwd": str(cwd_rows[0]),
             }
         ]
+        middle_cwds = cwd_rows[1:-1] if terminal else cwd_rows[1:]
+        rows.extend(
+            {
+                "type": "assistant",
+                "session_id": session_ref,
+                "cwd": str(stored_cwd),
+                "message": {"content": "working"},
+            }
+            for stored_cwd in middle_cwds
+        )
         if terminal:
             rows.append(
                 {
                     "type": "result",
                     "subtype": "success",
                     "session_id": session_ref,
-                    "cwd": str(self.root),
+                    "cwd": str(cwd_rows[-1]),
                     "result": "done",
                 }
             )
@@ -1063,6 +1081,15 @@ class ConversationAdapterTest(unittest.TestCase):
         adapter, runner = self.build("claude")
         turn = adapter.start(self.context, "hello")
         argv = runner.calls[-1][0]
+        injection = [
+            "--mcp-config",
+            (
+                '{"mcpServers":{"windows-mcp":{"type":"http",'
+                '"url":"http://127.0.0.1:18000/mcp"}}}'
+            ),
+        ]
+        self.assertEqual(argv[1:3], injection)
+        self.assertEqual(argv.count("--mcp-config"), 1)
         self.assertIn("--session-id", argv)
         self.assertNotIn("--resume", argv)
         self.assertIn("--include-partial-messages", argv)
@@ -1073,6 +1100,95 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertNotIn("--session-id", argv)
         self.assertTrue(adapter.interrupt(resumed).acknowledged)
         self.assertEqual(runner.processes[-1].signals, [signal.SIGINT])
+
+    def test_claude_resume_accepts_resolved_worktree_descendants(self) -> None:
+        adapter, runner = self.build("claude")
+        session_ref = "11111111-1111-4111-8111-111111111111"
+        descendant = self.root / "project" / "src"
+        descendant.mkdir(parents=True)
+        self.write_claude_session(
+            adapter,
+            session_ref,
+            stored_cwds=[self.root, descendant, self.root],
+        )
+
+        inspection = adapter.inspect(session_ref, self.context)
+        resumed = adapter.resume(session_ref, self.context, "again")
+        argv, cwd, _env = runner.calls[-1]
+
+        self.assertTrue(inspection.exists)
+        self.assertEqual(inspection.state, "idle")
+        self.assertEqual(resumed.session_ref, session_ref)
+        self.assertEqual(cwd, self.root)
+        self.assertEqual(argv[argv.index("--resume") + 1], session_ref)
+        self.assertNotIn("--session-id", argv)
+
+    def test_claude_resume_rejects_resolved_paths_outside_worktree(self) -> None:
+        adapter, runner = self.build("claude")
+        with (
+            tempfile.TemporaryDirectory(
+                prefix=f"{self.root.name}-",
+                dir=self.root.parent,
+            ) as prefix_sibling_dir,
+            tempfile.TemporaryDirectory(
+                prefix="outside-",
+                dir=self.root.parent,
+            ) as unrelated_dir,
+        ):
+            prefix_sibling = Path(prefix_sibling_dir).resolve()
+            unrelated = Path(unrelated_dir).resolve()
+            external_target = unrelated / "target"
+            external_target.mkdir()
+            symlink_escape = self.root / "escape"
+            symlink_escape.symlink_to(external_target, target_is_directory=True)
+            rejected = {
+                "parent": self.root.parent,
+                "prefix-sharing sibling": prefix_sibling,
+                "unrelated": unrelated,
+                "symlink escape": symlink_escape,
+            }
+
+            for index, (label, stored_cwd) in enumerate(rejected.items(), 1):
+                with self.subTest(path_kind=label):
+                    session_ref = (
+                        f"00000000-0000-4000-8000-{index:012d}"
+                    )
+                    self.write_claude_session(
+                        adapter,
+                        session_ref,
+                        stored_cwds=[self.root, stored_cwd, self.root],
+                    )
+                    spawn_count = len(runner.calls)
+
+                    with self.assertRaisesRegex(
+                        AdapterError,
+                        "HARNESS_WORKTREE_MISMATCH",
+                    ):
+                        adapter.resume(session_ref, self.context, "again")
+
+                    self.assertEqual(len(runner.calls), spawn_count)
+
+    def test_codex_app_server_receives_managed_mcp_before_subcommand(self) -> None:
+        native = FakeCodexRpc()
+        with mock.patch.object(
+            codex_adapter,
+            "JsonLineRpcProcess",
+            return_value=native,
+        ) as process:
+            adapter = CodexAdapter()
+            adapter.start(self.context, "hello")
+
+        self.assertEqual(
+            process.call_args.kwargs["argv"],
+            [
+                "codex",
+                "-c",
+                'mcp_servers.windows-mcp.url="http://127.0.0.1:18000/mcp"',
+                "app-server",
+                "--stdio",
+            ],
+        )
+        self.assertEqual(process.call_args.kwargs["cwd"], self.root)
 
     def test_kimi_discovers_native_identity_before_stream_and_resumes_exactly(
         self,

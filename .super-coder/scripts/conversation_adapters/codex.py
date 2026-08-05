@@ -26,6 +26,7 @@ from .base import (
     ensure_exact_session,
     ensure_nonempty_message,
     load_manifest,
+    managed_mcp_launch_args,
     merged_env,
     terminal_outcome,
 )
@@ -225,7 +226,14 @@ class CodexAdapter(ConversationAdapter):
 
     def _transport(self, context: ConversationContext) -> RpcTransport:
         if self._rpc is None:
+            launch = self.manifest["launch"][0]
             self._rpc = JsonLineRpcProcess(
+                argv=[
+                    launch,
+                    *managed_mcp_launch_args(self.manifest),
+                    "app-server",
+                    "--stdio",
+                ],
                 cwd=context.checked_worktree(),
                 env=merged_env(self.manifest, context),
             )
