@@ -913,6 +913,12 @@ class SprintSkillTest(unittest.TestCase):
         self.assertIn(
             "participant pickup belongs to native delivery", bodies["sprint_prep"]
         )
+        self.assertIn(
+            "moderate share of eligible shells", bodies["sprint_prep"]
+        )
+        self.assertIn(
+            "one Developer and one Reviewer", bodies["sprint_prep"]
+        )
         planner = " ".join(bodies["sprint_pln"].split())
         for fact in (
             "scheduled dispatch",
