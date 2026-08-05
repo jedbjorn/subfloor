@@ -7,7 +7,7 @@
       "broker": {"ready": true},
       "domain": {"name": "win-test", "state": "running"},
       "ssh": {"ready": true, "last_error": null},
-      "mcp": {"tunnel_running": false},
+      "mcp": {"tunnel_running": false, "unverified": false},
       "relay": {"state": "deferred"},
       "endpoint": {"state": "deferred"},
       "adapter": {"state": "deferred"}

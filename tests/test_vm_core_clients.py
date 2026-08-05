@@ -53,6 +53,7 @@ class BrokerReadinessTests(unittest.TestCase):
              mock.patch.object(vm, "_ssh_ready", return_value=(False, "not ready")), \
              mock.patch.object(vm, "mcp_status", return_value={
                  "ok": True, "running": False, "pid": None, "socket": None,
+                 "unverified": False,
              }), \
              mock.patch.object(vm, "_run") as run:
             result = vm.do_status()
@@ -63,6 +64,32 @@ class BrokerReadinessTests(unittest.TestCase):
             "ssh_ready": False,
             "ssh_error": "not ready",
             "mcp_tunnel_running": False,
+            "mcp_tunnel_unverified": False,
+        })
+        run.assert_not_called()
+
+    def test_status_reports_a_live_unverified_tunnel_without_mutation(self):
+        with mock.patch.object(vm, "read", return_value=SAVED), \
+             mock.patch.object(vm, "_domain_state", return_value=(True, "running")), \
+             mock.patch.object(vm, "_ssh_ready", return_value=(True, None)), \
+             mock.patch.object(vm, "mcp_status", return_value={
+                 "ok": True,
+                 "running": False,
+                 "pid": None,
+                 "socket": str(vm.MCP_SOCKET),
+                 "listening": True,
+                 "unverified": True,
+             }), \
+             mock.patch.object(vm, "_run") as run:
+            result = vm.do_status()
+        self.assertEqual(result, {
+            "ok": True,
+            "domain": "win-test",
+            "domain_state": "running",
+            "ssh_ready": True,
+            "ssh_error": None,
+            "mcp_tunnel_running": False,
+            "mcp_tunnel_unverified": True,
         })
         run.assert_not_called()
 
@@ -341,12 +368,49 @@ class PublicClientTests(unittest.TestCase):
             "ssh_ready": True,
             "ssh_error": None,
             "mcp_tunnel_running": False,
+            "mcp_tunnel_unverified": False,
         }
         with mock.patch.object(vm, "broker_call", return_value=response) as call:
             result = vm.run_operation("status")
         self.assertEqual(result, GOLDEN["status_success"])
         call.assert_called_once_with(
             "GET", "/status", None, timeout=vm.DEFAULT_CLIENT_TIMEOUT
+        )
+
+    def test_status_preserves_unverified_tunnel_state(self):
+        response = {
+            "ok": True,
+            "domain": "win-test",
+            "domain_state": "powered_off",
+            "ssh_ready": True,
+            "ssh_error": None,
+            "mcp_tunnel_running": False,
+            "mcp_tunnel_unverified": True,
+        }
+        with mock.patch.object(vm, "broker_call", return_value=response):
+            result = vm.run_operation("status")
+        self.assertEqual(result["result"]["mcp"], {
+            "tunnel_running": False,
+            "unverified": True,
+        })
+        self.assertEqual(result["error"], None)
+
+    def test_status_human_output_names_an_unverified_tunnel(self):
+        value = {
+            "schema_version": 1,
+            "ok": True,
+            "operation": "status",
+            "result": {
+                "domain": {"name": "win-test", "state": "powered_off"},
+                "ssh": {"ready": True, "last_error": None},
+                "mcp": {"tunnel_running": False, "unverified": True},
+            },
+            "error": None,
+        }
+        self.assertEqual(
+            vm._human_result(value),
+            "VM powered_off · SSH ready · broker ready · MCP tunnel unverified · "
+            "relay/endpoint deferred to WU7 · adapter deferred to WU10",
         )
 
     def test_start_json_matches_golden_shape_and_uses_longer_budget(self):
@@ -582,6 +646,7 @@ class PublicClientTests(unittest.TestCase):
                 "broker.ready",
                 "ssh.last_error",
                 "mcp.tunnel_running",
+                "mcp.unverified",
                 "relay.state",
                 "endpoint.state",
                 "adapter.state",
@@ -597,8 +662,9 @@ class PublicClientTests(unittest.TestCase):
                  self.assertRaises(SystemExit) as raised:
                 vm.client_main([command, "--help"])
             self.assertEqual(raised.exception.code, 0)
+            help_text = " ".join(output.getvalue().split())
             for field in expected:
-                self.assertIn(field, output.getvalue())
+                self.assertIn(field, help_text)
 
 
 if __name__ == "__main__":

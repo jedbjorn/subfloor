@@ -645,6 +645,7 @@ def do_status() -> dict:
         "ssh_ready": ssh_ready,
         "ssh_error": ssh_error,
         "mcp_tunnel_running": bool(tunnel["running"]),
+        "mcp_tunnel_unverified": bool(tunnel.get("unverified")),
     }
 
 
@@ -1366,7 +1367,10 @@ def run_operation(operation: str) -> dict:
                     "ready": bool(response["ssh_ready"]),
                     "last_error": response.get("ssh_error"),
                 },
-                "mcp": {"tunnel_running": bool(response["mcp_tunnel_running"])},
+                "mcp": {
+                    "tunnel_running": bool(response["mcp_tunnel_running"]),
+                    "unverified": bool(response.get("mcp_tunnel_unverified")),
+                },
                 # Keep the deferred fields stable without exposing this repo's
                 # local planning identifiers in the public result.
                 "relay": {"state": "deferred"},
@@ -1417,9 +1421,18 @@ def _human_result(value: dict) -> str:
     result = value["result"]
     if operation == "status":
         ssh = "ready" if result["ssh"]["ready"] else "not ready"
+        mcp = (
+            "MCP tunnel unverified"
+            if result["mcp"]["unverified"]
+            else (
+                "MCP tunnel running"
+                if result["mcp"]["tunnel_running"]
+                else "MCP tunnel not running"
+            )
+        )
         return (
             f"VM {result['domain']['state']} · SSH {ssh} · broker ready · "
-            "relay/endpoint deferred to WU7 · adapter deferred to WU10"
+            f"{mcp} · relay/endpoint deferred to WU7 · adapter deferred to WU10"
         )
     if operation == "start":
         action = "started" if result["started"] else "already running"
@@ -1438,7 +1451,8 @@ def client_main(argv: list[str]) -> int:
         help="observe VM readiness without mutation",
         description=(
             "Read-only status. JSON result fields: broker.ready; domain.name, "
-            "domain.state; ssh.ready, ssh.last_error; mcp.tunnel_running; "
+            "domain.state; ssh.ready, ssh.last_error; mcp.tunnel_running, "
+            "mcp.unverified; "
             "relay.state and endpoint.state (deferred to work unit 7); "
             "adapter.state (deferred to work unit 10)."
         ),
