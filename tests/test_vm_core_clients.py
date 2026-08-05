@@ -654,6 +654,16 @@ class PublicClientTests(unittest.TestCase):
                 "work unit 10",
             ),
             "start": ("started", "ssh.attempts", "ssh.last_error"),
+            "push": ("source", "destination"),
+            "exec": ("--command-file", "exit_code", "stdout", "stderr"),
+            "capture": (
+                "--output",
+                ".sc-state/local",
+                "path",
+                "bytes",
+                "format",
+                "mime_type",
+            ),
             "reset": ("domain.state", "snapshot", "--off"),
         }
         for command, expected in cases.items():

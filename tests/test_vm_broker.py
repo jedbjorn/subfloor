@@ -147,7 +147,18 @@ class VerbDispatchTests(unittest.TestCase):
         with mock.patch.object(vm, "read", return_value=cfg):
             r = vm.do_push(src, "staged.py")
         self.assertTrue(r["ok"], r)
-        self.assertTrue((Path(share) / "staged.py").is_file())
+        target = Path(share) / "staged.py"
+        self.assertTrue(target.is_file())
+        self.assertEqual(r["source"], str(Path(src).resolve()))
+        self.assertEqual(r["destination"], str(target.resolve()))
+
+    def test_capture_missing_domain_is_a_failure_without_screenshot_data(self):
+        with mock.patch.object(vm, "read", return_value={}):
+            r = vm.do_capture()
+        self.assertEqual(r, {
+            "ok": False,
+            "screenshot_error": "missing required field(s): domain",
+        })
 
     def test_exec_survives_non_utf8_guest_output(self):
         # #261: Windows guests routinely emit non-UTF-8 (UTF-16 files, OEM
