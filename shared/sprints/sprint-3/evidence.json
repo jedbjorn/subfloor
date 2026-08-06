@@ -1,0 +1,206 @@
+{
+  "anomalies": {
+    "events": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    },
+    "failed_wakes": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    }
+  },
+  "conformance": {
+    "final_reports": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    },
+    "followups": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    },
+    "missing_conformance": true,
+    "missing_final_report": true,
+    "reports": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    }
+  },
+  "full_history_links": {
+    "participant_conversations": [
+      {
+        "conversation_id": "cv_4dc0252d3f5a48bd826f3d6cf9e92d8d",
+        "conversation_scope": "sprint",
+        "role": "developer",
+        "shell_id": 11,
+        "sprint_participant_id": 18,
+        "state": "running",
+        "url": "/api/conversations/cv_4dc0252d3f5a48bd826f3d6cf9e92d8d"
+      },
+      {
+        "conversation_id": "cv_bc0b9f1be3a54f668986f413e8fabc84",
+        "conversation_scope": "sprint",
+        "role": "reviewer",
+        "shell_id": 8,
+        "sprint_participant_id": 19,
+        "state": "closed",
+        "url": "/api/conversations/cv_bc0b9f1be3a54f668986f413e8fabc84"
+      },
+      {
+        "conversation_id": "cv_c534acca53104c5589cf389f4b1bf2f2",
+        "conversation_scope": "sprint",
+        "role": "reviewer",
+        "shell_id": 8,
+        "sprint_participant_id": 19,
+        "state": "running",
+        "url": "/api/conversations/cv_c534acca53104c5589cf389f4b1bf2f2"
+      }
+    ],
+    "timeline": "/_sc/sprint/3/timeline"
+  },
+  "judgments_and_deviations": {
+    "items": [
+      {
+        "body": "Submitting https://github.com/jedbjorn/subfloor/pull/1063; registered Sprint PR 15; head e6361f7db2d842b32b5dc8ef8b9a53d0f6e5ceb2; work unit 18.",
+        "created_at": "2026-08-05 23:25:28",
+        "judgment_id": 59,
+        "kind": "decision",
+        "shell_id": 11,
+        "shortname": "DEV5",
+        "work_unit_id": 18
+      },
+      {
+        "body": "# Review verdict \u2014 Sprint 3, work unit 18, registered PR 15\n\n**Verdict: approved**\n**PR:** https://github.com/jedbjorn/subfloor/pull/1063\n**Reviewed head:** e6361f7db2d842b32b5dc8ef8b9a53d0f6e5ceb2 (exact bound head)\n**Spec:** #116 @ 400fc63cbf2f9d3d3c885fd9f35d07d3d7ddce03926c5ea8b2fae5085df66aa4 (QAQC approval 9, pass)\n**Scope:** task #352 \u2014 source-only installed-fork Sprint canary\n\n## Findings\n\nNo Critical, Major, or Medium findings.\n\n**Low (report note, non-blocking):** the failure receipt's run-state evidence is\nbounded to the board's pickup/delivery projections plus pause reason on the\n`CANARY_SPRINT_FAILED` path; per-conversation run states are not captured\nverbatim on every failure boundary. The receipt still carries stable CanaryError\ncodes, stage, pickup action, and bounded board evidence, which is sufficient for\ndiagnosis. Deepening per-conversation run-state capture is a resilience\nimprovement, not a correctness gap in the delivered behavior.\n\n## Code quality\n\nTraced the real paths, not the names:\n\n- `maintainer/` is confirmed outside `ENGINE_PATHS`\n  (`.super-coder/scripts/engine_manifest.py:56`); no `sc` verb was added, and\n  `test_maintainer_command_is_not_distributed_or_added_as_sc_verb` guards both\n  via AST literal-eval of the manifest plus a dispatcher scan.\n- Container naming matches the live dispatcher: `CNAME=\"sc-$(basename $here)\"`\n  (`dispatch.sh:126`) equals the ledger's `sc-<workspace.name>`; `SC_NET`\n  overrides the network (`dispatch.sh:130`), so launch, preflight collision\n  checks, and cleanup all name the same real resources. Ports land in the\n  8800\u20138899 band consistent with `ports.py` and are held bound from preflight\n  until launch, closing the obvious race.\n- `sc harness-status` docker-execs `harness_versions.py` inside the sandbox\n  (`dispatch.sh:247`), so recorded harness versions are launched-runtime\n  provenance, not host binaries \u2014 exactly what spec item 2 demands.\n- Cleanup identity guards are real: branch deletes require the\n  `subfloor-canary/<run_id>/` prefix, container/network names must equal the\n  expected derived names, workspace removal requires the marker file binding\n  run_id and candidate SHA, and a foreign PR identity refuses close\n  (`test_cleanup_refuses_a_pr_whose_remote_identity_does_not_match` turns this\n  red). Cleanup failure is fatal and preserves the primary failure\n  (`test_cleanup_failure_is_fatal_and_preserves_primary_failure`).\n- The receipt write is atomic (mkstemp + fsync + replace) and recursively\n  redacted; hermetic tests prove secret values never reach disk.\n\n## Edge cases and gaps\n\n- Deadline model verified: per-stage deadlines reset on genuine board-signature\n  progress but remain capped by the whole-run deadline; cleanup gets its own\n  bounded grace so a whole-run timeout cannot strand resources. Covered by\n  `test_deadlines_enforce_stage_whole_run_and_cleanup_grace`.\n- Preflight-before-writes is proven: no receipt, workspace, branch, or container\n  exists when preflight refuses\n  (`test_preflight_failure_happens_before_every_resource_write`).\n- Checked the one sequencing risk against live state: the preflight gate refuses\n  a live dos-app with any prepared/armed/paused Sprint, while task #353 runs the\n  canary before dos-app Sprint 5 recovery. Verified the live dos-app engine DB\n  directly \u2014 Sprint 5 is now `aborted`, so the gate does not conflict with the\n  current floor. No finding.\n- Postgres sidecar cannot leak: it only starts with a `pg` key in instance.json\n  (`dispatch.sh:928`); the disposable install's fresh instance.json has none.\n\n## Spec conformance (spec #116, \"Installed-fork canary\" section)\n\n- Disposable copy at exact base with isolated DB/namespace/ports/worktrees; live\n  dos-app DB never used for the Sprint \u2014 conforms (items 1\u20132).\n- Candidate resolved to one commit, materialized via exact-SHA refspec, engine\n  pin and callable `sc engine-ref` both asserted \u2014 conforms; hermetic test\n  proves the refspec and pin check.\n- Codex Planner with nullable model/effort (exercises #1056), Kimi Reviewer\n  (exercises #1055), closed originating Planner chat forcing a fresh Re-enter\n  whose route must be canonical non-null \u2014 conforms (items 3\u20134).\n- Ephemeral base/head branches only, main-isolation proven by merge-base against\n  origin/main; real PR, real pickup chain to `lifecycle.completed` with no\n  synthetic rows possible (public API + prompts only) \u2014 conforms (items 5\u20136).\n- Stage/whole deadlines fail closed; sanitized durable receipt preserved outside\n  disposable state under gitignored `shared/`; idempotent cleanup with a rerun\n  subcommand \u2014 conforms (items 7\u20138).\n- Lane boundary honored: no live receipt, no dos-app install update, no Sprint 5\n  recovery claimed \u2014 those remain task #353.\n\n## Verification evidence\n\n- All six CI checks pass at the exact reviewed head (tests, verify,\n  render-check, CodeQL \u00d72 + suite).\n- Locally at the reviewed head: `python3 -m unittest\n  tests.test_dos_app_sprint_canary` \u2014 12/12 OK; `tests.test_sprint_removal_manifest` \u2014\n  14/14 OK (fixture manifest consistently extended for the new test file).\n- PR body contains only the work-unit id and spec reference; readiness body was\n  a bare locator. Protocol clean.",
+        "created_at": "2026-08-05 23:33:14",
+        "judgment_id": 60,
+        "kind": "decision",
+        "shell_id": 8,
+        "shortname": "REV2",
+        "work_unit_id": 18
+      }
+    ],
+    "total": 2,
+    "truncated": 0
+  },
+  "packet_version": 1,
+  "pause_and_recovery": {
+    "items": [],
+    "total": 0,
+    "truncated": 0
+  },
+  "planned_vs_actual": {
+    "items": [
+      {
+        "assigned_shell_id": 11,
+        "completed_at": "2026-08-05 23:34:10",
+        "completion_result": null,
+        "created_at": "2026-08-05 22:42:10",
+        "depends_on": [],
+        "disposition": "completed",
+        "expected_output": "A reviewed and merged source-only subfloor maintainer canary outside\n`ENGINE_PATHS`, with no distributed `sc` verb. The implementation must include\nhermetic coverage for preflight, exact-ref materialization, orchestration,\ndeadlines, receipt redaction, partial-failure cleanup, and idempotent cleanup.\nThe post-merge live receipt and dos-app Sprint 5 recovery remain task #353 and\nare not claimed by this editing lane.",
+        "output_kind": "code",
+        "planned_wave": 0,
+        "reviewer_shell_id": 8,
+        "task_ids": [
+          352
+        ],
+        "title": "Source-only dos-app Sprint canary",
+        "updated_at": "2026-08-05 23:34:10",
+        "work_unit_id": 18
+      }
+    ],
+    "total": 1,
+    "truncated": 0
+  },
+  "pr_outcomes": {
+    "items": [
+      {
+        "normalized_state": "merged",
+        "observed_at": "2026-08-05 23:34:10",
+        "observed_head_sha": "e6361f7db2d842b32b5dc8ef8b9a53d0f6e5ceb2",
+        "owner_participant_id": 18,
+        "pr_number": 1063,
+        "registered_at": "2026-08-05 23:13:40",
+        "registered_pr_id": 15,
+        "repository": "jedbjorn/subfloor",
+        "url": "https://github.com/jedbjorn/subfloor/pull/1063",
+        "work_unit_ids": [
+          18
+        ]
+      }
+    ],
+    "total": 1,
+    "truncated": 0
+  },
+  "scope": {
+    "aborted_at": null,
+    "armed_at": "2026-08-05 22:42:30",
+    "completed_at": null,
+    "created_at": "2026-08-05 22:42:06",
+    "feature_id": 31,
+    "feature_title": "Sprints v2.0 \u2014 collaborative orchestration",
+    "lifecycle": "armed",
+    "originating_planner_shell_id": 9,
+    "sprint_id": 3
+  },
+  "spec_revisions": {
+    "bound": [
+      {
+        "approval_id": 9,
+        "bound_revision_sha256": "400fc63cbf2f9d3d3c885fd9f35d07d3d7ddce03926c5ea8b2fae5085df66aa4",
+        "current_revision_sha256": "400fc63cbf2f9d3d3c885fd9f35d07d3d7ddce03926c5ea8b2fae5085df66aa4",
+        "document_id": 116,
+        "included_at": "2026-08-05 22:42:06",
+        "reviewed_at": "2026-08-05 22:39:50",
+        "reviewer_shell_id": 8,
+        "title": "Sprint pickup reliability",
+        "verdict": "pass"
+      }
+    ],
+    "mid_sprint_edits": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    }
+  },
+  "unresolved_work": {
+    "actionable_messages": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    },
+    "followups": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    },
+    "work_units": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    }
+  },
+  "wake_health": {
+    "attempt_outcomes": {
+      "delivered": 5
+    },
+    "escalations": 0,
+    "failed_wakes": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    },
+    "liveness_expectations": {
+      "open": 0,
+      "resolved": 2
+    },
+    "nudges": 0,
+    "wake_states": {
+      "delivered": 5
+    }
+  }
+}
