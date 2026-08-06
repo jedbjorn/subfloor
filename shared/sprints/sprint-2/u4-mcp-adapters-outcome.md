@@ -1,0 +1,1 @@
+A merged implementation PR declares supported/unsupported adapter MCP capabilities, injects the managed endpoint idempotently, and provides verified MCP status/up/down lifecycle. Evidence includes golden repeat-launch coverage and the mandatory live Codex first-turn Windows MCP tool listing; that proof performs no VM reset and records tunnel/relay cleanup separately.

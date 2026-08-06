@@ -1,0 +1,23 @@
+[
+  {
+    "shell_id": 9,
+    "role": "planner",
+    "harness": "codex",
+    "model": "gpt-5.6-sol",
+    "effort": "high"
+  },
+  {
+    "shell_id": 11,
+    "role": "developer",
+    "harness": "codex",
+    "model": "gpt-5.6-sol",
+    "effort": "high"
+  },
+  {
+    "shell_id": 8,
+    "role": "reviewer",
+    "harness": "kimi",
+    "model": "kimi-code/k3",
+    "effort": "high"
+  }
+]

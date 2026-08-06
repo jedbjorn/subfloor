@@ -1,0 +1,1 @@
+A merged integration PR rewrites both Windows skills to the canonical supplied-state, start-if-off, end-only-reset workflow, adds the trailing reseed migration, and closes the focused #1020-#1026 / SC-467 / SC-468 regression matrix. Hermetic render and full-suite verification are green; no live rst-c acceptance or reset occurs in this lane.

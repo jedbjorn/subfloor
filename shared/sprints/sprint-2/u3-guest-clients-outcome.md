@@ -1,0 +1,1 @@
+A merged implementation PR adds shell-safe push/exec and atomic bounded capture artifacts on the shared structured client contract. Tests prove complex PowerShell/Unicode fidelity, allowed-path enforcement, mode-0600 capture output, and cleanup of partial or oversized artifacts without touching or resetting the rst-c VM.

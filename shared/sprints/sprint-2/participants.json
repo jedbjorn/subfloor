@@ -1,0 +1,66 @@
+[
+  {
+    "shell_id": 9,
+    "role": "planner",
+    "harness": "codex",
+    "model": "gpt-5.6-sol",
+    "effort": "high",
+    "route": "codex-cache"
+  },
+  {
+    "shell_id": 5,
+    "role": "developer",
+    "harness": "codex",
+    "model": "gpt-5.6-sol",
+    "effort": "high",
+    "route": "codex-cache"
+  },
+  {
+    "shell_id": 6,
+    "role": "developer",
+    "harness": "codex",
+    "model": "gpt-5.6-sol",
+    "effort": "high",
+    "route": "codex-cache"
+  },
+  {
+    "shell_id": 11,
+    "role": "developer",
+    "harness": "codex",
+    "model": "gpt-5.6-sol",
+    "effort": "high",
+    "route": "codex-cache"
+  },
+  {
+    "shell_id": 12,
+    "role": "developer",
+    "harness": "codex",
+    "model": "gpt-5.6-sol",
+    "effort": "high",
+    "route": "codex-cache"
+  },
+  {
+    "shell_id": 7,
+    "role": "reviewer",
+    "harness": "claude",
+    "model": "opus",
+    "effort": "high",
+    "route": "claude-cli"
+  },
+  {
+    "shell_id": 8,
+    "role": "reviewer",
+    "harness": "claude",
+    "model": "opus",
+    "effort": "high",
+    "route": "claude-cli"
+  },
+  {
+    "shell_id": 13,
+    "role": "reviewer",
+    "harness": "claude",
+    "model": "opus",
+    "effort": "high",
+    "route": "claude-cli"
+  }
+]

@@ -1,0 +1,5 @@
+Planner ruling and merged-unit context for future work unit 10; do not start before its assignment.
+
+Preserve PR #1027's status distinctions: `running` means the tunnel/relay instance is owned and identity-verified; `listening` reports any live listener; `unverified` identifies a listener without owned state; `socket` is present whenever listening. Normalize every primitive result branch into the public `./sc vm` envelope.
+
+Spec #108's bind-failure evidence requirement does not override its public redaction boundary. Never copy raw primitive `output`, stderr, or a Python traceback into `error.details`. Emit stable error fields and, where useful, a bounded `diagnostic_tail` sanitized line-by-line: omit traceback headers, frame paths/source lines, payloads, credentials, and other prohibited content; retain only safe non-stack log lines and a safe final cause summary. If raw bounded logs are retained locally, the public result may reference the allowed local artifact path but not expose the raw content. Tests must prove the sanitizer and every public result branch.

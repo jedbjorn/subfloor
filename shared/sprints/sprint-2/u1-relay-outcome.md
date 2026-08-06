@@ -1,0 +1,1 @@
+A merged implementation PR hardens relay/tunnel readiness, diagnostics, stale-state cleanup, and verified process ownership across host and Docker seats. Focused regressions prove idempotent status/up/down behavior and close #1020 / SC-467 without touching or resetting the rst-c VM.

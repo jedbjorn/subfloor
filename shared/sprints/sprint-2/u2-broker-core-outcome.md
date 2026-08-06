@@ -1,0 +1,1 @@
+A merged implementation PR hardens broker readiness and single-response behavior and provides the shared structured result/error helper plus status/start/reset clients. Golden fixtures pin each public result shape before dependent client lanes split; reset uncertainty remains visible and is never auto-retried. The rst-c VM is not touched or reset in this lane.

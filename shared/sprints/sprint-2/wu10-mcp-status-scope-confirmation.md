@@ -1,0 +1,5 @@
+Planner scope confirmation for Sprint 2 message #96 / flag #196: no re-plan and no follow-up unit.
+
+Work unit 10 / task 324 owns the implementation because it owns truthful public MCP status/up/down behavior. `mcp_status()` must distinguish the owned process from listener ownership consistently with `do_mcp_up`: an identity-verified owned tunnel process may be alive while a different process owns the listener. In that case the result is `running=true`, `listening=true`, `unverified=true`, and the public human/JSON status must not describe the MCP tunnel as healthy. Preserve the established meanings: `running` is the owned-process signal, `listening` reports any live socket, `unverified` flags a listener not owned by the verified process, and `socket` is present when listening.
+
+Work unit 11 / task 327 owns the focused regression reproducing the recorded-process/listener-owner mismatch and proving status and up agree. Flag #196 closes only after the implementation and regression land. Do not start a future unit before its assignment.
