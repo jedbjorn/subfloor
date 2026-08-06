@@ -354,6 +354,11 @@ def apply_sandbox(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
     return _merge_json_spec((adapter.get("sandbox") or {}).get("merge_json") or {}, root)
 
 
+def execution_mode() -> str:
+    """Name the seat that the current launcher process actually occupies."""
+    return "container" if os.environ.get("SC_SANDBOX") else "host"
+
+
 def shell_work_dir(shortname: "str | None", flavor: "str | None") -> Path:
     """The one worktree rule, shared by every boot path (interactive CLI,
     headless `sc run`, Interface exec): the admin flavor boots at the repo
@@ -1242,7 +1247,8 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
                            floor_note=floor_note,
                            source_mode=install.is_source_repo(),
                            api_key=full["api_key"],
-                           api_port=api_port)
+                           api_port=api_port,
+                           launch_mode=execution_mode())
     render_harness_skills(
         con, full["shell_id"], work_dir, adapter
     )
@@ -1668,7 +1674,8 @@ def main() -> None:
                                floor_note=floor_note,
                                source_mode=install.is_source_repo(),
                                api_key=full["api_key"],
-                               api_port=api_port)
+                               api_port=api_port,
+                               launch_mode=execution_mode())
 
         # Render this shell's granted skills to every directory declared by the
         # selected harness — gitignored and rebuilt per boot.

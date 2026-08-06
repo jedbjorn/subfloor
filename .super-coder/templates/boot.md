@@ -38,10 +38,8 @@ different ways, so keep them straight:
   Gitignored and rebuilt from tracked text. **Write through `sc mem`** — the
   write lands in the live engine DB, durable and visible to all. `sc mem which`
   confirms the API is reachable and which shell this session resolves as.
-  `sc mem` routes through the engine API (no direct-DB fallback). If it reports
-  "API unreachable", the engine server is down — surface this to FnB; they
-  restart it with `sc restart` / `make dos-r`. Do not retry silently; surface
-  the error and stop.
+  `sc mem` routes through the engine API (no direct-DB fallback).
+{{api_unreachable_guidance}}
 - **App product DB** — the database of the product *this repo* builds. Its name
   and path **vary per fork** and live **outside** `.super-coder/`. Holds the
   product's runtime data + schema. Change it the way the product does — schema
@@ -224,20 +222,6 @@ cleanup, what not to commit: the `git` skill; flag detail: the `flags` skill.
 
 ---
 
-## RUNNING THE APP
-
-You run **inside the sandbox container**; this repo is bind-mounted in at its host
-path. The app the FnB watches in their browser is a **separate instance** — the
-host-supervised stack, outside your container. So there are two runtimes with two
-homes — keep them apart:
-
-- **Project dev servers** (vite, `npm run dev`, etc.) belong in the **sandbox**,
-  bound to `0.0.0.0:$SC_DEV_PORT` — the per-fork port `sc launch` publishes to
-  the host for exactly this. Reach it at `http://127.0.0.1:$SC_DEV_PORT`.
-- **A process-supervised host stack** (pm2 / `make`) is owned by its supervisor.
-  Start/stop/restart only through it (`make up`, `make restart`) — never a bare
-  `vite dev` / `npm run dev` on the host. A hand-run dev server races the
-  supervised process for its port, fails to bind, and orphans — taking the app
-  down.
+{{execution_context}}
 
 ---
