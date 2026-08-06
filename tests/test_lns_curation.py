@@ -375,12 +375,16 @@ class CurationGovernanceTest(unittest.TestCase):
         self.assertIn("FnB-authorized exception", reporting)
         self.assertIn("administrator-owned", reporting)
 
-    def test_admin_asset_seed_snapshot_workflow_remains_explicit(self):
+    def test_planner_db_first_skill_workflow_remains_explicit(self):
         text = (
             ENGINE / "assets" / "skills" / "local_skill_management" / "SKILL.md"
         ).read_text()
-        self.assertIn("file -> seed -> grant -> local snapshot", text)
-        self.assertIn("SC_ADMIN=1 sc snapshot", text)
+        self.assertIn("sc skill put --file", text)
+        self.assertIn("requires the launched shell identity to resolve as Planner", text)
+        self.assertIn("DB + snapshot + flat render + skill projections reconciled", text)
+        self.assertIn("Creation alone grants nothing", text)
+        self.assertNotIn("file -> seed -> grant -> local snapshot", text)
+        self.assertNotIn("SC_ADMIN=1 sc snapshot", text)
 
     def test_trailing_migration_matches_changed_skill_assets_exactly(self):
         con = sqlite3.connect(self.db)

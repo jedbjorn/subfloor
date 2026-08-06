@@ -1346,24 +1346,21 @@ def run_script(key: str) -> dict | None:
 
 def run_snapshot_render() -> str:
     """The header 'save locally ⤓' shortcut — serialize then render."""
-    snap = run_script("snapshot")
-    if not snap["ok"]:
-        raise RuntimeError("snapshot failed:\n" + snap["output"])
-    rend = run_script("render")
-    if not rend["ok"]:
-        raise RuntimeError("render failed:\n" + rend["output"])
+    with artifact_policy.content_write_lock():
+        snap = run_script("snapshot")
+        if not snap["ok"]:
+            raise RuntimeError("snapshot failed:\n" + snap["output"])
+        rend = run_script("render")
+        if not rend["ok"]:
+            raise RuntimeError("render failed:\n" + rend["output"])
     return (snap["output"] + "\n" + rend["output"]).strip()
 
 
 # ONE serialization boundary for every path that writes the non-atomic
 # snapshot/render outputs (content.sql + the flat-render mirror): mem doc writes
 # (serialize_doc_write) and the header '/api/snapshot' shortcut. Held at the
-# caller level only: run_snapshot_render() itself never takes it.
-#
-# SINGLE-WRITER CONSTRAINT: this is an in-process lock only. It is sufficient
-# because rendered artifacts are created solely by manual admin-shell or GUI
-# actions — no concurrent writers exist in real use. Do not add writers outside
-# this process without first adding an appropriate cross-process lock.
+# caller level. run_snapshot_render also takes the cross-process artifact lock,
+# which serializes API writes against the first-class `sc skill` CLI writer.
 _CONTENT_WRITE_LOCK = threading.Lock()
 
 

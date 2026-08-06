@@ -20,12 +20,12 @@ DB_PATH = ENGINE / "shell_db.db"
 
 sys.path.insert(0, str(ENGINE / "render"))
 sys.path.insert(0, str(ENGINE / "scripts"))
-import artifact_policy  # noqa: E402
-import db_driver  # noqa: E402
-import flat  # noqa: E402
-import skill_projection  # noqa: E402
-from _serialize_guard import require_admin  # noqa: E402
-from seed_skills import sync_engine_skills  # noqa: E402
+import artifact_policy
+import db_driver
+import flat
+import skill_projection
+from _serialize_guard import require_admin
+from seed_skills import sync_engine_skills
 
 
 def _open():
@@ -67,6 +67,12 @@ def _report(label: str, summary: dict) -> None:
         print(f"  {marker} {p.relative_to(flat.REPO_ROOT)}")
 
 
+def persist_visibility(con) -> dict:
+    """Persist the ignored flat DB projection for an authorized mutation."""
+    artifact_policy.prepare_local_state()
+    return flat.render_visibility(con)
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         sys.exit(__doc__)
@@ -76,16 +82,14 @@ def main(argv: list[str]) -> int:
         if mode == "flat":
             require_admin("render flat")
             _heal_fresh(con)
-            artifact_policy.prepare_local_state()
-            _report("flat", flat.render_visibility(con))
+            _report("flat", persist_visibility(con))
         elif mode in ("skills", "all"):
             if len(argv) < 2:
                 sys.exit(f"render: `{mode}` needs a shell shortname")
             if mode == "all":
                 require_admin("render flat")
                 _heal_fresh(con)
-                artifact_policy.prepare_local_state()
-                _report("flat", flat.render_visibility(con))
+                _report("flat", persist_visibility(con))
             shell = _resolve_shell(con, argv[1])
             checkout = skill_projection.shell_checkout(
                 shell["shortname"], shell["flavor"]
