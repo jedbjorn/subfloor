@@ -1,7 +1,7 @@
--- 0186 — publish the Planner DB-first local skill lifecycle.
+-- 0187 — publish the Planner DB-first local skill lifecycle.
 --
 -- Full-body UPSERT converges fully migrated installations after 0156 reseeds
--- the previous local_skill_management body. Sprint decision message #228
+-- the previous local_skill_management body. REV2 decision message #228
 -- requires this trailing reseed and strict isolation from unrelated seed drift.
 
 BEGIN;
