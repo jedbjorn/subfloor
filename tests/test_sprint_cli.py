@@ -719,6 +719,429 @@ class SprintCliApiTest(unittest.TestCase):
         finally:
             con.close()
 
+    def test_declare_binds_current_spec_without_qaqc_evidence(self):
+        self.use_isolated_db()
+        con = sqlite3.connect(self.db)
+        try:
+            feature_id = int(
+                con.execute(
+                    "INSERT INTO roadmap (title,roadmap_status) "
+                    "VALUES ('Direct declaration','in_progress')"
+                ).lastrowid
+            )
+            body = "current direct spec body"
+            document_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',1,'Direct spec',?)",
+                    (feature_id, body),
+                ).lastrowid
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        sprint_id = self.run_cli(
+            TOKENS["planner"],
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec",
+            str(document_id),
+            "--participants-file",
+            self.participants_file(),
+            "--merge-grant",
+        )["sprint_id"]
+
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                (document_id, hashlib.sha256(body.encode()).hexdigest(), None),
+                con.execute(
+                    "SELECT document_id,bound_revision_sha256,approval_id "
+                    "FROM sprint_specs WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone(),
+            )
+            self.assertEqual(
+                0,
+                con.execute("SELECT COUNT(*) FROM sprint_spec_approvals").fetchone()[0],
+            )
+            payload = json.loads(
+                con.execute(
+                    "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='sprint.declared'",
+                    (sprint_id,),
+                ).fetchone()[0]
+            )
+            self.assertEqual([document_id], payload["spec_document_ids"])
+            self.assertNotIn("spec_approval_ids", payload)
+        finally:
+            con.close()
+
+    def test_legacy_selector_is_verdict_agnostic_and_mixed_input_deduplicates(self):
+        self.use_isolated_db()
+        con = sqlite3.connect(self.db)
+        try:
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id,api_key) "
+                "VALUES (6,'Active reviewer','REV2','reviewer','prompt',1,'rev2-token')"
+            )
+            feature_id = int(
+                con.execute(
+                    "INSERT INTO roadmap (title,roadmap_status) "
+                    "VALUES ('Legacy declaration','in_progress')"
+                ).lastrowid
+            )
+            old_body = "historically reviewed body"
+            current_body = "current body after review"
+            document_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',1,'Legacy spec',?)",
+                    (feature_id, old_body),
+                ).lastrowid
+            )
+            approval_id = int(
+                con.execute(
+                    "INSERT INTO sprint_spec_approvals "
+                    "(document_id,revision_sha256,reviewer_shell_id,verdict) "
+                    "VALUES (?,?,2,'fail')",
+                    (document_id, hashlib.sha256(old_body.encode()).hexdigest()),
+                ).lastrowid
+            )
+            con.execute(
+                "UPDATE documents SET body=? WHERE document_id=?",
+                (current_body, document_id),
+            )
+            con.execute("UPDATE shells SET is_deleted=1 WHERE shell_id=2")
+            con.commit()
+        finally:
+            con.close()
+
+        participants = self.write(
+            json.dumps(
+                [
+                    {"shell_id": 3, "role": "planner", "harness": "codex"},
+                    {"shell_id": 1, "role": "developer", "harness": "codex"},
+                    {"shell_id": 6, "role": "reviewer", "harness": "kimi"},
+                ]
+            )
+        )
+
+        sprint_id = self.run_cli(
+            TOKENS["planner"],
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec",
+            str(document_id),
+            "--spec-approval",
+            str(approval_id),
+            "--participants-file",
+            participants,
+            "--merge-grant",
+        )["sprint_id"]
+
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                1,
+                con.execute(
+                    "SELECT COUNT(*) FROM sprint_specs WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                (
+                    document_id,
+                    hashlib.sha256(current_body.encode()).hexdigest(),
+                    approval_id,
+                ),
+                con.execute(
+                    "SELECT document_id,bound_revision_sha256,approval_id "
+                    "FROM sprint_specs WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone(),
+            )
+        finally:
+            con.close()
+
+    def test_review_properties_never_change_authenticated_launch_eligibility(self):
+        cases = (
+            ("no-review", None, False, False, False),
+            ("current-pass", "pass", False, False, False),
+            ("current-fail", "fail", False, False, False),
+            ("unresolved-findings", "pass", False, True, False),
+            ("stale-review", "pass", True, False, False),
+            ("deleted-signer", "pass", False, False, True),
+            ("mixed-selectors", "pass", False, False, False),
+        )
+        for name, verdict, stale, findings, deleted_signer in cases:
+            with self.subTest(name=name):
+                self.use_isolated_db()
+                con = sqlite3.connect(self.db)
+                try:
+                    reviewer_shell_id = 2
+                    if deleted_signer:
+                        con.execute(
+                            "INSERT INTO shells "
+                            "(shell_id,display_name,shortname,flavor,system_prompt,"
+                            "user_id,api_key) VALUES "
+                            "(6,'Active reviewer','REV2','reviewer','prompt',1,'rev2-token')"
+                        )
+                        con.execute("UPDATE shells SET is_deleted=1 WHERE shell_id=2")
+                        reviewer_shell_id = 6
+                    feature_id = int(
+                        con.execute(
+                            "INSERT INTO roadmap (title,roadmap_status) VALUES (?,?)",
+                            (f"Matrix {name}", "in_progress"),
+                        ).lastrowid
+                    )
+                    reviewed_body = f"reviewed body {name}"
+                    current_body = (
+                        f"current body {name}" if stale else reviewed_body
+                    )
+                    document_id = int(
+                        con.execute(
+                            "INSERT INTO documents "
+                            "(feature_id,kind,seq,title,body) "
+                            "VALUES (?,'spec',1,?,?)",
+                            (feature_id, f"Spec {name}", current_body),
+                        ).lastrowid
+                    )
+                    findings_id = None
+                    if findings:
+                        findings_id = int(
+                            con.execute(
+                                "INSERT INTO documents (kind,seq,title,body) "
+                                "VALUES ('doc',1,'Unresolved findings','still open')"
+                            ).lastrowid
+                        )
+                    approval_id = None
+                    if verdict is not None:
+                        approval_id = int(
+                            con.execute(
+                                "INSERT INTO sprint_spec_approvals "
+                                "(document_id,revision_sha256,reviewer_shell_id,"
+                                "verdict,findings_document_id) VALUES (?,?,?,?,?)",
+                                (
+                                    document_id,
+                                    hashlib.sha256(reviewed_body.encode()).hexdigest(),
+                                    2,
+                                    verdict,
+                                    findings_id,
+                                ),
+                            ).lastrowid
+                        )
+                    task_id = int(
+                        con.execute(
+                            "INSERT INTO spec_tasks "
+                            "(feature_id,document_id,seq,title) VALUES (?,?,0,?)",
+                            (feature_id, document_id, f"Task {name}"),
+                        ).lastrowid
+                    )
+                    con.commit()
+                finally:
+                    con.close()
+                participants = self.write(
+                    json.dumps(
+                        [
+                            {"shell_id": 3, "role": "planner", "harness": "codex"},
+                            {"shell_id": 1, "role": "developer", "harness": "codex"},
+                            {
+                                "shell_id": reviewer_shell_id,
+                                "role": "reviewer",
+                                "harness": "kimi",
+                            },
+                        ]
+                    )
+                )
+                selectors = ["--spec", str(document_id)]
+                if approval_id is not None and name != "mixed-selectors":
+                    selectors = ["--spec-approval", str(approval_id)]
+                elif approval_id is not None:
+                    selectors.extend(("--spec-approval", str(approval_id)))
+                declaration = self.run_cli(
+                    TOKENS["planner"],
+                    "declare",
+                    "--feature",
+                    str(feature_id),
+                    *selectors,
+                    "--participants-file",
+                    participants,
+                    "--merge-grant",
+                )
+                unit = self.run_cli(
+                    TOKENS["planner"],
+                    "plan-unit",
+                    "--sprint",
+                    str(declaration["sprint_id"]),
+                    "--developer-shell",
+                    "1",
+                    "--reviewer-shell",
+                    str(reviewer_shell_id),
+                    "--title",
+                    f"Matrix lane {name}",
+                    "--expected-output-file",
+                    self.write("One verified launch."),
+                    "--task",
+                    str(task_id),
+                )
+                armed = self.run_cli(
+                    TOKENS["planner"],
+                    "arm",
+                    "--sprint",
+                    str(declaration["sprint_id"]),
+                )
+
+                self.assertEqual(2, len(armed["wake_ids"]))
+                con = sqlite3.connect(self.db)
+                try:
+                    self.assertEqual(
+                        (
+                            "armed",
+                            1,
+                            document_id,
+                            hashlib.sha256(current_body.encode()).hexdigest(),
+                            approval_id,
+                            "ready",
+                        ),
+                        con.execute(
+                            "SELECT s.lifecycle,COUNT(ss.document_id),ss.document_id,"
+                            "ss.bound_revision_sha256,ss.approval_id,u.disposition "
+                            "FROM sprints s JOIN sprint_specs ss USING (sprint_id) "
+                            "JOIN sprint_work_units u USING (sprint_id) "
+                            "WHERE s.sprint_id=? AND u.work_unit_id=?",
+                            (declaration["sprint_id"], unit["work_unit_id"]),
+                        ).fetchone(),
+                    )
+                finally:
+                    con.close()
+
+    def test_declaration_rejects_invalid_spec_resources_without_writes(self):
+        self.use_isolated_db()
+        con = sqlite3.connect(self.db)
+        try:
+            feature_id = int(
+                con.execute(
+                    "INSERT INTO roadmap (title,roadmap_status) "
+                    "VALUES ('Declaration guards','in_progress')"
+                ).lastrowid
+            )
+            other_feature_id = int(
+                con.execute(
+                    "INSERT INTO roadmap (title,roadmap_status) "
+                    "VALUES ('Other feature','in_progress')"
+                ).lastrowid
+            )
+            valid_document_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',1,'Valid','valid')",
+                    (feature_id,),
+                ).lastrowid
+            )
+            wrong_feature_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',1,'Wrong feature','valid')",
+                    (other_feature_id,),
+                ).lastrowid
+            )
+            non_spec_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'doc',2,'Not a spec','valid')",
+                    (feature_id,),
+                ).lastrowid
+            )
+            unscoped_spec_id = int(
+                con.execute(
+                    "INSERT INTO documents (kind,seq,title,body) "
+                    "VALUES ('spec',4,'Unscoped','valid')"
+                ).lastrowid
+            )
+            empty_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',3,'Empty','   ')",
+                    (feature_id,),
+                ).lastrowid
+            )
+            approval_ids = [
+                int(
+                    con.execute(
+                        "INSERT INTO sprint_spec_approvals "
+                        "(document_id,revision_sha256,reviewer_shell_id,verdict) "
+                        "VALUES (?,?,?,?)",
+                        (
+                            valid_document_id,
+                            hashlib.sha256(b"valid").hexdigest(),
+                            reviewer_shell_id,
+                            verdict,
+                        ),
+                    ).lastrowid
+                )
+                for reviewer_shell_id, verdict in ((2, "pass"), (1, "fail"))
+            ]
+            con.commit()
+        finally:
+            con.close()
+        base = (
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--participants-file",
+            self.participants_file(),
+            "--merge-grant",
+        )
+        cases = (
+            ((), "HTTP 400.*at least one"),
+            (("--spec", "999999"), "HTTP 404.*unknown Sprint spec document"),
+            (
+                ("--spec-approval", "999999"),
+                "HTTP 404.*unknown Sprint spec approval",
+            ),
+            (
+                ("--spec", str(wrong_feature_id)),
+                "HTTP 409.*non-empty spec documents for its feature",
+            ),
+            (
+                ("--spec", str(non_spec_id)),
+                "HTTP 409.*non-empty spec documents for its feature",
+            ),
+            (
+                ("--spec", str(unscoped_spec_id)),
+                "HTTP 409.*non-empty spec documents for its feature",
+            ),
+            (
+                ("--spec", str(empty_id)),
+                "HTTP 409.*non-empty spec documents for its feature",
+            ),
+            (
+                (
+                    "--spec-approval",
+                    str(approval_ids[0]),
+                    "--spec-approval",
+                    str(approval_ids[1]),
+                ),
+                "HTTP 400.*multiple spec approvals select the same document",
+            ),
+        )
+        for selectors, error in cases:
+            with self.subTest(selectors=selectors):
+                with self.assertRaisesRegex(SystemExit, error):
+                    self.run_cli(TOKENS["planner"], *base, *selectors)
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(0, con.execute("SELECT COUNT(*) FROM sprints").fetchone()[0])
+            self.assertEqual(0, con.execute("SELECT COUNT(*) FROM sprint_specs").fetchone()[0])
+            self.assertEqual(0, con.execute("SELECT COUNT(*) FROM sprint_events").fetchone()[0])
+        finally:
+            con.close()
+
     def test_participant_send_confirms_durable_message_wake_and_route(self):
         response = self.run_cli(
             TOKENS["developer"],
@@ -881,23 +1304,26 @@ class SprintCliApiTest(unittest.TestCase):
             con.commit()
         finally:
             con.close()
-        with self.assertRaisesRegex(
-            SystemExit, "HTTP 409.*current passing approvals"
-        ):
-            self.run_cli(
-                TOKENS["planner"],
-                "declare",
-                "--feature",
-                str(feature_id),
-                "--spec-approval",
-                str(bad_approval_id),
-                "--participants-file",
-                participants,
-                "--merge-grant",
-            )
+        evidence_sprint_id = self.run_cli(
+            TOKENS["planner"],
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec-approval",
+            str(bad_approval_id),
+            "--participants-file",
+            participants,
+            "--merge-grant",
+        )["sprint_id"]
         con = sqlite3.connect(self.db)
         try:
-            self.assertEqual(0, con.execute("SELECT COUNT(*) FROM sprints").fetchone()[0])
+            self.assertEqual(
+                (bad_approval_id,),
+                con.execute(
+                    "SELECT approval_id FROM sprint_specs WHERE sprint_id=?",
+                    (evidence_sprint_id,),
+                ).fetchone(),
+            )
         finally:
             con.close()
         sprint_id = self.run_cli(

@@ -1002,6 +1002,32 @@ class EvidenceCompilerTest(SprintCloseCase):
         )
         self.assertGreater(packet["anomalies"]["events"]["truncated"], 0)
 
+    def test_packet_includes_bound_spec_without_review_evidence(self):
+        self.con.execute(
+            "UPDATE sprint_specs SET approval_id=NULL WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+
+        packet = self.close.compile_evidence_packet(self.sprint_id, 3)
+
+        self.assertEqual(1, len(packet["spec_revisions"]["bound"]))
+        spec = packet["spec_revisions"]["bound"][0]
+        self.assertEqual(self.document_id, spec["document_id"])
+        self.assertEqual(
+            hashlib.sha256(b"governing spec revision 1").hexdigest(),
+            spec["bound_revision_sha256"],
+        )
+        for field in (
+            "approval_id",
+            "reviewer_shell_id",
+            "verdict",
+            "reviewed_revision_sha256",
+            "findings_document_id",
+            "reviewed_at",
+        ):
+            self.assertIsNone(spec[field])
+
     def test_planner_admin_and_participating_reviewer_compile_evidence(self):
         planner_packet = self.close.compile_evidence_packet(self.sprint_id, 3)
         reviewer_packet = self.close.compile_evidence_packet(self.sprint_id, 2)

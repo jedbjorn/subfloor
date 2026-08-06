@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,9 +19,11 @@ SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
 FOUNDATION = MIGRATIONS / "0146_sprint_v2_domain.sql"
 GENERATION_MIGRATION = MIGRATIONS / "0155_sprint_conversation_generations.sql"
+OPTIONAL_QAQC_MIGRATION = MIGRATIONS / "0185_optional_sprint_qaqc.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
+import migrate  # noqa: E402
 import sprint_domain  # noqa: E402
 
 
@@ -115,6 +118,174 @@ class SprintDomainCase(unittest.TestCase):
 
 
 class MigrationAndShapeTest(SprintDomainCase):
+    @staticmethod
+    def _seed_prechange_binding(con: sqlite3.Connection) -> tuple[int, int, str, int]:
+        con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
+        con.executemany(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (?,?,?,?,?,1)",
+            (
+                (2, "Reviewer", "REV1", "reviewer", "prompt"),
+                (3, "Planner", "PLN1", "planner", "prompt"),
+            ),
+        )
+        feature_id = int(
+            con.execute("INSERT INTO roadmap (title) VALUES ('Feature')").lastrowid
+        )
+        body = "reviewed governing spec"
+        document_id = int(
+            con.execute(
+                "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                "VALUES (?,'spec',1,'Reviewed',?)",
+                (feature_id, body),
+            ).lastrowid
+        )
+        revision = hashlib.sha256(body.encode()).hexdigest()
+        approval_id = int(
+            con.execute(
+                "INSERT INTO sprint_spec_approvals "
+                "(document_id,revision_sha256,reviewer_shell_id,verdict) "
+                "VALUES (?,?,2,'fail')",
+                (document_id, revision),
+            ).lastrowid
+        )
+        sprint_id = int(
+            con.execute(
+                "INSERT INTO sprints "
+                "(feature_id,originating_planner_shell_id) VALUES (?,3)",
+                (feature_id,),
+            ).lastrowid
+        )
+        con.execute(
+            "INSERT INTO sprint_specs "
+            "(sprint_id,document_id,bound_revision_sha256,approval_id,included_at) "
+            "VALUES (?,?,?,?,?)",
+            (sprint_id, document_id, revision, approval_id, "2026-08-05 12:34:56"),
+        )
+        con.commit()
+        return sprint_id, document_id, revision, approval_id
+
+    def test_optional_qaqc_migration_preserves_reviewed_binding_and_allows_null(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.row_factory = sqlite3.Row
+            apply_schema(con, through="0184_reseed_sprint_skill_polish.sql")
+            reviewed = self._seed_prechange_binding(con)
+
+            con.executescript(OPTIONAL_QAQC_MIGRATION.read_text())
+
+            self.assertEqual(
+                (*reviewed, "2026-08-05 12:34:56"),
+                tuple(con.execute("SELECT * FROM sprint_specs").fetchone()),
+            )
+            feature_id = int(
+                con.execute("SELECT feature_id FROM sprints").fetchone()[0]
+            )
+            direct_body = "direct governing spec"
+            direct_document_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',2,'Direct',?)",
+                    (feature_id, direct_body),
+                ).lastrowid
+            )
+            direct_sprint_id = int(
+                con.execute(
+                    "INSERT INTO sprints "
+                    "(feature_id,originating_planner_shell_id) VALUES (?,3)",
+                    (feature_id,),
+                ).lastrowid
+            )
+            direct_revision = hashlib.sha256(direct_body.encode()).hexdigest()
+            con.execute(
+                "INSERT INTO sprint_specs "
+                "(sprint_id,document_id,bound_revision_sha256,approval_id) "
+                "VALUES (?,?,?,NULL)",
+                (direct_sprint_id, direct_document_id, direct_revision),
+            )
+            self.assertEqual(
+                (direct_document_id, direct_revision, None),
+                tuple(
+                    con.execute(
+                        "SELECT document_id,bound_revision_sha256,approval_id "
+                        "FROM sprint_specs WHERE sprint_id=?",
+                        (direct_sprint_id,),
+                    ).fetchone()
+                ),
+            )
+            self.assertEqual(2, con.execute("SELECT COUNT(*) FROM sprint_specs").fetchone()[0])
+            self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
+
+    def test_optional_qaqc_migration_failure_rolls_back_original_table(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / OPTIONAL_QAQC_MIGRATION.name
+            path.write_text(
+                OPTIONAL_QAQC_MIGRATION.read_text()
+                + "\nSELECT missing_migration_function();\n"
+            )
+            with closing(sqlite3.connect(":memory:")) as con:
+                con.row_factory = sqlite3.Row
+                apply_schema(con, through="0184_reseed_sprint_skill_polish.sql")
+                original = self._seed_prechange_binding(con)
+
+                with self.assertRaisesRegex(
+                    sqlite3.OperationalError, "missing_migration_function"
+                ):
+                    migrate.apply(con, path)
+
+                self.assertEqual(
+                    original,
+                    tuple(
+                        con.execute(
+                            "SELECT sprint_id,document_id,bound_revision_sha256,"
+                            "approval_id FROM sprint_specs"
+                        ).fetchone()
+                    ),
+                )
+                approval_column = next(
+                    row
+                    for row in con.execute("PRAGMA table_info(sprint_specs)")
+                    if row[1] == "approval_id"
+                )
+                self.assertEqual(1, approval_column[3])
+                self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
+
+    def test_optional_qaqc_normal_migration_discovery_does_not_reapply(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            migration_dir = Path(temp_dir)
+            path = migration_dir / OPTIONAL_QAQC_MIGRATION.name
+            path.write_text(OPTIONAL_QAQC_MIGRATION.read_text())
+            with closing(sqlite3.connect(":memory:")) as con:
+                con.row_factory = sqlite3.Row
+                apply_schema(con, through="0184_reseed_sprint_skill_polish.sql")
+                original = self._seed_prechange_binding(con)
+
+                migrate.apply(con, path)
+                with mock.patch.object(migrate, "MIGRATIONS_DIR", migration_dir):
+                    self.assertEqual([], migrate.pending(con))
+                    for pending_path in migrate.pending(con):
+                        migrate.apply(con, pending_path)
+
+                self.assertEqual(
+                    original,
+                    tuple(
+                        con.execute(
+                            "SELECT sprint_id,document_id,bound_revision_sha256,"
+                            "approval_id FROM sprint_specs"
+                        ).fetchone()
+                    ),
+                )
+                self.assertEqual(
+                    [(OPTIONAL_QAQC_MIGRATION.name,)],
+                    [
+                        tuple(row)
+                        for row in con.execute(
+                            "SELECT filename FROM schema_migrations WHERE filename=?",
+                            (OPTIONAL_QAQC_MIGRATION.name,),
+                        )
+                    ],
+                )
+
     def test_conversation_generation_backfills_prepared_plan_without_drift(self) -> None:
         with closing(sqlite3.connect(":memory:")) as con:
             con.row_factory = sqlite3.Row
@@ -359,7 +530,7 @@ class SpecApprovalTest(SprintDomainCase):
         self.assertEqual(1, len(listed))
         self.assertEqual("REV1", listed[0]["reviewer_shortname"])
 
-    def test_non_reviewer_cannot_record_or_arm_hand_seeded_approval(self) -> None:
+    def test_non_reviewer_cannot_record_but_hand_seeded_evidence_does_not_gate_arm(self) -> None:
         feature_id = int(
             self.con.execute(
                 "INSERT INTO roadmap (title) VALUES ('Bad signer feature')"
@@ -394,12 +565,9 @@ class SpecApprovalTest(SprintDomainCase):
             (sprint_id,),
         )
         self.con.commit()
-        with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError, "passing spec approval"
-        ):
-            self.store.arm(sprint_id, 3)
+        self.store.arm(sprint_id, 3)
         self.assertEqual(
-            "prepared",
+            "armed",
             self.con.execute(
                 "SELECT lifecycle FROM sprints WHERE sprint_id=?", (sprint_id,)
             ).fetchone()[0],
@@ -744,12 +912,67 @@ class LifecycleTest(SprintDomainCase):
             ],
         )
 
-    def test_arm_rejects_wrong_planner_and_unapproved_spec_without_effect(self) -> None:
+    def test_arm_rejects_wrong_planner_but_accepts_failing_review_evidence(self) -> None:
         sprint_id, unit_id = self.create_sprint(approval_verdict="fail")
         with self.assertRaises(sprint_domain.SprintAuthorityError):
             self.store.arm(sprint_id, 4)
-        with self.assertRaises(sprint_domain.SprintInvariantError):
+        wake_ids = self.store.arm(sprint_id, 3)
+        self.assertEqual(
+            ("armed", "ready", 2),
+            (
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?", (sprint_id,)
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                    (unit_id,),
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_wake_outbox WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone()[0],
+            ),
+        )
+        self.assertEqual(2, len(wake_ids))
+
+    def test_arm_accepts_no_qaqc_evidence(self) -> None:
+        sprint_id, _ = self.create_sprint()
+        approval_id = self.con.execute(
+            "SELECT approval_id FROM sprint_specs WHERE sprint_id=?", (sprint_id,)
+        ).fetchone()[0]
+        self.con.execute(
+            "UPDATE sprint_specs SET approval_id=NULL WHERE sprint_id=?", (sprint_id,)
+        )
+        self.con.execute(
+            "DELETE FROM sprint_spec_approvals WHERE approval_id=?", (approval_id,)
+        )
+        self.con.commit()
+
+        self.store.arm(sprint_id, 3)
+
+        self.assertEqual(
+            ("armed", None, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,ss.approval_id,"
+                    "(SELECT COUNT(*) FROM sprint_spec_approvals) "
+                    "FROM sprints s JOIN sprint_specs ss USING (sprint_id) "
+                    "WHERE s.sprint_id=?",
+                    (sprint_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_arm_rejects_missing_bound_spec_without_effect(self) -> None:
+        sprint_id, unit_id = self.create_sprint()
+        self.con.execute("DELETE FROM sprint_specs WHERE sprint_id=?", (sprint_id,))
+        self.con.commit()
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "exact current governing spec"
+        ):
             self.store.arm(sprint_id, 3)
+
         self.assertEqual(
             ("prepared", "planned", 0),
             (
@@ -767,6 +990,41 @@ class LifecycleTest(SprintDomainCase):
             ),
         )
 
+    def test_arm_ignores_stale_failed_findings_and_deleted_signer_evidence(self) -> None:
+        sprint_id, _ = self.create_sprint()
+        findings_id = int(
+            self.con.execute(
+                "INSERT INTO documents (kind,seq,title,body) "
+                "VALUES ('doc',1,'Unresolved findings','blocking history')"
+            ).lastrowid
+        )
+        self.con.execute("UPDATE shells SET is_deleted=1 WHERE shell_id=4")
+        self.con.execute(
+            "UPDATE sprint_spec_approvals "
+            "SET verdict='fail',revision_sha256=?,reviewer_shell_id=4,"
+            "findings_document_id=? "
+            "WHERE approval_id=(SELECT approval_id FROM sprint_specs "
+            "WHERE sprint_id=?)",
+            ("0" * 64, findings_id, sprint_id),
+        )
+        self.con.commit()
+
+        self.store.arm(sprint_id, 3)
+
+        self.assertEqual(
+            ("armed", "fail", "0" * 64, 4, findings_id),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,a.verdict,a.revision_sha256,"
+                    "a.reviewer_shell_id,a.findings_document_id "
+                    "FROM sprints s JOIN sprint_specs ss USING (sprint_id) "
+                    "JOIN sprint_spec_approvals a USING (approval_id) "
+                    "WHERE s.sprint_id=?",
+                    (sprint_id,),
+                ).fetchone()
+            ),
+        )
+
     def test_arm_rejects_spec_edited_after_approval_without_effect(self) -> None:
         sprint_id, unit_id = self.create_sprint()
         self.con.execute(
@@ -778,7 +1036,7 @@ class LifecycleTest(SprintDomainCase):
         self.con.commit()
 
         with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError, "exact, passing spec approval"
+            sprint_domain.SprintInvariantError, "exact current governing spec"
         ):
             self.store.arm(sprint_id, 3)
 

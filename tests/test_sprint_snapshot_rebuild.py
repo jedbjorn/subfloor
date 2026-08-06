@@ -46,7 +46,7 @@ def rows_by_table(path: Path, tables: list[str]) -> dict[str, list[tuple]]:
         con.close()
 
 
-def seed_prepared(con: sqlite3.Connection) -> int:
+def seed_prepared(con: sqlite3.Connection, *, reviewed: bool = True) -> int:
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
     con.executemany(
@@ -70,12 +70,14 @@ def seed_prepared(con: sqlite3.Connection) -> int:
         (feature_id, body),
     ).lastrowid
     revision = hashlib.sha256(body.encode()).hexdigest()
-    approval_id = con.execute(
-        "INSERT INTO sprint_spec_approvals "
-        "(approval_id,document_id,revision_sha256,reviewer_shell_id,verdict) "
-        "VALUES (2,?,?,2,'pass')",
-        (document_id, revision),
-    ).lastrowid
+    approval_id = None
+    if reviewed:
+        approval_id = con.execute(
+            "INSERT INTO sprint_spec_approvals "
+            "(approval_id,document_id,revision_sha256,reviewer_shell_id,verdict) "
+            "VALUES (2,?,?,2,'pass')",
+            (document_id, revision),
+        ).lastrowid
     sprint_id = con.execute(
         "INSERT INTO sprints "
         "(sprint_id,feature_id,originating_planner_shell_id,merge_grant_enabled) "
@@ -358,6 +360,26 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
 
     def test_prepared_sprint_roundtrips_without_plan_or_generation_drift(self) -> None:
         self.assert_roundtrip(armed=False)
+
+    def test_unreviewed_spec_binding_roundtrips_with_null_evidence(self) -> None:
+        con = sqlite3.connect(self.db)
+        try:
+            seed_prepared(con, reviewed=False)
+        finally:
+            con.close()
+        before = rows_by_table(self.db, ["sprint_specs", "sprint_spec_approvals"])
+        self.assertEqual([], before["sprint_spec_approvals"])
+        self.assertIsNone(before["sprint_specs"][0][3])
+
+        self.snapshot_and_rebuild()
+
+        after = rows_by_table(self.db, ["sprint_specs", "sprint_spec_approvals"])
+        self.assertEqual(before, after)
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
+        finally:
+            con.close()
 
     def test_armed_in_flight_sprint_roundtrips_every_v2_table_exactly(self) -> None:
         self.assert_roundtrip(armed=True)

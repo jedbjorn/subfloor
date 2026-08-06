@@ -1,11 +1,64 @@
----
-name: sprint_prep
-description: Prepare and arm a Sprints v2 run — bind exact current specs, optionally gather QA/QC evidence, shape work units and dependencies, and enforce every launch invariant.
-category: workflow
-common: false
----
+-- 0185 — make pre-Sprint QA/QC optional evidence.
+--
+-- A Sprint remains bound to an exact current spec revision, but the historical
+-- approval row is no longer a launch credential. Preserve reviewed bindings
+-- while permitting direct document bindings with no approval evidence.
 
-# sprint_prep — declare the riverbed
+-- migrate: foreign-keys-off
+PRAGMA foreign_keys=OFF;
+
+BEGIN;
+
+DROP TRIGGER IF EXISTS trg_sprint_followups_spec_scope;
+
+CREATE TABLE _sprint_specs_optional_evidence (
+    sprint_id              INTEGER NOT NULL REFERENCES sprints(sprint_id),
+    document_id            INTEGER NOT NULL REFERENCES documents(document_id),
+    bound_revision_sha256  TEXT NOT NULL
+                           CHECK (
+                             length(bound_revision_sha256)=64
+                             AND bound_revision_sha256 NOT GLOB '*[^0-9a-f]*'
+                           ),
+    approval_id            INTEGER
+                           REFERENCES sprint_spec_approvals(approval_id),
+    included_at            TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (sprint_id, document_id)
+);
+
+INSERT INTO _sprint_specs_optional_evidence (
+    sprint_id,
+    document_id,
+    bound_revision_sha256,
+    approval_id,
+    included_at
+)
+SELECT sprint_id,
+       document_id,
+       bound_revision_sha256,
+       approval_id,
+       included_at
+FROM sprint_specs;
+
+DROP TABLE sprint_specs;
+ALTER TABLE _sprint_specs_optional_evidence RENAME TO sprint_specs;
+
+CREATE TRIGGER trg_sprint_followups_spec_scope
+BEFORE INSERT ON sprint_followups
+WHEN NEW.spec_document_id IS NOT NULL AND NOT EXISTS (
+  SELECT 1 FROM sprint_specs
+  WHERE sprint_id=NEW.sprint_id AND document_id=NEW.spec_document_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Sprint follow-up spec is not bound to this Sprint');
+END;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_prep',
+  'Prepare and arm a Sprints v2 run — bind exact current specs, optionally gather QA/QC evidence, shape work units and dependencies, and enforce every launch invariant.',
+  'workflow',
+  NULL,
+  0,
+  '# sprint_prep — declare the riverbed
 
 Use as the owning Planner while a Sprint is `prepared`. Preparation ends at one
 atomic arming decision; it does not launch participants piecemeal.
@@ -86,7 +139,7 @@ comparison; they do not forbid safe out-of-order completion. Reviews are not
 editing lanes.
 
 Prefer the smallest dependency graph that preserves correctness. Record the
-expected output in outcome language. Do not encode a shell's implementation
+expected output in outcome language. Do not encode a shell''s implementation
 steps into the durable plan when its role skill and judgment can decide them.
 
 ### Balance capacity and parallelism
@@ -178,4 +231,16 @@ accepted risks. State whether pre-Sprint QA/QC was performed and summarize any
 available evidence without treating it as an eligibility result.
 
 Stop when the Sprint is armed or when one concrete eligibility blocker has been
-surfaced. Do not dispatch from a partially prepared plan.
+surfaced. Do not dispatch from a partially prepared plan.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+
+COMMIT;
+
+PRAGMA foreign_keys=ON;
+PRAGMA foreign_key_check;
