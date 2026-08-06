@@ -19,6 +19,7 @@ ENGINE = ROOT / ".super-coder"
 MIGRATION = ENGINE / "migrations" / "0186_admin_singleton.sql"
 sys.path.insert(0, str(ENGINE / "scripts"))
 run = importlib.import_module("run")
+compose = importlib.import_module("compose")
 shell_factory = importlib.import_module("shell_factory")
 init_fork = importlib.import_module("init_fork")
 
@@ -195,6 +196,47 @@ class AdminDispatcherTest(unittest.TestCase):
         self.assertEqual(completed.stdout, "")
         self.assertIn("run make dos-admin from a host terminal", completed.stderr)
         self.assertNotIn('["--host-admin"]', completed.stdout)
+
+
+class AdminExecutionContextTest(unittest.TestCase):
+    def test_container_admin_names_contained_limits_and_host_exit(self):
+        context = compose.render_execution_context("admin", "container")
+        api_guidance = compose.render_api_unreachable_guidance("admin", "container")
+
+        self.assertIn("inside the sandbox container", context)
+        self.assertIn("0.0.0.0:$SC_DEV_PORT", context)
+        self.assertIn("running `make dos-admin` from a host terminal", context)
+        self.assertNotIn("Host authority is available", context)
+        self.assertIn("surface this to FnB", api_guidance)
+        self.assertNotIn("host Admin boot remains valid", api_guidance)
+
+    def test_host_admin_names_authority_role_boundary_and_offline_recovery(self):
+        context = compose.render_execution_context("admin", "host")
+        api_guidance = compose.render_api_unreachable_guidance("admin", "host")
+
+        self.assertIn("directly on the host", context)
+        self.assertIn("bound to `127.0.0.1`", context)
+        self.assertIn("engine update, rollback, migration", context)
+        self.assertIn("does not transfer product feature work", context)
+        self.assertIn("operator owns avoiding simultaneous use", context)
+        self.assertNotIn("0.0.0.0:$SC_DEV_PORT", context)
+        self.assertIn("host Admin boot remains valid", api_guidance)
+        self.assertIn("`sc mem` remains unavailable until the API returns", api_guidance)
+        self.assertNotIn("surface this to FnB", api_guidance)
+
+    def test_unknown_launch_mode_is_rejected_instead_of_misrendered(self):
+        with self.assertRaisesRegex(ValueError, "unsupported launch mode: vm"):
+            compose.render_execution_context("admin", "vm")
+
+
+class AdminFocusTest(unittest.TestCase):
+    def test_admin_template_has_no_standing_sweep(self):
+        admin = json.loads((ENGINE / "templates" / "shells" / "admin.json").read_text())
+
+        self.assertIn("there is no standing every-session sweep", admin["focus"])
+        self.assertIn("Recovery work takes precedence", admin["focus"])
+        self.assertNotIn("Run your standing maintenance pass", admin["focus"])
+        self.assertNotIn("`flag_sweep`", admin["focus"])
 
 
 if __name__ == "__main__":

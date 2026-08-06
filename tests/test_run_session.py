@@ -364,6 +364,51 @@ class HeadlessSessionFailureTest(unittest.TestCase):
         liveness.assert_not_called()
         open_session.assert_not_called()
 
+    def test_host_admin_reaches_session_open_when_api_is_unavailable(self) -> None:
+        con = mock.Mock()
+        chosen = {"shell_id": 1, "shortname": "ADM1", "flavor": "admin"}
+        fdefaults = {
+            "admin": {"default_harness": "codex", "models": {"codex": "gpt-test"}}
+        }
+        open_session = mock.Mock(side_effect=_StopAfterSession)
+        liveness = mock.Mock()
+
+        with mock.patch.dict(
+                run.os.environ,
+                {
+                    "SC_API_BASE": "http://127.0.0.1:1",
+                    "SC_API_TOKEN": "unreachable-test-token",
+                },
+                clear=True,
+            ), \
+                mock.patch.object(
+                    run.sys, "argv", ["run.py", "--host-admin", "--harness", "codex"]
+                ), \
+                mock.patch.object(run.global_pointer, "write_global_pointers"), \
+                mock.patch.object(run, "open_db", return_value=con), \
+                mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
+                mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
+                mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
+                mock.patch.object(run, "select_host_admin", return_value=chosen), \
+                mock.patch.object(run, "browser_conversation_active", return_value=False), \
+                mock.patch.object(run.sys.stdin, "isatty", return_value=False), \
+                mock.patch.object(run.shell_liveness, "compute", liveness), \
+                mock.patch.object(run, "ensure_harness_path"), \
+                mock.patch.object(
+                    run, "load_adapter", return_value={"launch": ["codex"]}
+                ), \
+                mock.patch.object(run, "require_host_harness"), \
+                mock.patch.object(run, "open_session", open_session), \
+                self.assertRaises(_StopAfterSession):
+            run.main()
+
+        open_session.assert_called_once_with(
+            con,
+            1,
+            lifecycle={"harness": "codex", "provider": "openai", "model": "gpt-test"},
+        )
+        liveness.assert_not_called()
+
     def test_host_admin_non_admin_reference_refuses_before_boot_artifacts(self) -> None:
         con = mock.Mock()
         pointers = mock.Mock()

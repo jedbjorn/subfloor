@@ -80,6 +80,78 @@ PROJECT_VS_ENGINE_SOURCE = (
     "   anything, and name the DB path explicitly rather than trusting whichever\n"
     "   one the dispatcher resolves.\n"
 )
+
+
+def render_execution_context(flavor: str | None, launch_mode: str) -> str:
+    """Render the real execution seat without changing the shell's mandate."""
+    if launch_mode not in {"container", "host"}:
+        raise ValueError(f"unsupported launch mode: {launch_mode}")
+
+    if launch_mode == "container":
+        admin_note = ""
+        if flavor == "admin":
+            admin_note = (
+                "\n\nThis is the contained Admin seat. Host-only engine recovery, "
+                "root-checkout repair, and host process work require exiting this "
+                "session and running `make dos-admin` from a host terminal."
+            )
+        return (
+            "## EXECUTION CONTEXT\n\n"
+            "You run **inside the sandbox container**; this repo is bind-mounted "
+            "at its host path. The app the FnB watches in their browser is a "
+            "separate host-supervised instance.\n\n"
+            "- Run project dev servers in the sandbox on `0.0.0.0:$SC_DEV_PORT`; "
+            "the published host URL is `http://127.0.0.1:$SC_DEV_PORT`.\n"
+            "- Operate an existing host stack only through its supervisor "
+            "(`pm2`, `systemd`, or `make`); do not start a competing process from "
+            "this seat."
+            f"{admin_note}"
+        )
+
+    admin_note = ""
+    if flavor == "admin":
+        admin_note = (
+            "\n\nHost authority is available for engine update, rollback, "
+            "migration, root-checkout reconciliation, diagnosis, and recovery. "
+            "It does not transfer product feature work or product-runtime "
+            "ownership from Dev and DevOps. The engine does not coordinate this "
+            "seat with a container Admin session; the operator owns avoiding "
+            "simultaneous use."
+        )
+    return (
+        "## EXECUTION CONTEXT\n\n"
+        "You run **directly on the host**. The host toolchain, network, "
+        "credentials, services, and files available to your user are in reach; "
+        "use that authority only within this shell's mandate.\n\n"
+        "- Run project dev servers on `$SC_DEV_PORT`, bound to `127.0.0.1` unless "
+        "the task explicitly requires another interface.\n"
+        "- Operate an existing process-supervised stack through its supervisor "
+        "(`pm2`, `systemd`, or `make`) instead of starting a competing process."
+        f"{admin_note}"
+    )
+
+
+def render_api_unreachable_guidance(
+    flavor: str | None, launch_mode: str
+) -> str:
+    """Keep ordinary API failure ownership, with a host-Admin recovery branch."""
+    if launch_mode not in {"container", "host"}:
+        raise ValueError(f"unsupported launch mode: {launch_mode}")
+    if flavor == "admin" and launch_mode == "host":
+        return (
+            "  If it reports \"API unreachable\", the host Admin boot remains "
+            "valid. Diagnose with `sc health`, `sc logs`, and the explicit "
+            "read-only `sc sql` lane; restore the managed engine with `sc restart` "
+            "/ `make dos-r`. `sc mem` remains unavailable until the API returns "
+            "and never falls back to raw writes."
+        )
+    return (
+        "  If it reports \"API unreachable\", the engine server is down — "
+        "surface this to FnB; they restart it with `sc restart` / `make dos-r`. "
+        "Do not retry silently; surface the error and stop."
+    )
+
+
 # The repo catalogue (dr_*) lives in its OWN db, separate from shell_db.db.
 MAP_DB_PATH = ENGINE.parent / ".sc-state" / "map.db"
 
@@ -308,7 +380,8 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                  floor_note: "str | None" = None,
                  api_key: "str | None" = None,
                  api_port: "int | None" = None,
-                 source_mode: bool = False) -> str:
+                 source_mode: bool = False,
+                 launch_mode: str = "container") -> str:
     """Assemble the full boot markdown for `shell`, driven by `user`.
 
     work_dir, when set, is the shell's effective working directory (dev-shell
@@ -326,9 +399,17 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     stays a pure render, no git).
     """
     template = TEMPLATE_PATH.read_text().rstrip()
+    flavor = (shell["flavor"] if "flavor" in shell.keys() else None)
     template = template.replace(
         "{{project_vs_engine}}",
         PROJECT_VS_ENGINE_SOURCE if source_mode else PROJECT_VS_ENGINE_FORK)
+    template = template.replace(
+        "{{execution_context}}", render_execution_context(flavor, launch_mode)
+    )
+    template = template.replace(
+        "{{api_unreachable_guidance}}",
+        render_api_unreachable_guidance(flavor, launch_mode),
+    )
     shell_id = shell["shell_id"]
     counts = fetch_counts(con, shell_id)
 
@@ -339,7 +420,6 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     # mapped? Drives the FIRST RUN prompt + the map-status line.
     bootstrapped = con.execute(
         "SELECT bootstrapped FROM shells WHERE shell_id=?", (shell_id,)).fetchone()[0]
-    flavor = (shell["flavor"] if "flavor" in shell.keys() else None)
     # Map-discrepancy protocol: every working shell reports a wrong map (it never
     # maps); the cartographer owns the fix, so the block is stripped from its boot.
     if flavor == "cartographer":
