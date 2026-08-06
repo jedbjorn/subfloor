@@ -23,6 +23,10 @@ WAKE_INDICATOR = APP[
     APP.index("function chatWakePendingIndicator"):
     APP.index("function chatPaintShellStatus")
 ]
+SHELL_INDICATORS = APP[
+    APP.index("function chatUnreadBadge(shell)"):
+    APP.index("function chatHeaderLabel(conversation)")
+]
 
 
 def run_js(script: str) -> dict:
@@ -70,8 +74,8 @@ def test_open_chat_restore_matches_the_flat_shell_projection():
 def test_sprint_badge_enters_the_current_conversation_without_a_wake():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]
-    badge = interface[interface.index('className: "chat-sprint-badge"'):
-                      interface.index('const status = el("span"')]
+    badge = APP[APP.index("function chatSprintBadge"):
+                APP.index("function chatPaintShellStatus")]
     assert "sprint.current_conversation_id" in badge
     assert "location.hash = chatHash(" in badge
     assert "chatApi(" not in badge
@@ -93,7 +97,7 @@ def test_shell_card_orders_left_identity_and_right_status_cluster():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]
     identity = interface[interface.index("const identity = el("):
-                         interface.index("const mail = chatUnreadBadge(item)")]
+                         interface.index("const button = el(")]
     assert identity.index('className: "chat-shell-shortname"') < identity.index(
         'className: "chat-shell-identity-separator"'
     ) < identity.index('className: "chat-shell-name"')
@@ -101,12 +105,9 @@ def test_shell_card_orders_left_identity_and_right_status_cluster():
     status = interface[interface.index('const status = el("span"'):
                        interface.index("rail.append(shellRow)")]
     assert 'className: "chat-shell-status"' in status
-    assert "chatPaintShellStatus(status, mail, badge, wake)" in status
+    assert "chatPaintShellIndicators(statusItem, item)" in status
     assert "shellStatusItems.set" in status
-    assert (
-        "chatPaintShellStatus(target.status, target.mail, target.badge, wake)"
-        in interface
-    )
+    assert "chatPaintShellIndicators(target, next)" in interface
 
     status_style = STYLE[STYLE.index(".chat-shell-status {"):
                          STYLE.index(".chat-sprint-badge {")]
@@ -154,10 +155,96 @@ def test_pending_wake_indicator_refreshes_without_a_new_polling_loop():
                     APP.index("// ── Tabs + boot")]
     assert 'const shellProjectionRequest = api("/shells")' in POLL_BLOCK
     assert "const { shells: nextShells } = await shellProjectionRequest" in POLL_BLOCK
-    assert "paintWakeIndicators(nextShells)" in POLL_BLOCK
+    assert "paintShellIndicators(nextShells)" in POLL_BLOCK
     assert "refreshWakeIndicators" in interface
     assert "onWakeDelivered(conversation.shell.shell_id)" in APP
     assert APP.count("setInterval(pollHistory, CHAT_HISTORY_POLL_MS)") == 1
+
+
+def test_shell_indicator_poll_adds_changes_and_removes_sprint_badges():
+    script = r"""
+class FakeElement {
+  constructor(tag) {
+    this.tag = tag;
+    this.nodeType = 1;
+    this.children = [];
+    this.className = "";
+    this.hidden = false;
+    this.classList = {
+      toggle: (name, on) => {
+        const names = new Set(this.className.split(" ").filter(Boolean));
+        if (on) names.add(name); else names.delete(name);
+        this.className = [...names].join(" ");
+      },
+    };
+  }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = [...nodes]; }
+  get textContent() {
+    return this.children.map((child) =>
+      typeof child === "string" ? child : child.textContent).join("");
+  }
+}
+const el = (tag, props = {}, ...children) => {
+  const node = Object.assign(new FakeElement(tag), props);
+  node.append(...children);
+  return node;
+};
+globalThis.location = {hash: ""};
+const chatHash = (shell, conversation) => `${shell}/${conversation}`;
+""" + SHELL_INDICATORS + r"""
+const target = {row: new FakeElement("div"), status: new FakeElement("span")};
+
+chatPaintShellIndicators(target, {
+  shortname: "DEV1",
+  sprint: {sprint_id: 12, role: "developer", disposition: "assigned",
+           current_conversation_id: "cv12"},
+});
+const first = {
+  rowClass: target.row.className,
+  status: target.status.textContent,
+};
+
+chatPaintShellIndicators(target, {
+  shortname: "DEV1",
+  sprint: {sprint_id: 13, role: "reviewer", disposition: "review",
+           current_conversation_id: "cv13"},
+});
+const changedBadge = target.status.children[0];
+changedBadge.onclick();
+const changed = {
+  rowClass: target.row.className,
+  status: target.status.textContent,
+  title: changedBadge.title,
+  hash: location.hash,
+};
+
+chatPaintShellIndicators(target, {shortname: "DEV1", sprint: null});
+const removed = {
+  rowClass: target.row.className,
+  status: target.status.textContent,
+  hidden: target.status.hidden,
+};
+console.log(JSON.stringify({first, changed, removed}));
+"""
+    result = run_js(script)
+    assert result == {
+        "first": {
+            "rowClass": "has-assignment",
+            "status": "Sprint 12",
+        },
+        "changed": {
+            "rowClass": "has-assignment",
+            "status": "Sprint 13",
+            "title": "Sprint 13 · reviewer · review",
+            "hash": "DEV1/cv13",
+        },
+        "removed": {
+            "rowClass": "",
+            "status": "",
+            "hidden": True,
+        },
+    }
 
 
 def test_sprint_conversations_are_not_closed_by_normal_chat_controls():
@@ -546,7 +633,8 @@ console.log(JSON.stringify({
         APP.index("async function renderInterface"):
         APP.index("// ── Tabs + boot")
     ]
-    assert "chatUnreadBadge(item)" in interface
+    assert "const mail = chatUnreadBadge(shell)" in SHELL_INDICATORS
+    assert "chatPaintShellIndicators(statusItem, item)" in interface
     assert ".chat-shell-mail" in STYLE
 
 
