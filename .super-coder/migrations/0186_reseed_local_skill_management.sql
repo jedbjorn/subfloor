@@ -1,11 +1,18 @@
----
-name: local_skill_management
-description: Create, update, assign, and remove DB-canonical fork-local skills through the supported CLI. Use for fork AI-team capabilities that must survive snapshot/rebuild without engine asset edits or Admin intervention.
-category: substrate
-common: false
----
+-- 0186 — publish the Planner DB-first local skill lifecycle.
+--
+-- Full-body UPSERT converges fully migrated installations after 0156 reseeds
+-- the previous local_skill_management body. Sprint decision message #228
+-- requires this trailing reseed and strict isolation from unrelated seed drift.
 
-# local_skill_management — manage fork-local skills through the DB
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'local_skill_management',
+  'Create, update, assign, and remove DB-canonical fork-local skills through the supported CLI. Use for fork AI-team capabilities that must survive snapshot/rebuild without engine asset edits or Admin intervention.',
+  'substrate',
+  NULL,
+  0,
+  '# local_skill_management — manage fork-local skills through the DB
 
 Fork-local skills are canonical in the live engine DB and persist in the local
 snapshot. Keep the input `SKILL.md` only as an authoring draft; never copy it
@@ -91,4 +98,12 @@ commit is live but not yet rebuild-durable.
 - Never run `sc seed-skills` for a fork-local skill.
 - Never use `SC_ADMIN=1`, `sc sql-rw`, or an Admin handoff for this lifecycle.
 - Never set a fork-local skill `common: true`; use explicit grants.
-- Change engine-owned skill bodies only through the upstream engine workflow.
+- Change engine-owned skill bodies only through the upstream engine workflow.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;

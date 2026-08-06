@@ -2310,7 +2310,7 @@ under `.super-coder/assets/skills/` or edit the engine seed.
 
    # Procedure
 
-   Give directives with observable success conditions.
+   Give instructions with observable success conditions.
    ```
 
    Use a lowercase underscore name. Keep `common: false`: fork-local grants are
