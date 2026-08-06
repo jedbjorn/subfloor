@@ -1,0 +1,67 @@
+--- 48 issue REV2 wu11 2026-08-05 11:31:08
+# Work unit 11 — review round 1
+
+Sprint 2 · registered PR 11 · head `2f58405f34017d98848b8f7eb751e9f3ed84b15c`
+Bound spec: document #108, revision SHA-256 `4b1b2cf7…a626e4` (current == bound;
+no mid-Sprint edit). Tasks 326, 327.
+
+**Verdict: changes_requested** — two Medium findings.
+
+## Checks
+
+All six checks green at the reviewed head (tests, verify, render-check, CodeQL
+×3). PR body carries only the work-unit id and spec reference. No red-check
+departure is involved.
+
+## What is correct
+
+- Both skills implement the spec's canonical workflow (§Skill Workflow) in
+  order: supplied state → read-only `status` → `start` only when off → work →
+  end-only `reset --off`, with no opening or mid-test reset.
+- Every documented command form parses and dispatches as written. I exercised
+  `status/start/push/exec (both forms)/capture/mcp up/reset --off` against
+  `client_main` at this head with the 
+--- 49 decision DEV3 wu11 2026-08-05 11:42:40
+Resubmitting for review: https://github.com/jedbjorn/subfloor/pull/1042; registered Sprint PR 11; head 0883d9ee6eff2e989ca62fd1b982bd719579a030; work unit 11.
+--- 50 issue REV2 wu11 2026-08-05 11:52:17
+# Work unit 11 — PR 1042 @ 0883d9ee — changes_requested
+
+Reviewed the full diff 89e9258..0883d9ee against spec #108 revision
+4b1b2cf7 (tasks 326, 327). Checks green (tests, verify, render-check,
+CodeQL). Base is exactly `origin/main`; migration 0180 is the unique next
+number.
+
+## Verified correct
+
+- Every command the rewritten skills name exists with the documented
+  signature in `vm.py:2184-2340` and `dispatch.sh:1275`: `status`, `start`,
+  `reset --off` (`--off` is `required=True`), `push src [dest]`,
+  `exec -- …` / `--command-file`, `capture --output`, `mcp status|up|down`.
+- The `exec` re-join claim added at 0883d9ee is accurate:
+  `" ".join(command_parts)` (`vm.py:2360`).
+- `start` does not restart a running domain — it falls through to
+  `_wait_for_ssh` (`vm.py:725-736`).
+- Envelope claim matches `operation_error`/`operation_result`
+  (`vm.py:1304-1325`): `schema_version`, `ok`, `
+--- 51 decision DEV3 wu11 2026-08-05 12:05:44
+Resubmitting PR https://github.com/jedbjorn/subfloor/pull/1042, registered Sprint PR 11, head 30a7531f6e105427b84bf9ae9c49e1ea41345a1a, work unit 11.
+--- 52 decision REV2 wu11 2026-08-05 12:15:02
+# Work unit 11 — PR 1042 @ 30a7531f — approved
+
+Reviewed the full diff `89e92580..30a7531f` against spec #108, bound revision
+SHA-256 `4b1b2cf7…a626e4` (bound == current; zero mid-Sprint edits). Tasks 326,
+327. Base merge-base is exactly `origin/main` (`89e92580`). PR body carries only
+the work-unit id and spec reference.
+
+## Checks
+
+All six checks green at the reviewed head: `tests`, `verify`, `render-check`,
+CodeQL ×3. Green-only handoff satisfied; no red-check departure is involved.
+
+## Round-2 findings — cleared by code at this head
+
+1. **Medium — guest Windows-MCP provisioning contract deleted behind a dangling
+   pointer.** Cleared. `windows_vm_gui/SKILL.md` now carries a live "Missing
+   guest Windows-MCP" section with the full contract: Python 3.13+ in the
+   committed winget manifest, `pip install uv`, `uvx windows-mcp serve --help`,
+   `windows-mcp install --transport streamabl
