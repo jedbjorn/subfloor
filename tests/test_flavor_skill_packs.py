@@ -15,9 +15,46 @@ ENGINE = ROOT / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
 ROOT_ONLY_MARKER = "<!-- sc-root-only:"
+RATIFIED_OPT_INS = {
+    "admin": {
+        "admin_git",
+        "authoring_syntax",
+        "git_cleanup",
+        "migration_management",
+        "self_update",
+    },
+    "planner": {
+        "api-design",
+        "authoring_syntax",
+        "blueprint",
+        "docs",
+        "flag_sweep",
+        "flags",
+        "git",
+        "local_skill_management",
+        "onboard",
+        "sprint_close",
+        "sprint_pln",
+        "sprint_prep",
+    },
+    "dev": {
+        "agents",
+        "authoring_syntax",
+        "database-migrations",
+        "dev_kit",
+        "docs",
+        "flags",
+        "git",
+        "redline_review",
+        "spec",
+        "sprint_dev",
+        "test_authoring",
+    },
+}
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import run  # noqa: E402
+import seed_skills  # noqa: E402
 import shell_factory  # noqa: E402
 import snapshot  # noqa: E402
 
@@ -29,11 +66,15 @@ import compose  # noqa: E402
 import flat  # noqa: E402
 
 
-def build_db(*, through_0105: bool = True) -> sqlite3.Connection:
+def build_db(
+    *, through_0105: bool = True, before: str | None = None
+) -> sqlite3.Connection:
     con = sqlite3.connect(":memory:")
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA.read_text())
     for path in sorted(MIGRATIONS.glob("*.sql")):
+        if before is not None and path.name >= before:
+            break
         if not through_0105 and path.name >= "0105_":
             break
         con.executescript(path.read_text())
@@ -109,6 +150,131 @@ class HardCutoverMigrationTest(unittest.TestCase):
                 inherited | set(template.get("skills", [])),
                 template["flavor"],
             )
+
+    def test_admin_planner_dev_opt_ins_match_ratified_packs(self) -> None:
+        con = build_db()
+        common = {
+            row[0]
+            for row in con.execute(
+                "SELECT name FROM skills WHERE common=1 AND is_deleted=0"
+            )
+        }
+        for flavor, expected in RATIFIED_OPT_INS.items():
+            actual = {
+                row[0]
+                for row in con.execute(
+                    "SELECT s.name FROM flavor_skills fs "
+                    "JOIN skills s ON s.skill_id=fs.skill_id "
+                    "WHERE fs.flavor=? AND s.is_deleted=0",
+                    (flavor,),
+                )
+            }
+            self.assertEqual(actual - common, expected, flavor)
+
+    def test_admin_git_asset_is_root_focused_not_working_shell_guidance(self) -> None:
+        body = (
+            ENGINE / "assets" / "skills" / "admin_git" / "SKILL.md"
+        ).read_text()
+        for section in (
+            "## Orient before writing",
+            "## Fast-forward main",
+            "## Commit a fork engine pin",
+            "## Merge an approved PR",
+            "## Source-repository exception",
+            "## Stop conditions",
+        ):
+            self.assertIn(section, body)
+        self.assertIn("git pull --ff-only origin main", body)
+        self.assertIn("Never switch its branch, stash,", body)
+        self.assertNotIn("git checkout -b", body)
+
+    def test_flag_sweep_is_planner_owned_and_not_a_boot_relay(self) -> None:
+        body = (
+            ENGINE / "assets" / "skills" / "flag_sweep" / "SKILL.md"
+        ).read_text()
+        self.assertIn("Planner-owned. Run periodically", body)
+        self.assertIn("Do not message yourself", body)
+        self.assertNotIn("Admin-only", body)
+        self.assertNotIn("every-session", body)
+        self.assertNotIn("sc mem message send", body)
+
+    def test_0188_converges_dirty_standard_packs_without_bespoke_drift(self) -> None:
+        migration = "0188_realign_flavor_skill_packs.sql"
+        con = build_db(before=migration)
+        bespoke = add_shell(con, "custom", None)
+        bespoke_names = {
+            "authoring_syntax",
+            "flag_sweep",
+            "git",
+            "local_skill_management",
+        }
+        con.executemany(
+            "INSERT INTO shell_skills (shell_id, skill_id) "
+            "SELECT ?, skill_id FROM skills WHERE name=?",
+            [(bespoke, name) for name in sorted(bespoke_names)],
+        )
+
+        con.execute(
+            "DELETE FROM flavor_skills WHERE flavor IN ('planner','dev') "
+            "AND skill_id IN (SELECT skill_id FROM skills "
+            "WHERE name IN ('authoring_syntax','flag_sweep',"
+            "'local_skill_management'))"
+        )
+        con.execute(
+            "INSERT OR IGNORE INTO flavor_skills (flavor, skill_id) "
+            "SELECT 'admin', skill_id FROM skills "
+            "WHERE name IN ('git','flag_sweep','local_skill_management')"
+        )
+        con.execute(
+            "DELETE FROM flavor_skills WHERE skill_id IN "
+            "(SELECT skill_id FROM skills WHERE name='admin_git')"
+        )
+        con.execute("DELETE FROM skills WHERE name='admin_git'")
+
+        sql = (MIGRATIONS / migration).read_text()
+        con.executescript(sql)
+        con.executescript(sql)
+
+        for name in ("admin_git", "flag_sweep"):
+            expected = seed_skills.parse_skill(
+                ENGINE / "assets" / "skills" / name / "SKILL.md"
+            )
+            actual = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name=?",
+                (name,),
+            ).fetchone()
+            self.assertEqual(
+                tuple(actual),
+                (
+                    expected["description"],
+                    expected["category"],
+                    expected["command"],
+                    expected["common"],
+                    expected["content"],
+                    0,
+                ),
+                name,
+            )
+
+        common = {
+            row[0]
+            for row in con.execute(
+                "SELECT name FROM skills WHERE common=1 AND is_deleted=0"
+            )
+        }
+        for flavor, expected in RATIFIED_OPT_INS.items():
+            actual = {
+                row[0]
+                for row in con.execute(
+                    "SELECT s.name FROM flavor_skills fs "
+                    "JOIN skills s ON s.skill_id=fs.skill_id "
+                    "WHERE fs.flavor=? AND s.is_deleted=0",
+                    (flavor,),
+                )
+            }
+            self.assertEqual(actual - common, expected, flavor)
+        self.assertEqual(resolved_names(con, bespoke), bespoke_names)
 
     def test_non_admin_skill_packs_use_the_canonical_sc_command(self) -> None:
         con = build_db()
