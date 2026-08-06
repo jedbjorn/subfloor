@@ -101,8 +101,12 @@ def test_shell_card_orders_left_identity_and_right_status_cluster():
     status = interface[interface.index('const status = el("span"'):
                        interface.index("rail.append(shellRow)")]
     assert 'className: "chat-shell-status"' in status
-    assert "chatPaintShellStatus(status, badge, mail, wake)" in status
+    assert "chatPaintShellStatus(status, mail, badge, wake)" in status
     assert "shellStatusItems.set" in status
+    assert (
+        "chatPaintShellStatus(target.status, target.mail, target.badge, wake)"
+        in interface
+    )
 
     status_style = STYLE[STYLE.index(".chat-shell-status {"):
                          STYLE.index(".chat-sprint-badge {")]
@@ -433,6 +437,65 @@ def test_conversation_identity_uses_shell_context_and_neutral_user_label():
     assert 'className: "chat-history-context"' in interface
     assert 'className: "chat-shell-shortname"' in interface
     assert "chatPaintShellState(button, openByShell.get(item.shell_id))" in interface
+
+
+def test_message_bubbles_show_local_creation_time_and_omit_invalid_values():
+    helper = APP[
+        APP.index("function chatMessageTimeLabel"):
+        APP.index("function chatShellLabel")
+    ]
+    bubble = APP[
+        APP.index("function chatBubble"):
+        APP.index("function chatTranscriptAtBottom")
+    ]
+    script = r"""
+process.env.TZ = "UTC";
+function el(tag, props = {}, ...children) {
+  return {
+    tag, ...props, children,
+    append(...items) { this.children.push(...items); },
+  };
+}
+function mdBlock(body) { return el("div", { className: "md" }, body); }
+function chatShellLabel() { return "Shell"; }
+""" + helper + bubble + r"""
+const createdAt = "2026-08-06T06:17:00+02:00";
+const user = chatBubble("user", "hello", "completed", null, createdAt);
+const activity = chatBubble("activity", "working");
+console.log(JSON.stringify({
+  valid: chatMessageTimeLabel(createdAt),
+  missing: chatMessageTimeLabel(null),
+  invalid: chatMessageTimeLabel("not-a-time"),
+  header: {
+    className: user.children[0].className,
+    who: user.children[0].children[0].children[0],
+    timeTag: user.children[0].children[1].tag,
+    timeClass: user.children[0].children[1].className,
+    dateTime: user.children[0].children[1].dateTime,
+    time: user.children[0].children[1].children[0],
+  },
+  activityHeaderItems: activity.children[0].children.length,
+}));
+"""
+    assert run_js(script) == {
+        "valid": "04:17",
+        "missing": "",
+        "invalid": "",
+        "header": {
+            "className": "chat-bubble-head",
+            "who": "You",
+            "timeTag": "time",
+            "timeClass": "chat-message-time",
+            "dateTime": "2026-08-06T06:17:00+02:00",
+            "time": "04:17",
+        },
+        "activityHeaderItems": 1,
+    }
+    transcript_item = APP[
+        APP.index("function chatTranscriptItemNode"):
+        APP.index("function chatUpdateTranscriptNode")
+    ]
+    assert "item.created_at" in transcript_item
 
 
 def test_shell_rail_mail_badge_only_renders_for_unread_messages():
