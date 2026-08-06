@@ -25,8 +25,8 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
-import seed_skills  # noqa: E402
-import skill as skill_cli  # noqa: E402
+import seed_skills
+import skill as skill_cli
 
 ENGINE_SKILLS = ("test_authoring", "review", "git")
 
@@ -91,6 +91,12 @@ class RetireTest(unittest.TestCase):
             },
         )
         self.reconcile_targets = self.target_projection.start()
+        self.persist_snapshot = mock.patch.object(
+            skill_cli, "_persist_snapshot"
+        ).start()
+        self.persist_render = mock.patch.object(
+            skill_cli, "_persist_render"
+        ).start()
         self.con = make_db()
 
     def tearDown(self):
@@ -98,6 +104,8 @@ class RetireTest(unittest.TestCase):
         self.con.close()
         self.target_projection.stop()
         self.projection.stop()
+        self.persist_render.stop()
+        self.persist_snapshot.stop()
         self.tmp.cleanup()
 
     def _retire_file(self, names) -> None:
@@ -230,7 +238,8 @@ class RetireTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             SystemExit,
-            "grant review committed in the DB, but skill projection failed: "
+            "grant review committed in the DB, snapshot, and flat render, "
+            "but skill projection failed: "
             "managed root is a symlink",
         ):
             skill_cli.cmd_grant(self.con, "review", ["BSP1"])

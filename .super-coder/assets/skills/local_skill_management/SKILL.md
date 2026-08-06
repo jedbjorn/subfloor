@@ -1,131 +1,94 @@
 ---
 name: local_skill_management
-description: Create, persist, assign, and remove fork-specific skills — the correct authoring path so skills survive snapshot/rebuild cycles.
+description: Create, update, assign, and remove DB-canonical fork-local skills through the supported CLI. Use for fork AI-team capabilities that must survive snapshot/rebuild without engine asset edits or Admin intervention.
 category: substrate
 common: false
 ---
 
-# local_skill_management — fork-specific skills that survive
+# local_skill_management — manage fork-local skills through the DB
 
-Fork-specific skills live in the DB and persist via `.sc-state/local/content.sql`
-(the snapshot). The asset file under `.super-coder/assets/skills/<name>/` is
-the **authoring source only** — it sits in gitignored engine territory, and
-that is safe: the engine/local boundary is the seed migration (0001,
-upstream-owned in a fork), not asset-file presence. The snapshot serializes
-your skill to content.sql whether or not the asset file is kept, and
-`sc update` neither manifests it nor heals over its DB row. **The live DB plus
-its local snapshot are durable; the asset file is your editor.**
+Fork-local skills are canonical in the live engine DB and persist in the local
+snapshot. Keep the input `SKILL.md` only as an authoring draft; never copy it
+under `.super-coder/assets/skills/` or edit the engine seed.
 
-The path: **file -> seed -> grant -> local snapshot**.
+## Create or update
 
-## Creating a fork-specific skill
+1. Write a draft `SKILL.md` in a Planner-owned path. Use flat frontmatter:
 
-1. **Write the skill file** at `.super-coder/assets/skills/<name>/SKILL.md`.
-
-   Required frontmatter:
    ```yaml
    ---
-   name: skill_name
-   description: One-line summary — shown in boot, catalogue, and the GUI Skills tab
-   category: substrate   # or craft; omit for default
+   name: repo_skill
+   description: State what the skill does and when it fires.
+   category: substrate
+   common: false
    ---
-   ```
-   Body: markdown procedure the shell will follow. Imperative, compressed —
-   this boots into context.
 
-2. **Seed into the live DB:**
+   # Procedure
+
+   Give directives with observable success conditions.
+   ```
+
+   Use a lowercase underscore name. Keep `common: false`: fork-local grants are
+   always explicit. Apply `authoring_syntax` to the description and body.
+
+2. Commit the draft to the catalogue:
+
    ```bash
-   sc seed-skills
+   sc skill put --file <path/to/SKILL.md>
    ```
-   UPSERTs every asset skill by name (id-stable) and reports what landed. In a
-   fork it deliberately does NOT regenerate the seed migration — that file is
-   upstream-owned engine territory. DB skills with no asset file = other local
-   skills, left intact.
 
-3. **Grant to the target pack** — name a shell by id or shortname:
+   Success prints `DB + snapshot + flat render + skill projections reconciled`.
+   The command requires the launched shell identity to resolve as Planner,
+   creates or updates the DB row, preserves every existing grant, and creates
+   no managed asset copy. An engine-owned name refuses before any write and
+   points to the upstream engine-skill workflow.
+
+3. Grant a new skill explicitly:
+
    ```bash
    sc skill grant <skill_name> <shell>...
    ```
-   A standard shell targets its shared flavor pack; every shell of that flavor
-   receives the skill. A Bespoke shell targets only itself. To create an
-   intentional one-shell assignment, create/use a Bespoke shell.
-   Unknown skill/shell names = hard error (no silent no-op grants).
-   `sc skill list` = catalogue with origins + current grants;
-   `sc skill revoke <name> <shell>...` reverses a grant.
 
-4. **Snapshot — the persistence step:**
-   ```bash
-   SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render
-   ```
-   `snapshot.py` serializes local skills (any skill the engine seed doesn't
-   own) into `.sc-state/local/content.sql` — what survives `sc update` and
-   `sc rebuild`; the row + flavor/Bespoke grants reconstruct from content.sql.
-   Skip this -> the skill is lost on next update.
+   Naming a standard shell updates its shared flavor pack. Naming a Bespoke
+   shell updates that shell only. Success includes the same persistence receipt.
+   Creation alone grants nothing.
 
-5. **Finish.** Run `sc render-check` — it fails if the local `skills_sc/`
-   mirror drifts from the DB render. Snapshot and renders stay ignored; commit
-   only deliberately authored engine assets/migrations in the source repo.
-
-## Updating a skill
-
-Edit the asset file -> repeat seed -> snapshot (steps 2, 4, 5).
-Asset file gone (removed / authored elsewhere) -> recreate it from the DB body
-first: `sc sql "SELECT content FROM skills WHERE name='<name>'"`.
-
-## Assigning an existing skill
+## Change assignments
 
 ```bash
 sc skill grant <skill_name> <shell>...
+sc skill revoke <skill_name> <shell>...
+sc skill list
 ```
-Name one standard shell to update its whole flavor, or name a Bespoke shell to
-update only that shell. Then `SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render`
-to refresh the local artifacts.
 
-## Removing a skill
+Unknown skills and shells fail loudly. Every successful grant or revoke writes
+the DB, local snapshot, flat catalogue render, and affected harness projections;
+do not run `SC_ADMIN=1`, `sc snapshot`, or `sc render` afterward.
 
-1. **Soft-delete the row + revoke its grants:**
-   ```bash
-   sc skill rm <skill_name>
-   ```
-   Refuses engine skills — the seed resurrects those on next update/rebuild.
-   Engine skill this fork has superseded -> retire fork-wide:
-   `sc skill retire <name>` (writes the ignored local
-   `.sc-state/local/skills_retired.json`; `sc skill unretire`
-   reverses). Flavor/Bespoke removal -> `sc skill revoke`.
+## Remove
 
-2. **Remove the asset file** (`.super-coder/assets/skills/<name>/`) —
-   otherwise the next `sc seed-skills` re-inserts the skill.
+```bash
+sc skill rm <skill_name>
+```
 
-3. **Snapshot and render locally:**
-   ```bash
-   SC_ADMIN=1 sc snapshot && SC_ADMIN=1 sc render
-   ```
+Local removal soft-deletes the catalogue row, revokes its flavor and Bespoke
+grants, persists every layer, and removes managed projections. Re-running the
+same removal is safe and reconciles a prior partial persistence failure.
 
-## How the GUI organizes skills
+Engine skills refuse `rm`. Use `sc skill retire <name>` only when the fork must
+retire an engine-owned skill; use `sc skill unretire <name>` to restore it.
 
-Shells → Skill Assignments shows the full catalogue in sections. Each standard
-flavor appears once; Bespoke shells appear individually.
+## Recover a partial persistence failure
 
-- **Repo skills** — lead section: skills authored in this fork. Membership is
-  *derived* — a skill the engine seed doesn't own is repo-local. Same rule
-  snapshot.py uses to decide what serializes into local `content.sql`, so
-  the section shows exactly what the snapshot keeps durable. No frontmatter
-  flag exists or is needed.
-- **Substrate / Craft / …** — engine skills, sectioned by `category`
-  frontmatter. A repo skill's `category` displays as a row label but never
-  moves it out of the Repo section.
+A failed command names each committed and uncommitted layer. Fix the reported
+snapshot, render, or projection path, then retry the exact same `sc skill`
+command. Stop only when it prints the full persistence receipt; a DB-only
+commit is live but not yet rebuild-durable.
 
-GUI grant toggles hit the same ownership boundary as `sc skill grant`:
-`flavor_skills` for standard flavors, `shell_skills` for Bespoke shells. They
-still need a snapshot (header button or `SC_ADMIN=1 sc snapshot`) to survive a
-rebuild.
+## Boundaries
 
-## What NOT to do
-
-- **NEVER skip the snapshot after creating a skill.** Seeding writes the live
-  DB only; content.sql is what survives `sc update` and `sc rebuild`.
-- **NEVER edit `0001_seed_skills.sql` by hand.** Generated, and in a fork
-  upstream-owned engine territory — a local edit blocks the next update.
-- **NEVER create skills via the GUI.** Toggling grants there is fine (snapshot
-  after); creating is not — the GUI writes only the DB and cannot write the
-  asset file or seed it. Use this procedure.
+- Never edit `.super-coder/assets/skills/` for a fork-local skill.
+- Never run `sc seed-skills` for a fork-local skill.
+- Never use `SC_ADMIN=1`, `sc sql-rw`, or an Admin handoff for this lifecycle.
+- Never set a fork-local skill `common: true`; use explicit grants.
+- Change engine-owned skill bodies only through the upstream engine workflow.

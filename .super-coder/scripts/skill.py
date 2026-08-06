@@ -7,13 +7,13 @@ escape hatch — and a grant whose skill name didn't resolve was a SILENT
 no-op (`INSERT ... SELECT` over zero rows, #253). This surface makes the
 lifecycle first-class and loud: unknown skill or shell names are hard
 errors, engine skills refuse `rm` (the seed would just resurrect them),
-and every write reminds you that `./sc snapshot` is the persistence step.
+and every supported mutation persists the local snapshot and projections.
 Naming a standard shell targets its shared flavor pack; naming a Bespoke shell
 targets only that shell.
 
-Catalogue rows themselves are authored as assets + `./sc seed-skills`
-(engine + administrator-authored fork-local alike); this command manages
-what's GRANTED where, and retires local skills.
+Engine catalogue rows are authored as assets + `./sc seed-skills`. Fork-local
+rows are DB-canonical and enter through `put --file`; the input file remains a
+draft and is never copied into managed engine assets.
 
 ENGINE skills can't be `rm`'d (the seed resurrects them on every update) —
 they retire via the fork retire list instead (#238): `retire` writes the
@@ -25,6 +25,7 @@ The list is re-applied after every seed sync/heal/rebuild, so it rides
 
 Usage:
     ./sc skill list                        catalogue: origin, common, grants
+    ./sc skill put --file <SKILL.md>       create/update a DB-canonical LOCAL skill
     ./sc skill grant  <name> <shell>...    grant via shell reference (flavor/Bespoke)
     ./sc skill revoke <name> <shell>...    revoke via shell reference
     ./sc skill rm     <name>               soft-delete a LOCAL skill + revoke all grants
@@ -38,14 +39,18 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import db_driver  # noqa: E402
-import artifact_policy  # noqa: E402
-import mem  # noqa: E402
-import seed_skills  # noqa: E402 — seeded_skill_names is the engine/local line
-import skill_projection  # noqa: E402
+import artifact_policy
+import db_driver
+import mem
+import render as render_mod
+import seed_skills
+import skill_projection
+import snapshot
 
 ENGINE = Path(__file__).resolve().parents[1]
 DB_PATH = ENGINE / "shell_db.db"
+MAX_SKILL_FILE_BYTES = 128 * 1024
+LOCAL_FRONTMATTER_FIELDS = {"name", "description", "category", "command", "common"}
 
 
 def connect():
@@ -60,6 +65,29 @@ def _shell_api_enabled() -> bool:
     mem._PROG = "skill"
     mem._require_api()
     return True
+
+
+def require_planner(con) -> int:
+    """Resolve the launched shell token locally and require Planner flavor."""
+    if not mem.SC_API_TOKEN:
+        sys.exit(
+            "sc skill: `put` requires a launched Planner shell; no shell token "
+            "is present"
+        )
+    row = con.execute(
+        "SELECT shell_id, shortname, flavor FROM shells WHERE api_key=? "
+        "AND COALESCE(is_deleted,0)=0",
+        (mem.SC_API_TOKEN,),
+    ).fetchone()
+    if row is None:
+        sys.exit("sc skill: `put` shell token does not resolve to an active shell")
+    if row[2] != "planner":
+        label = row[1] or row[0]
+        sys.exit(
+            f"sc skill: `put` is Planner-owned; shell {label} has flavor "
+            f"{row[2] or 'bespoke'}"
+        )
+    return int(row[0])
 
 
 def resolve_shell(con, ref: str) -> tuple[int, str]:
@@ -141,30 +169,137 @@ def resolve_skill(con, name: str) -> int:
                  f"(.sc-state/skills_retired.json) — `./sc skill unretire {name}` "
                  "to restore it.")
     if row:
-        sys.exit(f"sc skill: '{name}' is soft-deleted — re-author + `./sc seed-skills` "
-                 "to restore it.")
-    sys.exit(f"sc skill: no skill '{name}' in the live DB — author "
-             f".super-coder/assets/skills/{name}/SKILL.md then `./sc seed-skills`.")
+        sys.exit(
+            f"sc skill: '{name}' is soft-deleted — restore it with "
+            f"`./sc skill put --file <{name}-SKILL.md>`"
+        )
+    sys.exit(
+        f"sc skill: no skill '{name}' in the live DB — create a fork-local skill "
+        "with `./sc skill put --file <SKILL.md>`"
+    )
 
 
-def persist_note() -> None:
-    target = artifact_policy.content_path().relative_to(ENGINE.parent)
-    suffix = " — commit it" if artifact_policy.tracks_local_artifacts() else " — local, ignored"
-    print(f"→ persist: ./sc snapshot   (serializes to {target}{suffix})")
+def _persist_snapshot(con) -> None:
+    snapshot.persist_instance(con)
 
 
-def _reconcile_targets(con, shell_ids: list[int], action: str) -> None:
+def _persist_render(con) -> None:
+    render_mod.persist_visibility(con)
+
+
+def _persist_mutation(con, action: str, reconcile) -> None:
+    """Persist each post-commit layer and report exact partial durability."""
     try:
-        skill_projection.reconcile_assignment_targets(con, shell_ids)
-    except skill_projection.ProjectionError as exc:
-        sys.exit(skill_projection.partial_failure_message(action, exc))
+        with artifact_policy.content_write_lock():
+            try:
+                _persist_snapshot(con)
+            except Exception as exc:  # noqa: BLE001 — report failed layer
+                sys.exit(
+                    f"sc skill: {action} committed in the DB, but snapshot "
+                    f"persistence failed: {exc}. Flat render and skill projection "
+                    "were not attempted; fix the named failure, then retry the "
+                    "same `sc skill` command."
+                )
 
+            try:
+                _persist_render(con)
+            except Exception as exc:  # noqa: BLE001 — report failed layer
+                sys.exit(
+                    f"sc skill: {action} committed in the DB and snapshot, but flat "
+                    f"render persistence failed: {exc}. Skill projection was not "
+                    "attempted; fix the named failure, then retry the same `sc skill` "
+                    "command."
+                )
+    except Exception as exc:  # noqa: BLE001 — lock/filesystem implementations vary
+        sys.exit(
+            f"sc skill: {action} committed in the DB, but the snapshot/render "
+            f"serialization lock failed before persistence: {exc}. Snapshot, flat "
+            "render, and skill projection were not attempted; fix the named failure, "
+            "then retry the same `sc skill` command."
+        )
 
-def _reconcile_all(con, action: str) -> None:
     try:
-        skill_projection.reconcile_existing_checkouts(con)
-    except skill_projection.ProjectionError as exc:
-        sys.exit(skill_projection.partial_failure_message(action, exc))
+        reconcile()
+    except Exception as exc:  # noqa: BLE001 — projection adapters vary by harness
+        sys.exit(
+            f"sc skill: {action} committed in the DB, snapshot, and flat render, "
+            f"but skill projection failed: {exc}. Fix the named path, then retry "
+            "the same `sc skill` command."
+        )
+    print("persist: DB + snapshot + flat render + skill projections reconciled")
+
+
+def parse_local_skill_file(path: Path) -> dict:
+    """Validate the bounded flat frontmatter accepted by `skill put`."""
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        sys.exit(f"sc skill: cannot read draft {path}: {exc}")
+    if len(raw) > MAX_SKILL_FILE_BYTES:
+        sys.exit(
+            f"sc skill: draft {path} is {len(raw)} bytes; maximum is "
+            f"{MAX_SKILL_FILE_BYTES} bytes"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        sys.exit(f"sc skill: draft {path} must be UTF-8: {exc}")
+
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        sys.exit(f"sc skill: draft {path} must start with YAML frontmatter")
+    try:
+        boundary = next(
+            index
+            for index, line in enumerate(lines[1:], start=1)
+            if line.strip() == "---"
+        )
+    except StopIteration:
+        sys.exit(f"sc skill: draft {path} has no closing frontmatter delimiter")
+
+    meta: dict[str, str] = {}
+    for line in lines[1:boundary]:
+        if not line.strip():
+            continue
+        if ":" not in line:
+            sys.exit(f"sc skill: invalid frontmatter line in {path}: {line!r}")
+        key, value = (part.strip() for part in line.split(":", 1))
+        if key not in LOCAL_FRONTMATTER_FIELDS:
+            sys.exit(f"sc skill: unsupported frontmatter field {key!r} in {path}")
+        if key in meta:
+            sys.exit(f"sc skill: duplicate frontmatter field {key!r} in {path}")
+        meta[key] = value
+
+    name = meta.get("name", "")
+    description = meta.get("description", "")
+    if not name or not seed_skills.SKILL_NAME_RE.fullmatch(name) or len(name) > 64:
+        sys.exit(
+            "sc skill: frontmatter `name` must be 1-64 lowercase letters, "
+            "digits, or underscores and start with a letter"
+        )
+    if not description:
+        sys.exit("sc skill: frontmatter `description` must be a non-empty line")
+
+    common_value = meta.get("common", "false").lower()
+    if common_value not in {"false", "0", "no"}:
+        if common_value in {"true", "1", "yes"}:
+            sys.exit(
+                "sc skill: fork-local skills must use `common: false`; assign "
+                "them explicitly with `sc skill grant`"
+            )
+        sys.exit("sc skill: frontmatter `common` must be true or false")
+
+    body = "\n".join(lines[boundary + 1:]).strip()
+    if not body:
+        sys.exit(f"sc skill: draft {path} must include a non-empty procedure body")
+    return {
+        "name": name,
+        "description": description,
+        "category": meta.get("category") or None,
+        "command": meta.get("command") or None,
+        "common": 0,
+        "content": body,
+    }
 
 
 def print_catalogue(rows: list[dict]) -> int:
@@ -209,8 +344,11 @@ def cmd_grant(con, name: str, shell_refs: list[str]) -> int:
         print(f"grant: {name} → {scope}"
               + ("" if changed else "  (already granted)"))
     con.commit()
-    _reconcile_targets(con, targets, f"grant {name}")
-    persist_note()
+    _persist_mutation(
+        con,
+        f"grant {name}",
+        lambda: skill_projection.reconcile_assignment_targets(con, targets),
+    )
     return 0
 
 
@@ -224,8 +362,63 @@ def cmd_revoke(con, name: str, shell_refs: list[str]) -> int:
         print(f"revoke: {name} ⇸ {scope}"
               + ("" if changed else "  (was not granted)"))
     con.commit()
-    _reconcile_targets(con, targets, f"revoke {name}")
-    persist_note()
+    _persist_mutation(
+        con,
+        f"revoke {name}",
+        lambda: skill_projection.reconcile_assignment_targets(con, targets),
+    )
+    return 0
+
+
+def cmd_put(con, path: Path) -> int:
+    require_planner(con)
+    spec = parse_local_skill_file(path)
+    name = spec["name"]
+    reserved = set(seed_skills.seeded_skill_names()) | set(
+        seed_skills.tombstoned_skill_names()
+    )
+    if name in reserved:
+        sys.exit(
+            f"sc skill: '{name}' is ENGINE-owned and cannot be overwritten by "
+            "the fork-local lane; change it in the upstream engine skill workflow"
+        )
+
+    existing = con.execute(
+        "SELECT skill_id, is_deleted FROM skills WHERE name=?", (name,)
+    ).fetchone()
+    if existing is None:
+        con.execute(
+            "INSERT INTO skills (name, description, category, command, common, "
+            "content, is_deleted) VALUES (?, ?, ?, ?, 0, ?, 0)",
+            (
+                name,
+                spec["description"],
+                spec["category"],
+                spec["command"],
+                spec["content"],
+            ),
+        )
+        verb = "created"
+    else:
+        con.execute(
+            "UPDATE skills SET description=?, category=?, command=?, common=0, "
+            "content=?, is_deleted=0 WHERE skill_id=?",
+            (
+                spec["description"],
+                spec["category"],
+                spec["command"],
+                spec["content"],
+                existing[0],
+            ),
+        )
+        verb = "restored" if existing[1] else "updated"
+    con.commit()
+    _persist_mutation(
+        con,
+        f"put {name}",
+        lambda: skill_projection.reconcile_existing_checkouts(con),
+    )
+    print(f"put: {name} {verb} in the DB; grants unchanged")
     return 0
 
 
@@ -256,7 +449,10 @@ def cmd_retire(con, name: str) -> int:
     if not already:
         _write_retire_list(names + [name])
     seed_skills.apply_retired(con)
-    _reconcile_all(con, f"retire {name}")
+    try:
+        skill_projection.reconcile_existing_checkouts(con)
+    except skill_projection.ProjectionError as exc:
+        sys.exit(skill_projection.partial_failure_message(f"retire {name}", exc))
     dormant = grant_count(
         con, con.execute(
             "SELECT skill_id FROM skills WHERE name=?", (name,)).fetchone()[0])
@@ -276,7 +472,10 @@ def cmd_unretire(con, name: str) -> int:
                  f"({seed_skills.RETIRED_FILE}).")
     _write_retire_list([n for n in names if n != name])
     seed_skills.apply_retired(con)
-    _reconcile_all(con, f"unretire {name}")
+    try:
+        skill_projection.reconcile_existing_checkouts(con)
+    except skill_projection.ProjectionError as exc:
+        sys.exit(skill_projection.partial_failure_message(f"unretire {name}", exc))
     grants = grant_count(
         con, con.execute(
             "SELECT skill_id FROM skills WHERE name=?", (name,)).fetchone()[0])
@@ -288,28 +487,37 @@ def cmd_unretire(con, name: str) -> int:
 
 
 def cmd_rm(con, name: str) -> int:
-    skill_id = resolve_skill(con, name)
-    if name in set(seed_skills.seeded_skill_names()):
+    engine_owned = set(seed_skills.seeded_skill_names()) | set(
+        seed_skills.tombstoned_skill_names()
+    )
+    if name in engine_owned:
         sys.exit(f"sc skill: '{name}' is an ENGINE skill — the seed re-inserts it "
                  "on every update/rebuild, so a local rm cannot stick. "
                  f"`./sc skill retire {name}` retires it fork-wide (durable), or "
                  "`./sc skill revoke` removes it from a flavor or Bespoke shell.")
+    row = con.execute(
+        "SELECT skill_id, is_deleted FROM skills WHERE name=?", (name,)
+    ).fetchone()
+    if row is None:
+        sys.exit(f"sc skill: no local skill '{name}' in the live DB")
+    skill_id, already_deleted = row
     n = con.execute("DELETE FROM flavor_skills WHERE skill_id=?", (skill_id,)).rowcount
     n += con.execute("DELETE FROM shell_skills WHERE skill_id=?", (skill_id,)).rowcount
     con.execute("UPDATE skills SET is_deleted=1 WHERE skill_id=?", (skill_id,))
     con.commit()
-    _reconcile_all(con, f"rm {name}")
-    print(f"rm: {name} soft-deleted, {n} grant(s) revoked.")
-    asset = ENGINE / "assets" / "skills" / name
-    if asset.exists():
-        print(f"  note: {asset.relative_to(ENGINE.parent)} still exists — remove it "
-              "or `./sc seed-skills` will re-insert the skill.")
-    persist_note()
+    _persist_mutation(
+        con,
+        f"rm {name}",
+        lambda: skill_projection.reconcile_existing_checkouts(con),
+    )
+    suffix = " (already removed; persistence reconciled)" if already_deleted else ""
+    print(f"rm: {name} soft-deleted, {n} grant(s) revoked.{suffix}")
     return 0
 
 
 def main(argv: list[str]) -> int:
-    usage = ("usage: ./sc skill list | grant <name> <shell>... | "
+    usage = ("usage: ./sc skill list | put --file <SKILL.md> | "
+             "grant <name> <shell>... | "
              "revoke <name> <shell>... | rm <name> | "
              "retire <name> | unretire <name>")
     if not argv or argv[0] in ("-h", "--help", "help"):
@@ -322,6 +530,8 @@ def main(argv: list[str]) -> int:
     try:
         if cmd == "list" and not args:
             return cmd_list(con)
+        if cmd == "put" and len(args) == 2 and args[0] == "--file":
+            return cmd_put(con, Path(args[1]))
         if cmd == "grant" and len(args) >= 2:
             return cmd_grant(con, args[0], args[1:])
         if cmd == "revoke" and len(args) >= 2:

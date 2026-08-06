@@ -21,17 +21,18 @@ Run:
 from __future__ import annotations
 
 import sqlite3
+import sys
 import tempfile
 import unittest
-import sys
 from pathlib import Path
+from unittest import mock
 
 ENGINE = Path(__file__).resolve().parents[1] / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
-import engine_manifest  # noqa: E402
-import seed_skills  # noqa: E402
-import skill as skill_mod  # noqa: E402
-import snapshot as snapshot_mod  # noqa: E402
+import engine_manifest
+import seed_skills
+import skill as skill_mod
+import snapshot as snapshot_mod
 
 SKILLS_DDL = (
     "CREATE TABLE skills (skill_id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, "
@@ -39,7 +40,7 @@ SKILLS_DDL = (
     "common INTEGER NOT NULL DEFAULT 1, is_deleted INTEGER NOT NULL DEFAULT 0)")
 SHELLS_DDL = (
     "CREATE TABLE shells (shell_id INTEGER PRIMARY KEY, shortname TEXT, "
-    "display_name TEXT, flavor TEXT, is_deleted INTEGER DEFAULT 0)")
+    "display_name TEXT, flavor TEXT, api_key TEXT, is_deleted INTEGER DEFAULT 0)")
 GRANTS_DDL = (
     "CREATE TABLE shell_skills (shell_skill_id INTEGER PRIMARY KEY, "
     "shell_id INTEGER NOT NULL, skill_id INTEGER NOT NULL, UNIQUE(shell_id, skill_id));"
@@ -133,6 +134,37 @@ class LocalSkillWorld(unittest.TestCase):
         self.assertIn("DELETE FROM skills WHERE name NOT IN ('eng_a');", lines)
 
 
+class LocalSkillManagementSeedTest(unittest.TestCase):
+    def test_engine_asset_and_generated_seed_match_for_management_skill(self):
+        spec = seed_skills.parse_skill(
+            ENGINE / "assets" / "skills" / "local_skill_management" / "SKILL.md"
+        )
+        con = sqlite3.connect(":memory:")
+        try:
+            con.execute(SKILLS_DDL)
+            con.executescript(
+                (ENGINE / "migrations" / "0001_seed_skills.sql").read_text()
+            )
+            self.assertEqual(
+                con.execute(
+                    "SELECT description, category, command, common, content "
+                    "FROM skills WHERE name='local_skill_management'"
+                ).fetchone(),
+                tuple(
+                    spec[key]
+                    for key in (
+                        "description",
+                        "category",
+                        "command",
+                        "common",
+                        "content",
+                    )
+                ),
+            )
+        finally:
+            con.close()
+
+
 class SkillCommandTest(unittest.TestCase):
     """`./sc skill` — loud grants/revokes/rm against a throwaway DB."""
 
@@ -141,7 +173,14 @@ class SkillCommandTest(unittest.TestCase):
         self.db = self.tmp / "shell_db.db"
         con = sqlite3.connect(self.db)
         con.executescript(SKILLS_DDL + ";" + SHELLS_DDL + ";" + GRANTS_DDL + ";")
-        con.execute("INSERT INTO shells (shell_id, shortname) VALUES (1, 'dev1')")
+        con.execute(
+            "INSERT INTO shells (shell_id, shortname, api_key) "
+            "VALUES (1, 'dev1', 'dev-token')"
+        )
+        con.execute(
+            "INSERT INTO shells (shell_id, shortname, flavor, api_key) "
+            "VALUES (2, 'PLN1', 'planner', 'planner-token')"
+        )
         con.execute("INSERT INTO skills (name, common) VALUES ('eng_a', 1)")
         con.execute("INSERT INTO skills (name, common) VALUES ('loc_b', 0)")
         con.commit()
@@ -151,10 +190,20 @@ class SkillCommandTest(unittest.TestCase):
         # Pin the engine/local line for rm: eng_a is seed-owned.
         self._saved_names = seed_skills.seeded_skill_names
         seed_skills.seeded_skill_names = lambda: ["eng_a"]
+        self._saved_token = skill_mod.mem.SC_API_TOKEN
+        skill_mod.mem.SC_API_TOKEN = "planner-token"
+        self.persist_snapshot = mock.patch.object(
+            skill_mod, "_persist_snapshot"
+        ).start()
+        self.persist_render = mock.patch.object(
+            skill_mod, "_persist_render"
+        ).start()
 
     def tearDown(self):
+        mock.patch.stopall()
         skill_mod.DB_PATH = self._saved_db
         seed_skills.seeded_skill_names = self._saved_names
+        skill_mod.mem.SC_API_TOKEN = self._saved_token
 
     def grants(self):
         con = sqlite3.connect(self.db)
@@ -164,6 +213,26 @@ class SkillCommandTest(unittest.TestCase):
                 "JOIN skills s USING (skill_id)").fetchall()
         finally:
             con.close()
+
+    def write_draft(
+        self,
+        name: str,
+        body: str,
+        *,
+        description: str = "local workflow",
+        common: str = "false",
+    ) -> Path:
+        path = self.tmp / f"{name}.md"
+        path.write_text(
+            "---\n"
+            f"name: {name}\n"
+            f"description: {description}\n"
+            "category: substrate\n"
+            f"common: {common}\n"
+            "---\n\n"
+            f"{body}\n"
+        )
+        return path
 
     def test_grant_revoke_roundtrip_by_shortname_and_id(self):
         self.assertEqual(skill_mod.main(["grant", "loc_b", "dev1"]), 0)
@@ -189,6 +258,308 @@ class SkillCommandTest(unittest.TestCase):
         con.close()
         self.assertEqual(deleted, 1)
         self.assertEqual(self.grants(), [])
+
+    def test_put_creates_ungranted_skill_and_update_preserves_grant(self):
+        draft = self.write_draft("loc_new", "First procedure")
+        self.assertEqual(skill_mod.main(["put", "--file", str(draft)]), 0)
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                con.execute(
+                    "SELECT description, category, command, common, content, "
+                    "is_deleted FROM skills WHERE name='loc_new'"
+                ).fetchone(),
+                ("local workflow", "substrate", None, 0, "First procedure", 0),
+            )
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM shell_skills ss JOIN skills s "
+                    "USING (skill_id) WHERE s.name='loc_new'"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            con.close()
+
+        self.assertEqual(skill_mod.main(["grant", "loc_new", "dev1"]), 0)
+        draft = self.write_draft(
+            "loc_new", "Second procedure", description="updated workflow"
+        )
+        self.assertEqual(skill_mod.main(["put", "--file", str(draft)]), 0)
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                con.execute(
+                    "SELECT description, content FROM skills WHERE name='loc_new'"
+                ).fetchone(),
+                ("updated workflow", "Second procedure"),
+            )
+        finally:
+            con.close()
+        self.assertEqual(self.grants(), [(1, "loc_new")])
+
+    def test_put_refuses_engine_name_and_implicit_common_grant(self):
+        with self.assertRaisesRegex(SystemExit, "ENGINE-owned"):
+            skill_mod.main(
+                ["put", "--file", str(self.write_draft("eng_a", "replacement"))]
+            )
+        with self.assertRaisesRegex(SystemExit, "must use `common: false`"):
+            skill_mod.main(
+                [
+                    "put",
+                    "--file",
+                    str(self.write_draft("loc_common", "body", common="true")),
+                ]
+            )
+        self.persist_snapshot.assert_not_called()
+        self.persist_render.assert_not_called()
+
+    def test_put_requires_the_launched_planner_identity(self):
+        draft = self.write_draft("loc_auth", "procedure")
+        skill_mod.mem.SC_API_TOKEN = "dev-token"
+        with self.assertRaisesRegex(SystemExit, "`put` is Planner-owned"):
+            skill_mod.main(["put", "--file", str(draft)])
+        skill_mod.mem.SC_API_TOKEN = "missing-token"
+        with self.assertRaisesRegex(SystemExit, "does not resolve"):
+            skill_mod.main(["put", "--file", str(draft)])
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM skills WHERE name='loc_auth'"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            con.close()
+
+    def test_put_validates_frontmatter_name_body_and_size_before_write(self):
+        bad_name = self.write_draft("Bad-Name", "procedure")
+        with self.assertRaisesRegex(SystemExit, "frontmatter `name` must be"):
+            skill_mod.main(["put", "--file", str(bad_name)])
+
+        empty_body = self.write_draft("loc_empty", "")
+        with self.assertRaisesRegex(SystemExit, "non-empty procedure body"):
+            skill_mod.main(["put", "--file", str(empty_body)])
+
+        oversized = self.tmp / "oversized.md"
+        oversized.write_bytes(b"x" * (skill_mod.MAX_SKILL_FILE_BYTES + 1))
+        with self.assertRaisesRegex(SystemExit, "maximum is"):
+            skill_mod.main(["put", "--file", str(oversized)])
+
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM skills WHERE name='loc_empty'"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            con.close()
+
+    def test_snapshot_failure_reports_db_only_and_retry_converges(self):
+        draft = self.write_draft("loc_partial", "procedure")
+        self.persist_snapshot.side_effect = OSError("snapshot unwritable")
+        with self.assertRaisesRegex(
+            SystemExit,
+            "put loc_partial committed in the DB, but snapshot persistence failed: "
+            "snapshot unwritable.*Flat render and skill projection were not attempted",
+        ):
+            skill_mod.main(["put", "--file", str(draft)])
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                con.execute(
+                    "SELECT content, is_deleted FROM skills WHERE name='loc_partial'"
+                ).fetchone(),
+                ("procedure", 0),
+            )
+        finally:
+            con.close()
+        self.persist_render.assert_not_called()
+
+        self.persist_snapshot.side_effect = None
+        self.assertEqual(skill_mod.main(["put", "--file", str(draft)]), 0)
+        self.persist_render.assert_called_once()
+
+    def test_serialization_lock_failure_reports_every_unattempted_layer(self):
+        draft = self.write_draft("loc_lock", "procedure")
+        with mock.patch.object(
+            skill_mod.artifact_policy,
+            "content_write_lock",
+            side_effect=OSError("lock unwritable"),
+        ), self.assertRaisesRegex(
+            SystemExit,
+            "serialization lock failed before persistence: lock unwritable.*"
+            "Snapshot, flat render, and skill projection were not attempted",
+        ):
+            skill_mod.main(["put", "--file", str(draft)])
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                con.execute(
+                    "SELECT content FROM skills WHERE name='loc_lock'"
+                ).fetchone()[0],
+                "procedure",
+            )
+        finally:
+            con.close()
+        self.persist_snapshot.assert_not_called()
+        self.persist_render.assert_not_called()
+
+    def test_remove_retry_reconciles_a_committed_soft_delete(self):
+        self.assertEqual(
+            skill_mod.main(
+                ["put", "--file", str(self.write_draft("loc_remove", "procedure"))]
+            ),
+            0,
+        )
+        with mock.patch.object(
+            skill_mod.skill_projection,
+            "reconcile_existing_checkouts",
+            side_effect=skill_mod.skill_projection.ProjectionError("blocked root"),
+        ), self.assertRaisesRegex(
+            SystemExit,
+            "DB, snapshot, and flat render, but skill projection failed: blocked root",
+        ):
+            skill_mod.main(["rm", "loc_remove"])
+        self.assertEqual(skill_mod.main(["rm", "loc_remove"]), 0)
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                con.execute(
+                    "SELECT is_deleted FROM skills WHERE name='loc_remove'"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            con.close()
+
+
+class LocalSkillPersistenceIntegrationTest(unittest.TestCase):
+    """Exercise real snapshot + flat-render persistence on a full schema."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_dir.cleanup)
+        self.tmp = Path(self.tmp_dir.name)
+        self.db = self.tmp / "shell_db.db"
+        self.snapshot = self.tmp / "content.sql"
+        self.render_root = self.tmp / "renders"
+        schema = (ENGINE / "schema.sql").read_text()
+        con = sqlite3.connect(self.db)
+        con.executescript(schema)
+        con.execute("ALTER TABLE shells ADD COLUMN api_key TEXT")
+        con.execute("INSERT INTO users (user_id, username) VALUES (1, 'operator')")
+        con.execute(
+            "INSERT INTO shells (shell_id, display_name, shortname, role, "
+            "system_prompt, flavor, user_id, api_key) VALUES "
+            "(7, 'Planner', 'PLN1', 'Planner', 'plan', 'planner', 1, 'planner-token')"
+        )
+        con.execute(
+            "INSERT INTO skills (name, description, common, content) "
+            "VALUES ('eng_a', 'engine', 0, 'engine body')"
+        )
+        con.commit()
+        con.close()
+
+        self.patches = [
+            mock.patch.object(skill_mod, "DB_PATH", self.db),
+            mock.patch.object(skill_mod.mem, "SC_API_TOKEN", "planner-token"),
+            mock.patch.object(snapshot_mod, "OUT_PATH", self.snapshot),
+            mock.patch.object(
+                skill_mod.artifact_policy, "prepare_local_state", return_value=[]
+            ),
+            mock.patch.object(
+                skill_mod.artifact_policy,
+                "render_root",
+                return_value=self.render_root,
+            ),
+            mock.patch.object(seed_skills, "seeded_skill_names", return_value=["eng_a"]),
+            mock.patch.object(
+                seed_skills, "tombstoned_skill_names", return_value=["retired_eng"]
+            ),
+            mock.patch.object(
+                skill_mod.skill_projection,
+                "reconcile_existing_checkouts",
+                return_value={"written": [], "skipped": [], "deleted": []},
+            ),
+            mock.patch.object(
+                skill_mod.skill_projection,
+                "reconcile_assignment_targets",
+                return_value={"written": [], "skipped": [], "deleted": []},
+            ),
+        ]
+        for patcher in self.patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write_draft(self, body: str) -> Path:
+        path = self.tmp / "SKILL.md"
+        path.write_text(
+            "---\n"
+            "name: repo_helper\n"
+            "description: Run the fork helper workflow.\n"
+            "category: workflow\n"
+            "common: false\n"
+            "---\n\n"
+            f"{body}\n"
+        )
+        return path
+
+    def rebuilt_row(self) -> tuple:
+        rebuilt = sqlite3.connect(":memory:")
+        try:
+            rebuilt.executescript((ENGINE / "schema.sql").read_text())
+            rebuilt.execute("ALTER TABLE shells ADD COLUMN api_key TEXT")
+            rebuilt.executescript(self.snapshot.read_text())
+            return rebuilt.execute(
+                "SELECT s.description, s.category, s.common, s.content, "
+                "s.is_deleted, (SELECT COUNT(*) FROM flavor_skills fs "
+                "WHERE fs.skill_id=s.skill_id) FROM skills s "
+                "WHERE s.name='repo_helper'"
+            ).fetchone()
+        finally:
+            rebuilt.close()
+
+    def test_create_update_grant_rebuild_revoke_and_remove_persist(self):
+        draft = self.write_draft("First procedure")
+        self.assertEqual(skill_mod.main(["put", "--file", str(draft)]), 0)
+        self.assertEqual(skill_mod.main(["grant", "repo_helper", "PLN1"]), 0)
+        self.assertTrue(self.snapshot.is_file())
+        self.assertTrue((self.render_root / "skills_sc" / "repo_helper.md").is_file())
+
+        draft = self.write_draft("Updated procedure")
+        self.assertEqual(skill_mod.main(["put", "--file", str(draft)]), 0)
+        self.assertEqual(
+            self.rebuilt_row(),
+            (
+                "Run the fork helper workflow.",
+                "workflow",
+                0,
+                "Updated procedure",
+                0,
+                1,
+            ),
+        )
+
+        self.assertEqual(skill_mod.main(["revoke", "repo_helper", "PLN1"]), 0)
+        self.assertEqual(skill_mod.main(["rm", "repo_helper"]), 0)
+        self.assertEqual(
+            self.rebuilt_row(),
+            (
+                "Run the fork helper workflow.",
+                "workflow",
+                0,
+                "Updated procedure",
+                1,
+                0,
+            ),
+        )
+        self.assertFalse(
+            (self.render_root / "skills_sc" / "repo_helper.md").exists()
+        )
 
 
 class ManifestScopeTest(unittest.TestCase):

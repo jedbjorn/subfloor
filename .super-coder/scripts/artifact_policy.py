@@ -7,6 +7,8 @@ import os
 import shutil
 import sqlite3
 import sys
+from contextlib import contextmanager
+from fcntl import LOCK_EX, LOCK_UN, flock
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[1]
@@ -88,6 +90,19 @@ def retired_skills_path() -> Path:
 def review_patch_root() -> Path:
     """Ignored, per-instance cache for canonical merged-PR patches."""
     return LOCAL_DIR / "review-patches"
+
+
+@contextmanager
+def content_write_lock():
+    """Serialize snapshot + flat-render pairs across API and CLI processes."""
+    path = LOCAL_DIR / ".content-write.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        flock(handle.fileno(), LOCK_EX)
+        try:
+            yield
+        finally:
+            flock(handle.fileno(), LOCK_UN)
 
 
 def _copy_file_once(source: Path, destination: Path) -> bool:

@@ -25,11 +25,11 @@ from __future__ import annotations
 import sqlite3  # kept for map.db (which stays SQLite)
 from pathlib import Path
 
-import artifact_policy  # noqa: E402
-import db_driver  # noqa: E402
-import map_db  # noqa: E402 — sibling module in scripts/
-import seed_skills  # noqa: E402 — seeded_skill_names is the engine/local line
-from _serialize_guard import require_admin  # noqa: E402
+import artifact_policy
+import db_driver
+import map_db
+import seed_skills
+from _serialize_guard import require_admin
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -509,6 +509,19 @@ def serialize_instance(con) -> str:
         con.rollback()
 
 
+def persist_instance(con) -> Path:
+    """Persist one coherent instance snapshot without changing DB state.
+
+    Callers that already own an authorized DB mutation use this after commit.
+    The standalone CLI keeps its Admin guard in ``main``; persistence itself is
+    deliberately reusable by narrower first-class mutation surfaces.
+    """
+    artifact_policy.prepare_local_state()
+    content = serialize_instance(con)
+    artifact_policy.atomic_write_text(OUT_PATH, content)
+    return OUT_PATH
+
+
 def main() -> int:
     require_admin("snapshot")
     copied = artifact_policy.prepare_local_state()
@@ -519,8 +532,7 @@ def main() -> int:
     con = db_driver.connect(DB_PATH)
     try:
         reconciled = seed_skills.reconcile_tombstoned_skills(con)
-        content = serialize_instance(con)
-        artifact_policy.atomic_write_text(OUT_PATH, content)
+        persist_instance(con)
     finally:
         con.close()
     if reconciled.changed_names:
