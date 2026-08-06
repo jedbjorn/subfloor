@@ -16,6 +16,7 @@
 #
 #   HOT (short + long):
 #   make dos-e   / dos-enter     attach a session (pick shell + harness); dos-e s=ap01 boots one
+#   make dos-admin               boot the sole Admin directly on the host
 #   make dos-l   / dos-launch    build + start the docker sandbox (+ review GUI)
 #   make dos-r   / dos-restart   confirm (YES) + DB backup, then down + launch
 #   make dos-d   / dos-down      stop the sandbox
@@ -37,7 +38,7 @@
 #              passthrough: make dos ARGS=health
 #
 SC := ./sc
-.PHONY: dos-e dos-enter dos-l dos-launch dos-r dos-restart dos-d dos-down dos-u dos-update \
+.PHONY: dos-e dos-enter dos-admin dos-l dos-launch dos-r dos-restart dos-d dos-down dos-u dos-update \
         dos-t dos-test dos-h dos-help dos-url dos-build dos-logs dos-serve dos-health dos-ports \
         dos-verify dos-map dos-render dos-snapshot dos-deps dos-install dos-rollback \
         dos-update-harnesses dos-harness-status dos-feat dos-feature dos-eject dos-remove \
@@ -50,6 +51,7 @@ model-shell-arg = $(if $(strip $(s)),--shell $(s))
 # Hot commands — long form, with a one-letter alias delegating to it.
 dos-enter:            ; $(SC) $(if $(strip $(s)),enter-$(s),enter) $(ARGS)
 dos-e: dos-enter
+dos-admin:            ; $(SC) admin $(ARGS)
 dos-launch:           ; $(SC) launch $(ARGS)
 dos-l: dos-launch
 dos-restart:          ; $(SC) restart $(ARGS)
@@ -110,6 +112,7 @@ dos-h:
 	@echo "  │ short │ long        │ what it does                             │"
 	@echo "  ├───────┼─────────────┼──────────────────────────────────────────┤"
 	@echo "  │ dos-e │ dos-enter   │ attach a session (pick shell + harness)  │"
+	@echo "  │       │ dos-admin   │ boot the sole Admin directly on host    │"
 	@echo "  │ dos-l │ dos-launch  │ build + start the docker sandbox + GUI   │"
 	@echo "  │ dos-r │ dos-restart │ confirm + DB backup, then recreate fresh │"
 	@echo "  │ dos-d │ dos-down    │ stop the sandbox                         │"
@@ -127,6 +130,8 @@ dos-help:
 	@echo "    dos-e / dos-enter [s=x]     pick/enter a shell, or enter x directly —"
 	@echo "                                new chat, reattach a live one, or take the"
 	@echo "                                writer role back from a dead GUI client"
+	@echo "    dos-admin                   boot the sole Admin directly on the host;"
+	@echo "                                dos-e remains the container Admin route"
 	@echo "    dos-l / dos-launch          build + start the sandbox and review GUI"
 	@echo "    dos-r / dos-restart         confirm + backup + fully restart (ARGS forwarded)"
 	@echo "    dos-d / dos-down            stop and remove the sandbox"

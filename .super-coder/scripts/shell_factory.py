@@ -180,13 +180,13 @@ def create_shell(con, *, flavor: str | None, name: str,
     normal factory/API calls intentionally create role-only shells. Returns the
     new shell_id. Caller commits."""
     tpl = load_flavor(flavor) if flavor else BESPOKE_TEMPLATE
-    # Cartographer is a singleton: one map-keeper per fork. Friendly pre-check
-    # here; the trg_singleton_cartographer trigger is the DB backstop. is_deleted=0
-    # so a deleted cartographer frees the slot.
-    if flavor == "cartographer" and con.execute(
-            "SELECT COUNT(*) FROM shells WHERE flavor='cartographer' AND is_deleted=0"
+    # Singleton flavors get a friendly factory error before their DB backstop.
+    # Soft-deleted identities remain historical and do not occupy the slot.
+    if flavor in {"admin", "cartographer"} and con.execute(
+            "SELECT COUNT(*) FROM shells WHERE flavor=? AND is_deleted=0",
+            (flavor,),
     ).fetchone()[0] >= 1:
-        raise ValueError("cartographer is a singleton — this fork already has one")
+        raise ValueError(f"{flavor} is a singleton — this fork already has one")
     repo = repo or REPO_ROOT.name
     role = role or tpl["role"]
     mandate = (mandate or tpl["mandate"]).replace("{{repo}}", repo)
