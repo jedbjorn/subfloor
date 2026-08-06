@@ -54,6 +54,7 @@ def cmd_declare(args: argparse.Namespace) -> int:
         {
             "feature_id": args.feature,
             "planner_shell_id": args.planner_shell,
+            "spec_document_ids": _integer_list(args.spec),
             "spec_approval_ids": _integer_list(args.spec_approval),
             "participants": _json_array(args.participants_file),
             "merge_grant_enabled": args.merge_grant,
@@ -392,7 +393,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="originating Planner; defaults to the authenticated caller",
     )
-    declare.add_argument("--spec-approval", type=int, action="append", required=True)
+    declare.add_argument(
+        "--spec",
+        type=int,
+        action="append",
+        help="current governing spec document; repeat for multiple specs",
+    )
+    declare.add_argument(
+        "--spec-approval",
+        type=int,
+        action="append",
+        help="deprecated: resolve the reviewed document and retain evidence",
+    )
     declare.add_argument("--participants-file", required=True)
     declare.add_argument("--merge-grant", action="store_true", required=True)
     declare.set_defaults(fn=cmd_declare)

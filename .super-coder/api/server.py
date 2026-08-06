@@ -1992,6 +1992,17 @@ class Handler(BaseHTTPRequestHandler):
             )
         )
 
+    @classmethod
+    def _sprint_optional_integer_list(cls, body: dict, name: str) -> list[int]:
+        values = body.get(name, [])
+        if not isinstance(values, list):
+            raise ValueError(f"{name} must be an array")
+        return list(
+            dict.fromkeys(
+                cls._sprint_integer({name: item}, name) for item in values
+            )
+        )
+
     def _sprint_error(self, exc: Exception):
         if isinstance(exc, sprint_domain.SprintAuthorityError):
             return self._send(403, {"error": str(exc)})
@@ -2062,7 +2073,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _declare_sprint(self, con, shell_id: int, body: dict) -> int:
         feature_id = self._sprint_integer(body, "feature_id")
-        approval_ids = self._sprint_integer_list(body, "spec_approval_ids")
+        document_ids = self._sprint_optional_integer_list(body, "spec_document_ids")
+        approval_ids = self._sprint_optional_integer_list(body, "spec_approval_ids")
+        if not document_ids and not approval_ids:
+            raise ValueError(
+                "at least one spec_document_ids or spec_approval_ids selector is required"
+            )
         participants = body.get("participants")
         if not isinstance(participants, list) or not participants:
             raise ValueError("participants must be a non-empty array")
@@ -2140,35 +2156,52 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT 1 FROM roadmap WHERE feature_id=?", (feature_id,)
             ).fetchone() is None:
                 raise KeyError(f"unknown feature: {feature_id}")
-            approval_rows = []
+            selected_specs: dict[int, dict] = {}
+            for document_id in document_ids:
+                document = con.execute(
+                    "SELECT document_id,feature_id,kind,body FROM documents "
+                    "WHERE document_id=?",
+                    (document_id,),
+                ).fetchone()
+                if document is None:
+                    raise KeyError(f"unknown Sprint spec document: {document_id}")
+                selected_specs[document_id] = {
+                    "document": document,
+                    "approval_id": None,
+                }
+            approval_documents: set[int] = set()
             for approval_id in approval_ids:
                 approval = con.execute(
-                    "SELECT a.document_id,a.revision_sha256,a.verdict,d.feature_id,"
-                    "d.kind,d.body,reviewer.flavor AS reviewer_flavor,"
-                    "COALESCE(reviewer.is_deleted,0) AS reviewer_deleted "
+                    "SELECT a.document_id,d.feature_id,d.kind,d.body "
                     "FROM sprint_spec_approvals a "
                     "JOIN documents d ON d.document_id=a.document_id "
-                    "JOIN shells reviewer ON reviewer.shell_id=a.reviewer_shell_id "
                     "WHERE a.approval_id=?",
                     (approval_id,),
                 ).fetchone()
                 if approval is None:
                     raise KeyError(f"unknown Sprint spec approval: {approval_id}")
-                current_revision = hashlib.sha256(
-                    approval["body"].encode()
-                ).hexdigest()
+                approval_document_id = int(approval["document_id"])
+                if approval_document_id in approval_documents:
+                    raise ValueError(
+                        "multiple spec approvals select the same document; use spec_document_ids"
+                    )
+                approval_documents.add(approval_document_id)
+                selected_specs[approval_document_id] = {
+                    "document": approval,
+                    "approval_id": approval_id,
+                }
+            for selected in selected_specs.values():
+                document = selected["document"]
                 if (
-                    approval["verdict"] != "pass"
-                    or approval["kind"] != "spec"
-                    or int(approval["feature_id"]) != feature_id
-                    or approval["revision_sha256"] != current_revision
-                    or approval["reviewer_flavor"] != "reviewer"
-                    or approval["reviewer_deleted"]
+                    document["kind"] != "spec"
+                    or document["feature_id"] is None
+                    or int(document["feature_id"]) != feature_id
+                    or not isinstance(document["body"], str)
+                    or not document["body"].strip()
                 ):
                     raise sprint_domain.SprintInvariantError(
-                        "declaration requires current passing approvals for its feature"
+                        "declaration requires non-empty spec documents for its feature"
                     )
-                approval_rows.append((approval_id, approval))
             active_shells = {
                 int(row["shell_id"]): str(row["flavor"])
                 for row in con.execute(
@@ -2207,11 +2240,11 @@ class Handler(BaseHTTPRequestHandler):
                 (
                     (
                         sprint_id,
-                        approval["document_id"],
-                        approval["revision_sha256"],
-                        approval_id,
+                        document_id,
+                        hashlib.sha256(selected["document"]["body"].encode()).hexdigest(),
+                        selected["approval_id"],
                     )
-                    for approval_id, approval in approval_rows
+                    for document_id, selected in selected_specs.items()
                 ),
             )
             con.executemany(
@@ -2242,7 +2275,12 @@ class Handler(BaseHTTPRequestHandler):
                     json.dumps(
                         {
                             "feature_id": feature_id,
-                            "spec_approval_ids": approval_ids,
+                            "spec_document_ids": list(selected_specs),
+                            **(
+                                {"spec_approval_ids": approval_ids}
+                                if approval_ids
+                                else {}
+                            ),
                             "participant_shell_ids": sorted(seen_shells),
                         },
                         sort_keys=True,

@@ -2279,34 +2279,27 @@ class SprintLifecycleStore:
         sprint_id = int(sprint["sprint_id"])
         if int(sprint["merge_grant_enabled"]) != 1:
             raise SprintInvariantError("arming requires a committed merge grant")
-        invalid_specs = self.con.execute(
-            "SELECT COUNT(*) FROM sprint_specs ss "
-            "JOIN sprint_spec_approvals a ON a.approval_id=ss.approval_id "
-            "JOIN documents d ON d.document_id=ss.document_id "
-            "JOIN shells reviewer ON reviewer.shell_id=a.reviewer_shell_id "
-            "WHERE ss.sprint_id=? AND "
-            "(a.verdict<>'pass' OR a.document_id<>ss.document_id "
-            "OR a.revision_sha256<>ss.bound_revision_sha256 "
-            "OR d.kind<>'spec' OR d.feature_id<>? "
-            "OR reviewer.flavor<>'reviewer' "
-            "OR COALESCE(reviewer.is_deleted,0)<>0)",
-            (sprint_id, sprint["feature_id"]),
-        ).fetchone()[0]
         bound_specs = self.con.execute(
-            "SELECT ss.bound_revision_sha256,d.body FROM sprint_specs ss "
-            "JOIN documents d ON d.document_id=ss.document_id "
+            "SELECT ss.bound_revision_sha256,d.document_id,d.feature_id,d.kind,d.body "
+            "FROM sprint_specs ss "
+            "LEFT JOIN documents d ON d.document_id=ss.document_id "
             "WHERE ss.sprint_id=?",
             (sprint_id,),
         ).fetchall()
-        current_revision_mismatch = any(
-            row["body"] is None
+        invalid_specs = any(
+            row["document_id"] is None
+            or row["kind"] != "spec"
+            or row["feature_id"] is None
+            or int(row["feature_id"]) != int(sprint["feature_id"])
+            or not isinstance(row["body"], str)
+            or not row["body"].strip()
             or hashlib.sha256(row["body"].encode()).hexdigest()
             != row["bound_revision_sha256"]
             for row in bound_specs
         )
-        if not bound_specs or invalid_specs or current_revision_mismatch:
+        if not bound_specs or invalid_specs:
             raise SprintInvariantError(
-                "arming requires at least one exact, passing spec approval"
+                "arming requires at least one exact current governing spec"
             )
         roles = {
             row[0]

@@ -577,6 +577,7 @@ class SprintBoardApiCase(unittest.TestCase):
                 "sprint.declared",
                 {
                     "feature_id": self.ids["feature_id"],
+                    "spec_document_ids": [self.ids["document_id"]],
                     "spec_approval_ids": [1],
                     "participant_shell_ids": [2, 3, 4],
                     "secret": "hidden",

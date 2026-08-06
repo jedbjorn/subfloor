@@ -472,9 +472,10 @@ class SprintCloseStore:
         rows = self._rows(
             "SELECT ss.document_id,ss.bound_revision_sha256,ss.approval_id,"
             "ss.included_at,d.title,d.body,a.reviewer_shell_id,a.verdict,"
-            "a.reviewed_at FROM sprint_specs ss "
+            "a.revision_sha256 AS reviewed_revision_sha256,"
+            "a.findings_document_id,a.reviewed_at FROM sprint_specs ss "
             "JOIN documents d ON d.document_id=ss.document_id "
-            "JOIN sprint_spec_approvals a ON a.approval_id=ss.approval_id "
+            "LEFT JOIN sprint_spec_approvals a ON a.approval_id=ss.approval_id "
             "WHERE ss.sprint_id=? ORDER BY ss.document_id",
             (sprint_id,),
         )

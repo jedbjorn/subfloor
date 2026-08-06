@@ -45,7 +45,12 @@ _RECOVERY_INSTRUCTION = (
 # are projected; an unknown event remains visible with an empty detail object.
 _EVENT_FIELDS = {
     "sprint.declared": frozenset(
-        {"feature_id", "spec_approval_ids", "participant_shell_ids"}
+        {
+            "feature_id",
+            "spec_document_ids",
+            "spec_approval_ids",
+            "participant_shell_ids",
+        }
     ),
     "sprint.delivery_terminal": frozenset(
         {"terminal_count", "completed_count", "cancelled_count"}
