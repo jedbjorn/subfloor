@@ -15,6 +15,8 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# agents — delegated waves under your discipline
 
+> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
+
 FnB invokes this as `--agents [model]`. It is an **overlay** on `spec` (dev
 mode) and `review` (review mode): it changes only what is written here.
 Everything upstream and downstream of the named steps — loading the spec,
@@ -561,15 +563,32 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'cartographer',
-  'Own the repo map — configure mapping to THIS repo, wire the auto-remap git hooks, heal both on drift. Cartographer-only; no working shell maps. Run on first boot + whenever the map looks wrong.',
+  'Own the repo map — configure mapping of the work surface (the declared work_repo when this install names one, else this repo), wire the auto-remap git hooks, heal both on drift. Cartographer-only; no working shell maps. Run on first boot + whenever the map looks wrong.',
   'substrate',
   'sc map-setup',
   0,
   '# cartographer — own the repo map so no other shell has to
 
 Working shells consume the `dr_*` catalogue (`surface_catalogue`) and never
-map. You alone do three things: **configure** how this repo is mapped, **wire**
-the automation that keeps it fresh, **heal** both on drift.
+map. You alone do three things: **configure** how the mapped repo is scanned,
+**wire** the automation that keeps it fresh, **heal** both on drift.
+
+## Mapping target — work repo vs home repo
+
+The map scans the shells'' WORK SURFACE. When `instance.json` declares a
+`work_repo`, that repo is what `sc map` scans and what every `dr_*` row
+describes; otherwise it is this repo. Verify after any remap:
+`sc map-sql "SELECT root FROM dr_repo"` -> must print the work-repo path.
+
+The map DB, `map.config.json`, and serialized sections stay in the HOME
+repo''s `.sc-state/` regardless. NEVER write cache files, wire hooks, or set
+`core.hooksPath` in the work repo — it may run its own substrate with its own
+hooks (subfloor does).
+
+Freshness caveat in work-repo mode: the auto-remap git hooks and cron watch
+the HOME clone, so a work-repo sync does NOT auto-remap. After the work repo
+moves (pull, merge, branch switch), re-run `sc map` yourself — treat a
+work-repo sync message from any shell as a remap trigger.
 
 Map db = `.sc-state/local/map/map.db`, separate from the engine memory db
 (`shell_db.db`) so an engine schema change never touches the map. Reads: `sc
@@ -1953,93 +1972,89 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'git',
-  'Git conventions for a super-coder shell — one repo, one cwd. Sync the base before work, branch before committing, open PRs (never merge without the FnB''s OK), attribute commits per-shell. Use before any git work.',
+  'Git conventions for this install — ALL version control happens in the work repo (~/Repos/subfloor), addressed explicitly with git -C / gh --repo. Sync the base before work, branch before committing, open PRs (never merge without the FnB''s OK). Use before any git work.',
   'substrate',
   NULL,
   0,
-  '# git — version control, the super-coder way
+  '# git — version control, the work-repo way
 
-One repo at its root -> plain `git` (cwd = repo root) is safe.
+Two repos are in reach; only one takes commits from you:
 
-Project = this repo minus `.super-coder/`. Engine = `.super-coder/` — gitignored, materialized by `sc update`, authored upstream in super-coder. NEVER commit or edit anything under `.super-coder/`.
+| Repo | Path | Git role |
+|---|---|---|
+| **work repo** | `~/Repos/subfloor` (GitHub `jedbjorn/subfloor`) | ALL of it: sync, branch, commit, push, PR |
+| **home repo** | the repo your cwd sits in | NONE. Local-only (no remotes); commits refused by a pre-commit guard |
+
+Your cwd is a home worktree -> a bare `git`/`gh` command targets the WRONG repo.
+Address the work repo explicitly, every time:
+
+- `git -C ~/Repos/subfloor <cmd>` — never rely on cwd, even right after a `cd`.
+- `gh --repo jedbjorn/subfloor <cmd>` for PR operations.
+- Success condition: `git -C ~/Repos/subfloor rev-parse --show-toplevel` prints
+  the subfloor path before your first write of a session.
+
+NEVER commit, branch, or open a PR in the home repo. The guard blocks the
+commit and prints this redirect; `SC_HOME_MAINTENANCE=1` is for FnB-approved
+home maintenance only — never a way around a mistake. Home and work repo are
+different products with divergent histories: NEVER retarget a commit, branch,
+or diff from one onto the other. Built against the wrong repo -> rebuild from
+scratch in the right one.
 
 ## Sync before you start — hard pre-code gate
 
-Run the gate every session + before each new unit of work. `shell/<shortname>` = a moving base pinned to `origin/main`, not a content branch — cut feature branches from it. A stale base -> you read code that no longer exists + your PRs conflict on arrival.
+Run before each new unit of work. A stale base -> you read code that no longer
+exists + your PRs conflict on arrival.
 
-The launcher auto-syncs at boot when provably nothing can be lost (on base branch + clean tree + no local-only commits). Read the `sync:` line in ACTIVE SESSION: auto-synced + nothing done since -> current, carry on. Says **NOT auto-synced** / you''re mid-session about to start new work -> run:
+1. `git -C ~/Repos/subfloor fetch origin main && git -C ~/Repos/subfloor rev-list --count HEAD..origin/main` -> 0 = carry on.
+2. Behind -> take stock BEFORE touching anything: `git -C ~/Repos/subfloor status` (uncommitted) + `git -C ~/Repos/subfloor rev-list origin/main..HEAD` (unmerged commits) + `git -C ~/Repos/subfloor branch --no-merged origin/main` (unlanded branches).
+3. Local state that is NOT yours -> another shell''s in-flight work: leave it untouched, take a worktree seat (below). Yours -> land or stash before syncing.
+4. Clean (or FnB said go) -> `git -C ~/Repos/subfloor checkout main && git -C ~/Repos/subfloor pull --ff-only`. Stale feature branch -> `git -C ~/Repos/subfloor rebase origin/main`.
 
-1. `git fetch origin main && git rev-list --count HEAD..origin/main` -> 0 = carry on.
-2. Behind -> take stock BEFORE touching anything: `git status` (uncommitted) + `git rev-list origin/main..HEAD` (unmerged commits) + `git branch --no-merged origin/main` (unlanded branches).
-3. Anything local -> surface to the FnB first: list the commits/files, ask land / stash / discard. No sync without their call (soft gate).
-4. Clean (or FnB said go) -> `git checkout shell/<shortname> && git reset --hard origin/main`. NEVER `git pull`/merge on the base — merge bubbles accumulate + your squash-merged work replays as conflicts.
-5. Reset only the base, never a feature branch. Stale feature branch -> `git rebase origin/main`.
+## Shared checkout — one clone, many shells
+
+`~/Repos/subfloor` is ONE checkout shared by every shell. Before switching
+branches: `git -C ~/Repos/subfloor status` — a dirty tree or a sibling''s
+checked-out branch = someone is mid-work. NEVER reset, stash, or branch-switch
+under them; take a worktree seat instead:
+
+    git -C ~/Repos/subfloor worktree add ~/Repos/subfloor-wt/<shortname> -b <type>/<short-desc> origin/main
+
+Work in it with `git -C ~/Repos/subfloor-wt/<shortname> …`; remove the seat
+(`git -C ~/Repos/subfloor worktree remove ~/Repos/subfloor-wt/<shortname>`)
+once its PR is open.
 
 ## Branch -> commit -> push -> PR -> stop
 
-1. NEVER commit to the default branch. Branch first: `git checkout -b <type>/<short-desc>` (feat/fix/chore/docs). *Admin-shell exception:* it boots at the repo root on `main`, exempt from the branch-guard; committing to main is its mandate (engine updates, migrations, approved patches) and it starts each session with `git pull --ff-only`. Every other shell branches, always.
+1. NEVER commit to `main`. Branch first: `git -C ~/Repos/subfloor checkout -b <type>/<short-desc>` (feat/fix/chore/docs).
 2. Commit in logical units. End every message with your shell''s trailer:
    ```
    Co-Authored-By: <shell display_name> (super-coder) <noreply@…>
    ```
-3. Push -> open a PR -> stop. Do NOT merge without an explicit FnB directive — opening is the default, merging is a separate gate.
+3. Push -> open the PR (`gh --repo jedbjorn/subfloor pr create`) -> stop. Do NOT merge without an explicit FnB directive — opening is the default, merging is a separate gate.
 
 ## Merging a stack (only when the FnB hands you one)
 
 Merge bottom-up, retargeting before each merge — never rely on GitHub''s auto-retarget:
 
-1. `gh pr view <n> --json mergeable,mergeStateStatus` -> clean.
-2. `gh pr merge <low> --squash --delete-branch`.
-3. BEFORE the next merge: `gh pr edit <next> --base main` — deleting the merged base otherwise orphans the PR above it (GitHub closes it `CONFLICTING`, base ref gone).
+1. `gh --repo jedbjorn/subfloor pr view <n> --json mergeable,mergeStateStatus` -> clean.
+2. `gh --repo jedbjorn/subfloor pr merge <low> --squash --delete-branch`.
+3. BEFORE the next merge: `gh --repo jedbjorn/subfloor pr edit <next> --base main` — deleting the merged base otherwise orphans the PR above it (GitHub closes it `CONFLICTING`, base ref gone).
 4. Re-check `MERGEABLE` -> merge. Repeat up the stack.
 
 PR already orphaned (base deleted under it) -> the head branch still holds the commits; reopen the SAME PR, don''t rebuild:
 
-1. `git push origin <merged-sha>:refs/heads/<deleted-branch>` — `<merged-sha>` = `gh pr view <merged-pr> --json headRefOid`.
-2. `gh pr reopen <closed-pr>` -> `gh pr edit <closed-pr> --base main`.
-3. Verify `MERGEABLE` -> delete the recreated branch again.
+1. `git -C ~/Repos/subfloor push origin <merged-sha>:refs/heads/<deleted-branch>` — `<merged-sha>` = `gh --repo jedbjorn/subfloor pr view <merged-pr> --json headRefOid`.
+2. `gh --repo jedbjorn/subfloor pr reopen <closed-pr>` -> `gh --repo jedbjorn/subfloor pr edit <closed-pr> --base main`.
+3. Verify `MERGEABLE` -> merge/close as directed; delete the recreated branch again.
 
 ## Finish before you stop
 
-Bookend to the sync gate. At end of session: `git status` (uncommitted) + `git rev-list origin/<base>..HEAD` (unpushed) -> resolve every hit:
+Bookend to the sync gate. At end of session: `git -C ~/Repos/subfloor status` (uncommitted) + `git -C ~/Repos/subfloor rev-list origin/main..HEAD` (unpushed) -> resolve every hit:
 
 1. Real work -> commit (attributed, trailer above) + push + open the PR. Don''t skip because the session is ending.
-2. Throwaway / experiment -> discard deliberately: `git restore` / `git stash`.
+2. Throwaway / experiment -> discard deliberately: `git -C ~/Repos/subfloor restore` / `stash`.
 3. Genuinely unsure -> surface to the FnB + leave it committed-and-pushed on a branch — never sitting uncommitted.
-
-Pass = tree clean, or on a pushed branch with a PR. A dirty/unpushed tree forces the admin''s `git_cleanup` to map attribution, check liveness, and commit on your behalf.
-
-## After a merge — clean up local
-
-Only after the PR is merged:
-
-1. Re-pin the base. In a worktree `git checkout main` fails (main is checked out at the repo root; git refuses a branch checked out elsewhere) -> `git checkout shell/<shortname> && git fetch origin && git reset --hard origin/main`. Admin at repo root: `git pull --ff-only` on main.
-2. `git branch -d <branch>`. Squash-merged -> `-d` refuses (commits aren''t ancestors of main); confirm the PR shows *merged* on the remote -> `git branch -D <branch>`.
-3. `git fetch --prune`.
-
-NEVER delete a branch carrying unmerged, un-PR''d work — no PR = lost work.
-
-## Never commit the engine or derived files
-
-- `/.super-coder/` is gitignored — never force-add anything under it.
-- Gitignored + regenerated, never commit: `CLAUDE.md`, `AGENTS.md`, `opencode.json`, `.claude/skills/`, `.sc-state/engine.ref.prev` (ephemeral rollback pointer).
-- From a worktree, commit only your project''s authored files. Generated
-  snapshots and `_sc` renders live under ignored `.sc-state/local/` and never
-  enter Git. `.sc-state/engine.ref` is the deliberate tracked exception: it is
-  the dependency pin and is updated by `sc update`.
-- Exception: in the super-coder SOURCE repo, `schema.sql` + `migrations/` are tracked — there the engine *is* the project.
-
-## After DB work
-
-An `sc mem` write lands in the shared engine DB immediately. The admin/API
-save-local path refreshes the ignored snapshot and renders used by rebuild and
-review. There is no generated-content commit or Publish PR. See `snapshot`.
-
-## Notes
-
-- Before destructive ops, confirm the repo — `git -C <abs-path>` if ever in doubt.
-- Multi-shell: each shell boots into its own worktree at `.sc-worktrees/<shortname>/` on branch `shell/<shortname>`; the launcher keeps the base pinned to `origin/main` (see the sync gate). Worktree isolation is automatic — no shared cwd. Admin shell = the one exception: repo root on `main`.
-- UI preview: worktree edits do NOT show on the fork''s main dev server. `sc preview` (start once from the main checkout if not running) serves every shell''s worktree UI live (HMR) on the fork''s `dev_port`, one subdomain each: `http://<shortname>.localhost:<dev_port>/`. The `post-commit` hook prints your URL after each commit — surface that line to the FnB.',
+4. Took a worktree seat -> remove it once its PR is open.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -2160,123 +2175,81 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'issue_reporting',
-  'Report engine defects upstream — the moment a sc command fails or lies, a skill contradicts your reality, the API blocks a documented workflow, or you work around the engine to proceed. File a GitHub issue on super-coder; your repo''s app bugs stay in the fork.',
+  'Route engine defects the maintainer way — a subfloor defect is yours to triage and fix in ~/Repos/subfloor (or file on its tracker as backlog); a HOME-substrate defect becomes a flag for the FnB, never an in-place fix. Fires the moment a command fails or lies, a skill contradicts reality, or you work around anything to proceed.',
   'substrate',
   NULL,
   1,
-  '# issue_reporting — the backwards flow
+  '# issue_reporting — defects land where they''re fixed
 
-An engine defect fixed upstream reaches every fork via `sc update`; worked
-around silently, every fork re-derives the workaround. File the issue while
-the failure is on screen — NEVER batch to session end.
+You maintain subfloor: there is no upstream above you to report engine defects
+to. A defect either lands in **your backlog** (subfloor) or in **the FnB''s
+hands** (home substrate). Route it while the failure is on screen — NEVER
+batch to session end.
 
-A workaround IS a report: deviating from a skill''s steps, wrapping a command,
-or hand-patching state to proceed -> you hold the exact repro; file it now.
+A workaround IS a signal: deviating from a skill''s steps, wrapping a command,
+or hand-patching state to proceed -> you hold the exact repro; route it now.
 
-## Boundary — engine vs fork
+## Boundary — whose defect is it
 
-| Where | What |
+| Where it lives | What you do |
 |---|---|
-| **Upstream — file it** | anything the engine materializes/owns: `.super-coder/`, `sc` + every subcommand, engine skills (this catalogue), the boot doc render, the sandbox / dev kit, `sc update` + migrations, the `_sc` API + `sc mem` |
-| **Fork — don''t** | the repo''s app code, fork-local skills (see `local_skill_management`), operator-owned host config |
+| **subfloor engine** (`~/Repos/subfloor`: its `sc` + subcommands, `.super-coder/` code, migrations, adapters, boot render, engine skills, `sc mem` API) | You are the maintainer. In current scope -> fix it in subfloor (`git` skill flow). Out of scope -> file it on the tracker (below) so it survives your session. |
+| **HOME substrate** (the engine your cwd runs on: its boot doc, its `sc mem`, its launcher) | NOT your work surface. Open a flag (`sc mem flag open "[Engine] <symptom> | Blocker for: <x>"`) + surface to the FnB. NEVER fix in place — home-engine edits are FnB-gated. |
+| **Fork reports** (issues filed on subfloor by installed forks: dos-arch, md-converter, ami, rst-c) | Your intake queue — triage like your own findings. |
 
-Unsure -> "would the same problem hit any other fork?" yes = upstream.
+Unsure which install misbehaved -> check where the failing command ran:
+your cwd = home substrate; `~/Repos/subfloor` or a fork = subfloor engine.
 
 ## Triggers
 
-Each row = a real engine defect filed by a fork shell doing ordinary work.
-Match the left column -> file.
+Each row = a real engine-defect shape (filed by fork shells doing ordinary
+work). Match the left column -> route it.
 
 | You hit | Real case |
 |---|---|
-| A `sc` command fails out of the box | `sc verify` always aborted — its own render step needed `SC_ADMIN` it never set (#227) |
-| A command exits green without doing the work | `sc test` silently fell back to unittest when pytest was missing — green-washed suites (#219) |
-| The documented remedy is a closed loop | `sc lint` said "run `sc deps` first," but deps skips pip in the sandbox — tool unobtainable from inside the box (#246) |
-| A skill instructs tools/paths your seat doesn''t have | `configure_winbox` drove raw `ssh`/`virsh` — neither exists in the broker-only sandbox (#248) |
+| A `./sc` command fails out of the box | `./sc verify` always aborted — its own render step needed `SC_ADMIN` it never set (#227) |
+| A command exits green without doing the work | `./sc test` silently fell back to unittest when pytest was missing — green-washed suites (#219) |
+| The documented remedy is a closed loop | `./sc lint` said "run `./sc deps` first," but deps skips pip in the sandbox — tool unobtainable from inside the box (#246) |
+| A skill instructs tools/paths the seat doesn''t have | `configure_winbox` drove raw `ssh`/`virsh` — neither exists in the broker-only sandbox (#248) |
 | A skill contradicts what the engine actually does | skills still taught raw `sqlite3` against the substrate DB after memory went API-only (#226) |
 | The API refuses what the skills document | `sc mem doc add` 400''d standalone docs the docs + onboard skills both document (#245) |
 | A permission wall mid-workflow | a dev shell could read a planner-owned feature but 404''d advancing its status (#224) |
 | Every write suddenly 401s | rebuild didn''t re-mint api_keys — all live shells locked out until an API bounce (#214) |
-| `sc update` / migrate wedges or half-applies | migration failed partway, retry died on `duplicate column name` (#229); update aborted crossing a commit that deleted an engine file (#209) |
-| A structural foot-gun keeps re-biting you | the cwd trap — `cd` to root for `sc`, then bare git hit the wrong tree, "my edits vanished" (#225) |
-| The sandbox can reach something it shouldn''t | `do_push` src/dest weren''t contained — sandbox→host escape (#228) |
+| `./sc update` / migrate wedges or half-applies | migration failed partway, retry died on `duplicate column name` (#229) |
+| A structural foot-gun keeps re-biting | the cwd trap — bare git resolving to the wrong tree, "my edits vanished" (#225) |
 
-Stale guidance (skill says X, engine does Y) files the same as a crash.
+Stale guidance (skill says X, engine does Y) routes the same as a crash.
 
 ## Capture — while the failure is on screen
 
-- **engine ref** = `sc engine-ref` — first line of every report
-- **staleness** = compare that ref to upstream head:
-  `git ls-remote https://github.com/jedbjorn/subfloor HEAD` — write
-  `current` or `behind head <sha7>`. Behind + the symptom is a missing
-  command or a skill/engine mismatch -> the fix may already be shipped:
-  ask your FnB for `sc update` first, and file only if the defect
-  survives the update (or updating isn''t an option — then the staleness
-  note carries that caveat). Triage reads this line to tell a live
-  engine defect from a stale fork build.
-- **fork + seat**: repo name, shell flavor, sandbox/host
+- **where**: which install (subfloor / fork name / home), shell, host seat
 - **ran / followed**: the exact command, or skill name + step
 - **expected vs actual**: exact output, trimmed to the failing lines
 - **workaround**: what unblocked you, or "blocked, none found"
 
-The issue is public: NEVER paste api keys, tokens, secrets, or private paths.
+The tracker is public: NEVER paste api keys, tokens, secrets, or private paths.
 
-## File it
+## Backlog it (subfloor defects out of current scope)
 
 ```bash
-# 1. dedup — someone may have hit it first
-gh issue list --repo jedbjorn/subfloor --search "<symptom keywords>" --state all
+# 1. dedup — a fork may have hit it first
+gh --repo jedbjorn/subfloor issue list --search "<symptom keywords>" --state all
 
-# 2. file — title: [<fork>] <area>: <one-line symptom>
-gh issue create --repo jedbjorn/subfloor \
-  --title "[<fork>] <area>: <symptom>" \
-  --body "$(cat <<''EOF''
-- engine ref: <sha from .sc-state/engine.ref> · <current | behind head <sha7>>
-- fork/seat: <repo> · <shell flavor> · <sandbox|host>
-
-**Ran / followed:** <command or skill+step>
-**Expected:** <what the docs/skill promise>
-**Actual:** <exact trimmed output>
-**Workaround:** <what unblocked you, or "blocked">
-EOF
-)"
+# 2. file — title: <area>: <one-line symptom>
+gh --repo jedbjorn/subfloor issue create \
+  --title "<area>: <symptom>" \
+  --body "<capture block above>"
 ```
 
-`jedbjorn/subfloor` = engine upstream; confirm: `git remote get-url super-coder`.
-
-Dedup hit -> comment your engine ref + repro on the existing issue; do NOT
-file a duplicate.
-
-No `gh` / no network from your seat -> save the identical body as a fork flag:
-`sc mem flag open "[Engine] <symptom> | Blocker for: <x>" --name UP-###`, then
-message the **admin** shell to relay it upstream (see `messaging`).
-
-## Authorized curation recommendation
-
-The `curate` skill has one FnB-authorized exception to the normal enhancement
-gate below. When a recurring L&S cluster may warrant a reusable upstream skill,
-the curating shell may search and file the recommendation directly without
-asking the FnB first.
-
-Search all upstream issues before opening anything. Add evidence to a matching
-recommendation, or open one titled `skills: recommend <topic>` containing the
-trigger, repeated incidents, proposed ownership boundary, expected users, why
-existing skills do not cover it, and a compact candidate procedure.
-
-This route recommends; it never creates or promotes a skill. Keep one compressed
-L&S entry until a reviewed upstream skill ships and is granted. If issue search
-or creation is unavailable, surface the failure to the FnB, keep the L&S, and
-create no local skill or asset. Deliberate fork-specific authoring remains the
-administrator-owned workflow in `local_skill_management`.
+Dedup hit -> comment your repro on the existing issue; do NOT file a duplicate.
 
 ## Rules
 
-- One defect per issue. Batch nothing.
+- One defect per issue/flag. Batch nothing.
 - Observed failure = the bar for filing unasked; enhancement ideas ("the
-  engine should…") go to your FnB first, except the authorized curation
-  recommendation route above.
-- Filing ≠ unblocked: defect blocks work -> also open a fork flag linking the
-  issue URL.',
+  engine should…") go to the FnB first.
+- Filing ≠ unblocked: defect blocks current work -> also open a flag linking
+  the issue URL.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -3052,6 +3025,8 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# review — gate a diff against its spec
 
+> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
+
 The reviewer''s job end to end. You are a **different lineage than the code**
 — reviewer shells are deliberately booted on a different model family than
 the authoring dev, so the review doesn''t share the author''s blind spots ->
@@ -3355,12 +3330,87 @@ ON CONFLICT(name) DO UPDATE SET
   content=excluded.content, is_deleted=0;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'source-maintenance',
+  'Maintain the subfloor engine source at ~/Repos/subfloor — you are its upstream. Use for changes to its sc, .super-coder code, migrations, adapters, prompts, shell templates, engine skills, update/rollback behavior, or its tracked dogfood state. NEVER for the home repo''s engine.',
+  'substrate',
+  NULL,
+  0,
+  '# Source maintenance — the subfloor engine
+
+The engine source you maintain lives at **`~/Repos/subfloor`** (GitHub
+`jedbjorn/subfloor`). THERE, `.super-coder/` and `sc` are the product and you
+are upstream: fix engine defects in that repo directly; the fork
+report-upstream / never-edit-engine procedures do not apply to it.
+
+The engine under your OWN cwd (the home repo''s `.super-coder/`) is a different
+install: your memory substrate, NOT your work surface. NEVER apply this skill
+to it — home-engine changes are FnB-gated maintenance (see the boot doc''s
+PROJECT vs ENGINE).
+
+Every command below runs against the work repo: `git -C ~/Repos/subfloor …`,
+or scripts from that root — never from your cwd (the `git` skill has the full
+addressing contract).
+
+## Orient
+
+1. Confirm the target: `git -C ~/Repos/subfloor remote get-url origin` ->
+   `…jedbjorn/subfloor…`. Anything else = wrong repo; stop.
+2. Read subfloor''s active decisions/specs before choosing an architecture.
+3. Work from a branch (or a worktree seat — `git` skill). Preserve subfloor''s
+   tracked `.sc-state/content.sql`; it is that repo''s dogfood memory, not a
+   disposable fork seed.
+
+## Change the right source (paths within ~/Repos/subfloor)
+
+| Concern | Authoritative source |
+|---|---|
+| Runtime and CLI lifecycle | `sc` plus `.super-coder/scripts/` |
+| Harness behavior | `.super-coder/adapters/<harness>/adapter.json` |
+| Boot-wide instructions | `.super-coder/templates/boot.md` and `render/compose.py` |
+| Shell flavor defaults | `.super-coder/templates/shells/*.json` |
+| Engine skill | `.super-coder/assets/skills/<name>/SKILL.md`, then `./sc seed-skills` |
+| Schema/system content | a new ordered migration; never rewrite an applied migration except the generated skill seed |
+| Subfloor''s own team state | its live DB, then `SC_ADMIN=1 ./sc snapshot` (run in subfloor) |
+
+Flat `_sc` markdown and `AGENTS.md`/`CLAUDE.md` are renders. Never author a
+behavioral change in them.
+
+## Downstream contract
+
+A subfloor change reaches installed forks (dos-arch, md-converter, ami, rst-c)
+only after it merges and they `./sc update` — keep migrations ordered and
+non-destructive, and never assume a running shell inherits a changed prompt or
+skill before its next boot.
+
+## Finish
+
+Run focused tests, then from `~/Repos/subfloor`:
+
+```bash
+./sc map
+./sc render-check
+./sc verify
+git -C ~/Repos/subfloor diff --check
+```
+
+If skill assets changed, run `./sc seed-skills` first (in subfloor). Then the
+`git` skill''s finish gate: branch -> commit -> push -> PR -> stop.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'spec',
   'Execute a spec across sessions — analyze viability, surface blockers and unclear items, break into tasks (Preparation → impl steps → Verification), and track progress in spec_tasks. Updates current_state at every step. Load when starting, implementing, or building any feature, spec, or roadmap item — before writing code.',
   'craft',
   NULL,
   0,
   '# spec — analyze and execute a spec
+
+> **Work repo:** every git/gh command in this procedure runs against `~/Repos/subfloor` (`git -C ~/Repos/subfloor`, `gh --repo jedbjorn/subfloor`) — NEVER against the home repo your cwd sits in. Addressing contract: the `git` skill.
 
 Load at the start of any session that builds or implements a feature, whether
 or not the work is framed as a "spec". A spec governs the work -> this skill
@@ -4853,14 +4903,17 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'surface_catalogue',
-  'Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree. Query first, lazy-load the few files it points at. Use to orient in an unfamiliar repo fast.',
+  'Read the mapped work surface via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree — it covers the declared work repo when this install names one, else the host repo. Query first, lazy-load the few files it points at. Use to orient fast.',
   'substrate',
   NULL,
   1,
   '# surface_catalogue — read the repo from the map, not by grepping
 
-super-coder lives inside a host repo. The `dr_*` tables = a scan of that repo
-— query them first to orient, not the tree. They live in the **map db**,
+The `dr_*` tables = a scan of your WORK SURFACE — the declared work repo when
+this install names one (boot doc PROJECT vs ENGINE; confirm with
+`sc map-sql "SELECT root FROM dr_repo"`), else the host repo super-coder lives
+in. Query them first to orient, not the tree. Paths in `dr_filepath` are
+relative to that mapped root — open them from there, not from your cwd. They live in the **map db**,
 `.sc-state/map.db` — a separate file from your memory db
 (`.super-coder/shell_db.db`). Query it via `sc map-sql "…"`.
 
@@ -5138,88 +5191,99 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'windows_devkit',
-  'Drive the linked Windows Test VM — push a build artifact, exec the installer/test over SSH, capture output + a screenshot, then reset to the clean snapshot. High-fidelity installer/system-level testing where Wine is useless. Use when building or verifying Windows software in a fork that has a configured VM.',
+  'Drive the linked Windows Test VM from its supplied state with typed status, start, push, exec, capture, and end-only reset commands. Use for Windows installer, service, registry, and system-level verification that Wine cannot represent.',
   'substrate',
   NULL,
   0,
-  '# windows_devkit — driving the Windows Test VM
+  '# windows_devkit — drive the supplied Windows test VM
 
-Real Windows, for the testing Wine can''t fake: MSI installers, services, the
-registry, system-level behavior. Opt-in + link-only — the operator runs the
-VM; you drive a verified loop against it. Devs build + test; the reviewer
-independently verifies the dev''s candidate artifact with exec → capture →
-reset. Grant is explicit, per-fork (`common=0`).
+Use the operator-supplied VM and application state. Inspect first, start or open
+only what is absent, perform the test, and reset once at the end. Planning,
+probing, skill review, and static verification never reset the VM.
 
-## Precondition — the link is configured
+## Preflight
 
-VM config = `vm` key in `.super-coder/instance.json` (set via the GUI Scripts
-→ **Windows Test VM** wizard, which live-tests every field before save):
+The linked fork must have a `vm` block in `.super-coder/instance.json`, created
+and validated through Scripts → **Windows Test VM**. The operator owns the VM,
+testing snapshot, credentials, and guest toolchain.
 
-```json
-"vm": { "domain": "win-test", "ssh_host": "127.0.0.1", "ssh_port": 22,
-        "ssh_user": "tester", "ssh_key_path": "~/.ssh/sc_win_test",
-        "transfer_dir": "/var/sc/win-xfer", "snapshot": "clean",
-        "libvirt_uri": "qemu:///system" }
+- No `vm` block: stop and ask the operator to link the VM.
+- Invalid configuration or missing broker: report the structured `./sc vm`
+  error and ask the operator to run `./sc vm-broker-up`. Do not read key
+  material, use `ssh` or `virsh` directly, or build raw broker requests.
+- Missing guest toolchain: ask the operator to run `configure_winbox` and
+  re-bake. Never install tools during the test and poison the testing snapshot.
+- If GUI work reports adapter state `unknown` because `SC_HARNESS` is absent,
+  the session predates the adapter identity contract. Relaunch the shell through
+  the engine; do not add persistent harness configuration. A declared
+  `unsupported` adapter is a capability stop, not a relaunch prompt.
+
+## Canonical workflow
+
+1. Assume the operator supplied a running VM with the testing application open.
+2. Run `./sc vm status --json`. This is read-only: it never starts, restarts, or
+   resets the VM.
+3. If the domain is off, run `./sc vm start --json`. If it is already running
+   but SSH is not ready, the same command waits for readiness without restarting
+   it. Do not invent sleeps.
+4. `./sc vm exec` runs in the SSH session context and cannot open a GUI
+   application on the interactive desktop. If the testing application is
+   absent, run `./sc vm mcp up --json`, open it with the injected Windows MCP
+   `App` tool, and visually confirm that it is open before proceeding.
+5. Use `push`, `exec`, and `capture` as needed, then perform the test.
+6. A test failure does not skip cleanup. When testing is finished and you still
+   have control, run `./sc vm mcp down --json` if GUI transport was used, then
+   run `./sc vm reset --off --json` once. This restores the configured testing
+   snapshot and leaves the domain powered off.
+7. Report the test result and cleanup result separately. Include any structured
+   error and never claim an unconfirmed operation succeeded.
+
+There is no reset at the beginning or during a test. Do not automatically retry
+a reset after a timeout, disconnect, malformed response, or
+`reset_result_unknown`; its effect may already have occurred.
+
+## Typed commands
+
+```text
+./sc vm status --json
+./sc vm start --json
+./sc vm push <repo-file> [destination] --json
+./sc vm exec --json -- <simple guest command and arguments>
+./sc vm exec --command-file <utf8-command-file> --json
+./sc vm capture [--output .sc-state/local/vm-captures/<name>] --json
+./sc vm mcp status|up|down --json
+./sc vm reset --off --json
 ```
 
-`libvirt_uri` optional — set it when the domain is system-scope (the default
-`qemu:///session` can''t see it); omit otherwise.
-
-- No `vm` block → no VM linked: stop + ask the operator to run the wizard.
-- `configure_winbox` must also have run, or the box has no toolchain — the
-  wizard''s `toolchain` check confirms it did.
-- A wrong field → fix it in the wizard (it re-validates); NEVER hand-edit
-  secrets into config.
-- `ssh_key_path` = a path, never key material. Never read it — the key lives
-  host-side with the broker (below).
-
-## Drive through the host broker — never ssh/virsh directly
-
-You run inside the sandbox; the VM lives on the host''s libvirt NAT,
-unreachable from here, and the container has no `ssh`, no `virsh`, no key.
-Call the host-side **vm-broker** over its unix socket in the bind-mounted
-repo; the broker holds the key + libvirt. (Detail:
-`.super-coder/docs/windows-vm-broker.md`.)
-
-```bash
-SOCK="$(sc vm-broker-sock)"
-curl -s --unix-socket "$SOCK" http://vm/health      # liveness check first
-```
-
-curl fails "not reachable" → broker down → ask the operator to run
-`sc vm-broker-up` on the host. You cannot start it yourself (host process,
-not sandbox).
-
-## The loop — push → exec → capture → reset
-
-Every run starts from the clean snapshot — without the reset, installer
-side-effects leak between runs and the next result is a lie.
-
-| Verb | Call |
-|---|---|
-| **push** | `curl -s --unix-socket "$SOCK" http://vm/push -d ''{"src":"<repo path to artifact>"}''` — stages into `transfer_dir` (the guest''s share) |
-| **exec** | `curl -s --unix-socket "$SOCK" http://vm/exec -d ''{"command":"<installer / test cmd>"}''` → `{ok, exit, stdout, stderr}` |
-| **capture** | `curl -s --unix-socket "$SOCK" http://vm/capture -d ''{"command":"<optional cmd>"}''` → stdout + a base64 `virsh screenshot` for GUI state |
-| **reset** (start) | `curl -s --unix-socket "$SOCK" http://vm/reset -X POST` — revert to clean + **boot** |
-| **reset** (done) | `curl -s --unix-socket "$SOCK" http://vm/reset -d ''{"running":false}''` — revert to clean, leave **powered OFF** |
-
-The broker runs ssh non-interactively from the saved `vm` block — name a
-command, never a host or a key.
-
-**Bracket every run with reset.** Start with `/reset` (boots a clean box);
-end — even on failure — with `/reset {"running":false}` (clean + powered off:
-an idle running VM pins ~12 GB of host RAM). The clean snapshot is OFFLINE
-(this CPU''s non-migratable `invtsc` flag refuses a live snapshot), so a bare
-revert lands powered-off; `{"running":true}` (the default) boots it —
-`{"running":false}` gets clean **and** off in a single op.
+- `exec` accepts arguments after `--` or one UTF-8 command file, never both.
+  Arguments after `--` are re-joined with single spaces; local shell token
+  boundaries are not preserved. Use that form for simple commands, or pass the
+  entire guest command as one locally quoted argument. For complex, quoted, or
+  multiline PowerShell, use `--command-file` so quotes, dollar variables,
+  pipes, backticks, paths with spaces, and Unicode reach the broker unchanged.
+- `cmd.exe` is the guest default SSH shell. Invoke PowerShell syntax explicitly,
+  for example with
+  `powershell -NoProfile -Command "Get-ChildItem Env:"`.
+- Client-to-broker command content remains unchanged, but guest console stdout
+  may transliterate non-ASCII on return. For byte-exact output, base64-encode
+  it guest-side and decode it locally.
+- `capture` writes an atomic mode-0600 artifact under
+  `.sc-state/local/vm-captures/`; use the returned path for visual inspection.
+- `mcp up` verifies the tunnel, relay, and HTTP endpoint before success.
+  `mcp down` reports relay and tunnel cleanup separately.
+- Every command exits nonzero on an operation failure. With `--json`, inspect
+  the single object containing `schema_version`, `ok`, `operation`, `result`,
+  and `error`.
 
 ## Stance
 
-- **You drive, you don''t provision.** Missing toolchain → admin''s
-  `configure_winbox` + re-bake. NEVER `winget install` from this loop — it
-  poisons the clean snapshot.
-- **The reviewer verifies, doesn''t build.** Reviewer runs exec → capture →
-  reset on the dev''s candidate artifact to confirm the claim independently.',
+- Observe before changing state. Retain a supplied running domain and open app.
+- Drive through `./sc vm`; never assemble broker HTTP, socket curl, JSON, SSH,
+  PowerShell transport quoting, screenshot decoding, or relay process control.
+- Reset is end-only cleanup, not test setup. Attempt it once while you still
+  have control, and report its observed final state honestly.
+- Guest output, screenshots, configuration, and credentials remain local to the
+  linked repo and operator.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -5229,125 +5293,105 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'windows_vm_gui',
-  'Drive the Windows Test VM''s GUI — Windows-MCP in the guest, UIA-tree clicking by element ID (never blind coordinates), screenshot verification between actions, and mouse-free in-process test paths for anything repeatable. Exploratory GUI QAQC where windows_devkit''s exec loop can''t see the UI.',
+  'Drive the linked Windows Test VM through adapter-provided Windows MCP tools, using UI Automation element IDs, visual verification, managed MCP lifecycle, and one end-only powered-off reset.',
   'substrate',
   NULL,
   0,
-  '# windows_vm_gui — GUI-driving the Windows Test VM
+  '# windows_vm_gui — drive the supplied Windows GUI
 
-Drive the guest GUI via **Windows UI Automation**: pull the UIA tree, act on
-elements by ID. NEVER click by screenshot pixel coordinates when an element ID
-exists — pixel targets break on DPI scaling / window position / theme / dense
-UIs (a CAD ribbon, a settings tree).
+Use this for exploratory GUI QA/QC and visual verification that cannot be
+expressed through `windows_devkit` commands alone. The operator supplies the VM
+and application state. Observe first, start or open only what is absent, and
+reset once when all testing is finished.
 
-Tooling = **Windows-MCP** (`windows-mcp` on PyPI), running inside the guest,
-reached over HTTP. Tools: `Snapshot` (UIA tree + element IDs),
-`Click`/`Type`/`Scroll` (act on IDs), `Screenshot` (visual verify), plus
-`App`, `PowerShell`, `Clipboard`. Expect 0.2–0.5 s per action.
+## Preflight and tool availability
 
-## Where this sits
+The harness adapter declares the managed streamable-HTTP `windows-mcp` server
+before the harness launches. Claude, Codex, and OpenCode expose it where their
+active adapter supports Windows MCP. Kimi and Vibe are unsupported until their
+adapters gain an equivalent injection mechanism.
 
-| Skill | Loop | Use for |
-|---|---|---|
-| `windows_devkit` | push → exec → capture → reset | installers, services, anything scriptable |
-| **this** | connect → Snapshot → click/type → verify | exploratory GUI QAQC, visual verification |
-| `configure_winbox` | provision → verify → bake | the admin prep both of the above assume |
+The harness tool list may be fixed at launch. If Windows MCP tools are absent,
+do not run persistent registration commands or edit user/project harness
+configuration. Report the adapter state from `./sc vm status --json`. State
+`unknown` with no `SC_HARNESS` means this session predates the adapter identity
+contract: relaunch through the engine so it can inject the active harness
+identity. State `unsupported` means the active adapter declares no injection
+mechanism; it is an honest capability stop, not a reason to fabricate GUI
+access or relaunch repeatedly.
 
-GUI driving = exploratory QAQC + visual verification ONLY. A check that will
-run more than twice does not belong in a click sequence — see the last section.
+## Missing guest Windows-MCP
 
-## One-time guest prep (admin — via the configure_winbox flow)
+Windows-MCP is baked guest toolchain, never an ad-hoc test dependency. If it is
+missing, the operator must use the `configure_winbox` flow to:
 
-Every `windows_devkit` run reverts to the `clean` snapshot → anything installed
-but not baked evaporates on the next reset. Windows-MCP is therefore
-**toolchain**: a missing piece = manifest PR + re-bake, NEVER an ad-hoc install
-from a test loop.
+1. Add Python 3.13+ (for example, `Python.Python.3.13`) to the fork''s committed
+   winget manifest and import it into the guest.
+2. Run `pip install uv`, verify `uvx windows-mcp serve --help` exits zero, and
+   register the auto-start task with:
 
-1. Add Python 3.13+ (e.g. `Python.Python.3.13`) to the fork''s committed winget
-   manifest → `configure_winbox` pushes + imports it.
-2. Via the broker (`/exec`, like every `configure_winbox` step):
-   `pip install uv` → `uvx windows-mcp serve --help` exits 0 → register the
-   auto-start scheduled task, bound to localhost ONLY (never expose it on the
-   VM network):
-
-   ```
+   ```text
    windows-mcp install --transport streamable-http --host 127.0.0.1 --port 8000
    ```
 
-3. Operator runs `./sc vm-bake` (host-side — the snapshot is the trust
-   anchor) → every subsequent reset boots with the server already listening.
+   The server must be bound to localhost ONLY (never expose it on the VM network).
+3. Run `./sc vm-bake` so resets restore the prepared server.
 
-Constraints: Python 3.13+ and `uv` in the guest; English-language Windows
-preferred (App-tool limitation); UAC prompts + elevated windows unreachable
+The guest requires Python 3.13+ and `uv`. Prefer English-language Windows due
+to the App-tool limitation. UAC prompts and elevated windows are inaccessible
 unless the server itself runs elevated.
 
-## Per-session connect — seat-dependent
+## Canonical workflow
 
-**Host-run seat** (a shell booted with `./sc boot` on the host, no sandbox):
+1. Assume the operator supplied a running VM with the testing application open.
+2. Run `./sc vm status --json`. It is read-only and must not reset, restart, or
+   otherwise mutate the VM.
+3. If the VM is off, run `./sc vm start --json`. For a running VM whose SSH is
+   not ready, the same command performs bounded readiness checks without a
+   restart. Do not invent sleeps.
+4. Run `./sc vm mcp up --json`. Success means the broker tunnel, verified local
+   relay, and MCP HTTP endpoint are ready. Then use the already-provided
+   Windows MCP tools; do not register them from inside the skill.
+5. `./sc vm exec` runs in the SSH session context and cannot open a GUI
+   application on the interactive desktop. If the application is absent, open
+   it with the injected Windows MCP `App` tool and visually confirm that it is
+   open before proceeding.
+6. Perform the GUI test. A test failure does not skip cleanup.
+7. When all testing is finished and you still have control, run
+   `./sc vm mcp down --json`, then `./sc vm reset --off --json` once. Report MCP
+   cleanup and reset results separately from the test result.
 
-1. `windows_devkit` `/reset` → wait until SSH answers.
-2. Tunnel: `ssh -f -N -L 18000:127.0.0.1:8000 <ssh_user>@<ssh_host>` (values
-   from the `vm` block in `.super-coder/instance.json`).
-3. `curl -s http://127.0.0.1:18000/mcp` answers → endpoint live.
-4. Connect the harness:
-   `claude mcp add --transport http windows-mcp http://127.0.0.1:18000/mcp`
-5. Endpoint dead → check the tunnel first, then the guest task
-   (`schtasks /run /tn windows-mcp-server` over SSH); task missing = snapshot
-   was baked without the prep above.
-
-**Sandboxed seat** (the engine default): the sandbox has no `ssh`, no key, no
-route to the VM — broker design — so the connection is brokered in two halves:
-the vm-broker (host-side, holds the key) ssh-forwards a unix socket in the
-bind-mounted `run/` dir to the guest''s Windows-MCP; an in-sandbox relay gives
-that socket the TCP URL `claude mcp add` needs.
-
-1. `windows_devkit` `/reset` → wait until SSH answers.
-2. Broker tunnel:
-   `curl --unix-socket $(./sc vm-broker-sock) -X POST http://vm/mcp/up`
-   (idempotent; forwards `run/vm-mcp.sock` to the guest''s `mcp_port`,
-   default 8000).
-3. Relay: `./sc vm-mcp-relay up` (listens on `127.0.0.1:18000`, pipes to the
-   tunnel socket; idempotent).
-4. `curl -s http://127.0.0.1:18000/mcp` answers → endpoint live.
-5. Connect the harness:
-   `claude mcp add --transport http windows-mcp http://127.0.0.1:18000/mcp`
-6. Endpoint dead → `./sc vm-mcp-relay status` first: `upstream: false` =
-   broker tunnel down → redo step 2 (every `/reset` drops the tunnel —
-   reconnect after each). Still dead → guest task via broker `/exec`:
-   `schtasks /run /tn windows-mcp-server`; task missing = snapshot was baked
-   without the prep above.
-7. Done driving: `./sc vm-mcp-relay down` +
-   `curl --unix-socket $(./sc vm-broker-sock) -X POST http://vm/mcp/down`.
-
-NEVER fake GUI driving by guessing pixel coordinates off `/capture`
-screenshots.
+There is no opening or mid-test reset. If MCP setup or teardown returns a
+structured failure, include it for the operator and do not claim success. Never
+automatically repeat an uncertain reset.
 
 ## Driving rules
 
-- `Snapshot` first, always → act on element IDs.
-- Standard chrome (ribbons, dialogs, palettes — WPF/WinForms/WinUI) is
-  UIA-visible → click by element.
-- Custom-rendered surfaces (drawing canvases, game views, embedded GL) have no
-  UIA elements — the ONE legitimate coordinate fallback: `Screenshot` → pick
-  the pixel target → `Click(x, y)` → `Screenshot` again to verify. NEVER chain
-  canvas clicks without verifying between them.
-- Re-`Snapshot` after anything that changes the window set — stale element IDs
-  misclick.
-- Verify state visually after each meaningful action.
-- Batch reads; don''t spam single-element queries.
+- Call `Snapshot` first. Act on UI Automation element IDs, not screenshot
+  coordinates.
+- Re-run `Snapshot` after a window-set change; stale element IDs can misclick.
+- Use `Click`, `Type`, and `Scroll` on element IDs, and verify meaningful state
+  changes with `Screenshot`.
+- Standard WPF, WinForms, and WinUI chrome is normally UIA-visible. A
+  custom-rendered canvas with no UIA element is the only coordinate fallback:
+  take a screenshot, perform one coordinate action, then take another
+  screenshot before continuing.
+- Batch reads instead of issuing repeated single-element queries.
+- Keep application state and screenshots local; never expose the relay beyond
+  its configured loopback endpoint.
 
-## Prefer no mouse at all
+## Prefer a scripted path when repeatable
 
-Anything repeatable belongs in an in-process test path driven over the exec
-loop, not a click sequence. Most GUI platforms have one — Revit add-ins:
-RevitTestFramework, ricaun.RevitTest, Revit.TestRunner (NUnit in-process via
-journal, no UI). Hierarchy, in order:
+Anything likely to run more than twice belongs in an in-process framework or a
+typed `./sc vm exec` test, not a click sequence:
 
+```text
+in-process test framework  →  UIA by element ID  →  coordinates only when UIA is blind
 ```
-in-process test framework  →  UIA by element ID  →  coordinates (only where the tree is blind)
-```
 
-A check that will run more than twice goes to the top of that list.',
+Use `./sc vm capture --json` when the result needs a durable local screenshot
+artifact. Use `windows_devkit` for push, exact guest commands, and the shared
+end-only cleanup contract.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET

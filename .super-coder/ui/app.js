@@ -2601,6 +2601,22 @@ function chatStartedLabel(conversation) {
   }).format(started);
 }
 
+function chatMessageTimeLabel(createdAt) {
+  if (!createdAt) return "";
+  const raw = String(createdAt);
+  const normalized = raw.replace(" ", "T");
+  const timestamp = /(?:Z|[+-]\d\d:\d\d)$/.test(normalized)
+    ? normalized
+    : `${normalized}Z`;
+  const created = new Date(timestamp);
+  if (Number.isNaN(created.getTime())) return "";
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(created);
+}
+
 function chatShellLabel(conversation) {
   const shell = conversation?.shell || {};
   return [shell.display_name, shell.shortname].filter(Boolean).join(" | ") || "Shell";
@@ -2775,12 +2791,19 @@ async function chatCloseForSwitch(conversation) {
   }
 }
 
-function chatBubble(kind, body, meta = "", conversation = null) {
+function chatBubble(kind, body, meta = "", conversation = null, createdAt = "") {
   const bubble = el("article", { className: `chat-bubble chat-${kind}` });
-  bubble.append(el("div", { className: "chat-who" },
-    kind === "user" ? "You"
-      : kind === "assistant" ? chatShellLabel(conversation)
-      : "Activity"));
+  const header = el("div", { className: "chat-bubble-head" },
+    el("div", { className: "chat-who" },
+      kind === "user" ? "You"
+        : kind === "assistant" ? chatShellLabel(conversation)
+        : "Activity"));
+  const time = chatMessageTimeLabel(createdAt);
+  if (time) header.append(el("time", {
+    className: "chat-message-time",
+    dateTime: String(createdAt),
+  }, time));
+  bubble.append(header);
   const content = kind === "activity"
     ? el("div", { className: "chat-activity-text" }, body)
     : mdBlock(body);
@@ -3642,6 +3665,7 @@ function chatTranscriptItemNode(item, conversation, retry) {
     item.text || "",
     item.kind === "user" ? item.state || "" : "",
     conversation,
+    item.created_at,
   );
   if (item.kind === "user" && item.state === "failed") {
     const button = el("button", {
@@ -4513,7 +4537,7 @@ async function renderInterface(root) {
       };
     }
     const status = el("span", { className: "chat-shell-status" });
-    chatPaintShellStatus(status, badge, mail, wake);
+    chatPaintShellStatus(status, mail, badge, wake);
     shellStatusItems.set(item.shell_id, { row: shellRow, status, badge, mail });
     shellRow.append(status);
     rail.append(shellRow);
@@ -4525,7 +4549,7 @@ async function renderInterface(root) {
       if (!target) continue;
       const wake = chatWakePendingIndicator(next);
       target.row.classList.toggle("has-wake", Boolean(wake));
-      chatPaintShellStatus(target.status, target.badge, target.mail, wake);
+      chatPaintShellStatus(target.status, target.mail, target.badge, wake);
     }
   };
   const refreshWakeIndicators = async () => {
