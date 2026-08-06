@@ -1,24 +1,17 @@
 ---
 name: flag_sweep
-description: Admin's every-session flag reconciliation — auto-close flags whose gating work is provably done, open ship flags for implemented-but-unshipped specs and docs-pending flags for shipped features that lack a doc (message the planner), surface judgment calls to the FnB. Step 1 of the admin standing pass; run before git_cleanup.
+description: Planner-owned periodic or on-demand delivery reconciliation — auto-close flags whose gating work is provably done, open missing ship/docs handoffs, and surface judgment calls to the FnB. Use for a requested sweep or when delivery state needs reconciliation.
 category: substrate
 common: false
 ---
 
 # flag_sweep — reconcile flags against state
 
-Admin-only. Leg 1 of the standing every-session pass -> then `git_cleanup` ->
-then optional `local_skill_management`. Working shells close the flags their
-own work clears (boot doc, "Finish before you stop"); this sweep is the
-backstop for the stragglers they dropped + the docs nobody opened a flag for.
-Two directions: close what's provably resolved, open what's provably missing.
-
-`<self>` = your shell_id. Resolve the planner once up front:
-
-```sql
-SELECT shortname FROM shells WHERE flavor='planner' AND COALESCE(is_deleted,0)=0;
--- no planner in this fork → surface to the FnB instead of messaging.
-```
+Planner-owned. Run periodically or when the FnB asks for delivery-state
+reconciliation; never make it a boot ritual. Working shells close the flags
+their own work clears (boot doc, "Finish before you stop"); this sweep is the
+backstop for dropped handoffs + shipped work nobody documented. Two directions:
+close what's provably resolved, open what's provably missing.
 
 ---
 
@@ -106,12 +99,10 @@ WHERE r.roadmap_status NOT IN ('shipped','retired')
            OR f.description LIKE '%not marked shipped%' OR f.description LIKE '%doc%pending%'));
 ```
 
-Per row: open + message the planner (no planner -> surface to the FnB) — same
-contract as the `flags` skill:
+Per row, open the flag in Planner's own queue. Do not message yourself:
 
 ```
 sc mem flag open "[Ship] <title> implemented, not marked shipped | Blocker for: <title> ship + doc" --name SC-### --priority Medium --feature <feature_id>
-sc mem message send <planner-shortname> "flag_sweep: <title> (#<feature_id>) — Verification done but still <status>; SC-### opened to mark shipped + reconcile docs to spec."
 ```
 
 ### 3B — Shipped but undocumented (docs-pending)
@@ -142,12 +133,10 @@ ADM1/0003, seven covered rows re-surfaced). The `'%doc%pending%'` fallback
 catches untagged organic wordings; its over-breadth only ever SKIPS an open —
 the conservative direction.
 
-Per row: open + message the planner (no planner -> surface to the FnB) — same
-contract as the `flags` skill:
+Per row, open the flag in Planner's own queue. Do not message yourself:
 
 ```
 sc mem flag open "[Docs] <title> shipped, doc pending | Blocker for: <title> doc" --name SC-### --priority Medium --feature <feature_id>
-sc mem message send <planner-shortname> "flag_sweep: <title> (#<feature_id>) is shipped with no doc — SC-### opened, ready to freeze + document."
 ```
 
 ---
@@ -173,8 +162,7 @@ unambiguous evidence.
 - **Backstop, not owner.** The shell that did the work closes its own flag
   with the richer "how" note; don't race to close a flag whose owner is still
   active on that feature.
-- **Both directions, every session.** An implemented-but-unshipped spec and an
+- **Both directions, every sweep.** An implemented-but-unshipped spec and an
   undocumented shipped feature are dropped handoffs; the signal is already in
   the DB (a `done` Verification task, a missing frozen doc) — surfacing them
   is deterministic.
-- **Then `git_cleanup`.** flag_sweep is leg 1 of the pass, not the whole pass.

@@ -8,6 +8,108 @@
 BEGIN;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'admin_git',
+  'Admin-only Git procedure for the repository root — identify main, fast-forward safely, commit fork engine pins, merge only approved PRs, and preserve every foreign worktree. Use before Admin performs Git maintenance or an authorized merge.',
+  'substrate',
+  NULL,
+  0,
+  '# admin_git — maintain the repository root
+
+Admin owns the root checkout and its `main` branch. Use this procedure for a
+specific update, reconciliation, or approved merge; it is not a standing
+cleanup pass. The FnB merge gate and the preservation rule remain in force.
+
+## Orient before writing
+
+```bash
+git rev-parse --show-toplevel
+git branch --show-current
+git status --short --branch
+git worktree list
+```
+
+Proceed only when the top level matches the repository named by the boot
+document and the root checkout is on `main`. A dirty root, detached head, or
+diverged main is a decision boundary: show the exact state to the FnB before
+changing it.
+
+Every other worktree belongs to its shell. Never switch its branch, stash,
+reset, clean, move, or remove it. When the FnB explicitly asks for repository-
+wide cleanup, load `git_cleanup`; otherwise leave foreign worktrees untouched.
+
+## Fast-forward main
+
+```bash
+git fetch origin main
+git pull --ff-only origin main
+```
+
+Success leaves `main` clean and at the fetched remote head. If `--ff-only`
+refuses, stop and report the local/remote commits; never create a merge bubble
+or reset main to make the command pass.
+
+## Commit a fork engine pin
+
+In a tracking fork, `.super-coder/` is a materialized dependency and remains
+gitignored. After `self_update` succeeds, stage only the durable public update:
+
+```bash
+git add .sc-state/engine.ref
+git status --short
+git commit -m "chore: update super-coder engine pin"
+```
+
+Add the root `sc` dispatcher or another public file only when the update
+deliberately changed it. Never force-add `.super-coder/`, local snapshots,
+rendered `_sc` state, or `.sc-state/engine.ref.prev`. Push the resulting main
+commit only within the operator''s requested update workflow.
+
+## Merge an approved PR
+
+Merge only after the FnB names or explicitly authorizes the PR. Re-read live
+state immediately before acting:
+
+```bash
+gh pr view <number> --json url,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup
+```
+
+Require the expected repository, `baseRefName=main`, the reviewed head, a
+mergeable state, and successful required checks. Use the repository''s approved
+merge method, then `git pull --ff-only origin main`. A changed head, red/pending
+check, or merge refusal invalidates the authorization; stop and return the live
+evidence instead of overriding it.
+
+For a stack, retarget each remaining PR to `main` before merging the PR above
+the one that landed. Never rely on automatic retargeting after a base branch is
+deleted.
+
+## Source-repository exception
+
+```bash
+git ls-files --error-unmatch .super-coder/schema.sql
+```
+
+Exit 0 means this repository authors super-coder itself: `.super-coder/` is
+tracked source, not a dependency, and `.sc-state/engine.ref` is not the delivery
+unit. Engine implementation still arrives through a Developer branch and PR;
+Admin fast-forwards main and merges only the exact approved PR. Apply live
+migrations or restart the engine only through their dedicated procedures and
+operator-owned recovery window.
+
+## Stop conditions
+
+- No approval -> do not merge.
+- Foreign worktree activity -> preserve it and surface it.
+- Main cannot fast-forward -> report divergence; do not reset.
+- Target repository, PR head, or checks differ from the authorization -> stop.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'agents',
   '--agents [model] — delegate work to spawned subagents under the system''s discipline. Dev — execute a spec''s task plan as implementer waves; reviewer — fan the three review axes out to an adversarial finding-panel. Overlay on spec/review; parent-only memory writes; AGENTS spawn ledger with a hard 6h validity window; parent-set timeouts. Load ONLY when the FnB invokes --agents.',
   'craft',
@@ -1648,24 +1750,17 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'flag_sweep',
-  'Admin''s every-session flag reconciliation — auto-close flags whose gating work is provably done, open ship flags for implemented-but-unshipped specs and docs-pending flags for shipped features that lack a doc (message the planner), surface judgment calls to the FnB. Step 1 of the admin standing pass; run before git_cleanup.',
+  'Planner-owned periodic or on-demand delivery reconciliation — auto-close flags whose gating work is provably done, open missing ship/docs handoffs, and surface judgment calls to the FnB. Use for a requested sweep or when delivery state needs reconciliation.',
   'substrate',
   NULL,
   0,
   '# flag_sweep — reconcile flags against state
 
-Admin-only. Leg 1 of the standing every-session pass -> then `git_cleanup` ->
-then optional `local_skill_management`. Working shells close the flags their
-own work clears (boot doc, "Finish before you stop"); this sweep is the
-backstop for the stragglers they dropped + the docs nobody opened a flag for.
-Two directions: close what''s provably resolved, open what''s provably missing.
-
-`<self>` = your shell_id. Resolve the planner once up front:
-
-```sql
-SELECT shortname FROM shells WHERE flavor=''planner'' AND COALESCE(is_deleted,0)=0;
--- no planner in this fork → surface to the FnB instead of messaging.
-```
+Planner-owned. Run periodically or when the FnB asks for delivery-state
+reconciliation; never make it a boot ritual. Working shells close the flags
+their own work clears (boot doc, "Finish before you stop"); this sweep is the
+backstop for dropped handoffs + shipped work nobody documented. Two directions:
+close what''s provably resolved, open what''s provably missing.
 
 ---
 
@@ -1753,12 +1848,10 @@ WHERE r.roadmap_status NOT IN (''shipped'',''retired'')
            OR f.description LIKE ''%not marked shipped%'' OR f.description LIKE ''%doc%pending%''));
 ```
 
-Per row: open + message the planner (no planner -> surface to the FnB) — same
-contract as the `flags` skill:
+Per row, open the flag in Planner''s own queue. Do not message yourself:
 
 ```
 sc mem flag open "[Ship] <title> implemented, not marked shipped | Blocker for: <title> ship + doc" --name SC-### --priority Medium --feature <feature_id>
-sc mem message send <planner-shortname> "flag_sweep: <title> (#<feature_id>) — Verification done but still <status>; SC-### opened to mark shipped + reconcile docs to spec."
 ```
 
 ### 3B — Shipped but undocumented (docs-pending)
@@ -1789,12 +1882,10 @@ ADM1/0003, seven covered rows re-surfaced). The `''%doc%pending%''` fallback
 catches untagged organic wordings; its over-breadth only ever SKIPS an open —
 the conservative direction.
 
-Per row: open + message the planner (no planner -> surface to the FnB) — same
-contract as the `flags` skill:
+Per row, open the flag in Planner''s own queue. Do not message yourself:
 
 ```
 sc mem flag open "[Docs] <title> shipped, doc pending | Blocker for: <title> doc" --name SC-### --priority Medium --feature <feature_id>
-sc mem message send <planner-shortname> "flag_sweep: <title> (#<feature_id>) is shipped with no doc — SC-### opened, ready to freeze + document."
 ```
 
 ---
@@ -1820,11 +1911,10 @@ unambiguous evidence.
 - **Backstop, not owner.** The shell that did the work closes its own flag
   with the richer "how" note; don''t race to close a flag whose owner is still
   active on that feature.
-- **Both directions, every session.** An implemented-but-unshipped spec and an
+- **Both directions, every sweep.** An implemented-but-unshipped spec and an
   undocumented shipped feature are dropped handoffs; the signal is already in
   the DB (a `done` Verification task, a missing frozen doc) — surfacing them
-  is deterministic.
-- **Then `git_cleanup`.** flag_sweep is leg 1 of the pass, not the whole pass.',
+  is deterministic.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
