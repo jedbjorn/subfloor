@@ -82,7 +82,8 @@
     ".super-coder/migrations/0176_reseed_sprint_red_check_doctrine.sql",
     ".super-coder/migrations/0178_reseed_sprint_watcher_state_skills.sql",
     ".super-coder/migrations/0179_reseed_atomic_sprint_closeout.sql",
-    ".super-coder/migrations/0184_reseed_sprint_skill_polish.sql"
+    ".super-coder/migrations/0184_reseed_sprint_skill_polish.sql",
+    ".super-coder/migrations/0185_optional_sprint_qaqc.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,

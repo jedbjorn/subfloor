@@ -28,7 +28,7 @@ V21_ROLE_SKILLS = set(SKILLS)
 HANDOFF_ROLE_SKILLS = {"sprint_dev", "sprint_rev", "sprint_pln"}
 CLOSEOUT_ROLE_SKILLS = {"sprint_close", "sprint_dev", "sprint_pln", "sprint_rev"}
 FORCE_NEW_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
-POLISHED_SPRINT_SKILLS = set(SKILLS)
+POLISHED_SPRINT_SKILLS = set(SKILLS) - {"sprint_prep"}
 
 ARTIFACT_PATH_RULE = """## Sprint artifact paths
 
@@ -454,6 +454,61 @@ class SprintSkillTest(unittest.TestCase):
                         "carries no evidence about the PR watcher", normalized
                     )
                     self.assertIn("Do not repeat", normalized)
+        finally:
+            con.close()
+
+    def test_optional_qaqc_reseed_matches_asset_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0185_optional_sprint_qaqc.sql":
+                    break
+                con.executescript(migration.read_text())
+            con.execute(
+                "UPDATE skills SET description='stale',category='stale',"
+                "command='stale',common=1,content='review gates launch',"
+                "is_deleted=1 WHERE name='sprint_prep'"
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0185_optional_sprint_qaqc.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            parsed = seed_skills.parse_skill(ASSETS / "sprint_prep" / "SKILL.md")
+            row = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='sprint_prep'"
+            ).fetchone()
+            self.assertEqual(
+                (
+                    parsed["description"],
+                    parsed["category"],
+                    parsed["command"],
+                    parsed["common"],
+                    parsed["content"],
+                    0,
+                ),
+                tuple(row),
+            )
+            normalized = " ".join(parsed["content"].split())
+            for guidance in (
+                "The FnB decides whether pre-Sprint QA/QC is useful",
+                "never blocks declaration or arming",
+                "--spec <spec-document-id>",
+                "server reads and hashes the body inside the declaration transaction",
+                "no current non-empty `spec` document",
+                "a selected task belongs to no work unit or more than one work unit",
+                "participant routes or required capacity are unavailable",
+                "merge grant was not committed",
+                "State whether pre-Sprint QA/QC was performed",
+            ):
+                self.assertIn(guidance, normalized)
+            self.assertNotIn("qualifying QAQC approval", normalized)
+            self.assertNotIn("Use `fail` until", normalized)
+            self.assertNotIn("lacks Review-shell QAQC approval", normalized)
         finally:
             con.close()
 
