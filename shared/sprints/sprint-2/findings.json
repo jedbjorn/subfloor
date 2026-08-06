@@ -1,0 +1,30 @@
+[
+  {
+    "severity": "Medium",
+    "title": "Live first-turn Windows MCP tool evidence was never obtained",
+    "body": "Spec #108 line 182 sets a minimum: \"a live Codex launch must show the Windows MCP tools on its first turn because #1021 was reported from Codex.\" No such evidence exists in the Sprint record. Both acceptance runs (unit 12 @ 12:24, unit 14 @ 13:29) reported a first-turn tool inventory with no Windows MCP Snapshot/Click/Type/Scroll/Screenshot surface.\n\nThis is an evidence gap, not an engine defect. Traced at f9dbc9c: SC_HARNESS is exported only by run.py at launch and is new this Sprint (absent at 07f1c0b, added in #1035 at 11:04), and run.py:managed_mcp_injection is additionally gated on linked_vm_configured(). I checked both repos: subfloor has no persisted vm block, rst-c does. Both acceptance runs were performed by subfloor-launched shells that reached rst-c by cd, so neither could carry SC_HARNESS from its pre-#1035 session, and neither would receive an injected MCP definition even after relaunch in subfloor. The unlinked-fork gating is correct and covered by test_unlinked_fork_has_no_managed_recipe_for_supported_adapters.\n\nConsequence: #1021 -- the originally reported Codex defect -- has adapter golden-test coverage but no live confirmation, so a launcher-integration regression between the golden recipe and a real harness start would not have been caught by this Sprint.\n\nFix boundary: no code change. Run `./sc update` in rst-c to pin f9dbc9c, launch a shell there through the engine on the Codex adapter, and record the first-turn tool inventory. This is an operator/deployment act; do not cut it as an implementation lane.",
+    "spec_document_id": 108,
+    "work_unit_id": 14
+  },
+  {
+    "severity": "Medium",
+    "title": "Downstream gate step 3 incomplete: mcp up and the one GUI observation/action are unproven",
+    "body": "Spec #108 line 188 requires the single rst-c session to \"exercise push, complex exec, capture, MCP up, one GUI observation/action, and MCP down.\" Across both acceptance runs, push, complex exec, capture, and mcp down were exercised and confirmed; mcp up failed with structured error mcp_adapter_unsupported (message 'SC_HARNESS is not set', details.recovery 'relaunch_through_engine'), and no GUI observation/action occurred.\n\nSame root cause as the finding above. The engine behaved as specced: vm.py:1774 refuses `up` on an unsupported adapter before any transport mutation, so no VM state was touched, and unit 13 (#1046) added the relaunch recovery hint that names the condition precisely.\n\nConsequence: the tunnel -> relay -> endpoint verification chain (vm.py:1798-1830) has strong unit coverage but no live end-to-end proof against the real VM. A defect reachable only with a real broker tunnel and a real relay -- for instance in endpoint probe pacing under genuine SSH latency -- remains possible and undetected.\n\nFix boundary: none in code. Fold into the same relaunched rst-c session as the finding above; capture the mcp up result, one GUI action, and mcp down, then the sole final reset --off. Do not re-run acceptance from a shell launched outside the linked repo.",
+    "spec_document_id": 108,
+    "work_unit_id": 12
+  },
+  {
+    "severity": "Low",
+    "title": "Testing application did not remain open after the open-if-absent step",
+    "body": "Spec #108 downstream gate step 2 requires opening the testing application only if absent. In both runs the absent-process branch was correctly detected (tasklist returned no Revit process), `cmd /c start ...\\Revit.exe` returned guest exit 0, and follow-up tasklist observations still found no Revit process. Unit 12's capture showed an entirely black display; unit 14's showed the desktop with an open cmd.exe window and no Revit UI.\n\nBoth Developers correctly recorded this as unconfirmed rather than claiming success, satisfying spec line 192.\n\nThis is very likely guest/application behavior rather than an engine defect: `exec` reported the launch faithfully, and application-specific test automation is explicitly out of scope (spec line 236). It is recorded so the next acceptance session does not silently inherit the same ambiguity.\n\nFix boundary: during the relaunched rst-c session, confirm whether Revit stays resident when started from an interactive guest session, and if it does not, treat application readiness as an operator-supplied precondition per spec line 51 rather than a shell-driven step.",
+    "spec_document_id": 108,
+    "work_unit_id": 14
+  },
+  {
+    "severity": "Low",
+    "title": "plan-unit accepts an unbounded expected_output body, and unit 13's field durably holds 23.5KB of pre-Sprint vm.py source",
+    "body": "Work unit 13's durable expected_output is 23,531 characters of the pre-Sprint .super-coder/scripts/vm.py rather than a deliverable description; peer units carry correct prose in the same field. I opened flag #203 for this mid-Sprint and left its cause open. It is now resolved: sprint_cli.py:_text reads --expected-output-file verbatim with no length or content validation, and there is no path by which plan-unit substitutes a different file. This was a Planner slip in the path argument, not an engine defect in plan-unit.\n\nNo delivery damage resulted -- DEV6 was corrected by durable context message and unit 13 shipped #1046 correctly -- but the corrupted field is immutable once a unit leaves `planned`, so the Sprint's permanent planned-vs-actual record misstates unit 13's intent, and anyone reading that record later would see what looks like an instruction to revert five merged units.\n\nFix boundary: a bounded length check on expected_output at the plan-unit entry point (sprint_cli.py:_text or the API handler) would have caught a 23KB body at submission. Optional hardening only; do not rewrite the durable row.",
+    "spec_document_id": 108,
+    "work_unit_id": 13
+  }
+]

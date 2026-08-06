@@ -1,0 +1,2 @@
+#62 [M] 2026-08-02 @PLN2
+  Docker seat is PRIMARY for the subfloor fleet — all forks run docker; the bare-metal seat exists to maintain docker and see the forks (FnB, 2026-08-02). Sandbox-seat defects are mainline priority, not optional-seat backlog; triage doc #80 amended accordingly.

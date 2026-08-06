@@ -1,0 +1,1649 @@
+diff --git a/.super-coder/api/server.py b/.super-coder/api/server.py
+index d7c00a9..b67e5a7 100644
+--- a/.super-coder/api/server.py
++++ b/.super-coder/api/server.py
+@@ -1992,6 +1992,17 @@ class Handler(BaseHTTPRequestHandler):
+             )
+         )
+ 
++    @classmethod
++    def _sprint_optional_integer_list(cls, body: dict, name: str) -> list[int]:
++        values = body.get(name, [])
++        if not isinstance(values, list):
++            raise ValueError(f"{name} must be an array")
++        return list(
++            dict.fromkeys(
++                cls._sprint_integer({name: item}, name) for item in values
++            )
++        )
++
+     def _sprint_error(self, exc: Exception):
+         if isinstance(exc, sprint_domain.SprintAuthorityError):
+             return self._send(403, {"error": str(exc)})
+@@ -2062,7 +2073,12 @@ class Handler(BaseHTTPRequestHandler):
+ 
+     def _declare_sprint(self, con, shell_id: int, body: dict) -> int:
+         feature_id = self._sprint_integer(body, "feature_id")
+-        approval_ids = self._sprint_integer_list(body, "spec_approval_ids")
++        document_ids = self._sprint_optional_integer_list(body, "spec_document_ids")
++        approval_ids = self._sprint_optional_integer_list(body, "spec_approval_ids")
++        if not document_ids and not approval_ids:
++            raise ValueError(
++                "at least one spec_document_ids or spec_approval_ids selector is required"
++            )
+         participants = body.get("participants")
+         if not isinstance(participants, list) or not participants:
+             raise ValueError("participants must be a non-empty array")
+@@ -2140,35 +2156,52 @@ class Handler(BaseHTTPRequestHandler):
+                 "SELECT 1 FROM roadmap WHERE feature_id=?", (feature_id,)
+             ).fetchone() is None:
+                 raise KeyError(f"unknown feature: {feature_id}")
+-            approval_rows = []
++            selected_specs: dict[int, dict] = {}
++            for document_id in document_ids:
++                document = con.execute(
++                    "SELECT document_id,feature_id,kind,body FROM documents "
++                    "WHERE document_id=?",
++                    (document_id,),
++                ).fetchone()
++                if document is None:
++                    raise KeyError(f"unknown Sprint spec document: {document_id}")
++                selected_specs[document_id] = {
++                    "document": document,
++                    "approval_id": None,
++                }
++            approval_documents: set[int] = set()
+             for approval_id in approval_ids:
+                 approval = con.execute(
+-                    "SELECT a.document_id,a.revision_sha256,a.verdict,d.feature_id,"
+-                    "d.kind,d.body,reviewer.flavor AS reviewer_flavor,"
+-                    "COALESCE(reviewer.is_deleted,0) AS reviewer_deleted "
++                    "SELECT a.document_id,d.feature_id,d.kind,d.body "
+                     "FROM sprint_spec_approvals a "
+                     "JOIN documents d ON d.document_id=a.document_id "
+-                    "JOIN shells reviewer ON reviewer.shell_id=a.reviewer_shell_id "
+                     "WHERE a.approval_id=?",
+                     (approval_id,),
+                 ).fetchone()
+                 if approval is None:
+                     raise KeyError(f"unknown Sprint spec approval: {approval_id}")
+-                current_revision = hashlib.sha256(
+-                    approval["body"].encode()
+-                ).hexdigest()
++                approval_document_id = int(approval["document_id"])
++                if approval_document_id in approval_documents:
++                    raise ValueError(
++                        "multiple spec approvals select the same document; use spec_document_ids"
++                    )
++                approval_documents.add(approval_document_id)
++                selected_specs[approval_document_id] = {
++                    "document": approval,
++                    "approval_id": approval_id,
++                }
++            for selected in selected_specs.values():
++                document = selected["document"]
+                 if (
+-                    approval["verdict"] != "pass"
+-                    or approval["kind"] != "spec"
+-                    or int(approval["feature_id"]) != feature_id
+-                    or approval["revision_sha256"] != current_revision
+-                    or approval["reviewer_flavor"] != "reviewer"
+-                    or approval["reviewer_deleted"]
++                    document["kind"] != "spec"
++                    or document["feature_id"] is None
++                    or int(document["feature_id"]) != feature_id
++                    or not isinstance(document["body"], str)
++                    or not document["body"].strip()
+                 ):
+                     raise sprint_domain.SprintInvariantError(
+-                        "declaration requires current passing approvals for its feature"
++                        "declaration requires non-empty spec documents for its feature"
+                     )
+-                approval_rows.append((approval_id, approval))
+             active_shells = {
+                 int(row["shell_id"]): str(row["flavor"])
+                 for row in con.execute(
+@@ -2207,11 +2240,11 @@ class Handler(BaseHTTPRequestHandler):
+                 (
+                     (
+                         sprint_id,
+-                        approval["document_id"],
+-                        approval["revision_sha256"],
+-                        approval_id,
++                        document_id,
++                        hashlib.sha256(selected["document"]["body"].encode()).hexdigest(),
++                        selected["approval_id"],
+                     )
+-                    for approval_id, approval in approval_rows
++                    for document_id, selected in selected_specs.items()
+                 ),
+             )
+             con.executemany(
+@@ -2242,7 +2275,12 @@ class Handler(BaseHTTPRequestHandler):
+                     json.dumps(
+                         {
+                             "feature_id": feature_id,
+-                            "spec_approval_ids": approval_ids,
++                            "spec_document_ids": list(selected_specs),
++                            **(
++                                {"spec_approval_ids": approval_ids}
++                                if approval_ids
++                                else {}
++                            ),
+                             "participant_shell_ids": sorted(seen_shells),
+                         },
+                         sort_keys=True,
+diff --git a/.super-coder/assets/skills/sprint_prep/SKILL.md b/.super-coder/assets/skills/sprint_prep/SKILL.md
+index c300419..1988f25 100644
+--- a/.super-coder/assets/skills/sprint_prep/SKILL.md
++++ b/.super-coder/assets/skills/sprint_prep/SKILL.md
+@@ -1,6 +1,6 @@
+ ---
+ name: sprint_prep
+-description: Prepare and arm a Sprints v2 run — bind reviewed spec revisions, shape work units and dependencies, assign routes and capacity, and refuse arming until the durable plan is eligible.
++description: Prepare and arm a Sprints v2 run — bind exact current specs, optionally gather QA/QC evidence, shape work units and dependencies, and enforce every launch invariant.
+ category: workflow
+ common: false
+ ---
+@@ -21,7 +21,7 @@ revalidation.
+ Produce one editable prepared Sprint with:
+ 
+ - one roadmap feature;
+-- exact governing spec revision hashes and their qualifying QAQC approvals;
++- exact governing spec revision hashes and any optional QA/QC evidence;
+ - work units made from existing spec tasks, each with one Developer and one
+   assigned Reviewer;
+ - dependency edges and planned waves;
+@@ -38,11 +38,13 @@ Participant chats are created or re-entered later by wake delivery.
+ 
+ ## Eligibility pass
+ 
+-Read the feature, selected spec bodies, task ledgers, QAQC records, shell roster,
+-model routes, quota state, repository access, and worktree availability. Record
+-the exact revision hash you inspected; a title or document id is not a revision.
++Read the feature, selected spec bodies, task ledgers, available QA/QC records,
++shell roster, model routes, quota state, repository access, and worktree
++availability. Record the exact revision hash you inspected; a title or document
++id is not a revision.
+ 
+-The Review shell records its verdict against the current exact body through the
++The FnB decides whether pre-Sprint QA/QC is useful. If requested, the Review
++shell records its verdict against the current exact body through the
+ authenticated Sprint surface:
+ 
+ ```text
+@@ -50,18 +52,21 @@ sc sprint record-qaqc --document <spec-document-id> --verdict pass \
+   [--findings-document <document-id>]
+ ```
+ 
+-Use `fail` until every blocking finding is resolved. A body edit changes the
+-revision hash and therefore needs a fresh signed record.
++The record is inspectable evidence, not launch authorization. Its absence,
++verdict, findings, revision age, or signer state never blocks declaration or
++arming. A body edit makes the prior record historical evidence; it does not
++change the exact revision the Planner later binds.
+ 
+-Request pre-Sprint QAQC explicitly from the Review shell through the ordinary
+-shell-to-shell channel. No Sprint relay or inbox exists yet. Once the signed
+-approval id is available, continue preparation here; after arming, switch to
+-`sprint_pln`.
++When the FnB requests pre-Sprint QA/QC, contact the Review shell through the
++ordinary shell-to-shell channel because no Sprint relay or inbox exists yet.
++Proceed with preparation regardless of whether review was performed or what it
++found; after arming, switch to `sprint_pln`.
+ 
+ Refuse arming when any of these is true:
+ 
+-- a selected current revision lacks Review-shell QAQC approval;
+-- any Medium-or-higher QAQC finding is unresolved;
++- no current non-empty `spec` document belonging to the feature is bound;
++- a bound spec body changed after declaration, so its current hash no longer
++  matches the exact declared revision;
+ - a selected task belongs to no work unit or more than one work unit;
+ - a dependency cycle exists;
+ - a work unit lacks an assigned Developer or Reviewer;
+@@ -116,12 +121,14 @@ shorten the critical path.
+ For every participant, record role, route, model, and effective effort. Never
+ pretend a native session can resume across harnesses.
+ 
+-Declare the prepared envelope from a JSON array of participant objects, then
+-add each editing lane from existing spec tasks:
++Declare the prepared envelope from a JSON array of participant objects, binding
++each current governing document directly. The server reads and hashes the body
++inside the declaration transaction; the client never supplies a revision hash.
++Then add each editing lane from existing spec tasks:
+ 
+ ```text
+ sc sprint declare --feature <feature-id> \
+-  --spec-approval <approval-id> --participants-file <path> --merge-grant
++  --spec <spec-document-id> --participants-file <path> --merge-grant
+ sc sprint plan-unit --sprint <id> \
+   --developer-shell <id> --reviewer-shell <id> --title <title> \
+   --expected-output-file <path> --task <task-id> \
+@@ -129,16 +136,23 @@ sc sprint plan-unit --sprint <id> \
+   [--output-kind code|report-only|no-code]
+ ```
+ 
++Repeat `--spec` for multiple governing documents. The deprecated
++`--spec-approval <approval-id>` selector remains compatible when an old caller
++must also retain a specific review row as evidence, but its verdict and reviewed
++revision do not affect eligibility and direct `--spec` is canonical.
++
+ The participant file contains `shell_id`, `role`, and `harness`, with optional
+ `model`, `effort`, and `route`. FnB may add `--planner-shell <id>` when declaring
+ for the originating Planner. Keep the Sprint prepared while shaping the plan.
+ 
+ ## Final arming check
+ 
+-Immediately before arming, re-read the spec revision hashes, QAQC records,
+-participant capacity, single-armed invariant, repository access, and merge
+-grant. The final read and durable plan commit belong to the authoritative
+-arming transaction; external harness and GitHub work occurs after it commits.
++Immediately before arming, re-read the exact spec revision hashes, available
++QA/QC evidence, task coverage, participant routes and capacity, single-armed
++invariant, repository access, and merge grant. Review evidence is summarized,
++never interpreted as authorization. The final read and durable plan commit
++belong to the authoritative arming transaction; external harness and GitHub
++work occurs after it commits.
+ 
+ Arming succeeds only when the first assignments and wake intents are durable.
+ A process crash after commit is outbox recovery; a crash before commit exposes
+@@ -160,7 +174,8 @@ Once armed, hand control to `sprint_pln` and stop preparation work. Give the FnB
+ a compact declaration:
+ Sprint id, feature, exact spec revisions, participants/routes, work-unit graph,
+ planned waves, capacity rationale and reserve, merge-grant state, and known
+-accepted risks.
++accepted risks. State whether pre-Sprint QA/QC was performed and summarize any
++available evidence without treating it as an eligibility result.
+ 
+ Stop when the Sprint is armed or when one concrete eligibility blocker has been
+ surfaced. Do not dispatch from a partially prepared plan.
+diff --git a/.super-coder/migrations/0185_optional_sprint_qaqc.sql b/.super-coder/migrations/0185_optional_sprint_qaqc.sql
+new file mode 100644
+index 0000000..a8f340a
+--- /dev/null
++++ b/.super-coder/migrations/0185_optional_sprint_qaqc.sql
+@@ -0,0 +1,246 @@
++-- 0185 — make pre-Sprint QA/QC optional evidence.
++--
++-- A Sprint remains bound to an exact current spec revision, but the historical
++-- approval row is no longer a launch credential. Preserve reviewed bindings
++-- while permitting direct document bindings with no approval evidence.
++
++-- migrate: foreign-keys-off
++PRAGMA foreign_keys=OFF;
++
++BEGIN;
++
++DROP TRIGGER IF EXISTS trg_sprint_followups_spec_scope;
++
++CREATE TABLE _sprint_specs_optional_evidence (
++    sprint_id              INTEGER NOT NULL REFERENCES sprints(sprint_id),
++    document_id            INTEGER NOT NULL REFERENCES documents(document_id),
++    bound_revision_sha256  TEXT NOT NULL
++                           CHECK (
++                             length(bound_revision_sha256)=64
++                             AND bound_revision_sha256 NOT GLOB '*[^0-9a-f]*'
++                           ),
++    approval_id            INTEGER
++                           REFERENCES sprint_spec_approvals(approval_id),
++    included_at            TEXT NOT NULL DEFAULT (datetime('now')),
++    PRIMARY KEY (sprint_id, document_id)
++);
++
++INSERT INTO _sprint_specs_optional_evidence (
++    sprint_id,
++    document_id,
++    bound_revision_sha256,
++    approval_id,
++    included_at
++)
++SELECT sprint_id,
++       document_id,
++       bound_revision_sha256,
++       approval_id,
++       included_at
++FROM sprint_specs;
++
++DROP TABLE sprint_specs;
++ALTER TABLE _sprint_specs_optional_evidence RENAME TO sprint_specs;
++
++CREATE TRIGGER trg_sprint_followups_spec_scope
++BEFORE INSERT ON sprint_followups
++WHEN NEW.spec_document_id IS NOT NULL AND NOT EXISTS (
++  SELECT 1 FROM sprint_specs
++  WHERE sprint_id=NEW.sprint_id AND document_id=NEW.spec_document_id
++)
++BEGIN
++  SELECT RAISE(ABORT, 'Sprint follow-up spec is not bound to this Sprint');
++END;
++
++INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
++  'sprint_prep',
++  'Prepare and arm a Sprints v2 run — bind exact current specs, optionally gather QA/QC evidence, shape work units and dependencies, and enforce every launch invariant.',
++  'workflow',
++  NULL,
++  0,
++  '# sprint_prep — declare the riverbed
++
++Use as the owning Planner while a Sprint is `prepared`. Preparation ends at one
++atomic arming decision; it does not launch participants piecemeal.
++
++Use the simplest path supported by current durable state. Treat authority,
++lifecycle preconditions, durable writes, and typed handoffs as hard boundaries;
++use judgment for planning and evidence gathering within them. Repeat a read only
++when later activity could have changed it or the final command requires live
++revalidation.
++
++## Outcome
++
++Produce one editable prepared Sprint with:
++
++- one roadmap feature;
++- exact governing spec revision hashes and any optional QA/QC evidence;
++- work units made from existing spec tasks, each with one Developer and one
++  assigned Reviewer;
++- dependency edges and planned waves;
++- one validated harness/model/effective effort selection per participant;
++- a committed Sprint merge grant; and
++- a capacity plan sized to justified parallel work and review demand, with the
++  local/GitHub capacity to execute it.
++
++The arming transaction validates every recorded selection (explicit null
++model/effort means the route default), records the armed transition, publishes
++the initial assignment messages, and declares a New wake to the overseeing
++Planner. Defaults satisfy the gate, but dispatch never precedes that validation.
++Participant chats are created or re-entered later by wake delivery.
++
++## Eligibility pass
++
++Read the feature, selected spec bodies, task ledgers, available QA/QC records,
++shell roster, model routes, quota state, repository access, and worktree
++availability. Record the exact revision hash you inspected; a title or document
++id is not a revision.
++
++The FnB decides whether pre-Sprint QA/QC is useful. If requested, the Review
++shell records its verdict against the current exact body through the
++authenticated Sprint surface:
++
++```text
++sc sprint record-qaqc --document <spec-document-id> --verdict pass \
++  [--findings-document <document-id>]
++```
++
++The record is inspectable evidence, not launch authorization. Its absence,
++verdict, findings, revision age, or signer state never blocks declaration or
++arming. A body edit makes the prior record historical evidence; it does not
++change the exact revision the Planner later binds.
++
++When the FnB requests pre-Sprint QA/QC, contact the Review shell through the
++ordinary shell-to-shell channel because no Sprint relay or inbox exists yet.
++Proceed with preparation regardless of whether review was performed or what it
++found; after arming, switch to `sprint_pln`.
++
++Refuse arming when any of these is true:
++
++- no current non-empty `spec` document belonging to the feature is bound;
++- a bound spec body changed after declaration, so its current hash no longer
++  matches the exact declared revision;
++- a selected task belongs to no work unit or more than one work unit;
++- a dependency cycle exists;
++- a work unit lacks an assigned Developer or Reviewer;
++- participant routes or required capacity are unavailable;
++- another Sprint is armed, or a selected shell already participates in an armed
++  Sprint; or
++- the merge grant was not committed as part of the final plan.
++
++Deficiencies remain editable in `prepared`. Do not weaken an invariant merely
++to get to `armed`; surface the missing fact or capacity to the FnB.
++
++## Shape work, do not script behavior
++
++A work unit is one coherent editing lane and may group related spec tasks. Use
++dependencies only for hard prerequisites. Waves express intent and later report
++comparison; they do not forbid safe out-of-order completion. Reviews are not
++editing lanes.
++
++Prefer the smallest dependency graph that preserves correctness. Record the
++expected output in outcome language. Do not encode a shell''s implementation
++steps into the durable plan when its role skill and judgment can decide them.
++
++### Balance capacity and parallelism
++
++Optimize for the smallest participant set that keeps justified critical-path
++development and review moving without avoidable queues. Neither minimum
++headcount nor maximum shell occupancy is a goal.
++
++Before choosing participants, analyze the task ledger and dependency graph for
++coherent non-overlapping editing lanes, expected readiness, critical-path work,
++and likely review demand. Put dependency-free Developer lanes in the same wave
++and plan Reviewer capacity so ready reviews can run alongside ongoing
++independent development. Do not serialize work merely because it appears in
++task order, split coherent work, or start a review before its unit is ready just
++to create concurrency.
++
++- For one coherent small lane, normally use one Developer and one Reviewer.
++- Add a Developer only when another independent lane can start or make useful
++  progress without conflicting ownership and has enough review capacity.
++- Add Reviewer capacity when expected concurrent review demand would otherwise
++  queue critical-path work. Reuse a Reviewer across units when their review
++  readiness is unlikely to overlap.
++- Leave eligible capacity unassigned when the roster allows, preserving room
++  for correction, re-plan, or urgent work. Use every eligible shell only when
++  the work graph and review demand justify simultaneous work and coordination
++  cost does not erase the expected time-to-completion gain.
++
++Record the capacity rationale: chosen participants, parallel lanes, expected
++review overlap, retained reserve, and why another shell would or would not
++shorten the critical path.
++
++For every participant, record role, route, model, and effective effort. Never
++pretend a native session can resume across harnesses.
++
++Declare the prepared envelope from a JSON array of participant objects, binding
++each current governing document directly. The server reads and hashes the body
++inside the declaration transaction; the client never supplies a revision hash.
++Then add each editing lane from existing spec tasks:
++
++```text
++sc sprint declare --feature <feature-id> \
++  --spec <spec-document-id> --participants-file <path> --merge-grant
++sc sprint plan-unit --sprint <id> \
++  --developer-shell <id> --reviewer-shell <id> --title <title> \
++  --expected-output-file <path> --task <task-id> \
++  [--task <task-id>] [--wave <n>] [--depends-on <work-unit-id>] \
++  [--output-kind code|report-only|no-code]
++```
++
++Repeat `--spec` for multiple governing documents. The deprecated
++`--spec-approval <approval-id>` selector remains compatible when an old caller
++must also retain a specific review row as evidence, but its verdict and reviewed
++revision do not affect eligibility and direct `--spec` is canonical.
++
++The participant file contains `shell_id`, `role`, and `harness`, with optional
++`model`, `effort`, and `route`. FnB may add `--planner-shell <id>` when declaring
++for the originating Planner. Keep the Sprint prepared while shaping the plan.
++
++## Final arming check
++
++Immediately before arming, re-read the exact spec revision hashes, available
++QA/QC evidence, task coverage, participant routes and capacity, single-armed
++invariant, repository access, and merge grant. Review evidence is summarized,
++never interpreted as authorization. The final read and durable plan commit
++belong to the authoritative arming transaction; external harness and GitHub
++work occurs after it commits.
++
++Arming succeeds only when the first assignments and wake intents are durable.
++A process crash after commit is outbox recovery; a crash before commit exposes
++no partial Sprint.
++
++```text
++sc sprint arm --sprint <id>
++```
++
++After `arm` succeeds, participant pickup belongs to native delivery. The armed
++runtime dispatches ready work and wake recovery reconciles unread pickup; the
++preparing Planner does not manually boot participants or create a second wake
++path. Initial assignments use Force-new delivery; a live turn reaches its
++natural boundary before delivery and the runtime owns rotation and recovery.
++
++## Handoff
++
++Once armed, hand control to `sprint_pln` and stop preparation work. Give the FnB
++a compact declaration:
++Sprint id, feature, exact spec revisions, participants/routes, work-unit graph,
++planned waves, capacity rationale and reserve, merge-grant state, and known
++accepted risks. State whether pre-Sprint QA/QC was performed and summarize any
++available evidence without treating it as an eligibility result.
++
++Stop when the Sprint is armed or when one concrete eligibility blocker has been
++surfaced. Do not dispatch from a partially prepared plan.',
++  0
++)
++ON CONFLICT(name) DO UPDATE SET
++  description=excluded.description, category=excluded.category,
++  command=excluded.command, common=excluded.common,
++  content=excluded.content, is_deleted=0;
++
++
++COMMIT;
++
++PRAGMA foreign_keys=ON;
++PRAGMA foreign_key_check;
+diff --git a/.super-coder/scripts/sprint_board.py b/.super-coder/scripts/sprint_board.py
+index 9936157..fa19d9e 100644
+--- a/.super-coder/scripts/sprint_board.py
++++ b/.super-coder/scripts/sprint_board.py
+@@ -45,7 +45,12 @@ _RECOVERY_INSTRUCTION = (
+ # are projected; an unknown event remains visible with an empty detail object.
+ _EVENT_FIELDS = {
+     "sprint.declared": frozenset(
+-        {"feature_id", "spec_approval_ids", "participant_shell_ids"}
++        {
++            "feature_id",
++            "spec_document_ids",
++            "spec_approval_ids",
++            "participant_shell_ids",
++        }
+     ),
+     "sprint.delivery_terminal": frozenset(
+         {"terminal_count", "completed_count", "cancelled_count"}
+diff --git a/.super-coder/scripts/sprint_cli.py b/.super-coder/scripts/sprint_cli.py
+index 756e2ca..409ee45 100755
+--- a/.super-coder/scripts/sprint_cli.py
++++ b/.super-coder/scripts/sprint_cli.py
+@@ -54,6 +54,7 @@ def cmd_declare(args: argparse.Namespace) -> int:
+         {
+             "feature_id": args.feature,
+             "planner_shell_id": args.planner_shell,
++            "spec_document_ids": _integer_list(args.spec),
+             "spec_approval_ids": _integer_list(args.spec_approval),
+             "participants": _json_array(args.participants_file),
+             "merge_grant_enabled": args.merge_grant,
+@@ -392,7 +393,18 @@ def build_parser() -> argparse.ArgumentParser:
+         type=int,
+         help="originating Planner; defaults to the authenticated caller",
+     )
+-    declare.add_argument("--spec-approval", type=int, action="append", required=True)
++    declare.add_argument(
++        "--spec",
++        type=int,
++        action="append",
++        help="current governing spec document; repeat for multiple specs",
++    )
++    declare.add_argument(
++        "--spec-approval",
++        type=int,
++        action="append",
++        help="deprecated: resolve the reviewed document and retain evidence",
++    )
+     declare.add_argument("--participants-file", required=True)
+     declare.add_argument("--merge-grant", action="store_true", required=True)
+     declare.set_defaults(fn=cmd_declare)
+diff --git a/.super-coder/scripts/sprint_close.py b/.super-coder/scripts/sprint_close.py
+index 8401e1b..1527d8f 100644
+--- a/.super-coder/scripts/sprint_close.py
++++ b/.super-coder/scripts/sprint_close.py
+@@ -472,9 +472,10 @@ class SprintCloseStore:
+         rows = self._rows(
+             "SELECT ss.document_id,ss.bound_revision_sha256,ss.approval_id,"
+             "ss.included_at,d.title,d.body,a.reviewer_shell_id,a.verdict,"
+-            "a.reviewed_at FROM sprint_specs ss "
++            "a.revision_sha256 AS reviewed_revision_sha256,"
++            "a.findings_document_id,a.reviewed_at FROM sprint_specs ss "
+             "JOIN documents d ON d.document_id=ss.document_id "
+-            "JOIN sprint_spec_approvals a ON a.approval_id=ss.approval_id "
++            "LEFT JOIN sprint_spec_approvals a ON a.approval_id=ss.approval_id "
+             "WHERE ss.sprint_id=? ORDER BY ss.document_id",
+             (sprint_id,),
+         )
+diff --git a/.super-coder/scripts/sprint_domain.py b/.super-coder/scripts/sprint_domain.py
+index eb9cd77..8c7bec0 100644
+--- a/.super-coder/scripts/sprint_domain.py
++++ b/.super-coder/scripts/sprint_domain.py
+@@ -2279,34 +2279,27 @@ class SprintLifecycleStore:
+         sprint_id = int(sprint["sprint_id"])
+         if int(sprint["merge_grant_enabled"]) != 1:
+             raise SprintInvariantError("arming requires a committed merge grant")
+-        invalid_specs = self.con.execute(
+-            "SELECT COUNT(*) FROM sprint_specs ss "
+-            "JOIN sprint_spec_approvals a ON a.approval_id=ss.approval_id "
+-            "JOIN documents d ON d.document_id=ss.document_id "
+-            "JOIN shells reviewer ON reviewer.shell_id=a.reviewer_shell_id "
+-            "WHERE ss.sprint_id=? AND "
+-            "(a.verdict<>'pass' OR a.document_id<>ss.document_id "
+-            "OR a.revision_sha256<>ss.bound_revision_sha256 "
+-            "OR d.kind<>'spec' OR d.feature_id<>? "
+-            "OR reviewer.flavor<>'reviewer' "
+-            "OR COALESCE(reviewer.is_deleted,0)<>0)",
+-            (sprint_id, sprint["feature_id"]),
+-        ).fetchone()[0]
+         bound_specs = self.con.execute(
+-            "SELECT ss.bound_revision_sha256,d.body FROM sprint_specs ss "
+-            "JOIN documents d ON d.document_id=ss.document_id "
++            "SELECT ss.bound_revision_sha256,d.document_id,d.feature_id,d.kind,d.body "
++            "FROM sprint_specs ss "
++            "LEFT JOIN documents d ON d.document_id=ss.document_id "
+             "WHERE ss.sprint_id=?",
+             (sprint_id,),
+         ).fetchall()
+-        current_revision_mismatch = any(
+-            row["body"] is None
++        invalid_specs = any(
++            row["document_id"] is None
++            or row["kind"] != "spec"
++            or row["feature_id"] is None
++            or int(row["feature_id"]) != int(sprint["feature_id"])
++            or not isinstance(row["body"], str)
++            or not row["body"].strip()
+             or hashlib.sha256(row["body"].encode()).hexdigest()
+             != row["bound_revision_sha256"]
+             for row in bound_specs
+         )
+-        if not bound_specs or invalid_specs or current_revision_mismatch:
++        if not bound_specs or invalid_specs:
+             raise SprintInvariantError(
+-                "arming requires at least one exact, passing spec approval"
++                "arming requires at least one exact current governing spec"
+             )
+         roles = {
+             row[0]
+diff --git a/tests/fixtures/sprint_removal/manifest.json b/tests/fixtures/sprint_removal/manifest.json
+index 4b1d57d..e571a3d 100644
+--- a/tests/fixtures/sprint_removal/manifest.json
++++ b/tests/fixtures/sprint_removal/manifest.json
+@@ -82,7 +82,8 @@
+     ".super-coder/migrations/0176_reseed_sprint_red_check_doctrine.sql",
+     ".super-coder/migrations/0178_reseed_sprint_watcher_state_skills.sql",
+     ".super-coder/migrations/0179_reseed_atomic_sprint_closeout.sql",
+-    ".super-coder/migrations/0184_reseed_sprint_skill_polish.sql"
++    ".super-coder/migrations/0184_reseed_sprint_skill_polish.sql",
++    ".super-coder/migrations/0185_optional_sprint_qaqc.sql"
+   ],
+   "baseline_migration_ledger": {
+     "count": 142,
+diff --git a/tests/test_sprint_board_api.py b/tests/test_sprint_board_api.py
+index 72c1525..27c6285 100644
+--- a/tests/test_sprint_board_api.py
++++ b/tests/test_sprint_board_api.py
+@@ -577,6 +577,7 @@ class SprintBoardApiCase(unittest.TestCase):
+                 "sprint.declared",
+                 {
+                     "feature_id": self.ids["feature_id"],
++                    "spec_document_ids": [self.ids["document_id"]],
+                     "spec_approval_ids": [1],
+                     "participant_shell_ids": [2, 3, 4],
+                     "secret": "hidden",
+diff --git a/tests/test_sprint_cli.py b/tests/test_sprint_cli.py
+index 48e3cec..72a1e2d 100644
+--- a/tests/test_sprint_cli.py
++++ b/tests/test_sprint_cli.py
+@@ -719,6 +719,429 @@ class SprintCliApiTest(unittest.TestCase):
+         finally:
+             con.close()
+ 
++    def test_declare_binds_current_spec_without_qaqc_evidence(self):
++        self.use_isolated_db()
++        con = sqlite3.connect(self.db)
++        try:
++            feature_id = int(
++                con.execute(
++                    "INSERT INTO roadmap (title,roadmap_status) "
++                    "VALUES ('Direct declaration','in_progress')"
++                ).lastrowid
++            )
++            body = "current direct spec body"
++            document_id = int(
++                con.execute(
++                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
++                    "VALUES (?,'spec',1,'Direct spec',?)",
++                    (feature_id, body),
++                ).lastrowid
++            )
++            con.commit()
++        finally:
++            con.close()
++
++        sprint_id = self.run_cli(
++            TOKENS["planner"],
++            "declare",
++            "--feature",
++            str(feature_id),
++            "--spec",
++            str(document_id),
++            "--participants-file",
++            self.participants_file(),
++            "--merge-grant",
++        )["sprint_id"]
++
++        con = sqlite3.connect(self.db)
++        try:
++            self.assertEqual(
++                (document_id, hashlib.sha256(body.encode()).hexdigest(), None),
++                con.execute(
++                    "SELECT document_id,bound_revision_sha256,approval_id "
++                    "FROM sprint_specs WHERE sprint_id=?",
++                    (sprint_id,),
++                ).fetchone(),
++            )
++            self.assertEqual(
++                0,
++                con.execute("SELECT COUNT(*) FROM sprint_spec_approvals").fetchone()[0],
++            )
++            payload = json.loads(
++                con.execute(
++                    "SELECT payload FROM sprint_events WHERE sprint_id=? "
++                    "AND event_type='sprint.declared'",
++                    (sprint_id,),
++                ).fetchone()[0]
++            )
++            self.assertEqual([document_id], payload["spec_document_ids"])
++            self.assertNotIn("spec_approval_ids", payload)
++        finally:
++            con.close()
++
++    def test_legacy_selector_is_verdict_agnostic_and_mixed_input_deduplicates(self):
++        self.use_isolated_db()
++        con = sqlite3.connect(self.db)
++        try:
++            con.execute(
++                "INSERT INTO shells "
++                "(shell_id,display_name,shortname,flavor,system_prompt,user_id,api_key) "
++                "VALUES (6,'Active reviewer','REV2','reviewer','prompt',1,'rev2-token')"
++            )
++            feature_id = int(
++                con.execute(
++                    "INSERT INTO roadmap (title,roadmap_status) "
++                    "VALUES ('Legacy declaration','in_progress')"
++                ).lastrowid
++            )
++            old_body = "historically reviewed body"
++            current_body = "current body after review"
++            document_id = int(
++                con.execute(
++                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
++                    "VALUES (?,'spec',1,'Legacy spec',?)",
++                    (feature_id, old_body),
++                ).lastrowid
++            )
++            approval_id = int(
++                con.execute(
++                    "INSERT INTO sprint_spec_approvals "
++                    "(document_id,revision_sha256,reviewer_shell_id,verdict) "
++                    "VALUES (?,?,2,'fail')",
++                    (document_id, hashlib.sha256(old_body.encode()).hexdigest()),
++                ).lastrowid
++            )
++            con.execute(
++                "UPDATE documents SET body=? WHERE document_id=?",
++                (current_body, document_id),
++            )
++            con.execute("UPDATE shells SET is_deleted=1 WHERE shell_id=2")
++            con.commit()
++        finally:
++            con.close()
++
++        participants = self.write(
++            json.dumps(
++                [
++                    {"shell_id": 3, "role": "planner", "harness": "codex"},
++                    {"shell_id": 1, "role": "developer", "harness": "codex"},
++                    {"shell_id": 6, "role": "reviewer", "harness": "kimi"},
++                ]
++            )
++        )
++
++        sprint_id = self.run_cli(
++            TOKENS["planner"],
++            "declare",
++            "--feature",
++            str(feature_id),
++            "--spec",
++            str(document_id),
++            "--spec-approval",
++            str(approval_id),
++            "--participants-file",
++            participants,
++            "--merge-grant",
++        )["sprint_id"]
++
++        con = sqlite3.connect(self.db)
++        try:
++            self.assertEqual(
++                1,
++                con.execute(
++                    "SELECT COUNT(*) FROM sprint_specs WHERE sprint_id=?",
++                    (sprint_id,),
++                ).fetchone()[0],
++            )
++            self.assertEqual(
++                (
++                    document_id,
++                    hashlib.sha256(current_body.encode()).hexdigest(),
++                    approval_id,
++                ),
++                con.execute(
++                    "SELECT document_id,bound_revision_sha256,approval_id "
++                    "FROM sprint_specs WHERE sprint_id=?",
++                    (sprint_id,),
++                ).fetchone(),
++            )
++        finally:
++            con.close()
++
++    def test_review_properties_never_change_authenticated_launch_eligibility(self):
++        cases = (
++            ("no-review", None, False, False, False),
++            ("current-pass", "pass", False, False, False),
++            ("current-fail", "fail", False, False, False),
++            ("unresolved-findings", "pass", False, True, False),
++            ("stale-review", "pass", True, False, False),
++            ("deleted-signer", "pass", False, False, True),
++            ("mixed-selectors", "pass", False, False, False),
++        )
++        for name, verdict, stale, findings, deleted_signer in cases:
++            with self.subTest(name=name):
++                self.use_isolated_db()
++                con = sqlite3.connect(self.db)
++                try:
++                    reviewer_shell_id = 2
++                    if deleted_signer:
++                        con.execute(
++                            "INSERT INTO shells "
++                            "(shell_id,display_name,shortname,flavor,system_prompt,"
++                            "user_id,api_key) VALUES "
++                            "(6,'Active reviewer','REV2','reviewer','prompt',1,'rev2-token')"
++                        )
++                        con.execute("UPDATE shells SET is_deleted=1 WHERE shell_id=2")
++                        reviewer_shell_id = 6
++                    feature_id = int(
++                        con.execute(
++                            "INSERT INTO roadmap (title,roadmap_status) VALUES (?,?)",
++                            (f"Matrix {name}", "in_progress"),
++                        ).lastrowid
++                    )
++                    reviewed_body = f"reviewed body {name}"
++                    current_body = (
++                        f"current body {name}" if stale else reviewed_body
++                    )
++                    document_id = int(
++                        con.execute(
++                            "INSERT INTO documents "
++                            "(feature_id,kind,seq,title,body) "
++                            "VALUES (?,'spec',1,?,?)",
++                            (feature_id, f"Spec {name}", current_body),
++                        ).lastrowid
++                    )
++                    findings_id = None
++                    if findings:
++                        findings_id = int(
++                            con.execute(
++                                "INSERT INTO documents (kind,seq,title,body) "
++                                "VALUES ('doc',1,'Unresolved findings','still open')"
++                            ).lastrowid
++                        )
++                    approval_id = None
++                    if verdict is not None:
++                        approval_id = int(
++                            con.execute(
++                                "INSERT INTO sprint_spec_approvals "
++                                "(document_id,revision_sha256,reviewer_shell_id,"
++                                "verdict,findings_document_id) VALUES (?,?,?,?,?)",
++                                (
++                                    document_id,
++                                    hashlib.sha256(reviewed_body.encode()).hexdigest(),
++                                    2,
++                                    verdict,
++                                    findings_id,
++                                ),
++                            ).lastrowid
++                        )
++                    task_id = int(
++                        con.execute(
++                            "INSERT INTO spec_tasks "
++                            "(feature_id,document_id,seq,title) VALUES (?,?,0,?)",
++                            (feature_id, document_id, f"Task {name}"),
++                        ).lastrowid
++                    )
++                    con.commit()
++                finally:
++                    con.close()
++                participants = self.write(
++                    json.dumps(
++                        [
++                            {"shell_id": 3, "role": "planner", "harness": "codex"},
++                            {"shell_id": 1, "role": "developer", "harness": "codex"},
++                            {
++                                "shell_id": reviewer_shell_id,
++                                "role": "reviewer",
++                                "harness": "kimi",
++                            },
++                        ]
++                    )
++                )
++                selectors = ["--spec", str(document_id)]
++                if approval_id is not None and name != "mixed-selectors":
++                    selectors = ["--spec-approval", str(approval_id)]
++                elif approval_id is not None:
++                    selectors.extend(("--spec-approval", str(approval_id)))
++                declaration = self.run_cli(
++                    TOKENS["planner"],
++                    "declare",
++                    "--feature",
++                    str(feature_id),
++                    *selectors,
++                    "--participants-file",
++                    participants,
++                    "--merge-grant",
++                )
++                unit = self.run_cli(
++                    TOKENS["planner"],
++                    "plan-unit",
++                    "--sprint",
++                    str(declaration["sprint_id"]),
++                    "--developer-shell",
++                    "1",
++                    "--reviewer-shell",
++                    str(reviewer_shell_id),
++                    "--title",
++                    f"Matrix lane {name}",
++                    "--expected-output-file",
++                    self.write("One verified launch."),
++                    "--task",
++                    str(task_id),
++                )
++                armed = self.run_cli(
++                    TOKENS["planner"],
++                    "arm",
++                    "--sprint",
++                    str(declaration["sprint_id"]),
++                )
++
++                self.assertEqual(2, len(armed["wake_ids"]))
++                con = sqlite3.connect(self.db)
++                try:
++                    self.assertEqual(
++                        (
++                            "armed",
++                            1,
++                            document_id,
++                            hashlib.sha256(current_body.encode()).hexdigest(),
++                            approval_id,
++                            "ready",
++                        ),
++                        con.execute(
++                            "SELECT s.lifecycle,COUNT(ss.document_id),ss.document_id,"
++                            "ss.bound_revision_sha256,ss.approval_id,u.disposition "
++                            "FROM sprints s JOIN sprint_specs ss USING (sprint_id) "
++                            "JOIN sprint_work_units u USING (sprint_id) "
++                            "WHERE s.sprint_id=? AND u.work_unit_id=?",
++                            (declaration["sprint_id"], unit["work_unit_id"]),
++                        ).fetchone(),
++                    )
++                finally:
++                    con.close()
++
++    def test_declaration_rejects_invalid_spec_resources_without_writes(self):
++        self.use_isolated_db()
++        con = sqlite3.connect(self.db)
++        try:
++            feature_id = int(
++                con.execute(
++                    "INSERT INTO roadmap (title,roadmap_status) "
++                    "VALUES ('Declaration guards','in_progress')"
++                ).lastrowid
++            )
++            other_feature_id = int(
++                con.execute(
++                    "INSERT INTO roadmap (title,roadmap_status) "
++                    "VALUES ('Other feature','in_progress')"
++                ).lastrowid
++            )
++            valid_document_id = int(
++                con.execute(
++                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
++                    "VALUES (?,'spec',1,'Valid','valid')",
++                    (feature_id,),
++                ).lastrowid
++            )
++            wrong_feature_id = int(
++                con.execute(
++                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
++                    "VALUES (?,'spec',1,'Wrong feature','valid')",
++                    (other_feature_id,),
++                ).lastrowid
++            )
++            non_spec_id = int(
++                con.execute(
++                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
++                    "VALUES (?,'doc',2,'Not a spec','valid')",
++                    (feature_id,),
++                ).lastrowid
++            )
++            unscoped_spec_id = int(
++                con.execute(
++                    "INSERT INTO documents (kind,seq,title,body) "
++                    "VALUES ('spec',4,'Unscoped','valid')"
++                ).lastrowid
++            )
++            empty_id = int(
++                con.execute(
++                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
++                    "VALUES (?,'spec',3,'Empty','   ')",
++                    (feature_id,),
++                ).lastrowid
++            )
++            approval_ids = [
++                int(
++                    con.execute(
++                        "INSERT INTO sprint_spec_approvals "
++                        "(document_id,revision_sha256,reviewer_shell_id,verdict) "
++                        "VALUES (?,?,?,?)",
++                        (
++                            valid_document_id,
++                            hashlib.sha256(b"valid").hexdigest(),
++                            reviewer_shell_id,
++                            verdict,
++                        ),
++                    ).lastrowid
++                )
++                for reviewer_shell_id, verdict in ((2, "pass"), (1, "fail"))
++            ]
++            con.commit()
++        finally:
++            con.close()
++        base = (
++            "declare",
++            "--feature",
++            str(feature_id),
++            "--participants-file",
++            self.participants_file(),
++            "--merge-grant",
++        )
++        cases = (
++            ((), "HTTP 400.*at least one"),
++            (("--spec", "999999"), "HTTP 404.*unknown Sprint spec document"),
++            (
++                ("--spec-approval", "999999"),
++                "HTTP 404.*unknown Sprint spec approval",
++            ),
++            (
++                ("--spec", str(wrong_feature_id)),
++                "HTTP 409.*non-empty spec documents for its feature",
++            ),
++            (
++                ("--spec", str(non_spec_id)),
++                "HTTP 409.*non-empty spec documents for its feature",
++            ),
++            (
++                ("--spec", str(unscoped_spec_id)),
++                "HTTP 409.*non-empty spec documents for its feature",
++            ),
++            (
++                ("--spec", str(empty_id)),
++                "HTTP 409.*non-empty spec documents for its feature",
++            ),
++            (
++                (
++                    "--spec-approval",
++                    str(approval_ids[0]),
++                    "--spec-approval",
++                    str(approval_ids[1]),
++                ),
++                "HTTP 400.*multiple spec approvals select the same document",
++            ),
++        )
++        for selectors, error in cases:
++            with self.subTest(selectors=selectors):
++                with self.assertRaisesRegex(SystemExit, error):
++                    self.run_cli(TOKENS["planner"], *base, *selectors)
++        con = sqlite3.connect(self.db)
++        try:
++            self.assertEqual(0, con.execute("SELECT COUNT(*) FROM sprints").fetchone()[0])
++            self.assertEqual(0, con.execute("SELECT COUNT(*) FROM sprint_specs").fetchone()[0])
++            self.assertEqual(0, con.execute("SELECT COUNT(*) FROM sprint_events").fetchone()[0])
++        finally:
++            con.close()
++
+     def test_participant_send_confirms_durable_message_wake_and_route(self):
+         response = self.run_cli(
+             TOKENS["developer"],
+@@ -881,23 +1304,26 @@ class SprintCliApiTest(unittest.TestCase):
+             con.commit()
+         finally:
+             con.close()
+-        with self.assertRaisesRegex(
+-            SystemExit, "HTTP 409.*current passing approvals"
+-        ):
+-            self.run_cli(
+-                TOKENS["planner"],
+-                "declare",
+-                "--feature",
+-                str(feature_id),
+-                "--spec-approval",
+-                str(bad_approval_id),
+-                "--participants-file",
+-                participants,
+-                "--merge-grant",
+-            )
++        evidence_sprint_id = self.run_cli(
++            TOKENS["planner"],
++            "declare",
++            "--feature",
++            str(feature_id),
++            "--spec-approval",
++            str(bad_approval_id),
++            "--participants-file",
++            participants,
++            "--merge-grant",
++        )["sprint_id"]
+         con = sqlite3.connect(self.db)
+         try:
+-            self.assertEqual(0, con.execute("SELECT COUNT(*) FROM sprints").fetchone()[0])
++            self.assertEqual(
++                (bad_approval_id,),
++                con.execute(
++                    "SELECT approval_id FROM sprint_specs WHERE sprint_id=?",
++                    (evidence_sprint_id,),
++                ).fetchone(),
++            )
+         finally:
+             con.close()
+         sprint_id = self.run_cli(
+diff --git a/tests/test_sprint_close.py b/tests/test_sprint_close.py
+index a329a0b..a5b0c23 100644
+--- a/tests/test_sprint_close.py
++++ b/tests/test_sprint_close.py
+@@ -1002,6 +1002,32 @@ class EvidenceCompilerTest(SprintCloseCase):
+         )
+         self.assertGreater(packet["anomalies"]["events"]["truncated"], 0)
+ 
++    def test_packet_includes_bound_spec_without_review_evidence(self):
++        self.con.execute(
++            "UPDATE sprint_specs SET approval_id=NULL WHERE sprint_id=?",
++            (self.sprint_id,),
++        )
++        self.con.commit()
++
++        packet = self.close.compile_evidence_packet(self.sprint_id, 3)
++
++        self.assertEqual(1, len(packet["spec_revisions"]["bound"]))
++        spec = packet["spec_revisions"]["bound"][0]
++        self.assertEqual(self.document_id, spec["document_id"])
++        self.assertEqual(
++            hashlib.sha256(b"governing spec revision 1").hexdigest(),
++            spec["bound_revision_sha256"],
++        )
++        for field in (
++            "approval_id",
++            "reviewer_shell_id",
++            "verdict",
++            "reviewed_revision_sha256",
++            "findings_document_id",
++            "reviewed_at",
++        ):
++            self.assertIsNone(spec[field])
++
+     def test_planner_admin_and_participating_reviewer_compile_evidence(self):
+         planner_packet = self.close.compile_evidence_packet(self.sprint_id, 3)
+         reviewer_packet = self.close.compile_evidence_packet(self.sprint_id, 2)
+diff --git a/tests/test_sprint_skills.py b/tests/test_sprint_skills.py
+index a796adf..a3e25d5 100644
+--- a/tests/test_sprint_skills.py
++++ b/tests/test_sprint_skills.py
+@@ -28,7 +28,7 @@ V21_ROLE_SKILLS = set(SKILLS)
+ HANDOFF_ROLE_SKILLS = {"sprint_dev", "sprint_rev", "sprint_pln"}
+ CLOSEOUT_ROLE_SKILLS = {"sprint_close", "sprint_dev", "sprint_pln", "sprint_rev"}
+ FORCE_NEW_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
+-POLISHED_SPRINT_SKILLS = set(SKILLS)
++POLISHED_SPRINT_SKILLS = set(SKILLS) - {"sprint_prep"}
+ 
+ ARTIFACT_PATH_RULE = """## Sprint artifact paths
+ 
+@@ -457,6 +457,61 @@ class SprintSkillTest(unittest.TestCase):
+         finally:
+             con.close()
+ 
++    def test_optional_qaqc_reseed_matches_asset_and_replays_idempotently(self):
++        con = sqlite3.connect(":memory:")
++        try:
++            con.executescript((ENGINE / "schema.sql").read_text())
++            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
++                if migration.name >= "0185_optional_sprint_qaqc.sql":
++                    break
++                con.executescript(migration.read_text())
++            con.execute(
++                "UPDATE skills SET description='stale',category='stale',"
++                "command='stale',common=1,content='review gates launch',"
++                "is_deleted=1 WHERE name='sprint_prep'"
++            )
++
++            migration = (
++                ENGINE / "migrations" / "0185_optional_sprint_qaqc.sql"
++            ).read_text()
++            con.executescript(migration)
++            con.executescript(migration)
++
++            parsed = seed_skills.parse_skill(ASSETS / "sprint_prep" / "SKILL.md")
++            row = con.execute(
++                "SELECT description,category,command,common,content,is_deleted "
++                "FROM skills WHERE name='sprint_prep'"
++            ).fetchone()
++            self.assertEqual(
++                (
++                    parsed["description"],
++                    parsed["category"],
++                    parsed["command"],
++                    parsed["common"],
++                    parsed["content"],
++                    0,
++                ),
++                tuple(row),
++            )
++            normalized = " ".join(parsed["content"].split())
++            for guidance in (
++                "The FnB decides whether pre-Sprint QA/QC is useful",
++                "never blocks declaration or arming",
++                "--spec <spec-document-id>",
++                "server reads and hashes the body inside the declaration transaction",
++                "no current non-empty `spec` document",
++                "a selected task belongs to no work unit or more than one work unit",
++                "participant routes or required capacity are unavailable",
++                "merge grant was not committed",
++                "State whether pre-Sprint QA/QC was performed",
++            ):
++                self.assertIn(guidance, normalized)
++            self.assertNotIn("qualifying QAQC approval", normalized)
++            self.assertNotIn("Use `fail` until", normalized)
++            self.assertNotIn("lacks Review-shell QAQC approval", normalized)
++        finally:
++            con.close()
++
+     def test_sprint_polish_reseed_matches_assets_and_replays_idempotently(self):
+         con = sqlite3.connect(":memory:")
+         try:
+diff --git a/tests/test_sprint_snapshot_rebuild.py b/tests/test_sprint_snapshot_rebuild.py
+index 6fcaebe..38187b9 100644
+--- a/tests/test_sprint_snapshot_rebuild.py
++++ b/tests/test_sprint_snapshot_rebuild.py
+@@ -46,7 +46,7 @@ def rows_by_table(path: Path, tables: list[str]) -> dict[str, list[tuple]]:
+         con.close()
+ 
+ 
+-def seed_prepared(con: sqlite3.Connection) -> int:
++def seed_prepared(con: sqlite3.Connection, *, reviewed: bool = True) -> int:
+     con.execute("PRAGMA foreign_keys=ON")
+     con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
+     con.executemany(
+@@ -70,12 +70,14 @@ def seed_prepared(con: sqlite3.Connection) -> int:
+         (feature_id, body),
+     ).lastrowid
+     revision = hashlib.sha256(body.encode()).hexdigest()
+-    approval_id = con.execute(
+-        "INSERT INTO sprint_spec_approvals "
+-        "(approval_id,document_id,revision_sha256,reviewer_shell_id,verdict) "
+-        "VALUES (2,?,?,2,'pass')",
+-        (document_id, revision),
+-    ).lastrowid
++    approval_id = None
++    if reviewed:
++        approval_id = con.execute(
++            "INSERT INTO sprint_spec_approvals "
++            "(approval_id,document_id,revision_sha256,reviewer_shell_id,verdict) "
++            "VALUES (2,?,?,2,'pass')",
++            (document_id, revision),
++        ).lastrowid
+     sprint_id = con.execute(
+         "INSERT INTO sprints "
+         "(sprint_id,feature_id,originating_planner_shell_id,merge_grant_enabled) "
+@@ -359,6 +361,26 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
+     def test_prepared_sprint_roundtrips_without_plan_or_generation_drift(self) -> None:
+         self.assert_roundtrip(armed=False)
+ 
++    def test_unreviewed_spec_binding_roundtrips_with_null_evidence(self) -> None:
++        con = sqlite3.connect(self.db)
++        try:
++            seed_prepared(con, reviewed=False)
++        finally:
++            con.close()
++        before = rows_by_table(self.db, ["sprint_specs", "sprint_spec_approvals"])
++        self.assertEqual([], before["sprint_spec_approvals"])
++        self.assertIsNone(before["sprint_specs"][0][3])
++
++        self.snapshot_and_rebuild()
++
++        after = rows_by_table(self.db, ["sprint_specs", "sprint_spec_approvals"])
++        self.assertEqual(before, after)
++        con = sqlite3.connect(self.db)
++        try:
++            self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
++        finally:
++            con.close()
++
+     def test_armed_in_flight_sprint_roundtrips_every_v2_table_exactly(self) -> None:
+         self.assert_roundtrip(armed=True)
+ 
+diff --git a/tests/test_sprint_v2_domain.py b/tests/test_sprint_v2_domain.py
+index 39b2ba7..96bad72 100644
+--- a/tests/test_sprint_v2_domain.py
++++ b/tests/test_sprint_v2_domain.py
+@@ -10,6 +10,7 @@ import tempfile
+ import unittest
+ from contextlib import closing
+ from pathlib import Path
++from unittest import mock
+ 
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+@@ -18,9 +19,11 @@ SCHEMA = ENGINE / "schema.sql"
+ MIGRATIONS = ENGINE / "migrations"
+ FOUNDATION = MIGRATIONS / "0146_sprint_v2_domain.sql"
+ GENERATION_MIGRATION = MIGRATIONS / "0155_sprint_conversation_generations.sql"
++OPTIONAL_QAQC_MIGRATION = MIGRATIONS / "0185_optional_sprint_qaqc.sql"
+ 
+ sys.path.insert(0, str(ENGINE / "scripts"))
+ import db_driver  # noqa: E402
++import migrate  # noqa: E402
+ import sprint_domain  # noqa: E402
+ 
+ 
+@@ -115,6 +118,174 @@ class SprintDomainCase(unittest.TestCase):
+ 
+ 
+ class MigrationAndShapeTest(SprintDomainCase):
++    @staticmethod
++    def _seed_prechange_binding(con: sqlite3.Connection) -> tuple[int, int, str, int]:
++        con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
++        con.executemany(
++            "INSERT INTO shells "
++            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
++            "VALUES (?,?,?,?,?,1)",
++            (
++                (2, "Reviewer", "REV1", "reviewer", "prompt"),
++                (3, "Planner", "PLN1", "planner", "prompt"),
++            ),
++        )
++        feature_id = int(
++            con.execute("INSERT INTO roadmap (title) VALUES ('Feature')").lastrowid
++        )
++        body = "reviewed governing spec"
++        document_id = int(
++            con.execute(
++                "INSERT INTO documents (feature_id,kind,seq,title,body) "
++                "VALUES (?,'spec',1,'Reviewed',?)",
++                (feature_id, body),
++            ).lastrowid
++        )
++        revision = hashlib.sha256(body.encode()).hexdigest()
++        approval_id = int(
++            con.execute(
++                "INSERT INTO sprint_spec_approvals "
++                "(document_id,revision_sha256,reviewer_shell_id,verdict) "
++                "VALUES (?,?,2,'fail')",
++                (document_id, revision),
++            ).lastrowid
++        )
++        sprint_id = int(
++            con.execute(
++                "INSERT INTO sprints "
++                "(feature_id,originating_planner_shell_id) VALUES (?,3)",
++                (feature_id,),
++            ).lastrowid
++        )
++        con.execute(
++            "INSERT INTO sprint_specs "
++            "(sprint_id,document_id,bound_revision_sha256,approval_id,included_at) "
++            "VALUES (?,?,?,?,?)",
++            (sprint_id, document_id, revision, approval_id, "2026-08-05 12:34:56"),
++        )
++        con.commit()
++        return sprint_id, document_id, revision, approval_id
++
++    def test_optional_qaqc_migration_preserves_reviewed_binding_and_allows_null(self) -> None:
++        with closing(sqlite3.connect(":memory:")) as con:
++            con.row_factory = sqlite3.Row
++            apply_schema(con, through="0184_reseed_sprint_skill_polish.sql")
++            reviewed = self._seed_prechange_binding(con)
++
++            con.executescript(OPTIONAL_QAQC_MIGRATION.read_text())
++
++            self.assertEqual(
++                (*reviewed, "2026-08-05 12:34:56"),
++                tuple(con.execute("SELECT * FROM sprint_specs").fetchone()),
++            )
++            feature_id = int(
++                con.execute("SELECT feature_id FROM sprints").fetchone()[0]
++            )
++            direct_body = "direct governing spec"
++            direct_document_id = int(
++                con.execute(
++                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
++                    "VALUES (?,'spec',2,'Direct',?)",
++                    (feature_id, direct_body),
++                ).lastrowid
++            )
++            direct_sprint_id = int(
++                con.execute(
++                    "INSERT INTO sprints "
++                    "(feature_id,originating_planner_shell_id) VALUES (?,3)",
++                    (feature_id,),
++                ).lastrowid
++            )
++            direct_revision = hashlib.sha256(direct_body.encode()).hexdigest()
++            con.execute(
++                "INSERT INTO sprint_specs "
++                "(sprint_id,document_id,bound_revision_sha256,approval_id) "
++                "VALUES (?,?,?,NULL)",
++                (direct_sprint_id, direct_document_id, direct_revision),
++            )
++            self.assertEqual(
++                (direct_document_id, direct_revision, None),
++                tuple(
++                    con.execute(
++                        "SELECT document_id,bound_revision_sha256,approval_id "
++                        "FROM sprint_specs WHERE sprint_id=?",
++                        (direct_sprint_id,),
++                    ).fetchone()
++                ),
++            )
++            self.assertEqual(2, con.execute("SELECT COUNT(*) FROM sprint_specs").fetchone()[0])
++            self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
++
++    def test_optional_qaqc_migration_failure_rolls_back_original_table(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            path = Path(temp_dir) / OPTIONAL_QAQC_MIGRATION.name
++            path.write_text(
++                OPTIONAL_QAQC_MIGRATION.read_text()
++                + "\nSELECT missing_migration_function();\n"
++            )
++            with closing(sqlite3.connect(":memory:")) as con:
++                con.row_factory = sqlite3.Row
++                apply_schema(con, through="0184_reseed_sprint_skill_polish.sql")
++                original = self._seed_prechange_binding(con)
++
++                with self.assertRaisesRegex(
++                    sqlite3.OperationalError, "missing_migration_function"
++                ):
++                    migrate.apply(con, path)
++
++                self.assertEqual(
++                    original,
++                    tuple(
++                        con.execute(
++                            "SELECT sprint_id,document_id,bound_revision_sha256,"
++                            "approval_id FROM sprint_specs"
++                        ).fetchone()
++                    ),
++                )
++                approval_column = next(
++                    row
++                    for row in con.execute("PRAGMA table_info(sprint_specs)")
++                    if row[1] == "approval_id"
++                )
++                self.assertEqual(1, approval_column[3])
++                self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
++
++    def test_optional_qaqc_normal_migration_discovery_does_not_reapply(self) -> None:
++        with tempfile.TemporaryDirectory() as temp_dir:
++            migration_dir = Path(temp_dir)
++            path = migration_dir / OPTIONAL_QAQC_MIGRATION.name
++            path.write_text(OPTIONAL_QAQC_MIGRATION.read_text())
++            with closing(sqlite3.connect(":memory:")) as con:
++                con.row_factory = sqlite3.Row
++                apply_schema(con, through="0184_reseed_sprint_skill_polish.sql")
++                original = self._seed_prechange_binding(con)
++
++                migrate.apply(con, path)
++                with mock.patch.object(migrate, "MIGRATIONS_DIR", migration_dir):
++                    self.assertEqual([], migrate.pending(con))
++                    for pending_path in migrate.pending(con):
++                        migrate.apply(con, pending_path)
++
++                self.assertEqual(
++                    original,
++                    tuple(
++                        con.execute(
++                            "SELECT sprint_id,document_id,bound_revision_sha256,"
++                            "approval_id FROM sprint_specs"
++                        ).fetchone()
++                    ),
++                )
++                self.assertEqual(
++                    [(OPTIONAL_QAQC_MIGRATION.name,)],
++                    [
++                        tuple(row)
++                        for row in con.execute(
++                            "SELECT filename FROM schema_migrations WHERE filename=?",
++                            (OPTIONAL_QAQC_MIGRATION.name,),
++                        )
++                    ],
++                )
++
+     def test_conversation_generation_backfills_prepared_plan_without_drift(self) -> None:
+         with closing(sqlite3.connect(":memory:")) as con:
+             con.row_factory = sqlite3.Row
+@@ -359,7 +530,7 @@ class SpecApprovalTest(SprintDomainCase):
+         self.assertEqual(1, len(listed))
+         self.assertEqual("REV1", listed[0]["reviewer_shortname"])
+ 
+-    def test_non_reviewer_cannot_record_or_arm_hand_seeded_approval(self) -> None:
++    def test_non_reviewer_cannot_record_but_hand_seeded_evidence_does_not_gate_arm(self) -> None:
+         feature_id = int(
+             self.con.execute(
+                 "INSERT INTO roadmap (title) VALUES ('Bad signer feature')"
+@@ -394,12 +565,9 @@ class SpecApprovalTest(SprintDomainCase):
+             (sprint_id,),
+         )
+         self.con.commit()
+-        with self.assertRaisesRegex(
+-            sprint_domain.SprintInvariantError, "passing spec approval"
+-        ):
+-            self.store.arm(sprint_id, 3)
++        self.store.arm(sprint_id, 3)
+         self.assertEqual(
+-            "prepared",
++            "armed",
+             self.con.execute(
+                 "SELECT lifecycle FROM sprints WHERE sprint_id=?", (sprint_id,)
+             ).fetchone()[0],
+@@ -744,12 +912,67 @@ class LifecycleTest(SprintDomainCase):
+             ],
+         )
+ 
+-    def test_arm_rejects_wrong_planner_and_unapproved_spec_without_effect(self) -> None:
++    def test_arm_rejects_wrong_planner_but_accepts_failing_review_evidence(self) -> None:
+         sprint_id, unit_id = self.create_sprint(approval_verdict="fail")
+         with self.assertRaises(sprint_domain.SprintAuthorityError):
+             self.store.arm(sprint_id, 4)
+-        with self.assertRaises(sprint_domain.SprintInvariantError):
++        wake_ids = self.store.arm(sprint_id, 3)
++        self.assertEqual(
++            ("armed", "ready", 2),
++            (
++                self.con.execute(
++                    "SELECT lifecycle FROM sprints WHERE sprint_id=?", (sprint_id,)
++                ).fetchone()[0],
++                self.con.execute(
++                    "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
++                    (unit_id,),
++                ).fetchone()[0],
++                self.con.execute(
++                    "SELECT COUNT(*) FROM sprint_wake_outbox WHERE sprint_id=?",
++                    (sprint_id,),
++                ).fetchone()[0],
++            ),
++        )
++        self.assertEqual(2, len(wake_ids))
++
++    def test_arm_accepts_no_qaqc_evidence(self) -> None:
++        sprint_id, _ = self.create_sprint()
++        approval_id = self.con.execute(
++            "SELECT approval_id FROM sprint_specs WHERE sprint_id=?", (sprint_id,)
++        ).fetchone()[0]
++        self.con.execute(
++            "UPDATE sprint_specs SET approval_id=NULL WHERE sprint_id=?", (sprint_id,)
++        )
++        self.con.execute(
++            "DELETE FROM sprint_spec_approvals WHERE approval_id=?", (approval_id,)
++        )
++        self.con.commit()
++
++        self.store.arm(sprint_id, 3)
++
++        self.assertEqual(
++            ("armed", None, 0),
++            tuple(
++                self.con.execute(
++                    "SELECT s.lifecycle,ss.approval_id,"
++                    "(SELECT COUNT(*) FROM sprint_spec_approvals) "
++                    "FROM sprints s JOIN sprint_specs ss USING (sprint_id) "
++                    "WHERE s.sprint_id=?",
++                    (sprint_id,),
++                ).fetchone()
++            ),
++        )
++
++    def test_arm_rejects_missing_bound_spec_without_effect(self) -> None:
++        sprint_id, unit_id = self.create_sprint()
++        self.con.execute("DELETE FROM sprint_specs WHERE sprint_id=?", (sprint_id,))
++        self.con.commit()
++
++        with self.assertRaisesRegex(
++            sprint_domain.SprintInvariantError, "exact current governing spec"
++        ):
+             self.store.arm(sprint_id, 3)
++
+         self.assertEqual(
+             ("prepared", "planned", 0),
+             (
+@@ -767,6 +990,41 @@ class LifecycleTest(SprintDomainCase):
+             ),
+         )
+ 
++    def test_arm_ignores_stale_failed_findings_and_deleted_signer_evidence(self) -> None:
++        sprint_id, _ = self.create_sprint()
++        findings_id = int(
++            self.con.execute(
++                "INSERT INTO documents (kind,seq,title,body) "
++                "VALUES ('doc',1,'Unresolved findings','blocking history')"
++            ).lastrowid
++        )
++        self.con.execute("UPDATE shells SET is_deleted=1 WHERE shell_id=4")
++        self.con.execute(
++            "UPDATE sprint_spec_approvals "
++            "SET verdict='fail',revision_sha256=?,reviewer_shell_id=4,"
++            "findings_document_id=? "
++            "WHERE approval_id=(SELECT approval_id FROM sprint_specs "
++            "WHERE sprint_id=?)",
++            ("0" * 64, findings_id, sprint_id),
++        )
++        self.con.commit()
++
++        self.store.arm(sprint_id, 3)
++
++        self.assertEqual(
++            ("armed", "fail", "0" * 64, 4, findings_id),
++            tuple(
++                self.con.execute(
++                    "SELECT s.lifecycle,a.verdict,a.revision_sha256,"
++                    "a.reviewer_shell_id,a.findings_document_id "
++                    "FROM sprints s JOIN sprint_specs ss USING (sprint_id) "
++                    "JOIN sprint_spec_approvals a USING (approval_id) "
++                    "WHERE s.sprint_id=?",
++                    (sprint_id,),
++                ).fetchone()
++            ),
++        )
++
+     def test_arm_rejects_spec_edited_after_approval_without_effect(self) -> None:
+         sprint_id, unit_id = self.create_sprint()
+         self.con.execute(
+@@ -778,7 +1036,7 @@ class LifecycleTest(SprintDomainCase):
+         self.con.commit()
+ 
+         with self.assertRaisesRegex(
+-            sprint_domain.SprintInvariantError, "exact, passing spec approval"
++            sprint_domain.SprintInvariantError, "exact current governing spec"
+         ):
+             self.store.arm(sprint_id, 3)
+ 

@@ -1,0 +1,531 @@
+diff --git a/.super-coder/scripts/sprint_domain.py b/.super-coder/scripts/sprint_domain.py
+index ae0e40f0..4bbd5c2d 100644
+--- a/.super-coder/scripts/sprint_domain.py
++++ b/.super-coder/scripts/sprint_domain.py
+@@ -255,23 +255,31 @@ def arm(self, sprint_id: int, planner_shell_id: int) -> list[int]:
+                 )
+             self._require_edge(sprint["lifecycle"], "armed")
+             self._authorize(sprint, "armed", actor)
+-            planner_participant = self._validate_arm_plan(sprint)
++            planner_participant, selections = self._validate_arm_plan(sprint)
+             self._update_lifecycle(
+                 sprint_id,
+                 current="prepared",
+                 target="armed",
+                 outcome=None,
+             )
+-            wake_ids = self._release_initial_work(
++            planner_wake_id = self._queue_arming_planner_wake(
+                 sprint_id,
+                 planner_participant_id=planner_participant,
++                selections=selections,
+             )
++            work_wake_ids = self._release_initial_work(
++                sprint_id,
++                planner_participant_id=planner_participant,
++            )
++            wake_ids = [*work_wake_ids, planner_wake_id]
+             self._event(
+                 sprint_id,
+                 "lifecycle.armed",
+                 actor,
+                 {
+                     "initial_wake_ids": wake_ids,
++                    "planner_wake_id": planner_wake_id,
++                    "work_wake_ids": work_wake_ids,
+                 },
+             )
+         return wake_ids
+@@ -1805,7 +1813,10 @@ def _authorize(
+                     "only an assigned participant may pause this Sprint"
+                 )
+ 
+-    def _validate_arm_plan(self, sprint: sqlite3.Row) -> int:
++    def _validate_arm_plan(
++        self,
++        sprint: sqlite3.Row,
++    ) -> tuple[int, list[sqlite3.Row]]:
+         sprint_id = int(sprint["sprint_id"])
+         if int(sprint["merge_grant_enabled"]) != 1:
+             raise SprintInvariantError("arming requires a committed merge grant")
+@@ -1886,7 +1897,59 @@ def _validate_arm_plan(self, sprint: sqlite3.Row) -> int:
+             raise SprintInvariantError(
+                 "arming requires routed work units with assigned reviewers"
+             )
+-        return int(planner[0])
++        selections = self.con.execute(
++            "SELECT p.participant_id,p.role,p.harness,p.model,p.effort,"
++            "sh.shortname FROM sprint_participants p "
++            "JOIN shells sh ON sh.shell_id=p.shell_id "
++            "WHERE p.sprint_id=? ORDER BY "
++            "CASE p.role WHEN 'planner' THEN 0 WHEN 'developer' THEN 1 ELSE 2 END,"
++            "p.participant_id",
++            (sprint_id,),
++        ).fetchall()
++        invalid_selections = [
++            row
++            for row in selections
++            if not str(row["harness"]).strip()
++            or (row["model"] is not None and not str(row["model"]).strip())
++            or (row["effort"] is not None and not str(row["effort"]).strip())
++        ]
++        if invalid_selections:
++            raise SprintInvariantError(
++                "arming requires recorded model selections for every participant"
++            )
++        return int(planner[0]), selections
++
++    def _queue_arming_planner_wake(
++        self,
++        sprint_id: int,
++        *,
++        planner_participant_id: int,
++        selections: list[sqlite3.Row],
++    ) -> int:
++        lines = [
++            f"Sprint {sprint_id} armed. Recorded participant launch selections:"
++        ]
++        for selection in selections:
++            model = selection["model"] or "default"
++            effort = selection["effort"] or "default"
++            lines.append(
++                f"- {selection['role']} {selection['shortname']}: "
++                f"{selection['harness']} · model={model} · effort={effort}"
++            )
++        from sprint_message_delivery import SprintMessageStore
++
++        receipt = SprintMessageStore(self.con).send_in_transaction(
++            sprint_id,
++            to_participant_id=planner_participant_id,
++            message_kind="notification",
++            body="\n".join(lines),
++            actionable=False,
++            declared_type="new",
++            idempotency_key=f"sprint:{sprint_id}:arming-model-selections",
++        )
++        if receipt.wake_id is None:
++            raise SprintInvariantError("Planner arming message has no wake")
++        return receipt.wake_id
+ 
+     def _release_initial_work(
+         self,
+diff --git a/tests/test_sprint_cli.py b/tests/test_sprint_cli.py
+index 54466e20..860a8528 100644
+--- a/tests/test_sprint_cli.py
++++ b/tests/test_sprint_cli.py
+@@ -376,7 +376,7 @@ def test_declare_plan_lifecycle_and_registration_surfaces(self):
+             str(task_id),
+         )
+         armed = self.run_cli(TOKENS["planner"], "arm", "--sprint", str(sprint_id))
+-        self.assertEqual(1, len(armed["wake_ids"]))
++        self.assertEqual(2, len(armed["wake_ids"]))
+ 
+         with mock.patch.object(
+             server.sprint_pr_watcher,
+@@ -494,10 +494,13 @@ def test_participant_send_confirms_durable_message_wake_and_route(self):
+             wake = con.execute(
+                 "SELECT wm.message_id,w.state FROM sprint_wake_outbox w "
+                 "JOIN sprint_wake_messages wm ON wm.wake_id=w.wake_id "
+-                "WHERE w.wake_id=?",
++                "WHERE w.wake_id=? ORDER BY wm.message_id",
+                 (response["wake_id"],),
+-            ).fetchone()
+-            self.assertEqual((response["message_id"], "pending"), wake)
++            ).fetchall()
++            self.assertEqual(
++                [(1, "pending"), (response["message_id"], "pending")],
++                wake,
++            )
+             current = con.execute(
+                 "SELECT current_conversation_id FROM sprint_participants "
+                 "WHERE participant_id=1",
+@@ -872,7 +875,7 @@ def test_admin_declares_for_planner_and_aborts_without_deleting_history(self):
+             str(task_id),
+         )["work_unit_id"]
+         armed = self.run_cli(TOKENS["admin"], "arm", "--sprint", str(sprint_id))
+-        self.assertEqual(1, len(armed["wake_ids"]))
++        self.assertEqual(2, len(armed["wake_ids"]))
+         aborted = self.run_cli(
+             TOKENS["admin"],
+             "abort",
+diff --git a/tests/test_sprint_live_proof.py b/tests/test_sprint_live_proof.py
+index d3348ea4..eff3f2b0 100644
+--- a/tests/test_sprint_live_proof.py
++++ b/tests/test_sprint_live_proof.py
+@@ -518,7 +518,7 @@ def close(self, sprint_id: int, document_id: int) -> dict:
+     def test_serial_sprint_runs_correction_merge_dispatch_and_close(self) -> None:
+         sprint_id, document_id, units = self.prepare(((1, 2, ()), (1, 2, (0,))))
+         initial_wakes = self.run_cli(3, "arm", "--sprint", str(sprint_id))["wake_ids"]
+-        self.assertEqual(1, len(initial_wakes))
++        self.assertEqual(2, len(initial_wakes))
+         self.assertEqual(
+             [(units[0], "ready"), (units[1], "planned")],
+             [
+@@ -592,7 +592,7 @@ def test_serial_sprint_runs_correction_merge_dispatch_and_close(self) -> None:
+     def test_parallel_sprint_completes_out_of_order_without_lane_overlap(self) -> None:
+         sprint_id, document_id, units = self.prepare(((1, 2, ()), (4, 5, ())))
+         initial_wakes = self.run_cli(3, "arm", "--sprint", str(sprint_id))["wake_ids"]
+-        self.assertEqual(2, len(initial_wakes))
++        self.assertEqual(3, len(initial_wakes))
+         self.deliver_browser_turns()
+         self.accept_assignment(units[0], 1)
+         self.accept_assignment(units[1], 4)
+@@ -743,12 +743,14 @@ def test_relay_review_and_terminal_pickup_recovery_form_one_durable_chain(
+             str(assignment_id),
+         )
+ 
+-        self.assertIsNone(
+-            self.con.execute(
+-                "SELECT current_conversation_id FROM sprint_participants "
+-                "WHERE sprint_id=? AND shell_id=3",
+-                (sprint_id,),
+-            ).fetchone()[0]
++        arming_planner_conversation = self.con.execute(
++            "SELECT current_conversation_id FROM sprint_participants "
++            "WHERE sprint_id=? AND shell_id=3",
++            (sprint_id,),
++        ).fetchone()[0]
++        self.assertIsNotNone(
++            arming_planner_conversation,
++            "arming opens the overseeing Planner's fresh wake chat",
+         )
+         question_prefix = "Which downstream compatibility fixture owns the proof? "
+         question = question_prefix + "q" * (6000 - len(question_prefix))
+@@ -766,7 +768,11 @@ def test_relay_review_and_terminal_pickup_recovery_form_one_durable_chain(
+         )
+         self.assertTrue(question_receipt["message_created"])
+         self.assertEqual("pending", question_receipt["wake_state"])
+-        self.assertIsNone(question_receipt["conversation_id"])
++        self.assertEqual(
++            arming_planner_conversation,
++            question_receipt["conversation_id"],
++            "later Planner-bound traffic re-enters the chat opened by arming",
++        )
+         self.assertEqual(
+             (1, 3, 6000, question),
+             tuple(
+diff --git a/tests/test_sprint_liveness.py b/tests/test_sprint_liveness.py
+index 57f9b31d..85d08626 100644
+--- a/tests/test_sprint_liveness.py
++++ b/tests/test_sprint_liveness.py
+@@ -152,9 +152,22 @@ def setUp(self) -> None:
+             ).fetchone()[0]
+         )
+         self.messages = sprint_message_delivery.SprintMessageStore(self.con)
+-        delivered = sprint_message_delivery.SprintWakeDeliveryService(
++        delivery_service = sprint_message_delivery.SprintWakeDeliveryService(
+             self.con
+-        ).deliver_once(
++        )
++        planner_delivery = delivery_service.deliver_once(
++            "liveness-planner-setup",
++            lambda _conversation, _prompt, _key: "liveness-planner-run",
++        )
++        self.assertNotEqual(wake_id, planner_delivery.wake_id)
++        arming_message_id = int(
++            self.con.execute(
++                "SELECT message_id FROM wake_message WHERE idempotency_key=?",
++                (f"sprint:{self.sprint_id}:arming-model-selections",),
++            ).fetchone()[0]
++        )
++        self.assertIsNone(self.messages.mark_read(arming_message_id, 3))
++        delivered = delivery_service.deliver_once(
+             "liveness-setup",
+             lambda _conversation, _prompt, _key: "liveness-setup-run",
+         )
+@@ -612,7 +625,8 @@ def failed(_participant, _accepted, _now):
+             "FROM sprint_participants WHERE participant_id=?",
+             (self.planner_id,),
+         ).fetchone()
+-        self.assertEqual((None, None), tuple(planner))
++        self.assertIsNotNone(planner[0])
++        self.assertEqual(planner[0], planner[1])
+         fallbacks = self.con.execute(
+             "SELECT link.purpose,c.harness FROM sprint_participant_conversations link "
+             "JOIN conversations c ON c.conversation_id=link.conversation_id "
+diff --git a/tests/test_sprint_message_delivery.py b/tests/test_sprint_message_delivery.py
+index b326dddf..af43cd19 100644
+--- a/tests/test_sprint_message_delivery.py
++++ b/tests/test_sprint_message_delivery.py
+@@ -107,19 +107,36 @@ def setUp(self) -> None:
+         self.con.commit()
+         self.lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+         initial_wake = self.lifecycle.arm(self.sprint_id, 3)[0]
++        setup_delivery = delivery.SprintWakeDeliveryService(self.con)
++        planner_delivery: list[str] = []
++        setup_delivery.deliver_once(
++            "setup-planner-worker",
++            lambda conversation, _prompt, _key: (
++                planner_delivery.append(conversation) or "setup-planner-run"
++            ),
++        )
++        self.assertEqual(1, len(planner_delivery))
++        self.messages = delivery.SprintMessageStore(self.con)
++        arming_message_id = int(
++            self.con.execute(
++                "SELECT message_id FROM wake_message WHERE idempotency_key=?",
++                (f"sprint:{self.sprint_id}:arming-model-selections",),
++            ).fetchone()[0]
++        )
++        self.assertIsNone(self.messages.mark_read(arming_message_id, 3))
+         initial_delivery: list[str] = []
+-        delivery.SprintWakeDeliveryService(self.con).deliver_once(
++        delivered = setup_delivery.deliver_once(
+             "setup-worker",
+             lambda conversation, _prompt, _key: (
+                 initial_delivery.append(conversation) or "setup-native-run"
+             ),
+         )
++        self.assertEqual(initial_wake, delivered.wake_id)
+         self.developer_conversation_id = initial_delivery[0]
+         initial_message = self.con.execute(
+             "SELECT message_id FROM sprint_wake_messages WHERE wake_id=?",
+             (initial_wake,),
+         ).fetchone()[0]
+-        self.messages = delivery.SprintMessageStore(self.con)
+         self.assertEqual("accepted", self.messages.mark_read(initial_message, 1))
+ 
+     def send(
+@@ -566,7 +583,7 @@ def test_armed_message_claims_foreign_paused_sprint_wake(self) -> None:
+         self.assertIn("armed sprint work", lease.prompt)
+         conversation_id = service._resolve_conversation(lease)
+         self.assertEqual(
+-            armed_planner_id,
++            self.planner_id,
+             self.con.execute(
+                 "SELECT sprint_participant_id "
+                 "FROM sprint_participant_conversations WHERE conversation_id=?",
+@@ -1346,10 +1363,13 @@ def test_relay_reuses_a_usable_current_conversation(self) -> None:
+             int(self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]),
+         )
+ 
+-    def test_relay_defers_fresh_chat_creation_until_delivery(self) -> None:
++    def test_relay_reuses_the_planner_chat_opened_by_arming(self) -> None:
+         before = int(
+             self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+         )
++        active_before = self.con.execute(
++            "SELECT chat_id FROM active_shell_chats WHERE shell_id=3"
++        ).fetchone()[0]
+ 
+         receipt = self.messages.relay(
+             self.sprint_id,
+@@ -1358,7 +1378,7 @@ def test_relay_defers_fresh_chat_creation_until_delivery(self) -> None:
+             body="Please answer from a fresh route.",
+             idempotency_key="participant-send:new-chat",
+         )
+-        self.assertIsNone(receipt.conversation_id)
++        self.assertEqual(active_before, receipt.conversation_id)
+         self.assertEqual(
+             before,
+             self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
+@@ -1381,9 +1401,10 @@ def test_relay_defers_fresh_chat_creation_until_delivery(self) -> None:
+             (conversation_id,),
+         ).fetchone()
+         self.assertEqual(
+-            before + 1,
++            before,
+             self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
+         )
++        self.assertEqual(active_before, conversation_id)
+         self.assertEqual(
+             (3, "idle", "sprint", "work", None, None),
+             tuple(route),
+@@ -1404,7 +1425,15 @@ def test_relay_defers_fresh_chat_creation_until_delivery(self) -> None:
+                     (self.sprint_id,),
+                 ).fetchone()[0]
+             )
+-            + f":wake:{receipt.wake_id}",
++            + ":wake:"
++            + str(
++                self.con.execute(
++                    "SELECT wm.wake_id FROM sprint_wake_messages wm "
++                    "JOIN wake_message m USING (message_id) "
++                    "WHERE m.idempotency_key=?",
++                    (f"sprint:{self.sprint_id}:arming-model-selections",),
++                ).fetchone()[0]
++            ),
+             self.con.execute(
+                 "SELECT creation_idempotency_key FROM conversations "
+                 "WHERE conversation_id=?",
+diff --git a/tests/test_sprint_v2_domain.py b/tests/test_sprint_v2_domain.py
+index f1dbc420..d7da4297 100644
+--- a/tests/test_sprint_v2_domain.py
++++ b/tests/test_sprint_v2_domain.py
+@@ -470,10 +470,10 @@ def test_arm_defers_participant_conversations_until_delivery(self) -> None:
+             "AND event_type='lifecycle.armed'",
+             (sprint_id,),
+         ).fetchone()
+-        self.assertEqual(
+-            1,
+-            len(json.loads(event["payload"])["initial_wake_ids"]),
+-        )
++        payload = json.loads(event["payload"])
++        self.assertEqual(2, len(payload["initial_wake_ids"]))
++        self.assertEqual(1, len(payload["work_wake_ids"]))
++        self.assertIn(payload["planner_wake_id"], payload["initial_wake_ids"])
+ 
+         self.con.execute(
+             "INSERT INTO conversations "
+@@ -568,7 +568,7 @@ def test_arm_ignores_orphan_conversation_keys_from_reused_numeric_ids(self) -> N
+ 
+         wake_ids = self.store.arm(sprint_id, 3)
+ 
+-        self.assertEqual(1, len(wake_ids))
++        self.assertEqual(2, len(wake_ids))
+         self.assertEqual(
+             "armed",
+             self.con.execute(
+@@ -652,7 +652,7 @@ def test_arm_atomically_releases_only_dependency_free_work(self) -> None:
+ 
+         wake_ids = self.store.arm(sprint_id, 3)
+ 
+-        self.assertEqual(1, len(wake_ids))
++        self.assertEqual(2, len(wake_ids))
+         self.assertEqual(
+             ("armed", 2),
+             tuple(
+@@ -675,7 +675,8 @@ def test_arm_atomically_releases_only_dependency_free_work(self) -> None:
+         )
+         message = self.con.execute(
+             "SELECT work_unit_id,message_kind,actionable,disposition,body "
+-            "FROM wake_message WHERE sprint_id=?",
++            "FROM wake_message WHERE sprint_id=? "
++            "AND message_kind='work_assignment'",
+             (sprint_id,),
+         ).fetchone()
+         self.assertEqual(first_unit, message["work_unit_id"])
+@@ -739,7 +740,7 @@ def test_arm_releases_only_one_ready_unit_per_participant(self) -> None:
+ 
+         wake_ids = self.store.arm(sprint_id, 3)
+ 
+-        self.assertEqual(1, len(wake_ids))
++        self.assertEqual(2, len(wake_ids))
+         self.assertEqual(
+             [(first_unit,)],
+             [
+diff --git a/tests/test_sprint_work_dispatch.py b/tests/test_sprint_work_dispatch.py
+index 59418e6d..d136d097 100644
+--- a/tests/test_sprint_work_dispatch.py
++++ b/tests/test_sprint_work_dispatch.py
+@@ -178,7 +178,7 @@ def test_ready_units_launch_in_parallel_regardless_of_wave_or_reviewer(self) ->
+ 
+         wake_ids = self.lifecycle.arm(self.sprint_id, 3)
+ 
+-        self.assertEqual(2, len(wake_ids))
++        self.assertEqual(3, len(wake_ids))
+         self.assertEqual(
+             [(late_wave, "ready"), (early_wave, "ready")],
+             self.dispositions(),
+@@ -204,6 +204,83 @@ def test_ready_units_launch_in_parallel_regardless_of_wave_or_reviewer(self) ->
+                 )
+             ],
+         )
++        planner_wake = self.con.execute(
++            "SELECT receiver_shell_id,message_kind,body,declared_type,actionable "
++            "FROM wake_message WHERE receiver_shell_id=3 "
++            "AND message_kind='notification'"
++        ).fetchone()
++        self.assertEqual(
++            (3, "notification", "new", 0),
++            (
++                planner_wake["receiver_shell_id"],
++                planner_wake["message_kind"],
++                planner_wake["declared_type"],
++                planner_wake["actionable"],
++            ),
++        )
++        self.assertEqual(
++            "Sprint 1 armed. Recorded participant launch selections:\n"
++            "- planner PLN1: codex · model=default · effort=default\n"
++            "- developer DEV1: codex · model=default · effort=default\n"
++            "- developer DEV2: codex · model=default · effort=default\n"
++            "- reviewer REV1: kimi · model=default · effort=default\n"
++            "- reviewer REV2: kimi · model=default · effort=default",
++            planner_wake["body"],
++        )
++
++    def test_arm_rejects_blank_model_selection_before_any_dispatch(self) -> None:
++        self.create_unit(developer=1)
++        self.con.execute(
++            "UPDATE sprint_participants SET model='' "
++            "WHERE sprint_id=? AND role='planner'",
++            (self.sprint_id,),
++        )
++        self.con.commit()
++
++        with self.assertRaisesRegex(
++            sprint_domain.SprintInvariantError,
++            "recorded model selections",
++        ):
++            self.lifecycle.arm(self.sprint_id, 3)
++
++        self.assertEqual(
++            ("prepared", 0, [(1, "planned")]),
++            (
++                self.con.execute(
++                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
++                    (self.sprint_id,),
++                ).fetchone()[0],
++                self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
++                self.dispositions(),
++            ),
++        )
++
++    def test_arm_rejects_blank_effort_selection_before_any_dispatch(self) -> None:
++        self.create_unit(developer=1)
++        self.con.execute(
++            "UPDATE sprint_participants SET effort='  ' "
++            "WHERE sprint_id=? AND role='reviewer'",
++            (self.sprint_id,),
++        )
++        self.con.commit()
++
++        with self.assertRaisesRegex(
++            sprint_domain.SprintInvariantError,
++            "recorded model selections",
++        ):
++            self.lifecycle.arm(self.sprint_id, 3)
++
++        self.assertEqual(
++            ("prepared", 0, [(1, "planned")]),
++            (
++                self.con.execute(
++                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
++                    (self.sprint_id,),
++                ).fetchone()[0],
++                self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
++                self.dispositions(),
++            ),
++        )
+ 
+     def test_dependencies_block_and_each_developer_gets_one_editing_lane(self) -> None:
+         first = self.create_unit(
+@@ -593,12 +670,17 @@ def test_armed_pulse_enqueues_every_parallel_ready_lane(self) -> None:
+ 
+         first_conversation = self.conversation_for(1)
+         second_conversation = self.conversation_for(4)
++        planner_conversation = self.conversation_for(3)
+         self.assertEqual(
+             [(first, "ready"), (second, "ready")],
+             self.dispositions(),
+         )
+         self.assertEqual(
+-            {first_conversation: 1, second_conversation: 1},
++            {
++                first_conversation: 1,
++                second_conversation: 1,
++                planner_conversation: 1,
++            },
+             {
+                 str(row[0]): int(row[1])
+                 for row in self.con.execute(
+@@ -608,7 +690,7 @@ def test_armed_pulse_enqueues_every_parallel_ready_lane(self) -> None:
+             },
+         )
+         self.assertEqual(
+-            [("delivered", 1), ("delivered", 1)],
++            [("delivered", 1), ("delivered", 1), ("delivered", 1)],
+             [
+                 tuple(row)
+                 for row in self.con.execute(

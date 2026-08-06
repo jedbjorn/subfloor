@@ -1,0 +1,210 @@
+{
+  "anomalies": {
+    "events": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    },
+    "failed_wakes": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    }
+  },
+  "conformance": {
+    "final_reports": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    },
+    "followups": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    },
+    "missing_conformance": true,
+    "missing_final_report": true,
+    "reports": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    }
+  },
+  "full_history_links": {
+    "participant_conversations": [
+      {
+        "conversation_id": "cv_99d4a477c0d748f1923089a2a4981b8f",
+        "conversation_scope": "sprint",
+        "role": "developer",
+        "shell_id": 12,
+        "sprint_participant_id": 21,
+        "state": "running",
+        "url": "/api/conversations/cv_99d4a477c0d748f1923089a2a4981b8f"
+      },
+      {
+        "conversation_id": "cv_9c07b297b4794eeba6754f3aabb928da",
+        "conversation_scope": "sprint",
+        "role": "reviewer",
+        "shell_id": 7,
+        "sprint_participant_id": 22,
+        "state": "closed",
+        "url": "/api/conversations/cv_9c07b297b4794eeba6754f3aabb928da"
+      },
+      {
+        "conversation_id": "cv_9a806162963e4e7bb36918ea73bff752",
+        "conversation_scope": "sprint",
+        "role": "reviewer",
+        "shell_id": 7,
+        "sprint_participant_id": 22,
+        "state": "running",
+        "url": "/api/conversations/cv_9a806162963e4e7bb36918ea73bff752"
+      }
+    ],
+    "timeline": "/_sc/sprint/4/timeline"
+  },
+  "judgments_and_deviations": {
+    "items": [
+      {
+        "body": "Submitting PR https://github.com/jedbjorn/subfloor/pull/1065 registered Sprint PR 16 head c48cfb188605b811ead74f5a65aea3d791778383 work-unit 19",
+        "created_at": "2026-08-06 03:42:48",
+        "judgment_id": 61,
+        "kind": "decision",
+        "shell_id": 12,
+        "shortname": "DEV6",
+        "work_unit_id": 19
+      },
+      {
+        "body": "# Review verdict \u2014 Sprint 4, work-unit 19, registered PR 16\n\n**Verdict: approved**\n\nPR: https://github.com/jedbjorn/subfloor/pull/1065\nReviewed head: c48cfb188605b811ead74f5a65aea3d791778383 (fetched and matched the\nregistered head exactly; diff taken as `origin/main...c48cfb1`).\nGoverning spec: document #117 (seq 17) \u2014 Optional pre-Sprint QA/QC.\nChecks at head: tests, verify, render-check, CodeQL, Analyze (actions),\nAnalyze (python) all SUCCESS; PR mergeable. Readiness body was a bare locator;\nPR body carries only work-unit id and spec reference \u2014 protocol conformant.\n\n## What was verified (traced, not trusted)\n\n**Declaration (server.py).** `spec_document_ids` is canonical; both selectors\nnormalized as positive-int lists with dedup. Server reads each document body and\nhashes it inside the declaration transaction; the client never submits a hash.\nCompatibility selector resolves the approval's document and binds the *current*\nbody, retaining the approval id as nullable evidence; duplicate compatibility\nselections for one document are rejected as ambiguous (400); mixed\ndirect+compat selection of one document dedups to exactly one `sprint_specs`\nrow with the evidence pointer kept (test proves it). Unknown document/approval\n\u2192 KeyError \u2192 404; non-spec, empty-body, NULL-feature, or wrong-feature \u2192\nSprintInvariantError \u2192 409; no selector \u2192 ValueError \u2192 400. Error mapping\nconfirmed in `_sprint_error`. The declared-event payload adds\n`spec_document_ids` and retains `spec_approval_ids` only when supplied \u2014\nmatches the API contract table row-for-row.\n\n**Migration 0185.** Rebuilds `sprint_specs` preserving PK, both FKs, the hash\nCHECK, and `included_at`, with `approval_id` now nullable; straight row-for-row\ncopy. `schema.sql` untouched. The one trigger referencing `sprint_specs`\n(`trg_sprint_followups_spec_scope` from 0150) is dropped and recreated\nverbatim \u2014 I diffed the definitions. No other trigger/index/view references\nthe table. Runs under the `-- migrate: foreign-keys-off` runner contract;\nfailure-before-commit rollback, no-reapply under normal discovery, and\npopulated-pre-change preservation are each tested. Fresh-null insert and\n`foreign_key_check` verified in tests.\n\n**Arming (sprint_domain.py).** The approval join and all verdict/revision/\nsigner/flavor/deleted checks are gone; arming now requires \u22651 bound row whose\ndocument still exists (LEFT JOIN + NULL detect), is a `spec`, belongs to the\nfeature, has a non-blank body, and whose current hash equals\n`bound_revision_sha256`. Post-declaration drift still refuses. I grepped the\nwhole engine surface for remaining `sprint_spec_approvals` joins: only the\ncompatibility resolver, the snapshot allowlist, the close LEFT JOIN, and the\n`record-qaqc` writer itself remain \u2014 no forgotten eligibility gate.\n\n**Reports/projections.** `sprint_close.py` uses the LEFT JOIN and surfaces\nverdict, reviewed revision, signer, findings reference, and timestamp as\nevidence; NULL-evidence packet contents asserted by test. Board whitelist\nexposes `spec_document_ids` while keeping historical events readable. Snapshot\nroundtrip with NULL evidence asserts rows are preserved without zero/omission\nconversion.\n\n**Guidance.** `sprint_prep` asset rewritten to FnB-decides, evidence-not-\nauthorization, `--spec` canonical; gating language (\"qualifying approval\",\n\"use fail until\", \"lacks Review-shell QAQC approval\") removed and asserted\nabsent. Reseed rides inside 0185 as the spec's single-migration instruction\nrequires; seed-convergence test compares granted row to the asset. The\n`POLISHED_SPRINT_SKILLS` exclusion of `sprint_prep` is the correct\nreseed-chain pattern (0184's historical content no longer matches the updated\nasset), not a masked regression \u2014 0185's own convergence test covers it.\n\n**Adversarial matrix.** The spec's verification gate is implemented as tests:\nno-row / pass / fail / unresolved-findings / stale / deleted-signer /\nmixed-selectors all reach `armed`; counter-tests reject no bound spec, unknown\ndocument, wrong-feature, non-spec, empty body, and pre-arm drift. Legacy\n`--spec-approval`-only declaration shape still works end to end.\n\n## Low findings (report notes only \u2014 non-blocking)\n\n1. **FK-check result discarded (Low).** 0185 ends with\n   `PRAGMA foreign_key_check;`, but the runner (`migrate.apply`) and direct\n   `executescript` both discard its rows, so a violation would not abort the\n   migration. The straight-copy rebuild plus post-migration\n   `foreign_key_check` assertions in tests make a real violation implausible,\n   and prior rebuild migrations (0144, 0168) ship no check at all \u2014 this is\n   strictly above convention. If the engine ever wants the check to bite, the\n   runner must assert an empty result.\n2. **Declaration invariant error does not name the failing document (Low).**\n   A multi-spec declaration that fails kind/feature/body validation reports\n   only \"declaration requires non-empty spec documents for its feature\";\n   the caller must bisect which selector failed. One-line diagnosability\n   improvement, no behavior change.\n\n## Conclusion\n\nImplementation matches spec #117 on every required-behavior clause I could\ntrace, the launch gate is genuinely gone from all three former layers, scope\nintegrity (kind, feature, non-empty body, exact revision, at-least-one-spec,\ndrift refusal) is preserved and tested, migration integrity is proven for the\npopulated/fresh/rebuild/rollback/idempotency cases, and checks are green at\nthe reviewed head. No Critical/Major/Medium finding remains. Approved.",
+        "created_at": "2026-08-06 03:52:33",
+        "judgment_id": 62,
+        "kind": "decision",
+        "shell_id": 7,
+        "shortname": "REV1",
+        "work_unit_id": 19
+      }
+    ],
+    "total": 2,
+    "truncated": 0
+  },
+  "packet_version": 1,
+  "pause_and_recovery": {
+    "items": [],
+    "total": 0,
+    "truncated": 0
+  },
+  "planned_vs_actual": {
+    "items": [
+      {
+        "assigned_shell_id": 12,
+        "completed_at": "2026-08-06 03:55:47",
+        "completion_result": null,
+        "created_at": "2026-08-06 03:02:50",
+        "depends_on": [],
+        "disposition": "completed",
+        "expected_output": "Deliver one coherent PR implementing approved spec #117 across migration 0185, direct current-spec declaration, review-independent arming, nullable-evidence projections, sprint_prep reseeding, and the complete adversarial/full-suite gate. Preserve every non-review launch invariant and legacy selector compatibility; do not modify schema.sql.",
+        "output_kind": "code",
+        "planned_wave": 1,
+        "reviewer_shell_id": 7,
+        "task_ids": [
+          347,
+          348,
+          349,
+          350,
+          351
+        ],
+        "title": "Optional pre-Sprint QA/QC implementation",
+        "updated_at": "2026-08-06 03:55:47",
+        "work_unit_id": 19
+      }
+    ],
+    "total": 1,
+    "truncated": 0
+  },
+  "pr_outcomes": {
+    "items": [
+      {
+        "normalized_state": "merged",
+        "observed_at": "2026-08-06 03:55:47",
+        "observed_head_sha": "c48cfb188605b811ead74f5a65aea3d791778383",
+        "owner_participant_id": 21,
+        "pr_number": 1065,
+        "registered_at": "2026-08-06 03:29:04",
+        "registered_pr_id": 16,
+        "repository": "jedbjorn/subfloor",
+        "url": "https://github.com/jedbjorn/subfloor/pull/1065",
+        "work_unit_ids": [
+          19
+        ]
+      }
+    ],
+    "total": 1,
+    "truncated": 0
+  },
+  "scope": {
+    "aborted_at": null,
+    "armed_at": "2026-08-06 03:03:24",
+    "completed_at": null,
+    "created_at": "2026-08-06 03:02:44",
+    "feature_id": 31,
+    "feature_title": "Sprints v2.0 \u2014 collaborative orchestration",
+    "lifecycle": "armed",
+    "originating_planner_shell_id": 10,
+    "sprint_id": 4
+  },
+  "spec_revisions": {
+    "bound": [
+      {
+        "approval_id": 11,
+        "bound_revision_sha256": "8c826c2e76be2b535ed31eb59deed39e030290d1b98b8960f511b3b1a02f0f80",
+        "current_revision_sha256": "8c826c2e76be2b535ed31eb59deed39e030290d1b98b8960f511b3b1a02f0f80",
+        "document_id": 117,
+        "included_at": "2026-08-06 03:02:44",
+        "reviewed_at": "2026-08-06 02:57:23",
+        "reviewer_shell_id": 7,
+        "title": "Optional pre-Sprint QA/QC",
+        "verdict": "pass"
+      }
+    ],
+    "mid_sprint_edits": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    }
+  },
+  "unresolved_work": {
+    "actionable_messages": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    },
+    "followups": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    },
+    "work_units": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    }
+  },
+  "wake_health": {
+    "attempt_outcomes": {
+      "delivered": 6
+    },
+    "escalations": 0,
+    "failed_wakes": {
+      "items": [],
+      "total": 0,
+      "truncated": 0
+    },
+    "liveness_expectations": {
+      "open": 0,
+      "resolved": 2
+    },
+    "nudges": 0,
+    "wake_states": {
+      "delivered": 6
+    }
+  }
+}

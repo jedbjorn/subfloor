@@ -1,0 +1,932 @@
+diff --git a/.super-coder/api/conversation_routes.py b/.super-coder/api/conversation_routes.py
+index 274d1f8..870cf88 100644
+--- a/.super-coder/api/conversation_routes.py
++++ b/.super-coder/api/conversation_routes.py
+@@ -586,7 +586,46 @@ def _cancel_queued_turns(con, conversation_id: str) -> int:
+     return int(cancelled)
+ 
+ 
+-def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
++def _enable_planner_coordinate_mode(
++    con,
++    *,
++    shell_id: int,
++    conversation_id: str,
++) -> int | None:
++    sprint = con.execute(
++        "SELECT sprint_id FROM sprints WHERE lifecycle='armed' "
++        "AND originating_planner_shell_id=? AND coordinate_mode=0",
++        (shell_id,),
++    ).fetchone()
++    if sprint is None:
++        return None
++    sprint_id = int(sprint["sprint_id"])
++    changed = con.execute(
++        "UPDATE sprints SET coordinate_mode=1,updated_at=datetime('now'),"
++        "version=version+1 WHERE sprint_id=? AND lifecycle='armed' "
++        "AND coordinate_mode=0",
++        (sprint_id,),
++    ).rowcount
++    if changed != 1:
++        return None
++    con.execute(
++        "INSERT INTO sprint_events "
++        "(sprint_id,event_type,actor_kind,payload) VALUES "
++        "(?,'coordinate_mode.enabled','fnb',?)",
++        (
++            sprint_id,
++            json.dumps(
++                {"conversation_id": conversation_id, "reason": "Planner chat closed"},
++                separators=(",", ":"),
++                sort_keys=True,
++            ),
++        ),
++    )
++    return sprint_id
++
++
++def _begin_close(con, conversation_id: str, current_state: str) -> None:
++    """Unconditionally close and unlink a chat selected by the FnB."""
+     active = con.execute(
+         "SELECT run_id,trigger_message_id FROM conversation_runs "
+         "WHERE conversation_id=? AND state IN ('leased','starting','running') "
+@@ -604,26 +643,6 @@ def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
+                 {"cancelled_queued_turns": cancelled},
+                 run_id=run_id,
+             )
+-        interrupt_exists = con.execute(
+-            "SELECT 1 FROM conversation_events WHERE run_id=? "
+-            "AND event_type='run.interrupt.requested' LIMIT 1",
+-            (run_id,),
+-        ).fetchone()
+-        if interrupt_exists is None:
+-            _append_event(
+-                con,
+-                conversation_id,
+-                "run.interrupt.requested",
+-                {"reason": "conversation.close"},
+-                message_id=int(active["trigger_message_id"]),
+-                run_id=run_id,
+-            )
+-        con.execute(
+-            "UPDATE conversations SET last_activity_at=datetime('now'),"
+-            "version=version+1 WHERE conversation_id=?",
+-            (conversation_id,),
+-        )
+-        return run_id
+ 
+     recovered_state = None
+     if current_state == "queued":
+@@ -632,7 +651,8 @@ def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
+             (conversation_id,),
+         )
+     elif current_state == "running":
+-        recovered_state = current_state
++        if active is None:
++            recovered_state = current_state
+         con.execute(
+             "UPDATE conversations SET state='error' WHERE conversation_id=?",
+             (conversation_id,),
+@@ -643,6 +663,10 @@ def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
+         "WHERE conversation_id=?",
+         (conversation_id,),
+     )
++    con.execute(
++        "DELETE FROM active_shell_chats WHERE chat_id=?",
++        (conversation_id,),
++    )
+     _append_event(
+         con,
+         conversation_id,
+@@ -655,9 +679,14 @@ def _begin_close(con, conversation_id: str, current_state: str) -> int | None:
+                 if recovered_state
+                 else {}
+             ),
++            **(
++                {"displaced_run_id": int(active["run_id"])}
++                if active is not None
++                else {}
++            ),
+         },
++        run_id=int(active["run_id"]) if active is not None else None,
+     )
+-    return None
+ 
+ 
+ def _deliver_close_interrupt(run_id: int) -> None:
+@@ -1097,12 +1126,6 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
+                 {"expected": int(row["version"]), "received": version},
+             )
+         closing = body.get("state") == "closed"
+-        if closing and row["conversation_scope"] == "sprint":
+-            raise ApiError(
+-                409,
+-                "SPRINT_CONVERSATION_MANAGED",
+-                "Sprint conversations close only with Sprint lifecycle cleanup",
+-            )
+         if row["state"] == "closed" and {"title", "state"}.intersection(body):
+             raise ApiError(
+                 409,
+@@ -1137,7 +1160,12 @@ def _patch_conversation(con, operator: dict, conversation_id: str, body: dict):
+                         ),
+                     },
+                 )
+-            active_run_id = _begin_close(con, conversation_id, row["state"])
++            _begin_close(con, conversation_id, row["state"])
++            _enable_planner_coordinate_mode(
++                con,
++                shell_id=int(row["shell_id"]),
++                conversation_id=conversation_id,
++            )
+         else:
+             sets.insert(0, "version=version+1")
+             if "title" in body:
+diff --git a/.super-coder/migrations/0166_sprint_coordinate_mode.sql b/.super-coder/migrations/0166_sprint_coordinate_mode.sql
+new file mode 100644
+index 0000000..0bcc1ef
+--- /dev/null
++++ b/.super-coder/migrations/0166_sprint_coordinate_mode.sql
+@@ -0,0 +1,14 @@
++-- 0166 — tracked Sprint coordinate mode.
++--
++-- Coordinate mode is an operator choice, not a property derived from whether
++-- the Planner currently has an open chat.  It therefore lives on the Sprint
++-- and survives automatic pause/resume cycles until an FnB lifecycle action
++-- explicitly clears it.
++
++BEGIN;
++
++ALTER TABLE sprints
++  ADD COLUMN coordinate_mode INTEGER NOT NULL DEFAULT 0
++  CHECK (coordinate_mode IN (0,1));
++
++COMMIT;
+diff --git a/.super-coder/scripts/conversation_broker.py b/.super-coder/scripts/conversation_broker.py
+index 7709d78..be56746 100644
+--- a/.super-coder/scripts/conversation_broker.py
++++ b/.super-coder/scripts/conversation_broker.py
+@@ -748,11 +748,13 @@ class BrokerStore:
+                     if pending
+                     else "idle"
+                 )
+-                require_transition(
+-                    "conversation",
+-                    row["conversation_state"],
+-                    conversation_target,
+-                )
++                already_closed = row["conversation_state"] == "closed"
++                if not already_closed:
++                    require_transition(
++                        "conversation",
++                        row["conversation_state"],
++                        conversation_target,
++                    )
+                 con.execute(
+                     "UPDATE conversation_runs SET state=?,ended_at=?,"
+                     "exit_code=?,error_code=?,error_detail=? WHERE run_id=?",
+@@ -775,11 +777,12 @@ class BrokerStore:
+                     "WHERE message_id=?",
+                     (message_state, now, row["trigger_message_id"]),
+                 )
+-                con.execute(
+-                    "UPDATE conversations SET state=?,last_activity_at=?,"
+-                    "version=version+1 WHERE conversation_id=?",
+-                    (conversation_target, now, row["conversation_id"]),
+-                )
++                if not already_closed:
++                    con.execute(
++                        "UPDATE conversations SET state=?,last_activity_at=?,"
++                        "version=version+1 WHERE conversation_id=?",
++                        (conversation_target, now, row["conversation_id"]),
++                    )
+                 terminal_payload = dict(payload or {})
+                 terminal_payload.setdefault("outcome", outcome)
+                 self._append_event(
+@@ -790,7 +793,7 @@ class BrokerStore:
+                     message_id=row["trigger_message_id"],
+                     run_id=run_id,
+                 )
+-                if close_after:
++                if close_after and not already_closed:
+                     require_transition(
+                         "conversation",
+                         conversation_target,
+diff --git a/.super-coder/scripts/sprint_board.py b/.super-coder/scripts/sprint_board.py
+index 3ff0f77..c2e5ed8 100644
+--- a/.super-coder/scripts/sprint_board.py
++++ b/.super-coder/scripts/sprint_board.py
+@@ -60,6 +60,8 @@ _EVENT_FIELDS = {
+             "anomalies",
+         }
+     ),
++    "coordinate_mode.enabled": frozenset({"conversation_id", "reason"}),
++    "coordinate_mode.cleared": frozenset({"reason"}),
+     "pause.interrupt_delivery_failed": frozenset({"run_id"}),
+     "work_unit.created": frozenset(
+         {
+diff --git a/.super-coder/scripts/sprint_domain.py b/.super-coder/scripts/sprint_domain.py
+index f721ec4..6bce9ac 100644
+--- a/.super-coder/scripts/sprint_domain.py
++++ b/.super-coder/scripts/sprint_domain.py
+@@ -318,6 +318,12 @@ class SprintLifecycleStore:
+                 target=target,
+                 outcome=terminal_outcome,
+             )
++            if target == "completed":
++                self._clear_coordinate_mode(
++                    sprint_id,
++                    actor,
++                    reason="Sprint closed by FnB",
++                )
+             if target == "completed":
+                 cleanup_run_ids, cleanup_conversations = (
+                     sprint_participant_chats.close_for_terminal_lifecycle(
+@@ -352,7 +358,12 @@ class SprintLifecycleStore:
+             sprint = self._sprint(sprint_id)
+             current = str(sprint["lifecycle"])
+             if current == "paused":
+-                return PauseReceipt(False, None, (), ())
++                cleared = self._clear_coordinate_mode(
++                    sprint_id,
++                    actor,
++                    reason="Sprint pause confirmed by FnB",
++                )
++                return PauseReceipt(cleared, None, (), ())
+             self._require_edge(current, "paused")
+             self._authorize(sprint, "paused", actor)
+             receipt = self._pause_in_transaction(
+@@ -361,6 +372,11 @@ class SprintLifecycleStore:
+                 reason=reason,
+                 detail=detail or {},
+             )
++            self._clear_coordinate_mode(
++                sprint_id,
++                actor,
++                reason="Sprint paused by FnB",
++            )
+         self._signal_interrupts_and_notifications(receipt)
+         return receipt
+ 
+@@ -587,6 +603,11 @@ class SprintLifecycleStore:
+                 target="aborted",
+                 outcome=outcome,
+             )
++            self._clear_coordinate_mode(
++                sprint_id,
++                actor,
++                reason="Sprint cancelled by FnB",
++            )
+             report_id = int(
+                 self.con.execute(
+                     "INSERT INTO sprint_reports "
+@@ -1828,6 +1849,30 @@ class SprintLifecycleStore:
+         if result.rowcount != 1:
+             raise SprintStateError("Sprint lifecycle changed concurrently")
+ 
++    def _clear_coordinate_mode(
++        self,
++        sprint_id: int,
++        actor: LifecycleActor,
++        *,
++        reason: str,
++    ) -> bool:
++        """Clear an operator-selected mode only for an FnB lifecycle action."""
++        if actor.kind != "fnb":
++            return False
++        changed = self.con.execute(
++            "UPDATE sprints SET coordinate_mode=0,updated_at=datetime('now'),"
++            "version=version+1 WHERE sprint_id=? AND coordinate_mode=1",
++            (sprint_id,),
++        ).rowcount
++        if changed:
++            self._event(
++                sprint_id,
++                "coordinate_mode.cleared",
++                actor,
++                {"reason": reason},
++            )
++        return bool(changed)
++
+     def _event(
+         self,
+         sprint_id: int,
+diff --git a/.super-coder/scripts/sprint_message_delivery.py b/.super-coder/scripts/sprint_message_delivery.py
+index 37a72b8..2276d3e 100644
+--- a/.super-coder/scripts/sprint_message_delivery.py
++++ b/.super-coder/scripts/sprint_message_delivery.py
+@@ -759,7 +759,14 @@ class SprintWakeDeliveryService:
+ 
+             messages = self.con.execute(
+                 "SELECT m.message_id,m.sprint_id,m.to_participant_id,"
+-                "m.declared_type,m.body,s.lifecycle,p.role "
++                "CASE WHEN m.declared_type='re-enter' AND EXISTS ("
++                "SELECT 1 FROM sprints coordinate_sprint "
++                "WHERE coordinate_sprint.lifecycle='armed' "
++                "AND coordinate_sprint.coordinate_mode=1 "
++                "AND coordinate_sprint.originating_planner_shell_id="
++                "m.receiver_shell_id) "
++                "THEN 'new' ELSE m.declared_type END AS declared_type,"
++                "m.body,s.lifecycle,p.role "
+                 "FROM wake_message m LEFT JOIN sprints s "
+                 "ON s.sprint_id=m.sprint_id LEFT JOIN sprint_participants p "
+                 "ON p.sprint_id=m.sprint_id "
+diff --git a/tests/fixtures/sprint_removal/manifest.json b/tests/fixtures/sprint_removal/manifest.json
+index 4c68dcc..92a211a 100644
+--- a/tests/fixtures/sprint_removal/manifest.json
++++ b/tests/fixtures/sprint_removal/manifest.json
+@@ -65,7 +65,8 @@
+     ".super-coder/migrations/0162_active_chat_registry.sql",
+     ".super-coder/migrations/0163_conversation_run_process_identity.sql",
+     ".super-coder/migrations/0164_wake_message_delivery.sql",
+-    ".super-coder/migrations/0165_pr_subscriptions.sql"
++    ".super-coder/migrations/0165_pr_subscriptions.sql",
++    ".super-coder/migrations/0166_sprint_coordinate_mode.sql"
+   ],
+   "baseline_migration_ledger": {
+     "count": 142,
+@@ -266,6 +267,7 @@
+     "tests/test_sprint_decoupling.py",
+     "tests/test_sprint_eventing.py",
+     "tests/test_sprint_no_render_read.py",
++    "tests/test_sprint_routing_coordinate.py",
+     "tests/test_sprints_ui_contract.py",
+     "tests/test_style_spinner.py",
+     "tests/test_supervision_sc.py",
+diff --git a/tests/test_conversation_api.py b/tests/test_conversation_api.py
+index 2d7d554..ab4f4b3 100644
+--- a/tests/test_conversation_api.py
++++ b/tests/test_conversation_api.py
+@@ -161,7 +161,7 @@ class ConversationApiCase(unittest.TestCase):
+             participant_id = con.execute(
+                 "INSERT INTO sprint_participants "
+                 "(sprint_id,shell_id,role,harness,model,effort,disposition) "
+-                "VALUES (7,1,'developer','codex','gpt-test','high','active')"
++                "VALUES (7,1,'planner','codex','gpt-test','high','active')"
+             ).lastrowid
+             return sprint_participant_chats.create_and_select(
+                 con,
+@@ -845,7 +845,7 @@ class ConversationResourceTest(ConversationApiCase):
+         )
+         self.assertEqual(live_runs, 0)
+ 
+-    def test_close_interrupts_active_run_and_closes_after_terminal_proof(self) -> None:
++    def test_fnb_close_unlinks_active_run_immediately(self) -> None:
+         conversation = self.create(key="active-close")
+         message_ids = []
+         for number in range(2):
+@@ -877,17 +877,9 @@ class ConversationResourceTest(ConversationApiCase):
+             )
+ 
+         self.assertEqual(status, 200, closing)
+-        self.assertEqual(closing["state"], "running")
+-        self.assertIsNotNone(closing["close_requested_at"])
+-        interrupt.assert_called_once_with(run.run_id)
+-        rejected_status, _, rejected = self.request(
+-            "POST",
+-            f"/api/conversations/{conversation['conversation_id']}/messages",
+-            body={"text": "must not queue"},
+-            key="active-close-rejected",
+-        )
+-        self.assertEqual(rejected_status, 409)
+-        self.assertEqual(rejected["error"]["code"], "CONVERSATION_CLOSING")
++        self.assertEqual(closing["state"], "closed")
++        self.assertIsNone(closing["close_requested_at"])
++        interrupt.assert_not_called()
+ 
+         con = self.connect()
+         try:
+@@ -905,10 +897,18 @@ class ConversationResourceTest(ConversationApiCase):
+             request_events = con.execute(
+                 "SELECT event_type,run_id FROM conversation_events "
+                 "WHERE conversation_id=? AND event_type IN "
+-                "('conversation.close.requested','run.interrupt.requested') "
++                "('conversation.close.requested','conversation.closed',"
++                "'run.interrupt.requested') "
+                 "ORDER BY sequence",
+                 (conversation["conversation_id"],),
+             ).fetchall()
++            active_registry = con.execute(
++                "SELECT COUNT(*) FROM active_shell_chats WHERE shell_id=1"
++            ).fetchone()[0]
++            run_state = con.execute(
++                "SELECT state FROM conversation_runs WHERE run_id=?",
++                (run.run_id,),
++            ).fetchone()[0]
+         finally:
+             con.close()
+         self.assertEqual(
+@@ -923,9 +923,11 @@ class ConversationResourceTest(ConversationApiCase):
+             [(row["event_type"], row["run_id"]) for row in request_events],
+             [
+                 ("conversation.close.requested", run.run_id),
+-                ("run.interrupt.requested", run.run_id),
++                ("conversation.closed", run.run_id),
+             ],
+         )
++        self.assertEqual(active_registry, 0)
++        self.assertEqual(run_state, "leased")
+ 
+         self.assertTrue(
+             store.finish_run(
+@@ -961,12 +963,11 @@ class ConversationResourceTest(ConversationApiCase):
+             [(message_ids[0], "cancelled"), (message_ids[1], "cancelled")],
+         )
+         self.assertEqual(
+-            [row["event_type"] for row in final_events][-4:],
++            [row["event_type"] for row in final_events][-3:],
+             [
+                 "conversation.close.requested",
+-                "run.interrupt.requested",
+-                "run.interrupted",
+                 "conversation.closed",
++                "run.interrupted",
+             ],
+         )
+ 
+@@ -1075,7 +1076,7 @@ class ConversationResourceTest(ConversationApiCase):
+         self.assertEqual(count, 1)
+         self.assertEqual(tuple(event), (1, "conversation.created"))
+ 
+-    def test_sprint_entry_is_read_only_and_normal_close_cannot_break_pointer(
++    def test_fnb_close_closes_sprint_chat_and_enables_coordinate_mode(
+         self,
+     ) -> None:
+         conversation_id = self.seed_sprint_conversation()
+@@ -1130,27 +1131,37 @@ class ConversationResourceTest(ConversationApiCase):
+         finally:
+             con.close()
+ 
+-        status, _, error = self.request(
++        status, _, closed = self.request(
+             "PATCH",
+             f"/api/conversations/{conversation_id}",
+             body={"version": viewed["version"], "state": "closed"},
+         )
+-        self.assertEqual(status, 409)
+-        self.assertEqual(error["error"]["code"], "SPRINT_CONVERSATION_MANAGED")
++        self.assertEqual(status, 200, closed)
++        self.assertEqual(closed["state"], "closed")
+         con = self.connect()
+         try:
+             self.assertEqual(
+-                ("idle", conversation_id),
++                ("closed", 0, 1),
+                 tuple(
+                     con.execute(
+-                        "SELECT c.state,p.current_conversation_id "
+-                        "FROM conversations c JOIN sprint_participants p "
+-                        "ON p.current_conversation_id=c.conversation_id "
++                        "SELECT c.state,"
++                        "(SELECT COUNT(*) FROM active_shell_chats a "
++                        " WHERE a.chat_id=c.conversation_id),s.coordinate_mode "
++                        "FROM conversations c JOIN sprints s ON s.sprint_id=7 "
+                         "WHERE c.conversation_id=?",
+                         (conversation_id,),
+                     ).fetchone()
+                 ),
+             )
++            event = con.execute(
++                "SELECT actor_kind,payload FROM sprint_events "
++                "WHERE sprint_id=7 AND event_type='coordinate_mode.enabled'"
++            ).fetchone()
++            self.assertEqual(event["actor_kind"], "fnb")
++            self.assertEqual(
++                json.loads(event["payload"])["conversation_id"],
++                conversation_id,
++            )
+         finally:
+             con.close()
+ 
+diff --git a/tests/test_sprint_board_api.py b/tests/test_sprint_board_api.py
+index 4af0a67..846fc04 100644
+--- a/tests/test_sprint_board_api.py
++++ b/tests/test_sprint_board_api.py
+@@ -36,6 +36,7 @@ def emitted_sprint_event_types() -> set[str]:
+     emitted = set()
+     emitter_paths = [
+         *(ENGINE / "scripts").glob("sprint_*.py"),
++        ENGINE / "api" / "conversation_routes.py",
+         ENGINE / "api" / "server.py",
+     ]
+     for path in sorted(emitter_paths):
+diff --git a/tests/test_sprint_message_delivery.py b/tests/test_sprint_message_delivery.py
+index aabc29a..54e9865 100644
+--- a/tests/test_sprint_message_delivery.py
++++ b/tests/test_sprint_message_delivery.py
+@@ -313,7 +313,8 @@ class AcceptanceAndDeclineTest(SprintMessageCase):
+         planner_results = [
+             tuple(row)
+             for row in self.con.execute(
+-                "SELECT message_id,to_participant_id,body FROM wake_message "
++                "SELECT message_id,to_participant_id,body,declared_type "
++                "FROM wake_message "
+                 "WHERE message_id IN (?,?) ORDER BY message_id",
+                 (assignment_result, review_result),
+             )
+@@ -325,6 +326,10 @@ class AcceptanceAndDeclineTest(SprintMessageCase):
+         )
+         self.assertIn("wrong editing lane", planner_results[0][2])
+         self.assertIn("review capacity unavailable", planner_results[1][2])
++        self.assertEqual(
++            ["re-enter", "re-enter"],
++            [row[3] for row in planner_results],
++        )
+         self.assertEqual(
+             1,
+             self.con.execute(
+diff --git a/tests/test_sprint_review_loop.py b/tests/test_sprint_review_loop.py
+index 2ae4c5b..dcf721e 100644
+--- a/tests/test_sprint_review_loop.py
++++ b/tests/test_sprint_review_loop.py
+@@ -152,7 +152,8 @@ class ReviewHandoffTest(SprintReviewLoopCase):
+         self.assertEqual("in_review", unit["disposition"])
+         message = self.con.execute(
+             "SELECT from_participant_id,to_participant_id,message_kind,body,"
+-            "actionable,disposition FROM wake_message WHERE message_id=?",
++            "declared_type,actionable,disposition FROM wake_message "
++            "WHERE message_id=?",
+             (handoff.message_id,),
+         ).fetchone()
+         self.assertEqual(
+@@ -161,6 +162,7 @@ class ReviewHandoffTest(SprintReviewLoopCase):
+                 self.reviewer_id,
+                 "review_request",
+                 "Focused and full gates are green; ready for review.",
++                "new",
+                 1,
+                 "pending",
+             ),
+@@ -408,6 +410,13 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
+             body="Medium: preserve the exact reviewed head.",
+             idempotency_key="changes-1",
+         )
++        self.assertEqual(
++            "re-enter",
++            self.con.execute(
++                "SELECT declared_type FROM wake_message WHERE message_id=?",
++                (changed.message_id,),
++            ).fetchone()[0],
++        )
+         self.assertEqual("fixing", changed.disposition)
+         self.assertIsNone(changed.conversation_id)
+         self.assertEqual(
+diff --git a/tests/test_sprint_routing_coordinate.py b/tests/test_sprint_routing_coordinate.py
+new file mode 100644
+index 0000000..82fcb28
+--- /dev/null
++++ b/tests/test_sprint_routing_coordinate.py
+@@ -0,0 +1,335 @@
++"""Sprint routing and tracked Planner coordinate-mode contracts."""
++
++from __future__ import annotations
++
++import hashlib
++import os
++import sqlite3
++import sys
++import unittest
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++ENGINE = ROOT / ".super-coder"
++sys.path.insert(0, str(ENGINE / "scripts"))
++
++import active_chat_registry
++import sprint_domain
++import sprint_message_delivery
++
++
++def apply_schema(con: sqlite3.Connection) -> None:
++    con.executescript((ENGINE / "schema.sql").read_text())
++    for migration in sorted((ENGINE / "migrations").glob("*.sql")):
++        con.executescript(migration.read_text())
++    con.execute("PRAGMA foreign_keys=ON")
++
++
++class SprintCoordinateModeTest(unittest.TestCase):
++    def setUp(self) -> None:
++        self.con = sqlite3.connect(":memory:")
++        self.addCleanup(self.con.close)
++        self.con.row_factory = sqlite3.Row
++        apply_schema(self.con)
++        self.con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
++        self.con.executemany(
++            "INSERT INTO shells "
++            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
++            "VALUES (?,?,?,?,?,1)",
++            (
++                (1, "Developer", "DEV1", "dev", "prompt"),
++                (2, "Reviewer", "REV1", "reviewer", "prompt"),
++                (3, "Planner", "PLN1", "planner", "prompt"),
++            ),
++        )
++        feature_id = int(
++            self.con.execute(
++                "INSERT INTO roadmap (title,roadmap_status) "
++                "VALUES ('Feature','in_progress')"
++            ).lastrowid
++        )
++        self.sprint_id = int(
++            self.con.execute(
++                "INSERT INTO sprints "
++                "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
++                "VALUES (?,3,1)",
++                (feature_id,),
++            ).lastrowid
++        )
++        self.con.execute(
++            "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?",
++            (self.sprint_id,),
++        )
++        self.con.executemany(
++            "INSERT INTO sprint_participants "
++            "(sprint_id,shell_id,role,harness,model,effort) VALUES (?,?,?,?,?,?)",
++            (
++                (self.sprint_id, 3, "planner", "codex", "gpt-test", "high"),
++                (self.sprint_id, 1, "developer", "codex", "gpt-test", "high"),
++                (self.sprint_id, 2, "reviewer", "codex", "gpt-test", "high"),
++            ),
++        )
++        participants = {
++            str(row["role"]): int(row["participant_id"])
++            for row in self.con.execute(
++                "SELECT role,participant_id FROM sprint_participants WHERE sprint_id=?",
++                (self.sprint_id,),
++            )
++        }
++        self.planner_id = participants["planner"]
++        self.developer_id = participants["developer"]
++        self.con.commit()
++        self.messages = sprint_message_delivery.SprintMessageStore(self.con)
++        self.lifecycle = sprint_domain.SprintLifecycleStore(
++            self.con,
++            interrupt_run=lambda _run_id: True,
++            notify_commit=lambda: True,
++        )
++
++    def open_planner_chat(self, key: str) -> str:
++        conversation_id = f"cv_{hashlib.sha256(key.encode()).hexdigest()[:32]}"
++        self.con.execute(
++            "INSERT INTO conversations "
++            "(conversation_id,shell_id,owner_user_id,harness,worktree,title,"
++            "creation_idempotency_key,creation_request_hash) "
++            "VALUES (?,3,1,'codex','/tmp','Planner chat',?,?)",
++            (conversation_id, key, hashlib.sha256(key.encode()).hexdigest()),
++        )
++        active_chat_registry.register(self.con, 3, conversation_id)
++        self.con.commit()
++        return conversation_id
++
++    def planner_message(self, key: str):
++        return self.messages.send(
++            self.sprint_id,
++            from_participant_id=self.developer_id,
++            to_participant_id=self.planner_id,
++            message_kind="notification",
++            body=f"Planner report {key}",
++            declared_type="re-enter",
++            idempotency_key=key,
++        )
++
++    def engine_planner_notice(self, key: str):
++        return self.messages.send_to_shell(
++            3,
++            message_kind="notification",
++            body=f"Engine notice {key}",
++            declared_type="re-enter",
++            idempotency_key=key,
++        )
++
++    def set_coordinate_mode(self) -> None:
++        self.con.execute(
++            "UPDATE sprints SET coordinate_mode=1 WHERE sprint_id=?",
++            (self.sprint_id,),
++        )
++        self.con.commit()
++
++    def coordinate_mode(self) -> int:
++        return int(
++            self.con.execute(
++                "SELECT coordinate_mode FROM sprints WHERE sprint_id=?",
++                (self.sprint_id,),
++            ).fetchone()[0]
++        )
++
++    def test_coordinate_mode_rotates_an_idle_planner_chat(self) -> None:
++        old_chat = self.open_planner_chat("idle-coordinate")
++        self.set_coordinate_mode()
++        sent = self.planner_message("idle-coordinate-message")
++        observed: list[tuple[str, str]] = []
++
++        outcome = sprint_message_delivery.SprintWakeDeliveryService(
++            self.con
++        ).deliver_once(
++            "coordinate-idle-worker",
++            lambda conversation, prompt, _key: (
++                observed.append((conversation, prompt)) or "native-run"
++            ),
++        )
++
++        self.assertEqual(outcome.wake_id, sent.wake_id)
++        self.assertNotEqual(observed[0][0], old_chat)
++        self.assertIn("(declared New)", observed[0][1])
++        self.assertEqual(
++            "closed",
++            self.con.execute(
++                "SELECT state FROM conversations WHERE conversation_id=?",
++                (old_chat,),
++            ).fetchone()[0],
++        )
++        self.assertEqual(
++            "re-enter",
++            self.con.execute(
++                "SELECT declared_type FROM wake_message WHERE message_id=?",
++                (sent.message_id,),
++            ).fetchone()[0],
++            "coordinate mode is tracked separately from the sender's route literal",
++        )
++
++    def test_coordinate_mode_rotates_engine_scoped_planner_notice(self) -> None:
++        old_chat = self.open_planner_chat("engine-notice-coordinate")
++        self.set_coordinate_mode()
++        sent = self.engine_planner_notice("engine-notice-coordinate-message")
++        observed: list[tuple[str, str]] = []
++
++        outcome = sprint_message_delivery.SprintWakeDeliveryService(
++            self.con
++        ).deliver_once(
++            "coordinate-engine-notice-worker",
++            lambda conversation, prompt, _key: (
++                observed.append((conversation, prompt)) or "native-run"
++            ),
++        )
++
++        self.assertEqual(outcome.wake_id, sent.wake_id)
++        self.assertEqual(len(observed), 1)
++        new_chat, prompt = observed[0]
++        self.assertNotEqual(new_chat, old_chat)
++        self.assertIn("(declared New)", prompt)
++        self.assertEqual(
++            {
++                (old_chat, "closed"),
++                (new_chat, "idle"),
++            },
++            {
++                (str(row["conversation_id"]), str(row["state"]))
++                for row in self.con.execute(
++                    "SELECT conversation_id,state FROM conversations WHERE shell_id=3"
++                )
++            },
++        )
++        message = self.con.execute(
++            "SELECT sprint_id,declared_type FROM wake_message WHERE message_id=?",
++            (sent.message_id,),
++        ).fetchone()
++        self.assertEqual(
++            (message["sprint_id"], message["declared_type"]),
++            (None, "re-enter"),
++        )
++
++    def test_engine_scoped_planner_notice_reenters_when_mode_is_clear(self) -> None:
++        planner_chat = self.open_planner_chat("engine-notice-supervise")
++        sent = self.engine_planner_notice("engine-notice-supervise-message")
++        observed: list[tuple[str, str]] = []
++
++        outcome = sprint_message_delivery.SprintWakeDeliveryService(
++            self.con
++        ).deliver_once(
++            "supervise-engine-notice-worker",
++            lambda conversation, prompt, _key: (
++                observed.append((conversation, prompt)) or "native-run"
++            ),
++        )
++
++        self.assertEqual(outcome.wake_id, sent.wake_id)
++        self.assertEqual(len(observed), 1)
++        self.assertEqual(observed[0][0], planner_chat)
++        self.assertIn("(declared Re-Enter)", observed[0][1])
++        self.assertEqual(
++            [(planner_chat, "idle")],
++            [
++                (str(row["conversation_id"]), str(row["state"]))
++                for row in self.con.execute(
++                    "SELECT conversation_id,state FROM conversations WHERE shell_id=3"
++                )
++            ],
++        )
++        message = self.con.execute(
++            "SELECT sprint_id,declared_type FROM wake_message WHERE message_id=?",
++            (sent.message_id,),
++        ).fetchone()
++        self.assertEqual(
++            (message["sprint_id"], message["declared_type"]),
++            (None, "re-enter"),
++        )
++
++    def test_coordinate_mode_new_reenters_when_planner_is_mid_turn(self) -> None:
++        planner_chat = self.open_planner_chat("busy-coordinate")
++        pid, start_ticks = active_chat_registry.process_identity(str(os.getpid()))
++        self.assertEqual(pid, os.getpid())
++        self.con.execute(
++            "UPDATE active_shell_chats SET process_pid=?,process_start_ticks=? "
++            "WHERE shell_id=3",
++            (pid, start_ticks),
++        )
++        self.con.commit()
++        self.set_coordinate_mode()
++        sent = self.planner_message("busy-coordinate-message")
++        observed: list[tuple[str, str]] = []
++
++        outcome = sprint_message_delivery.SprintWakeDeliveryService(
++            self.con
++        ).deliver_once(
++            "coordinate-busy-worker",
++            lambda conversation, prompt, _key: (
++                observed.append((conversation, prompt)) or "native-run"
++            ),
++        )
++
++        self.assertEqual(outcome.wake_id, sent.wake_id)
++        self.assertEqual(observed[0][0], planner_chat)
++        self.assertIn("(declared New)", observed[0][1])
++        self.assertEqual(
++            1,
++            self.con.execute(
++                "SELECT COUNT(*) FROM conversations WHERE shell_id=3"
++            ).fetchone()[0],
++        )
++
++    def test_automatic_pause_preserves_mode_until_fnb_confirms_pause(self) -> None:
++        self.set_coordinate_mode()
++        automatic = self.lifecycle.pause(
++            self.sprint_id,
++            sprint_domain.LifecycleActor("system"),
++            reason="wake_delivery_exhausted",
++        )
++        self.assertTrue(automatic.changed)
++        self.assertEqual(self.coordinate_mode(), 1)
++
++        confirmed = self.lifecycle.pause(
++            self.sprint_id,
++            sprint_domain.LifecycleActor("fnb"),
++            reason="FnB switches back to supervise mode",
++        )
++        self.assertTrue(confirmed.changed)
++        self.assertEqual(self.coordinate_mode(), 0)
++
++    def test_only_fnb_cancel_clears_coordinate_mode(self) -> None:
++        self.set_coordinate_mode()
++        receipt = self.lifecycle.abort(
++            self.sprint_id,
++            sprint_domain.LifecycleActor("planner", 3),
++            reason="Planner cancellation",
++            terminal_outcome="cancelled",
++        )
++        self.assertTrue(receipt.changed)
++        self.assertEqual(self.coordinate_mode(), 1)
++
++    def test_fnb_cancel_clears_coordinate_mode(self) -> None:
++        self.set_coordinate_mode()
++        receipt = self.lifecycle.abort(
++            self.sprint_id,
++            sprint_domain.LifecycleActor("fnb"),
++            reason="FnB cancellation",
++            terminal_outcome="cancelled",
++        )
++        self.assertTrue(receipt.changed)
++        self.assertEqual(self.coordinate_mode(), 0)
++
++    def test_fnb_close_clears_coordinate_mode(self) -> None:
++        self.set_coordinate_mode()
++        changed = self.lifecycle.transition(
++            self.sprint_id,
++            "completed",
++            sprint_domain.LifecycleActor("fnb"),
++            reason="Sprint accepted",
++            terminal_outcome="accepted",
++        )
++        self.assertTrue(changed)
++        self.assertEqual(self.coordinate_mode(), 0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_sprint_work_dispatch.py b/tests/test_sprint_work_dispatch.py
+index 28fd111..59418e6 100644
+--- a/tests/test_sprint_work_dispatch.py
++++ b/tests/test_sprint_work_dispatch.py
+@@ -195,11 +195,11 @@ class DispatchGateTest(SprintWorkDispatchCase):
+             "one Reviewer may cover parallel units without consuming a lane",
+         )
+         self.assertEqual(
+-            [early_wave, late_wave],
++            [(early_wave, "new"), (late_wave, "new")],
+             [
+-                row[0]
++                tuple(row)
+                 for row in self.con.execute(
+-                    "SELECT work_unit_id FROM wake_message "
++                    "SELECT work_unit_id,declared_type FROM wake_message "
+                     "WHERE message_kind='work_assignment' ORDER BY message_id"
+                 )
+             ],

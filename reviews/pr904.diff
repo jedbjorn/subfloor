@@ -1,0 +1,4094 @@
+diff --git a/.super-coder/api/server.py b/.super-coder/api/server.py
+index d7729e95..83028dda 100644
+--- a/.super-coder/api/server.py
++++ b/.super-coder/api/server.py
+@@ -2365,6 +2365,21 @@ def _sprint_post(self, path: str, body: dict):
+                     sprint_id=sprint_id,
+                 )
+                 return self._send(200, {"result_message_id": message_id})
++            if path == "/_sc/sprint/send":
++                receipt = sprint_message_delivery.SprintMessageStore(con).relay(
++                    sprint_id,
++                    from_shell_id=shell_id,
++                    to_shortname=body.get("to") or "",
++                    body=body.get("body") or "",
++                    idempotency_key=body.get("idempotency_key") or "",
++                )
++                return self._send(201 if receipt.message_created else 200, {
++                    "message_id": receipt.message_id,
++                    "wake_id": receipt.wake_id,
++                    "message_created": receipt.message_created,
++                    "wake_state": receipt.wake_state,
++                    "conversation_id": receipt.conversation_id,
++                })
+             if path == "/_sc/sprint/register-pr":
+                 receipt = sprint_pr_watcher.SprintPRWatcher(
+                     con, repo_root=REPO_ROOT
+@@ -2521,6 +2536,10 @@ def _sprint_post(self, path: str, body: dict):
+                 return self._send(200, {"wake_ids": released})
+             if path == "/_sc/sprint/monitor":
+                 self._require_sprint_planner(con, sprint_id, shell_id)
++                sprint_domain.SprintLifecycleStore(con).reconcile_unread_pickup(
++                    sprint_id,
++                    trigger="monitor",
++                )
+                 outcomes = sprint_liveness.SprintLivenessMonitor(con).evaluate(
+                     sprint_id
+                 )
+diff --git a/.super-coder/assets/skills/sprint_close/SKILL.md b/.super-coder/assets/skills/sprint_close/SKILL.md
+index c1bebb24..55652bfa 100644
+--- a/.super-coder/assets/skills/sprint_close/SKILL.md
++++ b/.super-coder/assets/skills/sprint_close/SKILL.md
+@@ -9,6 +9,43 @@ common: false
+ 
+ Use as the owning Planner when delivery work is terminal, or when abort has
+ been chosen. Close-out supplies meaning; the compiler supplies facts.
++On entry or any wake, load `sprint_close`, run `sc sprint inbox --sprint <id>`,
++inspect the durable message, and accept or decline it only when actionable.
++
++```text
++sc sprint accept --sprint <id> --message <message-id>
++sc sprint decline --sprint <id> --message <message-id> --reason <reason>
++```
++
++## Questions, answers, blockers, and failures
++
++Put a concrete question, answer, blocker, or context request in a short body
++file, then send it to the conformance Reviewer or participant who owns the fact:
++
++```text
++sc sprint send --sprint <id> --to <shortname> --body-file <path>
++```
++
++Answer incoming questions through `send`. For a blocker, send the evidence,
++impact, and exact action needed to the originating Planner/FnB and every directly
++affected participant. Continue safe synthesis, but stop at a decision boundary
++when the answer is required. Do not send duplicate reminders; unread recovery
++owns re-waking.
++
++Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
++characters is the hard maximum. Before submitting, run `wc -m < <path>` and
++condense if needed. The handoff is complete only when the Sprint command exits
++successfully and confirms the durable write and wake where applicable.
++
++If a Sprint command is rejected or transport fails, the write or handoff is
++incomplete. Correct and retry when safe; relay the exact failure if it cannot
++complete. For an integrity threat, pause first, confirm it, then send evidence:
++
++```text
++sc sprint pause --sprint <id> --reason <integrity-threat>
++```
++
++After the pause succeeds, use the `send` command above for the evidence.
+ 
+ ## Delivery-complete gate
+ 
+@@ -39,6 +76,9 @@ synthesis.
+ FnB records one terminal disposition per follow-up. `accepted` acknowledges
+ ship-as-is; `resolved` and `dismissed` require a resolution file.
+ 
++Keep a resolution at about 6,000 characters or fewer; 8,000 is the hard
++maximum. Run `wc -m < <path>` and require a successful durable disposition.
++
+ ```text
+ sc sprint disposition-followup --sprint <id> --followup <id> \
+   --disposition accepted
+@@ -112,6 +152,10 @@ Abort only under Planner or FnB authority. Terminal state stops Sprint services
+ and removes live pills while retaining conversations, messages, events, PR
+ evidence, reports, and follow-ups.
+ 
++Keep the final report at about 6,000 characters or fewer; 8,000 is the hard
++maximum. Run `wc -m < <path>` before the typed terminal handoff, then require
++the successful report receipt and lifecycle transition.
++
+ ```text
+ sc sprint complete --sprint <id> --reason <summary> --outcome <outcome> \
+   --report-file <path> --key <stable-key>
+@@ -119,4 +163,5 @@ sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
+ ```
+ 
+ Hand the FnB the final report id, follow-up list, integrated SHA, and evidence
+-links. Stop after the terminal transition; Sprint-scoped authority is over.
++links. Re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message,
++and stop after the terminal transition; Sprint-scoped authority is over.
+diff --git a/.super-coder/assets/skills/sprint_dev/SKILL.md b/.super-coder/assets/skills/sprint_dev/SKILL.md
+index 03bf25c4..8bf09910 100644
+--- a/.super-coder/assets/skills/sprint_dev/SKILL.md
++++ b/.super-coder/assets/skills/sprint_dev/SKILL.md
+@@ -10,6 +10,8 @@ common: false
+ Use for an actionable work-unit assignment in an armed Sprint. Marking that
+ Sprint message read is acceptance and starts work immediately. If you cannot
+ accept, decline with a concrete reason; never leave it unread and waking.
++On every wake or re-entry, load `sprint_dev`, run the exact inbox command below,
++and inspect the durable message before deciding what to do.
+ 
+ ```text
+ sc sprint inbox --sprint <id>
+@@ -29,6 +31,39 @@ unit's scope, record the choice and rationale, and continue. Escalate changes to
+ the unit boundary, interfaces another unit consumes, deliverable cuts, or scope
+ growth to the Planner.
+ 
++## Questions, answers, blockers, and failures
++
++Write a concrete question, answer, blocker, or useful context to a short body
++file, then send it durably to the participant who can act:
++
++```text
++sc sprint send --sprint <id> --to <shortname> --body-file <path>
++```
++
++Ask the Planner about scope, priority, or cross-unit decisions; ask the assigned
++Reviewer about review evidence. Answer an incoming question through `send` so it
++wakes the asker. For a blocker, send evidence, impact, and the exact action
++needed to the Planner and any directly affected participant. Continue safe
++independent work, but stop at a decision boundary when the answer is required.
++No immediate response is not a reason to send duplicates: the durable message
++and recovery reconciler own re-waking.
++
++Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
++characters is the hard maximum. Before submitting, run `wc -m < <path>` and
++condense if needed. The handoff is complete only when the Sprint command exits
++successfully and confirms the durable write and wake where applicable.
++
++If a Sprint command is rejected or transport fails, the write or handoff is
++incomplete. Correct and retry when safe; if it still cannot complete, relay the
++problem to the Planner. For an integrity threat, pause first, confirm the pause,
++then send the evidence needed to resolve it:
++
++```text
++sc sprint pause --sprint <id> --reason <integrity-threat>
++```
++
++After the pause succeeds, use the `send` command above for the evidence.
++
+ ## Build and verify
+ 
+ Sync the assigned repository, work on a feature branch, match the surrounding
+@@ -44,6 +79,10 @@ An explicitly planned report-only or no-code lane completes with its durable
+ result instead of a PR. Code lanes cannot use this path; they complete only
+ after merge authorization and observation.
+ 
++Keep the result at about 6,000 characters or fewer; 8,000 is the hard maximum.
++Run `wc -m < <path>` before submitting, then require a successful command and
++durable completion receipt.
++
+ ```text
+ sc sprint complete-unit --sprint <id> --work-unit <id> \
+   --result-file <path>
+@@ -63,6 +102,10 @@ sc sprint register-pr --sprint <id> --repository <owner/name> \
+ 
+ Put the readiness claim in a file, then use one stable retry key:
+ 
++Keep the readiness claim at about 6,000 characters or fewer; 8,000 is the hard
++maximum. Run `wc -m < <path>` and condense before the typed handoff. The handoff
++exists only after the command succeeds and confirms its durable write and wake.
++
+ ```text
+ sc sprint request-review \
+   --sprint <id> --registered-pr <registered-id> \
+@@ -103,5 +146,6 @@ sc sprint pause --sprint <id> --reason <integrity-threat>
+ ```
+ 
+ Stop when the unit is merged and reported, declined, paused awaiting recovery,
+-or returned to review. Ask the Planner for later work only after the current
+-editing lane is terminal.
++or returned to review. Before stopping, re-run `sc sprint inbox --sprint <id>`,
++act on any newly arrived message, and confirm the final typed handoff succeeded.
++Ask the Planner for later work only after the current editing lane is terminal.
+diff --git a/.super-coder/assets/skills/sprint_pln/SKILL.md b/.super-coder/assets/skills/sprint_pln/SKILL.md
+index 0993fb8b..c810756c 100644
+--- a/.super-coder/assets/skills/sprint_pln/SKILL.md
++++ b/.super-coder/assets/skills/sprint_pln/SKILL.md
+@@ -9,6 +9,8 @@ common: false
+ 
+ Use as the originating Planner after `sprint_prep` arms the Sprint. The system
+ captures deterministic facts; you decide scope, sequencing, and recovery.
++On every wake or re-entry, load `sprint_pln`, run the exact inbox command below,
++and inspect the durable message before deciding what to do.
+ 
+ ## Start from durable state
+ 
+@@ -20,6 +22,7 @@ observation, not activity; never manufacture progress from browser presence.
+ ```text
+ sc sprint inbox --sprint <id>
+ sc sprint accept --sprint <id> --message <message-id>
++sc sprint decline --sprint <id> --message <message-id> --reason <reason>
+ ```
+ 
+ Release every dependency-ready lane through the production surface:
+@@ -32,6 +35,10 @@ The returned ids are wake identities. Work-unit disposition and messages are
+ the authoritative release facts. Dispatch is safe to repeat: occupied Developer
+ lanes and stable assignment generations prevent double booking.
+ 
++Accept or decline only when the inbox item is actionable. Informational
++questions, answers, blockers, and evidence remain unread until you inspect them;
++reading them does not invent a work-unit transition.
++
+ ## Running loop
+ 
+ - Keep dependencies as the only hard sequence. Re-plan assignments, waves, or
+@@ -56,6 +63,37 @@ sc sprint monitor --sprint <id>
+ Do not poll this command on a schedule. It evaluates only due accepted
+ expectations and its nudge/escalation identities are durable.
+ 
++## Questions, answers, blockers, and failures
++
++Put a concrete question, answer, decision, blocker, or useful context in a short
++body file and address the participant who owns the needed fact or action:
++
++```text
++sc sprint send --sprint <id> --to <shortname> --body-file <path>
++```
++
++Answer incoming questions through `send` so the answer is durable and wakes the
++asker. For a cross-unit blocker, send evidence, impact, and the exact action
++needed to every directly affected participant. Continue safe independent
++governance, but stop at a decision boundary when an answer is required. Do not
++spam duplicates when no response is immediate; unread recovery owns re-waking.
++
++Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
++characters is the hard maximum. Before submitting, run `wc -m < <path>` and
++condense if needed. The handoff is complete only when the Sprint command exits
++successfully and confirms the durable write and wake where applicable.
++
++If a Sprint command is rejected or transport fails, the write or handoff is
++incomplete. Correct and retry when safe; if it cannot complete, send the exact
++failure to an eligible participant or surface it to FnB. For an integrity
++threat, pause first, confirm the pause, then relay the evidence:
++
++```text
++sc sprint pause --sprint <id> --reason <integrity-threat>
++```
++
++After the pause succeeds, use the `send` command above for the evidence.
++
+ Revise only a still-planned lane; name its complete new projection so the
+ before/after event is reviewable. Cancel only an unreleased lane, with the
+ reason retained as its terminal result:
+@@ -105,5 +143,6 @@ outcomes move the Developer to fresh fix/merge conversations automatically;
+ the next work assignment returns it to the persistent lane.
+ 
+ When all planned delivery work is terminal and merged or explicitly no-code,
+-stop dispatching and invoke `sprint_close`. Do not fix close-out conformance
+-findings inside this Sprint.
++re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message, confirm
++the final typed transition succeeded, stop dispatching, and invoke
++`sprint_close`. Do not fix close-out conformance findings inside this Sprint.
+diff --git a/.super-coder/assets/skills/sprint_rev/SKILL.md b/.super-coder/assets/skills/sprint_rev/SKILL.md
+index dbdd3c7c..9c259141 100644
+--- a/.super-coder/assets/skills/sprint_rev/SKILL.md
++++ b/.super-coder/assets/skills/sprint_rev/SKILL.md
+@@ -9,6 +9,8 @@ common: false
+ 
+ Use in one of two modes: a work-unit PR review during the loop, or the final
+ whole-Sprint conformance pass. The evidence differs; independence does not.
++On every wake or re-entry, load `sprint_rev`, run the exact inbox command below,
++and inspect the durable message before deciding what to do.
+ 
+ Read and accept the actionable request before beginning. During preparation,
+ sign the exact current spec revision through the same authenticated surface:
+@@ -20,6 +22,44 @@ sc sprint record-qaqc --document <spec-document-id> \
+   --verdict pass [--findings-document <document-id>]
+ ```
+ 
++Decline an actionable request you cannot take, with a concrete reason:
++
++```text
++sc sprint decline --sprint <id> --message <message-id> --reason <reason>
++```
++
++## Questions, answers, blockers, and failures
++
++Put a concrete question, answer, blocker, or useful context in a short body file
++and send it to the participant who can act. Ask the Developer for missing PR
++evidence and the Planner for scope or severity decisions:
++
++```text
++sc sprint send --sprint <id> --to <shortname> --body-file <path>
++```
++
++Answer incoming questions through `send` so the answer is durable and wakes the
++asker. A blocker names evidence, impact, and the exact action needed, and goes to
++the Planner plus any directly affected Developer. Continue independent safe
++review, but stop at a decision boundary when the answer is required. Do not send
++duplicate reminders; unread recovery owns re-waking.
++
++Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
++characters is the hard maximum. Before submitting, run `wc -m < <path>` and
++condense if needed. The handoff is complete only when the Sprint command exits
++successfully and confirms the durable write and wake where applicable.
++
++If a Sprint command is rejected or transport fails, the verdict or handoff is
++incomplete. Correct and retry when safe; if it cannot complete, relay the exact
++failure to the Planner. For an integrity threat, pause first, confirm it, and
++then relay the evidence:
++
++```text
++sc sprint pause --sprint <id> --reason <integrity-threat>
++```
++
++After the pause succeeds, use the `send` command above for the evidence.
++
+ ## Severity rubric
+ 
+ This skill owns severity. The governing spec intentionally does not.
+@@ -54,6 +94,10 @@ Findings must state:
+ 
+ Put the verdict body in a file and record it through the authenticated surface:
+ 
++Keep the verdict at about 6,000 characters or fewer; 8,000 is the hard maximum.
++Run `wc -m < <path>` before submission. The typed review handoff exists only
++after the command succeeds and confirms its durable write and Developer wake.
++
+ ```text
+ sc sprint record-review \
+   --sprint <id> --registered-pr <registered-id> \
+@@ -94,6 +138,11 @@ Write the narrative report and a JSON findings array:
+ 
+ Then record both atomically:
+ 
++Keep the conformance report and each finding body at about 6,000 characters or
++fewer; 8,000 is the hard maximum for each. Run `wc -m < <report>` and length-check
++each finding body before submission. Require the successful report and
++follow-up receipt before stopping.
++
+ ```text
+ sc sprint record-conformance \
+   --sprint <id> --body-file <report> --findings-file <json> \
+@@ -108,5 +157,6 @@ Surface immediate safety risk to the FnB, but preserve the close-out rule.
+ ## Stop
+ 
+ For unit review, stop after the durable verdict is recorded. For conformance,
+-stop after the report and all findings replay idempotently and give the Planner
+-their report/follow-up ids.
++re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and stop
++after the report and all findings replay idempotently and give the Planner their
++report/follow-up ids.
+diff --git a/.super-coder/migrations/0001_seed_skills.sql b/.super-coder/migrations/0001_seed_skills.sql
+index 7080b342..f618f864 100644
+--- a/.super-coder/migrations/0001_seed_skills.sql
++++ b/.super-coder/migrations/0001_seed_skills.sql
+@@ -3724,6 +3724,43 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
+ 
+ Use as the owning Planner when delivery work is terminal, or when abort has
+ been chosen. Close-out supplies meaning; the compiler supplies facts.
++On entry or any wake, load `sprint_close`, run `sc sprint inbox --sprint <id>`,
++inspect the durable message, and accept or decline it only when actionable.
++
++```text
++sc sprint accept --sprint <id> --message <message-id>
++sc sprint decline --sprint <id> --message <message-id> --reason <reason>
++```
++
++## Questions, answers, blockers, and failures
++
++Put a concrete question, answer, blocker, or context request in a short body
++file, then send it to the conformance Reviewer or participant who owns the fact:
++
++```text
++sc sprint send --sprint <id> --to <shortname> --body-file <path>
++```
++
++Answer incoming questions through `send`. For a blocker, send the evidence,
++impact, and exact action needed to the originating Planner/FnB and every directly
++affected participant. Continue safe synthesis, but stop at a decision boundary
++when the answer is required. Do not send duplicate reminders; unread recovery
++owns re-waking.
++
++Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
++characters is the hard maximum. Before submitting, run `wc -m < <path>` and
++condense if needed. The handoff is complete only when the Sprint command exits
++successfully and confirms the durable write and wake where applicable.
++
++If a Sprint command is rejected or transport fails, the write or handoff is
++incomplete. Correct and retry when safe; relay the exact failure if it cannot
++complete. For an integrity threat, pause first, confirm it, then send evidence:
++
++```text
++sc sprint pause --sprint <id> --reason <integrity-threat>
++```
++
++After the pause succeeds, use the `send` command above for the evidence.
+ 
+ ## Delivery-complete gate
+ 
+@@ -3754,6 +3791,9 @@ synthesis.
+ FnB records one terminal disposition per follow-up. `accepted` acknowledges
+ ship-as-is; `resolved` and `dismissed` require a resolution file.
+ 
++Keep a resolution at about 6,000 characters or fewer; 8,000 is the hard
++maximum. Run `wc -m < <path>` and require a successful durable disposition.
++
+ ```text
+ sc sprint disposition-followup --sprint <id> --followup <id> \
+   --disposition accepted
+@@ -3827,6 +3867,10 @@ Abort only under Planner or FnB authority. Terminal state stops Sprint services
+ and removes live pills while retaining conversations, messages, events, PR
+ evidence, reports, and follow-ups.
+ 
++Keep the final report at about 6,000 characters or fewer; 8,000 is the hard
++maximum. Run `wc -m < <path>` before the typed terminal handoff, then require
++the successful report receipt and lifecycle transition.
++
+ ```text
+ sc sprint complete --sprint <id> --reason <summary> --outcome <outcome> \
+   --report-file <path> --key <stable-key>
+@@ -3834,7 +3878,8 @@ sc sprint abort --sprint <id> --reason <reason> [--outcome <outcome>]
+ ```
+ 
+ Hand the FnB the final report id, follow-up list, integrated SHA, and evidence
+-links. Stop after the terminal transition; Sprint-scoped authority is over.',
++links. Re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message,
++and stop after the terminal transition; Sprint-scoped authority is over.',
+   0
+ )
+ ON CONFLICT(name) DO UPDATE SET
+@@ -3853,6 +3898,8 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
+ Use for an actionable work-unit assignment in an armed Sprint. Marking that
+ Sprint message read is acceptance and starts work immediately. If you cannot
+ accept, decline with a concrete reason; never leave it unread and waking.
++On every wake or re-entry, load `sprint_dev`, run the exact inbox command below,
++and inspect the durable message before deciding what to do.
+ 
+ ```text
+ sc sprint inbox --sprint <id>
+@@ -3872,6 +3919,39 @@ unit''s scope, record the choice and rationale, and continue. Escalate changes t
+ the unit boundary, interfaces another unit consumes, deliverable cuts, or scope
+ growth to the Planner.
+ 
++## Questions, answers, blockers, and failures
++
++Write a concrete question, answer, blocker, or useful context to a short body
++file, then send it durably to the participant who can act:
++
++```text
++sc sprint send --sprint <id> --to <shortname> --body-file <path>
++```
++
++Ask the Planner about scope, priority, or cross-unit decisions; ask the assigned
++Reviewer about review evidence. Answer an incoming question through `send` so it
++wakes the asker. For a blocker, send evidence, impact, and the exact action
++needed to the Planner and any directly affected participant. Continue safe
++independent work, but stop at a decision boundary when the answer is required.
++No immediate response is not a reason to send duplicates: the durable message
++and recovery reconciler own re-waking.
++
++Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
++characters is the hard maximum. Before submitting, run `wc -m < <path>` and
++condense if needed. The handoff is complete only when the Sprint command exits
++successfully and confirms the durable write and wake where applicable.
++
++If a Sprint command is rejected or transport fails, the write or handoff is
++incomplete. Correct and retry when safe; if it still cannot complete, relay the
++problem to the Planner. For an integrity threat, pause first, confirm the pause,
++then send the evidence needed to resolve it:
++
++```text
++sc sprint pause --sprint <id> --reason <integrity-threat>
++```
++
++After the pause succeeds, use the `send` command above for the evidence.
++
+ ## Build and verify
+ 
+ Sync the assigned repository, work on a feature branch, match the surrounding
+@@ -3887,6 +3967,10 @@ An explicitly planned report-only or no-code lane completes with its durable
+ result instead of a PR. Code lanes cannot use this path; they complete only
+ after merge authorization and observation.
+ 
++Keep the result at about 6,000 characters or fewer; 8,000 is the hard maximum.
++Run `wc -m < <path>` before submitting, then require a successful command and
++durable completion receipt.
++
+ ```text
+ sc sprint complete-unit --sprint <id> --work-unit <id> \
+   --result-file <path>
+@@ -3906,6 +3990,10 @@ sc sprint register-pr --sprint <id> --repository <owner/name> \
+ 
+ Put the readiness claim in a file, then use one stable retry key:
+ 
++Keep the readiness claim at about 6,000 characters or fewer; 8,000 is the hard
++maximum. Run `wc -m < <path>` and condense before the typed handoff. The handoff
++exists only after the command succeeds and confirms its durable write and wake.
++
+ ```text
+ sc sprint request-review \
+   --sprint <id> --registered-pr <registered-id> \
+@@ -3946,8 +4034,9 @@ sc sprint pause --sprint <id> --reason <integrity-threat>
+ ```
+ 
+ Stop when the unit is merged and reported, declined, paused awaiting recovery,
+-or returned to review. Ask the Planner for later work only after the current
+-editing lane is terminal.',
++or returned to review. Before stopping, re-run `sc sprint inbox --sprint <id>`,
++act on any newly arrived message, and confirm the final typed handoff succeeded.
++Ask the Planner for later work only after the current editing lane is terminal.',
+   0
+ )
+ ON CONFLICT(name) DO UPDATE SET
+@@ -3965,6 +4054,8 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
+ 
+ Use as the originating Planner after `sprint_prep` arms the Sprint. The system
+ captures deterministic facts; you decide scope, sequencing, and recovery.
++On every wake or re-entry, load `sprint_pln`, run the exact inbox command below,
++and inspect the durable message before deciding what to do.
+ 
+ ## Start from durable state
+ 
+@@ -3976,6 +4067,7 @@ observation, not activity; never manufacture progress from browser presence.
+ ```text
+ sc sprint inbox --sprint <id>
+ sc sprint accept --sprint <id> --message <message-id>
++sc sprint decline --sprint <id> --message <message-id> --reason <reason>
+ ```
+ 
+ Release every dependency-ready lane through the production surface:
+@@ -3988,6 +4080,10 @@ The returned ids are wake identities. Work-unit disposition and messages are
+ the authoritative release facts. Dispatch is safe to repeat: occupied Developer
+ lanes and stable assignment generations prevent double booking.
+ 
++Accept or decline only when the inbox item is actionable. Informational
++questions, answers, blockers, and evidence remain unread until you inspect them;
++reading them does not invent a work-unit transition.
++
+ ## Running loop
+ 
+ - Keep dependencies as the only hard sequence. Re-plan assignments, waves, or
+@@ -4012,6 +4108,37 @@ sc sprint monitor --sprint <id>
+ Do not poll this command on a schedule. It evaluates only due accepted
+ expectations and its nudge/escalation identities are durable.
+ 
++## Questions, answers, blockers, and failures
++
++Put a concrete question, answer, decision, blocker, or useful context in a short
++body file and address the participant who owns the needed fact or action:
++
++```text
++sc sprint send --sprint <id> --to <shortname> --body-file <path>
++```
++
++Answer incoming questions through `send` so the answer is durable and wakes the
++asker. For a cross-unit blocker, send evidence, impact, and the exact action
++needed to every directly affected participant. Continue safe independent
++governance, but stop at a decision boundary when an answer is required. Do not
++spam duplicates when no response is immediate; unread recovery owns re-waking.
++
++Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
++characters is the hard maximum. Before submitting, run `wc -m < <path>` and
++condense if needed. The handoff is complete only when the Sprint command exits
++successfully and confirms the durable write and wake where applicable.
++
++If a Sprint command is rejected or transport fails, the write or handoff is
++incomplete. Correct and retry when safe; if it cannot complete, send the exact
++failure to an eligible participant or surface it to FnB. For an integrity
++threat, pause first, confirm the pause, then relay the evidence:
++
++```text
++sc sprint pause --sprint <id> --reason <integrity-threat>
++```
++
++After the pause succeeds, use the `send` command above for the evidence.
++
+ Revise only a still-planned lane; name its complete new projection so the
+ before/after event is reviewable. Cancel only an unreleased lane, with the
+ reason retained as its terminal result:
+@@ -4061,8 +4188,9 @@ outcomes move the Developer to fresh fix/merge conversations automatically;
+ the next work assignment returns it to the persistent lane.
+ 
+ When all planned delivery work is terminal and merged or explicitly no-code,
+-stop dispatching and invoke `sprint_close`. Do not fix close-out conformance
+-findings inside this Sprint.',
++re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message, confirm
++the final typed transition succeeded, stop dispatching, and invoke
++`sprint_close`. Do not fix close-out conformance findings inside this Sprint.',
+   0
+ )
+ ON CONFLICT(name) DO UPDATE SET
+@@ -4202,6 +4330,8 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
+ 
+ Use in one of two modes: a work-unit PR review during the loop, or the final
+ whole-Sprint conformance pass. The evidence differs; independence does not.
++On every wake or re-entry, load `sprint_rev`, run the exact inbox command below,
++and inspect the durable message before deciding what to do.
+ 
+ Read and accept the actionable request before beginning. During preparation,
+ sign the exact current spec revision through the same authenticated surface:
+@@ -4213,6 +4343,44 @@ sc sprint record-qaqc --document <spec-document-id> \
+   --verdict pass [--findings-document <document-id>]
+ ```
+ 
++Decline an actionable request you cannot take, with a concrete reason:
++
++```text
++sc sprint decline --sprint <id> --message <message-id> --reason <reason>
++```
++
++## Questions, answers, blockers, and failures
++
++Put a concrete question, answer, blocker, or useful context in a short body file
++and send it to the participant who can act. Ask the Developer for missing PR
++evidence and the Planner for scope or severity decisions:
++
++```text
++sc sprint send --sprint <id> --to <shortname> --body-file <path>
++```
++
++Answer incoming questions through `send` so the answer is durable and wakes the
++asker. A blocker names evidence, impact, and the exact action needed, and goes to
++the Planner plus any directly affected Developer. Continue independent safe
++review, but stop at a decision boundary when the answer is required. Do not send
++duplicate reminders; unread recovery owns re-waking.
++
++Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
++characters is the hard maximum. Before submitting, run `wc -m < <path>` and
++condense if needed. The handoff is complete only when the Sprint command exits
++successfully and confirms the durable write and wake where applicable.
++
++If a Sprint command is rejected or transport fails, the verdict or handoff is
++incomplete. Correct and retry when safe; if it cannot complete, relay the exact
++failure to the Planner. For an integrity threat, pause first, confirm it, and
++then relay the evidence:
++
++```text
++sc sprint pause --sprint <id> --reason <integrity-threat>
++```
++
++After the pause succeeds, use the `send` command above for the evidence.
++
+ ## Severity rubric
+ 
+ This skill owns severity. The governing spec intentionally does not.
+@@ -4247,6 +4415,10 @@ Findings must state:
+ 
+ Put the verdict body in a file and record it through the authenticated surface:
+ 
++Keep the verdict at about 6,000 characters or fewer; 8,000 is the hard maximum.
++Run `wc -m < <path>` before submission. The typed review handoff exists only
++after the command succeeds and confirms its durable write and Developer wake.
++
+ ```text
+ sc sprint record-review \
+   --sprint <id> --registered-pr <registered-id> \
+@@ -4287,6 +4459,11 @@ Write the narrative report and a JSON findings array:
+ 
+ Then record both atomically:
+ 
++Keep the conformance report and each finding body at about 6,000 characters or
++fewer; 8,000 is the hard maximum for each. Run `wc -m < <report>` and length-check
++each finding body before submission. Require the successful report and
++follow-up receipt before stopping.
++
+ ```text
+ sc sprint record-conformance \
+   --sprint <id> --body-file <report> --findings-file <json> \
+@@ -4301,8 +4478,9 @@ Surface immediate safety risk to the FnB, but preserve the close-out rule.
+ ## Stop
+ 
+ For unit review, stop after the durable verdict is recorded. For conformance,
+-stop after the report and all findings replay idempotently and give the Planner
+-their report/follow-up ids.',
++re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and stop
++after the report and all findings replay idempotently and give the Planner their
++report/follow-up ids.',
+   0
+ )
+ ON CONFLICT(name) DO UPDATE SET
+diff --git a/.super-coder/migrations/0153_harden_sprint_handoff_skills.sql b/.super-coder/migrations/0153_harden_sprint_handoff_skills.sql
+new file mode 100644
+index 00000000..cb993abd
+--- /dev/null
++++ b/.super-coder/migrations/0153_harden_sprint_handoff_skills.sql
+@@ -0,0 +1,352 @@
++-- 0153 — publish Sprint handoff contingencies and bounded-write guidance.
++--
++-- The baseline seed is regenerated from the assets for fresh installs. These
++-- targeted replacements advance existing databases whose 0001 migration has
++-- already been recorded, without disturbing fork-local skill catalogue rows.
++
++BEGIN;
++
++UPDATE skills SET content=replace(content,
++'been chosen. Close-out supplies meaning; the compiler supplies facts.
++
++## Delivery-complete gate',
++'been chosen. Close-out supplies meaning; the compiler supplies facts.
++On entry or any wake, load `sprint_close`, run `sc sprint inbox --sprint <id>`,
++inspect the durable message, and accept or decline it only when actionable.
++
++```text
++sc sprint accept --sprint <id> --message <message-id>
++sc sprint decline --sprint <id> --message <message-id> --reason <reason>
++```
++
++## Questions, answers, blockers, and failures
++
++Put a concrete question, answer, blocker, or context request in a short body
++file, then send it to the conformance Reviewer or participant who owns the fact:
++
++```text
++sc sprint send --sprint <id> --to <shortname> --body-file <path>
++```
++
++Answer incoming questions through `send`. For a blocker, send the evidence,
++impact, and exact action needed to the originating Planner/FnB and every directly
++affected participant. Continue safe synthesis, but stop at a decision boundary
++when the answer is required. Do not send duplicate reminders; unread recovery
++owns re-waking.
++
++Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
++characters is the hard maximum. Before submitting, run `wc -m < <path>` and
++condense if needed. The handoff is complete only when the Sprint command exits
++successfully and confirms the durable write and wake where applicable.
++
++If a Sprint command is rejected or transport fails, the write or handoff is
++incomplete. Correct and retry when safe; relay the exact failure if it cannot
++complete. For an integrity threat, pause first, confirm it, then send evidence:
++
++```text
++sc sprint pause --sprint <id> --reason <integrity-threat>
++```
++
++After the pause succeeds, use the `send` command above for the evidence.
++
++## Delivery-complete gate')
++WHERE name='sprint_close';
++
++UPDATE skills SET content=replace(content,
++'ship-as-is; `resolved` and `dismissed` require a resolution file.
++
++```text',
++'ship-as-is; `resolved` and `dismissed` require a resolution file.
++
++Keep a resolution at about 6,000 characters or fewer; 8,000 is the hard
++maximum. Run `wc -m < <path>` and require a successful durable disposition.
++
++```text')
++WHERE name='sprint_close';
++
++UPDATE skills SET content=replace(content,
++'evidence, reports, and follow-ups.
++
++```text',
++'evidence, reports, and follow-ups.
++
++Keep the final report at about 6,000 characters or fewer; 8,000 is the hard
++maximum. Run `wc -m < <path>` before the typed terminal handoff, then require
++the successful report receipt and lifecycle transition.
++
++```text')
++WHERE name='sprint_close';
++
++UPDATE skills SET content=replace(content,
++'links. Stop after the terminal transition; Sprint-scoped authority is over.',
++'links. Re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message,
++and stop after the terminal transition; Sprint-scoped authority is over.')
++WHERE name='sprint_close';
++
++UPDATE skills SET content=replace(content,
++'accept, decline with a concrete reason; never leave it unread and waking.
++
++```text',
++'accept, decline with a concrete reason; never leave it unread and waking.
++On every wake or re-entry, load `sprint_dev`, run the exact inbox command below,
++and inspect the durable message before deciding what to do.
++
++```text')
++WHERE name='sprint_dev';
++
++UPDATE skills SET content=replace(content,
++'growth to the Planner.
++
++## Build and verify',
++'growth to the Planner.
++
++## Questions, answers, blockers, and failures
++
++Write a concrete question, answer, blocker, or useful context to a short body
++file, then send it durably to the participant who can act:
++
++```text
++sc sprint send --sprint <id> --to <shortname> --body-file <path>
++```
++
++Ask the Planner about scope, priority, or cross-unit decisions; ask the assigned
++Reviewer about review evidence. Answer an incoming question through `send` so it
++wakes the asker. For a blocker, send evidence, impact, and the exact action
++needed to the Planner and any directly affected participant. Continue safe
++independent work, but stop at a decision boundary when the answer is required.
++No immediate response is not a reason to send duplicates: the durable message
++and recovery reconciler own re-waking.
++
++Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
++characters is the hard maximum. Before submitting, run `wc -m < <path>` and
++condense if needed. The handoff is complete only when the Sprint command exits
++successfully and confirms the durable write and wake where applicable.
++
++If a Sprint command is rejected or transport fails, the write or handoff is
++incomplete. Correct and retry when safe; if it still cannot complete, relay the
++problem to the Planner. For an integrity threat, pause first, confirm the pause,
++then send the evidence needed to resolve it:
++
++```text
++sc sprint pause --sprint <id> --reason <integrity-threat>
++```
++
++After the pause succeeds, use the `send` command above for the evidence.
++
++## Build and verify')
++WHERE name='sprint_dev';
++
++UPDATE skills SET content=replace(content,
++'after merge authorization and observation.
++
++```text
++sc sprint complete-unit',
++'after merge authorization and observation.
++
++Keep the result at about 6,000 characters or fewer; 8,000 is the hard maximum.
++Run `wc -m < <path>` before submitting, then require a successful command and
++durable completion receipt.
++
++```text
++sc sprint complete-unit')
++WHERE name='sprint_dev';
++
++UPDATE skills SET content=replace(content,
++'Put the readiness claim in a file, then use one stable retry key:
++
++```text',
++'Put the readiness claim in a file, then use one stable retry key:
++
++Keep the readiness claim at about 6,000 characters or fewer; 8,000 is the hard
++maximum. Run `wc -m < <path>` and condense before the typed handoff. The handoff
++exists only after the command succeeds and confirms its durable write and wake.
++
++```text')
++WHERE name='sprint_dev';
++
++UPDATE skills SET content=replace(content,
++'or returned to review. Ask the Planner for later work only after the current
++editing lane is terminal.',
++'or returned to review. Before stopping, re-run `sc sprint inbox --sprint <id>`,
++act on any newly arrived message, and confirm the final typed handoff succeeded.
++Ask the Planner for later work only after the current editing lane is terminal.')
++WHERE name='sprint_dev';
++
++UPDATE skills SET content=replace(content,
++'captures deterministic facts; you decide scope, sequencing, and recovery.
++
++## Start from durable state',
++'captures deterministic facts; you decide scope, sequencing, and recovery.
++On every wake or re-entry, load `sprint_pln`, run the exact inbox command below,
++and inspect the durable message before deciding what to do.
++
++## Start from durable state')
++WHERE name='sprint_pln';
++
++UPDATE skills SET content=replace(content,
++'sc sprint accept --sprint <id> --message <message-id>
++```',
++'sc sprint accept --sprint <id> --message <message-id>
++sc sprint decline --sprint <id> --message <message-id> --reason <reason>
++```')
++WHERE name='sprint_pln';
++
++UPDATE skills SET content=replace(content,
++'lanes and stable assignment generations prevent double booking.
++
++## Running loop',
++'lanes and stable assignment generations prevent double booking.
++
++Accept or decline only when the inbox item is actionable. Informational
++questions, answers, blockers, and evidence remain unread until you inspect them;
++reading them does not invent a work-unit transition.
++
++## Running loop')
++WHERE name='sprint_pln';
++
++UPDATE skills SET content=replace(content,
++'expectations and its nudge/escalation identities are durable.
++
++Revise only a still-planned lane',
++'expectations and its nudge/escalation identities are durable.
++
++## Questions, answers, blockers, and failures
++
++Put a concrete question, answer, decision, blocker, or useful context in a short
++body file and address the participant who owns the needed fact or action:
++
++```text
++sc sprint send --sprint <id> --to <shortname> --body-file <path>
++```
++
++Answer incoming questions through `send` so the answer is durable and wakes the
++asker. For a cross-unit blocker, send evidence, impact, and the exact action
++needed to every directly affected participant. Continue safe independent
++governance, but stop at a decision boundary when an answer is required. Do not
++spam duplicates when no response is immediate; unread recovery owns re-waking.
++
++Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
++characters is the hard maximum. Before submitting, run `wc -m < <path>` and
++condense if needed. The handoff is complete only when the Sprint command exits
++successfully and confirms the durable write and wake where applicable.
++
++If a Sprint command is rejected or transport fails, the write or handoff is
++incomplete. Correct and retry when safe; if it cannot complete, send the exact
++failure to an eligible participant or surface it to FnB. For an integrity
++threat, pause first, confirm the pause, then relay the evidence:
++
++```text
++sc sprint pause --sprint <id> --reason <integrity-threat>
++```
++
++After the pause succeeds, use the `send` command above for the evidence.
++
++Revise only a still-planned lane')
++WHERE name='sprint_pln';
++
++UPDATE skills SET content=replace(content,
++'stop dispatching and invoke `sprint_close`. Do not fix close-out conformance
++findings inside this Sprint.',
++'re-run `sc sprint inbox --sprint <id>`, act on any newly arrived message, confirm
++the final typed transition succeeded, stop dispatching, and invoke
++`sprint_close`. Do not fix close-out conformance findings inside this Sprint.')
++WHERE name='sprint_pln';
++
++UPDATE skills SET content=replace(content,
++'whole-Sprint conformance pass. The evidence differs; independence does not.
++
++Read and accept',
++'whole-Sprint conformance pass. The evidence differs; independence does not.
++On every wake or re-entry, load `sprint_rev`, run the exact inbox command below,
++and inspect the durable message before deciding what to do.
++
++Read and accept')
++WHERE name='sprint_rev';
++
++UPDATE skills SET content=replace(content,
++'  --verdict pass [--findings-document <document-id>]
++```
++
++## Severity rubric',
++'  --verdict pass [--findings-document <document-id>]
++```
++
++Decline an actionable request you cannot take, with a concrete reason:
++
++```text
++sc sprint decline --sprint <id> --message <message-id> --reason <reason>
++```
++
++## Questions, answers, blockers, and failures
++
++Put a concrete question, answer, blocker, or useful context in a short body file
++and send it to the participant who can act. Ask the Developer for missing PR
++evidence and the Planner for scope or severity decisions:
++
++```text
++sc sprint send --sprint <id> --to <shortname> --body-file <path>
++```
++
++Answer incoming questions through `send` so the answer is durable and wakes the
++asker. A blocker names evidence, impact, and the exact action needed, and goes to
++the Planner plus any directly affected Developer. Continue independent safe
++review, but stop at a decision boundary when the answer is required. Do not send
++duplicate reminders; unread recovery owns re-waking.
++
++Keep this Sprint message or result at about 6,000 characters or fewer; 8,000
++characters is the hard maximum. Before submitting, run `wc -m < <path>` and
++condense if needed. The handoff is complete only when the Sprint command exits
++successfully and confirms the durable write and wake where applicable.
++
++If a Sprint command is rejected or transport fails, the verdict or handoff is
++incomplete. Correct and retry when safe; if it cannot complete, relay the exact
++failure to the Planner. For an integrity threat, pause first, confirm it, and
++then relay the evidence:
++
++```text
++sc sprint pause --sprint <id> --reason <integrity-threat>
++```
++
++After the pause succeeds, use the `send` command above for the evidence.
++
++## Severity rubric')
++WHERE name='sprint_rev';
++
++UPDATE skills SET content=replace(content,
++'Put the verdict body in a file and record it through the authenticated surface:
++
++```text',
++'Put the verdict body in a file and record it through the authenticated surface:
++
++Keep the verdict at about 6,000 characters or fewer; 8,000 is the hard maximum.
++Run `wc -m < <path>` before submission. The typed review handoff exists only
++after the command succeeds and confirms its durable write and Developer wake.
++
++```text')
++WHERE name='sprint_rev';
++
++UPDATE skills SET content=replace(content,
++'Then record both atomically:
++
++```text',
++'Then record both atomically:
++
++Keep the conformance report and each finding body at about 6,000 characters or
++fewer; 8,000 is the hard maximum for each. Run `wc -m < <report>` and length-check
++each finding body before submission. Require the successful report and
++follow-up receipt before stopping.
++
++```text')
++WHERE name='sprint_rev';
++
++UPDATE skills SET content=replace(content,
++'For unit review, stop after the durable verdict is recorded. For conformance,
++stop after the report and all findings replay idempotently and give the Planner
++their report/follow-up ids.',
++'For unit review, stop after the durable verdict is recorded. For conformance,
++re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and stop
++after the report and all findings replay idempotently and give the Planner their
++report/follow-up ids.')
++WHERE name='sprint_rev';
++
++COMMIT;
+diff --git a/.super-coder/scripts/callable_floor.py b/.super-coder/scripts/callable_floor.py
+new file mode 100644
+index 00000000..3f6718fc
+--- /dev/null
++++ b/.super-coder/scripts/callable_floor.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++"""Verify that the fork dispatcher and materialized engine are callable together."""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import re
++import subprocess
++from pathlib import Path
++
++
++_SCRIPT_REF_RE = re.compile(r'"\$S/([^"$]+)"')
++_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
++
++
++def read_engine_ref(repo_root: Path) -> str | None:
++    try:
++        value = (repo_root / ".sc-state" / "engine.ref").read_text().strip()
++    except OSError:
++        return None
++    return value if _SHA_RE.fullmatch(value) else None
++
++
++def _sha256(data: bytes) -> str:
++    return hashlib.sha256(data).hexdigest()
++
++
++def _dispatcher_at_ref(repo_root: Path, ref: str) -> bytes | None:
++    result = subprocess.run(
++        ["git", "-C", str(repo_root), "show", f"{ref}:sc"],
++        capture_output=True,
++        check=False,
++    )
++    return result.stdout if result.returncode == 0 else None
++
++
++def _manifest_dispatcher_hash(repo_root: Path) -> str | None:
++    path = repo_root / ".super-coder" / "engine.manifest"
++    try:
++        manifest = json.loads(path.read_text())
++    except (OSError, json.JSONDecodeError):
++        return None
++    digest = manifest.get("sc") if isinstance(manifest, dict) else None
++    return digest if isinstance(digest, str) else None
++
++
++def inspect_callable_floor(
++    repo_root: Path,
++    *,
++    expected_ref: str | None,
++    allow_unpinned: bool = False,
++) -> tuple[str, ...]:
++    """Return every dispatcher/engine mismatch without changing the floor."""
++    dispatcher = repo_root / "sc"
++    try:
++        dispatcher_bytes = dispatcher.read_bytes()
++    except OSError:
++        return (f"dispatcher is missing or unreadable: {dispatcher}",)
++
++    issues: list[str] = []
++    if dispatcher_bytes.startswith(b"#!") and not os.access(dispatcher, os.X_OK):
++        issues.append(f"dispatcher is not executable: {dispatcher}")
++
++    if expected_ref is None:
++        if not allow_unpinned:
++            issues.append(".sc-state/engine.ref is missing or empty")
++    else:
++        target_dispatcher = _dispatcher_at_ref(repo_root, expected_ref)
++        if target_dispatcher is not None:
++            if dispatcher_bytes != target_dispatcher:
++                issues.append(
++                    f"dispatcher does not match engine ref {expected_ref[:12]}"
++                )
++        else:
++            expected_hash = _manifest_dispatcher_hash(repo_root)
++            if expected_hash is None:
++                issues.append(
++                    f"engine ref {expected_ref[:12]} is unavailable locally and "
++                    "the materialized manifest has no dispatcher hash"
++                )
++            elif _sha256(dispatcher_bytes) != expected_hash:
++                issues.append(
++                    f"dispatcher does not match the materialized manifest for "
++                    f"engine ref {expected_ref[:12]}"
++                )
++
++    text = dispatcher_bytes.decode(errors="replace")
++    missing = sorted(
++        {
++            script
++            for script in _SCRIPT_REF_RE.findall(text)
++            if not (repo_root / ".super-coder" / "scripts" / script).is_file()
++        }
++    )
++    if missing:
++        issues.append(
++            "dispatcher routes to missing engine script(s): " + ", ".join(missing)
++        )
++    return tuple(issues)
++
++
++def require_callable_floor(
++    repo_root: Path,
++    *,
++    expected_ref: str | None,
++    allow_unpinned: bool = False,
++    context: str,
++) -> None:
++    issues = inspect_callable_floor(
++        repo_root,
++        expected_ref=expected_ref,
++        allow_unpinned=allow_unpinned,
++    )
++    if not issues:
++        return
++    detail = "\n".join(f"  - {issue}" for issue in issues)
++    raise SystemExit(
++        f"{context}: callable dispatcher/engine floor mismatch:\n{detail}\n"
++        "  supported repair: run the update from the main checkout:\n"
++        f"    cd {repo_root} && ./sc update"
++    )
+diff --git a/.super-coder/scripts/install.py b/.super-coder/scripts/install.py
+index a88d1ea9..61deb917 100644
+--- a/.super-coder/scripts/install.py
++++ b/.super-coder/scripts/install.py
+@@ -50,6 +50,7 @@
+ IS_MAC = platform.system() == "Darwin"  # guidance arms differ (colima/brew vs systemd/apt)
+ 
+ sys.path.insert(0, str(ENGINE / "scripts"))
++import callable_floor  # noqa: E402
+ import engine_manifest  # noqa: E402
+ import ports as ports_mod  # noqa: E402
+ 
+@@ -763,6 +764,12 @@ def main(argv: list[str]) -> int:
+     # to silently overwrite) any local edit to an engine file.
+     n = engine_manifest.write_manifest(engine_manifest.ENGINE_PATHS)
+     print(f"  engine manifest written ({n} files) — local engine edits now detected on update")
++    callable_floor.require_callable_floor(
++        REPO_ROOT,
++        expected_ref=pinned,
++        allow_unpinned=pinned is None,
++        context="install",
++    )
+ 
+     # 3.6 Create the shared scratch / handoff dir -----------------------------
+     # A host-repo dir for screenshots, drafts, quick handoffs. The CONNECTIONS
+diff --git a/.super-coder/scripts/rollback.py b/.super-coder/scripts/rollback.py
+index c695f411..6a57c781 100644
+--- a/.super-coder/scripts/rollback.py
++++ b/.super-coder/scripts/rollback.py
+@@ -39,6 +39,7 @@
+ 
+ sys.path.insert(0, str(ENGINE / "scripts"))
+ import db_backup as db_backup_mod  # noqa: E402
++import callable_floor  # noqa: E402
+ import engine_manifest  # noqa: E402
+ import rebuild as rebuild_mod  # noqa: E402  (BACKUP_DIR, backup_db, prune_backups, KEEP_BACKUPS)
+ import update as update_mod    # noqa: E402  (materialize_engine, super_coder_remote, git)
+@@ -147,6 +148,11 @@ def restore_engine(prev_sha: str) -> None:
+             prev_sha,
+             engine_paths=previous_materialize_paths,
+         )
++    callable_floor.require_callable_floor(
++        REPO_ROOT,
++        expected_ref=prev_sha,
++        context="rollback",
++    )
+     ENGINE_REF.write_text(prev_sha + "\n")
+     # Re-baseline the hash manifest at the restored engine — without this, the
+     # next update would read every rolled-back file as a "local edit" and block.
+diff --git a/.super-coder/scripts/run.py b/.super-coder/scripts/run.py
+index 73403b6f..9e7d4326 100644
+--- a/.super-coder/scripts/run.py
++++ b/.super-coder/scripts/run.py
+@@ -52,6 +52,7 @@
+ 
+ sys.path.insert(0, str(ENGINE / "scripts"))
+ import artifact_policy  # noqa: E402
++import callable_floor  # noqa: E402
+ import db_driver  # noqa: E402
+ import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
+ import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
+@@ -1218,6 +1219,33 @@ def review_gui_panel(api_port: int, has_key: bool) -> str:
+ 
+ 
+ def main() -> None:
++    source_repo = install.is_source_repo()
++    tracked_engine = subprocess.run(
++        [
++            "git",
++            "-C",
++            str(REPO_ROOT),
++            "ls-files",
++            "--error-unmatch",
++            ".super-coder/scripts/run.py",
++        ],
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.DEVNULL,
++        check=False,
++    ).returncode == 0
++    owns_engine = (
++        source_repo
++        or tracked_engine
++        or (REPO_ROOT / ".sc-state" / "ejected").is_file()
++    )
++    callable_floor.require_callable_floor(
++        REPO_ROOT,
++        expected_ref=(
++            None if owns_engine else callable_floor.read_engine_ref(REPO_ROOT)
++        ),
++        allow_unpinned=owns_engine,
++        context="session launch",
++    )
+     args = sys.argv[1:]
+     first = "--first" in args
+     headless = "--headless" in args
+diff --git a/.super-coder/scripts/sprint_cli.py b/.super-coder/scripts/sprint_cli.py
+index 1d1ccc6b..e27c6a0b 100755
+--- a/.super-coder/scripts/sprint_cli.py
++++ b/.super-coder/scripts/sprint_cli.py
+@@ -6,10 +6,16 @@
+ import argparse
+ import json
+ import sys
++import uuid
+ from pathlib import Path
+ 
+ import mem
+ 
++PAYLOAD_FILE_HELP = "text file; hard maximum 8,000 characters"
++FINDINGS_FILE_HELP = (
++    "JSON array; each finding body has a hard maximum of 8,000 characters"
++)
++
+ 
+ def _text(path: str, name: str) -> str:
+     if path == "-":
+@@ -116,6 +122,21 @@ def cmd_inbox(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def cmd_send(args: argparse.Namespace) -> int:
++    result = _post(
++        "/_sc/sprint/send",
++        {
++            "sprint_id": args.sprint,
++            "to": args.to,
++            "body": _text(args.body_file, "message body"),
++            "idempotency_key": "participant-send:" + uuid.uuid4().hex,
++        },
++        idempotent=True,
++    )
++    print(json.dumps(result, indent=2, sort_keys=True))
++    return 0
++
++
+ def cmd_accept(args: argparse.Namespace) -> int:
+     result = _post(
+         "/_sc/sprint/inbox-read",
+@@ -408,6 +429,14 @@ def build_parser() -> argparse.ArgumentParser:
+     inbox.add_argument("--sprint", type=int, required=True)
+     inbox.set_defaults(fn=cmd_inbox)
+ 
++    send = sub.add_parser(
++        "send", help="Send one freeform message to another Sprint participant"
++    )
++    send.add_argument("--sprint", type=int, required=True)
++    send.add_argument("--to", required=True, help="recipient shell shortname")
++    send.add_argument("--body-file", required=True, help=PAYLOAD_FILE_HELP)
++    send.set_defaults(fn=cmd_send)
++
+     accept = sub.add_parser(
+         "accept", help="Mark one Sprint message read and accept actionable work"
+     )
+@@ -428,7 +457,9 @@ def build_parser() -> argparse.ArgumentParser:
+     )
+     complete_unit.add_argument("--sprint", type=int, required=True)
+     complete_unit.add_argument("--work-unit", type=int, required=True)
+-    complete_unit.add_argument("--result-file", required=True)
++    complete_unit.add_argument(
++        "--result-file", required=True, help=PAYLOAD_FILE_HELP
++    )
+     complete_unit.set_defaults(fn=cmd_complete_unit)
+ 
+     cancel_unit = sub.add_parser(
+@@ -462,7 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
+     complete.add_argument("--sprint", type=int, required=True)
+     complete.add_argument("--reason", required=True)
+     complete.add_argument("--outcome", required=True)
+-    complete.add_argument("--report-file")
++    complete.add_argument("--report-file", help=PAYLOAD_FILE_HELP)
+     complete.add_argument("--key", help="stable final-report retry identity")
+     complete.set_defaults(fn=cmd_complete)
+ 
+@@ -479,7 +510,9 @@ def build_parser() -> argparse.ArgumentParser:
+     )
+     request.add_argument("--sprint", type=int, required=True)
+     request.add_argument("--registered-pr", type=int, required=True)
+-    request.add_argument("--readiness-file", required=True)
++    request.add_argument(
++        "--readiness-file", required=True, help=PAYLOAD_FILE_HELP
++    )
+     request.add_argument("--key", required=True, help="stable retry identity")
+     request.set_defaults(fn=cmd_request_review)
+ 
+@@ -489,7 +522,7 @@ def build_parser() -> argparse.ArgumentParser:
+     record.add_argument(
+         "--verdict", required=True, choices=("changes_requested", "approved")
+     )
+-    record.add_argument("--body-file", required=True)
++    record.add_argument("--body-file", required=True, help=PAYLOAD_FILE_HELP)
+     record.add_argument("--key", required=True, help="stable retry identity")
+     record.set_defaults(fn=cmd_record_review)
+ 
+@@ -512,8 +545,12 @@ def build_parser() -> argparse.ArgumentParser:
+         "record-conformance", help="Reviewer records a report and follow-ups"
+     )
+     conformance.add_argument("--sprint", type=int, required=True)
+-    conformance.add_argument("--body-file", required=True)
+-    conformance.add_argument("--findings-file", required=True)
++    conformance.add_argument(
++        "--body-file", required=True, help=PAYLOAD_FILE_HELP
++    )
++    conformance.add_argument(
++        "--findings-file", required=True, help=FINDINGS_FILE_HELP
++    )
+     conformance.add_argument("--key", required=True, help="stable retry identity")
+     conformance.set_defaults(fn=cmd_record_conformance)
+ 
+@@ -527,7 +564,7 @@ def build_parser() -> argparse.ArgumentParser:
+         choices=("accepted", "resolved", "dismissed"),
+         required=True,
+     )
+-    followup.add_argument("--resolution-file")
++    followup.add_argument("--resolution-file", help=PAYLOAD_FILE_HELP)
+     followup.set_defaults(fn=cmd_disposition_followup)
+ 
+     report = sub.add_parser(
+diff --git a/.super-coder/scripts/sprint_close.py b/.super-coder/scripts/sprint_close.py
+index 62d67dca..bf737d17 100644
+--- a/.super-coder/scripts/sprint_close.py
++++ b/.super-coder/scripts/sprint_close.py
+@@ -183,7 +183,10 @@ def disposition_followup(
+         if disposition in {"resolved", "dismissed"} and not normalized_resolution:
+             raise ValueError(f"{disposition} follow-ups require a resolution")
+         if len(normalized_resolution) > 8000:
+-            raise ValueError("follow-up resolution exceeds 8000 characters")
++            raise ValueError(
++                f"follow-up resolution is {len(normalized_resolution)} characters; "
++                "maximum is 8000"
++            )
+         with db_driver.write_transaction(self.con, "sprint.followup.disposition"):
+             caller = self.con.execute(
+                 "SELECT flavor FROM shells WHERE shell_id=? "
+@@ -694,7 +697,9 @@ def _required(value: str, name: str, maximum: int = 8000) -> str:
+         if not value:
+             raise ValueError(f"{name} is required")
+         if len(value) > maximum:
+-            raise ValueError(f"{name} exceeds {maximum} characters")
++            raise ValueError(
++                f"{name} is {len(value)} characters; maximum is {maximum}"
++            )
+         return value
+ 
+     @staticmethod
+diff --git a/.super-coder/scripts/sprint_domain.py b/.super-coder/scripts/sprint_domain.py
+index 9f6ff2e5..54e65361 100644
+--- a/.super-coder/scripts/sprint_domain.py
++++ b/.super-coder/scripts/sprint_domain.py
+@@ -389,7 +389,10 @@ def resume(
+             )
+             if reconcile_in_transaction is not None:
+                 reconcile_in_transaction(self.con)
+-            requeued = self._requeue_failed_wakes_in_transaction(sprint_id)
++            requeued = self._reconcile_unread_wakes_in_transaction(
++                sprint_id,
++                trigger="resume",
++            )
+             projected, resolved = self._reconcile_registered_prs_in_transaction(
+                 sprint_id
+             )
+@@ -417,7 +420,7 @@ def resume(
+                     sprint_id,
+                     body=(
+                         f"Sprint {sprint_id} resumed with reconciliation evidence: "
+-                        f"{len(requeued)} failed wake(s) re-queued, "
++                        f"{len(requeued)} unread wake(s) repaired, "
+                         f"{len(drift)} spec drift item(s), "
+                         f"{len(all_anomalies)} anomaly item(s)."
+                     ),
+@@ -641,6 +644,10 @@ def recover_on_startup(
+                             sprint_id
+                         )
+                     else:
++                        self._reconcile_unread_wakes_in_transaction(
++                            sprint_id,
++                            trigger="startup",
++                        )
+                         self._reconcile_registered_prs_in_transaction(sprint_id)
+             if run_ids or conversations:
+                 self._signal_interrupts_and_notifications(
+@@ -649,6 +656,23 @@ def recover_on_startup(
+             recovered.append((sprint_id, lifecycle))
+         return tuple(recovered)
+ 
++    def reconcile_unread_pickup(
++        self,
++        sprint_id: int,
++        *,
++        trigger: str = "pulse",
++    ) -> tuple[int, ...]:
++        """Repair terminal wake delivery that left relevant messages unread."""
++        trigger = self._required_text(trigger, "pickup recovery trigger", 64)
++        with db_driver.write_transaction(self.con, "sprint.wake.pickup_recover"):
++            sprint = self._sprint(sprint_id)
++            if sprint["lifecycle"] != "armed":
++                return ()
++            return self._reconcile_unread_wakes_in_transaction(
++                sprint_id,
++                trigger=trigger,
++            )
++
+     def _pause_in_transaction(
+         self,
+         sprint: sqlite3.Row,
+@@ -898,15 +922,22 @@ def _reconcile_registered_prs_in_transaction(
+                     )
+         return tuple(sorted(set(projected))), tuple(sorted(set(resolved)))
+ 
+-    def _requeue_failed_wakes_in_transaction(self, sprint_id: int) -> tuple[int, ...]:
++    def _reconcile_unread_wakes_in_transaction(
++        self,
++        sprint_id: int,
++        *,
++        trigger: str,
++    ) -> tuple[int, ...]:
+         if not self.con.in_transaction:
+             raise RuntimeError("wake reconciliation requires an active transaction")
+         rows = self.con.execute(
+-            "SELECT DISTINCT w.wake_id,w.participant_id FROM sprint_wake_outbox w "
++            "SELECT DISTINCT w.wake_id,w.participant_id,w.state,w.idempotency_key "
++            "FROM sprint_wake_outbox w "
+             "JOIN sprint_wake_messages wm ON wm.sprint_id=w.sprint_id "
+             "AND wm.wake_id=w.wake_id JOIN sprint_messages m "
+             "ON m.sprint_id=wm.sprint_id AND m.message_id=wm.message_id "
+-            "WHERE w.sprint_id=? AND w.state='failed' AND m.read_at IS NULL "
++            "WHERE w.sprint_id=? AND w.state IN ('failed','delivered') "
++            "AND m.read_at IS NULL "
+             "ORDER BY w.wake_id",
+             (sprint_id,),
+         ).fetchall()
+@@ -914,42 +945,134 @@ def _requeue_failed_wakes_in_transaction(self, sprint_id: int) -> tuple[int, ...
+         for row in rows:
+             old_wake_id = int(row["wake_id"])
+             participant_id = int(row["participant_id"])
+-            pending = self.con.execute(
++            wake_key = str(row["idempotency_key"])
++            if wake_key.startswith("sprint-recovery:") or ":failed-wake:" in wake_key:
++                continue
++            turn = self._wake_turn_evidence(old_wake_id)
++            if self._participant_has_pickup_turn(participant_id):
++                continue
++            deliverable = self.con.execute(
+                 "SELECT wake_id FROM sprint_wake_outbox WHERE sprint_id=? "
+-                "AND participant_id=? AND state='pending'",
++                "AND participant_id=? AND state IN ('pending','delivering') "
++                "ORDER BY wake_id LIMIT 1",
+                 (sprint_id, participant_id),
+             ).fetchone()
+-            if pending is None:
++            recovery_key = (
++                f"sprint-resume:{sprint_id}:failed-wake:{old_wake_id}"
++                if row["state"] == "failed"
++                else f"sprint-recovery:{sprint_id}:delivered-unread:{old_wake_id}"
++            )
++            if deliverable is None:
++                prior_recovery = self.con.execute(
++                    "SELECT wake_id,state FROM sprint_wake_outbox "
++                    "WHERE idempotency_key=?",
++                    (recovery_key,),
++                ).fetchone()
++                if prior_recovery is not None:
++                    if prior_recovery["state"] not in {"pending", "delivering"}:
++                        continue
++                    deliverable = prior_recovery
++            created = deliverable is None
++            if created:
+                 new_wake_id = int(
+                     self.con.execute(
+                         "INSERT INTO sprint_wake_outbox "
+                         "(sprint_id,participant_id,idempotency_key) VALUES (?,?,?)",
+-                        (
+-                            sprint_id,
+-                            participant_id,
+-                            f"sprint-resume:{sprint_id}:failed-wake:{old_wake_id}",
+-                        ),
++                        (sprint_id, participant_id, recovery_key),
+                     ).lastrowid
+                 )
+             else:
+-                new_wake_id = int(pending["wake_id"])
++                new_wake_id = int(deliverable["wake_id"])
+             self.con.execute(
+                 "UPDATE sprint_wake_messages SET wake_id=? "
+                 "WHERE sprint_id=? AND wake_id=?",
+                 (new_wake_id, sprint_id, old_wake_id),
+             )
++            route = sprint_participant_chats.ensure_wake_conversation(
++                self.con,
++                participant_id,
++                idempotency_key=(
++                    f"sprint:{sprint_id}:wake:{new_wake_id}:conversation"
++                ),
++            )
+             self._event(
+                 sprint_id,
+                 "wake.requeued",
+                 LifecycleActor("system"),
+                 {
+-                    "failed_wake_id": old_wake_id,
++                    "trigger": trigger,
++                    "prior_wake_id": old_wake_id,
++                    "prior_wake_state": str(row["state"]),
++                    "prior_turn_state": turn,
+                     "replacement_wake_id": new_wake_id,
++                    "replacement_created": created,
++                    "replacement_conversation_id": route.conversation_id,
++                    **(
++                        {"failed_wake_id": old_wake_id}
++                        if row["state"] == "failed"
++                        else {}
++                    ),
+                 },
+             )
+             replacements.append(new_wake_id)
+         return tuple(sorted(set(replacements)))
+ 
++    def _participant_has_pickup_turn(self, participant_id: int) -> bool:
++        return self.con.execute(
++            "SELECT 1 FROM sprint_participant_conversations pc "
++            "JOIN conversation_messages m "
++            "ON m.conversation_id=pc.conversation_id "
++            "WHERE pc.sprint_participant_id=? "
++            "AND (m.state='queued' OR (m.state='running' AND EXISTS ("
++            "SELECT 1 FROM conversation_runs r WHERE r.trigger_message_id=m.message_id "
++            "AND r.state IN ('leased','starting','running') AND NOT EXISTS ("
++            "SELECT 1 FROM conversation_events e WHERE e.run_id=r.run_id "
++            "AND e.event_type='run.interrupt.requested')))) LIMIT 1",
++            (participant_id,),
++        ).fetchone() is not None
++
++    def _wake_turn_evidence(self, wake_id: int) -> dict[str, str | int | None]:
++        wake = self.con.execute(
++            "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
++            (wake_id,),
++        ).fetchone()
++        attempt = self.con.execute(
++            "SELECT attempt_number,target_conversation_id,native_run_ref,outcome "
++            "FROM sprint_wake_attempts WHERE wake_id=? "
++            "ORDER BY attempt_number DESC LIMIT 1",
++            (wake_id,),
++        ).fetchone()
++        if wake is None or attempt is None:
++            return {
++                "attempt_number": None,
++                "target_conversation_id": None,
++                "native_run_ref": None,
++                "attempt_outcome": None,
++                "message_state": None,
++                "run_state": None,
++            }
++        message = self.con.execute(
++            "SELECT message_id,state FROM conversation_messages "
++            "WHERE conversation_id=? AND idempotency_key=?",
++            (attempt["target_conversation_id"], wake["idempotency_key"]),
++        ).fetchone()
++        run_state = None
++        if message is not None:
++            run = self.con.execute(
++                "SELECT state FROM conversation_runs WHERE trigger_message_id=? "
++                "ORDER BY attempt DESC LIMIT 1",
++                (message["message_id"],),
++            ).fetchone()
++            run_state = str(run["state"]) if run is not None else None
++        return {
++            "attempt_number": int(attempt["attempt_number"]),
++            "target_conversation_id": attempt["target_conversation_id"],
++            "native_run_ref": attempt["native_run_ref"],
++            "attempt_outcome": str(attempt["outcome"]),
++            "message_state": str(message["state"]) if message is not None else None,
++            "run_state": run_state,
++        }
++
+     def _resolve_review_expectations_in_transaction(
+         self, work_unit_id: int, resolution: str
+     ) -> tuple[int, ...]:
+@@ -1143,7 +1266,7 @@ def _queue_planner_notice(
+         ).fetchone()
+         if conversation is None or conversation["state"] == "closed":
+             return message_id, ()
+-        prompt = f"{body}\n\nCheck the Sprint inbox and recovery evidence."
++        prompt = sprint_participant_chats.wake_prompt(sprint_id, "planner")
+         prompt_key = f"{idempotency_key}:planner-conversation"
+         queued = self.con.execute(
+             "SELECT message_id FROM conversation_messages "
+@@ -1642,7 +1765,10 @@ def complete(
+         if not result:
+             raise ValueError("work-unit completion result is required")
+         if len(result) > 8000:
+-            raise ValueError("work-unit completion result exceeds 8000 characters")
++            raise ValueError(
++                f"work-unit completion result is {len(result)} characters; "
++                "maximum is 8000"
++            )
+         with db_driver.write_transaction(self.con, "sprint.work_unit.complete"):
+             unit = self._unit(sprint_id, work_unit_id)
+             if int(unit["assigned_shell_id"]) != shell_id:
+diff --git a/.super-coder/scripts/sprint_message_delivery.py b/.super-coder/scripts/sprint_message_delivery.py
+index 8096d0b0..9b5cdd57 100644
+--- a/.super-coder/scripts/sprint_message_delivery.py
++++ b/.super-coder/scripts/sprint_message_delivery.py
+@@ -15,12 +15,11 @@
+ from datetime import datetime, timedelta, timezone
+ 
+ import db_driver
++import sprint_participant_chats
+ from sprint_domain import SprintInvariantError, SprintLifecycleStore
+ 
+-FIXED_WAKE_PROMPT = (
+-    "Check your inbox. If you accept the task(s), mark the message as read "
+-    "and act on the message using your assigned sprint skill."
+-)
++wake_prompt = sprint_participant_chats.wake_prompt
++
+ ACTIONABLE_KINDS = frozenset({"work_assignment", "review_request"})
+ 
+ 
+@@ -31,11 +30,21 @@ class MessageReceipt:
+     created: bool
+ 
+ 
++@dataclass(frozen=True)
++class ParticipantRelayReceipt:
++    message_id: int
++    wake_id: int
++    message_created: bool
++    wake_state: str
++    conversation_id: str
++
++
+ @dataclass(frozen=True)
+ class WakeLease:
+     wake_id: int
+     sprint_id: int
+     participant_id: int
++    participant_role: str
+     target_conversation_id: str | None
+     idempotency_key: str
+     attempt_number: int
+@@ -96,6 +105,73 @@ def send(
+                 active=active,
+             )
+ 
++    def relay(
++        self,
++        sprint_id: int,
++        *,
++        from_shell_id: int,
++        to_shortname: str,
++        body: str,
++        idempotency_key: str,
++    ) -> ParticipantRelayReceipt:
++        body = body.strip()
++        to_shortname = to_shortname.strip()
++        if not body:
++            raise ValueError("Sprint message body is empty")
++        if len(body) > 8000:
++            raise ValueError(
++                f"Sprint message body is {len(body)} characters; maximum is 8000"
++            )
++        if not to_shortname:
++            raise ValueError("Sprint recipient shortname is empty")
++        with db_driver.write_transaction(self.con, "sprint.message.relay"):
++            sender = self.con.execute(
++                "SELECT participant_id FROM sprint_participants "
++                "WHERE sprint_id=? AND shell_id=?",
++                (sprint_id, from_shell_id),
++            ).fetchone()
++            if sender is None:
++                raise SprintInvariantError("sender is not a Sprint participant")
++            recipient = self.con.execute(
++                "SELECT p.participant_id FROM sprint_participants p "
++                "JOIN shells sh ON sh.shell_id=p.shell_id "
++                "WHERE p.sprint_id=? AND lower(sh.shortname)=lower(?)",
++                (sprint_id, to_shortname),
++            ).fetchone()
++            if recipient is None:
++                raise SprintInvariantError("recipient is not a Sprint participant")
++            if int(recipient["participant_id"]) == int(sender["participant_id"]):
++                raise SprintInvariantError("Sprint participants cannot relay to self")
++            receipt = self._send(
++                sprint_id,
++                to_participant_id=int(recipient["participant_id"]),
++                message_kind="notification",
++                body=body,
++                idempotency_key=idempotency_key,
++                from_participant_id=int(sender["participant_id"]),
++                work_unit_id=None,
++                actionable=False,
++                active=True,
++            )
++            wake = self.con.execute(
++                "SELECT state FROM sprint_wake_outbox WHERE wake_id=?",
++                (receipt.wake_id,),
++            ).fetchone()
++            route = self.con.execute(
++                "SELECT current_conversation_id FROM sprint_participants "
++                "WHERE participant_id=?",
++                (recipient["participant_id"],),
++            ).fetchone()
++            if wake is None or route is None or route["current_conversation_id"] is None:
++                raise SprintInvariantError("Sprint relay did not produce a deliverable wake")
++            return ParticipantRelayReceipt(
++                message_id=receipt.message_id,
++                wake_id=int(receipt.wake_id),
++                message_created=receipt.created,
++                wake_state=str(wake["state"]),
++                conversation_id=str(route["current_conversation_id"]),
++            )
++
+     def send_in_transaction(
+         self,
+         sprint_id: int,
+@@ -407,6 +483,11 @@ def _coalesce_wake(
+             "VALUES (?,?,?)",
+             (sprint_id, wake_id, message_id),
+         )
++        sprint_participant_chats.ensure_wake_conversation(
++            self.con,
++            participant_id,
++            idempotency_key=f"sprint:{sprint_id}:wake:{wake_id}:conversation",
++        )
+         return wake_id
+ 
+     def _recipient_message(
+@@ -503,7 +584,7 @@ def claim_next(self, owner: str, *, lease_seconds: int = 60) -> WakeLease | None
+                 (now,),
+             )
+             row = self.con.execute(
+-                "SELECT w.*,p.current_conversation_id "
++                "SELECT w.*,p.current_conversation_id,p.role "
+                 "FROM sprint_wake_outbox w "
+                 "JOIN sprints s USING (sprint_id) "
+                 "JOIN sprint_participants p "
+@@ -535,11 +616,19 @@ def claim_next(self, owner: str, *, lease_seconds: int = 60) -> WakeLease | None
+                 )
+             if result.rowcount != 1:
+                 return None
++            route = sprint_participant_chats.ensure_wake_conversation(
++                self.con,
++                int(row["participant_id"]),
++                idempotency_key=(
++                    f"sprint:{row['sprint_id']}:wake:{row['wake_id']}:conversation"
++                ),
++            )
+             return WakeLease(
+                 wake_id=int(row["wake_id"]),
+                 sprint_id=int(row["sprint_id"]),
+                 participant_id=int(row["participant_id"]),
+-                target_conversation_id=row["current_conversation_id"],
++                participant_role=str(row["role"]),
++                target_conversation_id=route.conversation_id,
+                 idempotency_key=str(row["idempotency_key"]),
+                 attempt_number=int(row["attempt_count"]) + 1,
+                 claim_owner=owner,
+@@ -558,7 +647,7 @@ def deliver_once(
+                 raise RuntimeError("participant has no current Sprint conversation")
+             native_run_ref = deliver(
+                 lease.target_conversation_id,
+-                FIXED_WAKE_PROMPT,
++                wake_prompt(lease.sprint_id, lease.participant_role),
+                 lease.idempotency_key,
+             )
+         except Exception as exc:  # external delivery faults become durable evidence
+diff --git a/.super-coder/scripts/sprint_participant_chats.py b/.super-coder/scripts/sprint_participant_chats.py
+index 8eb4ee54..a1d49ac7 100644
+--- a/.super-coder/scripts/sprint_participant_chats.py
++++ b/.super-coder/scripts/sprint_participant_chats.py
+@@ -12,18 +12,47 @@
+ import hashlib
+ import json
+ import uuid
++from dataclasses import dataclass
+ from typing import Any
+ 
+ import conversation_broker
+ import run as run_mod
+ 
+ _PURPOSES = {"work", "fix", "merge", "fallback"}
++_USABLE_WAKE_STATES = {"idle", "queued", "running", "waiting"}
++_WAKE_ROLES = {
++    "developer": ("Developer", "sprint_dev"),
++    "reviewer": ("Reviewer", "sprint_rev"),
++    "planner": ("originating Planner", "sprint_pln"),
++}
+ 
+ 
+ class SprintConversationError(ValueError):
+     """The requested Sprint conversation transition violates its contract."""
+ 
+ 
++@dataclass(frozen=True)
++class WakeConversationRoute:
++    conversation_id: str
++    created: bool
++
++
++def wake_prompt(sprint_id: int, role: str) -> str:
++    try:
++        label, skill = _WAKE_ROLES[role]
++    except KeyError as exc:
++        raise SprintConversationError(
++            f"unsupported Sprint participant role: {role}"
++        ) from exc
++    return (
++        f"Sprint {sprint_id} handoff for your {label} role. Load `{skill}`. "
++        f"Run `sc sprint inbox --sprint {sprint_id}` now and act on the Sprint "
++        f"message(s) using `{skill}`. Confirm every Sprint write succeeds before "
++        f"stopping. If the handoff is not complete, load `{skill}` again and run "
++        f"`sc sprint inbox --sprint {sprint_id}` again."
++    )
++
++
+ def _canonical_json(value: Any) -> str:
+     return json.dumps(value, separators=(",", ":"), sort_keys=True)
+ 
+@@ -416,6 +445,81 @@ def select_work(con, participant_id: int) -> str:
+     return conversation_id
+ 
+ 
++def ensure_wake_conversation(
++    con,
++    participant_id: int,
++    *,
++    idempotency_key: str,
++) -> WakeConversationRoute:
++    """Return a usable current chat, creating one linked route when absent."""
++    row = con.execute(
++        "SELECT p.participant_id,p.sprint_id,p.harness,p.model,p.effort,"
++        "p.persistent_conversation_id,p.current_conversation_id,"
++        "sh.shortname,sh.flavor,owner.user_id,c.state AS current_state "
++        "FROM sprint_participants p "
++        "JOIN sprints s ON s.sprint_id=p.sprint_id "
++        "JOIN shells sh ON sh.shell_id=p.shell_id "
++        "JOIN shells owner ON owner.shell_id=s.originating_planner_shell_id "
++        "LEFT JOIN conversations c "
++        "ON c.conversation_id=p.current_conversation_id "
++        "WHERE p.participant_id=?",
++        (participant_id,),
++    ).fetchone()
++    if row is None:
++        raise SprintConversationError("Sprint participant does not exist")
++    current_id = row["current_conversation_id"]
++    if (
++        current_id is not None
++        and row["current_state"] in _USABLE_WAKE_STATES
++        and _linked_to_participant(con, participant_id, current_id)
++    ):
++        return WakeConversationRoute(str(current_id), False)
++    if row["user_id"] is None:
++        raise SprintConversationError("originating Planner has no browser owner")
++
++    parent_id = None
++    for candidate in (current_id, row["persistent_conversation_id"]):
++        if candidate is not None and _linked_to_participant(
++            con, participant_id, candidate
++        ):
++            parent_id = str(candidate)
++            break
++    purpose = "fallback" if parent_id is not None else "work"
++    existing = con.execute(
++        "SELECT conversation_id FROM conversations "
++        "WHERE owner_user_id=? AND creation_idempotency_key=?",
++        (row["user_id"], idempotency_key),
++    ).fetchone()
++    worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
++    conversation_id = create_and_select(
++        con,
++        participant_id=participant_id,
++        owner_user_id=int(row["user_id"]),
++        purpose=purpose,
++        harness=row["harness"],
++        provider=run_mod.session_provider(row["harness"], row["model"]),
++        model=row["model"],
++        effort=row["effort"],
++        worktree=str(worktree.resolve(strict=False)),
++        title=(
++            f"Sprint {row['sprint_id']} · Wake route · {row['shortname']}"
++        ),
++        idempotency_key=idempotency_key,
++        parent_conversation_id=parent_id,
++        context_packet=(
++            {
++                "reason": "sprint wake requires a usable current conversation",
++                "sprint_id": int(row["sprint_id"]),
++                "participant_id": participant_id,
++                "previous_conversation_id": parent_id,
++            }
++            if parent_id is not None
++            else None
++        ),
++    )
++    return WakeConversationRoute(conversation_id, existing is None)
++
++
+ def create_review_outcome(
+     con,
+     *,
+diff --git a/.super-coder/scripts/sprint_review_loop.py b/.super-coder/scripts/sprint_review_loop.py
+index 461b51c4..eb301552 100644
+--- a/.super-coder/scripts/sprint_review_loop.py
++++ b/.super-coder/scripts/sprint_review_loop.py
+@@ -331,7 +331,9 @@ def _required(value: str, name: str, maximum: int = 8000) -> str:
+         if not value:
+             raise ValueError(f"{name} is empty")
+         if len(value) > maximum:
+-            raise ValueError(f"{name} exceeds {maximum} characters")
++            raise ValueError(
++                f"{name} is {len(value)} characters; maximum is {maximum}"
++            )
+         return value
+ 
+     @staticmethod
+diff --git a/.super-coder/scripts/sprint_runtime.py b/.super-coder/scripts/sprint_runtime.py
+index 1363e960..5fe4d802 100644
+--- a/.super-coder/scripts/sprint_runtime.py
++++ b/.super-coder/scripts/sprint_runtime.py
+@@ -190,10 +190,14 @@ def pulse_once(self, *, startup: bool = False) -> bool:
+             con.close()
+ 
+     def _switch(self, con: sqlite3.Connection) -> ArmedServiceSwitch:
++        lifecycle = SprintLifecycleStore(con)
+         units = SprintWorkUnitStore(con)
+         wakes = SprintWakeDeliveryService(con)
+         liveness = SprintLivenessMonitor(con)
+ 
++        def recover_pickup(sprint_id: int, trigger: str) -> None:
++            lifecycle.reconcile_unread_pickup(sprint_id, trigger=trigger)
++
+         def dispatch(sprint_id: int, _trigger: str) -> None:
+             units.dispatch_ready(sprint_id)
+ 
+@@ -207,8 +211,8 @@ def evaluate_liveness(sprint_id: int, _trigger: str) -> None:
+             liveness.evaluate(sprint_id)
+ 
+         return ArmedServiceSwitch(
+-            SprintLifecycleStore(con),
+-            (dispatch, evaluate_liveness, deliver),
++            lifecycle,
++            (recover_pickup, dispatch, evaluate_liveness, deliver),
+         )
+ 
+     def run(self) -> None:  # pragma: no cover - loop tested through pulse_once
+diff --git a/.super-coder/scripts/update.py b/.super-coder/scripts/update.py
+index 583d5250..fc197fcd 100644
+--- a/.super-coder/scripts/update.py
++++ b/.super-coder/scripts/update.py
+@@ -69,6 +69,7 @@
+ 
+ sys.path.insert(0, str(ENGINE / "scripts"))
+ import artifact_policy  # noqa: E402
++import callable_floor  # noqa: E402
+ import db_driver  # noqa: E402
+ import engine_manifest  # noqa: E402
+ import install as install_mod  # noqa: E402  (ensure_harnesses)
+@@ -687,6 +688,11 @@ def materialize_fetched_engine(sha: str, *, force: bool = False) -> None:
+         resolved_paths + materializable_delta,
+         REPO_ROOT,
+     )
++    callable_floor.require_callable_floor(
++        REPO_ROOT,
++        expected_ref=sha,
++        context="update",
++    )
+     ENGINE_REF.write_text(sha + "\n")
+     n = engine_manifest.write_manifest(
+         materialized_paths,
+@@ -699,6 +705,34 @@ def materialize_fetched_engine(sha: str, *, force: bool = False) -> None:
+     print(f"  engine pinned at {sha[:12]} (.sc-state/engine.ref) · manifest over {n} files")
+ 
+ 
++def repair_callable_dispatcher(sha: str) -> bool:
++    """Heal a dispatcher missed by the already-running legacy updater."""
++    issues = callable_floor.inspect_callable_floor(
++        REPO_ROOT,
++        expected_ref=sha,
++    )
++    if not issues:
++        return False
++
++    materialize_engine(sha, engine_paths=["sc"])
++    callable_floor.require_callable_floor(
++        REPO_ROOT,
++        expected_ref=sha,
++        context="update compatibility repair",
++    )
++    materialized_paths = _materialized_engine_paths(REPO_ROOT)
++    engine_manifest.write_manifest(
++        materialized_paths,
++        files=_engine_files_at(
++            sha,
++            repo_root=REPO_ROOT,
++            engine_paths=materialized_paths,
++        ),
++    )
++    print(f"→ legacy update bridge: repaired callable dispatcher at {sha[:12]}")
++    return True
++
++
+ def fetch_and_materialize(branch: str, ref: str | None = None,
+                           force: bool = False) -> None:
+     """Compatibility wrapper for callers that already performed their own
+diff --git a/.super-coder/scripts/update_compat.py b/.super-coder/scripts/update_compat.py
+index 5a9c3c3d..28b21cf2 100644
+--- a/.super-coder/scripts/update_compat.py
++++ b/.super-coder/scripts/update_compat.py
+@@ -60,15 +60,19 @@ def needs_legacy_bridge() -> tuple[bool, str | None]:
+ 
+ 
+ def main() -> int:
++    current = _read_ref(ENGINE_REF)
++    if current is not None:
++        # Unlike the path-repair migration below, dispatcher coherence is a
++        # standing invariant. Existing forks may already carry the v1 marker
++        # while their tracked bootstrap still routes to a retired script.
++        import update
++
++        update.repair_callable_dispatcher(current)
++
+     needed, current = needs_legacy_bridge()
+     if not needed:
+         return 0
+ 
+-    # Import lazily: this process starts after materialization, so ``update`` is
+-    # the new module on disk rather than the legacy module still loaded by the
+-    # parent updater.
+-    import update
+-
+     print("→ legacy update bridge: finish relocated-fork path repair")
+     update.repair_git_worktrees()
+     update.refresh_installed_brokers()
+diff --git a/tests/fixtures/sprint_handoff_hardening_acceptance.json b/tests/fixtures/sprint_handoff_hardening_acceptance.json
+new file mode 100644
+index 00000000..4bfd6f41
+--- /dev/null
++++ b/tests/fixtures/sprint_handoff_hardening_acceptance.json
+@@ -0,0 +1,35 @@
++{
++  "spec_document_id": 68,
++  "gates": [
++    {
++      "gate": "An updated downstream-style fork repairs the callable floor while preserving a pre-existing linked worktree",
++      "file": "tests/test_update_materialize.py",
++      "test": "test_legacy_bridge_repairs_stale_dispatcher_and_rebaselines_manifest"
++    },
++    {
++      "gate": "The installed dispatcher is coherent with the pinned engine or materialized manifest",
++      "file": "tests/test_callable_floor.py",
++      "test": "test_exact_dispatcher_and_present_route_are_coherent"
++    },
++    {
++      "gate": "Question, answer, typed review handoffs, active and replacement chats, near-budget payload, and terminal pickup recovery form one durable chain",
++      "file": "tests/test_sprint_live_proof.py",
++      "test": "test_relay_review_and_terminal_pickup_recovery_form_one_durable_chain"
++    },
++    {
++      "gate": "Every role receives the exact general wake template",
++      "file": "tests/test_sprint_message_delivery.py",
++      "test": "test_every_participant_role_receives_the_exact_general_template"
++    },
++    {
++      "gate": "Delivered-unread recovery is idempotent across startup passes",
++      "file": "tests/test_sprint_recovery.py",
++      "test": "test_startup_reconciliation_repairs_once_across_repeated_passes"
++    },
++    {
++      "gate": "Role skills cover handoff contingencies using the shipped command surface",
++      "file": "tests/test_sprint_skills.py",
++      "test": "test_role_skills_cover_every_handoff_contingency_with_real_commands"
++    }
++  ]
++}
+diff --git a/tests/fixtures/sprint_removal/manifest.json b/tests/fixtures/sprint_removal/manifest.json
+index c5385d7a..fcbb1d82 100644
+--- a/tests/fixtures/sprint_removal/manifest.json
++++ b/tests/fixtures/sprint_removal/manifest.json
+@@ -7,6 +7,7 @@
+     ".super-coder/migrations/0150_sprint_close_reports.sql",
+     ".super-coder/migrations/0151_seed_sprint_v2_skills.sql",
+     ".super-coder/migrations/0152_sprint_surface_completion.sql",
++    ".super-coder/migrations/0153_harden_sprint_handoff_skills.sql",
+     ".super-coder/assets/skills/sprint_prep/SKILL.md",
+     ".super-coder/assets/skills/sprint_pln/SKILL.md",
+     ".super-coder/assets/skills/sprint_dev/SKILL.md",
+@@ -43,7 +44,10 @@
+     "tests/test_sprint_live_proof.py",
+     "tests/test_sprint_board_api.py",
+     "tests/test_sprint_board_ui.py",
+-    "tests/fixtures/sprint_v2_acceptance.json"
++    "tests/fixtures/sprint_v2_acceptance.json",
++    "tests/fixtures/sprint_handoff_hardening_acceptance.json",
++    "tests/test_callable_floor.py",
++    "tests/test_update_materialize.py"
+   ],
+   "baseline_migration_ledger": {
+     "count": 142,
+diff --git a/tests/test_callable_floor.py b/tests/test_callable_floor.py
+new file mode 100644
+index 00000000..6ca6c8d7
+--- /dev/null
++++ b/tests/test_callable_floor.py
+@@ -0,0 +1,139 @@
++#!/usr/bin/env python3
++"""Regression tests for the dispatcher/materialized-engine callable floor."""
++from __future__ import annotations
++
++import hashlib
++import json
++import subprocess
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
++import callable_floor  # noqa: E402
++
++
++def _git(root: Path, *args: str) -> str:
++    return subprocess.run(
++        ["git", "-C", str(root), *args],
++        check=True,
++        capture_output=True,
++        text=True,
++    ).stdout.strip()
++
++
++class CallableFloorTest(unittest.TestCase):
++    def setUp(self) -> None:
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.root = Path(self.temp.name)
++        self.scripts = self.root / ".super-coder" / "scripts"
++        self.scripts.mkdir(parents=True)
++        _git(self.root, "init", "-b", "main")
++        _git(self.root, "config", "user.name", "Callable Floor Test")
++        _git(self.root, "config", "user.email", "floor@example.invalid")
++
++    def write_dispatcher(self, script: str = "sprint_cli.py") -> None:
++        dispatcher = self.root / "sc"
++        dispatcher.write_text(
++            "#!/bin/sh\n"
++            "S=\"$PWD/.super-coder/scripts\"\n"
++            f'exec "$PY" "$S/{script}" "$@"\n'
++        )
++        dispatcher.chmod(0o755)
++
++    def commit_floor(self) -> str:
++        _git(self.root, "add", ".")
++        _git(self.root, "commit", "-m", "callable floor")
++        return _git(self.root, "rev-parse", "HEAD")
++
++    def test_exact_dispatcher_and_present_route_are_coherent(self) -> None:
++        self.write_dispatcher()
++        (self.scripts / "sprint_cli.py").write_text("print('help')\n")
++        ref = self.commit_floor()
++
++        self.assertEqual(
++            callable_floor.inspect_callable_floor(
++                self.root,
++                expected_ref=ref,
++            ),
++            (),
++        )
++
++    def test_stale_dispatcher_reports_ref_mismatch_and_missing_route(self) -> None:
++        self.write_dispatcher()
++        (self.scripts / "sprint_cli.py").write_text("print('help')\n")
++        ref = self.commit_floor()
++        self.write_dispatcher("sprint.py")
++
++        self.assertEqual(
++            callable_floor.inspect_callable_floor(
++                self.root,
++                expected_ref=ref,
++            ),
++            (
++                f"dispatcher does not match engine ref {ref[:12]}",
++                "dispatcher routes to missing engine script(s): sprint.py",
++            ),
++        )
++
++    def test_pruned_ref_falls_back_to_manifest_dispatcher_hash(self) -> None:
++        self.write_dispatcher()
++        dispatcher = (self.root / "sc").read_bytes()
++        manifest = {"sc": hashlib.sha256(dispatcher).hexdigest()}
++        (self.root / ".super-coder" / "engine.manifest").write_text(
++            json.dumps(manifest) + "\n"
++        )
++        (self.scripts / "sprint_cli.py").write_text("print('help')\n")
++
++        self.assertEqual(
++            callable_floor.inspect_callable_floor(
++                self.root,
++                expected_ref="f" * 40,
++            ),
++            (),
++        )
++        self.write_dispatcher("other.py")
++        (self.scripts / "other.py").write_text("print('other')\n")
++        self.assertEqual(
++            callable_floor.inspect_callable_floor(
++                self.root,
++                expected_ref="f" * 40,
++            ),
++            (
++                "dispatcher does not match the materialized manifest for "
++                "engine ref ffffffffffff",
++            ),
++        )
++
++    def test_failure_names_the_supported_main_checkout_repair(self) -> None:
++        self.write_dispatcher("sprint.py")
++        with self.assertRaises(SystemExit) as raised:
++            callable_floor.require_callable_floor(
++                self.root,
++                expected_ref=None,
++                context="session launch",
++            )
++
++        self.assertEqual(
++            str(raised.exception),
++            "session launch: callable dispatcher/engine floor mismatch:\n"
++            "  - .sc-state/engine.ref is missing or empty\n"
++            "  - dispatcher routes to missing engine script(s): sprint.py\n"
++            "  supported repair: run the update from the main checkout:\n"
++            f"    cd {self.root} && ./sc update",
++        )
++
++    def test_malformed_pin_is_not_accepted_as_a_manifest_authority(self) -> None:
++        state = self.root / ".sc-state"
++        state.mkdir()
++        (state / "engine.ref").write_text("not-a-sha\n")
++
++        self.assertIsNone(callable_floor.read_engine_ref(self.root))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_harness_epoch.py b/tests/test_harness_epoch.py
+index 2200f441..569e1789 100644
+--- a/tests/test_harness_epoch.py
++++ b/tests/test_harness_epoch.py
+@@ -201,9 +201,15 @@ def __init__(self) -> None:
+         shutil.copy2(ROOT / "sc", self.root / "sc")
+         # cli_entry.py is not optional in a synthetic fork: every entrypoint
+         # imports it from its __main__ block (SIGPIPE hygiene, #384).
+-        for script in ("install.py", "engine_manifest.py", "ports.py",
+-                       "artifact_policy.py", "harness_versions.py",
+-                       "cli_entry.py"):
++        for script in (
++            "install.py",
++            "callable_floor.py",
++            "engine_manifest.py",
++            "ports.py",
++            "artifact_policy.py",
++            "harness_versions.py",
++            "cli_entry.py",
++        ):
+             shutil.copy2(ENGINE / "scripts" / script, self.scripts / script)
+         (self.engine / "Dockerfile").write_text("FROM scratch\n")
+         self._write_fake_docker()
+diff --git a/tests/test_rollback_half_floor.py b/tests/test_rollback_half_floor.py
+index f9d1e7ca..f034d6c5 100644
+--- a/tests/test_rollback_half_floor.py
++++ b/tests/test_rollback_half_floor.py
+@@ -272,7 +272,10 @@ def test_restore_engine_fallback_keeps_broader_installed_paths_symmetric(self):
+             ), mock.patch.object(
+                 rollback.engine_manifest,
+                 "write_manifest",
+-            ):
++            ), mock.patch.object(
++                rollback.callable_floor,
++                "require_callable_floor",
++            ) as require_floor:
+                 rollback.restore_engine(old_sha)
+ 
+             self.assertEqual(
+@@ -287,6 +290,11 @@ def test_restore_engine_fallback_keeps_broader_installed_paths_symmetric(self):
+                 "addition in the rollback deletion candidate set",
+             )
+             self.assertEqual(engine_ref.read_text(), old_sha + "\n")
++            require_floor.assert_called_once_with(
++                root,
++                expected_ref=old_sha,
++                context="rollback",
++            )
+ 
+     def test_engine_only_refuses_previous_floor_with_unrelated_extra(self):
+         with tempfile.TemporaryDirectory() as raw_tmp:
+diff --git a/tests/test_sprint_cli.py b/tests/test_sprint_cli.py
+index b4a7e91b..b51d44ec 100644
+--- a/tests/test_sprint_cli.py
++++ b/tests/test_sprint_cli.py
+@@ -391,6 +391,55 @@ def test_declare_plan_lifecycle_and_registration_surfaces(self):
+         finally:
+             con.close()
+ 
++    def test_participant_send_confirms_durable_message_wake_and_route(self):
++        response = self.run_cli(
++            TOKENS["developer"],
++            "send",
++            "--sprint",
++            str(self.sprint_id),
++            "--to",
++            "PLN1",
++            "--body-file",
++            self.write("Please confirm the downstream handoff."),
++        )
++
++        self.assertEqual(
++            {
++                "conversation_id",
++                "message_created",
++                "message_id",
++                "wake_id",
++                "wake_state",
++            },
++            set(response),
++        )
++        self.assertTrue(response["message_created"])
++        self.assertEqual("pending", response["wake_state"])
++
++        with contextlib.closing(sqlite3.connect(self.db)) as con:
++            message = con.execute(
++                "SELECT from_participant_id,to_participant_id,"
++                "message_kind,body,actionable,work_unit_id,disposition "
++                "FROM sprint_messages WHERE message_id=?",
++                (response["message_id"],),
++            ).fetchone()
++            self.assertEqual(
++                (2, 1, "notification", "Please confirm the downstream handoff.", 0, None, None),
++                message,
++            )
++            wake = con.execute(
++                "SELECT wm.message_id,w.state FROM sprint_wake_outbox w "
++                "JOIN sprint_wake_messages wm ON wm.wake_id=w.wake_id "
++                "WHERE w.wake_id=?",
++                (response["wake_id"],),
++            ).fetchone()
++            self.assertEqual((response["message_id"], "pending"), wake)
++            current = con.execute(
++                "SELECT current_conversation_id FROM sprint_participants "
++                "WHERE participant_id=1",
++            ).fetchone()
++            self.assertEqual((response["conversation_id"],), current)
++
+     def test_remediation_surfaces_are_authenticated_and_durable(self):
+         self.use_isolated_db()
+         con = sqlite3.connect(self.db)
+diff --git a/tests/test_sprint_close.py b/tests/test_sprint_close.py
+index 8ffb96f7..70c87164 100644
+--- a/tests/test_sprint_close.py
++++ b/tests/test_sprint_close.py
+@@ -165,6 +165,111 @@ def test_surface_migration_preserves_code_units_and_accepts_non_code_result(self
+ 
+ 
+ class ConformanceFollowupTest(SprintCloseCase):
++    def test_close_payloads_accept_8000_and_reject_8001_without_partial_writes(self):
++        with self.assertRaisesRegex(
++            ValueError,
++            "conformance body is 8001 characters; maximum is 8000",
++        ):
++            self.close.record_conformance(
++                self.sprint_id,
++                2,
++                body="x" * 8001,
++                findings=[],
++                idempotency_key="oversize-conformance",
++            )
++        with self.assertRaisesRegex(
++            ValueError,
++            "finding body is 8001 characters; maximum is 8000",
++        ):
++            self.close.record_conformance(
++                self.sprint_id,
++                2,
++                body="bounded",
++                findings=[self.finding(body="x" * 8001)],
++                idempotency_key="oversize-finding",
++            )
++        self.assertEqual(
++            (0, 0),
++            tuple(
++                self.con.execute(
++                    "SELECT (SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=?),"
++                    "(SELECT COUNT(*) FROM sprint_followups WHERE sprint_id=?)",
++                    (self.sprint_id, self.sprint_id),
++                ).fetchone()
++            ),
++        )
++
++        conformance = self.close.record_conformance(
++            self.sprint_id,
++            2,
++            body="x" * 8000,
++            findings=[self.finding(body="x" * 8000)],
++            idempotency_key="bounded-conformance",
++        )
++        self.assertTrue(conformance.created)
++        self.con.execute(
++            "INSERT INTO shells "
++            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
++            "VALUES (5,'FnB','FNB','admin','prompt',1)"
++        )
++        self.con.commit()
++        with self.assertRaisesRegex(
++            ValueError,
++            "follow-up resolution is 8001 characters; maximum is 8000",
++        ):
++            self.close.disposition_followup(
++                self.sprint_id,
++                conformance.followup_ids[0],
++                5,
++                disposition="resolved",
++                resolution="x" * 8001,
++            )
++        self.assertEqual(
++            ("pending", None),
++            tuple(
++                self.con.execute(
++                    "SELECT disposition,resolution FROM sprint_followups "
++                    "WHERE followup_id=?",
++                    (conformance.followup_ids[0],),
++                ).fetchone()
++            ),
++        )
++        self.assertTrue(
++            self.close.disposition_followup(
++                self.sprint_id,
++                conformance.followup_ids[0],
++                5,
++                disposition="resolved",
++                resolution="x" * 8000,
++            )
++        )
++
++        with self.assertRaisesRegex(
++            ValueError,
++            "final report body is 8001 characters; maximum is 8000",
++        ):
++            self.close.record_final_report(
++                self.sprint_id,
++                3,
++                body="x" * 8001,
++                idempotency_key="oversize-final",
++            )
++        self.assertEqual(
++            0,
++            self.con.execute(
++                "SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=? "
++                "AND report_kind='final'",
++                (self.sprint_id,),
++            ).fetchone()[0],
++        )
++        final = self.close.record_final_report(
++            self.sprint_id,
++            3,
++            body="x" * 8000,
++            idempotency_key="bounded-final",
++        )
++        self.assertTrue(final.created)
++
+     def test_database_rejects_cross_sprint_report_and_spec_links(self):
+         other_sprint_id, _ = self.create_sprint()
+         other_report_id = int(
+diff --git a/tests/test_sprint_live_proof.py b/tests/test_sprint_live_proof.py
+index 83af7d90..3abf5fae 100644
+--- a/tests/test_sprint_live_proof.py
++++ b/tests/test_sprint_live_proof.py
+@@ -18,6 +18,9 @@
+ ROOT = Path(__file__).resolve().parents[1]
+ ENGINE = ROOT / ".super-coder"
+ ACCEPTANCE = ROOT / "tests" / "fixtures" / "sprint_v2_acceptance.json"
++HANDOFF_ACCEPTANCE = (
++    ROOT / "tests" / "fixtures" / "sprint_handoff_hardening_acceptance.json"
++)
+ sys.path[:0] = [
+     str(ENGINE / "scripts"),
+     str(ENGINE / "api"),
+@@ -289,6 +292,50 @@ def deliver_browser_turns(self) -> None:
+         )
+         self.assertTrue(runtime.pulse_once())
+ 
++    def deliver_terminal_turn(self, wake_id: int) -> tuple[str, str]:
++        """Deliver one wake into a native turn that has already terminated."""
++        captured: list[tuple[str, str]] = []
++
++        def deliver(conversation_id: str, prompt: str, key: str) -> str:
++            captured.append((conversation_id, prompt))
++            message_id = int(
++                self.con.execute(
++                    "INSERT INTO conversation_messages "
++                    "(conversation_id,sender_kind,sender_ref,message_kind,body,"
++                    "idempotency_key,request_hash,state,completed_at) "
++                    "VALUES (?,'engine','live-proof','prompt',?,?,?,'completed',"
++                    "'2026-08-01 00:00:01')",
++                    (conversation_id, prompt, key, key),
++                ).lastrowid
++            )
++            run_id = int(
++                self.con.execute(
++                    "INSERT INTO conversation_runs "
++                    "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
++                    "lease_expires_at,started_at,ended_at,exit_code) "
++                    "SELECT ?,shell_id,?,'succeeded','live-proof',"
++                    "'2026-08-01 00:00:01','2026-08-01 00:00:00',"
++                    "'2026-08-01 00:00:01',0 FROM conversations "
++                    "WHERE conversation_id=?",
++                    (conversation_id, message_id, conversation_id),
++                ).lastrowid
++            )
++            for state in ("queued", "running", "waiting"):
++                self.con.execute(
++                    "UPDATE conversations SET state=? WHERE conversation_id=?",
++                    (state, conversation_id),
++                )
++            self.con.commit()
++            return f"conversation-run:{run_id}"
++
++        outcome = sprint_message_delivery.SprintWakeDeliveryService(
++            self.con
++        ).deliver_once(f"live-proof-terminal:{wake_id}", deliver)
++        self.assertIsNotNone(outcome)
++        self.assertEqual(wake_id, outcome.wake_id)
++        self.assertEqual("delivered", outcome.state)
++        return captured[0]
++
+     def assignment_message(self, unit_id: int) -> int:
+         row = self.con.execute(
+             "SELECT message_id FROM sprint_messages "
+@@ -626,7 +673,7 @@ def conversation_write() -> None:
+                 sprint_runtime.enqueue_conversation_turn(
+                     self.db_path,
+                     conversation_id,
+-                    sprint_message_delivery.FIXED_WAKE_PROMPT,
++                    "concurrent Sprint turn",
+                     "live-proof:concurrent-conversation",
+                 )
+             except BaseException as exc:  # noqa: BLE001 - asserted below
+@@ -674,6 +721,282 @@ def watcher_write() -> None:
+             ],
+         )
+ 
++    def test_relay_review_and_terminal_pickup_recovery_form_one_durable_chain(
++        self,
++    ) -> None:
++        sprint_id, _document_id, units = self.prepare(((1, 2, ()),))
++        self.run_cli(3, "arm", "--sprint", str(sprint_id))
++        self.deliver_browser_turns()
++        self.run_cli(
++            1,
++            "accept",
++            "--sprint",
++            str(sprint_id),
++            "--message",
++            str(self.assignment_message(units[0])),
++        )
++
++        planner_conversation = str(
++            self.con.execute(
++                "SELECT current_conversation_id FROM sprint_participants "
++                "WHERE sprint_id=? AND shell_id=3",
++                (sprint_id,),
++            ).fetchone()[0]
++        )
++        question_prefix = "Which downstream compatibility fixture owns the proof? "
++        question = question_prefix + "q" * (6000 - len(question_prefix))
++        question_receipt = self.run_cli(
++            1,
++            "send",
++            "--sprint",
++            str(sprint_id),
++            "--to",
++            "PLN1",
++            "--body-file",
++            self.write_input(question),
++        )
++        self.assertTrue(question_receipt["message_created"])
++        self.assertEqual("pending", question_receipt["wake_state"])
++        self.assertEqual(planner_conversation, question_receipt["conversation_id"])
++        self.assertEqual(
++            (1, 3, 6000, question),
++            tuple(
++                self.con.execute(
++                    "SELECT sender.shell_id,recipient.shell_id,length(m.body),m.body "
++                    "FROM sprint_messages m "
++                    "JOIN sprint_participants sender "
++                    "ON sender.participant_id=m.from_participant_id "
++                    "JOIN sprint_participants recipient "
++                    "ON recipient.participant_id=m.to_participant_id "
++                    "WHERE m.message_id=?",
++                    (question_receipt["message_id"],),
++                ).fetchone()
++            ),
++        )
++        self.deliver_browser_turns()
++        self.assertEqual(
++            sprint_message_delivery.wake_prompt(sprint_id, "planner"),
++            self.con.execute(
++                "SELECT cm.body FROM sprint_wake_outbox w "
++                "JOIN conversation_messages cm "
++                "ON cm.idempotency_key=w.idempotency_key WHERE w.wake_id=?",
++                (question_receipt["wake_id"],),
++            ).fetchone()[0],
++        )
++        self.run_cli(
++            3,
++            "accept",
++            "--sprint",
++            str(sprint_id),
++            "--message",
++            str(question_receipt["message_id"]),
++        )
++
++        answer_receipt = self.run_cli(
++            3,
++            "send",
++            "--sprint",
++            str(sprint_id),
++            "--to",
++            "DEV1",
++            "--body-file",
++            self.write_input(
++                "Use the legacy update fixture with its pre-existing linked worktree."
++            ),
++        )
++        self.deliver_browser_turns()
++        self.run_cli(
++            1,
++            "accept",
++            "--sprint",
++            str(sprint_id),
++            "--message",
++            str(answer_receipt["message_id"]),
++        )
++
++        self.github.set(6801, "OPEN")
++        registration = self.run_cli(
++            1,
++            "register-pr",
++            "--sprint",
++            str(sprint_id),
++            "--repository",
++            "acme/live-proof",
++            "--pr",
++            "6801",
++            "--work-unit",
++            str(units[0]),
++        )
++        reviewer_old = str(
++            self.con.execute(
++                "SELECT current_conversation_id FROM sprint_participants "
++                "WHERE sprint_id=? AND shell_id=2",
++                (sprint_id,),
++            ).fetchone()[0]
++        )
++        self.con.execute(
++            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
++            "WHERE conversation_id=?",
++            (reviewer_old,),
++        )
++        self.con.commit()
++        review_request = self.run_cli(
++            1,
++            "request-review",
++            "--sprint",
++            str(sprint_id),
++            "--registered-pr",
++            str(registration["registered_pr_id"]),
++            "--readiness-file",
++            self.write_input("The downstream handoff proof is green and ready."),
++            "--key",
++            "proof:68:dev-to-review",
++        )
++        reviewer_new = str(
++            self.con.execute(
++                "SELECT current_conversation_id FROM sprint_participants "
++                "WHERE sprint_id=? AND shell_id=2",
++                (sprint_id,),
++            ).fetchone()[0]
++        )
++        self.assertNotEqual(reviewer_old, reviewer_new)
++        self.assertEqual(
++            ("fallback", reviewer_old),
++            tuple(
++                self.con.execute(
++                    "SELECT purpose,parent_conversation_id "
++                    "FROM sprint_participant_conversations "
++                    "WHERE conversation_id=?",
++                    (reviewer_new,),
++                ).fetchone()
++            ),
++        )
++        self.deliver_browser_turns()
++        self.run_cli(
++            2,
++            "accept",
++            "--sprint",
++            str(sprint_id),
++            "--message",
++            str(review_request["message_id"]),
++        )
++
++        outcome = self.run_cli(
++            2,
++            "record-review",
++            "--sprint",
++            str(sprint_id),
++            "--registered-pr",
++            str(registration["registered_pr_id"]),
++            "--verdict",
++            "changes_requested",
++            "--body-file",
++            self.write_input("Retain the terminal-turn recovery evidence."),
++            "--key",
++            "proof:68:review-to-dev",
++        )
++        terminal_conversation, terminal_prompt = self.deliver_terminal_turn(
++            outcome["wake_id"]
++        )
++        self.assertEqual(outcome["conversation_id"], terminal_conversation)
++        self.assertEqual(
++            sprint_message_delivery.wake_prompt(sprint_id, "developer"),
++            terminal_prompt,
++        )
++        self.assertIsNone(
++            self.con.execute(
++                "SELECT read_at FROM sprint_messages WHERE message_id=?",
++                (outcome["message_id"],),
++            ).fetchone()[0]
++        )
++        prior_pickup_turns = [
++            int(row[0])
++            for row in self.con.execute(
++                "SELECT m.message_id FROM conversation_messages m "
++                "JOIN sprint_participant_conversations pc "
++                "ON pc.conversation_id=m.conversation_id "
++                "JOIN sprint_participants p "
++                "ON p.participant_id=pc.sprint_participant_id "
++                "WHERE p.sprint_id=? AND p.shell_id=1 AND m.state='queued'",
++                (sprint_id,),
++            )
++        ]
++        for message_id in prior_pickup_turns:
++            self.con.execute(
++                "UPDATE conversation_messages SET state='running' WHERE message_id=?",
++                (message_id,),
++            )
++            self.con.execute(
++                "UPDATE conversation_messages SET state='completed',"
++                "completed_at=datetime('now') WHERE message_id=?",
++                (message_id,),
++            )
++        self.con.commit()
++
++        self.run_cli(
++            1,
++            "pause",
++            "--sprint",
++            str(sprint_id),
++            "--reason",
++            "Prove delivered-unread pickup recovery",
++        )
++        resumed = self.run_cli(
++            3,
++            "resume",
++            "--sprint",
++            str(sprint_id),
++            "--reason",
++            "Restore the Developer correction handoff",
++        )
++        self.assertEqual(1, len(resumed["requeued_wake_ids"]))
++        replacement = resumed["requeued_wake_ids"][0]
++        self.assertNotEqual(outcome["wake_id"], replacement)
++        self.deliver_browser_turns()
++        self.run_cli(
++            1,
++            "accept",
++            "--sprint",
++            str(sprint_id),
++            "--message",
++            str(outcome["message_id"]),
++        )
++        evidence = json.loads(
++            self.con.execute(
++                "SELECT payload FROM sprint_events WHERE sprint_id=? "
++                "AND event_type='wake.requeued' ORDER BY event_id DESC LIMIT 1",
++                (sprint_id,),
++            ).fetchone()[0]
++        )
++        self.assertEqual("delivered", evidence["prior_wake_state"])
++        self.assertEqual("completed", evidence["prior_turn_state"]["message_state"])
++        self.assertEqual("succeeded", evidence["prior_turn_state"]["run_state"])
++        self.assertEqual(outcome["wake_id"], evidence["prior_wake_id"])
++        self.assertEqual(replacement, evidence["replacement_wake_id"])
++        self.assertEqual(
++            ("fixing", "armed", "delivered"),
++            tuple(
++                self.con.execute(
++                    "SELECT u.disposition,s.lifecycle,w.state "
++                    "FROM sprint_work_units u JOIN sprints s USING (sprint_id) "
++                    "JOIN sprint_wake_outbox w ON w.wake_id=? "
++                    "WHERE u.work_unit_id=?",
++                    (replacement, units[0]),
++                ).fetchone()
++            ),
++        )
++
++    def test_handoff_hardening_manifest_references_compositional_proof(self) -> None:
++        manifest = json.loads(HANDOFF_ACCEPTANCE.read_text())
++        self.assertEqual(68, manifest["spec_document_id"])
++        self.assertEqual(6, len(manifest["gates"]))
++        identities = {(entry["file"], entry["test"]) for entry in manifest["gates"]}
++        self.assertEqual(len(manifest["gates"]), len(identities))
++        for entry in manifest["gates"]:
++            with self.subTest(gate=entry["gate"]):
++                source = ROOT.joinpath(entry["file"]).read_text()
++                self.assertIn(f"def {entry['test']}", source)
++
+     def test_adversarial_acceptance_manifest_references_real_gates(self) -> None:
+         manifest = json.loads(ACCEPTANCE.read_text())
+         self.assertEqual(46, manifest["spec_document_id"])
+diff --git a/tests/test_sprint_message_delivery.py b/tests/test_sprint_message_delivery.py
+index ee173a85..2d9df5b9 100644
+--- a/tests/test_sprint_message_delivery.py
++++ b/tests/test_sprint_message_delivery.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import hashlib
++import json
+ import sqlite3
+ import sys
+ import unittest
+@@ -357,7 +358,7 @@ def test_decline_while_paused_records_passive_planner_result(self) -> None:
+ 
+ 
+ class WakeDeliveryTest(SprintMessageCase):
+-    def test_fixed_prompt_and_target_are_durable_delivery_evidence(self) -> None:
++    def test_role_aware_prompt_and_target_are_durable_delivery_evidence(self) -> None:
+         sent = self.send("deliver")
+         observed: list[tuple[str, str, str]] = []
+         service = delivery.SprintWakeDeliveryService(self.con)
+@@ -373,7 +374,13 @@ def test_fixed_prompt_and_target_are_durable_delivery_evidence(self) -> None:
+             [
+                 (
+                     self.developer_conversation_id,
+-                    delivery.FIXED_WAKE_PROMPT,
++                    f"Sprint {self.sprint_id} handoff for your Developer role. "
++                    "Load `sprint_dev`. Run `sc sprint inbox --sprint "
++                    f"{self.sprint_id}` now and act on the Sprint message(s) using "
++                    "`sprint_dev`. Confirm every Sprint write succeeds before "
++                    "stopping. If the handoff is not complete, load `sprint_dev` "
++                    "again and run `sc sprint inbox --sprint "
++                    f"{self.sprint_id}` again.",
+                     self._wake_key(sent.wake_id),
+                 )
+             ],
+@@ -393,6 +400,50 @@ def test_fixed_prompt_and_target_are_durable_delivery_evidence(self) -> None:
+             tuple(attempt),
+         )
+ 
++    def test_every_participant_role_receives_the_exact_general_template(self) -> None:
++        expected = {
++            "developer": (
++                self.developer_id,
++                "Developer",
++                "sprint_dev",
++            ),
++            "reviewer": (self.reviewer_id, "Reviewer", "sprint_rev"),
++            "planner": (self.planner_id, "originating Planner", "sprint_pln"),
++        }
++        observed: dict[str, str] = {}
++        service = delivery.SprintWakeDeliveryService(self.con)
++        for role, (participant_id, label, skill) in expected.items():
++            self.messages.send(
++                self.sprint_id,
++                to_participant_id=participant_id,
++                from_participant_id=(
++                    self.developer_id if role != "developer" else self.planner_id
++                ),
++                message_kind="notification",
++                body="PR #321, message 987, work unit 654, sha deadbeef",
++                idempotency_key=f"role-prompt:{role}",
++            )
++            outcome = service.deliver_once(
++                "role-worker",
++                lambda _conversation, prompt, _key, role=role: (
++                    observed.__setitem__(role, prompt) or f"run-{role}"
++                ),
++            )
++            self.assertEqual("delivered", outcome.state)
++            self.assertEqual(
++                observed[role],
++                f"Sprint {self.sprint_id} handoff for your {label} role. "
++                f"Load `{skill}`. Run `sc sprint inbox --sprint {self.sprint_id}` "
++                f"now and act on the Sprint message(s) using `{skill}`. Confirm "
++                "every Sprint write succeeds before stopping. If the handoff is "
++                f"not complete, load `{skill}` again and run `sc sprint inbox "
++                f"--sprint {self.sprint_id}` again.",
++            )
++            self.assertNotIn("PR #321", observed[role])
++            self.assertNotIn("message 987", observed[role])
++            self.assertNotIn("work unit 654", observed[role])
++            self.assertNotIn("deadbeef", observed[role])
++
+     def test_messages_behind_delivering_wake_coalesce_once(self) -> None:
+         first = self.send("first")
+         service = delivery.SprintWakeDeliveryService(self.con)
+@@ -525,5 +576,259 @@ def _wake_key(self, wake_id: int | None) -> str:
+         ).fetchone()[0]
+ 
+ 
++class ParticipantRelayTest(SprintMessageCase):
++    def test_relay_is_freeform_communication_without_workflow_mutation(self) -> None:
++        before = tuple(
++            self.con.execute(
++                "SELECT s.lifecycle,u.disposition FROM sprints s "
++                "JOIN sprint_work_units u USING (sprint_id) "
++                "WHERE s.sprint_id=? AND u.work_unit_id=?",
++                (self.sprint_id, self.unit_id),
++            ).fetchone()
++        )
++
++        receipt = self.messages.relay(
++            self.sprint_id,
++            from_shell_id=1,
++            to_shortname="pln1",
++            body="Which acceptance criterion owns the empty-input case?",
++            idempotency_key="participant-send:question-1",
++        )
++
++        message = self.con.execute(
++            "SELECT m.from_participant_id,m.to_participant_id,m.work_unit_id,"
++            "m.message_kind,m.body,m.actionable,m.disposition,m.read_at "
++            "FROM sprint_messages m WHERE m.message_id=?",
++            (receipt.message_id,),
++        ).fetchone()
++        self.assertEqual(
++            (
++                self.developer_id,
++                self.planner_id,
++                None,
++                "notification",
++                "Which acceptance criterion owns the empty-input case?",
++                0,
++                None,
++                None,
++            ),
++            tuple(message),
++        )
++        self.assertEqual("pending", receipt.wake_state)
++        self.assertTrue(receipt.message_created)
++        self.assertEqual(
++            [(receipt.wake_id, receipt.message_id)],
++            [
++                tuple(row)
++                for row in self.con.execute(
++                    "SELECT wake_id,message_id FROM sprint_wake_messages "
++                    "WHERE message_id=?",
++                    (receipt.message_id,),
++                )
++            ],
++        )
++        after = tuple(
++            self.con.execute(
++                "SELECT s.lifecycle,u.disposition FROM sprints s "
++                "JOIN sprint_work_units u USING (sprint_id) "
++                "WHERE s.sprint_id=? AND u.work_unit_id=?",
++                (self.sprint_id, self.unit_id),
++            ).fetchone()
++        )
++        self.assertEqual(before, after)
++
++    def test_relay_reuses_a_usable_current_conversation(self) -> None:
++        current = self.con.execute(
++            "SELECT current_conversation_id FROM sprint_participants "
++            "WHERE participant_id=?",
++            (self.planner_id,),
++        ).fetchone()[0]
++        before = int(
++            self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
++        )
++
++        receipt = self.messages.relay(
++            self.sprint_id,
++            from_shell_id=1,
++            to_shortname="PLN1",
++            body="A durable answer is needed.",
++            idempotency_key="participant-send:reuse-chat",
++        )
++
++        self.assertEqual(current, receipt.conversation_id)
++        self.assertEqual(
++            before,
++            int(self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]),
++        )
++
++    def test_relay_creates_and_selects_a_linked_chat_when_current_is_closed(self) -> None:
++        old_conversation = self.con.execute(
++            "SELECT current_conversation_id FROM sprint_participants "
++            "WHERE participant_id=?",
++            (self.planner_id,),
++        ).fetchone()[0]
++        self.con.execute(
++            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
++            "WHERE conversation_id=?",
++            (old_conversation,),
++        )
++        self.con.commit()
++        before = int(
++            self.con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
++        )
++
++        receipt = self.messages.relay(
++            self.sprint_id,
++            from_shell_id=1,
++            to_shortname="PLN1",
++            body="Please answer from a fresh route.",
++            idempotency_key="participant-send:new-chat",
++        )
++
++        route = self.con.execute(
++            "SELECT c.shell_id,c.state,c.conversation_scope,pc.purpose,"
++            "pc.parent_conversation_id,pc.context_packet "
++            "FROM conversations c JOIN sprint_participant_conversations pc "
++            "USING (conversation_id) WHERE c.conversation_id=?",
++            (receipt.conversation_id,),
++        ).fetchone()
++        self.assertNotEqual(old_conversation, receipt.conversation_id)
++        self.assertEqual(before + 1, self.con.execute(
++            "SELECT COUNT(*) FROM conversations"
++        ).fetchone()[0])
++        self.assertEqual(
++            (3, "idle", "sprint", "fallback", old_conversation),
++            tuple(route)[:5],
++        )
++        packet = json.loads(route["context_packet"])
++        self.assertEqual(self.sprint_id, packet["sprint_id"])
++        self.assertEqual(self.planner_id, packet["participant_id"])
++        self.assertEqual(old_conversation, packet["previous_conversation_id"])
++        self.assertEqual(
++            receipt.conversation_id,
++            self.con.execute(
++                "SELECT current_conversation_id FROM sprint_participants "
++                "WHERE participant_id=?",
++                (self.planner_id,),
++            ).fetchone()[0],
++        )
++
++    def test_relay_replay_returns_one_message_and_one_wake(self) -> None:
++        first = self.messages.relay(
++            self.sprint_id,
++            from_shell_id=1,
++            to_shortname="PLN1",
++            body="Idempotent question",
++            idempotency_key="participant-send:replay",
++        )
++        replay = self.messages.relay(
++            self.sprint_id,
++            from_shell_id=1,
++            to_shortname="PLN1",
++            body="Idempotent question",
++            idempotency_key="participant-send:replay",
++        )
++
++        self.assertEqual(first.message_id, replay.message_id)
++        self.assertEqual(first.wake_id, replay.wake_id)
++        self.assertFalse(replay.message_created)
++        self.assertEqual(
++            1,
++            self.con.execute(
++                "SELECT COUNT(*) FROM sprint_messages WHERE idempotency_key=?",
++                ("participant-send:replay",),
++            ).fetchone()[0],
++        )
++        self.assertEqual(
++            1,
++            self.con.execute(
++                "SELECT COUNT(*) FROM sprint_wake_messages WHERE message_id=?",
++                (first.message_id,),
++            ).fetchone()[0],
++        )
++
++    def test_relay_rejects_nonparticipant_sender_without_any_write(self) -> None:
++        self.con.execute(
++            "INSERT INTO shells "
++            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
++            "VALUES (4,'Outside','OUT1','dev','prompt',1)"
++        )
++        self.con.commit()
++        before = tuple(
++            self.con.execute(
++                "SELECT (SELECT COUNT(*) FROM sprint_messages),"
++                "(SELECT COUNT(*) FROM sprint_wake_outbox),"
++                "(SELECT COUNT(*) FROM conversations)"
++            ).fetchone()
++        )
++
++        with self.assertRaisesRegex(
++            sprint_domain.SprintInvariantError,
++            "sender is not a Sprint participant",
++        ):
++            self.messages.relay(
++                self.sprint_id,
++                from_shell_id=4,
++                to_shortname="PLN1",
++                body="should not land",
++                idempotency_key="participant-send:outsider",
++            )
++
++        self.assertEqual(
++            before,
++            tuple(
++                self.con.execute(
++                    "SELECT (SELECT COUNT(*) FROM sprint_messages),"
++                    "(SELECT COUNT(*) FROM sprint_wake_outbox),"
++                    "(SELECT COUNT(*) FROM conversations)"
++                ).fetchone()
++            ),
++        )
++
++    def test_relay_rejects_nonparticipant_recipient_without_any_write(self) -> None:
++        self.con.execute(
++            "INSERT INTO shells "
++            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
++            "VALUES (4,'Outside','OUT1','dev','prompt',1)"
++        )
++        self.con.commit()
++        before = self.con.execute("SELECT COUNT(*) FROM sprint_messages").fetchone()[0]
++
++        with self.assertRaisesRegex(
++            sprint_domain.SprintInvariantError,
++            "recipient is not a Sprint participant",
++        ):
++            self.messages.relay(
++                self.sprint_id,
++                from_shell_id=1,
++                to_shortname="OUT1",
++                body="should not land",
++                idempotency_key="participant-send:bad-recipient",
++            )
++
++        self.assertEqual(
++            before,
++            self.con.execute("SELECT COUNT(*) FROM sprint_messages").fetchone()[0],
++        )
++
++    def test_relay_rejects_oversize_body_with_actual_and_maximum_counts(self) -> None:
++        before = self.con.execute("SELECT COUNT(*) FROM sprint_messages").fetchone()[0]
++        with self.assertRaisesRegex(
++            ValueError,
++            "Sprint message body is 8001 characters; maximum is 8000",
++        ):
++            self.messages.relay(
++                self.sprint_id,
++                from_shell_id=1,
++                to_shortname="PLN1",
++                body="x" * 8001,
++                idempotency_key="participant-send:oversize",
++            )
++        self.assertEqual(
++            before,
++            self.con.execute("SELECT COUNT(*) FROM sprint_messages").fetchone()[0],
++        )
++
++
+ if __name__ == "__main__":
+     unittest.main(verbosity=2)
+diff --git a/tests/test_sprint_recovery.py b/tests/test_sprint_recovery.py
+index ef1c9e8c..a93c77f0 100644
+--- a/tests/test_sprint_recovery.py
++++ b/tests/test_sprint_recovery.py
+@@ -91,6 +91,71 @@ def add_live_run(self, shell_id: int = 1) -> int:
+         self.con.commit()
+         return run_id
+ 
++    def deliver_wake_with_turn(
++        self,
++        wake_id: int,
++        *,
++        terminal: bool,
++    ) -> tuple[str, str]:
++        prompts: list[str] = []
++
++        def deliver(conversation_id: str, prompt: str, key: str) -> str:
++            prompts.append(prompt)
++            message_state = "completed" if terminal else "queued"
++            message_id = int(
++                self.con.execute(
++                    "INSERT INTO conversation_messages "
++                    "(conversation_id,sender_kind,sender_ref,message_kind,body,"
++                    "idempotency_key,request_hash,state,completed_at) "
++                    "VALUES (?,'engine','test','prompt',?,?,?, ?,?)",
++                    (
++                        conversation_id,
++                        prompt,
++                        key,
++                        key,
++                        message_state,
++                        "2026-08-01 00:00:01" if terminal else None,
++                    ),
++                ).lastrowid
++            )
++            if terminal:
++                run_id = int(
++                    self.con.execute(
++                        "INSERT INTO conversation_runs "
++                        "(conversation_id,shell_id,trigger_message_id,state,"
++                        "lease_owner,lease_expires_at,started_at,ended_at,exit_code) "
++                        "SELECT ?,shell_id,?,'succeeded','test-broker',"
++                        "'2026-08-01 00:00:01','2026-08-01 00:00:00',"
++                        "'2026-08-01 00:00:01',0 FROM conversations "
++                        "WHERE conversation_id=?",
++                        (conversation_id, message_id, conversation_id),
++                    ).lastrowid
++                )
++                for state in ("queued", "running", "waiting"):
++                    self.con.execute(
++                        "UPDATE conversations SET state=? WHERE conversation_id=?",
++                        (state, conversation_id),
++                    )
++                self.con.commit()
++                return f"conversation-run:{run_id}"
++            self.con.execute(
++                "UPDATE conversations SET state='queued' WHERE conversation_id=?",
++                (conversation_id,),
++            )
++            self.con.commit()
++            return f"conversation-message:{message_id}"
++
++        outcome = sprint_message_delivery.SprintWakeDeliveryService(
++            self.con
++        ).deliver_once(f"delivery-{wake_id}", deliver)
++        self.assertIsNotNone(outcome)
++        self.assertEqual(wake_id, outcome.wake_id)
++        self.assertEqual("delivered", outcome.state)
++        return prompts[0], self.con.execute(
++            "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
++            (wake_id,),
++        ).fetchone()[0]
++
+     def test_participant_pause_atomically_persists_report_interrupt_and_notice(self):
+         self.register()
+         run_id = self.add_live_run()
+@@ -152,11 +217,19 @@ def test_participant_pause_atomically_persists_report_interrupt_and_notice(self)
+             ],
+         )
+         self.assertEqual(
+-            [("engine", "sprint-recovery", "queued")],
++            [
++                (
++                    "engine",
++                    "sprint-recovery",
++                    "queued",
++                    sprint_message_delivery.wake_prompt(self.sprint_id, "planner"),
++                )
++            ],
+             [
+                 tuple(row)
+                 for row in self.con.execute(
+-                    "SELECT sender_kind,sender_ref,state FROM conversation_messages "
++                    "SELECT sender_kind,sender_ref,state,body "
++                    "FROM conversation_messages "
+                     "WHERE idempotency_key LIKE 'sprint-pause:%:planner-conversation'"
+                 )
+             ],
+@@ -258,6 +331,224 @@ def test_terminal_wake_failure_uses_the_same_pause_machinery(self):
+         self.assertEqual(replacement, lease.wake_id)
+         self.assertEqual(1, lease.attempt_number)
+ 
++    def test_resume_repairs_delivered_unread_assignment_once(self):
++        assignment = self.send(
++            "pickup-assignment",
++            kind="work_assignment",
++            actionable=True,
++        )
++        old_wake = int(assignment.wake_id)
++        prompt, _ = self.deliver_wake_with_turn(old_wake, terminal=True)
++        self.assertEqual(
++            sprint_message_delivery.wake_prompt(self.sprint_id, "developer"),
++            prompt,
++        )
++        self.lifecycle.pause(
++            self.sprint_id,
++            sprint_domain.LifecycleActor("participant", 1),
++            reason="exercise delivered-unread recovery",
++        )
++
++        receipt = self.coordinator().resume(
++            self.sprint_id,
++            sprint_domain.LifecycleActor("planner", 3),
++            reason="recover the unread assignment",
++        )
++
++        self.assertEqual(1, len(receipt.requeued_wake_ids))
++        replacement = receipt.requeued_wake_ids[0]
++        self.assertNotEqual(old_wake, replacement)
++        self.assertEqual(
++            (replacement, "pending"),
++            tuple(
++                self.con.execute(
++                    "SELECT wm.wake_id,w.state FROM sprint_wake_messages wm "
++                    "JOIN sprint_wake_outbox w USING (wake_id) "
++                    "WHERE wm.message_id=?",
++                    (assignment.message_id,),
++                ).fetchone()
++            ),
++        )
++        event = json.loads(
++            self.con.execute(
++                "SELECT payload FROM sprint_events WHERE sprint_id=? "
++                "AND event_type='wake.requeued' ORDER BY event_id DESC LIMIT 1",
++                (self.sprint_id,),
++            ).fetchone()[0]
++        )
++        self.assertEqual("delivered", event["prior_wake_state"])
++        self.assertEqual("completed", event["prior_turn_state"]["message_state"])
++        self.assertEqual("succeeded", event["prior_turn_state"]["run_state"])
++        self.assertEqual(old_wake, event["prior_wake_id"])
++        self.assertEqual(replacement, event["replacement_wake_id"])
++
++        self.assertEqual(
++            (),
++            self.lifecycle.reconcile_unread_pickup(
++                self.sprint_id,
++                trigger="monitor",
++            ),
++        )
++        self.assertEqual(
++            1,
++            self.con.execute(
++                "SELECT COUNT(*) FROM sprint_wake_outbox "
++                "WHERE idempotency_key LIKE 'sprint-recovery:%'"
++            ).fetchone()[0],
++        )
++
++    def test_resume_repairs_delivered_unread_participant_relay(self):
++        relay = self.messages.relay(
++            self.sprint_id,
++            from_shell_id=3,
++            to_shortname="DEV1",
++            body="Which compatibility fixture should I use?",
++            idempotency_key="pickup-relay",
++        )
++        old_wake = relay.wake_id
++        self.deliver_wake_with_turn(old_wake, terminal=True)
++        before = self.con.execute(
++            "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
++            (self.unit_id,),
++        ).fetchone()[0]
++        self.lifecycle.pause(
++            self.sprint_id,
++            sprint_domain.LifecycleActor("participant", 1),
++            reason="recover a participant question",
++        )
++
++        receipt = self.coordinator().resume(
++            self.sprint_id,
++            sprint_domain.LifecycleActor("planner", 3),
++            reason="restore message pickup",
++        )
++
++        replacement = receipt.requeued_wake_ids[0]
++        captured: list[tuple[int, str]] = []
++        delivery = sprint_message_delivery.SprintWakeDeliveryService(self.con)
++        outcome = None
++        while outcome is None or outcome.wake_id != replacement:
++            actual_prompt: list[str] = []
++            outcome = delivery.deliver_once(
++                "relay-recovery",
++                lambda _conversation, prompt, _key: actual_prompt.append(prompt)
++                or "native",
++            )
++            self.assertIsNotNone(outcome)
++            captured.append((outcome.wake_id, actual_prompt[0]))
++        self.assertEqual(replacement, outcome.wake_id)
++        self.assertEqual(
++            sprint_message_delivery.wake_prompt(self.sprint_id, "developer"),
++            captured[-1][1],
++        )
++        self.assertEqual(
++            before,
++            self.con.execute(
++                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
++                (self.unit_id,),
++            ).fetchone()[0],
++        )
++
++    def test_resume_does_not_replace_an_adequate_turn_or_deliverable_wake(self):
++        queued_turn = self.send("pickup-queued-turn")
++        _, queued_key = self.deliver_wake_with_turn(
++            int(queued_turn.wake_id),
++            terminal=False,
++        )
++        self.lifecycle.pause(
++            self.sprint_id,
++            sprint_domain.LifecycleActor("participant", 1),
++            reason="test adequate queued turn",
++        )
++        first = self.coordinator().resume(
++            self.sprint_id,
++            sprint_domain.LifecycleActor("planner", 3),
++        )
++        self.assertEqual((), first.requeued_wake_ids)
++
++        self.messages.mark_read(queued_turn.message_id, 1)
++        self.con.execute(
++            "UPDATE conversation_messages SET state='running' "
++            "WHERE idempotency_key=?",
++            (queued_key,),
++        )
++        self.con.execute(
++            "UPDATE conversation_messages SET state='completed',"
++            "completed_at=datetime('now') WHERE idempotency_key=?",
++            (queued_key,),
++        )
++        for state in ("running", "waiting"):
++            self.con.execute(
++                "UPDATE conversations SET state=? WHERE conversation_id=?",
++                (state, self.developer_conversation_id),
++            )
++        self.con.commit()
++        terminal = self.send("pickup-existing-wake")
++        self.deliver_wake_with_turn(int(terminal.wake_id), terminal=True)
++        deliverable = self.send("pickup-already-pending")
++        wake_count = self.con.execute(
++            "SELECT COUNT(*) FROM sprint_wake_outbox"
++        ).fetchone()[0]
++        self.lifecycle.pause(
++            self.sprint_id,
++            sprint_domain.LifecycleActor("participant", 1),
++            reason="test adequate pending wake",
++        )
++        second = self.coordinator().resume(
++            self.sprint_id,
++            sprint_domain.LifecycleActor("planner", 3),
++        )
++        self.assertIn(deliverable.wake_id, second.requeued_wake_ids)
++        self.assertEqual(
++            wake_count,
++            self.con.execute("SELECT COUNT(*) FROM sprint_wake_outbox").fetchone()[0],
++            "resume reuses existing wakes instead of adding a pickup fallback",
++        )
++        self.assertEqual(
++            [(deliverable.wake_id,), (deliverable.wake_id,)],
++            [
++                tuple(row)
++                for row in self.con.execute(
++                    "SELECT wake_id FROM sprint_wake_messages "
++                    "WHERE message_id IN (?,?) ORDER BY message_id",
++                    (terminal.message_id, deliverable.message_id),
++                )
++            ],
++        )
++
++    def test_startup_reconciliation_repairs_once_across_repeated_passes(self):
++        message = self.send("pickup-startup")
++        old_wake = int(message.wake_id)
++        self.deliver_wake_with_turn(old_wake, terminal=True)
++        coordinator = self.coordinator()
++
++        self.assertEqual("armed", coordinator.recover_on_startup(self.sprint_id))
++        replacement = int(
++            self.con.execute(
++                "SELECT wake_id FROM sprint_wake_messages WHERE message_id=?",
++                (message.message_id,),
++            ).fetchone()[0]
++        )
++        self.assertNotEqual(old_wake, replacement)
++        count = self.con.execute(
++            "SELECT COUNT(*) FROM sprint_wake_outbox"
++        ).fetchone()[0]
++
++        self.assertEqual("armed", coordinator.recover_on_startup(self.sprint_id))
++        self.assertEqual(
++            count,
++            self.con.execute("SELECT COUNT(*) FROM sprint_wake_outbox").fetchone()[0],
++        )
++        self.assertEqual(
++            (replacement,),
++            tuple(
++                self.con.execute(
++                    "SELECT wake_id FROM sprint_wake_messages WHERE message_id=?",
++                    (message.message_id,),
++                ).fetchone()
++            ),
++        )
++
+     def test_resume_projects_observed_merge_before_releasing_downstream(self):
+         registered = self.register()
+         self.con.execute(
+diff --git a/tests/test_sprint_review_loop.py b/tests/test_sprint_review_loop.py
+index b423ed91..93dd0b9d 100644
+--- a/tests/test_sprint_review_loop.py
++++ b/tests/test_sprint_review_loop.py
+@@ -64,6 +64,74 @@ def approve(self, key: str = "approved-1"):
+ 
+ 
+ class ReviewHandoffTest(SprintReviewLoopCase):
++    def test_review_payloads_accept_8000_and_reject_8001_without_state_change(self):
++        before_messages = self.con.execute(
++            "SELECT COUNT(*) FROM sprint_messages"
++        ).fetchone()[0]
++        with self.assertRaisesRegex(
++            ValueError,
++            "readiness judgment is 8001 characters; maximum is 8000",
++        ):
++            self.loop.request_review(
++                self.sprint_id,
++                self.registered_pr_id,
++                1,
++                readiness="x" * 8001,
++                idempotency_key="oversize-readiness",
++            )
++        self.assertEqual(
++            ("active", before_messages),
++            tuple(
++                self.con.execute(
++                    "SELECT u.disposition,(SELECT COUNT(*) FROM sprint_messages) "
++                    "FROM sprint_work_units u WHERE u.work_unit_id=?",
++                    (self.unit_id,),
++                ).fetchone()
++            ),
++        )
++
++        handoff = self.loop.request_review(
++            self.sprint_id,
++            self.registered_pr_id,
++            1,
++            readiness="x" * 8000,
++            idempotency_key="bounded-readiness",
++        )
++        self.accept_review(handoff.message_id)
++        before_judgments = self.con.execute(
++            "SELECT COUNT(*) FROM sprint_judgments WHERE sprint_id=?",
++            (self.sprint_id,),
++        ).fetchone()[0]
++        with self.assertRaisesRegex(
++            ValueError,
++            "review body is 8001 characters; maximum is 8000",
++        ):
++            self.loop.record_review(
++                self.sprint_id,
++                self.registered_pr_id,
++                2,
++                verdict="approved",
++                body="x" * 8001,
++                idempotency_key="oversize-review",
++            )
++        self.assertEqual(
++            before_judgments,
++            self.con.execute(
++                "SELECT COUNT(*) FROM sprint_judgments WHERE sprint_id=?",
++                (self.sprint_id,),
++            ).fetchone()[0],
++        )
++
++        outcome = self.loop.record_review(
++            self.sprint_id,
++            self.registered_pr_id,
++            2,
++            verdict="approved",
++            body="x" * 8000,
++            idempotency_key="bounded-review",
++        )
++        self.assertTrue(outcome.created)
++
+     def test_green_readiness_commits_judgment_and_active_reviewer_request(self):
+         handoff = self.request_review()
+ 
+diff --git a/tests/test_sprint_skills.py b/tests/test_sprint_skills.py
+index 42894614..7d6d6da8 100644
+--- a/tests/test_sprint_skills.py
++++ b/tests/test_sprint_skills.py
+@@ -87,6 +87,7 @@ def test_skills_use_only_the_shipped_shell_command_surface(self):
+             "replan-unit",
+             "arm",
+             "inbox",
++            "send",
+             "accept",
+             "decline",
+             "complete-unit",
+@@ -119,3 +120,63 @@ def test_skills_use_only_the_shipped_shell_command_surface(self):
+             if isinstance(action, sprint_cli.argparse._SubParsersAction)
+         ).choices
+         self.assertEqual(expected, set(commands))
++
++    def test_role_skills_cover_every_handoff_contingency_with_real_commands(self):
++        role_skills = {"sprint_pln", "sprint_dev", "sprint_rev", "sprint_close"}
++        for name in role_skills:
++            with self.subTest(name=name):
++                body = (ASSETS / name / "SKILL.md").read_text()
++                for command in (
++                    "sc sprint inbox --sprint <id>",
++                    "sc sprint accept --sprint <id> --message <message-id>",
++                    "sc sprint decline --sprint <id> --message <message-id>",
++                    "sc sprint send --sprint <id> --to <shortname> --body-file <path>",
++                    "sc sprint pause --sprint <id> --reason <integrity-threat>",
++                ):
++                    self.assertIn(command, body)
++                normalized = " ".join(body.lower().split())
++                for guidance in (
++                    "on every wake" if name != "sprint_close" else "on entry or any wake",
++                    "incoming question",
++                    "blocker",
++                    "decision boundary",
++                    "duplicate",
++                    "command is rejected or transport fails",
++                    "6,000 characters",
++                    "8,000",
++                    "wc -m < <path>",
++                    "command exits successfully",
++                    "re-run `sc sprint inbox --sprint <id>`",
++                ):
++                    self.assertIn(guidance, normalized)
++                self.assertEqual(
++                    1,
++                    body.count(
++                        "sc sprint send --sprint <id> --to <shortname> "
++                        "--body-file <path>"
++                    ),
++                )
++                for invented in ("ASK:", "ANSWER:", "BLOCKED:"):
++                    self.assertNotIn(invented, body)
++
++    def test_every_affected_file_argument_names_the_hard_ceiling(self):
++        parser = sprint_cli.build_parser()
++        commands = next(
++            action
++            for action in parser._actions
++            if isinstance(action, sprint_cli.argparse._SubParsersAction)
++        ).choices
++        for command, arguments in {
++            "send": ("--body-file",),
++            "complete-unit": ("--result-file",),
++            "request-review": ("--readiness-file",),
++            "record-review": ("--body-file",),
++            "record-conformance": ("--body-file", "--findings-file"),
++            "disposition-followup": ("--resolution-file",),
++            "complete": ("--report-file",),
++        }.items():
++            with self.subTest(command=command):
++                help_text = commands[command].format_help()
++                for argument in arguments:
++                    self.assertIn(argument, help_text)
++                self.assertIn("8,000 characters", help_text)
+diff --git a/tests/test_sprint_work_dispatch.py b/tests/test_sprint_work_dispatch.py
+index 151d5f36..580febaa 100644
+--- a/tests/test_sprint_work_dispatch.py
++++ b/tests/test_sprint_work_dispatch.py
+@@ -302,6 +302,46 @@ def test_only_explicit_non_code_lane_completes_with_exact_result(self) -> None:
+             "Published conformance report #77", json.loads(event[0])["result"]
+         )
+ 
++    def test_non_code_result_accepts_8000_and_rejects_8001_without_state_change(self):
++        report = self.create_unit(
++            developer=1,
++            title="Bounded report",
++            output_kind="report_only",
++        )
++        self.lifecycle.arm(self.sprint_id, 3)
++        self.messages.mark_read(self.assignment_message(report), 1)
++
++        with self.assertRaisesRegex(
++            ValueError,
++            "work-unit completion result is 8001 characters; maximum is 8000",
++        ):
++            self.units.complete(self.sprint_id, report, 1, result="x" * 8001)
++        self.assertEqual(
++            ("active", None),
++            tuple(
++                self.con.execute(
++                    "SELECT disposition,completion_result FROM sprint_work_units "
++                    "WHERE work_unit_id=?",
++                    (report,),
++                ).fetchone()
++            ),
++        )
++
++        self.assertEqual(
++            [],
++            self.units.complete(self.sprint_id, report, 1, result="x" * 8000),
++        )
++        self.assertEqual(
++            ("completed", 8000),
++            tuple(
++                self.con.execute(
++                    "SELECT disposition,length(completion_result) "
++                    "FROM sprint_work_units WHERE work_unit_id=?",
++                    (report,),
++                ).fetchone()
++            ),
++        )
++
+     def test_planner_cancels_only_unreleased_lane_with_reason(self) -> None:
+         cancelled = self.create_unit(developer=1, title="Cancelled")
+         self.assertTrue(
+@@ -561,7 +601,15 @@ def test_armed_pulse_delivers_wake_as_one_idempotent_native_turn(self) -> None:
+             "WHERE conversation_id=? AND idempotency_key=?",
+             (conversation_id, wake_key),
+         ).fetchone()
+-        self.assertEqual(delivery.FIXED_WAKE_PROMPT, native["body"])
++        expected_prompt = (
++            f"Sprint {self.sprint_id} handoff for your Developer role. Load "
++            "`sprint_dev`. Run `sc sprint inbox --sprint "
++            f"{self.sprint_id}` now and act on the Sprint message(s) using "
++            "`sprint_dev`. Confirm every Sprint write succeeds before stopping. "
++            "If the handoff is not complete, load `sprint_dev` again and run `sc "
++            f"sprint inbox --sprint {self.sprint_id}` again."
++        )
++        self.assertEqual(expected_prompt, native["body"])
+         self.assertEqual(wake_key, native["idempotency_key"])
+         self.assertEqual("queued", native["state"])
+         self.assertEqual(
+@@ -588,7 +636,7 @@ def test_armed_pulse_delivers_wake_as_one_idempotent_native_turn(self) -> None:
+         replay_ref = sprint_runtime.enqueue_conversation_turn(
+             self.db_path,
+             conversation_id,
+-            delivery.FIXED_WAKE_PROMPT,
++            expected_prompt,
+             wake_key,
+         )
+         attempt_ref = self.con.execute(
+diff --git a/tests/test_supervision_sc.py b/tests/test_supervision_sc.py
+index 39803130..3332fb94 100644
+--- a/tests/test_supervision_sc.py
++++ b/tests/test_supervision_sc.py
+@@ -37,6 +37,7 @@ def __init__(self) -> None:
+         # imports it from its __main__ block (SIGPIPE hygiene, #384).
+         for script in (
+             "artifact_policy.py",
++            "callable_floor.py",
+             "db_backup.py",
+             "cli_entry.py",
+             "engine_manifest.py",
+diff --git a/tests/test_update_legacy_compat.py b/tests/test_update_legacy_compat.py
+index c5961a49..e728e807 100644
+--- a/tests/test_update_legacy_compat.py
++++ b/tests/test_update_legacy_compat.py
+@@ -80,6 +80,8 @@ def test_runs_once_when_previous_engine_lacked_bridge(self) -> None:
+                 ENGINE_REF_PREV=engine_ref_prev,
+                 MARKER=marker,
+             ), mock.patch.object(
++                update, "repair_callable_dispatcher"
++            ) as repair_dispatcher, mock.patch.object(
+                 update, "repair_git_worktrees"
+             ) as repair, mock.patch.object(
+                 update, "refresh_installed_brokers"
+@@ -87,6 +89,10 @@ def test_runs_once_when_previous_engine_lacked_bridge(self) -> None:
+                 self.assertEqual(0, update_compat.main())
+                 self.assertEqual(0, update_compat.main())
+ 
++            self.assertEqual(
++                repair_dispatcher.call_args_list,
++                [mock.call(new_ref), mock.call(new_ref)],
++            )
+             repair.assert_called_once_with()
+             refresh.assert_called_once_with()
+             self.assertEqual(new_ref + "\n", marker.read_text())
+@@ -130,12 +136,15 @@ def test_skips_when_previous_engine_already_had_bridge(self) -> None:
+                 ENGINE_REF_PREV=engine_ref_prev,
+                 MARKER=marker,
+             ), mock.patch.object(
++                update, "repair_callable_dispatcher"
++            ) as repair_dispatcher, mock.patch.object(
+                 update, "repair_git_worktrees"
+             ) as repair, mock.patch.object(
+                 update, "refresh_installed_brokers"
+             ) as refresh:
+                 self.assertEqual(0, update_compat.main())
+ 
++            repair_dispatcher.assert_called_once_with(current_ref)
+             repair.assert_not_called()
+             refresh.assert_not_called()
+             self.assertFalse(marker.exists())
+@@ -163,6 +172,7 @@ def test_materialized_map_setup_runs_bridge_in_fresh_process(self) -> None:
+                 "    path.write_text(old + value + '\\n')\n"
+                 "def repair_git_worktrees(): _record('repair')\n"
+                 "def refresh_installed_brokers(): _record('brokers')\n"
++                "def repair_callable_dispatcher(ref): _record('dispatcher')\n"
+             )
+             (scripts / "map_repo.py").write_text(
+                 "def main(): return 0\n"
+@@ -188,7 +198,7 @@ def test_materialized_map_setup_runs_bridge_in_fresh_process(self) -> None:
+             )
+ 
+             self.assertEqual(0, completed.returncode, completed.stderr)
+-            self.assertEqual("repair\nbrokers\n", log.read_text())
++            self.assertEqual("dispatcher\nrepair\nbrokers\n", log.read_text())
+             self.assertEqual(
+                 current_ref + "\n",
+                 (state / "local" / "update-compat-v1.done").read_text(),
+diff --git a/tests/test_update_materialize.py b/tests/test_update_materialize.py
+index d5e14197..6f4990b2 100644
+--- a/tests/test_update_materialize.py
++++ b/tests/test_update_materialize.py
+@@ -22,6 +22,7 @@
+ import contextlib
+ import io
+ import json
++import os
+ import subprocess
+ import sys
+ import tempfile
+@@ -183,6 +184,144 @@ def test_added_path_resolves_from_target_ref_and_materializes(self):
+             output.getvalue(),
+         )
+ 
++    def test_missing_dispatch_target_does_not_advance_engine_pin(self):
++        installed = ["sc", ".super-coder/scripts"]
++        (self.root / "sc").write_text("old dispatcher\n")
++        self.write_manifest(installed)
++        (self.scripts / "floor.txt").write_text("old floor\n")
++        old_sha = self.commit("old floor")
++
++        (self.root / "sc").write_text(
++            "#!/bin/sh\n"
++            'exec "$PY" "$S/sprint_cli.py" "$@"\n'
++        )
++        (self.root / "sc").chmod(0o755)
++        (self.root / ".gitignore").write_text("/.sc-worktrees/\n")
++        self.write_manifest(installed)
++        new_sha = self.commit("broken target floor")
++        _git(self.root, "checkout", old_sha)
++
++        state = self.root / ".sc-state"
++        engine = self.root / ".super-coder"
++        with mock.patch.multiple(
++            update,
++            REPO_ROOT=self.root,
++            ENGINE=engine,
++            STATE_DIR=state,
++            ENGINE_REF=state / "engine.ref",
++            ENGINE_REF_PREV=state / "engine.ref.prev",
++            ENGINE_PATHS=installed,
++        ), mock.patch.multiple(
++            update.engine_manifest,
++            REPO_ROOT=self.root,
++            ENGINE=engine,
++            MANIFEST=engine / "engine.manifest",
++            local_edits=mock.Mock(return_value={}),
++        ):
++            with self.assertRaises(SystemExit) as raised:
++                update.materialize_fetched_engine(new_sha)
++
++        self.assertIn(
++            "dispatcher routes to missing engine script(s): sprint_cli.py",
++            str(raised.exception),
++        )
++        self.assertIn(
++            f"cd {self.root} && ./sc update",
++            str(raised.exception),
++        )
++        self.assertFalse((state / "engine.ref").exists())
++        self.assertEqual((self.root / "sc").read_text().splitlines()[0], "#!/bin/sh")
++
++    def test_legacy_bridge_repairs_stale_dispatcher_and_rebaselines_manifest(self):
++        installed = ["sc", ".super-coder/scripts"]
++        (self.root / "sc").write_text(
++            "#!/bin/sh\n"
++            "S=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)/.super-coder/scripts\"\n"
++            'exec "${PY:-python3}" "$S/sprint.py" "$@"\n'
++        )
++        (self.root / "sc").chmod(0o755)
++        self.write_manifest(installed)
++        (self.scripts / "sprint.py").write_text("print('legacy help')\n")
++        old_sha = self.commit("legacy callable floor")
++        worktree = self.root / ".sc-worktrees" / "dev1"
++        _git(self.root, "worktree", "add", "-b", "shell/dev1", str(worktree), old_sha)
++
++        (self.root / "sc").write_text(
++            "#!/bin/sh\n"
++            "S=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)/.super-coder/scripts\"\n"
++            "cmd=\"${1:-}\"\n"
++            "[ \"$cmd\" = sprint ] && shift\n"
++            'exec "${PY:-python3}" "$S/sprint_cli.py" "$@"\n'
++        )
++        (self.scripts / "sprint.py").unlink()
++        (self.scripts / "sprint_cli.py").write_text(
++            "import sys\n"
++            "if sys.argv[1:] == ['-h']:\n"
++            "    print('usage: sc sprint [-h]')\n"
++            "elif sys.argv[1:] == ['inbox', '-h']:\n"
++            "    print('usage: sc sprint inbox [-h] --sprint SPRINT')\n"
++            "else:\n"
++            "    raise SystemExit(2)\n"
++        )
++        self.write_manifest(installed)
++        target_sha = self.commit("current callable floor")
++        _git(self.root, "checkout", "--detach", old_sha)
++
++        engine = self.root / ".super-coder"
++        manifest = engine / "engine.manifest"
++        output = io.StringIO()
++        with mock.patch.multiple(
++            update,
++            REPO_ROOT=self.root,
++            ENGINE=engine,
++            ENGINE_PATHS=installed,
++        ), mock.patch.multiple(
++            update.engine_manifest,
++            REPO_ROOT=self.root,
++            ENGINE=engine,
++            MANIFEST=manifest,
++        ), contextlib.redirect_stdout(output):
++            update.materialize_engine(
++                target_sha,
++                engine_paths=[".super-coder/scripts"],
++            )
++            repaired = update.repair_callable_dispatcher(target_sha)
++
++        env = {**os.environ, "PATH": f"{self.root}:{os.environ['PATH']}"}
++        main_help = subprocess.run(
++            [str(self.root / "sc"), "sprint", "-h"],
++            cwd=self.root,
++            capture_output=True,
++            text=True,
++            check=False,
++        )
++        worktree_before = _git(worktree, "status", "--porcelain")
++        worktree_help = subprocess.run(
++            ["sc", "sprint", "inbox", "-h"],
++            cwd=worktree,
++            env=env,
++            capture_output=True,
++            text=True,
++            check=False,
++        )
++
++        self.assertTrue(repaired)
++        self.assertIn("sprint_cli.py", (self.root / "sc").read_text())
++        self.assertNotIn("sprint.py", (self.root / "sc").read_text())
++        self.assertIn("legacy update bridge: repaired callable dispatcher", output.getvalue())
++        self.assertEqual(main_help.returncode, 0, main_help.stderr)
++        self.assertEqual(main_help.stdout, "usage: sc sprint [-h]\n")
++        self.assertEqual(worktree_help.returncode, 0, worktree_help.stderr)
++        self.assertEqual(
++            worktree_help.stdout,
++            "usage: sc sprint inbox [-h] --sprint SPRINT\n",
++        )
++        self.assertEqual(_git(worktree, "status", "--porcelain"), worktree_before)
++        recorded = json.loads(manifest.read_text())
++        self.assertIn("sc", recorded)
++        self.assertIn(".super-coder/scripts/sprint_cli.py", recorded)
++        self.assertNotIn(".super-coder/scripts/sprint.py", recorded)
++
+     def test_retired_path_is_not_materialized_and_is_reported(self):
+         base = ["sc", ".super-coder/scripts"]
+         installed = [*base, ".super-coder/retired-path"]
+diff --git a/tests/test_verify_clean_clone.py b/tests/test_verify_clean_clone.py
+index 1a5e230b..1abad00e 100644
+--- a/tests/test_verify_clean_clone.py
++++ b/tests/test_verify_clean_clone.py
+@@ -28,9 +28,13 @@ def test_verify_initializes_an_empty_source_instance(self):
+             subprocess.run(
+                 ["git", "checkout", "--quiet", sha], cwd=checkout, check=True,
+             )
+-            # Include a locally edited dispatcher when this regression test is
+-            # run before its fix has been committed.
++            # Include locally edited launch-floor files when this regression
++            # test is run before their fixes have been committed.
+             shutil.copy2(ROOT / "sc", checkout / "sc")
++            shutil.copy2(
++                ROOT / ".super-coder" / "scripts" / "run.py",
++                checkout / ".super-coder" / "scripts" / "run.py",
++            )
+             env = os.environ.copy()
+             env.pop("SC_ARTIFACT_MODE", None)
+             result = subprocess.run(
+diff --git a/tests/test_worktree_targets.py b/tests/test_worktree_targets.py
+index d7be804d..fd9d356c 100644
+--- a/tests/test_worktree_targets.py
++++ b/tests/test_worktree_targets.py
+@@ -81,6 +81,15 @@ def run_bare_sc(cwd: Path, live_root: Path,
+         check=False, env=env)
+ 
+ 
++def git_status(cwd: Path) -> str:
++    return subprocess.run(
++        ["git", "-C", str(cwd), "status", "--porcelain"],
++        capture_output=True,
++        text=True,
++        check=True,
++    ).stdout
++
++
+ def state_digest(root: Path) -> dict[str, str]:
+     """The live-state artifacts of an instance, by content: the DB, its WAL/SHM
+     sidecars, and every backup. A replaced DB shows as a changed digest, a new
+@@ -395,6 +404,20 @@ def test_bare_sc_works_when_the_worktree_launcher_is_absent(self):
+         self.assertEqual(pin.returncode, 0, pin.stderr)
+         self.assertEqual(pin.stdout, ENGINE_PIN + "\n")
+ 
++    def test_bare_sprint_help_uses_canonical_dispatcher_without_dirtying_worktree(self):
++        before = git_status(self.wt)
++
++        sprint = run_bare_sc(self.wt, self.main, "sprint", "-h")
++        inbox = run_bare_sc(self.wt, self.main, "sprint", "inbox", "-h")
++
++        self.assertEqual(sprint.returncode, 0, sprint.stderr)
++        self.assertIn("usage: sc sprint", sprint.stdout)
++        self.assertNotIn("scripts/sprint.py", sprint.stderr)
++        self.assertEqual(inbox.returncode, 0, inbox.stderr)
++        self.assertIn("usage: sc sprint inbox", inbox.stdout)
++        self.assertNotIn("scripts/sprint.py", inbox.stderr)
++        self.assertEqual(git_status(self.wt), before)
++
+     def test_engine_ref_refuses_a_missing_or_malformed_live_pin(self):
+         path = self.main / ".sc-state" / "engine.ref"
+         for bad in (None, "short-pin\n", "g" * 40 + "\n"):
