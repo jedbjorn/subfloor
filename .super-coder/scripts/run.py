@@ -14,6 +14,7 @@ Flow:
 
 Usage:
     python3 .super-coder/scripts/run.py [shortname] [--first]
+    python3 .super-coder/scripts/run.py --host-admin [admin-shortname]
     RENDER_ONLY=1 python3 .super-coder/scripts/run.py --first   # render, don't exec
 
 Interactive and headless launches share this direct boot path. `./sc enter`
@@ -763,6 +764,49 @@ def list_shells(con, user_id: int) -> list:
     return shells
 
 
+def select_host_admin(con, requested: "str | None" = None) -> dict:
+    """Resolve the installation's sole active Admin without a shell picker.
+
+    The migration-backed unique index makes the multi-row branch unreachable on
+    a healthy floor, but keeping the launch check explicit gives an older or
+    half-migrated installation a deterministic repair error instead of silently
+    choosing an identity.
+    """
+    rows = [dict(row) for row in con.execute(
+        "SELECT shell_id, display_name, shortname, mandate, is_shared, flavor, "
+        "current_state FROM shells WHERE flavor='admin' "
+        "AND COALESCE(is_deleted,0)=0 ORDER BY shell_id"
+    ).fetchall()]
+    if not rows:
+        raise LaunchError(
+            "no active Admin exists; repair the installation before launching"
+        )
+    if len(rows) != 1:
+        ids = ", ".join(str(row["shell_id"]) for row in rows)
+        raise LaunchError(
+            f"Admin singleton invariant is not converged (active shell ids: {ids}); "
+            "run the pending engine migration or repair the live DB"
+        )
+    chosen = rows[0]
+    if requested and (chosen["shortname"] or "").lower() != requested.lower():
+        raise LaunchError(
+            f"shell '{requested}' is not the sole active Admin "
+            f"('{chosen['shortname'] or chosen['shell_id']}')"
+        )
+    return chosen
+
+
+def require_host_harness(adapter: dict, harness: str) -> None:
+    """Refuse a host Admin boot before opening a durable session."""
+    command = str((adapter.get("launch") or [harness])[0])
+    if shutil.which(command):
+        return
+    raise LaunchError(
+        f"host harness '{command}' is not installed; run ./sc ensure-harness "
+        "or use make dos-e for the container Admin route"
+    )
+
+
 def flavor_defaults(con) -> dict:
     """flavor -> {'default_harness', 'models': {harness: model}} launch defaults.
     The (flavor, harness) matrix: each flavor names a model per harness, and one
@@ -1333,9 +1377,16 @@ def main() -> None:
         allow_unpinned=owns_engine,
         context="session launch",
     )
-    if not os.environ.get("RENDER_ONLY"):
+    raw_args = sys.argv[1:]
+    host_admin = "--host-admin" in raw_args
+    if host_admin and os.environ.get("SC_SANDBOX"):
+        sys.exit(
+            "sc admin: host Admin launch is unavailable inside the sandbox; "
+            "run make dos-admin from a host terminal"
+        )
+    if not os.environ.get("RENDER_ONLY") and not host_admin:
         global_pointer.write_global_pointers()
-    args = sys.argv[1:]
+    args = raw_args
     first = "--first" in args
     headless = "--headless" in args
     # --harness <name> / --harness=<name> forces the harness and skips the
@@ -1349,7 +1400,7 @@ def main() -> None:
     i = 0
     while i < len(args):
         a = args[i]
-        if a in ("--first", "--headless"):
+        if a in ("--first", "--headless", "--host-admin"):
             i += 1
             continue
         if a == "--harness":
@@ -1382,6 +1433,8 @@ def main() -> None:
             positional.append(a)
         i += 1
     requested = positional[0] if positional else None
+    if host_admin and (headless or len(positional) > 1):
+        sys.exit("usage: ./sc admin [admin-shortname] [--harness <h>]")
     if headless and not requested:
         sys.exit('usage: ./sc run <shortname> [-p "<prompt>"] [--harness <h>] '
                  '[-m <model>] [--effort <level>]')
@@ -1390,7 +1443,17 @@ def main() -> None:
     if not headless and not os.environ.get("RENDER_ONLY") and sys.stdin.isatty():
         print(style.banner(REPO_ROOT.name))
 
-    con = open_db()
+    try:
+        con = open_db()
+    except (SystemExit, Exception) as exc:
+        if not host_admin:
+            raise
+        detail = str(exc).strip() or type(exc).__name__
+        sys.exit(
+            f"sc admin: cannot open the live engine DB at {DB_PATH}: {detail}\n"
+            "Use the global repair-mode instructions to repair or rebuild that exact DB, "
+            "then retry make dos-admin."
+        )
     # Self-heal stale engine skills before anything this boot reads them
     # (compose's SKILLS block, render_skill_md). A DB stranded by an in-place
     # `0001` regen repairs itself from assets/skills/ instead of needing a manual
@@ -1418,9 +1481,16 @@ def main() -> None:
     # confirm before booting into a live worktree. Headless keeps its own lazy
     # compute below; non-TTY boots (--first, piped) can't confirm, so no snap.
     snap = (shell_liveness.compute()
-            if not headless and sys.stdin.isatty() else None)
-    launchable = list_shells(con, user["user_id"])
-    chosen = pick_shell(launchable, requested, first, fdefaults, snap)
+            if not host_admin and not headless and sys.stdin.isatty() else None)
+    if host_admin:
+        try:
+            chosen = select_host_admin(con, requested)
+        except LaunchError as exc:
+            con.close()
+            sys.exit(f"sc admin: {exc}")
+    else:
+        launchable = list_shells(con, user["user_id"])
+        chosen = pick_shell(launchable, requested, first, fdefaults, snap)
     if browser_conversation_active(con, chosen["shell_id"]):
         con.close()
         sys.exit(
@@ -1482,6 +1552,14 @@ def main() -> None:
     # OpenCode exposes none and keeps the model's own default.
     flavor_model = fdef["models"].get(harness) if fdef else None
     adapter = load_adapter(harness)
+    if host_admin:
+        try:
+            require_host_harness(adapter, harness)
+        except LaunchError as exc:
+            con.close()
+            sys.exit(f"sc admin: {exc}")
+        if not os.environ.get("RENDER_ONLY"):
+            global_pointer.write_global_pointers()
     if headless:
         try:
             resolved_route = resolve_headless_route(

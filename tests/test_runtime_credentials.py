@@ -8,8 +8,8 @@ Two halves, one contract:
   `.super-coder/run/mem/`, refreshes them every boot (key rotation), and
   sweeps artifacts whose shell is gone, demoted, deleted, or unkeyed.
 - `mem.py` discovery — with BOTH SC_API_BASE/SC_API_TOKEN absent, `sc mem`
-  adopts the unique Admin artifact and still calls the API; multiple Admins
-  refuse until SC_MEM_AS names one; a symlinked or otherwise insecure
+  adopts the unique Admin artifact and still calls the API; a symlinked or
+  otherwise insecure
   artifact and a stale (rotated) token refuse with the supported action.
 
 The trust boundary is the real artifact, never a path: neither half may follow
@@ -93,8 +93,7 @@ def deadline(seconds=5):
 
 
 def build_shells_db(path: Path) -> None:
-    """Engine-shaped DB with a keyed Admin, a keyed dev, an unkeyed Admin,
-    and a deleted Admin — the full provisioning matrix."""
+    """Engine-shaped DB with one active Admin plus negative dev/deleted rows."""
     con = sqlite3.connect(path)
     con.executescript(SCHEMA.read_text())
     for p in sorted(MIGRATIONS.glob("*.sql")):
@@ -103,7 +102,7 @@ def build_shells_db(path: Path) -> None:
     rows = [
         (1, "Adm One", "ADM1", "admin", "k-adm1", 0),
         (2, "Dev One", "DEV1", "dev", "k-dev1", 0),
-        (3, "Adm Two", "ADM2", "admin", None, 0),
+        (3, "Adm Two", "ADM2", "admin", None, 1),
         (4, "Adm Three", "ADM3", "admin", "k-adm3", 1),
     ]
     con.executemany(

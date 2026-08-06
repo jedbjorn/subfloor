@@ -309,6 +309,107 @@ class OpenSessionContentionTest(unittest.TestCase):
 
 
 class HeadlessSessionFailureTest(unittest.TestCase):
+    def test_host_admin_refuses_sandbox_before_boot_artifacts_or_database(self) -> None:
+        with mock.patch.dict(run.os.environ, {"SC_SANDBOX": "1"}, clear=True), \
+                mock.patch.object(run.sys, "argv", ["run.py", "--host-admin"]), \
+                mock.patch.object(run.global_pointer, "write_global_pointers") as pointers, \
+                mock.patch.object(run, "open_db") as open_db, \
+                self.assertRaises(SystemExit) as raised:
+            run.main()
+
+        self.assertIn("run make dos-admin from a host terminal", str(raised.exception))
+        pointers.assert_not_called()
+        open_db.assert_not_called()
+
+    def test_host_admin_missing_harness_refuses_before_session_creation(self) -> None:
+        con = mock.Mock()
+        chosen = {"shell_id": 1, "shortname": "ADM1", "flavor": "admin"}
+        fdefaults = {
+            "admin": {"default_harness": "codex", "models": {"codex": "gpt-test"}}
+        }
+        open_session = mock.Mock()
+        liveness = mock.Mock()
+
+        with mock.patch.dict(run.os.environ, {}, clear=True), \
+                mock.patch.object(
+                    run.sys, "argv", ["run.py", "--host-admin", "--harness", "codex"]
+                ), \
+                mock.patch.object(
+                    run.global_pointer, "write_global_pointers"
+                ) as pointers, \
+                mock.patch.object(run, "open_db", return_value=con), \
+                mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
+                mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
+                mock.patch.object(run, "flavor_defaults", return_value=fdefaults), \
+                mock.patch.object(run, "select_host_admin", return_value=chosen), \
+                mock.patch.object(run, "browser_conversation_active", return_value=False), \
+                mock.patch.object(run.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(run.shell_liveness, "compute", liveness), \
+                mock.patch.object(run, "ensure_harness_path"), \
+                mock.patch.object(
+                    run, "load_adapter", return_value={"harness": "codex", "launch": ["codex"]}
+                ), \
+                mock.patch.object(run.shutil, "which", return_value=None), \
+                mock.patch.object(run, "open_session", open_session), \
+                self.assertRaises(SystemExit) as raised:
+            run.main()
+
+        self.assertEqual(
+            str(raised.exception),
+            "sc admin: host harness 'codex' is not installed; run ./sc "
+            "ensure-harness or use make dos-e for the container Admin route",
+        )
+        con.close.assert_called_once_with()
+        pointers.assert_not_called()
+        liveness.assert_not_called()
+        open_session.assert_not_called()
+
+    def test_host_admin_non_admin_reference_refuses_before_boot_artifacts(self) -> None:
+        con = mock.Mock()
+        pointers = mock.Mock()
+        with mock.patch.dict(run.os.environ, {}, clear=True), \
+                mock.patch.object(run.sys, "argv", ["run.py", "--host-admin", "DEV1"]), \
+                mock.patch.object(
+                    run.global_pointer, "write_global_pointers", pointers
+                ), \
+                mock.patch.object(run, "open_db", return_value=con), \
+                mock.patch.object(run.seed_skills, "sync_engine_skills", return_value=[]), \
+                mock.patch.object(run, "authenticate", return_value={"user_id": 1}), \
+                mock.patch.object(run, "flavor_defaults", return_value={}), \
+                mock.patch.object(
+                    run,
+                    "select_host_admin",
+                    side_effect=run.LaunchError(
+                        "shell 'DEV1' is not the sole active Admin ('ADM1')"
+                    ),
+                ), \
+                self.assertRaises(SystemExit) as raised:
+            run.main()
+
+        self.assertEqual(
+            str(raised.exception),
+            "sc admin: shell 'DEV1' is not the sole active Admin ('ADM1')",
+        )
+        con.close.assert_called_once_with()
+        pointers.assert_not_called()
+
+    def test_host_admin_db_failure_points_to_global_repair_before_artifacts(self) -> None:
+        failure = run.db_driver.OperationalError("database disk image is malformed")
+        with mock.patch.dict(run.os.environ, {}, clear=True), \
+                mock.patch.object(run.sys, "argv", ["run.py", "--host-admin"]), \
+                mock.patch.object(
+                    run.global_pointer, "write_global_pointers"
+                ) as pointers, \
+                mock.patch.object(run, "open_db", side_effect=failure), \
+                self.assertRaises(SystemExit) as raised:
+            run.main()
+
+        message = str(raised.exception)
+        self.assertIn(str(run.DB_PATH), message)
+        self.assertIn("database disk image is malformed", message)
+        self.assertIn("global repair-mode instructions", message)
+        pointers.assert_not_called()
+
     def test_removed_launch_context_flags_fail_before_database_access(self) -> None:
         for option in ("--slot", "--sprint", "--await-sprint-active"):
             with self.subTest(option=option), mock.patch.object(

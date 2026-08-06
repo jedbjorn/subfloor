@@ -457,8 +457,8 @@ class CollectorTest(unittest.TestCase):
 
     def test_shell_only_attribution(self):
         """Rows predating lifecycle archives still get shell_id from cwd alone;
-        a later window match upgrades them to full attribution; ambiguous
-        root-cwd (two admin shells) stays NULL."""
+        a later window match upgrades them to full attribution; deleted Admin
+        history does not make root-cwd attribution ambiguous."""
         con = self.con()
         wt = str(analytics.REPO_ROOT / ".sc-worktrees/dev1")
         root = str(analytics.REPO_ROOT)
@@ -497,21 +497,22 @@ class CollectorTest(unittest.TestCase):
         got = con.execute("SELECT archive_id, shell_id FROM session_token_usage "
                           "WHERE harness_session_ref='h1'").fetchone()
         self.assertEqual((got[0], got[1]), (20, 2))
-        # two admin shells → root cwd is ambiguous, second sweep leaves h2 as-is
+        # A deleted historical Admin does not compete with the canonical active
+        # Admin for root-cwd attribution.
         con.execute("INSERT INTO shells (shell_id, display_name, shortname, mandate, "
                     "system_prompt, user_id, is_shared, has_identity, bootstrapped, "
-                    "flavor, api_key) VALUES (3, 'Admin2', 'adm2', 't', 'sp', 1, 0, "
-                    "1, 0, 'admin', 'tok-b')")
+                    "flavor, api_key, is_deleted) VALUES (3, 'Admin2', 'adm2', 't', "
+                    "'sp', 1, 0, 1, 0, 'admin', 'tok-b', 1)")
         con.commit()
         rows[1]["harness_session_ref"] = "h4"
         analytics._upsert(con, rows[1], "2026-07-19T13:00:00Z")
         con.commit()
         n, shell_only = analytics._attribute(con, [rows[1]], lambda m: None)
         con.commit()
-        self.assertEqual((n, shell_only), (0, 0))
-        self.assertIsNone(con.execute(
+        self.assertEqual((n, shell_only), (0, 1))
+        self.assertEqual(con.execute(
             "SELECT shell_id FROM session_token_usage "
-            "WHERE harness_session_ref='h4'").fetchone()[0])
+            "WHERE harness_session_ref='h4'").fetchone()[0], 1)
 
 
 if __name__ == "__main__":

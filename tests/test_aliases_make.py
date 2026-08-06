@@ -125,6 +125,9 @@ class MakeAliasContractTest(unittest.TestCase):
         cases = [
             (("dos-enter",), "./sc enter"),
             (("dos-e", "s=DEV1"), "./sc enter-DEV1"),
+            (("dos-admin",), "./sc admin"),
+            (("dos-admin", "ARGS=--harness codex"),
+             "./sc admin --harness codex"),
             (("dos-launch", "ARGS=--no-build"), "./sc launch --no-build"),
             (("dos-l",), "./sc launch"),
             (("dos-restart", "ARGS=--yes --no-build"),
@@ -191,6 +194,7 @@ class MakeAliasContractTest(unittest.TestCase):
             "dos-model-list",
             "dos-model-resolve",
             "dos-job",
+            "dos-admin",
             "dos-setup",
             "dos-url",
             "dos ARGS='<cmd>'",
@@ -198,6 +202,8 @@ class MakeAliasContractTest(unittest.TestCase):
             self.assertIn(target, help_text)
         self.assertNotIn("dos-sprint", help_text)
         self.assertNotIn("dos-watch", help_text)
+        self.assertIn("sole Admin directly on the host", help_text)
+        self.assertIn("dos-e remains the container Admin route", help_text)
 
     def test_full_help_describes_every_maintenance_command(self):
         """A name is not documentation. `make dos-help` must say what each

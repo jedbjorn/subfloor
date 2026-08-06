@@ -35,9 +35,19 @@ UNCHARTED_BY_DESIGN = {
 
 
 def sc(*args: str, env: dict | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["./sc", *args], cwd=ROOT, text=True,
-                          capture_output=True, check=False,
-                          env={**os.environ, "NO_COLOR": "1", **(env or {})})
+    return subprocess.run(
+        ["./sc", *args],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={
+            **os.environ,
+            "NO_COLOR": "1",
+            "SC_DISPATCH": str(ROOT / ".super-coder" / "scripts" / "dispatch.sh"),
+            **(env or {}),
+        },
+    )
 
 
 def fork_ports() -> dict:

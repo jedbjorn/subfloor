@@ -1315,6 +1315,17 @@ case "$cmd" in
   pg-init)      sc_pg_init ;;
   pg-up)        sc_pg_up ;;
   pg-down)      sc_pg_down ;;
+  admin)
+    if sc_help_form "$@"; then
+      echo "usage: ./sc admin [admin-shortname] [--harness <h>]"
+      echo "Boot the sole active Admin directly on the host; no Docker or API is required."
+      exit 0
+    fi
+    if [ -n "${SC_SANDBOX:-}" ]; then
+      echo "sc admin: host Admin launch is unavailable inside the sandbox; run make dos-admin from a host terminal" >&2
+      exit 1
+    fi
+    exec "$PY" "$S/run.py" --host-admin "$@" ;;
   boot)         exec "$PY" "$S/run.py" "$@" ;;
   boot-*)       exec "$PY" "$S/run.py" "${cmd#boot-}" "$@" ;;
   # Headless boot: same render-then-exec path as boot, minus the picker and
@@ -1651,6 +1662,7 @@ super-coder — forkable shell substrate
   container only sees this repo + your harness creds):
   ./sc launch              build + start the sandbox container (server + GUI), 127.0.0.1 only
                              --no-build reuses the existing image and refuses before runtime changes when absent
+  ./sc admin               boot the sole active Admin directly on the host (no Docker or API required)
   ./sc enter               boot an interactive shell directly (picker when omitted)
   ./sc enter-<shortname>   enter that shell directly (skip the shell picker)
                              harness: --harness <name> or HARNESS=<name> forces it; else when
