@@ -535,11 +535,20 @@ def report_logins() -> dict:
 
 
 # Ignore lines a fork needs — the rebuilt/derived artifacts. The git checkout
-# that brings the engine in doesn't carry super-coder's .gitignore, so the
-# installer appends them to the host repo's .gitignore (idempotent via marker).
-_GITIGNORE_MARKER = "# super-coder — rebuilt/derived; never commit"
-_GITIGNORE_BLOCK = f"""
-{_GITIGNORE_MARKER}
+# that brings the engine in doesn't carry subfloor's .gitignore, so install and
+# update own one exact sentinel-bounded range in the mixed host file.
+_GITIGNORE_BEGIN = "# >>> subfloor managed ignores >>>"
+_GITIGNORE_END = "# <<< subfloor managed ignores <<<"
+_LEGACY_GITIGNORE_MARKER = "# super-coder — rebuilt/derived; never commit"
+_LEGACY_GITIGNORE_TOPUP = "# super-coder — engine ignore rules added by `./sc update`"
+_LEGACY_GITIGNORE_PATTERNS = {
+    "/.super-coder/shell_db.db",
+    "/.super-coder/shell_db.db-wal",
+    "/.super-coder/shell_db.db-shm",
+    "/.super-coder/instance.json",
+}
+_GITIGNORE_MARKER = _GITIGNORE_BEGIN  # compatibility for callers/tests
+_GITIGNORE_BLOCK = f"""{_GITIGNORE_BEGIN}
 # The engine is a materialized, gitignored DEPENDENCY (B7) — fetched from
 # upstream, refreshed by `./sc update`, never committed to the fork. Your project
 # is everything ELSE in this repo.
@@ -574,39 +583,158 @@ _GITIGNORE_BLOCK = f"""
 /.sc-state/map.db-wal
 /.sc-state/map.db-shm
 /.sc-state/db_backups/
+{_GITIGNORE_END}
 """
 
 
 def _required_ignores() -> list[str]:
-    """The ignore PATTERNS in the block (path lines, not comments). Single source
-    of truth — adding a line to _GITIGNORE_BLOCK above is enough for both fresh
-    installs and `./sc update` top-ups."""
+    """The ignore patterns inside the canonical managed range."""
     return [ln.strip() for ln in _GITIGNORE_BLOCK.splitlines()
             if ln.strip() and not ln.strip().startswith("#")]
 
 
-def ensure_gitignore(repo_root: Path = REPO_ROOT) -> bool:
-    """Ensure the host repo's .gitignore covers every engine-derived path.
+class GitignoreError(ValueError):
+    """The mixed host file cannot be changed without guessing ownership."""
 
-    First install (marker absent): append the full annotated block. On a fork
-    that already has the block, **top up** any patterns added in later releases
-    (e.g. the map DB cache `/.sc-state/map.db`) — line-additive, so a fork that
-    picks up new engine ignore rules via `./sc update` self-heals instead of
-    silently committing a churning derived cache. Returns True if it changed."""
+
+def _gitignore_lines(text: str) -> list[tuple[int, int, int, str]]:
+    """Return (line number, start, end, content) without normalizing bytes."""
+    result = []
+    offset = 0
+    for number, raw in enumerate(text.splitlines(keepends=True), 1):
+        content = raw
+        if content.endswith("\r\n"):
+            content = content[:-2]
+        elif content.endswith(("\n", "\r")):
+            content = content[:-1]
+        end = offset + len(raw)
+        result.append((number, offset, end, content))
+        offset = end
+    return result
+
+
+def _sentinel_span(text: str) -> tuple[int, int] | None:
+    lines = _gitignore_lines(text)
+    begins = [line for line in lines if line[3] == _GITIGNORE_BEGIN]
+    ends = [line for line in lines if line[3] == _GITIGNORE_END]
+    if not begins and not ends:
+        return None
+    if len(begins) != 1 or len(ends) != 1:
+        begin_lines = ", ".join(str(line[0]) for line in begins) or "none"
+        end_lines = ", ".join(str(line[0]) for line in ends) or "none"
+        raise GitignoreError(
+            "malformed subfloor managed ignore sentinels: "
+            f"begin lines {begin_lines}; end lines {end_lines}; "
+            "expected exactly one ordered pair"
+        )
+    begin, end = begins[0], ends[0]
+    if begin[0] >= end[0]:
+        raise GitignoreError(
+            "malformed subfloor managed ignore sentinels: "
+            f"begin line {begin[0]} follows end line {end[0]}"
+        )
+    return begin[1], end[2]
+
+
+def _legacy_span(text: str) -> tuple[int, int] | None:
+    lines = _gitignore_lines(text)
+    initial = [i for i, line in enumerate(lines) if line[3] == _LEGACY_GITIGNORE_MARKER]
+    topups = [i for i, line in enumerate(lines) if line[3] == _LEGACY_GITIGNORE_TOPUP]
+    if not initial and not topups:
+        return None
+    if len(initial) != 1:
+        locations = ", ".join(str(lines[i][0]) for i in initial) or "none"
+        raise GitignoreError(
+            "ambiguous legacy subfloor ignore range: "
+            f"initial marker lines {locations}; expected exactly one"
+        )
+    start_i = initial[0]
+    before = [i for i in topups if i < start_i]
+    if before:
+        locations = ", ".join(str(lines[i][0]) for i in before)
+        raise GitignoreError(
+            "ambiguous legacy subfloor ignore range: "
+            f"update marker before initial marker at lines {locations}"
+        )
+
+    final_marker_i = topups[-1] if topups else start_i
+    patterns = set(_required_ignores()) | _LEGACY_GITIGNORE_PATTERNS
+    ambiguous = []
+    seen = set()
+    for line in lines[start_i + 1:final_marker_i]:
+        content = line[3].strip()
+        if content in patterns:
+            seen.add(content)
+        elif content and not content.startswith("#"):
+            ambiguous.append((line[0], line[3]))
+
+    last_pattern = None
+    pending_ambiguous = []
+    for line in lines[final_marker_i + 1:]:
+        content = line[3].strip()
+        if content in patterns:
+            if content in seen:
+                break
+            seen.add(content)
+            ambiguous.extend(pending_ambiguous)
+            pending_ambiguous.clear()
+            last_pattern = line
+            continue
+        if content and not content.startswith("#"):
+            pending_ambiguous.append((line[0], line[3]))
+    if ambiguous:
+        detail = "; ".join(f"line {number}: {content}" for number, content in ambiguous)
+        raise GitignoreError(f"ambiguous legacy subfloor ignore range: {detail}")
+    if last_pattern is None:
+        marker_line = lines[final_marker_i][0]
+        raise GitignoreError(
+            "ambiguous legacy subfloor ignore range: "
+            f"marker at line {marker_line} has no recognized managed pattern"
+        )
+    return lines[start_i][1], last_pattern[2]
+
+
+def _managed_gitignore_span(text: str) -> tuple[int, int] | None:
+    sentinel = _sentinel_span(text)
+    return sentinel if sentinel is not None else _legacy_span(text)
+
+
+def gitignore_without_managed(text: str) -> str:
+    """Remove only the canonical or bounded legacy engine-owned range."""
+    span = _managed_gitignore_span(text)
+    if span is None:
+        return text
+    return text[:span[0]] + text[span[1]:]
+
+
+def _read_gitignore(path: Path) -> str:
+    return path.read_bytes().decode("utf-8", errors="surrogateescape")
+
+
+def _write_gitignore(path: Path, text: str) -> None:
+    path.write_bytes(text.encode("utf-8", errors="surrogateescape"))
+
+
+def validate_gitignore(repo_root: Path = REPO_ROOT) -> None:
+    """Fail closed on malformed ownership without changing the host file."""
+    path = repo_root / ".gitignore"
+    if path.exists():
+        _managed_gitignore_span(_read_gitignore(path))
+
+
+def ensure_gitignore(repo_root: Path = REPO_ROOT) -> bool:
+    """Install or refresh the one canonical engine-owned ignore range."""
     gi = repo_root / ".gitignore"
-    existing = gi.read_text() if gi.exists() else ""
-    if _GITIGNORE_MARKER not in existing:
-        with gi.open("a") as f:
-            f.write(("" if existing.endswith("\n") or not existing else "\n") + _GITIGNORE_BLOCK)
-        return True
-    present = {ln.strip() for ln in existing.splitlines()}
-    missing = [p for p in _required_ignores() if p not in present]
-    if not missing:
+    existing = _read_gitignore(gi) if gi.exists() else ""
+    span = _managed_gitignore_span(existing)
+    if span is None:
+        separator = "" if not existing or existing.endswith(("\n", "\r")) else "\n"
+        updated = existing + separator + _GITIGNORE_BLOCK
+    else:
+        updated = existing[:span[0]] + _GITIGNORE_BLOCK + existing[span[1]:]
+    if updated == existing:
         return False
-    with gi.open("a") as f:
-        f.write(("" if existing.endswith("\n") else "\n")
-                + "# super-coder — engine ignore rules added by `./sc update`\n"
-                + "\n".join(missing) + "\n")
+    _write_gitignore(gi, updated)
     return True
 
 
@@ -714,6 +842,10 @@ def main(argv: list[str]) -> int:
         sys.exit("install: this fork is already installed (.super-coder/instance.json "
                  "has installed_at). Re-installing destroys content — pass --force "
                  "to override, or just `./sc launch`.")
+    try:
+        validate_gitignore(REPO_ROOT)
+    except GitignoreError as exc:
+        sys.exit(f"install: {exc}")
 
     # 2. Requirements ---------------------------------------------------------
     step("Checking requirements")
@@ -756,8 +888,12 @@ def main(argv: list[str]) -> int:
 
     # 3.5 Wire the host repo's .gitignore -------------------------------------
     step("Wiring .gitignore")
-    print("  added super-coder ignore lines" if ensure_gitignore()
-          else "  (already present)")
+    try:
+        changed_gitignore = ensure_gitignore()
+    except GitignoreError as exc:
+        sys.exit(f"install: {exc}")
+    print("  installed canonical subfloor ignore block" if changed_gitignore
+          else "  (already canonical)")
 
     # 3.55 Engine = gitignored dependency (B7) — untrack it + pin its version ---
     # The bootstrap checkout staged .super-coder/ into the fork's index; drop it

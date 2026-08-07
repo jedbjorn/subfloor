@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import sqlite3
 import stat
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -164,9 +166,12 @@ class EndToEndRemoveTest(RemoveFixture):
         self.assertIn("echo host", makefile)
         self.assertNotIn("aliases.mk", makefile)
         gitignore = (self.repo / ".gitignore").read_text()
-        self.assertIn("*.keep", gitignore)
-        self.assertIn(remove_mod.BACKUP_IGNORE, gitignore)
-        self.assertNotIn("/.super-coder/", gitignore)
+        self.assertEqual(
+            gitignore,
+            "*.keep\n"
+            f"{remove_mod.BACKUP_IGNORE_COMMENT}\n"
+            f"{remove_mod.BACKUP_IGNORE}\n",
+        )
 
         hooks = subprocess.run(
             ["git", "config", "--get", "core.hooksPath"],
@@ -199,6 +204,50 @@ class EndToEndRemoveTest(RemoveFixture):
 
 
 class RemoveSafetyGateTest(RemoveFixture):
+    def test_malformed_sentinel_refuses_before_any_mutation(self) -> None:
+        original = (
+            "*.keep\n"
+            f"{install._GITIGNORE_BEGIN}\n"
+            "/.super-coder/\n"
+        )
+        (self.repo / ".gitignore").write_text(original)
+        stderr = io.StringIO()
+
+        with redirect_stderr(stderr):
+            self.assertEqual(remove_mod.main(["--yes"]), 1)
+
+        self.assertEqual((self.repo / ".gitignore").read_text(), original)
+        self.assertFalse((self.repo / ".sc-state/db_backups").exists())
+        remove_mod.quiesce_runtime.assert_not_called()
+        self.assertEqual(
+            stderr.getvalue(),
+            "remove: malformed subfloor managed ignore sentinels: "
+            "begin lines 2; end lines none; expected exactly one ordered pair\n",
+        )
+
+    def test_ambiguous_legacy_range_refuses_before_any_mutation(self) -> None:
+        original = (
+            f"{install._LEGACY_GITIGNORE_MARKER}\n"
+            "/.super-coder/\n"
+            "host-owned/\n"
+            f"{install._LEGACY_GITIGNORE_TOPUP}\n"
+            "/.agents/skills/\n"
+        )
+        (self.repo / ".gitignore").write_text(original)
+        stderr = io.StringIO()
+
+        with redirect_stderr(stderr):
+            self.assertEqual(remove_mod.main(["--yes"]), 1)
+
+        self.assertEqual((self.repo / ".gitignore").read_text(), original)
+        self.assertFalse((self.repo / ".sc-state/db_backups").exists())
+        remove_mod.quiesce_runtime.assert_not_called()
+        self.assertEqual(
+            stderr.getvalue(),
+            "remove: ambiguous legacy subfloor ignore range: "
+            "line 3: host-owned/\n",
+        )
+
     def test_dirty_worktree_refuses_before_quiesce(self) -> None:
         worktree = self.repo / ".sc-worktrees/dev1"
         worktree.mkdir(parents=True)
@@ -347,6 +396,52 @@ class RuntimeQuiescenceTest(unittest.TestCase):
             ):
                 remove_mod.quiesce_runtime(repo)
 
+
+class GitignoreLifecycleTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name)
+        self.gitignore = self.repo / ".gitignore"
+
+    def test_removal_preserves_host_duplicate_outside_managed_range(self) -> None:
+        before = "/.super-coder/\n# host prefix\n"
+        after = "# host suffix\n/.agents/skills/\n"
+        self.gitignore.write_text(before + install._GITIGNORE_BLOCK + after)
+
+        self.assertTrue(remove_mod.cleanup_gitignore(self.repo))
+
+        self.assertEqual(
+            self.gitignore.read_text(),
+            before
+            + after
+            + remove_mod.BACKUP_IGNORE_COMMENT
+            + "\n"
+            + remove_mod.BACKUP_IGNORE
+            + "\n",
+        )
+
+    def test_install_remove_repetition_converges_without_debris(self) -> None:
+        expected_removed = (
+            "host-prefix/\n"
+            f"{remove_mod.BACKUP_IGNORE_COMMENT}\n"
+            f"{remove_mod.BACKUP_IGNORE}\n"
+        )
+        self.gitignore.write_text("host-prefix/\n")
+
+        for _ in range(2):
+            self.assertTrue(install.ensure_gitignore(self.repo))
+            installed = self.gitignore.read_text()
+            self.assertEqual(installed.count(install._GITIGNORE_BEGIN), 1)
+            self.assertEqual(installed.count(install._GITIGNORE_END), 1)
+            self.assertTrue(remove_mod.cleanup_gitignore(self.repo))
+            self.assertEqual(self.gitignore.read_text(), expected_removed)
+
+        removed = self.gitignore.read_text()
+        self.assertNotIn(install._LEGACY_GITIGNORE_MARKER, removed)
+        self.assertNotIn(install._LEGACY_GITIGNORE_TOPUP, removed)
+        self.assertNotIn(install._GITIGNORE_BEGIN, removed)
+        self.assertEqual(removed.count(remove_mod.BACKUP_IGNORE), 1)
 
 class WiringTest(unittest.TestCase):
     def test_dispatcher_and_make_alias_are_public(self) -> None:

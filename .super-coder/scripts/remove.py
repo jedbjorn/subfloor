@@ -202,12 +202,14 @@ def confirm(repo_root: Path) -> None:
 
 def ensure_backup_ignore(repo_root: Path) -> None:
     gitignore = repo_root / ".gitignore"
-    text = gitignore.read_text() if gitignore.exists() else ""
+    text = install._read_gitignore(gitignore) if gitignore.exists() else ""
+    install.gitignore_without_managed(text)  # validate before first mutation
     lines = text.splitlines()
     if BACKUP_IGNORE in {line.strip() for line in lines}:
         return
-    suffix = "" if not text or text.endswith("\n") else "\n"
-    gitignore.write_text(
+    suffix = "" if not text or text.endswith(("\n", "\r")) else "\n"
+    install._write_gitignore(
+        gitignore,
         text + suffix + f"\n{BACKUP_IGNORE_COMMENT}\n{BACKUP_IGNORE}\n"
     )
 
@@ -404,32 +406,17 @@ def cleanup_makefile(repo_root: Path) -> bool:
 
 def cleanup_gitignore(repo_root: Path) -> bool:
     path = repo_root / ".gitignore"
-    existing = path.read_text() if path.exists() else ""
-    remove_patterns = set(install._required_ignores())
-    remove_patterns.discard(BACKUP_IGNORE)
-    remove_comments = {
-        line.strip()
-        for line in install._GITIGNORE_BLOCK.splitlines()
-        if line.strip().startswith("#")
-    }
-    remove_comments.add("# super-coder — engine ignore rules added by `./sc update`")
-    remove_comments.add(BACKUP_IGNORE_COMMENT)
-    kept = [
-        line
-        for line in existing.splitlines()
-        if line.strip() not in remove_patterns
-        and line.strip() not in remove_comments
-        and line.strip() != BACKUP_IGNORE
-    ]
-    while kept and not kept[-1].strip():
-        kept.pop()
-    updated = "\n".join(kept)
-    if updated:
-        updated += "\n\n"
-    updated += f"{BACKUP_IGNORE_COMMENT}\n{BACKUP_IGNORE}\n"
+    existing = install._read_gitignore(path) if path.exists() else ""
+    try:
+        updated = install.gitignore_without_managed(existing)
+    except install.GitignoreError as exc:
+        raise RemoveError(str(exc)) from exc
+    if BACKUP_IGNORE not in {line.strip() for line in updated.splitlines()}:
+        separator = "" if not updated or updated.endswith(("\n", "\r")) else "\n"
+        updated += separator + f"{BACKUP_IGNORE_COMMENT}\n{BACKUP_IGNORE}\n"
     if updated == existing:
         return False
-    path.write_text(updated)
+    install._write_gitignore(path, updated)
     return True
 
 
@@ -609,6 +596,10 @@ def main(argv: list[str]) -> int:
                 f"dirty managed worktree(s) must be resolved first:\n  - {joined}"
             )
         edits, added = engine_drift(repo_root)
+        try:
+            install.validate_gitignore(repo_root)
+        except install.GitignoreError as exc:
+            raise RemoveError(str(exc)) from exc
         show_plan(repo_root, worktrees, edits, added)
         if args.dry_run:
             print("dry-run: no services stopped and no files changed")
