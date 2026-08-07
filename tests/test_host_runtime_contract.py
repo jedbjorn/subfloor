@@ -36,9 +36,10 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         )
         self.dispatch = scripts / "dispatch.sh"
 
-    def invoke(self, python: str) -> subprocess.CompletedProcess[str]:
+    def invoke(self, python: str, *argv: str) -> subprocess.CompletedProcess[str]:
+        command = argv or ("install",)
         return subprocess.run(
-            ["sh", str(self.dispatch), "install"],
+            ["sh", str(self.dispatch), *command],
             cwd=self.root,
             env={
                 **os.environ,
@@ -104,6 +105,28 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
             (self.root / ".super-coder/scripts/install-ran").read_text(),
             "yes",
         )
+
+    def test_only_shell_implemented_help_bypasses_the_probe(self) -> None:
+        selected = str(self.root / "missing-python")
+        help_result = self.invoke(selected, "deps", "-h")
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertEqual(help_result.stdout, "Usage: ./sc deps [-h|--help]\n")
+        self.assertNotIn("host Python preflight", help_result.stderr)
+
+        for command in ("test", "lint", "typecheck", "rebuild"):
+            with self.subTest(command=command):
+                completed = self.invoke(selected, command, "-h")
+                self.assertEqual(completed.returncode, 1)
+                self.assertIn(
+                    f"SC_PYTHON '{selected}' is not executable",
+                    completed.stderr,
+                )
+                self.assertIn(
+                    "export SC_PYTHON=/absolute/path/to/python3",
+                    completed.stderr,
+                )
+                self.assertNotIn("No such file or directory", completed.stderr)
+                self.assertFalse((self.root / ".venv").exists())
 
 
 class OptionalTomlTest(unittest.TestCase):

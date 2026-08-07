@@ -1193,12 +1193,14 @@ sc_restart_health_summary() {
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
 
 # Capability-check every dispatcher route that can execute host Python before
-# it reaches imports or mutation. Help stays dependency-free, and container
-# entry deliberately remains a Docker handoff rather than a host-runtime gate.
+# it reaches imports or mutation. Shell-implemented help (deps/map/admin/
+# launch/restart) stays dependency-free; script-owned help (remove/rebuild/
+# migrate) probes first because it executes host Python. Container entry
+# deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
   install|ensure-harness|doctor|update|update-harnesses|harness-status|rollback|feature|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|map-sql|map-sql-rw|render|render-check|map|map-setup|analytics|models|seed-skills|skill|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health)
     case "$cmd" in
-      deps|test|lint|typecheck|launch|restart|admin|map)
+      deps|launch|restart|admin|map)
         sc_help_form "$@" || sc_python_probe ;;
       *) sc_python_probe ;;
     esac ;;
