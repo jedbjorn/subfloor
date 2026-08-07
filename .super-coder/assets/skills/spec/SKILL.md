@@ -53,11 +53,22 @@ Surface all three before any planning or code:
   slice.
 - No stated done-condition in the spec -> that is the first unclear item.
 
+### Current posture and scope
+Treat `## Current Posture` as the intended baseline and `## Scope` as the
+delivery boundary. Plan every **In Scope** promise and no **Out of Scope** item.
+If Preparation shows that documented posture and code disagree, stop and return
+the discrepancy to the Planner/FnB; do not silently redefine the baseline.
+
+New specs and substantively revised unfrozen specs must carry both sections
+(see `docs`). Frozen historical specs may predate them; absence there is not a
+blocker, but ambiguity still is.
+
 ### Anticipated User Activity
 The spec's `## Anticipated User Activity` section is governing intent: its
-roles, reach, and tenancy invariants shape the plan — access and tenancy
-checks are planned tasks, not afterthoughts. Older specs predate the section;
-absence there is not a blocker.
+roles, per-surface audience posture, reach, process curation, safety hardening,
+and tenancy invariants shape the plan — access, validation, recovery, authority,
+and tenancy checks are planned tasks, not afterthoughts. Older specs predate the
+section; absence there is not a blocker.
 
 ### Unclear items
 Anything you cannot act on without guessing:
@@ -127,7 +138,7 @@ shared DB immediately:
 sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points"
 sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>"
 sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>"
-sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, check the build against the spec's Anticipated User Activity section, snapshot + render"
+sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test every In Scope promise and done-condition, check the build against Anticipated User Activity assurance, snapshot + render"
 ```
 
 Then set `current_state` — nothing done yet, next = Preparation:
@@ -219,7 +230,7 @@ directly and leave the docs-pending flag open for whoever picks up docs.
 
 ## Watch for creep while you build
 
-Mid-build, the work grows past the spec's stated what/why:
+Mid-build, the work crosses the spec's In Scope / Out of Scope boundary:
 
 - **Small growth** (same mental model, a few more tasks) -> the unfrozen spec
   is living; edit it (`sc mem doc edit`) and carry on. No ceremony.
@@ -238,9 +249,10 @@ Mid-build, the work grows past the spec's stated what/why:
   marked done.
 - **Verification is not optional.** It is the last task; skipping it makes
   "done" meaningless.
-- **Anticipated User Activity is intent.** Verification checks the build
-  against the spec's section — a capability beyond its stated roles, or data
-  crossing a tenancy line it states, is a finding, not a nuance.
+- **Scope and Anticipated User Activity are intent.** Verification checks every
+  In Scope promise and the audience/assurance contract — an Out of Scope
+  capability, reach beyond the stated roles, weakened hardening obligation, or
+  data crossing a tenancy line is a finding, not a nuance.
 - **Spec too large for one session** -> scope a slice at Preparation: cover
   steps 1–K verifiable now, leave K+1–N pending. NEVER start work that can't
   be verified before the session ends.

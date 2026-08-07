@@ -61,9 +61,10 @@ stream. Surface to the FnB only when ambiguous — several streams fit, or a
 new stream you're unsure how to name. Exempt (as with stages): work that
 isn't a feature/spec (a quick fix) needs no work-stream.
 
-## Review first
+## Establish posture, then challenge
 
-Before writing — don't duplicate, don't re-litigate:
+Before writing — don't duplicate, don't re-litigate, and don't transcribe the
+request uncritically:
 ```
 sc mem get documents      # every spec/doc in the engine DB (kind, seq, frozen, task_count)
 sc mem get decisions      # active-decision index (<id> = full row + rationale; --all incl. superseded)
@@ -73,6 +74,44 @@ sc map-sql "SELECT path FROM dr_filepath WHERE role='doc';"   # repo's own docs 
 Spec touches a recorded decision -> honor it, or supersede explicitly: say so
 in the spec + record `sc mem decision "…" --parent <old_id>`. NEVER silently
 re-decide a settled choice.
+
+Read the documentation for every related system the change relies on or alters.
+Documentation is the preferred account of intended posture. If it is absent,
+ambiguous, or plausibly stale, use the repo map to locate and verify the narrow
+code path; name that fallback in the spec. Documentation and code disagree ->
+surface both as an inconsistency to the FnB. Do not silently choose one as truth.
+
+Walk the proposed workflow end to end. Challenge contradictions, missing
+boundaries, hidden assumptions, audience mismatches, partial failure, concurrent
+use, permissions, and the unhappy path. Ask the FnB to resolve anything that
+could change implementation or acceptance. Finalize only after each material
+question is either resolved or explicitly deferred; a deferral belongs in
+**Out of Scope**, with the boundary it leaves behind. Editorial uncertainty that
+cannot change the build does not block authoring.
+
+The conversation is input; the spec is the resolved contract. Paraphrase or
+synthesize settled FnB decisions beside the design clause they govern. Preserve
+the requirement and consequential rationale, not the dialogue. Never promote an
+unconfirmed suggestion to a requirement or hide an unresolved choice in fluent
+prose.
+
+## Required spec contract
+
+Every newly authored spec, and every substantive revision to an unfrozen spec,
+must make these boundaries explicit:
+
+| section | holds |
+|---|---|
+| `## Current Posture` | related systems and intended behavior before this change; name the documents and decisions consulted, plus any code paths used because documentation was missing, ambiguous, or stale |
+| `## Scope` / `### In Scope` | behavior this delivery promises to add, change, or remove |
+| `## Scope` / `### Out of Scope` | adjacent behavior deliberately excluded from this delivery, including explicit deferrals and the boundary retained |
+| relevant design sections | synthesized FnB decisions and rationale placed beside the requirement they constrain |
+| `## Anticipated User Activity` | actors, per-surface audience posture, reach, process curation, safety hardening, tenancy, and behavior beyond intention |
+
+Out of scope means "not in this delivery," never "will never be built." Do not
+use it to park an unresolved requirement that changes the in-scope design. Mixed
+surfaces may have different audiences and controls; specify them separately.
+Frozen historical specs are immutable and need no backfill.
 
 ## Author
 
@@ -95,9 +134,10 @@ sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-
 
 Every spec (`kind='spec'`) ships an `## Anticipated User Activity` section —
 the feature's posture statement: who is expected to touch it, where it can be
-reached, whose data it holds, and what it does not intend to allow. Soft
-vocabulary, hard invariants — the nouns stay gentle, every statement stays
-checkable from code ("a Valid User only ever sees rows tied to their own
+reached, how much process guidance each surface needs, which safety controls its
+exposure and impact require, whose data it holds, and what it does not intend to
+allow. Soft vocabulary, hard invariants — the nouns stay gentle, every statement
+stays checkable from code ("a Valid User only ever sees rows tied to their own
 account"), because review + Verification test the build against this section.
 
 Shape (H3s under the section H2):
@@ -107,6 +147,7 @@ Shape (H3s under the section H2):
 | `### Vocabulary` | the cast — roles from the shared roster below + any feature-specific ones, each defined in one line |
 | `### Expected Activity` | per role: what they do, what they see, what they can change |
 | `### Reach` | where the feature meets the world — pages, endpoints, jobs, files it adds or alters, and which roles can arrive at each |
+| `### Audience and Assurance` | for each reachable surface: intended audience posture(s), process curation, and concrete safety hardening derived from exposure, authority, data sensitivity, reversibility, and blast radius |
 | `### Data Tenancy` | whose data the feature touches; what stays within one account; what, if anything, is deliberately shared |
 | `### Beyond Intention` | activity the feature does not intend to accommodate — anything observed here in review is a finding, not a nuance |
 
@@ -122,6 +163,30 @@ Shared roster (always available; same meaning in every spec):
 | **Shell** | an AI agent shell acting through its granted tools — its activity is messages, memory writes, file edits |
 | **Unexpected Participant** | anyone acting outside the roles above — where the spec says what must never be reachable |
 
+Audience postures describe the expected user of a surface; they do not replace
+the activity roles above and are not mutually exclusive:
+
+| posture | design consequence |
+|---|---|
+| **Unknown User** | identity and competence are not established at entry; public/anonymous reach needs the most tolerance of unanticipated input, guidance, safe defaults, and bounded disclosure |
+| **Authenticated User** | identity is established, but trust is not assumed; keep account boundaries, validation, recovery, and clear feedback explicit |
+| **Operational User** | a trained user performs a recurring workflow; optimize safe repetition, observable state, partial-failure recovery, and low ambiguity |
+| **Technical User** | a user understands technical concepts or automation; instructional curation may be lighter, while contracts, validation, precise errors, and compatibility stay rigorous |
+| **Administrator** | a user holds broad authority; instructional curation may be light, while authorization, consequential-action confirmation, auditability, reversibility, and recovery reflect the larger blast radius |
+
+Separate **process curation** from **safety hardening**. Expertise can reduce
+explanation and hand-holding; it never waives correctness, input validation,
+authorization, tenancy, or safe failure. Derive hardening from the surface's
+reach and consequence, not from a single audience ranking. An Unknown User
+demands the strongest unanticipated-input posture; an Administrator may demand
+the strongest authority and recovery controls. State concrete obligations, not
+only a posture label.
+
+An Unknown User is expected anonymous/public traffic. An Unexpected Participant
+is activity outside the stated contract, whether or not identity is known. For
+machine-only behavior, name `System` or `Shell`, say that there is no human
+audience, and still specify reach and assurance.
+
 Language — soft by design. Specs never use: threat model, attack or attack
 surface, adversary, exploit, abuse case, vulnerability, breach, privilege
 escalation, exfiltration, malicious. Say it in roster words instead: threat
@@ -130,9 +195,10 @@ case -> Beyond Intention · access matrix -> Expected Activity · attack
 surface -> Reach · isolation -> tenancy. Describe behavior and boundaries,
 never hostility.
 
-Internal-only feature -> the section still ships, one line ("All activity is
-by Valid Privileged Users; no tenancy boundary"). Whole section ≤ ~40 lines —
-it frames the build, it does not enumerate it.
+Internal-only feature -> the section still ships; identify its operational,
+technical, or administrator surface, reach, authority controls, and tenancy
+posture. Whole section ≤ ~60 lines — it frames the build, it does not enumerate
+it.
 
 ## Revise before freeze
 
