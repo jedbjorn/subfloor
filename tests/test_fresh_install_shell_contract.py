@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Regression tests for the fresh-install shell/worktree contract."""
 from __future__ import annotations
 
@@ -8,14 +7,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".super-coder" / "render"))
-import compose  # noqa: E402
+import compose
 
 
 class FreshInstallShellContractTest(unittest.TestCase):
     def test_install_is_committed_before_first_shell_worktree(self) -> None:
         for relative in ("README.md", "docs/README.md"):
             text = (ROOT / relative).read_text()
-            commit = text.index('git commit -m "chore: install subfloor"')
+            commit = text.index(
+                'git commit --no-verify -m "chore: install subfloor"'
+            )
             enter = text.index("./sc enter", commit)
             self.assertLess(commit, enter, relative)
 

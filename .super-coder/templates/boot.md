@@ -209,8 +209,8 @@ branch per unit of work; never edit on the default branch. Commit each unit when
 it is done, then push, open a PR, and **stop** — merging is the FnB's gate, not
 yours. (This is enforced, not just asked: claude/codex/opencode block edits made
 while on the default branch at the harness level; a git pre-commit hook refuses
-the commit on every harness, vibe included. Both are escapable when you mean it —
-`git commit --no-verify` — but the default is the rule.)
+the commit on every harness, vibe included. Create a branch and retry; launched
+shells receive no protected-branch bypass.)
 
 Finish before you stop. Before you go dormant, leave your tree **clean or on a
 pushed branch with a PR** — never a dirty or unpushed worktree for the admin to

@@ -48,8 +48,10 @@ What that buys you in practice:
 ## Install
 
 > [!class4]
-> **The bar: a reachable docker daemon + one signed-in harness CLI on PATH.**
-> `./sc doctor` reports what it finds and the exact next command. The
+> **The bar: Python 3.9+ with `sqlite3`, a reachable docker daemon, and one signed-in harness CLI on PATH.**
+> `./sc doctor` reports the selected interpreter and what it finds. Set
+> `SC_PYTHON` to an exact interpreter, for example
+> `export SC_PYTHON="$(brew --prefix)/bin/python3"` on macOS. The
 > prerequisites table (Arch / macOS), docker modes, and the no-docker escape
 > hatch: [*Install*](README.md#install).
 
@@ -70,7 +72,17 @@ Five steps, from an existing git repo to a booted shell:
 4. **Launch.** `./sc launch` builds and starts the sandbox container — the
    engine server plus the Review GUI, published to `127.0.0.1` only.
 5. **Commit the install.** Only `sc`, `.sc-state/`, and config track; the
-   engine itself stays a gitignored dependency.
+   engine itself stays a gitignored dependency. Installation has already
+   activated the branch guard, so make the deliberate operator-owned bootstrap
+   commit with the exact command:
+
+   ```bash
+   git add -A && git commit --no-verify -m "chore: install subfloor"
+   ```
+
+   Later direct operator commits on a protected default branch require the same
+   deliberate bypass. Launched shells—including vibe—remain branch-first and
+   receive no bypass recipe.
 
 ## First boot
 
@@ -127,4 +139,12 @@ The step-by-step version, with each flavor's skills and GUI tab:
 - **Opt-in extras.** A Postgres sidecar, a Windows test VM, tailnet / pm2 /
   db brokers: [*Opt-in features*](README.md#opt-in-features).
 - **Staying current.** `./sc update` pulls the new engine and migrates the DB
-  in place, memory intact: [*Update a fork*](README.md#update-a-fork).
+  in place, memory intact. Commit that protected-default-branch update with the
+  exact operator command:
+
+  ```bash
+  ./sc update
+  git add .sc-state/engine.ref sc && git commit --no-verify -m "chore: update subfloor"
+  ```
+
+  Full details: [*Update a fork*](README.md#update-a-fork).

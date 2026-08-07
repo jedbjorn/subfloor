@@ -94,12 +94,12 @@ coding harness.
 | Need | Arch Linux | macOS |
 |---|---|---|
 | **Container engine** | `sudo pacman -S docker`, then start a daemon — rootless default: `dockerd-rootless-setuptool.sh install && systemctl --user enable --now docker` | `brew install colima docker && colima start` (or Docker Desktop) |
-| **Base tools** | `sudo pacman -S git curl python sqlite` (usually already present) | `xcode-select --install` (git/curl); python3 + sqlite3 ship with macOS |
+| **Base tools** | `sudo pacman -S git curl python sqlite` (usually already present); Python 3.9+ with `sqlite3` is required | `xcode-select --install` (git/curl); use the bundled Python only when it is 3.9+ with `sqlite3`, otherwise `brew install python` |
 | **Harness CLI** | installed for you by `./sc install` (`claude` · `opencode` · `codex` · `vibe` · `kimi`, native installers). Repair by hand: `curl -fsSL https://claude.ai/install.sh \| bash` | same — **and put `~/.local/bin` on your PATH** (a fresh macOS shell omits it) |
 | **Harness account** | a plan for one of Claude Code · OpenCode · Codex · Vibe · Kimi Code; sign in once on the host (step 3) | same |
 
 > [!class4]
-> **The bar: a reachable docker daemon + a harness CLI on PATH.** `./sc doctor` reports the docker mode it finds (rootless / rootful) and the exact next command; `python3` + `sqlite3` are the only *hard* requirements (the engine runtime). **macOS PATH gotcha:** if `claude` reports *"missing or broken — run claude install to repair"*, the CLI installed fine but `~/.local/bin` isn't on your PATH. Add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile (`~/.zshrc`), open a new shell, then `claude install`. No docker at all? The `./sc serve` + `./sc boot` escape hatch runs the shell on the host.
+> **The bar: Python 3.9+ with `sqlite3`, a reachable docker daemon, and a harness CLI on PATH.** `./sc doctor` reports the selected absolute interpreter, version, SQLite result, docker mode (rootless / rootful), and the exact next command. `SC_PYTHON`, when non-empty, selects the exact interpreter; on macOS use `export SC_PYTHON="$(brew --prefix)/bin/python3"` when `/usr/bin/python3` shadows Homebrew. **macOS PATH gotcha:** if `claude` reports *"missing or broken — run claude install to repair"*, the CLI installed fine but `~/.local/bin` isn't on your PATH. Add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile (`~/.zshrc`), open a new shell, then `claude install`. No docker at all? The `./sc serve` + `./sc boot` escape hatch runs the shell on the host.
 
 **Install & launch**
 
@@ -124,7 +124,7 @@ claude                          # or:  opencode auth login  ·  codex login  · 
 ./sc launch
 
 # 5. Commit the install before creating shell worktrees:
-git add -A && git commit -m "chore: install subfloor"
+git add -A && git commit --no-verify -m "chore: install subfloor"
 
 # 6. Attach a session:
 ./sc enter                      # auth + pick a shell + pick a harness + boot
@@ -133,6 +133,12 @@ git add -A && git commit -m "chore: install subfloor"
 That's the happy path. Each step is covered in depth below — installer internals,
 harness sign-in, the docker modes, and the localhost review GUI. For the full
 arc from a fresh repo through ship-and-loop, see [*The loop*](#the-loop).
+
+Installation intentionally activates the universal branch guard before step 5.
+That one operator-owned bootstrap commit is a deliberate commit to the
+repository's default branch, so its copy-paste command uses `--no-verify`.
+Later direct operator commits on a protected default branch require the same
+deliberate bypass. Shell and feature work remains branch-first.
 
 ### Installer internals
 
@@ -145,7 +151,7 @@ inherits the **system** (schema + the skill catalogue + the render chain), never
 subfloor's own memory or roadmap.
 
 > [!class4]
-> **Requirements: `docker`.** The default run mode is a sandbox container, so the harness's "allow everything" is safe — the kernel is the boundary, and the container sees only this repo + your harness creds. The image bakes the rest: `python3`, `sqlite3`, `git`, `curl`, and the four harness CLIs. No docker? The `./sc serve` + `./sc boot` primitives run on the host with only `python3` + `sqlite3` (and a harness on `PATH`).
+> **Requirements: Python 3.9+ with `sqlite3`, plus `docker`.** The default run mode is a sandbox container, so the harness's "allow everything" is safe — the kernel is the boundary, and the container sees only this repo + your harness creds. The image bakes the rest: `python3`, `sqlite3`, `git`, `curl`, and the harness CLIs. No docker? The `./sc serve` + `./sc boot` primitives run on the host with the selected Python 3.9+ interpreter, `sqlite3`, and a harness on `PATH`. Set `SC_PYTHON` to select that interpreter explicitly.
 
 **Docker mode — rootless is the default.** `./sc doctor` checks your docker.
 Both modes work (the launcher's `duser()` adapts), and **rootless is the chosen
@@ -590,8 +596,12 @@ floor with every row intact. (The shell-facing version of this is the
 
 ```bash
 ./sc update                     # fetch + materialize the engine, reconcile in place
-git add .sc-state/engine.ref sc && git commit -m "chore: update subfloor"
+git add .sc-state/engine.ref sc && git commit --no-verify -m "chore: update subfloor"
 ```
+
+The update commit is another deliberate operator-owned commit on the protected
+default branch. Launched shells still create a feature branch first and are not
+given a bypass recipe.
 
 `./sc update` fetches the engine from the `super-coder` remote and
 **materializes** it into the gitignored `.super-coder/` dir (the engine is a

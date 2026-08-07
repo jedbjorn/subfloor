@@ -114,7 +114,7 @@ harness already ships, nothing patched, nothing forked: [*Architecture*](docs/RE
 ## Install quickstart
 
 > [!class4]
-> **The bar: a reachable docker daemon + one signed-in harness CLI on PATH.** `./sc doctor` reports what it finds and the exact next command. Full prerequisites table (Arch / macOS), docker modes, and the no-docker escape hatch: [*Install*](docs/README.md#install).
+> **The bar: Python 3.9+ with `sqlite3`, a reachable docker daemon, and one signed-in harness CLI on PATH.** `./sc doctor` reports the exact interpreter and capabilities it finds. Set `SC_PYTHON` to select a specific interpreter, for example `export SC_PYTHON="$(brew --prefix)/bin/python3"` when `/usr/bin/python3` shadows Homebrew. Full prerequisites table (Arch / macOS), docker modes, and the no-docker escape hatch: [*Install*](docs/README.md#install).
 
 Drop subfloor into an existing git repo and boot a shell:
 
@@ -136,7 +136,7 @@ claude                          # or:  opencode auth login  ·  codex login  · 
 ./sc launch
 
 # 5. Commit the install before creating shell worktrees:
-git add -A && git commit -m "chore: install subfloor"
+git add -A && git commit --no-verify -m "chore: install subfloor"
 
 # 6. Attach a session:
 ./sc enter                      # auth + pick a shell + pick a harness + boot
@@ -146,6 +146,17 @@ That's the happy path — you're talking to a planner shell in your repo, with a
 whole team behind it. Installer internals and harness sign-in, step by step:
 [*Install*](docs/README.md#install). First boot and the daily loop, guided:
 [*Quick start*](docs/quick-start.md).
+
+Installation intentionally activates the universal branch guard before the
+first commit. The command above is the operator-owned bootstrap exception on
+the repository's default branch. Later direct operator commits there require
+the same deliberate bypass; launched shells remain branch-first and receive no
+bypass recipe. The protected-default-branch update is:
+
+```bash
+./sc update
+git add .sc-state/engine.ref sc && git commit --no-verify -m "chore: update subfloor"
+```
 
 ## Docs
 
