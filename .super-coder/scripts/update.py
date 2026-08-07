@@ -1209,6 +1209,11 @@ def main(argv: list[str]) -> int:
                  "upstream to update from; edit .super-coder/ directly and commit "
                  "like any other code. (To re-adopt upstream, that's a manual "
                  "re-fork — see README → 'Customize a fork vs diverge from it'.)")
+    if not source:
+        try:
+            install_mod.validate_gitignore(REPO_ROOT)
+        except install_mod.GitignoreError as exc:
+            sys.exit(f"update: {exc}")
 
     # Reconcile every shell worktree before any pull or engine materialization.
     # A whole fork move preserves the directories but invalidates Git's absolute
@@ -1235,11 +1240,14 @@ def main(argv: list[str]) -> int:
         no_fetch = True
     else:
         migrate_engine_untrack()  # one-time B7: untrack the engine (idempotent)
-        # Top up the fork's .gitignore with any engine ignore rules added since it
-        # was installed (e.g. the map DB cache /.sc-state/map.db) — line-additive,
-        # so an already-installed fork never silently commits a new derived cache.
-        if install_mod.ensure_gitignore():
-            print("→ .gitignore: added engine ignore rule(s) for this release")
+        # Replace the one owned range from the current canonical renderer so an
+        # already-installed fork never silently commits a new derived cache.
+        try:
+            changed_gitignore = install_mod.ensure_gitignore()
+        except install_mod.GitignoreError as exc:
+            sys.exit(f"update: {exc}")
+        if changed_gitignore:
+            print("→ .gitignore: installed canonical subfloor ignore block")
         migrate_generated_artifacts_local()
 
     if no_fetch:
