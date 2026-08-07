@@ -28,7 +28,9 @@ Review a diff *against intent*, never in a vacuum. Get both:
 
 - The change: the PR diff, or `git -C <author-worktree> diff origin/main...<branch>`.
 - The spec it was built to: the feature's spec doc (`spec` skill, Step 1 —
-  `documents` where `kind='spec'`). Its done-condition = your yardstick.
+  `documents` where `kind='spec'`). Its Current Posture, In Scope promises,
+  Out of Scope exclusions, done-condition, and Anticipated User Activity = your
+  yardstick.
 
 Note the **author** — Step 4 proposes a handoff to them. Resolve their
 shortname from the branch (`shell/<shortname>`) or the commit trailer
@@ -54,9 +56,10 @@ the diff touches:
 2. **Edge cases & gaps** — inputs and states the author didn't handle:
    empty, null, boundary, concurrent, partial-failure, the unhappy path.
    Name what's missing, not only what's wrong.
-3. **Spec conformance** — diff vs the spec's done-condition. Flag where the
-   implementation diverges from intent AND where the spec itself was silent
-   or wrong.
+3. **Spec conformance** — diff vs current posture, explicit scope,
+   done-condition, and the per-surface audience/assurance contract. Flag an
+   unmet In Scope promise, implemented Out of Scope behavior, reach or hardening
+   mismatch, and anywhere the spec itself was silent or wrong.
 
 | Diff touches | Lens |
 |---|---|
@@ -110,8 +113,9 @@ sc mem message send <planner-shortname> "Review of <feature> surfaced a spec gap
   path. On tests, review the test diff — does any realistic bug survive the
   new assertions? — do NOT re-run the green suite the dev and CI already
   ran. A README-level "it filters X" is not proof the filter runs.
-- **Review against the spec, not your taste.** The done-condition is the
-  bar. Scope creep in the diff = a flag, not a silent pass.
+- **Review against the spec, not your taste.** In Scope promises and the
+  done-condition are the bar. Out of Scope work or an audience/assurance
+  mismatch in the diff = a flag, not a silent pass.
 - **Handoffs are gated.** You flag and recommend; the FnB decides defect vs
   intended before anything reaches another shell. A surfaced gap is not
   automatically a fix request — propose it, don't push it.
