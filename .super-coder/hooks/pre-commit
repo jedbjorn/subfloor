@@ -7,12 +7,22 @@
 # edit: refuses to commit while HEAD is a protected default branch.
 #
 # Reuses the one shared branch-decision script (exit 2 = block, stderr = reason);
-# any non-zero aborts the commit. Bypassable with `git commit --no-verify` — by
-# design, an escape hatch for the rare deliberate commit on a default branch.
+# any non-zero aborts the commit. A bare operator gets the deliberate
+# default-branch recovery hint. Launched shells retain branch-first guidance
+# without being taught a bypass recipe.
 #
 # Resolve the guard from $SC_ENGINE_DIR when set, else relative to THIS hook's
 # own path (core.hooksPath points at <engine>/hooks, so ../scripts is the engine
 # install). show-toplevel was wrong in a fork worktree, where .super-coder/ is
 # gitignored and absent — the same trap the harness hooks fell into.
 guard="${SC_ENGINE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)}/scripts/branch-guard.sh"
-exec bash "$guard"
+bash "$guard"
+status=$?
+
+if [ "$status" -eq 2 ] \
+  && [ -z "${SC_SHELL_FLAVOR:-}" ] \
+  && [ -z "${SC_SHELL_WORKTREE:-}" ]; then
+  echo "Bare operator recovery for a deliberate default-branch commit: rerun the same git commit command with --no-verify." >&2
+fi
+
+exit "$status"
