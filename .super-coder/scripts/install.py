@@ -36,6 +36,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -116,6 +117,52 @@ STRIP = [
 
 def sh(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(args, capture_output=True, text=True)
+
+
+def report_host_runtime(*, report: bool = True) -> None:
+    """Validate and report the exact interpreter before installer mutation."""
+    version = platform.python_version()
+    executable = str(Path(sys.executable).resolve())
+    if sys.version_info < (3, 9):
+        raise SystemExit(
+            f"install: Python 3.9+ required; selected {executable} reports {version}.\n"
+            f"  recovery: {'brew install python; ' if IS_MAC else ''}"
+            "export SC_PYTHON=/absolute/path/to/python3"
+        )
+    try:
+        import sqlite3
+    except ImportError:
+        raise SystemExit(
+            f"install: selected Python {executable} ({version}) cannot import sqlite3.\n"
+            f"  recovery: {'brew install python; ' if IS_MAC else ''}"
+            "export SC_PYTHON=/absolute/path/to/python3"
+        )
+    if report:
+        print(
+            f"  python    {executable} · {version} · "
+            f"sqlite3 {sqlite3.sqlite_version} ✓"
+        )
+
+
+def run_critical_phase(
+    name: str,
+    argv: list[str],
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
+    """Stream one required installer phase and stop truthfully on failure."""
+    step(name)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    completed = subprocess.run(argv, env=env, check=False)
+    if completed.returncode == 0:
+        return
+    print(f"install: critical phase failed: {name}", file=sys.stderr)
+    print(f"  interpreter: {Path(PY).resolve()}", file=sys.stderr)
+    print(f"  argv: {shlex.join(argv)}", file=sys.stderr)
+    print(f"  exit code: {completed.returncode}", file=sys.stderr)
+    print("  repair the reported cause, then retry: ./sc install", file=sys.stderr)
+    raise SystemExit(completed.returncode)
 
 
 # Repo basenames that identify the SOURCE repo (canonical set — update.py and
@@ -212,6 +259,22 @@ def already_installed() -> bool:
     try:
         return "installed_at" in json.loads(ports_mod.CONFIG.read_text())
     except json.JSONDecodeError:
+        return False
+
+
+def starting_team_exists() -> bool:
+    """Whether an incomplete prior install already persisted its seeded team."""
+    db = ENGINE / "shell_db.db"
+    if not db.exists():
+        return False
+    import sqlite3
+
+    try:
+        with sqlite3.connect(db) as con:
+            return bool(con.execute(
+                "SELECT EXISTS(SELECT 1 FROM shells WHERE COALESCE(is_deleted,0)=0)"
+            ).fetchone()[0])
+    except sqlite3.Error:
         return False
 
 
@@ -683,6 +746,10 @@ def main(argv: list[str]) -> int:
         print(roll_harness_epoch())
         return 0
 
+    report_host_runtime(report=any(flag in argv for flag in (
+        "--update-harnesses", "--ensure-harness", "--check-docker"
+    )))
+
     # Standalone: force-update all harness CLIs to latest and exit.
     if "--update-harnesses" in argv:
         step("Updating harness CLIs to latest (claude + opencode + codex + vibe + kimi)")
@@ -717,12 +784,7 @@ def main(argv: list[str]) -> int:
 
     # 2. Requirements ---------------------------------------------------------
     step("Checking requirements")
-    try:
-        import sqlite3  # noqa: F401
-        print("  python3 + sqlite3 ✓")
-    except ImportError:
-        hint = "brew install python" if IS_MAC else "your package manager"
-        sys.exit(f"  python3 is missing the sqlite3 module — install it ({hint}) and retry.")
+    report_host_runtime()
     brew = " (brew install git curl)" if IS_MAC else ""
     if not shutil.which("git"):
         print(f"  ⚠ git not on PATH — needed for the commit→PR flow later.{brew}")
@@ -824,30 +886,43 @@ def main(argv: list[str]) -> int:
             print(f"  (already absent) {p.relative_to(REPO_ROOT)}")
 
     # 5. Build the system DB --------------------------------------------------
-    step("Building the system DB (schema + migrations)")
-    r = subprocess.run([PY, str(ENGINE / "scripts/rebuild.py")])
-    if r.returncode != 0:
-        sys.exit("install: rebuild failed.")
+    run_critical_phase(
+        "Building the system DB (schema + migrations)",
+        [PY, str(ENGINE / "scripts/rebuild.py")],
+    )
 
     # 6. Seed the starting team (interactive: username only) ------------------
-    step("Seeding this fork's starting team")
-    r = subprocess.run([PY, str(ENGINE / "scripts/init_fork.py"), *fork_args])
-    if r.returncode != 0:
-        sys.exit("install: starting-team seeding failed (or was aborted).")
+    if starting_team_exists():
+        step("Seeding this fork's starting team")
+        print("  (already seeded by an incomplete prior install)")
+    else:
+        run_critical_phase(
+            "Seeding this fork's starting team",
+            [PY, str(ENGINE / "scripts/init_fork.py"), *fork_args],
+        )
 
     # 7. Wire the auto-remap hooks + map the host repo --------------------------
     # map-setup points core.hooksPath at the tracked hooks so the dr_* catalogue
     # stays fresh on every pull/checkout/rebase, then runs the initial map. The
     # Cartographer shell (seeded above) tunes map.config.json + heals later.
-    step("Wiring map automation + mapping the repo (dr_* catalogue)")
-    subprocess.run([PY, str(ENGINE / "scripts/map_setup.py")])
+    run_critical_phase(
+        "Wiring map automation + mapping the repo (dr_* catalogue)",
+        [PY, str(ENGINE / "scripts/map_setup.py")],
+    )
 
     # 8. Persist: snapshot + render ------------------------------------------
     # Admin/setup surface — pass SC_ADMIN so the serialize guard lets it through.
-    step("Serializing + rendering")
     admin_env = {**os.environ, "SC_ADMIN": "1"}
-    subprocess.run([PY, str(ENGINE / "scripts/snapshot.py")], env=admin_env)
-    subprocess.run([PY, str(ENGINE / "scripts/render.py"), "flat"], env=admin_env)
+    run_critical_phase(
+        "Serializing the installed state",
+        [PY, str(ENGINE / "scripts/snapshot.py")],
+        env=admin_env,
+    )
+    run_critical_phase(
+        "Rendering installed shell surfaces",
+        [PY, str(ENGINE / "scripts/render.py"), "flat"],
+        env=admin_env,
+    )
 
     # 8.5 Wire `make` aliases. The `dos-` prefix can't collide with the fork's own
     # targets, so we append the include rather than leave it to the operator (#13

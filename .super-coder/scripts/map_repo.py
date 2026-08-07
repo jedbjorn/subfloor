@@ -29,6 +29,7 @@ from pathlib import Path
 
 import artifact_policy  # noqa: E402
 import map_db  # noqa: E402 — sibling module in scripts/ (on sys.path for script + importers)
+import toml_compat  # noqa: E402
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -199,9 +200,10 @@ def deps_requirements(p: Path) -> list[tuple]:
 
 def deps_pyproject(p: Path) -> list[tuple]:
     out = []
+    if not toml_compat.AVAILABLE:
+        return out
     try:
-        import tomllib
-        data = tomllib.loads(p.read_text())
+        data = toml_compat.loads(p.read_text())
     except Exception:
         return out
     for dep in (data.get("project", {}).get("dependencies") or []):
@@ -226,9 +228,10 @@ def deps_go_mod(p: Path) -> list[tuple]:
 
 def deps_cargo(p: Path) -> list[tuple]:
     out = []
+    if not toml_compat.AVAILABLE:
+        return out
     try:
-        import tomllib
-        data = tomllib.loads(p.read_text())
+        data = toml_compat.loads(p.read_text())
     except Exception:
         return out
     for name, ver in (data.get("dependencies") or {}).items():

@@ -731,7 +731,10 @@ class SprintSkillTest(unittest.TestCase):
         for command in expected:
             self.assertIn(f"sc sprint {command}", combined)
         dispatcher = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
-        self.assertIn('sprint)       exec "$PY" "$S/sprint_cli.py" "$@" ;;', dispatcher)
+        self.assertIn(
+            'sprint)       sc_python_probe; exec "$PY" "$S/sprint_cli.py" "$@" ;;',
+            dispatcher,
+        )
         parser = sprint_cli.build_parser()
         commands = next(
             action

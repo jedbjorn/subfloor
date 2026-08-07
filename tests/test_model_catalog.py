@@ -185,6 +185,7 @@ class LocalRouteDiscoveryTest(unittest.TestCase):
         self.assertEqual(model["source"], "codex-cache")
         self.assertIn("high", model["supported_efforts"])
 
+    @unittest.skipUnless(mc.toml_compat.AVAILABLE, "stdlib TOML parser unavailable")
     def test_kimi_config_selector_is_alias_not_provider_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "config.toml").write_text(

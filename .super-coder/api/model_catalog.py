@@ -37,7 +37,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-import tomllib
+import toml_compat
 from conversation_adapters.opencode import (
     connected_models as opencode_connected_models,
 )
@@ -240,11 +240,11 @@ def _from_codex_cache(env, run) -> list[dict]:
 
 def _from_kimi_config(env, run) -> list[dict]:
     """Read Kimi's exact user-defined aliases without touching credentials."""
-    if not shutil.which("kimi"):
+    if not shutil.which("kimi") or not toml_compat.AVAILABLE:
         return []
     root = Path(env.get("KIMI_CODE_HOME") or (Path.home() / ".kimi-code"))
     try:
-        data = tomllib.loads((root / "config.toml").read_text())
+        data = toml_compat.loads((root / "config.toml").read_text())
     except Exception:  # noqa: BLE001
         return []
     version = _cli_version("kimi", run)
