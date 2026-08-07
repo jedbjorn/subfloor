@@ -24,6 +24,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 GUARD = ROOT / ".super-coder" / "scripts" / "branch-guard.sh"
 HOOK = ROOT / ".super-coder" / "hooks" / "pre-commit"
+INSTALL_COMMIT = 'git add -A && git commit --no-verify -m "chore: install subfloor"'
+UPDATE_COMMIT = (
+    "git add .sc-state/engine.ref sc && git commit --no-verify "
+    '-m "chore: update subfloor"'
+)
 
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
@@ -109,7 +114,7 @@ class BranchGuardTest(unittest.TestCase):
                 self.assertIn("Create a feature branch first", result.stderr)
                 self.assertNotIn("no-verify", result.stderr)
 
-    def test_no_verify_bypasses_the_installed_hook_for_operator_commit(self):
+    def test_exact_operator_install_and_update_commits_bypass_the_hook(self):
         repo = Path(tempfile.mkdtemp(prefix="sc-bg-bypass-", dir=Path.home()))
         self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
         engine = repo / ".super-coder"
@@ -131,25 +136,41 @@ class BranchGuardTest(unittest.TestCase):
 
         git("init", "-q", "-b", "main")
         git("config", "core.hooksPath", str(engine / "hooks"))
+        (repo / ".gitignore").write_text("/.super-coder/\n")
         (repo / "tracked.txt").write_text("one\n")
-        git("add", "tracked.txt")
+        (repo / "sc").write_text("first\n")
+        git("add", ".gitignore", "tracked.txt", "sc")
         blocked = git("commit", "-m", "blocked", check=False)
         self.assertEqual(blocked.returncode, 1)
         self.assertIn("--no-verify", blocked.stderr)
 
-        committed = git("commit", "--no-verify", "-m", "allowed", check=False)
-        self.assertEqual(committed.returncode, 0, committed.stderr)
-        self.assertEqual(git("rev-list", "--count", "HEAD").stdout.strip(), "1")
+        installed = subprocess.run(
+            ["bash", "-c", INSTALL_COMMIT], cwd=repo, env=operator_env,
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+
+        (repo / ".sc-state").mkdir()
+        (repo / ".sc-state" / "engine.ref").write_text("abc123\n")
+        (repo / "sc").write_text("second\n")
+        updated = subprocess.run(
+            ["bash", "-c", UPDATE_COMMIT], cwd=repo, env=operator_env,
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        self.assertEqual(git("rev-list", "--count", "HEAD").stdout.strip(), "2")
+        subjects = git("log", "--format=%s").stdout.splitlines()
+        self.assertEqual(
+            subjects,
+            ["chore: update subfloor", "chore: install subfloor"],
+        )
+        changed = set(
+            git("show", "--pretty=format:", "--name-only", "HEAD").stdout.splitlines()
+        )
+        self.assertEqual(changed, {".sc-state/engine.ref", "sc"})
 
 
 class OperatorDocumentationTest(unittest.TestCase):
-    INSTALL_COMMIT = (
-        'git add -A && git commit --no-verify -m "chore: install subfloor"'
-    )
-    UPDATE_COMMIT = (
-        "git add .sc-state/engine.ref sc && git commit --no-verify "
-        '-m "chore: update subfloor"'
-    )
     DOC_PATHS = (ROOT / "README.md", ROOT / "docs" / "README.md",
                  ROOT / "docs" / "quick-start.md")
 
@@ -157,8 +178,8 @@ class OperatorDocumentationTest(unittest.TestCase):
         for path in self.DOC_PATHS:
             with self.subTest(path=path.relative_to(ROOT)):
                 body = path.read_text()
-                self.assertIn(self.INSTALL_COMMIT, body)
-                self.assertIn(self.UPDATE_COMMIT, body)
+                self.assertIn(INSTALL_COMMIT, body)
+                self.assertIn(UPDATE_COMMIT, body)
 
     def test_public_install_docs_pin_runtime_floor_and_override(self):
         for path in self.DOC_PATHS:

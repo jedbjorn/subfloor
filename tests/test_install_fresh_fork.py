@@ -93,6 +93,54 @@ class FreshForkInstallTest(unittest.TestCase):
             )
             self.assertIn("Installed ✓", result.stdout)
 
+    def test_direct_installer_rejects_old_python_before_repository_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo, home = self.prepare_repo(raw)
+            before = subprocess.run(
+                ["git", "status", "--porcelain=v1"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            install = repo / ".super-coder" / "scripts" / "install.py"
+            direct_entry = (
+                "import platform, runpy, sys; "
+                "sys.version_info = (3, 8, 20); "
+                "platform.python_version = lambda: '3.8.20'; "
+                f"sys.argv = [{str(install)!r}, '--skip-harness-install']; "
+                f"runpy.run_path({str(install)!r}, run_name='__main__')"
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-c", direct_entry],
+                cwd=repo,
+                env={
+                    **os.environ,
+                    "HOME": str(home),
+                    "NO_COLOR": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Python 3.9+ required", result.stderr)
+            self.assertIn("reports 3.8.20", result.stderr)
+            self.assertFalse((repo / ".gitignore").exists())
+            self.assertFalse((repo / ".sc-state").exists())
+            self.assertFalse((repo / ".super-coder" / "instance.json").exists())
+            after = subprocess.run(
+                ["git", "status", "--porcelain=v1"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertEqual(after, before)
+
     def test_each_failed_critical_phase_withholds_marker_and_reruns_cleanly(self) -> None:
         phases = {
             "rebuild.py": "Building the system DB (schema + migrations)",

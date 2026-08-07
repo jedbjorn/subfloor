@@ -20,6 +20,31 @@ permissions:
   contents: read
 
 jobs:
+  python39-contract:
+    name: Python 3.9 host contract (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      # These acceptance modules are stdlib-only. Keeping this lane free of a
+      # package install proves the clean host contract instead of the dev kit.
+      - name: Run host and temporary-repository acceptance
+        run: >-
+          python -m unittest -v
+          tests.test_host_runtime_contract
+          tests.test_install_fresh_fork
+          tests.test_install_phases
+          tests.test_model_catalog
+          tests.test_gitignore_sync
+          tests.test_remove
+          tests.test_branch_guard
+
   tests:
     runs-on: ubuntu-latest
     steps:
