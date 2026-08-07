@@ -53,7 +53,65 @@ ENGINE="$ROOT/.super-coder"
 PY="${SC_PYTHON:-python3}"
 DB="$ENGINE/shell_db.db"
 S="$ENGINE/scripts"
-MAPDB="$("$PY" "$S/artifact_policy.py" path map-db)"
+MAPDB=""
+
+sc_python_recovery() {
+  if [ "$(uname -s 2>/dev/null || true)" = "Darwin" ]; then
+    echo '  recovery: brew install python' >&2
+    echo '            export SC_PYTHON="$(brew --prefix)/bin/python3"' >&2
+  else
+    echo '  recovery: install Python 3.9+ with sqlite3, then:' >&2
+    echo '            export SC_PYTHON=/absolute/path/to/python3' >&2
+  fi
+}
+
+sc_python_probe() {
+  requested="$PY"
+  resolved="$(command -v "$requested" 2>/dev/null || true)"
+  if [ -z "$resolved" ] || [ ! -x "$resolved" ]; then
+    if [ -n "${SC_PYTHON:-}" ]; then
+      echo "✗ host Python preflight: SC_PYTHON '$SC_PYTHON' is not executable." >&2
+    else
+      echo "✗ host Python preflight: python3 is not executable on PATH." >&2
+    fi
+    sc_python_recovery
+    exit 1
+  fi
+  probe="$("$resolved" -c '
+import os
+import platform
+import sys
+
+executable = os.path.realpath(sys.executable)
+version = platform.python_version()
+if sys.version_info < (3, 9):
+    print("Python 3.9+ required; {} reports {}".format(executable, version))
+    raise SystemExit(2)
+try:
+    import sqlite3
+except ImportError:
+    print("{} ({}) cannot import sqlite3".format(executable, version))
+    raise SystemExit(3)
+print("{}|{}|{}".format(executable, version, sqlite3.sqlite_version))
+' 2>&1)" || {
+    echo "✗ host Python preflight failed for '$requested' ($resolved):" >&2
+    printf '  %s\n' "$probe" >&2
+    sc_python_recovery
+    exit 1
+  }
+  SC_PYTHON_EXECUTABLE="${probe%%|*}"
+  SC_PYTHON_RUNTIME="${probe#*|}"
+  PY="$resolved"
+  SC_PYTHON="$resolved"
+  export PY SC_PYTHON SC_PYTHON_EXECUTABLE SC_PYTHON_RUNTIME
+}
+
+sc_mapdb() {
+  if [ -z "$MAPDB" ]; then
+    MAPDB="$("$PY" "$S/artifact_policy.py" path map-db)"
+  fi
+  printf '%s\n' "$MAPDB"
+}
 
 # --- linked-worktree target safety (spec #68, decision #81) -------------------
 # A command whose subject is the SHARED live instance refuses from a linked
@@ -1134,6 +1192,20 @@ sc_restart_health_summary() {
 
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
 
+# Capability-check every dispatcher route that can execute host Python before
+# it reaches imports or mutation. Shell-implemented help (deps/map/admin/
+# launch/restart) stays dependency-free; script-owned help (remove/rebuild/
+# migrate) probes first because it executes host Python. Container entry
+# deliberately remains a Docker handoff rather than a host-runtime gate.
+case "$cmd" in
+  install|ensure-harness|doctor|update|update-harnesses|harness-status|rollback|feature|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|map-sql|map-sql-rw|render|render-check|map|map-setup|analytics|models|seed-skills|skill|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health)
+    case "$cmd" in
+      deps|launch|restart|admin|map)
+        sc_help_form "$@" || sc_python_probe ;;
+      *) sc_python_probe ;;
+    esac ;;
+esac
+
 case "$cmd" in
   install)         exec "$PY" "$S/install.py" "$@" ;;
   ensure-harness)  exec "$PY" "$S/install.py" --ensure-harness ;;
@@ -1188,7 +1260,7 @@ case "$cmd" in
                 exec "$PY" "$S/snapshot.py" ;;
   mem)          exec "$PY" "$S/mem.py" "$@" ;;
   pr)           exec "$PY" "$S/pr_cli.py" "$@" ;;
-  sprint)       exec "$PY" "$S/sprint_cli.py" "$@" ;;
+  sprint)       sc_python_probe; exec "$PY" "$S/sprint_cli.py" "$@" ;;
   token)        exec "$PY" "$S/operator_token.py" "$@" ;;
   engine-ref)   sc_engine_ref_path="$LIVE_ROOT/.sc-state/engine.ref"
                 if [ ! -r "$sc_engine_ref_path" ]; then
@@ -1222,9 +1294,9 @@ case "$cmd" in
   # map authoring) — only use one where a skill names it. Skill grants have
   # their own surface now: `./sc skill`.
   sql)          exec sqlite3 -readonly "$DB" "$@" ;;
-  map-sql)      exec sqlite3 -readonly "$MAPDB" "$@" ;;
+  map-sql)      exec sqlite3 -readonly "$(sc_mapdb)" "$@" ;;
   sql-rw)       exec sqlite3 "$DB" "$@" ;;
-  map-sql-rw)   exec sqlite3 "$MAPDB" "$@" ;;
+  map-sql-rw)   exec sqlite3 "$(sc_mapdb)" "$@" ;;
   render)       if [ "$LINKED" -eq 1 ]; then
                   sc_refuse_linked render \
                     "$DB -> $("$PY" "$S/artifact_policy.py" path renders)"
@@ -1244,7 +1316,7 @@ case "$cmd" in
                 fi
                 exec "$PY" "$CALLER_ENGINE/scripts/render_check.py" ;;
   map)          case "${1:-}" in
-                  -h|--help) echo "usage: ./sc map — rescan the host repo into the dr_* catalogue ($MAPDB); takes no arguments"
+                  -h|--help) echo "usage: ./sc map — rescan the host repo into the configured dr_* catalogue; takes no arguments"
                              exit 0 ;;
                   ?*)        echo "sc map: unknown argument '$1' (takes none; -h for usage)" >&2
                              exit 2 ;;
