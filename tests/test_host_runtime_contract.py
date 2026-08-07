@@ -112,6 +112,11 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertEqual(help_result.returncode, 0, help_result.stderr)
         self.assertEqual(help_result.stdout, "Usage: ./sc deps [-h|--help]\n")
         self.assertNotIn("host Python preflight", help_result.stderr)
+        recovery = (
+            'export SC_PYTHON="$(brew --prefix)/bin/python3"'
+            if sys.platform == "darwin"
+            else "export SC_PYTHON=/absolute/path/to/python3"
+        )
 
         for command in ("test", "lint", "typecheck", "rebuild"):
             with self.subTest(command=command):
@@ -122,7 +127,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                     completed.stderr,
                 )
                 self.assertIn(
-                    "export SC_PYTHON=/absolute/path/to/python3",
+                    recovery,
                     completed.stderr,
                 )
                 self.assertNotIn("No such file or directory", completed.stderr)
