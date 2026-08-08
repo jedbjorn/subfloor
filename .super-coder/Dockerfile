@@ -169,7 +169,8 @@ ENV PATH=/home/${SC_USER}/.local/bin:/home/${SC_USER}/.opencode/bin:${PATH}
 # ~/.codex/packages. Runtime mounts the host's whole ~/.codex so auth, sessions,
 # goals, plugins, and other durable state survive; without relocation that mount
 # also masks the image's newer package (#775). Copy the resolved standalone
-# executable into image-owned ~/.local/libexec and repoint the launcher there.
+# executable and its code-mode helper into image-owned ~/.local/libexec, then
+# repoint the launcher there.
 # Vibe's installer self-bootstraps uv (astral.sh) then `uv tool install`s into
 # ~/.local/bin.
 # (kimi is baked earlier, in the root stage — see the comment there.)
@@ -180,9 +181,12 @@ RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
  && curl -fsSL https://opencode.ai/install | bash \
  && curl -fsSL https://chatgpt.com/codex/install.sh | sh \
  && codex_installed="$(readlink -f "$HOME/.local/bin/codex")" \
+ && codex_code_mode_host="$(dirname "$codex_installed")/codex-code-mode-host" \
  && test -x "$codex_installed" \
+ && test -x "$codex_code_mode_host" \
  && mkdir -p "$HOME/.local/libexec" \
  && install -m 0755 "$codex_installed" "$HOME/.local/libexec/codex" \
+ && install -m 0755 "$codex_code_mode_host" "$HOME/.local/libexec/codex-code-mode-host" \
  && ln -sfn "$HOME/.local/libexec/codex" "$HOME/.local/bin/codex" \
  && "$HOME/.local/bin/codex" --version \
  && curl -LsSf https://mistral.ai/vibe/install.sh | bash
