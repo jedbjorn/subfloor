@@ -336,6 +336,11 @@ completed state, Planner message id, and Planner wake id. This creates
 append-only evidence, pending follow-ups, terminal lifecycle, and one
 informational engine-wide Planner Re-enter in the same transaction. Never
 record conformance first and then close around it; send no conclude message.
+On that successful commit, the engine also closes every other active chat
+immutably linked to the Sprint. The originating Planner and this
+report-authoring Reviewer remain open. Do not manually close peer chats as an
+extra closeout step. Pause, abort, re-entry, failed conformance, and rejected
+fallback completion keep their existing no-cleanup behavior.
 Never reopen an editing
 lane after recording; the re-enter branch defers the report until added scope
 reaches terminal disposition and a fresh delivery-terminal wake starts the next

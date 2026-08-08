@@ -399,6 +399,7 @@ class SprintLifecycleStore:
                 reason=reason or terminal_outcome or "aborted",
                 terminal_outcome=terminal_outcome,
             ).changed
+        closed_conversation_ids: tuple[str, ...] = ()
         with db_driver.write_transaction(self.con, "sprint.transition"):
             sprint = self._sprint(sprint_id)
             current = str(sprint["lifecycle"])
@@ -421,17 +422,34 @@ class SprintLifecycleStore:
                 outcome=terminal_outcome,
             )
             if target == "completed":
+                closed_conversation_ids = (
+                    self._close_completed_participant_chats_in_transaction(sprint_id)
+                )
                 self._clear_coordinate_mode(
                     sprint_id,
                     actor,
                     reason="Sprint closed by FnB",
                 )
+            event_payload = {"from": current, "reason": reason}
+            if target == "completed":
+                event_payload["closed_conversation_ids"] = list(
+                    closed_conversation_ids
+                )
             self._event(
                 sprint_id,
                 f"lifecycle.{target}",
                 actor,
-                {"from": current, "reason": reason},
+                event_payload,
             )
+        notification_error: Exception | None = None
+        for conversation_id in closed_conversation_ids:
+            try:
+                conversation_events.notify(conversation_id)
+            except Exception as exc:  # noqa: BLE001 - finish post-commit fanout
+                if notification_error is None:
+                    notification_error = exc
+        if notification_error is not None:
+            raise notification_error
         return True
 
     def complete_from_conformance_in_transaction(
@@ -442,7 +460,7 @@ class SprintLifecycleStore:
         reason: str,
         terminal_outcome: str,
         idempotency_key: str,
-    ) -> None:
+    ) -> tuple[str, ...]:
         """Project Reviewer conformance approval as an atomic terminal edge."""
         if not self.con.in_transaction:
             raise RuntimeError("conformance completion requires an active transaction")
@@ -471,6 +489,12 @@ class SprintLifecycleStore:
             target="completed",
             outcome=terminal_outcome,
         )
+        closed_conversation_ids = (
+            self._close_completed_participant_chats_in_transaction(
+                sprint_id,
+                retained_reviewer_shell_id=reviewer_shell_id,
+            )
+        )
         self._event(
             sprint_id,
             "lifecycle.completed",
@@ -480,8 +504,10 @@ class SprintLifecycleStore:
                 "reason": reason,
                 "via": "conformance",
                 "idempotency_key": idempotency_key,
+                "closed_conversation_ids": list(closed_conversation_ids),
             },
         )
+        return closed_conversation_ids
 
     def pause(
         self,
@@ -2413,6 +2439,102 @@ class SprintLifecycleStore:
             sprint_id,
             planner_participant_id=planner_participant_id,
         )
+
+    def _close_completed_participant_chats_in_transaction(
+        self,
+        sprint_id: int,
+        retained_reviewer_shell_id: int | None = None,
+    ) -> tuple[str, ...]:
+        """Close active chats immutably linked to a successfully closed Sprint."""
+        if not self.con.in_transaction:
+            raise RuntimeError("Sprint chat cleanup requires an active transaction")
+        sprint = self.con.execute(
+            "SELECT originating_planner_shell_id FROM sprints WHERE sprint_id=?",
+            (sprint_id,),
+        ).fetchone()
+        if sprint is None:
+            raise KeyError(f"unknown Sprint: {sprint_id}")
+        planner_shell_id = int(sprint["originating_planner_shell_id"])
+        planner = self.con.execute(
+            "SELECT 1 FROM sprint_participants WHERE sprint_id=? AND shell_id=? "
+            "AND role='planner'",
+            (sprint_id, planner_shell_id),
+        ).fetchone()
+        if planner is None:
+            raise SprintInvariantError(
+                "Sprint has no originating Planner participant"
+            )
+
+        retained_shell_ids = {planner_shell_id}
+        if retained_reviewer_shell_id is not None:
+            reviewer = self.con.execute(
+                "SELECT 1 FROM sprint_participants WHERE sprint_id=? AND shell_id=? "
+                "AND role='reviewer'",
+                (sprint_id, retained_reviewer_shell_id),
+            ).fetchone()
+            if reviewer is None:
+                raise SprintAuthorityError(
+                    "retained report author must be a participating Reviewer"
+                )
+            retained_shell_ids.add(retained_reviewer_shell_id)
+        else:
+            final_report_authors = self.con.execute(
+                "SELECT DISTINCT report.author_shell_id FROM sprint_reports report "
+                "JOIN sprint_participants participant "
+                "ON participant.sprint_id=report.sprint_id "
+                "AND participant.shell_id=report.author_shell_id "
+                "AND participant.role='reviewer' "
+                "WHERE report.sprint_id=? AND report.report_kind='final' "
+                "ORDER BY report.author_shell_id",
+                (sprint_id,),
+            ).fetchall()
+            if len(final_report_authors) == 1:
+                retained_shell_ids.add(
+                    int(final_report_authors[0]["author_shell_id"])
+                )
+
+        retained = sorted(retained_shell_ids)
+        linked_active_chats = self.con.execute(
+            "SELECT DISTINCT participant.participant_id,participant.shell_id,"
+            "active.chat_id FROM sprint_participants participant "
+            "JOIN sprint_participant_conversations link "
+            "ON link.sprint_participant_id=participant.participant_id "
+            "JOIN active_shell_chats active "
+            "ON active.shell_id=participant.shell_id "
+            "AND active.chat_id=link.conversation_id "
+            "WHERE participant.sprint_id=? "
+            "ORDER BY participant.participant_id",
+            (sprint_id,),
+        ).fetchall()
+        closed_conversation_ids: list[str] = []
+        for linked in linked_active_chats:
+            shell_id = int(linked["shell_id"])
+            if shell_id in retained_shell_ids:
+                continue
+            expected_chat_id = str(linked["chat_id"])
+            closed = active_chat_registry.close_for_displacement(
+                self.con,
+                shell_id,
+                allow_live_process=True,
+            )
+            if closed is None or closed.chat_id != expected_chat_id:
+                raise SprintInvariantError(
+                    f"Sprint-linked active chat changed while closing: "
+                    f"{expected_chat_id}"
+                )
+            sprint_participant_chats._append_event(
+                self.con,
+                closed.chat_id,
+                "conversation.closed",
+                {
+                    "reason": "sprint_completed",
+                    "state": "closed",
+                    "sprint_id": sprint_id,
+                    "retained_shell_ids": retained,
+                },
+            )
+            closed_conversation_ids.append(closed.chat_id)
+        return tuple(closed_conversation_ids)
 
     def _update_lifecycle(
         self,

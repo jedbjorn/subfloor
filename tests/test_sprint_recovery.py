@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from unittest import mock
@@ -15,7 +16,6 @@ sys.path[:0] = [str(SCRIPTS), str(API), str(ROOT / "tests")]
 import server
 import sprint_domain
 import sprint_message_delivery
-import sprint_participant_chats
 import sprint_recovery
 from github_pull_requests import GitHubReadError
 from test_sprint_pr_watcher import SprintPRWatcherCase, pull_request
@@ -2666,29 +2666,50 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
             ).fetchone()[0],
         )
 
-    def test_completion_does_not_close_or_interrupt_registry_chats(self):
+    def test_completion_closes_linked_live_chat_without_interrupt_and_notifies(self):
         sprint_id, _ = self.create_sprint()
         self.store.arm(sprint_id, 3)
         planner_conversation, planner_run = self.add_live_run(sprint_id, 3)
         developer_conversation, developer_run = self.add_live_run(sprint_id, 1)
+        reviewer_conversation = self.ensure_wake_chat(sprint_id, 2)
+        process = sprint_domain.active_chat_registry.process_details(str(os.getpid()))
+        self.assertIsNotNone(process)
+        self.con.execute(
+            "UPDATE active_shell_chats SET process_pid=?,process_start_ticks=? "
+            "WHERE shell_id=1",
+            (process.pid, process.start_ticks),
+        )
+        self.con.commit()
         interrupts: list[int] = []
         lifecycle = sprint_domain.SprintLifecycleStore(
             self.con,
             interrupt_run=lambda run_id: interrupts.append(run_id) or True,
             notify_commit=lambda: True,
         )
+        notified: list[str] = []
 
-        self.assertTrue(
-            lifecycle.transition(
-                sprint_id,
-                "completed",
-                sprint_domain.LifecycleActor("planner", 3),
-                reason="finish without displacement",
-                terminal_outcome="accepted",
-            )
+        def notify_after_commit(conversation_id: str) -> int:
+            self.assertFalse(self.con.in_transaction)
+            notified.append(conversation_id)
+            return 1
+
+        with mock.patch.object(
+            sprint_domain.conversation_events,
+            "notify",
+            side_effect=notify_after_commit,
+        ):
+            self.assertTrue(
+                lifecycle.transition(
+                    sprint_id,
+                    "completed",
+                    sprint_domain.LifecycleActor("planner", 3),
+                    reason="finish with successful chat cleanup",
+                    terminal_outcome="accepted",
+                )
         )
 
         self.assertEqual([], interrupts)
+        self.assertEqual([developer_conversation, reviewer_conversation], notified)
         self.assertEqual(
             [(planner_run, "running"), (developer_run, "running")],
             [
@@ -2701,7 +2722,7 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
             ],
         )
         self.assertEqual(
-            [(1, developer_conversation), (3, planner_conversation)],
+            [(3, planner_conversation)],
             [
                 tuple(row)
                 for row in self.con.execute(
@@ -2711,17 +2732,87 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
             ],
         )
         self.assertEqual(
-            0,
-            self.con.execute(
-                "SELECT COUNT(*) FROM conversation_events "
-                "WHERE event_type='conversation.close.requested'"
-            ).fetchone()[0],
+            ("closed", 1),
+            tuple(
+                self.con.execute(
+                    "SELECT state,closed_at IS NOT NULL FROM conversations "
+                    "WHERE conversation_id=?",
+                    (developer_conversation,),
+                ).fetchone()
+            ),
         )
         self.assertEqual(
-            [{"shell_id": 1, "sprint": None}, {"shell_id": 3, "sprint": None}],
-            sprint_participant_chats.attach_live_participations(
-                self.con,
-                [{"shell_id": 1}, {"shell_id": 3}],
+            ("closed", 1),
+            tuple(
+                self.con.execute(
+                    "SELECT state,closed_at IS NOT NULL FROM conversations "
+                    "WHERE conversation_id=?",
+                    (reviewer_conversation,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            {
+                "reason": "sprint_completed",
+                "retained_shell_ids": [3],
+                "sprint_id": sprint_id,
+                "state": "closed",
+            },
+            json.loads(
+                self.con.execute(
+                    "SELECT payload FROM conversation_events "
+                    "WHERE conversation_id=? AND event_type='conversation.closed' "
+                    "AND json_extract(payload,'$.reason')='sprint_completed'",
+                    (developer_conversation,),
+                ).fetchone()[0]
+            ),
+        )
+        self.assertEqual(
+            [developer_conversation, reviewer_conversation],
+            json.loads(
+                self.con.execute(
+                    "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='lifecycle.completed'",
+                    (sprint_id,),
+                ).fetchone()[0]
+            )["closed_conversation_ids"],
+        )
+
+        later_chat = str(
+            self.con.execute(
+                "INSERT INTO conversations "
+                "(shell_id,owner_user_id,harness,worktree,state,"
+                "creation_idempotency_key,creation_request_hash) "
+                "VALUES (1,1,'codex','/tmp/work','idle','later-normal','later-normal') "
+                "RETURNING conversation_id"
+            ).fetchone()[0]
+        )
+        self.con.execute(
+            "INSERT INTO active_shell_chats (shell_id,chat_id) VALUES (1,?)",
+            (later_chat,),
+        )
+        self.con.commit()
+        with mock.patch.object(sprint_domain.conversation_events, "notify") as notify:
+            self.assertFalse(
+                lifecycle.transition(
+                    sprint_id,
+                    "completed",
+                    sprint_domain.LifecycleActor("planner", 3),
+                    reason="idempotent replay",
+                    terminal_outcome="accepted",
+                )
+            )
+        notify.assert_not_called()
+        self.assertEqual(
+            ("idle", later_chat),
+            tuple(
+                self.con.execute(
+                    "SELECT conversation.state,active.chat_id "
+                    "FROM conversations conversation JOIN active_shell_chats active "
+                    "ON active.chat_id=conversation.conversation_id "
+                    "WHERE conversation.conversation_id=?",
+                    (later_chat,),
+                ).fetchone()
             ),
         )
 
@@ -2769,48 +2860,208 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
                 "WHERE event_type='conversation.close.requested'"
             ).fetchone()[0],
         )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversation_events "
+                "WHERE event_type='conversation.closed' "
+                "AND json_extract(payload,'$.reason')='sprint_completed'"
+            ).fetchone()[0],
+        )
 
-    def test_completed_sprint_keeps_idle_registry_chats_open(self):
+    def test_fallback_retains_unique_reviewer_final_report_author(self):
         sprint_id, _ = self.create_sprint()
         self.store.arm(sprint_id, 3)
-        conversation_ids = [
-            self.ensure_wake_chat(sprint_id, shell_id)
+        chats = {
+            shell_id: self.ensure_wake_chat(sprint_id, shell_id)
             for shell_id in (1, 2, 3)
-        ]
+        }
+        self.con.execute(
+            "INSERT INTO sprint_reports "
+            "(sprint_id,report_kind,author_shell_id,body,idempotency_key) "
+            "VALUES (?,'final',2,'Reviewer final report','fallback-final')",
+            (sprint_id,),
+        )
+        self.con.commit()
 
         self.store.transition(
             sprint_id,
             "completed",
             sprint_domain.LifecycleActor("planner", 3),
-            reason="finish without chat displacement",
+            reason="finish with unique Reviewer author",
             terminal_outcome="completed",
         )
 
-        marks = ",".join("?" for _ in conversation_ids)
         self.assertEqual(
-            [("idle", 0)] * 3,
+            [(1, chats[1], "closed"), (2, chats[2], "idle"), (3, chats[3], "idle")],
             [
                 tuple(row)
                 for row in self.con.execute(
-                    "SELECT state,closed_at IS NOT NULL FROM conversations "
-                    f"WHERE conversation_id IN ({marks}) ORDER BY conversation_id",
-                    conversation_ids,
+                    "SELECT shell_id,conversation_id,state FROM conversations "
+                    "WHERE conversation_id IN (?,?,?) ORDER BY shell_id",
+                    (chats[1], chats[2], chats[3]),
                 )
             ],
         )
         self.assertEqual(
-            3,
-            self.con.execute(
-                "SELECT COUNT(*) FROM active_shell_chats "
-                f"WHERE chat_id IN ({marks})",
-                conversation_ids,
-            ).fetchone()[0],
+            [(2, chats[2]), (3, chats[3])],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT shell_id,chat_id FROM active_shell_chats "
+                    "WHERE shell_id IN (1,2,3) ORDER BY shell_id"
+                )
+            ],
         )
         self.assertEqual(
-            [{"shell_id": 1, "sprint": None}, {"shell_id": 2, "sprint": None}],
-            sprint_participant_chats.attach_live_participations(
-                self.con,
-                [{"shell_id": 1}, {"shell_id": 2}],
+            [2, 3],
+            json.loads(
+                self.con.execute(
+                    "SELECT payload FROM conversation_events "
+                    "WHERE conversation_id=? AND event_type='conversation.closed'",
+                    (chats[1],),
+                ).fetchone()[0]
+            )["retained_shell_ids"],
+        )
+
+    def test_fallback_ambiguous_authors_close_linked_reviewers_not_unrelated_chat(
+        self,
+    ):
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (5,'Reviewer 5','REV5','reviewer','prompt',1)"
+        )
+        sprint_id, _ = self.create_sprint()
+        self.con.execute(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness,model,effort) "
+            "VALUES (?,5,'reviewer','codex','model','high')",
+            (sprint_id,),
+        )
+        self.con.commit()
+        self.store.arm(sprint_id, 3)
+        chats = {
+            shell_id: self.ensure_wake_chat(sprint_id, shell_id)
+            for shell_id in (1, 2, 3, 5)
+        }
+        self.con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+            "WHERE conversation_id=?",
+            (chats[2],),
+        )
+        unrelated_reviewer_chat = str(
+            self.con.execute(
+                "INSERT INTO conversations "
+                "(shell_id,owner_user_id,harness,worktree,state,"
+                "creation_idempotency_key,creation_request_hash) "
+                "VALUES (2,1,'kimi','/tmp/work','idle','reviewer-normal',"
+                "'reviewer-normal') RETURNING conversation_id"
+            ).fetchone()[0]
+        )
+        self.con.execute(
+            "INSERT INTO active_shell_chats (shell_id,chat_id) VALUES (2,?)",
+            (unrelated_reviewer_chat,),
+        )
+        self.con.executemany(
+            "INSERT INTO sprint_reports "
+            "(sprint_id,report_kind,author_shell_id,body,idempotency_key) "
+            "VALUES (?,'final',?,?,?)",
+            (
+                (sprint_id, 2, "Reviewer 2 final", "ambiguous-final-2"),
+                (sprint_id, 5, "Reviewer 5 final", "ambiguous-final-5"),
+            ),
+        )
+        self.con.commit()
+
+        self.store.transition(
+            sprint_id,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="ambiguous final-report author evidence",
+            terminal_outcome="completed",
+        )
+
+        self.assertEqual(
+            [(2, unrelated_reviewer_chat), (3, chats[3])],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT shell_id,chat_id FROM active_shell_chats "
+                    "WHERE shell_id IN (1,2,3,5) ORDER BY shell_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            [(1, chats[1], "closed"), (5, chats[5], "closed")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT shell_id,conversation_id,state FROM conversations "
+                    "WHERE conversation_id IN (?,?) ORDER BY shell_id",
+                    (chats[1], chats[5]),
+                )
+            ],
+        )
+        self.assertEqual(
+            ("idle", 0),
+            tuple(
+                self.con.execute(
+                    "SELECT state,closed_at IS NOT NULL FROM conversations "
+                    "WHERE conversation_id=?",
+                    (unrelated_reviewer_chat,),
+                ).fetchone()
+            ),
+        )
+        retained_sets = [
+            json.loads(row[0])["retained_shell_ids"]
+            for row in self.con.execute(
+                "SELECT payload FROM conversation_events "
+                "WHERE event_type='conversation.closed' "
+                "AND json_extract(payload,'$.reason')='sprint_completed' "
+                "ORDER BY event_id"
+            )
+        ]
+        self.assertEqual([[3], [3]], retained_sets)
+
+    def test_post_commit_notification_failure_preserves_completed_cleanup(self):
+        sprint_id, _ = self.create_sprint()
+        self.store.arm(sprint_id, 3)
+        developer_chat = self.ensure_wake_chat(sprint_id, 1)
+        reviewer_chat = self.ensure_wake_chat(sprint_id, 2)
+        with (
+            mock.patch.object(
+                sprint_domain.conversation_events,
+                "notify",
+                side_effect=(RuntimeError("notifier unavailable"), 1),
+            ) as notify,
+            self.assertRaisesRegex(RuntimeError, "notifier unavailable"),
+        ):
+            self.store.transition(
+                sprint_id,
+                "completed",
+                sprint_domain.LifecycleActor("planner", 3),
+                reason="commit before notifier",
+                terminal_outcome="completed",
+            )
+
+        self.assertEqual(
+            [mock.call(developer_chat), mock.call(reviewer_chat)],
+            notify.call_args_list,
+        )
+        self.assertEqual(
+            ("completed", "closed", 1, "closed", 1, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT sprint.lifecycle,conversation.state,"
+                    "conversation.closed_at IS NOT NULL,"
+                    "reviewer.state,reviewer.closed_at IS NOT NULL,"
+                    "(SELECT COUNT(*) FROM active_shell_chats WHERE shell_id=1) "
+                    "FROM sprints sprint JOIN conversations conversation "
+                    "ON conversation.conversation_id=? JOIN conversations reviewer "
+                    "ON reviewer.conversation_id=? WHERE sprint.sprint_id=?",
+                    (developer_chat, reviewer_chat, sprint_id),
+                ).fetchone()
             ),
         )
     def test_restart_recovers_prepared_armed_and_paused_without_state_drift(self):

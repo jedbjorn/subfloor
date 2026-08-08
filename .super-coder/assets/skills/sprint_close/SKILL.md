@@ -49,6 +49,12 @@ exception: it stores conformance, findings, and the Reviewer-authored final
 report, completes the Sprint, and publishes the informational Planner receipt
 atomically. FnB retains the board-level override from decision #46.
 
+Any successful completion automatically closes other active participant chats
+immutably linked to that Sprint while retaining the originating Planner and the
+report-authoring Reviewer. Do not manually close peer chats as an extra
+closeout step. Pause, abort, re-entry, failed conformance, and rejected fallback
+completion never invoke this cleanup.
+
 If a command rejects a decision, preserve the returned durable state. Do not
 substitute another transition or invent an alternate handoff. Return the
 conflict to the deciding role, or surface it to FnB when the relay itself is

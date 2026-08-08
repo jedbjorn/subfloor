@@ -29,6 +29,7 @@ HANDOFF_ROLE_SKILLS = {"sprint_dev", "sprint_rev", "sprint_pln"}
 CLOSEOUT_ROLE_SKILLS = {"sprint_close", "sprint_dev", "sprint_pln", "sprint_rev"}
 FORCE_NEW_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
 POLISHED_SPRINT_SKILLS = set(SKILLS) - {"sprint_prep"}
+CHAT_CLEANUP_SKILLS = {"sprint_close", "sprint_pln", "sprint_rev"}
 
 ARTIFACT_PATH_RULE = """## Sprint artifact paths
 
@@ -533,6 +534,11 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0184_reseed_sprint_skill_polish.sql":
+                    con.executescript(later_migration.read_text())
 
             for name in sorted(POLISHED_SPRINT_SKILLS):
                 with self.subTest(name=name):
@@ -554,6 +560,73 @@ class SprintSkillTest(unittest.TestCase):
                             0,
                         ),
                     )
+        finally:
+            con.close()
+
+    def test_successful_chat_cleanup_reseed_matches_assets_and_is_idempotent(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0190_reseed_successful_sprint_chat_cleanup.sql":
+                    break
+                con.executescript(migration.read_text())
+            placeholders = ",".join("?" for _ in CHAT_CLEANUP_SKILLS)
+            con.execute(
+                f"UPDATE skills SET description='stale',category='stale',"
+                f"command='stale',common=1,content='manual peer close',"
+                f"is_deleted=1 WHERE name IN ({placeholders})",
+                tuple(sorted(CHAT_CLEANUP_SKILLS)),
+            )
+            developer_before = tuple(
+                con.execute(
+                    "SELECT description,category,command,common,content,is_deleted "
+                    "FROM skills WHERE name='sprint_dev'"
+                ).fetchone()
+            )
+
+            migration = (
+                ENGINE
+                / "migrations"
+                / "0190_reseed_successful_sprint_chat_cleanup.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for name in sorted(CHAT_CLEANUP_SKILLS):
+                with self.subTest(name=name):
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(1, len(rows))
+                    self.assertEqual(
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                        tuple(rows[0]),
+                    )
+                    normalized = " ".join(parsed["content"].split())
+                    self.assertIn("originating Planner", normalized)
+                    self.assertIn("report-authoring Reviewer", normalized)
+                    self.assertIn("Do not manually close peer chats", normalized)
+                    self.assertIn("failed conformance", normalized)
+            self.assertEqual(
+                developer_before,
+                tuple(
+                    con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name='sprint_dev'"
+                    ).fetchone()
+                ),
+            )
         finally:
             con.close()
 
