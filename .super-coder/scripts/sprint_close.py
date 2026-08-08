@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+import conversation_events
 import db_driver
 from sprint_domain import (
     SprintAuthorityError,
@@ -66,6 +67,7 @@ class SprintCloseStore:
             idempotency_key, "idempotency key", maximum=220
         )
         normalized = tuple(self._normalize_finding(item) for item in findings)
+        closed_conversation_ids: tuple[str, ...] = ()
         with db_driver.write_transaction(self.con, "sprint.close.conformance"):
             self._require_reviewer(sprint_id, reviewer_shell_id)
             planner_shell_id = self._planner_shell_id(sprint_id)
@@ -181,13 +183,24 @@ class SprintCloseStore:
                     "planner_wake_id": planner_wake_id,
                 },
             )
-            SprintLifecycleStore(self.con).complete_from_conformance_in_transaction(
+            closed_conversation_ids = SprintLifecycleStore(
+                self.con
+            ).complete_from_conformance_in_transaction(
                 sprint_id,
                 reviewer_shell_id,
                 reason=reason,
                 terminal_outcome=terminal_outcome,
                 idempotency_key=idempotency_key,
             )
+        notification_error: Exception | None = None
+        for conversation_id in closed_conversation_ids:
+            try:
+                conversation_events.notify(conversation_id)
+            except Exception as exc:  # noqa: BLE001 - finish post-commit fanout
+                if notification_error is None:
+                    notification_error = exc
+        if notification_error is not None:
+            raise notification_error
         return ConformanceReceipt(
             report_id,
             tuple(followup_ids),
@@ -868,12 +881,21 @@ class SprintCloseStore:
             "via": "conformance",
             "idempotency_key": idempotency_key,
         }
+        event_payload = json.loads(event["payload"]) if event is not None else {}
+        closed_conversation_ids = event_payload.pop(
+            "closed_conversation_ids", []
+        )
         if (
             sprint is None
             or sprint["lifecycle"] != "completed"
             or sprint["terminal_outcome"] != terminal_outcome
             or event is None
-            or json.loads(event["payload"]) != expected
+            or event_payload != expected
+            or not isinstance(closed_conversation_ids, list)
+            or any(
+                not isinstance(conversation_id, str)
+                for conversation_id in closed_conversation_ids
+            )
         ):
             raise SprintInvariantError(
                 "conformance idempotency key was reused with different completion"

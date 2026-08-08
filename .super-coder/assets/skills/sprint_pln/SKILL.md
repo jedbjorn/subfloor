@@ -265,6 +265,11 @@ report, completed lifecycle, and an informational engine-wide Planner receipt.
 When that Re-enter arrives, confirm the receipt names the expected Sprint,
 reports, outcome, and completed state. Do not run `complete`; closure is already
 durable and the notification has no actionable liveness expectation.
+Successful completion also closes every other active participant chat
+immutably linked to that Sprint. The originating Planner and report-authoring
+Reviewer remain open. Do not manually close peer chats as a second closeout
+action. Pause, abort, re-entry, failed conformance, and rejected fallback
+completion retain their existing no-cleanup behavior.
 
 Do not run `compile-report` by default, synthesize the final report, or
 editorialize the Reviewer body. The Reviewer compiles its own evidence. A
