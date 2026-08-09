@@ -81,6 +81,16 @@ PROJECT_VS_ENGINE_SOURCE = (
     "   one the dispatcher resolves.\n"
 )
 
+DEVKIT_DECLARED_STATUS = "**Fork dev kit:** `.subfloor/dev-kit.json` declared."
+DEVKIT_ABSENT_STATUS = "**Fork dev kit:** no fork dev kit declared."
+
+
+def render_project_vs_engine(source_mode: bool, devkit_declared: bool) -> str:
+    """Render repo position and the checkout's fork-dev-kit status together."""
+    project = PROJECT_VS_ENGINE_SOURCE if source_mode else PROJECT_VS_ENGINE_FORK
+    devkit = DEVKIT_DECLARED_STATUS if devkit_declared else DEVKIT_ABSENT_STATUS
+    return f"{project}\n\n{devkit}"
+
 
 def render_execution_context(flavor: str | None, launch_mode: str) -> str:
     """Render the real execution seat without changing the shell's mandate."""
@@ -395,6 +405,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                  api_key: "str | None" = None,
                  api_port: "int | None" = None,
                  source_mode: bool = False,
+                 devkit_declared: bool = False,
                  launch_mode: str = "container") -> str:
     """Assemble the full boot markdown for `shell`, driven by `user`.
 
@@ -412,13 +423,14 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     inherit the substrate or floor result. source_mode flips
     PROJECT vs ENGINE to the
     source-repo variant (caller decides via install.is_source_repo() — compose
-    stays a pure render, no git).
+    stays a pure render, no git). devkit_declared is the caller's observation
+    of `.subfloor/dev-kit.json` in the exact checkout receiving this boot.
     """
     template = TEMPLATE_PATH.read_text().rstrip()
     flavor = (shell["flavor"] if "flavor" in shell.keys() else None)
     template = template.replace(
         "{{project_vs_engine}}",
-        PROJECT_VS_ENGINE_SOURCE if source_mode else PROJECT_VS_ENGINE_FORK)
+        render_project_vs_engine(source_mode, devkit_declared))
     template = template.replace(
         "{{execution_context}}", render_execution_context(flavor, launch_mode)
     )

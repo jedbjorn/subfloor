@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "hooks": {
+    "deps": {
+      "argv": ["./.subfloor/dev-kit", "deps"],
+      "cwd": "."
+    },
+    "test": {
+      "argv": ["./.subfloor/dev-kit", "test"],
+      "cwd": "."
+    },
+    "lint": {
+      "argv": ["./.subfloor/dev-kit", "lint"],
+      "cwd": "."
+    },
+    "typecheck": {
+      "argv": ["./.subfloor/dev-kit", "typecheck"],
+      "cwd": "."
+    }
+  }
+}

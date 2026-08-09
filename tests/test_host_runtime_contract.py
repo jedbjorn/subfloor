@@ -108,17 +108,22 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
 
     def test_only_shell_implemented_help_bypasses_the_probe(self) -> None:
         selected = str(self.root / "missing-python")
-        help_result = self.invoke(selected, "deps", "-h")
-        self.assertEqual(help_result.returncode, 0, help_result.stderr)
-        self.assertEqual(help_result.stdout, "Usage: ./sc deps [-h|--help]\n")
-        self.assertNotIn("host Python preflight", help_result.stderr)
+        for command in ("deps", "test", "lint", "typecheck"):
+            with self.subTest(command=command):
+                help_result = self.invoke(selected, command, "-h")
+                self.assertEqual(help_result.returncode, 0, help_result.stderr)
+                self.assertEqual(
+                    help_result.stdout,
+                    f"Usage: ./sc {command} [-h|--help]\n",
+                )
+                self.assertNotIn("host Python preflight", help_result.stderr)
         recovery = (
             'export SC_PYTHON="$(brew --prefix)/bin/python3"'
             if sys.platform == "darwin"
             else "export SC_PYTHON=/absolute/path/to/python3"
         )
 
-        for command in ("test", "lint", "typecheck", "rebuild"):
+        for command in ("rebuild",):
             with self.subTest(command=command):
                 completed = self.invoke(selected, command, "-h")
                 self.assertEqual(completed.returncode, 1)
