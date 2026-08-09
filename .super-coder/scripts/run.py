@@ -56,6 +56,7 @@ import artifact_policy  # noqa: E402
 import callable_floor  # noqa: E402
 import db_driver  # noqa: E402
 import global_pointer  # noqa: E402
+import git_freshness  # noqa: E402
 import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
 import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
@@ -493,101 +494,49 @@ def trust_codex_worktree(work_dir: Path) -> "str | None":
         return f"→ codex trust: skipped ({e})"
 
 
-def _git(work_dir: Path, *args: str, timeout: int = 15) -> "subprocess.CompletedProcess[str]":
-    return subprocess.run(["git", "-C", str(work_dir), *args],
-                          capture_output=True, text=True, timeout=timeout)
+def sync_worktree(work_dir: Path, shortname: str, flavor: str | None = None) -> str:
+    """Project one shell checkout; mutate only a clean expected shell base."""
+    reviewer = flavor == "reviewer"
+    projection = git_freshness.project(
+        work_dir,
+        policy=(
+            git_freshness.TARGET_REVIEWER_HEAD
+            if reviewer
+            else git_freshness.TARGET_ISOLATED_SHELL
+        ),
+        expected_branch=f"shell/{shortname.lower()}",
+        allow_auto_advance=not reviewer,
+    )
+    return git_freshness.render(projection)
 
 
-def sync_worktree(work_dir: Path, shortname: str) -> str:
-    """Bring a shell's worktree base in line with the default branch — or say
-    why not. Returns a one-line status for the boot doc + launch print.
-
-    Doctrine: `shell/<shortname>` is a MOVING BASE pinned to origin/<default>,
-    not a content branch — work happens on feature branches cut from it, so a
-    worktree is born at first-boot HEAD and drifts as PRs merge unless someone
-    moves it. This does, when provably nothing can be lost: HEAD is the shell
-    base branch, the tree is clean, and there are no local-only commits → fetch
-    + `reset --hard origin/<default>` (NEVER pull/merge: merge bubbles on a
-    long-lived branch, and squash-merged work replays as conflicts). Anything
-    local → no touch; the status tells the shell to surface it to the FnB
-    (git skill, 'Sync before you start'). Soft-fails on network/timeout —
-    an offline boot must never block on a drift check.
-    """
-    default = (os.environ.get("SC_PROTECTED_BRANCHES") or "main").split()[0]
-    upstream = f"origin/{default}"
-    try:
-        if _git(work_dir, "fetch", "origin", default, "--quiet",
-                timeout=20).returncode != 0:
-            return f"drift check skipped (could not fetch {upstream} — offline?)"
-        if _git(work_dir, "rev-parse", "--verify", "--quiet",
-                upstream).returncode != 0:
-            return f"drift check skipped (no {upstream})"
-        behind = int(_git(work_dir, "rev-list", "--count",
-                          f"HEAD..{upstream}").stdout.strip() or 0)
-        ahead = int(_git(work_dir, "rev-list", "--count",
-                         f"{upstream}..HEAD").stdout.strip() or 0)
-        dirty = bool(_git(work_dir, "status", "--porcelain").stdout.strip())
-        branch = _git(work_dir, "symbolic-ref", "--short", "HEAD").stdout.strip()
-
-        local = [p for p, on in ((f"{ahead} unmerged local commit(s)", ahead),
-                                 ("uncommitted changes", dirty)) if on]
-        if behind == 0:
-            note = f" ({'; '.join(local)})" if local else ""
-            return f"in sync with {upstream}{note}"
-        if branch != f"shell/{shortname.lower()}":
-            return (f"{behind} behind {upstream}, mid-work on `{branch}` — not "
-                    "auto-synced; land or stash first (git skill: 'Sync before "
-                    "you start')")
-        if local:
-            return (f"⚠ {behind} behind {upstream} with {' + '.join(local)} — "
-                    "NOT auto-synced. Surface the local work to the FnB before "
-                    "doing anything else (git skill: 'Sync before you start')")
-        if _git(work_dir, "reset", "--hard", upstream).returncode != 0:
-            return f"⚠ {behind} behind {upstream} — auto-sync FAILED; see git skill"
-        return f"auto-synced to {upstream} (was {behind} behind; nothing local to lose)"
-    except (subprocess.TimeoutExpired, OSError, ValueError):
-        return "drift check skipped (git timed out or errored)"
+def main_checkout_note(repo_root: Path) -> str:
+    """Project the live engine checkout without ever rewriting it."""
+    return git_freshness.render(
+        git_freshness.project(
+            repo_root,
+            policy=git_freshness.TARGET_LIVE_ENGINE,
+        )
+    )
 
 
-def main_checkout_note(repo_root: Path) -> "str | None":
-    """Report the MAIN CHECKOUT's position against the default branch — the tree
-    every shell's `./sc` resolves the engine from (sc:11-21 derives ROOT via
-    git's common dir), which hosts the gitignored live DB and runs the
-    supervised server.
-
-    Why this exists separately from sync_worktree: that function reports the
-    SHELL'S OWN worktree, so a shell could be exactly current, be told so at
-    boot, and still drive a stale engine. That produced three wrong answers in
-    one session — a `./sc help` query answered from a stale tree, a
-    pending-migration check that came back empty because it globbed a stale
-    migrations dir, and dormant PR watches against a stale running floor.
-    Admin is the shell that maintains main directly and, before this, was the
-    only shell given no drift line at all.
-
-    STRICTLY READ-ONLY. sync_worktree may `reset --hard` a shell base; this must
-    never touch the main checkout — the server is running from it and a reset
-    would discard whatever the operator has in flight. Soft-fails like its
-    sibling: an offline boot must not block on a drift check.
-    """
-    default = (os.environ.get("SC_PROTECTED_BRANCHES") or "main").split()[0]
-    upstream = f"origin/{default}"
-    try:
-        if _git(repo_root, "rev-parse", "--verify", "--quiet",
-                upstream).returncode != 0:
-            return None
-        behind = int(_git(repo_root, "rev-list", "--count",
-                          f"HEAD..{upstream}").stdout.strip() or 0)
-        if behind == 0:
-            return f"engine floor current with {upstream}"
-        return (f"\u26a0 engine floor is {behind} commit(s) BEHIND {upstream} — "
-                f"your `./sc`, the live DB and the running server all resolve "
-                f"from `{repo_root}`, so commands may answer from stale code. "
-                "Verify engine claims with `git show origin/"
-                f"{default}:<path>` rather than the working tree, and ask the "
-                "FnB to pull + reconcile (restart is theirs; it kills live "
-                "sessions).")
-    except (subprocess.TimeoutExpired, OSError, ValueError):
+def declared_work_repo_note(repo_root: Path = REPO_ROOT) -> str | None:
+    """Project a separately declared work repo independently from substrate."""
+    raw = install.work_repo()
+    if not raw:
         return None
+    target = Path(raw).expanduser()
+    try:
+        if target.resolve() == repo_root.resolve():
+            return None
+    except OSError:
+        pass
+    return git_freshness.render(
+        git_freshness.project(
+            target,
+            policy=git_freshness.TARGET_SHARED_WORK,
+        )
+    )
 
 
 def ensure_harness_path() -> None:
@@ -1233,18 +1182,22 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     sync_note = None
     if work_dir != REPO_ROOT:
         ensure_worktree(work_dir, chosen["shortname"])
-        sync_note = sync_worktree(work_dir, chosen["shortname"])
+        sync_note = sync_worktree(
+            work_dir, chosen["shortname"], chosen["flavor"]
+        )
         link_worktree_map(work_dir)
         if harness == "codex":
             trust_codex_worktree(work_dir)
     # Every shell — including admin at the repo root — is told whether the tree
     # its ./sc resolves from is current. Read-only; never syncs main.
     floor_note = main_checkout_note(REPO_ROOT)
+    work_repo_note = declared_work_repo_note(REPO_ROOT)
 
     content = compose_boot(con, full, user, session_id, archive_id,
                            work_dir=work_dir if work_dir != REPO_ROOT else None,
                            sync_note=sync_note,
                            floor_note=floor_note,
+                           work_repo_note=work_repo_note,
                            source_mode=install.is_source_repo(),
                            api_key=full["api_key"],
                            api_port=api_port,
@@ -1644,13 +1597,16 @@ def main() -> None:
         if work_dir != REPO_ROOT:
             spinner.label = "syncing worktree"
             ensure_worktree(work_dir, chosen["shortname"])
-            sync_note = sync_worktree(work_dir, chosen["shortname"])
+            sync_note = sync_worktree(
+                work_dir, chosen["shortname"], chosen["flavor"]
+            )
             map_note = link_worktree_map(work_dir)
             if harness == "codex":
                 trust_note = trust_codex_worktree(work_dir)
         # Read-only floor check for EVERY shell, admin included — see
         # main_checkout_note. The tree ./sc resolves from is not the shell's own.
         floor_note = main_checkout_note(REPO_ROOT)
+        work_repo_note = declared_work_repo_note(REPO_ROOT)
 
         # Repo-global branch hygiene: delete local branches whose PR is provably
         # merged (git_hygiene's `stale` set — gh-confirmed MERGED, never a base or a
@@ -1672,6 +1628,7 @@ def main() -> None:
                                work_dir=work_dir if work_dir != REPO_ROOT else None,
                                sync_note=sync_note,
                                floor_note=floor_note,
+                               work_repo_note=work_repo_note,
                                source_mode=install.is_source_repo(),
                                api_key=full["api_key"],
                                api_port=api_port,

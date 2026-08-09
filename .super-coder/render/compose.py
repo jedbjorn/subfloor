@@ -374,10 +374,24 @@ def render_lns_status(counts: dict) -> str:
     return line
 
 
+def render_target_freshness(
+    floor_note: "str | None",
+    work_repo_note: "str | None",
+) -> list[str]:
+    """Keep live-floor and declared-work evidence visibly independent."""
+    lines: list[str] = []
+    if floor_note:
+        lines.append(f"- floor: {floor_note}")
+    if work_repo_note:
+        lines.append(f"- work repo: {work_repo_note}")
+    return lines
+
+
 def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                  archive_id: int, work_dir: "Path | None" = None,
                  sync_note: "str | None" = None,
                  floor_note: "str | None" = None,
+                 work_repo_note: "str | None" = None,
                  api_key: "str | None" = None,
                  api_port: "int | None" = None,
                  source_mode: bool = False,
@@ -393,7 +407,9 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     MAIN CHECKOUT's drift, which is a different tree from the shell's worktree
     and the one every `./sc` resolves the engine from; it renders for EVERY
     shell including admin at the repo root, because admin maintains main and was
-    previously the only shell given no drift line at all. source_mode flips
+    previously the only shell given no drift line at all. work_repo_note is the
+    independently projected, never-mutated declared work surface; it must not
+    inherit the substrate or floor result. source_mode flips
     PROJECT vs ENGINE to the
     source-repo variant (caller decides via install.is_source_repo() — compose
     stays a pure render, no git).
@@ -495,8 +511,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     # reported unconditionally — a worktree can be current while the tree its
     # ./sc resolves from is stale, and admin (repo root) got no drift line here
     # at all before this.
-    if floor_note:
-        active_session.append(f"- floor: {floor_note}")
+    active_session.extend(render_target_freshness(floor_note, work_repo_note))
 
     parts = [
         template,

@@ -43,6 +43,9 @@ jobs:
           tests.test_model_catalog
           tests.test_gitignore_sync
           tests.test_remove
+          tests.test_sc_wrapper
+          tests.test_git_freshness
+          tests.test_worktree_sync
           tests.test_branch_guard
 
   tests:

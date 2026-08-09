@@ -61,6 +61,19 @@ class ProjectVsEngineTest(unittest.TestCase):
         self.assertIn("gitignored dependency", fork_render)
         self.assertIn("you are upstream", source_render)
 
+    def test_floor_and_declared_work_repo_render_as_separate_targets(self):
+        lines = compose.render_target_freshness(
+            "live_engine_checkout: `/substrate` · remote unverified",
+            "shared_work_repo: `/work` · remote verified · behind 2",
+        )
+        self.assertEqual(
+            lines,
+            [
+                "- floor: live_engine_checkout: `/substrate` · remote unverified",
+                "- work repo: shared_work_repo: `/work` · remote verified · behind 2",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

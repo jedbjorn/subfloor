@@ -58,6 +58,40 @@ def commit(root: Path, message: str) -> str:
 
 
 class LegacyUpdateCompatTest(unittest.TestCase):
+    def test_installed_repo_reconciles_managed_host_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "fork"
+            engine = root / ".super-coder"
+            engine.mkdir(parents=True)
+            (engine / "instance.json").write_text('{"installed_at":"2026-08-09"}\n')
+            with mock.patch.multiple(
+                update_compat,
+                REPO_ROOT=root,
+                ENGINE=engine,
+            ), mock.patch.object(
+                update_compat.sc_wrapper, "register_install", return_value="ready"
+            ) as register, contextlib.redirect_stdout(io.StringIO()) as output:
+                update_compat.reconcile_host_wrapper()
+
+            register.assert_called_once_with(root)
+            self.assertIn("managed host sc wrapper: ready", output.getvalue())
+
+    def test_uninstalled_repo_does_not_claim_host_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "fork"
+            engine = root / ".super-coder"
+            engine.mkdir(parents=True)
+            with mock.patch.multiple(
+                update_compat,
+                REPO_ROOT=root,
+                ENGINE=engine,
+            ), mock.patch.object(
+                update_compat.sc_wrapper, "register_install"
+            ) as register:
+                update_compat.reconcile_host_wrapper()
+
+            register.assert_not_called()
+
     def make_ref_boundary(self, root: Path) -> tuple[str, str]:
         scripts = root / ".super-coder" / "scripts"
         scripts.mkdir(parents=True)
@@ -193,6 +227,7 @@ class LegacyUpdateCompatTest(unittest.TestCase):
             shutil.copy2(
                 SCRIPTS / "update_compat.py", scripts / "update_compat.py"
             )
+            shutil.copy2(SCRIPTS / "sc_wrapper.py", scripts / "sc_wrapper.py")
             (scripts / "update.py").write_text(
                 "import os\n"
                 "from pathlib import Path\n"

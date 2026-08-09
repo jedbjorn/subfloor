@@ -66,7 +66,12 @@ class FreshForkInstallTest(unittest.TestCase):
                 "Gate",
             ],
             cwd=repo,
-            env={**os.environ, "HOME": str(home), "NO_COLOR": "1"},
+            env={
+                **os.environ,
+                "HOME": str(home),
+                "XDG_STATE_HOME": str(home / ".local/state"),
+                "NO_COLOR": "1",
+            },
             capture_output=True,
             text=True,
             timeout=120,
@@ -92,6 +97,17 @@ class FreshForkInstallTest(unittest.TestCase):
                 re.compile(r"^\d{4}-\d{2}-\d{2}$"),
             )
             self.assertIn("Installed ✓", result.stdout)
+            wrapper = home / ".local/bin/sc"
+            registry = home / ".local/state/super-coder/installs.json"
+            wrapper_text = wrapper.read_text()
+            self.assertIn("# managed-by: subfloor sc-wrapper v1", wrapper_text)
+            self.assertIn("git rev-parse --show-toplevel", wrapper_text)
+            self.assertNotIn("SC_ROOT", wrapper_text)
+            self.assertEqual(
+                json.loads(registry.read_text())["installs"],
+                [str(repo.resolve())],
+            )
+            self.assertIn("subfloor managed PATH", (home / ".profile").read_text())
 
     def test_direct_installer_rejects_old_python_before_repository_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
