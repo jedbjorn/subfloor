@@ -368,6 +368,8 @@ def build_images(plan: ImagePlan, *, runner: Runner = subprocess.run) -> str:
 def preflight_image(plan: ImagePlan, *, runner: Runner = subprocess.run) -> str:
     try:
         _require_labels(plan.runtime_tag, plan.runtime_labels, runner=runner)
+    except SandboxPrerequisiteError:
+        raise
     except SandboxImageError as exc:
         raise SandboxImageError(
             f"--no-build cannot reuse {plan.runtime_tag!r}: {exc}. "

@@ -286,6 +286,32 @@ class SandboxImagePlanTest(unittest.TestCase):
         self.assertIn("cannot run docker", completed.stderr)
         self.assertNotIn("state: invalid", completed.stderr)
 
+    def test_preflight_preserves_missing_docker_as_a_prerequisite_error(self):
+        fixture = ImageFixture(self.base, "missing-docker-preflight")
+        completed = subprocess.run(
+            (
+                sys.executable,
+                str(SCRIPTS / "sandbox_devkit.py"),
+                "preflight",
+                str(fixture.root),
+                str(fixture.engine),
+                "20260809T170000.000000Z",
+                "tester",
+                "1000",
+                "1000",
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PATH": str(self.base / "empty-path")},
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("dev-kit prerequisite error", completed.stderr)
+        self.assertIn("cannot run docker", completed.stderr)
+        self.assertNotIn("state: invalid", completed.stderr)
+        self.assertNotIn("--no-build cannot reuse", completed.stderr)
+
     def test_build_uses_immutable_base_id_exact_context_and_required_labels(self):
         fixture = ImageFixture(self.base, "fork")
         plan = fixture.plan()
