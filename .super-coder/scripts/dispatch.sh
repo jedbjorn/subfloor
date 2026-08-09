@@ -317,330 +317,29 @@ sc_harness_status() {
   fi
 }
 
-# ── dev kit (deps + test) — in-container primitives, like serve/boot ──────────
-# A shell runs these from INSIDE the sandbox, where pip/npm act directly on the
-# bind-mounted repo: the .venv / node_modules they create live in the mount and so
-# persist across image rebuilds (the point of installing per-fork instead of baking
-# into the image). They run in the CURRENT environment — no docker re-exec — so on
-# the no-docker host path they use host python3/node, exactly like serve/boot.
+# ── fork-declared dev-kit hooks — exact current-seat execution ────────────────
+# Hooks run in the current host or Docker environment against the invoking Git
+# checkout. The engine owns validation and exact execution, never project policy.
 
-# List a fork's manifests, pruning the install-artifact + engine + vcs trees that
-# map_repo.py's SKIP_DIRS also excludes (never descend an installed/engine tree).
-# Also prunes `vendor/` — installing has a stronger reason to skip it than mapping
-# does: a vendored/submodule package.json (e.g. ui/vendor/md-converter) is built by
-# its parent, and a stray `npm ci`/`pip install` there runs third-party lifecycle
-# scripts we don't own. We install only the manifests the fork itself authors.
-# `.sc-worktrees/` is pruned too — each shell worktree is a sibling checkout of
-# the SAME repo, so descending it would install/test every manifest N× (QAQC-02).
-_sc_find_manifests() {  # $1 = filename glob, e.g. 'requirements*.txt'
-  find "$here" \
-    \( -name node_modules -o -name .venv -o -name venv -o -name .super-coder \
-       -o -name .sc-state -o -name .sc-worktrees -o -name .git -o -name __pycache__ \
-       -o -name dist -o -name build -o -name vendor \) -prune -o \
-    -name "$1" -type f -print
-}
-
-# One map-independent presence gate for Python suites. Reuse the manifest walk
-# so tests inherit its engine, worktree, environment, dependency, and build
-# pruning; pytest still owns actual recursive collection from the repo root.
-_sc_has_python_tests() {
-  _sc_find_manifests 'test_*.py' | (
-    while IFS= read -r test_file; do
-      relative_test=${test_file#"$here"/}
-      case "$relative_test" in tests/*|*/tests/*) exit 0 ;; esac
-    done
-    exit 1
-  )
-}
-
-# Is the repo .venv's tooling runnable BY THE INTERPRETER THAT RESOLVES HERE?
-# Existence is not runnability. A .venv is bind-mounted into the sandbox from
-# the host, and `python -m venv` records its interpreter as an UNVERSIONED
-# symlink (.venv/bin/python3 -> /usr/bin/python3). That path exists in both
-# places and resolves to a DIFFERENT minor version in each whenever the host's
-# python3 and the image's python3 disagree. The venv's packages live in
-# lib/python<X.Y>/site-packages for the host's X.Y, so under the image's
-# interpreter every .venv/bin/* shim is still present and executable and
-# imports NOTHING — `ModuleNotFoundError: No module named '_pytest'`, which
-# reads as a broken tool or a failing suite rather than as the version skew it
-# is. Probe the interpreter against its own site-packages before trusting the
-# shims. (The launch-time py_mount passthrough solves this properly for a venv
-# built from an out-of-tree interpreter under $HOME; it deliberately declines
-# to shadow /usr, so a system-python venv lands here instead.)
-_sc_venv_runnable() {
-  venv="$here/.venv"
-  [ -x "$venv/bin/python" ] || return 1
-  vv="$("$venv/bin/python" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)" || return 1
-  [ -n "$vv" ] && [ -d "$venv/lib/python$vv/site-packages" ]
-}
-
-# Resolve a dev-kit tool (ruff / mypy): the fork's .venv copy wins (its pins +
-# config) WHEN IT RUNS HERE, else the image/PATH copy (baked into the sandbox
-# for exactly this case), else fail with the honest fix. A host-managed .venv
-# (pinned out-of-tree interpreter mounted by launch) is pip-skipped in the
-# sandbox BY DESIGN, so "run ./sc deps first" was a closed loop there — the
-# tool was unobtainable from inside the box (dos-arch QAQC-02). Say what is
-# actually wrong and where the fix runs instead.
-_sc_devtool() {  # $1 = tool name → prints the executable path, or fails
-  venv="$here/.venv"
-  if [ -x "$venv/bin/$1" ] && _sc_venv_runnable; then printf '%s\n' "$venv/bin/$1"; return 0; fi
-  if command -v "$1" >/dev/null 2>&1; then command -v "$1"; return 0; fi
-  hostmanaged=""
-  if [ -n "${SC_SANDBOX:-}" ] && [ -e "$venv/bin/python" ]; then
-    case "$(readlink -f "$venv/bin/python" 2>/dev/null || true)" in
-      "$here"/*) : ;;                       # sandbox-built venv — deps can provision it
-      *) hostmanaged=1 ;;                   # pinned host interpreter — pip skipped here
-    esac
-  fi
-  if [ -x "$venv/bin/$1" ] && ! _sc_venv_runnable; then
-    # Present but unimportable: name the skew, not a phantom missing package.
-    echo "✗ $1: $venv/bin/$1 exists but its interpreter cannot import it — this .venv was built by a different python minor than the one resolving here ($("$venv/bin/python" -V 2>&1), packages under $(ls -d "$venv"/lib/python* 2>/dev/null | tr '\n' ' '))." >&2
-    echo "  Fix: \`./sc build\` to bake $1 into the image as the PATH fallback — or on the HOST rebuild .venv from an interpreter launch can mount (a uv-managed one under \$HOME), which carries the SAME binary into the sandbox." >&2
-  elif [ -n "$hostmanaged" ]; then
-    echo "✗ $1: unavailable, and this .venv is host-managed (pinned out-of-tree interpreter) — in-sandbox pip is skipped by design, so \`./sc deps\` cannot provision it here." >&2
-    echo "  Fix on the HOST: install $1 into the pinned venv (e.g. uv pip install $1) — or \`./sc build\` to refresh the sandbox image, which bakes $1 as the PATH fallback." >&2
-  else
-    echo "✗ $1: not provisioned — run ./sc deps first" >&2
-  fi
-  return 1
-}
-
-# Install the fork's deps into the bind-mounted repo: always a repo-root .venv with
-# the engine baseline dev kit (pytest/ruff/mypy/...), plus every requirements*.txt
-# layered in first with fork pins winning; plus `npm ci` for each package.json.
-# Discovery is a glob walk (map-independent — runs on a fresh fork before `./sc map`).
-# A map-backed fast path would read dr_filepath.path (dr_dependency.source_file is
-# basename-only, so it can't locate a manifest's dir).
-sc_deps() {
-  if sc_help_form "$@"; then
-    echo "Usage: ./sc deps [-h|--help]"
+# Fork lifecycle policy lives only in .subfloor/dev-kit.json.  Keep the shell
+# adapter deliberately thin: exact one-argument help is engine-owned, a leading
+# separator is removed, and every other argument reaches the Python runner as a
+# literal argv element.
+sc_devkit_hook() {  # $1 = hook name; remaining args append to declared argv
+  hook="$1"
+  shift
+  if sc_devkit_help_form "$@"; then
+    echo "Usage: ./sc $hook [-h|--help]"
     return 0
   fi
-  rc=0
-  venv="$here/.venv"
-  # In the sandbox, a .venv whose interpreter lives OUTSIDE the repo is host-built
-  # and host-managed — a pinned out-of-tree CPython (uv standalone) that `./sc
-  # launch` mounts in, with deps already installed against it. Recreating it with
-  # the image's python or pip-ing into it here would clobber that shared tree, so
-  # leave python deps to the host (`make install` / `uv`). Node deps still install.
-  skip_py=""
-  if [ -n "${SC_SANDBOX:-}" ] && [ -e "$venv/bin/python" ]; then
-    case "$(readlink -f "$venv/bin/python" 2>/dev/null || true)" in
-      "$here"/*) : ;;       # sandbox-built venv inside the repo — manage normally
-      *) skip_py=1 ;;       # host-managed pinned interpreter — don't touch it
-    esac
-  fi
-  reqs="$(_sc_find_manifests 'requirements*.txt')"
-  base_reqs="$(printf '%s\n' "$reqs" | grep -v 'requirements-dev\.txt' || true)"
-  if [ -n "$skip_py" ]; then
-    echo "→ deps: python deps are host-managed (pinned interpreter mounted by launch) — skipping venv/pip in the sandbox"
-    # Never green-lie the skip (#314/#324/#339): the pinned tree carries what
-    # the host installed at launch time, which silently lags the fork's
-    # declared pins (a branch adds requirements → deps says done → 12 mystery
-    # ModuleNotFoundError test failures). Verify every declared pin resolves
-    # in the mounted tree; a missing one is a hard failure with the fix named,
-    # not a ✓. (Installing from in here stays off-limits by design — the tree
-    # is host-managed and shared.)
-    if [ -n "$base_reqs" ]; then
-      missing="$(printf '%s\n' "$base_reqs" | "$venv/bin/python" -c '
-import importlib.metadata as md, re, sys
-missing = []
-for path in (l.strip() for l in sys.stdin):
-    if not path:
-        continue
-    try:
-        lines = open(path).read().splitlines()
-    except OSError:
-        continue
-    for raw in lines:
-        line = raw.split("#", 1)[0].strip()
-        # skip options (-r/-e/--hash), URL/path requirements — only plain pins verify
-        if not line or line.startswith("-") or "://" in line or line.startswith((".", "/")):
-            continue
-        name = re.split(r"[<>=!~\[; ]", line, 1)[0].strip()
-        if not name:
-            continue
-        try:
-            md.version(name)
-        except md.PackageNotFoundError:
-            missing.append(line)
-print("\n".join(missing))
-')"
-      if [ -n "$missing" ]; then
-        echo "✗ deps: host-managed venv is missing declared python deps:" >&2
-        printf '%s\n' "$missing" | sed 's/^/    /' >&2
-        echo "  Fix: install the pins above into the pinned venv — on the host (e.g. uv pip install …)," >&2
-        echo "  or \`$venv/bin/pip install <pins>\` (the mounted tree accepts installs; ownership lands root)." >&2
-        rc=1
-      else
-        echo "→ deps: host-managed tree verified — every declared python pin present"
-      fi
-    fi
-  else
-  # The engine dev kit lives in this .venv, so create it unconditionally — a fork
-  # that declares no requirements*.txt still needs pytest on hand for `./sc test`
-  # and for shells writing tests. (Previously the venv + kit were gated on $base_reqs,
-  # which left pure-JS and undeclared-dep forks with no pytest at all.)
-  if [ ! -x "$venv/bin/python" ]; then
-    echo "→ deps: creating $venv"
-    "$PY" -m venv "$venv" || { echo "✗ deps: venv create failed" >&2; return 1; }
-  fi
-  # Fork pins first (authoritative), with a sibling requirements-dev.txt if present.
-  if [ -n "$base_reqs" ]; then
-    printf '%s\n' "$base_reqs" | while IFS= read -r req; do
-      [ -n "$req" ] || continue
-      echo "→ deps: pip install -r $req"
-      "$venv/bin/pip" install -q -r "$req" || exit 1
-      dev="$(dirname "$req")/requirements-dev.txt"
-      if [ -f "$dev" ]; then
-        echo "→ deps: pip install -r $dev"
-        "$venv/bin/pip" install -q -r "$dev" || exit 1
-      fi
-    done || rc=1
-  fi
-  # Engine baseline dev kit — test (pytest/httpx/coverage), lint+format (ruff),
-  # type-check (mypy), SQLite GUI (datasette). only-if-needed never overrides a
-  # fork's pin or its [tool.ruff]/[tool.mypy] config — available, not enforced.
-  echo "→ deps: engine dev kit (pytest httpx coverage ruff mypy datasette, only-if-needed)"
-  "$venv/bin/pip" install -q --upgrade-strategy only-if-needed pytest httpx coverage ruff mypy datasette || rc=1
-  fi
-  pkgs="$(_sc_find_manifests 'package.json')"
-  if [ -n "$pkgs" ]; then
-    printf '%s\n' "$pkgs" | while IFS= read -r pkg; do
-      [ -n "$pkg" ] || continue
-      d="$(dirname "$pkg")"
-      if [ -f "$d/package-lock.json" ]; then
-        echo "→ deps: npm ci in $d"; ( cd "$d" && npm ci ) || exit 1
-      else
-        echo "→ deps: npm install in $d"; ( cd "$d" && npm install ) || exit 1
-      fi
-    done || rc=1
-  fi
-  if [ -z "$base_reqs" ] && [ -z "$pkgs" ]; then
-    echo "→ deps: no fork requirements*.txt or package.json found — engine dev kit only"
-  fi
-  [ "$rc" -eq 0 ] || { echo "✗ deps: one or more installs failed" >&2; return 1; }
-  echo "✓ deps: done"
+  if [ "${1:-}" = "--" ]; then shift; fi
+  "$PY" "$S/devkit.py" run "$CALLER_ROOT" "$hook" "$@"
 }
 
-# True if the fork declares a pytest config — pytest.ini, a [tool.pytest…] table in
-# pyproject.toml, or [tool:pytest] in setup.cfg. The discriminator between "this
-# fork opted out of pytest" (→ stdlib unittest fallback) and "this fork needs
-# pytest but the .venv is unprovisioned" (→ hard error, never a silent downgrade).
-_sc_wants_pytest() {
-  [ -f "$here/pytest.ini" ] && return 0
-  [ -f "$here/pyproject.toml" ] && grep -q '\[tool\.pytest' "$here/pyproject.toml" 2>/dev/null && return 0
-  [ -f "$here/setup.cfg" ] && grep -q '\[tool:pytest\]' "$here/setup.cfg" 2>/dev/null && return 0
+sc_devkit_help_form() {
+  [ "$#" -eq 1 ] || return 1
+  case "$1" in -h|--help) return 0 ;; esac
   return 1
-}
-
-# Run the fork's test suites: backend (the .venv's pytest, honoring the fork's
-# pytest.ini; else the engine's own stdlib-unittest suite) + UI (npm run test /
-# vitest in any package.json dir that declares a test script). Non-zero if any fail.
-sc_test() {
-  venv="$here/.venv"
-  python_tests=""
-  _sc_has_python_tests && python_tests=1
-  # Self-heal an unprovisioned OR unrunnable host venv before selecting a test
-  # runner. A dangling interpreter leaves the pytest shim executable, so -x is
-  # not evidence that the venv can run. On the host the repo-local .venv is ours
-  # to rebuild; in the sandbox a host-managed venv stays untouched and sc_deps'
-  # existing ownership check chooses the safe PATH fallback.
-  provision_reason=""
-  if [ -n "$python_tests" ]; then
-    if [ ! -x "$venv/bin/pytest" ]; then
-      provision_reason=missing
-    elif ! _sc_venv_runnable; then
-      provision_reason=unrunnable
-    fi
-  fi
-  if [ -n "$provision_reason" ]; then
-    if [ "$provision_reason" = unrunnable ] && [ -z "${SC_SANDBOX:-}" ]; then
-      echo "→ test: $venv is not runnable — rebuilding before provisioning"
-      ( cd "$here" && rm -rf -- .venv )
-    else
-      echo "→ test: $venv/bin/pytest unavailable — provisioning first (./sc deps)"
-    fi
-    sc_deps || echo "→ test: provisioning incomplete — continuing" >&2
-  fi
-  # Which pytest can we actually RUN? The .venv copy wins (fork pins + config)
-  # only when its interpreter can import it — see _sc_venv_runnable. Running a
-  # present-but-unimportable shim anyway fails the ENTIRE suite with
-  # ModuleNotFoundError, which reads as a real test failure and sends whoever
-  # sees it hunting a bug that is not there. The image bakes pytest as the
-  # fallback for exactly this case; it is a real pytest, not the stdlib
-  # downgrade the branch below guards against, so a fork's own missing deps
-  # still fail loudly rather than passing green.
-  pytest_bin=""
-  if [ -x "$venv/bin/pytest" ] && _sc_venv_runnable; then
-    pytest_bin="$venv/bin/pytest"
-  elif command -v pytest >/dev/null 2>&1; then
-    pytest_bin="$(command -v pytest)"
-    [ -x "$venv/bin/pytest" ] && echo "→ test: $venv/bin/pytest is not importable by its interpreter ($("$venv/bin/python" -V 2>&1)) — using $pytest_bin" >&2
-  fi
-  rc=0
-  if [ -n "$pytest_bin" ]; then
-    echo "→ test: $pytest_bin"
-    ( cd "$here" && "$pytest_bin" "$@" )
-    prc=$?
-    if [ "$prc" -eq 5 ] && [ $# -eq 0 ]; then
-      # pytest exit 5 = collected nothing. On a bare `./sc test` in a fork with
-      # no python tests (JS-only forks: vitest is the real suite) that is not a
-      # failure — counting it as one left every JS-only fork permanently red
-      # (#310). With explicit args a collection miss stays red: a typo'd path
-      # must not pass green.
-      echo "→ test: pytest collected no python tests — not counted as a failure (JS-only fork)"
-    elif [ "$prc" -ne 0 ]; then
-      rc=1
-    fi
-  elif [ -n "$python_tests" ]; then
-    # pytest still unavailable after provisioning (venv create failed, or a
-    # host-managed sandbox interpreter that skips pip). A fork that *declares*
-    # pytest must not be green-washed through stdlib unittest — fail loud with the
-    # fix. Only a fork with no pytest config keeps the legacy stdlib fallback.
-    if _sc_wants_pytest; then
-      echo "✗ test: pytest required (pytest config present) but unavailable — neither $venv nor PATH has a runnable copy; run ./sc deps to provision it (or ./sc build to bake the image fallback)" >&2
-      rc=1
-    else
-      echo "→ test: python3 -m unittest discover (stdlib)"
-      ( cd "$here" && "$PY" -m unittest discover -s tests -p 'test_*.py' ) || rc=1
-    fi
-  else
-    echo "→ test: no python tests found"
-  fi
-  pkgs="$(_sc_find_manifests 'package.json')"
-  if [ -n "$pkgs" ]; then
-    printf '%s\n' "$pkgs" | while IFS= read -r pkg; do
-      [ -n "$pkg" ] || continue
-      d="$(dirname "$pkg")"
-      # Only run where a "test" script is declared (else npm errors "missing script").
-      if "$PY" -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get('scripts',{}).get('test') else 1)" "$pkg" 2>/dev/null; then
-        echo "→ test: npm run test in $d"; ( cd "$d" && npm run test ) || exit 1
-      fi
-    done || rc=1
-  fi
-  [ "$rc" -eq 0 ] || { echo "✗ test: one or more suites failed" >&2; return 1; }
-  echo "✓ test: all suites passed"
-}
-
-# Lint + format-check the fork's python with ruff (the .venv copy when present —
-# honors the fork's [tool.ruff] config — else the image's baked fallback).
-# Defaults to the repo root; pass paths/flags through. The tool is available,
-# not enforced — a fork opts in by running this.
-sc_lint() {
-  tool="$(_sc_devtool ruff)" || return 1
-  echo "→ lint: $tool check"
-  ( cd "$here" && "$tool" check "$@" )
-}
-
-# Type-check the fork's python with mypy (.venv copy → image fallback, same
-# resolution as lint; honors the fork's [tool.mypy] config when the .venv copy
-# runs). Same available-not-enforced stance as lint.
-sc_typecheck() {
-  tool="$(_sc_devtool mypy)" || return 1
-  echo "→ typecheck: $tool"
-  if [ $# -gt 0 ]; then ( cd "$here" && "$tool" "$@" )
-  else ( cd "$here" && "$tool" . ); fi
 }
 
 # ── Windows VM broker (HOST-side; drives the test VM for sandboxed forks) ──────
@@ -1200,7 +899,9 @@ cmd="${1:-help}"; [ $# -gt 0 ] && shift
 case "$cmd" in
   install|ensure-harness|doctor|update|update-harnesses|harness-status|rollback|feature|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|map-sql|map-sql-rw|render|render-check|map|map-setup|analytics|models|seed-skills|skill|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health)
     case "$cmd" in
-      deps|launch|restart|admin|map)
+      deps|test|lint|typecheck)
+        sc_devkit_help_form "$@" || sc_python_probe ;;
+      launch|restart|admin|map)
         sc_help_form "$@" || sc_python_probe ;;
       *) sc_python_probe ;;
     esac ;;
@@ -1403,10 +1104,10 @@ case "$cmd" in
   # Headless boot: same render-then-exec path as boot, minus the picker and
   # the TTY. Also used by the no-docker host path.
   run)          exec "$PY" "$S/run.py" --headless "$@" ;;
-  deps)         sc_deps "$@" ;;
-  test)         sc_test "$@" ;;
-  lint)         sc_lint "$@" ;;
-  typecheck)    sc_typecheck "$@" ;;
+  deps)         sc_devkit_hook deps "$@" ;;
+  test)         sc_devkit_hook test "$@" ;;
+  lint)         sc_devkit_hook lint "$@" ;;
+  typecheck)    sc_devkit_hook typecheck "$@" ;;
   # ── docker sandbox (host-side; the default way to run) ──
   launch)
     no_build=""
@@ -1460,7 +1161,7 @@ case "$cmd" in
     # interpreter by absolute path. Mount it read-only at the SAME path so the
     # shared .venv runs end-to-end inside the sandbox on the *identical* binary:
     # same ABI as the wheels the host installed (psycopg etc. import with zero
-    # rebuild), and .venv/bin/{python,pytest,ruff,mypy} all resolve. Engine
+    # rebuild), and every declared .venv tool resolves. Engine
     # python (the image's own python3, SQLite-only) is untouched — this is the
     # product app's interpreter, a separate concern. Skipped when the venv's
     # interpreter is a system path (don't shadow /usr) or already inside the repo
@@ -1754,11 +1455,12 @@ super-coder — forkable shell substrate
   Primitives (run inside the container; also the no-docker host escape hatch):
   ./sc serve               run the review layer (api + static UI) in the foreground
   ./sc boot [shortname]    direct interactive launch (host/no-docker primitive)
-  ./sc deps                install this fork's python (.venv) + node (node_modules) deps into the bind-mount
-                             (plus an only-if-needed dev kit: pytest httpx coverage ruff mypy datasette)
-  ./sc test                run backend (.venv pytest or stdlib unittest) + UI (vitest) suites; non-zero on any failure
-  ./sc lint [paths]        ruff check the fork's python (.venv ruff; honors [tool.ruff]) — available, not enforced
-  ./sc typecheck [paths]   mypy the fork's python (.venv mypy; honors [tool.mypy]) — available, not enforced
+  ./sc deps [args]         run the fork-declared deps argv; exit 78 when not configured
+  ./sc test [args]         run the fork-declared test argv exactly
+  ./sc lint [args]         run the fork-declared lint argv exactly
+  ./sc typecheck [args]    run the fork-declared typecheck argv exactly
+                             all four validate .subfloor/dev-kit.json, preserve child output/status,
+                             and never infer a manifest, tool, file set, or fallback
 
   Windows VM broker (run on the HOST — drives the test VM for sandboxed forks;
   holds the ssh key + virsh so the fork never does. See .super-coder/docs/windows-vm-broker.md).

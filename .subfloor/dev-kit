@@ -1,0 +1,74 @@
+#!/bin/sh
+# super-coder's fork-owned project policy.  The engine only validates and runs
+# this argv; dependency and quality-gate choices belong to this source repo.
+set -eu
+
+root="${SC_DEVKIT_ROOT:-}"
+if [ -z "$root" ]; then
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "dev-kit: not inside the super-coder source checkout" >&2
+    exit 64
+  }
+fi
+cd "$root"
+
+python="${SC_PYTHON:-python3}"
+venv="$root/.venv"
+
+case "${1:-}" in
+  deps)
+    shift
+    [ "$#" -eq 0 ] || {
+      echo "dev-kit deps: unexpected arguments: $*" >&2
+      exit 64
+    }
+    if [ ! -x "$venv/bin/python" ]; then
+      echo "→ deps: creating $venv"
+      "$python" -m venv "$venv"
+    fi
+    echo "→ deps: install super-coder runtime and test requirements"
+    "$venv/bin/python" -m pip install -q -r requirements.txt
+    "$venv/bin/python" -m pip install -q --upgrade-strategy only-if-needed \
+      pytest httpx coverage ruff mypy datasette
+    echo "✓ deps: done"
+    ;;
+  test)
+    shift
+    if [ "$#" -eq 0 ]; then set -- tests/; fi
+    if [ -x "$venv/bin/python" ] && "$venv/bin/python" -c 'import pytest' 2>/dev/null; then
+      python="$venv/bin/python"
+    fi
+    exec "$python" -m pytest "$@"
+    ;;
+  lint)
+    shift
+    if [ -x "$venv/bin/ruff" ]; then
+      tool="$venv/bin/ruff"
+    else
+      tool="$(command -v ruff 2>/dev/null || true)"
+    fi
+    [ -n "$tool" ] || {
+      echo "dev-kit lint: ruff unavailable; run ./sc deps" >&2
+      exit 126
+    }
+    exec "$tool" check "$@"
+    ;;
+  typecheck)
+    shift
+    if [ -x "$venv/bin/mypy" ]; then
+      tool="$venv/bin/mypy"
+    else
+      tool="$(command -v mypy 2>/dev/null || true)"
+    fi
+    [ -n "$tool" ] || {
+      echo "dev-kit typecheck: mypy unavailable; run ./sc deps" >&2
+      exit 126
+    }
+    if [ "$#" -eq 0 ]; then set -- .; fi
+    exec "$tool" "$@"
+    ;;
+  *)
+    echo "usage: .subfloor/dev-kit <deps|test|lint|typecheck> [args...]" >&2
+    exit 64
+    ;;
+esac
