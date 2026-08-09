@@ -1007,10 +1007,10 @@ def main(argv: Sequence[str]) -> int:
         print(plan.runtime_tag)
     elif command == "build":
         build_images(plan)
-        print(f"dev-kit image ready: {plan.runtime_tag}")
+        print(f"dev-kit image state: ready — built {plan.runtime_tag}")
     elif command == "preflight":
         preflight_image(plan)
-        print(f"dev-kit image current: {plan.runtime_tag}")
+        print(f"dev-kit image state: ready — current {plan.runtime_tag}")
     elif command == "docker-run":
         if not extra or extra[0] != "--":
             raise SandboxImageError("docker-run requires -- before Docker arguments")
@@ -1022,32 +1022,47 @@ def main(argv: Sequence[str]) -> int:
             )
         result = launch_container(plan, extra[0], extra[2:])
         if result["state"] == "not_declared":
-            print("dev-kit provisioning: not declared")
+            print("dev-kit provision state: absent — no fork provisioning declared")
         elif result["reused"]:
-            print(f"dev-kit provisioning: current ({result['fingerprint'][:12]})")
+            print(
+                "dev-kit provision state: ready — current receipt "
+                f"({result['fingerprint'][:12]})"
+            )
         else:
-            print(f"dev-kit provisioning: ready ({result['fingerprint'][:12]})")
+            print(
+                "dev-kit provision state: ready — receipt written "
+                f"({result['fingerprint'][:12]})"
+            )
     elif command == "provision":
         if len(extra) != 1:
             raise SandboxImageError("provision requires one container name")
         result = provision_checkout(plan, extra[0])
         if result["state"] == "not_declared":
-            print("dev-kit provisioning: not declared")
+            print("dev-kit provision state: absent — no fork provisioning declared")
         elif result["reused"]:
-            print(f"dev-kit provisioning: current ({result['fingerprint'][:12]})")
+            print(
+                "dev-kit provision state: ready — current receipt "
+                f"({result['fingerprint'][:12]})"
+            )
         else:
-            print(f"dev-kit provisioning: ready ({result['fingerprint'][:12]})")
+            print(
+                "dev-kit provision state: ready — receipt written "
+                f"({result['fingerprint'][:12]})"
+            )
     else:
         if len(extra) != 1:
             raise SandboxImageError("ready requires one container name")
         result = readiness(plan, extra[0])
         if result["state"] == "not_declared":
-            print("dev-kit readiness: no fork provisioning declared")
+            print("dev-kit provision state: absent — no fork provisioning declared")
         elif result["ready"]:
-            print(f"dev-kit readiness: current ({result['fingerprint'][:12]})")
+            print(
+                "dev-kit provision state: ready — current receipt "
+                f"({result['fingerprint'][:12]})"
+            )
         else:
             print(
-                "dev-kit readiness: not ready: " + result["reason"],
+                "dev-kit provision state: stale — " + result["reason"],
                 file=sys.stderr,
             )
             return 1
@@ -1058,10 +1073,10 @@ def cli(argv: Sequence[str]) -> int:
     try:
         return main(argv)
     except ProvisionFailed as exc:
-        print(f"dev-kit image: {exc}", file=sys.stderr)
+        print(f"dev-kit provision state: failed — {exc}", file=sys.stderr)
         return exc.status
     except (OSError, SandboxImageError) as exc:
-        print(f"dev-kit image: {exc}", file=sys.stderr)
+        print(f"dev-kit state: invalid — {exc}", file=sys.stderr)
         return 1
 
 

@@ -1234,7 +1234,7 @@ case "$cmd" in
       SC_DEVKIT_MOUNTS \
       "$IMG" ./sc serve --port "$p" || provision_rc=$?
     if [ "$provision_rc" -ne 0 ]; then
-      echo "✗ fork provisioning failed; retained sandbox '$CNAME' and local evidence." >&2
+      echo "✗ dev-kit state: failed — retained sandbox '$CNAME' and local evidence." >&2
       echo "  retry:  ./sc launch --no-build" >&2
       echo "  repair: ./sc enter --devkit-repair" >&2
       exit "$provision_rc"
@@ -1269,13 +1269,13 @@ case "$cmd" in
   enter)
     if [ "${1:-}" = "--devkit-repair" ]; then
       shift
-      echo "! DEV-KIT REPAIR SESSION — provisioning is NOT ready; no readiness claim is made." >&2
+      echo "! dev-kit state: repair — provisioning is not ready; no readiness claim is made." >&2
       echo "  inspect .sc-state/local/dev-kit/ and run the declared hook explicitly." >&2
       sc_urls || true
       exec docker exec -it -e SC_DEVKIT_REPAIR=1 "$CNAME" ./sc boot "$@"
     fi
     sc_devkit_ready || {
-      echo "✗ normal entry blocked until fork provisioning is current." >&2
+      echo "✗ dev-kit state: stale — normal entry blocked until fork provisioning is ready." >&2
       echo "  retry:  ./sc launch --no-build" >&2
       echo "  repair: ./sc enter --devkit-repair" >&2
       exit 1
@@ -1288,7 +1288,7 @@ case "$cmd" in
       exit 2
     fi
     sc_devkit_ready || {
-      echo "✗ normal entry blocked until fork provisioning is current." >&2
+      echo "✗ dev-kit state: stale — normal entry blocked until fork provisioning is ready." >&2
       echo "  retry:  ./sc launch --no-build" >&2
       echo "  repair: ./sc enter --devkit-repair" >&2
       exit 1
@@ -1483,10 +1483,11 @@ super-coder — forkable shell substrate
   Sandbox (docker — the default way to run; allow-everything is safe because the
   container only sees this repo + your harness creds):
   ./sc launch              build the exact base/fork image, start the sandbox, and run declared provisioning
-                             --no-build reuses only a current labeled image; failed setup retains container + evidence
+                             states: absent · invalid · failed · stale · ready; failed setup retains container + evidence
+                             --no-build reuses only a ready labeled image
   ./sc admin               boot the sole active Admin directly on the host (no Docker or API required)
-  ./sc enter               boot an interactive shell only when declared provisioning is current
-                             --devkit-repair enters a retained failed sandbox without claiming readiness
+  ./sc enter               boot an interactive shell only when declared provisioning is ready
+                             --devkit-repair enters state repair without claiming readiness
   ./sc enter-<shortname>   enter that shell directly when ready (skip the shell picker)
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)

@@ -364,7 +364,7 @@ class RestrictedLaunchTests(unittest.TestCase):
     def test_launch_no_build_reuses_existing_image_without_buildx(self):
         result = self.fx.run("launch", "--no-build")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("dev-kit provisioning: not declared", result.stdout)
+        self.assertIn("provision state: absent", result.stdout)
         self.assertNotIn("container-1", result.stdout)
         calls = self.fx.calls()
         image_inspects = [
@@ -389,7 +389,7 @@ class RestrictedLaunchTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("dependencies installed", result.stdout)
-        self.assertIn("dev-kit provisioning: ready", result.stdout)
+        self.assertIn("provision state: ready", result.stdout)
         self.assertNotIn("container-1", result.stdout)
 
     def test_launch_no_build_missing_image_refuses_before_runtime_change(self):
@@ -409,6 +409,7 @@ class RestrictedLaunchTests(unittest.TestCase):
         result = self.fx.run("launch", "--no-build")
 
         self.assertEqual(result.returncode, 23)
+        self.assertIn("dev-kit state: failed", result.stderr)
         self.assertIn("retained sandbox", result.stderr)
         self.assertIn("./sc launch --no-build", result.stderr)
         self.assertIn("./sc enter --devkit-repair", result.stderr)
@@ -427,13 +428,14 @@ class RestrictedLaunchTests(unittest.TestCase):
         normal = self.fx.run("enter")
 
         self.assertEqual(normal.returncode, 1)
+        self.assertIn("dev-kit state: stale", normal.stderr)
         self.assertIn("normal entry blocked", normal.stderr)
         self.assertFalse(
             [line for line in self.fx.calls() if line.startswith("docker exec ")]
         )
         repair = self.fx.run("enter", "--devkit-repair")
         self.assertEqual(repair.returncode, 0, repair.stderr)
-        self.assertIn("DEV-KIT REPAIR SESSION", repair.stderr)
+        self.assertIn("dev-kit state: repair", repair.stderr)
         self.assertIn("no readiness claim", repair.stderr)
         self.assertIn(
             f"docker exec -it -e SC_DEVKIT_REPAIR=1 {container} ./sc boot",

@@ -85,7 +85,8 @@
     ".super-coder/migrations/0184_reseed_sprint_skill_polish.sql",
     ".super-coder/migrations/0185_optional_sprint_qaqc.sql",
     ".super-coder/migrations/0186_admin_singleton.sql",
-    ".super-coder/migrations/0189_reseed_spec_scope_audience.sql"
+    ".super-coder/migrations/0189_reseed_spec_scope_audience.sql",
+    ".super-coder/migrations/0191_reseed_target_aware_dev_kit.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
