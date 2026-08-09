@@ -3,9 +3,10 @@
 
 The catalog is layered and best-effort: models.dev (keyless, all five
 harnesses) → provider APIs (only with env keys) → OpenCode's connected-provider
-projection → cache → static floor. Payload v4 retains family metadata:
+projection → cache → static floor. Payload v5 retains family metadata
 (newest-first; claude families with a CLI alias resolve `latest` to the
-alias) plus the flat `models` list for sub-version search. These tests pin
+alias), the flat `models` list for sub-version search, and fork-local harness
+and configured-route verification. These tests pin
 that contract: harness→provider mapping and opencode prefixing, family
 grouping/alias resolution, opportunistic merges that never fail the sweep,
 stale-cache-on-failure, version-mismatched caches ignored, and the floor
@@ -265,6 +266,255 @@ class RoutePersistenceTest(unittest.TestCase):
         got = routes_cli.resolve(self.con, "kimi", "kimi-code/legacy")
         self.assertFalse(got["ok"])
         self.assertIn("high-effort", got["error"])
+
+
+class RuntimeVerificationTest(unittest.TestCase):
+    def setUp(self):
+        self.con = sqlite3.connect(":memory:")
+        self.con.row_factory = sqlite3.Row
+        self.addCleanup(self.con.close)
+        self.con.executescript((
+            ROOT / ".super-coder" / "migrations" / "0075_model_routes.sql"
+        ).read_text())
+        self.con.execute(
+            "CREATE TABLE flavor_defaults ("
+            "flavor TEXT NOT NULL,harness TEXT NOT NULL,model TEXT,"
+            "is_default INTEGER NOT NULL DEFAULT 0,"
+            "PRIMARY KEY (flavor,harness))"
+        )
+
+    @staticmethod
+    def harnesses():
+        base = {
+            "minimum_version": "1.0.0",
+            "maximum_version_exclusive": "2.0.0",
+            "verified_version": "1.5.0",
+        }
+        return {
+            "codex": {
+                **base, "version": "2.0.0",
+                "compatibility": "newer-unverified", "error": None,
+            },
+            "claude": {
+                **base, "version": "1.5.0",
+                "compatibility": "verified", "error": None,
+            },
+            "opencode": {
+                **base, "version": "1.6.0",
+                "compatibility": "supported", "error": None,
+            },
+            "vibe": {
+                "version": None, "compatibility": None,
+                "minimum_version": None,
+                "maximum_version_exclusive": None,
+                "verified_version": None,
+                "error": "HARNESS_UNAVAILABLE",
+            },
+        }
+
+    def insert_default(self, flavor, harness, model, is_default=0):
+        self.con.execute(
+            "INSERT INTO flavor_defaults (flavor,harness,model,is_default) "
+            "VALUES (?,?,?,?)",
+            (flavor, harness, model, is_default),
+        )
+
+    def test_report_combines_harness_compatibility_and_exact_route_evidence(self):
+        self.insert_default("dev", "codex", "gpt-ready", 1)
+        self.insert_default("planner", "codex", "gpt-missing", 1)
+        self.insert_default("reviewer", "claude", None, 1)
+        self.insert_default("cartographer", "opencode", "openai/local", 1)
+        self.insert_default("dev", "vibe", "vibe-model")
+        mc.persist_routes(self.con, {
+            "fetched_at": "2026-08-09T00:00:00+00:00",
+            "stale": False,
+            "harnesses": {
+                "codex": {"models": [mc._entry(
+                    "gpt-ready", source="codex-cache",
+                    availability="available", supported_efforts=["high"]
+                )]},
+                "opencode": {"models": [mc._entry(
+                    "openai/local", source="opencode-provider-api",
+                    availability="available"
+                )]},
+            },
+        })
+
+        report = mc.runtime_verification(
+            self.con, env={"SC_SANDBOX": "1"}, harness_probe=self.harnesses
+        )
+
+        self.assertEqual(report["runtime"], "sandbox")
+        self.assertEqual(report["harnesses"]["codex"]["compatibility"],
+                         "newer-unverified")
+        self.assertEqual(report["summary"], {
+            "harnesses_checked": 4,
+            "harnesses_ready": 3,
+            "exact_routes": 4,
+            "exact_routes_runnable": 2,
+            "harness_defaults": 1,
+        })
+        by_key = {
+            (row["flavor"], row["harness"]): row
+            for row in report["defaults"]
+        }
+        self.assertEqual(by_key[("dev", "codex")], {
+            "flavor": "dev", "harness": "codex", "model": "gpt-ready",
+            "is_default": True, "state": "runnable", "runnable": True,
+            "reason": None,
+        })
+        self.assertEqual(by_key[("planner", "codex")]["state"],
+                         "route-missing")
+        self.assertFalse(by_key[("planner", "codex")]["runnable"])
+        self.assertEqual(by_key[("reviewer", "claude")]["state"],
+                         "harness-default")
+        self.assertIsNone(by_key[("reviewer", "claude")]["runnable"])
+        self.assertEqual(by_key[("cartographer", "opencode")]["state"],
+                         "runnable")
+        self.assertTrue(by_key[("cartographer", "opencode")]["runnable"])
+        self.assertEqual(by_key[("dev", "vibe")]["reason"],
+                         "HARNESS_UNAVAILABLE")
+        self.assertFalse(by_key[("dev", "vibe")]["runnable"])
+
+    def test_probe_failure_is_visible_without_skipping_the_response(self):
+        def fail_probe():
+            raise RuntimeError("probe transport failed")
+
+        report = mc.runtime_verification(
+            self.con, env={}, harness_probe=fail_probe
+        )
+
+        self.assertEqual(report["runtime"], "host")
+        self.assertEqual(report["error"], "probe transport failed")
+        self.assertEqual(report["harnesses"], {})
+        self.assertEqual(report["defaults"], [])
+        self.assertEqual(report["summary"], {
+            "harnesses_checked": 0,
+            "harnesses_ready": 0,
+            "exact_routes": 0,
+            "exact_routes_runnable": 0,
+            "harness_defaults": 0,
+        })
+
+    def test_non_runnable_route_states_keep_exact_failure_reasons(self):
+        self.insert_default("dev", "codex", "gpt-stale")
+        self.insert_default("planner", "claude", "opus-advisory")
+        self.insert_default("reviewer", "vibe", "vibe-local")
+        self.insert_default("cartographer", "kimi", "kimi-low")
+        mc.persist_routes(self.con, {
+            "fetched_at": "2026-08-09T00:00:00+00:00",
+            "stale": False,
+            "harnesses": {
+                "codex": {"models": [mc._entry(
+                    "gpt-stale", availability="available",
+                    supported_efforts=["high"]
+                )]},
+                "claude": {"models": [mc._entry(
+                    "opus-advisory", availability="advisory",
+                    supported_efforts=["high"]
+                )]},
+                "vibe": {"models": [mc._entry(
+                    "vibe-local", availability="available"
+                )]},
+                "kimi": {"models": [mc._entry(
+                    "kimi-low", availability="available",
+                    supported_efforts=["low"]
+                )]},
+            },
+        })
+        self.con.execute(
+            "UPDATE model_routes SET stale=1,last_error='catalog offline' "
+            "WHERE harness='codex' AND selector='gpt-stale'"
+        )
+        statuses = self.harnesses()
+        statuses["vibe"] = {
+            "version": "vibe 1.0.0", "compatibility": None,
+            "minimum_version": None, "maximum_version_exclusive": None,
+            "verified_version": None, "error": None,
+        }
+        statuses["kimi"] = {
+            **statuses["claude"], "version": "1.6.0",
+            "compatibility": "supported",
+        }
+
+        report = mc.runtime_verification(
+            self.con, env={}, harness_probe=lambda: statuses
+        )
+
+        by_harness = {row["harness"]: row for row in report["defaults"]}
+        self.assertEqual(
+            (by_harness["codex"]["state"], by_harness["codex"]["reason"]),
+            ("route-stale", "catalog offline"),
+        )
+        self.assertEqual(
+            (by_harness["claude"]["state"], by_harness["claude"]["reason"]),
+            ("route-unavailable", "route is advisory, not locally available"),
+        )
+        self.assertEqual(
+            (by_harness["vibe"]["state"], by_harness["vibe"]["reason"]),
+            ("headless-unsupported", "harness has no headless launch seam"),
+        )
+        self.assertEqual(
+            (by_harness["kimi"]["state"], by_harness["kimi"]["reason"]),
+            ("effort-unsupported",
+             "default high-effort route was not locally verified"),
+        )
+        self.assertTrue(all(
+            row["runnable"] is False for row in report["defaults"]
+        ))
+
+    def test_explicit_refresh_caches_verification_for_later_gui_reads(self):
+        self.insert_default("dev", "codex", "gpt-5.5", 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cache = mc.CACHE
+            mc.CACHE = Path(tmp) / "model_catalog.json"
+            self.addCleanup(lambda: setattr(mc, "CACHE", old_cache))
+            probe = mock.Mock(return_value=self.harnesses())
+            with mock.patch.object(mc.shutil, "which", return_value=None):
+                first = mc.catalog(
+                    refresh=True, fetch=fetch_ok, env={}, run=None, con=self.con,
+                    opencode_provider=lambda: [], harness_probe=probe,
+                )
+                second = mc.catalog(
+                    fetch=fetch_down, env={}, run=None, con=self.con,
+                    opencode_provider=lambda: [],
+                    harness_probe=mock.Mock(
+                        side_effect=AssertionError("reprobed")
+                    ),
+                )
+
+        probe.assert_called_once_with()
+        self.assertEqual(first["verification"]["summary"]["exact_routes"], 1)
+        self.assertEqual(
+            first["verification"]["summary"]["exact_routes_runnable"], 0
+        )
+        self.assertEqual(second["verification"], first["verification"])
+        self.assertFalse(second["stale"])
+
+    def test_failed_first_refresh_still_persists_fork_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_cache = mc.CACHE
+            mc.CACHE = Path(tmp) / "model_catalog.json"
+            self.addCleanup(lambda: setattr(mc, "CACHE", old_cache))
+            with mock.patch.object(mc.shutil, "which", return_value=None):
+                got = mc.catalog(
+                    refresh=True, fetch=fetch_down, env={}, run=None,
+                    con=self.con, opencode_provider=lambda: [],
+                    harness_probe=self.harnesses,
+                )
+            cached = json.loads(mc.CACHE.read_text())
+
+        self.assertTrue(got["stale"])
+        self.assertEqual(got["sources"], ["static"])
+        self.assertEqual(got["verification"]["summary"], {
+            "harnesses_checked": 4,
+            "harnesses_ready": 3,
+            "exact_routes": 0,
+            "exact_routes_runnable": 0,
+            "harness_defaults": 0,
+        })
+        self.assertEqual(cached["verification"], got["verification"])
+        self.assertIsNone(cached["fetched_at"])
 
 
 class RouteCliConnectionTest(unittest.TestCase):

@@ -17,6 +17,8 @@ SHELL_STATE = APP[APP.index("let selectedShell ="):
                   APP.index("// Rough token estimator")]
 SHELL_RENDER = APP[APP.index("async function renderShells(root)"):
                    APP.index("// Default Models — the flavor_defaults")]
+DEFAULT_MODELS = APP[APP.index("async function renderDefaultModels(root, s,"):
+                     APP.index("// Harness — the shell's surfaces")]
 ROUTER_AT = APP.index("function routeFromHash()")
 ROUTER = APP[ROUTER_AT:
              APP.index('document.querySelectorAll("nav button").forEach',
@@ -333,3 +335,100 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
     assert "second role" in result["text"]
     assert "Code-01" not in result["text"]
     assert "first role" not in result["text"]
+
+
+def test_model_refresh_verifies_and_renders_fork_local_harness_evidence():
+    script = r"""
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag;
+    this.nodeType = 1;
+    this.children = [];
+    this.className = "";
+    this._text = "";
+    this.disabled = false;
+  }
+  append(...nodes) { this.children.push(...nodes); }
+  set textContent(value) { this._text = String(value ?? ""); this.children = []; }
+  get textContent() {
+    return this._text + this.children.map(
+      (child) => typeof child === "string" ? child : child.textContent
+    ).join("");
+  }
+}
+globalThis.document = {
+  createElement: (tag) => new FakeElement(tag),
+  createTextNode: (text) => ({ nodeType: 3, textContent: String(text ?? "") }),
+};
+const el = (tag, props = {}, ...kids) => {
+  const node = Object.assign(new FakeElement(tag), props);
+  for (const kid of kids)
+    node.append(kid?.nodeType ? kid : document.createTextNode(kid ?? ""));
+  return node;
+};
+const catalog = {
+  harnesses: {}, sources: ["models.dev", "codex-cache"],
+  fetched_at: "2026-08-09T18:00:00+00:00", stale: false,
+  verification: {
+    checked_at: "2026-08-09T18:01:00+00:00", runtime: "sandbox",
+    harnesses: {
+      codex: {
+        version: "0.147.0", compatibility: "newer-unverified", error: null,
+      },
+      vibe: { version: null, compatibility: null, error: "HARNESS_UNAVAILABLE" },
+    },
+    defaults: [{
+      flavor: "planner", harness: "vibe", model: "vibe-model",
+      runnable: false, state: "harness-error", reason: "HARNESS_UNAVAILABLE",
+    }],
+    summary: {
+      harnesses_ready: 1, harnesses_checked: 2,
+      exact_routes_runnable: 1, exact_routes: 2, harness_defaults: 0,
+    },
+  },
+};
+const requests = [];
+async function api(path) {
+  requests.push(path);
+  if (path === "/flavor-defaults")
+    return { flavors: {}, harnesses: ["codex", "vibe"] };
+  if (path === "/models" || path === "/models?refresh=1") return catalog;
+  throw new Error("unexpected API call: " + path);
+}
+const statuses = [];
+function setStatus(value) { statuses.push(value); }
+function toast() {}
+const microlabel = (text) => el("span", {}, text);
+function all(root, predicate, found = []) {
+  if (predicate(root)) found.push(root);
+  for (const child of root.children || [])
+    if (child?.nodeType === 1) all(child, predicate, found);
+  return found;
+}
+""" + DEFAULT_MODELS + r"""
+(async () => {
+  const root = new FakeElement("div");
+  await renderDefaultModels(root, {});
+  const button = all(root, (node) => node.tagName === "button")[0];
+  await button.onclick();
+  console.log(JSON.stringify({ text: root.textContent, requests, statuses }));
+})().catch((error) => {
+  console.error(error.stack || error);
+  process.exit(1);
+});
+"""
+    result = run_js(script)
+    assert result["requests"] == [
+        "/flavor-defaults", "/models", "/models?refresh=1",
+        "/flavor-defaults",
+    ]
+    assert result["statuses"] == [
+        "refreshing model catalog and harnesses…",
+        "refresh complete — review verification warnings",
+    ]
+    assert "Refresh & verify" in result["text"]
+    assert "Fork verification" in result["text"]
+    assert "codex0.147.0newer-unverified" in result["text"]
+    assert "vibenot installedHARNESS_UNAVAILABLE" in result["text"]
+    assert "exact defaults: 1/2 runnable" in result["text"]
+    assert "planner · vibe · vibe-model — HARNESS_UNAVAILABLE" in result["text"]

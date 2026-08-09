@@ -543,22 +543,36 @@ function dmModelPicker(harness, cat, row, save) {
   return { current, input, results };
 }
 
-async function renderDefaultModels(root, s) {
+async function renderDefaultModels(root, s, catalogOverride = null) {
   root.textContent = "";
   let fd;
   try { fd = await api("/flavor-defaults"); }
   catch (e) { root.append(el("div", { className: "vpanel" }, "flavor-defaults error: " + e.message)); return; }
   let cat = { harnesses: {}, sources: [], fetched_at: null, stale: true };
-  try { cat = await api("/models"); } catch { /* picker shows Harness default only */ }
+  if (catalogOverride) cat = catalogOverride;
+  else try { cat = await api("/models"); } catch { /* picker shows Harness default only */ }
 
   const head = el("div", { className: "viewer-head" }, microlabel("Default Models"));
-  const refresh = el("button", { className: "act", type: "button", textContent: "↻ Refresh models" });
+  const refresh = el("button", { className: "act", type: "button", textContent: "↻ Refresh & verify" });
   refresh.onclick = async () => {
     refresh.disabled = true;
-    setStatus("refreshing model catalog…");
-    try { await api("/models?refresh=1"); setStatus("model catalog refreshed"); }
-    catch (e) { toast("catalog refresh error: " + e.message); setStatus("catalog refresh failed"); }
-    renderDefaultModels(root, s);
+    setStatus("refreshing model catalog and harnesses…");
+    let refreshed = null;
+    try {
+      refreshed = await api("/models?refresh=1");
+      const verification = refreshed.verification || {};
+      const warnings = refreshed.stale || verification.error || verification.route_error
+        || Object.values(verification.harnesses || {}).some(
+          (status) => status.error || status.compatibility === "newer-unverified")
+        || (verification.defaults || []).some((route) => route.runnable === false);
+      setStatus(warnings
+        ? "refresh complete — review verification warnings"
+        : "model catalog and harnesses verified");
+    } catch (e) {
+      toast("catalog refresh error: " + e.message);
+      setStatus("catalog and harness verification failed");
+    }
+    await renderDefaultModels(root, s, refreshed);
   };
   head.append(refresh);
   root.append(head);
@@ -566,6 +580,50 @@ async function renderDefaultModels(root, s) {
   root.append(el("div", { className: "dm-meta" },
     `catalog: ${(cat.sources || []).join(" + ") || "none"} · as of ${when}`
     + (cat.stale ? " (stale — live refresh failed)" : "")));
+
+  const verification = cat.verification;
+  if (!verification) {
+    root.append(el("div", { className: "dm-meta" },
+      "harnesses: not verified — use Refresh & verify on this fork"));
+  } else {
+    const panel = el("div", { className: "vpanel dm-verify" });
+    panel.append(el("div", { className: "acc-group" }, "Fork verification"));
+    const checked = verification.checked_at
+      ? new Date(verification.checked_at).toLocaleString() : "unknown";
+    panel.append(el("div", { className: "dm-meta dm-verify-meta" },
+      `${verification.runtime || "runtime"} · checked ${checked}`));
+    const harnessOrder = [...new Set([
+      ...(fd.harnesses || []), ...Object.keys(verification.harnesses || {}),
+    ])];
+    for (const harness of harnessOrder) {
+      const status = (verification.harnesses || {})[harness] || {};
+      const verdict = status.error || status.compatibility
+        || (status.version ? "detected" : "not checked");
+      const stateClass = status.error ? "dm-verify-bad"
+        : status.compatibility === "newer-unverified" ? "dm-verify-warn"
+          : "dm-verify-ok";
+      panel.append(el("div", { className: "dm-verify-row" },
+        el("span", { className: "dm-harness" }, harness),
+        el("span", { className: "dm-current" }, status.version || "not installed"),
+        el("span", { className: `dm-verify-state ${stateClass}` }, verdict)));
+    }
+    const summary = verification.summary || {};
+    panel.append(el("div", { className: "dm-meta dm-verify-summary" },
+      `harnesses: ${summary.harnesses_ready || 0}/${summary.harnesses_checked || 0} ready`
+      + ` · exact defaults: ${summary.exact_routes_runnable || 0}/${summary.exact_routes || 0} runnable`
+      + ` · harness-selected: ${summary.harness_defaults || 0}`));
+    if (verification.error || verification.route_error) {
+      panel.append(el("div", { className: "dm-verify-failure" },
+        verification.error || verification.route_error));
+    }
+    for (const route of (verification.defaults || []).filter(
+      (candidate) => candidate.runnable === false)) {
+      panel.append(el("div", { className: "dm-verify-failure" },
+        `${route.flavor} · ${route.harness} · ${route.model || "Harness default"}`
+        + ` — ${route.reason || route.state}`));
+    }
+    root.append(panel);
+  }
 
   // App-wide config: flavors in a stable alphabetical order (no shell-scoped
   // emphasis — the shell header above is inert on this tab), one card per

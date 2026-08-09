@@ -1067,6 +1067,20 @@ a { color: var(--accent); }
 .subbar-inert { opacity: .85; pointer-events: none; }
 .dm-card + .dm-card { margin-top: 5px; }
 .dm-meta { padding: .1rem .2rem .4rem; font-size: 11px; color: var(--dim); }
+.dm-verify { margin-bottom: 5px; }
+.dm-verify-meta { padding: .45rem 1.1rem .25rem; }
+.dm-verify-row {
+  display: grid; grid-template-columns: 100px minmax(8rem, 1fr) minmax(8rem, auto);
+  align-items: center; gap: .7rem; padding: .35rem 1.1rem;
+  border-top: 1px solid var(--line-soft);
+}
+.dm-verify-state { font: 11px/1.4 ui-monospace, "Cascadia Mono", "Menlo", monospace;
+  text-align: right; }
+.dm-verify-ok { color: var(--ok); }
+.dm-verify-warn, .dm-verify-bad, .dm-verify-failure { color: var(--warn); }
+.dm-verify-summary { padding: .45rem 1.1rem; border-top: 1px solid var(--line-soft); }
+.dm-verify-failure { padding: .25rem 1.1rem; font-size: 11px; }
+.dm-verify-failure:last-child { padding-bottom: .55rem; }
 .dm-row {
   display: grid; grid-template-columns: 24px 100px minmax(8rem, 22rem) 1fr;
   align-items: center; gap: .7rem; padding: .4rem 1.1rem;
