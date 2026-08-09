@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -18,10 +19,20 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 
 import devkit
+import seed_skills
 from devkit import DevkitConfigError, load_declaration
 
 RUNNER = ROOT / ".super-coder" / "scripts" / "devkit.py"
 SOURCE_DEVKIT = ROOT / ".subfloor" / "dev-kit"
+DEVKIT_SKILL = (
+    ROOT / ".super-coder" / "assets" / "seed" / "skills" / "dev_kit" / "SKILL.md"
+)
+DEVKIT_RESEED = (
+    ROOT
+    / ".super-coder"
+    / "migrations"
+    / "0191_reseed_target_aware_dev_kit.sql"
+)
 
 
 class DeclarationTest(unittest.TestCase):
@@ -285,14 +296,16 @@ class RunnerTest(unittest.TestCase):
     def test_absent_invalid_and_missing_hook_are_distinct(self):
         absent = self.run_hook("test")
         self.assertEqual(absent.returncode, 78)
-        self.assertIn("absent", absent.stderr)
+        self.assertIn("hook state: absent", absent.stderr)
         self.write({"version": 2})
         invalid = self.run_hook("test")
         self.assertEqual(invalid.returncode, 64)
+        self.assertIn("hook state: invalid", invalid.stderr)
         self.assertIn("$.version", invalid.stderr)
         self.write({"version": 1})
         missing = self.run_hook("test")
         self.assertEqual(missing.returncode, 78)
+        self.assertIn("hook state: absent", missing.stderr)
         self.assertIn("not configured", missing.stderr)
 
     def test_relative_hook_preserves_literal_arguments_cwd_context_and_output(self):
@@ -559,9 +572,7 @@ class SourcePolicyTest(unittest.TestCase):
             self.assertFalse(fallback_marker.exists())
 
     def test_distributed_guidance_describes_fork_owned_hooks(self):
-        skill = (
-            ROOT / ".super-coder" / "assets" / "seed" / "skills" / "dev_kit" / "SKILL.md"
-        ).read_text()
+        skill = DEVKIT_SKILL.read_text()
         readme = (ROOT / "docs" / "README.md").read_text()
         readme_section = readme.split("### Dev kit", 1)[1].split("## Opt-in features", 1)[0]
         for guidance in (skill, readme_section):
@@ -569,6 +580,71 @@ class SourcePolicyTest(unittest.TestCase):
             self.assertIn("exit `78`", guidance)
             self.assertIn("no fork dev kit declared", guidance)
             self.assertNotIn("every `requirements*.txt`", guidance)
+
+        self.assertLess(
+            skill.index("invariant exact-execution hooks"),
+            skill.index("## Read the active seat"),
+        )
+        self.assertNotIn("## You are in a container", skill)
+        self.assertIn("boot document's execution-context section", skill)
+        for state in ("absent", "invalid", "failed", "stale", "ready", "repair"):
+            self.assertIn(f"| **{state}** |", skill)
+        self.assertIn("Engine baseline", skill)
+        self.assertIn("Fork extension", skill)
+        self.assertIn("Checkout setup", skill)
+        self.assertIn("Host prerequisites", skill)
+        self.assertIn("never infers manifests", skill)
+        self.assertIn("never installs privileged host packages", skill)
+        self.assertIn("`./sc` remains valid", skill)
+        self.assertIn("exit the container", skill)
+
+
+class DevKitReseedConformanceTest(unittest.TestCase):
+    def test_trailing_reseed_converges_dirty_downstream_and_replays(self):
+        expected = seed_skills.parse_skill(DEVKIT_SKILL)
+        with sqlite3.connect(":memory:") as con:
+            con.executescript(
+                "CREATE TABLE skills ("
+                "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
+                "category TEXT, command TEXT, common INTEGER, content TEXT, "
+                "is_deleted INTEGER DEFAULT 0);"
+                "INSERT INTO skills VALUES "
+                "(41,'dev_kit','stale description','wrong','old-command',1,"
+                "'You are in a container',1),"
+                "(99,'fork_only_skill','local','fork',NULL,0,'bespoke body',0);"
+            )
+            migration = DEVKIT_RESEED.read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+            actual = con.execute(
+                "SELECT skill_id,name,description,category,command,common,content,"
+                "is_deleted FROM skills WHERE name='dev_kit'"
+            ).fetchone()
+            local = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='fork_only_skill'"
+            ).fetchone()
+
+        self.assertEqual(
+            actual,
+            (
+                41,
+                expected["name"],
+                expected["description"],
+                expected["category"],
+                expected["command"],
+                expected["common"],
+                expected["content"],
+                0,
+            ),
+        )
+        self.assertEqual(local, ("local", "fork", None, 0, "bespoke body", 0))
+
+    def test_reseed_is_last_in_the_ordered_chain(self):
+        migrations = sorted(
+            (ROOT / ".super-coder" / "migrations").glob("[0-9][0-9][0-9][0-9]_*.sql")
+        )
+        self.assertEqual(migrations[-1], DEVKIT_RESEED)
 
 
 class DispatcherHelpTest(unittest.TestCase):

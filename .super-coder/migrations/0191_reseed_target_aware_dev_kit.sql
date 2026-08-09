@@ -1,11 +1,16 @@
----
-name: dev_kit
-description: Run fork-owned dev-kit hooks and diagnose host or Docker provisioning states without inferring project policy.
-category: substrate
-common: false
----
+-- 0191 — reseed target-aware dev-kit guidance.
+-- Converge existing installs to the host/Docker hook and provisioning-state
+-- contract while the authoritative seed asset supplies fresh installations.
 
-# dev_kit — target-aware project tooling
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'dev_kit',
+  'Run fork-owned dev-kit hooks and diagnose host or Docker provisioning states without inferring project policy.',
+  'substrate',
+  NULL,
+  0,
+  '# dev_kit — target-aware project tooling
 
 `deps`, `test`, `lint`, and `typecheck` are invariant exact-execution hooks on
 both host and Docker seats. The fork owns their argv in the tracked
@@ -24,20 +29,20 @@ and the equivalent baked wrapper in Docker.
 
 ## Read the active seat
 
-Read the boot document's execution-context section before acting. It is the
-authority for this shell's active seat.
+Read the boot document''s execution-context section before acting. It is the
+authority for this shell''s active seat.
 
 - **Host:** commands and project processes run directly on the host. Respect an
   existing supervisor (`pm2`, `systemd`, or `make`) and bind ad-hoc dev servers
   to `127.0.0.1:$SC_DEV_PORT` unless the task requires another interface.
 - **Docker:** the checkout is bind-mounted at its host path. Run a dev server on
   `0.0.0.0:$SC_DEV_PORT`; the published host URL is
-  `http://127.0.0.1:$SC_DEV_PORT`. The FnB's host-supervised app is a separate
+  `http://127.0.0.1:$SC_DEV_PORT`. The FnB''s host-supervised app is a separate
   instance.
 
 Host lifecycle remedies such as `sc launch` and `sc enter --devkit-repair`
 must be run from a host terminal. If this shell is in Docker, exit the container
-before using them. Never restart the FnB's host stack from a sandbox shell.
+before using them. Never restart the FnB''s host stack from a sandbox shell.
 
 ## State and remedy contract
 
@@ -72,7 +77,7 @@ selected.
   prerequisites; it does not elevate or install them.
 
 Read `.subfloor/dev-kit.json` and its executable before invoking a hook. Run
-`sc deps` first only when the declaration makes `deps` the fork's dependency
+`sc deps` first only when the declaration makes `deps` the fork''s dependency
 policy. A fork may choose a virtualenv, npm, another tool, or no dependency step
 at all. In Docker, fork code must treat an out-of-checkout interpreter as
 host-managed and shared: verify it, but never install into it.
@@ -90,7 +95,7 @@ policy.
 
 When a fork sets `"pg": {}` in `.super-coder/instance.json` (`sc pg-init` adds
 it), `sc launch` starts a `postgres:17` sidecar and forwards `DATABASE_URL` into
-Docker. This is only the fork application's database. The engine memory DB is
+Docker. This is only the fork application''s database. The engine memory DB is
 always SQLite and never reads `DATABASE_URL`.
 
 Inside Docker the app connects by the container hostname in `DATABASE_URL`, not
@@ -98,7 +103,7 @@ Inside Docker the app connects by the container hostname in `DATABASE_URL`, not
 hooks. Data persists in the install-owned Docker volume.
 
 An unset `DATABASE_URL` means no sidecar is configured. A set URL with an empty
-schema means provision the real app DB through the fork's migrations and
+schema means provision the real app DB through the fork''s migrations and
 bootstrap; it is not a blocker and is not permission to create a second
 throwaway database.
 
@@ -107,4 +112,15 @@ throwaway database.
 The declaration and active boot seat are the truth. Diagnose the exact state,
 use the remedy for that seat, and require observable execution evidence rather
 than command narration. Do not convert an absent capability into inferred
-policy or a repair session into a readiness claim.
+policy or a repair session into a readiness claim.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description,
+  category=excluded.category,
+  command=excluded.command,
+  common=excluded.common,
+  content=excluded.content,
+  is_deleted=0;
+
+COMMIT;

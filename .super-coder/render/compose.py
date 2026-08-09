@@ -81,11 +81,17 @@ PROJECT_VS_ENGINE_SOURCE = (
     "   one the dispatcher resolves.\n"
 )
 
-DEVKIT_DECLARED_STATUS = "**Fork dev kit:** `.subfloor/dev-kit.json` declared."
-DEVKIT_ABSENT_STATUS = "**Fork dev kit:** no fork dev kit declared."
+DEVKIT_DECLARED_STATUS = (
+    "**Fork dev kit:** `.subfloor/dev-kit.json` declared; readiness is proven "
+    "only by hook execution or a current Docker receipt."
+)
+DEVKIT_ABSENT_STATUS = (
+    "**Fork dev kit state:** absent — no fork dev kit declared; the engine "
+    "baseline remains available."
+)
 DEVKIT_REPAIR_STATUS = (
-    "**Fork dev kit repair:** provisioning is not ready. This shell is in the "
-    "explicit repair posture and makes no readiness claim."
+    "**Fork dev kit state:** repair — provisioning is not ready. This shell "
+    "makes no readiness claim; exit to the host and run `sc launch` after repair."
 )
 
 

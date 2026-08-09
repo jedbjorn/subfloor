@@ -63,21 +63,36 @@ class ProjectVsEngineTest(unittest.TestCase):
         for render in (fork_render, source_render):
             self.assertNotIn(SLOT, render)
         self.assertIn("gitignored dependency", fork_render)
+        self.assertIn("state:** absent", fork_render)
         self.assertIn("no fork dev kit declared", fork_render)
         self.assertIn("you are upstream", source_render)
         self.assertIn("`.subfloor/dev-kit.json` declared", source_render)
+        self.assertNotIn("state:** ready", source_render)
+        self.assertIn("readiness is proven", source_render)
 
     def test_devkit_status_distinguishes_absent_and_declared(self):
         absent = compose.render_project_vs_engine(False, False)
         declared = compose.render_project_vs_engine(False, True)
+        self.assertIn("state:** absent", absent)
         self.assertIn("no fork dev kit declared", absent)
         self.assertNotIn("no fork dev kit declared", declared)
         self.assertIn("`.subfloor/dev-kit.json` declared", declared)
+        self.assertNotIn("state:** ready", declared)
+        self.assertIn("current Docker receipt", declared)
+
+    def test_declared_file_presence_never_claims_ready_on_a_host_boot(self):
+        # run.py supplies only Path.is_file() here. That evidence also matches an
+        # invalid {"version": 2} declaration or a declaration with no hooks.
+        rendered = compose.render_project_vs_engine(False, True)
+        self.assertIn("`.subfloor/dev-kit.json` declared", rendered)
+        self.assertNotIn("state:** ready", rendered)
+        self.assertIn("hook execution", rendered)
 
     def test_repair_boot_replaces_status_with_explicit_non_readiness(self):
         repair = compose.render_project_vs_engine(False, True, True)
-        self.assertIn("explicit repair posture", repair)
+        self.assertIn("state:** repair", repair)
         self.assertIn("makes no readiness claim", repair)
+        self.assertIn("exit to the host", repair)
         self.assertNotIn("`.subfloor/dev-kit.json` declared", repair)
 
     def test_floor_and_declared_work_repo_render_as_separate_targets(self):

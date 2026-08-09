@@ -47,6 +47,10 @@ class SandboxImageError(RuntimeError):
     """The requested sandbox image is invalid, stale, or unavailable."""
 
 
+class SandboxPrerequisiteError(SandboxImageError):
+    """A host prerequisite could not be invoked."""
+
+
 class ProvisionFailed(SandboxImageError):
     """A declared provision hook completed unsuccessfully."""
 
@@ -120,7 +124,9 @@ def _engine_ref(checkout: Path, engine: Path) -> str:
             text=True,
         )
     except OSError as exc:
-        raise SandboxImageError(f"cannot resolve engine ref: {exc}") from exc
+        raise SandboxPrerequisiteError(
+            f"cannot run git to resolve engine ref: {exc}"
+        ) from exc
     fallback = done.stdout.strip()
     if done.returncode != 0 or not HEX_REF.fullmatch(fallback):
         detail = done.stderr.strip() or "no valid .sc-state/engine.ref or Git HEAD"
@@ -268,7 +274,7 @@ def _run(command: Sequence[str], *, runner: Runner, capture: bool = False) -> st
             **({"capture_output": True} if capture else {}),
         )
     except OSError as exc:
-        raise SandboxImageError(f"cannot run {command[0]}: {exc}") from exc
+        raise SandboxPrerequisiteError(f"cannot run {command[0]}: {exc}") from exc
     if done.returncode != 0:
         detail = ((done.stderr or "") if capture else "").strip()
         suffix = f": {detail}" if detail else ""
@@ -362,6 +368,8 @@ def build_images(plan: ImagePlan, *, runner: Runner = subprocess.run) -> str:
 def preflight_image(plan: ImagePlan, *, runner: Runner = subprocess.run) -> str:
     try:
         _require_labels(plan.runtime_tag, plan.runtime_labels, runner=runner)
+    except SandboxPrerequisiteError:
+        raise
     except SandboxImageError as exc:
         raise SandboxImageError(
             f"--no-build cannot reuse {plan.runtime_tag!r}: {exc}. "
@@ -399,7 +407,7 @@ def _inspect_volume(name: str, *, runner: Runner) -> dict[str, Any] | None:
             capture_output=True,
         )
     except OSError as exc:
-        raise SandboxImageError(f"cannot run docker: {exc}") from exc
+        raise SandboxPrerequisiteError(f"cannot run docker: {exc}") from exc
     if done.returncode != 0:
         return None
     try:
@@ -551,7 +559,9 @@ def _artifact_root(
             capture_output=True,
         )
     except OSError as exc:
-        raise SandboxImageError(f"cannot verify local artifact ignore policy: {exc}") from exc
+        raise SandboxPrerequisiteError(
+            f"cannot run git to verify local artifact ignore policy: {exc}"
+        ) from exc
     if ignored.returncode != 0:
         raise SandboxImageError(
             f"local dev-kit artifact root is not ignored: {base}; restore the "
@@ -822,7 +832,7 @@ def _remove_container(container: str, *, runner: Runner) -> None:
             capture_output=True,
         )
     except OSError as exc:
-        raise SandboxImageError(f"cannot run docker: {exc}") from exc
+        raise SandboxPrerequisiteError(f"cannot run docker: {exc}") from exc
 
 
 def launch_container(
@@ -1007,10 +1017,10 @@ def main(argv: Sequence[str]) -> int:
         print(plan.runtime_tag)
     elif command == "build":
         build_images(plan)
-        print(f"dev-kit image ready: {plan.runtime_tag}")
+        print(f"dev-kit image state: ready — built {plan.runtime_tag}")
     elif command == "preflight":
         preflight_image(plan)
-        print(f"dev-kit image current: {plan.runtime_tag}")
+        print(f"dev-kit image state: ready — current {plan.runtime_tag}")
     elif command == "docker-run":
         if not extra or extra[0] != "--":
             raise SandboxImageError("docker-run requires -- before Docker arguments")
@@ -1022,32 +1032,47 @@ def main(argv: Sequence[str]) -> int:
             )
         result = launch_container(plan, extra[0], extra[2:])
         if result["state"] == "not_declared":
-            print("dev-kit provisioning: not declared")
+            print("dev-kit provision state: absent — no fork provisioning declared")
         elif result["reused"]:
-            print(f"dev-kit provisioning: current ({result['fingerprint'][:12]})")
+            print(
+                "dev-kit provision state: ready — current receipt "
+                f"({result['fingerprint'][:12]})"
+            )
         else:
-            print(f"dev-kit provisioning: ready ({result['fingerprint'][:12]})")
+            print(
+                "dev-kit provision state: ready — receipt written "
+                f"({result['fingerprint'][:12]})"
+            )
     elif command == "provision":
         if len(extra) != 1:
             raise SandboxImageError("provision requires one container name")
         result = provision_checkout(plan, extra[0])
         if result["state"] == "not_declared":
-            print("dev-kit provisioning: not declared")
+            print("dev-kit provision state: absent — no fork provisioning declared")
         elif result["reused"]:
-            print(f"dev-kit provisioning: current ({result['fingerprint'][:12]})")
+            print(
+                "dev-kit provision state: ready — current receipt "
+                f"({result['fingerprint'][:12]})"
+            )
         else:
-            print(f"dev-kit provisioning: ready ({result['fingerprint'][:12]})")
+            print(
+                "dev-kit provision state: ready — receipt written "
+                f"({result['fingerprint'][:12]})"
+            )
     else:
         if len(extra) != 1:
             raise SandboxImageError("ready requires one container name")
         result = readiness(plan, extra[0])
         if result["state"] == "not_declared":
-            print("dev-kit readiness: no fork provisioning declared")
+            print("dev-kit provision state: absent — no fork provisioning declared")
         elif result["ready"]:
-            print(f"dev-kit readiness: current ({result['fingerprint'][:12]})")
+            print(
+                "dev-kit provision state: ready — current receipt "
+                f"({result['fingerprint'][:12]})"
+            )
         else:
             print(
-                "dev-kit readiness: not ready: " + result["reason"],
+                "dev-kit provision state: stale — " + result["reason"],
                 file=sys.stderr,
             )
             return 1
@@ -1058,10 +1083,13 @@ def cli(argv: Sequence[str]) -> int:
     try:
         return main(argv)
     except ProvisionFailed as exc:
-        print(f"dev-kit image: {exc}", file=sys.stderr)
+        print(f"dev-kit provision state: failed — {exc}", file=sys.stderr)
         return exc.status
-    except (OSError, SandboxImageError) as exc:
-        print(f"dev-kit image: {exc}", file=sys.stderr)
+    except (OSError, SandboxPrerequisiteError) as exc:
+        print(f"dev-kit prerequisite error — {exc}", file=sys.stderr)
+        return 1
+    except SandboxImageError as exc:
+        print(f"dev-kit state: invalid — {exc}", file=sys.stderr)
         return 1
 
 

@@ -378,13 +378,17 @@ def run_hook(
     declaration = load_declaration(checkout)
     if declaration is None:
         print(
-            f"dev-kit: {DECLARATION_PATH} absent; hook {hook_name!r} not configured",
+            f"dev-kit hook state: absent — {DECLARATION_PATH} absent; "
+            f"hook {hook_name!r} not configured",
             file=sys.stderr,
         )
         return 78
     hook = declaration.hooks.get(hook_name)
     if hook is None:
-        print(f"dev-kit: hook {hook_name!r} not configured", file=sys.stderr)
+        print(
+            f"dev-kit hook state: absent — hook {hook_name!r} not configured",
+            file=sys.stderr,
+        )
         return 78
 
     child_environment = dict(environment if environment is not None else os.environ)
@@ -404,7 +408,7 @@ def run_hook(
     try:
         executable = _resolve_executable(hook, child_environment)
     except OSError as exc:
-        print(f"dev-kit: start failed: {exc}", file=sys.stderr)
+        print(f"dev-kit hook state: failed — start failed: {exc}", file=sys.stderr)
         return 126
 
     command = (str(executable), *hook.argv[1:], *arguments)
@@ -417,10 +421,21 @@ def run_hook(
             check=False,
         )
     except OSError as exc:
-        print(f"dev-kit: start failed for {executable}: {exc}", file=sys.stderr)
+        print(
+            f"dev-kit hook state: failed — start failed for {executable}: {exc}",
+            file=sys.stderr,
+        )
         return 126
     if completed.returncode < 0:
         return 128 - completed.returncode
+    if completed.returncode == 0:
+        print(f"dev-kit hook state: ready — {hook_name!r}", file=sys.stderr)
+    else:
+        print(
+            f"dev-kit hook state: failed — {hook_name!r} exited "
+            f"{completed.returncode}",
+            file=sys.stderr,
+        )
     return completed.returncode
 
 
@@ -436,7 +451,7 @@ def cli(argv: Sequence[str]) -> int:
     try:
         return main(argv)
     except DevkitConfigError as exc:
-        print(f"dev-kit: invalid configuration: {exc}", file=sys.stderr)
+        print(f"dev-kit hook state: invalid — {exc}", file=sys.stderr)
         return 64
 
 
