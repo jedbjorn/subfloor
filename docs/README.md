@@ -767,25 +767,27 @@ its name and is always identical.
 > [!class2]
 > **UI** Scripts · **Shells** dev (and any builder)
 
-Every sandbox bakes a **toolchain** — `rg`, `sqlite3`, `curl`, Node 22 / `npm`,
-and a Playwright + Chromium browser for E2E — but deliberately **not** your
-project's dependencies. Those you install per fork with `./sc deps`, which builds
-a repo-root `.venv` from every `requirements*.txt` (your pins are authoritative)
-and runs `npm ci`/`install` for each `package.json`. Because the install lands in
-the **bind-mounted repo** rather than the image, it survives rebuilds — built in
-the container, run in the container, persisted in the mount. Run it first in a
-fresh sandbox; a "module not found" is almost always just deps-not-yet-installed.
-On top of your deps it layers a small engine baseline — `pytest`, `httpx`,
-`coverage`, `ruff`, `mypy`, `datasette` — with pip's `only-if-needed` strategy, so
-it never overrides a fork's pin or its `[tool.ruff]` / `[tool.mypy]` config.
-**Available, not enforced:** opt into whichever pieces you want, fork by fork.
+Every sandbox bakes a **seat toolchain** — `rg`, `sqlite3`, `curl`, Node 22 /
+`npm`, and a Playwright + Chromium browser for E2E — but deliberately not a
+fork's dependency, test, lint, or typecheck policy. A fork owns that policy in
+its tracked `.subfloor/dev-kit.json`. The engine validates the declaration and
+runs only the exact argv attached to each named hook; it does not discover
+manifests, create `.venv`, install packages, or choose pytest/Ruff/mypy/vitest.
 
 ```bash
-./sc deps          # install fork deps into the bind-mount (.venv + npm) — run first
-./sc test          # backend (.venv pytest / stdlib unittest) + UI (npm test / vitest)
-./sc lint [paths]  # ruff check  (.venv/bin/ruff format to apply formatting)
-./sc typecheck     # mypy
+./sc deps          # exact fork-declared dependency hook
+./sc test          # exact fork-declared test hook
+./sc lint [paths]  # exact fork-declared lint hook plus literal caller args
+./sc typecheck     # exact fork-declared typecheck hook
 ```
+
+Boot reports `no fork dev kit declared` when the file is absent. An absent
+declaration or missing named hook returns exit `78` with no fallback; invalid
+policy exits `64`, an unavailable executable exits `126`, and a started child
+keeps its shell-observable status. `SC_DEVKIT_ROOT`, `SC_DEVKIT_SEAT`, and
+`SC_DEVKIT_HOOK` provide neutral context to the fork script. In Docker, a
+fork-owned dependency hook should treat an out-of-repo interpreter as a
+host-managed shared tree: verify it, but never pip-install into it.
 
 One boundary trips people up: **you work inside the sandbox container**, and the
 app the FnB watches in their browser is a *separate*, host-supervised instance. To

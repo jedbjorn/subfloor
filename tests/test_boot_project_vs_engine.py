@@ -54,12 +54,25 @@ class ProjectVsEngineTest(unittest.TestCase):
         self.assertNotIn("do not treat it as the project", source)
 
     def test_substitution_resolves_per_mode(self):
-        fork_render = self.template.replace(SLOT, compose.PROJECT_VS_ENGINE_FORK)
-        source_render = self.template.replace(SLOT, compose.PROJECT_VS_ENGINE_SOURCE)
+        fork_render = self.template.replace(
+            SLOT, compose.render_project_vs_engine(False, False)
+        )
+        source_render = self.template.replace(
+            SLOT, compose.render_project_vs_engine(True, True)
+        )
         for render in (fork_render, source_render):
             self.assertNotIn(SLOT, render)
         self.assertIn("gitignored dependency", fork_render)
+        self.assertIn("no fork dev kit declared", fork_render)
         self.assertIn("you are upstream", source_render)
+        self.assertIn("`.subfloor/dev-kit.json` declared", source_render)
+
+    def test_devkit_status_distinguishes_absent_and_declared(self):
+        absent = compose.render_project_vs_engine(False, False)
+        declared = compose.render_project_vs_engine(False, True)
+        self.assertIn("no fork dev kit declared", absent)
+        self.assertNotIn("no fork dev kit declared", declared)
+        self.assertIn("`.subfloor/dev-kit.json` declared", declared)
 
     def test_floor_and_declared_work_repo_render_as_separate_targets(self):
         lines = compose.render_target_freshness(

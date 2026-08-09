@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,7 @@ import devkit
 from devkit import DevkitConfigError, load_declaration
 
 RUNNER = ROOT / ".super-coder" / "scripts" / "devkit.py"
+SOURCE_DEVKIT = ROOT / ".subfloor" / "dev-kit"
 
 
 class DeclarationTest(unittest.TestCase):
@@ -304,6 +306,10 @@ class RunnerTest(unittest.TestCase):
         missing = self.run_hook("test")
         self.assertEqual(missing.returncode, 126)
         self.assertIn("start failed", missing.stderr)
+        self.assertIn(f"dev-kit checkout: {self.root.resolve()}", missing.stderr)
+        self.assertIn("dev-kit seat: host", missing.stderr)
+        self.assertIn(f"dev-kit cwd: {self.root.resolve()}", missing.stderr)
+        self.assertIn("dev-kit argv: ./missing", missing.stderr)
         child = self.root / "fail"
         child.write_text("#!/bin/sh\necho child-error >&2\nexit 23\n")
         child.chmod(0o755)
@@ -311,6 +317,14 @@ class RunnerTest(unittest.TestCase):
         failed = self.run_hook("test")
         self.assertEqual(failed.returncode, 23)
         self.assertIn("child-error", failed.stderr)
+
+    def test_signal_terminated_child_uses_shell_observable_status(self):
+        child = self.root / "signal"
+        child.write_text("#!/bin/sh\nkill -9 $$\n")
+        child.chmod(0o755)
+        self.write({"version": 1, "hooks": {"test": {"argv": ["./signal"]}}})
+        failed = self.run_hook("test")
+        self.assertEqual(failed.returncode, 137)
 
     def test_dangling_provision_reference_fails_before_child_execution(self):
         marker = self.root / "child-ran"
@@ -396,6 +410,92 @@ class SourcePolicyTest(unittest.TestCase):
         self.assertEqual(ENGINE_PATHS[0], "sc")
         self.assertTrue(all(path.startswith(".super-coder/") for path in ENGINE_PATHS[1:]))
         self.assertNotIn(".subfloor", ENGINE_PATHS)
+
+    def test_docker_host_managed_venv_is_verified_without_pip(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "checkout"
+            (root / ".subfloor").mkdir(parents=True)
+            (root / ".venv" / "bin").mkdir(parents=True)
+            script = root / ".subfloor" / "dev-kit"
+            shutil.copy2(SOURCE_DEVKIT, script)
+            (root / "requirements.txt").write_text(
+                "wu31-package-that-does-not-exist==1\n"
+            )
+            calls = base / "python-calls"
+            outside_python = base / "outside-python"
+            outside_python.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s\\n' \"$*\" >> {shlex.quote(str(calls))}\n"
+                f"exec {shlex.quote(sys.executable)} \"$@\"\n"
+            )
+            outside_python.chmod(0o755)
+            (root / ".venv" / "bin" / "python").symlink_to(outside_python)
+            environment = dict(os.environ)
+            environment.update(
+                {"SC_DEVKIT_ROOT": str(root), "SC_DEVKIT_SEAT": "docker"}
+            )
+            done = subprocess.run(
+                (str(script), "deps"),
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+            self.assertIn("verifying without pip", done.stdout)
+            self.assertIn("wu31-package-that-does-not-exist==1", done.stderr)
+            self.assertNotIn("-m pip", calls.read_text())
+
+    def test_docker_host_managed_test_never_falls_back_to_image_python(self):
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            root = base / "checkout"
+            (root / ".subfloor").mkdir(parents=True)
+            (root / ".venv" / "bin").mkdir(parents=True)
+            script = root / ".subfloor" / "dev-kit"
+            shutil.copy2(SOURCE_DEVKIT, script)
+            outside_python = base / "outside-python"
+            outside_python.write_text("#!/bin/sh\nexit 1\n")
+            outside_python.chmod(0o755)
+            (root / ".venv" / "bin" / "python").symlink_to(outside_python)
+            fallback_marker = base / "fallback-ran"
+            fallback = base / "fallback-python"
+            fallback.write_text(
+                f"#!/bin/sh\ntouch {shlex.quote(str(fallback_marker))}\n"
+            )
+            fallback.chmod(0o755)
+            environment = dict(os.environ)
+            environment.update(
+                {
+                    "SC_DEVKIT_ROOT": str(root),
+                    "SC_DEVKIT_SEAT": "docker",
+                    "SC_PYTHON": str(fallback),
+                }
+            )
+            done = subprocess.run(
+                (str(script), "test"),
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(done.returncode, 126, done.stdout + done.stderr)
+            self.assertIn("host-managed venv", done.stderr)
+            self.assertIn("install it", done.stderr)
+            self.assertFalse(fallback_marker.exists())
+
+    def test_distributed_guidance_describes_fork_owned_hooks(self):
+        skill = (
+            ROOT / ".super-coder" / "assets" / "seed" / "skills" / "dev_kit" / "SKILL.md"
+        ).read_text()
+        readme = (ROOT / "docs" / "README.md").read_text()
+        readme_section = readme.split("### Dev kit", 1)[1].split("## Opt-in features", 1)[0]
+        for guidance in (skill, readme_section):
+            self.assertIn(".subfloor/dev-kit.json", guidance)
+            self.assertIn("exit `78`", guidance)
+            self.assertIn("no fork dev kit declared", guidance)
+            self.assertNotIn("every `requirements*.txt`", guidance)
 
 
 class DispatcherHelpTest(unittest.TestCase):

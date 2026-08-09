@@ -362,6 +362,10 @@ def run_hook(
         }
     )
     requested = (*hook.argv, *arguments)
+    print(f"dev-kit checkout: {checkout}", file=sys.stderr)
+    print(f"dev-kit seat: {seat}", file=sys.stderr)
+    print(f"dev-kit cwd: {hook.cwd}", file=sys.stderr)
+    print(f"dev-kit argv: {shlex.join(requested)}", file=sys.stderr)
     try:
         executable = _resolve_executable(hook, child_environment)
     except OSError as exc:
@@ -369,10 +373,6 @@ def run_hook(
         return 126
 
     command = (str(executable), *hook.argv[1:], *arguments)
-    print(f"dev-kit checkout: {checkout}", file=sys.stderr)
-    print(f"dev-kit seat: {seat}", file=sys.stderr)
-    print(f"dev-kit cwd: {hook.cwd}", file=sys.stderr)
-    print(f"dev-kit argv: {shlex.join(requested)}", file=sys.stderr)
     print(f"dev-kit executable: {executable}", file=sys.stderr)
     try:
         completed = subprocess.run(
@@ -384,6 +384,8 @@ def run_hook(
     except OSError as exc:
         print(f"dev-kit: start failed for {executable}: {exc}", file=sys.stderr)
         return 126
+    if completed.returncode < 0:
+        return 128 - completed.returncode
     return completed.returncode
 
 

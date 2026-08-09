@@ -19,30 +19,26 @@ yourself, run a dev server **inside** the sandbox on `0.0.0.0:$SC_DEV_PORT`; the
 FnB reaches that instance at `http://127.0.0.1:$SC_DEV_PORT`. (See the boot
 doc's `RUNNING THE APP` section.)
 
-## Install + run
+## Fork-owned lifecycle hooks
 
-- `./sc deps` — install the fork's deps into the bind-mount: a repo-root `.venv`
-  from every `requirements*.txt` (fork pins win) + `npm ci`/`install` per
-  `package.json`. Persists across image rebuilds. **Run this first.**
-- `./sc test` — backend (`.venv` pytest honoring the fork's `pytest.ini`, else
-  the engine's stdlib unittest) + UI (`npm run test` / vitest where a `test`
-  script is declared). Non-zero if any suite fails.
+`./sc deps`, `./sc test`, `./sc lint`, and `./sc typecheck` are stable engine
+verbs, but their behavior belongs entirely to the fork. The engine loads the
+tracked `.subfloor/dev-kit.json`, validates it, and executes only the exact argv
+declared for that hook. It never discovers manifests, selects language tools,
+creates a virtualenv, installs packages, or supplies a missing test runner.
 
-## The `.venv` dev kit
+- Boot says `no fork dev kit declared` when the declaration is absent.
+- An absent declaration or missing named hook exits `78`; there is no fallback.
+- Invalid declaration or invocation exits `64`; an unavailable executable exits
+  `126`; a started child keeps its shell-observable status.
+- `SC_DEVKIT_ROOT`, `SC_DEVKIT_SEAT`, and `SC_DEVKIT_HOOK` tell a fork-owned
+  script which checkout, seat, and hook the engine selected.
 
-`./sc deps` layers these onto the fork's own deps with `--upgrade-strategy
-only-if-needed`, so a fork's pins and its `[tool.ruff]`/`[tool.mypy]` config
-always win. **Available, not enforced** — opt in per fork.
-
-- `./sc lint [paths]` → `.venv/bin/ruff check` — lint + format-check.
-  (`.venv/bin/ruff format` to apply formatting.)
-- `./sc typecheck [paths]` → `.venv/bin/mypy` — Python type-check.
-- `.venv/bin/pytest` / `coverage` / `httpx` — test + HTTP client (also via `./sc test`).
-- `.venv/bin/datasette <db.sqlite>` — browse a SQLite DB in a web GUI when the
-  `sqlite3` CLI isn't enough. Bind `0.0.0.0:$SC_DEV_PORT` to view it from the host.
-
-> The `.venv` baseline only materializes when the fork declares Python (a
-> `requirements*.txt`). A pure-frontend fork gets node only.
+Read `.subfloor/dev-kit.json` and its declared executable before invoking a
+hook. Run `./sc deps` first only when that declaration gives `deps` the fork's
+provisioning policy. A fork may choose `.venv`, npm, another package manager, or
+no dependency step at all. In Docker, a fork script must treat an out-of-repo
+interpreter as host-managed and shared: verify it, but never pip-install into it.
 
 ## Baked into the image
 
@@ -56,8 +52,9 @@ Always present, no `./sc deps` needed:
 
 ## Frontend checks
 
-`svelte-check`, `tsc`, vitest come from the fork's own `package.json` devDeps —
-installed by `./sc deps`' `npm ci`, run via the fork's npm scripts (or `./sc test`).
+Frontend tools such as `svelte-check`, `tsc`, and vitest come from the fork's
+own dependencies. Whether and how they are installed or run is declared by the
+fork's lifecycle hooks, not inferred from `package.json` by the engine.
 
 ## Postgres sidecar (app-only)
 
@@ -73,8 +70,9 @@ review GUI at the wrong DB.
   the sandbox is its own loopback. Override with `SC_DATABASE_URL` on the host.
 - Data persists in a named Docker volume across restarts + image rebuilds.
 - The **Postgres driver is the fork's own dependency**, not the engine dev kit:
-  declare `psycopg[binary]` (psycopg 3) in the fork's `requirements*.txt` so
-  `./sc deps` installs it. Then the app + `pytest` connect with no extra steps.
+  declare `psycopg[binary]` (psycopg 3) through the fork's own dependency system
+  and make its declared `deps` hook provision it. Then the app and declared test
+  hook can connect.
 
 Verify with `echo $DATABASE_URL`. *Unset* → the fork has no `pg` block; run
 `./sc pg-init && ./sc restart` on the host.
@@ -89,10 +87,10 @@ task off as "no DB available." You have one.
 
 ## Stance
 
-`./sc deps` before anything else in a fresh sandbox — qwen's "node missing" was
-just deps-not-installed. Lint/type-check are there when you want them, never
-forced; respect the fork's config. To see the app, run a dev server in the
+The declaration is the truth: inspect it before assuming what any lifecycle
+verb provides. An exit `78` means the fork did not declare that hook, not that
+the engine forgot to discover its stack. To see the app, run a dev server in the
 container — never restart the FnB's host stack. Before calling an app-DB task
-blocked on a missing/empty DB: check `DATABASE_URL`; if it's set but empty,
+blocked on a missing/empty DB: check `DATABASE_URL`; if it is set but empty,
 provision the sidecar with the fork's own migrations. In a sandbox the DB is
 never the blocker.
