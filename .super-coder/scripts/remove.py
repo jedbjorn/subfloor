@@ -7,8 +7,10 @@ The removal backup is the one intentional residue:
 
 Everything destructive is gated on an exact target, clean shell worktrees, a
 quiesced repo runtime, and a verified WAL-safe database backup.  Machine-wide
-harnesses, credentials, images, project files, branches, and unrelated Git
-configuration are outside this command's ownership boundary.
+harnesses, credentials, shared engine-base images, project files, branches, and
+unrelated Git configuration are outside this command's ownership boundary.
+Install-labeled fork-extension images and dependency volumes are removed only
+after the verified backup gate.
 
 Usage:
     ./sc remove [--dry-run] [--yes]
@@ -40,6 +42,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import db_backup
 import engine_manifest
 import install
+import sandbox_devkit
 import sc_wrapper
 
 BACKUP_IGNORE = "/.sc-state/db_backups/"
@@ -182,9 +185,9 @@ def show_plan(
         for path in added:
             print(f"    added    {path}")
     print("  remove     : repo runtime, engine, generated state, shell worktrees,")
-    print("               subfloor hook/remote/Makefile integration")
+    print("               install-owned extension images/volumes and integration")
     print("  preserve   : project files, branches, unrelated Git config, shared")
-    print("               machine tools, credentials, images, and all DB backups")
+    print("               machine tools, credentials, engine-base images, and backups")
 
 
 def confirm(repo_root: Path) -> None:
@@ -537,6 +540,15 @@ def remove_installation(repo_root: Path) -> tuple[list[str], list[str]]:
     return removed, preserved
 
 
+def cleanup_devkit_resources(repo_root: Path) -> list[str]:
+    if shutil.which("docker") is None:
+        return []
+    try:
+        return sandbox_devkit.cleanup_owned_resources(repo_root / ".super-coder")
+    except sandbox_devkit.SandboxImageError as exc:
+        raise RemoveError(f"could not remove owned dev-kit resources: {exc}") from exc
+
+
 def verify_removed(repo_root: Path) -> list[str]:
     remaining: list[str] = []
     for relative in (
@@ -626,6 +638,7 @@ def main(argv: list[str]) -> int:
                 f"→ verified WAL-safe DB backup: {destination / data['database']['file']}"
             )
 
+        data["removed"].extend(cleanup_devkit_resources(repo_root))
         removed, preserved = remove_installation(repo_root)
         data["removed"].extend(removed)
         data["preserved"].extend(preserved)

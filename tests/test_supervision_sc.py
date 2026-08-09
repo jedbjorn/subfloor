@@ -2,7 +2,9 @@
 """Behavioral coverage for restricted-seat launch/restart supervision."""
 from __future__ import annotations
 
+import json
 import os
+import pwd
 import shutil
 import socket
 import sqlite3
@@ -14,6 +16,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 
 
 class SupervisionFixture:
@@ -44,12 +47,16 @@ class SupervisionFixture:
             "engine_manifest.py",
             "global_pointer.py",
             "install.py",
+            "devkit.py",
+            "sandbox_devkit.py",
         ):
             shutil.copy2(
                 ROOT / ".super-coder" / "scripts" / script,
                 self.scripts / script,
             )
         (self.engine / "Dockerfile").write_text("FROM scratch\n")
+        (self.root / ".sc-state").mkdir()
+        (self.root / ".sc-state" / "engine.ref").write_text("a" * 40 + "\n")
         self._write_scripts()
         self._write_fake_commands()
         for directory in (
@@ -81,6 +88,20 @@ class SupervisionFixture:
             }
         )
         self.env.pop("SC_DB_BACKUP_DIR", None)
+        from sandbox_devkit import image_plan  # noqa: PLC0415
+
+        plan = image_plan(
+            self.root,
+            self.engine,
+            "0",
+            user=pwd.getpwuid(os.getuid()).pw_name,
+            uid=str(os.getuid()),
+            gid=str(os.getgid()),
+        )
+        (self.docker_state / "image.json").write_text(json.dumps([{
+            "Id": "sha256:" + "b" * 64,
+            "Config": {"Labels": plan.runtime_labels},
+        }]))
         self._sockets: list[socket.socket] = []
 
     def close(self) -> None:
@@ -132,14 +153,38 @@ class SupervisionFixture:
             state_dir="$SC_TEST_DOCKER_STATE"
             if [ "$1" = info ]; then exit 0; fi
             if [ "$1" = image ] && [ "$2" = inspect ]; then
-              [ "$SC_TEST_IMAGE" = present ]
-              exit
+              [ "$SC_TEST_IMAGE" = present ] || exit 1
+              case " $* " in
+                *" --format "*) echo 0 ;;
+                *) cat "$state_dir/image.json" ;;
+              esac
+              exit 0
             fi
             if [ "$1" = network ] && [ "$2" = inspect ]; then exit 0; fi
             if [ "$1" = network ] && [ "$2" = create ]; then exit 0; fi
             if [ "$1" = build ]; then
-              [ "${SC_TEST_BUILD_FAIL:-}" != 1 ]
-              exit
+              [ "${SC_TEST_BUILD_FAIL:-}" != 1 ] || exit 1
+              labels="$state_dir/image.labels"
+              : > "$labels"
+              while [ "$#" -gt 0 ]; do
+                if [ "$1" = --label ]; then
+                  printf '%s\\n' "$2" >> "$labels"
+                  shift 2
+                else
+                  shift
+                fi
+              done
+              printf '[{"Id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","Config":{"Labels":{' > "$state_dir/image.json"
+              first=1
+              while IFS= read -r label; do
+                key="${label%%=*}"
+                value="${label#*=}"
+                [ "$first" -eq 1 ] || printf ',' >> "$state_dir/image.json"
+                printf '"%s":"%s"' "$key" "$value" >> "$state_dir/image.json"
+                first=0
+              done < "$labels"
+              printf '}}}]' >> "$state_dir/image.json"
+              exit 0
             fi
             if [ "$1" = rm ]; then
               name="$3"
@@ -148,6 +193,7 @@ class SupervisionFixture:
                 exit 1
               fi
               rm -f "$state_dir/$name.id"
+              rm -f "$state_dir/$name.image"
               exit 0
             fi
             if [ "$1" = run ]; then
@@ -167,6 +213,7 @@ class SupervisionFixture:
                 next=$((next + 1))
                 printf '%s\\n' "$next" > "$next_file"
                 printf 'container-%s\\n' "$next" > "$state_dir/$name.id"
+                printf 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\n' > "$state_dir/$name.image"
                 echo "container-$next"
               else
                 echo fake-container-id
@@ -175,7 +222,11 @@ class SupervisionFixture:
             fi
             if [ "$1" = inspect ] && [ "$2" = --format ]; then
               if [ -f "$state_dir/$4.id" ]; then
-                echo true
+                if [ "$3" = "{{.Image}}" ]; then
+                  cat "$state_dir/$4.image"
+                else
+                  echo true
+                fi
                 exit 0
               fi
               exit 1
@@ -191,8 +242,27 @@ class SupervisionFixture:
               exit 0
             fi
             if [ "$1" = exec ]; then
-              [ -f "$state_dir/$2.id" ]
-              exit
+              original="$*"
+              shift
+              while [ "$#" -gt 0 ]; do
+                case "$1" in
+                  -e|--env) shift 2 ;;
+                  -*) shift ;;
+                  *) break ;;
+                esac
+              done
+              name="$1"
+              [ -f "$state_dir/$name.id" ] || exit 1
+              case " $original " in
+                *devkit.py*)
+                  if [ -n "${SC_TEST_PROVISION_FAIL:-}" ]; then
+                    echo provision-failed >&2
+                    exit "$SC_TEST_PROVISION_FAIL"
+                  fi
+                  [ -z "${SC_TEST_PROVISION_OUTPUT:-}" ] ||
+                    printf '%s\\n' "$SC_TEST_PROVISION_OUTPUT" ;;
+              esac
+              exit 0
             fi
             exit 0
             """,
@@ -264,6 +334,20 @@ class SupervisionFixture:
     def configure_pg(self) -> None:
         (self.engine / "instance.json").write_text('{"pg": {}}\n')
 
+    def configure_provision(self) -> None:
+        subfloor = self.root / ".subfloor"
+        subfloor.mkdir(exist_ok=True)
+        hook = subfloor / "provision"
+        hook.write_text("#!/bin/sh\nexit 0\n")
+        hook.chmod(0o755)
+        (subfloor / "dev-kit.json").write_text(json.dumps({
+            "version": 1,
+            "hooks": {"deps": {"argv": ["./.subfloor/provision"]}},
+            "provision": {"hook": "deps", "inputs": []},
+        }))
+        (self.root / ".gitignore").write_text("/.sc-state/local/\n")
+        subprocess.run(("git", "init", "-q", str(self.root)), check=True)
+
     def pg_identity(self) -> str:
         return (
             self.docker_state / f"{self.env['SC_TEST_PG_NAME']}.id"
@@ -280,8 +364,14 @@ class RestrictedLaunchTests(unittest.TestCase):
     def test_launch_no_build_reuses_existing_image_without_buildx(self):
         result = self.fx.run("launch", "--no-build")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dev-kit provisioning: not declared", result.stdout)
+        self.assertNotIn("container-1", result.stdout)
         calls = self.fx.calls()
-        self.assertIn("docker image inspect super-coder-sandbox", calls)
+        image_inspects = [
+            line for line in calls if line.startswith("docker image inspect ")
+        ]
+        self.assertEqual(len(image_inspects), 1)
+        self.assertIn("super-coder-base:", image_inspects[0])
         sandbox_run = next(
             line
             for line in calls
@@ -290,6 +380,17 @@ class RestrictedLaunchTests(unittest.TestCase):
         )
         self.assertIn(" --init ", sandbox_run)
         self.assertFalse(any(line.startswith("docker build ") for line in calls))
+
+    def test_successful_provision_reports_hook_output_and_ready_state(self):
+        self.fx.configure_provision()
+        self.fx.env["SC_TEST_PROVISION_OUTPUT"] = "dependencies installed"
+
+        result = self.fx.run("launch", "--no-build")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dependencies installed", result.stdout)
+        self.assertIn("dev-kit provisioning: ready", result.stdout)
+        self.assertNotIn("container-1", result.stdout)
 
     def test_launch_no_build_missing_image_refuses_before_runtime_change(self):
         self.fx.env["SC_TEST_IMAGE"] = "missing"
@@ -300,6 +401,44 @@ class RestrictedLaunchTests(unittest.TestCase):
         self.assertFalse(any(line.startswith("docker rm ") for line in calls))
         self.assertFalse(any(line.startswith("docker run ") for line in calls))
         self.assertFalse(any(line.startswith("docker build ") for line in calls))
+
+    def test_failed_provision_retains_container_and_prints_retry_and_repair(self):
+        self.fx.configure_provision()
+        self.fx.env["SC_TEST_PROVISION_FAIL"] = "23"
+
+        result = self.fx.run("launch", "--no-build")
+
+        self.assertEqual(result.returncode, 23)
+        self.assertIn("retained sandbox", result.stderr)
+        self.assertIn("./sc launch --no-build", result.stderr)
+        self.assertIn("./sc enter --devkit-repair", result.stderr)
+        self.assertTrue(
+            (self.fx.docker_state / f"sc-{self.fx.root.name}.id").exists()
+        )
+        artifact = self.fx.root / ".sc-state" / "local" / "dev-kit"
+        self.assertEqual(len(list(artifact.glob("*/attempts/*.json"))), 1)
+        self.assertFalse(list(artifact.glob("*/ready.json")))
+
+    def test_normal_entry_blocks_stale_provision_but_repair_bypasses_without_claim(self):
+        self.fx.configure_provision()
+        container = f"sc-{self.fx.root.name}"
+        (self.fx.docker_state / f"{container}.id").write_text("container-1\n")
+
+        normal = self.fx.run("enter")
+
+        self.assertEqual(normal.returncode, 1)
+        self.assertIn("normal entry blocked", normal.stderr)
+        self.assertFalse(
+            [line for line in self.fx.calls() if line.startswith("docker exec ")]
+        )
+        repair = self.fx.run("enter", "--devkit-repair")
+        self.assertEqual(repair.returncode, 0, repair.stderr)
+        self.assertIn("DEV-KIT REPAIR SESSION", repair.stderr)
+        self.assertIn("no readiness claim", repair.stderr)
+        self.assertIn(
+            f"docker exec -it -e SC_DEVKIT_REPAIR=1 {container} ./sc boot",
+            self.fx.calls(),
+        )
 
     def test_restart_missing_image_does_not_backup_or_stop(self):
         self.fx.env["SC_TEST_IMAGE"] = "missing"
@@ -364,7 +503,9 @@ class RestrictedLaunchTests(unittest.TestCase):
         bad_override = Path(self.fx._tmp.name) / "override-file"
         bad_home.write_text("not a directory\n")
         bad_override.write_text("not a directory\n")
-        (self.fx.root / ".sc-state").write_text("not a directory\n")
+        (self.fx.root / ".sc-state" / "db_backups").write_text(
+            "not a directory\n"
+        )
         self.fx.env["HOME"] = str(bad_home)
         self.fx.env["SC_DB_BACKUP_DIR"] = str(bad_override)
 

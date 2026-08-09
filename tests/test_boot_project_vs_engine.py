@@ -74,6 +74,12 @@ class ProjectVsEngineTest(unittest.TestCase):
         self.assertNotIn("no fork dev kit declared", declared)
         self.assertIn("`.subfloor/dev-kit.json` declared", declared)
 
+    def test_repair_boot_replaces_status_with_explicit_non_readiness(self):
+        repair = compose.render_project_vs_engine(False, True, True)
+        self.assertIn("explicit repair posture", repair)
+        self.assertIn("makes no readiness claim", repair)
+        self.assertNotIn("`.subfloor/dev-kit.json` declared", repair)
+
     def test_floor_and_declared_work_repo_render_as_separate_targets(self):
         lines = compose.render_target_freshness(
             "live_engine_checkout: `/substrate` · remote unverified",

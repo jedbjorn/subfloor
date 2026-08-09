@@ -83,12 +83,21 @@ PROJECT_VS_ENGINE_SOURCE = (
 
 DEVKIT_DECLARED_STATUS = "**Fork dev kit:** `.subfloor/dev-kit.json` declared."
 DEVKIT_ABSENT_STATUS = "**Fork dev kit:** no fork dev kit declared."
+DEVKIT_REPAIR_STATUS = (
+    "**Fork dev kit repair:** provisioning is not ready. This shell is in the "
+    "explicit repair posture and makes no readiness claim."
+)
 
 
-def render_project_vs_engine(source_mode: bool, devkit_declared: bool) -> str:
+def render_project_vs_engine(
+    source_mode: bool, devkit_declared: bool, devkit_repair: bool = False
+) -> str:
     """Render repo position and the checkout's fork-dev-kit status together."""
     project = PROJECT_VS_ENGINE_SOURCE if source_mode else PROJECT_VS_ENGINE_FORK
-    devkit = DEVKIT_DECLARED_STATUS if devkit_declared else DEVKIT_ABSENT_STATUS
+    if devkit_repair:
+        devkit = DEVKIT_REPAIR_STATUS
+    else:
+        devkit = DEVKIT_DECLARED_STATUS if devkit_declared else DEVKIT_ABSENT_STATUS
     return f"{project}\n\n{devkit}"
 
 
@@ -406,6 +415,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
                  api_port: "int | None" = None,
                  source_mode: bool = False,
                  devkit_declared: bool = False,
+                 devkit_repair: bool = False,
                  launch_mode: str = "container") -> str:
     """Assemble the full boot markdown for `shell`, driven by `user`.
 
@@ -430,7 +440,7 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     flavor = (shell["flavor"] if "flavor" in shell.keys() else None)
     template = template.replace(
         "{{project_vs_engine}}",
-        render_project_vs_engine(source_mode, devkit_declared))
+        render_project_vs_engine(source_mode, devkit_declared, devkit_repair))
     template = template.replace(
         "{{execution_context}}", render_execution_context(flavor, launch_mode)
     )

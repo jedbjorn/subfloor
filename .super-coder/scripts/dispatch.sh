@@ -251,10 +251,25 @@ dnet() {
 harness_epoch()      { "$PY" "$S/install.py" --harness-epoch; }
 harness_epoch_roll() { "$PY" "$S/install.py" --roll-harness-epoch; }
 
+sc_devkit_image_name() {
+  epoch="$1"
+  "$PY" "$S/sandbox_devkit.py" image-name \
+    "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)"
+}
+
+sc_devkit_ready() {
+  epoch="$(harness_epoch)"
+  "$PY" "$S/sandbox_devkit.py" ready \
+    "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)" \
+    "$CNAME"
+}
+
 # What the CURRENT image was actually built with, read back from the label the
 # Dockerfile stamps. Empty for an image built before this seam existed (or none
 # at all) — callers treat that as "unknown", never as "current".
 harness_epoch_built() {
+  epoch="$(harness_epoch)"
+  IMG="$(sc_devkit_image_name "$epoch")" || return 1
   docker image inspect "$IMG" --format '{{index .Config.Labels "sc.harness_epoch"}}' 2>/dev/null \
     | sed 's/^<no value>$//' || true
 }
@@ -263,21 +278,17 @@ harness_epoch_built() {
 # .dockerignore: the build context is empty). Cheap to re-run; layers cache —
 # including the harness layers, unless the epoch below has been rolled since.
 dbuild() {
-  docker build -t "$IMG" -f "$ENGINE/Dockerfile" \
-    --build-arg SC_USER="$(id -un)" \
-    --build-arg SC_UID="$(id -u)" \
-    --build-arg SC_GID="$(id -g)" \
-    --build-arg SC_HARNESS_EPOCH="$(harness_epoch)" \
-    "$here"
+  epoch="$(harness_epoch)"
+  IMG="$(sc_devkit_image_name "$epoch")" || return 1
+  "$PY" "$S/sandbox_devkit.py" build \
+    "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)"
 }
 
 dimage_preflight() {
-  if docker image inspect "$IMG" >/dev/null 2>&1; then
-    return 0
-  fi
-  echo "✗ --no-build: sandbox image '$IMG:latest' is missing; nothing was stopped." >&2
-  echo "  Run ./sc build, then retry with --no-build." >&2
-  return 1
+  epoch="$(harness_epoch)"
+  IMG="$(sc_devkit_image_name "$epoch")" || return 1
+  "$PY" "$S/sandbox_devkit.py" preflight \
+    "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)"
 }
 
 drunning() { [ "$(docker inspect -f '{{.State.Running}}' "$CNAME" 2>/dev/null || echo false)" = true ]; }
@@ -1116,7 +1127,7 @@ case "$cmd" in
         --no-build) no_build=1 ;;
         -h|--help)
           echo "usage: ./sc launch [--no-build]"
-          echo "  --no-build  reuse the existing $IMG:latest image; refuse if absent"
+          echo "  --no-build  reuse only the current install's exactly labeled image"
           exit 0 ;;
         *)
           echo "sc launch: unknown argument '$1' (usage: ./sc launch [--no-build])" >&2
@@ -1191,12 +1202,16 @@ case "$cmd" in
           fi ;;
       esac
     fi
-    docker rm -f "$CNAME" >/dev/null 2>&1 || true
     # Docker's init shim is PID 1 so orphaned harness/worker subprocesses are
     # reaped. Without it the Python API server becomes PID 1, never wait()s on
     # reparented children, and long-running multi-shell work exhausts the
     # container's PID limit with zombies (flag #323).
-    docker run -d --name "$CNAME" --restart unless-stopped --init \
+    epoch="$(harness_epoch)"
+    provision_rc=0
+    "$PY" "$S/sandbox_devkit.py" launch-container \
+      "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)" \
+      "$CNAME" -- \
+      -d --name "$CNAME" --restart unless-stopped --init \
       --network "$SC_NET" \
       --user "$(duser)" \
       -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
@@ -1216,7 +1231,14 @@ case "$cmd" in
       -v "$HOME/.kimi-code:$HOME/.kimi-code" \
       -p "127.0.0.1:$p:$p" \
       -p "127.0.0.1:$dp:$dp" \
-      "$IMG" ./sc serve --port "$p" >/dev/null
+      SC_DEVKIT_MOUNTS \
+      "$IMG" ./sc serve --port "$p" || provision_rc=$?
+    if [ "$provision_rc" -ne 0 ]; then
+      echo "✗ fork provisioning failed; retained sandbox '$CNAME' and local evidence." >&2
+      echo "  retry:  ./sc launch --no-build" >&2
+      echo "  repair: ./sc enter --devkit-repair" >&2
+      exit "$provision_rc"
+    fi
     if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
       printf '\033[1m→ sandbox up\033[0m · \033[1mReview GUI  \033[36mhttp://127.0.0.1:%s\033[0m\n' "$p"
     else
@@ -1244,8 +1266,35 @@ case "$cmd" in
     sc_db_broker_up || true
     # Start the PG sidecar when configured — self-skips otherwise.
     sc_pg_up || true ;;
-  enter)        sc_urls || true; exec docker exec -it "$CNAME" ./sc boot "$@" ;;
-  enter-*)      sc_urls || true; exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
+  enter)
+    if [ "${1:-}" = "--devkit-repair" ]; then
+      shift
+      echo "! DEV-KIT REPAIR SESSION — provisioning is NOT ready; no readiness claim is made." >&2
+      echo "  inspect .sc-state/local/dev-kit/ and run the declared hook explicitly." >&2
+      sc_urls || true
+      exec docker exec -it -e SC_DEVKIT_REPAIR=1 "$CNAME" ./sc boot "$@"
+    fi
+    sc_devkit_ready || {
+      echo "✗ normal entry blocked until fork provisioning is current." >&2
+      echo "  retry:  ./sc launch --no-build" >&2
+      echo "  repair: ./sc enter --devkit-repair" >&2
+      exit 1
+    }
+    sc_urls || true
+    exec docker exec -it "$CNAME" ./sc boot "$@" ;;
+  enter-*)
+    if [ "${1:-}" = "--devkit-repair" ]; then
+      echo "sc ${cmd}: repair posture is available only as ./sc enter --devkit-repair" >&2
+      exit 2
+    fi
+    sc_devkit_ready || {
+      echo "✗ normal entry blocked until fork provisioning is current." >&2
+      echo "  retry:  ./sc launch --no-build" >&2
+      echo "  repair: ./sc enter --devkit-repair" >&2
+      exit 1
+    }
+    sc_urls || true
+    exec docker exec -it "$CNAME" ./sc boot "${cmd#enter-}" "$@" ;;
   down)         docker rm -f "$CNAME" >/dev/null 2>&1 && echo "→ sandbox stopped" || echo "→ not running"
                 sc_vm_broker_down
                 sc_ts_broker_down
@@ -1272,7 +1321,7 @@ case "$cmd" in
         -h|--help)
           echo "usage: ./sc restart [-y|--yes] [--no-build]"
           echo "  default     refresh harness CLIs, rebuild the image, then bounce"
-          echo "  --no-build  reuse the existing $IMG:latest image; preflight before down"
+          echo "  --no-build  reuse the current exactly labeled image; preflight before down"
           exit 0 ;;
         *)
           echo "sc restart: unknown argument '$1' (usage: ./sc restart [-y|--yes] [--no-build])" >&2
@@ -1433,11 +1482,12 @@ super-coder — forkable shell substrate
 
   Sandbox (docker — the default way to run; allow-everything is safe because the
   container only sees this repo + your harness creds):
-  ./sc launch              build + start the sandbox container (server + GUI), 127.0.0.1 only
-                             --no-build reuses the existing image and refuses before runtime changes when absent
+  ./sc launch              build the exact base/fork image, start the sandbox, and run declared provisioning
+                             --no-build reuses only a current labeled image; failed setup retains container + evidence
   ./sc admin               boot the sole active Admin directly on the host (no Docker or API required)
-  ./sc enter               boot an interactive shell directly (picker when omitted)
-  ./sc enter-<shortname>   enter that shell directly (skip the shell picker)
+  ./sc enter               boot an interactive shell only when declared provisioning is current
+                             --devkit-repair enters a retained failed sandbox without claiming readiness
+  ./sc enter-<shortname>   enter that shell directly when ready (skip the shell picker)
                              harness: --harness <name> or HARNESS=<name> forces it; else when
                              >1 harness is on PATH you're prompted (per-launch, not persisted)
   make dos-help            supported operator aliases for lifecycle, models,
