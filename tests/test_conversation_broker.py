@@ -301,7 +301,13 @@ class ConversationBrokerCase(unittest.TestCase):
     def tearDown(self) -> None:
         for broker in self.brokers:
             broker.stop()
+        for broker in self.brokers:
             broker.join(2)
+            self.assertFalse(broker.is_alive(), "broker dispatcher did not stop")
+            self.assertTrue(
+                broker.wait_idle(2),
+                "broker worker did not stop before fixture cleanup",
+            )
         self.tmp.cleanup()
 
     def connect(self) -> sqlite3.Connection:
