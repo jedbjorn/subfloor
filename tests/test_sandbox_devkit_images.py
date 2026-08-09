@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -259,6 +260,31 @@ class SandboxImagePlanTest(unittest.TestCase):
                 dockerfile.write_text(text)
                 with self.assertRaisesRegex(SandboxImageError, "SC_BASE_IMAGE"):
                     fixture.plan()
+
+    def test_missing_docker_is_a_host_prerequisite_error_not_invalid_state(self):
+        fixture = ImageFixture(self.base, "missing-docker")
+        completed = subprocess.run(
+            (
+                sys.executable,
+                str(SCRIPTS / "sandbox_devkit.py"),
+                "build",
+                str(fixture.root),
+                str(fixture.engine),
+                "20260809T170000.000000Z",
+                "tester",
+                "1000",
+                "1000",
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PATH": str(self.base / "empty-path")},
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("dev-kit prerequisite error", completed.stderr)
+        self.assertIn("cannot run docker", completed.stderr)
+        self.assertNotIn("state: invalid", completed.stderr)
 
     def test_build_uses_immutable_base_id_exact_context_and_required_labels(self):
         fixture = ImageFixture(self.base, "fork")

@@ -82,7 +82,8 @@ PROJECT_VS_ENGINE_SOURCE = (
 )
 
 DEVKIT_DECLARED_STATUS = (
-    "**Fork dev kit state:** ready — `.subfloor/dev-kit.json` declared."
+    "**Fork dev kit:** `.subfloor/dev-kit.json` declared; readiness is proven "
+    "only by hook execution or a current Docker receipt."
 )
 DEVKIT_ABSENT_STATUS = (
     "**Fork dev kit state:** absent — no fork dev kit declared; the engine "
