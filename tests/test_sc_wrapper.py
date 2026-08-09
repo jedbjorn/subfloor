@@ -80,7 +80,7 @@ class WrapperTargetingTest(WrapperFixture):
         self.assertEqual(result.returncode, 23)
         self.assertEqual(
             result.stdout.splitlines(),
-            [f"cwd={nested}", "arg=one", "arg=two words"],
+            [f"cwd={nested.resolve()}", "arg=one", "arg=two words"],
         )
 
     def test_wrapper_fails_127_outside_git_and_for_untracked_launcher(self) -> None:
@@ -129,7 +129,8 @@ class WrapperLifecycleTest(WrapperFixture):
         self.assertIn("no registration", result)
         self.assertTrue(self.wrapper.exists())
         self.assertEqual(
-            json.loads(self.registry.read_text())["installs"], [str(self.repo_a)]
+            json.loads(self.registry.read_text())["installs"],
+            [str(self.repo_a.resolve())],
         )
 
     def test_multi_install_last_owner_and_modified_wrapper_preservation(self) -> None:
@@ -140,7 +141,8 @@ class WrapperLifecycleTest(WrapperFixture):
         data = json.loads(self.registry.read_text())
         self.assertEqual(data["schema"], sc_wrapper.REGISTRY_SCHEMA)
         self.assertEqual(
-            data["installs"], sorted([str(self.repo_a), str(self.repo_b)])
+            data["installs"],
+            sorted([str(self.repo_a.resolve()), str(self.repo_b.resolve())]),
         )
         self.assertIn(
             "# managed-by: subfloor sc-wrapper v1",
@@ -205,7 +207,7 @@ class WrapperLifecycleTest(WrapperFixture):
             sc_wrapper.register_install(self.repo_b, self.env)
 
         self.assertEqual(self.registry.read_bytes(), before)
-        self.assertEqual(json.loads(before)["installs"], [str(self.repo_a)])
+        self.assertEqual(json.loads(before)["installs"], [str(self.repo_a.resolve())])
 
     def test_atomic_create_never_replaces_a_racing_user_command(self) -> None:
         target = self.wrapper
@@ -240,7 +242,7 @@ class WrapperLifecycleTest(WrapperFixture):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         self.assertEqual(
             json.loads(self.registry.read_text())["installs"],
-            sorted([str(self.repo_a), str(self.repo_b)]),
+            sorted([str(self.repo_a.resolve()), str(self.repo_b.resolve())]),
         )
 
 

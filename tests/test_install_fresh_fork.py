@@ -103,7 +103,10 @@ class FreshForkInstallTest(unittest.TestCase):
             self.assertIn("# managed-by: subfloor sc-wrapper v1", wrapper_text)
             self.assertIn("git rev-parse --show-toplevel", wrapper_text)
             self.assertNotIn("SC_ROOT", wrapper_text)
-            self.assertEqual(json.loads(registry.read_text())["installs"], [str(repo)])
+            self.assertEqual(
+                json.loads(registry.read_text())["installs"],
+                [str(repo.resolve())],
+            )
             self.assertIn("subfloor managed PATH", (home / ".profile").read_text())
 
     def test_direct_installer_rejects_old_python_before_repository_mutation(self) -> None:

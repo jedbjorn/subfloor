@@ -256,9 +256,9 @@ class EnsureWorktreeTest(unittest.TestCase):
 
         self.assertEqual(
             Path(git(moved_wt, "rev-parse", "--show-toplevel")),
-            moved_wt,
+            moved_wt.resolve(),
         )
-        self.assertIn(str(moved_wt), git(moved, "worktree", "list"))
+        self.assertIn(str(moved_wt.resolve()), git(moved, "worktree", "list"))
 
 
 if __name__ == "__main__":
