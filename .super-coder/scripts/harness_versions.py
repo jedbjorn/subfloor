@@ -127,6 +127,12 @@ def main(argv: list[str]) -> int:
         compatibility = status["compatibility"]
         if status["error"]:
             detail = f"{version or '—'} · {status['error']}"
+        elif version and compatibility == "newer-unverified":
+            detail = (
+                f"{version} · {compatibility} · tested "
+                f"[{status['minimum_version']}, "
+                f"{status['maximum_version_exclusive']})"
+            )
         elif version and compatibility:
             detail = (
                 f"{version} · {compatibility} · supported "

@@ -667,7 +667,7 @@ class ConversationAdapterTest(unittest.TestCase):
         self.linked_vm.stop()
         self.temp.cleanup()
 
-    def test_declared_compatibility_ranges_enforce_closed_open_boundaries(self) -> None:
+    def test_declared_compatibility_ranges_enforce_floor_and_flag_newer(self) -> None:
         cases = {
             "claude": ("2.1.219", "2.1.220", "2.1.222", "2.2.0"),
             "codex": ("0.144.999", "0.145.0", "0.146.1", "0.147.0"),
@@ -696,11 +696,10 @@ class ConversationAdapterTest(unittest.TestCase):
                     rf"{harness} {re.escape(below)} is older than required {re.escape(lower)}",
                 ):
                     adapter._probe_result(below)
-                with self.assertRaisesRegex(
-                    AdapterError,
-                    rf"{harness} {re.escape(upper)} is outside supported range",
-                ):
-                    adapter._probe_result(upper)
+                upper_result = adapter._probe_result(upper)
+                self.assertEqual(upper_result.version, upper)
+                self.assertEqual(upper_result.compatibility, "newer-unverified")
+                self.assertEqual(upper_result.maximum_version_exclusive, upper)
 
     def test_verified_probe_result_names_missing_manifest_keys(self) -> None:
         adapter, _native = self.build("claude")
