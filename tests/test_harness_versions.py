@@ -51,6 +51,27 @@ def test_runtime_binary_version_is_checked_against_adapter_range() -> None:
         }
 
 
+def test_newer_runtime_is_reported_without_becoming_an_error() -> None:
+    with (
+        mock.patch.object(harness_versions, "HARNESSES", ("codex",)),
+        mock.patch.object(
+            harness_versions,
+            "probe",
+            return_value="codex-cli 0.147.0",
+        ),
+    ):
+        assert harness_versions.compatibility_status() == {
+            "codex": {
+                "version": "0.147.0",
+                "compatibility": "newer-unverified",
+                "minimum_version": "0.145.0",
+                "maximum_version_exclusive": "0.147.0",
+                "verified_version": "0.145.0",
+                "error": None,
+            }
+        }
+
+
 def test_text_status_couples_host_provenance_and_compatibility() -> None:
     output = io.StringIO()
     with (
@@ -63,6 +84,28 @@ def test_text_status_couples_host_provenance_and_compatibility() -> None:
     assert output.getvalue().splitlines() == [
         "  runtime:   host",
         "  codex     0.145.0 · verified · supported [0.145.0, 0.147.0)",
+    ]
+
+
+def test_text_status_marks_newer_runtime_as_unverified() -> None:
+    status = {
+        "codex": {
+            **STATUS["codex"],
+            "version": "0.147.0",
+            "compatibility": "newer-unverified",
+        }
+    }
+    output = io.StringIO()
+    with (
+        mock.patch.object(harness_versions, "compatibility_status", return_value=status),
+        mock.patch.dict(os.environ, {}, clear=True),
+        redirect_stdout(output),
+    ):
+        assert harness_versions.main([]) == 0
+
+    assert output.getvalue().splitlines() == [
+        "  runtime:   host",
+        "  codex     0.147.0 · newer-unverified · tested [0.145.0, 0.147.0)",
     ]
 
 

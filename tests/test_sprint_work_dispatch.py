@@ -23,6 +23,7 @@ import sprint_domain
 import sprint_message_delivery as delivery
 import sprint_runtime
 from conversation_adapters import AdapterError
+from conversation_adapters.base import AdapterCapabilities, checked_probe_result
 
 
 def apply_schema(con: sqlite3.Connection) -> None:
@@ -290,13 +291,58 @@ class DispatchGateTest(SprintWorkDispatchCase):
         self.assertIsInstance(caught.exception, sprint_domain.SprintPreflightError)
         self.assert_arm_left_no_writes()
 
-    def test_arm_rejects_out_of_range_harness_before_any_write(self) -> None:
+    def test_arm_allows_newer_unverified_harness(self) -> None:
+        self.create_unit(developer=1)
+        observed: list[tuple[str, str]] = []
+        capabilities = AdapterCapabilities(
+            exact_session_resume=True,
+            structured_streaming=True,
+            interruption=True,
+            interactive_permission_response=True,
+            server_backed=True,
+            session_inspection=True,
+        )
+        manifest = {
+            "conversation": {
+                "minimum_cli_version": "1.0.0",
+                "maximum_cli_version_exclusive": "2.0.0",
+                "verified_cli_version": "1.5.0",
+            }
+        }
+
+        def newer(harness: str):
+            result = checked_probe_result(
+                harness=harness,
+                manifest=manifest,
+                capabilities=capabilities,
+                version="2.0.0",
+            )
+            observed.append((harness, result.compatibility))
+            return result
+
+        sprint_domain.SprintLifecycleStore(
+            self.con, probe_harness=newer
+        ).arm(self.sprint_id, 3)
+
+        self.assertEqual(
+            [("codex", "newer-unverified"), ("kimi", "newer-unverified")],
+            observed,
+        )
+        self.assertEqual(
+            "armed",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+
+    def test_arm_rejects_too_old_harness_before_any_write(self) -> None:
         self.create_unit(developer=1)
 
-        def unsupported(harness: str):
+        def too_old(harness: str):
             raise AdapterError(
                 "HARNESS_VERSION_UNSUPPORTED",
-                f"{harness} 99.0.0 is outside supported range [1.0.0, 2.0.0)",
+                f"{harness} 0.9.0 is older than required 1.0.0",
             )
 
         with self.assertRaisesRegex(
@@ -304,7 +350,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
             "HARNESS_VERSION_UNSUPPORTED",
         ) as caught:
             sprint_domain.SprintLifecycleStore(
-                self.con, probe_harness=unsupported
+                self.con, probe_harness=too_old
             ).arm(self.sprint_id, 3)
 
         self.assertIsInstance(caught.exception, sprint_domain.SprintPreflightError)

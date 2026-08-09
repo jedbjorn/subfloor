@@ -126,12 +126,17 @@ def checked_probe_result(
             "HARNESS_VERSION_UNSUPPORTED",
             f"{harness} {version} is older than required {minimum}",
         )
-    if version_tuple(version) >= version_tuple(maximum):
-        raise AdapterError(
-            "HARNESS_VERSION_UNSUPPORTED",
-            f"{harness} {version} is outside supported range "
-            f"[{minimum}, {maximum})",
-        )
+    # The minimum is a capability floor: older releases are known not to
+    # satisfy this adapter contract.  The maximum is only the edge of the
+    # tested envelope.  Vendor releases newer than that envelope must stay
+    # visible without globally locking otherwise valid engine actions; actual
+    # protocol incompatibilities still fail at the operation that observes
+    # them.
+    compatibility_status = (
+        "newer-unverified"
+        if version_tuple(version) >= version_tuple(maximum)
+        else ("verified" if version == verified else "supported")
+    )
     return ProbeResult(
         harness=harness,
         version=version,
@@ -139,7 +144,7 @@ def checked_probe_result(
         capabilities=capabilities,
         maximum_version_exclusive=maximum,
         verified_version=verified,
-        compatibility=("verified" if version == verified else "supported"),
+        compatibility=compatibility_status,
     )
 
 
