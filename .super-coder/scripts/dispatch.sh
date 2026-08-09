@@ -1232,7 +1232,7 @@ case "$cmd" in
       -p "127.0.0.1:$p:$p" \
       -p "127.0.0.1:$dp:$dp" \
       SC_DEVKIT_MOUNTS \
-      "$IMG" ./sc serve --port "$p" >/dev/null || provision_rc=$?
+      "$IMG" ./sc serve --port "$p" || provision_rc=$?
     if [ "$provision_rc" -ne 0 ]; then
       echo "✗ fork provisioning failed; retained sandbox '$CNAME' and local evidence." >&2
       echo "  retry:  ./sc launch --no-build" >&2

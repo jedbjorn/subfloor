@@ -258,7 +258,9 @@ class SupervisionFixture:
                   if [ -n "${SC_TEST_PROVISION_FAIL:-}" ]; then
                     echo provision-failed >&2
                     exit "$SC_TEST_PROVISION_FAIL"
-                  fi ;;
+                  fi
+                  [ -z "${SC_TEST_PROVISION_OUTPUT:-}" ] ||
+                    printf '%s\\n' "$SC_TEST_PROVISION_OUTPUT" ;;
               esac
               exit 0
             fi
@@ -362,6 +364,8 @@ class RestrictedLaunchTests(unittest.TestCase):
     def test_launch_no_build_reuses_existing_image_without_buildx(self):
         result = self.fx.run("launch", "--no-build")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dev-kit provisioning: not declared", result.stdout)
+        self.assertNotIn("container-1", result.stdout)
         calls = self.fx.calls()
         image_inspects = [
             line for line in calls if line.startswith("docker image inspect ")
@@ -376,6 +380,17 @@ class RestrictedLaunchTests(unittest.TestCase):
         )
         self.assertIn(" --init ", sandbox_run)
         self.assertFalse(any(line.startswith("docker build ") for line in calls))
+
+    def test_successful_provision_reports_hook_output_and_ready_state(self):
+        self.fx.configure_provision()
+        self.fx.env["SC_TEST_PROVISION_OUTPUT"] = "dependencies installed"
+
+        result = self.fx.run("launch", "--no-build")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dependencies installed", result.stdout)
+        self.assertIn("dev-kit provisioning: ready", result.stdout)
+        self.assertNotIn("container-1", result.stdout)
 
     def test_launch_no_build_missing_image_refuses_before_runtime_change(self):
         self.fx.env["SC_TEST_IMAGE"] = "missing"

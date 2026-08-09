@@ -497,7 +497,9 @@ def docker_run(
         *mount_arguments,
         *arguments[marker + 1 :],
     )
-    _run(command, runner=runner)
+    # `docker run -d` prints only the container ID.  Suppress that transport
+    # detail here so callers can leave provisioning output visible.
+    _run(command, runner=runner, capture=True)
 
 
 def _utc_now() -> str:
