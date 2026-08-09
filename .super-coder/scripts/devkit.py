@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ from typing import Any
 
 DECLARATION_PATH = Path(".subfloor/dev-kit.json")
 HOOK_NAMES = frozenset(("deps", "test", "lint", "typecheck"))
+MOUNT_NAME = re.compile(r"\A[a-z0-9][a-z0-9_-]{0,47}\Z")
 
 
 class DevkitConfigError(RuntimeError):
@@ -217,12 +219,45 @@ def _sandbox(checkout: Path, value: Any) -> Sandbox:
         mount = _object(mount_value, mount_field)
         _keys(mount, mount_field, allowed=("name", "target"), required=("name", "target"))
         name = _string(mount["name"], f"{mount_field}.name")
+        if not MOUNT_NAME.fullmatch(name):
+            raise _error(
+                f"{mount_field}.name",
+                "must be 1-48 lowercase letters, digits, underscores, or hyphens",
+            )
         if name in names:
             raise _error(f"{mount_field}.name", f"duplicate mount name {name!r}")
         names.add(name)
         target_declared, target = _repo_path(
             checkout, mount["target"], f"{mount_field}.target"
         )
+        if target.exists() and not target.is_dir():
+            raise _error(f"{mount_field}.target", "must resolve to a directory")
+        protected = (
+            checkout / ".git",
+            checkout / ".super-coder",
+            checkout / ".sc-state",
+            checkout / DECLARATION_PATH,
+        )
+        if any(
+            target == path
+            or target in path.parents
+            or path in target.parents
+            for path in protected
+        ):
+            raise _error(
+                f"{mount_field}.target",
+                "must not overlap Git metadata, engine state, or the declaration",
+            )
+        for prior in mounts:
+            if (
+                target == prior.target
+                or target in prior.target.parents
+                or prior.target in target.parents
+            ):
+                raise _error(
+                    f"{mount_field}.target",
+                    f"must not overlap mount target {prior.target_declared!r}",
+                )
         mounts.append(SandboxMount(name, target_declared, target))
     return Sandbox(
         dockerfile_declared,

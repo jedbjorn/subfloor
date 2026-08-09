@@ -20,6 +20,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -106,6 +107,16 @@ class EnterPreAttachPrintTest(unittest.TestCase):
     def setUp(self):
         self.bin = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.bin)
+        # These tests exercise URL ordering and attach dispatch, not the
+        # provisioning contract.  The launcher resolves helpers from the live
+        # main checkout even when SC_DISPATCH points at this worktree, so keep
+        # readiness at its already-satisfied seam here.
+        self._stub(
+            "python3",
+            "#!/bin/sh\n"
+            "case \"$*\" in *sandbox_devkit.py*) exit 0 ;; esac\n"
+            f"exec {sys.executable} \"$@\"\n",
+        )
         self._stub(
             "docker",
             "#!/bin/sh\n"
@@ -115,8 +126,11 @@ class EnterPreAttachPrintTest(unittest.TestCase):
         # A python that runs everything except ports.py — the one seam whose
         # failure must not decide whether the operator gets a shell.
         self._stub("no-ports-python",
-                   "#!/bin/sh\ncase \"$*\" in *ports.py*) exit 1 ;; esac\n"
-                   "exec python3 \"$@\"\n")
+                   "#!/bin/sh\ncase \"$*\" in\n"
+                   "  *ports.py*) exit 1 ;;\n"
+                   "  *sandbox_devkit.py*) exit 0 ;;\n"
+                   "esac\n"
+                   f"exec {sys.executable} \"$@\"\n")
 
     def _stub(self, name: str, body: str) -> Path:
         path = self.bin / name

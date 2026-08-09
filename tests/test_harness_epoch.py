@@ -17,7 +17,9 @@ guaranteed rather than left to docker's arg-cache heuristics.
 """
 from __future__ import annotations
 
+import json
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -195,6 +197,7 @@ class ScFixture:
         self.fakebin = Path(self._tmp.name) / "bin"
         self.log = Path(self._tmp.name) / "calls.log"
         self.epoch_file = Path(self._tmp.name) / "state" / "harness-epoch"
+        self.image_state = Path(self._tmp.name) / "image.json"
         self.scripts.mkdir(parents=True)
         self.fakebin.mkdir()
         self.log.touch()
@@ -210,10 +213,14 @@ class ScFixture:
             "ports.py",
             "artifact_policy.py",
             "harness_versions.py",
+            "devkit.py",
+            "sandbox_devkit.py",
             "cli_entry.py",
         ):
             shutil.copy2(ENGINE / "scripts" / script, self.scripts / script)
         (self.engine / "Dockerfile").write_text("FROM scratch\n")
+        (self.root / ".sc-state").mkdir()
+        (self.root / ".sc-state" / "engine.ref").write_text("a" * 40 + "\n")
         self._write_fake_docker()
         # Stub curl too. The no-docker branch of update-harnesses runs the real
         # vendor installers; a regression that took that branch under docker
@@ -236,8 +243,24 @@ class ScFixture:
             "SC_TEST_LOG": str(self.log),
             "SC_TEST_LABEL": "",
             "SC_TEST_RUNNING": "1",
+            "SC_TEST_IMAGE_STATE": str(self.image_state),
             "NO_COLOR": "1",
         })
+        from sandbox_devkit import image_plan  # noqa: PLC0415
+
+        plan = image_plan(
+            self.root,
+            self.engine,
+            "0",
+            user=pwd.getpwuid(os.getuid()).pw_name,
+            uid=str(os.getuid()),
+            gid=str(os.getgid()),
+        )
+        self.image_state.parent.mkdir(parents=True, exist_ok=True)
+        self.image_state.write_text(json.dumps([{
+            "Id": "sha256:" + "b" * 64,
+            "Config": {"Labels": plan.runtime_labels},
+        }]))
 
     def close(self) -> None:
         self._tmp.cleanup()
@@ -257,8 +280,34 @@ class ScFixture:
             printf '\\n' >> "$SC_TEST_LOG"
             case "$1" in
               info) exit 0 ;;
-              build) exit 0 ;;
-              image) printf '%s\\n' "$SC_TEST_LABEL"; exit 0 ;;
+              build)
+                labels="$SC_TEST_IMAGE_STATE.labels"
+                : > "$labels"
+                while [ "$#" -gt 0 ]; do
+                  if [ "$1" = --label ]; then
+                    printf '%s\\n' "$2" >> "$labels"
+                    shift 2
+                  else
+                    shift
+                  fi
+                done
+                printf '[{"Id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","Config":{"Labels":{' > "$SC_TEST_IMAGE_STATE"
+                first=1
+                while IFS= read -r label; do
+                  key="${label%%=*}"
+                  value="${label#*=}"
+                  [ "$first" -eq 1 ] || printf ',' >> "$SC_TEST_IMAGE_STATE"
+                  printf '"%s":"%s"' "$key" "$value" >> "$SC_TEST_IMAGE_STATE"
+                  first=0
+                done < "$labels"
+                printf '}}}]' >> "$SC_TEST_IMAGE_STATE"
+                exit 0 ;;
+              image)
+                case " $* " in
+                  *" --format "*) printf '%s\\n' "$SC_TEST_LABEL" ;;
+                  *) cat "$SC_TEST_IMAGE_STATE" ;;
+                esac
+                exit 0 ;;
               inspect) [ -n "$SC_TEST_RUNNING" ] && echo true || echo false; exit 0 ;;
               exec)
                 # `docker exec <name> claude --version` — the launch banner probe.

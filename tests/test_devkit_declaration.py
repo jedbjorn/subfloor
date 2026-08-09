@@ -176,6 +176,79 @@ class DeclarationTest(unittest.TestCase):
         self.assertEqual(declaration.sandbox.context, dockerfile.parent.resolve())
         self.assertEqual(declaration.sandbox.mounts[0].target, (self.root / ".venv").resolve())
 
+    def test_sandbox_mount_names_are_bounded_safe_identifiers(self):
+        dockerfile = self.root / ".subfloor" / "Dockerfile"
+        dockerfile.write_text("FROM scratch\n")
+        for name in ("Upper", "with.dot", "-leading", "x" * 49, "two words"):
+            with self.subTest(name=name):
+                self.assert_invalid(
+                    {
+                        "version": 1,
+                        "sandbox": {
+                            "dockerfile": ".subfloor/Dockerfile",
+                            "mounts": [{"name": name, "target": ".venv"}],
+                        },
+                    },
+                    r"\$\.sandbox\.mounts\[0\]\.name",
+                )
+
+    def test_sandbox_mounts_reject_protected_file_and_overlapping_targets(self):
+        dockerfile = self.root / ".subfloor" / "Dockerfile"
+        dockerfile.write_text("FROM scratch\n")
+        (self.root / "file-target").write_text("not a directory")
+        protected = (".", ".git", ".super-coder/cache", ".sc-state/cache", ".subfloor")
+        for target in (*protected, "file-target"):
+            with self.subTest(target=target):
+                self.assert_invalid(
+                    {
+                        "version": 1,
+                        "sandbox": {
+                            "dockerfile": ".subfloor/Dockerfile",
+                            "mounts": [{"name": "cache", "target": target}],
+                        },
+                    },
+                    r"\$\.sandbox\.mounts\[0\]\.target",
+                )
+        self.assert_invalid(
+            {
+                "version": 1,
+                "sandbox": {
+                    "dockerfile": ".subfloor/Dockerfile",
+                    "mounts": [
+                        {"name": "cache", "target": "build"},
+                        {"name": "nested", "target": "build/nested"},
+                    ],
+                },
+            },
+            r"must not overlap mount target 'build'",
+        )
+
+    def test_sandbox_dockerfile_context_and_mount_cannot_escape_by_symlink(self):
+        outside = Path(self.temp.name) / "outside-sandbox"
+        outside.mkdir()
+        (outside / "Dockerfile").write_text("FROM scratch\n")
+        (self.root / "escape-sandbox").symlink_to(outside, target_is_directory=True)
+        cases = (
+            {
+                "dockerfile": "escape-sandbox/Dockerfile",
+            },
+            {
+                "dockerfile": ".subfloor/Dockerfile",
+                "context": "escape-sandbox",
+            },
+            {
+                "dockerfile": ".subfloor/Dockerfile",
+                "mounts": [{"name": "cache", "target": "escape-sandbox/cache"}],
+            },
+        )
+        (self.root / ".subfloor" / "Dockerfile").write_text("FROM scratch\n")
+        for sandbox in cases:
+            with self.subTest(sandbox=sandbox):
+                self.assert_invalid(
+                    {"version": 1, "sandbox": sandbox},
+                    r"must stay inside the invoking checkout",
+                )
+
     def test_canonical_json_is_stable_across_key_order(self):
         first = {"version": 1, "hooks": {"test": {"cwd": ".", "argv": ["tool"]}}}
         second = {"hooks": {"test": {"argv": ["tool"], "cwd": "."}}, "version": 1}

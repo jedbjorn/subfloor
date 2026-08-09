@@ -1200,6 +1200,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
                            work_repo_note=work_repo_note,
                            source_mode=install.is_source_repo(),
                            devkit_declared=(work_dir / ".subfloor" / "dev-kit.json").is_file(),
+                           devkit_repair=bool(os.environ.get("SC_DEVKIT_REPAIR")),
                            api_key=full["api_key"],
                            api_port=api_port,
                            launch_mode=execution_mode())
@@ -1632,6 +1633,7 @@ def main() -> None:
                                work_repo_note=work_repo_note,
                                source_mode=install.is_source_repo(),
                                devkit_declared=(work_dir / ".subfloor" / "dev-kit.json").is_file(),
+                               devkit_repair=bool(os.environ.get("SC_DEVKIT_REPAIR")),
                                api_key=full["api_key"],
                                api_port=api_port,
                                launch_mode=execution_mode())
