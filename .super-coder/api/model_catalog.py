@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import toml_compat
+import harness_versions
 from conversation_adapters.opencode import (
     connected_models as opencode_connected_models,
 )
@@ -71,7 +72,7 @@ CLAUDE_ALIASES = ["fable", "opus", "sonnet", "haiku"]
 # Bump when the response/cache shape changes — a cached payload from another
 # version is ignored (treated as no cache) instead of being served to a
 # client that expects the new shape.
-PAYLOAD_VERSION = 4
+PAYLOAD_VERSION = 5
 
 # provider APIs, keyed by harness: (env var, url, header builder). Responses
 # are the OpenAI-style {"data": [{"id": ...}, ...]} shape on all three.
@@ -391,6 +392,128 @@ def persist_routes(con, payload: dict) -> None:
     con.commit()
 
 
+def _requires_high_effort(harness: str) -> bool:
+    """Match run.py: high is implicit only when the adapter transports it."""
+    try:
+        cfg = json.loads((ADAPTERS / harness / "adapter.json").read_text())
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(((cfg.get("headless") or {}).get("effort")))
+
+
+def _default_route_verification(con, harnesses: dict[str, dict]) -> list[dict]:
+    """Validate every configured flavor route against this fork's live rows."""
+    defaults = []
+    for configured in con.execute(
+        "SELECT flavor,harness,model,is_default FROM flavor_defaults "
+        "ORDER BY flavor,harness"
+    ):
+        flavor = configured["flavor"]
+        harness = configured["harness"]
+        model = configured["model"]
+        status = harnesses.get(harness) or {}
+        harness_error = status.get("error")
+        if status.get("version") is None:
+            harness_error = harness_error or "HARNESS_UNAVAILABLE"
+
+        route = None
+        if model is not None:
+            found = con.execute(
+                "SELECT availability,headless_supported,"
+                "high_effort_supported,stale,last_error FROM model_routes "
+                "WHERE harness=? AND selector=?",
+                (harness, model),
+            ).fetchone()
+            route = dict(found) if found is not None else None
+
+        runnable: bool | None = False
+        if harness_error:
+            state = "harness-error"
+            reason = harness_error
+        elif model is None:
+            state = "harness-default"
+            runnable = None
+            reason = "model selected by harness at launch"
+        elif route is None:
+            state = "route-missing"
+            reason = "exact model route was not discovered locally"
+        elif route["stale"]:
+            state = "route-stale"
+            reason = route["last_error"] or "last-known route is stale"
+        elif route["availability"] != "available":
+            state = "route-unavailable"
+            reason = f"route is {route['availability']}, not locally available"
+        elif not route["headless_supported"]:
+            state = "headless-unsupported"
+            reason = "harness has no headless launch seam"
+        elif _requires_high_effort(harness) and not route["high_effort_supported"]:
+            state = "effort-unsupported"
+            reason = "default high-effort route was not locally verified"
+        else:
+            state = "runnable"
+            runnable = True
+            reason = None
+
+        defaults.append({
+            "flavor": flavor,
+            "harness": harness,
+            "model": model,
+            "is_default": bool(configured["is_default"]),
+            "state": state,
+            "runnable": runnable,
+            "reason": reason,
+        })
+    return defaults
+
+
+def runtime_verification(con, *, env=os.environ,
+                         harness_probe=harness_versions.compatibility_status) -> dict:
+    """Fork-local harness and configured-route evidence for one refresh."""
+    checked_at = datetime.now(timezone.utc).isoformat()
+    report = {
+        "checked_at": checked_at,
+        "runtime": "sandbox" if env.get("SC_SANDBOX") else "host",
+        "harnesses": {},
+        "defaults": [],
+        "summary": {
+            "harnesses_checked": 0,
+            "harnesses_ready": 0,
+            "exact_routes": 0,
+            "exact_routes_runnable": 0,
+            "harness_defaults": 0,
+        },
+    }
+    try:
+        harnesses = harness_probe()
+    except Exception as exc:  # noqa: BLE001
+        report["error"] = str(exc)
+        return report
+
+    report["harnesses"] = harnesses
+    report["summary"]["harnesses_checked"] = len(harnesses)
+    report["summary"]["harnesses_ready"] = sum(
+        1 for status in harnesses.values()
+        if status.get("version") is not None and not status.get("error")
+    )
+    try:
+        defaults = _default_route_verification(con, harnesses)
+    except Exception as exc:  # noqa: BLE001
+        report["route_error"] = str(exc)
+        return report
+
+    report["defaults"] = defaults
+    report["summary"]["exact_routes"] = sum(
+        1 for route in defaults if route["model"] is not None
+    )
+    report["summary"]["exact_routes_runnable"] = sum(
+        1 for route in defaults if route["runnable"] is True
+    )
+    report["summary"]["harness_defaults"] = sum(
+        1 for route in defaults if route["state"] == "harness-default"
+    )
+    return report
+
+
 def _served(payload: dict, con=None) -> dict:
     if con is not None:
         persist_routes(con, payload)
@@ -437,7 +560,8 @@ def _with_live_opencode(payload: dict, provider_models) -> dict:
 
 def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             run=subprocess.run, con=None,
-            opencode_provider=opencode_connected_models) -> dict:
+            opencode_provider=opencode_connected_models,
+            harness_probe=harness_versions.compatibility_status) -> dict:
     """The cached-with-fallbacks entry point the API serves.
 
     fresh cache → serve it; miss/stale/refresh → live sweep, cache the result;
@@ -451,17 +575,44 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
         fresh = build(fetch, env, run)
     except Exception as e:  # noqa: BLE001
         if cached:
-            return _served(_with_live_opencode(
+            response = _served(_with_live_opencode(
                 {**cached, "stale": True, "error": str(e)},
                 opencode_provider,
             ), con)
-        return _served(_with_live_opencode(
-            {"v": PAYLOAD_VERSION, "fetched_at": None,
-             "sources": ["static"], "stale": True,
-             "error": str(e), "harnesses": _floor()},
-            opencode_provider,
+            if refresh and con is not None:
+                verification = runtime_verification(
+                    con, env=env, harness_probe=harness_probe
+                )
+                response["verification"] = verification
+                CACHE.write_text(json.dumps(
+                    {**cached, "verification": verification}, indent=1
+                ) + "\n")
+            return response
+        fallback = {
+            "v": PAYLOAD_VERSION, "fetched_at": None,
+            "sources": ["static"], "stale": True,
+            "error": str(e), "harnesses": _floor(),
+        }
+        response = _served(_with_live_opencode(
+            fallback, opencode_provider,
         ), con)
+        if refresh and con is not None:
+            verification = runtime_verification(
+                con, env=env, harness_probe=harness_probe
+            )
+            fallback["verification"] = verification
+            response["verification"] = verification
+            CACHE.parent.mkdir(parents=True, exist_ok=True)
+            CACHE.write_text(json.dumps(fallback, indent=1) + "\n")
+        return response
+    response = _served(_with_live_opencode(
+        {**fresh, "stale": False}, opencode_provider), con)
+    if refresh and con is not None:
+        verification = runtime_verification(
+            con, env=env, harness_probe=harness_probe
+        )
+        fresh["verification"] = verification
+        response["verification"] = verification
     CACHE.parent.mkdir(parents=True, exist_ok=True)
     CACHE.write_text(json.dumps(fresh, indent=1) + "\n")
-    return _served(_with_live_opencode(
-        {**fresh, "stale": False}, opencode_provider), con)
+    return response

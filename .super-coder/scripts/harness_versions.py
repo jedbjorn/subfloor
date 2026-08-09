@@ -69,7 +69,7 @@ def compatibility_status() -> dict[str, dict[str, str | None]]:
                 "minimum_version": None,
                 "maximum_version_exclusive": None,
                 "verified_version": None,
-                "error": None,
+                "error": None if raw_version else "HARNESS_UNAVAILABLE",
             }
             continue
         if version is None:

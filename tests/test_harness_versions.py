@@ -72,6 +72,23 @@ def test_newer_runtime_is_reported_without_becoming_an_error() -> None:
         }
 
 
+def test_missing_non_conversation_harness_is_reported_unavailable() -> None:
+    with (
+        mock.patch.object(harness_versions, "HARNESSES", ("vibe",)),
+        mock.patch.object(harness_versions, "probe", return_value=None),
+    ):
+        assert harness_versions.compatibility_status() == {
+            "vibe": {
+                "version": None,
+                "compatibility": None,
+                "minimum_version": None,
+                "maximum_version_exclusive": None,
+                "verified_version": None,
+                "error": "HARNESS_UNAVAILABLE",
+            }
+        }
+
+
 def test_text_status_couples_host_provenance_and_compatibility() -> None:
     output = io.StringIO()
     with (
