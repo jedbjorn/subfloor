@@ -40,6 +40,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import db_backup
 import engine_manifest
 import install
+import sc_wrapper
 
 BACKUP_IGNORE = "/.sc-state/db_backups/"
 BACKUP_IGNORE_COMMENT = "# subfloor removal backup — preserved after make dos-remove"
@@ -636,6 +637,12 @@ def main(argv: list[str]) -> int:
             raise RemoveError(
                 "teardown incomplete; remaining surfaces: " + ", ".join(remaining)
             )
+
+        try:
+            wrapper_result = sc_wrapper.unregister_install(repo_root)
+        except sc_wrapper.WrapperError as exc:
+            raise RemoveError(str(exc)) from exc
+        print(f"→ managed host sc wrapper: {wrapper_result}")
 
         data["status"] = "removed"
         write_manifest(manifest_path, data)

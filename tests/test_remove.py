@@ -108,6 +108,11 @@ class RemoveFixture(unittest.TestCase):
             mock.patch.object(remove_mod, "managed_worktrees", return_value=[]),
             mock.patch.object(remove_mod, "engine_drift", return_value=({}, [])),
             mock.patch.object(remove_mod, "quiesce_runtime"),
+            mock.patch.object(
+                remove_mod.sc_wrapper,
+                "unregister_install",
+                return_value="removed fixture registration",
+            ),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -183,6 +188,7 @@ class EndToEndRemoveTest(RemoveFixture):
         self.assertNotEqual(hooks.returncode, 0)
         self.assertNotIn("super-coder", git(self.repo, "remote").stdout.splitlines())
         self.assertIn("mirror", git(self.repo, "remote").stdout.splitlines())
+        remove_mod.sc_wrapper.unregister_install.assert_called_once_with(self.repo)
 
     def test_no_database_is_reported_truthfully(self) -> None:
         self.writer.close()

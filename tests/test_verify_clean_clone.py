@@ -40,6 +40,14 @@ class VerifyCleanCloneTest(unittest.TestCase):
                 checkout / ".super-coder" / "scripts" / "run.py",
             )
             shutil.copy2(
+                ROOT / ".super-coder" / "scripts" / "git_freshness.py",
+                checkout / ".super-coder" / "scripts" / "git_freshness.py",
+            )
+            shutil.copy2(
+                ROOT / ".super-coder" / "render" / "compose.py",
+                checkout / ".super-coder" / "render" / "compose.py",
+            )
+            shutil.copy2(
                 ROOT / ".super-coder" / "scripts" / "global_pointer.py",
                 checkout / ".super-coder" / "scripts" / "global_pointer.py",
             )

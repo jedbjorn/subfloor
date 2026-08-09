@@ -109,10 +109,19 @@ RUN printf '%s\n' \
       '# Durable bare `sc` (baked in the sandbox image — see Dockerfile). Resolves the' \
       '# checkout from the caller cwd via git and execs its tracked ./sc. Never uses' \
       '# $0 or inherited env, so it survives whatever shell a harness spawns.' \
-      'top=$(git rev-parse --show-toplevel 2>/dev/null || true)' \
-      '[ -n "$top" ] && [ -x "$top/sc" ] && exec "$top/sc" "$@"' \
-      '[ -n "$SC_ROOT" ] && [ -x "$SC_ROOT/sc" ] && exec "$SC_ROOT/sc" "$@"' \
-      'echo "sc: not in a super-coder checkout (no ./sc via git toplevel or SC_ROOT)" >&2' \
+      'top=$(git rev-parse --show-toplevel 2>/dev/null) || {' \
+      '  echo "sc: current directory is not inside a Git checkout; use ./sc from a subfloor checkout" >&2' \
+      '  exit 127' \
+      '}' \
+      'git -C "$top" ls-files --error-unmatch -- sc >/dev/null 2>&1 || {' \
+      '  echo "sc: Git checkout has no tracked sc launcher: $top/sc; use ./sc after installing subfloor in this checkout" >&2' \
+      '  exit 127' \
+      '}' \
+      '[ -x "$top/sc" ] || {' \
+      '  echo "sc: tracked launcher is not executable: $top/sc; repair it, then use ./sc" >&2' \
+      '  exit 127' \
+      '}' \
+      'exec "$top/sc" "$@"' \
       'exit 127' \
       > /usr/local/bin/sc \
  && chmod 0755 /usr/local/bin/sc

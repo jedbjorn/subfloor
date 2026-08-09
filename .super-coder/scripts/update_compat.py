@@ -17,10 +17,13 @@ projection code even when the parent updater was already loaded.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 from pathlib import Path
+
+import sc_wrapper
 
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
@@ -52,6 +55,25 @@ def _current_update_ref() -> str | None:
     return _pending_update_ref() or _read_ref(ENGINE_REF)
 
 
+def _installed_repo() -> bool:
+    try:
+        data = json.loads((ENGINE / "instance.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(data.get("installed_at"))
+
+
+def reconcile_host_wrapper() -> None:
+    """Adopt the host wrapper even on the first update to this engine floor."""
+    if not _installed_repo():
+        return
+    try:
+        result = sc_wrapper.register_install(REPO_ROOT)
+    except sc_wrapper.WrapperError as exc:
+        raise SystemExit(f"update compatibility: {exc}") from exc
+    print(f"→ managed host sc wrapper: {result}")
+
+
 def _ref_contains_bridge(ref: str) -> bool:
     return subprocess.run(
         ["git", "-C", str(REPO_ROOT), "cat-file", "-e", f"{ref}:{BRIDGE_PATH}"],
@@ -75,6 +97,7 @@ def needs_legacy_bridge() -> tuple[bool, str | None]:
 
 
 def main() -> int:
+    reconcile_host_wrapper()
     pending = _pending_update_ref()
     current = _current_update_ref()
     if current is not None:

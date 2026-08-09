@@ -13,6 +13,8 @@ Run:
 """
 from __future__ import annotations
 
+import ast
+import inspect
 import os
 import subprocess
 import sys
@@ -83,12 +85,14 @@ class WorktreeSyncTest(unittest.TestCase):
 
     def test_in_sync_reports_clean(self) -> None:
         note = sync_worktree(self.wt, "DEV1")
-        self.assertIn("in sync", note)
+        self.assertIn("current", note)
+        self.assertIn("remote verified", note)
 
     def test_behind_and_clean_auto_syncs(self) -> None:
         tip = self.advance_origin()
         note = sync_worktree(self.wt, "DEV1")
-        self.assertIn("auto-synced", note)
+        self.assertIn("auto_advanced", note)
+        self.assertIn("auto-advanced", note)
         self.assertEqual(head(self.wt), tip)
         # Still on the base branch, not detached.
         self.assertEqual(git(self.wt, "symbolic-ref", "--short", "HEAD"),
@@ -99,8 +103,8 @@ class WorktreeSyncTest(unittest.TestCase):
         (self.wt / "f.txt").write_text("local edit\n")
         before = head(self.wt)
         note = sync_worktree(self.wt, "DEV1")
-        self.assertIn("NOT auto-synced", note)
-        self.assertIn("uncommitted changes", note)
+        self.assertIn("preserved", note)
+        self.assertIn("dirty state", note)
         self.assertEqual(head(self.wt), before)
         self.assertEqual((self.wt / "f.txt").read_text(), "local edit\n")
 
@@ -111,8 +115,8 @@ class WorktreeSyncTest(unittest.TestCase):
         git(self.wt, "commit", "-qm", "local work")
         before = head(self.wt)
         note = sync_worktree(self.wt, "DEV1")
-        self.assertIn("NOT auto-synced", note)
-        self.assertIn("unmerged local commit", note)
+        self.assertIn("preserved", note)
+        self.assertIn("local-only commits", note)
         self.assertEqual(head(self.wt), before)
 
     def test_feature_branch_left_alone(self) -> None:
@@ -120,22 +124,75 @@ class WorktreeSyncTest(unittest.TestCase):
         self.advance_origin()
         before = head(self.wt)
         note = sync_worktree(self.wt, "DEV1")
-        self.assertIn("mid-work on `feat/x`", note)
+        self.assertIn("active_branch", note)
+        self.assertIn("branch `feat/x`", note)
         self.assertEqual(head(self.wt), before)
         self.assertEqual(git(self.wt, "symbolic-ref", "--short", "HEAD"), "feat/x")
 
     def test_no_remote_soft_fails(self) -> None:
         git(self.repo, "remote", "remove", "origin")
         note = sync_worktree(self.wt, "DEV1")
-        self.assertIn("drift check skipped", note)
+        self.assertIn("freshness unverified", note)
+        self.assertIn("ahead/behind unknown", note)
 
     def test_in_sync_with_local_commits_notes_them(self) -> None:
         (self.wt / "mine.txt").write_text("x\n")
         git(self.wt, "add", "mine.txt")
         git(self.wt, "commit", "-qm", "local work")
         note = sync_worktree(self.wt, "DEV1")
-        self.assertIn("in sync", note)
-        self.assertIn("unmerged local commit", note)
+        self.assertIn("preserved", note)
+        self.assertIn("local-only commits", note)
+
+    def test_reviewer_exact_head_is_never_advanced(self) -> None:
+        self.advance_origin()
+        before = head(self.wt)
+
+        note = sync_worktree(self.wt, "DEV1", "reviewer")
+
+        self.assertIn("reviewer_exact_head", note)
+        self.assertIn("reviewer head pinned", note)
+        self.assertEqual(head(self.wt), before)
+
+    def test_declared_work_repo_is_not_substituted_by_local_only_substrate(self) -> None:
+        substrate = Path(self.tmp.name) / "substrate"
+        substrate.mkdir()
+        git(substrate, "init", "-q", "-b", "main")
+        (substrate / "home.txt").write_text("home\n")
+        git(substrate, "add", "home.txt")
+        git(substrate, "commit", "-qm", "home")
+        self.advance_origin()
+
+        with mock.patch.object(run_mod.install, "work_repo", return_value=str(self.repo)):
+            floor = run_mod.main_checkout_note(substrate)
+            work = run_mod.declared_work_repo_note(substrate)
+
+        self.assertIn(f"live_engine_checkout: `{substrate.resolve()}`", floor)
+        self.assertIn("remote unverified", floor)
+        self.assertIn(f"shared_work_repo: `{self.repo.resolve()}`", work)
+        self.assertIn("remote verified", work)
+        self.assertIn("behind 1", work)
+        self.assertNotIn(str(substrate.resolve()), work)
+
+
+class LaunchPathFreshnessWiringTest(unittest.TestCase):
+    def test_interactive_headless_and_interface_compositions_receive_work_repo(self) -> None:
+        tree = ast.parse(inspect.getsource(run_mod))
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "compose_boot"
+        ]
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertIn("work_repo_note", {item.arg for item in call.keywords})
+
+        self.assertIn("declared_work_repo_note", inspect.getsource(run_mod.main))
+        self.assertIn(
+            "declared_work_repo_note",
+            inspect.getsource(run_mod.prepare_launch),
+        )
 
 
 class ShellWorkDirTest(unittest.TestCase):

@@ -900,6 +900,11 @@ def main(argv: list[str]) -> int:
         report_logins()
         return 0
 
+    # Wrapper lifecycle is install-only. Keep the import below the standalone
+    # harness/doctor exits so minimal maintenance fixtures and older engines
+    # can run those independent commands without the newly added module.
+    import sc_wrapper
+
     # 1. Guards ---------------------------------------------------------------
     if is_source_repo() and not force:
         sys.exit("install: this is the super-coder SOURCE repo — the installer is "
@@ -909,6 +914,10 @@ def main(argv: list[str]) -> int:
         sys.exit("install: this fork is already installed (.super-coder/instance.json "
                  "has installed_at). Re-installing destroys content — pass --force "
                  "to override, or just `./sc launch`.")
+    try:
+        sc_wrapper.check_install()
+    except sc_wrapper.WrapperError as exc:
+        sys.exit(f"install: {exc}")
     try:
         validate_gitignore(REPO_ROOT)
     except GitignoreError as exc:
@@ -1065,6 +1074,16 @@ def main(argv: list[str]) -> int:
     # forbids clobbering a host Makefile, not appending one non-colliding line).
     step("Wiring make aliases")
     print(f"  {wire_make_aliases()}")
+
+    # The user-local command is shared by every installed checkout. Register
+    # only after all checkout setup phases have succeeded, and revalidate the
+    # target while holding the lifecycle lock so a concurrent install/remove
+    # cannot replace or steal it between preflight and commit.
+    step("Wiring managed host sc wrapper")
+    try:
+        print(f"  {sc_wrapper.register_install(REPO_ROOT)}")
+    except sc_wrapper.WrapperError as exc:
+        sys.exit(f"install: {exc}")
 
     # Record harness + installed marker in instance.json ---------------------
     cfg = ports_mod.resolve(persist=False)
