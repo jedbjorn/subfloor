@@ -1,4 +1,0 @@
-interface:
-  display_name: "Source Maintenance"
-  short_description: "Maintain the super-coder engine source safely"
-  default_prompt: "Maintain this super-coder source repository using its bare-metal lifecycle and source-of-truth rules."
