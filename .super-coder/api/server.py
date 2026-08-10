@@ -69,7 +69,6 @@ import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
 import sprint_close  # noqa: E402  (Sprints v2 conformance + report evidence)
 import sprint_domain  # noqa: E402  (Sprints v2 work dispatch authority)
-import sprint_liveness  # noqa: E402  (Sprints v2 one-shot monitor surface)
 import sprint_message_delivery  # noqa: E402  (Sprints v2 inbox acceptance)
 import sprint_recovery  # noqa: E402  (Sprints v2 pause/resume reconciliation)
 import sprint_review_loop  # noqa: E402  (Sprints v2 Dev/Review command surface)
@@ -4379,21 +4378,14 @@ def sprint_monitor_response(
     con: sqlite3.Connection,
     sprint_id: int,
 ) -> dict[str, object]:
-    """Run one idempotent pickup/liveness evaluation without wake delivery."""
+    """Reconcile unread pickup once, then return compatible runtime projections."""
     requeued = sprint_domain.SprintLifecycleStore(con).reconcile_unread_pickup(
         sprint_id,
         trigger="monitor",
     )
-    outcomes = sprint_liveness.SprintLivenessMonitor(con).evaluate(sprint_id)
+    health = sprint_board.SprintBoardProjection(con).board(sprint_id).get("health", {})
     return {
-        "outcomes": [
-            {
-                "message_id": outcome.message_id,
-                "action": outcome.action,
-                "silence_episode": outcome.silence_episode,
-            }
-            for outcome in outcomes
-        ],
+        "outcomes": [],
         "pickup": sprint_board.pickup_projection(
             con,
             sprint_id,
@@ -4401,6 +4393,7 @@ def sprint_monitor_response(
             include_exhausted=False,
         ),
         "runtime": sprint_runtime.runtime_status(con),
+        "health": health,
     }
 
 

@@ -67,6 +67,29 @@ class SprintReviewLoopCase(SprintPRWatcherCase):
         self.deliver_message(message_id)
         self.assertEqual("accepted", self.messages.mark_read(message_id, 2))
 
+    def seed_historical_expectation(self, message_id: int) -> None:
+        message = self.con.execute(
+            "SELECT sprint_id,to_participant_id,read_at FROM wake_message "
+            "WHERE message_id=?",
+            (message_id,),
+        ).fetchone()
+        self.assertIsNotNone(message["read_at"])
+        self.con.execute(
+            "INSERT INTO sprint_liveness_expectations "
+            "(message_id,sprint_id,participant_id,accepted_at,last_strong_at,"
+            "last_strong_key,next_evaluation_at) VALUES (?,?,?,?,?,?,?)",
+            (
+                message_id,
+                message["sprint_id"],
+                message["to_participant_id"],
+                message["read_at"],
+                message["read_at"],
+                f"message.accepted:{message_id}",
+                "2999-01-01 00:00:00",
+            ),
+        )
+        self.con.commit()
+
     def approve(self, key: str = "approved-1"):
         handoff = self.request_review(f"{key}:request")
         self.accept_review(handoff.message_id)
@@ -202,14 +225,7 @@ class ReviewHandoffTest(SprintReviewLoopCase):
             "FROM sprint_liveness_expectations WHERE message_id=?",
             (assignment_message_id,),
         ).fetchone()
-        self.assertIsNotNone(assignment_expectation["resolved_at"])
-        self.assertEqual(
-            ("work_unit.in_review", None),
-            (
-                assignment_expectation["resolution"],
-                assignment_expectation["next_evaluation_at"],
-            ),
-        )
+        self.assertIsNone(assignment_expectation)
         observed: list[tuple[int, str]] = []
         service = sprint_message_delivery.SprintWakeDeliveryService(self.con)
         while True:
@@ -239,9 +255,7 @@ class ReviewHandoffTest(SprintReviewLoopCase):
             "FROM sprint_liveness_expectations WHERE message_id=?",
             (handoff.message_id,),
         ).fetchone()
-        self.assertIsNone(review_expectation["resolved_at"])
-        self.assertIsNone(review_expectation["resolution"])
-        self.assertIsNotNone(review_expectation["next_evaluation_at"])
+        self.assertIsNone(review_expectation)
         self.assertEqual(
             0,
             self.con.execute(
@@ -416,13 +430,6 @@ class ReviewHandoffTest(SprintReviewLoopCase):
             body="Clean on the reviewed head.",
             idempotency_key="idempotent-approval",
         )
-        resolved_once = tuple(
-            self.con.execute(
-                "SELECT resolved_at,resolution,next_evaluation_at "
-                "FROM sprint_liveness_expectations WHERE message_id=?",
-                (first.message_id,),
-            ).fetchone()
-        )
         approval_replay = self.loop.record_review(
             self.sprint_id,
             self.registered_pr_id,
@@ -436,19 +443,13 @@ class ReviewHandoffTest(SprintReviewLoopCase):
         self.assertFalse(approval_replay.created)
         self.assertEqual(approved.message_id, approval_replay.message_id)
         self.assertEqual(approved.conversation_id, approval_replay.conversation_id)
-        self.assertIsNotNone(resolved_once[0])
         self.assertEqual(
-            ("review submitted: approved", None), resolved_once[1:]
-        )
-        self.assertEqual(
-            resolved_once,
-            tuple(
-                self.con.execute(
-                    "SELECT resolved_at,resolution,next_evaluation_at "
-                    "FROM sprint_liveness_expectations WHERE message_id=?",
-                    (first.message_id,),
-                ).fetchone()
-            ),
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_liveness_expectations e "
+                "JOIN wake_message m USING(message_id) WHERE m.work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
         )
         self.assertEqual(
             (2, 2, 0),
@@ -474,6 +475,7 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
     def test_verdict_and_liveness_resolution_survive_post_commit_abort(self):
         handoff = self.request_review("atomic-review-request")
         self.accept_review(handoff.message_id)
+        self.seed_historical_expectation(handoff.message_id)
         real_write_transaction = sprint_review_loop.db_driver.write_transaction
 
         @contextmanager
@@ -569,25 +571,19 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
             "FROM sprint_liveness_expectations WHERE message_id=?",
             (changed.message_id,),
         ).fetchone()
-        self.assertIsNone(changed_expectation["resolved_at"])
-        self.assertIsNone(changed_expectation["resolution"])
-        self.assertIsNotNone(changed_expectation["next_evaluation_at"])
+        self.assertIsNone(changed_expectation)
         assignment_expectation = self.con.execute(
             "SELECT resolution FROM sprint_liveness_expectations expectation "
             "JOIN wake_message message USING(message_id) "
             "WHERE message.work_unit_id=? AND message.message_kind='work_assignment'",
             (self.unit_id,),
         ).fetchone()
-        self.assertEqual("work_unit.in_review", assignment_expectation["resolution"])
-        self.assertEqual(
-            ("review submitted: changes_requested", 0),
-            tuple(
-                self.con.execute(
-                    "SELECT resolution,next_evaluation_at IS NOT NULL "
-                    "FROM sprint_liveness_expectations WHERE message_id=?",
-                    (first.message_id,),
-                ).fetchone()
-            ),
+        self.assertIsNone(assignment_expectation)
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT 1 FROM sprint_liveness_expectations WHERE message_id=?",
+                (first.message_id,),
+            ).fetchone()
         )
         while service.deliver_once(
             "stage6-before-red",
@@ -632,10 +628,7 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
             "FROM sprint_liveness_expectations WHERE message_id=?",
             (changed.message_id,),
         ).fetchone()
-        self.assertEqual(
-            ("work_unit.in_review", None),
-            tuple(changed_expectation),
-        )
+        self.assertIsNone(changed_expectation)
         second_delivery: list[str] = []
         while True:
             outcome = service.deliver_once(
@@ -678,15 +671,11 @@ class ReviewOutcomeTest(SprintReviewLoopCase):
                 (self.developer_id,),
             ).fetchone()[0],
         )
-        self.assertEqual(
-            ("review submitted: approved", 0),
-            tuple(
-                self.con.execute(
-                    "SELECT resolution,next_evaluation_at IS NOT NULL "
-                    "FROM sprint_liveness_expectations WHERE message_id=?",
-                    (second.message_id,),
-                ).fetchone()
-            ),
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT 1 FROM sprint_liveness_expectations WHERE message_id=?",
+                (second.message_id,),
+            ).fetchone()
         )
         self.assertEqual(
             [("issue", "Medium: preserve the exact reviewed head."),
@@ -1217,6 +1206,7 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
     def test_grant_bypassed_merge_resolves_accepted_review_expectation(self):
         handoff = self.request_review()
         self.accept_review(handoff.message_id)
+        self.seed_historical_expectation(handoff.message_id)
         self.reader.current = pull_request(
             state="MERGED", checks="SUCCESS", checks_failed=False
         )

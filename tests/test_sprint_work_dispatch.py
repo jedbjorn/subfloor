@@ -20,6 +20,7 @@ sys.path.insert(0, str(ENGINE / "api"))
 import db_driver
 import server
 import sprint_domain
+import sprint_liveness
 import sprint_message_delivery as delivery
 import sprint_runtime
 from conversation_adapters import AdapterError
@@ -1158,6 +1159,89 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
 
 
 class ProductionPulseTest(SprintWorkDispatchCase):
+    def test_armed_pulse_never_evaluates_historical_liveness(self) -> None:
+        unit = self.create_unit(developer=1)
+        self.lifecycle.arm(self.sprint_id, 3)
+        message = self.con.execute(
+            "SELECT message_id,to_participant_id FROM wake_message "
+            "WHERE work_unit_id=? AND message_kind='work_assignment'",
+            (unit,),
+        ).fetchone()
+        self.con.execute(
+            "UPDATE wake_message SET disposition='accepted',"
+            "read_at='2000-01-01 00:00:00' WHERE message_id=?",
+            (message["message_id"],),
+        )
+        self.con.execute(
+            "INSERT OR IGNORE INTO sprint_liveness_expectations "
+            "(message_id,sprint_id,participant_id,accepted_at,last_strong_at,"
+            "last_strong_key,next_evaluation_at) VALUES (?,?,?,?,?,?,?)",
+            (
+                message["message_id"],
+                self.sprint_id,
+                message["to_participant_id"],
+                "2000-01-01 00:00:00",
+                "2000-01-01 00:00:00",
+                f"message.accepted:{message['message_id']}",
+                "2000-01-01 00:05:00",
+            ),
+        )
+        self.con.execute(
+            "UPDATE sprint_liveness_expectations SET last_strong_at=?,"
+            "last_strong_key=?,next_evaluation_at=? WHERE message_id=?",
+            (
+                "2000-01-01 00:00:00",
+                f"message.accepted:{message['message_id']}",
+                "2000-01-01 00:05:00",
+                message["message_id"],
+            ),
+        )
+        self.con.commit()
+        before = tuple(
+            self.con.execute(
+                "SELECT last_evaluated_at,next_evaluation_at,nudge_at,escalated_at "
+                "FROM sprint_liveness_expectations WHERE message_id=?",
+                (message["message_id"],),
+            ).fetchone()
+        )
+        runtime = sprint_runtime.SprintRuntimeService(
+            self.db_path,
+            owner="no-liveness-runtime-test",
+        )
+
+        with mock.patch.object(
+            sprint_liveness.SprintLivenessMonitor,
+            "evaluate",
+            side_effect=AssertionError("retired liveness evaluator called"),
+        ):
+            self.assertTrue(runtime.pulse_once(startup=True))
+
+        self.assertEqual(
+            before,
+            tuple(
+                self.con.execute(
+                    "SELECT last_evaluated_at,next_evaluation_at,nudge_at,"
+                    "escalated_at FROM sprint_liveness_expectations "
+                    "WHERE message_id=?",
+                    (message["message_id"],),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE message_kind IN ('nudge','escalation')"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events "
+                "WHERE event_type LIKE 'liveness.%'"
+            ).fetchone()[0],
+        )
+
     def test_successful_pulses_advance_runtime_heartbeat_but_failure_does_not(self) -> None:
         runtime = sprint_runtime.SprintRuntimeService(
             self.db_path,

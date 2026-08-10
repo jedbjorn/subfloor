@@ -21,7 +21,6 @@ from sprint_domain import (
     SprintLifecycleStore,
     SprintWorkUnitStore,
 )
-from sprint_liveness import SprintLivenessMonitor
 from sprint_message_delivery import SprintWakeDeliveryService
 
 DEFAULT_PULSE_SECONDS = 5.0
@@ -273,7 +272,6 @@ class SprintRuntimeService(threading.Thread):
     def _switch(self, con: sqlite3.Connection) -> ArmedServiceSwitch:
         lifecycle = SprintLifecycleStore(con)
         units = SprintWorkUnitStore(con)
-        liveness = SprintLivenessMonitor(con)
 
         def recover_pickup(sprint_id: int, trigger: str) -> None:
             lifecycle.reconcile_unread_pickup(sprint_id, trigger=trigger)
@@ -281,12 +279,9 @@ class SprintRuntimeService(threading.Thread):
         def dispatch(sprint_id: int, _trigger: str) -> None:
             units.dispatch_ready(sprint_id)
 
-        def evaluate_liveness(sprint_id: int, _trigger: str) -> None:
-            liveness.evaluate(sprint_id)
-
         return ArmedServiceSwitch(
             lifecycle,
-            (recover_pickup, dispatch, evaluate_liveness),
+            (recover_pickup, dispatch),
         )
 
     def _deliver_wakes(self, con: sqlite3.Connection) -> bool:

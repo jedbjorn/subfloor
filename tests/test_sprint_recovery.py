@@ -1082,14 +1082,10 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             run_state="unknown",
         )
 
-        with mock.patch.object(
-            server.sprint_liveness.SprintLivenessMonitor,
-            "evaluate",
-            return_value=(),
-        ):
-            response = server.sprint_monitor_response(self.con, self.sprint_id)
+        response = server.sprint_monitor_response(self.con, self.sprint_id)
 
         self.assertEqual([], response["outcomes"])
+        self.assertEqual({}, response["health"])
         self.assertEqual(
             {
                 "action": "paused",
@@ -1102,6 +1098,41 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         self.assertEqual(None, response["runtime"]["beat_at"])
         self.assertEqual(5, response["runtime"]["interval_seconds"])
 
+    def test_monitor_reconciles_pickup_once_before_projecting_health(self):
+        order: list[str] = []
+        original_reconcile = (
+            sprint_domain.SprintLifecycleStore.reconcile_unread_pickup
+        )
+
+        def reconcile(store, sprint_id, *, trigger):
+            order.append("pickup")
+            return original_reconcile(store, sprint_id, trigger=trigger)
+
+        def board(_projection, sprint_id):
+            self.assertEqual(self.sprint_id, sprint_id)
+            self.assertEqual(["pickup"], order)
+            order.append("health")
+            return {"health": {"condition": "progressing"}}
+
+        with mock.patch.object(
+            sprint_domain.SprintLifecycleStore,
+            "reconcile_unread_pickup",
+            autospec=True,
+            side_effect=reconcile,
+        ) as pickup, mock.patch.object(
+            server.sprint_board.SprintBoardProjection,
+            "board",
+            autospec=True,
+            side_effect=board,
+        ):
+            response = server.sprint_monitor_response(self.con, self.sprint_id)
+
+        pickup.assert_called_once()
+        self.assertEqual("monitor", pickup.call_args.kwargs["trigger"])
+        self.assertEqual(["pickup", "health"], order)
+        self.assertEqual([], response["outcomes"])
+        self.assertEqual({"condition": "progressing"}, response["health"])
+
     def test_monitor_requeue_is_idempotent_and_never_delivers_a_second_copy(self):
         message = self.send("monitor-requeue")
         original = int(message.wake_id)
@@ -1112,25 +1143,21 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         )
         self.con.commit()
 
-        with mock.patch.object(
-            server.sprint_liveness.SprintLivenessMonitor,
-            "evaluate",
-            return_value=(),
-        ):
-            first = server.sprint_monitor_response(self.con, self.sprint_id)
-            native_before = self.con.execute(
-                "SELECT COUNT(*) FROM conversation_messages"
-            ).fetchone()[0]
-            wakes_before = self.con.execute(
-                "SELECT COUNT(*) FROM sprint_wake_outbox"
-            ).fetchone()[0]
-            second = server.sprint_monitor_response(self.con, self.sprint_id)
+        first = server.sprint_monitor_response(self.con, self.sprint_id)
+        native_before = self.con.execute(
+            "SELECT COUNT(*) FROM conversation_messages"
+        ).fetchone()[0]
+        wakes_before = self.con.execute(
+            "SELECT COUNT(*) FROM sprint_wake_outbox"
+        ).fetchone()[0]
+        second = server.sprint_monitor_response(self.con, self.sprint_id)
 
         replacement = first["pickup"]["requeued_wake_ids"]
         self.assertEqual(1, len(replacement))
         self.assertNotEqual(original, replacement[0])
         self.assertEqual("requeued", first["pickup"]["action"])
         self.assertEqual([], first["outcomes"])
+        self.assertEqual({}, first["health"])
         self.assertEqual(
             {
                 "state": "stale",
@@ -1148,6 +1175,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             second["pickup"],
         )
         self.assertEqual([], second["outcomes"])
+        self.assertEqual({}, second["health"])
         self.assertEqual(
             native_before,
             self.con.execute(
@@ -2470,6 +2498,26 @@ class ClosedReviewRecoveryTest(SprintReviewLoopCase):
     def test_closed_without_merge_resolves_every_review_expectation(self):
         handoff = self.request_review()
         self.accept_review(handoff.message_id)
+        accepted = self.con.execute(
+            "SELECT sprint_id,to_participant_id,read_at FROM wake_message "
+            "WHERE message_id=?",
+            (handoff.message_id,),
+        ).fetchone()
+        self.con.execute(
+            "INSERT INTO sprint_liveness_expectations "
+            "(message_id,sprint_id,participant_id,accepted_at,last_strong_at,"
+            "last_strong_key,next_evaluation_at) VALUES (?,?,?,?,?,?,?)",
+            (
+                handoff.message_id,
+                accepted["sprint_id"],
+                accepted["to_participant_id"],
+                accepted["read_at"],
+                accepted["read_at"],
+                f"message.accepted:{handoff.message_id}",
+                "2999-01-01 00:00:00",
+            ),
+        )
+        self.con.commit()
         lifecycle = sprint_domain.SprintLifecycleStore(
             self.con,
             interrupt_run=lambda _run_id: True,
