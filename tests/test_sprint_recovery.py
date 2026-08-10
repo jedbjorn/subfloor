@@ -1085,7 +1085,9 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         response = server.sprint_monitor_response(self.con, self.sprint_id)
 
         self.assertEqual([], response["outcomes"])
-        self.assertEqual({}, response["health"])
+        self.assertEqual("paused", response["health"]["condition"])
+        self.assertIsNone(response["health"]["since"])
+        self.assertEqual([], response["health"]["root_causes"])
         self.assertEqual(
             {
                 "action": "paused",
@@ -1157,7 +1159,11 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         self.assertNotEqual(original, replacement[0])
         self.assertEqual("requeued", first["pickup"]["action"])
         self.assertEqual([], first["outcomes"])
-        self.assertEqual({}, first["health"])
+        self.assertEqual("infrastructure", first["health"]["condition"])
+        self.assertEqual(
+            ["runtime_stale"],
+            [root["cause"] for root in first["health"]["root_causes"]],
+        )
         self.assertEqual(
             {
                 "state": "stale",
@@ -1175,7 +1181,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             second["pickup"],
         )
         self.assertEqual([], second["outcomes"])
-        self.assertEqual({}, second["health"])
+        self.assertEqual(first["health"], second["health"])
         self.assertEqual(
             native_before,
             self.con.execute(

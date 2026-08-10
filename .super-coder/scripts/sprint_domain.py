@@ -1609,6 +1609,14 @@ class SprintLifecycleStore:
                         new_wake_id,
                     ),
                 )
+            recovered_message_ids = [
+                int(message["message_id"])
+                for message in self.con.execute(
+                    "SELECT message_id FROM sprint_wake_messages "
+                    "WHERE sprint_id=? AND wake_id=? ORDER BY message_id",
+                    (sprint_id, old_wake_id),
+                )
+            ]
             self.con.execute(
                 "UPDATE wake_message SET delivered_at=NULL WHERE message_id IN ("
                 "SELECT message_id FROM sprint_wake_messages "
@@ -1620,7 +1628,7 @@ class SprintLifecycleStore:
                 "WHERE sprint_id=? AND wake_id=?",
                 (new_wake_id, sprint_id, old_wake_id),
             )
-            self._event(
+            recovery_event_id = self._event(
                 sprint_id,
                 "wake.requeued",
                 LifecycleActor("system"),
@@ -1639,6 +1647,21 @@ class SprintLifecycleStore:
                         else {}
                     ),
                 },
+            )
+            self.con.executemany(
+                "INSERT INTO sprint_wake_recovery_messages "
+                "(recovery_event_id,sprint_id,prior_wake_id,replacement_wake_id,"
+                "message_id) VALUES (?,?,?,?,?)",
+                [
+                    (
+                        recovery_event_id,
+                        sprint_id,
+                        old_wake_id,
+                        new_wake_id,
+                        message_id,
+                    )
+                    for message_id in recovered_message_ids
+                ],
             )
             replacements.append(new_wake_id)
 
@@ -1688,7 +1711,7 @@ class SprintLifecycleStore:
                 "(sprint_id,wake_id,message_id) VALUES (?,?,?)",
                 (sprint_id, new_wake_id, int(message["message_id"])),
             )
-            self._event(
+            recovery_event_id = self._event(
                 sprint_id,
                 "wake.requeued",
                 LifecycleActor("system"),
@@ -1702,6 +1725,17 @@ class SprintLifecycleStore:
                     "replacement_created": created,
                     "replacement_conversation_id": None,
                 },
+            )
+            self.con.execute(
+                "INSERT INTO sprint_wake_recovery_messages "
+                "(recovery_event_id,sprint_id,prior_wake_id,replacement_wake_id,"
+                "message_id) VALUES (?, ?, NULL, ?, ?)",
+                (
+                    recovery_event_id,
+                    sprint_id,
+                    new_wake_id,
+                    int(message["message_id"]),
+                ),
             )
             replacements.append(new_wake_id)
         return _WakeReconcileResult(tuple(sorted(set(replacements))))
@@ -2597,18 +2631,20 @@ class SprintLifecycleStore:
         event_type: str,
         actor: LifecycleActor,
         payload: dict,
-    ) -> None:
-        self.con.execute(
-            "INSERT INTO sprint_events "
-            "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
-            "VALUES (?,?,?,?,?)",
-            (
-                sprint_id,
-                event_type,
-                actor.kind,
-                actor.shell_id,
-                json.dumps(payload, sort_keys=True),
-            ),
+    ) -> int:
+        return int(
+            self.con.execute(
+                "INSERT INTO sprint_events "
+                "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    sprint_id,
+                    event_type,
+                    actor.kind,
+                    actor.shell_id,
+                    json.dumps(payload, sort_keys=True),
+                ),
+            ).lastrowid
         )
 
 

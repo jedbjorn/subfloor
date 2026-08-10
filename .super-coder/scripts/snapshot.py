@@ -69,6 +69,7 @@ SPRINT_INSTANCE_TABLES = [
     "sprint_reports",
     "sprint_followups",
     "sprint_events",
+    "sprint_wake_recovery_messages",
 ]
 
 
