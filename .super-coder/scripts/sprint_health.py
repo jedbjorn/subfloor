@@ -399,9 +399,15 @@ class SprintHealthProjection:
             "w.state wake_state,w.attempt_count,w.created_at wake_created_at,"
             "w.available_at,w.delivered_at wake_delivered_at,w.failed_at,w.claimed_at,"
             "a.attempt_id,a.attempted_at,a.target_conversation_id,a.native_run_ref,a.outcome,"
-            "r.run_id,r.state run_state,r.started_at,r.heartbeat_at,r.ended_at,"
+            "COALESCE(direct_run.run_id,message_run.run_id) run_id,"
+            "COALESCE(direct_run.state,message_run.state) run_state,"
+            "COALESCE(direct_run.started_at,message_run.started_at) started_at,"
+            "COALESCE(direct_run.heartbeat_at,message_run.heartbeat_at) heartbeat_at,"
+            "COALESCE(direct_run.ended_at,message_run.ended_at) ended_at,"
+            "native_message.message_id native_message_id,"
             "recovery.recovery_event_id,recovery_event.created_at recovery_created_at,"
             "cm.idempotency_key trigger_idempotency_key,"
+            "cm.state trigger_message_state,"
             "c.creation_idempotency_key,pc.sprint_participant_id linked_participant_id,"
             "active.chat_id active_chat_id,"
             "active.process_pid,active.process_start_ticks "
@@ -411,8 +417,17 @@ class SprintHealthProjection:
             "LEFT JOIN sprint_wake_attempts a ON a.attempt_id=("
             " SELECT latest.attempt_id FROM sprint_wake_attempts latest "
             " WHERE latest.wake_id=w.wake_id ORDER BY latest.attempt_id DESC LIMIT 1) "
-            "LEFT JOIN conversation_runs r "
-            "ON a.native_run_ref='conversation-run:' || r.run_id "
+            "LEFT JOIN conversation_messages native_message "
+            "ON a.native_run_ref='conversation-message:' || native_message.message_id "
+            "AND native_message.conversation_id=a.target_conversation_id "
+            "LEFT JOIN conversation_runs direct_run "
+            "ON a.native_run_ref='conversation-run:' || direct_run.run_id "
+            "AND direct_run.conversation_id=a.target_conversation_id "
+            "LEFT JOIN conversation_runs message_run ON message_run.run_id=("
+            " SELECT latest_run.run_id FROM conversation_runs latest_run "
+            " WHERE latest_run.trigger_message_id=native_message.message_id "
+            " AND latest_run.conversation_id=a.target_conversation_id "
+            " ORDER BY latest_run.run_id DESC LIMIT 1) "
             "LEFT JOIN sprint_wake_recovery_messages recovery "
             "ON recovery.recovery_event_id=("
             " SELECT latest_recovery.recovery_event_id "
@@ -423,7 +438,9 @@ class SprintHealthProjection:
             " ORDER BY latest_recovery.recovery_event_id DESC LIMIT 1) "
             "LEFT JOIN sprint_events recovery_event "
             "ON recovery_event.event_id=recovery.recovery_event_id "
-            "LEFT JOIN conversation_messages cm ON cm.message_id=r.trigger_message_id "
+            "LEFT JOIN conversation_messages cm ON cm.message_id=COALESCE("
+            "direct_run.trigger_message_id,message_run.trigger_message_id,"
+            "native_message.message_id) "
             "LEFT JOIN conversations c ON c.conversation_id=a.target_conversation_id "
             "LEFT JOIN sprint_participant_conversations pc "
             "ON pc.conversation_id=a.target_conversation_id "
@@ -454,17 +471,26 @@ class SprintHealthProjection:
             )
             if item.get("attempt_id") is not None and item.get("outcome") == "delivered":
                 native_ref = item.get("native_run_ref")
-                well_formed = bool(
-                    isinstance(native_ref, str)
-                    and native_ref.startswith("conversation-run:")
-                    and native_ref.removeprefix("conversation-run:").isdigit()
+                resolved_message = bool(
+                    item.get("native_message_id") is not None
+                    and native_ref == f"conversation-message:{item['native_message_id']}"
                 )
-                if not well_formed or item.get("run_id") is None:
+                resolved_run = bool(
+                    item.get("run_id") is not None
+                    and native_ref == f"conversation-run:{item['run_id']}"
+                )
+                if (
+                    (not resolved_message and not resolved_run)
+                    or item.get("run_state") == "unknown"
+                ):
                     signal = {
                         "kind": "native_run",
                         "id": int(item["attempt_id"]),
                         "at": _stamp(
-                            _parse(item.get("attempted_at"))
+                            _parse(item.get("ended_at"))
+                            or _parse(item.get("heartbeat_at"))
+                            or _parse(item.get("started_at"))
+                            or _parse(item.get("attempted_at"))
                             or _parse(item.get("wake_delivered_at"))
                             or _parse(item.get("wake_created_at"))
                         ),
@@ -678,10 +704,9 @@ class SprintHealthProjection:
             for value in (_parse(signal.get("at")) for signal in unreadable)
             if value is not None
         ]
-        anchor = (
-            _max_stamp(floor, *unreadable_times)
-            if unreadable
-            else self._latest_reset(unit_id, relevant, floor)
+        anchor = _max_stamp(
+            self._latest_reset(unit_id, relevant, floor),
+            *unreadable_times,
         )
         overdue = self.now - anchor >= ATTENTION_AFTER
         cause = (
@@ -861,7 +886,10 @@ class SprintHealthProjection:
         )
         if any(
             message.get("exact_generation")
-            and message.get("run_state") in _PICKUP_RUN_STATES
+            and (
+                message.get("run_state") in _PICKUP_RUN_STATES
+                or message.get("trigger_message_state") in {"queued", "running"}
+            )
             for message in messages
         ):
             applicable = False
@@ -939,7 +967,10 @@ class SprintHealthProjection:
             elif (
                 state == "delivered"
                 and message.get("exact_generation")
-                and message.get("run_state") in _PICKUP_RUN_STATES
+                and (
+                    message.get("run_state") in _PICKUP_RUN_STATES
+                    or message.get("trigger_message_state") in {"queued", "running"}
+                )
             ):
                 at = (
                     _parse(message.get("started_at"))
@@ -1349,11 +1380,16 @@ class SprintHealthProjection:
         for message in messages:
             for field_name in (
                 "created_at", "delivered_at", "read_at", "wake_created_at",
-                "attempted_at", "started_at", "ended_at",
+                "attempted_at",
             ):
                 value = _parse(message.get(field_name))
                 if value:
                     values.append(value)
+            if message.get("exact_generation"):
+                for field_name in ("started_at", "ended_at"):
+                    value = _parse(message.get(field_name))
+                    if value:
+                        values.append(value)
         pr = self.prs.get(unit_id)
         if pr:
             value = _parse(pr.get("observed_at"))

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -16,6 +17,9 @@ sys.path[:0] = [str(ENGINE / "scripts")]
 import sprint_domain
 import sprint_health
 import sprint_message_delivery
+import sprint_runtime
+from conversation_adapters import NativeTurn
+from conversation_broker import BrokerStore
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
 
@@ -31,7 +35,8 @@ class SprintHealthCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.con = sqlite3.connect(Path(self.tmp.name) / "health.db")
+        self.db = Path(self.tmp.name) / "health.db"
+        self.con = sqlite3.connect(self.db)
         self.addCleanup(self.con.close)
         self.con.row_factory = sqlite3.Row
         apply_schema(self.con)
@@ -533,6 +538,143 @@ class SprintHealthCase(unittest.TestCase):
         self.assertEqual("progressing", projected[first]["condition"])
         self.assertEqual("no_progress_grace", projected[second]["cause"])
         self.assertEqual("waiting_external", projected[second]["condition"])
+
+    def test_default_runtime_message_reference_resolves_exact_broker_run(self) -> None:
+        unit = self.add_unit("active", developer=3)
+        assignment = self.add_message(
+            unit_id=unit,
+            receiver=3,
+            kind="work_assignment",
+            disposition="accepted",
+            read_at="2026-08-10 10:05:00",
+            created_at="2026-08-10 10:00:00",
+        )
+        wake = self.add_wake(
+            assignment,
+            receiver=3,
+            state="pending",
+            created_at="2026-08-10 10:00:00",
+        )
+        self.add_event(
+            "work_unit.accepted",
+            at="2026-08-10 10:05:00",
+            work_unit_id=unit,
+            payload={"message_id": assignment},
+        )
+        self.con.commit()
+
+        delivered = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con,
+            force_new_quiet_seconds=0,
+        ).deliver_once(
+            "health-runtime",
+            lambda conversation_id, prompt, key: sprint_runtime.enqueue_conversation_turn(
+                self.db,
+                conversation_id,
+                prompt,
+                key,
+            ),
+        )
+        self.assertEqual((wake, "delivered", 1), (
+            delivered.wake_id,
+            delivered.state,
+            delivered.attempt_number,
+        ))
+        attempt = self.con.execute(
+            "SELECT attempt_id,target_conversation_id,native_run_ref "
+            "FROM sprint_wake_attempts WHERE wake_id=?",
+            (wake,),
+        ).fetchone()
+        native_message = self.con.execute(
+            "SELECT message_id,conversation_id FROM conversation_messages "
+            "WHERE conversation_id=? AND idempotency_key=("
+            "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?)",
+            (attempt["target_conversation_id"], wake),
+        ).fetchone()
+        self.assertEqual(
+            f"conversation-message:{int(native_message['message_id'])}",
+            attempt["native_run_ref"],
+        )
+        queued = self.project(
+            now=datetime.now(timezone.utc) + timedelta(minutes=1)
+        )
+        self.assertEqual(
+            ("waiting_external", "pickup_active", []),
+            (
+                queued["work_units"][unit]["condition"],
+                queued["work_units"][unit]["cause"],
+                queued["work_units"][unit]["unreadable_signals"],
+            ),
+        )
+
+        broker = BrokerStore(self.db)
+        run = broker.claim_next("health-broker")
+        self.assertEqual(
+            (native_message["conversation_id"], int(native_message["message_id"])),
+            (run.conversation_id, run.message_id),
+        )
+        broker.mark_starting(run.run_id, "health-broker")
+        worktree = Path(
+            self.con.execute(
+                "SELECT worktree FROM conversations WHERE conversation_id=?",
+                (run.conversation_id,),
+            ).fetchone()[0]
+        )
+        broker.mark_native_started(
+            run.run_id,
+            "health-broker",
+            NativeTurn(
+                "codex",
+                "health-session",
+                "health-native-run",
+                worktree,
+                process_ref=str(os.getpid()),
+            ),
+        )
+        unrelated_message_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state,completed_at) "
+                "VALUES (?,'engine','test','prompt','unrelated',"
+                "'unrelated-run','unrelated-hash','completed',datetime('now'))",
+                (run.conversation_id,),
+            ).lastrowid
+        )
+        unrelated_run_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                "lease_expires_at,started_at,heartbeat_at,ended_at) "
+                "VALUES (?,3,?,'succeeded','other','2026-08-10 12:00:00',"
+                "'2026-08-10 11:00:00','2026-08-10 11:01:00',"
+                "'2026-08-10 11:02:00')",
+                (run.conversation_id, unrelated_message_id),
+            ).lastrowid
+        )
+        self.assertGreater(unrelated_run_id, run.run_id)
+
+        projected = self.project(
+            now=datetime.now(timezone.utc) + timedelta(minutes=1)
+        )
+
+        self.assertEqual(
+            ("progressing", "run_active", "live"),
+            (
+                projected["work_units"][unit]["condition"],
+                projected["work_units"][unit]["cause"],
+                projected["work_units"][unit]["activity"],
+            ),
+        )
+        self.assertEqual(
+            {"kind": "run", "id": run.run_id},
+            {
+                "kind": projected["work_units"][unit]["last_evidence"]["kind"],
+                "id": projected["work_units"][unit]["last_evidence"]["id"],
+            },
+        )
+        self.assertEqual([], projected["work_units"][unit]["unreadable_signals"])
+        self.assertEqual([], projected["health"]["unreadable_signals"])
 
     def test_reenter_run_uses_participant_link_not_creation_wake(self) -> None:
         unit = self.add_unit("fixing", developer=3, updated_at="2026-08-10 11:54:00")
@@ -1225,6 +1367,277 @@ class SprintHealthCase(unittest.TestCase):
         rendered = json.dumps(boundary, sort_keys=True)
         self.assertNotIn("native-run-malformed", rendered)
         self.assertNotIn("conversation-run:999999", rendered)
+
+    def test_later_exact_carrier_reset_and_newer_unreadable_fact_order_clocks(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+
+        def add_episode(
+            developer: int,
+            *,
+            unreadable_at: str,
+            carrier_started_at: str,
+            carrier_ended_at: str,
+        ) -> tuple[int, int]:
+            unit = self.add_unit("active", developer=developer)
+            assignment = self.add_message(
+                unit_id=unit,
+                receiver=developer,
+                kind="work_assignment",
+                disposition="accepted",
+                read_at="2026-08-10 10:00:00",
+                delivered_at="2026-08-10 10:00:00",
+                created_at="2026-08-10 10:00:00",
+            )
+            assignment_wake = self.add_wake(
+                assignment,
+                receiver=developer,
+                state="delivered",
+                created_at="2026-08-10 10:00:00",
+            )
+            unreadable_attempt = int(
+                self.con.execute(
+                    "INSERT INTO sprint_wake_attempts "
+                    "(wake_id,attempt_number,native_run_ref,outcome,attempted_at) "
+                    "VALUES (?,1,'unreadable-native','delivered',?)",
+                    (assignment_wake, unreadable_at),
+                ).lastrowid
+            )
+            self.add_event(
+                "work_unit.accepted",
+                at="2026-08-10 10:00:00",
+                work_unit_id=unit,
+                payload={"message_id": assignment},
+            )
+
+            recovery = self.add_message(
+                unit_id=unit,
+                receiver=developer,
+                delivered_at=carrier_started_at,
+                created_at=carrier_started_at,
+            )
+            recovery_wake = self.add_wake(
+                recovery,
+                receiver=developer,
+                state="delivered",
+                created_at=carrier_started_at,
+            )
+            self.con.execute(
+                "UPDATE sprint_wake_outbox SET idempotency_key=? WHERE wake_id=?",
+                (
+                    f"sprint-recovery:{self.sprint_id}:health:{unit}",
+                    recovery_wake,
+                ),
+            )
+            run_id = self.add_live_run(
+                recovery,
+                recovery_wake,
+                shell_id=developer,
+                suffix=f"carrier-reset-{unit}",
+            )
+            run = self.con.execute(
+                "SELECT conversation_id,trigger_message_id FROM conversation_runs "
+                "WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            self.con.execute(
+                "UPDATE sprint_wake_attempts SET attempted_at=? WHERE wake_id=?",
+                (carrier_started_at, recovery_wake),
+            )
+            self.con.execute(
+                "UPDATE conversation_runs SET state='succeeded',started_at=?,"
+                "heartbeat_at=?,ended_at=? WHERE run_id=?",
+                (
+                    carrier_started_at,
+                    carrier_started_at,
+                    carrier_ended_at,
+                    run_id,
+                ),
+            )
+            self.con.execute(
+                "UPDATE conversation_messages SET state='completed',completed_at=? "
+                "WHERE message_id=?",
+                (carrier_ended_at, int(run["trigger_message_id"])),
+            )
+            self.con.execute(
+                "UPDATE conversations SET state='idle' WHERE conversation_id=?",
+                (str(run["conversation_id"]),),
+            )
+            self.con.execute(
+                "DELETE FROM active_shell_chats WHERE shell_id=?",
+                (developer,),
+            )
+            return unit, unreadable_attempt
+
+        later_carrier, later_carrier_attempt = add_episode(
+            3,
+            unreadable_at="2026-08-10 10:00:00",
+            carrier_started_at="2026-08-10 10:40:00",
+            carrier_ended_at="2026-08-10 10:50:00",
+        )
+        newer_unreadable, newer_unreadable_attempt = add_episode(
+            4,
+            unreadable_at="2026-08-10 10:50:00",
+            carrier_started_at="2026-08-10 10:10:00",
+            carrier_ended_at="2026-08-10 10:20:00",
+        )
+
+        before = self.project(
+            now=datetime(2026, 8, 10, 11, 19, 59, tzinfo=timezone.utc)
+        )
+        boundary = self.project(
+            now=datetime(2026, 8, 10, 11, 20, 0, tzinfo=timezone.utc)
+        )
+
+        for unit, attempt_id in (
+            (later_carrier, later_carrier_attempt),
+            (newer_unreadable, newer_unreadable_attempt),
+        ):
+            signal = {
+                "kind": "native_run",
+                "id": attempt_id,
+                "at": (
+                    "2026-08-10T10:00:00Z"
+                    if unit == later_carrier
+                    else "2026-08-10T10:50:00Z"
+                ),
+            }
+            self.assertEqual(
+                (
+                    "waiting_external",
+                    "no_progress_grace",
+                    "2026-08-10T10:50:00Z",
+                    1799,
+                    [signal],
+                ),
+                (
+                    before["work_units"][unit]["condition"],
+                    before["work_units"][unit]["cause"],
+                    before["work_units"][unit]["since"],
+                    before["work_units"][unit]["age_seconds"],
+                    before["work_units"][unit]["unreadable_signals"],
+                ),
+            )
+            self.assertEqual(
+                ("attention", "unreadable_evidence", 1800),
+                (
+                    boundary["work_units"][unit]["condition"],
+                    boundary["work_units"][unit]["cause"],
+                    boundary["work_units"][unit]["age_seconds"],
+                ),
+            )
+
+    def test_joined_unknown_run_is_sanitized_unreadable_evidence(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        unit = self.add_unit("active", developer=3)
+        assignment = self.add_message(
+            unit_id=unit,
+            receiver=3,
+            kind="work_assignment",
+            disposition="accepted",
+            read_at="2026-08-10 10:00:00",
+            delivered_at="2026-08-10 10:00:00",
+            created_at="2026-08-10 10:00:00",
+        )
+        wake = self.add_wake(
+            assignment,
+            receiver=3,
+            state="delivered",
+            created_at="2026-08-10 10:00:00",
+        )
+        self.add_event(
+            "work_unit.accepted",
+            at="2026-08-10 10:00:00",
+            work_unit_id=unit,
+            payload={"message_id": assignment},
+        )
+        run_id = self.add_live_run(
+            assignment,
+            wake,
+            shell_id=3,
+            suffix="unknown-outcome",
+        )
+        run = self.con.execute(
+            "SELECT conversation_id,trigger_message_id FROM conversation_runs "
+            "WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        attempt_id = int(
+            self.con.execute(
+                "SELECT attempt_id FROM sprint_wake_attempts WHERE wake_id=?",
+                (wake,),
+            ).fetchone()[0]
+        )
+        self.con.execute(
+            "UPDATE sprint_wake_attempts SET attempted_at='2026-08-10 10:00:00' "
+            "WHERE attempt_id=?",
+            (attempt_id,),
+        )
+        self.con.execute(
+            "UPDATE conversation_runs SET state='unknown',"
+            "started_at='2026-08-10 10:20:00',"
+            "heartbeat_at='2026-08-10 10:25:00',"
+            "ended_at='2026-08-10 10:30:00',"
+            "error_code='HARNESS_OUTCOME_UNKNOWN',"
+            "error_detail='secret native reconciliation detail' WHERE run_id=?",
+            (run_id,),
+        )
+        self.con.execute(
+            "UPDATE conversation_messages SET state='failed',"
+            "completed_at='2026-08-10 10:30:00' WHERE message_id=?",
+            (int(run["trigger_message_id"]),),
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='error' WHERE conversation_id=?",
+            (str(run["conversation_id"]),),
+        )
+        self.con.execute("DELETE FROM active_shell_chats WHERE shell_id=3")
+
+        before = self.project(
+            now=datetime(2026, 8, 10, 10, 59, 59, tzinfo=timezone.utc)
+        )
+        boundary = self.project(
+            now=datetime(2026, 8, 10, 11, 0, 0, tzinfo=timezone.utc)
+        )
+        signal = {
+            "kind": "native_run",
+            "id": attempt_id,
+            "at": "2026-08-10T10:30:00Z",
+        }
+
+        self.assertEqual(
+            ("waiting_external", "no_progress_grace", 1799),
+            (
+                before["work_units"][unit]["condition"],
+                before["work_units"][unit]["cause"],
+                before["work_units"][unit]["age_seconds"],
+            ),
+        )
+        self.assertEqual(
+            (
+                "attention",
+                "unreadable_evidence",
+                "2026-08-10T10:30:00Z",
+                1800,
+                [signal],
+            ),
+            (
+                boundary["work_units"][unit]["condition"],
+                boundary["work_units"][unit]["cause"],
+                boundary["work_units"][unit]["since"],
+                boundary["work_units"][unit]["age_seconds"],
+                boundary["work_units"][unit]["unreadable_signals"],
+            ),
+        )
+        self.assertEqual([signal], boundary["health"]["unreadable_signals"])
+        rendered = json.dumps(boundary, sort_keys=True)
+        self.assertNotIn("secret native reconciliation detail", rendered)
+        self.assertNotIn("HARNESS_OUTCOME_UNKNOWN", rendered)
 
     def test_plural_dependency_roots_preserve_mixed_conditions(self) -> None:
         attention = self.add_unit("active", developer=3, updated_at="2026-08-10 09:00:00")
