@@ -280,10 +280,18 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         "spec_document_id,work_unit_id,idempotency_key) "
         "VALUES (1,1,1,'Medium','Follow-up','Inspect after close',56,1,'followup-1')"
     )
+    recovery_event_id = int(
+        con.execute(
+            "INSERT INTO sprint_events "
+            "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+            "VALUES (1,'wake.requeued','system',NULL,'{\"replacement_wake_id\":1}')"
+        ).lastrowid
+    )
     con.execute(
-        "INSERT INTO sprint_events "
-        "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
-        "VALUES (1,'fixture.in_flight','system',NULL,'{\"head\":\"aaaaaaaa\"}')"
+        "INSERT INTO sprint_wake_recovery_messages "
+        "(recovery_event_id,sprint_id,prior_wake_id,replacement_wake_id,message_id) "
+        "VALUES (?,1,1,1,1)",
+        (recovery_event_id,),
     )
     con.commit()
 

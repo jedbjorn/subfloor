@@ -6,13 +6,14 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 sys.path[:0] = [str(ENGINE / "scripts")]
 
+import sprint_domain
 import sprint_health
 import sprint_message_delivery
 
@@ -366,6 +367,59 @@ class SprintHealthCase(unittest.TestCase):
                 (shell_id, conversation),
             )
         return run_id
+
+    def recover_terminal_wake(
+        self,
+        message_id: int,
+        wake_id: int,
+        *,
+        shell_id: int,
+    ) -> int:
+        run_id = self.add_live_run(
+            message_id,
+            wake_id,
+            shell_id=shell_id,
+            suffix=f"recovery-{message_id}",
+        )
+        turn = self.con.execute(
+            "SELECT r.conversation_id,r.trigger_message_id "
+            "FROM conversation_runs r WHERE r.run_id=?",
+            (run_id,),
+        ).fetchone()
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET state='delivered',"
+            "attempt_count=1,delivered_at='2026-08-10 11:54:00' WHERE wake_id=?",
+            (wake_id,),
+        )
+        self.con.execute(
+            "UPDATE wake_message SET delivered_at='2026-08-10 11:54:00' "
+            "WHERE message_id=?",
+            (message_id,),
+        )
+        self.con.execute(
+            "UPDATE conversation_runs SET state='succeeded',"
+            "ended_at='2026-08-10 11:54:30' WHERE run_id=?",
+            (run_id,),
+        )
+        self.con.execute(
+            "UPDATE conversation_messages SET state='completed',"
+            "completed_at='2026-08-10 11:54:30' WHERE message_id=?",
+            (int(turn["trigger_message_id"]),),
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='idle' WHERE conversation_id=?",
+            (str(turn["conversation_id"]),),
+        )
+        self.con.execute(
+            "DELETE FROM active_shell_chats WHERE shell_id=?",
+            (shell_id,),
+        )
+        self.con.commit()
+        recovered = sprint_domain.SprintLifecycleStore(
+            self.con
+        ).reconcile_unread_pickup(self.sprint_id, trigger="health-test")
+        self.assertEqual(1, len(recovered))
+        return recovered[0]
 
     def project(self, *, now: datetime = NOW) -> dict:
         self.con.commit()
@@ -995,17 +1049,19 @@ class SprintHealthCase(unittest.TestCase):
             [root["root_id"] for root in second["root_causes"]],
         )
 
-    def test_blocked_accepts_only_open_reply_or_current_planner_recovery(self) -> None:
+    def test_blocked_recovery_requires_exact_unit_provenance_after_coalescing(self) -> None:
+        clock_now = datetime.now(timezone.utc).replace(microsecond=0)
+        stale_at = (clock_now - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
         self.con.execute(
-            "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
-            (self.sprint_id,),
+            "UPDATE sprints SET armed_at=? WHERE sprint_id=?",
+            (stale_at, self.sprint_id),
         )
-        stale = self.add_unit("blocked", developer=3, updated_at="2026-08-10 11:50:00")
+        stale = self.add_unit("blocked", developer=3, updated_at=stale_at)
         planner_recovery = self.add_unit(
-            "blocked", developer=4, updated_at="2026-08-10 11:50:00"
+            "blocked", developer=4, updated_at=stale_at
         )
         scoped_blocker = self.add_unit(
-            "blocked", developer=5, updated_at="2026-08-10 11:50:00"
+            "blocked", developer=5, updated_at=stale_at
         )
         for receiver, kind, created in (
             (3, "work_assignment", "2026-08-10 10:00:00"),
@@ -1020,43 +1076,50 @@ class SprintHealthCase(unittest.TestCase):
             )
             self.add_wake(message, receiver=receiver, state="pending", created_at=created)
 
-        recovery_message = self.add_message(
-            unit_id=planner_recovery,
-            receiver=1,
-            created_at="2026-08-10 11:55:00",
+        self.con.commit()
+        messages = sprint_message_delivery.SprintMessageStore(self.con)
+        original = messages.relay(
+            self.sprint_id,
+            from_shell_id=4,
+            to_shortname="PLN1",
+            body="Planner recovery carrier",
+            idempotency_key="health-real-recovery",
+            work_unit_id=planner_recovery,
         )
-        recovery_wake = self.add_wake(
-            recovery_message,
-            receiver=1,
-            state="pending",
-            created_at="2026-08-10 11:55:00",
+        recovery_wake = self.recover_terminal_wake(
+            original.message_id,
+            original.wake_id,
+            shell_id=1,
         )
-        self.con.execute(
-            "UPDATE sprint_wake_outbox SET idempotency_key=? WHERE wake_id=?",
-            (
-                f"sprint-recovery:{self.sprint_id}:blocked:{planner_recovery}",
-                recovery_wake,
-            ),
+        unrelated = messages.relay(
+            self.sprint_id,
+            from_shell_id=3,
+            to_shortname="PLN1",
+            body="Ordinary blocked-unit information",
+            idempotency_key="health-unrelated-coalesced",
+            work_unit_id=stale,
         )
-        blocker_message = self.add_message(
-            unit_id=scoped_blocker,
-            receiver=5,
+        self.assertEqual(recovery_wake, unrelated.wake_id)
+        blocker = messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="DEV5",
+            body="Explicit blocker",
+            idempotency_key="health-explicit-blocker",
             intent="blocker",
             requires_reply=True,
-            created_at="2026-08-10 11:56:00",
+            work_unit_id=scoped_blocker,
         )
-        self.add_wake(
-            blocker_message,
-            receiver=5,
-            state="pending",
-            created_at="2026-08-10 11:56:00",
+        projection_now = clock_now + timedelta(minutes=1)
+        self.heartbeat(
+            "sprint-runtime",
+            projection_now.strftime("%Y-%m-%d %H:%M:%S"),
         )
-        self.heartbeat("sprint-runtime", "2026-08-10 12:00:00")
 
-        projected = self.project()["work_units"]
+        projected = self.project(now=projection_now)["work_units"]
 
         self.assertEqual(
-            ("waiting_external", "blocked_grace", [], "PLN1"),
+            ("attention", "blocked_unowned", [], "PLN1"),
             (
                 projected[stale]["condition"],
                 projected[stale]["cause"],
@@ -1065,7 +1128,7 @@ class SprintHealthCase(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            ("wake_pending", [{"message_id": recovery_message}], "PLN1"),
+            ("wake_pending", [{"message_id": original.message_id}], "PLN1"),
             (
                 projected[planner_recovery]["cause"],
                 projected[planner_recovery]["message_refs"],
@@ -1073,13 +1136,95 @@ class SprintHealthCase(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            ("wake_pending", [{"message_id": blocker_message}], "DEV5"),
+            ("wake_pending", [{"message_id": blocker.message_id}], "DEV5"),
             (
                 projected[scoped_blocker]["cause"],
                 projected[scoped_blocker]["message_refs"],
                 projected[scoped_blocker]["owner"]["participants"][0]["shortname"],
             ),
         )
+
+    def test_unknown_native_run_evidence_is_sanitized_and_uses_its_own_clock(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        raw_refs = (None, "native-run-malformed", "conversation-run:999999")
+        units: list[tuple[int, int]] = []
+        for offset, raw_ref in enumerate(raw_refs, start=3):
+            unit = self.add_unit("active", developer=offset)
+            message = self.add_message(
+                unit_id=unit,
+                receiver=offset,
+                kind="work_assignment",
+                disposition="accepted",
+                read_at="2026-08-10 10:05:00",
+                delivered_at="2026-08-10 10:05:00",
+                created_at="2026-08-10 10:00:00",
+            )
+            wake = self.add_wake(
+                message,
+                receiver=offset,
+                state="delivered",
+                created_at="2026-08-10 10:05:00",
+            )
+            attempt_id = int(
+                self.con.execute(
+                    "INSERT INTO sprint_wake_attempts "
+                    "(wake_id,attempt_number,native_run_ref,outcome,attempted_at) "
+                    "VALUES (?,1,?,'delivered','2026-08-10 10:30:00')",
+                    (wake, raw_ref),
+                ).lastrowid
+            )
+            self.add_event(
+                "work_unit.accepted",
+                at="2026-08-10 10:00:00",
+                work_unit_id=unit,
+                payload={"message_id": message},
+            )
+            units.append((unit, attempt_id))
+
+        before = self.project(
+            now=datetime(2026, 8, 10, 10, 59, 59, tzinfo=timezone.utc)
+        )
+        boundary = self.project(
+            now=datetime(2026, 8, 10, 11, 0, 0, tzinfo=timezone.utc)
+        )
+
+        for unit, attempt_id in units:
+            expected_signal = {
+                "kind": "native_run",
+                "id": attempt_id,
+                "at": "2026-08-10T10:30:00Z",
+            }
+            self.assertEqual(
+                ("waiting_external", "no_progress_grace", 1799),
+                (
+                    before["work_units"][unit]["condition"],
+                    before["work_units"][unit]["cause"],
+                    before["work_units"][unit]["age_seconds"],
+                ),
+            )
+            self.assertEqual(
+                (
+                    "attention",
+                    "unreadable_evidence",
+                    "2026-08-10T10:30:00Z",
+                    1800,
+                    [expected_signal],
+                ),
+                (
+                    boundary["work_units"][unit]["condition"],
+                    boundary["work_units"][unit]["cause"],
+                    boundary["work_units"][unit]["since"],
+                    boundary["work_units"][unit]["age_seconds"],
+                    boundary["work_units"][unit]["unreadable_signals"],
+                ),
+            )
+            self.assertIn(expected_signal, boundary["health"]["unreadable_signals"])
+        rendered = json.dumps(boundary, sort_keys=True)
+        self.assertNotIn("native-run-malformed", rendered)
+        self.assertNotIn("conversation-run:999999", rendered)
 
     def test_plural_dependency_roots_preserve_mixed_conditions(self) -> None:
         attention = self.add_unit("active", developer=3, updated_at="2026-08-10 09:00:00")

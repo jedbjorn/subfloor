@@ -22,6 +22,7 @@ QUOTA_FRESH_FOR = timedelta(minutes=10)
 MAX_EVENTS = 2000
 MAX_MESSAGE_REFS = 100
 MAX_ROOT_CAUSES = 100
+MAX_UNREADABLE_SIGNALS = 100
 
 _SEVERITY = {
     "staged": 0,
@@ -209,6 +210,7 @@ class SprintHealthProjection:
         self.sprint_reply_attention_count = 0
         self.prs: dict[int, dict[str, Any]] = {}
         self.unreadable: list[dict[str, Any]] = []
+        self.unreadable_by_unit: dict[int, list[dict[str, Any]]] = defaultdict(list)
         self.runtime: dict[str, Any] = {}
         self.watcher: dict[str, Any] = {}
         self._quota_cache: dict[str | None, dict[str, Any]] = {}
@@ -398,6 +400,7 @@ class SprintHealthProjection:
             "w.available_at,w.delivered_at wake_delivered_at,w.failed_at,w.claimed_at,"
             "a.attempt_id,a.attempted_at,a.target_conversation_id,a.native_run_ref,a.outcome,"
             "r.run_id,r.state run_state,r.started_at,r.heartbeat_at,r.ended_at,"
+            "recovery.recovery_event_id,recovery_event.created_at recovery_created_at,"
             "cm.idempotency_key trigger_idempotency_key,"
             "c.creation_idempotency_key,pc.sprint_participant_id linked_participant_id,"
             "active.chat_id active_chat_id,"
@@ -410,6 +413,16 @@ class SprintHealthProjection:
             " WHERE latest.wake_id=w.wake_id ORDER BY latest.attempt_id DESC LIMIT 1) "
             "LEFT JOIN conversation_runs r "
             "ON a.native_run_ref='conversation-run:' || r.run_id "
+            "LEFT JOIN sprint_wake_recovery_messages recovery "
+            "ON recovery.recovery_event_id=("
+            " SELECT latest_recovery.recovery_event_id "
+            " FROM sprint_wake_recovery_messages latest_recovery "
+            " WHERE latest_recovery.sprint_id=m.sprint_id "
+            " AND latest_recovery.replacement_wake_id=w.wake_id "
+            " AND latest_recovery.message_id=m.message_id "
+            " ORDER BY latest_recovery.recovery_event_id DESC LIMIT 1) "
+            "LEFT JOIN sprint_events recovery_event "
+            "ON recovery_event.event_id=recovery.recovery_event_id "
             "LEFT JOIN conversation_messages cm ON cm.message_id=r.trigger_message_id "
             "LEFT JOIN conversations c ON c.conversation_id=a.target_conversation_id "
             "LEFT JOIN sprint_participant_conversations pc "
@@ -439,6 +452,24 @@ class SprintHealthProjection:
                 and item.get("process_pid") is not None
                 and item.get("process_start_ticks") is not None
             )
+            if item.get("attempt_id") is not None and item.get("outcome") == "delivered":
+                native_ref = item.get("native_run_ref")
+                well_formed = bool(
+                    isinstance(native_ref, str)
+                    and native_ref.startswith("conversation-run:")
+                    and native_ref.removeprefix("conversation-run:").isdigit()
+                )
+                if not well_formed or item.get("run_id") is None:
+                    signal = {
+                        "kind": "native_run",
+                        "id": int(item["attempt_id"]),
+                        "at": _stamp(
+                            _parse(item.get("attempted_at"))
+                            or _parse(item.get("wake_delivered_at"))
+                            or _parse(item.get("wake_created_at"))
+                        ),
+                    }
+                    self._record_unreadable(signal, item.get("work_unit_id"))
             self.messages.append(item)
             if item.get("work_unit_id") is not None:
                 self.messages_by_unit[int(item["work_unit_id"])].append(item)
@@ -641,9 +672,18 @@ class SprintHealthProjection:
                 next_code, next_detail, work_unit_id=unit_id, capacity=capacity,
             )
 
-        anchor = self._latest_reset(unit_id, relevant, floor)
-        overdue = self.now - anchor >= ATTENTION_AFTER
         unreadable = self._unit_unreadable(unit_id)
+        unreadable_times = [
+            value
+            for value in (_parse(signal.get("at")) for signal in unreadable)
+            if value is not None
+        ]
+        anchor = (
+            _max_stamp(floor, *unreadable_times)
+            if unreadable
+            else self._latest_reset(unit_id, relevant, floor)
+        )
+        overdue = self.now - anchor >= ATTENTION_AFTER
         cause = (
             "unreadable_evidence"
             if overdue and unreadable
@@ -707,18 +747,10 @@ class SprintHealthProjection:
                 for message in self._open_reply_candidates(unit_id)
             }
             for message in self.messages_by_unit[unit_id]:
-                wake_key = str(message.get("wake_idempotency_key") or "")
-                recovery_at = _parse(
-                    message.get("wake_created_at") or message.get("created_at")
-                )
+                recovery_at = _parse(message.get("recovery_created_at"))
                 is_planner_recovery = (
                     int(message["receiver_shell_id"]) == owner_shell
-                    and wake_key.startswith(
-                        (
-                            f"sprint-recovery:{self.sprint['sprint_id']}:",
-                            f"sprint-resume:{self.sprint['sprint_id']}:",
-                        )
-                    )
+                    and message.get("recovery_event_id") is not None
                     and recovery_at is not None
                     and recovery_at >= floor
                 )
@@ -1234,7 +1266,7 @@ class SprintHealthProjection:
                         for candidate in sprint_other_roots
                     )
                 ),
-                "unreadable_signals": self.unreadable,
+                "unreadable_signals": self._bounded_unreadable(self.unreadable),
                 "machinery": {
                     "runtime": self.runtime,
                     "watcher": self.watcher,
@@ -1363,11 +1395,41 @@ class SprintHealthProjection:
 
     def _unit_unreadable(self, unit_id: int) -> list[dict[str, Any]]:
         relevant_ids = {int(event["event_id"]) for event in self.events_by_unit[unit_id]}
-        return [
+        signals = [
             signal for signal in self.unreadable
-            if signal["kind"] == "dependency_cycle" and signal["id"] == unit_id
-            or signal["kind"] == "sprint_event" and signal["id"] in relevant_ids
+            if (
+                signal["kind"] == "dependency_cycle" and signal["id"] == unit_id
+                or signal["kind"] == "sprint_event" and signal["id"] in relevant_ids
+            )
         ]
+        signals.extend(self.unreadable_by_unit[unit_id])
+        return self._bounded_unreadable(signals)
+
+    def _record_unreadable(
+        self,
+        signal: dict[str, Any],
+        work_unit_id: object = None,
+    ) -> None:
+        if signal not in self.unreadable:
+            self.unreadable.append(signal)
+        if work_unit_id is None:
+            return
+        unit_signals = self.unreadable_by_unit[int(work_unit_id)]
+        if signal not in unit_signals:
+            unit_signals.append(signal)
+
+    @staticmethod
+    def _bounded_unreadable(
+        signals: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        return sorted(
+            signals,
+            key=lambda signal: (
+                str(signal.get("kind") or ""),
+                int(signal.get("id") or 0),
+                str(signal.get("at") or ""),
+            ),
+        )[:MAX_UNREADABLE_SIGNALS]
 
     @staticmethod
     def _newest(candidates: list[Evidence]) -> Evidence | None:
