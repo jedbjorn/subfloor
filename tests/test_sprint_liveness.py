@@ -14,7 +14,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 MIGRATIONS = ENGINE / "migrations"
-RETIREMENT_MIGRATION = MIGRATIONS / "0193_retire_sprint_liveness_writers.sql"
+RETIREMENT_MIGRATION = MIGRATIONS / "0193_retire_sprint_liveness_acceptance.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import sprint_domain
