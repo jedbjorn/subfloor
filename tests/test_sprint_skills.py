@@ -592,6 +592,11 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0190_reseed_successful_sprint_chat_cleanup.sql":
+                    con.executescript(later_migration.read_text())
 
             for name in sorted(CHAT_CLEANUP_SKILLS):
                 with self.subTest(name=name):
@@ -626,6 +631,45 @@ class SprintSkillTest(unittest.TestCase):
                         "FROM skills WHERE name='sprint_dev'"
                     ).fetchone()
                 ),
+            )
+        finally:
+            con.close()
+
+    def test_pr_recovery_reseed_matches_asset_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0192_reseed_sprint_pr_recovery.sql":
+                    break
+                con.executescript(migration.read_text())
+            con.execute(
+                "UPDATE skills SET description='stale',category='stale',"
+                "command='stale',common=1,content='no recovery surface',"
+                "is_deleted=1 WHERE name='sprint_pln'"
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0192_reseed_sprint_pr_recovery.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            parsed = seed_skills.parse_skill(ASSETS / "sprint_pln" / "SKILL.md")
+            row = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='sprint_pln'"
+            ).fetchone()
+            self.assertEqual(
+                (
+                    parsed["description"],
+                    parsed["category"],
+                    parsed["command"],
+                    parsed["common"],
+                    parsed["content"],
+                    0,
+                ),
+                tuple(row),
             )
         finally:
             con.close()
@@ -784,6 +828,7 @@ class SprintSkillTest(unittest.TestCase):
             "complete-unit",
             "cancel-unit",
             "register-pr",
+            "reconcile-pr",
             "pause",
             "resume",
             "complete",

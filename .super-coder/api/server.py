@@ -2496,6 +2496,28 @@ class Handler(BaseHTTPRequestHandler):
                     "registered_pr_id": receipt.registered_pr_id,
                     "created": receipt.created,
                 })
+            if path == "/_sc/sprint/reconcile-pr":
+                receipt = sprint_pr_watcher.SprintPRWatcher(
+                    con, repo_root=REPO_ROOT
+                ).reconcile_aborted_registration(
+                    sprint_id,
+                    actor=self._sprint_actor(con, sprint_id, shell_id),
+                    repository=body.get("repository") or "",
+                    pr_number=self._sprint_integer(body, "pr_number"),
+                    work_unit_id=self._sprint_integer(body, "work_unit_id"),
+                    reason=body.get("reason") or "",
+                )
+                return self._send(200, {
+                    "registered_pr_id": receipt.registered_pr_id,
+                    "changed": receipt.changed,
+                    "from_sprint_id": receipt.from_sprint_id,
+                    "normalized_state": receipt.normalized_state,
+                    "head_sha": receipt.head_sha,
+                    "merge_sha": receipt.merge_sha,
+                    "completed_work_unit_ids": list(
+                        receipt.completed_work_unit_ids
+                    ),
+                })
             if path == "/_sc/sprint/pause":
                 receipt = sprint_recovery.SprintRecoveryCoordinator(
                     con, repo_root=REPO_ROOT

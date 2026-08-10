@@ -27,6 +27,7 @@ import server
 import sprint_cli
 import sprint_domain
 import sprint_message_delivery
+import sprint_pr_watcher
 from github_pull_requests import PullRequest
 from test_sprint_v2_domain import apply_schema
 
@@ -53,6 +54,7 @@ class SprintCliDispatcherTest(unittest.TestCase):
         self.assertIn("record-qaqc", completed.stdout)
         self.assertIn("compile-report", completed.stdout)
         self.assertIn("watcher-state", completed.stdout)
+        self.assertIn("reconcile-pr", completed.stdout)
 
 
 class Reader:
@@ -296,6 +298,63 @@ class SprintCliApiTest(unittest.TestCase):
         self.assertEqual((1, None, None, "re-enter"), message[:4])
         self.assertIn("number=85", message[4])
         self.assertIn("event=green", message[4])
+
+    def test_reconcile_pr_is_fnb_only_and_projects_the_durable_receipt(self):
+        argv = (
+            "reconcile-pr",
+            "--sprint",
+            str(self.sprint_id),
+            "--repository",
+            "Acme/Repo",
+            "--pr",
+            "42",
+            "--work-unit",
+            str(self.unit_id),
+            "--reason",
+            "repair aborted Sprint ownership",
+        )
+        with mock.patch.object(
+            server.sprint_pr_watcher,
+            "GitHubPullRequestReader",
+            return_value=Reader(),
+        ), self.assertRaisesRegex(SystemExit, "HTTP 403.*only .*FnB"):
+            self.run_cli(TOKENS["developer"], *argv)
+
+        expected = sprint_pr_watcher.RegistrationReconciliationReceipt(
+            self.registered_pr_id,
+            True,
+            9,
+            "merged",
+            "a" * 40,
+            "b" * 40,
+            (self.unit_id,),
+        )
+        with mock.patch.object(
+            server.sprint_pr_watcher.SprintPRWatcher,
+            "reconcile_aborted_registration",
+            return_value=expected,
+        ) as reconcile:
+            response = self.run_cli(TOKENS["admin"], *argv)
+
+        self.assertEqual(
+            {
+                "changed": True,
+                "completed_work_unit_ids": [self.unit_id],
+                "from_sprint_id": 9,
+                "head_sha": "a" * 40,
+                "merge_sha": "b" * 40,
+                "normalized_state": "merged",
+                "registered_pr_id": self.registered_pr_id,
+            },
+            response,
+        )
+        call = reconcile.call_args
+        self.assertEqual(self.sprint_id, call.args[0])
+        self.assertEqual("fnb", call.kwargs["actor"].kind)
+        self.assertEqual(5, call.kwargs["actor"].shell_id)
+        self.assertEqual("Acme/Repo", call.kwargs["repository"])
+        self.assertEqual(42, call.kwargs["pr_number"])
+        self.assertEqual(self.unit_id, call.kwargs["work_unit_id"])
 
     def deliver_message(self, message_id: int) -> None:
         # The delivery worker is out of frame in these surface tests: stamp

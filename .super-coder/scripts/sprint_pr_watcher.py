@@ -28,7 +28,7 @@ from github_pull_requests import (
     GitHubReadError,
     PullRequest,
 )
-from sprint_domain import SprintInvariantError
+from sprint_domain import LifecycleActor, SprintAuthorityError, SprintInvariantError
 from sprint_message_delivery import SprintMessageStore
 from sprint_review_loop import SprintReviewLoopStore
 
@@ -287,6 +287,17 @@ class RegistrationReceipt:
 
 
 @dataclass(frozen=True)
+class RegistrationReconciliationReceipt:
+    registered_pr_id: int
+    changed: bool
+    from_sprint_id: int
+    normalized_state: str
+    head_sha: str
+    merge_sha: str | None
+    completed_work_unit_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class SubscriptionReceipt:
     subscription_id: int
     created: bool
@@ -519,6 +530,323 @@ class SprintPRRegistrationStore:
             notify_commit()
         return RegistrationReceipt(registered_pr_id, True)
 
+    def reconcile_aborted_registration(
+        self,
+        sprint_id: int,
+        *,
+        actor: LifecycleActor,
+        repository: str,
+        pr_number: int,
+        work_unit_id: int,
+        reason: str,
+        pull_request: PullRequest,
+        notify_service: bool = True,
+    ) -> RegistrationReconciliationReceipt:
+        """Move one PR from an aborted Sprint, preserving explicit FnB evidence."""
+        if actor.kind != "fnb" or actor.shell_id is None:
+            raise SprintAuthorityError("only FnB may reconcile Sprint PR ownership")
+        repository = repository.strip().lower()
+        if not _REPOSITORY.fullmatch(repository):
+            raise ValueError("repository must be owner/name")
+        if not isinstance(pr_number, int) or pr_number < 1:
+            raise ValueError("PR number must be a positive integer")
+        if not isinstance(work_unit_id, int) or work_unit_id < 1:
+            raise ValueError("work-unit ID must be a positive integer")
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("reconciliation reason is empty")
+        if len(reason) > 2000:
+            raise ValueError("reconciliation reason exceeds 2000 characters")
+        if pull_request.number != pr_number:
+            raise GitHubReadError("GitHub returned a different PR identity")
+        state = normalize_state(pull_request)
+
+        completed: tuple[int, ...] = ()
+        with db_driver.write_transaction(self.con, "sprint.pr.reconcile"):
+            caller = self.con.execute(
+                "SELECT flavor FROM shells WHERE shell_id=? "
+                "AND COALESCE(is_deleted,0)=0",
+                (actor.shell_id,),
+            ).fetchone()
+            if caller is None or caller["flavor"] != "admin":
+                raise SprintAuthorityError(
+                    "only an authenticated FnB shell may reconcile Sprint PR ownership"
+                )
+            target_sprint = self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (sprint_id,),
+            ).fetchone()
+            if target_sprint is None:
+                raise KeyError(f"unknown Sprint: {sprint_id}")
+            if target_sprint["lifecycle"] != "paused":
+                raise SprintInvariantError(
+                    "PR ownership reconciliation requires a paused target Sprint"
+                )
+            target = self.con.execute(
+                "SELECT u.disposition,u.output_kind,u.assigned_shell_id,"
+                "p.participant_id FROM sprint_work_units u "
+                "JOIN sprint_participants p ON p.sprint_id=u.sprint_id "
+                "AND p.shell_id=u.assigned_shell_id AND p.role='developer' "
+                "WHERE u.sprint_id=? AND u.work_unit_id=?",
+                (sprint_id, work_unit_id),
+            ).fetchone()
+            if target is None:
+                raise SprintInvariantError(
+                    "reconciliation target must be a Developer-owned work unit"
+                )
+            if target["output_kind"] != "code":
+                raise SprintInvariantError(
+                    "PR ownership reconciliation requires a code work unit"
+                )
+
+            existing = self.con.execute(
+                "SELECT pr.registered_pr_id,pr.sprint_id,pr.owner_participant_id,"
+                "s.lifecycle,p.shell_id AS owner_shell_id "
+                "FROM sprint_registered_prs pr "
+                "JOIN sprints s ON s.sprint_id=pr.sprint_id "
+                "JOIN sprint_participants p "
+                "ON p.participant_id=pr.owner_participant_id "
+                "WHERE pr.repository=? AND pr.pr_number=?",
+                (repository, pr_number),
+            ).fetchone()
+            if existing is None:
+                raise SprintInvariantError(
+                    "PR ownership reconciliation requires an existing registration"
+                )
+            registered_pr_id = int(existing["registered_pr_id"])
+            old_unit_ids = tuple(
+                int(row[0])
+                for row in self.con.execute(
+                    "SELECT work_unit_id FROM sprint_pr_work_units "
+                    "WHERE registered_pr_id=? ORDER BY work_unit_id",
+                    (registered_pr_id,),
+                )
+            )
+            exact = (
+                int(existing["sprint_id"]) == sprint_id
+                and int(existing["owner_participant_id"])
+                == int(target["participant_id"])
+                and old_unit_ids == (work_unit_id,)
+            )
+            if exact:
+                durable = self.con.execute(
+                    "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='pr.registration_reconciled' "
+                    "AND json_extract(payload,'$.registered_pr_id')=? "
+                    "AND json_extract(payload,'$.to_work_unit_id')=? "
+                    "ORDER BY event_id DESC LIMIT 1",
+                    (sprint_id, registered_pr_id, work_unit_id),
+                ).fetchone()
+                if durable is None:
+                    raise SprintInvariantError(
+                        "PR is already owned by the target without a recovery receipt"
+                    )
+                durable_payload = json.loads(durable["payload"])
+                durable_state = str(durable_payload["normalized_state"])
+                completed = (
+                    (work_unit_id,)
+                    if target["disposition"] == "completed"
+                    and durable_state == "merged"
+                    else ()
+                )
+                return RegistrationReconciliationReceipt(
+                    registered_pr_id,
+                    False,
+                    int(durable_payload["from_sprint_id"]),
+                    durable_state,
+                    str(durable_payload["head_sha"]),
+                    (
+                        str(durable_payload["merge_sha"])
+                        if durable_payload["merge_sha"] is not None
+                        else None
+                    ),
+                    completed,
+                )
+            if state == "closed":
+                raise SprintInvariantError(
+                    "closed unmerged PR ownership cannot be reconciled"
+                )
+            if not pull_request.head_sha:
+                raise SprintInvariantError(
+                    "PR ownership reconciliation requires an exact head"
+                )
+            if state == "merged" and not pull_request.merge_sha:
+                raise SprintInvariantError(
+                    "merged PR reconciliation requires exact head and merge commit"
+                )
+            if existing["lifecycle"] != "aborted":
+                raise SprintInvariantError(
+                    "PR ownership may be reconciled only from an aborted Sprint"
+                )
+            if target["disposition"] != "active":
+                raise SprintInvariantError(
+                    "PR ownership reconciliation requires an active target work unit"
+                )
+            target_registration = self.con.execute(
+                "SELECT registered_pr_id FROM sprint_pr_work_units "
+                "WHERE sprint_id=? AND work_unit_id=?",
+                (sprint_id, work_unit_id),
+            ).fetchone()
+            if target_registration is not None:
+                raise SprintInvariantError(
+                    "reconciliation target work unit already has a registered PR"
+                )
+
+            prior_sprint_id = int(existing["sprint_id"])
+            self.con.execute(
+                "DELETE FROM sprint_pr_work_units WHERE registered_pr_id=?",
+                (registered_pr_id,),
+            )
+            self.con.execute(
+                "UPDATE sprint_registered_prs SET sprint_id=?,owner_participant_id=? "
+                "WHERE registered_pr_id=?",
+                (sprint_id, target["participant_id"], registered_pr_id),
+            )
+            self.con.execute(
+                "INSERT INTO sprint_pr_work_units "
+                "(sprint_id,registered_pr_id,work_unit_id) VALUES (?,?,?)",
+                (sprint_id, registered_pr_id, work_unit_id),
+            )
+            subscription = self.con.execute(
+                "SELECT subscription_id FROM pr_subscriptions "
+                "WHERE repository=? AND pr_number=?",
+                (repository, pr_number),
+            ).fetchone()
+            if subscription is None:
+                subscription_id = PRSubscriptionStore(self.con).subscribe(
+                    owner_shell_id=int(target["assigned_shell_id"]),
+                    repository=repository,
+                    pr_number=pr_number,
+                    sprint_registered_pr_id=registered_pr_id,
+                ).subscription_id
+            else:
+                subscription_id = int(subscription["subscription_id"])
+                self.con.execute(
+                    "UPDATE pr_subscriptions SET owner_shell_id=?,"
+                    "sprint_registered_pr_id=?,updated_at=datetime('now') "
+                    "WHERE subscription_id=?",
+                    (
+                        target["assigned_shell_id"],
+                        registered_pr_id,
+                        subscription_id,
+                    ),
+                )
+
+            transition_key: str | None = None
+            if state == "merged":
+                transition_key = hashlib.sha256(
+                    (
+                        f"reconcile:{registered_pr_id}:{prior_sprint_id}:"
+                        f"{sprint_id}:{work_unit_id}:{pull_request.head_sha}:"
+                        f"{pull_request.merge_sha}"
+                    ).encode()
+                ).hexdigest()
+                evidence = json.dumps(
+                    {
+                        "base_ref": pull_request.base_ref,
+                        "base_sha": pull_request.base_sha,
+                        "checks": pull_request.checks,
+                        "checks_failed": pull_request.checks_failed,
+                        "head_ref": pull_request.head_ref,
+                        "merge_sha": pull_request.merge_sha,
+                        "review_decision": pull_request.review_decision,
+                        "state": pull_request.state,
+                        "title": pull_request.title,
+                        "trigger": "fnb_reconciliation",
+                        "url": pull_request.url,
+                    },
+                    sort_keys=True,
+                )
+                self.con.execute(
+                    "INSERT INTO pr_subscription_transitions "
+                    "(subscription_id,normalized_state,transition_key,"
+                    "observed_head_sha,evidence) VALUES (?,?,?,?,?)",
+                    (
+                        subscription_id,
+                        state,
+                        transition_key,
+                        pull_request.head_sha,
+                        evidence,
+                    ),
+                )
+                self.con.execute(
+                    "INSERT INTO sprint_pr_transitions "
+                    "(registered_pr_id,normalized_state,transition_key,"
+                    "observed_head_sha,evidence) VALUES (?,?,?,?,?)",
+                    (
+                        registered_pr_id,
+                        state,
+                        transition_key,
+                        pull_request.head_sha,
+                        evidence,
+                    ),
+                )
+                self.con.execute(
+                    "UPDATE sprint_work_units SET disposition='completed',"
+                    "completed_at=datetime('now'),updated_at=datetime('now') "
+                    "WHERE work_unit_id=?",
+                    (work_unit_id,),
+                )
+                completed = (work_unit_id,)
+
+            payload = json.dumps(
+                {
+                    "from_sprint_id": prior_sprint_id,
+                    "from_work_unit_ids": old_unit_ids,
+                    "head_sha": pull_request.head_sha,
+                    "merge_sha": pull_request.merge_sha,
+                    "normalized_state": state,
+                    "pr_number": pr_number,
+                    "reason": reason,
+                    "registered_pr_id": registered_pr_id,
+                    "repository": repository,
+                    "to_sprint_id": sprint_id,
+                    "to_work_unit_id": work_unit_id,
+                },
+                sort_keys=True,
+            )
+            self.con.executemany(
+                "INSERT INTO sprint_events "
+                "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+                "VALUES (?,'pr.registration_reconciled','fnb',?,?)",
+                (
+                    (prior_sprint_id, actor.shell_id, payload),
+                    (sprint_id, actor.shell_id, payload),
+                ),
+            )
+            if completed:
+                self.con.execute(
+                    "INSERT INTO sprint_events "
+                    "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+                    "VALUES (?,'work_unit.completed','fnb',?,?)",
+                    (
+                        sprint_id,
+                        actor.shell_id,
+                        json.dumps(
+                            {
+                                "head_sha": pull_request.head_sha,
+                                "merge_sha": pull_request.merge_sha,
+                                "registered_pr_id": registered_pr_id,
+                                "source": "fnb.pr_recovery_override",
+                                "transition_key": transition_key,
+                                "work_unit_id": work_unit_id,
+                            },
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+        if notify_service:
+            notify_commit()
+        return RegistrationReconciliationReceipt(
+            registered_pr_id,
+            True,
+            prior_sprint_id,
+            state,
+            str(pull_request.head_sha),
+            pull_request.merge_sha,
+            completed,
+        )
+
 
 class SprintPRWatcher:
     """Observe every active PR subscription, regardless of Sprint state."""
@@ -597,6 +925,54 @@ class SprintPRWatcher:
         ).fetchone()
         if receipt.created and row is not None:
             self._observe_rows((row,), "registration", ignore_backoff=True)
+        notify_commit()
+        return receipt
+
+    def reconcile_aborted_registration(
+        self,
+        sprint_id: int,
+        *,
+        actor: LifecycleActor,
+        repository: str,
+        pr_number: int,
+        work_unit_id: int,
+        reason: str,
+    ) -> RegistrationReconciliationReceipt:
+        """Read GitHub, then perform the bounded FnB ownership repair."""
+        caller = self.con.execute(
+            "SELECT flavor FROM shells WHERE shell_id=? "
+            "AND COALESCE(is_deleted,0)=0",
+            (actor.shell_id,),
+        ).fetchone()
+        if (
+            actor.kind != "fnb"
+            or actor.shell_id is None
+            or caller is None
+            or caller["flavor"] != "admin"
+        ):
+            raise SprintAuthorityError(
+                "only an authenticated FnB shell may reconcile Sprint PR ownership"
+            )
+        normalized_repository = repository.strip().lower()
+        if not _REPOSITORY.fullmatch(normalized_repository):
+            raise ValueError("repository must be owner/name")
+        live = self.reader_factory(normalized_repository).get(pr_number)
+        receipt = self.registration.reconcile_aborted_registration(
+            sprint_id,
+            actor=actor,
+            repository=normalized_repository,
+            pr_number=pr_number,
+            work_unit_id=work_unit_id,
+            reason=reason,
+            pull_request=live,
+            notify_service=False,
+        )
+        row = self.con.execute(
+            "SELECT * FROM pr_subscriptions WHERE sprint_registered_pr_id=?",
+            (receipt.registered_pr_id,),
+        ).fetchone()
+        if receipt.changed and row is not None:
+            self._observe_rows((row,), "reconciliation", ignore_backoff=True)
         notify_commit()
         return receipt
 

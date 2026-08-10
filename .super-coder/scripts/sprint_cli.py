@@ -207,6 +207,22 @@ def cmd_register_pr(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reconcile_pr(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/reconcile-pr",
+        {
+            "sprint_id": args.sprint,
+            "repository": args.repository,
+            "pr_number": args.pr,
+            "work_unit_id": args.work_unit,
+            "reason": args.reason,
+        },
+        idempotent=True,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_pause(args: argparse.Namespace) -> int:
     result = _post(
         "/_sc/sprint/pause",
@@ -503,6 +519,17 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--pr", type=int, required=True)
     register.add_argument("--work-unit", type=int, required=True)
     register.set_defaults(fn=cmd_register_pr)
+
+    reconcile = sub.add_parser(
+        "reconcile-pr",
+        help="FnB repairs PR ownership inherited from an aborted Sprint",
+    )
+    reconcile.add_argument("--sprint", type=int, required=True)
+    reconcile.add_argument("--repository", required=True)
+    reconcile.add_argument("--pr", type=int, required=True)
+    reconcile.add_argument("--work-unit", type=int, required=True)
+    reconcile.add_argument("--reason", required=True)
+    reconcile.set_defaults(fn=cmd_reconcile_pr)
 
     pause = sub.add_parser("pause", help="Participant or FnB pauses for integrity")
     pause.add_argument("--sprint", type=int, required=True)

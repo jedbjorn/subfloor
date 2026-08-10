@@ -1,11 +1,15 @@
----
-name: sprint_pln
-description: Run an armed Sprints v2 collaboration loop as Planner — dispatch ready lanes and execute Reviewer decisions through durable re-plan, pause, cancel, resume, and close protocols.
-category: workflow
-common: false
----
+-- 0192 — reseed FnB Sprint PR ownership recovery guidance.
+-- Converge existing installs after adding the authenticated reconcile-pr surface.
 
-# sprint_pln — govern the armed Sprint
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_pln',
+  'Run an armed Sprints v2 collaboration loop as Planner — dispatch ready lanes and execute Reviewer decisions through durable re-plan, pause, cancel, resume, and close protocols.',
+  'workflow',
+  NULL,
+  0,
+  '# sprint_pln — govern the armed Sprint
 
 Use as the originating Planner after `sprint_prep` arms the Sprint. The system
 captures deterministic facts; the Reviewer decides and documents, and the
@@ -149,7 +153,7 @@ unavailable while paused.
 Sprint working artifacts (per-unit review notes, raw diffs, evidence packets,
 report drafts, and Dev scratch proof) go to the gitignored
 `shared/sprints/sprint-<n>/` directory. They are never committed, branched, or
-PR'd in the work repo; a review-notes commit is a finding.
+PR''d in the work repo; a review-notes commit is a finding.
 
 DB rows stay the durable record: judgments via `record-review`, report bodies in
 `sprint_reports`, and decisions in the durable relay. Files in the Sprint
@@ -254,7 +258,7 @@ sc mem task add "<task-title>" --feature <feature-id> \
   --desc "<task-description>"
 ```
 
-Create the requested bound work units from those task ids, wiring the Reviewer's
+Create the requested bound work units from those task ids, wiring the Reviewer''s
 waves and dependencies directly:
 
 ```text
@@ -304,12 +308,12 @@ it is terminal and deletes nothing.
 
 Planner → Developer assignments and Developer → Reviewer review requests use
 Force-new delivery; Developer/Reviewer → Planner results are Re-enter. Forced
-delivery waits for the prior live turn's natural boundary; runtime delivery
+delivery waits for the prior live turn''s natural boundary; runtime delivery
 owns the rest. These are delivery guarantees, not a parent/child chat topology.
 The Planner receives no PR-event wakes; Developer-owned subscriptions carry
 red, green, and externally closed facts directly to the owning Developer.
 
-Never dispatch the next wave from a merge-observation turn. The Developer's
+Never dispatch the next wave from a merge-observation turn. The Developer''s
 merged-work handoff wake is the only normal next-wave dispatch trigger. On that
 wake, complete the turn in this exact order:
 
@@ -332,4 +336,12 @@ sc sprint dispatch --sprint <id>
 On a clean completion receipt, verify the named Sprint is terminal and record
 the bounded receipt; run no close command. The Planner does not author a second
 report, accept an actionable handoff, or wait for another actor to finish the
-Sprint.
+Sprint.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;
