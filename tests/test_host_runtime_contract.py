@@ -2,6 +2,7 @@
 """Host Python selection and optional-TOML regression coverage."""
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import stat
@@ -44,6 +45,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         *argv: str,
         kernel: str | None = None,
         os_release: Path | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = argv or ("install",)
         environment = {
@@ -54,6 +56,8 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
             "SC_PLATFORM_UNAME": kernel or "Linux",
             "SC_PLATFORM_OS_RELEASE": str(os_release or self.supported_release),
         }
+        if extra_env:
+            environment.update(extra_env)
         return subprocess.run(
             ["sh", str(self.dispatch), *command],
             cwd=self.root,
@@ -91,6 +95,20 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
         return path
 
+    def snapshot_tree(self, root: Path) -> list[tuple[str, str, int, str]]:
+        snapshot = []
+        for path in sorted(root.rglob("*")):
+            relative = str(path.relative_to(root))
+            mode = path.lstat().st_mode
+            if path.is_symlink():
+                snapshot.append((relative, "symlink", mode, os.readlink(path)))
+            elif path.is_file():
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                snapshot.append((relative, "file", mode, digest))
+            elif path.is_dir():
+                snapshot.append((relative, "directory", mode, ""))
+        return snapshot
+
     def test_linux_allowlist_accepts_exact_supported_families(self) -> None:
         fixtures = {
             "ubuntu": "ID=ubuntu\n",
@@ -117,11 +135,32 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
     def test_unsupported_host_refuses_before_python_or_target_with_stable_bytes(self) -> None:
         release = self.os_release("misleading", "ID=notarch\nID_LIKE=notarch\n")
         python = self.sentinel_python()
+        git = self.root / "git"
+        git.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = rev-parse ]; then exit 1; fi\n"
+            f"touch {self.root / 'git-mutator-ran'}\n"
+            "exit 99\n"
+        )
+        git.chmod(git.stat().st_mode | stat.S_IXUSR)
+        docker = self.root / "docker"
+        docker.write_text(
+            "#!/bin/sh\n"
+            f"touch {self.root / 'docker-ran'}\n"
+            "exit 99\n"
+        )
+        docker.chmod(docker.stat().st_mode | stat.S_IXUSR)
+        before = self.snapshot_tree(self.root)
+        sentinels = {
+            "PATH": f"{self.root}:{os.environ['PATH']}",
+        }
         first = self.invoke(
-            str(python), "install", kernel="Linux", os_release=release
+            str(python), "install", kernel="Linux", os_release=release,
+            extra_env=sentinels,
         )
         second = self.invoke(
-            str(python), "install", kernel="Linux", os_release=release
+            str(python), "install", kernel="Linux", os_release=release,
+            extra_env=sentinels,
         )
         expected = (
             "✗ subfloor refused: unsupported host.\n"
@@ -135,7 +174,21 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertEqual(first.stderr, expected)
         self.assertEqual(second.stderr, expected)
         self.assertFalse((self.root / "python-ran").exists())
+        self.assertFalse((self.root / "docker-ran").exists())
+        self.assertFalse((self.root / "git-mutator-ran").exists())
         self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
+        self.assertEqual(self.snapshot_tree(self.root), before)
+
+    def test_unreadable_os_release_uses_the_stable_refusal(self) -> None:
+        release = self.root / "invalid-os-release"
+        release.write_bytes(b"\xff\n")
+        python = self.sentinel_python()
+        completed = self.invoke(
+            str(python), "install", kernel="Linux", os_release=release
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("ID=unknown; ID_LIKE=unknown", completed.stderr)
+        self.assertFalse((self.root / "python-ran").exists())
 
     def test_missing_os_release_refuses_before_the_python_probe(self) -> None:
         python = self.sentinel_python()

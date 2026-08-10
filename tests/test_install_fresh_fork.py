@@ -1,6 +1,7 @@
 """Fresh-fork installer completion regression coverage."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -15,6 +16,38 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FreshForkInstallTest(unittest.TestCase):
+    def snapshot_tree(self, root: Path) -> list[tuple[str, str, int, str]]:
+        snapshot = []
+        for path in sorted(root.rglob("*")):
+            relative = str(path.relative_to(root))
+            mode = path.lstat().st_mode
+            if path.is_symlink():
+                snapshot.append((relative, "symlink", mode, os.readlink(path)))
+            elif path.is_file():
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                snapshot.append((relative, "file", mode, digest))
+            elif path.is_dir():
+                snapshot.append((relative, "directory", mode, ""))
+        return snapshot
+
+    def assert_direct_refusal_is_pristine(
+        self,
+        repo: Path,
+        home: Path,
+        before_repo: list[tuple[str, str, int, str]],
+        before_home: list[tuple[str, str, int, str]],
+    ) -> None:
+        self.assertEqual(self.snapshot_tree(repo), before_repo)
+        self.assertEqual(self.snapshot_tree(home), before_home)
+        self.assertFalse((repo / ".gitignore").exists())
+        self.assertFalse((repo / "Makefile").exists())
+        self.assertFalse((repo / ".sc-state").exists())
+        self.assertFalse((repo / ".super-coder" / "instance.json").exists())
+        self.assertFalse((repo / ".super-coder" / "shell_db.db").exists())
+        self.assertFalse((home / ".local" / "bin" / "sc").exists())
+        self.assertFalse((home / ".local" / "state" / "super-coder" / "installs.json").exists())
+        self.assertFalse((home / ".profile").exists())
+
     def prepare_repo(self, raw: str) -> tuple[Path, Path]:
         repo = Path(raw) / "host-project"
         home = Path(raw) / "home"
@@ -186,13 +219,8 @@ class FreshForkInstallTest(unittest.TestCase):
                 release = Path(raw) / "os-release"
                 if contents is not None:
                     release.write_text(contents)
-                before = subprocess.run(
-                    ["git", "status", "--porcelain=v1"],
-                    cwd=repo,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                ).stdout
+                before_repo = self.snapshot_tree(repo)
+                before_home = self.snapshot_tree(home)
                 result = subprocess.run(
                     [
                         sys.executable,
@@ -211,23 +239,46 @@ class FreshForkInstallTest(unittest.TestCase):
                     text=True,
                     check=False,
                 )
-                after = subprocess.run(
-                    ["git", "status", "--porcelain=v1"],
-                    cwd=repo,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                ).stdout
-                self.assertEqual(after, before)
                 if accepted:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout.strip(), "0")
                 else:
                     self.assertEqual(result.returncode, 1)
                     self.assertIn("supported Linux VM", result.stderr)
-                    self.assertFalse((repo / ".gitignore").exists())
-                    self.assertFalse((repo / ".sc-state").exists())
-                    self.assertFalse((repo / ".super-coder/instance.json").exists())
+                    self.assert_direct_refusal_is_pristine(
+                        repo, home, before_repo, before_home
+                    )
+
+    def test_direct_installer_refuses_unreadable_os_release_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo, home = self.prepare_repo(raw)
+            release = Path(raw) / "invalid-os-release"
+            release.write_bytes(b"\xff\n")
+            before_repo = self.snapshot_tree(repo)
+            before_home = self.snapshot_tree(home)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(repo / ".super-coder/scripts/install.py"),
+                    "--harness-epoch",
+                ],
+                cwd=repo,
+                env={
+                    **os.environ,
+                    "HOME": str(home),
+                    "SC_PLATFORM_UNAME": "Linux",
+                    "SC_PLATFORM_OS_RELEASE": str(release),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("ID=unknown; ID_LIKE=unknown", result.stderr)
+            self.assert_direct_refusal_is_pristine(
+                repo, home, before_repo, before_home
+            )
 
     def test_each_failed_critical_phase_withholds_marker_and_reruns_cleanly(self) -> None:
         phases = {

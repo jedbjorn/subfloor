@@ -66,7 +66,7 @@ def _platform_identity() -> tuple[str, str, str]:
                 key, separator, value = line.rstrip("\n").partition("=")
                 if separator and key in {"ID", "ID_LIKE"}:
                     fields[key] = value.strip().strip('"').strip("'")
-    except OSError:
+    except (OSError, UnicodeError):
         pass
     return kernel, fields.get("ID", ""), fields.get("ID_LIKE", "")
 
