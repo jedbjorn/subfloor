@@ -55,6 +55,57 @@ DB="$ENGINE/shell_db.db"
 S="$ENGINE/scripts"
 MAPDB=""
 
+sc_platform_unquote() {
+  _platform_value="$1"
+  case "$_platform_value" in
+    \"*\") _platform_value=${_platform_value#\"}; _platform_value=${_platform_value%\"} ;;
+    \'*\') _platform_value=${_platform_value#\'}; _platform_value=${_platform_value%\'} ;;
+  esac
+  printf '%s\n' "$_platform_value"
+}
+
+sc_platform_detect() {
+  if [ -n "${SC_PLATFORM_UNAME+x}" ]; then
+    SC_PLATFORM_KERNEL="$SC_PLATFORM_UNAME"
+  else
+    SC_PLATFORM_KERNEL="$(uname -s 2>/dev/null || true)"
+  fi
+  if [ -n "${SC_PLATFORM_OS_RELEASE+x}" ]; then
+    _platform_release="$SC_PLATFORM_OS_RELEASE"
+  else
+    _platform_release=/etc/os-release
+  fi
+  SC_PLATFORM_ID=""
+  SC_PLATFORM_ID_LIKE=""
+  if [ -r "$_platform_release" ]; then
+    while IFS='=' read -r _platform_key _platform_value; do
+      case "$_platform_key" in
+        ID) SC_PLATFORM_ID="$(sc_platform_unquote "$_platform_value")" ;;
+        ID_LIKE) SC_PLATFORM_ID_LIKE="$(sc_platform_unquote "$_platform_value")" ;;
+      esac
+    done < "$_platform_release"
+  fi
+}
+
+sc_require_supported_host() {
+  sc_platform_detect
+  case "$SC_PLATFORM_KERNEL:$SC_PLATFORM_ID" in
+    Linux:ubuntu|Linux:fedora|Linux:arch) return 0 ;;
+  esac
+  case " $SC_PLATFORM_ID_LIKE " in
+    *" arch ") [ "$SC_PLATFORM_KERNEL" = Linux ] && return 0 ;;
+  esac
+  {
+    echo '✗ subfloor refused: unsupported host.'
+    echo "  detected kernel: ${SC_PLATFORM_KERNEL:-unknown}"
+    echo "  detected distribution: ID=${SC_PLATFORM_ID:-unknown}; ID_LIKE=${SC_PLATFORM_ID_LIKE:-unknown}"
+    echo '  supported hosts: Ubuntu LTS, Fedora stable, Arch-compatible Linux.'
+    echo '  Create a supported Linux VM, keep the checkout on the guest filesystem, then run ./sc install inside the guest.'
+    echo '  The rejected command was not run and no native compatibility path exists.'
+  } >&2
+  exit 1
+}
+
 sc_python_recovery() {
   if [ "$(uname -s 2>/dev/null || true)" = "Darwin" ]; then
     echo '  recovery: brew install python' >&2
@@ -901,6 +952,13 @@ sc_restart_health_summary() {
 
 
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
+
+# Bare and explicit help remain readable on every host. Every other command is
+# an action surface and must refuse before Python, Docker, Git, or engine code.
+case "$cmd" in
+  help|-h|--help) ;;
+  *) sc_require_supported_host ;;
+esac
 
 # Capability-check every dispatcher route that can execute host Python before
 # it reaches imports or mutation. Shell-implemented help (deps/map/admin/

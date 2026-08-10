@@ -35,18 +35,29 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
             "Path(__file__).with_name('install-ran').write_text('yes')\n"
         )
         self.dispatch = scripts / "dispatch.sh"
+        self.supported_release = self.root / "os-release"
+        self.supported_release.write_text("ID=ubuntu\n")
 
-    def invoke(self, python: str, *argv: str) -> subprocess.CompletedProcess[str]:
+    def invoke(
+        self,
+        python: str,
+        *argv: str,
+        kernel: str | None = None,
+        os_release: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         command = argv or ("install",)
+        environment = {
+            **os.environ,
+            "SC_CALLER_ROOT": str(self.root),
+            "SC_PYTHON": python,
+            "NO_COLOR": "1",
+            "SC_PLATFORM_UNAME": kernel or "Linux",
+            "SC_PLATFORM_OS_RELEASE": str(os_release or self.supported_release),
+        }
         return subprocess.run(
             ["sh", str(self.dispatch), *command],
             cwd=self.root,
-            env={
-                **os.environ,
-                "SC_CALLER_ROOT": str(self.root),
-                "SC_PYTHON": python,
-                "NO_COLOR": "1",
-            },
+            env=environment,
             text=True,
             capture_output=True,
             check=False,
@@ -64,6 +75,122 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         )
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
         return path
+
+    def os_release(self, name: str, contents: str) -> Path:
+        path = self.root / name
+        path.write_text(contents)
+        return path
+
+    def sentinel_python(self) -> Path:
+        path = self.root / "python-sentinel"
+        path.write_text(
+            "#!/bin/sh\n"
+            f"touch {self.root / 'python-ran'}\n"
+            "exit 99\n"
+        )
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        return path
+
+    def test_linux_allowlist_accepts_exact_supported_families(self) -> None:
+        fixtures = {
+            "ubuntu": "ID=ubuntu\n",
+            "fedora": "ID=fedora\n",
+            "arch": "ID=arch\n",
+            "cachyos": "ID=cachyos\nID_LIKE=arch\n",
+        }
+        for name, contents in fixtures.items():
+            with self.subTest(name=name):
+                release = self.os_release(name, contents)
+                completed = self.invoke(
+                    sys.executable,
+                    "install",
+                    kernel="Linux",
+                    os_release=release,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(
+                    (self.root / ".super-coder/scripts/install-ran").read_text(),
+                    "yes",
+                )
+                (self.root / ".super-coder/scripts/install-ran").unlink()
+
+    def test_unsupported_host_refuses_before_python_or_target_with_stable_bytes(self) -> None:
+        release = self.os_release("misleading", "ID=notarch\nID_LIKE=notarch\n")
+        python = self.sentinel_python()
+        first = self.invoke(
+            str(python), "install", kernel="Linux", os_release=release
+        )
+        second = self.invoke(
+            str(python), "install", kernel="Linux", os_release=release
+        )
+        expected = (
+            "✗ subfloor refused: unsupported host.\n"
+            "  detected kernel: Linux\n"
+            "  detected distribution: ID=notarch; ID_LIKE=notarch\n"
+            "  supported hosts: Ubuntu LTS, Fedora stable, Arch-compatible Linux.\n"
+            "  Create a supported Linux VM, keep the checkout on the guest filesystem, then run ./sc install inside the guest.\n"
+            "  The rejected command was not run and no native compatibility path exists.\n"
+        )
+        self.assertEqual(first.returncode, 1)
+        self.assertEqual(first.stderr, expected)
+        self.assertEqual(second.stderr, expected)
+        self.assertFalse((self.root / "python-ran").exists())
+        self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
+
+    def test_missing_os_release_refuses_before_the_python_probe(self) -> None:
+        python = self.sentinel_python()
+        completed = self.invoke(
+            str(python),
+            "install",
+            kernel="Linux",
+            os_release=self.root / "missing-os-release",
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("ID=unknown; ID_LIKE=unknown", completed.stderr)
+        self.assertFalse((self.root / "python-ran").exists())
+
+    def test_help_stays_readable_but_doctor_and_make_delegate_to_the_gate(self) -> None:
+        release = self.os_release("darwin", "ID=macos\n")
+        python = self.sentinel_python()
+        help_result = self.invoke(
+            str(python), "help", kernel="Darwin", os_release=release
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("super-coder", help_result.stdout)
+
+        doctor = self.invoke(
+            str(python), "doctor", kernel="Darwin", os_release=release
+        )
+        self.assertEqual(doctor.returncode, 1)
+        self.assertIn("Create a supported Linux VM", doctor.stderr)
+        self.assertFalse((self.root / "python-ran").exists())
+
+        windows = self.invoke(
+            str(python), "install", kernel="MINGW64_NT", os_release=release
+        )
+        self.assertEqual(windows.returncode, 1)
+        self.assertIn("detected kernel: MINGW64_NT", windows.stderr)
+        self.assertFalse((self.root / "python-ran").exists())
+
+        (self.root / "Makefile").write_text(
+            "dos-l:\n\tsh .super-coder/scripts/dispatch.sh install\n"
+        )
+        make_result = subprocess.run(
+            ["make", "dos-l"],
+            cwd=self.root,
+            env={
+                **os.environ,
+                "SC_PLATFORM_UNAME": "Darwin",
+                "SC_PLATFORM_OS_RELEASE": str(release),
+                "SC_PYTHON": str(python),
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(make_result.returncode, 0)
+        self.assertIn("no native compatibility path exists", make_result.stderr)
+        self.assertFalse((self.root / "python-ran").exists())
 
     def test_missing_explicit_interpreter_stops_before_target(self) -> None:
         selected = str(self.root / "missing-python")

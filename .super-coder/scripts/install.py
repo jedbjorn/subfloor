@@ -50,6 +50,55 @@ REPO_ROOT = ENGINE.parent
 PY = sys.executable
 IS_MAC = platform.system() == "Darwin"  # guidance arms differ (colima/brew vs systemd/apt)
 
+
+def _platform_identity() -> tuple[str, str, str]:
+    """Return the kernel and os-release identity without guessing a distro."""
+    kernel = (
+        os.environ["SC_PLATFORM_UNAME"]
+        if "SC_PLATFORM_UNAME" in os.environ
+        else platform.system()
+    )
+    release = os.environ.get("SC_PLATFORM_OS_RELEASE", "/etc/os-release")
+    fields: dict[str, str] = {}
+    try:
+        with open(release, encoding="utf-8") as stream:
+            for line in stream:
+                key, separator, value = line.rstrip("\n").partition("=")
+                if separator and key in {"ID", "ID_LIKE"}:
+                    fields[key] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return kernel, fields.get("ID", ""), fields.get("ID_LIKE", "")
+
+
+def require_supported_host() -> None:
+    """Refuse unsupported hosts before installer imports or repository writes."""
+    kernel, distro_id, distro_like = _platform_identity()
+    supported = kernel == "Linux" and (
+        distro_id in {"ubuntu", "fedora", "arch"}
+        or "arch" in distro_like.split()
+    )
+    if supported:
+        return
+    raise SystemExit(
+        "✗ subfloor refused: unsupported host.\n"
+        f"  detected kernel: {kernel or 'unknown'}\n"
+        "  detected distribution: "
+        f"ID={distro_id or 'unknown'}; ID_LIKE={distro_like or 'unknown'}\n"
+        "  supported hosts: Ubuntu LTS, Fedora stable, Arch-compatible Linux.\n"
+        "  Create a supported Linux VM, keep the checkout on the guest filesystem, "
+        "then run ./sc install inside the guest.\n"
+        "  The rejected command was not run and no native compatibility path exists."
+    )
+
+
+# Direct execution reaches this module before `main`, so enforce the boundary
+# before loading engine modules that could otherwise create local bytecode. An
+# imported installer remains inspectable by tests and maintenance tooling; its
+# action entry point enforces the same boundary below.
+if __name__ == "__main__":
+    require_supported_host()
+
 sys.path.insert(0, str(ENGINE / "scripts"))
 import callable_floor  # noqa: E402
 import engine_manifest  # noqa: E402
@@ -857,6 +906,7 @@ def step(msg: str) -> None:
 
 
 def main(argv: list[str]) -> int:
+    require_supported_host()
     force = "--force" in argv
     skip_harness = "--skip-harness-install" in argv
     # super-coder's own flags — strip them so they don't reach init_fork's parser.

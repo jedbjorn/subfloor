@@ -47,6 +47,10 @@ class FreshForkInstallTest(unittest.TestCase):
             cwd=repo, check=True,
         )
         subprocess.run(
+            ["git", "config", "maintenance.auto", "false"],
+            cwd=repo, check=True,
+        )
+        subprocess.run(
             ["git", "add", ".super-coder", "sc", "README.md"],
             cwd=repo, check=True,
         )
@@ -57,6 +61,8 @@ class FreshForkInstallTest(unittest.TestCase):
         return repo, home
 
     def run_install(self, repo: Path, home: Path) -> subprocess.CompletedProcess[str]:
+        release = home / "os-release"
+        release.write_text("ID=ubuntu\n")
         return subprocess.run(
             [
                 sys.executable,
@@ -71,6 +77,8 @@ class FreshForkInstallTest(unittest.TestCase):
                 "HOME": str(home),
                 "XDG_STATE_HOME": str(home / ".local/state"),
                 "NO_COLOR": "1",
+                "SC_PLATFORM_UNAME": "Linux",
+                "SC_PLATFORM_OS_RELEASE": str(release),
             },
             capture_output=True,
             text=True,
@@ -120,6 +128,8 @@ class FreshForkInstallTest(unittest.TestCase):
                 check=True,
             ).stdout
             install = repo / ".super-coder" / "scripts" / "install.py"
+            release = home / "os-release"
+            release.write_text("ID=ubuntu\n")
             direct_entry = (
                 "import platform, runpy, sys; "
                 "sys.version_info = (3, 8, 20); "
@@ -136,6 +146,8 @@ class FreshForkInstallTest(unittest.TestCase):
                     "HOME": str(home),
                     "NO_COLOR": "1",
                     "PYTHONDONTWRITEBYTECODE": "1",
+                    "SC_PLATFORM_UNAME": "Linux",
+                    "SC_PLATFORM_OS_RELEASE": str(release),
                 },
                 capture_output=True,
                 text=True,
@@ -156,6 +168,66 @@ class FreshForkInstallTest(unittest.TestCase):
                 check=True,
             ).stdout
             self.assertEqual(after, before)
+
+    def test_direct_installer_platform_gate_matches_allowlist_without_mutation(self) -> None:
+        fixtures = {
+            "ubuntu": ("Linux", "ID=ubuntu\n", True),
+            "fedora": ("Linux", "ID=fedora\n", True),
+            "arch": ("Linux", "ID=arch\n", True),
+            "cachyos": ("Linux", "ID=cachyos\nID_LIKE=arch\n", True),
+            "unknown-linux": ("Linux", "ID=notarch\nID_LIKE=notarch\n", False),
+            "missing-os-release": ("Linux", None, False),
+            "darwin": ("Darwin", "ID=macos\n", False),
+            "windows": ("MINGW64_NT", "ID=windows\n", False),
+        }
+        for name, (kernel, contents, accepted) in fixtures.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as raw:
+                repo, home = self.prepare_repo(raw)
+                release = Path(raw) / "os-release"
+                if contents is not None:
+                    release.write_text(contents)
+                before = subprocess.run(
+                    ["git", "status", "--porcelain=v1"],
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(repo / ".super-coder/scripts/install.py"),
+                        "--harness-epoch",
+                    ],
+                    cwd=repo,
+                    env={
+                        **os.environ,
+                        "HOME": str(home),
+                        "SC_PLATFORM_UNAME": kernel,
+                        "SC_PLATFORM_OS_RELEASE": str(release),
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                after = subprocess.run(
+                    ["git", "status", "--porcelain=v1"],
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+                self.assertEqual(after, before)
+                if accepted:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), "0")
+                else:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("supported Linux VM", result.stderr)
+                    self.assertFalse((repo / ".gitignore").exists())
+                    self.assertFalse((repo / ".sc-state").exists())
+                    self.assertFalse((repo / ".super-coder/instance.json").exists())
 
     def test_each_failed_critical_phase_withholds_marker_and_reruns_cleanly(self) -> None:
         phases = {
