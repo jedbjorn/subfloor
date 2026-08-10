@@ -302,6 +302,7 @@ class SprintHealthCase(unittest.TestCase):
         active: bool = True,
         creation_wake_id: int | None = None,
         creation_generation: int | None = None,
+        provider: str | None = None,
     ) -> int:
         generation = self.con.execute(
             "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
@@ -319,12 +320,13 @@ class SprintHealthCase(unittest.TestCase):
         ).fetchone()[0]
         self.con.execute(
             "INSERT INTO conversations "
-            "(conversation_id,shell_id,owner_user_id,harness,worktree,state,title,"
+            "(conversation_id,shell_id,owner_user_id,harness,provider,worktree,state,title,"
             "creation_idempotency_key,creation_request_hash,conversation_scope) "
-            "VALUES (?,?,1,'codex','/work','running','test',?,?,'sprint')",
+            "VALUES (?,?,1,'codex',?,'/work','running','test',?,?,'sprint')",
             (
                 conversation,
                 shell_id,
+                provider,
                 creation_key,
                 suffix,
             ),
@@ -1697,6 +1699,276 @@ class SprintHealthCase(unittest.TestCase):
         self.assertEqual([], projected["health"]["root_causes"])
         self.assertEqual([], projected["work_units"][dependent]["root_work_unit_ids"])
 
+    def test_rootless_progress_and_external_aggregates_keep_oldest_clock(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET armed_at='2026-08-10 11:00:00' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        running_units: list[int] = []
+        for developer, heartbeat in ((3, "2026-08-10 11:50:00"), (4, "2026-08-10 11:55:00")):
+            unit = self.add_unit(
+                "active", developer=developer, updated_at="2026-08-10 11:10:00"
+            )
+            message = self.add_message(
+                unit_id=unit,
+                receiver=developer,
+                kind="work_assignment",
+                disposition="accepted",
+                read_at="2026-08-10 11:10:00",
+                delivered_at="2026-08-10 11:09:00",
+                created_at="2026-08-10 11:08:00",
+            )
+            wake = self.add_wake(
+                message,
+                receiver=developer,
+                state="delivered",
+                created_at="2026-08-10 11:08:00",
+            )
+            self.add_event(
+                "work_unit.accepted",
+                at="2026-08-10 11:10:00",
+                work_unit_id=unit,
+                payload={"message_id": message},
+            )
+            run_id = self.add_live_run(
+                message,
+                wake,
+                shell_id=developer,
+                suffix=f"rootless-progress-{developer}",
+            )
+            self.con.execute(
+                "UPDATE conversation_runs SET heartbeat_at=? WHERE run_id=?",
+                (heartbeat, run_id),
+            )
+            running_units.append(unit)
+
+        progressing = self.project()
+        self.assertEqual(
+            ("progressing", "2026-08-10T11:50:00Z", 600, [], []),
+            (
+                progressing["health"]["condition"],
+                progressing["health"]["since"],
+                progressing["health"]["age_seconds"],
+                progressing["health"]["root_work_unit_ids"],
+                progressing["health"]["root_causes"],
+            ),
+        )
+        self.assertEqual(
+            ["2026-08-10T11:50:00Z", "2026-08-10T11:55:00Z"],
+            [progressing["work_units"][unit]["since"] for unit in running_units],
+        )
+
+        external_units = [
+            self.add_unit("active", developer=5, updated_at="2026-08-10 11:40:00"),
+            self.add_unit("active", developer=6, updated_at="2026-08-10 11:45:00"),
+        ]
+        waiting = self.project()
+        self.assertEqual(
+            ("waiting_external", "2026-08-10T11:40:00Z", 1200, [], []),
+            (
+                waiting["health"]["condition"],
+                waiting["health"]["since"],
+                waiting["health"]["age_seconds"],
+                waiting["health"]["root_work_unit_ids"],
+                waiting["health"]["root_causes"],
+            ),
+        )
+        self.assertEqual(
+            ["no_progress_grace", "no_progress_grace"],
+            [waiting["work_units"][unit]["cause"] for unit in external_units],
+        )
+
+    def test_historical_quota_escalations_replay_without_new_liveness_wakes(self) -> None:
+        account_id = int(
+            self.con.execute(
+                "INSERT INTO harness_quota_account (provider,account_ref) "
+                "VALUES ('anthropic','historical-reviewer')"
+            ).lastrowid
+        )
+        self.con.execute(
+            "INSERT INTO harness_quota_window "
+            "(account_pk,window_kind,used_percent,resets_at,captured_at,status) "
+            "VALUES (?,'five_hour',100,'2026-08-10 13:00:00',"
+            "'2026-08-10 11:59:00','ok')",
+            (account_id,),
+        )
+        sprint_ids: list[int] = []
+        case = 0
+        for sprint_index in range(8):
+            if sprint_index:
+                self.sprint_id = self._new_sprint()
+            sprint_ids.append(self.sprint_id)
+            case_count = 3 if sprint_index < 5 else 2
+            for _ in range(case_count):
+                unit = self.add_unit(
+                    "in_review",
+                    developer=3 + (case % 13),
+                    updated_at="2026-08-10 11:50:00",
+                )
+                request = self.add_message(
+                    unit_id=unit,
+                    receiver=2,
+                    kind="review_request",
+                    disposition="accepted",
+                    read_at="2026-08-10 11:54:00",
+                    delivered_at="2026-08-10 11:53:00",
+                    created_at=f"2026-08-10 11:{case:02d}:00",
+                )
+                wake = self.add_wake(
+                    request,
+                    receiver=2,
+                    state="delivered",
+                    created_at=f"2026-08-10 11:{case:02d}:00",
+                )
+                self.add_event(
+                    "review.requested",
+                    at="2026-08-10 11:54:00",
+                    work_unit_id=unit,
+                    payload={"message_id": request},
+                )
+                run_id = self.add_live_run(
+                    request,
+                    wake,
+                    shell_id=2,
+                    suffix=f"historical-review-{case}",
+                    provider="anthropic",
+                )
+                reviewer_participant_id = int(
+                    self.con.execute(
+                        "SELECT participant_id FROM sprint_participants "
+                        "WHERE sprint_id=? AND shell_id=2",
+                        (self.sprint_id,),
+                    ).fetchone()[0]
+                )
+                self.con.execute(
+                    "INSERT INTO sprint_liveness_expectations "
+                    "(message_id,sprint_id,participant_id,accepted_at,last_strong_at,"
+                    "last_strong_key,next_evaluation_at,escalated_at) "
+                    "VALUES (?,?,?,'2026-08-10 11:54:00','2026-08-10 11:54:00',"
+                    "?,'2026-08-10 11:59:00','2026-08-10 11:59:00')",
+                    (
+                        request,
+                        self.sprint_id,
+                        reviewer_participant_id,
+                        f"message.accepted:{request}",
+                    ),
+                )
+                escalation = self.add_message(
+                    unit_id=None,
+                    receiver=1,
+                    kind="escalation",
+                    created_at=f"2026-08-10 11:{case:02d}:30",
+                )
+                self.add_event(
+                    "liveness.escalated",
+                    at=f"2026-08-10 11:{case:02d}:30",
+                    payload={
+                        "expectation_message_id": request,
+                        "escalation_message_id": escalation,
+                    },
+                )
+                self.con.commit()
+                history_before = (
+                    self.con.execute(
+                        "SELECT COUNT(*) FROM sprint_liveness_expectations"
+                    ).fetchone()[0],
+                    self.con.execute(
+                        "SELECT COUNT(*) FROM sprint_events "
+                        "WHERE event_type LIKE 'liveness.%'"
+                    ).fetchone()[0],
+                    self.con.execute(
+                        "SELECT COUNT(*) FROM wake_message "
+                        "WHERE message_kind IN ('nudge','escalation')"
+                    ).fetchone()[0],
+                )
+                changes_before = self.con.total_changes
+
+                projected = self.project()
+
+                self.assertEqual(changes_before, self.con.total_changes)
+                self.assertEqual(
+                    history_before,
+                    (
+                        self.con.execute(
+                            "SELECT COUNT(*) FROM sprint_liveness_expectations"
+                        ).fetchone()[0],
+                        self.con.execute(
+                            "SELECT COUNT(*) FROM sprint_events "
+                            "WHERE event_type LIKE 'liveness.%'"
+                        ).fetchone()[0],
+                        self.con.execute(
+                            "SELECT COUNT(*) FROM wake_message "
+                            "WHERE message_kind IN ('nudge','escalation')"
+                        ).fetchone()[0],
+                    ),
+                )
+                self.assertEqual(
+                    ("progressing", "run_active", "exhausted", []),
+                    (
+                        projected["work_units"][unit]["condition"],
+                        projected["work_units"][unit]["cause"],
+                        projected["work_units"][unit]["capacity"]["state"],
+                        projected["work_units"][unit]["root_work_unit_ids"],
+                    ),
+                )
+                active_conversation = self.con.execute(
+                    "SELECT chat_id FROM active_shell_chats WHERE shell_id=2"
+                ).fetchone()[0]
+                trigger_message_id = self.con.execute(
+                    "SELECT trigger_message_id FROM conversation_runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()[0]
+                self.con.execute(
+                    "UPDATE conversation_runs SET state='succeeded',"
+                    "ended_at='2026-08-10 12:00:00' WHERE run_id=?",
+                    (run_id,),
+                )
+                self.con.execute(
+                    "UPDATE conversation_messages SET state='completed',"
+                    "completed_at='2026-08-10 12:00:00' WHERE message_id=?",
+                    (trigger_message_id,),
+                )
+                self.con.execute(
+                    "UPDATE conversations SET state='idle' WHERE conversation_id=?",
+                    (active_conversation,),
+                )
+                self.con.execute("DELETE FROM active_shell_chats WHERE shell_id=2")
+                self.con.execute(
+                    "UPDATE conversations SET state='closed',"
+                    "closed_at='2026-08-10 12:00:00' WHERE conversation_id=?",
+                    (active_conversation,),
+                )
+                self.con.commit()
+                case += 1
+            self.con.execute(
+                "UPDATE sprints SET lifecycle='completed',terminal_outcome='success',"
+                "completed_at='2026-08-10 12:00:00' WHERE sprint_id=?",
+                (self.sprint_id,),
+            )
+            self.con.commit()
+
+        self.assertEqual(8, len(set(sprint_ids)))
+        self.assertEqual(21, case)
+        self.assertEqual(
+            (21, 21, 0, 21),
+            (
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_liveness_expectations"
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='liveness.escalated'"
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM wake_message WHERE message_kind='nudge'"
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM wake_message "
+                    "WHERE message_kind='escalation'"
+                ).fetchone()[0],
+            ),
+        )
+
     def test_all_terminal_armed_sprint_projects_closeout_handoff_and_idle(self) -> None:
         self.con.execute(
             "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
@@ -1747,6 +2019,126 @@ class SprintHealthCase(unittest.TestCase):
         self.assertEqual(
             [{"message_id": message}],
             idle["health"]["root_causes"][0]["message_refs"],
+        )
+
+    def test_closeout_boundary_and_finished_carrier_restart_the_clock(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.add_unit("completed", developer=3, updated_at="2026-08-10 10:30:00")
+        event_id = self.add_event(
+            "sprint.delivery_terminal",
+            at="2026-08-10 11:00:00",
+            payload={"terminal_count": 1, "completed_count": 1},
+        )
+        message = self.add_message(
+            unit_id=None,
+            receiver=2,
+            delivered_at="2026-08-10 11:00:00",
+            created_at="2026-08-10 11:00:00",
+        )
+        self.con.execute(
+            "UPDATE wake_message SET idempotency_key=? WHERE message_id=?",
+            (f"sprint:{self.sprint_id}:delivery-terminal:1", message),
+        )
+        wake = self.add_wake(
+            message,
+            receiver=2,
+            state="delivered",
+            created_at="2026-08-10 11:00:00",
+        )
+
+        before = self.project(
+            now=datetime(2026, 8, 10, 11, 29, 59, tzinfo=timezone.utc)
+        )["health"]
+        boundary = self.project(
+            now=datetime(2026, 8, 10, 11, 30, 0, tzinfo=timezone.utc)
+        )["health"]
+        self.assertEqual(
+            ("waiting_external", "2026-08-10T11:00:00Z", 1799, []),
+            (
+                before["condition"],
+                before["since"],
+                before["age_seconds"],
+                before["root_causes"],
+            ),
+        )
+        self.assertEqual(
+            (
+                "attention",
+                "conformance_idle",
+                "2026-08-10T11:00:00Z",
+                1800,
+                f"sprint:closeout:{event_id}",
+                [{"message_id": message}],
+                "conformance_recorded",
+            ),
+            (
+                boundary["condition"],
+                boundary["root_causes"][0]["cause"],
+                boundary["since"],
+                boundary["age_seconds"],
+                boundary["root_causes"][0]["root_id"],
+                boundary["root_causes"][0]["message_refs"],
+                boundary["root_causes"][0]["next_expected_event"]["code"],
+            ),
+        )
+
+        run_id = self.add_live_run(
+            message,
+            wake,
+            shell_id=2,
+            suffix="closeout-carrier",
+        )
+        active = self.project()["health"]
+        self.assertEqual(("progressing", "2026-08-10T11:59:59Z"), (
+            active["condition"], active["since"]
+        ))
+        self.con.execute(
+            "UPDATE conversation_runs SET state='succeeded',"
+            "heartbeat_at='2026-08-10 12:00:00',ended_at='2026-08-10 12:00:00' "
+            "WHERE run_id=?",
+            (run_id,),
+        )
+        run = self.con.execute(
+            "SELECT conversation_id,trigger_message_id FROM conversation_runs "
+            "WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        self.con.execute(
+            "UPDATE conversation_messages SET state='completed',"
+            "completed_at='2026-08-10 12:00:00' WHERE message_id=?",
+            (run["trigger_message_id"],),
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='idle' WHERE conversation_id=?",
+            (run["conversation_id"],),
+        )
+        self.con.execute("DELETE FROM active_shell_chats WHERE shell_id=2")
+
+        reset_before = self.project(
+            now=datetime(2026, 8, 10, 12, 29, 59, tzinfo=timezone.utc)
+        )["health"]
+        reset_boundary = self.project(
+            now=datetime(2026, 8, 10, 12, 30, 0, tzinfo=timezone.utc)
+        )["health"]
+        self.assertEqual(
+            ("waiting_external", "2026-08-10T12:00:00Z", 1799),
+            (
+                reset_before["condition"],
+                reset_before["since"],
+                reset_before["age_seconds"],
+            ),
+        )
+        self.assertEqual(
+            ("attention", "2026-08-10T12:00:00Z", 1800, run_id),
+            (
+                reset_boundary["condition"],
+                reset_boundary["since"],
+                reset_boundary["age_seconds"],
+                reset_boundary["root_causes"][0]["last_evidence"]["id"],
+            ),
         )
 
     def test_projection_performs_only_bounded_reads(self) -> None:
