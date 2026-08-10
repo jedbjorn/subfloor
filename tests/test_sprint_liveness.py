@@ -28,6 +28,9 @@ def apply_schema(con: sqlite3.Connection) -> None:
         if migration == RETIREMENT_MIGRATION:
             break
         con.executescript(migration.read_text())
+    con.executescript(
+        (MIGRATIONS / "0194_sprint_scoped_reply_waits.sql").read_text()
+    )
     con.execute("PRAGMA foreign_keys=ON")
 
 

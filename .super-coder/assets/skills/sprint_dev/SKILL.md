@@ -60,23 +60,43 @@ successful typed handoff so the next delivery can proceed cleanly.
 ## Questions, answers, blockers, and failures
 
 Put one concrete question, answer, blocker, or useful context item in a short
-body file, then send it to the participant who owns the next fact or action:
+body file. Declare the message intent and whether the required reply belongs to
+this work unit or the whole Sprint.
+
+A question or blocker about this lane requires a reply and names the work unit:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent question --requires-reply --work-unit <work-unit-id> \
   --key <stable-key>
 ```
 
-Ask the Planner about scope, priority, or cross-unit decisions and the Reviewer
-about review evidence. Answer an incoming question through `send`, confirm the
-write, then mark the handled message read with `accept`. For a blocker or
-integrity concern, send the Planner evidence, impact, the exact action needed,
-and your recommendation. Continue safe independent work, but stop at a decision
-boundary when an answer is required. Unread recovery owns re-waking; do not send
-duplicate reminders.
+Use `--intent blocker` instead for a blocked lane. A cross-unit, closeout, or
+external-authority ruling is a Sprint-level decision:
 
-Choose one stable key for the intended recipient and exact body. Reuse it only
-when retrying that same write; use a new key when the recipient or body changes.
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent decision --requires-reply --sprint-level --key <stable-key>
+```
+
+Answer the stored sender through the original message. The server inherits its
+unit or Sprint scope; never add `--work-unit` or `--sprint-level` to a reply:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent information --reply-to <message-id> --key <stable-key>
+```
+
+Ask the Planner about scope, priority, or cross-unit decisions and the Reviewer
+about review evidence. Confirm the reply write, then mark the handled incoming
+message read with `accept`. For a blocker or integrity concern, send the Planner
+evidence, impact, the exact action needed, and your recommendation. Continue
+safe independent work, but stop at a decision boundary when an answer is
+required. Unread recovery owns re-waking; do not send duplicate reminders.
+
+Choose one stable key for the intended recipient, exact body, intent, reply
+linkage, and scope. Reuse it only when retrying that same write; use a new key
+when any of those fields changes.
 
 Keep the body near 6,000 characters and below the 8,000 hard maximum; run
 `wc -m < <path>`. A handoff is complete only when the Sprint command exits
@@ -158,8 +178,7 @@ sc sprint watcher-state --sprint <id>
 
 Run it once to distinguish a stale or never-started watcher from red, pending,
 or absent PR observation, then stop or return the evidence to the Planner. Do
-not repeat the read as a polling loop. `sc sprint monitor` evaluates accepted
-liveness expectations and carries no evidence about the PR watcher.
+not repeat the read as a polling loop.
 
 ## Review handoff
 
@@ -227,7 +246,7 @@ After the exact authorized merge succeeds, complete close-out in this order:
 
 ```text
 sc sprint send --sprint <id> --to <planner-shortname> --body-file <path> \
-  --key <stable-merged-handoff-key>
+  --intent handoff --key <stable-merged-handoff-key>
 ```
 
 5. When the command confirms the durable write and Planner wake, stop
