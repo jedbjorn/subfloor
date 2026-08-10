@@ -72,11 +72,12 @@ class SprintReviewLoopStore:
         registered_pr_id: int,
         developer_shell_id: int,
         *,
-        readiness: str,
+        intent: str | None = None,
+        readiness: str | None = None,
         idempotency_key: str,
     ) -> ReviewHandoffReceipt:
-        """Record Developer readiness and actively hand the green PR to review."""
-        readiness = self._required(readiness, "readiness judgment")
+        """Author the exact locator and actively hand the green PR to review."""
+        intent = self._review_intent(intent, readiness)
         idempotency_key = self._required(idempotency_key, "idempotency key", 255)
         with db_driver.write_transaction(self.con, "sprint.review.request"):
             lane = self._lane(sprint_id, registered_pr_id)
@@ -87,13 +88,18 @@ class SprintReviewLoopStore:
                 raise SprintInvariantError(self._review_gate_error(transition))
             if transition["observed_head_sha"] is None:
                 raise SprintInvariantError("registered PR has no exact observed head")
+            locator = self._review_locator(
+                lane,
+                str(transition["observed_head_sha"]),
+                intent,
+            )
             receipt = self.messages.send_in_transaction(
                 sprint_id,
                 to_participant_id=int(lane["reviewer_participant_id"]),
                 from_participant_id=int(lane["developer_participant_id"]),
                 work_unit_id=int(lane["work_unit_id"]),
                 message_kind="review_request",
-                body=readiness,
+                body=locator,
                 actionable=True,
                 declared_type="force-new",
                 idempotency_key=idempotency_key,
@@ -106,7 +112,7 @@ class SprintReviewLoopStore:
                 raise SprintInvariantError(
                     f"review handoff cannot start from {lane['disposition']}"
                 )
-            self._record_judgment(lane, developer_shell_id, "decision", readiness)
+            self._record_judgment(lane, developer_shell_id, "decision", locator)
             self.con.execute(
                 "UPDATE sprint_work_units SET disposition='in_review',"
                 "updated_at=datetime('now') WHERE work_unit_id=?",
@@ -345,7 +351,9 @@ class SprintReviewLoopStore:
         return rows[0]
 
     @staticmethod
-    def _required(value: str, name: str, maximum: int = 8000) -> str:
+    def _required(value: str | None, name: str, maximum: int = 8000) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{name} must be a string")
         value = value.strip()
         if not value:
             raise ValueError(f"{name} is empty")
@@ -354,6 +362,39 @@ class SprintReviewLoopStore:
                 f"{name} is {len(value)} characters; maximum is {maximum}"
             )
         return value
+
+    @classmethod
+    def _review_intent(
+        cls,
+        intent: str | None,
+        legacy_readiness: str | None,
+    ) -> str:
+        if intent is not None and legacy_readiness is not None:
+            raise ValueError("provide review intent or legacy readiness, not both")
+        if intent is not None:
+            normalized = cls._required(intent, "review intent", 20).lower()
+            if normalized not in {"submit", "resubmit"}:
+                raise ValueError("review intent must be submit or resubmit")
+            return normalized
+        legacy = cls._required(legacy_readiness, "readiness judgment")
+        opening = legacy.lower().lstrip()
+        if opening.startswith(("re-submitting", "resubmitting", "re-submit")):
+            return "resubmit"
+        return "submit"
+
+    @staticmethod
+    def _review_locator(lane: sqlite3.Row, head_sha: str, intent: str) -> str:
+        opening = (
+            "Submitting PR for review"
+            if intent == "submit"
+            else "Re-submitting PR for review"
+        )
+        return (
+            f"{opening}: https://github.com/{lane['repository']}/pull/"
+            f"{lane['pr_number']}; registered Sprint PR "
+            f"{lane['registered_pr_id']}; exact head {head_sha}; work unit "
+            f"{lane['work_unit_id']}."
+        )
 
     @staticmethod
     def _require_armed(lane: sqlite3.Row) -> None:

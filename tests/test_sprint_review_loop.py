@@ -172,7 +172,7 @@ class ReviewHandoffTest(SprintReviewLoopCase):
         )
         self.assertTrue(outcome.created)
 
-    def test_green_readiness_commits_judgment_and_active_reviewer_request(self):
+    def test_green_legacy_readiness_is_replaced_by_engine_locator(self):
         assignment_message_id = int(
             self.con.execute(
                 "SELECT message_id FROM wake_message WHERE work_unit_id=? "
@@ -195,12 +195,17 @@ class ReviewHandoffTest(SprintReviewLoopCase):
             "WHERE message_id=?",
             (handoff.message_id,),
         ).fetchone()
+        locator = (
+            "Submitting PR for review: https://github.com/acme/repo/pull/42; "
+            f"registered Sprint PR {self.registered_pr_id}; exact head "
+            f"{'a' * 40}; work unit {self.unit_id}."
+        )
         self.assertEqual(
             (
                 self.developer_id,
                 self.reviewer_id,
                 "review_request",
-                "Focused and full gates are green; ready for review.",
+                locator,
                 "force-new",
                 1,
                 "pending",
@@ -216,7 +221,7 @@ class ReviewHandoffTest(SprintReviewLoopCase):
             (
                 self.developer_id,
                 "decision",
-                "Focused and full gates are green; ready for review.",
+                locator,
             ),
             tuple(judgment),
         )
@@ -265,6 +270,80 @@ class ReviewHandoffTest(SprintReviewLoopCase):
             ).fetchone()[0],
             "the watcher never bypasses Developer judgment to request review",
         )
+
+    def test_resubmit_intent_generates_exact_engine_locator(self):
+        handoff = self.loop.request_review(
+            self.sprint_id,
+            self.registered_pr_id,
+            1,
+            intent="resubmit",
+            idempotency_key="review-resubmit",
+        )
+
+        body = self.con.execute(
+            "SELECT body FROM wake_message WHERE message_id=?",
+            (handoff.message_id,),
+        ).fetchone()[0]
+        self.assertEqual(
+            "Re-submitting PR for review: "
+            "https://github.com/acme/repo/pull/42; registered Sprint PR "
+            f"{self.registered_pr_id}; exact head {'a' * 40}; work unit "
+            f"{self.unit_id}.",
+            body,
+        )
+
+    def test_review_intent_rejects_latest_and_ambiguous_legacy_input(self):
+        with self.assertRaisesRegex(
+            ValueError, "review intent must be submit or resubmit"
+        ):
+            self.loop.request_review(
+                self.sprint_id,
+                self.registered_pr_id,
+                1,
+                intent="latest",
+                idempotency_key="invalid-intent",
+            )
+        with self.assertRaisesRegex(
+            ValueError, "provide review intent or legacy readiness, not both"
+        ):
+            self.loop.request_review(
+                self.sprint_id,
+                self.registered_pr_id,
+                1,
+                intent="submit",
+                readiness="Submitting old locator",
+                idempotency_key="ambiguous-intent",
+            )
+
+    def test_unchanged_registration_replay_hands_off_without_second_wake(self):
+        transitions_before = self.con.execute(
+            "SELECT COUNT(*) FROM sprint_pr_transitions"
+        ).fetchone()[0]
+        wakes_before = self.con.execute(
+            "SELECT COUNT(*) FROM wake_message"
+        ).fetchone()[0]
+
+        replay = self.register()
+
+        self.assertFalse(replay.created)
+        self.assertEqual(
+            transitions_before,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_pr_transitions"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            wakes_before,
+            self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
+        )
+        handoff = self.loop.request_review(
+            self.sprint_id,
+            self.registered_pr_id,
+            1,
+            intent="submit",
+            idempotency_key="unchanged-replay-review",
+        )
+        self.assertTrue(handoff.created)
 
     def test_non_green_and_wrong_developer_leave_no_review_evidence(self):
         self.reader.current = pull_request(

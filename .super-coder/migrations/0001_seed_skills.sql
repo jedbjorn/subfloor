@@ -1445,9 +1445,10 @@ stream. Surface to the FnB only when ambiguous — several streams fit, or a
 new stream you''re unsure how to name. Exempt (as with stages): work that
 isn''t a feature/spec (a quick fix) needs no work-stream.
 
-## Review first
+## Establish posture, then challenge
 
-Before writing — don''t duplicate, don''t re-litigate:
+Before writing — don''t duplicate, don''t re-litigate, and don''t transcribe the
+request uncritically:
 ```
 sc mem get documents      # every spec/doc in the engine DB (kind, seq, frozen, task_count)
 sc mem get decisions      # active-decision index (<id> = full row + rationale; --all incl. superseded)
@@ -1457,6 +1458,44 @@ sc map-sql "SELECT path FROM dr_filepath WHERE role=''doc'';"   # repo''s own do
 Spec touches a recorded decision -> honor it, or supersede explicitly: say so
 in the spec + record `sc mem decision "…" --parent <old_id>`. NEVER silently
 re-decide a settled choice.
+
+Read the documentation for every related system the change relies on or alters.
+Documentation is the preferred account of intended posture. If it is absent,
+ambiguous, or plausibly stale, use the repo map to locate and verify the narrow
+code path; name that fallback in the spec. Documentation and code disagree ->
+surface both as an inconsistency to the FnB. Do not silently choose one as truth.
+
+Walk the proposed workflow end to end. Challenge contradictions, missing
+boundaries, hidden assumptions, audience mismatches, partial failure, concurrent
+use, permissions, and the unhappy path. Ask the FnB to resolve anything that
+could change implementation or acceptance. Finalize only after each material
+question is either resolved or explicitly deferred; a deferral belongs in
+**Out of Scope**, with the boundary it leaves behind. Editorial uncertainty that
+cannot change the build does not block authoring.
+
+The conversation is input; the spec is the resolved contract. Paraphrase or
+synthesize settled FnB decisions beside the design clause they govern. Preserve
+the requirement and consequential rationale, not the dialogue. Never promote an
+unconfirmed suggestion to a requirement or hide an unresolved choice in fluent
+prose.
+
+## Required spec contract
+
+Every newly authored spec, and every substantive revision to an unfrozen spec,
+must make these boundaries explicit:
+
+| section | holds |
+|---|---|
+| `## Current Posture` | related systems and intended behavior before this change; name the documents and decisions consulted, plus any code paths used because documentation was missing, ambiguous, or stale |
+| `## Scope` / `### In Scope` | behavior this delivery promises to add, change, or remove |
+| `## Scope` / `### Out of Scope` | adjacent behavior deliberately excluded from this delivery, including explicit deferrals and the boundary retained |
+| relevant design sections | synthesized FnB decisions and rationale placed beside the requirement they constrain |
+| `## Anticipated User Activity` | actors, per-surface audience posture, reach, process curation, safety hardening, tenancy, and behavior beyond intention |
+
+Out of scope means "not in this delivery," never "will never be built." Do not
+use it to park an unresolved requirement that changes the in-scope design. Mixed
+surfaces may have different audiences and controls; specify them separately.
+Frozen historical specs are immutable and need no backfill.
 
 ## Author
 
@@ -1479,9 +1518,10 @@ sc mem doc add "…" --kind spec --feature <id> --body-file ./draft.md --render-
 
 Every spec (`kind=''spec''`) ships an `## Anticipated User Activity` section —
 the feature''s posture statement: who is expected to touch it, where it can be
-reached, whose data it holds, and what it does not intend to allow. Soft
-vocabulary, hard invariants — the nouns stay gentle, every statement stays
-checkable from code ("a Valid User only ever sees rows tied to their own
+reached, how much process guidance each surface needs, which safety controls its
+exposure and impact require, whose data it holds, and what it does not intend to
+allow. Soft vocabulary, hard invariants — the nouns stay gentle, every statement
+stays checkable from code ("a Valid User only ever sees rows tied to their own
 account"), because review + Verification test the build against this section.
 
 Shape (H3s under the section H2):
@@ -1491,6 +1531,7 @@ Shape (H3s under the section H2):
 | `### Vocabulary` | the cast — roles from the shared roster below + any feature-specific ones, each defined in one line |
 | `### Expected Activity` | per role: what they do, what they see, what they can change |
 | `### Reach` | where the feature meets the world — pages, endpoints, jobs, files it adds or alters, and which roles can arrive at each |
+| `### Audience and Assurance` | for each reachable surface: intended audience posture(s), process curation, and concrete safety hardening derived from exposure, authority, data sensitivity, reversibility, and blast radius |
 | `### Data Tenancy` | whose data the feature touches; what stays within one account; what, if anything, is deliberately shared |
 | `### Beyond Intention` | activity the feature does not intend to accommodate — anything observed here in review is a finding, not a nuance |
 
@@ -1506,6 +1547,30 @@ Shared roster (always available; same meaning in every spec):
 | **Shell** | an AI agent shell acting through its granted tools — its activity is messages, memory writes, file edits |
 | **Unexpected Participant** | anyone acting outside the roles above — where the spec says what must never be reachable |
 
+Audience postures describe the expected user of a surface; they do not replace
+the activity roles above and are not mutually exclusive:
+
+| posture | design consequence |
+|---|---|
+| **Unknown User** | identity and competence are not established at entry; public/anonymous reach needs the most tolerance of unanticipated input, guidance, safe defaults, and bounded disclosure |
+| **Authenticated User** | identity is established, but trust is not assumed; keep account boundaries, validation, recovery, and clear feedback explicit |
+| **Operational User** | a trained user performs a recurring workflow; optimize safe repetition, observable state, partial-failure recovery, and low ambiguity |
+| **Technical User** | a user understands technical concepts or automation; instructional curation may be lighter, while contracts, validation, precise errors, and compatibility stay rigorous |
+| **Administrator** | a user holds broad authority; instructional curation may be light, while authorization, consequential-action confirmation, auditability, reversibility, and recovery reflect the larger blast radius |
+
+Separate **process curation** from **safety hardening**. Expertise can reduce
+explanation and hand-holding; it never waives correctness, input validation,
+authorization, tenancy, or safe failure. Derive hardening from the surface''s
+reach and consequence, not from a single audience ranking. An Unknown User
+demands the strongest unanticipated-input posture; an Administrator may demand
+the strongest authority and recovery controls. State concrete obligations, not
+only a posture label.
+
+An Unknown User is expected anonymous/public traffic. An Unexpected Participant
+is activity outside the stated contract, whether or not identity is known. For
+machine-only behavior, name `System` or `Shell`, say that there is no human
+audience, and still specify reach and assurance.
+
 Language — soft by design. Specs never use: threat model, attack or attack
 surface, adversary, exploit, abuse case, vulnerability, breach, privilege
 escalation, exfiltration, malicious. Say it in roster words instead: threat
@@ -1514,9 +1579,10 @@ case -> Beyond Intention · access matrix -> Expected Activity · attack
 surface -> Reach · isolation -> tenancy. Describe behavior and boundaries,
 never hostility.
 
-Internal-only feature -> the section still ships, one line ("All activity is
-by Valid Privileged Users; no tenancy boundary"). Whole section ≤ ~40 lines —
-it frames the build, it does not enumerate it.
+Internal-only feature -> the section still ships; identify its operational,
+technical, or administrator surface, reach, authority controls, and tenancy
+posture. Whole section ≤ ~60 lines — it frames the build, it does not enumerate
+it.
 
 ## Revise before freeze
 
@@ -3126,7 +3192,9 @@ Review a diff *against intent*, never in a vacuum. Get both:
 
 - The change: the PR diff, or `git -C <author-worktree> diff origin/main...<branch>`.
 - The spec it was built to: the feature''s spec doc (`spec` skill, Step 1 —
-  `documents` where `kind=''spec''`). Its done-condition = your yardstick.
+  `documents` where `kind=''spec''`). Its Current Posture, In Scope promises,
+  Out of Scope exclusions, done-condition, and Anticipated User Activity = your
+  yardstick.
 
 Note the **author** — Step 4 proposes a handoff to them. Resolve their
 shortname from the branch (`shell/<shortname>`) or the commit trailer
@@ -3152,9 +3220,10 @@ the diff touches:
 2. **Edge cases & gaps** — inputs and states the author didn''t handle:
    empty, null, boundary, concurrent, partial-failure, the unhappy path.
    Name what''s missing, not only what''s wrong.
-3. **Spec conformance** — diff vs the spec''s done-condition. Flag where the
-   implementation diverges from intent AND where the spec itself was silent
-   or wrong.
+3. **Spec conformance** — diff vs current posture, explicit scope,
+   done-condition, and the per-surface audience/assurance contract. Flag an
+   unmet In Scope promise, implemented Out of Scope behavior, reach or hardening
+   mismatch, and anywhere the spec itself was silent or wrong.
 
 | Diff touches | Lens |
 |---|---|
@@ -3208,8 +3277,9 @@ sc mem message send <planner-shortname> "Review of <feature> surfaced a spec gap
   path. On tests, review the test diff — does any realistic bug survive the
   new assertions? — do NOT re-run the green suite the dev and CI already
   ran. A README-level "it filters X" is not proof the filter runs.
-- **Review against the spec, not your taste.** The done-condition is the
-  bar. Scope creep in the diff = a flag, not a silent pass.
+- **Review against the spec, not your taste.** In Scope promises and the
+  done-condition are the bar. Out of Scope work or an audience/assurance
+  mismatch in the diff = a flag, not a silent pass.
 - **Handoffs are gated.** You flag and recommend; the FnB decides defect vs
   intended before anything reaches another shell. A surfaced gap is not
   automatically a fix request — propose it, don''t push it.
@@ -3461,11 +3531,22 @@ Surface all three before any planning or code:
   slice.
 - No stated done-condition in the spec -> that is the first unclear item.
 
+### Current posture and scope
+Treat `## Current Posture` as the intended baseline and `## Scope` as the
+delivery boundary. Plan every **In Scope** promise and no **Out of Scope** item.
+If Preparation shows that documented posture and code disagree, stop and return
+the discrepancy to the Planner/FnB; do not silently redefine the baseline.
+
+New specs and substantively revised unfrozen specs must carry both sections
+(see `docs`). Frozen historical specs may predate them; absence there is not a
+blocker, but ambiguity still is.
+
 ### Anticipated User Activity
 The spec''s `## Anticipated User Activity` section is governing intent: its
-roles, reach, and tenancy invariants shape the plan — access and tenancy
-checks are planned tasks, not afterthoughts. Older specs predate the section;
-absence there is not a blocker.
+roles, per-surface audience posture, reach, process curation, safety hardening,
+and tenancy invariants shape the plan — access, validation, recovery, authority,
+and tenancy checks are planned tasks, not afterthoughts. Older specs predate the
+section; absence there is not a blocker.
 
 ### Unclear items
 Anything you cannot act on without guessing:
@@ -3535,7 +3616,7 @@ shared DB immediately:
 sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points"
 sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>"
 sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>"
-sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test against done-condition, check the build against the spec''s Anticipated User Activity section, snapshot + render"
+sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test every In Scope promise and done-condition, check the build against Anticipated User Activity assurance, snapshot + render"
 ```
 
 Then set `current_state` — nothing done yet, next = Preparation:
@@ -3627,7 +3708,7 @@ directly and leave the docs-pending flag open for whoever picks up docs.
 
 ## Watch for creep while you build
 
-Mid-build, the work grows past the spec''s stated what/why:
+Mid-build, the work crosses the spec''s In Scope / Out of Scope boundary:
 
 - **Small growth** (same mental model, a few more tasks) -> the unfrozen spec
   is living; edit it (`sc mem doc edit`) and carry on. No ceremony.
@@ -3646,9 +3727,10 @@ Mid-build, the work grows past the spec''s stated what/why:
   marked done.
 - **Verification is not optional.** It is the last task; skipping it makes
   "done" meaningless.
-- **Anticipated User Activity is intent.** Verification checks the build
-  against the spec''s section — a capability beyond its stated roles, or data
-  crossing a tenancy line it states, is a finding, not a nuance.
+- **Scope and Anticipated User Activity are intent.** Verification checks every
+  In Scope promise and the audience/assurance contract — an Out of Scope
+  capability, reach beyond the stated roles, weakened hardening obligation, or
+  data crossing a tenancy line is a finding, not a nuance.
 - **Spec too large for one session** -> scope a slice at Preparation: cover
   steps 1–K verifiable now, leave K+1–N pending. NEVER start work that can''t
   be verified before the session ends.
@@ -3716,6 +3798,12 @@ decisions. The Reviewer''s clean `record-conformance` command is the one narrow
 exception: it stores conformance, findings, and the Reviewer-authored final
 report, completes the Sprint, and publishes the informational Planner receipt
 atomically. FnB retains the board-level override from decision #46.
+
+Any successful completion automatically closes other active participant chats
+immutably linked to that Sprint while retaining the originating Planner and the
+report-authoring Reviewer. Do not manually close peer chats as an extra
+closeout step. Pause, abort, re-entry, failed conformance, and rejected fallback
+completion never invoke this cleanup.
 
 If a command rejects a decision, preserve the returned durable state. Do not
 substitute another transition or invent an alternate handoff. Return the
@@ -3839,23 +3927,43 @@ successful typed handoff so the next delivery can proceed cleanly.
 ## Questions, answers, blockers, and failures
 
 Put one concrete question, answer, blocker, or useful context item in a short
-body file, then send it to the participant who owns the next fact or action:
+body file. Declare the message intent and whether the required reply belongs to
+this work unit or the whole Sprint.
+
+A question or blocker about this lane requires a reply and names the work unit:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent question --requires-reply --work-unit <work-unit-id> \
   --key <stable-key>
 ```
 
-Ask the Planner about scope, priority, or cross-unit decisions and the Reviewer
-about review evidence. Answer an incoming question through `send`, confirm the
-write, then mark the handled message read with `accept`. For a blocker or
-integrity concern, send the Planner evidence, impact, the exact action needed,
-and your recommendation. Continue safe independent work, but stop at a decision
-boundary when an answer is required. Unread recovery owns re-waking; do not send
-duplicate reminders.
+Use `--intent blocker` instead for a blocked lane. A cross-unit, closeout, or
+external-authority ruling is a Sprint-level decision:
 
-Choose one stable key for the intended recipient and exact body. Reuse it only
-when retrying that same write; use a new key when the recipient or body changes.
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent decision --requires-reply --sprint-level --key <stable-key>
+```
+
+Answer the stored sender through the original message. The server inherits its
+unit or Sprint scope; never add `--work-unit` or `--sprint-level` to a reply:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent information --reply-to <message-id> --key <stable-key>
+```
+
+Ask the Planner about scope, priority, or cross-unit decisions and the Reviewer
+about review evidence. Confirm the reply write, then mark the handled incoming
+message read with `accept`. For a blocker or integrity concern, send the Planner
+evidence, impact, the exact action needed, and your recommendation. Continue
+safe independent work, but stop at a decision boundary when an answer is
+required. Unread recovery owns re-waking; do not send duplicate reminders.
+
+Choose one stable key for the intended recipient, exact body, intent, reply
+linkage, and scope. Reuse it only when retrying that same write; use a new key
+when any of those fields changes.
 
 Keep the body near 6,000 characters and below the 8,000 hard maximum; run
 `wc -m < <path>`. A handoff is complete only when the Sprint command exits
@@ -3894,7 +4002,9 @@ Immediately before a typed Developer handoff (`complete-unit`, `register-pr`,
 or `request-review`), re-run `sc sprint inbox --sprint <id>` once and act on
 anything new; a ruling may have arrived during the build. This is a once-only
 pre-handoff check. After the handoff confirms its durable write, stop without a
-further inbox pass.
+further inbox pass. The reopened-PR recovery sequence below is the one
+exception: its single inbox check covers the exact registration replay and the
+immediately following review request, which remains the turn''s final action.
 
 ## Report-only or no-code completion
 
@@ -3928,15 +4038,19 @@ If GitHub closed this registered PR externally and you reopened, rebased, and
 pushed the same PR, replay the exact `register-pr` command above. The replay
 keeps the registered PR and ownership unchanged while taking one fresh watcher
 snapshot; `created: false` is the expected registration receipt. Confirm that
-write and stop. The refreshed observation arrives as the native PR-fact wake;
-on its green Re-enter, retry the blocked `request-review` with its original
-stable key. Do not register a replacement PR or ask the Planner to bypass the
-observed-green gate.
+write, perform no second inbox pass, then immediately attempt the typed
+`request-review`; do not wait for a second PR-fact wake. An unchanged state at
+the same head is intentionally deduplicated, so that wake would not exist. The
+review gate consumes the fresh durable snapshot: green proceeds, while any
+other state returns the existing watcher diagnostic without a partial handoff.
+Reuse the original stable key only when retrying a request that never returned
+a durable receipt; a new review round uses a new key. Do not register a
+replacement PR or ask the Planner to bypass the observed-green gate.
 
-When no local implementation action remains, stop and await the native PR-fact
-wake. Use Sprint-native wakes for coordination. Do not start a recurring shell
-loop, scheduled job, manual watcher daemon, or external PR watcher to track the
-registered PR.
+Outside that reopened-PR recovery sequence, when no local implementation action
+remains, stop and await the native PR-fact wake. Use Sprint-native wakes for
+coordination. Do not start a recurring shell loop, scheduled job, manual
+watcher daemon, or external PR watcher to track the registered PR.
 
 If a watcher-dependent gate has stalled, one bounded inspection is sanctioned:
 
@@ -3946,8 +4060,7 @@ sc sprint watcher-state --sprint <id>
 
 Run it once to distinguish a stale or never-started watcher from red, pending,
 or absent PR observation, then stop or return the evidence to the Planner. Do
-not repeat the read as a polling loop. `sc sprint monitor` evaluates accepted
-liveness expectations and carries no evidence about the PR watcher.
+not repeat the read as a polling loop.
 
 ## Review handoff
 
@@ -3955,33 +4068,34 @@ Complete a review handoff in this exact order. Every review round uses
 Force-new delivery, so stop cleanly after the request confirms and let the
 Reviewer begin in a fresh chat with the full bundled request:
 
-1. Finish the readiness claim and every local verification step.
+1. Finish the readiness judgment and every local verification step.
 2. Perform the once-only typed-handoff inbox check above, act on newly arrived
    messages, and mark every handled informational message read with `accept`.
-3. Make the readiness body a bare one-line locator containing only the
-   submitting or resubmitting intent, PR URL, registered Sprint PR id, exact
-   head SHA, and work-unit id. Include no scope narrative, verification
-   evidence, judgment rationale, or review-focus steering. Put only the
-   work-unit id and spec reference in the PR body, and write no PR comments or
-   annotations.
-4. Run `wc -m < <path>` and confirm the locator is below the 8,000-character
-   hard maximum.
-5. As the literal final action of the turn, send the typed handoff with one
+3. Choose `submit` for the first review round or `resubmit` after a
+   changes-requested verdict. The engine injects the PR URL, registered Sprint
+   PR id, exact durable green head SHA, and work-unit id into the Reviewer''s
+   canonical bare one-line locator. Create no readiness file and include no
+   scope narrative,
+   verification evidence, judgment rationale, or review-focus steering. Put
+   only the work-unit id and spec reference in the PR body, and write no PR
+   comments or annotations.
+4. As the literal final action of the turn, send the typed handoff with one
    stable retry key:
 
 ```text
 sc sprint request-review \
   --sprint <id> --registered-pr <registered-id> \
-  --readiness-file <path> --key <stable-key>
+  --intent <submit|resubmit> --key <stable-key>
 ```
 
-6. When the command confirms the durable write and Reviewer wake, immediately
+5. When the command confirms the durable write and Reviewer wake, immediately
    stop and await the native verdict wake. Run no trailing command.
 
 A changes-requested verdict returns as Re-enter to your registry chat. Apply
 every blocking finding, re-establish green, and hand back with a new stable
-review key and a new bare locator. Do not narrate how prior findings were
-cleared; the Reviewer verifies that from the full diff at the new head. Record
+review key and `--intent resubmit`. Do not narrate how prior findings were
+cleared; the Reviewer verifies that from the full diff at the engine-injected
+exact head. Record
 disagreements as judgment; the Reviewer owns scope/severity decisions and the
 Planner executes any resulting action.
 
@@ -4015,7 +4129,7 @@ After the exact authorized merge succeeds, complete close-out in this order:
 
 ```text
 sc sprint send --sprint <id> --to <planner-shortname> --body-file <path> \
-  --key <stable-merged-handoff-key>
+  --intent handoff --key <stable-merged-handoff-key>
 ```
 
 5. When the command confirms the durable write and Planner wake, stop
@@ -4080,8 +4194,8 @@ Load `sprint_pln` on every entry. Do not turn entry routing into a polling loop.
 
 ## Start from durable state
 
-The armed runtime owns scheduled dispatch, unread wake recovery, liveness
-evaluation, and registered-PR observation. React to its durable inbox and wake
+The armed runtime owns scheduled dispatch and unread wake recovery. The
+registered-PR watcher owns subscription observation. React to their durable
 facts; use the Planner turn for dispatch and exact execution of durable Reviewer
 decisions. The Reviewer owns pause, cancel, and conclude decisions plus the
 conformance and final Sprint reports. The Planner owns control transitions;
@@ -4136,21 +4250,9 @@ not change Sprint or work-unit state.
   durable Reviewer decision before the edit. The running Sprint remains bound
   to its approved revision unless that decision explicitly says otherwise.
 
-The armed runtime evaluates liveness on its five-second pulse. A one-shot
-diagnostic/evaluation is available when evidence requires it:
-
-```text
-sc sprint monitor --sprint <id>
-```
-
-Run `monitor` once for concrete evidence, then return control to native
-delivery. It evaluates only due accepted expectations and its
-nudge/escalation identities are durable. Use Sprint-native wakes for
-coordination. Do not start a recurring shell loop, scheduled job, manual
-participant boot, or external PR watcher to track Sprint state.
-
-`monitor` carries no evidence about the PR watcher. When a
-watcher-dependent gate has stalled, use the separate bounded read once:
+Use Sprint-native wakes for coordination. Do not start a recurring shell loop,
+scheduled job, manual participant boot, or external PR watcher to track Sprint
+state. When a watcher-dependent gate has stalled, use the bounded read once:
 
 ```text
 sc sprint watcher-state --sprint <id>
@@ -4163,21 +4265,42 @@ as a polling loop; act on the evidence, then return control to native delivery.
 ## Questions, answers, blockers, and failures
 
 Put one concrete question, answer, decision, blocker, or useful context item in
-a short body file and address the participant who owns the next fact or action:
+a short body file. Declare the message intent and whether the required reply
+belongs to one work unit or the whole Sprint.
+
+A question or blocker about one lane requires a reply and names that unit:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent question --requires-reply --work-unit <work-unit-id> \
   --key <stable-key>
 ```
 
-Answer an incoming question through `send`, confirm the write, then mark the
-handled message read with `accept`. For a blocker, include evidence, impact,
-and the exact action needed. Continue safe independent governance, but stop at
-a decision boundary when an answer is required. Unread recovery owns re-waking;
-do not send duplicate reminders.
+Use `--intent blocker` instead for a blocked lane. A cross-unit, closeout, or
+external-authority ruling is a Sprint-level decision:
 
-Choose one stable key for the intended recipient and exact body. Reuse it only
-when retrying that same write; use a new key when the recipient or body changes.
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent decision --requires-reply --sprint-level --key <stable-key>
+```
+
+Answer the stored sender through the original message. The server inherits its
+unit or Sprint scope; never add `--work-unit` or `--sprint-level` to a reply:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent information --reply-to <message-id> --key <stable-key>
+```
+
+Confirm the reply write, then mark the handled incoming message read with
+`accept`. For a blocker, include evidence, impact, and the exact action needed.
+Continue safe independent governance, but stop at a decision boundary when an
+answer is required. Unread recovery owns re-waking; do not send duplicate
+reminders.
+
+Choose one stable key for the intended recipient, exact body, intent, reply
+linkage, and scope. Reuse it only when retrying that same write; use a new key
+when any of those fields changes.
 Keep the body near 6,000 characters and below the 8,000 hard maximum; run
 `wc -m < <path>`. A handoff is complete only when the Sprint command exits
 successfully and confirms the durable write and wake.
@@ -4205,14 +4328,36 @@ artifact directory are working material only.
 Pause, cancel, re-enter, and abort are Reviewer decisions and Planner actions.
 A valid control decision arrives as a durable Reviewer → Planner Re-enter
 message and names the decision, evidence, target ids, reason, and exact
-requested transition. Clean conformance instead closes atomically and sends an
-informational engine-wide completion receipt. Mark each handled Sprint message
-through `accept`, verify it came from the assigned
-Reviewer, and execute that transition without re-adjudicating the decision.
-Record the decision message id and action receipt together.
-Re-run `sc sprint inbox --sprint <id>` before acting on any Sprint-scoped
-control decision; the engine-wide completion receipt requires no Sprint inbox
-acceptance.
+requested transition. Resolve every required-reply control decision through its
+original message before acting. Complete this order without reordering:
+
+1. Re-run `sc sprint inbox --sprint <id>`, verify the decision came from the
+   assigned Reviewer, and retain its message id.
+2. Put a short acknowledgement of the exact requested transition in a body
+   file, then send the linked reply:
+
+```text
+sc sprint send --sprint <id> --to <reviewer-shortname> --body-file <path> \
+  --intent information --reply-to <decision-message-id> \
+  --key <stable-control-reply-key>
+```
+
+3. Require the reply command to confirm its durable message and wake. Retry the
+   same command and key if it fails or does not confirm both.
+4. Mark the original decision accepted and require a successful receipt:
+
+```text
+sc sprint accept --sprint <id> --message <decision-message-id>
+```
+
+5. Only after acceptance confirms, execute the requested transition without
+   re-adjudicating the decision. The linked reply must precede any pause or
+   abort that makes the Sprint relay unavailable.
+
+Record the decision message id, reply receipt, acceptance receipt, and action
+receipt together. Clean conformance instead closes atomically and sends an
+informational engine-wide completion receipt; it requires no linked reply or
+Sprint inbox acceptance.
 
 The FnB board-level override from decision #46 is unaffected: a live FnB
 instruction may direct or supersede any action. Name that override in the
@@ -4244,6 +4389,23 @@ sc sprint resume --sprint <id> [--reason <reviewer-reconciliation-decision>]
 An exhausted recovery wake is bounded manual-recovery evidence, not a retry
 loop. Preserve the unread message and failed wake, involve FnB, and do not create
 recursive fallbacks. Drift informs; it never silently blocks resume.
+
+PR ownership inherited from an aborted Sprint is an originating-Planner repair
+boundary. Keep the replacement Sprint paused and establish the exact old and
+new ownership. The originating Planner may reconcile that identity; the FnB
+retains the same operation as a board-level override:
+
+```text
+sc sprint reconcile-pr --sprint <replacement-id> --repository <owner/repo> \
+  --pr <number> --work-unit <replacement-unit-id> --reason <recovery-reason>
+```
+
+The command refuses a live source Sprint or target Sprint, a non-originating
+Planner, a non-code or already owned target unit, and a closed unmerged PR. It
+records the old and new owners plus the live GitHub head and acting authority.
+If the PR is already merged, it also records the merge commit and completes the
+replacement unit as explicit recovery evidence. Treat the receipt as recovery
+evidence; wait for a separate Reviewer decision before resuming.
 
 ### Cancel or re-plan
 
@@ -4309,7 +4471,13 @@ command atomically stores conformance, follow-ups, the Reviewer-authored final
 report, completed lifecycle, and an informational engine-wide Planner receipt.
 When that Re-enter arrives, confirm the receipt names the expected Sprint,
 reports, outcome, and completed state. Do not run `complete`; closure is already
-durable and the notification has no actionable liveness expectation.
+durable and the notification is informational because closure is already
+terminal.
+Successful completion also closes every other active participant chat
+immutably linked to that Sprint. The originating Planner and report-authoring
+Reviewer remain open. Do not manually close peer chats as a second closeout
+action. Pause, abort, re-entry, failed conformance, and rejected fallback
+completion retain their existing no-cleanup behavior.
 
 Do not run `compile-report` by default, synthesize the final report, or
 editorialize the Reviewer body. The Reviewer compiles its own evidence. A
@@ -4366,7 +4534,7 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'sprint_prep',
-  'Prepare and arm a Sprints v2 run — bind reviewed spec revisions, shape work units and dependencies, assign routes and capacity, and refuse arming until the durable plan is eligible.',
+  'Prepare and arm a Sprints v2 run — bind exact current specs, optionally gather QA/QC evidence, shape work units and dependencies, and enforce every launch invariant.',
   'workflow',
   NULL,
   0,
@@ -4386,7 +4554,7 @@ revalidation.
 Produce one editable prepared Sprint with:
 
 - one roadmap feature;
-- exact governing spec revision hashes and their qualifying QAQC approvals;
+- exact governing spec revision hashes and any optional QA/QC evidence;
 - work units made from existing spec tasks, each with one Developer and one
   assigned Reviewer;
 - dependency edges and planned waves;
@@ -4403,11 +4571,13 @@ Participant chats are created or re-entered later by wake delivery.
 
 ## Eligibility pass
 
-Read the feature, selected spec bodies, task ledgers, QAQC records, shell roster,
-model routes, quota state, repository access, and worktree availability. Record
-the exact revision hash you inspected; a title or document id is not a revision.
+Read the feature, selected spec bodies, task ledgers, available QA/QC records,
+shell roster, model routes, quota state, repository access, and worktree
+availability. Record the exact revision hash you inspected; a title or document
+id is not a revision.
 
-The Review shell records its verdict against the current exact body through the
+The FnB decides whether pre-Sprint QA/QC is useful. If requested, the Review
+shell records its verdict against the current exact body through the
 authenticated Sprint surface:
 
 ```text
@@ -4415,18 +4585,21 @@ sc sprint record-qaqc --document <spec-document-id> --verdict pass \
   [--findings-document <document-id>]
 ```
 
-Use `fail` until every blocking finding is resolved. A body edit changes the
-revision hash and therefore needs a fresh signed record.
+The record is inspectable evidence, not launch authorization. Its absence,
+verdict, findings, revision age, or signer state never blocks declaration or
+arming. A body edit makes the prior record historical evidence; it does not
+change the exact revision the Planner later binds.
 
-Request pre-Sprint QAQC explicitly from the Review shell through the ordinary
-shell-to-shell channel. No Sprint relay or inbox exists yet. Once the signed
-approval id is available, continue preparation here; after arming, switch to
-`sprint_pln`.
+When the FnB requests pre-Sprint QA/QC, contact the Review shell through the
+ordinary shell-to-shell channel because no Sprint relay or inbox exists yet.
+Proceed with preparation regardless of whether review was performed or what it
+found; after arming, switch to `sprint_pln`.
 
 Refuse arming when any of these is true:
 
-- a selected current revision lacks Review-shell QAQC approval;
-- any Medium-or-higher QAQC finding is unresolved;
+- no current non-empty `spec` document belonging to the feature is bound;
+- a bound spec body changed after declaration, so its current hash no longer
+  matches the exact declared revision;
 - a selected task belongs to no work unit or more than one work unit;
 - a dependency cycle exists;
 - a work unit lacks an assigned Developer or Reviewer;
@@ -4481,12 +4654,14 @@ shorten the critical path.
 For every participant, record role, route, model, and effective effort. Never
 pretend a native session can resume across harnesses.
 
-Declare the prepared envelope from a JSON array of participant objects, then
-add each editing lane from existing spec tasks:
+Declare the prepared envelope from a JSON array of participant objects, binding
+each current governing document directly. The server reads and hashes the body
+inside the declaration transaction; the client never supplies a revision hash.
+Then add each editing lane from existing spec tasks:
 
 ```text
 sc sprint declare --feature <feature-id> \
-  --spec-approval <approval-id> --participants-file <path> --merge-grant
+  --spec <spec-document-id> --participants-file <path> --merge-grant
 sc sprint plan-unit --sprint <id> \
   --developer-shell <id> --reviewer-shell <id> --title <title> \
   --expected-output-file <path> --task <task-id> \
@@ -4494,16 +4669,23 @@ sc sprint plan-unit --sprint <id> \
   [--output-kind code|report-only|no-code]
 ```
 
+Repeat `--spec` for multiple governing documents. The deprecated
+`--spec-approval <approval-id>` selector remains compatible when an old caller
+must also retain a specific review row as evidence, but its verdict and reviewed
+revision do not affect eligibility and direct `--spec` is canonical.
+
 The participant file contains `shell_id`, `role`, and `harness`, with optional
 `model`, `effort`, and `route`. FnB may add `--planner-shell <id>` when declaring
 for the originating Planner. Keep the Sprint prepared while shaping the plan.
 
 ## Final arming check
 
-Immediately before arming, re-read the spec revision hashes, QAQC records,
-participant capacity, single-armed invariant, repository access, and merge
-grant. The final read and durable plan commit belong to the authoritative
-arming transaction; external harness and GitHub work occurs after it commits.
+Immediately before arming, re-read the exact spec revision hashes, available
+QA/QC evidence, task coverage, participant routes and capacity, single-armed
+invariant, repository access, and merge grant. Review evidence is summarized,
+never interpreted as authorization. The final read and durable plan commit
+belong to the authoritative arming transaction; external harness and GitHub
+work occurs after it commits.
 
 Arming succeeds only when the first assignments and wake intents are durable.
 A process crash after commit is outbox recovery; a crash before commit exposes
@@ -4525,7 +4707,8 @@ Once armed, hand control to `sprint_pln` and stop preparation work. Give the FnB
 a compact declaration:
 Sprint id, feature, exact spec revisions, participants/routes, work-unit graph,
 planned waves, capacity rationale and reserve, merge-grant state, and known
-accepted risks.
+accepted risks. State whether pre-Sprint QA/QC was performed and summarize any
+available evidence without treating it as an eligibility result.
 
 Stop when the Sprint is armed or when one concrete eligibility blocker has been
 surfaced. Do not dispatch from a partially prepared plan.',
@@ -4604,24 +4787,44 @@ PR-event subscription wakes.
 ## Questions, answers, blockers, and failures
 
 Put one concrete question, answer, blocker, or useful context item in a short
-body file and send it to the participant who owns the next fact or action. Ask
-the Developer for missing PR evidence and the Planner for durable state or
-action-feasibility facts. Do not delegate Reviewer judgment to the Planner:
+body file. Declare the message intent and whether the required reply belongs to
+one work unit or the whole Sprint. Ask the Developer for missing PR evidence
+with a unit-scoped question:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent question --requires-reply --work-unit <work-unit-id> \
   --key <stable-key>
 ```
 
-Answer an incoming question through `send`, confirm the write, then mark the
-handled message read with `accept`. A blocker or integrity concern is evidence
-for your decision. If action is needed, send the Planner the decision, impact,
-exact action, and recommendation. Continue safe independent review, but stop at
-the decision boundary when missing facts prevent an honest decision. Unread
-recovery owns re-waking; do not send duplicate reminders.
+Use `--intent blocker` instead when the unit cannot advance. Ask the Planner for
+durable state or action-feasibility facts without delegating Reviewer judgment.
+A cross-unit, closeout, pause, replan, re-enter, cancel, or abort ruling is a
+Sprint-level decision:
 
-Choose one stable key for the intended recipient and exact body. Reuse it only
-when retrying that same write; use a new key when the recipient or body changes.
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent decision --requires-reply --sprint-level --key <stable-key>
+```
+
+Answer the stored sender through the original message. The server inherits its
+unit or Sprint scope; never add `--work-unit` or `--sprint-level` to a reply:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent information --reply-to <message-id> --key <stable-key>
+```
+
+Confirm the reply write, then mark the handled incoming message read with
+`accept`. A blocker or integrity concern is evidence for your decision. If
+action is needed, send the Planner the decision, impact, exact action, and
+recommendation. Continue safe independent review, but stop at the decision
+boundary when missing facts prevent an honest decision. Unread recovery owns
+re-waking; do not send duplicate reminders.
+
+Choose one stable key for the intended recipient, exact body, intent, reply
+linkage, and scope. Reuse it only when retrying that same write; use a new key
+when any of those fields changes.
 
 Keep the body near 6,000 characters and below the 8,000 hard maximum; run
 `wc -m < <path>`. A handoff is complete only when the Sprint command exits
@@ -4651,7 +4854,7 @@ artifact directory are working material only.
 The Reviewer owns all pause, cancel, and conclude decisions and recommendations.
 The Planner owns control actions; clean conformance approval atomically performs
 its own close. Base a decision on durable Sprint state,
-the exact bound revisions, current work/PR facts, liveness evidence, and any
+the exact bound revisions, current work/PR facts, progress-carrier evidence, and any
 ratified judgment; ambiguous silence is not enough to corrupt a disposition.
 
 Send pause, resume, replan, re-enter, cancel, and abort decisions through the
@@ -4697,12 +4900,19 @@ acceptable post-Sprint follow-up.
 
 ## Work-unit review
 
-Accept the actionable review request. Its readiness body must be only the bare
+Accept the actionable review request and retain that exact message id as the
+identity of this review round. Its readiness body must be only the bare
 locator: submitting or resubmitting intent, PR URL, registered Sprint PR id,
 exact head SHA, and work-unit id. Treat scope narrative, verification evidence,
 judgment rationale, or review-focus steering in that body as a protocol defect;
 do not use it to frame the review. Neither party writes PR comments or
 annotations, and the PR body contains only the work-unit id and spec reference.
+
+Bind every inspection and the eventual verdict to the accepted request''s
+message id, registered PR, work unit, and exact head. Another request in the
+same delivery, another unit assigned to this Reviewer, or role activity in a
+different conversation does not belong to this round. Accept and review each
+request explicitly; never infer a review lane from Reviewer identity alone.
 
 Review the exact bound spec revision and the full diff at the request''s exact
 head, then inspect checks, tests, relevant runtime evidence, and ratified
@@ -4768,17 +4978,21 @@ sc sprint record-review \
 
 Use `approved` only when no Critical/Major/Medium finding remains. The engine
 checks that the request was accepted and still binds to the reviewed head,
-records judgment evidence, sends a Re-enter wake to the Developer, and
-resolves the review liveness expectation. Do not message around this surface;
+records judgment evidence and sends a Re-enter wake to the Developer. Do not
+message around this surface;
 an unrecorded verdict cannot unlock merge.
 
 ## Delivery-terminal closeout
 
 The `sprint.delivery_terminal` notification is the entry signal for
-whole-Sprint conformance. On that wake, inspect the inbox and current work-unit
-state first. If any non-terminal unit is visible, the wake is stale: mark the
-informational notification handled with `accept`, exit, and await the next
-episode''s delivery-terminal wake.
+whole-Sprint conformance. Retain that exact notification message id and its
+delivered wake as the closeout entry identity; another Reviewer turn or an old
+terminal notification does not carry this episode. On that wake, inspect the
+inbox, lifecycle, and current work-unit state first. If the lifecycle is already
+`completed` or `aborted`, mark the informational notification handled with
+`accept` and stop. If any non-terminal unit is visible, the wake is stale: mark
+it handled with `accept`, exit, and await the next episode''s delivery-terminal
+wake. Only an armed Sprint whose units are all terminal enters conformance.
 
 Compile the bounded evidence packet first and do so yourself, then judge
 integrated `main` against every governing bound revision, exact recorded
@@ -4873,6 +5087,11 @@ completed state, Planner message id, and Planner wake id. This creates
 append-only evidence, pending follow-ups, terminal lifecycle, and one
 informational engine-wide Planner Re-enter in the same transaction. Never
 record conformance first and then close around it; send no conclude message.
+On that successful commit, the engine also closes every other active chat
+immutably linked to the Sprint. The originating Planner and this
+report-authoring Reviewer remain open. Do not manually close peer chats as an
+extra closeout step. Pause, abort, re-entry, failed conformance, and rejected
+fallback completion keep their existing no-cleanup behavior.
 Never reopen an editing
 lane after recording; the re-enter branch defers the report until added scope
 reaches terminal disposition and a fresh delivery-terminal wake starts the next
@@ -4901,6 +5120,7 @@ requested action. Then complete this final handoff order:
 
 ```text
 sc sprint send --sprint <id> --to <planner-shortname> --body-file <path> \
+  --intent decision --requires-reply --sprint-level \
   --key <stable-decision-handoff-key>
 ```
 
@@ -5200,88 +5420,99 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'windows_devkit',
-  'Drive the linked Windows Test VM — push a build artifact, exec the installer/test over SSH, capture output + a screenshot, then reset to the clean snapshot. High-fidelity installer/system-level testing where Wine is useless. Use when building or verifying Windows software in a fork that has a configured VM.',
+  'Drive the linked Windows Test VM from its supplied state with typed status, start, push, exec, capture, and end-only reset commands. Use for Windows installer, service, registry, and system-level verification that Wine cannot represent.',
   'substrate',
   NULL,
   0,
-  '# windows_devkit — driving the Windows Test VM
+  '# windows_devkit — drive the supplied Windows test VM
 
-Real Windows, for the testing Wine can''t fake: MSI installers, services, the
-registry, system-level behavior. Opt-in + link-only — the operator runs the
-VM; you drive a verified loop against it. Devs build + test; the reviewer
-independently verifies the dev''s candidate artifact with exec → capture →
-reset. Grant is explicit, per-fork (`common=0`).
+Use the operator-supplied VM and application state. Inspect first, start or open
+only what is absent, perform the test, and reset once at the end. Planning,
+probing, skill review, and static verification never reset the VM.
 
-## Precondition — the link is configured
+## Preflight
 
-VM config = `vm` key in `.super-coder/instance.json` (set via the GUI Scripts
-→ **Windows Test VM** wizard, which live-tests every field before save):
+The linked fork must have a `vm` block in `.super-coder/instance.json`, created
+and validated through Scripts → **Windows Test VM**. The operator owns the VM,
+testing snapshot, credentials, and guest toolchain.
 
-```json
-"vm": { "domain": "win-test", "ssh_host": "127.0.0.1", "ssh_port": 22,
-        "ssh_user": "tester", "ssh_key_path": "~/.ssh/sc_win_test",
-        "transfer_dir": "/var/sc/win-xfer", "snapshot": "clean",
-        "libvirt_uri": "qemu:///system" }
+- No `vm` block: stop and ask the operator to link the VM.
+- Invalid configuration or missing broker: report the structured `./sc vm`
+  error and ask the operator to run `./sc vm-broker-up`. Do not read key
+  material, use `ssh` or `virsh` directly, or build raw broker requests.
+- Missing guest toolchain: ask the operator to run `configure_winbox` and
+  re-bake. Never install tools during the test and poison the testing snapshot.
+- If GUI work reports adapter state `unknown` because `SC_HARNESS` is absent,
+  the session predates the adapter identity contract. Relaunch the shell through
+  the engine; do not add persistent harness configuration. A declared
+  `unsupported` adapter is a capability stop, not a relaunch prompt.
+
+## Canonical workflow
+
+1. Assume the operator supplied a running VM with the testing application open.
+2. Run `./sc vm status --json`. This is read-only: it never starts, restarts, or
+   resets the VM.
+3. If the domain is off, run `./sc vm start --json`. If it is already running
+   but SSH is not ready, the same command waits for readiness without restarting
+   it. Do not invent sleeps.
+4. `./sc vm exec` runs in the SSH session context and cannot open a GUI
+   application on the interactive desktop. If the testing application is
+   absent, run `./sc vm mcp up --json`, open it with the injected Windows MCP
+   `App` tool, and visually confirm that it is open before proceeding.
+5. Use `push`, `exec`, and `capture` as needed, then perform the test.
+6. A test failure does not skip cleanup. When testing is finished and you still
+   have control, run `./sc vm mcp down --json` if GUI transport was used, then
+   run `./sc vm reset --off --json` once. This restores the configured testing
+   snapshot and leaves the domain powered off.
+7. Report the test result and cleanup result separately. Include any structured
+   error and never claim an unconfirmed operation succeeded.
+
+There is no reset at the beginning or during a test. Do not automatically retry
+a reset after a timeout, disconnect, malformed response, or
+`reset_result_unknown`; its effect may already have occurred.
+
+## Typed commands
+
+```text
+./sc vm status --json
+./sc vm start --json
+./sc vm push <repo-file> [destination] --json
+./sc vm exec --json -- <simple guest command and arguments>
+./sc vm exec --command-file <utf8-command-file> --json
+./sc vm capture [--output .sc-state/local/vm-captures/<name>] --json
+./sc vm mcp status|up|down --json
+./sc vm reset --off --json
 ```
 
-`libvirt_uri` optional — set it when the domain is system-scope (the default
-`qemu:///session` can''t see it); omit otherwise.
-
-- No `vm` block → no VM linked: stop + ask the operator to run the wizard.
-- `configure_winbox` must also have run, or the box has no toolchain — the
-  wizard''s `toolchain` check confirms it did.
-- A wrong field → fix it in the wizard (it re-validates); NEVER hand-edit
-  secrets into config.
-- `ssh_key_path` = a path, never key material. Never read it — the key lives
-  host-side with the broker (below).
-
-## Drive through the host broker — never ssh/virsh directly
-
-You run inside the sandbox; the VM lives on the host''s libvirt NAT,
-unreachable from here, and the container has no `ssh`, no `virsh`, no key.
-Call the host-side **vm-broker** over its unix socket in the bind-mounted
-repo; the broker holds the key + libvirt. (Detail:
-`.super-coder/docs/windows-vm-broker.md`.)
-
-```bash
-SOCK="$(sc vm-broker-sock)"
-curl -s --unix-socket "$SOCK" http://vm/health      # liveness check first
-```
-
-curl fails "not reachable" → broker down → ask the operator to run
-`sc vm-broker-up` on the host. You cannot start it yourself (host process,
-not sandbox).
-
-## The loop — push → exec → capture → reset
-
-Every run starts from the clean snapshot — without the reset, installer
-side-effects leak between runs and the next result is a lie.
-
-| Verb | Call |
-|---|---|
-| **push** | `curl -s --unix-socket "$SOCK" http://vm/push -d ''{"src":"<repo path to artifact>"}''` — stages into `transfer_dir` (the guest''s share) |
-| **exec** | `curl -s --unix-socket "$SOCK" http://vm/exec -d ''{"command":"<installer / test cmd>"}''` → `{ok, exit, stdout, stderr}` |
-| **capture** | `curl -s --unix-socket "$SOCK" http://vm/capture -d ''{"command":"<optional cmd>"}''` → stdout + a base64 `virsh screenshot` for GUI state |
-| **reset** (start) | `curl -s --unix-socket "$SOCK" http://vm/reset -X POST` — revert to clean + **boot** |
-| **reset** (done) | `curl -s --unix-socket "$SOCK" http://vm/reset -d ''{"running":false}''` — revert to clean, leave **powered OFF** |
-
-The broker runs ssh non-interactively from the saved `vm` block — name a
-command, never a host or a key.
-
-**Bracket every run with reset.** Start with `/reset` (boots a clean box);
-end — even on failure — with `/reset {"running":false}` (clean + powered off:
-an idle running VM pins ~12 GB of host RAM). The clean snapshot is OFFLINE
-(this CPU''s non-migratable `invtsc` flag refuses a live snapshot), so a bare
-revert lands powered-off; `{"running":true}` (the default) boots it —
-`{"running":false}` gets clean **and** off in a single op.
+- `exec` accepts arguments after `--` or one UTF-8 command file, never both.
+  Arguments after `--` are re-joined with single spaces; local shell token
+  boundaries are not preserved. Use that form for simple commands, or pass the
+  entire guest command as one locally quoted argument. For complex, quoted, or
+  multiline PowerShell, use `--command-file` so quotes, dollar variables,
+  pipes, backticks, paths with spaces, and Unicode reach the broker unchanged.
+- `cmd.exe` is the guest default SSH shell. Invoke PowerShell syntax explicitly,
+  for example with
+  `powershell -NoProfile -Command "Get-ChildItem Env:"`.
+- Client-to-broker command content remains unchanged, but guest console stdout
+  may transliterate non-ASCII on return. For byte-exact output, base64-encode
+  it guest-side and decode it locally.
+- `capture` writes an atomic mode-0600 artifact under
+  `.sc-state/local/vm-captures/`; use the returned path for visual inspection.
+- `mcp up` verifies the tunnel, relay, and HTTP endpoint before success.
+  `mcp down` reports relay and tunnel cleanup separately.
+- Every command exits nonzero on an operation failure. With `--json`, inspect
+  the single object containing `schema_version`, `ok`, `operation`, `result`,
+  and `error`.
 
 ## Stance
 
-- **You drive, you don''t provision.** Missing toolchain → admin''s
-  `configure_winbox` + re-bake. NEVER `winget install` from this loop — it
-  poisons the clean snapshot.
-- **The reviewer verifies, doesn''t build.** Reviewer runs exec → capture →
-  reset on the dev''s candidate artifact to confirm the claim independently.',
+- Observe before changing state. Retain a supplied running domain and open app.
+- Drive through `./sc vm`; never assemble broker HTTP, socket curl, JSON, SSH,
+  PowerShell transport quoting, screenshot decoding, or relay process control.
+- Reset is end-only cleanup, not test setup. Attempt it once while you still
+  have control, and report its observed final state honestly.
+- Guest output, screenshots, configuration, and credentials remain local to the
+  linked repo and operator.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -5291,125 +5522,105 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'windows_vm_gui',
-  'Drive the Windows Test VM''s GUI — Windows-MCP in the guest, UIA-tree clicking by element ID (never blind coordinates), screenshot verification between actions, and mouse-free in-process test paths for anything repeatable. Exploratory GUI QAQC where windows_devkit''s exec loop can''t see the UI.',
+  'Drive the linked Windows Test VM through adapter-provided Windows MCP tools, using UI Automation element IDs, visual verification, managed MCP lifecycle, and one end-only powered-off reset.',
   'substrate',
   NULL,
   0,
-  '# windows_vm_gui — GUI-driving the Windows Test VM
+  '# windows_vm_gui — drive the supplied Windows GUI
 
-Drive the guest GUI via **Windows UI Automation**: pull the UIA tree, act on
-elements by ID. NEVER click by screenshot pixel coordinates when an element ID
-exists — pixel targets break on DPI scaling / window position / theme / dense
-UIs (a CAD ribbon, a settings tree).
+Use this for exploratory GUI QA/QC and visual verification that cannot be
+expressed through `windows_devkit` commands alone. The operator supplies the VM
+and application state. Observe first, start or open only what is absent, and
+reset once when all testing is finished.
 
-Tooling = **Windows-MCP** (`windows-mcp` on PyPI), running inside the guest,
-reached over HTTP. Tools: `Snapshot` (UIA tree + element IDs),
-`Click`/`Type`/`Scroll` (act on IDs), `Screenshot` (visual verify), plus
-`App`, `PowerShell`, `Clipboard`. Expect 0.2–0.5 s per action.
+## Preflight and tool availability
 
-## Where this sits
+The harness adapter declares the managed streamable-HTTP `windows-mcp` server
+before the harness launches. Claude, Codex, and OpenCode expose it where their
+active adapter supports Windows MCP. Kimi and Vibe are unsupported until their
+adapters gain an equivalent injection mechanism.
 
-| Skill | Loop | Use for |
-|---|---|---|
-| `windows_devkit` | push → exec → capture → reset | installers, services, anything scriptable |
-| **this** | connect → Snapshot → click/type → verify | exploratory GUI QAQC, visual verification |
-| `configure_winbox` | provision → verify → bake | the admin prep both of the above assume |
+The harness tool list may be fixed at launch. If Windows MCP tools are absent,
+do not run persistent registration commands or edit user/project harness
+configuration. Report the adapter state from `./sc vm status --json`. State
+`unknown` with no `SC_HARNESS` means this session predates the adapter identity
+contract: relaunch through the engine so it can inject the active harness
+identity. State `unsupported` means the active adapter declares no injection
+mechanism; it is an honest capability stop, not a reason to fabricate GUI
+access or relaunch repeatedly.
 
-GUI driving = exploratory QAQC + visual verification ONLY. A check that will
-run more than twice does not belong in a click sequence — see the last section.
+## Missing guest Windows-MCP
 
-## One-time guest prep (admin — via the configure_winbox flow)
+Windows-MCP is baked guest toolchain, never an ad-hoc test dependency. If it is
+missing, the operator must use the `configure_winbox` flow to:
 
-Every `windows_devkit` run reverts to the `clean` snapshot → anything installed
-but not baked evaporates on the next reset. Windows-MCP is therefore
-**toolchain**: a missing piece = manifest PR + re-bake, NEVER an ad-hoc install
-from a test loop.
+1. Add Python 3.13+ (for example, `Python.Python.3.13`) to the fork''s committed
+   winget manifest and import it into the guest.
+2. Run `pip install uv`, verify `uvx windows-mcp serve --help` exits zero, and
+   register the auto-start task with:
 
-1. Add Python 3.13+ (e.g. `Python.Python.3.13`) to the fork''s committed winget
-   manifest → `configure_winbox` pushes + imports it.
-2. Via the broker (`/exec`, like every `configure_winbox` step):
-   `pip install uv` → `uvx windows-mcp serve --help` exits 0 → register the
-   auto-start scheduled task, bound to localhost ONLY (never expose it on the
-   VM network):
-
-   ```
+   ```text
    windows-mcp install --transport streamable-http --host 127.0.0.1 --port 8000
    ```
 
-3. Operator runs `./sc vm-bake` (host-side — the snapshot is the trust
-   anchor) → every subsequent reset boots with the server already listening.
+   The server must be bound to localhost ONLY (never expose it on the VM network).
+3. Run `./sc vm-bake` so resets restore the prepared server.
 
-Constraints: Python 3.13+ and `uv` in the guest; English-language Windows
-preferred (App-tool limitation); UAC prompts + elevated windows unreachable
+The guest requires Python 3.13+ and `uv`. Prefer English-language Windows due
+to the App-tool limitation. UAC prompts and elevated windows are inaccessible
 unless the server itself runs elevated.
 
-## Per-session connect — seat-dependent
+## Canonical workflow
 
-**Host-run seat** (a shell booted with `./sc boot` on the host, no sandbox):
+1. Assume the operator supplied a running VM with the testing application open.
+2. Run `./sc vm status --json`. It is read-only and must not reset, restart, or
+   otherwise mutate the VM.
+3. If the VM is off, run `./sc vm start --json`. For a running VM whose SSH is
+   not ready, the same command performs bounded readiness checks without a
+   restart. Do not invent sleeps.
+4. Run `./sc vm mcp up --json`. Success means the broker tunnel, verified local
+   relay, and MCP HTTP endpoint are ready. Then use the already-provided
+   Windows MCP tools; do not register them from inside the skill.
+5. `./sc vm exec` runs in the SSH session context and cannot open a GUI
+   application on the interactive desktop. If the application is absent, open
+   it with the injected Windows MCP `App` tool and visually confirm that it is
+   open before proceeding.
+6. Perform the GUI test. A test failure does not skip cleanup.
+7. When all testing is finished and you still have control, run
+   `./sc vm mcp down --json`, then `./sc vm reset --off --json` once. Report MCP
+   cleanup and reset results separately from the test result.
 
-1. `windows_devkit` `/reset` → wait until SSH answers.
-2. Tunnel: `ssh -f -N -L 18000:127.0.0.1:8000 <ssh_user>@<ssh_host>` (values
-   from the `vm` block in `.super-coder/instance.json`).
-3. `curl -s http://127.0.0.1:18000/mcp` answers → endpoint live.
-4. Connect the harness:
-   `claude mcp add --transport http windows-mcp http://127.0.0.1:18000/mcp`
-5. Endpoint dead → check the tunnel first, then the guest task
-   (`schtasks /run /tn windows-mcp-server` over SSH); task missing = snapshot
-   was baked without the prep above.
-
-**Sandboxed seat** (the engine default): the sandbox has no `ssh`, no key, no
-route to the VM — broker design — so the connection is brokered in two halves:
-the vm-broker (host-side, holds the key) ssh-forwards a unix socket in the
-bind-mounted `run/` dir to the guest''s Windows-MCP; an in-sandbox relay gives
-that socket the TCP URL `claude mcp add` needs.
-
-1. `windows_devkit` `/reset` → wait until SSH answers.
-2. Broker tunnel:
-   `curl --unix-socket $(./sc vm-broker-sock) -X POST http://vm/mcp/up`
-   (idempotent; forwards `run/vm-mcp.sock` to the guest''s `mcp_port`,
-   default 8000).
-3. Relay: `./sc vm-mcp-relay up` (listens on `127.0.0.1:18000`, pipes to the
-   tunnel socket; idempotent).
-4. `curl -s http://127.0.0.1:18000/mcp` answers → endpoint live.
-5. Connect the harness:
-   `claude mcp add --transport http windows-mcp http://127.0.0.1:18000/mcp`
-6. Endpoint dead → `./sc vm-mcp-relay status` first: `upstream: false` =
-   broker tunnel down → redo step 2 (every `/reset` drops the tunnel —
-   reconnect after each). Still dead → guest task via broker `/exec`:
-   `schtasks /run /tn windows-mcp-server`; task missing = snapshot was baked
-   without the prep above.
-7. Done driving: `./sc vm-mcp-relay down` +
-   `curl --unix-socket $(./sc vm-broker-sock) -X POST http://vm/mcp/down`.
-
-NEVER fake GUI driving by guessing pixel coordinates off `/capture`
-screenshots.
+There is no opening or mid-test reset. If MCP setup or teardown returns a
+structured failure, include it for the operator and do not claim success. Never
+automatically repeat an uncertain reset.
 
 ## Driving rules
 
-- `Snapshot` first, always → act on element IDs.
-- Standard chrome (ribbons, dialogs, palettes — WPF/WinForms/WinUI) is
-  UIA-visible → click by element.
-- Custom-rendered surfaces (drawing canvases, game views, embedded GL) have no
-  UIA elements — the ONE legitimate coordinate fallback: `Screenshot` → pick
-  the pixel target → `Click(x, y)` → `Screenshot` again to verify. NEVER chain
-  canvas clicks without verifying between them.
-- Re-`Snapshot` after anything that changes the window set — stale element IDs
-  misclick.
-- Verify state visually after each meaningful action.
-- Batch reads; don''t spam single-element queries.
+- Call `Snapshot` first. Act on UI Automation element IDs, not screenshot
+  coordinates.
+- Re-run `Snapshot` after a window-set change; stale element IDs can misclick.
+- Use `Click`, `Type`, and `Scroll` on element IDs, and verify meaningful state
+  changes with `Screenshot`.
+- Standard WPF, WinForms, and WinUI chrome is normally UIA-visible. A
+  custom-rendered canvas with no UIA element is the only coordinate fallback:
+  take a screenshot, perform one coordinate action, then take another
+  screenshot before continuing.
+- Batch reads instead of issuing repeated single-element queries.
+- Keep application state and screenshots local; never expose the relay beyond
+  its configured loopback endpoint.
 
-## Prefer no mouse at all
+## Prefer a scripted path when repeatable
 
-Anything repeatable belongs in an in-process test path driven over the exec
-loop, not a click sequence. Most GUI platforms have one — Revit add-ins:
-RevitTestFramework, ricaun.RevitTest, Revit.TestRunner (NUnit in-process via
-journal, no UI). Hierarchy, in order:
+Anything likely to run more than twice belongs in an in-process framework or a
+typed `./sc vm exec` test, not a click sequence:
 
+```text
+in-process test framework  →  UIA by element ID  →  coordinates only when UIA is blind
 ```
-in-process test framework  →  UIA by element ID  →  coordinates (only where the tree is blind)
-```
 
-A check that will run more than twice goes to the top of that list.',
+Use `./sc vm capture --json` when the result needs a durable local screenshot
+artifact. Use `windows_devkit` for push, exact guest commands, and the shared
+end-only cleanup contract.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET

@@ -1900,12 +1900,26 @@ class SprintCliApiTest(unittest.TestCase):
             str(self.sprint_id),
             "--registered-pr",
             str(self.registered_pr_id),
-            "--readiness-file",
-            self.write("All gates green."),
+            "--intent",
+            "submit",
             "--key",
             "cli-review-request",
         )
         self.assertTrue(request["created"])
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                "Submitting PR for review: "
+                "https://github.com/acme/repo/pull/42; registered Sprint PR "
+                f"{self.registered_pr_id}; exact head {'a' * 40}; work unit "
+                f"{self.unit_id}.",
+                con.execute(
+                    "SELECT body FROM wake_message WHERE message_id=?",
+                    (request["message_id"],),
+                ).fetchone()[0],
+            )
+        finally:
+            con.close()
         self.deliver_message(request["message_id"])
 
         con = sqlite3.connect(self.db)

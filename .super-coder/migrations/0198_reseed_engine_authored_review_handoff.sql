@@ -1,11 +1,15 @@
----
-name: sprint_dev
-description: Execute a Sprints v2 Developer lane — accept one assignment, implement and verify it, own the PR through green and review, merge only after live authorization, and record judgment without overlapping edits.
-category: workflow
-common: false
----
+-- 0198 — converge engine-authored Sprint review handoff guidance.
+-- Existing installs receive the current Developer contract after update.
 
-# sprint_dev — own one editing lane
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_dev',
+  'Execute a Sprints v2 Developer lane — accept one assignment, implement and verify it, own the PR through green and review, merge only after live authorization, and record judgment without overlapping edits.',
+  'workflow',
+  NULL,
+  0,
+  '# sprint_dev — own one editing lane
 
 Use for an actionable work-unit assignment in an armed Sprint. Marking that
 Sprint message read is acceptance and starts work immediately. If you cannot
@@ -45,10 +49,10 @@ Sprint or work-unit state.
 Read the assignment, expected output, bound spec revision, dependencies,
 assigned Reviewer, repository/worktree, merge grant, and prior judgments. One
 Developer shell may own one active work unit in the Sprint. Do not start a
-second editing lane or edit another shell's worktree.
+second editing lane or edit another shell''s worktree.
 
 If the requirement is ambiguous, choose the shippable reading within your
-unit's scope, record the choice and rationale, and continue. Escalate changes to
+unit''s scope, record the choice and rationale, and continue. Escalate changes to
 the unit boundary, interfaces another unit consumes, deliverable cuts, or scope
 growth to the Planner.
 
@@ -114,7 +118,7 @@ that decision.
 Sprint working artifacts (per-unit review notes, raw diffs, evidence packets,
 report drafts, and Dev scratch proof) go to the gitignored
 `shared/sprints/sprint-<n>/` directory. They are never committed, branched, or
-PR'd in the work repo; a review-notes commit is a finding.
+PR''d in the work repo; a review-notes commit is a finding.
 
 DB rows stay the durable record: judgments via `record-review`, report bodies in
 `sprint_reports`, and decisions in the durable relay. Files in the Sprint
@@ -126,7 +130,7 @@ Sync the assigned repository, work on a feature branch, match the surrounding
 code, and implement the smallest complete change. Keep external calls outside
 database transactions. Preserve durable identities and append-only evidence.
 
-Verification must exercise the unit's independent stage gate and realistic
+Verification must exercise the unit''s independent stage gate and realistic
 failure paths. A local exploratory number is not merge evidence. Record real CI
 failures, anomalous infrastructure failures, retries, review friction, and
 known departures for the final report.
@@ -137,7 +141,7 @@ anything new; a ruling may have arrived during the build. This is a once-only
 pre-handoff check. After the handoff confirms its durable write, stop without a
 further inbox pass. The reopened-PR recovery sequence below is the one
 exception: its single inbox check covers the exact registration replay and the
-immediately following review request, which remains the turn's final action.
+immediately following review request, which remains the turn''s final action.
 
 ## Report-only or no-code completion
 
@@ -206,7 +210,7 @@ Reviewer begin in a fresh chat with the full bundled request:
    messages, and mark every handled informational message read with `accept`.
 3. Choose `submit` for the first review round or `resubmit` after a
    changes-requested verdict. The engine injects the PR URL, registered Sprint
-   PR id, exact durable green head SHA, and work-unit id into the Reviewer's
+   PR id, exact durable green head SHA, and work-unit id into the Reviewer''s
    canonical bare one-line locator. Create no readiness file and include no
    scope narrative,
    verification evidence, judgment rationale, or review-focus steering. Put
@@ -282,5 +286,13 @@ Stop when the unit is merged and reported, declined, awaiting Planner/FnB
 recovery, returned to review, or paused awaiting a native PR-fact or verdict
 wake. For normal review and merge handoffs, the
 ordered procedures above place inbox handling before the typed handoff and make
-that handoff the turn's last action. Ask the Planner for later work only after
-the current editing lane is terminal.
+that handoff the turn''s last action. Ask the Planner for later work only after
+the current editing lane is terminal.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;
