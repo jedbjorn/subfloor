@@ -13,6 +13,7 @@ import sqlite3
 from collections import defaultdict
 from typing import Any
 
+import sprint_health
 import sprint_runtime
 
 LIFECYCLES = frozenset({"prepared", "armed", "paused", "completed", "aborted"})
@@ -677,6 +678,7 @@ class SprintBoardProjection:
             )
 
         units = []
+        health = sprint_health.SprintHealthProjection(self.con).project(sprint_id)
         counts = {name: 0 for name in ("done", "review", "dev", "waiting", "blocked")}
         for row in self.con.execute(
             "SELECT u.*,dev.shortname developer_shortname,rev.shortname reviewer_shortname "
@@ -721,6 +723,7 @@ class SprintBoardProjection:
                     "dependent_ids": dependents[unit_id],
                     "pull_requests": prs[unit_id],
                     "messages": messages[unit_id],
+                    "health": health["work_units"][unit_id],
                     **(
                         {"pickup": exhausted}
                         if unit_id == exhausted_unit_id
@@ -767,6 +770,7 @@ class SprintBoardProjection:
             "column_counts": counts,
             "runtime": runtime,
             "pickup": pickup,
+            "health": health["health"],
             "feed_counts": {
                 "events": int(feed_counts["event_count"]),
                 "summaries": int(feed_counts["judgment_count"])

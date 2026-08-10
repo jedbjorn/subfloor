@@ -26,7 +26,7 @@ def apply_schema(con: sqlite3.Connection) -> None:
     con.executescript((ENGINE / "schema.sql").read_text())
     for migration in sorted(MIGRATIONS.glob("*.sql")):
         if migration == RETIREMENT_MIGRATION:
-            break
+            continue
         con.executescript(migration.read_text())
     con.executescript(
         (MIGRATIONS / "0194_sprint_scoped_reply_waits.sql").read_text()
