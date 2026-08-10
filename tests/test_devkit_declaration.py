@@ -640,11 +640,15 @@ class DevKitReseedConformanceTest(unittest.TestCase):
         )
         self.assertEqual(local, ("local", "fork", None, 0, "bespoke body", 0))
 
-    def test_reseed_is_last_in_the_ordered_chain(self):
+    def test_later_migrations_do_not_override_the_terminal_reseed(self):
         migrations = sorted(
             (ROOT / ".super-coder" / "migrations").glob("[0-9][0-9][0-9][0-9]_*.sql")
         )
-        self.assertEqual(migrations[-1], DEVKIT_RESEED)
+        later = migrations[migrations.index(DEVKIT_RESEED) + 1 :]
+        self.assertTrue(later)
+        for migration in later:
+            with self.subTest(migration=migration.name):
+                self.assertNotIn("  'dev_kit',", migration.read_text())
 
 
 class DispatcherHelpTest(unittest.TestCase):

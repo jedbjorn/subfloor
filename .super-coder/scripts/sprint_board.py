@@ -190,6 +190,21 @@ _EVENT_FIELDS = {
     "pr.registered": frozenset(
         {"registered_pr_id", "repository", "pr_number", "work_unit_ids"}
     ),
+    "pr.registration_reconciled": frozenset(
+        {
+            "from_sprint_id",
+            "from_work_unit_ids",
+            "head_sha",
+            "merge_sha",
+            "normalized_state",
+            "pr_number",
+            "reason",
+            "registered_pr_id",
+            "repository",
+            "to_sprint_id",
+            "to_work_unit_id",
+        }
+    ),
     "pr.transition": frozenset(
         {"registered_pr_id", "transition_id", "normalized_state"}
     ),
