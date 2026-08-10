@@ -1,97 +1,109 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "source_summary": {
     "sprint_count": 8,
+    "liveness_expectations": 105,
     "quota_reviewer_episodes": 21,
     "liveness_nudges": 2,
     "wake_requeues": 19
   },
+  "quota_episode_topology": {
+    "sprint_key": "history-02",
+    "generation_alias": "G2",
+    "messages_per_wake": 1,
+    "successful_attempts_per_wake": 1,
+    "shared_wakes": false,
+    "shared_conversations": false,
+    "stale_generations": false,
+    "requeues_include_episode_wakes": false
+  },
   "sprints": [
     {
       "key": "history-01",
-      "conversation_generation": "00000000000000000000000000000004",
-      "developer_slots": [3, 4],
+      "generation_alias": "G1",
+      "liveness_expectation_count": 16,
+      "quota_reviewer_episode_count": 0,
       "nudge_count": 1,
-      "wake_requeues": 3,
-      "bundles": [
-        {"key": "a", "episodes": [{"accepted_offset_seconds": 60, "escalation_after_seconds": 300, "verdict_after_seconds": 13}]},
-        {"key": "b", "episodes": [{"accepted_offset_seconds": 180, "escalation_after_seconds": 301, "verdict_after_seconds": 479}]}
-      ]
+      "wake_requeues": 12
     },
     {
       "key": "history-02",
-      "conversation_generation": "00000000000000000000000000000002",
-      "developer_slots": [5, 6, 7],
+      "generation_alias": "G2",
+      "liveness_expectation_count": 45,
+      "quota_reviewer_episode_count": 21,
       "nudge_count": 0,
-      "wake_requeues": 2,
-      "bundles": [
-        {"key": "coalesced", "episodes": [{"accepted_offset_seconds": 240, "escalation_after_seconds": 302, "verdict_after_seconds": 41}, {"accepted_offset_seconds": 240, "escalation_after_seconds": 307, "verdict_after_seconds": 88}]},
-        {"key": "single", "episodes": [{"accepted_offset_seconds": 360, "escalation_after_seconds": 303, "verdict_after_seconds": 144}]}
-      ]
+      "wake_requeues": 6
     },
     {
       "key": "history-03",
-      "conversation_generation": "00000000000000000000000000000003",
-      "developer_slots": [8],
+      "generation_alias": "G3",
+      "liveness_expectation_count": 2,
+      "quota_reviewer_episode_count": 0,
       "nudge_count": 0,
-      "wake_requeues": 4,
-      "bundles": [
-        {"key": "generation-rotated", "episodes": [{"accepted_offset_seconds": 420, "escalation_after_seconds": 304, "verdict_after_seconds": 233}]}
-      ]
+      "wake_requeues": 0
     },
     {
       "key": "history-04",
-      "conversation_generation": "00000000000000000000000000000001",
-      "developer_slots": [9, 10, 11, 12],
-      "nudge_count": 1,
-      "wake_requeues": 1,
-      "bundles": [
-        {"key": "left", "episodes": [{"accepted_offset_seconds": 480, "escalation_after_seconds": 305, "verdict_after_seconds": 55}, {"accepted_offset_seconds": 480, "escalation_after_seconds": 306, "verdict_after_seconds": 101}]},
-        {"key": "right", "episodes": [{"accepted_offset_seconds": 600, "escalation_after_seconds": 300, "verdict_after_seconds": 167}, {"accepted_offset_seconds": 600, "escalation_after_seconds": 307, "verdict_after_seconds": 311}]}
-      ]
+      "generation_alias": "G4",
+      "liveness_expectation_count": 2,
+      "quota_reviewer_episode_count": 0,
+      "nudge_count": 0,
+      "wake_requeues": 0
     },
     {
       "key": "history-05",
-      "conversation_generation": "00000000000000000000000000000005",
-      "developer_slots": [13, 14],
+      "generation_alias": "G5",
+      "liveness_expectation_count": 11,
+      "quota_reviewer_episode_count": 0,
       "nudge_count": 0,
-      "wake_requeues": 3,
-      "bundles": [
-        {"key": "a", "episodes": [{"accepted_offset_seconds": 660, "escalation_after_seconds": 301, "verdict_after_seconds": 74}]},
-        {"key": "b", "episodes": [{"accepted_offset_seconds": 720, "escalation_after_seconds": 302, "verdict_after_seconds": 190}]}
-      ]
+      "wake_requeues": 1
     },
     {
       "key": "history-06",
-      "conversation_generation": "00000000000000000000000000000006",
-      "developer_slots": [3, 7, 11],
-      "nudge_count": 0,
-      "wake_requeues": 2,
-      "bundles": [
-        {"key": "triple", "episodes": [{"accepted_offset_seconds": 780, "escalation_after_seconds": 303, "verdict_after_seconds": 29}, {"accepted_offset_seconds": 780, "escalation_after_seconds": 304, "verdict_after_seconds": 207}, {"accepted_offset_seconds": 780, "escalation_after_seconds": 305, "verdict_after_seconds": 352}]}
-      ]
+      "generation_alias": "G6",
+      "liveness_expectation_count": 11,
+      "quota_reviewer_episode_count": 0,
+      "nudge_count": 1,
+      "wake_requeues": 0
     },
     {
       "key": "history-07",
-      "conversation_generation": "00000000000000000000000000000007",
-      "developer_slots": [4, 8, 12, 15],
+      "generation_alias": "G7",
+      "liveness_expectation_count": 2,
+      "quota_reviewer_episode_count": 0,
       "nudge_count": 0,
-      "wake_requeues": 2,
-      "bundles": [
-        {"key": "first", "episodes": [{"accepted_offset_seconds": 840, "escalation_after_seconds": 306, "verdict_after_seconds": 95}]},
-        {"key": "coalesced", "episodes": [{"accepted_offset_seconds": 900, "escalation_after_seconds": 307, "verdict_after_seconds": 126}, {"accepted_offset_seconds": 900, "escalation_after_seconds": 300, "verdict_after_seconds": 418}]},
-        {"key": "last", "episodes": [{"accepted_offset_seconds": 1020, "escalation_after_seconds": 301, "verdict_after_seconds": 63}]}
-      ]
+      "wake_requeues": 0
     },
     {
       "key": "history-08",
-      "conversation_generation": "00000000000000000000000000000008",
-      "developer_slots": [6, 10],
+      "generation_alias": "G8",
+      "liveness_expectation_count": 16,
+      "quota_reviewer_episode_count": 0,
       "nudge_count": 0,
-      "wake_requeues": 2,
-      "bundles": [
-        {"key": "terminal-wave", "episodes": [{"accepted_offset_seconds": 1080, "escalation_after_seconds": 302, "verdict_after_seconds": 214}, {"accepted_offset_seconds": 1080, "escalation_after_seconds": 306, "verdict_after_seconds": 377}]}
-      ]
+      "wake_requeues": 0
     }
+  ],
+  "quota_reviewer_episodes": [
+    {"sequence": "E01", "unit_alias": "UA", "reviewer_alias": "R1", "wake_alias": "W01", "conversation_alias": "C01", "accepted_to_escalation_seconds": 301, "escalation_to_verdict_seconds": 115, "verdict": "changes_requested"},
+    {"sequence": "E02", "unit_alias": "UB", "reviewer_alias": "R2", "wake_alias": "W02", "conversation_alias": "C02", "accepted_to_escalation_seconds": 302, "escalation_to_verdict_seconds": 100, "verdict": "changes_requested"},
+    {"sequence": "E03", "unit_alias": "UA", "reviewer_alias": "R1", "wake_alias": "W03", "conversation_alias": "C03", "accepted_to_escalation_seconds": 304, "escalation_to_verdict_seconds": 163, "verdict": "changes_requested"},
+    {"sequence": "E04", "unit_alias": "UB", "reviewer_alias": "R2", "wake_alias": "W04", "conversation_alias": "C04", "accepted_to_escalation_seconds": 300, "escalation_to_verdict_seconds": 338, "verdict": "changes_requested"},
+    {"sequence": "E05", "unit_alias": "UA", "reviewer_alias": "R1", "wake_alias": "W05", "conversation_alias": "C05", "accepted_to_escalation_seconds": 302, "escalation_to_verdict_seconds": 321, "verdict": "changes_requested"},
+    {"sequence": "E06", "unit_alias": "UB", "reviewer_alias": "R2", "wake_alias": "W06", "conversation_alias": "C06", "accepted_to_escalation_seconds": 304, "escalation_to_verdict_seconds": 394, "verdict": "changes_requested"},
+    {"sequence": "E07", "unit_alias": "UA", "reviewer_alias": "R1", "wake_alias": "W07", "conversation_alias": "C07", "accepted_to_escalation_seconds": 302, "escalation_to_verdict_seconds": 295, "verdict": "approved"},
+    {"sequence": "E08", "unit_alias": "UB", "reviewer_alias": "R2", "wake_alias": "W08", "conversation_alias": "C08", "accepted_to_escalation_seconds": 301, "escalation_to_verdict_seconds": 406, "verdict": "changes_requested"},
+    {"sequence": "E09", "unit_alias": "UB", "reviewer_alias": "R2", "wake_alias": "W09", "conversation_alias": "C09", "accepted_to_escalation_seconds": 302, "escalation_to_verdict_seconds": 248, "verdict": "approved"},
+    {"sequence": "E10", "unit_alias": "UC", "reviewer_alias": "R3", "wake_alias": "W10", "conversation_alias": "C10", "accepted_to_escalation_seconds": 303, "escalation_to_verdict_seconds": 384, "verdict": "changes_requested"},
+    {"sequence": "E11", "unit_alias": "UD", "reviewer_alias": "R1", "wake_alias": "W11", "conversation_alias": "C11", "accepted_to_escalation_seconds": 303, "escalation_to_verdict_seconds": 162, "verdict": "changes_requested"},
+    {"sequence": "E12", "unit_alias": "UC", "reviewer_alias": "R3", "wake_alias": "W12", "conversation_alias": "C12", "accepted_to_escalation_seconds": 300, "escalation_to_verdict_seconds": 479, "verdict": "changes_requested"},
+    {"sequence": "E13", "unit_alias": "UD", "reviewer_alias": "R1", "wake_alias": "W13", "conversation_alias": "C13", "accepted_to_escalation_seconds": 301, "escalation_to_verdict_seconds": 374, "verdict": "changes_requested"},
+    {"sequence": "E14", "unit_alias": "UC", "reviewer_alias": "R3", "wake_alias": "W14", "conversation_alias": "C14", "accepted_to_escalation_seconds": 301, "escalation_to_verdict_seconds": 429, "verdict": "approved"},
+    {"sequence": "E15", "unit_alias": "UD", "reviewer_alias": "R1", "wake_alias": "W15", "conversation_alias": "C15", "accepted_to_escalation_seconds": 303, "escalation_to_verdict_seconds": 205, "verdict": "approved"},
+    {"sequence": "E16", "unit_alias": "UE", "reviewer_alias": "R2", "wake_alias": "W16", "conversation_alias": "C16", "accepted_to_escalation_seconds": 300, "escalation_to_verdict_seconds": 135, "verdict": "changes_requested"},
+    {"sequence": "E17", "unit_alias": "UE", "reviewer_alias": "R2", "wake_alias": "W17", "conversation_alias": "C17", "accepted_to_escalation_seconds": 304, "escalation_to_verdict_seconds": 249, "verdict": "changes_requested"},
+    {"sequence": "E18", "unit_alias": "UE", "reviewer_alias": "R2", "wake_alias": "W18", "conversation_alias": "C18", "accepted_to_escalation_seconds": 304, "escalation_to_verdict_seconds": 229, "verdict": "approved"},
+    {"sequence": "E19", "unit_alias": "UF", "reviewer_alias": "R1", "wake_alias": "W19", "conversation_alias": "C19", "accepted_to_escalation_seconds": 307, "escalation_to_verdict_seconds": 348, "verdict": "approved"},
+    {"sequence": "E20", "unit_alias": "UG", "reviewer_alias": "R2", "wake_alias": "W20", "conversation_alias": "C20", "accepted_to_escalation_seconds": 302, "escalation_to_verdict_seconds": 13, "verdict": "approved"},
+    {"sequence": "E21", "unit_alias": "UH", "reviewer_alias": "R2", "wake_alias": "W21", "conversation_alias": "C21", "accepted_to_escalation_seconds": 303, "escalation_to_verdict_seconds": 350, "verdict": "approved"}
   ]
 }

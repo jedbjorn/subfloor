@@ -52,7 +52,9 @@ class SprintHealthCase(unittest.TestCase):
         )
         rows = [
             (1, "Planner", "PLN1", "planner"),
-            (2, "Reviewer", "REV1", "reviewer"),
+            (2, "Reviewer 1", "REV1", "reviewer"),
+            (16, "Reviewer 2", "REV2", "reviewer"),
+            (17, "Reviewer 3", "REV3", "reviewer"),
         ] + [
             (shell_id, f"Developer {shell_id}", f"DEV{shell_id}", "dev")
             for shell_id in range(3, 16)
@@ -86,7 +88,12 @@ class SprintHealthCase(unittest.TestCase):
                 (self.feature_id, conversation_generation),
             ).lastrowid
         )
-        for shell_id, role in [(1, "planner"), (2, "reviewer")] + [
+        for shell_id, role in [
+            (1, "planner"),
+            (2, "reviewer"),
+            (16, "reviewer"),
+            (17, "reviewer"),
+        ] + [
             (shell_id, "developer") for shell_id in range(3, 16)
         ]:
             self.con.execute(
@@ -118,6 +125,7 @@ class SprintHealthCase(unittest.TestCase):
         disposition: str,
         *,
         developer: int,
+        reviewer: int = 2,
         updated_at: str = "2026-08-10 10:00:00",
     ) -> int:
         return int(
@@ -125,10 +133,11 @@ class SprintHealthCase(unittest.TestCase):
                 "INSERT INTO sprint_work_units "
                 "(sprint_id,assigned_shell_id,reviewer_shell_id,title,expected_output,"
                 "planned_wave,disposition,updated_at,completed_at) "
-                "VALUES (?,?,2,?,?,0,?,?,?)",
+                "VALUES (?,?,?,?,?,0,?,?,?)",
                 (
                     self.sprint_id,
                     developer,
+                    reviewer,
                     f"Unit {developer}",
                     "output",
                     disposition,
@@ -2261,35 +2270,118 @@ class SprintHealthCase(unittest.TestCase):
         fixture = json.loads(HISTORICAL_REPLAY.read_text())
         summary = fixture["source_summary"]
         sprints = fixture["sprints"]
-        episodes = [
-            episode
-            for sprint in sprints
-            for bundle in sprint["bundles"]
-            for episode in bundle["episodes"]
+        episodes = fixture["quota_reviewer_episodes"]
+        topology = fixture["quota_episode_topology"]
+
+        expected_sprints = [
+            ("history-01", "G1", 16, 0, 1, 12),
+            ("history-02", "G2", 45, 21, 0, 6),
+            ("history-03", "G3", 2, 0, 0, 0),
+            ("history-04", "G4", 2, 0, 0, 0),
+            ("history-05", "G5", 11, 0, 0, 1),
+            ("history-06", "G6", 11, 0, 1, 0),
+            ("history-07", "G7", 2, 0, 0, 0),
+            ("history-08", "G8", 16, 0, 0, 0),
         ]
-        self.assertEqual(1, fixture["schema_version"])
-        self.assertEqual(summary["sprint_count"], len(sprints))
-        self.assertEqual(summary["quota_reviewer_episodes"], len(episodes))
-        self.assertEqual(
-            summary["liveness_nudges"],
-            sum(sprint["nudge_count"] for sprint in sprints),
-        )
-        self.assertEqual(
-            summary["wake_requeues"],
-            sum(sprint["wake_requeues"] for sprint in sprints),
-        )
-        self.assertGreater(len({sprint["conversation_generation"] for sprint in sprints}), 1)
-        self.assertTrue(
-            any(
-                len(bundle["episodes"]) > 1
-                for sprint in sprints
-                for bundle in sprint["bundles"]
+        expected_episodes = [
+            ("E01", "UA", "R1", "W01", "C01", 301, 115, "changes_requested"),
+            ("E02", "UB", "R2", "W02", "C02", 302, 100, "changes_requested"),
+            ("E03", "UA", "R1", "W03", "C03", 304, 163, "changes_requested"),
+            ("E04", "UB", "R2", "W04", "C04", 300, 338, "changes_requested"),
+            ("E05", "UA", "R1", "W05", "C05", 302, 321, "changes_requested"),
+            ("E06", "UB", "R2", "W06", "C06", 304, 394, "changes_requested"),
+            ("E07", "UA", "R1", "W07", "C07", 302, 295, "approved"),
+            ("E08", "UB", "R2", "W08", "C08", 301, 406, "changes_requested"),
+            ("E09", "UB", "R2", "W09", "C09", 302, 248, "approved"),
+            ("E10", "UC", "R3", "W10", "C10", 303, 384, "changes_requested"),
+            ("E11", "UD", "R1", "W11", "C11", 303, 162, "changes_requested"),
+            ("E12", "UC", "R3", "W12", "C12", 300, 479, "changes_requested"),
+            ("E13", "UD", "R1", "W13", "C13", 301, 374, "changes_requested"),
+            ("E14", "UC", "R3", "W14", "C14", 301, 429, "approved"),
+            ("E15", "UD", "R1", "W15", "C15", 303, 205, "approved"),
+            ("E16", "UE", "R2", "W16", "C16", 300, 135, "changes_requested"),
+            ("E17", "UE", "R2", "W17", "C17", 304, 249, "changes_requested"),
+            ("E18", "UE", "R2", "W18", "C18", 304, 229, "approved"),
+            ("E19", "UF", "R1", "W19", "C19", 307, 348, "approved"),
+            ("E20", "UG", "R2", "W20", "C20", 302, 13, "approved"),
+            ("E21", "UH", "R2", "W21", "C21", 303, 350, "approved"),
+        ]
+        actual_sprints = [
+            (
+                sprint["key"],
+                sprint["generation_alias"],
+                sprint["liveness_expectation_count"],
+                sprint["quota_reviewer_episode_count"],
+                sprint["nudge_count"],
+                sprint["wake_requeues"],
             )
+            for sprint in sprints
+        ]
+        actual_episodes = [
+            (
+                episode["sequence"],
+                episode["unit_alias"],
+                episode["reviewer_alias"],
+                episode["wake_alias"],
+                episode["conversation_alias"],
+                episode["accepted_to_escalation_seconds"],
+                episode["escalation_to_verdict_seconds"],
+                episode["verdict"],
+            )
+            for episode in episodes
+        ]
+        self.assertEqual(2, fixture["schema_version"])
+        self.assertEqual(expected_sprints, actual_sprints)
+        self.assertEqual(expected_episodes, actual_episodes)
+        self.assertEqual(
+            (8, 105, 21, 2, 19),
+            (
+                summary["sprint_count"],
+                summary["liveness_expectations"],
+                summary["quota_reviewer_episodes"],
+                summary["liveness_nudges"],
+                summary["wake_requeues"],
+            ),
         )
+        self.assertEqual(
+            ("history-02", "G2", 1, 1, False, False, False, False),
+            (
+                topology["sprint_key"],
+                topology["generation_alias"],
+                topology["messages_per_wake"],
+                topology["successful_attempts_per_wake"],
+                topology["shared_wakes"],
+                topology["shared_conversations"],
+                topology["stale_generations"],
+                topology["requeues_include_episode_wakes"],
+            ),
+        )
+        self.assertEqual(
+            (105, 21, 2, 19),
+            (
+                sum(sprint[2] for sprint in expected_sprints),
+                sum(sprint[3] for sprint in expected_sprints),
+                sum(sprint[4] for sprint in expected_sprints),
+                sum(sprint[5] for sprint in expected_sprints),
+            ),
+        )
+        self.assertEqual(8, len({sprint[1] for sprint in expected_sprints}))
+        self.assertEqual(
+            (["UA", "UB", "UC", "UD", "UE", "UF", "UG", "UH"], ["R1", "R2", "R3"]),
+            (
+                list(dict.fromkeys(episode[1] for episode in expected_episodes)),
+                list(dict.fromkeys(episode[2] for episode in expected_episodes)),
+            ),
+        )
+        self.assertEqual(21, len({episode[3] for episode in expected_episodes}))
+        self.assertEqual(21, len({episode[4] for episode in expected_episodes}))
+
         sanitized = json.dumps(fixture, sort_keys=True)
         for forbidden in (
             "/home/",
             "account_ref",
+            "shell_id",
+            "participant_id",
             "process_pid",
             "process_start_ticks",
             "native_run_ref",
@@ -2303,7 +2395,23 @@ class SprintHealthCase(unittest.TestCase):
                 "VALUES ('anthropic','sanitized-replay-route')"
             ).lastrowid
         )
-        base = datetime(2026, 8, 10, 11, 45, tzinfo=timezone.utc)
+        replay_base = datetime(2026, 8, 10, 0, 0, tzinfo=timezone.utc)
+        reviewer_shells = {"R1": 2, "R2": 16, "R3": 17}
+        developer_shells = {
+            "UA": 3,
+            "UB": 4,
+            "UC": 5,
+            "UD": 6,
+            "UE": 7,
+            "UF": 8,
+            "UG": 9,
+            "UH": 10,
+        }
+        generation_tokens = {
+            f"G{index}": f"{index:032x}" for index in range(1, 9)
+        }
+        source_sprint_id_by_key: dict[str, int] = {}
+        episode_records: list[dict] = []
 
         def stamp(value: datetime) -> str:
             return value.strftime("%Y-%m-%d %H:%M:%S")
@@ -2332,20 +2440,38 @@ class SprintHealthCase(unittest.TestCase):
         for sprint_index, sprint_shape in enumerate(sprints):
             with self.subTest(sprint=sprint_shape["key"]):
                 self.sprint_id = self.replace_armed_sprint(
-                    armed_at="2026-08-10 11:45:00",
-                    conversation_generation=sprint_shape["conversation_generation"],
+                    armed_at=stamp(replay_base),
+                    conversation_generation=generation_tokens[
+                        sprint_shape["generation_alias"]
+                    ],
+                )
+                source_sprint_id_by_key[sprint_shape["key"]] = self.sprint_id
+                reviewer_participant_id = int(
+                    self.con.execute(
+                        "SELECT participant_id FROM sprint_participants "
+                        "WHERE sprint_id=? AND shell_id=2",
+                        (self.sprint_id,),
+                    ).fetchone()[0]
                 )
                 for requeue_index in range(sprint_shape["wake_requeues"]):
                     self.add_event(
                         "wake.requeued",
-                        at=stamp(base + timedelta(seconds=sprint_index * 20 + requeue_index)),
+                        at=stamp(
+                            replay_base
+                            + timedelta(
+                                seconds=sprint_index * 100 + requeue_index
+                            )
+                        ),
                         payload={
                             "classification": "sanitized_historical_requeue",
+                            "source_subset": "outside_quota_reviewer_episodes",
                             "ordinal": requeue_index + 1,
                         },
                     )
                 for nudge_index in range(sprint_shape["nudge_count"]):
-                    nudge_at = base + timedelta(seconds=30 + sprint_index * 10 + nudge_index)
+                    nudge_at = replay_base + timedelta(
+                        seconds=1000 + sprint_index * 10 + nudge_index
+                    )
                     nudge = self.add_message(
                         unit_id=None,
                         receiver=2,
@@ -2360,106 +2486,132 @@ class SprintHealthCase(unittest.TestCase):
                         payload={"nudge_message_id": nudge},
                     )
 
-                expected_developers: list[int] = []
-                expected_timings: dict[int, tuple[int, int]] = {}
-                bundle_sizes: list[int] = []
-                developer_index = 0
-                for bundle in sprint_shape["bundles"]:
-                    bundle_requests: list[tuple[int, int, datetime, datetime]] = []
-                    wake_id = None
-                    first_request = None
-                    for episode in bundle["episodes"]:
-                        developer = sprint_shape["developer_slots"][developer_index]
-                        developer_index += 1
-                        expected_developers.append(developer)
-                        accepted_at = base + timedelta(
-                            seconds=episode["accepted_offset_seconds"]
-                        )
-                        escalated_at = accepted_at + timedelta(
-                            seconds=episode["escalation_after_seconds"]
-                        )
-                        verdict_at = escalated_at + timedelta(
-                            seconds=episode["verdict_after_seconds"]
-                        )
-                        unit = self.add_unit(
+                generic_expectation_count = (
+                    sprint_shape["liveness_expectation_count"]
+                    - sprint_shape["quota_reviewer_episode_count"]
+                )
+                for expectation_index in range(generic_expectation_count):
+                    accepted_at = replay_base + timedelta(
+                        seconds=2000 + sprint_index * 200 + expectation_index
+                    )
+                    message = self.add_message(
+                        unit_id=None,
+                        receiver=2,
+                        read_at=stamp(accepted_at),
+                        delivered_at=stamp(accepted_at - timedelta(seconds=1)),
+                        created_at=stamp(accepted_at - timedelta(seconds=2)),
+                    )
+                    self.con.execute(
+                        "INSERT INTO sprint_liveness_expectations "
+                        "(message_id,sprint_id,participant_id,accepted_at,last_strong_at,"
+                        "last_strong_key,next_evaluation_at,escalated_at) "
+                        "VALUES (?,?,?,?,?,?,?,NULL)",
+                        (
+                            message,
+                            self.sprint_id,
+                            reviewer_participant_id,
+                            stamp(accepted_at),
+                            stamp(accepted_at),
+                            f"message.accepted:{message}",
+                            stamp(accepted_at + timedelta(minutes=10)),
+                        ),
+                    )
+
+                sprint_episodes = (
+                    episodes
+                    if sprint_shape["key"] == topology["sprint_key"]
+                    else []
+                )
+                unit_ids: dict[str, int] = {}
+                if sprint_episodes:
+                    unit_reviewers = {
+                        episode["unit_alias"]: episode["reviewer_alias"]
+                        for episode in sprint_episodes
+                    }
+                    for unit_alias, developer in developer_shells.items():
+                        unit_ids[unit_alias] = self.add_unit(
                             "in_review",
                             developer=developer,
-                            updated_at=stamp(accepted_at),
+                            reviewer=reviewer_shells[unit_reviewers[unit_alias]],
+                            updated_at=stamp(replay_base),
                         )
-                        request = self.add_message(
-                            unit_id=unit,
-                            receiver=2,
-                            kind="review_request",
-                            disposition="accepted",
-                            read_at=stamp(accepted_at),
-                            delivered_at=stamp(accepted_at - timedelta(seconds=1)),
-                            created_at=stamp(accepted_at - timedelta(seconds=2)),
-                        )
-                        if wake_id is None:
-                            wake_id = self.add_wake(
-                                request,
-                                receiver=2,
-                                state="delivered",
-                                created_at=stamp(accepted_at - timedelta(seconds=1)),
-                            )
-                            first_request = request
-                        else:
-                            self.con.execute(
-                                "INSERT INTO sprint_wake_messages "
-                                "(sprint_id,wake_id,message_id) VALUES (?,?,?)",
-                                (self.sprint_id, wake_id, request),
-                            )
-                        self.add_event(
-                            "review.requested",
-                            at=stamp(accepted_at),
-                            work_unit_id=unit,
-                            payload={"message_id": request},
-                        )
-                        reviewer_participant_id = int(
-                            self.con.execute(
-                                "SELECT participant_id FROM sprint_participants "
-                                "WHERE sprint_id=? AND shell_id=2",
-                                (self.sprint_id,),
-                            ).fetchone()[0]
-                        )
-                        self.con.execute(
-                            "INSERT INTO sprint_liveness_expectations "
-                            "(message_id,sprint_id,participant_id,accepted_at,last_strong_at,"
-                            "last_strong_key,next_evaluation_at,escalated_at) "
-                            "VALUES (?,?,?,?,?,?,?,?)",
-                            (
-                                request,
-                                self.sprint_id,
-                                reviewer_participant_id,
-                                stamp(accepted_at),
-                                stamp(accepted_at),
-                                f"message.accepted:{request}",
-                                stamp(escalated_at),
-                                stamp(escalated_at),
-                            ),
-                        )
-                        escalation = self.add_message(
-                            unit_id=None,
-                            receiver=1,
-                            kind="escalation",
-                            created_at=stamp(escalated_at),
-                        )
-                        self.add_event(
-                            "liveness.escalated",
-                            at=stamp(escalated_at),
-                            payload={
-                                "expectation_message_id": request,
-                                "escalation_message_id": escalation,
-                            },
-                        )
-                        expected_timings[request] = (
-                            episode["escalation_after_seconds"],
-                            episode["verdict_after_seconds"],
-                        )
-                        bundle_requests.append((unit, request, escalated_at, verdict_at))
 
-                    assert wake_id is not None and first_request is not None
-                    project_at = max(item[2] for item in bundle_requests) + timedelta(seconds=1)
+                for episode_index, episode in enumerate(sprint_episodes):
+                    reviewer_shell = reviewer_shells[episode["reviewer_alias"]]
+                    accepted_at = replay_base + timedelta(
+                        hours=1, seconds=episode_index * 1200
+                    )
+                    escalated_at = accepted_at + timedelta(
+                        seconds=episode["accepted_to_escalation_seconds"]
+                    )
+                    verdict_at = escalated_at + timedelta(
+                        seconds=episode["escalation_to_verdict_seconds"]
+                    )
+                    unit = unit_ids[episode["unit_alias"]]
+                    request = self.add_message(
+                        unit_id=unit,
+                        receiver=reviewer_shell,
+                        kind="review_request",
+                        disposition="accepted",
+                        read_at=stamp(accepted_at),
+                        delivered_at=stamp(accepted_at - timedelta(seconds=1)),
+                        created_at=stamp(accepted_at - timedelta(seconds=2)),
+                    )
+                    wake_id = self.add_wake(
+                        request,
+                        receiver=reviewer_shell,
+                        state="delivered",
+                        created_at=stamp(accepted_at - timedelta(seconds=1)),
+                    )
+                    self.con.execute(
+                        "UPDATE sprint_wake_outbox SET attempt_count=1 "
+                        "WHERE wake_id=?",
+                        (wake_id,),
+                    )
+                    self.add_event(
+                        "review.requested",
+                        at=stamp(accepted_at),
+                        work_unit_id=unit,
+                        payload={"message_id": request},
+                    )
+                    participant_id = int(
+                        self.con.execute(
+                            "SELECT participant_id FROM sprint_participants "
+                            "WHERE sprint_id=? AND shell_id=?",
+                            (self.sprint_id, reviewer_shell),
+                        ).fetchone()[0]
+                    )
+                    self.con.execute(
+                        "INSERT INTO sprint_liveness_expectations "
+                        "(message_id,sprint_id,participant_id,accepted_at,last_strong_at,"
+                        "last_strong_key,next_evaluation_at,escalated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (
+                            request,
+                            self.sprint_id,
+                            participant_id,
+                            stamp(accepted_at),
+                            stamp(accepted_at),
+                            f"message.accepted:{request}",
+                            stamp(escalated_at),
+                            stamp(escalated_at),
+                        ),
+                    )
+                    escalation = self.add_message(
+                        unit_id=None,
+                        receiver=1,
+                        kind="escalation",
+                        created_at=stamp(escalated_at),
+                    )
+                    self.add_event(
+                        "liveness.escalated",
+                        at=stamp(escalated_at),
+                        payload={
+                            "expectation_message_id": request,
+                            "escalation_message_id": escalation,
+                        },
+                    )
+                    project_at = escalated_at + timedelta(seconds=1)
                     self.con.execute(
                         "INSERT INTO harness_quota_window "
                         "(account_pk,window_kind,used_percent,resets_at,captured_at,status) "
@@ -2475,12 +2627,12 @@ class SprintHealthCase(unittest.TestCase):
                         ),
                     )
                     run_id = self.add_live_run(
-                        first_request,
+                        request,
                         wake_id,
-                        shell_id=2,
-                        suffix=f"{sprint_shape['key']}-{bundle['key']}",
+                        shell_id=reviewer_shell,
+                        suffix=f"source-{episode['conversation_alias']}",
                         provider="anthropic",
-                        started_at=stamp(min(item[2] for item in bundle_requests) - timedelta(seconds=1)),
+                        started_at=stamp(escalated_at - timedelta(seconds=1)),
                         heartbeat_at=stamp(project_at),
                         lease_expires_at=stamp(project_at + timedelta(minutes=10)),
                     )
@@ -2492,83 +2644,138 @@ class SprintHealthCase(unittest.TestCase):
 
                     self.assertEqual(before_changes, self.con.total_changes)
                     self.assertEqual(before_counts, history_counts())
-                    for unit, _, _, _ in bundle_requests:
-                        health = projected["work_units"][unit]
-                        self.assertEqual(
-                            ("progressing", "run_active", "exhausted", [], []),
-                            (
-                                health["condition"],
-                                health["cause"],
-                                health["capacity"]["state"],
-                                health["root_work_unit_ids"],
-                                health["unreadable_signals"],
-                            ),
-                        )
+                    health = projected["work_units"][unit]
+                    self.assertEqual(
+                        ("progressing", "run_active", "exhausted", [], []),
+                        (
+                            health["condition"],
+                            health["cause"],
+                            health["capacity"]["state"],
+                            health["root_work_unit_ids"],
+                            health["unreadable_signals"],
+                        ),
+                    )
 
                     run = self.con.execute(
-                        "SELECT conversation_id,trigger_message_id FROM conversation_runs "
-                        "WHERE run_id=?",
+                        "SELECT conversation_id,trigger_message_id,started_at "
+                        "FROM conversation_runs WHERE run_id=?",
                         (run_id,),
                     ).fetchone()
-                    ended_at = stamp(project_at + timedelta(seconds=1))
+                    ended_at = project_at + timedelta(seconds=1)
                     self.con.execute(
                         "UPDATE conversation_runs SET state='succeeded',heartbeat_at=?,"
                         "ended_at=? WHERE run_id=?",
-                        (ended_at, ended_at, run_id),
+                        (stamp(ended_at), stamp(ended_at), run_id),
                     )
                     self.con.execute(
                         "UPDATE conversation_messages SET state='completed',completed_at=? "
                         "WHERE message_id=?",
-                        (ended_at, run["trigger_message_id"]),
+                        (stamp(ended_at), run["trigger_message_id"]),
                     )
                     self.con.execute(
-                        "UPDATE conversations SET state='idle' WHERE conversation_id=?",
+                        "UPDATE conversations SET state='idle' "
+                        "WHERE conversation_id=?",
                         (run["conversation_id"],),
                     )
                     self.con.execute(
                         "UPDATE conversations SET state='closed',closed_at=? "
                         "WHERE conversation_id=?",
-                        (ended_at, run["conversation_id"]),
+                        (stamp(ended_at), run["conversation_id"]),
                     )
-                    self.con.execute("DELETE FROM active_shell_chats WHERE shell_id=2")
-                    for unit, request, _, verdict_at in bundle_requests:
-                        self.add_event(
-                            "review.approved",
-                            at=stamp(verdict_at),
-                            work_unit_id=unit,
-                            payload={"request_message_id": request},
-                        )
-                    bundle_sizes.append(len(bundle_requests))
+                    self.con.execute(
+                        "DELETE FROM active_shell_chats WHERE shell_id=?",
+                        (reviewer_shell,),
+                    )
+                    verdict_event = (
+                        "review.approved"
+                        if episode["verdict"] == "approved"
+                        else "review.changes_requested"
+                    )
+                    self.add_event(
+                        verdict_event,
+                        at=stamp(verdict_at),
+                        work_unit_id=unit,
+                        payload={"request_message_id": request},
+                    )
 
-                actual_developers = [
-                    int(row[0])
-                    for row in self.con.execute(
-                        "SELECT assigned_shell_id FROM sprint_work_units "
-                        "WHERE sprint_id=? ORDER BY work_unit_id",
-                        (self.sprint_id,),
+                    wake_row = self.con.execute(
+                        "SELECT state,attempt_count,idempotency_key "
+                        "FROM sprint_wake_outbox WHERE wake_id=?",
+                        (wake_id,),
+                    ).fetchone()
+                    wake_message_count = int(
+                        self.con.execute(
+                            "SELECT COUNT(*) FROM sprint_wake_messages "
+                            "WHERE wake_id=?",
+                            (wake_id,),
+                        ).fetchone()[0]
                     )
-                ]
-                actual_bundle_sizes = [
-                    int(row[0])
-                    for row in self.con.execute(
-                        "SELECT COUNT(*) FROM sprint_wake_messages swm "
-                        "JOIN wake_message m ON m.message_id=swm.message_id "
-                        "WHERE swm.sprint_id=? AND m.message_kind='review_request' "
-                        "GROUP BY swm.wake_id ORDER BY MIN(m.message_id)",
-                        (self.sprint_id,),
+                    attempt = self.con.execute(
+                        "SELECT attempt_number,target_conversation_id,outcome "
+                        "FROM sprint_wake_attempts WHERE wake_id=?",
+                        (wake_id,),
+                    ).fetchone()
+                    conversation = self.con.execute(
+                        "SELECT creation_idempotency_key FROM conversations "
+                        "WHERE conversation_id=?",
+                        (run["conversation_id"],),
+                    ).fetchone()
+                    self.assertEqual(
+                        ("delivered", 1, 1, 1, run["conversation_id"], "delivered"),
+                        (
+                            wake_row["state"],
+                            wake_row["attempt_count"],
+                            wake_message_count,
+                            attempt["attempt_number"],
+                            attempt["target_conversation_id"],
+                            attempt["outcome"],
+                        ),
                     )
-                ]
-                self.assertEqual(expected_developers, actual_developers)
-                self.assertEqual(bundle_sizes, actual_bundle_sizes)
-                self.assertEqual(
-                    sprint_shape["conversation_generation"],
-                    str(self.con.execute(
-                        "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
+                    self.assertEqual(
+                        "generation:"
+                        f"{generation_tokens[topology['generation_alias']]}:"
+                        f"wake:{wake_id}",
+                        conversation["creation_idempotency_key"],
+                    )
+                    self.assertEqual(
+                        (
+                            episode["accepted_to_escalation_seconds"],
+                            episode["escalation_to_verdict_seconds"],
+                        ),
+                        (
+                            int((escalated_at - accepted_at).total_seconds()),
+                            int((verdict_at - escalated_at).total_seconds()),
+                        ),
+                    )
+                    self.assertLessEqual(parse(run["started_at"]), escalated_at)
+                    self.assertGreaterEqual(ended_at, escalated_at)
+                    episode_records.append(
+                        {
+                            "sequence": episode["sequence"],
+                            "sprint_id": self.sprint_id,
+                            "request_id": request,
+                            "wake_id": wake_id,
+                            "conversation_id": run["conversation_id"],
+                            "run_id": run_id,
+                        }
+                    )
+
+                actual_counts = (
+                    int(self.con.execute(
+                        "SELECT COUNT(*) FROM sprint_liveness_expectations "
+                        "WHERE sprint_id=?",
                         (self.sprint_id,),
                     ).fetchone()[0]),
-                )
-                self.assertEqual(
-                    sprint_shape["wake_requeues"],
+                    int(self.con.execute(
+                        "SELECT COUNT(*) FROM sprint_liveness_expectations "
+                        "WHERE sprint_id=? AND escalated_at IS NOT NULL",
+                        (self.sprint_id,),
+                    ).fetchone()[0]),
+                    int(self.con.execute(
+                        "SELECT COUNT(*) FROM wake_message "
+                        "WHERE sprint_id=? AND message_kind='nudge'",
+                        (self.sprint_id,),
+                    ).fetchone()[0]),
                     int(self.con.execute(
                         "SELECT COUNT(*) FROM sprint_events "
                         "WHERE sprint_id=? AND event_type='wake.requeued'",
@@ -2576,60 +2783,122 @@ class SprintHealthCase(unittest.TestCase):
                     ).fetchone()[0]),
                 )
                 self.assertEqual(
-                    sprint_shape["nudge_count"],
-                    int(self.con.execute(
-                        "SELECT COUNT(*) FROM wake_message "
-                        "WHERE sprint_id=? AND message_kind='nudge'",
-                        (self.sprint_id,),
-                    ).fetchone()[0]),
+                    (
+                        sprint_shape["liveness_expectation_count"],
+                        sprint_shape["quota_reviewer_episode_count"],
+                        sprint_shape["nudge_count"],
+                        sprint_shape["wake_requeues"],
+                    ),
+                    actual_counts,
                 )
-                for request, expected in expected_timings.items():
-                    expectation = self.con.execute(
-                        "SELECT accepted_at,escalated_at FROM sprint_liveness_expectations "
-                        "WHERE message_id=?",
-                        (request,),
-                    ).fetchone()
-                    verdict = self.con.execute(
-                        "SELECT created_at FROM sprint_events "
-                        "WHERE sprint_id=? AND event_type='review.approved' "
-                        "AND json_extract(payload,'$.request_message_id')=?",
-                        (self.sprint_id, request),
-                    ).fetchone()
-                    actual = (
-                        int((parse(expectation["escalated_at"]) - parse(expectation["accepted_at"])).total_seconds()),
-                        int((parse(verdict["created_at"]) - parse(expectation["escalated_at"])).total_seconds()),
-                    )
-                    self.assertEqual(expected, actual)
                 self.con.execute(
                     "UPDATE sprints SET lifecycle='completed',terminal_outcome='success',"
-                    "completed_at='2026-08-10 13:00:00' WHERE sprint_id=?",
-                    (self.sprint_id,),
+                    "completed_at=? WHERE sprint_id=?",
+                    (stamp(replay_base + timedelta(days=1)), self.sprint_id),
                 )
 
+        source_sprint_ids = set(source_sprint_id_by_key.values())
+        self.assertEqual(8, len(source_sprint_ids))
         self.assertEqual(
+            {source_sprint_id_by_key["history-02"]},
+            {record["sprint_id"] for record in episode_records},
+        )
+        self.assertEqual(
+            (21, 21, 21, 21),
             (
-                summary["quota_reviewer_episodes"],
-                summary["quota_reviewer_episodes"] + summary["liveness_nudges"],
-                summary["liveness_nudges"],
-                summary["quota_reviewer_episodes"],
-                summary["wake_requeues"],
+                len({record["request_id"] for record in episode_records}),
+                len({record["wake_id"] for record in episode_records}),
+                len({record["conversation_id"] for record in episode_records}),
+                len({record["run_id"] for record in episode_records}),
             ),
+        )
+        self.assertEqual(
+            [episode["sequence"] for episode in episodes],
+            [record["sequence"] for record in episode_records],
+        )
+        sprint_two_id = source_sprint_id_by_key["history-02"]
+        self.assertEqual(
+            (8, 21, 21, 21, 13, 8),
             (
-                self.con.execute("SELECT COUNT(*) FROM sprint_liveness_expectations").fetchone()[0],
                 self.con.execute(
-                    "SELECT COUNT(*) FROM sprint_events WHERE event_type LIKE 'liveness.%'"
+                    "SELECT COUNT(*) FROM sprint_work_units WHERE sprint_id=?",
+                    (sprint_two_id,),
                 ).fetchone()[0],
                 self.con.execute(
-                    "SELECT COUNT(*) FROM wake_message WHERE message_kind='nudge'"
+                    "SELECT COUNT(*) FROM wake_message "
+                    "WHERE sprint_id=? AND message_kind='review_request'",
+                    (sprint_two_id,),
                 ).fetchone()[0],
                 self.con.execute(
-                    "SELECT COUNT(*) FROM wake_message WHERE message_kind='escalation'"
+                    "SELECT COUNT(*) FROM sprint_wake_outbox WHERE sprint_id=?",
+                    (sprint_two_id,),
                 ).fetchone()[0],
                 self.con.execute(
-                    "SELECT COUNT(*) FROM sprint_events WHERE event_type='wake.requeued'"
+                    "SELECT COUNT(*) FROM sprint_wake_attempts a "
+                    "JOIN sprint_wake_outbox w ON w.wake_id=a.wake_id "
+                    "WHERE w.sprint_id=?",
+                    (sprint_two_id,),
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_events "
+                    "WHERE sprint_id=? AND event_type='review.changes_requested'",
+                    (sprint_two_id,),
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_events "
+                    "WHERE sprint_id=? AND event_type='review.approved'",
+                    (sprint_two_id,),
                 ).fetchone()[0],
             ),
         )
+        self.assertEqual(
+            (105, 23, 2, 21, 19),
+            (
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_liveness_expectations "
+                    f"WHERE sprint_id IN ({','.join('?' for _ in source_sprint_ids)})",
+                    tuple(source_sprint_ids),
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type LIKE 'liveness.%' "
+                    f"AND sprint_id IN ({','.join('?' for _ in source_sprint_ids)})",
+                    tuple(source_sprint_ids),
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM wake_message WHERE message_kind='nudge' "
+                    f"AND sprint_id IN ({','.join('?' for _ in source_sprint_ids)})",
+                    tuple(source_sprint_ids),
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM wake_message WHERE message_kind='escalation' "
+                    f"AND sprint_id IN ({','.join('?' for _ in source_sprint_ids)})",
+                    tuple(source_sprint_ids),
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_events WHERE event_type='wake.requeued' "
+                    f"AND sprint_id IN ({','.join('?' for _ in source_sprint_ids)})",
+                    tuple(source_sprint_ids),
+                ).fetchone()[0],
+            ),
+        )
+        self.assertEqual(
+            (0, 0),
+            (
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='wake.requeued' "
+                    "AND COALESCE(json_extract(payload,'$.source_subset'),'')!="
+                    "'outside_quota_reviewer_episodes'"
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='wake.requeued' "
+                    "AND json_type(payload,'$.wake_id') IS NOT NULL"
+                ).fetchone()[0],
+            ),
+        )
+
 
     def test_synthetic_quota_escalation_matrix_keeps_live_runs_dominant(self) -> None:
         account_id = int(
