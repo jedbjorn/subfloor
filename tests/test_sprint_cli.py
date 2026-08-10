@@ -1231,12 +1231,24 @@ class SprintCliApiTest(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(self.db)) as con:
             message = con.execute(
                 "SELECT from_participant_id,to_participant_id,"
-                "message_kind,body,actionable,work_unit_id,disposition "
+                "message_kind,body,actionable,work_unit_id,disposition,"
+                "intent,requires_reply,reply_to_message_id "
                 "FROM wake_message WHERE message_id=?",
                 (response["message_id"],),
             ).fetchone()
             self.assertEqual(
-                (2, 1, "notification", "Please confirm the downstream handoff.", 0, None, None),
+                (
+                    2,
+                    1,
+                    "notification",
+                    "Please confirm the downstream handoff.",
+                    0,
+                    None,
+                    None,
+                    "information",
+                    0,
+                    None,
+                ),
                 message,
             )
             wake = con.execute(
@@ -1272,6 +1284,93 @@ class SprintCliApiTest(unittest.TestCase):
         self.assertEqual(response["message_id"], replay["message_id"])
         self.assertEqual(response["wake_id"], replay["wake_id"])
         self.assertFalse(replay["message_created"])
+
+    def test_participant_send_persists_scope_and_reply_linkage(self):
+        question = self.run_cli(
+            TOKENS["developer"],
+            "send",
+            "--sprint",
+            str(self.sprint_id),
+            "--to",
+            "PLN1",
+            "--body-file",
+            self.write("Which unit contract applies?"),
+            "--key",
+            "cli-participant-unit-question",
+            "--intent",
+            "question",
+            "--requires-reply",
+            "--work-unit",
+            str(self.unit_id),
+        )
+        answer = self.run_cli(
+            TOKENS["planner"],
+            "send",
+            "--sprint",
+            str(self.sprint_id),
+            "--to",
+            "DEV1",
+            "--body-file",
+            self.write("Use the unit-bound contract."),
+            "--key",
+            "cli-participant-unit-answer",
+            "--reply-to",
+            str(question["message_id"]),
+        )
+
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            rows = con.execute(
+                "SELECT message_id,intent,requires_reply,work_unit_id,"
+                "reply_to_message_id FROM wake_message "
+                "WHERE message_id IN (?,?) ORDER BY message_id",
+                (question["message_id"], answer["message_id"]),
+            ).fetchall()
+            self.assertEqual(
+                [
+                    (
+                        question["message_id"],
+                        "question",
+                        1,
+                        self.unit_id,
+                        None,
+                    ),
+                    (
+                        answer["message_id"],
+                        "information",
+                        0,
+                        self.unit_id,
+                        question["message_id"],
+                    ),
+                ],
+                rows,
+            )
+
+    def test_participant_send_rejects_unscoped_reply_wait_without_a_write(self):
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            before = con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0]
+        with self.assertRaisesRegex(
+            SystemExit, "HTTP 409.*exactly one work-unit or Sprint-level scope"
+        ):
+            self.run_cli(
+                TOKENS["developer"],
+                "send",
+                "--sprint",
+                str(self.sprint_id),
+                "--to",
+                "PLN1",
+                "--body-file",
+                self.write("Unscoped question."),
+                "--key",
+                "cli-participant-unscoped-question",
+                "--intent",
+                "question",
+                "--requires-reply",
+            )
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            self.assertEqual(
+                before,
+                con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
+            )
 
     def test_participant_send_rejects_non_string_body_and_key_as_bad_requests(self):
         mem.SC_API_TOKEN = TOKENS["developer"]
