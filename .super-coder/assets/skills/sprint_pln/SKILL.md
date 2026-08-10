@@ -35,8 +35,8 @@ Load `sprint_pln` on every entry. Do not turn entry routing into a polling loop.
 
 ## Start from durable state
 
-The armed runtime owns scheduled dispatch, unread wake recovery, liveness
-evaluation, and registered-PR observation. React to its durable inbox and wake
+The armed runtime owns scheduled dispatch and unread wake recovery. The
+registered-PR watcher owns subscription observation. React to their durable
 facts; use the Planner turn for dispatch and exact execution of durable Reviewer
 decisions. The Reviewer owns pause, cancel, and conclude decisions plus the
 conformance and final Sprint reports. The Planner owns control transitions;
@@ -91,21 +91,9 @@ not change Sprint or work-unit state.
   durable Reviewer decision before the edit. The running Sprint remains bound
   to its approved revision unless that decision explicitly says otherwise.
 
-The armed runtime evaluates liveness on its five-second pulse. A one-shot
-diagnostic/evaluation is available when evidence requires it:
-
-```text
-sc sprint monitor --sprint <id>
-```
-
-Run `monitor` once for concrete evidence, then return control to native
-delivery. It evaluates only due accepted expectations and its
-nudge/escalation identities are durable. Use Sprint-native wakes for
-coordination. Do not start a recurring shell loop, scheduled job, manual
-participant boot, or external PR watcher to track Sprint state.
-
-`monitor` carries no evidence about the PR watcher. When a
-watcher-dependent gate has stalled, use the separate bounded read once:
+Use Sprint-native wakes for coordination. Do not start a recurring shell loop,
+scheduled job, manual participant boot, or external PR watcher to track Sprint
+state. When a watcher-dependent gate has stalled, use the bounded read once:
 
 ```text
 sc sprint watcher-state --sprint <id>
@@ -118,21 +106,42 @@ as a polling loop; act on the evidence, then return control to native delivery.
 ## Questions, answers, blockers, and failures
 
 Put one concrete question, answer, decision, blocker, or useful context item in
-a short body file and address the participant who owns the next fact or action:
+a short body file. Declare the message intent and whether the required reply
+belongs to one work unit or the whole Sprint.
+
+A question or blocker about one lane requires a reply and names that unit:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent question --requires-reply --work-unit <work-unit-id> \
   --key <stable-key>
 ```
 
-Answer an incoming question through `send`, confirm the write, then mark the
-handled message read with `accept`. For a blocker, include evidence, impact,
-and the exact action needed. Continue safe independent governance, but stop at
-a decision boundary when an answer is required. Unread recovery owns re-waking;
-do not send duplicate reminders.
+Use `--intent blocker` instead for a blocked lane. A cross-unit, closeout, or
+external-authority ruling is a Sprint-level decision:
 
-Choose one stable key for the intended recipient and exact body. Reuse it only
-when retrying that same write; use a new key when the recipient or body changes.
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent decision --requires-reply --sprint-level --key <stable-key>
+```
+
+Answer the stored sender through the original message. The server inherits its
+unit or Sprint scope; never add `--work-unit` or `--sprint-level` to a reply:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent information --reply-to <message-id> --key <stable-key>
+```
+
+Confirm the reply write, then mark the handled incoming message read with
+`accept`. For a blocker, include evidence, impact, and the exact action needed.
+Continue safe independent governance, but stop at a decision boundary when an
+answer is required. Unread recovery owns re-waking; do not send duplicate
+reminders.
+
+Choose one stable key for the intended recipient, exact body, intent, reply
+linkage, and scope. Reuse it only when retrying that same write; use a new key
+when any of those fields changes.
 Keep the body near 6,000 characters and below the 8,000 hard maximum; run
 `wc -m < <path>`. A handoff is complete only when the Sprint command exits
 successfully and confirms the durable write and wake.
@@ -281,7 +290,8 @@ command atomically stores conformance, follow-ups, the Reviewer-authored final
 report, completed lifecycle, and an informational engine-wide Planner receipt.
 When that Re-enter arrives, confirm the receipt names the expected Sprint,
 reports, outcome, and completed state. Do not run `complete`; closure is already
-durable and the notification has no actionable liveness expectation.
+durable and the notification is informational because closure is already
+terminal.
 Successful completion also closes every other active participant chat
 immutably linked to that Sprint. The originating Planner and report-authoring
 Reviewer remain open. Do not manually close peer chats as a second closeout

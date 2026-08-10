@@ -67,24 +67,44 @@ PR-event subscription wakes.
 ## Questions, answers, blockers, and failures
 
 Put one concrete question, answer, blocker, or useful context item in a short
-body file and send it to the participant who owns the next fact or action. Ask
-the Developer for missing PR evidence and the Planner for durable state or
-action-feasibility facts. Do not delegate Reviewer judgment to the Planner:
+body file. Declare the message intent and whether the required reply belongs to
+one work unit or the whole Sprint. Ask the Developer for missing PR evidence
+with a unit-scoped question:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent question --requires-reply --work-unit <work-unit-id> \
   --key <stable-key>
 ```
 
-Answer an incoming question through `send`, confirm the write, then mark the
-handled message read with `accept`. A blocker or integrity concern is evidence
-for your decision. If action is needed, send the Planner the decision, impact,
-exact action, and recommendation. Continue safe independent review, but stop at
-the decision boundary when missing facts prevent an honest decision. Unread
-recovery owns re-waking; do not send duplicate reminders.
+Use `--intent blocker` instead when the unit cannot advance. Ask the Planner for
+durable state or action-feasibility facts without delegating Reviewer judgment.
+A cross-unit, closeout, pause, replan, re-enter, cancel, or abort ruling is a
+Sprint-level decision:
 
-Choose one stable key for the intended recipient and exact body. Reuse it only
-when retrying that same write; use a new key when the recipient or body changes.
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent decision --requires-reply --sprint-level --key <stable-key>
+```
+
+Answer the stored sender through the original message. The server inherits its
+unit or Sprint scope; never add `--work-unit` or `--sprint-level` to a reply:
+
+```text
+sc sprint send --sprint <id> --to <shortname> --body-file <path> \
+  --intent information --reply-to <message-id> --key <stable-key>
+```
+
+Confirm the reply write, then mark the handled incoming message read with
+`accept`. A blocker or integrity concern is evidence for your decision. If
+action is needed, send the Planner the decision, impact, exact action, and
+recommendation. Continue safe independent review, but stop at the decision
+boundary when missing facts prevent an honest decision. Unread recovery owns
+re-waking; do not send duplicate reminders.
+
+Choose one stable key for the intended recipient, exact body, intent, reply
+linkage, and scope. Reuse it only when retrying that same write; use a new key
+when any of those fields changes.
 
 Keep the body near 6,000 characters and below the 8,000 hard maximum; run
 `wc -m < <path>`. A handoff is complete only when the Sprint command exits
@@ -114,7 +134,7 @@ artifact directory are working material only.
 The Reviewer owns all pause, cancel, and conclude decisions and recommendations.
 The Planner owns control actions; clean conformance approval atomically performs
 its own close. Base a decision on durable Sprint state,
-the exact bound revisions, current work/PR facts, liveness evidence, and any
+the exact bound revisions, current work/PR facts, progress-carrier evidence, and any
 ratified judgment; ambiguous silence is not enough to corrupt a disposition.
 
 Send pause, resume, replan, re-enter, cancel, and abort decisions through the
@@ -160,12 +180,19 @@ acceptable post-Sprint follow-up.
 
 ## Work-unit review
 
-Accept the actionable review request. Its readiness body must be only the bare
+Accept the actionable review request and retain that exact message id as the
+identity of this review round. Its readiness body must be only the bare
 locator: submitting or resubmitting intent, PR URL, registered Sprint PR id,
 exact head SHA, and work-unit id. Treat scope narrative, verification evidence,
 judgment rationale, or review-focus steering in that body as a protocol defect;
 do not use it to frame the review. Neither party writes PR comments or
 annotations, and the PR body contains only the work-unit id and spec reference.
+
+Bind every inspection and the eventual verdict to the accepted request's
+message id, registered PR, work unit, and exact head. Another request in the
+same delivery, another unit assigned to this Reviewer, or role activity in a
+different conversation does not belong to this round. Accept and review each
+request explicitly; never infer a review lane from Reviewer identity alone.
 
 Review the exact bound spec revision and the full diff at the request's exact
 head, then inspect checks, tests, relevant runtime evidence, and ratified
@@ -231,17 +258,21 @@ sc sprint record-review \
 
 Use `approved` only when no Critical/Major/Medium finding remains. The engine
 checks that the request was accepted and still binds to the reviewed head,
-records judgment evidence, sends a Re-enter wake to the Developer, and
-resolves the review liveness expectation. Do not message around this surface;
+records judgment evidence and sends a Re-enter wake to the Developer. Do not
+message around this surface;
 an unrecorded verdict cannot unlock merge.
 
 ## Delivery-terminal closeout
 
 The `sprint.delivery_terminal` notification is the entry signal for
-whole-Sprint conformance. On that wake, inspect the inbox and current work-unit
-state first. If any non-terminal unit is visible, the wake is stale: mark the
-informational notification handled with `accept`, exit, and await the next
-episode's delivery-terminal wake.
+whole-Sprint conformance. Retain that exact notification message id and its
+delivered wake as the closeout entry identity; another Reviewer turn or an old
+terminal notification does not carry this episode. On that wake, inspect the
+inbox, lifecycle, and current work-unit state first. If the lifecycle is already
+`completed` or `aborted`, mark the informational notification handled with
+`accept` and stop. If any non-terminal unit is visible, the wake is stale: mark
+it handled with `accept`, exit, and await the next episode's delivery-terminal
+wake. Only an armed Sprint whose units are all terminal enters conformance.
 
 Compile the bounded evidence packet first and do so yourself, then judge
 integrated `main` against every governing bound revision, exact recorded
@@ -369,6 +400,7 @@ requested action. Then complete this final handoff order:
 
 ```text
 sc sprint send --sprint <id> --to <planner-shortname> --body-file <path> \
+  --intent decision --requires-reply --sprint-level \
   --key <stable-decision-handoff-key>
 ```
 

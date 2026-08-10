@@ -30,6 +30,7 @@ CLOSEOUT_ROLE_SKILLS = {"sprint_close", "sprint_dev", "sprint_pln", "sprint_rev"
 FORCE_NEW_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
 POLISHED_SPRINT_SKILLS = set(SKILLS) - {"sprint_prep"}
 CHAT_CLEANUP_SKILLS = {"sprint_close", "sprint_pln", "sprint_rev"}
+PROGRESS_CARRIER_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
 
 ARTIFACT_PATH_RULE = """## Sprint artifact paths
 
@@ -451,9 +452,6 @@ class SprintSkillTest(unittest.TestCase):
                     )
                     normalized = " ".join(parsed["content"].split())
                     self.assertIn("sc sprint watcher-state --sprint <id>", normalized)
-                    self.assertIn(
-                        "carries no evidence about the PR watcher", normalized
-                    )
                     self.assertIn("Do not repeat", normalized)
         finally:
             con.close()
@@ -592,6 +590,15 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            self.assertEqual(
+                developer_before,
+                tuple(
+                    con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name='sprint_dev'"
+                    ).fetchone()
+                ),
+            )
             for later_migration in sorted(
                 (ENGINE / "migrations").glob("*.sql")
             ):
@@ -623,15 +630,6 @@ class SprintSkillTest(unittest.TestCase):
                     self.assertIn("report-authoring Reviewer", normalized)
                     self.assertIn("Do not manually close peer chats", normalized)
                     self.assertIn("failed conformance", normalized)
-            self.assertEqual(
-                developer_before,
-                tuple(
-                    con.execute(
-                        "SELECT description,category,command,common,content,is_deleted "
-                        "FROM skills WHERE name='sprint_dev'"
-                    ).fetchone()
-                ),
-            )
         finally:
             con.close()
 
@@ -654,6 +652,17 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            self.assertIn(
+                "sc sprint reconcile-pr",
+                con.execute(
+                    "SELECT content FROM skills WHERE name='sprint_pln'"
+                ).fetchone()[0],
+            )
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0192_reseed_sprint_pr_recovery.sql":
+                    con.executescript(later_migration.read_text())
 
             parsed = seed_skills.parse_skill(ASSETS / "sprint_pln" / "SKILL.md")
             row = con.execute(
@@ -671,6 +680,53 @@ class SprintSkillTest(unittest.TestCase):
                 ),
                 tuple(row),
             )
+        finally:
+            con.close()
+
+    def test_progress_carrier_reseed_matches_assets_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0195_reseed_sprint_progress_carriers.sql":
+                    break
+                con.executescript(migration.read_text())
+            placeholders = ",".join("?" for _ in PROGRESS_CARRIER_ROLE_SKILLS)
+            con.execute(
+                f"UPDATE skills SET description='stale',category='stale',"
+                f"command='stale',common=1,content='legacy liveness workflow',"
+                f"is_deleted=1 WHERE name IN ({placeholders})",
+                tuple(sorted(PROGRESS_CARRIER_ROLE_SKILLS)),
+            )
+
+            migration = (
+                ENGINE
+                / "migrations"
+                / "0195_reseed_sprint_progress_carriers.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for name in sorted(PROGRESS_CARRIER_ROLE_SKILLS):
+                with self.subTest(name=name):
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(1, len(rows))
+                    self.assertEqual(
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                        tuple(rows[0]),
+                    )
         finally:
             con.close()
 
@@ -809,7 +865,10 @@ class SprintSkillTest(unittest.TestCase):
         normalized_planner = " ".join(planner.split())
         self.assertIn("clean `record-conformance` command atomically", normalized_planner)
         self.assertIn("Do not run `complete`", planner)
-        self.assertIn("notification has no actionable liveness expectation", planner)
+        self.assertIn(
+            "notification is informational because closure is already terminal",
+            normalized_planner,
+        )
         normalized_close = " ".join(close.split())
         self.assertIn("completes the Sprint", normalized_close)
         self.assertIn("informational Planner receipt", normalized_close)
@@ -856,8 +915,9 @@ class SprintSkillTest(unittest.TestCase):
         combined = "\n".join(
             (ASSETS / name / "SKILL.md").read_text() for name in SKILLS
         )
-        for command in expected:
+        for command in expected - {"monitor"}:
             self.assertIn(f"sc sprint {command}", combined)
+        self.assertNotIn("sc sprint monitor", combined)
         dispatcher = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
         self.assertIn(
             'sprint)       sc_python_probe; exec "$PY" "$S/sprint_cli.py" "$@" ;;',
@@ -880,14 +940,17 @@ class SprintSkillTest(unittest.TestCase):
                     "sc sprint inbox --sprint <id>",
                     "sc sprint accept --sprint <id> --message <message-id>",
                     "sc sprint decline --sprint <id> --message <message-id>",
-                    "sc sprint send --sprint <id> --to <shortname> --body-file <path> \\",
+                    "--intent question --requires-reply --work-unit <work-unit-id>",
+                    "--intent decision --requires-reply --sprint-level",
+                    "--intent information --reply-to <message-id>",
                 ):
                     self.assertIn(command, body)
                 normalized = " ".join(body.lower().split())
                 for guidance in (
                     "on every entry",
                     "route the entry",
-                    "incoming question",
+                    "original message",
+                    "inherits its",
                     "blocker",
                     "decision boundary",
                     "duplicate",
@@ -902,17 +965,51 @@ class SprintSkillTest(unittest.TestCase):
                     "re-run `sc sprint inbox --sprint <id>`",
                 ):
                     self.assertIn(guidance, normalized)
-                self.assertEqual(
-                    1,
-                    body.count(
-                        "sc sprint send --sprint <id> --to <shortname> "
-                        "--body-file <path> \\\n  --key <stable-key>"
-                    ),
-                )
                 self.assertIn("reuse it only", normalized)
-                self.assertIn("recipient or body changes", normalized)
+                self.assertIn("when any of those fields changes", normalized)
                 for invented in ("ASK:", "ANSWER:", "BLOCKED:"):
                     self.assertNotIn(invented, body)
+
+    def test_role_messages_are_scoped_and_progress_carrier_driven(self):
+        bodies = {
+            name: (ASSETS / name / "SKILL.md").read_text()
+            for name in PROGRESS_CARRIER_ROLE_SKILLS
+        }
+        for name, body in bodies.items():
+            with self.subTest(name=name):
+                normalized = " ".join(body.split())
+                self.assertIn(
+                    "--intent question --requires-reply --work-unit <work-unit-id>",
+                    normalized,
+                )
+                self.assertIn("Use `--intent blocker`", normalized)
+                self.assertIn(
+                    "--intent decision --requires-reply --sprint-level",
+                    normalized,
+                )
+                self.assertIn(
+                    "--intent information --reply-to <message-id>",
+                    normalized,
+                )
+                self.assertIn(
+                    "never add `--work-unit` or `--sprint-level` to a reply",
+                    normalized,
+                )
+                self.assertNotIn("liveness", body.lower())
+                self.assertNotIn("sc sprint monitor", body)
+
+        self.assertIn(
+            "--intent handoff --key <stable-merged-handoff-key>",
+            " ".join(bodies["sprint_dev"].split()),
+        )
+        reviewer = " ".join(bodies["sprint_rev"].split())
+        self.assertIn("retain that exact message id", reviewer)
+        self.assertIn(
+            "accepted request's message id, registered PR, work unit, and exact head",
+            reviewer,
+        )
+        self.assertIn("exact notification message id", reviewer)
+        self.assertIn("Only an armed Sprint whose units are all terminal", reviewer)
 
     def test_authority_split_assigns_reviewer_decisions_and_planner_actions(self):
         planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()
@@ -1131,16 +1228,10 @@ class SprintSkillTest(unittest.TestCase):
         planner = " ".join(bodies["sprint_pln"].split())
         self.assertIn("dependency graph and capacity plan match the decision", planner)
         self.assertIn("rather than silently re-routing", planner)
-        for fact in (
-            "scheduled dispatch",
-            "unread wake recovery",
-            "liveness evaluation",
-            "registered-PR observation",
-        ):
+        for fact in ("scheduled dispatch", "unread wake recovery"):
             self.assertIn(fact, planner)
-        self.assertIn(
-            "Run `monitor` once for concrete evidence", bodies["sprint_pln"]
-        )
+        self.assertIn("registered-PR watcher owns subscription observation", planner)
+        self.assertNotIn("sc sprint monitor", bodies["sprint_pln"])
         self.assertIn(
             "After `register-pr` succeeds", bodies["sprint_dev"]
         )

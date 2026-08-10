@@ -88,7 +88,8 @@
     ".super-coder/migrations/0189_reseed_spec_scope_audience.sql",
     ".super-coder/migrations/0191_reseed_target_aware_dev_kit.sql",
     ".super-coder/migrations/0192_reseed_sprint_pr_recovery.sql",
-    ".super-coder/migrations/0194_sprint_scoped_reply_waits.sql"
+    ".super-coder/migrations/0194_sprint_scoped_reply_waits.sql",
+    ".super-coder/migrations/0195_reseed_sprint_progress_carriers.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
