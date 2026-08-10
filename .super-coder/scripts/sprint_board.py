@@ -41,6 +41,7 @@ _RECOVERY_INSTRUCTION = (
     "Inspect the pause report, repair the named route or service, then use an "
     "authorized resume."
 )
+_MAX_HEALTH_MESSAGE_REPLIES = 100
 
 # Payloads are internal evidence.  Only fields with an explicit browser use
 # are projected; an unknown event remains visible with an empty detail object.
@@ -481,6 +482,97 @@ class SprintBoardProjection:
             if owns_transaction:
                 self.con.rollback()
 
+    def _health_messages(
+        self,
+        sprint_id: int,
+        message_ids: set[int],
+    ) -> list[dict[str, Any]]:
+        """Project exact health references independently of audit-history limits."""
+        if not message_ids:
+            return []
+        encoded_ids = json.dumps(sorted(message_ids))
+        linked_replies: dict[int, list[int]] = defaultdict(list)
+        linked_reply_counts: dict[int, int] = {}
+        for row in self.con.execute(
+            "WITH ranked AS ("
+            " SELECT m.reply_to_message_id,m.message_id,"
+            " ROW_NUMBER() OVER (PARTITION BY m.reply_to_message_id "
+            " ORDER BY m.message_id) reply_rank,"
+            " COUNT(*) OVER (PARTITION BY m.reply_to_message_id) reply_count "
+            " FROM wake_message m JOIN json_each(?) refs "
+            " ON m.reply_to_message_id=CAST(refs.value AS INTEGER) "
+            " WHERE m.sprint_id=?) "
+            "SELECT * FROM ranked WHERE reply_rank<=? "
+            "ORDER BY reply_to_message_id,message_id",
+            (encoded_ids, sprint_id, _MAX_HEALTH_MESSAGE_REPLIES),
+        ):
+            parent_id = int(row["reply_to_message_id"])
+            linked_replies[parent_id].append(int(row["message_id"]))
+            linked_reply_counts[parent_id] = int(row["reply_count"])
+
+        rows = self.con.execute(
+            "SELECT m.message_id,m.work_unit_id,m.message_kind,m.body,m.intent,"
+            "m.requires_reply,m.reply_to_message_id,m.created_at,m.delivered_at,"
+            "m.read_at,sender_shell.shell_id sender_shell_id,"
+            "sender_shell.shortname sender_shortname,"
+            "recipient_shell.shell_id recipient_shell_id,"
+            "recipient_shell.shortname recipient_shortname "
+            "FROM json_each(?) refs JOIN wake_message m "
+            "ON m.message_id=CAST(refs.value AS INTEGER) "
+            "LEFT JOIN sprint_participants sender "
+            "ON sender.participant_id=m.from_participant_id "
+            "LEFT JOIN shells sender_shell "
+            "ON sender_shell.shell_id=COALESCE(sender.shell_id,m.sender_shell_id) "
+            "JOIN sprint_participants recipient "
+            "ON recipient.participant_id=m.to_participant_id "
+            "JOIN shells recipient_shell ON recipient_shell.shell_id=recipient.shell_id "
+            "WHERE m.sprint_id=? ORDER BY m.message_id",
+            (encoded_ids, sprint_id),
+        ).fetchall()
+        projected = []
+        for row in rows:
+            message_id = int(row["message_id"])
+            reply_ids = linked_replies[message_id]
+            reply_count = linked_reply_counts.get(message_id, 0)
+            work_unit_id = row["work_unit_id"]
+            projected.append(
+                {
+                    "message_id": message_id,
+                    "scope": "work_unit" if work_unit_id is not None else "sprint",
+                    "work_unit_id": (
+                        int(work_unit_id) if work_unit_id is not None else None
+                    ),
+                    "kind": row["message_kind"],
+                    "body": row["body"],
+                    "intent": row["intent"],
+                    "requires_reply": bool(row["requires_reply"]),
+                    "reply_to_message_id": (
+                        int(row["reply_to_message_id"])
+                        if row["reply_to_message_id"] is not None
+                        else None
+                    ),
+                    "linked_reply_message_ids": reply_ids,
+                    "linked_reply_count": reply_count,
+                    "linked_replies_truncated": reply_count > len(reply_ids),
+                    "created_at": row["created_at"],
+                    "delivered_at": row["delivered_at"],
+                    "read_at": row["read_at"],
+                    "sender": (
+                        {
+                            "shell_id": int(row["sender_shell_id"]),
+                            "shortname": row["sender_shortname"],
+                        }
+                        if row["sender_shell_id"] is not None
+                        else None
+                    ),
+                    "recipient": {
+                        "shell_id": int(row["recipient_shell_id"]),
+                        "shortname": row["recipient_shortname"],
+                    },
+                }
+            )
+        return projected
+
     def _board_in_snapshot(self, sprint_id: int) -> dict[str, Any]:
         sprint = self.con.execute(
             "SELECT sp.*,r.title feature_title,planner.shortname planner_shortname "
@@ -677,8 +769,20 @@ class SprintBoardProjection:
                 }
             )
 
-        units = []
         health = sprint_health.SprintHealthProjection(self.con).project(sprint_id)
+        health_message_ids = {
+            int(ref["message_id"])
+            for root in health["health"].get("root_causes", [])
+            for ref in root.get("message_refs", [])
+        }
+        health_message_ids.update(
+            int(ref["message_id"])
+            for unit_health in health["work_units"].values()
+            for ref in unit_health.get("message_refs", [])
+        )
+        health_messages = self._health_messages(sprint_id, health_message_ids)
+
+        units = []
         counts = {name: 0 for name in ("done", "review", "dev", "waiting", "blocked")}
         for row in self.con.execute(
             "SELECT u.*,dev.shortname developer_shortname,rev.shortname reviewer_shortname "
@@ -771,6 +875,7 @@ class SprintBoardProjection:
             "runtime": runtime,
             "pickup": pickup,
             "health": health["health"],
+            "health_messages": health_messages,
             "feed_counts": {
                 "events": int(feed_counts["event_count"]),
                 "summaries": int(feed_counts["judgment_count"])

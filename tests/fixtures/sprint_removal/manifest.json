@@ -638,7 +638,7 @@
         "title: `${label} \u00b7 Sprint ${sprint.sprint_id}`,",
         "title: `Sprint ${sprint.sprint_id} \u00b7 ${sprint.role} \u00b7 ${sprint.disposition}`,",
       "wrap.classList.toggle(\"sprint-wire-focus\", on);",
-      "const scope = root.scope === \"work_unit\" ? `Work unit U${root.work_unit_id}` : \"Sprint\";",
+      ": message?.scope === \"sprint\" ? \"Sprint\" : \"Unavailable\";",
       "const body = el(\"div\", { className: \"sprint-unit-detail\" }, facts);",
       "body.append(el(\"div\", { className: \"grid2 sprint-unit-facts\" },",
       "el(\"div\", { className: \"sprint-long-text\" }, message.body));",

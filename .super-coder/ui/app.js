@@ -5232,12 +5232,8 @@ function sprintUnitList(ids, empty = "None") {
 }
 
 function sprintFindHealthMessage(snapshot, messageId) {
-  for (const message of snapshot.messages || [])
-    if (message.message_id === messageId) return message;
-  for (const unit of snapshot.work_units || [])
-    for (const message of unit.messages || [])
-      if (message.message_id === messageId) return message;
-  return null;
+  return (snapshot.health_messages || []).find(
+    (message) => message.message_id === messageId) || null;
 }
 
 function sprintParticipantLink(person) {
@@ -5463,7 +5459,10 @@ function sprintActionButtons(sprint) {
 
 function openSprintHealthMessageModal(messageId, root, snapshot) {
   const message = sprintFindHealthMessage(snapshot, messageId);
-  const scope = root.scope === "work_unit" ? `Work unit U${root.work_unit_id}` : "Sprint";
+  const has = (key) => message && Object.prototype.hasOwnProperty.call(message, key);
+  const scope = message?.scope === "work_unit" && message.work_unit_id !== null
+    ? `Work unit U${message.work_unit_id}`
+    : message?.scope === "sprint" ? "Sprint" : "Unavailable";
   const facts = el("div", { className: "grid2 sprint-unit-facts" },
     el("span", { className: "k" }, "message"), el("span", {}, `#${messageId}`),
     el("span", { className: "k" }, "scope"), el("span", {}, scope),
@@ -5471,20 +5470,36 @@ function openSprintHealthMessageModal(messageId, root, snapshot) {
   const body = el("div", { className: "sprint-unit-detail" }, facts);
   if (message) {
     const sender = message.sender?.shortname || "system";
-    const recipient = message.recipient?.shortname || "unknown";
+    const recipient = message.recipient?.shortname || "Unavailable";
+    const replyTo = !has("reply_to_message_id") ? "Unavailable"
+      : message.reply_to_message_id === null ? "None" : `#${message.reply_to_message_id}`;
+    const linkedReplyIds = has("linked_reply_message_ids")
+      ? message.linked_reply_message_ids : null;
+    const linkedReplies = linkedReplyIds === null ? "Unavailable"
+      : linkedReplyIds.length ? linkedReplyIds.map((id) => `#${id}`).join(", ") : "None";
+    const linkedReplySuffix = message.linked_replies_truncated
+      ? ` (showing ${linkedReplyIds.length} of ${message.linked_reply_count})` : "";
     body.append(el("div", { className: "grid2 sprint-unit-facts" },
       el("span", { className: "k" }, "route"), el("span", {}, `${sender} → ${recipient}`),
-      el("span", { className: "k" }, "kind"), el("span", {}, message.kind || "notification"),
-      el("span", { className: "k" }, "intent"), el("span", {}, message.intent || "information"),
-      el("span", { className: "k" }, "requires reply"), el("span", {}, message.requires_reply ? "yes" : "no"),
-      el("span", { className: "k" }, "reply to"), el("span", {}, message.reply_to_message_id ? `#${message.reply_to_message_id}` : "None"),
-      el("span", { className: "k" }, "created"), el("span", {}, sprintTimestamp(message.created_at)),
-      el("span", { className: "k" }, "read"), el("span", {}, message.read_at ? sprintTimestamp(message.read_at) : "Unread")),
+      el("span", { className: "k" }, "kind"), el("span", {}, has("kind") ? String(message.kind) : "Unavailable"),
+      el("span", { className: "k" }, "intent"), el("span", {}, has("intent") ? String(message.intent) : "Unavailable"),
+      el("span", { className: "k" }, "requires reply"), el("span", {},
+        message.requires_reply === true ? "yes" : message.requires_reply === false ? "no" : "Unavailable"),
+      el("span", { className: "k" }, "reply to"), el("span", {}, replyTo),
+      el("span", { className: "k" }, "linked replies"), el("span", {}, linkedReplies + linkedReplySuffix),
+      el("span", { className: "k" }, "created"), el("span", {},
+        has("created_at") ? sprintTimestamp(message.created_at) : "Unavailable"),
+      el("span", { className: "k" }, "delivered"), el("span", {},
+        !has("delivered_at") ? "Unavailable" : message.delivered_at
+          ? sprintTimestamp(message.delivered_at) : "Not delivered"),
+      el("span", { className: "k" }, "read"), el("span", {},
+        !has("read_at") ? "Unavailable" : message.read_at
+          ? sprintTimestamp(message.read_at) : "Unread")),
     el("h3", {}, "Bounded message body"),
     el("div", { className: "sprint-long-text" }, message.body));
   } else {
     body.append(el("div", { className: "muted sprint-health-message-note" },
-      "The health summary intentionally exposes only this durable numeric message reference."));
+      "Durable message detail is unavailable in this snapshot."));
   }
   const closeButton = el("button", { className: "act", type: "button", textContent: "Close" });
   const close = openModal({

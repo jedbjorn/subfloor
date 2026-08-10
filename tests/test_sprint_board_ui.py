@@ -652,6 +652,67 @@ console.log(JSON.stringify({
     assert result["messageTitle"] == "Open bounded detail for message 441"
 
 
+def test_health_message_modal_uses_exact_projection_for_unit_sprint_and_old_waits():
+    script = HEALTH_BOARD_HARNESS + SPRINT_BLOCK + r"""
+const snapshot = {
+  sprint: {sprint_id: 9},
+  work_units: [{work_unit_id: 12, messages: [{
+    message_id: 501, kind: "notification", body: "Sparse audit copy",
+    created_at: "2026-08-10T10:00:00Z",
+  }]}],
+  health_messages: [
+    {message_id: 501, scope: "work_unit", work_unit_id: 12, kind: "notification",
+      body: "Unit question", intent: "question", requires_reply: true,
+      reply_to_message_id: null, linked_reply_message_ids: [], linked_reply_count: 0,
+      linked_replies_truncated: false, created_at: "2026-08-10T10:00:00Z",
+      delivered_at: null, read_at: null, sender: {shortname: "PLN1"},
+      recipient: {shortname: "DEV3"}},
+    {message_id: 502, scope: "sprint", work_unit_id: null, kind: "notification",
+      body: "Sprint decision", intent: "decision", requires_reply: true,
+      reply_to_message_id: null, linked_reply_message_ids: [], linked_reply_count: 0,
+      linked_replies_truncated: false, created_at: "2026-08-10T10:01:00Z",
+      delivered_at: "2026-08-10T10:02:00Z", read_at: "2026-08-10T10:03:00Z",
+      sender: {shortname: "PLN1"}, recipient: {shortname: "REV1"}},
+    {message_id: 401, scope: "work_unit", work_unit_id: 12, kind: "notification",
+      body: "Old blocker beyond audit history", intent: "blocker", requires_reply: true,
+      reply_to_message_id: null, linked_reply_message_ids: [], linked_reply_count: 0,
+      linked_replies_truncated: false, created_at: "2026-08-10T08:00:00Z",
+      delivered_at: "2026-08-10T08:01:00Z", read_at: null,
+      sender: {shortname: "PLN1"}, recipient: {shortname: "DEV3"}},
+  ],
+};
+const unitRoot = {root_id: "work_unit:12:reply_unread", scope: "work_unit", work_unit_id: 12};
+const sprintRoot = {root_id: "sprint:message:502", scope: "sprint", work_unit_id: null};
+openSprintHealthMessageModal(501, unitRoot, snapshot);
+openSprintHealthMessageModal(502, sprintRoot, snapshot);
+openSprintHealthMessageModal(401, unitRoot, snapshot);
+console.log(JSON.stringify(opened.map((modal) => modal.bodyNode.textContent)));
+"""
+    unit, sprint, old = run_js(script)
+    assert "scopeWork unit U12" in unit
+    assert "routePLN1 → DEV3" in unit
+    assert "intentquestionrequires replyyes" in unit
+    assert "reply toNonelinked repliesNone" in unit
+    assert "deliveredNot deliveredreadUnread" in unit
+    assert unit.endswith("Bounded message bodyUnit question")
+    assert "information" not in unit
+
+    assert "scopeSprint" in sprint
+    assert "routePLN1 → REV1" in sprint
+    assert "intentdecisionrequires replyyes" in sprint
+    assert "deliveredNot delivered" not in sprint
+    assert "readUnread" not in sprint
+    assert sprint.endswith("Bounded message bodySprint decision")
+    assert "information" not in sprint
+
+    assert "scopeWork unit U12" in old
+    assert "intentblockerrequires replyyes" in old
+    assert "readUnread" in old
+    assert old.endswith("Bounded message bodyOld blocker beyond audit history")
+    assert "Sparse audit copy" not in old
+    assert "information" not in old
+
+
 def test_plural_root_path_highlighting_selects_each_upstream_branch_and_not_downstream_edges():
     script = HEALTH_BOARD_HARNESS + SPRINT_BLOCK + r"""
 const unit = (id, roots) => ({work_unit_id: id, health: {root_work_unit_ids: roots}});

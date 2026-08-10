@@ -295,6 +295,7 @@ class SprintBoardApiCase(unittest.TestCase):
             "second_sprint_id": second,
             "third_sprint_id": third,
             "unit": unit_ids[2],
+            "active_unit": unit_ids[5],
             "ready_unit": unit_ids[7],
             "other_unit": unit_ids[0],
             "developer_participant_id": participant_ids["developer"],
@@ -385,6 +386,174 @@ class SprintBoardApiCase(unittest.TestCase):
         cancelled = next(row for row in units.values() if row["disposition"] == "cancelled")
         self.assertEqual("done", cancelled["column"])
         self.assertEqual("cancelled cleanly", cancelled["completion_result"])
+
+    def test_health_messages_project_exact_scoped_waits_beyond_audit_history(self):
+        with self.connect() as con:
+            planner = int(
+                con.execute(
+                    "SELECT participant_id FROM sprint_participants "
+                    "WHERE sprint_id=? AND shell_id=2",
+                    (self.ids["sprint_id"],),
+                ).fetchone()[0]
+            )
+            developer = int(
+                con.execute(
+                    "SELECT participant_id FROM sprint_participants "
+                    "WHERE sprint_id=? AND shell_id=7",
+                    (self.ids["sprint_id"],),
+                ).fetchone()[0]
+            )
+            reviewer = int(
+                con.execute(
+                    "SELECT participant_id FROM sprint_participants "
+                    "WHERE sprint_id=? AND shell_id=4",
+                    (self.ids["sprint_id"],),
+                ).fetchone()[0]
+            )
+
+            def add_message(
+                *,
+                key: str,
+                recipient: int,
+                receiver_shell_id: int,
+                unit_id: int | None,
+                body: str,
+                intent: str = "information",
+                requires_reply: bool = False,
+                created_at: str = "2026-08-01 10:30:00",
+                delivered_at: str | None = None,
+                read_at: str | None = None,
+            ) -> int:
+                return int(
+                    con.execute(
+                        "INSERT INTO wake_message "
+                        "(sprint_id,sender_shell_id,receiver_shell_id,"
+                        "from_participant_id,to_participant_id,work_unit_id,"
+                        "message_kind,body,declared_type,actionable,idempotency_key,"
+                        "intent,requires_reply,created_at,delivered_at,read_at) "
+                        "VALUES (?,2,?,?,?,?,'notification',?,'re-enter',0,?,?,?,?,?,?)",
+                        (
+                            self.ids["sprint_id"],
+                            receiver_shell_id,
+                            planner,
+                            recipient,
+                            unit_id,
+                            body,
+                            key,
+                            intent,
+                            int(requires_reply),
+                            created_at,
+                            delivered_at,
+                            read_at,
+                        ),
+                    ).lastrowid
+                )
+
+            old_unit_wait = add_message(
+                key="health-old-unit-wait",
+                recipient=developer,
+                receiver_shell_id=7,
+                unit_id=self.ids["active_unit"],
+                body="Old decision still required",
+                intent="decision",
+                requires_reply=True,
+                created_at="2026-08-01 10:02:00",
+                delivered_at="2026-08-01 10:03:00",
+            )
+            for index in range(100):
+                add_message(
+                    key=f"health-audit-{index}",
+                    recipient=developer,
+                    receiver_shell_id=7,
+                    unit_id=self.ids["active_unit"],
+                    body=f"Audit message {index}",
+                    created_at="2026-08-01 10:20:00",
+                )
+            current_unit_wait = add_message(
+                key="health-current-unit-wait",
+                recipient=developer,
+                receiver_shell_id=7,
+                unit_id=self.ids["active_unit"],
+                body="Current blocker requires action",
+                intent="blocker",
+                requires_reply=True,
+                created_at="2026-08-01 10:40:00",
+                delivered_at="2026-08-01 10:41:00",
+            )
+            sprint_wait = add_message(
+                key="health-sprint-wait",
+                recipient=reviewer,
+                receiver_shell_id=4,
+                unit_id=None,
+                body="Sprint decision required",
+                intent="question",
+                requires_reply=True,
+                created_at="2026-08-01 10:42:00",
+                delivered_at="2026-08-01 10:43:00",
+                read_at="2026-08-01 10:44:00",
+            )
+
+        status, _, board = self.request(
+            "GET", f"/api/sprints/{self.ids['sprint_id']}"
+        )
+        self.assertEqual(200, status, board)
+        projected = {row["message_id"]: row for row in board["health_messages"]}
+        self.assertEqual(
+            {old_unit_wait, current_unit_wait, sprint_wait}, set(projected)
+        )
+        self.assertEqual(
+            {
+                "scope": "work_unit",
+                "work_unit_id": self.ids["active_unit"],
+                "intent": "decision",
+                "requires_reply": True,
+                "created_at": "2026-08-01 10:02:00",
+                "delivered_at": "2026-08-01 10:03:00",
+                "read_at": None,
+                "reply_to_message_id": None,
+                "linked_reply_message_ids": [],
+                "linked_reply_count": 0,
+                "linked_replies_truncated": False,
+            },
+            {
+                key: projected[old_unit_wait][key]
+                for key in (
+                    "scope",
+                    "work_unit_id",
+                    "intent",
+                    "requires_reply",
+                    "created_at",
+                    "delivered_at",
+                    "read_at",
+                    "reply_to_message_id",
+                    "linked_reply_message_ids",
+                    "linked_reply_count",
+                    "linked_replies_truncated",
+                )
+            },
+        )
+        self.assertEqual("blocker", projected[current_unit_wait]["intent"])
+        self.assertEqual(
+            ("sprint", None, "question", "2026-08-01 10:44:00"),
+            (
+                projected[sprint_wait]["scope"],
+                projected[sprint_wait]["work_unit_id"],
+                projected[sprint_wait]["intent"],
+                projected[sprint_wait]["read_at"],
+            ),
+        )
+        active = next(
+            row
+            for row in board["work_units"]
+            if row["work_unit_id"] == self.ids["active_unit"]
+        )
+        self.assertNotIn(
+            old_unit_wait,
+            {message["message_id"] for message in active["messages"]},
+        )
+        self.assertIn(
+            {"message_id": old_unit_wait}, active["health"]["message_refs"]
+        )
 
     def test_board_projects_stale_runtime_and_bounded_pickup_exhaustion(self):
         exhausted = {
