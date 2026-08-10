@@ -130,6 +130,11 @@ def cmd_send(args: argparse.Namespace) -> int:
             "to": args.to,
             "body": _text(args.body_file, "message body"),
             "idempotency_key": args.key,
+            "intent": args.intent,
+            "requires_reply": args.requires_reply,
+            "work_unit_id": args.work_unit,
+            "sprint_level": args.sprint_level,
+            "reply_to_message_id": args.reply_to,
         },
         idempotent=True,
     )
@@ -466,15 +471,28 @@ def build_parser() -> argparse.ArgumentParser:
     inbox.set_defaults(fn=cmd_inbox)
 
     send = sub.add_parser(
-        "send", help="Send one freeform message to another Sprint participant"
+        "send", help="Send one typed relay to another Sprint participant"
     )
     send.add_argument("--sprint", type=int, required=True)
     send.add_argument("--to", required=True, help="recipient shell shortname")
     send.add_argument("--body-file", required=True, help=PAYLOAD_FILE_HELP)
     send.add_argument(
+        "--intent",
+        choices=("information", "handoff", "question", "blocker", "decision"),
+        default="information",
+    )
+    send.add_argument("--requires-reply", action="store_true")
+    scope = send.add_mutually_exclusive_group()
+    scope.add_argument("--work-unit", type=int)
+    scope.add_argument("--sprint-level", action="store_true")
+    send.add_argument("--reply-to", type=int)
+    send.add_argument(
         "--key",
         required=True,
-        help="stable retry key; reuse it only for the same recipient and body",
+        help=(
+            "stable retry key; reuse it only for the same recipient, body, intent, "
+            "reply linkage, and scope"
+        ),
     )
     send.set_defaults(fn=cmd_send)
 

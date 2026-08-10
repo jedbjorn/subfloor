@@ -28,6 +28,10 @@ ACTIONABLE_KIND_ERROR = (
 )
 DECLARED_TYPES = frozenset({"force-new", "new", "re-enter"})
 DECLARED_TYPE_ERROR = "wake message type must be force-new, new, or re-enter"
+MESSAGE_INTENTS = frozenset(
+    {"information", "handoff", "question", "blocker", "decision"}
+)
+REPLY_REQUIRED_INTENTS = frozenset({"question", "blocker", "decision"})
 
 
 class ForceNewDeferred(RuntimeError):
@@ -241,16 +245,28 @@ class SprintMessageStore:
         to_shortname: str,
         body: str,
         idempotency_key: str,
+        intent: str = "information",
+        requires_reply: bool = False,
+        work_unit_id: int | None = None,
+        sprint_level: bool = False,
+        reply_to_message_id: int | None = None,
     ) -> ParticipantRelayReceipt:
         if not isinstance(body, str):
-            raise ValueError("Sprint message body must be a string")
+            raise TypeError("Sprint message body must be a string")
         if not isinstance(to_shortname, str):
-            raise ValueError("Sprint recipient shortname must be a string")
+            raise TypeError("Sprint recipient shortname must be a string")
         if not isinstance(idempotency_key, str):
-            raise ValueError("Sprint message idempotency key must be a string")
+            raise TypeError("Sprint message idempotency key must be a string")
+        if not isinstance(intent, str):
+            raise TypeError("Sprint message intent must be a string")
+        if not isinstance(requires_reply, bool):
+            raise TypeError("requires_reply must be a boolean")
+        if not isinstance(sprint_level, bool):
+            raise TypeError("sprint_level must be a boolean")
         body = body.strip()
         to_shortname = to_shortname.strip()
         idempotency_key = idempotency_key.strip()
+        intent = intent.strip()
         if not body:
             raise ValueError("Sprint message body is empty")
         if len(body) > 8000:
@@ -261,16 +277,37 @@ class SprintMessageStore:
             raise ValueError("Sprint recipient shortname is empty")
         if not idempotency_key:
             raise ValueError("Sprint message idempotency key is empty")
+        if intent not in MESSAGE_INTENTS:
+            raise ValueError(
+                "Sprint message intent must be information, handoff, question, "
+                "blocker, or decision"
+            )
+        if requires_reply and intent not in REPLY_REQUIRED_INTENTS:
+            raise SprintInvariantError(
+                "reply-requiring messages must use question, blocker, or decision intent"
+            )
+        if reply_to_message_id is not None and (work_unit_id is not None or sprint_level):
+            raise SprintInvariantError(
+                "replies inherit scope; do not supply work_unit_id or sprint_level"
+            )
+        if (
+            reply_to_message_id is None
+            and requires_reply
+            and (work_unit_id is None) == (not sprint_level)
+        ):
+            raise SprintInvariantError(
+                "reply-requiring messages need exactly one work-unit or Sprint-level scope"
+            )
         with db_driver.write_transaction(self.con, "sprint.message.relay"):
             sender = self.con.execute(
-                "SELECT participant_id FROM sprint_participants "
+                "SELECT participant_id,role FROM sprint_participants "
                 "WHERE sprint_id=? AND shell_id=?",
                 (sprint_id, from_shell_id),
             ).fetchone()
             if sender is None:
                 raise SprintInvariantError("sender is not a Sprint participant")
             recipient = self.con.execute(
-                "SELECT p.participant_id FROM sprint_participants p "
+                "SELECT p.participant_id,p.role,p.shell_id FROM sprint_participants p "
                 "JOIN shells sh ON sh.shell_id=p.shell_id "
                 "WHERE p.sprint_id=? AND lower(sh.shortname)=lower(?)",
                 (sprint_id, to_shortname),
@@ -279,6 +316,27 @@ class SprintMessageStore:
                 raise SprintInvariantError("recipient is not a Sprint participant")
             if int(recipient["participant_id"]) == int(sender["participant_id"]):
                 raise SprintInvariantError("Sprint participants cannot relay to self")
+            if reply_to_message_id is not None:
+                original = self._reply_target(
+                    sprint_id,
+                    reply_to_message_id,
+                    sender_participant_id=int(sender["participant_id"]),
+                    recipient_participant_id=int(recipient["participant_id"]),
+                )
+                work_unit_id = (
+                    int(original["work_unit_id"])
+                    if original["work_unit_id"] is not None
+                    else None
+                )
+            if work_unit_id is not None:
+                self._validate_unit_scope(
+                    sprint_id,
+                    work_unit_id,
+                    sender_shell_id=from_shell_id,
+                    sender_role=str(sender["role"]),
+                    recipient_shell_id=int(recipient["shell_id"]),
+                    recipient_role=str(recipient["role"]),
+                )
             receipt = self._send(
                 sprint_id,
                 to_participant_id=int(recipient["participant_id"]),
@@ -286,9 +344,12 @@ class SprintMessageStore:
                 body=body,
                 idempotency_key=idempotency_key,
                 from_participant_id=int(sender["participant_id"]),
-                work_unit_id=None,
+                work_unit_id=work_unit_id,
                 actionable=False,
                 declared_type="re-enter",
+                intent=intent,
+                requires_reply=requires_reply,
+                reply_to_message_id=reply_to_message_id,
             )
             wake = self.con.execute(
                 "SELECT state FROM sprint_wake_outbox WHERE wake_id=?",
@@ -308,6 +369,58 @@ class SprintMessageStore:
                 wake_state=str(wake["state"]),
                 conversation_id=(str(route["chat_id"]) if route is not None else None),
             )
+
+    def _reply_target(
+        self,
+        sprint_id: int,
+        message_id: int,
+        *,
+        sender_participant_id: int,
+        recipient_participant_id: int,
+    ) -> sqlite3.Row:
+        original = self.con.execute(
+            "SELECT * FROM wake_message WHERE sprint_id=? AND message_id=?",
+            (sprint_id, message_id),
+        ).fetchone()
+        if original is None:
+            raise SprintInvariantError("reply target is not an earlier message in this Sprint")
+        if not original["requires_reply"]:
+            raise SprintInvariantError("reply target does not require a reply")
+        if (
+            int(original["to_participant_id"]) != sender_participant_id
+            or int(original["from_participant_id"]) != recipient_participant_id
+        ):
+            raise SprintInvariantError(
+                "reply sender and recipient must reverse the original message endpoints"
+            )
+        return original
+
+    def _validate_unit_scope(
+        self,
+        sprint_id: int,
+        work_unit_id: int,
+        *,
+        sender_shell_id: int,
+        sender_role: str,
+        recipient_shell_id: int,
+        recipient_role: str,
+    ) -> None:
+        unit = self.con.execute(
+            "SELECT assigned_shell_id,reviewer_shell_id FROM sprint_work_units "
+            "WHERE sprint_id=? AND work_unit_id=?",
+            (sprint_id, work_unit_id),
+        ).fetchone()
+        if unit is None:
+            raise SprintInvariantError("work unit does not belong to this Sprint")
+        allowed = {int(unit["assigned_shell_id"]), int(unit["reviewer_shell_id"])}
+        for shell_id, role in (
+            (sender_shell_id, sender_role),
+            (recipient_shell_id, recipient_role),
+        ):
+            if role != "planner" and shell_id not in allowed:
+                raise SprintInvariantError(
+                    "unit-scoped message endpoint does not own this work unit"
+                )
 
     def send_in_transaction(
         self,
@@ -510,6 +623,9 @@ class SprintMessageStore:
         work_unit_id: int | None,
         actionable: bool,
         declared_type: str,
+        intent: str = "information",
+        requires_reply: bool = False,
+        reply_to_message_id: int | None = None,
     ) -> MessageReceipt:
         if declared_type not in DECLARED_TYPES:
             raise ValueError(DECLARED_TYPE_ERROR)
@@ -551,6 +667,9 @@ class SprintMessageStore:
                 str(existing["body"]),
                 bool(existing["actionable"]),
                 str(existing["declared_type"]),
+                str(existing["intent"]),
+                bool(existing["requires_reply"]),
+                existing["reply_to_message_id"],
             )
             expected = (
                 sprint_id,
@@ -561,6 +680,9 @@ class SprintMessageStore:
                 body,
                 actionable,
                 declared_type,
+                intent,
+                requires_reply,
+                reply_to_message_id,
             )
             wake = self.con.execute(
                 "SELECT wake_id FROM sprint_wake_messages WHERE message_id=?",
@@ -582,8 +704,8 @@ class SprintMessageStore:
                 "INSERT INTO wake_message "
                 "(sprint_id,sender_shell_id,receiver_shell_id,from_participant_id,"
                 "to_participant_id,work_unit_id,message_kind,body,declared_type,"
-                "actionable,disposition,idempotency_key) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "actionable,disposition,idempotency_key,intent,requires_reply,"
+                "reply_to_message_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     sprint_id,
                     sender_shell_id,
@@ -597,6 +719,9 @@ class SprintMessageStore:
                     1 if actionable else 0,
                     disposition,
                     idempotency_key,
+                    intent,
+                    1 if requires_reply else 0,
+                    reply_to_message_id,
                 ),
             ).lastrowid
         )

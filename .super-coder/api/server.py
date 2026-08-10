@@ -2472,6 +2472,19 @@ class Handler(BaseHTTPRequestHandler):
                     to_shortname=body.get("to") or "",
                     body=body.get("body") or "",
                     idempotency_key=body.get("idempotency_key") or "",
+                    intent=body.get("intent", "information"),
+                    requires_reply=body.get("requires_reply", False),
+                    work_unit_id=(
+                        self._sprint_integer(body, "work_unit_id")
+                        if body.get("work_unit_id") is not None
+                        else None
+                    ),
+                    sprint_level=body.get("sprint_level", False),
+                    reply_to_message_id=(
+                        self._sprint_integer(body, "reply_to_message_id")
+                        if body.get("reply_to_message_id") is not None
+                        else None
+                    ),
                 )
                 return self._send(201 if receipt.message_created else 200, {
                     "message_id": receipt.message_id,

@@ -248,6 +248,75 @@ class ForceNewMigrationTest(unittest.TestCase):
             )
 
 
+class ScopedReplyMigrationTest(unittest.TestCase):
+    def test_upgrade_preserves_legacy_relays_and_enforces_reply_intent(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.row_factory = sqlite3.Row
+            apply_schema(con, through="0192_reseed_sprint_pr_recovery.sql")
+            con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (1,'Developer','DEV1','dev','prompt',1)"
+            )
+            legacy_id = int(
+                con.execute(
+                    "INSERT INTO wake_message "
+                    "(receiver_shell_id,message_kind,body,declared_type,idempotency_key) "
+                    "VALUES (1,'notification','legacy','re-enter','legacy-relay')"
+                ).lastrowid
+            )
+            con.commit()
+
+            con.executescript(
+                (MIGRATIONS / "0194_sprint_scoped_reply_waits.sql").read_text()
+            )
+
+            self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
+            self.assertEqual(
+                ("information", 0, None),
+                tuple(
+                    con.execute(
+                        "SELECT intent,requires_reply,reply_to_message_id "
+                        "FROM wake_message WHERE message_id=?",
+                        (legacy_id,),
+                    ).fetchone()
+                ),
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                con.execute(
+                    "INSERT INTO wake_message "
+                    "(receiver_shell_id,message_kind,body,declared_type,idempotency_key,"
+                    "intent,requires_reply) "
+                    "VALUES (1,'notification','invalid','re-enter','invalid-wait',"
+                    "'information',1)"
+                )
+            self.assertEqual(
+                0,
+                con.execute(
+                    "SELECT COUNT(*) FROM wake_message "
+                    "WHERE idempotency_key='invalid-wait'"
+                ).fetchone()[0],
+            )
+            valid_id = int(
+                con.execute(
+                    "INSERT INTO wake_message "
+                    "(receiver_shell_id,message_kind,body,declared_type,idempotency_key,"
+                    "intent,requires_reply) "
+                    "VALUES (1,'notification','valid','re-enter','valid-wait',"
+                    "'question',1)"
+                ).lastrowid
+            )
+            con.execute(
+                "INSERT INTO wake_message "
+                "(receiver_shell_id,message_kind,body,declared_type,idempotency_key,"
+                "reply_to_message_id) VALUES "
+                "(1,'notification','reply','re-enter','valid-reply',?)",
+                (valid_id,),
+            )
+            self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
+
+
 class SprintMessageCase(unittest.TestCase):
     def setUp(self) -> None:
         quiet_env = mock.patch.dict(
@@ -2299,6 +2368,250 @@ class ParticipantRelayTest(SprintMessageCase):
             ).fetchone()
         )
         self.assertEqual(before, after)
+
+    def test_unit_and_sprint_reply_waits_persist_typed_scope(self) -> None:
+        unit_wait = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="PLN1",
+            body="Which unit rule applies?",
+            idempotency_key="participant-send:unit-wait",
+            intent="question",
+            requires_reply=True,
+            work_unit_id=self.unit_id,
+        )
+        sprint_wait = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=2,
+            to_shortname="PLN1",
+            body="Choose the cross-unit order.",
+            idempotency_key="participant-send:sprint-wait",
+            intent="decision",
+            requires_reply=True,
+            sprint_level=True,
+        )
+
+        rows = self.con.execute(
+            "SELECT message_id,intent,requires_reply,work_unit_id,"
+            "reply_to_message_id,actionable FROM wake_message "
+            "WHERE message_id IN (?,?) ORDER BY message_id",
+            (unit_wait.message_id, sprint_wait.message_id),
+        ).fetchall()
+        self.assertEqual(
+            [
+                (unit_wait.message_id, "question", 1, self.unit_id, None, 0),
+                (sprint_wait.message_id, "decision", 1, None, None, 0),
+            ],
+            [tuple(row) for row in rows],
+        )
+
+    def test_reply_reverses_endpoints_and_inherits_original_scope(self) -> None:
+        original = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="PLN1",
+            body="Need a unit ruling.",
+            idempotency_key="participant-send:reply-original",
+            intent="blocker",
+            requires_reply=True,
+            work_unit_id=self.unit_id,
+        )
+        reply = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=3,
+            to_shortname="DEV1",
+            body="Use the bounded rule.",
+            idempotency_key="participant-send:reply-answer",
+            intent="information",
+            reply_to_message_id=original.message_id,
+        )
+
+        self.assertEqual(
+            (
+                self.planner_id,
+                self.developer_id,
+                self.unit_id,
+                "information",
+                0,
+                original.message_id,
+            ),
+            tuple(
+                self.con.execute(
+                    "SELECT from_participant_id,to_participant_id,work_unit_id,"
+                    "intent,requires_reply,reply_to_message_id FROM wake_message "
+                    "WHERE message_id=?",
+                    (reply.message_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_reply_wait_validation_rejects_invalid_combinations_without_writes(self) -> None:
+        before = self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0]
+        cases = (
+            (
+                {"intent": "question", "requires_reply": True},
+                "exactly one work-unit or Sprint-level scope",
+            ),
+            (
+                {
+                    "intent": "question",
+                    "requires_reply": True,
+                    "work_unit_id": self.unit_id,
+                    "sprint_level": True,
+                },
+                "exactly one work-unit or Sprint-level scope",
+            ),
+            (
+                {
+                    "intent": "information",
+                    "requires_reply": True,
+                    "work_unit_id": self.unit_id,
+                },
+                "must use question, blocker, or decision",
+            ),
+            (
+                {
+                    "intent": "question",
+                    "requires_reply": True,
+                    "work_unit_id": self.unit_id + 999,
+                },
+                "work unit does not belong to this Sprint",
+            ),
+        )
+        for index, (kwargs, error) in enumerate(cases):
+            with self.subTest(error=error), self.assertRaisesRegex(
+                sprint_domain.SprintInvariantError, error
+            ):
+                self.messages.relay(
+                    self.sprint_id,
+                    from_shell_id=1,
+                    to_shortname="PLN1",
+                    body="invalid wait",
+                    idempotency_key=f"participant-send:invalid-wait:{index}",
+                    **kwargs,
+                )
+        self.assertEqual(
+            before,
+            self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
+        )
+
+    def test_unit_scope_rejects_unrelated_participant_endpoint(self) -> None:
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (4,'Other Developer','DEV2','dev','prompt',1)"
+        )
+        self.con.execute(
+            "INSERT INTO sprint_participants (sprint_id,shell_id,role,harness) "
+            "VALUES (?,4,'developer','codex')",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        before = self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0]
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "unit-scoped message endpoint does not own this work unit",
+        ):
+            self.messages.relay(
+                self.sprint_id,
+                from_shell_id=4,
+                to_shortname="PLN1",
+                body="unrelated unit wait",
+                idempotency_key="participant-send:unrelated-unit",
+                intent="question",
+                requires_reply=True,
+                work_unit_id=self.unit_id,
+            )
+        self.assertEqual(
+            before,
+            self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
+        )
+
+    def test_reply_rejects_wrong_recipient_and_caller_supplied_scope(self) -> None:
+        original = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="PLN1",
+            body="Need a Sprint ruling.",
+            idempotency_key="participant-send:reply-validation-original",
+            intent="decision",
+            requires_reply=True,
+            sprint_level=True,
+        )
+        before = self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0]
+        cases = (
+            ({"to_shortname": "REV1"}, "must reverse the original message endpoints"),
+            (
+                {"to_shortname": "DEV1", "work_unit_id": self.unit_id},
+                "replies inherit scope",
+            ),
+            (
+                {"to_shortname": "DEV1", "sprint_level": True},
+                "replies inherit scope",
+            ),
+        )
+        for index, (overrides, error) in enumerate(cases):
+            with self.subTest(error=error), self.assertRaisesRegex(
+                sprint_domain.SprintInvariantError, error
+            ):
+                self.messages.relay(
+                    self.sprint_id,
+                    from_shell_id=3,
+                    to_shortname=overrides.pop("to_shortname"),
+                    body="invalid reply",
+                    idempotency_key=f"participant-send:invalid-reply:{index}",
+                    reply_to_message_id=original.message_id,
+                    **overrides,
+                )
+        self.assertEqual(
+            before,
+            self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
+        )
+
+    def test_relay_idempotency_includes_reply_semantics_and_scope(self) -> None:
+        first = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="PLN1",
+            body="Stable question.",
+            idempotency_key="participant-send:semantic-replay",
+            intent="question",
+            requires_reply=True,
+            work_unit_id=self.unit_id,
+        )
+        replay = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="PLN1",
+            body="Stable question.",
+            idempotency_key="participant-send:semantic-replay",
+            intent="question",
+            requires_reply=True,
+            work_unit_id=self.unit_id,
+        )
+        self.assertEqual(first.message_id, replay.message_id)
+        self.assertFalse(replay.message_created)
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "different input"
+        ):
+            self.messages.relay(
+                self.sprint_id,
+                from_shell_id=1,
+                to_shortname="PLN1",
+                body="Stable question.",
+                idempotency_key="participant-send:semantic-replay",
+                intent="blocker",
+                requires_reply=True,
+                work_unit_id=self.unit_id,
+            )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE idempotency_key='participant-send:semantic-replay'"
+            ).fetchone()[0],
+        )
 
     def test_relay_reuses_a_usable_current_conversation(self) -> None:
         first = self.messages.relay(
