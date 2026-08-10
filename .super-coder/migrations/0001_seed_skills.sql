@@ -3924,6 +3924,15 @@ sc sprint register-pr --sprint <id> --repository <owner/name> \
   --pr <number> --work-unit <id>
 ```
 
+If GitHub closed this registered PR externally and you reopened, rebased, and
+pushed the same PR, replay the exact `register-pr` command above. The replay
+keeps the registered PR and ownership unchanged while taking one fresh watcher
+snapshot; `created: false` is the expected registration receipt. Confirm that
+write and stop. The refreshed observation arrives as the native PR-fact wake;
+on its green Re-enter, retry the blocked `request-review` with its original
+stable key. Do not register a replacement PR or ask the Planner to bypass the
+observed-green gate.
+
 When no local implementation action remains, stop and await the native PR-fact
 wake. Use Sprint-native wakes for coordination. Do not start a recurring shell
 loop, scheduled job, manual watcher daemon, or external PR watcher to track the

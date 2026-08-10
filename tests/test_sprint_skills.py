@@ -683,6 +683,53 @@ class SprintSkillTest(unittest.TestCase):
         finally:
             con.close()
 
+    def test_reopened_pr_reseed_matches_asset_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0197_reseed_reopened_pr_resubscription.sql":
+                    break
+                con.executescript(migration.read_text())
+            con.execute(
+                "UPDATE skills SET description='stale',category='stale',"
+                "command='stale',common=1,content='no resubscription guidance',"
+                "is_deleted=1 WHERE name='sprint_dev'"
+            )
+
+            migration = (
+                ENGINE
+                / "migrations"
+                / "0197_reseed_reopened_pr_resubscription.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+            self.assertIn(
+                "replay the exact `register-pr` command",
+                con.execute(
+                    "SELECT content FROM skills WHERE name='sprint_dev'"
+                ).fetchone()[0],
+            )
+
+            parsed = seed_skills.parse_skill(ASSETS / "sprint_dev" / "SKILL.md")
+            row = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='sprint_dev'"
+            ).fetchone()
+            self.assertEqual(
+                (
+                    parsed["description"],
+                    parsed["category"],
+                    parsed["command"],
+                    parsed["common"],
+                    parsed["content"],
+                    0,
+                ),
+                tuple(row),
+            )
+        finally:
+            con.close()
+
     def test_progress_carrier_reseed_matches_assets_and_replays_idempotently(self):
         con = sqlite3.connect(":memory:")
         try:
@@ -706,6 +753,11 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0195_reseed_sprint_progress_carriers.sql":
+                    con.executescript(later_migration.read_text())
 
             for name in sorted(PROGRESS_CARRIER_ROLE_SKILLS):
                 with self.subTest(name=name):
@@ -1259,6 +1311,9 @@ class SprintSkillTest(unittest.TestCase):
         self.assertNotIn("sc sprint monitor", bodies["sprint_pln"])
         self.assertIn(
             "After `register-pr` succeeds", bodies["sprint_dev"]
+        )
+        self.assertIn(
+            "replay the exact `register-pr` command", bodies["sprint_dev"]
         )
         self.assertIn(
             "stop and await the native verdict wake", bodies["sprint_dev"]
