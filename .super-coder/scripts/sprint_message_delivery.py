@@ -328,7 +328,7 @@ class SprintMessageStore:
                     if original["work_unit_id"] is not None
                     else None
                 )
-            if work_unit_id is not None:
+            if work_unit_id is not None and reply_to_message_id is None:
                 self._validate_unit_scope(
                     sprint_id,
                     work_unit_id,

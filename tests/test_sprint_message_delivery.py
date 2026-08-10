@@ -2445,6 +2445,112 @@ class ParticipantRelayTest(SprintMessageCase):
             ),
         )
 
+    def test_reply_keeps_stored_endpoints_after_legal_replan(self) -> None:
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (4,'Replacement Developer','DEV2','dev','prompt',1)"
+        )
+        replacement_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness) "
+                "VALUES (?,4,'developer','codex')",
+                (self.sprint_id,),
+            ).lastrowid
+        )
+        planned_unit = int(
+            self.con.execute(
+                "INSERT INTO sprint_work_units "
+                "(sprint_id,assigned_shell_id,reviewer_shell_id,title,expected_output) "
+                "VALUES (?,1,2,'Still planned','Answer then implement')",
+                (self.sprint_id,),
+            ).lastrowid
+        )
+        self.con.commit()
+        original = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=3,
+            to_shortname="DEV1",
+            body="Which path should this unit take?",
+            idempotency_key="participant-send:replan-original",
+            intent="question",
+            requires_reply=True,
+            work_unit_id=planned_unit,
+        )
+
+        self.assertTrue(
+            sprint_domain.SprintWorkUnitStore(self.con).replan(
+                self.sprint_id,
+                planned_unit,
+                3,
+                assigned_shell_id=4,
+                reviewer_shell_id=2,
+                planned_wave=0,
+                dependency_ids=(),
+            )
+        )
+        reply = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="PLN1",
+            body="Take the bounded path.",
+            idempotency_key="participant-send:replan-answer",
+            reply_to_message_id=original.message_id,
+        )
+
+        before_hijack = self.con.execute(
+            "SELECT COUNT(*) FROM wake_message WHERE reply_to_message_id=?",
+            (original.message_id,),
+        ).fetchone()[0]
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "must reverse the original message endpoints",
+        ):
+            self.messages.relay(
+                self.sprint_id,
+                from_shell_id=4,
+                to_shortname="PLN1",
+                body="Replacement answer.",
+                idempotency_key="participant-send:replan-hijack",
+                reply_to_message_id=original.message_id,
+            )
+        self.assertEqual(
+            before_hijack,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message WHERE reply_to_message_id=?",
+                (original.message_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            [
+                (
+                    reply.message_id,
+                    self.developer_id,
+                    self.planner_id,
+                    planned_unit,
+                    original.message_id,
+                )
+            ],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT message_id,from_participant_id,to_participant_id,"
+                    "work_unit_id,reply_to_message_id FROM wake_message "
+                    "WHERE reply_to_message_id=?",
+                    (original.message_id,),
+                )
+            ],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message "
+                "WHERE reply_to_message_id=? AND from_participant_id=?",
+                (original.message_id, replacement_id),
+            ).fetchone()[0],
+        )
+
     def test_reply_wait_validation_rejects_invalid_combinations_without_writes(self) -> None:
         before = self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0]
         cases = (
