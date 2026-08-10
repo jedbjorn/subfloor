@@ -20,6 +20,7 @@ ATTENTION_AFTER = timedelta(minutes=30)
 CI_STUCK_AFTER = timedelta(minutes=90)
 QUOTA_FRESH_FOR = timedelta(minutes=10)
 MAX_EVENTS = 2000
+MAX_MESSAGE_REFS = 100
 
 _SEVERITY = {
     "staged": 0,
@@ -197,6 +198,10 @@ class SprintHealthProjection:
         self.events_by_unit: dict[int, list[dict[str, Any]]] = defaultdict(list)
         self.messages: list[dict[str, Any]] = []
         self.messages_by_unit: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        self.open_replies_by_unit: dict[int | None, list[dict[str, Any]]] = (
+            defaultdict(list)
+        )
+        self.stage_message_ids: dict[int, int] = {}
         self.prs: dict[int, dict[str, Any]] = {}
         self.unreadable: list[dict[str, Any]] = []
         self.runtime: dict[str, Any] = {}
@@ -294,8 +299,17 @@ class SprintHealthProjection:
             if isinstance(unit_id, int) and unit_id in self.units:
                 self.events_by_unit[unit_id].append(event)
 
+        for unit_id, unit in self.units.items():
+            stage_events = _EVENT_STAGE[str(unit["disposition"])]
+            for event in self.events_by_unit[unit_id]:
+                message_id = event["payload"].get("message_id")
+                if event["event_type"] in stage_events and isinstance(message_id, int):
+                    self.stage_message_ids[unit_id] = message_id
+                    break
+
         self._load_prs(sprint_id)
         self._load_messages(sprint_id)
+        self._load_open_replies(sprint_id)
         self.runtime = sprint_runtime.runtime_status(self.con, now=self.now)
         heartbeat = self.con.execute(
             "SELECT beat_at,interval_s FROM daemon_heartbeats WHERE name=?",
@@ -327,6 +341,11 @@ class SprintHealthProjection:
 
     def _load_messages(self, sprint_id: int) -> None:
         assert self.sprint is not None
+        stage_message_ids = sorted(set(self.stage_message_ids.values()))
+        stage_filter = ""
+        if stage_message_ids:
+            marks = ",".join("?" for _ in stage_message_ids)
+            stage_filter = f" OR m.message_id IN ({marks})"
         rows = self.con.execute(
             "WITH ranked_messages AS ("
             " SELECT m.*,ROW_NUMBER() OVER (PARTITION BY COALESCE(m.work_unit_id,0) "
@@ -334,11 +353,12 @@ class SprintHealthProjection:
             " WHERE m.sprint_id=?) "
             "SELECT m.*,w.wake_id,w.idempotency_key wake_idempotency_key,"
             "w.state wake_state,w.attempt_count,w.created_at wake_created_at,"
-            "w.available_at,w.delivered_at wake_delivered_at,w.failed_at,"
+            "w.available_at,w.delivered_at wake_delivered_at,w.failed_at,w.claimed_at,"
             "a.attempt_id,a.attempted_at,a.target_conversation_id,a.native_run_ref,a.outcome,"
             "r.run_id,r.state run_state,r.started_at,r.heartbeat_at,r.ended_at,"
             "cm.idempotency_key trigger_idempotency_key,"
-            "c.creation_idempotency_key,active.chat_id active_chat_id,"
+            "c.creation_idempotency_key,pc.sprint_participant_id linked_participant_id,"
+            "active.chat_id active_chat_id,"
             "active.process_pid,active.process_start_ticks "
             "FROM ranked_messages m "
             "LEFT JOIN sprint_wake_messages wm ON wm.message_id=m.message_id "
@@ -350,9 +370,11 @@ class SprintHealthProjection:
             "ON a.native_run_ref='conversation-run:' || r.run_id "
             "LEFT JOIN conversation_messages cm ON cm.message_id=r.trigger_message_id "
             "LEFT JOIN conversations c ON c.conversation_id=a.target_conversation_id "
+            "LEFT JOIN sprint_participant_conversations pc "
+            "ON pc.conversation_id=a.target_conversation_id "
             "LEFT JOIN active_shell_chats active ON active.shell_id=m.receiver_shell_id "
-            "WHERE m.message_rank<=100 ORDER BY m.message_id DESC",
-            (sprint_id,),
+            f"WHERE (m.message_rank<=100{stage_filter}) ORDER BY m.message_id DESC",
+            (sprint_id, *stage_message_ids),
         ).fetchall()
         generation = str(self.sprint["conversation_generation"])
         for row in rows:
@@ -361,8 +383,10 @@ class SprintHealthProjection:
             item["exact_generation"] = bool(
                 wake_id is not None
                 and item.get("target_conversation_id")
-                and item.get("creation_idempotency_key")
-                == f"generation:{generation}:wake:{int(wake_id)}"
+                and item.get("linked_participant_id") == item.get("to_participant_id")
+                and str(item.get("creation_idempotency_key") or "").startswith(
+                    f"generation:{generation}:wake:"
+                )
                 and item.get("trigger_idempotency_key")
                 == item.get("wake_idempotency_key")
             )
@@ -376,6 +400,25 @@ class SprintHealthProjection:
             self.messages.append(item)
             if item.get("work_unit_id") is not None:
                 self.messages_by_unit[int(item["work_unit_id"])].append(item)
+
+    def _load_open_replies(self, sprint_id: int) -> None:
+        rows = self.con.execute(
+            "SELECT m.message_id,m.work_unit_id,m.receiver_shell_id,m.created_at,"
+            "m.delivered_at,m.read_at FROM wake_message m "
+            "WHERE m.sprint_id=? AND m.requires_reply=1 "
+            "AND m.reply_to_message_id IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM wake_message reply "
+            " WHERE reply.sprint_id=m.sprint_id "
+            " AND reply.reply_to_message_id=m.message_id) "
+            "ORDER BY m.message_id",
+            (sprint_id,),
+        ).fetchall()
+        for row in rows:
+            item = dict(row)
+            unit_id = item.get("work_unit_id")
+            self.open_replies_by_unit[
+                int(unit_id) if unit_id is not None else None
+            ].append(item)
 
     def _classify_unit(self, unit_id: int) -> Candidate:
         unit = self.units[unit_id]
@@ -559,21 +602,65 @@ class SprintHealthProjection:
         }
 
     def _relevant_messages(self, unit: sqlite3.Row) -> list[dict[str, Any]]:
+        assert self.sprint is not None
         unit_id = int(unit["work_unit_id"])
         disposition = str(unit["disposition"])
         owner_shell = self._owner_shell(unit)
         result = []
+        recovery_message_ids: set[int] = set()
+        stage_kind = {
+            "ready": "work_assignment",
+            "active": "work_assignment",
+            "in_review": "review_request",
+            "fixing": "notification",
+            "merge_ready": "notification",
+        }.get(disposition)
         for message in self.messages_by_unit[unit_id]:
-            if disposition == "in_review" and message["message_kind"] != "review_request":
-                continue
-            if disposition == "ready" and message["message_kind"] != "work_assignment":
+            wake_key = str(message.get("wake_idempotency_key") or "")
+            is_recovery = wake_key.startswith(
+                (
+                    f"sprint-recovery:{self.sprint['sprint_id']}:",
+                    f"sprint-resume:{self.sprint['sprint_id']}:",
+                )
+            )
+            if is_recovery:
+                recovery_message_ids.add(int(message["message_id"]))
+            if (
+                stage_kind is not None
+                and message["message_kind"] != stage_kind
+                and not is_recovery
+            ):
                 continue
             if disposition == "planned":
                 continue
             if disposition != "blocked" and int(message["receiver_shell_id"]) != owner_shell:
                 continue
             result.append(message)
-        return result
+        if stage_kind is None or disposition == "blocked" or not result:
+            return result
+        stage_message_id = self.stage_message_ids.get(unit_id)
+        if stage_message_id is not None:
+            return [
+                message
+                for message in result
+                if int(message["message_id"]) == stage_message_id
+                or int(message["message_id"]) in recovery_message_ids
+            ]
+        recovery = [
+            message
+            for message in result
+            if int(message["message_id"]) in recovery_message_ids
+        ]
+        stage = [
+            message
+            for message in result
+            if int(message["message_id"]) not in recovery_message_ids
+        ]
+        return recovery + (
+            [max(stage, key=lambda message: int(message["message_id"]))]
+            if stage
+            else []
+        )
 
     def _live_run(
         self,
@@ -675,15 +762,16 @@ class SprintHealthProjection:
         rows = []
         for message in messages:
             state = message.get("wake_state")
+            if state in {"pending", "delivering"}:
+                at = _max_stamp(
+                    floor,
+                    _parse(message.get("wake_created_at")),
+                    _parse(message.get("claimed_at")),
+                    _parse(message.get("attempted_at")),
+                )
             if state == "pending":
-                at = _parse(message.get("wake_created_at")) or floor
                 rows.append((0, "wake_pending", at, message))
             elif state == "delivering":
-                at = (
-                    _parse(message.get("available_at"))
-                    or _parse(message.get("wake_created_at"))
-                    or floor
-                )
                 rows.append((1, "wake_delivering", at, message))
             elif (
                 state == "delivered"
@@ -753,6 +841,12 @@ class SprintHealthProjection:
             row for row in pool
             if (row.get("read_at") is None) == is_unread
         ]
+        same.sort(
+            key=lambda row: (
+                _parse(row.get(trigger_field)) or _parse(row["created_at"]),
+                int(row["message_id"]),
+            )
+        )
         receiver = int(selected["receiver_shell_id"])
         return Candidate(
             condition, cause, since, self._owner([receiver]),
@@ -760,21 +854,13 @@ class SprintHealthProjection:
                 "reply", int(selected["message_id"]), trigger, 2
             ),
             "linked_reply", f"{self.participants[receiver]['shortname']} sends a linked reply",
-            message_refs=[int(row["message_id"]) for row in same],
+            message_refs=[
+                int(row["message_id"]) for row in same[:MAX_MESSAGE_REFS]
+            ],
         )
 
     def _open_reply_candidates(self, unit_id: int | None) -> list[dict[str, Any]]:
-        return [
-            message
-            for message in self.messages
-            if bool(message.get("requires_reply"))
-            and message.get("reply_to_message_id") is None
-            and message.get("work_unit_id") == unit_id
-            and not any(
-                reply.get("reply_to_message_id") == message["message_id"]
-                for reply in self.messages
-            )
-        ]
+        return self.open_replies_by_unit[unit_id]
 
     def _sprint_reply_candidates(self) -> list[Candidate]:
         result = []

@@ -293,12 +293,19 @@ class SprintHealthCase(unittest.TestCase):
         shell_id: int,
         suffix: str,
         active: bool = True,
+        creation_wake_id: int | None = None,
+        creation_generation: int | None = None,
     ) -> int:
         generation = self.con.execute(
             "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
             (self.sprint_id,),
         ).fetchone()[0]
         conversation = f"cv_{suffix}"
+        conversation_generation = creation_generation or generation
+        conversation_wake = creation_wake_id or wake_id
+        creation_key = (
+            f"generation:{conversation_generation}:wake:{conversation_wake}"
+        )
         wake_key = self.con.execute(
             "SELECT idempotency_key FROM sprint_wake_outbox WHERE wake_id=?",
             (wake_id,),
@@ -308,7 +315,22 @@ class SprintHealthCase(unittest.TestCase):
             "(conversation_id,shell_id,owner_user_id,harness,worktree,state,title,"
             "creation_idempotency_key,creation_request_hash,conversation_scope) "
             "VALUES (?,?,1,'codex','/work','running','test',?,?,'sprint')",
-            (conversation, shell_id, f"generation:{generation}:wake:{wake_id}", suffix),
+            (
+                conversation,
+                shell_id,
+                creation_key,
+                suffix,
+            ),
+        )
+        participant_id = self.con.execute(
+            "SELECT participant_id FROM sprint_participants "
+            "WHERE sprint_id=? AND shell_id=?",
+            (self.sprint_id, shell_id),
+        ).fetchone()[0]
+        self.con.execute(
+            "INSERT INTO sprint_participant_conversations "
+            "(sprint_participant_id,conversation_id) VALUES (?,?)",
+            (participant_id, conversation),
         )
         prompt_id = int(
             self.con.execute(
@@ -443,6 +465,12 @@ class SprintHealthCase(unittest.TestCase):
                 delivered_at="2026-08-10 11:53:00",
             )
             wake = self.add_wake(message, receiver=2, state="delivered")
+            self.add_event(
+                "review.requested",
+                at="2026-08-10 11:54:00",
+                work_unit_id=unit,
+                payload={"message_id": message},
+            )
             if index == 1:
                 self.add_live_run(message, wake, shell_id=2, suffix="review_one")
         projected = self.project()["work_units"]
@@ -450,6 +478,138 @@ class SprintHealthCase(unittest.TestCase):
         self.assertEqual("progressing", projected[first]["condition"])
         self.assertEqual("no_progress_grace", projected[second]["cause"])
         self.assertEqual("waiting_external", projected[second]["condition"])
+
+    def test_reenter_run_uses_participant_link_not_creation_wake(self) -> None:
+        unit = self.add_unit("fixing", developer=3, updated_at="2026-08-10 11:54:00")
+        self.add_pr(unit, "red", at="2026-08-10 11:54:00", number=20)
+        self.heartbeat("sprint-pr-watcher", "2026-08-10 12:00:00", 30)
+        earlier = self.add_message(
+            unit_id=None,
+            receiver=3,
+            delivered_at="2026-08-10 11:45:00",
+            created_at="2026-08-10 11:44:00",
+        )
+        earlier_wake = self.add_wake(
+            earlier,
+            receiver=3,
+            state="delivered",
+            created_at="2026-08-10 11:44:00",
+        )
+        verdict = self.add_message(
+            unit_id=unit,
+            receiver=3,
+            disposition="accepted",
+            read_at="2026-08-10 11:55:00",
+            delivered_at="2026-08-10 11:54:30",
+            created_at="2026-08-10 11:54:00",
+        )
+        verdict_wake = self.add_wake(
+            verdict,
+            receiver=3,
+            state="delivered",
+            created_at="2026-08-10 11:54:00",
+        )
+        self.add_event(
+            "review.changes_requested",
+            at="2026-08-10 11:54:00",
+            work_unit_id=unit,
+            payload={"message_id": verdict},
+        )
+        run_id = self.add_live_run(
+            verdict,
+            verdict_wake,
+            shell_id=3,
+            suffix="reenter_fix",
+            creation_wake_id=earlier_wake,
+        )
+
+        projected = self.project()["work_units"][unit]
+
+        self.assertEqual(("progressing", "run_active", "live"), (
+            projected["condition"], projected["cause"], projected["activity"]
+        ))
+        self.assertEqual(
+            {"kind": "run", "id": run_id, "at": "2026-08-10T11:59:59Z"},
+            projected["last_evidence"],
+        )
+
+    def test_live_run_rejects_participant_chat_from_stale_generation(self) -> None:
+        unit = self.add_unit("active", developer=3, updated_at="2026-08-10 11:50:00")
+        assignment = self.add_message(
+            unit_id=unit,
+            receiver=3,
+            kind="work_assignment",
+            disposition="accepted",
+            read_at="2026-08-10 11:50:00",
+            delivered_at="2026-08-10 11:49:00",
+            created_at="2026-08-10 11:48:00",
+        )
+        wake = self.add_wake(
+            assignment,
+            receiver=3,
+            state="delivered",
+            created_at="2026-08-10 11:48:00",
+        )
+        self.add_event(
+            "work_unit.accepted",
+            at="2026-08-10 11:50:00",
+            work_unit_id=unit,
+            payload={"message_id": assignment},
+        )
+        self.add_live_run(
+            assignment,
+            wake,
+            shell_id=3,
+            suffix="stale_generation",
+            creation_generation=999,
+        )
+
+        projected = self.project()["work_units"][unit]
+
+        self.assertEqual(
+            ("waiting_external", "no_progress_grace", "unknown"),
+            (projected["condition"], projected["cause"], projected["activity"]),
+        )
+
+    def test_new_review_request_excludes_older_accepted_live_run(self) -> None:
+        unit = self.add_unit("in_review", developer=3, updated_at="2026-08-10 11:58:00")
+        older = self.add_message(
+            unit_id=unit,
+            receiver=2,
+            kind="review_request",
+            disposition="accepted",
+            read_at="2026-08-10 11:50:00",
+            delivered_at="2026-08-10 11:49:00",
+            created_at="2026-08-10 11:48:00",
+        )
+        older_wake = self.add_wake(
+            older, receiver=2, state="delivered", created_at="2026-08-10 11:48:00"
+        )
+        self.add_live_run(older, older_wake, shell_id=2, suffix="stale_review")
+        current = self.add_message(
+            unit_id=unit,
+            receiver=2,
+            kind="review_request",
+            disposition="pending",
+            created_at="2026-08-10 11:58:00",
+        )
+        self.add_wake(
+            current, receiver=2, state="pending", created_at="2026-08-10 11:58:00"
+        )
+        self.add_event(
+            "review.requested",
+            at="2026-08-10 11:58:00",
+            work_unit_id=unit,
+            payload={"message_id": current},
+        )
+        self.heartbeat("sprint-runtime", "2026-08-10 12:00:00")
+
+        projected = self.project()["work_units"][unit]
+
+        self.assertEqual(("waiting_external", "wake_pending", "idle"), (
+            projected["condition"], projected["cause"], projected["activity"]
+        ))
+        self.assertEqual([{"message_id": current}], projected["message_refs"])
 
     def test_ci_boundaries_and_watcher_precedence_are_exact(self) -> None:
         self.con.execute(
@@ -517,6 +677,55 @@ class SprintHealthCase(unittest.TestCase):
             (boundary[ready]["condition"], boundary[ready]["cause"]),
         )
 
+    def test_pending_wake_retry_restarts_the_exact_boundary(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        unit = self.add_unit("ready", developer=3, updated_at="2026-08-10 10:00:00")
+        message = self.add_message(
+            unit_id=unit,
+            receiver=3,
+            kind="work_assignment",
+            disposition="pending",
+            created_at="2026-08-10 10:00:00",
+        )
+        wake = self.add_wake(
+            message, receiver=3, state="pending", created_at="2026-08-10 10:00:00"
+        )
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET attempt_count=2,"
+            "available_at='2026-08-10 11:30:00' WHERE wake_id=?",
+            (wake,),
+        )
+        self.con.execute(
+            "INSERT INTO sprint_wake_attempts "
+            "(wake_id,attempt_number,outcome,error_detail,attempted_at) "
+            "VALUES (?,2,'failed','temporary delivery fault','2026-08-10 11:30:00')",
+            (wake,),
+        )
+        self.add_event(
+            "work_unit.ready",
+            at="2026-08-10 10:00:00",
+            work_unit_id=unit,
+            payload={"message_id": message, "wake_id": wake},
+        )
+        self.heartbeat("sprint-runtime", "2026-08-10 12:00:00")
+
+        before = self.project(
+            now=datetime(2026, 8, 10, 11, 59, 59, tzinfo=timezone.utc)
+        )["work_units"][unit]
+        boundary = self.project()["work_units"][unit]
+
+        self.assertEqual(("waiting_external", "wake_pending"), (
+            before["condition"], before["cause"]
+        ))
+        self.assertEqual(("attention", "wake_pending"), (
+            boundary["condition"], boundary["cause"]
+        ))
+        self.assertEqual("2026-08-10T11:30:00Z", boundary["since"])
+        self.assertEqual(1800, boundary["age_seconds"])
+
     def test_reply_scope_and_linkage_do_not_cross_unit_boundary(self) -> None:
         self.con.execute(
             "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
@@ -562,6 +771,52 @@ class SprintHealthCase(unittest.TestCase):
             {root["root_id"] for root in resolved["health"]["root_causes"]},
         )
 
+    def test_old_open_reply_survives_bounded_message_history_until_linked(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        unit = self.add_unit("active", developer=3, updated_at="2026-08-10 10:00:00")
+        required = self.add_message(
+            unit_id=unit,
+            receiver=1,
+            read_at="2026-08-10 10:30:00",
+            delivered_at="2026-08-10 10:29:00",
+            intent="decision",
+            requires_reply=True,
+            created_at="2026-08-10 10:28:00",
+        )
+        for index in range(100):
+            self.add_message(
+                unit_id=unit,
+                receiver=3,
+                created_at=(
+                    f"2026-08-10 11:{index // 60:02d}:{index % 60:02d}"
+                ),
+            )
+
+        open_wait = self.project()["work_units"][unit]
+
+        self.assertEqual(("attention", "reply_overdue"), (
+            open_wait["condition"], open_wait["cause"]
+        ))
+        self.assertEqual([{"message_id": required}], open_wait["message_refs"])
+
+        reply = self.add_message(
+            unit_id=unit,
+            receiver=3,
+            reply_to=required,
+            created_at="2026-08-10 11:59:00",
+        )
+        resolved = self.project()["work_units"][unit]
+
+        self.assertNotEqual("reply_overdue", resolved["cause"])
+        self.assertNotIn(
+            {"message_id": required},
+            resolved["message_refs"],
+        )
+        self.assertGreater(reply, required)
+
     def test_plural_dependency_roots_preserve_mixed_conditions(self) -> None:
         attention = self.add_unit("active", developer=3, updated_at="2026-08-10 09:00:00")
         infrastructure = self.add_unit("active", developer=4, updated_at="2026-08-10 09:00:00")
@@ -603,6 +858,12 @@ class SprintHealthCase(unittest.TestCase):
             delivered_at="2026-08-10 11:49:00",
         )
         wake = self.add_wake(message, receiver=3, state="delivered")
+        self.add_event(
+            "work_unit.accepted",
+            at="2026-08-10 11:50:00",
+            work_unit_id=upstream,
+            payload={"message_id": message},
+        )
         self.add_live_run(message, wake, shell_id=3, suffix="developer_progress")
         self.con.execute(
             "INSERT INTO sprint_work_unit_dependencies "
