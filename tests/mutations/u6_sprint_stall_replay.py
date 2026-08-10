@@ -116,6 +116,15 @@ MUTATIONS = [
             'Evidence("runtime_heartbeat", 0, beat, 5)'
         ),
     ),
+    (
+        "M10 unscoped historical recovery evidence leaks into the first unit",
+        "recovery_and_nudge_topology",
+        "                    self._record_unreadable(signal, item.get(\"work_unit_id\"))",
+        (
+            "                    self._record_unreadable("
+            "signal, item.get(\"work_unit_id\") or min(self.units))"
+        ),
+    ),
 ]
 
 

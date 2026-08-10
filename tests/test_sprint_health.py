@@ -2882,6 +2882,21 @@ class SprintHealthCase(unittest.TestCase):
             ("N1", "history-01", "G1", "E1", "U1", "D1", 1801, 0, 51, 1, 255, "succeeded", "CN1"),
             ("N2", "history-06", "G6", "E2", "U2", "D2", 905, 0, 35, 6, 44, "succeeded", "CN2"),
         ]
+        attention_recoveries = {
+            "R04",
+            "R05",
+            "R06",
+            "R07",
+            "R08",
+            "R09",
+            "R10",
+            "R11",
+            "R12",
+            "R15",
+            "R16",
+            "R17",
+            "R18",
+        }
         self.assertEqual(
             expected_snapshots,
             [
@@ -2988,10 +3003,14 @@ class SprintHealthCase(unittest.TestCase):
         snapshot_sources: dict[str, dict] = {}
         recovery_records: list[dict] = []
         nudge_records: list[dict] = []
+        historical_unreadable_times: dict[int, list[datetime]] = {}
         projection_count = 0
 
         def stamp(value: datetime) -> str:
             return value.strftime("%Y-%m-%d %H:%M:%S")
+
+        def iso(value: datetime) -> str:
+            return value.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         def participant_id(shell_id: int) -> int:
             return int(
@@ -3030,6 +3049,130 @@ class SprintHealthCase(unittest.TestCase):
             self.assertEqual(before, after)
             projection_count += 1
             return projected
+
+        def assert_historical_projection(
+            projected: dict,
+            *,
+            source: dict,
+            observed_at: datetime,
+            condition: str,
+            cause: str,
+        ) -> None:
+            since = source["run_ended_at"]
+            age_seconds = max(0, int((observed_at - since).total_seconds()))
+            unit_ids = source["unit_ids"]
+            roots = unit_ids if condition == "attention" else []
+            next_event = {
+                "code": "developer_evidence",
+                "detail": "Developer activity or a registered PR transition",
+            }
+
+            def owner(shell_id: int) -> dict:
+                return {
+                    "mode": "single",
+                    "participants": [
+                        {
+                            "role": "developer",
+                            "shell_id": shell_id,
+                            "shortname": f"DEV{shell_id}",
+                        }
+                    ],
+                }
+
+            expected_root_causes = [
+                {
+                    "age_seconds": age_seconds,
+                    "cause": cause,
+                    "condition": condition,
+                    "last_evidence": {
+                        "at": iso(since),
+                        "id": source["run_ids"][unit_id],
+                        "kind": "run",
+                    },
+                    "message_refs": [],
+                    "next_expected_event": next_event,
+                    "owner": owner(source["unit_owners"][unit_id]),
+                    "root_id": f"work_unit:{unit_id}:{cause}",
+                    "scope": "work_unit",
+                    "since": iso(since),
+                    "work_unit_id": unit_id,
+                }
+                for unit_id in roots
+            ]
+            selected_unit = source["unit_id"]
+            self.assertEqual(
+                {
+                    "activity": "unknown",
+                    "age_seconds": age_seconds,
+                    "capacity": {
+                        "age_seconds": None,
+                        "captured_at": None,
+                        "provider": None,
+                        "reset_at": None,
+                        "state": "unknown",
+                    },
+                    "cause": cause,
+                    "condition": condition,
+                    "last_evidence": {
+                        "at": iso(since),
+                        "id": source["run_ids"][selected_unit],
+                        "kind": "run",
+                    },
+                    "message_refs": [],
+                    "next_expected_event": next_event,
+                    "owner": owner(source["unit_owners"][selected_unit]),
+                    "root_work_unit_ids": (
+                        [selected_unit] if condition == "attention" else []
+                    ),
+                    "since": iso(since),
+                    "unreadable_signals": [],
+                    "waiting_on_work_unit_ids": [],
+                },
+                projected["work_units"][selected_unit],
+            )
+            health = projected["health"]
+            self.assertEqual(
+                {
+                    "age_seconds": age_seconds,
+                    "attention_count": len(roots),
+                    "condition": condition,
+                    "machinery": {
+                        "applicable": True,
+                        "runtime": {
+                            "beat_at": None,
+                            "interval_seconds": 5,
+                            "state": "missing",
+                        },
+                        "watcher": {
+                            "beat_at": None,
+                            "interval_seconds": None,
+                            "state": "never-started",
+                        },
+                    },
+                    "root_cause_count": len(roots),
+                    "root_causes": expected_root_causes,
+                    "root_causes_truncated": False,
+                    "root_work_unit_ids": roots,
+                    "since": iso(since),
+                },
+                {
+                    key: value
+                    for key, value in health.items()
+                    if key != "unreadable_signals"
+                },
+            )
+            unreadable = health["unreadable_signals"]
+            self.assertEqual(
+                [
+                    ("native_run", iso(at))
+                    for at in historical_unreadable_times[self.sprint_id]
+                ],
+                [(signal["kind"], signal["at"]) for signal in unreadable],
+            )
+            self.assertEqual(
+                [{"at", "id", "kind"}] * len(unreadable),
+                [set(signal) for signal in unreadable],
+            )
 
         def insert_terminal_run(
             conversation_id: str,
@@ -3072,11 +3215,15 @@ class SprintHealthCase(unittest.TestCase):
                     ],
                 )
                 source_sprint_ids[sprint_shape["key"]] = self.sprint_id
+                historical_unreadable_times[self.sprint_id] = []
                 selected_unit = None
                 selected_request = None
                 selected_wake = None
                 selected_conversation = None
                 snapshot_runs: list[tuple[int, int, str, int]] = []
+                snapshot_unit_ids: list[int] = []
+                snapshot_run_ids: dict[int, int] = {}
+                snapshot_unit_owners: dict[int, int] = {}
                 for expectation_index in range(
                     snapshot["accepted_expectation_count"]
                 ):
@@ -3097,6 +3244,8 @@ class SprintHealthCase(unittest.TestCase):
                         developer=developer,
                         updated_at=stamp(accepted_at),
                     )
+                    snapshot_unit_ids.append(unit)
+                    snapshot_unit_owners[unit] = developer
                     request = self.add_message(
                         unit_id=unit,
                         receiver=developer,
@@ -3146,6 +3295,7 @@ class SprintHealthCase(unittest.TestCase):
                         heartbeat_at=stamp(project_at),
                         lease_expires_at=stamp(project_at + timedelta(minutes=10)),
                     )
+                    snapshot_run_ids[unit] = run_id
                     run = self.con.execute(
                         "SELECT conversation_id,trigger_message_id "
                         "FROM conversation_runs WHERE run_id=?",
@@ -3231,6 +3381,10 @@ class SprintHealthCase(unittest.TestCase):
                     ),
                     "accepted_at": replay_base
                     + timedelta(seconds=snapshot["accepted_offset"]),
+                    "run_ended_at": snapshot_end,
+                    "unit_ids": snapshot_unit_ids,
+                    "run_ids": snapshot_run_ids,
+                    "unit_owners": snapshot_unit_owners,
                 }
 
                 conversation_ids: dict[str, str] = {}
@@ -3452,8 +3606,22 @@ class SprintHealthCase(unittest.TestCase):
                             "replacement_conversation_id": conversation_id,
                         },
                     )
+                    historical_unreadable_times[self.sprint_id].append(event_at)
                     projected = project_without_writes(event_at)
-                    self.assertIn("health", projected)
+                    needs_attention = recovery["sequence"] in attention_recoveries
+                    assert_historical_projection(
+                        projected,
+                        source=snapshot_sources[sprint_shape["key"]],
+                        observed_at=event_at,
+                        condition=(
+                            "attention" if needs_attention else "waiting_external"
+                        ),
+                        cause=(
+                            "no_progress_carrier"
+                            if needs_attention
+                            else "no_progress_grace"
+                        ),
+                    )
                     self.assertEqual(
                         (0, 1, 1, conversation_id, conversation_id),
                         (
@@ -3617,8 +3785,15 @@ class SprintHealthCase(unittest.TestCase):
                             "nudge_message_id": nudge_message,
                         },
                     )
+                    historical_unreadable_times[self.sprint_id].append(nudge_at)
                     projected = project_without_writes(nudge_at)
-                    self.assertIn("health", projected)
+                    assert_historical_projection(
+                        projected,
+                        source=source,
+                        observed_at=nudge_at,
+                        condition="waiting_external",
+                        cause="no_progress_grace",
+                    )
                     nudge_start = nudge_at + timedelta(
                         seconds=nudge["run_start_offset"]
                     )
