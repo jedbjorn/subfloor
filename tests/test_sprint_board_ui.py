@@ -33,6 +33,43 @@ def run_js(script: str) -> dict:
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
+HEALTH_BOARD_HARNESS = r"""
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag; this.nodeType = 1; this.children = []; this._text = "";
+    this.className = ""; this.dataset = {}; this.attributes = {}; this.isConnected = false;
+    this.scrollWidth = 1200; this.scrollHeight = 500; this.open = false;
+    this.hidden = false; this.disabled = false;
+    this.classList = {toggle() {}};
+  }
+  append(...nodes) { this.children.push(...nodes); }
+  replaceChildren(...nodes) { this.children = [...nodes]; this._text = ""; }
+  set textContent(value) { this._text = String(value ?? ""); this.children = []; }
+  get textContent() { return this._text + this.children.map(
+    (node) => typeof node === "string" ? node : (node.textContent || "")).join(""); }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  querySelectorAll() { return []; }
+  getBoundingClientRect() { return {left: 0, right: 100, top: 0, height: 50}; }
+}
+globalThis.document = {
+  hidden: false,
+  createElement: (tag) => new FakeElement(tag),
+  createTextNode: (text) => ({nodeType: 3, textContent: String(text ?? "")}),
+  createElementNS: (_ns, tag) => new FakeElement(tag),
+};
+globalThis.window = {addEventListener() {}, removeEventListener() {}};
+globalThis.requestAnimationFrame = () => {};
+globalThis.SVGNS = "svg";
+const el = (tag, props = {}, ...kids) => {
+  const node = Object.assign(new FakeElement(tag), props);
+  node.append(...kids.map((kid) => kid?.nodeType ? kid : document.createTextNode(kid ?? "")));
+  return node;
+};
+const opened = [];
+function openModal(options) { opened.push(options); return () => {}; }
+"""
+
+
 def test_global_header_leads_with_chats_sprints_shells_and_keeps_remaining_order():
     nav = INDEX[INDEX.index("<nav>"):INDEX.index("</nav>")]
     names = [
@@ -465,6 +502,178 @@ console.log(JSON.stringify({actual, expected}));
     result = run_js(script)
     for lifecycle, expected in result["expected"].items():
         assert result["actual"][lifecycle] == {"badge": lifecycle, **expected}
+
+
+def test_board_renders_every_aggregate_health_badge_even_without_roots():
+    script = HEALTH_BOARD_HARNESS + SPRINT_BLOCK + r"""
+const labels = {};
+for (const condition of [
+  "staged", "progressing", "waiting_dependency", "waiting_external",
+  "waiting_decision", "attention", "infrastructure", "paused", "terminal",
+]) {
+  const lifecycle = condition === "staged" ? "prepared"
+    : condition === "paused" ? "paused" : condition === "terminal" ? "completed" : "armed";
+  const sprint = {
+    sprint_id: 9, feature: {feature_id: 31, title: "Board"}, planner: {shortname: "PLN1"},
+    lifecycle, created_at: "2026-08-10 10:00:00", armed_at: "2026-08-10 10:01:00",
+    paused_at: lifecycle === "paused" ? "2026-08-10 10:02:00" : null,
+    completed_at: lifecycle === "completed" ? "2026-08-10 10:03:00" : null,
+    aborted_at: null, terminal_outcome: null,
+  };
+  const health = {condition, age_seconds: condition === "progressing" ? 45 : null,
+    root_causes: [], root_cause_count: 0, root_causes_truncated: false};
+  const root = sprintBoardNode({sprint, health, specs: [], work_units: [], dependencies: []});
+  const heading = root.children[0].children[0];
+  labels[condition] = {
+    lifecycle: heading.children[1].textContent,
+    health: heading.children[2].textContent,
+    age: heading.children[3].textContent,
+    rootStrip: root.children[0].children.some((node) => node.className === "sprint-health-strip"),
+  };
+}
+console.log(JSON.stringify(labels));
+"""
+    assert run_js(script) == {
+        "staged": {"lifecycle": "prepared", "health": "Staged", "age": "Episode age unavailable", "rootStrip": False},
+        "progressing": {"lifecycle": "armed", "health": "Progressing", "age": "Episode 45s", "rootStrip": False},
+        "waiting_dependency": {"lifecycle": "armed", "health": "Waiting on dependency", "age": "Episode age unavailable", "rootStrip": False},
+        "waiting_external": {"lifecycle": "armed", "health": "Waiting externally", "age": "Episode age unavailable", "rootStrip": False},
+        "waiting_decision": {"lifecycle": "armed", "health": "Decision waiting", "age": "Episode age unavailable", "rootStrip": False},
+        "attention": {"lifecycle": "armed", "health": "Needs attention", "age": "Episode age unavailable", "rootStrip": False},
+        "infrastructure": {"lifecycle": "armed", "health": "Infrastructure failure", "age": "Episode age unavailable", "rootStrip": False},
+        "paused": {"lifecycle": "paused", "health": "Paused", "age": "Episode age unavailable", "rootStrip": False},
+        "terminal": {"lifecycle": "completed", "health": "Terminal", "age": "Episode age unavailable", "rootStrip": False},
+    }
+
+
+def test_unit_health_chip_and_modal_keep_episode_fact_and_capacity_ages_distinct():
+    script = HEALTH_BOARD_HARNESS + SPRINT_BLOCK + r"""
+Date.now = () => Date.parse("2026-08-10T10:05:00Z");
+const person = (shortname) => ({shell_id: 1, shortname, current_conversation_id: null});
+const unit = {
+  work_unit_id: 12, title: "Fan in", expected_output: "Visible health", output_kind: "code",
+  completion_result: null, planned_wave: 3, disposition: "planned", column: "waiting",
+  developer: person("DEV3"), reviewer: person("REV1"), task_ids: [], tasks: [],
+  prerequisite_ids: [9, 10], dependent_ids: [], pull_requests: [], messages: [{
+    message_id: 441, kind: "notification", body: "Decision needed", created_at: "2026-08-10T10:01:00Z",
+    read_at: "2026-08-10T10:02:00Z", sender: {shortname: "REV1"}, recipient: {shortname: "PLN1"},
+  }],
+  health: {
+    condition: "waiting_dependency", cause: "dependency_wait", since: "2026-08-10T10:03:00Z",
+    age_seconds: 120, owner: {mode: "single", participants: [{role: "planner", shortname: "PLN1"}]},
+    last_evidence: {kind: "pr_transition", id: 812, at: "2026-08-10T10:00:00Z"},
+    next_expected_event: {code: "upstream_recovery", detail: "all upstream roots recover"},
+    waiting_on_work_unit_ids: [9, 10], root_work_unit_ids: [9, 11], message_refs: [{message_id: 441}],
+    activity: "unknown", unreadable_signals: [],
+    capacity: {provider: "openai", state: "available", age_seconds: 30, reset_at: "2026-08-10T11:00:00Z"},
+  },
+};
+const snapshot = {sprint: {sprint_id: 9, lifecycle: "armed"}, work_units: [unit]};
+const card = sprintWorkUnitCard(unit, snapshot);
+card.onclick();
+console.log(JSON.stringify({card: card.textContent, modal: opened[0].bodyNode.textContent}));
+"""
+    result = run_js(script)
+    assert "Waiting on dependencydependency_wait2m (120s)" in result["card"]
+    assert "Waiting on U9, U10 · Root causes U9, U11" in result["card"]
+    assert "episode age2m (120s)" in result["modal"]
+    assert "pr transition #812" in result["modal"]
+    assert "fact 5m (300s) old" in result["modal"]
+    assert "upstream_recovery: all upstream roots recover" in result["modal"]
+    assert "Capacity: openai · available · reading 30s old" in result["modal"]
+    assert "Message 441" in result["modal"]
+
+
+def test_mixed_health_roots_render_stable_scope_owner_closeout_and_drilldown_evidence():
+    script = HEALTH_BOARD_HARNESS + SPRINT_BLOCK + r"""
+const roots = [
+  {root_id: "work_unit:12:watcher_missing", scope: "work_unit", work_unit_id: 12,
+    condition: "infrastructure", cause: "watcher_missing", since: "2026-08-10T10:00:00Z", age_seconds: 1900,
+    message_refs: [], owner: {mode: "single", participants: [{role: "developer", shortname: "DEV3"}]},
+    last_evidence: {kind: "pr_transition", id: 812, at: "2026-08-10T10:00:00Z"},
+    next_expected_event: {code: "watcher_observed", detail: "the watcher records a fresh transition"}},
+  {root_id: "sprint:closeout:901", scope: "sprint", work_unit_id: null,
+    condition: "attention", cause: "conformance_idle", since: "2026-08-10T10:01:00Z", age_seconds: 1800,
+    message_refs: [{message_id: 450}, {message_id: 451}], owner: {mode: "any", participants: [
+      {role: "reviewer", shortname: "REV1"}, {role: "reviewer", shortname: "REV2"}]},
+    last_evidence: {kind: "lifecycle_event", id: 901, at: "2026-08-10T10:01:00Z"},
+    next_expected_event: {code: "conformance_recorded", detail: "a Reviewer records conformance"}},
+  {root_id: "sprint:message:441", scope: "sprint", work_unit_id: null,
+    condition: "waiting_decision", cause: "reply_waiting", since: "2026-08-10T10:02:00Z", age_seconds: 60,
+    message_refs: [{message_id: 441}], owner: {mode: "single", participants: [{role: "planner", shortname: "PLN1"}]},
+    last_evidence: {kind: "message_read", id: 441, at: "2026-08-10T10:02:00Z"},
+    next_expected_event: {code: "linked_reply", detail: "PLN1 sends a linked reply"}},
+];
+const unit = {work_unit_id: 12, title: "Root", expected_output: "Root", output_kind: "code",
+  completion_result: null, planned_wave: 1, disposition: "active", column: "dev",
+  developer: {shortname: "DEV3"}, reviewer: {shortname: "REV1"}, task_ids: [], tasks: [],
+  prerequisite_ids: [], dependent_ids: [], pull_requests: [], messages: []};
+const snapshot = {
+  sprint: {sprint_id: 9, feature: {feature_id: 31, title: "Board"}, planner: {shortname: "PLN1"},
+    lifecycle: "armed", created_at: "2026-08-10 10:00:00", armed_at: "2026-08-10 10:00:00",
+    paused_at: null, completed_at: null, aborted_at: null, terminal_outcome: null},
+  health: {condition: "infrastructure", age_seconds: 1900, root_causes: roots,
+    root_cause_count: 4, root_causes_truncated: true},
+  specs: [], work_units: [unit], dependencies: [],
+};
+const board = sprintBoardNode(snapshot);
+function all(node, pred, out = []) {
+  if (node?.nodeType === 1 && pred(node)) out.push(node);
+  for (const child of node?.children || []) all(child, pred, out);
+  return out;
+}
+const rootButtons = all(board, (node) => node.className.includes("sprint-health-root "));
+rootButtons[2].onclick();
+const drilldown = opened[0].bodyNode;
+const messageButton = all(drilldown, (node) =>
+  node.className.split(" ").includes("sprint-health-message-ref"))[0];
+console.log(JSON.stringify({
+  ids: rootButtons.map((node) => node.dataset.rootId),
+  texts: rootButtons.map((node) => node.textContent),
+  strip: all(board, (node) => node.className === "sprint-health-strip")[0].textContent,
+  drilldown: drilldown.textContent,
+  messageTitle: messageButton.title,
+}));
+"""
+    result = run_js(script)
+    assert result["ids"] == [
+        "work_unit:12:watcher_missing",
+        "sprint:closeout:901",
+        "sprint:message:441",
+    ]
+    assert "Infrastructure failureU12watcher_missing" in result["texts"][0]
+    assert "Needs attentionSprint closeoutconformance_idle" in result["texts"][1]
+    assert "reviewer REV1 or reviewer REV2" in result["texts"][1]
+    assert "Decision waitingSprintreply_waiting" in result["texts"][2]
+    assert "Health roots (4)Showing 3 of 4" in result["strip"]
+    assert "root idsprint:message:441" in result["drilldown"]
+    assert "next eventlinked_reply: PLN1 sends a linked reply" in result["drilldown"]
+    assert "Message 441" in result["drilldown"]
+    assert result["messageTitle"] == "Open bounded detail for message 441"
+
+
+def test_plural_root_path_highlighting_selects_each_upstream_branch_and_not_downstream_edges():
+    script = HEALTH_BOARD_HARNESS + SPRINT_BLOCK + r"""
+const unit = (id, roots) => ({work_unit_id: id, health: {root_work_unit_ids: roots}});
+const units = [unit(1, [1]), unit(2, [1]), unit(3, [3]), unit(4, [3]), unit(5, [1, 3]), unit(6, [1, 3])];
+const dependencies = [
+  {depends_on_work_unit_id: 1, work_unit_id: 2},
+  {depends_on_work_unit_id: 3, work_unit_id: 4},
+  {depends_on_work_unit_id: 2, work_unit_id: 5},
+  {depends_on_work_unit_id: 4, work_unit_id: 5},
+  {depends_on_work_unit_id: 5, work_unit_id: 6},
+];
+console.log(JSON.stringify({
+  fanIn: [...sprintHealthPathEdgeKeys(5, units, dependencies)].sort(),
+  firstRoot: [...sprintHealthPathEdgeKeys(1, units, dependencies)].sort(),
+  noRoot: [...sprintHealthPathEdgeKeys(99, units, dependencies)].sort(),
+}));
+"""
+    assert run_js(script) == {
+        "fanIn": ["1:2", "2:5", "3:4", "4:5"],
+        "firstRoot": ["1:2", "2:5", "5:6"],
+        "noRoot": [],
+    }
 
 
 def test_global_and_scoped_audit_feeds_do_not_read_until_expanded():
