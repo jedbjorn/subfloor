@@ -299,7 +299,7 @@ class SprintCliApiTest(unittest.TestCase):
         self.assertIn("number=85", message[4])
         self.assertIn("event=green", message[4])
 
-    def test_reconcile_pr_is_fnb_only_and_projects_the_durable_receipt(self):
+    def test_reconcile_pr_allows_originating_planner_and_projects_receipt(self):
         argv = (
             "reconcile-pr",
             "--sprint",
@@ -317,7 +317,7 @@ class SprintCliApiTest(unittest.TestCase):
             server.sprint_pr_watcher,
             "GitHubPullRequestReader",
             return_value=Reader(),
-        ), self.assertRaisesRegex(SystemExit, "HTTP 403.*only .*FnB"):
+        ), self.assertRaisesRegex(SystemExit, "HTTP 403.*originating Planner"):
             self.run_cli(TOKENS["developer"], *argv)
 
         expected = sprint_pr_watcher.RegistrationReconciliationReceipt(
@@ -334,7 +334,7 @@ class SprintCliApiTest(unittest.TestCase):
             "reconcile_aborted_registration",
             return_value=expected,
         ) as reconcile:
-            response = self.run_cli(TOKENS["admin"], *argv)
+            response = self.run_cli(TOKENS["planner"], *argv)
 
         self.assertEqual(
             {
@@ -350,8 +350,8 @@ class SprintCliApiTest(unittest.TestCase):
         )
         call = reconcile.call_args
         self.assertEqual(self.sprint_id, call.args[0])
-        self.assertEqual("fnb", call.kwargs["actor"].kind)
-        self.assertEqual(5, call.kwargs["actor"].shell_id)
+        self.assertEqual("planner", call.kwargs["actor"].kind)
+        self.assertEqual(3, call.kwargs["actor"].shell_id)
         self.assertEqual("Acme/Repo", call.kwargs["repository"])
         self.assertEqual(42, call.kwargs["pr_number"])
         self.assertEqual(self.unit_id, call.kwargs["work_unit_id"])

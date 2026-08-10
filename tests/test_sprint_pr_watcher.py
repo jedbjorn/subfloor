@@ -537,29 +537,29 @@ class RegistrationRecoveryTest(SprintPRWatcherCase):
             )
         return target_sprint_id, target_unit_id
 
-    def test_fnb_reconciles_merged_pr_from_aborted_sprint_atomically(self):
+    def test_originating_planner_reconciles_merged_pr_atomically(self):
         self.reader.current = pull_request(state="MERGED", checks="SUCCESS", checks_failed=False)
         original = self.register()
         target_sprint_id, target_unit_id = self._prepare_replacement()
 
         receipt = self.watcher.reconcile_aborted_registration(
             target_sprint_id,
-            actor=sprint_domain.LifecycleActor("fnb", 4),
+            actor=sprint_domain.LifecycleActor("planner", 3),
             repository="Acme/Repo",
             pr_number=42,
             work_unit_id=target_unit_id,
-            reason="FnB merged the preserved replacement implementation",
+            reason="preserve the merged replacement implementation",
         )
         self.reader.current = pull_request(
             state="CLOSED", checks=None, checks_failed=False
         )
         replay = self.watcher.reconcile_aborted_registration(
             target_sprint_id,
-            actor=sprint_domain.LifecycleActor("fnb", 4),
+            actor=sprint_domain.LifecycleActor("planner", 3),
             repository="acme/repo",
             pr_number=42,
             work_unit_id=target_unit_id,
-            reason="FnB merged the preserved replacement implementation",
+            reason="preserve the merged replacement implementation",
         )
 
         self.assertTrue(receipt.changed)
@@ -622,8 +622,8 @@ class RegistrationRecoveryTest(SprintPRWatcherCase):
         self.assertEqual({self.sprint_id, target_sprint_id}, {int(row[0]) for row in events})
         for event in events:
             payload = json.loads(event["payload"])
-            self.assertEqual("fnb", event["actor_kind"])
-            self.assertEqual(4, event["actor_shell_id"])
+            self.assertEqual("planner", event["actor_kind"])
+            self.assertEqual(3, event["actor_shell_id"])
             self.assertEqual(self.sprint_id, payload["from_sprint_id"])
             self.assertEqual(target_sprint_id, payload["to_sprint_id"])
             self.assertEqual([self.unit_id], payload["from_work_unit_ids"])
@@ -642,7 +642,7 @@ class RegistrationRecoveryTest(SprintPRWatcherCase):
             self.con.execute(
                 "SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
                 "AND event_type='work_unit.completed' "
-                "AND json_extract(payload,'$.source')='fnb.pr_recovery_override'",
+                "AND json_extract(payload,'$.source')='planner.pr_recovery'",
                 (target_sprint_id,),
             ).fetchone()[0],
         )
@@ -719,14 +719,17 @@ class RegistrationRecoveryTest(SprintPRWatcherCase):
             ).fetchone()[0],
         )
 
-    def test_reconciliation_rejects_non_fnb_and_non_aborted_ownership_without_changes(self):
+    def test_reconciliation_rejects_non_owner_and_live_source_without_changes(self):
         original = self.register()
         target_sprint_id, target_unit_id = self._prepare_replacement(
             abort_source=False
         )
 
         for actor, message in (
-            (sprint_domain.LifecycleActor("planner", 3), "only .*FnB"),
+            (
+                sprint_domain.LifecycleActor("planner", 2),
+                "only the originating Planner",
+            ),
             (sprint_domain.LifecycleActor("fnb", 4), "aborted Sprint"),
         ):
             with self.assertRaisesRegex(sprint_domain.SprintLifecycleError, message):
@@ -739,6 +742,7 @@ class RegistrationRecoveryTest(SprintPRWatcherCase):
                     reason="attempted repair",
                 )
 
+        self.assertEqual([42, 42], self.reader.get_calls)
         self.assertEqual(
             self.sprint_id,
             self.con.execute(

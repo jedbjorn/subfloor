@@ -1,4 +1,4 @@
--- 0192 — reseed FnB Sprint PR ownership recovery guidance.
+-- 0192 — reseed Planner Sprint PR ownership recovery guidance.
 -- Converge existing installs after adding the authenticated reconcile-pr surface.
 
 BEGIN;
@@ -204,21 +204,22 @@ An exhausted recovery wake is bounded manual-recovery evidence, not a retry
 loop. Preserve the unread message and failed wake, involve FnB, and do not create
 recursive fallbacks. Drift informs; it never silently blocks resume.
 
-PR ownership inherited from an aborted Sprint is an FnB repair boundary, not a
-Planner action. Keep the replacement Sprint paused and surface the exact old
-and new ownership. An authenticated FnB/admin shell may reconcile that identity:
+PR ownership inherited from an aborted Sprint is an originating-Planner repair
+boundary. Keep the replacement Sprint paused and establish the exact old and
+new ownership. The originating Planner may reconcile that identity; the FnB
+retains the same operation as a board-level override:
 
 ```text
 sc sprint reconcile-pr --sprint <replacement-id> --repository <owner/repo> \
-  --pr <number> --work-unit <replacement-unit-id> --reason <override-reason>
+  --pr <number> --work-unit <replacement-unit-id> --reason <recovery-reason>
 ```
 
-The command refuses a live source Sprint or target Sprint, non-code or already
-owned target unit, and a closed unmerged PR. It records the old and new owners
-plus the live GitHub head. If the PR is already merged, it also records the
-merge commit and completes the replacement unit as an explicit FnB override.
-Treat the receipt as recovery evidence; wait for a separate Reviewer decision
-before resuming. A Planner must never run this command under Planner authority.
+The command refuses a live source Sprint or target Sprint, a non-originating
+Planner, a non-code or already owned target unit, and a closed unmerged PR. It
+records the old and new owners plus the live GitHub head and acting authority.
+If the PR is already merged, it also records the merge commit and completes the
+replacement unit as explicit recovery evidence. Treat the receipt as recovery
+evidence; wait for a separate Reviewer decision before resuming.
 
 ### Cancel or re-plan
 

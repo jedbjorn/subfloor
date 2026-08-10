@@ -814,6 +814,16 @@ class SprintSkillTest(unittest.TestCase):
         self.assertIn("completes the Sprint", normalized_close)
         self.assertIn("informational Planner receipt", normalized_close)
 
+    def test_originating_planner_owns_pr_reconciliation(self):
+        planner = " ".join(
+            (ASSETS / "sprint_pln" / "SKILL.md").read_text().split()
+        )
+
+        self.assertIn("originating Planner may reconcile that identity", planner)
+        self.assertIn("refuses a live source Sprint or target Sprint", planner)
+        self.assertIn("a non-originating Planner", planner)
+        self.assertIn("separate Reviewer decision before resuming", planner)
+
     def test_skills_use_only_the_shipped_shell_command_surface(self):
         expected = {
             "record-qaqc",

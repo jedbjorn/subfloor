@@ -542,9 +542,12 @@ class SprintPRRegistrationStore:
         pull_request: PullRequest,
         notify_service: bool = True,
     ) -> RegistrationReconciliationReceipt:
-        """Move one PR from an aborted Sprint, preserving explicit FnB evidence."""
-        if actor.kind != "fnb" or actor.shell_id is None:
-            raise SprintAuthorityError("only FnB may reconcile Sprint PR ownership")
+        """Move one PR from an aborted Sprint, preserving actor provenance."""
+        if actor.shell_id is None:
+            raise SprintAuthorityError(
+                "only the originating Planner or authenticated FnB may reconcile "
+                "Sprint PR ownership"
+            )
         repository = repository.strip().lower()
         if not _REPOSITORY.fullmatch(repository):
             raise ValueError("repository must be owner/name")
@@ -563,14 +566,25 @@ class SprintPRRegistrationStore:
 
         completed: tuple[int, ...] = ()
         with db_driver.write_transaction(self.con, "sprint.pr.reconcile"):
-            caller = self.con.execute(
-                "SELECT flavor FROM shells WHERE shell_id=? "
-                "AND COALESCE(is_deleted,0)=0",
-                (actor.shell_id,),
+            authority = self.con.execute(
+                "SELECT sp.originating_planner_shell_id,caller.flavor "
+                "FROM sprints sp LEFT JOIN shells caller ON caller.shell_id=? "
+                "AND COALESCE(caller.is_deleted,0)=0 WHERE sp.sprint_id=?",
+                (actor.shell_id, sprint_id),
             ).fetchone()
-            if caller is None or caller["flavor"] != "admin":
+            if authority is None:
+                raise KeyError(f"unknown Sprint: {sprint_id}")
+            is_fnb = actor.kind == "fnb" and authority["flavor"] == "admin"
+            is_planner = (
+                actor.kind == "planner"
+                and int(authority["originating_planner_shell_id"])
+                == actor.shell_id
+                and authority["flavor"] is not None
+            )
+            if not is_fnb and not is_planner:
                 raise SprintAuthorityError(
-                    "only an authenticated FnB shell may reconcile Sprint PR ownership"
+                    "only the originating Planner or authenticated FnB may reconcile "
+                    "Sprint PR ownership"
                 )
             target_sprint = self.con.execute(
                 "SELECT lifecycle FROM sprints WHERE sprint_id=?",
@@ -752,7 +766,7 @@ class SprintPRRegistrationStore:
                         "review_decision": pull_request.review_decision,
                         "state": pull_request.state,
                         "title": pull_request.title,
-                        "trigger": "fnb_reconciliation",
+                        "trigger": f"{actor.kind}_reconciliation",
                         "url": pull_request.url,
                     },
                     sort_keys=True,
@@ -808,26 +822,31 @@ class SprintPRRegistrationStore:
             self.con.executemany(
                 "INSERT INTO sprint_events "
                 "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
-                "VALUES (?,'pr.registration_reconciled','fnb',?,?)",
+                "VALUES (?,'pr.registration_reconciled',?,?,?)",
                 (
-                    (prior_sprint_id, actor.shell_id, payload),
-                    (sprint_id, actor.shell_id, payload),
+                    (prior_sprint_id, actor.kind, actor.shell_id, payload),
+                    (sprint_id, actor.kind, actor.shell_id, payload),
                 ),
             )
             if completed:
                 self.con.execute(
                     "INSERT INTO sprint_events "
                     "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
-                    "VALUES (?,'work_unit.completed','fnb',?,?)",
+                    "VALUES (?,'work_unit.completed',?,?,?)",
                     (
                         sprint_id,
+                        actor.kind,
                         actor.shell_id,
                         json.dumps(
                             {
                                 "head_sha": pull_request.head_sha,
                                 "merge_sha": pull_request.merge_sha,
                                 "registered_pr_id": registered_pr_id,
-                                "source": "fnb.pr_recovery_override",
+                                "source": (
+                                    "fnb.pr_recovery_override"
+                                    if actor.kind == "fnb"
+                                    else "planner.pr_recovery"
+                                ),
                                 "transition_key": transition_key,
                                 "work_unit_id": work_unit_id,
                             },
@@ -938,20 +957,26 @@ class SprintPRWatcher:
         work_unit_id: int,
         reason: str,
     ) -> RegistrationReconciliationReceipt:
-        """Read GitHub, then perform the bounded FnB ownership repair."""
-        caller = self.con.execute(
-            "SELECT flavor FROM shells WHERE shell_id=? "
-            "AND COALESCE(is_deleted,0)=0",
-            (actor.shell_id,),
+        """Read GitHub, then perform the bounded ownership repair."""
+        authority = self.con.execute(
+            "SELECT sp.originating_planner_shell_id,caller.flavor "
+            "FROM sprints sp LEFT JOIN shells caller ON caller.shell_id=? "
+            "AND COALESCE(caller.is_deleted,0)=0 WHERE sp.sprint_id=?",
+            (actor.shell_id, sprint_id),
         ).fetchone()
-        if (
-            actor.kind != "fnb"
-            or actor.shell_id is None
-            or caller is None
-            or caller["flavor"] != "admin"
-        ):
+        if authority is None:
+            raise KeyError(f"unknown Sprint: {sprint_id}")
+        is_fnb = actor.kind == "fnb" and authority["flavor"] == "admin"
+        is_planner = (
+            actor.kind == "planner"
+            and actor.shell_id is not None
+            and int(authority["originating_planner_shell_id"]) == actor.shell_id
+            and authority["flavor"] is not None
+        )
+        if not is_fnb and not is_planner:
             raise SprintAuthorityError(
-                "only an authenticated FnB shell may reconcile Sprint PR ownership"
+                "only the originating Planner or authenticated FnB may reconcile "
+                "Sprint PR ownership"
             )
         normalized_repository = repository.strip().lower()
         if not _REPOSITORY.fullmatch(normalized_repository):

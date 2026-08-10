@@ -522,7 +522,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     reconcile = sub.add_parser(
         "reconcile-pr",
-        help="FnB repairs PR ownership inherited from an aborted Sprint",
+        help="Planner repairs PR ownership inherited from an aborted Sprint",
     )
     reconcile.add_argument("--sprint", type=int, required=True)
     reconcile.add_argument("--repository", required=True)
