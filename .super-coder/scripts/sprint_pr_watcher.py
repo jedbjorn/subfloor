@@ -928,7 +928,7 @@ class SprintPRWatcher:
         pr_number: int,
         work_unit_ids: Iterable[int],
     ) -> RegistrationReceipt:
-        """Register, then take the required initial snapshot after commit."""
+        """Register or resubscribe, then snapshot the current PR after commit."""
         receipt = self.registration.register(
             sprint_id,
             owner_shell_id=owner_shell_id,
@@ -942,7 +942,7 @@ class SprintPRWatcher:
             "WHERE subscription.sprint_registered_pr_id=?",
             (receipt.registered_pr_id,),
         ).fetchone()
-        if receipt.created and row is not None:
+        if row is not None:
             self._observe_rows((row,), "registration", ignore_backoff=True)
         notify_commit()
         return receipt

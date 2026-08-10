@@ -281,8 +281,8 @@ class RegistrationTest(SprintPRWatcherCase):
         self.assertTrue(first.created)
         self.assertFalse(second.created)
         self.assertEqual(first.registered_pr_id, second.registered_pr_id)
-        self.assertEqual([42], self.reader.get_calls)
-        self.assertEqual(["acme/repo"], self.repositories)
+        self.assertEqual([42, 42], self.reader.get_calls)
+        self.assertEqual(["acme/repo", "acme/repo"], self.repositories)
         self.assertEqual(
             [("acme/repo", 42)],
             [
@@ -320,6 +320,44 @@ class RegistrationTest(SprintPRWatcherCase):
                     "FROM sprint_pr_transitions"
                 )
             ],
+        )
+
+    def test_exact_registration_replay_reactivates_a_reopened_subscription(self):
+        self.reader.current = pull_request(
+            state="CLOSED", checks=None, checks_failed=False
+        )
+        first = self.register()
+        self.assertFalse(self.watcher.poll_once())
+
+        reopened_head = "d" * 40
+        self.reader.current = pull_request(
+            checks="SUCCESS",
+            checks_failed=False,
+            head_sha=reopened_head,
+        )
+        replay = self.register()
+
+        self.assertFalse(replay.created)
+        self.assertEqual(first.registered_pr_id, replay.registered_pr_id)
+        self.assertEqual([42, 42], self.reader.get_calls)
+        self.assertEqual(
+            [("closed", "a" * 40), ("green", reopened_head)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT normalized_state,observed_head_sha "
+                    "FROM sprint_pr_transitions ORDER BY transition_id"
+                )
+            ],
+        )
+
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual([42, 42, 42], self.reader.get_calls)
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_pr_transitions"
+            ).fetchone()[0],
         )
 
     def test_registration_without_checks_records_one_diagnostic_event(self):
