@@ -279,14 +279,18 @@ def cmd_abort(args: argparse.Namespace) -> int:
 
 
 def cmd_request_review(args: argparse.Namespace) -> int:
+    payload = {
+        "sprint_id": args.sprint,
+        "registered_pr_id": args.registered_pr,
+        "idempotency_key": args.key,
+    }
+    if args.intent is not None:
+        payload["intent"] = args.intent
+    else:
+        payload["readiness"] = _text(args.readiness_file, "readiness")
     result = _post(
         "/_sc/sprint/review-request",
-        {
-            "sprint_id": args.sprint,
-            "registered_pr_id": args.registered_pr,
-            "readiness": _text(args.readiness_file, "readiness"),
-            "idempotency_key": args.key,
-        },
+        payload,
         idempotent=True,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -580,8 +584,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     request.add_argument("--sprint", type=int, required=True)
     request.add_argument("--registered-pr", type=int, required=True)
-    request.add_argument(
-        "--readiness-file", required=True, help=PAYLOAD_FILE_HELP
+    review_source = request.add_mutually_exclusive_group(required=True)
+    review_source.add_argument(
+        "--intent",
+        choices=("submit", "resubmit"),
+        help="Developer judgment; the engine injects the exact review locator",
+    )
+    review_source.add_argument(
+        "--readiness-file",
+        help=f"legacy compatibility only; content is not forwarded; {PAYLOAD_FILE_HELP}",
     )
     request.add_argument("--key", required=True, help="stable retry identity")
     request.set_defaults(fn=cmd_request_review)

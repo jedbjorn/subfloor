@@ -710,6 +710,11 @@ class SprintSkillTest(unittest.TestCase):
                     "SELECT content FROM skills WHERE name='sprint_dev'"
                 ).fetchone()[0],
             )
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0197_reseed_reopened_pr_resubscription.sql":
+                    con.executescript(later_migration.read_text())
 
             parsed = seed_skills.parse_skill(ASSETS / "sprint_dev" / "SKILL.md")
             row = con.execute(
@@ -726,6 +731,52 @@ class SprintSkillTest(unittest.TestCase):
                     0,
                 ),
                 tuple(row),
+            )
+        finally:
+            con.close()
+
+    def test_engine_authored_review_handoff_reseed_is_idempotent(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0198_reseed_engine_authored_review_handoff.sql":
+                    break
+                con.executescript(migration.read_text())
+            con.execute(
+                "UPDATE skills SET description='stale',category='stale',"
+                "command='stale',common=1,content='wait for duplicate wake',"
+                "is_deleted=1 WHERE name='sprint_dev'"
+            )
+
+            migration = (
+                ENGINE
+                / "migrations"
+                / "0198_reseed_engine_authored_review_handoff.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            parsed = seed_skills.parse_skill(ASSETS / "sprint_dev" / "SKILL.md")
+            row = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='sprint_dev'"
+            ).fetchone()
+            self.assertEqual(
+                (
+                    parsed["description"],
+                    parsed["category"],
+                    parsed["command"],
+                    parsed["common"],
+                    parsed["content"],
+                    0,
+                ),
+                tuple(row),
+            )
+            self.assertIn("--intent <submit|resubmit>", row[4])
+            self.assertIn(
+                "do not wait for a second pr-fact wake",
+                " ".join(row[4].lower().split()),
             )
         finally:
             con.close()
@@ -1201,6 +1252,9 @@ class SprintSkillTest(unittest.TestCase):
         reviewer = " ".join(bodies["sprint_rev"].lower().split())
         for guidance in (
             "bare one-line locator",
+            "the engine injects",
+            "--intent <submit|resubmit>",
+            "do not wait for a second pr-fact wake",
             "no scope narrative",
             "verification evidence",
             "review-focus steering",

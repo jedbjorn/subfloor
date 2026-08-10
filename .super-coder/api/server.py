@@ -2620,7 +2620,8 @@ class Handler(BaseHTTPRequestHandler):
                     sprint_id,
                     self._sprint_integer(body, "registered_pr_id"),
                     shell_id,
-                    readiness=body.get("readiness") or "",
+                    intent=body.get("intent"),
+                    readiness=body.get("readiness"),
                     idempotency_key=body.get("idempotency_key") or "",
                 )
                 return self._send(201 if receipt.created else 200, {
