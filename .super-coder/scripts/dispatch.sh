@@ -77,11 +77,13 @@ sc_platform_detect() {
   fi
   SC_PLATFORM_ID=""
   SC_PLATFORM_ID_LIKE=""
+  SC_PLATFORM_VERSION_ID=""
   if [ -r "$_platform_release" ]; then
     while IFS='=' read -r _platform_key _platform_value; do
       case "$_platform_key" in
         ID) SC_PLATFORM_ID="$(sc_platform_unquote "$_platform_value")" ;;
         ID_LIKE) SC_PLATFORM_ID_LIKE="$(sc_platform_unquote "$_platform_value")" ;;
+        VERSION_ID) SC_PLATFORM_VERSION_ID="$(sc_platform_unquote "$_platform_value")" ;;
       esac
     done < "$_platform_release"
   fi
@@ -89,8 +91,8 @@ sc_platform_detect() {
 
 sc_require_supported_host() {
   sc_platform_detect
-  case "$SC_PLATFORM_KERNEL:$SC_PLATFORM_ID" in
-    Linux:ubuntu|Linux:fedora|Linux:arch) return 0 ;;
+  case "$SC_PLATFORM_KERNEL:$SC_PLATFORM_ID:$SC_PLATFORM_VERSION_ID" in
+    Linux:ubuntu:24.04|Linux:fedora:42|Linux:arch:*) return 0 ;;
   esac
   case " $SC_PLATFORM_ID_LIKE " in
     *" arch ") [ "$SC_PLATFORM_KERNEL" = Linux ] && return 0 ;;

@@ -37,7 +37,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         )
         self.dispatch = scripts / "dispatch.sh"
         self.supported_release = self.root / "os-release"
-        self.supported_release.write_text("ID=ubuntu\n")
+        self.supported_release.write_text("ID=ubuntu\nVERSION_ID=24.04\n")
 
     def invoke(
         self,
@@ -111,8 +111,8 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
 
     def test_linux_allowlist_accepts_exact_supported_families(self) -> None:
         fixtures = {
-            "ubuntu": "ID=ubuntu\n",
-            "fedora": "ID=fedora\n",
+            "ubuntu-lts": "ID=ubuntu\nVERSION_ID=24.04\n",
+            "fedora-stable": "ID=fedora\nVERSION_ID=42\n",
             "arch": "ID=arch\n",
             "cachyos": "ID=cachyos\nID_LIKE=arch\n",
         }
@@ -131,6 +131,25 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                     "yes",
                 )
                 (self.root / ".super-coder/scripts/install-ran").unlink()
+
+    def test_release_allowlist_rejects_ubuntu_interim_and_fedora_rawhide(self) -> None:
+        python = self.sentinel_python()
+        fixtures = {
+            "ubuntu-interim": "ID=ubuntu\nVERSION_ID=25.04\n",
+            "fedora-rawhide": "ID=fedora\nVERSION_ID=rawhide\n",
+        }
+        for name, contents in fixtures.items():
+            with self.subTest(name=name):
+                release = self.os_release(name, contents)
+                completed = self.invoke(
+                    str(python), "install", kernel="Linux", os_release=release
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertIn("supported Linux VM", completed.stderr)
+                self.assertFalse((self.root / "python-ran").exists())
+                self.assertFalse(
+                    (self.root / ".super-coder/scripts/install-ran").exists()
+                )
 
     def test_unsupported_host_refuses_before_python_or_target_with_stable_bytes(self) -> None:
         release = self.os_release("misleading", "ID=notarch\nID_LIKE=notarch\n")

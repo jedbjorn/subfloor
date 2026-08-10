@@ -51,7 +51,7 @@ PY = sys.executable
 IS_MAC = platform.system() == "Darwin"  # guidance arms differ (colima/brew vs systemd/apt)
 
 
-def _platform_identity() -> tuple[str, str, str]:
+def _platform_identity() -> tuple[str, str, str, str]:
     """Return the kernel and os-release identity without guessing a distro."""
     kernel = (
         os.environ["SC_PLATFORM_UNAME"]
@@ -64,18 +64,25 @@ def _platform_identity() -> tuple[str, str, str]:
         with open(release, encoding="utf-8") as stream:
             for line in stream:
                 key, separator, value = line.rstrip("\n").partition("=")
-                if separator and key in {"ID", "ID_LIKE"}:
+                if separator and key in {"ID", "ID_LIKE", "VERSION_ID"}:
                     fields[key] = value.strip().strip('"').strip("'")
     except (OSError, UnicodeError):
         pass
-    return kernel, fields.get("ID", ""), fields.get("ID_LIKE", "")
+    return (
+        kernel,
+        fields.get("ID", ""),
+        fields.get("ID_LIKE", ""),
+        fields.get("VERSION_ID", ""),
+    )
 
 
 def require_supported_host() -> None:
     """Refuse unsupported hosts before installer imports or repository writes."""
-    kernel, distro_id, distro_like = _platform_identity()
+    kernel, distro_id, distro_like, version_id = _platform_identity()
     supported = kernel == "Linux" and (
-        distro_id in {"ubuntu", "fedora", "arch"}
+        (distro_id == "ubuntu" and version_id == "24.04")
+        or (distro_id == "fedora" and version_id == "42")
+        or distro_id == "arch"
         or "arch" in distro_like.split()
     )
     if supported:

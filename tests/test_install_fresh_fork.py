@@ -95,7 +95,7 @@ class FreshForkInstallTest(unittest.TestCase):
 
     def run_install(self, repo: Path, home: Path) -> subprocess.CompletedProcess[str]:
         release = home / "os-release"
-        release.write_text("ID=ubuntu\n")
+        release.write_text("ID=ubuntu\nVERSION_ID=24.04\n")
         return subprocess.run(
             [
                 sys.executable,
@@ -162,7 +162,7 @@ class FreshForkInstallTest(unittest.TestCase):
             ).stdout
             install = repo / ".super-coder" / "scripts" / "install.py"
             release = home / "os-release"
-            release.write_text("ID=ubuntu\n")
+            release.write_text("ID=ubuntu\nVERSION_ID=24.04\n")
             direct_entry = (
                 "import platform, runpy, sys; "
                 "sys.version_info = (3, 8, 20); "
@@ -204,10 +204,12 @@ class FreshForkInstallTest(unittest.TestCase):
 
     def test_direct_installer_platform_gate_matches_allowlist_without_mutation(self) -> None:
         fixtures = {
-            "ubuntu": ("Linux", "ID=ubuntu\n", True),
-            "fedora": ("Linux", "ID=fedora\n", True),
+            "ubuntu-lts": ("Linux", "ID=ubuntu\nVERSION_ID=24.04\n", True),
+            "fedora-stable": ("Linux", "ID=fedora\nVERSION_ID=42\n", True),
             "arch": ("Linux", "ID=arch\n", True),
             "cachyos": ("Linux", "ID=cachyos\nID_LIKE=arch\n", True),
+            "ubuntu-interim": ("Linux", "ID=ubuntu\nVERSION_ID=25.04\n", False),
+            "fedora-rawhide": ("Linux", "ID=fedora\nVERSION_ID=rawhide\n", False),
             "unknown-linux": ("Linux", "ID=notarch\nID_LIKE=notarch\n", False),
             "missing-os-release": ("Linux", None, False),
             "darwin": ("Darwin", "ID=macos\n", False),
