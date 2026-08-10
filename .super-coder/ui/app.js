@@ -5074,6 +5074,18 @@ const SPRINT_COLUMNS = [
   ["blocked", "Blocked"],
 ];
 
+const SPRINT_HEALTH_LABELS = {
+  staged: "Staged",
+  progressing: "Progressing",
+  waiting_dependency: "Waiting on dependency",
+  waiting_external: "Waiting externally",
+  waiting_decision: "Decision waiting",
+  attention: "Needs attention",
+  infrastructure: "Infrastructure failure",
+  paused: "Paused",
+  terminal: "Terminal",
+};
+
 function sprintStopPolling() {
   if (sprintPollTimer !== null) clearTimeout(sprintPollTimer);
   sprintPollTimer = null;
@@ -5169,6 +5181,59 @@ function sprintElapsed(sprint) {
   const minutes = Math.floor((seconds % 3600) / 60);
   return [days ? `${days}d` : "", hours ? `${hours}h` : "", `${minutes}m`]
     .filter(Boolean).join(" ");
+}
+
+function sprintHealthLabel(value) {
+  if (!value) return "Unknown";
+  return SPRINT_HEALTH_LABELS[value]
+    || String(value).replaceAll("_", " ").replace(/^./, (letter) => letter.toUpperCase());
+}
+
+function sprintHealthAge(seconds) {
+  if (seconds === null || seconds === undefined || !Number.isFinite(Number(seconds)))
+    return "age unavailable";
+  const exact = Math.max(0, Math.floor(Number(seconds)));
+  if (exact < 60) return `${exact}s`;
+  const days = Math.floor(exact / 86400);
+  const hours = Math.floor((exact % 86400) / 3600);
+  const minutes = Math.floor((exact % 3600) / 60);
+  const compact = [days ? `${days}d` : "", hours ? `${hours}h` : "", minutes ? `${minutes}m` : ""]
+    .filter(Boolean).slice(0, 2).join(" ");
+  return `${compact} (${exact}s)`;
+}
+
+function sprintEvidenceAge(value) {
+  if (!value) return "fact age unavailable";
+  const parsed = new Date(String(value).replace(" ", "T") + (String(value).includes("Z") ? "" : "Z"));
+  if (Number.isNaN(parsed.getTime())) return "fact age unavailable";
+  return `fact ${sprintHealthAge(Math.max(0, Math.floor((Date.now() - parsed.getTime()) / 1000)))} old`;
+}
+
+function sprintOwnerLabel(owner) {
+  const participants = owner?.participants || [];
+  if (!participants.length) return "No assigned owner";
+  const labels = participants.map((person) => `${person.role} ${person.shortname}`);
+  return labels.join(owner.mode === "single" ? "" : " or ");
+}
+
+function sprintEvidenceLabel(evidence) {
+  if (!evidence) return "No durable evidence";
+  const kind = String(evidence.kind || "evidence").replaceAll("_", " ");
+  return `${kind} #${evidence.id} · ${sprintTimestamp(evidence.at)} · ${sprintEvidenceAge(evidence.at)}`;
+}
+
+function sprintNextEventLabel(nextEvent) {
+  if (!nextEvent) return "No next event recorded";
+  return `${nextEvent.code}: ${nextEvent.detail}`;
+}
+
+function sprintUnitList(ids, empty = "None") {
+  return ids?.length ? ids.map((id) => `U${id}`).join(", ") : empty;
+}
+
+function sprintFindHealthMessage(snapshot, messageId) {
+  return (snapshot.health_messages || []).find(
+    (message) => message.message_id === messageId) || null;
 }
 
 function sprintParticipantLink(person) {
@@ -5392,6 +5457,194 @@ function sprintActionButtons(sprint) {
   return row;
 }
 
+function openSprintHealthMessageModal(messageId, root, snapshot) {
+  const message = sprintFindHealthMessage(snapshot, messageId);
+  const has = (key) => message && Object.prototype.hasOwnProperty.call(message, key);
+  const scope = message?.scope === "work_unit" && message.work_unit_id !== null
+    ? `Work unit U${message.work_unit_id}`
+    : message?.scope === "sprint" ? "Sprint" : "Unavailable";
+  const facts = el("div", { className: "grid2 sprint-unit-facts" },
+    el("span", { className: "k" }, "message"), el("span", {}, `#${messageId}`),
+    el("span", { className: "k" }, "scope"), el("span", {}, scope),
+    el("span", { className: "k" }, "health root"), el("span", {}, root.root_id));
+  const body = el("div", { className: "sprint-unit-detail" }, facts);
+  if (message) {
+    const sender = message.sender?.shortname || "system";
+    const recipient = message.recipient?.shortname || "Unavailable";
+    const replyTo = !has("reply_to_message_id") ? "Unavailable"
+      : message.reply_to_message_id === null ? "None" : `#${message.reply_to_message_id}`;
+    const linkedReplyIds = has("linked_reply_message_ids")
+      ? message.linked_reply_message_ids : null;
+    const linkedReplies = linkedReplyIds === null ? "Unavailable"
+      : linkedReplyIds.length ? linkedReplyIds.map((id) => `#${id}`).join(", ") : "None";
+    const linkedReplySuffix = message.linked_replies_truncated
+      ? ` (showing ${linkedReplyIds.length} of ${message.linked_reply_count})` : "";
+    body.append(el("div", { className: "grid2 sprint-unit-facts" },
+      el("span", { className: "k" }, "route"), el("span", {}, `${sender} → ${recipient}`),
+      el("span", { className: "k" }, "kind"), el("span", {}, has("kind") ? String(message.kind) : "Unavailable"),
+      el("span", { className: "k" }, "intent"), el("span", {}, has("intent") ? String(message.intent) : "Unavailable"),
+      el("span", { className: "k" }, "requires reply"), el("span", {},
+        message.requires_reply === true ? "yes" : message.requires_reply === false ? "no" : "Unavailable"),
+      el("span", { className: "k" }, "reply to"), el("span", {}, replyTo),
+      el("span", { className: "k" }, "linked replies"), el("span", {}, linkedReplies + linkedReplySuffix),
+      el("span", { className: "k" }, "created"), el("span", {},
+        has("created_at") ? sprintTimestamp(message.created_at) : "Unavailable"),
+      el("span", { className: "k" }, "delivered"), el("span", {},
+        !has("delivered_at") ? "Unavailable" : message.delivered_at
+          ? sprintTimestamp(message.delivered_at) : "Not delivered"),
+      el("span", { className: "k" }, "read"), el("span", {},
+        !has("read_at") ? "Unavailable" : message.read_at
+          ? sprintTimestamp(message.read_at) : "Unread")),
+    el("h3", {}, "Bounded message body"),
+    el("div", { className: "sprint-long-text" }, message.body));
+  } else {
+    body.append(el("div", { className: "muted sprint-health-message-note" },
+      "Durable message detail is unavailable in this snapshot."));
+  }
+  const closeButton = el("button", { className: "act", type: "button", textContent: "Close" });
+  const close = openModal({
+    title: `Message ${messageId} · health evidence`,
+    bodyNode: body,
+    footerStart: el("span", { className: "muted" }, `Sprint ${snapshot.sprint.sprint_id}`),
+    footerEnd: closeButton,
+    width: 680,
+    height: 600,
+  });
+  closeButton.onclick = close;
+}
+
+function sprintHealthMessageRefs(refs, root, snapshot) {
+  const wrap = el("div", { className: "sprint-health-message-refs" });
+  if (!refs?.length) {
+    wrap.append(el("span", { className: "muted" }, "None"));
+    return wrap;
+  }
+  for (const ref of refs) {
+    const button = el("button", {
+      className: "act sprint-health-message-ref",
+      type: "button",
+      textContent: `Message ${ref.message_id}`,
+      title: `Open bounded detail for message ${ref.message_id}`,
+    });
+    button.onclick = () => openSprintHealthMessageModal(ref.message_id, root, snapshot);
+    wrap.append(button);
+  }
+  return wrap;
+}
+
+function openSprintHealthRootModal(root, snapshot) {
+  const scope = root.scope === "work_unit" ? `Work unit U${root.work_unit_id}`
+    : root.root_id.startsWith("sprint:closeout:") ? "Sprint closeout" : "Sprint";
+  const body = el("div", { className: "sprint-unit-detail" },
+    el("div", { className: "grid2 sprint-unit-facts" },
+      el("span", { className: "k" }, "root id"), el("span", {}, root.root_id),
+      el("span", { className: "k" }, "scope"), el("span", {}, scope),
+      el("span", { className: "k" }, "condition"), el("span", {}, sprintHealthLabel(root.condition)),
+      el("span", { className: "k" }, "cause"), el("span", {}, root.cause),
+      el("span", { className: "k" }, "episode since"), el("span", {}, root.since ? sprintTimestamp(root.since) : "Not running"),
+      el("span", { className: "k" }, "episode age"), el("span", {}, sprintHealthAge(root.age_seconds)),
+      el("span", { className: "k" }, "owner"), el("span", {}, sprintOwnerLabel(root.owner)),
+      el("span", { className: "k" }, "last evidence"), el("span", {}, sprintEvidenceLabel(root.last_evidence)),
+      el("span", { className: "k" }, "next event"), el("span", {}, sprintNextEventLabel(root.next_expected_event))),
+    el("h3", {}, "Message references"), sprintHealthMessageRefs(root.message_refs, root, snapshot));
+  let close;
+  if (root.work_unit_id !== null && root.work_unit_id !== undefined) {
+    const unit = snapshot.work_units.find((item) => item.work_unit_id === root.work_unit_id);
+    if (unit) {
+      const openUnit = el("button", {
+        className: "act", type: "button", textContent: `Open U${root.work_unit_id}`,
+      });
+      openUnit.onclick = () => { close(); openSprintUnitModal(unit, snapshot); };
+      body.append(el("h3", {}, "Work unit"), openUnit);
+    }
+  }
+  const closeButton = el("button", { className: "act", type: "button", textContent: "Close" });
+  close = openModal({
+    title: `${sprintHealthLabel(root.condition)} · ${root.root_id}`,
+    bodyNode: body,
+    footerStart: el("span", { className: "muted" }, `Sprint ${snapshot.sprint.sprint_id}`),
+    footerEnd: closeButton,
+    width: 760,
+    height: 660,
+  });
+  closeButton.onclick = close;
+}
+
+function sprintHealthRootStrip(health, snapshot) {
+  const roots = health?.root_causes || [];
+  if (!roots.length) return null;
+  const list = el("div", { className: "sprint-health-roots" });
+  list.setAttribute("role", "list");
+  list.setAttribute("aria-label", "Sprint health root causes");
+  for (const root of roots) {
+    const scope = root.scope === "work_unit" ? `U${root.work_unit_id}`
+      : root.root_id.startsWith("sprint:closeout:") ? "Sprint closeout" : "Sprint";
+    const button = el("button", {
+      className: `sprint-health-root sprint-health-${root.condition}`,
+      type: "button",
+      title: `Open health evidence for ${root.root_id}`,
+    });
+    button.dataset.rootId = root.root_id;
+    button.append(
+      el("span", { className: "sprint-health-root-head" },
+        el("span", { className: `pill sprint-health-${root.condition}` }, sprintHealthLabel(root.condition)),
+        el("span", { className: "sprint-health-root-scope" }, scope),
+        el("span", { className: "mono" }, root.cause)),
+      el("span", { className: "sprint-health-root-meta" },
+        `Episode ${sprintHealthAge(root.age_seconds)} · ${sprintOwnerLabel(root.owner)}`),
+      el("span", { className: "sprint-health-root-meta" }, sprintEvidenceLabel(root.last_evidence)),
+      el("span", { className: "sprint-health-root-next" }, sprintNextEventLabel(root.next_expected_event)));
+    button.onclick = () => openSprintHealthRootModal(root, snapshot);
+    const item = el("div");
+    item.setAttribute("role", "listitem");
+    item.append(button);
+    list.append(item);
+  }
+  const total = health.root_cause_count ?? roots.length;
+  const wrap = el("section", { className: "sprint-health-strip" },
+    el("div", { className: "sprint-health-strip-head" },
+      el("strong", {}, `Health roots (${total})`),
+      health.root_causes_truncated
+        ? el("span", { className: "muted" }, `Showing ${roots.length} of ${total}`)
+        : ""),
+    list);
+  return wrap;
+}
+
+function sprintUnitHealthDetail(unit, snapshot) {
+  const health = unit.health;
+  if (!health) return null;
+  const root = {
+    root_id: `work_unit:${unit.work_unit_id}:${health.cause}`,
+    scope: "work_unit",
+    work_unit_id: unit.work_unit_id,
+  };
+  const detail = el("section", { className: "sprint-unit-health-detail" },
+    el("h3", {}, "Progress carrier"),
+    el("div", { className: "grid2 sprint-unit-facts" },
+      el("span", { className: "k" }, "condition"), el("span", {}, sprintHealthLabel(health.condition)),
+      el("span", { className: "k" }, "cause"), el("span", {}, health.cause),
+      el("span", { className: "k" }, "episode since"), el("span", {}, health.since ? sprintTimestamp(health.since) : "Not running"),
+      el("span", { className: "k" }, "episode age"), el("span", {}, sprintHealthAge(health.age_seconds)),
+      el("span", { className: "k" }, "owner"), el("span", {}, sprintOwnerLabel(health.owner)),
+      el("span", { className: "k" }, "activity"), el("span", {}, health.activity || "unknown"),
+      el("span", { className: "k" }, "last evidence"), el("span", {}, sprintEvidenceLabel(health.last_evidence)),
+      el("span", { className: "k" }, "next event"), el("span", {}, sprintNextEventLabel(health.next_expected_event)),
+      el("span", { className: "k" }, "waiting on"), el("span", {}, sprintUnitList(health.waiting_on_work_unit_ids)),
+      el("span", { className: "k" }, "propagated roots"), el("span", {}, sprintUnitList(health.root_work_unit_ids))));
+  if (health.capacity) detail.append(el("div", { className: "sprint-health-capacity" },
+    `Capacity: ${health.capacity.provider || "unknown provider"} · ${health.capacity.state}`,
+    health.capacity.age_seconds === null ? " · reading age unavailable" : ` · reading ${sprintHealthAge(health.capacity.age_seconds)} old`,
+    health.capacity.reset_at ? ` · resets ${sprintTimestamp(health.capacity.reset_at)}` : ""));
+  if (health.message_refs?.length) detail.append(
+    el("h3", {}, "Carrier messages"), sprintHealthMessageRefs(health.message_refs, root, snapshot));
+  if (health.unreadable_signals?.length) detail.append(
+    el("h3", {}, "Unreadable evidence"),
+    ...health.unreadable_signals.map((signal) => el("div", { className: "muted" },
+      `${signal.kind} #${signal.id}${signal.at ? ` · ${sprintTimestamp(signal.at)}` : ""}`)));
+  return detail;
+}
+
 function openSprintUnitModal(unit, snapshot) {
   sprintOpenUnitId = unit.work_unit_id;
   const body = el("div", { className: "sprint-unit-detail" });
@@ -5405,7 +5658,10 @@ function openSprintUnitModal(unit, snapshot) {
     el("span", {}, unit.prerequisite_ids.length ? unit.prerequisite_ids.map((id) => `U${id}`).join(", ") : "None"),
     el("span", { className: "k" }, "dependents"),
     el("span", {}, unit.dependent_ids.length ? unit.dependent_ids.map((id) => `U${id}`).join(", ") : "None"));
-  body.append(facts,
+  body.append(facts);
+  const healthDetail = sprintUnitHealthDetail(unit, snapshot);
+  if (healthDetail) body.append(healthDetail);
+  body.append(
     el("h3", {}, "Expected output"), el("div", { className: "sprint-long-text" }, unit.expected_output));
   if (unit.completion_result) body.append(
     el("h3", {}, unit.disposition === "cancelled" ? "Cancellation result" : "Completion result"),
@@ -5458,6 +5714,7 @@ function sprintWorkUnitCard(unit, snapshot) {
   });
   card.dataset.unitId = String(unit.work_unit_id);
   const pr = unit.pull_requests[0];
+  const health = unit.health;
   card.append(
     el("div", { className: "sprint-unit-title" },
       el("span", { className: "sprint-unit-id" }, `U${unit.work_unit_id}`),
@@ -5474,6 +5731,25 @@ function sprintWorkUnitCard(unit, snapshot) {
     el("div", { className: "sprint-unit-foot" },
       el("span", {}, unit.output_kind.replaceAll("_", " ")),
       el("span", {}, pr ? `PR #${pr.pr_number} · ${pr.normalized_state || "registered"}` : "No PR")));
+  if (snapshot.sprint.lifecycle === "armed"
+      && !["completed", "cancelled"].includes(unit.disposition)
+      && health) {
+    card.append(el("div", {
+      className: `sprint-unit-health sprint-health-${health.condition}`,
+      title: `Health condition ${health.condition}; cause ${health.cause}; episode ${health.age_seconds ?? "unknown"} seconds`,
+    },
+    el("span", { className: `pill sprint-health-${health.condition}` }, sprintHealthLabel(health.condition)),
+    el("span", { className: "mono" }, health.cause),
+    el("span", { className: "sprint-unit-health-age" }, sprintHealthAge(health.age_seconds))));
+    if (health.waiting_on_work_unit_ids?.length || health.root_work_unit_ids?.length) {
+      card.append(el("div", { className: "sprint-unit-health-deps" },
+        health.waiting_on_work_unit_ids?.length
+          ? `Waiting on ${sprintUnitList(health.waiting_on_work_unit_ids)}` : "",
+        health.waiting_on_work_unit_ids?.length && health.root_work_unit_ids?.length ? " · " : "",
+        health.root_work_unit_ids?.length
+          ? `Root causes ${sprintUnitList(health.root_work_unit_ids)}` : ""));
+    }
+  }
   if (unit.disposition === "cancelled") card.append(
     el("div", { className: "sprint-cancelled-note" }, "Cancelled — not completed"));
   if (unit.pickup) card.append(
@@ -5489,7 +5765,36 @@ function sprintWorkUnitCard(unit, snapshot) {
   return card;
 }
 
-function sprintWireGraph(wrap, canvas, svg, cardById, dependencies) {
+function sprintHealthPathEdgeKeys(unitId, units, dependencies) {
+  const byId = Object.fromEntries(units.map((unit) => [String(unit.work_unit_id), unit]));
+  const focused = byId[String(unitId)];
+  const roots = new Set((focused?.health?.root_work_unit_ids || []).map(String));
+  if (!roots.size) return new Set();
+  const ancestors = new Set([String(unitId)]);
+  const pending = [String(unitId)];
+  while (pending.length) {
+    const target = pending.pop();
+    for (const edge of dependencies) {
+      if (String(edge.work_unit_id) !== target) continue;
+      const source = String(edge.depends_on_work_unit_id);
+      if (!ancestors.has(source)) { ancestors.add(source); pending.push(source); }
+    }
+  }
+  const focusedIsRoot = roots.has(String(unitId));
+  const result = new Set();
+  for (const edge of dependencies) {
+    const source = String(edge.depends_on_work_unit_id);
+    const target = String(edge.work_unit_id);
+    const targetRoots = new Set((byId[target]?.health?.root_work_unit_ids || []).map(String));
+    const sourceRoots = new Set((byId[source]?.health?.root_work_unit_ids || []).map(String));
+    const carriesFocusedRoot = [...roots].some((root) => targetRoots.has(root) && sourceRoots.has(root));
+    if (carriesFocusedRoot && (focusedIsRoot || ancestors.has(target)))
+      result.add(`${source}:${target}`);
+  }
+  return result;
+}
+
+function sprintWireGraph(wrap, canvas, svg, cardById, dependencies, units) {
   const draw = () => {
     if (!canvas.isConnected) return;
     const base = canvas.getBoundingClientRect();
@@ -5515,6 +5820,7 @@ function sprintWireGraph(wrap, canvas, svg, cardById, dependencies) {
       path.setAttribute("class", "sprint-wire");
       path.dataset.from = String(edge.depends_on_work_unit_id);
       path.dataset.to = String(edge.work_unit_id);
+      path.dataset.edgeKey = `${edge.depends_on_work_unit_id}:${edge.work_unit_id}`;
       svg.append(path);
     }
   };
@@ -5524,8 +5830,10 @@ function sprintWireGraph(wrap, canvas, svg, cardById, dependencies) {
 
   const highlight = (unitId, on) => {
     const direct = new Set([String(unitId)]);
+    const healthPaths = on ? sprintHealthPathEdgeKeys(unitId, units, dependencies) : new Set();
     for (const path of svg.querySelectorAll(".sprint-wire")) {
-      const lit = path.dataset.from === String(unitId) || path.dataset.to === String(unitId);
+      const lit = path.dataset.from === String(unitId) || path.dataset.to === String(unitId)
+        || healthPaths.has(path.dataset.edgeKey);
       path.classList.toggle("lit", on && lit);
       if (lit) { direct.add(path.dataset.from); direct.add(path.dataset.to); }
     }
@@ -5542,10 +5850,17 @@ function sprintWireGraph(wrap, canvas, svg, cardById, dependencies) {
 
 function sprintBoardNode(snapshot) {
   const sprint = snapshot.sprint;
+  const health = snapshot.health;
   const header = el("div", { className: "sprint-board-head" });
   const heading = el("div", { className: "sprint-heading" },
     el("h2", {}, `Sprint ${sprint.sprint_id}`),
     el("span", { className: `pill sprint-${sprint.lifecycle}` }, sprint.lifecycle));
+  if (health?.condition) heading.append(
+    el("span", {
+      className: `pill sprint-health-badge sprint-health-${health.condition}`,
+      title: `Sprint health ${health.condition}; episode ${health.age_seconds ?? "unknown"} seconds`,
+    }, sprintHealthLabel(health.condition)),
+    el("span", { className: "sprint-health-age" }, `Episode ${sprintHealthAge(health.age_seconds)}`));
   const feature = el("a", {
     href: `#roadmap-feature-${sprint.feature.feature_id}`,
     textContent: sprint.feature.title,
@@ -5584,6 +5899,8 @@ function sprintBoardNode(snapshot) {
       `message ${exhausted.message_id} · wake ${exhausted.wake_id} · `,
       `attempt ${exhausted.attempt_count}`),
     el("span", {}, exhausted.recovery_instruction)));
+  const rootStrip = sprintHealthRootStrip(health, snapshot);
+  if (rootStrip) header.append(rootStrip);
 
   const scroll = el("div", { className: "sprint-board-scroll" });
   const canvas = el("div", { className: "sprint-board-canvas" });
@@ -5608,7 +5925,7 @@ function sprintBoardNode(snapshot) {
   }
   canvas.append(svg, columns);
   scroll.append(canvas);
-  sprintWireGraph(scroll, canvas, svg, cardById, snapshot.dependencies);
+  sprintWireGraph(scroll, canvas, svg, cardById, snapshot.dependencies, snapshot.work_units);
   return el("div", { className: "sprint-board-view" }, header, scroll,
     sprintFeedsNode(sprint.sprint_id));
 }
