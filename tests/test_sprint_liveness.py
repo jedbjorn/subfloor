@@ -14,6 +14,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 MIGRATIONS = ENGINE / "migrations"
+RETIREMENT_MIGRATION = MIGRATIONS / "0193_retire_sprint_liveness_writers.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import sprint_domain
@@ -24,6 +25,8 @@ import sprint_message_delivery
 def apply_schema(con: sqlite3.Connection) -> None:
     con.executescript((ENGINE / "schema.sql").read_text())
     for migration in sorted(MIGRATIONS.glob("*.sql")):
+        if migration == RETIREMENT_MIGRATION:
+            break
         con.executescript(migration.read_text())
     con.execute("PRAGMA foreign_keys=ON")
 
@@ -377,6 +380,56 @@ class SprintLivenessCase(unittest.TestCase):
         )
         self.con.commit()
         return receipt.message_id
+
+    def test_retirement_preserves_history_and_stops_new_expectations(self) -> None:
+        historical = dict(self.expectation())
+
+        self.con.executescript(RETIREMENT_MIGRATION.read_text())
+        self.con.executescript(RETIREMENT_MIGRATION.read_text())
+
+        next_message_id = int(
+            self.con.execute(
+                "INSERT INTO wake_message "
+                "(sprint_id,sender_shell_id,receiver_shell_id,from_participant_id,"
+                "to_participant_id,work_unit_id,message_kind,body,declared_type,"
+                "actionable,disposition,idempotency_key) "
+                "VALUES (?,3,2,?,?,?,?,'Review this head',"
+                "'force-new',1,'pending','retirement-review-request')",
+                (
+                    self.sprint_id,
+                    self.planner_id,
+                    self.reviewer_id,
+                    self.unit_id,
+                    "review_request",
+                ),
+            ).lastrowid
+        )
+        self.con.execute(
+            "UPDATE wake_message SET disposition='accepted',"
+            "read_at='2026-08-10 12:00:00' WHERE message_id=?",
+            (next_message_id,),
+        )
+
+        self.assertEqual(historical, dict(self.expectation()))
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT 1 FROM sprint_liveness_expectations WHERE message_id=?",
+                (next_message_id,),
+            ).fetchone()
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_liveness_expectations"
+            ).fetchone()[0],
+        )
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                "AND name='trg_sprint_liveness_acceptance'"
+            ).fetchone()
+        )
+        self.assertEqual([], self.con.execute("PRAGMA foreign_key_check").fetchall())
 
 
 class SuppressorCollectorTest(SprintLivenessCase):
@@ -1614,7 +1667,6 @@ class MigrationGateTest(unittest.TestCase):
             terminal_message_id, [row["message_id"] for row in expectations]
         )
         self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
-
 
 if __name__ == "__main__":
     unittest.main()
