@@ -254,8 +254,31 @@ class FreshForkInstallTest(unittest.TestCase):
             repo, home = self.prepare_repo(raw)
             release = Path(raw) / "invalid-os-release"
             release.write_bytes(b"\xff\n")
+            sentinel = home / "python-sentinel"
+            sentinel.write_text(
+                "#!/bin/sh\n"
+                f"touch {home / 'python-ran'}\n"
+                "exit 99\n"
+            )
+            sentinel.chmod(sentinel.stat().st_mode | 0o100)
             before_repo = self.snapshot_tree(repo)
             before_home = self.snapshot_tree(home)
+            shell = subprocess.run(
+                ["sh", str(repo / ".super-coder/scripts/dispatch.sh"), "install"],
+                cwd=repo,
+                env={
+                    **os.environ,
+                    "HOME": str(home),
+                    "SC_CALLER_ROOT": str(repo),
+                    "SC_PYTHON": str(sentinel),
+                    "SC_PLATFORM_UNAME": "Linux",
+                    "SC_PLATFORM_OS_RELEASE": str(release),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
             result = subprocess.run(
                 [
                     sys.executable,
@@ -274,8 +297,11 @@ class FreshForkInstallTest(unittest.TestCase):
                 text=True,
                 check=False,
             )
+            self.assertEqual(shell.returncode, 1)
             self.assertEqual(result.returncode, 1)
+            self.assertEqual(shell.stderr, result.stderr)
             self.assertIn("ID=unknown; ID_LIKE=unknown", result.stderr)
+            self.assertFalse((home / "python-ran").exists())
             self.assert_direct_refusal_is_pristine(
                 repo, home, before_repo, before_home
             )
