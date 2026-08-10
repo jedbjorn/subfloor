@@ -449,14 +449,36 @@ artifact directory are working material only.
 Pause, cancel, re-enter, and abort are Reviewer decisions and Planner actions.
 A valid control decision arrives as a durable Reviewer → Planner Re-enter
 message and names the decision, evidence, target ids, reason, and exact
-requested transition. Clean conformance instead closes atomically and sends an
-informational engine-wide completion receipt. Mark each handled Sprint message
-through `accept`, verify it came from the assigned
-Reviewer, and execute that transition without re-adjudicating the decision.
-Record the decision message id and action receipt together.
-Re-run `sc sprint inbox --sprint <id>` before acting on any Sprint-scoped
-control decision; the engine-wide completion receipt requires no Sprint inbox
-acceptance.
+requested transition. Resolve every required-reply control decision through its
+original message before acting. Complete this order without reordering:
+
+1. Re-run `sc sprint inbox --sprint <id>`, verify the decision came from the
+   assigned Reviewer, and retain its message id.
+2. Put a short acknowledgement of the exact requested transition in a body
+   file, then send the linked reply:
+
+```text
+sc sprint send --sprint <id> --to <reviewer-shortname> --body-file <path> \
+  --intent information --reply-to <decision-message-id> \
+  --key <stable-control-reply-key>
+```
+
+3. Require the reply command to confirm its durable message and wake. Retry the
+   same command and key if it fails or does not confirm both.
+4. Mark the original decision accepted and require a successful receipt:
+
+```text
+sc sprint accept --sprint <id> --message <decision-message-id>
+```
+
+5. Only after acceptance confirms, execute the requested transition without
+   re-adjudicating the decision. The linked reply must precede any pause or
+   abort that makes the Sprint relay unavailable.
+
+Record the decision message id, reply receipt, acceptance receipt, and action
+receipt together. Clean conformance instead closes atomically and sends an
+informational engine-wide completion receipt; it requires no linked reply or
+Sprint inbox acceptance.
 
 The FnB board-level override from decision #46 is unaffected: a live FnB
 instruction may direct or supersede any action. Name that override in the

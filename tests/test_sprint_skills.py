@@ -1053,6 +1053,31 @@ class SprintSkillTest(unittest.TestCase):
             self.assertIn("fnb board-level override", normalized)
             self.assertIn("decision #46", normalized)
 
+    def test_planner_control_decisions_reply_before_accept_and_action(self):
+        planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()
+        control = planner[
+            planner.index("## Reviewer decision actions"):
+            planner.index("The FnB board-level override")
+        ]
+
+        linked_reply = "--reply-to <decision-message-id>"
+        accept = "sc sprint accept --sprint <id> --message <decision-message-id>"
+        action = "execute the requested transition"
+        self.assertIn(linked_reply, control)
+        self.assertIn(accept, control)
+        self.assertIn(action, control)
+        self.assertLess(control.index(linked_reply), control.index(accept))
+        self.assertLess(control.index(accept), control.index(action))
+        self.assertIn(
+            "reply command to confirm its durable message and wake",
+            control,
+        )
+        self.assertIn(
+            "linked reply must precede any pause or\n"
+            "   abort that makes the Sprint relay unavailable",
+            control,
+        )
+
     def test_developer_reports_integrity_concerns_without_taking_pause_action(self):
         developer = (ASSETS / "sprint_dev" / "SKILL.md").read_text()
         normalized = " ".join(developer.lower().split())
