@@ -23,7 +23,7 @@ PYTHON = ROOT / ".venv" / "bin" / "python"
 MUTATIONS = [
     (
         "M1 an exact live run no longer wins over exhausted quota or silence",
-        "historical_quota_escalations or rootless_progress_and_external",
+        "sanitized_historical_corpus or rootless_progress_and_external",
         '        if live_match is not None and disposition != "ready":',
         '        if False and live_match is not None and disposition != "ready":',
     ),
@@ -45,7 +45,7 @@ MUTATIONS = [
     ),
     (
         "M3 a fresh exhausted provider is projected as available",
-        "historical_quota_escalations",
+        "sanitized_historical_corpus",
         (
             '            else "exhausted"\n'
             "            if exhausted\n"
@@ -76,6 +76,45 @@ MUTATIONS = [
         "plural_dependency_roots",
         "                value = sorted(set(value))",
         "                value = sorted(set(value))[:1]",
+    ),
+    (
+        "M6 dependency roots propagate only one hop",
+        "chain_fork_multilevel_fanin",
+        "                    value.extend(roots(upstream))",
+        (
+            "                    value.extend("
+            "[upstream] if candidates[upstream].condition in _ROOT_CONDITIONS else [])"
+        ),
+    ),
+    (
+        "M7 an unowned red PR loses its stable cause",
+        "pr_and_reply_carrier_matrix",
+        '                    "pr_red_unowned" if overdue else "no_progress_grace",',
+        '                    "no_progress_carrier" if overdue else "no_progress_grace",',
+    ),
+    (
+        "M8 an unread required reply is mislabeled as read",
+        "pr_and_reply_carrier_matrix",
+        (
+            '        cause = "reply_unread" if is_unread else '
+            '"reply_overdue" if overdue else "reply_waiting"'
+        ),
+        (
+            '        cause = "reply_waiting" if is_unread else '
+            '"reply_overdue" if overdue else "reply_waiting"'
+        ),
+    ),
+    (
+        "M9 a stale runtime reports the missing-runtime cause",
+        "machinery_carrier_matrix",
+        (
+            '        return "runtime_stale", _max_stamp(floor, due), '
+            'Evidence("runtime_heartbeat", 0, beat, 5)'
+        ),
+        (
+            '        return "runtime_missing", _max_stamp(floor, due), '
+            'Evidence("runtime_heartbeat", 0, beat, 5)'
+        ),
     ),
 ]
 

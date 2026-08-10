@@ -22,6 +22,9 @@ from conversation_adapters import NativeTurn
 from conversation_broker import BrokerStore
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+HISTORICAL_REPLAY = (
+    ROOT / "tests" / "fixtures" / "sprint_health" / "historical_replay.json"
+)
 
 
 def apply_schema(con: sqlite3.Connection) -> None:
@@ -72,13 +75,15 @@ class SprintHealthCase(unittest.TestCase):
         *,
         lifecycle: str = "armed",
         armed_at: str = "2026-08-10 11:45:00",
+        conversation_generation: str = "",
     ) -> int:
         sprint_id = int(
             self.con.execute(
                 "INSERT INTO sprints "
-                "(feature_id,originating_planner_shell_id,merge_grant_enabled,created_at) "
-                "VALUES (?,1,1,'2026-08-10 09:00:00')",
-                (self.feature_id,),
+                "(feature_id,originating_planner_shell_id,merge_grant_enabled,"
+                "conversation_generation,created_at) "
+                "VALUES (?,1,1,?,'2026-08-10 09:00:00')",
+                (self.feature_id, conversation_generation),
             ).lastrowid
         )
         for shell_id, role in [(1, "planner"), (2, "reviewer")] + [
@@ -303,6 +308,9 @@ class SprintHealthCase(unittest.TestCase):
         creation_wake_id: int | None = None,
         creation_generation: int | None = None,
         provider: str | None = None,
+        started_at: str = "2026-08-10 11:55:00",
+        heartbeat_at: str = "2026-08-10 11:59:59",
+        lease_expires_at: str = "2026-08-10 12:10:00",
     ) -> int:
         generation = self.con.execute(
             "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
@@ -355,23 +363,29 @@ class SprintHealthCase(unittest.TestCase):
                 "INSERT INTO conversation_runs "
                 "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
                 "lease_expires_at,started_at,heartbeat_at) "
-                "VALUES (?,?,?,'running','test','2026-08-10 12:10:00',"
-                "'2026-08-10 11:55:00','2026-08-10 11:59:59')",
-                (conversation, shell_id, prompt_id),
+                "VALUES (?,?,?,'running','test',?,?,?)",
+                (
+                    conversation,
+                    shell_id,
+                    prompt_id,
+                    lease_expires_at,
+                    started_at,
+                    heartbeat_at,
+                ),
             ).lastrowid
         )
         self.con.execute(
             "INSERT INTO sprint_wake_attempts "
             "(wake_id,attempt_number,target_conversation_id,native_run_ref,outcome,attempted_at) "
-            "VALUES (?,1,?,?,'delivered','2026-08-10 11:55:00')",
-            (wake_id, conversation, f"conversation-run:{run_id}"),
+            "VALUES (?,1,?,?,'delivered',?)",
+            (wake_id, conversation, f"conversation-run:{run_id}", started_at),
         )
         if active:
             self.con.execute(
                 "INSERT INTO active_shell_chats "
                 "(shell_id,chat_id,process_pid,process_start_ticks,updated_at) "
-                "VALUES (?,?,123,456,'2026-08-10 11:59:59')",
-                (shell_id, conversation),
+                "VALUES (?,?,123,456,?)",
+                (shell_id, conversation, heartbeat_at),
             )
         return run_id
 
@@ -432,6 +446,22 @@ class SprintHealthCase(unittest.TestCase):
         self.con.commit()
         return sprint_health.SprintHealthProjection(self.con, now=now).project(
             self.sprint_id
+        )
+
+    def replace_armed_sprint(
+        self,
+        *,
+        armed_at: str,
+        conversation_generation: str = "",
+    ) -> int:
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='completed',terminal_outcome='success',"
+            "completed_at=? WHERE lifecycle='armed'",
+            (armed_at,),
+        )
+        return self._new_sprint(
+            armed_at=armed_at,
+            conversation_generation=conversation_generation,
         )
 
     def test_lifecycle_gate_and_every_armed_entry_floor(self) -> None:
@@ -873,6 +903,343 @@ class SprintHealthCase(unittest.TestCase):
                 boundary["age_seconds"],
             ),
         )
+
+    def test_pr_and_reply_carrier_matrix_honors_floor_boundary_and_reset(self) -> None:
+        cases = (
+            ("red", "active", "pr_red_unowned", "developer_evidence"),
+            ("green", "active", "green_handoff_idle", "developer_evidence"),
+            ("green", "merge_ready", "merge_idle", "merge_observed"),
+            ("reply_unread", "active", "reply_unread", "linked_reply"),
+            ("reply_waiting", "active", "reply_overdue", "linked_reply"),
+            ("blocked", "blocked", "blocked_unowned", "blocker_resolved"),
+        )
+        before_at = datetime(2026, 8, 10, 11, 59, 59, tzinfo=timezone.utc)
+        boundary_at = datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
+        reset_before_at = datetime(2026, 8, 10, 12, 44, 59, tzinfo=timezone.utc)
+        reset_boundary_at = datetime(2026, 8, 10, 12, 45, 0, tzinfo=timezone.utc)
+
+        for index, (carrier, disposition, boundary_cause, next_code) in enumerate(cases):
+            with self.subTest(carrier=carrier):
+                self.sprint_id = self.replace_armed_sprint(
+                    armed_at="2026-08-10 11:30:00"
+                )
+                unit = self.add_unit(
+                    disposition, developer=3, updated_at="2026-08-10 10:00:00"
+                )
+                pr_id = None
+                reply_id = None
+                if carrier in {"red", "green"}:
+                    pr_id = self.add_pr(
+                        unit,
+                        carrier,
+                        at="2026-08-10 10:00:00",
+                        number=100 + index,
+                    )
+                    self.heartbeat("sprint-pr-watcher", "2026-08-10 13:00:00", 30)
+                elif carrier == "reply_unread":
+                    reply_id = self.add_message(
+                        unit_id=unit,
+                        receiver=1,
+                        delivered_at="2026-08-10 10:00:00",
+                        intent="question",
+                        requires_reply=True,
+                        created_at="2026-08-10 09:59:00",
+                    )
+                elif carrier == "reply_waiting":
+                    reply_id = self.add_message(
+                        unit_id=unit,
+                        receiver=1,
+                        delivered_at="2026-08-10 09:59:00",
+                        read_at="2026-08-10 10:00:00",
+                        intent="decision",
+                        requires_reply=True,
+                        created_at="2026-08-10 09:58:00",
+                    )
+
+                before = self.project(now=before_at)["work_units"][unit]
+                boundary = self.project(now=boundary_at)["work_units"][unit]
+                grace_cause = (
+                    "reply_unread"
+                    if carrier == "reply_unread"
+                    else "reply_waiting"
+                    if carrier == "reply_waiting"
+                    else "blocked_grace"
+                    if carrier == "blocked"
+                    else "no_progress_grace"
+                )
+                grace_condition = (
+                    "waiting_decision"
+                    if carrier == "reply_waiting"
+                    else "waiting_external"
+                )
+                self.assertEqual(
+                    (grace_condition, grace_cause, "2026-08-10T11:30:00Z", 1799),
+                    (
+                        before["condition"],
+                        before["cause"],
+                        before["since"],
+                        before["age_seconds"],
+                    ),
+                )
+                self.assertEqual(
+                    ("attention", boundary_cause, "2026-08-10T11:30:00Z", 1800),
+                    (
+                        boundary["condition"],
+                        boundary["cause"],
+                        boundary["since"],
+                        boundary["age_seconds"],
+                    ),
+                )
+                self.assertEqual(next_code, boundary["next_expected_event"]["code"])
+
+                if pr_id is not None:
+                    self.con.execute(
+                        "INSERT INTO sprint_pr_transitions "
+                        "(registered_pr_id,normalized_state,transition_key,observed_at) "
+                        "VALUES (?,?,?,?)",
+                        (pr_id, carrier, f"reset-{carrier}-{index}", "2026-08-10 12:15:00"),
+                    )
+                elif carrier == "reply_unread":
+                    self.con.execute(
+                        "UPDATE wake_message SET delivered_at='2026-08-10 12:15:00' "
+                        "WHERE message_id=?",
+                        (reply_id,),
+                    )
+                elif carrier == "reply_waiting":
+                    self.add_message(
+                        unit_id=unit,
+                        receiver=3,
+                        reply_to=reply_id,
+                        created_at="2026-08-10 12:14:00",
+                    )
+                    self.add_message(
+                        unit_id=unit,
+                        receiver=1,
+                        delivered_at="2026-08-10 12:14:30",
+                        read_at="2026-08-10 12:15:00",
+                        intent="decision",
+                        requires_reply=True,
+                        created_at="2026-08-10 12:14:00",
+                    )
+                else:
+                    self.add_event(
+                        "work_unit.replanned",
+                        at="2026-08-10 12:15:00",
+                        work_unit_id=unit,
+                    )
+
+                reset_before = self.project(now=reset_before_at)["work_units"][unit]
+                reset_boundary = self.project(now=reset_boundary_at)["work_units"][unit]
+                self.assertEqual(
+                    (grace_condition, grace_cause, "2026-08-10T12:15:00Z", 1799),
+                    (
+                        reset_before["condition"],
+                        reset_before["cause"],
+                        reset_before["since"],
+                        reset_before["age_seconds"],
+                    ),
+                )
+                self.assertEqual(
+                    ("attention", boundary_cause, "2026-08-10T12:15:00Z", 1800),
+                    (
+                        reset_boundary["condition"],
+                        reset_boundary["cause"],
+                        reset_boundary["since"],
+                        reset_boundary["age_seconds"],
+                    ),
+                )
+
+    def test_machinery_carrier_matrix_honors_due_floor_and_recovery(self) -> None:
+        with self.subTest(carrier="runtime_missing"):
+            self.sprint_id = self.replace_armed_sprint(
+                armed_at="2026-08-10 11:30:00"
+            )
+            unit = self.add_unit(
+                "planned", developer=3, updated_at="2026-08-10 10:00:00"
+            )
+            missing = self.project(
+                now=datetime(2026, 8, 10, 11, 30, 0, tzinfo=timezone.utc)
+            )["work_units"][unit]
+            self.assertEqual(
+                ("infrastructure", "runtime_missing", "2026-08-10T11:30:00Z"),
+                (missing["condition"], missing["cause"], missing["since"]),
+            )
+            self.heartbeat("sprint-runtime", "2026-08-10 11:30:00", 5)
+            self.assertEqual(
+                "no_progress_grace",
+                self.project(
+                    now=datetime(2026, 8, 10, 11, 30, 0, tzinfo=timezone.utc)
+                )["work_units"][unit]["cause"],
+            )
+
+        with self.subTest(carrier="watcher_missing"):
+            self.sprint_id = self.replace_armed_sprint(
+                armed_at="2026-08-10 11:30:00"
+            )
+            unit = self.add_unit(
+                "active", developer=3, updated_at="2026-08-10 10:00:00"
+            )
+            self.add_pr(unit, "pending", at="2026-08-10 10:00:00", number=200)
+            missing = self.project(
+                now=datetime(2026, 8, 10, 11, 30, 0, tzinfo=timezone.utc)
+            )["work_units"][unit]
+            self.assertEqual(
+                ("infrastructure", "watcher_missing", "2026-08-10T11:30:00Z"),
+                (missing["condition"], missing["cause"], missing["since"]),
+            )
+            self.heartbeat("sprint-pr-watcher", "2026-08-10 11:30:00", 30)
+            self.assertEqual(
+                "ci_pending",
+                self.project(
+                    now=datetime(2026, 8, 10, 11, 30, 0, tzinfo=timezone.utc)
+                )["work_units"][unit]["cause"],
+            )
+
+        with self.subTest(carrier="runtime_stale"):
+            self.sprint_id = self.replace_armed_sprint(
+                armed_at="2026-08-10 11:30:00"
+            )
+            unit = self.add_unit("planned", developer=3, updated_at="2026-08-10 10:00:00")
+            self.heartbeat("sprint-runtime", "2026-08-10 11:29:45", 5)
+            due = self.project(
+                now=datetime(2026, 8, 10, 11, 30, 0, tzinfo=timezone.utc)
+            )["work_units"][unit]
+            stale = self.project(
+                now=datetime(2026, 8, 10, 11, 30, 1, tzinfo=timezone.utc)
+            )["work_units"][unit]
+            self.assertEqual(("waiting_external", "no_progress_grace"), (
+                due["condition"], due["cause"]
+            ))
+            self.assertEqual(
+                ("infrastructure", "runtime_stale", "2026-08-10T11:30:00Z", 1),
+                (stale["condition"], stale["cause"], stale["since"], stale["age_seconds"]),
+            )
+            self.heartbeat("sprint-runtime", "2026-08-10 12:14:45", 5)
+            recovered = self.project(
+                now=datetime(2026, 8, 10, 12, 15, 0, tzinfo=timezone.utc)
+            )["work_units"][unit]
+            restale = self.project(
+                now=datetime(2026, 8, 10, 12, 15, 1, tzinfo=timezone.utc)
+            )["work_units"][unit]
+            self.assertEqual("no_progress_carrier", recovered["cause"])
+            self.assertEqual(("runtime_stale", "2026-08-10T12:15:00Z"), (
+                restale["cause"], restale["since"]
+            ))
+
+        with self.subTest(carrier="watcher_stale"):
+            self.sprint_id = self.replace_armed_sprint(
+                armed_at="2026-08-10 11:30:00"
+            )
+            unit = self.add_unit("active", developer=3, updated_at="2026-08-10 10:00:00")
+            self.add_pr(unit, "pending", at="2026-08-10 10:00:00", number=201)
+            watcher_window = 3 * (30 + sprint_health.sprint_pr_watcher.GITHUB_TIMEOUT_SECONDS)
+            first_beat = datetime(2026, 8, 10, 11, 30, tzinfo=timezone.utc) - timedelta(
+                seconds=watcher_window
+            )
+            self.heartbeat("sprint-pr-watcher", first_beat.strftime("%Y-%m-%d %H:%M:%S"), 30)
+            due = self.project(
+                now=datetime(2026, 8, 10, 11, 30, 0, tzinfo=timezone.utc)
+            )["work_units"][unit]
+            stale = self.project(
+                now=datetime(2026, 8, 10, 11, 30, 1, tzinfo=timezone.utc)
+            )["work_units"][unit]
+            self.assertEqual("ci_pending", due["cause"])
+            self.assertEqual(
+                ("watcher_stale", "2026-08-10T11:30:00Z", 1),
+                (stale["cause"], stale["since"], stale["age_seconds"]),
+            )
+            second_due = datetime(2026, 8, 10, 12, 15, tzinfo=timezone.utc)
+            second_beat = second_due - timedelta(seconds=watcher_window)
+            self.heartbeat("sprint-pr-watcher", second_beat.strftime("%Y-%m-%d %H:%M:%S"), 30)
+            self.assertEqual(
+                "ci_pending", self.project(now=second_due)["work_units"][unit]["cause"]
+            )
+            restale = self.project(now=second_due + timedelta(seconds=1))["work_units"][unit]
+            self.assertEqual(("watcher_stale", "2026-08-10T12:15:00Z"), (
+                restale["cause"], restale["since"]
+            ))
+
+        with self.subTest(carrier="wake_failed"):
+            self.sprint_id = self.replace_armed_sprint(
+                armed_at="2026-08-10 11:30:00"
+            )
+            unit = self.add_unit("ready", developer=3, updated_at="2026-08-10 10:00:00")
+            message = self.add_message(
+                unit_id=unit,
+                receiver=3,
+                kind="work_assignment",
+                disposition="pending",
+                created_at="2026-08-10 10:00:00",
+            )
+            wake = self.add_wake(
+                message, receiver=3, state="failed", created_at="2026-08-10 10:00:00"
+            )
+            self.heartbeat("sprint-runtime", "2026-08-10 12:30:00", 5)
+            floored = self.project(
+                now=datetime(2026, 8, 10, 11, 30, 0, tzinfo=timezone.utc)
+            )["work_units"][unit]
+            self.assertEqual(("waiting_external", "no_progress_grace"), (
+                floored["condition"], floored["cause"]
+            ))
+            self.con.execute(
+                "UPDATE sprint_wake_outbox SET failed_at='2026-08-10 12:15:00' "
+                "WHERE wake_id=?",
+                (wake,),
+            )
+            failed = self.project(
+                now=datetime(2026, 8, 10, 12, 15, 0, tzinfo=timezone.utc)
+            )["work_units"][unit]
+            self.assertEqual(("infrastructure", "wake_failed", "2026-08-10T12:15:00Z"), (
+                failed["condition"], failed["cause"], failed["since"]
+            ))
+            self.con.execute(
+                "UPDATE sprint_wake_outbox SET state='pending',failed_at=NULL,"
+                "available_at='2026-08-10 12:20:00' WHERE wake_id=?",
+                (wake,),
+            )
+            recovered = self.project(
+                now=datetime(2026, 8, 10, 12, 20, 0, tzinfo=timezone.utc)
+            )["work_units"][unit]
+            self.assertEqual(("waiting_external", "wake_pending", "2026-08-10T12:20:00Z"), (
+                recovered["condition"], recovered["cause"], recovered["since"]
+            ))
+
+        with self.subTest(carrier="pickup_exhausted"):
+            self.sprint_id = self.replace_armed_sprint(
+                armed_at="2026-08-10 11:30:00"
+            )
+            unit = self.add_unit("active", developer=3, updated_at="2026-08-10 10:00:00")
+            self.add_event(
+                "wake.pickup_exhausted",
+                at="2026-08-10 10:00:00",
+                work_unit_id=unit,
+            )
+            floored = self.project(
+                now=datetime(2026, 8, 10, 11, 30, 0, tzinfo=timezone.utc)
+            )["work_units"][unit]
+            self.assertEqual("no_progress_grace", floored["cause"])
+            self.add_event(
+                "wake.pickup_exhausted",
+                at="2026-08-10 12:15:00",
+                work_unit_id=unit,
+            )
+            exhausted = self.project(
+                now=datetime(2026, 8, 10, 12, 15, 0, tzinfo=timezone.utc)
+            )["work_units"][unit]
+            self.assertEqual(
+                ("infrastructure", "pickup_exhausted", "2026-08-10T12:15:00Z"),
+                (exhausted["condition"], exhausted["cause"], exhausted["since"]),
+            )
+            self.con.execute(
+                "UPDATE sprints SET armed_at='2026-08-10 12:20:00' WHERE sprint_id=?",
+                (self.sprint_id,),
+            )
+            recovered = self.project(
+                now=datetime(2026, 8, 10, 12, 20, 0, tzinfo=timezone.utc)
+            )["work_units"][unit]
+            self.assertEqual(("waiting_external", "no_progress_grace", "2026-08-10T12:20:00Z"), (
+                recovered["condition"], recovered["cause"], recovered["since"]
+            ))
 
     def test_thirty_minute_no_progress_and_unpicked_wake_boundaries_are_exact(self) -> None:
         self.con.execute(
@@ -1670,6 +2037,118 @@ class SprintHealthCase(unittest.TestCase):
             set(projected["health"]["root_work_unit_ids"]),
         )
 
+    def test_chain_fork_multilevel_fanin_and_cycle_topologies_are_total(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        attention = self.add_unit(
+            "active", developer=3, updated_at="2026-08-10 10:00:00"
+        )
+        chain = self.add_unit(
+            "planned", developer=4, updated_at="2026-08-10 10:00:00"
+        )
+        chain_leaf = self.add_unit(
+            "planned", developer=5, updated_at="2026-08-10 10:00:00"
+        )
+        fork_left = self.add_unit(
+            "planned", developer=6, updated_at="2026-08-10 10:00:00"
+        )
+        fork_right = self.add_unit(
+            "planned", developer=7, updated_at="2026-08-10 10:00:00"
+        )
+        infrastructure = self.add_unit(
+            "active", developer=8, updated_at="2026-08-10 10:00:00"
+        )
+        fanin = self.add_unit(
+            "planned", developer=9, updated_at="2026-08-10 10:00:00"
+        )
+        self.add_pr(
+            infrastructure, "red", at="2026-08-10 11:50:00", number=301
+        )
+        edges = (
+            (chain, attention),
+            (chain_leaf, chain),
+            (fork_left, chain),
+            (fork_right, chain),
+            (fanin, chain_leaf),
+            (fanin, fork_left),
+            (fanin, fork_right),
+            (fanin, infrastructure),
+        )
+        self.con.executemany(
+            "INSERT INTO sprint_work_unit_dependencies "
+            "(sprint_id,work_unit_id,depends_on_work_unit_id) VALUES (?,?,?)",
+            [(self.sprint_id, unit, upstream) for unit, upstream in edges],
+        )
+
+        projected = self.project()
+
+        for unit in (chain, chain_leaf, fork_left, fork_right):
+            self.assertEqual(
+                [attention],
+                projected["work_units"][unit]["root_work_unit_ids"],
+                unit,
+            )
+        self.assertEqual(
+            [chain_leaf, fork_left, fork_right, infrastructure],
+            projected["work_units"][fanin]["waiting_on_work_unit_ids"],
+        )
+        self.assertEqual(
+            [attention, infrastructure],
+            projected["work_units"][fanin]["root_work_unit_ids"],
+        )
+        self.assertEqual(
+            ("infrastructure", 1, [attention, infrastructure]),
+            (
+                projected["health"]["condition"],
+                projected["health"]["attention_count"],
+                projected["health"]["root_work_unit_ids"],
+            ),
+        )
+        self.assertEqual(
+            {
+                f"work_unit:{attention}:no_progress_carrier",
+                f"work_unit:{infrastructure}:watcher_missing",
+            },
+            {root["root_id"] for root in projected["health"]["root_causes"]},
+        )
+
+        self.sprint_id = self.replace_armed_sprint(
+            armed_at="2026-08-10 10:00:00"
+        )
+        cycle_left = self.add_unit(
+            "planned", developer=10, updated_at="2026-08-10 10:00:00"
+        )
+        cycle_right = self.add_unit(
+            "planned", developer=11, updated_at="2026-08-10 10:00:00"
+        )
+        self.con.executemany(
+            "INSERT INTO sprint_work_unit_dependencies "
+            "(sprint_id,work_unit_id,depends_on_work_unit_id) VALUES (?,?,?)",
+            (
+                (self.sprint_id, cycle_left, cycle_right),
+                (self.sprint_id, cycle_right, cycle_left),
+            ),
+        )
+
+        cycle = self.project()
+
+        self.assertEqual(
+            ("waiting_dependency", [], []),
+            (
+                cycle["health"]["condition"],
+                cycle["health"]["root_work_unit_ids"],
+                cycle["health"]["root_causes"],
+            ),
+        )
+        self.assertEqual([], cycle["work_units"][cycle_left]["root_work_unit_ids"])
+        self.assertEqual([], cycle["work_units"][cycle_right]["root_work_unit_ids"])
+        self.assertEqual(
+            [{"kind": "dependency_cycle", "id": cycle_left}],
+            cycle["health"]["unreadable_signals"],
+        )
+
     def test_rootless_dependency_aggregate_keeps_oldest_winning_clock(self) -> None:
         upstream = self.add_unit("active", developer=3)
         dependent = self.add_unit("planned", developer=4)
@@ -1778,7 +2257,381 @@ class SprintHealthCase(unittest.TestCase):
             [waiting["work_units"][unit]["cause"] for unit in external_units],
         )
 
-    def test_historical_quota_escalations_replay_without_new_liveness_wakes(self) -> None:
+    def test_sanitized_historical_corpus_replays_distinct_durable_shapes(self) -> None:
+        fixture = json.loads(HISTORICAL_REPLAY.read_text())
+        summary = fixture["source_summary"]
+        sprints = fixture["sprints"]
+        episodes = [
+            episode
+            for sprint in sprints
+            for bundle in sprint["bundles"]
+            for episode in bundle["episodes"]
+        ]
+        self.assertEqual(1, fixture["schema_version"])
+        self.assertEqual(summary["sprint_count"], len(sprints))
+        self.assertEqual(summary["quota_reviewer_episodes"], len(episodes))
+        self.assertEqual(
+            summary["liveness_nudges"],
+            sum(sprint["nudge_count"] for sprint in sprints),
+        )
+        self.assertEqual(
+            summary["wake_requeues"],
+            sum(sprint["wake_requeues"] for sprint in sprints),
+        )
+        self.assertGreater(len({sprint["conversation_generation"] for sprint in sprints}), 1)
+        self.assertTrue(
+            any(
+                len(bundle["episodes"]) > 1
+                for sprint in sprints
+                for bundle in sprint["bundles"]
+            )
+        )
+        sanitized = json.dumps(fixture, sort_keys=True)
+        for forbidden in (
+            "/home/",
+            "account_ref",
+            "process_pid",
+            "process_start_ticks",
+            "native_run_ref",
+            "message_body",
+        ):
+            self.assertNotIn(forbidden, sanitized)
+
+        account_id = int(
+            self.con.execute(
+                "INSERT INTO harness_quota_account (provider,account_ref) "
+                "VALUES ('anthropic','sanitized-replay-route')"
+            ).lastrowid
+        )
+        base = datetime(2026, 8, 10, 11, 45, tzinfo=timezone.utc)
+
+        def stamp(value: datetime) -> str:
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+
+        def parse(value: str) -> datetime:
+            parsed = datetime.fromisoformat(value)
+            return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+        def history_counts() -> tuple[int, int, int, int]:
+            return (
+                int(self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_liveness_expectations"
+                ).fetchone()[0]),
+                int(self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type LIKE 'liveness.%'"
+                ).fetchone()[0]),
+                int(self.con.execute(
+                    "SELECT COUNT(*) FROM wake_message WHERE message_kind='nudge'"
+                ).fetchone()[0]),
+                int(self.con.execute(
+                    "SELECT COUNT(*) FROM wake_message WHERE message_kind='escalation'"
+                ).fetchone()[0]),
+            )
+
+        for sprint_index, sprint_shape in enumerate(sprints):
+            with self.subTest(sprint=sprint_shape["key"]):
+                self.sprint_id = self.replace_armed_sprint(
+                    armed_at="2026-08-10 11:45:00",
+                    conversation_generation=sprint_shape["conversation_generation"],
+                )
+                for requeue_index in range(sprint_shape["wake_requeues"]):
+                    self.add_event(
+                        "wake.requeued",
+                        at=stamp(base + timedelta(seconds=sprint_index * 20 + requeue_index)),
+                        payload={
+                            "classification": "sanitized_historical_requeue",
+                            "ordinal": requeue_index + 1,
+                        },
+                    )
+                for nudge_index in range(sprint_shape["nudge_count"]):
+                    nudge_at = base + timedelta(seconds=30 + sprint_index * 10 + nudge_index)
+                    nudge = self.add_message(
+                        unit_id=None,
+                        receiver=2,
+                        kind="nudge",
+                        delivered_at=stamp(nudge_at),
+                        read_at=stamp(nudge_at + timedelta(seconds=1)),
+                        created_at=stamp(nudge_at),
+                    )
+                    self.add_event(
+                        "liveness.nudged",
+                        at=stamp(nudge_at),
+                        payload={"nudge_message_id": nudge},
+                    )
+
+                expected_developers: list[int] = []
+                expected_timings: dict[int, tuple[int, int]] = {}
+                bundle_sizes: list[int] = []
+                developer_index = 0
+                for bundle in sprint_shape["bundles"]:
+                    bundle_requests: list[tuple[int, int, datetime, datetime]] = []
+                    wake_id = None
+                    first_request = None
+                    for episode in bundle["episodes"]:
+                        developer = sprint_shape["developer_slots"][developer_index]
+                        developer_index += 1
+                        expected_developers.append(developer)
+                        accepted_at = base + timedelta(
+                            seconds=episode["accepted_offset_seconds"]
+                        )
+                        escalated_at = accepted_at + timedelta(
+                            seconds=episode["escalation_after_seconds"]
+                        )
+                        verdict_at = escalated_at + timedelta(
+                            seconds=episode["verdict_after_seconds"]
+                        )
+                        unit = self.add_unit(
+                            "in_review",
+                            developer=developer,
+                            updated_at=stamp(accepted_at),
+                        )
+                        request = self.add_message(
+                            unit_id=unit,
+                            receiver=2,
+                            kind="review_request",
+                            disposition="accepted",
+                            read_at=stamp(accepted_at),
+                            delivered_at=stamp(accepted_at - timedelta(seconds=1)),
+                            created_at=stamp(accepted_at - timedelta(seconds=2)),
+                        )
+                        if wake_id is None:
+                            wake_id = self.add_wake(
+                                request,
+                                receiver=2,
+                                state="delivered",
+                                created_at=stamp(accepted_at - timedelta(seconds=1)),
+                            )
+                            first_request = request
+                        else:
+                            self.con.execute(
+                                "INSERT INTO sprint_wake_messages "
+                                "(sprint_id,wake_id,message_id) VALUES (?,?,?)",
+                                (self.sprint_id, wake_id, request),
+                            )
+                        self.add_event(
+                            "review.requested",
+                            at=stamp(accepted_at),
+                            work_unit_id=unit,
+                            payload={"message_id": request},
+                        )
+                        reviewer_participant_id = int(
+                            self.con.execute(
+                                "SELECT participant_id FROM sprint_participants "
+                                "WHERE sprint_id=? AND shell_id=2",
+                                (self.sprint_id,),
+                            ).fetchone()[0]
+                        )
+                        self.con.execute(
+                            "INSERT INTO sprint_liveness_expectations "
+                            "(message_id,sprint_id,participant_id,accepted_at,last_strong_at,"
+                            "last_strong_key,next_evaluation_at,escalated_at) "
+                            "VALUES (?,?,?,?,?,?,?,?)",
+                            (
+                                request,
+                                self.sprint_id,
+                                reviewer_participant_id,
+                                stamp(accepted_at),
+                                stamp(accepted_at),
+                                f"message.accepted:{request}",
+                                stamp(escalated_at),
+                                stamp(escalated_at),
+                            ),
+                        )
+                        escalation = self.add_message(
+                            unit_id=None,
+                            receiver=1,
+                            kind="escalation",
+                            created_at=stamp(escalated_at),
+                        )
+                        self.add_event(
+                            "liveness.escalated",
+                            at=stamp(escalated_at),
+                            payload={
+                                "expectation_message_id": request,
+                                "escalation_message_id": escalation,
+                            },
+                        )
+                        expected_timings[request] = (
+                            episode["escalation_after_seconds"],
+                            episode["verdict_after_seconds"],
+                        )
+                        bundle_requests.append((unit, request, escalated_at, verdict_at))
+
+                    assert wake_id is not None and first_request is not None
+                    project_at = max(item[2] for item in bundle_requests) + timedelta(seconds=1)
+                    self.con.execute(
+                        "INSERT INTO harness_quota_window "
+                        "(account_pk,window_kind,used_percent,resets_at,captured_at,status) "
+                        "VALUES (?,'five_hour',100,?,?,'ok') "
+                        "ON CONFLICT(account_pk,window_kind,COALESCE(scope,'')) "
+                        "DO UPDATE SET used_percent=excluded.used_percent,"
+                        "resets_at=excluded.resets_at,captured_at=excluded.captured_at,"
+                        "status=excluded.status",
+                        (
+                            account_id,
+                            stamp(project_at + timedelta(hours=1)),
+                            stamp(project_at - timedelta(seconds=1)),
+                        ),
+                    )
+                    run_id = self.add_live_run(
+                        first_request,
+                        wake_id,
+                        shell_id=2,
+                        suffix=f"{sprint_shape['key']}-{bundle['key']}",
+                        provider="anthropic",
+                        started_at=stamp(min(item[2] for item in bundle_requests) - timedelta(seconds=1)),
+                        heartbeat_at=stamp(project_at),
+                        lease_expires_at=stamp(project_at + timedelta(minutes=10)),
+                    )
+                    self.con.commit()
+                    before_counts = history_counts()
+                    before_changes = self.con.total_changes
+
+                    projected = self.project(now=project_at)
+
+                    self.assertEqual(before_changes, self.con.total_changes)
+                    self.assertEqual(before_counts, history_counts())
+                    for unit, _, _, _ in bundle_requests:
+                        health = projected["work_units"][unit]
+                        self.assertEqual(
+                            ("progressing", "run_active", "exhausted", [], []),
+                            (
+                                health["condition"],
+                                health["cause"],
+                                health["capacity"]["state"],
+                                health["root_work_unit_ids"],
+                                health["unreadable_signals"],
+                            ),
+                        )
+
+                    run = self.con.execute(
+                        "SELECT conversation_id,trigger_message_id FROM conversation_runs "
+                        "WHERE run_id=?",
+                        (run_id,),
+                    ).fetchone()
+                    ended_at = stamp(project_at + timedelta(seconds=1))
+                    self.con.execute(
+                        "UPDATE conversation_runs SET state='succeeded',heartbeat_at=?,"
+                        "ended_at=? WHERE run_id=?",
+                        (ended_at, ended_at, run_id),
+                    )
+                    self.con.execute(
+                        "UPDATE conversation_messages SET state='completed',completed_at=? "
+                        "WHERE message_id=?",
+                        (ended_at, run["trigger_message_id"]),
+                    )
+                    self.con.execute(
+                        "UPDATE conversations SET state='idle' WHERE conversation_id=?",
+                        (run["conversation_id"],),
+                    )
+                    self.con.execute(
+                        "UPDATE conversations SET state='closed',closed_at=? "
+                        "WHERE conversation_id=?",
+                        (ended_at, run["conversation_id"]),
+                    )
+                    self.con.execute("DELETE FROM active_shell_chats WHERE shell_id=2")
+                    for unit, request, _, verdict_at in bundle_requests:
+                        self.add_event(
+                            "review.approved",
+                            at=stamp(verdict_at),
+                            work_unit_id=unit,
+                            payload={"request_message_id": request},
+                        )
+                    bundle_sizes.append(len(bundle_requests))
+
+                actual_developers = [
+                    int(row[0])
+                    for row in self.con.execute(
+                        "SELECT assigned_shell_id FROM sprint_work_units "
+                        "WHERE sprint_id=? ORDER BY work_unit_id",
+                        (self.sprint_id,),
+                    )
+                ]
+                actual_bundle_sizes = [
+                    int(row[0])
+                    for row in self.con.execute(
+                        "SELECT COUNT(*) FROM sprint_wake_messages swm "
+                        "JOIN wake_message m ON m.message_id=swm.message_id "
+                        "WHERE swm.sprint_id=? AND m.message_kind='review_request' "
+                        "GROUP BY swm.wake_id ORDER BY MIN(m.message_id)",
+                        (self.sprint_id,),
+                    )
+                ]
+                self.assertEqual(expected_developers, actual_developers)
+                self.assertEqual(bundle_sizes, actual_bundle_sizes)
+                self.assertEqual(
+                    sprint_shape["conversation_generation"],
+                    str(self.con.execute(
+                        "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
+                        (self.sprint_id,),
+                    ).fetchone()[0]),
+                )
+                self.assertEqual(
+                    sprint_shape["wake_requeues"],
+                    int(self.con.execute(
+                        "SELECT COUNT(*) FROM sprint_events "
+                        "WHERE sprint_id=? AND event_type='wake.requeued'",
+                        (self.sprint_id,),
+                    ).fetchone()[0]),
+                )
+                self.assertEqual(
+                    sprint_shape["nudge_count"],
+                    int(self.con.execute(
+                        "SELECT COUNT(*) FROM wake_message "
+                        "WHERE sprint_id=? AND message_kind='nudge'",
+                        (self.sprint_id,),
+                    ).fetchone()[0]),
+                )
+                for request, expected in expected_timings.items():
+                    expectation = self.con.execute(
+                        "SELECT accepted_at,escalated_at FROM sprint_liveness_expectations "
+                        "WHERE message_id=?",
+                        (request,),
+                    ).fetchone()
+                    verdict = self.con.execute(
+                        "SELECT created_at FROM sprint_events "
+                        "WHERE sprint_id=? AND event_type='review.approved' "
+                        "AND json_extract(payload,'$.request_message_id')=?",
+                        (self.sprint_id, request),
+                    ).fetchone()
+                    actual = (
+                        int((parse(expectation["escalated_at"]) - parse(expectation["accepted_at"])).total_seconds()),
+                        int((parse(verdict["created_at"]) - parse(expectation["escalated_at"])).total_seconds()),
+                    )
+                    self.assertEqual(expected, actual)
+                self.con.execute(
+                    "UPDATE sprints SET lifecycle='completed',terminal_outcome='success',"
+                    "completed_at='2026-08-10 13:00:00' WHERE sprint_id=?",
+                    (self.sprint_id,),
+                )
+
+        self.assertEqual(
+            (
+                summary["quota_reviewer_episodes"],
+                summary["quota_reviewer_episodes"] + summary["liveness_nudges"],
+                summary["liveness_nudges"],
+                summary["quota_reviewer_episodes"],
+                summary["wake_requeues"],
+            ),
+            (
+                self.con.execute("SELECT COUNT(*) FROM sprint_liveness_expectations").fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_events WHERE event_type LIKE 'liveness.%'"
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM wake_message WHERE message_kind='nudge'"
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM wake_message WHERE message_kind='escalation'"
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_events WHERE event_type='wake.requeued'"
+                ).fetchone()[0],
+            ),
+        )
+
+    def test_synthetic_quota_escalation_matrix_keeps_live_runs_dominant(self) -> None:
         account_id = int(
             self.con.execute(
                 "INSERT INTO harness_quota_account (provider,account_ref) "

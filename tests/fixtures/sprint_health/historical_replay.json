@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "source_summary": {
+    "sprint_count": 8,
+    "quota_reviewer_episodes": 21,
+    "liveness_nudges": 2,
+    "wake_requeues": 19
+  },
+  "sprints": [
+    {
+      "key": "history-01",
+      "conversation_generation": "00000000000000000000000000000004",
+      "developer_slots": [3, 4],
+      "nudge_count": 1,
+      "wake_requeues": 3,
+      "bundles": [
+        {"key": "a", "episodes": [{"accepted_offset_seconds": 60, "escalation_after_seconds": 300, "verdict_after_seconds": 13}]},
+        {"key": "b", "episodes": [{"accepted_offset_seconds": 180, "escalation_after_seconds": 301, "verdict_after_seconds": 479}]}
+      ]
+    },
+    {
+      "key": "history-02",
+      "conversation_generation": "00000000000000000000000000000002",
+      "developer_slots": [5, 6, 7],
+      "nudge_count": 0,
+      "wake_requeues": 2,
+      "bundles": [
+        {"key": "coalesced", "episodes": [{"accepted_offset_seconds": 240, "escalation_after_seconds": 302, "verdict_after_seconds": 41}, {"accepted_offset_seconds": 240, "escalation_after_seconds": 307, "verdict_after_seconds": 88}]},
+        {"key": "single", "episodes": [{"accepted_offset_seconds": 360, "escalation_after_seconds": 303, "verdict_after_seconds": 144}]}
+      ]
+    },
+    {
+      "key": "history-03",
+      "conversation_generation": "00000000000000000000000000000003",
+      "developer_slots": [8],
+      "nudge_count": 0,
+      "wake_requeues": 4,
+      "bundles": [
+        {"key": "generation-rotated", "episodes": [{"accepted_offset_seconds": 420, "escalation_after_seconds": 304, "verdict_after_seconds": 233}]}
+      ]
+    },
+    {
+      "key": "history-04",
+      "conversation_generation": "00000000000000000000000000000001",
+      "developer_slots": [9, 10, 11, 12],
+      "nudge_count": 1,
+      "wake_requeues": 1,
+      "bundles": [
+        {"key": "left", "episodes": [{"accepted_offset_seconds": 480, "escalation_after_seconds": 305, "verdict_after_seconds": 55}, {"accepted_offset_seconds": 480, "escalation_after_seconds": 306, "verdict_after_seconds": 101}]},
+        {"key": "right", "episodes": [{"accepted_offset_seconds": 600, "escalation_after_seconds": 300, "verdict_after_seconds": 167}, {"accepted_offset_seconds": 600, "escalation_after_seconds": 307, "verdict_after_seconds": 311}]}
+      ]
+    },
+    {
+      "key": "history-05",
+      "conversation_generation": "00000000000000000000000000000005",
+      "developer_slots": [13, 14],
+      "nudge_count": 0,
+      "wake_requeues": 3,
+      "bundles": [
+        {"key": "a", "episodes": [{"accepted_offset_seconds": 660, "escalation_after_seconds": 301, "verdict_after_seconds": 74}]},
+        {"key": "b", "episodes": [{"accepted_offset_seconds": 720, "escalation_after_seconds": 302, "verdict_after_seconds": 190}]}
+      ]
+    },
+    {
+      "key": "history-06",
+      "conversation_generation": "00000000000000000000000000000006",
+      "developer_slots": [3, 7, 11],
+      "nudge_count": 0,
+      "wake_requeues": 2,
+      "bundles": [
+        {"key": "triple", "episodes": [{"accepted_offset_seconds": 780, "escalation_after_seconds": 303, "verdict_after_seconds": 29}, {"accepted_offset_seconds": 780, "escalation_after_seconds": 304, "verdict_after_seconds": 207}, {"accepted_offset_seconds": 780, "escalation_after_seconds": 305, "verdict_after_seconds": 352}]}
+      ]
+    },
+    {
+      "key": "history-07",
+      "conversation_generation": "00000000000000000000000000000007",
+      "developer_slots": [4, 8, 12, 15],
+      "nudge_count": 0,
+      "wake_requeues": 2,
+      "bundles": [
+        {"key": "first", "episodes": [{"accepted_offset_seconds": 840, "escalation_after_seconds": 306, "verdict_after_seconds": 95}]},
+        {"key": "coalesced", "episodes": [{"accepted_offset_seconds": 900, "escalation_after_seconds": 307, "verdict_after_seconds": 126}, {"accepted_offset_seconds": 900, "escalation_after_seconds": 300, "verdict_after_seconds": 418}]},
+        {"key": "last", "episodes": [{"accepted_offset_seconds": 1020, "escalation_after_seconds": 301, "verdict_after_seconds": 63}]}
+      ]
+    },
+    {
+      "key": "history-08",
+      "conversation_generation": "00000000000000000000000000000008",
+      "developer_slots": [6, 10],
+      "nudge_count": 0,
+      "wake_requeues": 2,
+      "bundles": [
+        {"key": "terminal-wave", "episodes": [{"accepted_offset_seconds": 1080, "escalation_after_seconds": 302, "verdict_after_seconds": 214}, {"accepted_offset_seconds": 1080, "escalation_after_seconds": 306, "verdict_after_seconds": 377}]}
+      ]
+    }
+  ]
+}
