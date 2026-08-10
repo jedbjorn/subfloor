@@ -14,6 +14,7 @@ ENGINE = ROOT / ".super-coder"
 sys.path[:0] = [str(ENGINE / "scripts")]
 
 import sprint_health
+import sprint_message_delivery
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
 
@@ -630,6 +631,51 @@ class SprintHealthCase(unittest.TestCase):
         )
         self.assertEqual("2026-08-10T10:30:00Z", at_boundary["since"])
 
+    def test_ci_pending_clock_ignores_later_owner_evidence(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        unit = self.add_unit("active", developer=3, updated_at="2026-08-10 10:00:00")
+        self.add_pr(unit, "pending", at="2026-08-10 10:00:00", number=21)
+        assignment = self.add_message(
+            unit_id=unit,
+            receiver=3,
+            kind="work_assignment",
+            disposition="accepted",
+            read_at="2026-08-10 11:20:00",
+            delivered_at="2026-08-10 11:19:00",
+            created_at="2026-08-10 11:18:00",
+        )
+        self.add_wake(
+            assignment,
+            receiver=3,
+            state="delivered",
+            created_at="2026-08-10 11:18:00",
+        )
+        self.heartbeat("sprint-pr-watcher", "2026-08-10 11:30:00", 30)
+
+        before = self.project(
+            now=datetime(2026, 8, 10, 11, 29, 59, tzinfo=timezone.utc)
+        )["work_units"][unit]
+        boundary = self.project(
+            now=datetime(2026, 8, 10, 11, 30, 0, tzinfo=timezone.utc)
+        )["work_units"][unit]
+
+        self.assertEqual(
+            ("waiting_external", "ci_pending", "2026-08-10T10:00:00Z", 5399),
+            (before["condition"], before["cause"], before["since"], before["age_seconds"]),
+        )
+        self.assertEqual(
+            ("attention", "ci_stuck", "2026-08-10T10:00:00Z", 5400),
+            (
+                boundary["condition"],
+                boundary["cause"],
+                boundary["since"],
+                boundary["age_seconds"],
+            ),
+        )
+
     def test_thirty_minute_no_progress_and_unpicked_wake_boundaries_are_exact(self) -> None:
         self.con.execute(
             "UPDATE sprints SET armed_at='2026-08-10 11:30:00' WHERE sprint_id=?",
@@ -726,6 +772,84 @@ class SprintHealthCase(unittest.TestCase):
         self.assertEqual("2026-08-10T11:30:00Z", boundary["since"])
         self.assertEqual(1800, boundary["age_seconds"])
 
+    def test_lease_expiry_requeue_restarts_pending_wake_boundary(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        unit = self.add_unit("ready", developer=3, updated_at="2026-08-10 10:00:00")
+        message = self.add_message(
+            unit_id=unit,
+            receiver=3,
+            kind="work_assignment",
+            disposition="pending",
+            created_at="2026-08-10 10:00:00",
+        )
+        wake = self.add_wake(
+            message, receiver=3, state="pending", created_at="2026-08-10 10:00:00"
+        )
+        self.add_event(
+            "work_unit.ready",
+            at="2026-08-10 10:00:00",
+            work_unit_id=unit,
+            payload={"message_id": message, "wake_id": wake},
+        )
+        clock = [datetime(2026, 8, 10, 11, 29, tzinfo=timezone.utc)]
+        delivery = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con,
+            now=lambda: clock[0],
+            force_new_quiet_seconds=0,
+        )
+        self.con.commit()
+
+        lease = delivery.claim_next("crashed-worker", lease_seconds=60)
+        self.assertEqual(wake, lease.wake_id if lease else None)
+        self.assertEqual(
+            ("delivering", "2026-08-10 11:29:00", "2026-08-10 11:30:00"),
+            tuple(
+                self.con.execute(
+                    "SELECT state,claimed_at,lease_expires_at "
+                    "FROM sprint_wake_outbox WHERE wake_id=?",
+                    (wake,),
+                ).fetchone()
+            ),
+        )
+
+        clock[0] = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(1, delivery.requeue_expired())
+        self.assertEqual(
+            ("pending", "2026-08-10 12:00:00", None, None),
+            tuple(
+                self.con.execute(
+                    "SELECT state,available_at,claimed_at,lease_expires_at "
+                    "FROM sprint_wake_outbox WHERE wake_id=?",
+                    (wake,),
+                ).fetchone()
+            ),
+        )
+        self.heartbeat("sprint-runtime", "2026-08-10 12:30:00")
+
+        before = self.project(
+            now=datetime(2026, 8, 10, 12, 29, 59, tzinfo=timezone.utc)
+        )["work_units"][unit]
+        boundary = self.project(
+            now=datetime(2026, 8, 10, 12, 30, 0, tzinfo=timezone.utc)
+        )["work_units"][unit]
+
+        self.assertEqual(
+            ("waiting_external", "wake_pending", "2026-08-10T12:00:00Z", 1799),
+            (before["condition"], before["cause"], before["since"], before["age_seconds"]),
+        )
+        self.assertEqual(
+            ("attention", "wake_pending", "2026-08-10T12:00:00Z", 1800),
+            (
+                boundary["condition"],
+                boundary["cause"],
+                boundary["since"],
+                boundary["age_seconds"],
+            ),
+        )
+
     def test_reply_scope_and_linkage_do_not_cross_unit_boundary(self) -> None:
         self.con.execute(
             "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
@@ -817,6 +941,146 @@ class SprintHealthCase(unittest.TestCase):
         )
         self.assertGreater(reply, required)
 
+    def test_sprint_reply_roots_are_bounded_with_exact_truncation_counts(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.add_unit("active", developer=3, updated_at="2026-08-10 11:50:00")
+        message_ids = []
+        for index in range(125):
+            stamp = f"2026-08-10 10:{index // 60:02d}:{index % 60:02d}"
+            message_ids.append(
+                self.add_message(
+                    unit_id=None,
+                    receiver=2,
+                    read_at=stamp,
+                    delivered_at=stamp,
+                    intent="decision",
+                    requires_reply=True,
+                    created_at=stamp,
+                )
+            )
+
+        first = self.project()["health"]
+
+        self.assertEqual(("attention", "2026-08-10T10:00:00Z"), (
+            first["condition"], first["since"]
+        ))
+        self.assertEqual(125, first["root_cause_count"])
+        self.assertEqual(125, first["attention_count"])
+        self.assertTrue(first["root_causes_truncated"])
+        self.assertEqual(100, len(first["root_causes"]))
+        self.assertEqual(
+            f"sprint:message:{message_ids[0]}", first["root_causes"][0]["root_id"]
+        )
+        visible_ids = [root["root_id"] for root in first["root_causes"]]
+
+        recent = self.add_message(
+            unit_id=None,
+            receiver=2,
+            read_at="2026-08-10 11:59:00",
+            delivered_at="2026-08-10 11:59:00",
+            intent="decision",
+            requires_reply=True,
+            created_at="2026-08-10 11:59:00",
+        )
+        second = self.project()["health"]
+
+        self.assertEqual(126, second["root_cause_count"])
+        self.assertEqual(125, second["attention_count"])
+        self.assertEqual(visible_ids, [root["root_id"] for root in second["root_causes"]])
+        self.assertNotIn(
+            f"sprint:message:{recent}",
+            [root["root_id"] for root in second["root_causes"]],
+        )
+
+    def test_blocked_accepts_only_open_reply_or_current_planner_recovery(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET armed_at='2026-08-10 10:00:00' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        stale = self.add_unit("blocked", developer=3, updated_at="2026-08-10 11:50:00")
+        planner_recovery = self.add_unit(
+            "blocked", developer=4, updated_at="2026-08-10 11:50:00"
+        )
+        scoped_blocker = self.add_unit(
+            "blocked", developer=5, updated_at="2026-08-10 11:50:00"
+        )
+        for receiver, kind, created in (
+            (3, "work_assignment", "2026-08-10 10:00:00"),
+            (2, "review_request", "2026-08-10 10:01:00"),
+        ):
+            message = self.add_message(
+                unit_id=stale,
+                receiver=receiver,
+                kind=kind,
+                disposition="pending",
+                created_at=created,
+            )
+            self.add_wake(message, receiver=receiver, state="pending", created_at=created)
+
+        recovery_message = self.add_message(
+            unit_id=planner_recovery,
+            receiver=1,
+            created_at="2026-08-10 11:55:00",
+        )
+        recovery_wake = self.add_wake(
+            recovery_message,
+            receiver=1,
+            state="pending",
+            created_at="2026-08-10 11:55:00",
+        )
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET idempotency_key=? WHERE wake_id=?",
+            (
+                f"sprint-recovery:{self.sprint_id}:blocked:{planner_recovery}",
+                recovery_wake,
+            ),
+        )
+        blocker_message = self.add_message(
+            unit_id=scoped_blocker,
+            receiver=5,
+            intent="blocker",
+            requires_reply=True,
+            created_at="2026-08-10 11:56:00",
+        )
+        self.add_wake(
+            blocker_message,
+            receiver=5,
+            state="pending",
+            created_at="2026-08-10 11:56:00",
+        )
+        self.heartbeat("sprint-runtime", "2026-08-10 12:00:00")
+
+        projected = self.project()["work_units"]
+
+        self.assertEqual(
+            ("waiting_external", "blocked_grace", [], "PLN1"),
+            (
+                projected[stale]["condition"],
+                projected[stale]["cause"],
+                projected[stale]["message_refs"],
+                projected[stale]["owner"]["participants"][0]["shortname"],
+            ),
+        )
+        self.assertEqual(
+            ("wake_pending", [{"message_id": recovery_message}], "PLN1"),
+            (
+                projected[planner_recovery]["cause"],
+                projected[planner_recovery]["message_refs"],
+                projected[planner_recovery]["owner"]["participants"][0]["shortname"],
+            ),
+        )
+        self.assertEqual(
+            ("wake_pending", [{"message_id": blocker_message}], "DEV5"),
+            (
+                projected[scoped_blocker]["cause"],
+                projected[scoped_blocker]["message_refs"],
+                projected[scoped_blocker]["owner"]["participants"][0]["shortname"],
+            ),
+        )
+
     def test_plural_dependency_roots_preserve_mixed_conditions(self) -> None:
         attention = self.add_unit("active", developer=3, updated_at="2026-08-10 09:00:00")
         infrastructure = self.add_unit("active", developer=4, updated_at="2026-08-10 09:00:00")
@@ -898,6 +1162,12 @@ class SprintHealthCase(unittest.TestCase):
             (f"sprint:{self.sprint_id}:delivery-terminal:2", message),
         )
         self.add_wake(message, receiver=2, state="pending", created_at="2026-08-10 11:00:00")
+        for index in range(100):
+            self.add_message(
+                unit_id=None,
+                receiver=3,
+                created_at=f"2026-08-10 11:{index // 60 + 1:02d}:{index % 60:02d}",
+            )
         handoff = self.project()
         self.assertEqual(("waiting_external", "conformance_handoff"), (
             handoff["health"]["condition"],
@@ -905,6 +1175,7 @@ class SprintHealthCase(unittest.TestCase):
             if handoff["health"]["root_causes"]
             else "conformance_handoff",
         ))
+        self.assertEqual("2026-08-10T11:00:00Z", handoff["health"]["since"])
 
         self.con.execute(
             "UPDATE sprint_wake_outbox SET state='delivered',delivered_at='2026-08-10 11:00:00'"

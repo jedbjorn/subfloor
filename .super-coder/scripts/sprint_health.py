@@ -21,6 +21,7 @@ CI_STUCK_AFTER = timedelta(minutes=90)
 QUOTA_FRESH_FOR = timedelta(minutes=10)
 MAX_EVENTS = 2000
 MAX_MESSAGE_REFS = 100
+MAX_ROOT_CAUSES = 100
 
 _SEVERITY = {
     "staged": 0,
@@ -202,6 +203,10 @@ class SprintHealthProjection:
             defaultdict(list)
         )
         self.stage_message_ids: dict[int, int] = {}
+        self.closeout_event: dict[str, Any] | None = None
+        self.closeout_message_ids: set[int] = set()
+        self.sprint_reply_root_count = 0
+        self.sprint_reply_attention_count = 0
         self.prs: dict[int, dict[str, Any]] = {}
         self.unreadable: list[dict[str, Any]] = []
         self.runtime: dict[str, Any] = {}
@@ -307,6 +312,7 @@ class SprintHealthProjection:
                     self.stage_message_ids[unit_id] = message_id
                     break
 
+        self._load_current_closeout_message_ids(sprint_id)
         self._load_prs(sprint_id)
         self._load_messages(sprint_id)
         self._load_open_replies(sprint_id)
@@ -339,13 +345,49 @@ class SprintHealthProjection:
             unit_id = int(row["work_unit_id"])
             self.prs.setdefault(unit_id, dict(row))
 
+    def _load_current_closeout_message_ids(self, sprint_id: int) -> None:
+        row = self.con.execute(
+            "SELECT event_id,event_type,payload,created_at FROM sprint_events "
+            "WHERE sprint_id=? AND event_type='sprint.delivery_terminal' "
+            "ORDER BY event_id DESC LIMIT 1",
+            (sprint_id,),
+        ).fetchone()
+        if row is None:
+            return
+        event = dict(row)
+        try:
+            payload = json.loads(str(row["payload"]))
+            if not isinstance(payload, dict):
+                raise TypeError
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+            unreadable = {"kind": "sprint_event", "id": int(row["event_id"])}
+            if unreadable not in self.unreadable:
+                self.unreadable.append(unreadable)
+        event["payload"] = payload
+        event["at"] = _parse(str(row["created_at"]))
+        self.closeout_event = event
+        terminal_count = payload.get("terminal_count")
+        if not isinstance(terminal_count, int):
+            return
+        base_key = f"sprint:{sprint_id}:delivery-terminal:{terminal_count}"
+        rows = self.con.execute(
+            "SELECT message_id FROM wake_message WHERE sprint_id=? "
+            "AND (idempotency_key=? OR idempotency_key LIKE ?) "
+            "ORDER BY message_id LIMIT ?",
+            (sprint_id, base_key, f"{base_key}:%", MAX_MESSAGE_REFS),
+        ).fetchall()
+        self.closeout_message_ids.update(int(row["message_id"]) for row in rows)
+
     def _load_messages(self, sprint_id: int) -> None:
         assert self.sprint is not None
-        stage_message_ids = sorted(set(self.stage_message_ids.values()))
-        stage_filter = ""
-        if stage_message_ids:
-            marks = ",".join("?" for _ in stage_message_ids)
-            stage_filter = f" OR m.message_id IN ({marks})"
+        exact_message_ids = sorted(
+            set(self.stage_message_ids.values()) | self.closeout_message_ids
+        )
+        exact_filter = ""
+        if exact_message_ids:
+            marks = ",".join("?" for _ in exact_message_ids)
+            exact_filter = f" OR m.message_id IN ({marks})"
         rows = self.con.execute(
             "WITH ranked_messages AS ("
             " SELECT m.*,ROW_NUMBER() OVER (PARTITION BY COALESCE(m.work_unit_id,0) "
@@ -373,8 +415,8 @@ class SprintHealthProjection:
             "LEFT JOIN sprint_participant_conversations pc "
             "ON pc.conversation_id=a.target_conversation_id "
             "LEFT JOIN active_shell_chats active ON active.shell_id=m.receiver_shell_id "
-            f"WHERE (m.message_rank<=100{stage_filter}) ORDER BY m.message_id DESC",
-            (sprint_id, *stage_message_ids),
+            f"WHERE (m.message_rank<=100{exact_filter}) ORDER BY m.message_id DESC",
+            (sprint_id, *exact_message_ids),
         ).fetchall()
         generation = str(self.sprint["conversation_generation"])
         for row in rows:
@@ -402,23 +444,66 @@ class SprintHealthProjection:
                 self.messages_by_unit[int(item["work_unit_id"])].append(item)
 
     def _load_open_replies(self, sprint_id: int) -> None:
-        rows = self.con.execute(
-            "SELECT m.message_id,m.work_unit_id,m.receiver_shell_id,m.created_at,"
-            "m.delivered_at,m.read_at FROM wake_message m "
-            "WHERE m.sprint_id=? AND m.requires_reply=1 "
-            "AND m.reply_to_message_id IS NULL "
-            "AND NOT EXISTS (SELECT 1 FROM wake_message reply "
-            " WHERE reply.sprint_id=m.sprint_id "
-            " AND reply.reply_to_message_id=m.message_id) "
-            "ORDER BY m.message_id",
-            (sprint_id,),
+        unit_rows = self.con.execute(
+            "WITH open_replies AS ("
+            " SELECT m.message_id,m.work_unit_id,m.receiver_shell_id,m.created_at,"
+            " m.delivered_at,m.read_at FROM wake_message m "
+            " WHERE m.sprint_id=? AND m.requires_reply=1 "
+            " AND m.reply_to_message_id IS NULL AND m.work_unit_id IS NOT NULL "
+            " AND NOT EXISTS (SELECT 1 FROM wake_message reply "
+            "  WHERE reply.sprint_id=m.sprint_id "
+            "  AND reply.reply_to_message_id=m.message_id)),"
+            "ranked_replies AS ("
+            " SELECT open_replies.*,ROW_NUMBER() OVER ("
+            "  PARTITION BY work_unit_id,(read_at IS NULL) "
+            "  ORDER BY julianday(COALESCE(read_at,delivered_at,created_at)),message_id"
+            " ) reply_rank FROM open_replies) "
+            "SELECT message_id,work_unit_id,receiver_shell_id,created_at,"
+            "delivered_at,read_at FROM ranked_replies WHERE reply_rank<=? "
+            "ORDER BY work_unit_id,reply_rank",
+            (sprint_id, MAX_MESSAGE_REFS),
         ).fetchall()
-        for row in rows:
+        for row in unit_rows:
             item = dict(row)
-            unit_id = item.get("work_unit_id")
-            self.open_replies_by_unit[
-                int(unit_id) if unit_id is not None else None
-            ].append(item)
+            self.open_replies_by_unit[int(item["work_unit_id"])].append(item)
+
+        assert self.sprint is not None
+        sprint_rows = self.con.execute(
+            "WITH open_replies AS ("
+            " SELECT m.message_id,m.receiver_shell_id,m.created_at,m.delivered_at,"
+            " m.read_at,COALESCE(m.read_at,m.delivered_at,m.created_at) trigger_at "
+            " FROM wake_message m WHERE m.sprint_id=? AND m.requires_reply=1 "
+            " AND m.reply_to_message_id IS NULL AND m.work_unit_id IS NULL "
+            " AND NOT EXISTS (SELECT 1 FROM wake_message reply "
+            "  WHERE reply.sprint_id=m.sprint_id "
+            "  AND reply.reply_to_message_id=m.message_id)),"
+            "classified AS ("
+            " SELECT open_replies.*,CASE "
+            "  WHEN (julianday(?) - MAX(julianday(?),julianday(trigger_at)))"
+            "       * 86400 >= ? THEN 3 "
+            "  WHEN read_at IS NOT NULL THEN 2 ELSE 1 END condition_rank "
+            " FROM open_replies) "
+            "SELECT message_id,NULL work_unit_id,receiver_shell_id,created_at,"
+            "delivered_at,read_at,condition_rank,COUNT(*) OVER () open_count,"
+            "SUM(condition_rank>=2) OVER () root_count,"
+            "SUM(condition_rank=3) OVER () attention_count "
+            "FROM classified ORDER BY condition_rank DESC,"
+            "MAX(julianday(?),julianday(trigger_at)),message_id LIMIT ?",
+            (
+                sprint_id,
+                _stamp(self.now),
+                self.sprint["armed_at"],
+                int(ATTENTION_AFTER.total_seconds()),
+                self.sprint["armed_at"],
+                MAX_ROOT_CAUSES,
+            ),
+        ).fetchall()
+        if sprint_rows:
+            self.sprint_reply_root_count = int(sprint_rows[0]["root_count"])
+            self.sprint_reply_attention_count = int(
+                sprint_rows[0]["attention_count"]
+            )
+        self.open_replies_by_unit[None].extend(dict(row) for row in sprint_rows)
 
     def _classify_unit(self, unit_id: int) -> Candidate:
         unit = self.units[unit_id]
@@ -451,12 +536,14 @@ class SprintHealthProjection:
             )
 
         relevant = self._relevant_messages(unit)
-        live = self._live_run(relevant, owner_shell, disposition)
-        if live is not None and disposition != "ready":
+        live_match = self._live_run(relevant, owner_shell, disposition)
+        if live_match is not None and disposition != "ready":
+            live, live_owner_shell = live_match
             return Candidate(
-                "progressing", "run_active", _max_stamp(floor, live.at), owner,
+                "progressing", "run_active", _max_stamp(floor, live.at),
+                self._owner([live_owner_shell]),
                 live, next_code, next_detail, work_unit_id=unit_id,
-                activity="live", capacity=capacity,
+                activity="live", capacity=self._capacity(live_owner_shell),
             )
 
         exhausted = self._pickup_exhausted(unit_id, floor)
@@ -492,29 +579,31 @@ class SprintHealthProjection:
 
         wake = self._wake_candidate(relevant, floor)
         if wake is not None:
-            condition, cause, since, evidence, refs = wake
+            condition, cause, since, evidence, refs, wake_owner_shell = wake
             return Candidate(
-                condition, cause, since, owner, evidence, next_code, next_detail,
+                condition, cause, since, self._owner([wake_owner_shell]), evidence,
+                next_code, next_detail,
                 work_unit_id=unit_id, message_refs=refs,
                 activity="live" if cause == "pickup_active" else "idle",
-                capacity=capacity,
+                capacity=self._capacity(wake_owner_shell),
             )
 
         reply = self._reply_candidate(unit_id, floor)
         if reply is not None:
             reply.work_unit_id = unit_id
-            reply.capacity = capacity
+            if reply.capacity is None:
+                reply.capacity = capacity
             return reply
 
         pr = self.prs.get(unit_id)
         if pr and pr.get("normalized_state") in _ACTIVE_PR_STATES:
             observed = _parse(pr.get("observed_at")) or floor
-            since = _max_stamp(floor, observed, self._latest_owner_reset(relevant, observed))
             evidence = Evidence(
                 "pr_transition", int(pr["transition_id"]), observed, 3
             )
             state = str(pr["normalized_state"])
             if state in {"created", "pending"}:
+                since = _max_stamp(floor, observed)
                 overdue = self.now - since >= CI_STUCK_AFTER
                 return Candidate(
                     "attention" if overdue else "waiting_external",
@@ -522,6 +611,9 @@ class SprintHealthProjection:
                     since, owner, evidence, next_code, next_detail,
                     work_unit_id=unit_id, capacity=capacity,
                 )
+            since = _max_stamp(
+                floor, observed, self._latest_owner_reset(relevant, observed)
+            )
             if state == "red":
                 overdue = self.now - since >= ATTENTION_AFTER
                 return Candidate(
@@ -608,6 +700,34 @@ class SprintHealthProjection:
         owner_shell = self._owner_shell(unit)
         result = []
         recovery_message_ids: set[int] = set()
+        if disposition == "blocked":
+            floor = self._stage_floor(unit)
+            open_reply_ids = {
+                int(message["message_id"])
+                for message in self._open_reply_candidates(unit_id)
+            }
+            for message in self.messages_by_unit[unit_id]:
+                wake_key = str(message.get("wake_idempotency_key") or "")
+                recovery_at = _parse(
+                    message.get("wake_created_at") or message.get("created_at")
+                )
+                is_planner_recovery = (
+                    int(message["receiver_shell_id"]) == owner_shell
+                    and wake_key.startswith(
+                        (
+                            f"sprint-recovery:{self.sprint['sprint_id']}:",
+                            f"sprint-resume:{self.sprint['sprint_id']}:",
+                        )
+                    )
+                    and recovery_at is not None
+                    and recovery_at >= floor
+                )
+                if (
+                    int(message["message_id"]) in open_reply_ids
+                    or is_planner_recovery
+                ):
+                    result.append(message)
+            return result
         stage_kind = {
             "ready": "work_assignment",
             "active": "work_assignment",
@@ -633,10 +753,10 @@ class SprintHealthProjection:
                 continue
             if disposition == "planned":
                 continue
-            if disposition != "blocked" and int(message["receiver_shell_id"]) != owner_shell:
+            if int(message["receiver_shell_id"]) != owner_shell:
                 continue
             result.append(message)
-        if stage_kind is None or disposition == "blocked" or not result:
+        if stage_kind is None or not result:
             return result
         stage_message_id = self.stage_message_ids.get(unit_id)
         if stage_message_id is not None:
@@ -667,12 +787,13 @@ class SprintHealthProjection:
         messages: list[dict[str, Any]],
         owner_shell: int,
         disposition: str,
-    ) -> Evidence | None:
-        candidates = []
+    ) -> tuple[Evidence, int] | None:
+        candidates: list[tuple[Evidence, int]] = []
         for message in messages:
             if not message["verified_live"]:
                 continue
-            if int(message["receiver_shell_id"]) != owner_shell:
+            receiver_shell = int(message["receiver_shell_id"])
+            if disposition != "blocked" and receiver_shell != owner_shell:
                 continue
             if disposition == "in_review" and not (
                 message["message_kind"] == "review_request"
@@ -687,8 +808,14 @@ class SprintHealthProjection:
                 continue
             at = _parse(message.get("heartbeat_at")) or _parse(message.get("started_at"))
             if at is not None:
-                candidates.append(Evidence("run", int(message["run_id"]), at, 0))
-        return self._newest(candidates)
+                candidates.append(
+                    (Evidence("run", int(message["run_id"]), at, 0), receiver_shell)
+                )
+        return max(
+            candidates,
+            key=lambda value: (value[0].at, -value[0].rank, value[0].row_id),
+            default=None,
+        )
 
     def _runtime_failure(
         self,
@@ -758,16 +885,20 @@ class SprintHealthProjection:
 
     def _wake_candidate(
         self, messages: list[dict[str, Any]], floor: datetime
-    ) -> tuple[str, str, datetime, Evidence, list[int]] | None:
+    ) -> tuple[str, str, datetime, Evidence, list[int], int] | None:
         rows = []
         for message in messages:
             state = message.get("wake_state")
             if state in {"pending", "delivering"}:
+                available = _parse(message.get("available_at"))
+                if available is not None and available > self.now:
+                    available = None
                 at = _max_stamp(
                     floor,
                     _parse(message.get("wake_created_at")),
                     _parse(message.get("claimed_at")),
                     _parse(message.get("attempted_at")),
+                    available if state == "pending" else None,
                 )
             if state == "pending":
                 rows.append((0, "wake_pending", at, message))
@@ -807,7 +938,14 @@ class SprintHealthProjection:
             and self.now - since >= ATTENTION_AFTER
             else "waiting_external"
         )
-        return condition, cause, since, evidence, refs
+        return (
+            condition,
+            cause,
+            since,
+            evidence,
+            refs,
+            int(selected["receiver_shell_id"]),
+        )
 
     def _reply_candidate(self, unit_id: int, floor: datetime) -> Candidate | None:
         candidates = self._open_reply_candidates(unit_id)
@@ -857,6 +995,7 @@ class SprintHealthProjection:
             message_refs=[
                 int(row["message_id"]) for row in same[:MAX_MESSAGE_REFS]
             ],
+            capacity=self._capacity(receiver),
         )
 
     def _open_reply_candidates(self, unit_id: int | None) -> list[dict[str, Any]]:
@@ -898,10 +1037,7 @@ class SprintHealthProjection:
     def _closeout_candidate(self) -> Candidate:
         assert self.sprint is not None
         floor = _required_stamp(self.sprint["armed_at"])
-        event = next(
-            (row for row in self.events if row["event_type"] == "sprint.delivery_terminal"),
-            None,
-        )
+        event = self.closeout_event
         if event is None:
             anchor = floor
             evidence = None
@@ -913,10 +1049,7 @@ class SprintHealthProjection:
         messages = [
             message
             for message in self.messages
-            if message.get("work_unit_id") is None
-            and str(message.get("idempotency_key", "")).startswith(
-                f"sprint:{self.sprint['sprint_id']}:delivery-terminal:"
-            )
+            if int(message["message_id"]) in self.closeout_message_ids
         ]
         owners = [int(message["receiver_shell_id"]) for message in messages]
         live = self._newest(
@@ -953,7 +1086,7 @@ class SprintHealthProjection:
             )
         wake = self._wake_candidate(messages, anchor)
         if wake:
-            _, _, since, wake_evidence, _ = wake
+            _, _, since, wake_evidence, _, _ = wake
             return Candidate(
                 "waiting_external", "conformance_handoff", since,
                 self._owner(owners), wake_evidence, "conformance_recorded",
@@ -1036,15 +1169,26 @@ class SprintHealthProjection:
             (candidate.since for candidate in winning if candidate.since is not None),
             default=None,
         )
-        roots = [
+        unit_roots = [
             candidate
             for unit_id, candidate in units.items()
             if candidate.condition in _ROOT_CONDITIONS
             and candidate.roots == [unit_id]
-        ] + [
-            candidate for candidate in sprint_candidates
-            if candidate.condition in _ROOT_CONDITIONS
         ]
+        sprint_reply_roots = [
+            candidate
+            for candidate in sprint_candidates
+            if candidate.condition in _ROOT_CONDITIONS
+            and candidate.scope == "sprint"
+            and candidate.root_key is None
+        ]
+        sprint_other_roots = [
+            candidate
+            for candidate in sprint_candidates
+            if candidate.condition in _ROOT_CONDITIONS
+            and not (candidate.scope == "sprint" and candidate.root_key is None)
+        ]
+        roots = unit_roots + sprint_reply_roots + sprint_other_roots
         root_public = [candidate.root_public(self.now) for candidate in roots]
         root_public.sort(
             key=lambda row: (
@@ -1054,6 +1198,18 @@ class SprintHealthProjection:
                 str(row["root_id"]),
             )
         )
+        sprint_reply_root_count = (
+            self.sprint_reply_root_count if lifecycle == "armed" else 0
+        )
+        sprint_reply_attention_count = (
+            self.sprint_reply_attention_count if lifecycle == "armed" else 0
+        )
+        root_cause_count = (
+            len(unit_roots)
+            + sprint_reply_root_count
+            + len(sprint_other_roots)
+        )
+        root_public = root_public[:MAX_ROOT_CAUSES]
         root_ids = sorted(
             {
                 int(candidate.work_unit_id)
@@ -1068,8 +1224,15 @@ class SprintHealthProjection:
                 "age_seconds": _age(self.now, since) if since else None,
                 "root_work_unit_ids": root_ids,
                 "root_causes": root_public,
-                "attention_count": sum(
-                    candidate.condition == "attention" for candidate in roots
+                "root_cause_count": root_cause_count,
+                "root_causes_truncated": root_cause_count > len(root_public),
+                "attention_count": (
+                    sum(candidate.condition == "attention" for candidate in unit_roots)
+                    + sprint_reply_attention_count
+                    + sum(
+                        candidate.condition == "attention"
+                        for candidate in sprint_other_roots
+                    )
                 ),
                 "unreadable_signals": self.unreadable,
                 "machinery": {

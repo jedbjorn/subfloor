@@ -874,14 +874,15 @@ class SprintWakeDeliveryService:
         now = _stamp(self.now())
         with db_driver.write_transaction(self.con, "sprint.wake.recover"):
             result = self.con.execute(
-                "UPDATE sprint_wake_outbox SET state='pending',claim_owner=NULL,"
+                "UPDATE sprint_wake_outbox SET state='pending',available_at=?,"
+                "claim_owner=NULL,"
                 "claimed_at=NULL,lease_expires_at=NULL "
                 "WHERE state='delivering' AND lease_expires_at<=? "
                 "AND NOT EXISTS (SELECT 1 FROM sprint_wake_outbox followup "
                 "WHERE followup.receiver_shell_id="
                 "sprint_wake_outbox.receiver_shell_id "
                 "AND followup.state='pending')",
-                (now,),
+                (now, now),
             )
         return int(result.rowcount)
 
@@ -921,14 +922,15 @@ class SprintWakeDeliveryService:
         expires = _stamp(now_value + timedelta(seconds=lease_seconds))
         with db_driver.write_transaction(self.con, "sprint.wake.claim"):
             self.con.execute(
-                "UPDATE sprint_wake_outbox SET state='pending',claim_owner=NULL,"
+                "UPDATE sprint_wake_outbox SET state='pending',available_at=?,"
+                "claim_owner=NULL,"
                 "claimed_at=NULL,lease_expires_at=NULL "
                 "WHERE state='delivering' AND lease_expires_at<=? "
                 "AND NOT EXISTS (SELECT 1 FROM sprint_wake_outbox followup "
                 "WHERE followup.receiver_shell_id="
                 "sprint_wake_outbox.receiver_shell_id "
                 "AND followup.state='pending')",
-                (now,),
+                (now, now),
             )
             candidates = self.con.execute(
                 "SELECT w.* FROM sprint_wake_outbox w "
