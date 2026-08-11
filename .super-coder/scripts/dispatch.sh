@@ -82,7 +82,11 @@ sc_platform_detect() {
     SC_PLATFORM_WSL=1
   fi
   if [ -r "$_platform_release" ] && command -p iconv -f UTF-8 -t UTF-8 "$_platform_release" >/dev/null 2>&1; then
+    if LC_ALL=C command -p od -An -v -t x1 "$_platform_release" | command -p grep -Eq '(^|[[:space:]])00([[:space:]]|$)'; then
+      SC_PLATFORM_INVALID=1
+    fi
     while IFS='=' read -r _platform_key _platform_value || [ -n "$_platform_key" ]; do
+      [ "$SC_PLATFORM_INVALID" = 1 ] && break
       case "$_platform_key" in
         ID) SC_PLATFORM_ID="$(sc_platform_unquote "$_platform_value")" || SC_PLATFORM_INVALID=1 ;;
         ID_LIKE) SC_PLATFORM_ID_LIKE="$(sc_platform_unquote "$_platform_value")" || SC_PLATFORM_INVALID=1 ;;

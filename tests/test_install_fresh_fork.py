@@ -490,6 +490,46 @@ class FreshForkInstallTest(unittest.TestCase):
                 repo, home, before_repo, before_home
             )
 
+    def test_direct_installer_refuses_nul_os_release_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo, home = self.prepare_repo(raw)
+            release = Path(raw) / "nul-os-release"
+            release.write_bytes(b"ID=ubuntu\nVERSION_ID=26.04\0")
+            sentinel = home / "python-sentinel"
+            sentinel.write_text(
+                "#!/bin/sh\n"
+                f"touch {home / 'python-ran'}\n"
+                "exit 99\n"
+            )
+            sentinel.chmod(sentinel.stat().st_mode | 0o100)
+            self.configure_dispatch_host(repo, "Linux", release)
+            before_repo = self.snapshot_tree(repo)
+            before_home = self.snapshot_tree(home)
+            shell = subprocess.run(
+                ["sh", str(repo / ".super-coder/scripts/dispatch.sh"), "install"],
+                cwd=repo,
+                env={
+                    **os.environ,
+                    "HOME": str(home),
+                    "SC_CALLER_ROOT": str(repo),
+                    "SC_PYTHON": str(sentinel),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            result = self.run_direct_host(repo, home, "Linux", release)
+
+            self.assertEqual(shell.returncode, 1)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(shell.stderr, result.stderr)
+            self.assertIn("ID=unknown; ID_LIKE=unknown", result.stderr)
+            self.assertFalse((home / "python-ran").exists())
+            self.assert_direct_refusal_is_pristine(
+                repo, home, before_repo, before_home
+            )
+
     def test_each_failed_critical_phase_withholds_marker_and_reruns_cleanly(self) -> None:
         phases = {
             "rebuild.py": "Building the system DB (schema + migrations)",

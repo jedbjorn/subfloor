@@ -59,6 +59,9 @@ def _platform_identity() -> tuple[str, str, str, str]:
     try:
         with open(release, encoding="utf-8") as stream:
             for line in stream:
+                if "\0" in line:
+                    fields.clear()
+                    break
                 key, separator, value = line.rstrip("\n").partition("=")
                 if separator and key in {"ID", "ID_LIKE", "VERSION_ID"}:
                     parsed = _os_release_value(value)
