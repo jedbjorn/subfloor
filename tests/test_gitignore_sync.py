@@ -236,6 +236,7 @@ class EnsureGitignoreTest(unittest.TestCase):
 
         with (
             mock.patch.object(install, "REPO_ROOT", self.root),
+            mock.patch.object(install.platform, "system", return_value="Linux"),
             mock.patch.object(install, "is_source_repo", return_value=False),
             mock.patch.object(install, "already_installed", return_value=False),
             mock.patch.object(install, "report_docker") as report_docker,

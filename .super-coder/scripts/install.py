@@ -50,6 +50,29 @@ REPO_ROOT = ENGINE.parent
 PY = sys.executable
 IS_MAC = platform.system() == "Darwin"  # guidance arms differ (colima/brew vs systemd/apt)
 
+
+def require_supported_host() -> None:
+    """Refuse unsupported hosts before installer imports or repository writes."""
+    kernel = platform.system()
+    if kernel == "Linux":
+        return
+    raise SystemExit(
+        "✗ subfloor refused: unsupported host.\n"
+        f"  detected kernel: {kernel or 'unknown'}\n"
+        "  subfloor runs on Linux.\n"
+        "  Create a Linux VM, keep the checkout on the guest filesystem, "
+        "then run ./sc install inside the guest.\n"
+        "  The rejected command was not run and no native compatibility path exists."
+    )
+
+
+# Direct execution reaches this module before `main`, so enforce the boundary
+# before loading engine modules that could otherwise create local bytecode. An
+# imported installer remains inspectable by tests and maintenance tooling; its
+# action entry point enforces the same boundary below.
+if __name__ == "__main__":
+    require_supported_host()
+
 sys.path.insert(0, str(ENGINE / "scripts"))
 import callable_floor  # noqa: E402
 import engine_manifest  # noqa: E402
@@ -857,6 +880,7 @@ def step(msg: str) -> None:
 
 
 def main(argv: list[str]) -> int:
+    require_supported_host()
     force = "--force" in argv
     skip_harness = "--skip-harness-install" in argv
     # super-coder's own flags — strip them so they don't reach init_fork's parser.

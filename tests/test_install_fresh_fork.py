@@ -1,6 +1,7 @@
 """Fresh-fork installer completion regression coverage."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -15,6 +16,38 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FreshForkInstallTest(unittest.TestCase):
+    def snapshot_tree(self, root: Path) -> list[tuple[str, str, int, str]]:
+        snapshot = []
+        for path in sorted(root.rglob("*")):
+            relative = str(path.relative_to(root))
+            mode = path.lstat().st_mode
+            if path.is_symlink():
+                snapshot.append((relative, "symlink", mode, os.readlink(path)))
+            elif path.is_file():
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                snapshot.append((relative, "file", mode, digest))
+            elif path.is_dir():
+                snapshot.append((relative, "directory", mode, ""))
+        return snapshot
+
+    def assert_direct_refusal_is_pristine(
+        self,
+        repo: Path,
+        home: Path,
+        before_repo: list[tuple[str, str, int, str]],
+        before_home: list[tuple[str, str, int, str]],
+    ) -> None:
+        self.assertEqual(self.snapshot_tree(repo), before_repo)
+        self.assertEqual(self.snapshot_tree(home), before_home)
+        self.assertFalse((repo / ".gitignore").exists())
+        self.assertFalse((repo / "Makefile").exists())
+        self.assertFalse((repo / ".sc-state").exists())
+        self.assertFalse((repo / ".super-coder" / "instance.json").exists())
+        self.assertFalse((repo / ".super-coder" / "shell_db.db").exists())
+        self.assertFalse((home / ".local" / "bin" / "sc").exists())
+        self.assertFalse((home / ".local" / "state" / "super-coder" / "installs.json").exists())
+        self.assertFalse((home / ".profile").exists())
+
     def prepare_repo(self, raw: str) -> tuple[Path, Path]:
         repo = Path(raw) / "host-project"
         home = Path(raw) / "home"
@@ -47,6 +80,10 @@ class FreshForkInstallTest(unittest.TestCase):
             cwd=repo, check=True,
         )
         subprocess.run(
+            ["git", "config", "maintenance.auto", "false"],
+            cwd=repo, check=True,
+        )
+        subprocess.run(
             ["git", "add", ".super-coder", "sc", "README.md"],
             cwd=repo, check=True,
         )
@@ -56,26 +93,95 @@ class FreshForkInstallTest(unittest.TestCase):
         )
         return repo, home
 
-    def run_install(self, repo: Path, home: Path) -> subprocess.CompletedProcess[str]:
+    def configure_dispatch_host(
+        self, repo: Path, kernel: str, release: Path, runtime: Path | None = None
+    ) -> None:
+        # Only this disposable dispatcher copy receives a deterministic host.
+        dispatch = repo / ".super-coder" / "scripts" / "dispatch.sh"
+        source = dispatch.read_text()
+        kernel_probe = 'SC_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"'
+        self.assertIn(kernel_probe, source)
+        dispatch.write_text(
+            source.replace(
+                kernel_probe, f"SC_PLATFORM_KERNEL={kernel!r}"
+            )
+        )
+
+    def run_direct_host(
+        self,
+        repo: Path,
+        home: Path,
+        kernel: str,
+        release: Path,
+        extra_env: dict[str, str] | None = None,
+        args: list[str] | None = None,
+        timeout: int | None = None,
+        python_version: tuple[int, int, int] | None = None,
+        runtime: Path | None = None,
+        clear_env: tuple[str, ...] = (),
+    ) -> subprocess.CompletedProcess[str]:
+        # The subprocess patches host probes before executing the unmodified installer.
+        install = repo / ".super-coder" / "scripts" / "install.py"
+        argv = [str(install), *(args or ["--harness-epoch"])]
+        python_probe = ""
+        if python_version:
+            version_text = ".".join(str(part) for part in python_version)
+            python_probe = (
+                f"sys.version_info = {python_version!r}\n"
+                f"platform.python_version = lambda: {version_text!r}\n"
+            )
+        direct_entry = (
+            "import builtins\n"
+            "import platform\n"
+            "import runpy\n"
+            "import sys\n"
+            "original_open = builtins.open\n"
+            f"release = {str(release)!r}\n"
+            f"runtime = {str(runtime) if runtime else None!r}\n"
+            f"platform.system = lambda: {kernel!r}\n"
+            "def host_open(path, *args, **kwargs):\n"
+            "    if path == '/etc/os-release':\n"
+            "        return original_open(release, *args, **kwargs)\n"
+            "    if path == '/proc/sys/kernel/osrelease' and runtime is not None:\n"
+            "        return original_open(runtime, *args, **kwargs)\n"
+            "    return original_open(path, *args, **kwargs)\n"
+            "builtins.open = host_open\n"
+            + python_probe
+            + f"sys.argv = {argv!r}\n"
+            + f"runpy.run_path({str(install)!r}, run_name='__main__')\n"
+        )
+        environment = {
+            **os.environ,
+            "HOME": str(home),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            **(extra_env or {}),
+        }
+        for name in clear_env:
+            environment.pop(name, None)
         return subprocess.run(
-            [
-                sys.executable,
-                str(repo / ".super-coder" / "scripts" / "install.py"),
-                "--skip-harness-install",
-                "--username",
-                "Gate",
-            ],
+            [sys.executable, "-c", direct_entry],
             cwd=repo,
-            env={
-                **os.environ,
-                "HOME": str(home),
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    def run_install(self, repo: Path, home: Path) -> subprocess.CompletedProcess[str]:
+        release = home / "os-release"
+        release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
+        return self.run_direct_host(
+            repo,
+            home,
+            "Linux",
+            release,
+            {
                 "XDG_STATE_HOME": str(home / ".local/state"),
                 "NO_COLOR": "1",
             },
-            capture_output=True,
-            text=True,
+            args=["--skip-harness-install", "--username", "Gate"],
             timeout=120,
-            check=False,
         )
 
     def test_noninteractive_install_reaches_durable_completion_marker(self) -> None:
@@ -119,27 +225,16 @@ class FreshForkInstallTest(unittest.TestCase):
                 text=True,
                 check=True,
             ).stdout
-            install = repo / ".super-coder" / "scripts" / "install.py"
-            direct_entry = (
-                "import platform, runpy, sys; "
-                "sys.version_info = (3, 8, 20); "
-                "platform.python_version = lambda: '3.8.20'; "
-                f"sys.argv = [{str(install)!r}, '--skip-harness-install']; "
-                f"runpy.run_path({str(install)!r}, run_name='__main__')"
-            )
-
-            result = subprocess.run(
-                [sys.executable, "-c", direct_entry],
-                cwd=repo,
-                env={
-                    **os.environ,
-                    "HOME": str(home),
-                    "NO_COLOR": "1",
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
-                capture_output=True,
-                text=True,
-                check=False,
+            release = home / "os-release"
+            release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
+            result = self.run_direct_host(
+                repo,
+                home,
+                "Linux",
+                release,
+                {"NO_COLOR": "1"},
+                args=["--skip-harness-install"],
+                python_version=(3, 8, 20),
             )
 
             self.assertNotEqual(result.returncode, 0)
@@ -156,6 +251,124 @@ class FreshForkInstallTest(unittest.TestCase):
                 check=True,
             ).stdout
             self.assertEqual(after, before)
+
+    def test_direct_installer_platform_gate_is_kernel_only(self) -> None:
+        fixtures = {
+            "ubuntu": ("Linux", "ID=ubuntu\nVERSION_ID=26.10", True),
+            "fedora": ("Linux", "ID=fedora\nVERSION_ID=rawhide", True),
+            "arch": ("Linux", "ID=arch\n", True),
+            "cachyos": ("Linux", "ID=cachyos\nID_LIKE=arch\n", True),
+            "malformed": ("Linux", 'ID="ubuntu\nVERSION_ID=26.04\n', True),
+            "unknown-linux": ("Linux", "ID=notarch\nID_LIKE=notarch\n", True),
+            "missing-os-release": ("Linux", None, True),
+            "darwin": ("Darwin", "ID=macos\n", False),
+            "windows": ("MINGW64_NT", "ID=windows\n", False),
+        }
+        for name, (kernel, contents, accepted) in fixtures.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as raw:
+                repo, home = self.prepare_repo(raw)
+                release = Path(raw) / "os-release"
+                if contents is not None:
+                    release.write_text(contents)
+                self.configure_dispatch_host(repo, kernel, release)
+                result = self.run_direct_host(repo, home, kernel, release)
+                (repo / ".super-coder/scripts/install.py").write_text(
+                    "#!/usr/bin/env python3\nprint('0')\n"
+                )
+                before_repo = self.snapshot_tree(repo)
+                before_home = self.snapshot_tree(home)
+                shell = subprocess.run(
+                    [
+                        "sh",
+                        str(repo / ".super-coder/scripts/dispatch.sh"),
+                        "install",
+                        "--harness-epoch",
+                    ],
+                    cwd=repo,
+                    env={
+                        **os.environ,
+                        "HOME": str(home),
+                        "SC_CALLER_ROOT": str(repo),
+                        "SC_PYTHON": sys.executable,
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if accepted:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), "0")
+                    self.assertEqual(shell.returncode, 0, shell.stderr)
+                    self.assertEqual(shell.stdout.strip(), "0")
+                else:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(f"detected kernel: {kernel}", result.stderr)
+                    self.assertIn("Create a Linux VM", result.stderr)
+                    self.assertEqual(shell.returncode, 1)
+                    self.assertEqual(shell.stderr, result.stderr)
+                    self.assert_direct_refusal_is_pristine(
+                        repo, home, before_repo, before_home
+                    )
+
+        for marker in ("WSL_DISTRO_NAME", "WSL_INTEROP"):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as raw:
+                repo, home = self.prepare_repo(raw)
+                release = Path(raw) / "os-release"
+                release.write_text("ID=unknown\n")
+                result = self.run_direct_host(
+                    repo, home, "Linux", release, {marker: "fixture"}
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "0")
+
+    def test_direct_installer_ignores_platform_environment_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo, home = self.prepare_repo(raw)
+            release = Path(raw) / "os-release"
+            release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
+            before_repo = self.snapshot_tree(repo)
+            before_home = self.snapshot_tree(home)
+
+            result = self.run_direct_host(
+                repo,
+                home,
+                "Darwin",
+                release,
+                {
+                    "SC_PLATFORM_UNAME": "Linux",
+                    "SC_PLATFORM_OS_RELEASE": str(release),
+                },
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("detected kernel: Darwin", result.stderr)
+            self.assert_direct_refusal_is_pristine(
+                repo, home, before_repo, before_home
+            )
+
+    def test_direct_installer_ignores_unreadable_os_release(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo, home = self.prepare_repo(raw)
+            release = Path(raw) / "invalid-os-release"
+            release.write_bytes(
+                b"ID=ubuntu\nVERSION_ID=26.04\nPADDING="
+                + b"x" * 20_000
+                + b"\nBROKEN=\xff\n"
+            )
+            result = self.run_direct_host(repo, home, "Linux", release)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "0")
+
+    def test_direct_installer_ignores_nul_os_release(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo, home = self.prepare_repo(raw)
+            release = Path(raw) / "nul-os-release"
+            release.write_bytes(b"ID=ubuntu\nVERSION_ID=26.04\0")
+            result = self.run_direct_host(repo, home, "Linux", release)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "0")
 
     def test_each_failed_critical_phase_withholds_marker_and_reruns_cleanly(self) -> None:
         phases = {

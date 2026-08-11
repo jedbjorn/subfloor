@@ -55,6 +55,22 @@ DB="$ENGINE/shell_db.db"
 S="$ENGINE/scripts"
 MAPDB=""
 
+sc_require_supported_host() {
+  SC_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"
+  [ "$SC_PLATFORM_KERNEL" = Linux ] || sc_platform_unsupported
+}
+
+sc_platform_unsupported() {
+  {
+    echo '✗ subfloor refused: unsupported host.'
+    echo "  detected kernel: ${SC_PLATFORM_KERNEL:-unknown}"
+    echo '  subfloor runs on Linux.'
+    echo '  Create a Linux VM, keep the checkout on the guest filesystem, then run ./sc install inside the guest.'
+    echo '  The rejected command was not run and no native compatibility path exists.'
+  } >&2
+  exit 1
+}
+
 sc_python_recovery() {
   if [ "$(uname -s 2>/dev/null || true)" = "Darwin" ]; then
     echo '  recovery: brew install python' >&2
@@ -902,6 +918,13 @@ sc_restart_health_summary() {
 
 cmd="${1:-help}"; [ $# -gt 0 ] && shift
 
+# Bare and explicit help remain readable on every host. Every other command is
+# an action surface and must refuse before Python, Docker, Git, or engine code.
+case "$cmd" in
+  help|-h|--help) ;;
+  *) sc_require_supported_host ;;
+esac
+
 # Capability-check every dispatcher route that can execute host Python before
 # it reaches imports or mutation. Shell-implemented help (deps/map/admin/
 # launch/restart) stays dependency-free; script-owned help (remove/rebuild/
@@ -1408,6 +1431,8 @@ PY
   help|-h|--help)
     cat <<'EOF'
 super-coder — forkable shell substrate
+
+  Host support: Linux-only — Ubuntu, Fedora, Arch, and CachyOS are tested examples.
 
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
   ./sc ensure-harness      install claude + opencode + codex + vibe + kimi if missing (official native installers, no npm)
