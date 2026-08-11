@@ -1431,6 +1431,113 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
         self.assertIn("FnB fallback receipt", notices[0]["body"])
         self.assertIn("cleanup-status", notices[0]["body"])
 
+    def test_legacy_success_commits_once_when_planner_and_fnb_are_inactive(self):
+        sprint_id = self._adopt_legacy_with_inactive_planner(
+            "no-receiver-adopts-legacy-success"
+        )
+        self.con.execute("UPDATE shells SET is_deleted=1 WHERE shell_id=5")
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='succeeded' "
+            "WHERE sprint_id=? AND target_kind='worktree'",
+            (sprint_id,),
+        )
+        self.con.commit()
+        claim = self.targets.claim_next("no-receiver-success")
+        self.assertEqual("artifact_dir", claim.target_kind)
+
+        self.assertTrue(self.targets.mark_succeeded(claim, {"existed": False}))
+        self.assertFalse(self.targets.mark_succeeded(claim, {"existed": False}))
+
+        target = self.con.execute(
+            "SELECT state,after_evidence FROM sprint_cleanup_targets "
+            "WHERE cleanup_target_id=?",
+            (claim.cleanup_target_id,),
+        ).fetchone()
+        events = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='sprint.cleanup_completed'",
+            (sprint_id,),
+        ).fetchall()
+        notices = self.con.execute(
+            "SELECT receiver_shell_id FROM wake_message WHERE idempotency_key=?",
+            (f"sprint:{sprint_id}:cleanup-completed",),
+        ).fetchall()
+        self.assertEqual(
+            ("succeeded", {"existed": False}),
+            (target["state"], json.loads(target["after_evidence"])),
+        )
+        self.assertEqual(1, len(events))
+        self.assertEqual(
+            {"aggregate_state": "succeeded", "succeeded_count": 4, "target_count": 4},
+            json.loads(events[0]["payload"]),
+        )
+        self.assertEqual([], notices)
+
+    def test_legacy_failure_commits_once_when_planner_and_fnb_are_inactive(self):
+        sprint_id = self._adopt_legacy_with_inactive_planner(
+            "no-receiver-adopts-legacy-failure"
+        )
+        self.con.execute("UPDATE shells SET is_deleted=1 WHERE shell_id=5")
+        self.con.commit()
+        claim = self.targets.claim_next("no-receiver-failure", shell_id=1)
+        self.assertEqual("worktree", claim.target_kind)
+
+        self.assertTrue(
+            self.targets.fail_safety(
+                claim,
+                "git_common_dir_mismatch",
+                "stored repository identity changed",
+            )
+        )
+        self.assertFalse(
+            self.targets.fail_safety(
+                claim,
+                "git_common_dir_mismatch",
+                "stored repository identity changed",
+            )
+        )
+
+        target = self.con.execute(
+            "SELECT state,last_error_code,last_error_detail "
+            "FROM sprint_cleanup_targets WHERE cleanup_target_id=?",
+            (claim.cleanup_target_id,),
+        ).fetchone()
+        events = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='sprint.cleanup_failed'",
+            (sprint_id,),
+        ).fetchall()
+        key = (
+            f"sprint:{sprint_id}:cleanup-failed:target:{claim.cleanup_target_id}:"
+            f"generation:{claim.claim_generation}"
+        )
+        notices = self.con.execute(
+            "SELECT receiver_shell_id FROM wake_message WHERE idempotency_key=?",
+            (key,),
+        ).fetchall()
+        self.assertEqual(
+            (
+                "failed",
+                "git_common_dir_mismatch",
+                "stored repository identity changed",
+            ),
+            tuple(target),
+        )
+        self.assertEqual(1, len(events))
+        self.assertEqual(
+            {
+                "aggregate_state": "failed",
+                "attempt_count": 0,
+                "claim_generation": claim.claim_generation,
+                "cleanup_target_id": claim.cleanup_target_id,
+                "error_code": "git_common_dir_mismatch",
+                "path_label": ".sc-worktrees/dev1",
+                "target_kind": "worktree",
+            },
+            json.loads(events[0]["payload"]),
+        )
+        self.assertEqual([], notices)
+
     def test_terminal_transitions_emit_exact_planner_receipts_atomically(self):
         failed = self.targets.claim_next("failure-fixture", shell_id=1)
         self.assertIsNotNone(failed)

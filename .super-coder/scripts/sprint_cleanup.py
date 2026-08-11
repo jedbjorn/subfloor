@@ -629,14 +629,6 @@ class SprintCleanupTargetStore:
         if row is None:
             raise RuntimeError("terminal cleanup target disappeared")
         projection = self.project(claim.sprint_id)
-        receiver_shell_id, fnb_fallback = self._terminal_receipt_receiver(
-            claim.sprint_id
-        )
-        fallback_note = (
-            " Originating Planner is inactive; this is the FnB fallback receipt."
-            if fnb_fallback
-            else ""
-        )
         from sprint_message_delivery import SprintMessageStore
 
         if row["state"] == "failed":
@@ -656,6 +648,16 @@ class SprintCleanupTargetStore:
                 "(sprint_id,event_type,actor_kind,payload) "
                 "VALUES (?,'sprint.cleanup_failed','system',?)",
                 (claim.sprint_id, json.dumps(payload, sort_keys=True)),
+            )
+            receiver_shell_id, fnb_fallback = self._terminal_receipt_receiver(
+                claim.sprint_id
+            )
+            if receiver_shell_id is None:
+                return
+            fallback_note = (
+                " Originating Planner is inactive; this is the FnB fallback receipt."
+                if fnb_fallback
+                else ""
             )
             SprintMessageStore(self.con).send_to_shell_in_transaction(
                 receiver_shell_id,
@@ -689,6 +691,16 @@ class SprintCleanupTargetStore:
             "VALUES (?,'sprint.cleanup_completed','system',?)",
             (claim.sprint_id, json.dumps(payload, sort_keys=True)),
         )
+        receiver_shell_id, fnb_fallback = self._terminal_receipt_receiver(
+            claim.sprint_id
+        )
+        if receiver_shell_id is None:
+            return
+        fallback_note = (
+            " Originating Planner is inactive; this is the FnB fallback receipt."
+            if fnb_fallback
+            else ""
+        )
         SprintMessageStore(self.con).send_to_shell_in_transaction(
             receiver_shell_id,
             message_kind="notification",
@@ -701,7 +713,9 @@ class SprintCleanupTargetStore:
             declared_type="re-enter",
         )
 
-    def _terminal_receipt_receiver(self, sprint_id: int) -> tuple[int, bool]:
+    def _terminal_receipt_receiver(
+        self, sprint_id: int
+    ) -> tuple[int | None, bool]:
         planner = self.con.execute(
             "SELECT sprint.originating_planner_shell_id,"
             "COALESCE(shell.is_deleted,1) planner_deleted "
@@ -719,11 +733,9 @@ class SprintCleanupTargetStore:
             "SELECT shell_id FROM shells WHERE flavor='admin' "
             "AND COALESCE(is_deleted,0)=0 ORDER BY shell_id"
         ).fetchall()
-        if len(admins) != 1:
-            raise RuntimeError(
-                "terminal cleanup receipt requires the active FnB singleton"
-            )
-        return int(admins[0]["shell_id"]), True
+        if len(admins) == 1:
+            return int(admins[0]["shell_id"]), True
+        return None, False
 
     @staticmethod
     def safe_path_label(row: sqlite3.Row) -> str:
