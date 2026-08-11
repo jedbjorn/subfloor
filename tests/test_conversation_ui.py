@@ -554,6 +554,7 @@ const createdAt = "2026-08-06T06:17:00+02:00";
 const user = chatBubble("user", "hello", "completed", null, createdAt);
 const userWithTokens = chatBubble("user", "hello", "", null, createdAt, 12345);
 const assistant = chatBubble("assistant", "hello", "", null, createdAt, 12345);
+const assistantWithoutTokens = chatBubble("assistant", "hello", "", null, createdAt);
 const activity = chatBubble("activity", "working");
 console.log(JSON.stringify({
   valid: chatMessageTimeLabel(createdAt),
@@ -573,6 +574,8 @@ console.log(JSON.stringify({
     text: assistant.children.at(-1).children[0],
   },
   userHasToken: userWithTokens.children.some(
+    (child) => child.className === "chat-context-tokens"),
+  assistantWithoutTokensHasToken: assistantWithoutTokens.children.some(
     (child) => child.className === "chat-context-tokens"),
 }));
 """
@@ -594,6 +597,7 @@ console.log(JSON.stringify({
             "text": "12,345 tok",
         },
         "userHasToken": False,
+        "assistantWithoutTokensHasToken": False,
     }
     transcript_item = APP[
         APP.index("function chatTranscriptItemNode"):
