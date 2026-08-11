@@ -100,19 +100,10 @@ class FreshForkInstallTest(unittest.TestCase):
         dispatch = repo / ".super-coder" / "scripts" / "dispatch.sh"
         source = dispatch.read_text()
         kernel_probe = 'SC_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"'
-        release_probe = "_platform_release=/etc/os-release"
-        runtime_probe = "_platform_wsl_release=/proc/sys/kernel/osrelease"
         self.assertIn(kernel_probe, source)
-        self.assertIn(release_probe, source)
-        self.assertIn(runtime_probe, source)
         dispatch.write_text(
             source.replace(
                 kernel_probe, f"SC_PLATFORM_KERNEL={kernel!r}"
-            )
-            .replace(release_probe, f"_platform_release={str(release)!r}")
-            .replace(
-                runtime_probe,
-                f"_platform_wsl_release={str(runtime or Path('/proc/sys/kernel/osrelease'))!r}",
             )
         )
 
@@ -261,17 +252,15 @@ class FreshForkInstallTest(unittest.TestCase):
             ).stdout
             self.assertEqual(after, before)
 
-    def test_direct_installer_platform_gate_matches_allowlist_without_mutation(self) -> None:
+    def test_direct_installer_platform_gate_is_kernel_only(self) -> None:
         fixtures = {
-            "ubuntu-lts": ("Linux", "ID=ubuntu\nVERSION_ID=26.04", True),
-            "fedora-stable": ("Linux", "ID=fedora\nVERSION_ID=44", True),
+            "ubuntu": ("Linux", "ID=ubuntu\nVERSION_ID=26.10", True),
+            "fedora": ("Linux", "ID=fedora\nVERSION_ID=rawhide", True),
             "arch": ("Linux", "ID=arch\n", True),
             "cachyos": ("Linux", "ID=cachyos\nID_LIKE=arch\n", True),
-            "ubuntu-interim": ("Linux", "ID=ubuntu\nVERSION_ID=26.10\n", False),
-            "fedora-rawhide": ("Linux", "ID=fedora\nVERSION_ID=rawhide\n", False),
-            "malformed-quote": ("Linux", 'ID="ubuntu\nVERSION_ID=26.04\n', False),
-            "unknown-linux": ("Linux", "ID=notarch\nID_LIKE=notarch\n", False),
-            "missing-os-release": ("Linux", None, False),
+            "malformed": ("Linux", 'ID="ubuntu\nVERSION_ID=26.04\n', True),
+            "unknown-linux": ("Linux", "ID=notarch\nID_LIKE=notarch\n", True),
+            "missing-os-release": ("Linux", None, True),
             "darwin": ("Darwin", "ID=macos\n", False),
             "windows": ("MINGW64_NT", "ID=windows\n", False),
         }
@@ -285,186 +274,50 @@ class FreshForkInstallTest(unittest.TestCase):
                 before_repo = self.snapshot_tree(repo)
                 before_home = self.snapshot_tree(home)
                 result = self.run_direct_host(repo, home, kernel, release)
+                shell = subprocess.run(
+                    [
+                        "sh",
+                        str(repo / ".super-coder/scripts/dispatch.sh"),
+                        "install",
+                        "--harness-epoch",
+                    ],
+                    cwd=repo,
+                    env={
+                        **os.environ,
+                        "HOME": str(home),
+                        "SC_CALLER_ROOT": str(repo),
+                        "SC_PYTHON": sys.executable,
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
                 if accepted:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout.strip(), "0")
+                    self.assertEqual(shell.returncode, 0, shell.stderr)
+                    self.assertEqual(shell.stdout.strip(), "0")
                 else:
                     self.assertEqual(result.returncode, 1)
-                    self.assertIn("supported Linux VM", result.stderr)
-                    if name == "ubuntu-interim":
-                        self.assertIn("VERSION_ID=26.10", result.stderr)
-                    if name == "fedora-rawhide":
-                        self.assertIn("VERSION_ID=rawhide", result.stderr)
-                    if name == "malformed-quote":
-                        self.assertIn("ID=unknown; ID_LIKE=unknown; VERSION_ID=unknown", result.stderr)
-                    shell = subprocess.run(
-                        ["sh", str(repo / ".super-coder/scripts/dispatch.sh"), "install"],
-                        cwd=repo,
-                        env={
-                            **os.environ,
-                            "HOME": str(home),
-                            "SC_CALLER_ROOT": str(repo),
-                            "SC_PYTHON": sys.executable,
-                            "PYTHONDONTWRITEBYTECODE": "1",
-                        },
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
+                    self.assertIn(f"detected kernel: {kernel}", result.stderr)
+                    self.assertIn("Create a Linux VM", result.stderr)
                     self.assertEqual(shell.returncode, 1)
                     self.assertEqual(shell.stderr, result.stderr)
                     self.assert_direct_refusal_is_pristine(
                         repo, home, before_repo, before_home
                     )
 
-    def test_separator_bearing_arch_id_refuses_with_shell_installer_parity(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            repo, home = self.prepare_repo(raw)
-            release = Path(raw) / "separator-id"
-            release.write_text("ID=arch:unknown\n")
-            sentinel = home / "python-sentinel"
-            sentinel.write_text(
-                "#!/bin/sh\n"
-                f"touch {home / 'python-ran'}\n"
-                "exit 99\n"
-            )
-            sentinel.chmod(sentinel.stat().st_mode | 0o100)
-            self.configure_dispatch_host(repo, "Linux", release)
-            before_repo = self.snapshot_tree(repo)
-            before_home = self.snapshot_tree(home)
-
-            direct = self.run_direct_host(repo, home, "Linux", release)
-            shell = subprocess.run(
-                ["sh", str(repo / ".super-coder/scripts/dispatch.sh"), "install"],
-                cwd=repo,
-                env={
-                    **os.environ,
-                    "HOME": str(home),
-                    "SC_CALLER_ROOT": str(repo),
-                    "SC_PYTHON": str(sentinel),
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-
-            self.assertEqual(direct.returncode, 1)
-            self.assertEqual(shell.returncode, 1)
-            self.assertEqual(shell.stderr, direct.stderr)
-            self.assertIn(
-                "ID=arch:unknown; ID_LIKE=unknown; VERSION_ID=unknown",
-                direct.stderr,
-            )
-            self.assertFalse((home / "python-ran").exists())
-            self.assert_direct_refusal_is_pristine(
-                repo, home, before_repo, before_home
-            )
-
-    def test_wsl_runtime_signature_refuses_without_marker_variables(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            repo, home = self.prepare_repo(raw)
-            release = Path(raw) / "os-release"
-            runtime = Path(raw) / "wsl-runtime"
-            release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
-            runtime.write_text("5.15.167.4-microsoft-standard-WSL2\n")
-            sentinel = home / "python-sentinel"
-            sentinel.write_text(
-                "#!/bin/sh\n"
-                f"touch {home / 'python-ran'}\n"
-                "exit 99\n"
-            )
-            sentinel.chmod(sentinel.stat().st_mode | 0o100)
-            self.configure_dispatch_host(repo, "Linux", release, runtime)
-            before_repo = self.snapshot_tree(repo)
-            before_home = self.snapshot_tree(home)
-            direct = self.run_direct_host(
-                repo,
-                home,
-                "Linux",
-                release,
-                runtime=runtime,
-                clear_env=("WSL_DISTRO_NAME", "WSL_INTEROP"),
-            )
-            shell_env = {
-                **os.environ,
-                "HOME": str(home),
-                "SC_CALLER_ROOT": str(repo),
-                "SC_PYTHON": str(sentinel),
-                "PYTHONDONTWRITEBYTECODE": "1",
-            }
-            shell_env.pop("WSL_DISTRO_NAME", None)
-            shell_env.pop("WSL_INTEROP", None)
-            shell = subprocess.run(
-                ["sh", str(repo / ".super-coder/scripts/dispatch.sh"), "install"],
-                cwd=repo,
-                env=shell_env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-
-            self.assertEqual(direct.returncode, 1)
-            self.assertEqual(shell.returncode, 1)
-            self.assertEqual(shell.stderr, direct.stderr)
-            self.assertIn("ID=ubuntu; ID_LIKE=unknown; VERSION_ID=26.04", direct.stderr)
-            self.assertFalse((home / "python-ran").exists())
-            self.assert_direct_refusal_is_pristine(
-                repo, home, before_repo, before_home
-            )
-
-    def test_wsl_ubuntu_refuses_with_dispatcher_parity_without_mutation(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            repo, home = self.prepare_repo(raw)
-            release = Path(raw) / "os-release"
-            release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
-            sentinel = home / "python-sentinel"
-            sentinel.write_text(
-                "#!/bin/sh\n"
-                f"touch {home / 'python-ran'}\n"
-                "exit 99\n"
-            )
-            sentinel.chmod(sentinel.stat().st_mode | 0o100)
-            self.configure_dispatch_host(repo, "Linux", release)
-            before_repo = self.snapshot_tree(repo)
-            before_home = self.snapshot_tree(home)
-            wsl = {
-                "WSL_DISTRO_NAME": "Ubuntu",
-                "WSL_INTEROP": "/run/WSL/1_interop",
-            }
-
-            for marker, value in wsl.items():
-                with self.subTest(marker=marker):
-                    direct = self.run_direct_host(
-                        repo, home, "Linux", release, {marker: value}
-                    )
-                    shell = subprocess.run(
-                        ["sh", str(repo / ".super-coder/scripts/dispatch.sh"), "install"],
-                        cwd=repo,
-                        env={
-                            **os.environ,
-                            "HOME": str(home),
-                            "SC_CALLER_ROOT": str(repo),
-                            "SC_PYTHON": str(sentinel),
-                            "PYTHONDONTWRITEBYTECODE": "1",
-                            marker: value,
-                        },
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
-
-                    self.assertEqual(direct.returncode, 1)
-                    self.assertEqual(shell.returncode, 1)
-                    self.assertEqual(shell.stderr, direct.stderr)
-                    self.assertIn(
-                        "ID=ubuntu; ID_LIKE=unknown; VERSION_ID=26.04",
-                        direct.stderr,
-                    )
-                    self.assertFalse((home / "python-ran").exists())
-                    self.assert_direct_refusal_is_pristine(
-                        repo, home, before_repo, before_home
-                    )
+        for marker in ("WSL_DISTRO_NAME", "WSL_INTEROP"):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as raw:
+                repo, home = self.prepare_repo(raw)
+                release = Path(raw) / "os-release"
+                release.write_text("ID=unknown\n")
+                result = self.run_direct_host(
+                    repo, home, "Linux", release, {marker: "fixture"}
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "0")
 
     def test_direct_installer_ignores_platform_environment_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -491,7 +344,7 @@ class FreshForkInstallTest(unittest.TestCase):
                 repo, home, before_repo, before_home
             )
 
-    def test_direct_installer_refuses_late_unreadable_os_release_without_mutation(self) -> None:
+    def test_direct_installer_ignores_unreadable_os_release(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repo, home = self.prepare_repo(raw)
             release = Path(raw) / "invalid-os-release"
@@ -500,79 +353,19 @@ class FreshForkInstallTest(unittest.TestCase):
                 + b"x" * 20_000
                 + b"\nBROKEN=\xff\n"
             )
-            sentinel = home / "python-sentinel"
-            sentinel.write_text(
-                "#!/bin/sh\n"
-                f"touch {home / 'python-ran'}\n"
-                "exit 99\n"
-            )
-            sentinel.chmod(sentinel.stat().st_mode | 0o100)
-            self.configure_dispatch_host(repo, "Linux", release)
-            before_repo = self.snapshot_tree(repo)
-            before_home = self.snapshot_tree(home)
-            shell = subprocess.run(
-                ["sh", str(repo / ".super-coder/scripts/dispatch.sh"), "install"],
-                cwd=repo,
-                env={
-                    **os.environ,
-                    "HOME": str(home),
-                    "SC_CALLER_ROOT": str(repo),
-                    "SC_PYTHON": str(sentinel),
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
-                capture_output=True,
-                text=True,
-                check=False,
-            )
             result = self.run_direct_host(repo, home, "Linux", release)
-            self.assertEqual(shell.returncode, 1)
-            self.assertEqual(result.returncode, 1)
-            self.assertEqual(shell.stderr, result.stderr)
-            self.assertIn("ID=unknown; ID_LIKE=unknown", result.stderr)
-            self.assertFalse((home / "python-ran").exists())
-            self.assert_direct_refusal_is_pristine(
-                repo, home, before_repo, before_home
-            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "0")
 
-    def test_direct_installer_refuses_nul_os_release_without_mutation(self) -> None:
+    def test_direct_installer_ignores_nul_os_release(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repo, home = self.prepare_repo(raw)
             release = Path(raw) / "nul-os-release"
             release.write_bytes(b"ID=ubuntu\nVERSION_ID=26.04\0")
-            sentinel = home / "python-sentinel"
-            sentinel.write_text(
-                "#!/bin/sh\n"
-                f"touch {home / 'python-ran'}\n"
-                "exit 99\n"
-            )
-            sentinel.chmod(sentinel.stat().st_mode | 0o100)
-            self.configure_dispatch_host(repo, "Linux", release)
-            before_repo = self.snapshot_tree(repo)
-            before_home = self.snapshot_tree(home)
-            shell = subprocess.run(
-                ["sh", str(repo / ".super-coder/scripts/dispatch.sh"), "install"],
-                cwd=repo,
-                env={
-                    **os.environ,
-                    "HOME": str(home),
-                    "SC_CALLER_ROOT": str(repo),
-                    "SC_PYTHON": str(sentinel),
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
-                capture_output=True,
-                text=True,
-                check=False,
-            )
             result = self.run_direct_host(repo, home, "Linux", release)
 
-            self.assertEqual(shell.returncode, 1)
-            self.assertEqual(result.returncode, 1)
-            self.assertEqual(shell.stderr, result.stderr)
-            self.assertIn("ID=unknown; ID_LIKE=unknown", result.stderr)
-            self.assertFalse((home / "python-ran").exists())
-            self.assert_direct_refusal_is_pristine(
-                repo, home, before_repo, before_home
-            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "0")
 
     def test_each_failed_critical_phase_withholds_marker_and_reruns_cleanly(self) -> None:
         phases = {

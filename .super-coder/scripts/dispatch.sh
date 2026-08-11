@@ -55,75 +55,17 @@ DB="$ENGINE/shell_db.db"
 S="$ENGINE/scripts"
 MAPDB=""
 
-sc_platform_unquote() {
-  _platform_value="$1"
-  case "$_platform_value" in
-    \"*\") _platform_value=${_platform_value#\"}; _platform_value=${_platform_value%\"} ;;
-    \'*\') _platform_value=${_platform_value#\'}; _platform_value=${_platform_value%\'} ;;
-    \"*|\'*|*\"|*\') return 1 ;;
-  esac
-  printf '%s\n' "$_platform_value"
-}
-
-sc_platform_detect() {
-  SC_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"
-  _platform_release=/etc/os-release
-  _platform_wsl_release=/proc/sys/kernel/osrelease
-  SC_PLATFORM_ID=""
-  SC_PLATFORM_ID_LIKE=""
-  SC_PLATFORM_VERSION_ID=""
-  SC_PLATFORM_INVALID=0
-  SC_PLATFORM_WSL=0
-  _platform_wsl_kernel="$(command -p cat "$_platform_wsl_release" 2>/dev/null || true)"
-  case "$_platform_wsl_kernel" in
-    *[Mm]icrosoft*|*[Ww][Ss][Ll]*) SC_PLATFORM_WSL=1 ;;
-  esac
-  if [ -n "${WSL_DISTRO_NAME:-}" ] || [ -n "${WSL_INTEROP:-}" ]; then
-    SC_PLATFORM_WSL=1
-  fi
-  if [ -r "$_platform_release" ] && command -p iconv -f UTF-8 -t UTF-8 "$_platform_release" >/dev/null 2>&1; then
-    if LC_ALL=C command -p od -An -v -t x1 "$_platform_release" | command -p grep -Eq '(^|[[:space:]])00([[:space:]]|$)'; then
-      SC_PLATFORM_INVALID=1
-    fi
-    while IFS='=' read -r _platform_key _platform_value || [ -n "$_platform_key" ]; do
-      [ "$SC_PLATFORM_INVALID" = 1 ] && break
-      case "$_platform_key" in
-        ID) SC_PLATFORM_ID="$(sc_platform_unquote "$_platform_value")" || SC_PLATFORM_INVALID=1 ;;
-        ID_LIKE) SC_PLATFORM_ID_LIKE="$(sc_platform_unquote "$_platform_value")" || SC_PLATFORM_INVALID=1 ;;
-        VERSION_ID) SC_PLATFORM_VERSION_ID="$(sc_platform_unquote "$_platform_value")" || SC_PLATFORM_INVALID=1 ;;
-      esac
-      [ "$SC_PLATFORM_INVALID" = 1 ] && break
-    done < "$_platform_release"
-  fi
-  if [ "$SC_PLATFORM_INVALID" = 1 ]; then
-    SC_PLATFORM_ID=""
-    SC_PLATFORM_ID_LIKE=""
-    SC_PLATFORM_VERSION_ID=""
-  fi
-}
-
 sc_require_supported_host() {
-  sc_platform_detect
-  [ "$SC_PLATFORM_WSL" = 1 ] && sc_platform_unsupported
+  SC_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"
   [ "$SC_PLATFORM_KERNEL" = Linux ] || sc_platform_unsupported
-  case "$SC_PLATFORM_ID" in
-    ubuntu) [ "$SC_PLATFORM_VERSION_ID" = 26.04 ] && return 0 ;;
-    fedora) [ "$SC_PLATFORM_VERSION_ID" = 44 ] && return 0 ;;
-    arch) return 0 ;;
-  esac
-  case " $SC_PLATFORM_ID_LIKE " in
-    *" arch ") [ "$SC_PLATFORM_KERNEL" = Linux ] && return 0 ;;
-  esac
-  sc_platform_unsupported
 }
 
 sc_platform_unsupported() {
   {
     echo '✗ subfloor refused: unsupported host.'
     echo "  detected kernel: ${SC_PLATFORM_KERNEL:-unknown}"
-    echo "  detected distribution: ID=${SC_PLATFORM_ID:-unknown}; ID_LIKE=${SC_PLATFORM_ID_LIKE:-unknown}; VERSION_ID=${SC_PLATFORM_VERSION_ID:-unknown}"
-    echo '  supported hosts: Ubuntu LTS, Fedora stable, Arch-compatible Linux.'
-    echo '  Create a supported Linux VM, keep the checkout on the guest filesystem, then run ./sc install inside the guest.'
+    echo '  subfloor runs on Linux.'
+    echo '  Create a Linux VM, keep the checkout on the guest filesystem, then run ./sc install inside the guest.'
     echo '  The rejected command was not run and no native compatibility path exists.'
   } >&2
   exit 1
@@ -1490,7 +1432,7 @@ PY
     cat <<'EOF'
 super-coder — forkable shell substrate
 
-  Host support: Linux-only — Ubuntu LTS, Fedora stable, Arch-compatible Linux.
+  Host support: Linux-only — Ubuntu, Fedora, Arch, and CachyOS are tested examples.
 
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
   ./sc ensure-harness      install claude + opencode + codex + vibe + kimi if missing (official native installers, no npm)

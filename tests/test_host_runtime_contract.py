@@ -37,65 +37,19 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
             "Path(__file__).with_name('install-ran').write_text('yes')\n"
         )
         self.dispatch = scripts / "dispatch.sh"
-        self.supported_release = self.root / "os-release"
-        self.supported_release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
-        self.configure_host("Linux", self.supported_release)
+        self.configure_host("Linux")
 
-    def configure_host(
-        self, kernel: str, os_release: Path, runtime: Path | None = None
-    ) -> None:
+    def configure_host(self, kernel: str) -> None:
         # Only this disposable dispatcher copy receives a deterministic host.
         kernel_probe = 'SC_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"'
-        release_probe = "_platform_release=/etc/os-release"
-        runtime_probe = "_platform_wsl_release=/proc/sys/kernel/osrelease"
         self.assertIn(kernel_probe, self.dispatch_source)
-        self.assertIn(release_probe, self.dispatch_source)
-        self.assertIn(runtime_probe, self.dispatch_source)
         self.dispatch.write_text(
             self.dispatch_source.replace(
                 kernel_probe, f"SC_PLATFORM_KERNEL={shlex.quote(kernel)}"
             )
-            .replace(release_probe, f"_platform_release={shlex.quote(str(os_release))}")
-            .replace(
-                runtime_probe,
-                f"_platform_wsl_release={shlex.quote(str(runtime or Path('/proc/sys/kernel/osrelease')))}",
-            )
         )
 
-    def configure_launcher_host(
-        self,
-        launcher: Path,
-        kernel: str,
-        os_release: Path,
-        runtime: Path | None = None,
-    ) -> None:
-        source = launcher.read_text()
-        kernel_probe = (
-            'SC_BOOTSTRAP_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"'
-        )
-        release_probe = "_platform_release=/etc/os-release"
-        runtime_probe = "_platform_wsl_release=/proc/sys/kernel/osrelease"
-        self.assertIn(kernel_probe, source)
-        self.assertIn(release_probe, source)
-        self.assertIn(runtime_probe, source)
-        launcher.write_text(
-            source.replace(
-                kernel_probe,
-                f"SC_BOOTSTRAP_PLATFORM_KERNEL={shlex.quote(kernel)}",
-            )
-            .replace(release_probe, f"_platform_release={shlex.quote(str(os_release))}")
-            .replace(
-                runtime_probe,
-                f"_platform_wsl_release={shlex.quote(str(runtime or Path('/proc/sys/kernel/osrelease')))}",
-            )
-        )
-
-    def tracked_launcher_fixture(
-        self,
-        kernel: str,
-        release_contents: str,
-        origin: str = "https://github.com/jedbjorn/subfloor.git",
-    ) -> tuple[Path, Path, Path]:
+    def tracked_launcher_fixture(self) -> tuple[Path, Path, Path]:
         source = self.root / "source"
         caller = self.root / "caller"
         home = self.root / "home"
@@ -122,7 +76,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                 "remote",
                 "add",
                 "origin",
-                origin,
+                "https://github.com/jedbjorn/subfloor.git",
             ],
             check=True,
         )
@@ -153,8 +107,6 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
             capture_output=True,
             text=True,
         )
-        release = self.os_release("launcher-os-release", release_contents)
-        self.configure_launcher_host(caller / "sc", kernel, release)
         return source, caller, home
 
     def invoke(
@@ -198,11 +150,6 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
         return path
 
-    def os_release(self, name: str, contents: str) -> Path:
-        path = self.root / name
-        path.write_text(contents)
-        return path
-
     def sentinel_python(self) -> Path:
         path = self.root / "python-sentinel"
         path.write_text(
@@ -227,17 +174,22 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                 snapshot.append((relative, "directory", mode, ""))
         return snapshot
 
-    def test_linux_allowlist_accepts_exact_supported_families(self) -> None:
+    def test_every_linux_kernel_reaches_the_dispatch_target(self) -> None:
         fixtures = {
-            "ubuntu-lts": "ID=ubuntu\nVERSION_ID=26.04",
-            "fedora-stable": "ID=fedora\nVERSION_ID=44",
+            "ubuntu": "ID=ubuntu\nVERSION_ID=26.10\n",
+            "fedora": "ID=fedora\nVERSION_ID=rawhide\n",
             "arch": "ID=arch\n",
             "cachyos": "ID=cachyos\nID_LIKE=arch\n",
+            "unknown": "ID=notarch\nID_LIKE=notarch\n",
+            "malformed": 'ID="ubuntu\nVERSION_ID=26.04\n',
+            "missing": None,
         }
         for name, contents in fixtures.items():
             with self.subTest(name=name):
-                release = self.os_release(name, contents)
-                self.configure_host("Linux", release)
+                release = self.root / name
+                if contents is not None:
+                    release.write_text(contents)
+                self.configure_host("Linux")
                 completed = self.invoke(sys.executable, "install")
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertEqual(
@@ -246,56 +198,20 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                 )
                 (self.root / ".super-coder/scripts/install-ran").unlink()
 
-    def test_release_allowlist_rejects_ubuntu_interim_and_fedora_rawhide(self) -> None:
-        python = self.sentinel_python()
-        fixtures = {
-            "ubuntu-interim": "ID=ubuntu\nVERSION_ID=26.10\n",
-            "fedora-rawhide": "ID=fedora\nVERSION_ID=rawhide\n",
-        }
-        for name, contents in fixtures.items():
-            with self.subTest(name=name):
-                release = self.os_release(name, contents)
-                self.configure_host("Linux", release)
-                completed = self.invoke(str(python), "install")
-                self.assertEqual(completed.returncode, 1)
-                self.assertIn("supported Linux VM", completed.stderr)
-                self.assertIn(
-                    f"VERSION_ID={'26.10' if name == 'ubuntu-interim' else 'rawhide'}",
-                    completed.stderr,
+        for marker in ("WSL_DISTRO_NAME", "WSL_INTEROP"):
+            with self.subTest(marker=marker):
+                self.configure_host("Linux")
+                completed = self.invoke(
+                    sys.executable, "install", extra_env={marker: "fixture"}
                 )
-                self.assertFalse((self.root / "python-ran").exists())
-                self.assertFalse(
-                    (self.root / ".super-coder/scripts/install-ran").exists()
-                )
-
-    def test_separator_bearing_arch_id_refuses_before_dispatch_target(self) -> None:
-        release = self.os_release("separator-id", "ID=arch:unknown\n")
-        python = self.sentinel_python()
-        self.configure_host("Linux", release)
-        before = self.snapshot_tree(self.root)
-
-        completed = self.invoke(str(python), "install")
-
-        self.assertEqual(completed.returncode, 1)
-        self.assertIn(
-            "ID=arch:unknown; ID_LIKE=unknown; VERSION_ID=unknown",
-            completed.stderr,
-        )
-        self.assertFalse((self.root / "python-ran").exists())
-        self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
-        self.assertEqual(self.snapshot_tree(self.root), before)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                (self.root / ".super-coder/scripts/install-ran").unlink()
 
     def test_global_help_states_linux_only_support_on_every_host(self) -> None:
-        hosts = {
-            "supported": ("Linux", self.supported_release),
-            "unsupported": ("Darwin", self.os_release("darwin", "ID=macos\n")),
-        }
-        support_line = (
-            "Host support: Linux-only — Ubuntu LTS, Fedora stable, "
-            "Arch-compatible Linux."
-        )
-        for name, (kernel, release) in hosts.items():
-            self.configure_host(kernel, release)
+        hosts = {"supported": "Linux", "unsupported": "Darwin"}
+        support_line = "Host support: Linux-only — Ubuntu, Fedora, Arch, and CachyOS are tested examples."
+        for name, kernel in hosts.items():
+            self.configure_host(kernel)
             for command in ((), ("help",), ("-h",), ("--help",)):
                 with self.subTest(host=name, command=command or ("bare",)):
                     result = self.invoke(
@@ -304,72 +220,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn(support_line, result.stdout)
 
-    def test_wsl_refuses_allowlisted_ubuntu_before_python_or_target(self) -> None:
-        release = self.os_release("wsl-ubuntu", "ID=ubuntu\nVERSION_ID=26.04\n")
-        python = self.sentinel_python()
-        self.configure_host("Linux", release)
-        before = self.snapshot_tree(self.root)
-        wsl = {
-            "WSL_DISTRO_NAME": "Ubuntu",
-            "WSL_INTEROP": "/run/WSL/1_interop",
-        }
-
-        for command in ((), ("help",), ("-h",), ("--help",)):
-            with self.subTest(command=command or ("bare",)):
-                help_result = self.invoke(
-                    str(python), *command, extra_env=wsl, bare=not command
-                )
-                self.assertEqual(help_result.returncode, 0, help_result.stderr)
-                self.assertIn("super-coder", help_result.stdout)
-                self.assertIn(
-                    "Host support: Linux-only — Ubuntu LTS, Fedora stable, "
-                    "Arch-compatible Linux.",
-                    help_result.stdout,
-                )
-
-        expected = (
-            "✗ subfloor refused: unsupported host.\n"
-            "  detected kernel: Linux\n"
-            "  detected distribution: ID=ubuntu; ID_LIKE=unknown; VERSION_ID=26.04\n"
-            "  supported hosts: Ubuntu LTS, Fedora stable, Arch-compatible Linux.\n"
-            "  Create a supported Linux VM, keep the checkout on the guest filesystem, then run ./sc install inside the guest.\n"
-            "  The rejected command was not run and no native compatibility path exists.\n"
-        )
-        for marker, value in wsl.items():
-            with self.subTest(marker=marker):
-                completed = self.invoke(
-                    str(python), "install", extra_env={marker: value}
-                )
-                self.assertEqual(completed.returncode, 1)
-                self.assertEqual(completed.stderr, expected)
-                self.assertFalse((self.root / "python-ran").exists())
-                self.assertFalse(
-                    (self.root / ".super-coder/scripts/install-ran").exists()
-                )
-                self.assertEqual(self.snapshot_tree(self.root), before)
-
-    def test_wsl_runtime_signature_refuses_without_marker_variables(self) -> None:
-        release = self.os_release("wsl-ubuntu", "ID=ubuntu\nVERSION_ID=26.04\n")
-        runtime = self.os_release(
-            "wsl-runtime", "5.15.167.4-microsoft-standard-WSL2\n"
-        )
-        python = self.sentinel_python()
-        self.configure_host("Linux", release, runtime)
-        before = self.snapshot_tree(self.root)
-        completed = self.invoke(
-            str(python),
-            "install",
-            clear_env=("WSL_DISTRO_NAME", "WSL_INTEROP"),
-        )
-
-        self.assertEqual(completed.returncode, 1)
-        self.assertIn("ID=ubuntu; ID_LIKE=unknown; VERSION_ID=26.04", completed.stderr)
-        self.assertFalse((self.root / "python-ran").exists())
-        self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
-        self.assertEqual(self.snapshot_tree(self.root), before)
-
-    def test_unsupported_host_refuses_before_python_or_target_with_stable_bytes(self) -> None:
-        release = self.os_release("misleading", "ID=notarch\nID_LIKE=notarch\n")
+    def test_unsupported_kernel_refuses_before_python_or_target(self) -> None:
         python = self.sentinel_python()
         git = self.root / "git"
         git.write_text(
@@ -386,7 +237,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
             "exit 99\n"
         )
         docker.chmod(docker.stat().st_mode | stat.S_IXUSR)
-        self.configure_host("Linux", release)
+        self.configure_host("Darwin")
         before = self.snapshot_tree(self.root)
         sentinels = {
             "PATH": f"{self.root}:{os.environ['PATH']}",
@@ -395,10 +246,9 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         second = self.invoke(str(python), "install", extra_env=sentinels)
         expected = (
             "✗ subfloor refused: unsupported host.\n"
-            "  detected kernel: Linux\n"
-            "  detected distribution: ID=notarch; ID_LIKE=notarch; VERSION_ID=unknown\n"
-            "  supported hosts: Ubuntu LTS, Fedora stable, Arch-compatible Linux.\n"
-            "  Create a supported Linux VM, keep the checkout on the guest filesystem, then run ./sc install inside the guest.\n"
+            "  detected kernel: Darwin\n"
+            "  subfloor runs on Linux.\n"
+            "  Create a Linux VM, keep the checkout on the guest filesystem, then run ./sc install inside the guest.\n"
             "  The rejected command was not run and no native compatibility path exists.\n"
         )
         self.assertEqual(first.returncode, 1)
@@ -410,41 +260,9 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
         self.assertEqual(self.snapshot_tree(self.root), before)
 
-    def test_corrupt_os_release_refuses_before_python_probe(self) -> None:
-        release = self.root / "invalid-os-release"
-        release.write_bytes(b"ID=ubuntu\nVERSION_ID=26.04\nBROKEN=\xff\n")
-        python = self.sentinel_python()
-        self.configure_host("Linux", release)
-        completed = self.invoke(str(python), "install")
-        self.assertEqual(completed.returncode, 1)
-        self.assertIn("ID=unknown; ID_LIKE=unknown", completed.stderr)
-        self.assertFalse((self.root / "python-ran").exists())
-
-    def test_malformed_os_release_quote_refuses_before_python_probe(self) -> None:
-        release = self.os_release("malformed-os-release", 'ID="ubuntu\nVERSION_ID=26.04\n')
-        python = self.sentinel_python()
-        self.configure_host("Linux", release)
-        before = self.snapshot_tree(self.root)
-        completed = self.invoke(str(python), "install")
-        self.assertEqual(completed.returncode, 1)
-        self.assertIn(
-            "ID=unknown; ID_LIKE=unknown; VERSION_ID=unknown", completed.stderr
-        )
-        self.assertFalse((self.root / "python-ran").exists())
-        self.assertEqual(self.snapshot_tree(self.root), before)
-
-    def test_missing_os_release_refuses_before_the_python_probe(self) -> None:
-        python = self.sentinel_python()
-        self.configure_host("Linux", self.root / "missing-os-release")
-        completed = self.invoke(str(python), "install")
-        self.assertEqual(completed.returncode, 1)
-        self.assertIn("ID=unknown; ID_LIKE=unknown", completed.stderr)
-        self.assertFalse((self.root / "python-ran").exists())
-
     def test_help_stays_readable_but_doctor_and_make_delegate_to_the_gate(self) -> None:
-        release = self.os_release("darwin", "ID=macos\n")
         python = self.sentinel_python()
-        self.configure_host("Darwin", release)
+        self.configure_host("Darwin")
         for command in ((), ("help",), ("-h",), ("--help",)):
             with self.subTest(command=command or ("bare",)):
                 help_result = self.invoke(
@@ -455,10 +273,10 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
 
         doctor = self.invoke(str(python), "doctor")
         self.assertEqual(doctor.returncode, 1)
-        self.assertIn("Create a supported Linux VM", doctor.stderr)
+        self.assertIn("Create a Linux VM", doctor.stderr)
         self.assertFalse((self.root / "python-ran").exists())
 
-        self.configure_host("MINGW64_NT", release)
+        self.configure_host("MINGW64_NT")
         windows = self.invoke(str(python), "install")
         self.assertEqual(windows.returncode, 1)
         self.assertIn("detected kernel: MINGW64_NT", windows.stderr)
@@ -467,7 +285,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         (self.root / "Makefile").write_text(
             "dos-l:\n\tsh .super-coder/scripts/dispatch.sh install\n"
         )
-        self.configure_host("Darwin", release)
+        self.configure_host("Darwin")
         make_result = subprocess.run(
             ["make", "dos-l"],
             cwd=self.root,
@@ -484,16 +302,15 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertFalse((self.root / "python-ran").exists())
 
     def test_platform_environment_cannot_override_test_host(self) -> None:
-        release = self.os_release("ubuntu", "ID=ubuntu\nVERSION_ID=26.04\n")
         python = self.sentinel_python()
-        self.configure_host("Darwin", release)
+        self.configure_host("Darwin")
 
         completed = self.invoke(
             str(python),
             "install",
             extra_env={
                 "SC_PLATFORM_UNAME": "Linux",
-                "SC_PLATFORM_OS_RELEASE": str(release),
+                "SC_PLATFORM_OS_RELEASE": "/tmp/ignored-os-release",
             },
         )
 
@@ -502,151 +319,8 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertFalse((self.root / "python-ran").exists())
         self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
 
-    def test_tracked_launcher_refuses_unsupported_host_before_dispatch_override(self) -> None:
-        source, caller, home = self.tracked_launcher_fixture(
-            "Darwin", "ID=macos\n"
-        )
-        override = caller / ".super-coder" / "scripts" / "dispatch.sh"
-        override.write_text(
-            "#!/bin/sh\n"
-            f"touch {shlex.quote(str(self.root / 'override-ran'))}\n"
-            "exit 0\n"
-        )
-        before_source = self.snapshot_tree(source)
-        before_caller = self.snapshot_tree(caller)
-        before_home = self.snapshot_tree(home)
-        environment = {
-            **os.environ,
-            "HOME": str(home),
-            "SC_DISPATCH": str(override),
-        }
-        environment.pop("WSL_DISTRO_NAME", None)
-        environment.pop("WSL_INTEROP", None)
-
-        completed = subprocess.run(
-            [str(caller / "sc"), "install"],
-            cwd=caller,
-            env=environment,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-
-        expected = (
-            "✗ subfloor refused: unsupported host.\n"
-            "  detected kernel: Darwin\n"
-            "  detected distribution: ID=macos; ID_LIKE=unknown; VERSION_ID=unknown\n"
-            "  supported hosts: Ubuntu LTS, Fedora stable, Arch-compatible Linux.\n"
-            "  Create a supported Linux VM, keep the checkout on the guest filesystem, then run ./sc install inside the guest.\n"
-            "  The rejected command was not run and no native compatibility path exists.\n"
-        )
-        self.assertEqual(completed.returncode, 1)
-        self.assertEqual(completed.stderr, expected)
-        self.assertFalse((self.root / "override-ran").exists())
-        self.assertFalse((self.root / "live-dispatch-ran").exists())
-        self.assertEqual(self.snapshot_tree(source), before_source)
-        self.assertEqual(self.snapshot_tree(caller), before_caller)
-        self.assertEqual(self.snapshot_tree(home), before_home)
-
-    def test_tracked_launcher_refuses_separator_id_before_dispatch_override(self) -> None:
-        source, caller, home = self.tracked_launcher_fixture(
-            "Linux", "ID=arch:unknown\n"
-        )
-        override = caller / ".super-coder" / "scripts" / "dispatch.sh"
-        override.write_text(
-            "#!/bin/sh\n"
-            f"touch {shlex.quote(str(self.root / 'override-ran'))}\n"
-            "exit 99\n"
-        )
-        before_source = self.snapshot_tree(source)
-        before_caller = self.snapshot_tree(caller)
-        before_home = self.snapshot_tree(home)
-        environment = {
-            **os.environ,
-            "HOME": str(home),
-            "SC_DISPATCH": str(override),
-        }
-        environment.pop("WSL_DISTRO_NAME", None)
-        environment.pop("WSL_INTEROP", None)
-
-        completed = subprocess.run(
-            [str(caller / "sc"), "install"],
-            cwd=caller,
-            env=environment,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-
-        self.assertEqual(completed.returncode, 1)
-        self.assertIn(
-            "ID=arch:unknown; ID_LIKE=unknown; VERSION_ID=unknown",
-            completed.stderr,
-        )
-        self.assertFalse((self.root / "override-ran").exists())
-        self.assertFalse((self.root / "live-dispatch-ran").exists())
-        self.assertEqual(self.snapshot_tree(source), before_source)
-        self.assertEqual(self.snapshot_tree(caller), before_caller)
-        self.assertEqual(self.snapshot_tree(home), before_home)
-
-    def test_tracked_launcher_override_keeps_global_help_readable_on_darwin(self) -> None:
-        source, caller, home = self.tracked_launcher_fixture(
-            "Darwin", "ID=macos\n"
-        )
-        override = caller / ".super-coder" / "scripts" / "dispatch.sh"
-        override.write_text(
-            "#!/bin/sh\n"
-            "case \"${1:-help}\" in\n"
-            "  help|-h|--help) printf 'override global help\\n'; exit 0 ;;\n"
-            "esac\n"
-            f"touch {shlex.quote(str(self.root / 'override-ran'))}\n"
-            "exit 99\n"
-        )
-        before_source = self.snapshot_tree(source)
-        before_caller = self.snapshot_tree(caller)
-        before_home = self.snapshot_tree(home)
-        environment = {
-            **os.environ,
-            "HOME": str(home),
-            "SC_DISPATCH": str(override),
-        }
-        environment.pop("WSL_DISTRO_NAME", None)
-        environment.pop("WSL_INTEROP", None)
-
-        for command in ((), ("help",), ("-h",), ("--help",)):
-            with self.subTest(command=command or ("bare",)):
-                completed = subprocess.run(
-                    [str(caller / "sc"), *command],
-                    cwd=caller,
-                    env=environment,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                )
-                self.assertEqual(completed.returncode, 0, completed.stderr)
-                self.assertEqual(completed.stdout, "override global help\n")
-                self.assertEqual(completed.stderr, "")
-
-        action = subprocess.run(
-            [str(caller / "sc"), "install"],
-            cwd=caller,
-            env=environment,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertEqual(action.returncode, 1)
-        self.assertIn("detected kernel: Darwin", action.stderr)
-        self.assertFalse((self.root / "override-ran").exists())
-        self.assertFalse((self.root / "live-dispatch-ran").exists())
-        self.assertEqual(self.snapshot_tree(source), before_source)
-        self.assertEqual(self.snapshot_tree(caller), before_caller)
-        self.assertEqual(self.snapshot_tree(home), before_home)
-
-    def test_dispatch_override_rejects_arbitrary_body_on_supported_host(self) -> None:
-        _source, caller, home = self.tracked_launcher_fixture(
-            "Linux", "ID=ubuntu\nVERSION_ID=26.04\n"
-        )
+    def test_tracked_launcher_leaves_operator_override_to_its_selected_body(self) -> None:
+        _source, caller, home = self.tracked_launcher_fixture()
         override = self.root / "arbitrary-dispatch.sh"
         override.write_text(
             "#!/bin/sh\n"
@@ -670,52 +344,8 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
             check=False,
         )
 
-        expected_dispatch = caller / ".super-coder" / "scripts" / "dispatch.sh"
-        self.assertEqual(completed.returncode, 1)
-        self.assertEqual(
-            completed.stderr,
-            "✗ ./sc: SC_DISPATCH is restricted to the canonical source "
-            f"checkout's tracked dispatcher: {expected_dispatch}\n",
-        )
-        self.assertFalse((self.root / "override-ran").exists())
-        self.assertFalse((self.root / "live-dispatch-ran").exists())
-
-    def test_dispatch_override_rejects_tracked_body_outside_source_repo(self) -> None:
-        _source, caller, home = self.tracked_launcher_fixture(
-            "Linux",
-            "ID=ubuntu\nVERSION_ID=26.04\n",
-            origin="https://github.com/example/subfloor.git",
-        )
-        override = caller / ".super-coder" / "scripts" / "dispatch.sh"
-        override.write_text(
-            "#!/bin/sh\n"
-            f"touch {shlex.quote(str(self.root / 'override-ran'))}\n"
-            "exit 0\n"
-        )
-        environment = {
-            **os.environ,
-            "HOME": str(home),
-            "SC_DISPATCH": str(override),
-        }
-        environment.pop("WSL_DISTRO_NAME", None)
-        environment.pop("WSL_INTEROP", None)
-
-        completed = subprocess.run(
-            [str(caller / "sc"), "install"],
-            cwd=caller,
-            env=environment,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-
-        self.assertEqual(completed.returncode, 1)
-        self.assertEqual(
-            completed.stderr,
-            "✗ ./sc: SC_DISPATCH is restricted to the canonical source "
-            f"checkout's tracked dispatcher: {override}\n",
-        )
-        self.assertFalse((self.root / "override-ran").exists())
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue((self.root / "override-ran").exists())
         self.assertFalse((self.root / "live-dispatch-ran").exists())
 
     def test_missing_explicit_interpreter_stops_before_target(self) -> None:

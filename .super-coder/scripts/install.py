@@ -51,76 +51,16 @@ PY = sys.executable
 IS_MAC = platform.system() == "Darwin"  # guidance arms differ (colima/brew vs systemd/apt)
 
 
-def _platform_identity() -> tuple[str, str, str, str]:
-    """Return the kernel and os-release identity without guessing a distro."""
-    kernel = platform.system()
-    release = "/etc/os-release"
-    fields: dict[str, str] = {}
-    try:
-        with open(release, encoding="utf-8") as stream:
-            for line in stream:
-                if "\0" in line:
-                    fields.clear()
-                    break
-                key, separator, value = line.rstrip("\n").partition("=")
-                if separator and key in {"ID", "ID_LIKE", "VERSION_ID"}:
-                    parsed = _os_release_value(value)
-                    if parsed is None:
-                        fields.clear()
-                        break
-                    fields[key] = parsed
-    except (OSError, UnicodeError):
-        fields.clear()
-    return (
-        kernel,
-        fields.get("ID", ""),
-        fields.get("ID_LIKE", ""),
-        fields.get("VERSION_ID", ""),
-    )
-
-
-def _os_release_value(value: str) -> str | None:
-    if value[:1] in {'"', "'"} or value[-1:] in {'"', "'"}:
-        quote = value[:1] or value[-1:]
-        if len(value) < 2 or value[0] != quote or value[-1] != quote:
-            return None
-        return value[1:-1]
-    return value
-
-
-def _is_wsl() -> bool:
-    try:
-        with open("/proc/sys/kernel/osrelease", encoding="utf-8") as stream:
-            runtime = stream.read().lower()
-    except OSError:
-        runtime = ""
-    return bool(
-        "microsoft" in runtime
-        or "wsl" in runtime
-        or os.environ.get("WSL_DISTRO_NAME")
-        or os.environ.get("WSL_INTEROP")
-    )
-
-
 def require_supported_host() -> None:
     """Refuse unsupported hosts before installer imports or repository writes."""
-    kernel, distro_id, distro_like, version_id = _platform_identity()
-    supported = not _is_wsl() and kernel == "Linux" and (
-        (distro_id == "ubuntu" and version_id == "26.04")
-        or (distro_id == "fedora" and version_id == "44")
-        or distro_id == "arch"
-        or "arch" in distro_like.split()
-    )
-    if supported:
+    kernel = platform.system()
+    if kernel == "Linux":
         return
     raise SystemExit(
         "✗ subfloor refused: unsupported host.\n"
         f"  detected kernel: {kernel or 'unknown'}\n"
-        "  detected distribution: "
-        f"ID={distro_id or 'unknown'}; ID_LIKE={distro_like or 'unknown'}; "
-        f"VERSION_ID={version_id or 'unknown'}\n"
-        "  supported hosts: Ubuntu LTS, Fedora stable, Arch-compatible Linux.\n"
-        "  Create a supported Linux VM, keep the checkout on the guest filesystem, "
+        "  subfloor runs on Linux.\n"
+        "  Create a Linux VM, keep the checkout on the guest filesystem, "
         "then run ./sc install inside the guest.\n"
         "  The rejected command was not run and no native compatibility path exists."
     )
