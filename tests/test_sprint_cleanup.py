@@ -19,6 +19,7 @@ sys.path[:0] = [str(ENGINE / "scripts"), str(ROOT / "tests")]
 import sprint_cleanup
 import sprint_close
 import sprint_domain
+import sprint_message_delivery
 from test_sprint_v2_domain import SprintDomainCase
 
 TEST_ROOT = Path("/srv/super-coder")
@@ -1356,7 +1357,7 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
         notices = self.con.execute(
             "SELECT receiver_shell_id,declared_type,body FROM wake_message "
             "WHERE idempotency_key=?",
-            (f"sprint:{sprint_id}:cleanup-completed",),
+            (f"_sc:system:sprint:{sprint_id}:cleanup-completed",),
         ).fetchall()
         self.assertEqual(("succeeded", {"existed": False}), (
             target["state"],
@@ -1405,7 +1406,8 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
             (sprint_id,),
         ).fetchall()
         key = (
-            f"sprint:{sprint_id}:cleanup-failed:target:{claim.cleanup_target_id}:"
+            f"_sc:system:sprint:{sprint_id}:cleanup-failed:"
+            f"target:{claim.cleanup_target_id}:"
             f"generation:{claim.claim_generation}"
         )
         notices = self.con.execute(
@@ -1430,6 +1432,152 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
         self.assertEqual((5, "re-enter"), tuple(notices[0][:2]))
         self.assertIn("FnB fallback receipt", notices[0]["body"])
         self.assertIn("cleanup-status", notices[0]["body"])
+
+    def test_participant_key_cannot_suppress_terminal_cleanup_receipt(self):
+        participant_key = f"sprint:{self.sprint_id}:cleanup-completed"
+        system_key = f"_sc:system:sprint:{self.sprint_id}:cleanup-completed"
+        participant = sprint_message_delivery.SprintMessageStore(self.con).relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="PLN1",
+            body="ordinary participant notification",
+            idempotency_key=participant_key,
+        )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "cannot use the reserved System namespace",
+        ):
+            sprint_message_delivery.SprintMessageStore(self.con).relay(
+                self.sprint_id,
+                from_shell_id=1,
+                to_shortname="PLN1",
+                body="attempt to occupy the cleanup receipt identity",
+                idempotency_key=system_key,
+            )
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='succeeded' "
+            "WHERE sprint_id=? AND target_kind='worktree'",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        claim = self.targets.claim_next("participant-key-collision")
+        self.assertEqual("artifact_dir", claim.target_kind)
+
+        evidence = {"existed": True, "removed_entry_count": 1}
+        self.assertTrue(self.targets.mark_succeeded(claim, evidence))
+        self.assertFalse(self.targets.mark_succeeded(claim, evidence))
+
+        target = self.con.execute(
+            "SELECT state,after_evidence FROM sprint_cleanup_targets "
+            "WHERE cleanup_target_id=?",
+            (claim.cleanup_target_id,),
+        ).fetchone()
+        events = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='sprint.cleanup_completed'",
+            (self.sprint_id,),
+        ).fetchall()
+        participant_messages = self.con.execute(
+            "SELECT sprint_id,sender_shell_id,receiver_shell_id,body "
+            "FROM wake_message WHERE idempotency_key=?",
+            (participant_key,),
+        ).fetchall()
+        receipts = self.con.execute(
+            "SELECT message_id,sprint_id,sender_shell_id,receiver_shell_id,"
+            "declared_type,body FROM wake_message WHERE idempotency_key=?",
+            (system_key,),
+        ).fetchall()
+        self.assertEqual(
+            ("succeeded", evidence),
+            (target["state"], json.loads(target["after_evidence"])),
+        )
+        self.assertEqual(1, len(events))
+        self.assertEqual(
+            {"aggregate_state": "succeeded", "succeeded_count": 4, "target_count": 4},
+            json.loads(events[0]["payload"]),
+        )
+        self.assertEqual(
+            [(self.sprint_id, 1, 3, "ordinary participant notification")],
+            [tuple(row) for row in participant_messages],
+        )
+        self.assertEqual(1, len(receipts))
+        self.assertEqual((None, None, 3, "re-enter"), tuple(receipts[0][1:5]))
+        self.assertIn("cleanup completed", receipts[0]["body"])
+        self.assertIn("worktrees are reusable", receipts[0]["body"])
+        self.assertEqual(
+            [(participant.message_id, 1), (receipts[0]["message_id"], 1)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT message_id,COUNT(*) FROM sprint_wake_messages "
+                    "WHERE message_id IN (?,?) GROUP BY message_id ORDER BY message_id",
+                    (participant.message_id, receipts[0]["message_id"]),
+                )
+            ],
+        )
+
+    def test_terminal_state_and_event_commit_across_reserved_key_collision(self):
+        system_key = f"_sc:system:sprint:{self.sprint_id}:cleanup-completed"
+        conflict = sprint_message_delivery.SprintMessageStore(
+            self.con
+        ).send_to_shell(
+            3,
+            message_kind="notification",
+            body="pre-existing engine-wide conflict",
+            idempotency_key=system_key,
+        )
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='succeeded' "
+            "WHERE sprint_id=? AND target_kind='worktree'",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        claim = self.targets.claim_next("reserved-key-collision")
+        self.assertEqual("artifact_dir", claim.target_kind)
+
+        evidence = {"existed": True, "removed_entry_count": 2}
+        self.assertTrue(self.targets.mark_succeeded(claim, evidence))
+        self.assertFalse(self.targets.mark_succeeded(claim, evidence))
+
+        target = self.con.execute(
+            "SELECT state,after_evidence FROM sprint_cleanup_targets "
+            "WHERE cleanup_target_id=?",
+            (claim.cleanup_target_id,),
+        ).fetchone()
+        events = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='sprint.cleanup_completed'",
+            (self.sprint_id,),
+        ).fetchall()
+        messages = self.con.execute(
+            "SELECT message_id,receiver_shell_id,body FROM wake_message "
+            "WHERE idempotency_key=?",
+            (system_key,),
+        ).fetchall()
+        self.assertEqual(
+            ("succeeded", evidence),
+            (target["state"], json.loads(target["after_evidence"])),
+        )
+        self.assertEqual(1, len(events))
+        self.assertEqual(
+            {"aggregate_state": "succeeded", "succeeded_count": 4, "target_count": 4},
+            json.loads(events[0]["payload"]),
+        )
+        self.assertEqual(
+            [(conflict.message_id, 3, "pre-existing engine-wide conflict")],
+            [tuple(row) for row in messages],
+        )
+        self.assertEqual(
+            [(conflict.message_id, conflict.wake_id)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT message_id,wake_id FROM sprint_wake_messages "
+                    "WHERE message_id=?",
+                    (conflict.message_id,),
+                )
+            ],
+        )
 
     def test_legacy_success_commits_once_when_planner_and_fnb_are_inactive(self):
         sprint_id = self._adopt_legacy_with_inactive_planner(
@@ -1460,7 +1608,7 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
         ).fetchall()
         notices = self.con.execute(
             "SELECT receiver_shell_id FROM wake_message WHERE idempotency_key=?",
-            (f"sprint:{sprint_id}:cleanup-completed",),
+            (f"_sc:system:sprint:{sprint_id}:cleanup-completed",),
         ).fetchall()
         self.assertEqual(
             ("succeeded", {"existed": False}),
@@ -1508,7 +1656,8 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
             (sprint_id,),
         ).fetchall()
         key = (
-            f"sprint:{sprint_id}:cleanup-failed:target:{claim.cleanup_target_id}:"
+            f"_sc:system:sprint:{sprint_id}:cleanup-failed:"
+            f"target:{claim.cleanup_target_id}:"
             f"generation:{claim.claim_generation}"
         )
         notices = self.con.execute(
@@ -1557,7 +1706,7 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
             "SELECT receiver_shell_id,declared_type,body FROM wake_message "
             "WHERE idempotency_key=?",
             (
-                f"sprint:{self.sprint_id}:cleanup-failed:"
+                f"_sc:system:sprint:{self.sprint_id}:cleanup-failed:"
                 f"target:{failed.cleanup_target_id}:generation:{failed.claim_generation}",
             ),
         ).fetchone()
@@ -1602,7 +1751,7 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
         completed_message = self.con.execute(
             "SELECT receiver_shell_id,declared_type,body FROM wake_message "
             "WHERE idempotency_key=?",
-            (f"sprint:{second_sprint}:cleanup-completed",),
+            (f"_sc:system:sprint:{second_sprint}:cleanup-completed",),
         ).fetchone()
         self.assertEqual(
             ("succeeded", 4),

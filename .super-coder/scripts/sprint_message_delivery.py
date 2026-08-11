@@ -32,10 +32,15 @@ MESSAGE_INTENTS = frozenset(
     {"information", "handoff", "question", "blocker", "decision"}
 )
 REPLY_REQUIRED_INTENTS = frozenset({"question", "blocker", "decision"})
+SYSTEM_IDEMPOTENCY_KEY_PREFIX = "_sc:system:"
 
 
 class ForceNewDeferred(RuntimeError):
     """A force-new lease lost a live-chat boundary race without an attempt."""
+
+
+class WakeMessageIdempotencyConflict(SprintInvariantError):
+    """A global wake identity is already bound to different input."""
 
 
 @dataclass(frozen=True)
@@ -201,7 +206,7 @@ class SprintMessageStore:
                 declared_type,
             )
             if actual != expected:
-                raise SprintInvariantError(
+                raise WakeMessageIdempotencyConflict(
                     "wake message idempotency key was reused with different input"
                 )
             wake = self.con.execute(
@@ -209,7 +214,9 @@ class SprintMessageStore:
                 (existing["message_id"],),
             ).fetchone()
             if wake is None:
-                raise SprintInvariantError("wake message has no delivery intent")
+                raise WakeMessageIdempotencyConflict(
+                    "wake message has no delivery intent"
+                )
             return MessageReceipt(
                 int(existing["message_id"]), int(wake["wake_id"]), False
             )
@@ -277,6 +284,11 @@ class SprintMessageStore:
             raise ValueError("Sprint recipient shortname is empty")
         if not idempotency_key:
             raise ValueError("Sprint message idempotency key is empty")
+        if idempotency_key.startswith(SYSTEM_IDEMPOTENCY_KEY_PREFIX):
+            raise SprintInvariantError(
+                "Sprint participant idempotency keys cannot use the reserved "
+                "System namespace"
+            )
         if intent not in MESSAGE_INTENTS:
             raise ValueError(
                 "Sprint message intent must be information, handoff, question, "
