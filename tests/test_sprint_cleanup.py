@@ -1289,6 +1289,148 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
             ),
         )
 
+    def _adopt_legacy_with_inactive_planner(self, key: str) -> int:
+        legacy_sprint, _unit = self.create_sprint()
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            probe_harness=lambda _harness: None,
+            cleanup_store=mock.Mock(
+                prepare_targets=mock.Mock(return_value=()),
+                schedule_in_transaction=mock.Mock(return_value=None),
+            ),
+        )
+        lifecycle.arm(legacy_sprint, 3)
+        lifecycle.transition(
+            legacy_sprint,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="historical completion before cleanup scheduling",
+            terminal_outcome="accepted",
+        )
+        receipt = self.recovery.recover(
+            legacy_sprint,
+            5,
+            idempotency_key=key,
+            adopt_legacy=True,
+        )
+        self.assertEqual((True, "adopted_legacy", 4), (
+            receipt.created,
+            receipt.action,
+            len(receipt.target_ids),
+        ))
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='succeeded' "
+            "WHERE sprint_id<>? AND state='pending'",
+            (legacy_sprint,),
+        )
+        self.con.execute("UPDATE shells SET is_deleted=1 WHERE shell_id=3")
+        self.con.commit()
+        return legacy_sprint
+
+    def test_legacy_success_routes_once_to_fnb_when_planner_is_inactive(self):
+        sprint_id = self._adopt_legacy_with_inactive_planner(
+            "fnb-adopts-legacy-success"
+        )
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='succeeded' "
+            "WHERE sprint_id=? AND target_kind='worktree'",
+            (sprint_id,),
+        )
+        self.con.commit()
+        claim = self.targets.claim_next("inactive-planner-success")
+        self.assertEqual("artifact_dir", claim.target_kind)
+
+        self.assertTrue(self.targets.mark_succeeded(claim, {"existed": False}))
+        self.assertFalse(self.targets.mark_succeeded(claim, {"existed": False}))
+
+        target = self.con.execute(
+            "SELECT state,after_evidence FROM sprint_cleanup_targets "
+            "WHERE cleanup_target_id=?",
+            (claim.cleanup_target_id,),
+        ).fetchone()
+        events = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='sprint.cleanup_completed'",
+            (sprint_id,),
+        ).fetchall()
+        notices = self.con.execute(
+            "SELECT receiver_shell_id,declared_type,body FROM wake_message "
+            "WHERE idempotency_key=?",
+            (f"sprint:{sprint_id}:cleanup-completed",),
+        ).fetchall()
+        self.assertEqual(("succeeded", {"existed": False}), (
+            target["state"],
+            json.loads(target["after_evidence"]),
+        ))
+        self.assertEqual(1, len(events))
+        self.assertEqual(
+            {"aggregate_state": "succeeded", "succeeded_count": 4, "target_count": 4},
+            json.loads(events[0]["payload"]),
+        )
+        self.assertEqual(1, len(notices))
+        self.assertEqual((5, "re-enter"), tuple(notices[0][:2]))
+        self.assertIn("FnB fallback receipt", notices[0]["body"])
+        self.assertIn("worktrees are reusable", notices[0]["body"])
+
+    def test_legacy_failure_routes_once_to_fnb_when_planner_is_inactive(self):
+        sprint_id = self._adopt_legacy_with_inactive_planner(
+            "fnb-adopts-legacy-failure"
+        )
+        claim = self.targets.claim_next("inactive-planner-failure", shell_id=1)
+        self.assertEqual("worktree", claim.target_kind)
+
+        self.assertTrue(
+            self.targets.fail_safety(
+                claim,
+                "git_common_dir_mismatch",
+                "stored repository identity changed",
+            )
+        )
+        self.assertFalse(
+            self.targets.fail_safety(
+                claim,
+                "git_common_dir_mismatch",
+                "stored repository identity changed",
+            )
+        )
+
+        target = self.con.execute(
+            "SELECT state,last_error_code,last_error_detail "
+            "FROM sprint_cleanup_targets WHERE cleanup_target_id=?",
+            (claim.cleanup_target_id,),
+        ).fetchone()
+        events = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='sprint.cleanup_failed'",
+            (sprint_id,),
+        ).fetchall()
+        key = (
+            f"sprint:{sprint_id}:cleanup-failed:target:{claim.cleanup_target_id}:"
+            f"generation:{claim.claim_generation}"
+        )
+        notices = self.con.execute(
+            "SELECT receiver_shell_id,declared_type,body FROM wake_message "
+            "WHERE idempotency_key=?",
+            (key,),
+        ).fetchall()
+        self.assertEqual(
+            (
+                "failed",
+                "git_common_dir_mismatch",
+                "stored repository identity changed",
+            ),
+            tuple(target),
+        )
+        self.assertEqual(1, len(events))
+        self.assertEqual(
+            "git_common_dir_mismatch",
+            json.loads(events[0]["payload"])["error_code"],
+        )
+        self.assertEqual(1, len(notices))
+        self.assertEqual((5, "re-enter"), tuple(notices[0][:2]))
+        self.assertIn("FnB fallback receipt", notices[0]["body"])
+        self.assertIn("cleanup-status", notices[0]["body"])
+
     def test_terminal_transitions_emit_exact_planner_receipts_atomically(self):
         failed = self.targets.claim_next("failure-fixture", shell_id=1)
         self.assertIsNotNone(failed)

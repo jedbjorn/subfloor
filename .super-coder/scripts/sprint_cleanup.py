@@ -629,13 +629,14 @@ class SprintCleanupTargetStore:
         if row is None:
             raise RuntimeError("terminal cleanup target disappeared")
         projection = self.project(claim.sprint_id)
-        planner = self.con.execute(
-            "SELECT originating_planner_shell_id FROM sprints WHERE sprint_id=?",
-            (claim.sprint_id,),
-        ).fetchone()
-        if planner is None:
-            raise RuntimeError("terminal cleanup Sprint disappeared")
-        planner_shell_id = int(planner["originating_planner_shell_id"])
+        receiver_shell_id, fnb_fallback = self._terminal_receipt_receiver(
+            claim.sprint_id
+        )
+        fallback_note = (
+            " Originating Planner is inactive; this is the FnB fallback receipt."
+            if fnb_fallback
+            else ""
+        )
         from sprint_message_delivery import SprintMessageStore
 
         if row["state"] == "failed":
@@ -657,11 +658,12 @@ class SprintCleanupTargetStore:
                 (claim.sprint_id, json.dumps(payload, sort_keys=True)),
             )
             SprintMessageStore(self.con).send_to_shell_in_transaction(
-                planner_shell_id,
+                receiver_shell_id,
                 message_kind="notification",
                 body=(
                     f"Sprint {claim.sprint_id} cleanup failed for {path_label} "
-                    f"(error_code={code}). Run `sc sprint cleanup-status --sprint "
+                    f"(error_code={code}).{fallback_note} Run "
+                    f"`sc sprint cleanup-status --sprint "
                     f"{claim.sprint_id}`; after correcting the named condition, run "
                     f"`sc sprint cleanup --sprint {claim.sprint_id} --key "
                     "<stable-retry-key>`. FnB may use the same status and retry surfaces."
@@ -688,16 +690,40 @@ class SprintCleanupTargetStore:
             (claim.sprint_id, json.dumps(payload, sort_keys=True)),
         )
         SprintMessageStore(self.con).send_to_shell_in_transaction(
-            planner_shell_id,
+            receiver_shell_id,
             message_kind="notification",
             body=(
                 f"Sprint {claim.sprint_id} cleanup completed. "
                 f"cleanup_state=succeeded; target_count={projection.target_count}. "
-                "Its managed participant worktrees are reusable."
+                f"Its managed participant worktrees are reusable.{fallback_note}"
             ),
             idempotency_key=f"sprint:{claim.sprint_id}:cleanup-completed",
             declared_type="re-enter",
         )
+
+    def _terminal_receipt_receiver(self, sprint_id: int) -> tuple[int, bool]:
+        planner = self.con.execute(
+            "SELECT sprint.originating_planner_shell_id,"
+            "COALESCE(shell.is_deleted,1) planner_deleted "
+            "FROM sprints sprint LEFT JOIN shells shell "
+            "ON shell.shell_id=sprint.originating_planner_shell_id "
+            "WHERE sprint.sprint_id=?",
+            (sprint_id,),
+        ).fetchone()
+        if planner is None:
+            raise RuntimeError("terminal cleanup Sprint disappeared")
+        if not int(planner["planner_deleted"]):
+            return int(planner["originating_planner_shell_id"]), False
+
+        admins = self.con.execute(
+            "SELECT shell_id FROM shells WHERE flavor='admin' "
+            "AND COALESCE(is_deleted,0)=0 ORDER BY shell_id"
+        ).fetchall()
+        if len(admins) != 1:
+            raise RuntimeError(
+                "terminal cleanup receipt requires the active FnB singleton"
+            )
+        return int(admins[0]["shell_id"]), True
 
     @staticmethod
     def safe_path_label(row: sqlite3.Row) -> str:
