@@ -2875,8 +2875,7 @@ async function chatCloseForSwitch(conversation) {
 }
 
 function chatContextTokenLabel(value) {
-  const tokens = Number(value);
-  return Number.isSafeInteger(tokens) && tokens >= 0 ? `${fmt(tokens)} tok` : "";
+  return Number.isSafeInteger(value) && value >= 0 ? `${fmt(value)} tok` : "";
 }
 
 function chatUpdateContextTokens(node, value) {
@@ -4416,7 +4415,7 @@ async function chatRenderOpen(
       const assistant = [...transcriptState.order].reverse()
         .map((itemId) => transcriptState.items.get(itemId))
         .find((item) => item?.kind === "assistant" && item.run_id === runId);
-      const contextTokens = Number(event.payload?.context_tokens);
+      const contextTokens = event.payload?.context_tokens;
       if (assistant && Number.isSafeInteger(contextTokens) && contextTokens >= 0) {
         assistant.context_tokens = contextTokens;
         transcriptState.dirty.add(assistant.item_id);
