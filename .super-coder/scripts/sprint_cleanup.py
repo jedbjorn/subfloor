@@ -1014,14 +1014,14 @@ class SprintCleanupExecutor:
             "JOIN sprint_participants participant "
             "ON participant.sprint_id=sprint.sprint_id "
             "WHERE participant.shell_id=? AND sprint.sprint_id>? "
-            "AND sprint.lifecycle IN ('armed','paused') "
+            "AND sprint.lifecycle<>'prepared' "
             "ORDER BY sprint.sprint_id LIMIT 1",
             (claim.shell_id, claim.sprint_id),
         ).fetchone()
         if newer is not None:
             raise SprintCleanupSafetyError(
                 "newer_sprint_owns_target",
-                f"newer Sprint {newer['sprint_id']} owns the cleanup shell",
+                f"newer Sprint {newer['sprint_id']} has used the cleanup shell",
             )
 
     def _validate_repository_identity(self, claim: CleanupClaim) -> None:

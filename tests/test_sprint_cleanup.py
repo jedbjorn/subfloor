@@ -759,6 +759,55 @@ class SprintCleanupExecutorTest(SprintDomainCase):
         self.assertEqual(("failed", 0), (row["state"], row["attempt_count"]))
         self.assertIsNotNone(row["before_evidence"])
 
+    def test_newer_aborted_sprint_preserves_work_without_attempt(self):
+        self._dirty_worktree()
+        newer_sprint, _unit = self.create_sprint()
+        calls = 0
+
+        def aborts_after_fetch(_claim):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.lifecycle.arm(newer_sprint, 3)
+                self.lifecycle.abort(
+                    newer_sprint,
+                    sprint_domain.LifecycleActor("planner", 3),
+                    reason="preserve aborted fixture work",
+                    terminal_outcome="aborted",
+                )
+            return "dormant"
+
+        receipt = self._executor(liveness=aborts_after_fetch).run_next(
+            "fixture", shell_id=1
+        )
+
+        self.assertEqual(
+            ("failed", "newer_sprint_owns_target", 0),
+            (receipt.state, receipt.code, receipt.attempt_count),
+        )
+        self.assertEqual(
+            "feat/disposable",
+            self._git(self.worktree, "branch", "--show-current").stdout.strip(),
+        )
+        self.assertEqual("staged dirt\n", (self.worktree / "tracked.txt").read_text())
+        self.assertEqual(
+            "discard\n", (self.worktree / "untracked.txt").read_text()
+        )
+        self.assertEqual(
+            "discard nested\n",
+            (self.worktree / "nested-repository" / "only-local.txt").read_text(),
+        )
+        row = self._worktree_row()
+        self.assertEqual(
+            ("failed", 0, "newer_sprint_owns_target"),
+            (
+                row["state"],
+                row["attempt_count"],
+                row["last_error_code"],
+            ),
+        )
+        self.assertIsNotNone(row["before_evidence"])
+
     def test_live_target_waits_without_consuming_attempt(self):
         receipt = self._executor(liveness=lambda _claim: "live").run_next(
             "fixture",
