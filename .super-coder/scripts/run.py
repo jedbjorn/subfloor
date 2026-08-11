@@ -360,15 +360,21 @@ def execution_mode() -> str:
     return "container" if os.environ.get("SC_SANDBOX") else "host"
 
 
-def shell_work_dir(shortname: "str | None", flavor: "str | None") -> Path:
+def shell_work_dir(
+    shortname: "str | None",
+    flavor: "str | None",
+    *,
+    root: "Path | None" = None,
+) -> Path:
     """The one worktree rule, shared by every boot path (interactive CLI,
     headless `sc run`, Interface exec): the admin flavor boots at the repo
     root (it maintains `main` itself); every other shell — dev, planner,
     reviewer alike — gets an isolated git worktree at
     `.sc-worktrees/<shortname>` on branch `shell/<shortname>`."""
+    root = root or REPO_ROOT
     if shortname and flavor != "admin":
-        return REPO_ROOT / ".sc-worktrees" / shortname.lower()
-    return REPO_ROOT
+        return root / ".sc-worktrees" / shortname.lower()
+    return root
 
 
 def ensure_worktree(work_dir: Path, shortname: str) -> None:

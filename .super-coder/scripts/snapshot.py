@@ -51,6 +51,7 @@ SPRINT_INSTANCE_TABLES = [
     "sprint_specs",
     "sprint_participants",
     "sprint_participant_conversations",
+    "sprint_cleanup_targets",
     "sprint_work_units",
     "sprint_work_unit_tasks",
     "sprint_work_unit_dependencies",
