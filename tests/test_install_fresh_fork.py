@@ -271,9 +271,12 @@ class FreshForkInstallTest(unittest.TestCase):
                 if contents is not None:
                     release.write_text(contents)
                 self.configure_dispatch_host(repo, kernel, release)
+                result = self.run_direct_host(repo, home, kernel, release)
+                (repo / ".super-coder/scripts/install.py").write_text(
+                    "#!/usr/bin/env python3\nprint('0')\n"
+                )
                 before_repo = self.snapshot_tree(repo)
                 before_home = self.snapshot_tree(home)
-                result = self.run_direct_host(repo, home, kernel, release)
                 shell = subprocess.run(
                     [
                         "sh",
