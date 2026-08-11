@@ -62,6 +62,101 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
             )
         )
 
+    def configure_launcher_host(
+        self,
+        launcher: Path,
+        kernel: str,
+        os_release: Path,
+        runtime: Path | None = None,
+    ) -> None:
+        source = launcher.read_text()
+        kernel_probe = (
+            'SC_BOOTSTRAP_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"'
+        )
+        release_probe = "_platform_release=/etc/os-release"
+        runtime_probe = "_platform_wsl_release=/proc/sys/kernel/osrelease"
+        self.assertIn(kernel_probe, source)
+        self.assertIn(release_probe, source)
+        self.assertIn(runtime_probe, source)
+        launcher.write_text(
+            source.replace(
+                kernel_probe,
+                f"SC_BOOTSTRAP_PLATFORM_KERNEL={shlex.quote(kernel)}",
+            )
+            .replace(release_probe, f"_platform_release={shlex.quote(str(os_release))}")
+            .replace(
+                runtime_probe,
+                f"_platform_wsl_release={shlex.quote(str(runtime or Path('/proc/sys/kernel/osrelease')))}",
+            )
+        )
+
+    def tracked_launcher_fixture(
+        self,
+        kernel: str,
+        release_contents: str,
+        origin: str = "https://github.com/jedbjorn/subfloor.git",
+    ) -> tuple[Path, Path, Path]:
+        source = self.root / "source"
+        caller = self.root / "caller"
+        home = self.root / "home"
+        scripts = source / ".super-coder" / "scripts"
+        scripts.mkdir(parents=True)
+        home.mkdir()
+        shutil.copy2(ROOT / "sc", source / "sc")
+        (scripts / "dispatch.sh").write_text(
+            "#!/bin/sh\n"
+            f"touch {shlex.quote(str(self.root / 'live-dispatch-ran'))}\n"
+            "exit 99\n"
+        )
+        subprocess.run(
+            ["git", "init", "-b", "main", str(source)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source),
+                "remote",
+                "add",
+                "origin",
+                origin,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(source), "add", "sc", ".super-coder/scripts/dispatch.sh"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source),
+                "-c",
+                "user.name=Host gate test",
+                "-c",
+                "user.email=host-gate@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(source), "worktree", "add", "-b", "fixture", str(caller)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        release = self.os_release("launcher-os-release", release_contents)
+        self.configure_launcher_host(caller / "sc", kernel, release)
+        return source, caller, home
+
     def invoke(
         self,
         python: str,
@@ -389,6 +484,127 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertIn("detected kernel: Darwin", completed.stderr)
         self.assertFalse((self.root / "python-ran").exists())
         self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
+
+    def test_tracked_launcher_refuses_unsupported_host_before_dispatch_override(self) -> None:
+        source, caller, home = self.tracked_launcher_fixture(
+            "Darwin", "ID=macos\n"
+        )
+        override = caller / ".super-coder" / "scripts" / "dispatch.sh"
+        override.write_text(
+            "#!/bin/sh\n"
+            f"touch {shlex.quote(str(self.root / 'override-ran'))}\n"
+            "exit 0\n"
+        )
+        before_source = self.snapshot_tree(source)
+        before_caller = self.snapshot_tree(caller)
+        before_home = self.snapshot_tree(home)
+        environment = {
+            **os.environ,
+            "HOME": str(home),
+            "SC_DISPATCH": str(override),
+        }
+        environment.pop("WSL_DISTRO_NAME", None)
+        environment.pop("WSL_INTEROP", None)
+
+        completed = subprocess.run(
+            [str(caller / "sc"), "install"],
+            cwd=caller,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        expected = (
+            "✗ subfloor refused: unsupported host.\n"
+            "  detected kernel: Darwin\n"
+            "  detected distribution: ID=macos; ID_LIKE=unknown; VERSION_ID=unknown\n"
+            "  supported hosts: Ubuntu LTS, Fedora stable, Arch-compatible Linux.\n"
+            "  Create a supported Linux VM, keep the checkout on the guest filesystem, then run ./sc install inside the guest.\n"
+            "  The rejected command was not run and no native compatibility path exists.\n"
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stderr, expected)
+        self.assertFalse((self.root / "override-ran").exists())
+        self.assertFalse((self.root / "live-dispatch-ran").exists())
+        self.assertEqual(self.snapshot_tree(source), before_source)
+        self.assertEqual(self.snapshot_tree(caller), before_caller)
+        self.assertEqual(self.snapshot_tree(home), before_home)
+
+    def test_dispatch_override_rejects_arbitrary_body_on_supported_host(self) -> None:
+        _source, caller, home = self.tracked_launcher_fixture(
+            "Linux", "ID=ubuntu\nVERSION_ID=26.04\n"
+        )
+        override = self.root / "arbitrary-dispatch.sh"
+        override.write_text(
+            "#!/bin/sh\n"
+            f"touch {shlex.quote(str(self.root / 'override-ran'))}\n"
+            "exit 0\n"
+        )
+        environment = {
+            **os.environ,
+            "HOME": str(home),
+            "SC_DISPATCH": str(override),
+        }
+        environment.pop("WSL_DISTRO_NAME", None)
+        environment.pop("WSL_INTEROP", None)
+
+        completed = subprocess.run(
+            [str(caller / "sc"), "install"],
+            cwd=caller,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        expected_dispatch = caller / ".super-coder" / "scripts" / "dispatch.sh"
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(
+            completed.stderr,
+            "✗ ./sc: SC_DISPATCH is restricted to the canonical source "
+            f"checkout's tracked dispatcher: {expected_dispatch}\n",
+        )
+        self.assertFalse((self.root / "override-ran").exists())
+        self.assertFalse((self.root / "live-dispatch-ran").exists())
+
+    def test_dispatch_override_rejects_tracked_body_outside_source_repo(self) -> None:
+        _source, caller, home = self.tracked_launcher_fixture(
+            "Linux",
+            "ID=ubuntu\nVERSION_ID=26.04\n",
+            origin="https://github.com/example/application.git",
+        )
+        override = caller / ".super-coder" / "scripts" / "dispatch.sh"
+        override.write_text(
+            "#!/bin/sh\n"
+            f"touch {shlex.quote(str(self.root / 'override-ran'))}\n"
+            "exit 0\n"
+        )
+        environment = {
+            **os.environ,
+            "HOME": str(home),
+            "SC_DISPATCH": str(override),
+        }
+        environment.pop("WSL_DISTRO_NAME", None)
+        environment.pop("WSL_INTEROP", None)
+
+        completed = subprocess.run(
+            [str(caller / "sc"), "install"],
+            cwd=caller,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(
+            completed.stderr,
+            "✗ ./sc: SC_DISPATCH is restricted to the canonical source "
+            f"checkout's tracked dispatcher: {override}\n",
+        )
+        self.assertFalse((self.root / "override-ran").exists())
+        self.assertFalse((self.root / "live-dispatch-ran").exists())
 
     def test_missing_explicit_interpreter_stops_before_target(self) -> None:
         selected = str(self.root / "missing-python")
