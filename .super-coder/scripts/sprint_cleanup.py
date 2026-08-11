@@ -86,7 +86,6 @@ class SprintCleanupTargetStore:
             "ON shell.shell_id=participant.shell_id "
             "WHERE participant.sprint_id=? "
             "AND COALESCE(shell.flavor,'')<>'admin' "
-            "AND COALESCE(shell.is_deleted,0)=0 "
             "ORDER BY participant.shell_id",
             (sprint_id,),
         ).fetchall()
@@ -283,7 +282,6 @@ class SprintCleanupTargetStore:
             "ON shell.shell_id=participant.shell_id "
             "WHERE participant.sprint_id=? "
             "AND COALESCE(shell.flavor,'')<>'admin' "
-            "AND COALESCE(shell.is_deleted,0)=0 "
             "ORDER BY participant.shell_id",
             (sprint_id,),
         ).fetchall()

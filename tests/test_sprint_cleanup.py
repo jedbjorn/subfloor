@@ -187,6 +187,60 @@ class SprintCleanupSchedulingTest(SprintDomainCase):
             {target.canonical_path for target in targets},
         )
 
+    def test_soft_deleted_participant_keeps_exact_target_on_replay(self):
+        self.con.execute("UPDATE shells SET is_deleted=1 WHERE shell_id=1")
+        self.con.commit()
+
+        self.assertTrue(
+            self.store.transition(
+                self.sprint_id,
+                "completed",
+                sprint_domain.LifecycleActor("planner", 3),
+                reason="Fallback close",
+                terminal_outcome="accepted",
+            )
+        )
+        rows = self.cleanup_rows()
+        self.assertEqual(4, len(rows))
+        self.assertEqual(
+            [
+                (
+                    1,
+                    "worktree",
+                    f"{TEST_ROOT}/.sc-worktrees/dev1",
+                    str(TEST_ROOT),
+                    str(TEST_COMMON_DIR),
+                    "shell/dev1",
+                    "pending",
+                    0,
+                    0,
+                )
+            ],
+            [tuple(row) for row in rows if row["shell_id"] == 1],
+        )
+
+        self.assertFalse(
+            self.store.transition(
+                self.sprint_id,
+                "completed",
+                sprint_domain.LifecycleActor("planner", 3),
+                reason="Fallback close",
+                terminal_outcome="accepted",
+            )
+        )
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [tuple(row) for row in self.cleanup_rows()],
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='sprint.cleanup_scheduled'",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+
     def test_scheduling_failure_rolls_back_direct_completion(self):
         self.con.execute(
             "CREATE TRIGGER reject_cleanup_schedule BEFORE INSERT "
