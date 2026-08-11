@@ -507,6 +507,33 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("[line truncated]", displayed)
         self.assertEqual(self.compact_log(done).stat().st_size, 2 * 1024 * 1024)
 
+    def test_compact_display_normalizes_controls_before_enforcing_bounds(self):
+        child = self.root / "controls"
+        raw = b"raw\rreturn\bbackspace\x00nul\x1b[31mred\x1b[0m\n"
+        child.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            f"sys.stdout.buffer.write({raw!r})\n"
+        )
+        child.chmod(0o755)
+        self.write({"version": 1, "hooks": {"test": {"argv": ["./controls"]}}})
+        adversarial = "return\rback\bspace\x1b[31m" + ("metadata-line\n" * 100)
+
+        done = self.run_hook("test", adversarial)
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        displayed = done.stdout + done.stderr
+        self.assertLessEqual(len(displayed.splitlines()), 80)
+        self.assertLessEqual(len(displayed.encode()), 16 * 1024)
+        for control in ("\n", "\r", "\b", "\x00", "\x1b"):
+            if control == "\n":
+                continue
+            self.assertNotIn(control, displayed)
+        self.assertIn(r"metadata-line\n", displayed)
+        self.assertIn(r"return\rback\bspace", displayed)
+        self.assertIn(r"raw\rreturn\bbackspace\x00nulred", displayed)
+        self.assertEqual(self.compact_log(done).read_bytes(), raw)
+
     def test_full_mode_inherits_streams_and_status_without_creating_a_log(self):
         child = self.root / "full-failure"
         child.write_text(
@@ -626,19 +653,47 @@ class RunnerTest(unittest.TestCase):
             [],
         )
 
-    def test_interruption_retains_running_log_and_reports_its_path(self):
+    def test_interruption_reaps_real_child_retains_log_and_reports_path(self):
         child = self.root / "interrupt"
-        child.write_text("#!/bin/sh\nexit 0\n")
+        child.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n")
         child.chmod(0o755)
         self.write({"version": 1, "hooks": {"test": {"argv": ["./interrupt"]}}})
 
+        real_popen = devkit.subprocess.Popen
+        spawned = []
+
         class InterruptedProcess:
-            def wait(self):
-                raise KeyboardInterrupt
+            def __init__(self, *args, **kwargs):
+                self.child = real_popen(*args, **kwargs)
+                self.interrupted = False
+                spawned.append(self.child)
+
+            def poll(self):
+                return self.child.poll()
+
+            def terminate(self):
+                return self.child.terminate()
+
+            def kill(self):
+                return self.child.kill()
+
+            def wait(self, *args, **kwargs):
+                if not self.interrupted:
+                    self.interrupted = True
+                    raise KeyboardInterrupt
+                return self.child.wait(*args, **kwargs)
+
+        def cleanup_children():
+            for process in spawned:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+
+        self.addCleanup(cleanup_children)
 
         output = io.StringIO()
         with contextlib.redirect_stderr(output), mock.patch.object(
-            devkit.subprocess, "Popen", return_value=InterruptedProcess()
+            devkit.subprocess, "Popen", side_effect=InterruptedProcess
         ), mock.patch.object(
             devkit, "invoking_checkout", return_value=self.root.resolve()
         ), mock.patch.object(
@@ -653,6 +708,10 @@ class RunnerTest(unittest.TestCase):
         )
         self.assertEqual(len(running), 1)
         self.assertIn(str(running[0].relative_to(self.root)), output.getvalue())
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].returncode)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(spawned[0].pid, 0)
 
     def test_dangling_provision_reference_fails_before_child_execution(self):
         marker = self.root / "child-ran"

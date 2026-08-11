@@ -1567,6 +1567,13 @@ class SprintSkillTest(unittest.TestCase):
         self.assertNotIn("sc sprint pause --sprint <id>", developer)
 
         spec = SPEC_SKILL.read_text()
+        parsed_spec = seed_skills.parse_skill(SPEC_SKILL)
+        self.assertEqual(
+            parsed_spec["description"],
+            "Load before implementing any feature, spec, or roadmap item. "
+            "Analyze viability, surface blockers, plan Preparation → implementation "
+            "→ Verification, and track spec_tasks/current_state across sessions.",
+        )
         spec_sections = [
             "## 1. Select the spec",
             "## 2. Analyze before planning",

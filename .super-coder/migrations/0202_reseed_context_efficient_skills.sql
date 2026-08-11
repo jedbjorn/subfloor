@@ -1,11 +1,11 @@
--- 0201 — reseed context-efficient shell execution skills.
+-- 0202 — reseed context-efficient shell execution skills.
 -- Existing installs receive compact role/spec procedures without losing durable workflow contracts.
 
 BEGIN;
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'spec',
-  'Execute a spec across sessions — analyze viability, surface blockers and unclear items, break into tasks (Preparation → impl steps → Verification), and track progress in spec_tasks. Updates current_state at every step.',
+  'Load before implementing any feature, spec, or roadmap item. Analyze viability, surface blockers, plan Preparation → implementation → Verification, and track spec_tasks/current_state across sessions.',
   'craft',
   NULL,
   0,

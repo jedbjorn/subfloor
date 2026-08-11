@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from collections import deque
 from collections.abc import Mapping, Sequence
@@ -43,6 +44,7 @@ DIAGNOSTIC = re.compile(
 )
 DISPLAY_LINE_BYTE_LIMIT = 1024
 DISPLAY_SCAN_BYTE_LIMIT = 4096
+INTERRUPT_TERMINATE_TIMEOUT = 1.0
 
 
 class DevkitConfigError(RuntimeError):
@@ -406,7 +408,32 @@ def _shell_status(returncode: int) -> int:
     return 128 - returncode if returncode < 0 else returncode
 
 
+def _sanitize_display(text: str) -> str:
+    clean = ANSI_ESCAPE.sub(
+        b"", text.encode("utf-8", errors="backslashreplace")
+    ).decode("utf-8", errors="replace")
+    visible: list[str] = []
+    named = {"\n": r"\n", "\r": r"\r", "\b": r"\b", "\t": r"\t"}
+    for character in clean:
+        category = unicodedata.category(character)
+        if category[0] != "C" and category not in {"Zl", "Zp"}:
+            visible.append(character)
+            continue
+        if character in named:
+            visible.append(named[character])
+            continue
+        codepoint = ord(character)
+        if codepoint <= 0xFF:
+            visible.append(f"\\x{codepoint:02x}")
+        elif codepoint <= 0xFFFF:
+            visible.append(f"\\u{codepoint:04x}")
+        else:
+            visible.append(f"\\U{codepoint:08x}")
+    return "".join(visible)
+
+
 def _truncate_display(text: str) -> str:
+    text = _sanitize_display(text)
     encoded = text.encode("utf-8")
     if len(encoded) <= DISPLAY_LINE_BYTE_LIMIT:
         return text
@@ -513,6 +540,7 @@ def _bounded_envelope(
     line_limit = FAILURE_LINE_LIMIT if failed else SUCCESS_LINE_LIMIT
     byte_limit = FAILURE_BYTE_LIMIT if failed else SUCCESS_BYTE_LIMIT
     prefix = [_truncate_display(line) for line in prefix]
+    excerpt = [_truncate_display(line) for line in excerpt]
     recovery = _truncate_display(recovery)
     fixed = [*prefix, recovery]
     kept: list[str] = []
@@ -556,6 +584,17 @@ def _run_full(command: Sequence[str], hook: Hook, child_environment: Mapping[str
     return _shell_status(completed.returncode)
 
 
+def _terminate_and_reap(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=INTERRUPT_TERMINATE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def _run_compact(
     checkout: Path,
     hook: Hook,
@@ -586,6 +625,7 @@ def _run_compact(
         try:
             returncode = process.wait()
         except BaseException:
+            _terminate_and_reap(process)
             log.flush()
             os.fsync(log.fileno())
             relative = running.relative_to(main_checkout)
