@@ -38,7 +38,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         )
         self.dispatch = scripts / "dispatch.sh"
         self.supported_release = self.root / "os-release"
-        self.supported_release.write_text("ID=ubuntu\nVERSION_ID=24.04\n")
+        self.supported_release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
         self.configure_host("Linux", self.supported_release)
 
     def configure_host(self, kernel: str, os_release: Path) -> None:
@@ -122,8 +122,8 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
 
     def test_linux_allowlist_accepts_exact_supported_families(self) -> None:
         fixtures = {
-            "ubuntu-lts": "ID=ubuntu\nVERSION_ID=24.04",
-            "fedora-stable": "ID=fedora\nVERSION_ID=42",
+            "ubuntu-lts": "ID=ubuntu\nVERSION_ID=26.04",
+            "fedora-stable": "ID=fedora\nVERSION_ID=44",
             "arch": "ID=arch\n",
             "cachyos": "ID=cachyos\nID_LIKE=arch\n",
         }
@@ -142,7 +142,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
     def test_release_allowlist_rejects_ubuntu_interim_and_fedora_rawhide(self) -> None:
         python = self.sentinel_python()
         fixtures = {
-            "ubuntu-interim": "ID=ubuntu\nVERSION_ID=25.04\n",
+            "ubuntu-interim": "ID=ubuntu\nVERSION_ID=26.10\n",
             "fedora-rawhide": "ID=fedora\nVERSION_ID=rawhide\n",
         }
         for name, contents in fixtures.items():
@@ -153,7 +153,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                 self.assertEqual(completed.returncode, 1)
                 self.assertIn("supported Linux VM", completed.stderr)
                 self.assertIn(
-                    f"VERSION_ID={'25.04' if name == 'ubuntu-interim' else 'rawhide'}",
+                    f"VERSION_ID={'26.10' if name == 'ubuntu-interim' else 'rawhide'}",
                     completed.stderr,
                 )
                 self.assertFalse((self.root / "python-ran").exists())
@@ -205,7 +205,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
 
     def test_corrupt_os_release_refuses_before_python_probe(self) -> None:
         release = self.root / "invalid-os-release"
-        release.write_bytes(b"ID=ubuntu\nVERSION_ID=24.04\nBROKEN=\xff\n")
+        release.write_bytes(b"ID=ubuntu\nVERSION_ID=26.04\nBROKEN=\xff\n")
         python = self.sentinel_python()
         self.configure_host("Linux", release)
         completed = self.invoke(str(python), "install")
@@ -264,7 +264,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertFalse((self.root / "python-ran").exists())
 
     def test_platform_environment_cannot_override_test_host(self) -> None:
-        release = self.os_release("ubuntu", "ID=ubuntu\nVERSION_ID=24.04\n")
+        release = self.os_release("ubuntu", "ID=ubuntu\nVERSION_ID=26.04\n")
         python = self.sentinel_python()
         self.configure_host("Darwin", release)
 

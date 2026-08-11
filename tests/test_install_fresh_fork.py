@@ -162,7 +162,7 @@ class FreshForkInstallTest(unittest.TestCase):
 
     def run_install(self, repo: Path, home: Path) -> subprocess.CompletedProcess[str]:
         release = home / "os-release"
-        release.write_text("ID=ubuntu\nVERSION_ID=24.04\n")
+        release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
         return self.run_direct_host(
             repo,
             home,
@@ -218,7 +218,7 @@ class FreshForkInstallTest(unittest.TestCase):
                 check=True,
             ).stdout
             release = home / "os-release"
-            release.write_text("ID=ubuntu\nVERSION_ID=24.04\n")
+            release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
             result = self.run_direct_host(
                 repo,
                 home,
@@ -246,11 +246,11 @@ class FreshForkInstallTest(unittest.TestCase):
 
     def test_direct_installer_platform_gate_matches_allowlist_without_mutation(self) -> None:
         fixtures = {
-            "ubuntu-lts": ("Linux", "ID=ubuntu\nVERSION_ID=24.04", True),
-            "fedora-stable": ("Linux", "ID=fedora\nVERSION_ID=42", True),
+            "ubuntu-lts": ("Linux", "ID=ubuntu\nVERSION_ID=26.04", True),
+            "fedora-stable": ("Linux", "ID=fedora\nVERSION_ID=44", True),
             "arch": ("Linux", "ID=arch\n", True),
             "cachyos": ("Linux", "ID=cachyos\nID_LIKE=arch\n", True),
-            "ubuntu-interim": ("Linux", "ID=ubuntu\nVERSION_ID=25.04\n", False),
+            "ubuntu-interim": ("Linux", "ID=ubuntu\nVERSION_ID=26.10\n", False),
             "fedora-rawhide": ("Linux", "ID=fedora\nVERSION_ID=rawhide\n", False),
             "unknown-linux": ("Linux", "ID=notarch\nID_LIKE=notarch\n", False),
             "missing-os-release": ("Linux", None, False),
@@ -274,7 +274,7 @@ class FreshForkInstallTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 1)
                     self.assertIn("supported Linux VM", result.stderr)
                     if name == "ubuntu-interim":
-                        self.assertIn("VERSION_ID=25.04", result.stderr)
+                        self.assertIn("VERSION_ID=26.10", result.stderr)
                     if name == "fedora-rawhide":
                         self.assertIn("VERSION_ID=rawhide", result.stderr)
                     shell = subprocess.run(
@@ -301,7 +301,7 @@ class FreshForkInstallTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             repo, home = self.prepare_repo(raw)
             release = Path(raw) / "os-release"
-            release.write_text("ID=ubuntu\nVERSION_ID=24.04\n")
+            release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
             before_repo = self.snapshot_tree(repo)
             before_home = self.snapshot_tree(home)
 
@@ -326,7 +326,7 @@ class FreshForkInstallTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             repo, home = self.prepare_repo(raw)
             release = Path(raw) / "invalid-os-release"
-            release.write_bytes(b"ID=ubuntu\nVERSION_ID=24.04\nBROKEN=\xff\n")
+            release.write_bytes(b"ID=ubuntu\nVERSION_ID=26.04\nBROKEN=\xff\n")
             sentinel = home / "python-sentinel"
             sentinel.write_text(
                 "#!/bin/sh\n"

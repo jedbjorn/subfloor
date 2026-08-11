@@ -76,8 +76,8 @@ def require_supported_host() -> None:
     """Refuse unsupported hosts before installer imports or repository writes."""
     kernel, distro_id, distro_like, version_id = _platform_identity()
     supported = kernel == "Linux" and (
-        (distro_id == "ubuntu" and version_id == "24.04")
-        or (distro_id == "fedora" and version_id == "42")
+        (distro_id == "ubuntu" and version_id == "26.04")
+        or (distro_id == "fedora" and version_id == "44")
         or distro_id == "arch"
         or "arch" in distro_like.split()
     )
