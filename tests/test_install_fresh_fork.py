@@ -204,8 +204,8 @@ class FreshForkInstallTest(unittest.TestCase):
 
     def test_direct_installer_platform_gate_matches_allowlist_without_mutation(self) -> None:
         fixtures = {
-            "ubuntu-lts": ("Linux", "ID=ubuntu\nVERSION_ID=24.04\n", True),
-            "fedora-stable": ("Linux", "ID=fedora\nVERSION_ID=42\n", True),
+            "ubuntu-lts": ("Linux", "ID=ubuntu\nVERSION_ID=24.04", True),
+            "fedora-stable": ("Linux", "ID=fedora\nVERSION_ID=42", True),
             "arch": ("Linux", "ID=arch\n", True),
             "cachyos": ("Linux", "ID=cachyos\nID_LIKE=arch\n", True),
             "ubuntu-interim": ("Linux", "ID=ubuntu\nVERSION_ID=25.04\n", False),
@@ -247,6 +247,28 @@ class FreshForkInstallTest(unittest.TestCase):
                 else:
                     self.assertEqual(result.returncode, 1)
                     self.assertIn("supported Linux VM", result.stderr)
+                    if name == "ubuntu-interim":
+                        self.assertIn("VERSION_ID=25.04", result.stderr)
+                    if name == "fedora-rawhide":
+                        self.assertIn("VERSION_ID=rawhide", result.stderr)
+                    shell = subprocess.run(
+                        ["sh", str(repo / ".super-coder/scripts/dispatch.sh"), "install"],
+                        cwd=repo,
+                        env={
+                            **os.environ,
+                            "HOME": str(home),
+                            "SC_CALLER_ROOT": str(repo),
+                            "SC_PYTHON": sys.executable,
+                            "SC_PLATFORM_UNAME": kernel,
+                            "SC_PLATFORM_OS_RELEASE": str(release),
+                            "PYTHONDONTWRITEBYTECODE": "1",
+                        },
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(shell.returncode, 1)
+                    self.assertEqual(shell.stderr, result.stderr)
                     self.assert_direct_refusal_is_pristine(
                         repo, home, before_repo, before_home
                     )

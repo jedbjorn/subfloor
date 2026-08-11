@@ -79,7 +79,7 @@ sc_platform_detect() {
   SC_PLATFORM_ID_LIKE=""
   SC_PLATFORM_VERSION_ID=""
   if [ -r "$_platform_release" ]; then
-    while IFS='=' read -r _platform_key _platform_value; do
+    while IFS='=' read -r _platform_key _platform_value || [ -n "$_platform_key" ]; do
       case "$_platform_key" in
         ID) SC_PLATFORM_ID="$(sc_platform_unquote "$_platform_value")" ;;
         ID_LIKE) SC_PLATFORM_ID_LIKE="$(sc_platform_unquote "$_platform_value")" ;;
@@ -100,7 +100,7 @@ sc_require_supported_host() {
   {
     echo '✗ subfloor refused: unsupported host.'
     echo "  detected kernel: ${SC_PLATFORM_KERNEL:-unknown}"
-    echo "  detected distribution: ID=${SC_PLATFORM_ID:-unknown}; ID_LIKE=${SC_PLATFORM_ID_LIKE:-unknown}"
+    echo "  detected distribution: ID=${SC_PLATFORM_ID:-unknown}; ID_LIKE=${SC_PLATFORM_ID_LIKE:-unknown}; VERSION_ID=${SC_PLATFORM_VERSION_ID:-unknown}"
     echo '  supported hosts: Ubuntu LTS, Fedora stable, Arch-compatible Linux.'
     echo '  Create a supported Linux VM, keep the checkout on the guest filesystem, then run ./sc install inside the guest.'
     echo '  The rejected command was not run and no native compatibility path exists.'

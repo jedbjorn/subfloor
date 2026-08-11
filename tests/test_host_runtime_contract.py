@@ -111,8 +111,8 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
 
     def test_linux_allowlist_accepts_exact_supported_families(self) -> None:
         fixtures = {
-            "ubuntu-lts": "ID=ubuntu\nVERSION_ID=24.04\n",
-            "fedora-stable": "ID=fedora\nVERSION_ID=42\n",
+            "ubuntu-lts": "ID=ubuntu\nVERSION_ID=24.04",
+            "fedora-stable": "ID=fedora\nVERSION_ID=42",
             "arch": "ID=arch\n",
             "cachyos": "ID=cachyos\nID_LIKE=arch\n",
         }
@@ -146,6 +146,10 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                 )
                 self.assertEqual(completed.returncode, 1)
                 self.assertIn("supported Linux VM", completed.stderr)
+                self.assertIn(
+                    f"VERSION_ID={'25.04' if name == 'ubuntu-interim' else 'rawhide'}",
+                    completed.stderr,
+                )
                 self.assertFalse((self.root / "python-ran").exists())
                 self.assertFalse(
                     (self.root / ".super-coder/scripts/install-ran").exists()
@@ -184,7 +188,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         expected = (
             "✗ subfloor refused: unsupported host.\n"
             "  detected kernel: Linux\n"
-            "  detected distribution: ID=notarch; ID_LIKE=notarch\n"
+            "  detected distribution: ID=notarch; ID_LIKE=notarch; VERSION_ID=unknown\n"
             "  supported hosts: Ubuntu LTS, Fedora stable, Arch-compatible Linux.\n"
             "  Create a supported Linux VM, keep the checkout on the guest filesystem, then run ./sc install inside the guest.\n"
             "  The rejected command was not run and no native compatibility path exists.\n"
