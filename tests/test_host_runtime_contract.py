@@ -242,6 +242,33 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertIn("make dos-l", public_docs[2])
         self.assertIn("make dos-e", public_docs[2])
 
+    def test_installer_banner_uses_declared_make_aliases(self) -> None:
+        installer = (ENGINE / "scripts" / "install.py").read_text()
+        aliases = (ENGINE / "aliases.mk").read_text()
+
+        self.assertIn("make dos-l", installer)
+        self.assertIn("make dos-e", installer)
+        self.assertNotIn("make launch", installer)
+        self.assertNotIn("make enter", installer)
+        self.assertIn("dos-launch", aliases)
+        self.assertIn("dos-enter", aliases)
+
+    def test_active_engine_surfaces_do_not_claim_native_mac_support(self) -> None:
+        surfaces = [
+            ENGINE / "scripts" / "install.py",
+            ENGINE / "scripts" / "run.py",
+            ENGINE / "docs" / "harness-freshness.md",
+            ENGINE / "adapters" / "kimi" / "README.md",
+            ENGINE / "Dockerfile",
+        ]
+        forbidden = ("darwin", "macos", "homebrew", "brew", "colima", "docker desktop")
+
+        for path in surfaces:
+            body = path.read_text().lower()
+            for term in forbidden:
+                with self.subTest(path=path, term=term):
+                    self.assertNotIn(term, body)
+
     def test_unsupported_kernel_refuses_before_python_or_target(self) -> None:
         python = self.sentinel_python()
         git = self.root / "git"

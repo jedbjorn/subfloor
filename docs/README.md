@@ -438,9 +438,10 @@ machine/account state and are not serialized into content snapshots.
 
 A new model arrives in a new harness **CLI release** — so a shell can only reach
 the models its CLI knows about. The CLIs are image-owned (harness state homes
-are mounted, but their executables must never resolve from the host: a darwin
-binary is fatal in a linux container, and vibe's entry point carries an absolute
-shebang into a host interpreter), and docker caches those layers indefinitely.
+are mounted, but their executables must never resolve from the host: a
+foreign-ABI binary is fatal in a Linux container, and vibe's entry point carries
+an absolute shebang into a host interpreter), and docker caches those layers
+indefinitely.
 `SC_HARNESS_EPOCH` is their cache key. A normal restart gives it a unique value
 and reinstalls every harness at latest before replacing the running sandbox.
 

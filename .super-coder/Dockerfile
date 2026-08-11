@@ -116,8 +116,8 @@ RUN printf '%s\n' \
 
 # ── Harness freshness seam ───────────────────────────────────────────────────
 # The harness CLIs are BAKED (here + below), never mounted from the host: their
-# binaries are host-ABI artifacts, not portable config. A darwin binary in a
-# linux container is fatal (see kimi's note below), vibe's entry point is a
+# binaries are host-ABI artifacts, not portable config. A foreign-ABI binary in
+# a Linux container is fatal (see kimi's note below), vibe's entry point is a
 # script with an absolute shebang into a host uv interpreter, and glibc baselines
 # differ across the distros we support. Auth travels; binaries do not.
 #
@@ -140,18 +140,17 @@ ARG SC_HARNESS_EPOCH=0
 # /usr/local/bin (root-writable, on every PATH), unlike the $HOME installs below.
 # Its default home, ~/.kimi-code, holds bin/ AND config in one dir, and
 # `./sc launch` bind-mounts the host's ~/.kimi-code for creds — installing there
-# would let the mount shadow the baked binary (fatal on a macOS host: darwin
-# binary, linux container). KIMI_NO_MODIFY_PATH skips its shell-rc edit.
+# would let the mount shadow the baked binary with an incompatible host binary.
+# KIMI_NO_MODIFY_PATH skips its shell-rc edit.
 RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
  && curl -fsSL https://code.kimi.com/kimi-code/install.sh \
       | env KIMI_INSTALL_DIR=/usr/local KIMI_NO_MODIFY_PATH=1 bash
 
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.
-# A host GID may already exist in the base image — notably macOS's primary GID 20
-# (`staff`) collides with Debian's pre-existing `dialout` group — so creating it
-# unconditionally fails the build there. Reuse an existing GID; only create when
-# absent. The group's *name* is irrelevant; only the numeric GID must match the
-# host for bind-mounted ownership to line up.
+# A host GID may already exist in the base image, so creating it unconditionally
+# can fail the build. Reuse an existing GID; only create when absent. The group's
+# *name* is irrelevant; only the numeric GID must match the host for bind-mounted
+# ownership to line up.
 RUN if ! getent group ${SC_GID} >/dev/null; then groupadd -g ${SC_GID} ${SC_USER}; fi \
  && useradd -m -u ${SC_UID} -g ${SC_GID} -s /bin/bash ${SC_USER}
 

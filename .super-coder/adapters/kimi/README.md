@@ -87,6 +87,6 @@ binary home (`bin/`) and its config home — unlike the other harnesses, which
 keep those apart. `./sc launch` bind-mounts host `~/.kimi-code` in (config,
 sessions, login state flow straight to the container), so the sandbox image
 deliberately bakes its own binary to `/usr/local/bin` (`KIMI_INSTALL_DIR=/usr/local`
-in the Dockerfile) — otherwise the mount would shadow the baked binary with the
-host's (fatal on a macOS host: a darwin binary inside the linux container).
+in the Dockerfile) — otherwise the mount would shadow the baked binary with an
+incompatible host binary inside the Linux container.
 Same reason `ensure_harness_path()` is a no-op under `SC_SANDBOX`.

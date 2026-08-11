@@ -555,7 +555,7 @@ def ensure_harness_path() -> None:
     baked binary dir, and folding host dirs in is actively wrong for kimi —
     host `~/.kimi-code` (its bin/ + config in one dir) is bind-mounted for
     creds, and prepending its bin/ would shadow the image's own kimi binary
-    with the host's (a darwin binary on a macOS host)."""
+    with an incompatible host binary."""
     if os.environ.get("SC_SANDBOX"):
         return
     try:

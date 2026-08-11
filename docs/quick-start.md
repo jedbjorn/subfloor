@@ -64,22 +64,21 @@ Four steps, from an existing git repo to a booted shell:
    [*Install*](README.md#install).
 2. **Bootstrap the fork.** `./sc install` checks requirements, installs the
    harness CLIs, wires your `.gitignore`, builds the DB, and seeds your
-   starting team. Commit the bootstrap, then use the normal Make aliases:
+   starting team. Commit the bootstrap:
 
    ```bash
    git add -A && git commit --no-verify -m "chore: install subfloor"
-   make dos-l
    ```
 
    What it does under the hood, and the flags to script it:
    [*Install → Installer internals*](README.md#install).
-3. **Sign in once, in Linux.** Each harness authenticates with your own
+3. **Launch.** `make dos-l` builds and starts the sandbox container and Review
+   GUI, published to `127.0.0.1` only.
+4. **Sign in and enter.** Each harness authenticates with your own
    account — `claude`, `opencode auth login`, `codex login`, `vibe --setup`,
    or `kimi login` — and the sandbox mounts the credentials in. Host, never
-   inside the sandbox: [*Install → Harness sign-in*](README.md#install).
-4. **Launch and enter.** `make dos-l` builds and starts the sandbox container
-   and Review GUI; after signing in, `make dos-e` enters a shell. The GUI
-   remains published to `127.0.0.1` only.
+   inside the sandbox. After signing in, `make dos-e` enters a shell:
+   [*Install → Harness sign-in*](README.md#install).
 
 ## First boot
 

@@ -346,7 +346,7 @@ def _harness_installed(name: str) -> bool:
 # `super-coder-sandbox` image. The container mounts harness state homes
 # (~/.claude, ~/.codex, …), but an image launcher must never resolve a binary
 # from those mounts. Binaries cannot be host-selected: they are host-ABI
-# artifacts (a darwin binary is fatal in a linux container, vibe's entry point
+# artifacts (a foreign-ABI binary is fatal in a Linux container, vibe's entry point
 # carries an absolute shebang into a host uv interpreter, glibc baselines differ
 # across the distros we support), which is why the Dockerfile bakes them.
 #
@@ -1112,9 +1112,9 @@ def main(argv: list[str]) -> int:
     print(f"  harness : {harness}")
     print(f"  GUI port: {cfg['port']}  (http://127.0.0.1:{cfg['port']})")
     print("\nNext:")
-    print("  git add -A && git commit -m 'install super-coder'")
-    print("  ./sc launch        # or: make launch — starts the sandbox + GUI")
-    print("  ./sc enter         # or: make enter  — attach + boot your shell")
+    print("  git add -A && git commit --no-verify -m 'chore: install subfloor'")
+    print("  make dos-l          # starts the sandbox + GUI")
+    print("  make dos-e          # attach + boot your shell")
     return 0
 
 
