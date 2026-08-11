@@ -114,9 +114,12 @@ class FreshForkInstallTest(unittest.TestCase):
         kernel: str,
         release: Path,
         extra_env: dict[str, str] | None = None,
+        args: list[str] | None = None,
+        timeout: int | None = None,
     ) -> subprocess.CompletedProcess[str]:
         # The subprocess patches host probes before executing the unmodified installer.
         install = repo / ".super-coder" / "scripts" / "install.py"
+        argv = [str(install), *(args or ["--harness-epoch"])]
         direct_entry = (
             "import builtins\n"
             "import platform\n"
@@ -130,7 +133,7 @@ class FreshForkInstallTest(unittest.TestCase):
             "        return original_open(release, *args, **kwargs)\n"
             "    return original_open(path, *args, **kwargs)\n"
             "builtins.open = host_open\n"
-            f"sys.argv = [{str(install)!r}, '--harness-epoch']\n"
+            f"sys.argv = {argv!r}\n"
             f"runpy.run_path({str(install)!r}, run_name='__main__')\n"
         )
         return subprocess.run(
@@ -144,29 +147,24 @@ class FreshForkInstallTest(unittest.TestCase):
             },
             capture_output=True,
             text=True,
+            timeout=timeout,
             check=False,
         )
 
     def run_install(self, repo: Path, home: Path) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [
-                sys.executable,
-                str(repo / ".super-coder" / "scripts" / "install.py"),
-                "--skip-harness-install",
-                "--username",
-                "Gate",
-            ],
-            cwd=repo,
-            env={
-                **os.environ,
-                "HOME": str(home),
+        release = home / "os-release"
+        release.write_text("ID=ubuntu\nVERSION_ID=24.04\n")
+        return self.run_direct_host(
+            repo,
+            home,
+            "Linux",
+            release,
+            {
                 "XDG_STATE_HOME": str(home / ".local/state"),
                 "NO_COLOR": "1",
             },
-            capture_output=True,
-            text=True,
+            args=["--skip-harness-install", "--username", "Gate"],
             timeout=120,
-            check=False,
         )
 
     def test_noninteractive_install_reaches_durable_completion_marker(self) -> None:
