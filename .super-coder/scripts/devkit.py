@@ -14,14 +14,37 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
+import unicodedata
+import uuid
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
+from artifact_policy import devkit_log_root
+
 DECLARATION_PATH = Path(".subfloor/dev-kit.json")
 HOOK_NAMES = frozenset(("deps", "test", "lint", "typecheck"))
 MOUNT_NAME = re.compile(r"\A[a-z0-9][a-z0-9_-]{0,47}\Z")
+COMPACT_HOOKS = frozenset(("test", "lint", "typecheck"))
+OUTPUT_MODES = frozenset(("compact", "full"))
+LOG_RETENTION = 20
+SUCCESS_LINE_LIMIT = 80
+SUCCESS_BYTE_LIMIT = 16 * 1024
+FAILURE_LINE_LIMIT = 240
+FAILURE_BYTE_LIMIT = 48 * 1024
+ANSI_ESCAPE = re.compile(
+    rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[@-_])"
+)
+DIAGNOSTIC = re.compile(
+    r"\b(?:error|errors|fail|failed|failure|fatal|panic|traceback|warning|warnings)\b",
+    re.IGNORECASE,
+)
+DISPLAY_LINE_BYTE_LIMIT = 1024
+DISPLAY_SCAN_BYTE_LIMIT = 4096
+INTERRUPT_TERMINATE_TIMEOUT = 1.0
 
 
 class DevkitConfigError(RuntimeError):
@@ -366,6 +389,283 @@ def _resolve_executable(hook: Hook, environment: Mapping[str, str]) -> Path:
     return executable
 
 
+def _main_checkout(checkout: Path) -> Path:
+    result = subprocess.run(
+        ("git", "-C", str(checkout), "rev-parse", "--git-common-dir"),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise _error("$checkout", "cannot resolve Git common directory")
+    common = Path(result.stdout.strip())
+    if not common.is_absolute():
+        common = checkout / common
+    return common.resolve().parent
+
+
+def _shell_status(returncode: int) -> int:
+    return 128 - returncode if returncode < 0 else returncode
+
+
+def _sanitize_display(text: str) -> str:
+    clean = ANSI_ESCAPE.sub(
+        b"", text.encode("utf-8", errors="backslashreplace")
+    ).decode("utf-8", errors="replace")
+    visible: list[str] = []
+    named = {"\n": r"\n", "\r": r"\r", "\b": r"\b", "\t": r"\t"}
+    for character in clean:
+        category = unicodedata.category(character)
+        if category[0] != "C" and category not in {"Zl", "Zp"}:
+            visible.append(character)
+            continue
+        if character in named:
+            visible.append(named[character])
+            continue
+        codepoint = ord(character)
+        if codepoint <= 0xFF:
+            visible.append(f"\\x{codepoint:02x}")
+        elif codepoint <= 0xFFFF:
+            visible.append(f"\\u{codepoint:04x}")
+        else:
+            visible.append(f"\\U{codepoint:08x}")
+    return "".join(visible)
+
+
+def _truncate_display(text: str) -> str:
+    text = _sanitize_display(text)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= DISPLAY_LINE_BYTE_LIMIT:
+        return text
+    clipped = encoded[: DISPLAY_LINE_BYTE_LIMIT - 24]
+    while clipped:
+        try:
+            prefix = clipped.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            clipped = clipped[:-1]
+    else:
+        prefix = ""
+    return prefix + " … [line truncated]"
+
+
+def _display_line(raw: bytes, *, source_truncated: bool = False) -> str:
+    clean = ANSI_ESCAPE.sub(b"", raw.rstrip(b"\r\n"))
+    text = clean.decode("utf-8", errors="replace")
+    if source_truncated:
+        text += " … [line truncated]"
+    return _truncate_display(text)
+
+
+@dataclass(frozen=True)
+class LogScan:
+    byte_count: int
+    line_count: int
+    head: tuple[tuple[int, str], ...]
+    diagnostics: tuple[tuple[int, str], ...]
+    tail: tuple[tuple[int, str], ...]
+
+
+def _scan_log(path: Path, *, failed: bool) -> LogScan:
+    head_limit = 40 if failed else 0
+    diagnostic_limit = 80 if failed else 24
+    tail_limit = 80 if failed else 40
+    head: list[tuple[int, str]] = []
+    diagnostics: list[tuple[int, str]] = []
+    tail: deque[tuple[int, str]] = deque(maxlen=tail_limit)
+    line_count = 0
+
+    def record(raw: bytes, source_truncated: bool) -> None:
+        nonlocal line_count
+        line_count += 1
+        displayed = _display_line(raw, source_truncated=source_truncated)
+        item = (line_count, displayed)
+        if len(head) < head_limit:
+            head.append(item)
+        if len(diagnostics) < diagnostic_limit and DIAGNOSTIC.search(displayed):
+            diagnostics.append(item)
+        tail.append(item)
+
+    pending = bytearray()
+    source_truncated = False
+    with path.open("rb") as handle:
+        while chunk := handle.read(64 * 1024):
+            pieces = chunk.split(b"\n")
+            for index, piece in enumerate(pieces):
+                room = max(0, DISPLAY_SCAN_BYTE_LIMIT - len(pending))
+                pending.extend(piece[:room])
+                source_truncated = source_truncated or len(piece) > room
+                if index < len(pieces) - 1:
+                    record(bytes(pending), source_truncated)
+                    pending.clear()
+                    source_truncated = False
+    if pending or source_truncated:
+        record(bytes(pending), source_truncated)
+    return LogScan(
+        byte_count=path.stat().st_size,
+        line_count=line_count,
+        head=tuple(head),
+        diagnostics=tuple(diagnostics),
+        tail=tuple(tail),
+    )
+
+
+def _excerpt_lines(scan: LogScan, *, failed: bool) -> list[str]:
+    sections = (
+        (("head", scan.head), ("diagnostic digest", scan.diagnostics), ("tail", scan.tail))
+        if failed
+        else (("diagnostic digest", scan.diagnostics), ("tail", scan.tail))
+    )
+    lines: list[str] = []
+    emitted: set[int] = set()
+    for label, items in sections:
+        unique = [(number, text) for number, text in items if number not in emitted]
+        if not unique:
+            continue
+        lines.append(f"dev-kit {label}:")
+        for number, value in unique:
+            lines.append(f"  {number}: {value}")
+            emitted.add(number)
+    omitted = scan.line_count - len(emitted)
+    if omitted > 0:
+        lines.append(f"dev-kit excerpt omitted: {omitted} lines")
+    elif scan.line_count == 0:
+        lines.append("dev-kit excerpt: (empty output)")
+    return lines
+
+
+def _bounded_envelope(
+    prefix: Sequence[str], excerpt: Sequence[str], recovery: str, *, failed: bool
+) -> str:
+    line_limit = FAILURE_LINE_LIMIT if failed else SUCCESS_LINE_LIMIT
+    byte_limit = FAILURE_BYTE_LIMIT if failed else SUCCESS_BYTE_LIMIT
+    prefix = [_truncate_display(line) for line in prefix]
+    excerpt = [_truncate_display(line) for line in excerpt]
+    recovery = _truncate_display(recovery)
+    fixed = [*prefix, recovery]
+    kept: list[str] = []
+    for line in excerpt:
+        candidate = [*prefix, *kept, line, recovery]
+        rendered = "\n".join(candidate) + "\n"
+        if len(candidate) > line_limit or len(rendered.encode("utf-8")) > byte_limit:
+            break
+        kept.append(line)
+    if len(kept) < len(excerpt):
+        marker = "dev-kit excerpt omitted: display bound reached"
+        candidate = [*prefix, *kept, marker, recovery]
+        rendered = "\n".join(candidate) + "\n"
+        if len(candidate) <= line_limit and len(rendered.encode("utf-8")) <= byte_limit:
+            kept.append(marker)
+    result = "\n".join([*prefix, *kept, recovery]) + "\n"
+    if len(fixed) > line_limit or len(result.encode("utf-8")) > byte_limit:
+        raise RuntimeError("dev-kit envelope metadata exceeds its display bound")
+    return result
+
+
+def _prune_logs(directory: Path) -> None:
+    dated = []
+    for path in directory.glob("*.log"):
+        try:
+            dated.append((path.stat().st_mtime_ns, path.name, path))
+        except FileNotFoundError:
+            continue
+    finalized = [item[2] for item in sorted(dated, reverse=True)]
+    for old in finalized[LOG_RETENTION:]:
+        old.unlink(missing_ok=True)
+
+
+def _run_full(command: Sequence[str], hook: Hook, child_environment: Mapping[str, str]) -> int:
+    completed = subprocess.run(
+        command,
+        cwd=hook.cwd,
+        env=child_environment,
+        check=False,
+    )
+    return _shell_status(completed.returncode)
+
+
+def _terminate_and_reap(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=INTERRUPT_TERMINATE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def _run_compact(
+    checkout: Path,
+    hook: Hook,
+    command: Sequence[str],
+    arguments: Sequence[str],
+    child_environment: Mapping[str, str],
+    seat: str,
+) -> int:
+    main_checkout = _main_checkout(checkout)
+    directory = devkit_log_root(main_checkout) / hook.name
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    name = f"{stamp}-{os.getpid()}-{uuid.uuid4().hex}.running"
+    running = directory / name
+    started = time.monotonic()
+    with running.open("xb") as log:
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=hook.cwd,
+                env=child_environment,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+        except OSError:
+            running.unlink(missing_ok=True)
+            raise
+        try:
+            returncode = process.wait()
+        except BaseException:
+            _terminate_and_reap(process)
+            log.flush()
+            os.fsync(log.fileno())
+            relative = running.relative_to(main_checkout)
+            print(f"dev-kit log interrupted: {relative}", file=sys.stderr)
+            raise
+        log.flush()
+        os.fsync(log.fileno())
+
+    finalized = running.with_suffix(".log")
+    running.replace(finalized)
+    duration = time.monotonic() - started
+    status = _shell_status(returncode)
+    failed = status != 0
+    scan = _scan_log(finalized, failed=failed)
+    relative = finalized.relative_to(main_checkout)
+    recovery_args = shlex.join(("./sc", hook.name, *arguments))
+    prefix = [
+        f"dev-kit checkout: {checkout}",
+        f"dev-kit seat: {seat}",
+        f"dev-kit hook: {hook.name}",
+        f"dev-kit command: {shlex.join(command)}",
+        f"dev-kit cwd: {hook.cwd}",
+        f"dev-kit exit status: {status}",
+        f"dev-kit duration: {duration:.3f}s",
+        f"dev-kit output: {scan.byte_count} bytes, {scan.line_count} lines",
+        f"dev-kit log: {relative}",
+        (
+            f"dev-kit hook state: failed — {hook.name!r} exited {status}"
+            if failed
+            else f"dev-kit hook state: ready — {hook.name!r}"
+        ),
+    ]
+    recovery = f"dev-kit full output: SC_DEVKIT_OUTPUT=full {recovery_args}"
+    sys.stderr.write(
+        _bounded_envelope(prefix, _excerpt_lines(scan, failed=failed), recovery, failed=failed)
+    )
+    _prune_logs(directory)
+    return status
+
+
 def run_hook(
     invocation_root: Path,
     hook_name: str,
@@ -400,43 +700,57 @@ def run_hook(
             "SC_DEVKIT_HOOK": hook_name,
         }
     )
+    output_mode = child_environment.get("SC_DEVKIT_OUTPUT", "compact")
+    if hook_name in COMPACT_HOOKS and output_mode not in OUTPUT_MODES:
+        print(
+            "dev-kit hook state: invalid — SC_DEVKIT_OUTPUT must be "
+            "'compact' or 'full'",
+            file=sys.stderr,
+        )
+        return 64
     requested = (*hook.argv, *arguments)
-    print(f"dev-kit checkout: {checkout}", file=sys.stderr)
-    print(f"dev-kit seat: {seat}", file=sys.stderr)
-    print(f"dev-kit cwd: {hook.cwd}", file=sys.stderr)
-    print(f"dev-kit argv: {shlex.join(requested)}", file=sys.stderr)
+    if hook_name not in COMPACT_HOOKS or output_mode == "full":
+        print(f"dev-kit checkout: {checkout}", file=sys.stderr)
+        print(f"dev-kit seat: {seat}", file=sys.stderr)
+        print(f"dev-kit cwd: {hook.cwd}", file=sys.stderr)
+        print(f"dev-kit argv: {shlex.join(requested)}", file=sys.stderr)
     try:
         executable = _resolve_executable(hook, child_environment)
     except OSError as exc:
+        if hook_name in COMPACT_HOOKS and output_mode == "compact":
+            print(f"dev-kit checkout: {checkout}", file=sys.stderr)
+            print(f"dev-kit seat: {seat}", file=sys.stderr)
+            print(f"dev-kit cwd: {hook.cwd}", file=sys.stderr)
+            print(f"dev-kit argv: {shlex.join(requested)}", file=sys.stderr)
         print(f"dev-kit hook state: failed — start failed: {exc}", file=sys.stderr)
         return 126
 
     command = (str(executable), *hook.argv[1:], *arguments)
-    print(f"dev-kit executable: {executable}", file=sys.stderr)
+    compact = hook_name in COMPACT_HOOKS and output_mode == "compact"
     try:
-        completed = subprocess.run(
-            command,
-            cwd=hook.cwd,
-            env=child_environment,
-            check=False,
-        )
+        if compact:
+            status = _run_compact(
+                checkout, hook, command, arguments, child_environment, seat
+            )
+        else:
+            print(f"dev-kit executable: {executable}", file=sys.stderr)
+            status = _run_full(command, hook, child_environment)
     except OSError as exc:
         print(
             f"dev-kit hook state: failed — start failed for {executable}: {exc}",
             file=sys.stderr,
         )
         return 126
-    if completed.returncode < 0:
-        return 128 - completed.returncode
-    if completed.returncode == 0:
-        print(f"dev-kit hook state: ready — {hook_name!r}", file=sys.stderr)
-    else:
-        print(
-            f"dev-kit hook state: failed — {hook_name!r} exited "
-            f"{completed.returncode}",
-            file=sys.stderr,
-        )
-    return completed.returncode
+    if not compact:
+        if status == 0:
+            print(f"dev-kit hook state: ready — {hook_name!r}", file=sys.stderr)
+        else:
+            print(
+                f"dev-kit hook state: failed — {hook_name!r} exited "
+                f"{status}",
+                file=sys.stderr,
+            )
+    return status
 
 
 def main(argv: Sequence[str]) -> int:

@@ -3479,269 +3479,136 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'spec',
-  'Execute a spec across sessions — analyze viability, surface blockers and unclear items, break into tasks (Preparation → impl steps → Verification), and track progress in spec_tasks. Updates current_state at every step. Load when starting, implementing, or building any feature, spec, or roadmap item — before writing code.',
+  'Load before implementing any feature, spec, or roadmap item. Analyze viability, surface blockers, plan Preparation → implementation → Verification, and track spec_tasks/current_state across sessions.',
   'craft',
   NULL,
   0,
   '# spec — analyze and execute a spec
 
-Load at the start of any session that builds or implements a feature, whether
-or not the work is framed as a "spec". A spec governs the work -> this skill
-executes it; one should exist but doesn''t -> the `docs` skill authors it first.
-Run **Analyze** before touching any code. Blockers / unclear items you can''t
-resolve alone -> pause for the FnB.
+Load before implementing any feature/spec/roadmap item. A governing spec is
+missing -> use `docs` to author it first. Analyze before code; unresolved
+ambiguity goes to FnB, while hard blockers get flags. `<self>` = your shell id.
 
-`<self>` = your shell_id.
+## 1. Select the spec
 
----
+Never auto-pick the latest document. Read the complete selected body + task
+ledger:
 
-## Step 1: Load the spec
-
-A feature can hold several unfrozen specs at once (see the `docs` skill).
-NEVER auto-pick "the latest" — list the feature''s open specs and choose the
-target explicitly:
-
-```
-# the feature''s documents — pick an unfrozen spec (frozen=0) by id:
+```text
 sc mem get documents --feature <id>
-# load the chosen spec body:
 sc mem get documents --doc <doc_id>
-# the spec''s task plan (empty = no plan yet):
 sc mem get tasks --doc <doc_id>
 ```
 
-`get documents --feature <id>` lists every spec/doc with `kind`, `seq`,
-`frozen`, `task_count`. Active spec = the unfrozen one with `task_count > 0`
-— resume it. `task_count = 0` = backlog; starting it (Step 3) makes it
-active. More than one open spec and the target unclear -> ask the FnB.
+The feature list includes `kind`, `seq`, `frozen`, and `task_count`. Resume the
+one unfrozen spec with tasks. An unfrozen zero-task spec is backlog; engaging it
+creates the plan below. Multiple plausible open specs -> ask FnB. Existing
+tasks -> skip planning and track the first unfinished one.
 
-Tasks already exist -> skip to **Step 4** (Track).
+## 2. Analyze before planning
 
-Read the entire spec body before going further. Do not skim.
+Return these findings before any code or task writes:
 
----
+| Check | Pass condition / action |
+|---|---|
+| Viability | Bounded, clear entry points, session-sized verification. Otherwise propose a verifiable slice. Missing done-condition = unclear. |
+| Current Posture | Preparation code/DB state matches the documented baseline. A mismatch stops for Planner/FnB; never redefine it silently. |
+| Scope | Every In Scope promise is planned; every Out of Scope item stays out. New/substantively revised specs contain both `## Current Posture` and `## Scope`; ambiguity stops. |
+| Anticipated User Activity | Plan stated roles, audience/reach, access, validation, recovery, authority, safety, process curation, and tenancy invariants. Older absence is allowed; ambiguity is not. |
+| Unclear item | Two plausible readings, missing target/interface, or unstated required knowledge -> ask FnB; do not flag a question they can answer. |
+| Blocker | Missing prerequisite/environment/external dependency -> open one High feature flag and stop at its boundary. |
 
-## Step 2: Analyze
-
-Surface all three before any planning or code:
-
-### Viability
-- Session-completable? Bounded + clear entry points = yes. Multiple layers /
-  migrations / unknown dependencies = no -> say so + propose a session-sized
-  slice.
-- No stated done-condition in the spec -> that is the first unclear item.
-
-### Current posture and scope
-Treat `## Current Posture` as the intended baseline and `## Scope` as the
-delivery boundary. Plan every **In Scope** promise and no **Out of Scope** item.
-If Preparation shows that documented posture and code disagree, stop and return
-the discrepancy to the Planner/FnB; do not silently redefine the baseline.
-
-New specs and substantively revised unfrozen specs must carry both sections
-(see `docs`). Frozen historical specs may predate them; absence there is not a
-blocker, but ambiguity still is.
-
-### Anticipated User Activity
-The spec''s `## Anticipated User Activity` section is governing intent: its
-roles, per-surface audience posture, reach, process curation, safety hardening,
-and tenancy invariants shape the plan — access, validation, recovery, authority,
-and tenancy checks are planned tasks, not afterthoughts. Older specs predate the
-section; absence there is not a blocker.
-
-### Unclear items
-Anything you cannot act on without guessing:
-- Ambiguous between two interpretations
-- Missing a critical detail (which table? which endpoint? which component?)
-- Implies knowledge not stated in the spec
-
-List them and ask the FnB before writing the plan.
-
-### Blockers
-Hard stops — prior work not shipped, missing environment state, unresolved
-external dependency. Open one flag per blocker:
-
-```
-sc mem flag open "[Spec] <what is blocked> | Blocker for: <feature title>" --name SC-### --priority High --feature <feature_id>
+```text
+sc mem flag open "[Spec] <blocked fact> | Blocker for: <feature>" \
+  --name SC-### --priority High --feature <feature_id>
 ```
 
-NEVER open a flag for an unclear item resolvable by asking — ask first.
+## 3. Engage and plan
 
----
+Building this session moves `brainstorm|long_term|near_term` to `in_progress`;
+planning ahead moves it to `next`. Matching/later stages are no-ops. Reading
+for reference moves nothing, and unspec''d small fixes have no stage ceremony.
 
-## Step 3: Plan
-
-### Reconcile the stage first
-
-Planning a spec = engaging it to build, so the feature''s `roadmap_status`
-(loaded in Step 1) must catch up to reality. Stages:
-`brainstorm · long_term · near_term · next · in_progress · shipped`.
-
-- At `brainstorm`/`long_term`/`near_term` + building this session ->
-  `sc mem roadmap status <feature_id> in_progress`
-- Planning ahead only (no build this session) -> move it to `next`.
-- Already at `in_progress` (or further) -> no-op; don''t churn it.
-
-The transition fires because you *act on* the spec — reading one for
-reference moves nothing. No spec governing the work (quick UI fix, minor
-migration) -> skip all stage handling (see Stance).
-
-### Confirm the work-stream too
-
-Check the feature''s work-stream (`roadmap.project_id` — the Flow-view
-grouping). Ungrouped -> assign now so the feature shows in a flow:
-
-```
-sc mem roadmap project <feature_id> <shortname>   # ''none'' to clear
+```text
+sc mem roadmap status <feature_id> in_progress
 ```
 
-Stream obvious -> assign; ambiguous -> surface to the FnB; already assigned
--> no-op. Full create/assess procedure (new streams, new features) = the
-`docs` skill; this is only the engage-time confirmation.
+Confirm `roadmap.project_id`. Assign the obvious stream; ask FnB if ambiguous;
+leave an existing assignment unchanged:
 
-### Write the task plan
-
-Analysis clear + blockers resolved or accepted -> generate the task list.
-Always this shape:
-
-| seq | title | role |
-|---|---|---|
-| 0 | Preparation | Always first — read code paths, verify DB state, confirm entry points |
-| 1..N | `<impl step title>` | As many as the scope needs; each independently verifiable |
-| N+1 | Verification | Always last — run tests, smoke-test against done-condition, check the build against the spec''s Anticipated User Activity section, snapshot + render |
-
-Add one task per seq with `sc mem task add` — each write is live in the
-shared DB immediately:
-
-```
-sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points"
-sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>"
-sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>"
-sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test every In Scope promise and done-condition, check the build against Anticipated User Activity assurance, snapshot + render"
+```text
+sc mem roadmap project <feature_id> <shortname>
 ```
 
-Then set `current_state` — nothing done yet, next = Preparation:
+Create exactly: Preparation, independently verifiable implementation steps,
+then Verification. Each write is immediately durable:
 
+```text
+sc mem task add "Preparation" --feature <id> --doc <doc_id> --seq 0 \
+  --desc "Read code paths, verify DB state, confirm entry points"
+sc mem task add "<step>" --feature <id> --doc <doc_id> --seq <n> \
+  --desc "<independently verifiable outcome>"
+sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <last> \
+  --desc "Test every scope promise, done-condition, audience assurance, snapshot, and render"
+sc mem state "[<feature>] — last: —. next: Preparation."
 ```
-sc mem state "[<feature_title>] — last: —. next: Preparation."
-```
 
----
+No task plan = no implementation.
 
-## Step 4: Track session by session
+## 4. Execute one task at a time
 
-**Agents overlay:** this shell granted `agents` + FnB invoked `--agents` ->
-that skill''s overlay replaces this step''s one-task-at-a-time loop with
-adjudicated waves. Load it and apply it on top of this step.
+When FnB explicitly invoked `--agents`, load `agents`; its adjudicated waves
+overlay this loop. Otherwise:
 
-At each work session''s start, load the plan:
-
-```
+```text
 sc mem get tasks --doc <doc_id>
-```
-
-Find the first `pending` task -> mark it in progress:
-
-```
 sc mem task start <task_id>
-```
-
-Work ONLY that task. When done:
-
-```
+# work and verify only this task
 sc mem task done <task_id>
 ```
 
-A planned task overtaken by a feature split or re-scope (its work moved to
-another feature/spec, never built here) is cancelled, not done:
+After completion, re-read the ledger. Set `current_state` to the highest done
+task + lowest pending task. Start the next only after the current task is
+verified and durably done. Work moved to another feature/spec is cancelled,
+never marked done or left pending under a shipped feature:
 
-```
+```text
 sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"
+sc mem state "[<feature>] — last: <last_done>. next: <next_up>."
 ```
 
-NEVER mark unbuilt work `done` and NEVER leave it `pending` under a shipped
-feature — the task ledger is how a planner answers "is this feature actually
-finished."
+The final Verification task runs focused/full gates, every In Scope
+done-condition, and the Anticipated User Activity contract. Unexpected reach,
+weakened hardening, or crossed tenancy is a failure. A large spec may stop
+after a verified task slice; leave later tasks pending and state the next one.
 
-Re-read the plan (`sc mem get tasks --doc <doc_id>`) and resolve from it:
-`last_done` = highest-`seq` `done` task; `next_up` = lowest-`seq` `pending`.
-Advance `current_state`:
+## 5. Ship and hand docs to Planner
 
+All tasks done + Verification green -> deliver:
+
+1. `sc mem roadmap status <feature_id> shipped`
+2. Open one Medium docs-pending feature flag.
+3. Message the planner: read shipped code, freeze the spec, write a `kind=doc`
+   document under the feature, then close the flag. Confirm the durable message.
+4. Tell FnB that code shipped and Planner owns freeze + docs. No planner shell ->
+   message nobody; tell FnB and leave the flag open.
+
+```text
+sc mem flag open "[Docs] <feature> shipped, doc pending | Blocker for: <feature> doc" \
+  --name SC-### --priority Medium --feature <feature_id>
 ```
-sc mem state "[<feature_title>] — last: <last_done>. next: <next_up>."
-```
 
-`next_up` NULL = all tasks done -> set current_state to reflect that.
+Do not freeze or author the shipped doc as Developer.
 
----
+## Scope change and stop rules
 
-## Step 5: Hand off on completion
+Small growth within the same intent -> revise the unfrozen spec with `docs`, add
+tasks, continue. A separate mental model -> stop and recommend a new feature +
+spec; never absorb it silently.
 
-Verification task passes (`next_up` NULL — the existing done-line) = feature
-delivered. As the dev: flip the horizon + hand the paperwork to the planner.
-Do NOT freeze the spec or write the doc — that''s the planner (`docs` skill).
-
-1. **Flip the horizon to shipped:**
-   ```
-   sc mem roadmap status <feature_id> shipped
-   ```
-2. **Open a docs-pending flag + message the planner with full instructions.**
-   `shipped` + an open flag = the honest interim state; the message carries
-   everything the planner needs without digging:
-   ```
-   sc mem flag open "[Docs] <feature> shipped, doc pending | Blocker for: <feature> doc" --name SC-### --priority Medium --feature <feature_id>
-   sc mem message send <planner-shortname> "**[Docs pending] <feature_title> (feature <feature_id>)**
-
-   Spec <doc_id> shipped. Flag SC-### is open — your action required:
-
-   1. **Read the shipped code first.** Write the doc from what actually shipped, not from the spec. Drift happens and decisions get made in production — the spec captures the intent, the code is the truth.
-   2. Freeze the spec: \`sc mem doc freeze <doc_id>\`
-   3. Write the doc (\`kind=''doc''\`) under feature <feature_id> (see the \`docs\` skill).
-   4. Close flag SC-### when the doc is live."
-   ```
-3. **Surface to the FnB:** "shipped; the planner needs to freeze the spec +
-   write the doc." The planner closes the flag when the doc lands.
-
-No planner-flavor shell in this fork -> message nobody; surface to the FnB
-directly and leave the docs-pending flag open for whoever picks up docs.
-
----
-
-## Watch for creep while you build
-
-Mid-build, the work crosses the spec''s In Scope / Out of Scope boundary:
-
-- **Small growth** (same mental model, a few more tasks) -> the unfrozen spec
-  is living; edit it (`sc mem doc edit`) and carry on. No ceremony.
-- **A separate coherent intent** (a new mental-model boundary — the
-  granularity test in the `docs` skill) -> do NOT quietly absorb it.
-  Recommend a **new spec** to the FnB, authored by the planner against its
-  own feature. Significant creep = planning event, not dev improvisation.
-
----
-
-## Stance
-
-- **Analyze before acting.** Analysis finds the gap between what the spec
-  says and what the code does.
-- **One task at a time.** Start task N+1 only after task N is verified +
-  marked done.
-- **Verification is not optional.** It is the last task; skipping it makes
-  "done" meaningless.
-- **Scope and Anticipated User Activity are intent.** Verification checks every
-  In Scope promise and the audience/assurance contract — an Out of Scope
-  capability, reach beyond the stated roles, weakened hardening obligation, or
-  data crossing a tenancy line is a finding, not a nuance.
-- **Spec too large for one session** -> scope a slice at Preparation: cover
-  steps 1–K verifiable now, leave K+1–N pending. NEVER start work that can''t
-  be verified before the session ends.
-- **current_state always reflects the plan.** Update after every task
-  completion — last done + next up. The next session resumes from it without
-  reading the full task list first.
-- **The stage tracks reality — spec''d work only.** Engaging a spec ->
-  `in_progress`; finishing -> `shipped`; already matching -> no-op, don''t
-  churn. Work with no spec (quick UI tweaks, minor migrations) is exempt
-  entirely: no promotion, no handoff, no creep check. Stage discipline never
-  blocks small things.',
+Stop for unresolved ambiguity/blocker, at the end of a verified session slice,
+or after the shipped/docs handoff. `current_state` must always point to the
+durable plan rather than reproduce its rationale.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -3874,27 +3741,21 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# sprint_dev — own one editing lane
 
-Use for an actionable work-unit assignment in an armed Sprint. Marking that
-Sprint message read is acceptance and starts work immediately. If you cannot
-accept, decline with a concrete reason; never leave it unread and waking.
-
-Use the simplest path supported by current durable state. Treat ownership,
-lifecycle preconditions, durable writes, and typed handoffs as hard boundaries;
-use judgment for implementation and verification within them. Repeat a read
-only when later activity could have changed it or the next command requires
-live revalidation.
+Use for an actionable work-unit assignment in an armed Sprint. Use the simplest
+path supported by current durable state. Treat ownership, lifecycle
+preconditions, durable writes, and typed handoffs as hard boundaries; use
+judgment inside them. Repeat a read only when later activity could have changed
+it or the next command requires live revalidation.
 
 ## Route the entry
 
-Load `sprint_dev` on every entry, then classify the trigger:
+Load `sprint_dev` on every entry, then classify it:
 
-- For a Sprint assignment, verdict, question, blocker, or other relay message,
-  inspect the Sprint inbox once and handle the relevant message.
-- For a self-describing engine-wide PR fact, inspect that fact and the
-  registered PR directly. Do not manufacture a Sprint inbox item; perform the
-  once-only inbox check immediately before the next typed handoff.
-- For a live FnB instruction, preserve its authority distinctly and inspect
-  only the durable state needed to act safely.
+| Trigger | First read / action |
+|---|---|
+| Assignment, verdict, question, blocker, relay | Inspect `sc sprint inbox --sprint <id>` once; accept or handle the relevant message. |
+| Self-describing engine-wide PR fact | Inspect the fact + registered PR directly. Do not manufacture a Sprint inbox item; check the inbox once immediately before the next typed handoff. |
+| Live FnB instruction | Preserve its authority; read only durable state needed for safe action. |
 
 ```text
 sc sprint inbox --sprint <id>
@@ -3902,35 +3763,26 @@ sc sprint accept --sprint <id> --message <message-id>
 sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 ```
 
-Use `accept` or `decline` for actionable work. After acting on an informational
-question, answer, blocker, or context message, run `accept` for that message.
-For informational messages it only marks the message read; it does not change
-Sprint or work-unit state.
+Accepting marks assignment ownership and starts work. Decline with a concrete
+reason when unable to accept. After handling an informational message, run
+`accept`; it marks the message read and does not change Sprint or work-unit
+state.
 
-## Orient and bound the lane
+Assignments and review requests use Force-new delivery; verdicts and PR-event
+wakes use Re-enter. Delivery waits for a natural boundary; the runtime owns
+bundling, rotation, and recovery. Stop after a successful typed handoff.
+
+## Bound the lane
 
 Read the assignment, expected output, bound spec revision, dependencies,
-assigned Reviewer, repository/worktree, merge grant, and prior judgments. One
-Developer shell may own one active work unit in the Sprint. Do not start a
-second editing lane or edit another shell''s worktree.
+Reviewer, repository/worktree, merge grant, and prior judgments. Own at most one
+active work unit; never start a second editing lane or edit another shell''s
+worktree. Resolve ambiguity with the shippable in-scope reading + recorded
+rationale. Ask the Planner before changing the unit boundary, shared interface,
+deliverable cut, priority, or scope.
 
-If the requirement is ambiguous, choose the shippable reading within your
-unit''s scope, record the choice and rationale, and continue. Escalate changes to
-the unit boundary, interfaces another unit consumes, deliverable cuts, or scope
-growth to the Planner.
-
-Assignments use Force-new delivery; Reviewer verdicts and engine-wide PR facts
-use Re-enter. Neither displaces a live turn; delivery waits for its natural
-boundary, and the runtime owns bundling, rotation, and recovery. Stop after a
-successful typed handoff so the next delivery can proceed cleanly.
-
-## Questions, answers, blockers, and failures
-
-Put one concrete question, answer, blocker, or useful context item in a short
-body file. Declare the message intent and whether the required reply belongs to
-this work unit or the whole Sprint.
-
-A question or blocker about this lane requires a reply and names the work unit:
+Put one question, blocker, decision, answer, or useful context item in a short
+body file. Unit questions/blockers require a reply:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
@@ -3938,149 +3790,116 @@ sc sprint send --sprint <id> --to <shortname> --body-file <path> \
   --key <stable-key>
 ```
 
-Use `--intent blocker` instead for a blocked lane. A cross-unit, closeout, or
-external-authority ruling is a Sprint-level decision:
+Use `--intent blocker` for a blocked lane. Cross-unit, closeout, or external
+authority rulings are Sprint-level decisions:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
   --intent decision --requires-reply --sprint-level --key <stable-key>
 ```
 
-Answer the stored sender through the original message. The server inherits its
-unit or Sprint scope; never add `--work-unit` or `--sprint-level` to a reply:
+Reply through the original message; the server inherits its scope, so never add
+`--work-unit` or `--sprint-level` to a reply:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
   --intent information --reply-to <message-id> --key <stable-key>
 ```
 
-Ask the Planner about scope, priority, or cross-unit decisions and the Reviewer
-about review evidence. Confirm the reply write, then mark the handled incoming
-message read with `accept`. For a blocker or integrity concern, send the Planner
-evidence, impact, the exact action needed, and your recommendation. Continue
-safe independent work, but stop at a decision boundary when an answer is
-required. Unread recovery owns re-waking; do not send duplicate reminders.
+Ask the Reviewer about review evidence and the Planner about scope or
+cross-unit authority. Confirm the durable reply, then `accept` the incoming
+message. At a decision boundary, stop until the required answer arrives;
+unread recovery re-wakes, so send no duplicate reminder.
 
-Choose one stable key for the intended recipient, exact body, intent, reply
-linkage, and scope. Reuse it only when retrying that same write; use a new key
-when any of those fields changes.
+A stable key identifies recipient + exact body + intent + reply linkage +
+scope. Reuse it only for the same failed/ambiguous write; when any of those
+fields changes, use a new key. Keep bodies near 6,000 characters and below the
+8,000-character hard limit; run `wc -m < <path>`. A handoff completes only when
+the command exits successfully and confirms its durable message/state + wake.
+If a command is rejected or transport fails, correct and retry safely. If the
+relay itself fails, give FnB the attempted command, evidence, impact, and
+recommendation; invent no alternate protocol.
 
-Keep the body near 6,000 characters and below the 8,000 hard maximum; run
-`wc -m < <path>`. A handoff is complete only when the Sprint command exits
-successfully and confirms the durable write and wake.
+A Developer does not pause the Sprint. Report blocker or integrity evidence to
+the Planner, continue safe independent work, and stop at the unsafe boundary.
+The Reviewer decides continue/replan/pause; the Planner executes the decision.
 
-If a command is rejected or transport fails, the handoff is incomplete. Correct
-and retry when safe. If the relay itself fails, surface the attempted command,
-evidence, impact, and recommendation to FnB; do not invent an alternate
-protocol. A Developer does not pause the Sprint. The Reviewer decides whether
-the evidence warrants continuing, re-planning, or pausing; the Planner executes
-that decision.
-
-## Sprint artifact paths
-
-Sprint working artifacts (per-unit review notes, raw diffs, evidence packets,
-report drafts, and Dev scratch proof) go to the gitignored
-`shared/sprints/sprint-<n>/` directory. They are never committed, branched, or
-PR''d in the work repo; a review-notes commit is a finding.
-
-DB rows stay the durable record: judgments via `record-review`, report bodies in
-`sprint_reports`, and decisions in the durable relay. Files in the Sprint
-artifact directory are working material only.
+Store scratch proof, diffs, evidence packets, review notes, and report drafts in
+gitignored `shared/sprints/sprint-<n>/`. Never commit or PR them. Durable
+judgments belong in `record-review`, reports in `sprint_reports`, and decisions
+in the relay.
 
 ## Build and verify
 
-Sync the assigned repository, work on a feature branch, match the surrounding
-code, and implement the smallest complete change. Keep external calls outside
-database transactions. Preserve durable identities and append-only evidence.
+Sync the assigned repository, branch, implement the smallest complete change,
+and exercise the unit''s independent gate + realistic failures. Keep external
+calls outside DB transactions; preserve durable identities and append-only
+evidence. Record CI failures, infrastructure anomalies, retries, review
+friction, and known departures for closeout.
 
-Verification must exercise the unit''s independent stage gate and realistic
-failure paths. A local exploratory number is not merge evidence. Record real CI
-failures, anomalous infrastructure failures, retries, review friction, and
-known departures for the final report.
-
-Immediately before a typed Developer handoff (`complete-unit`, `register-pr`,
-or `request-review`), re-run `sc sprint inbox --sprint <id>` once and act on
-anything new; a ruling may have arrived during the build. This is a once-only
-pre-handoff check. After the handoff confirms its durable write, stop without a
-further inbox pass. The reopened-PR recovery sequence below is the one
-exception: its single inbox check covers the exact registration replay and the
-immediately following review request, which remains the turn''s final action.
+Immediately before `complete-unit`, `register-pr`, or `request-review`, re-run
+`sc sprint inbox --sprint <id>` once and act on new messages. After the typed
+handoff confirms its durable write, stop without another inbox pass. The
+reopened-PR route below is the sole exception.
 
 ## Report-only or no-code completion
 
-An explicitly planned report-only or no-code lane completes with its durable
-result instead of a PR. Code lanes cannot use this path; they complete only
-after merge authorization and observation.
-
-Keep the result at about 6,000 characters or fewer; 8,000 is the hard maximum.
-Run `wc -m < <path>` before submitting, then require a successful command and
-durable completion receipt.
+Only an explicitly planned report/no-code lane may finish without a PR. Keep
+the result near 6,000 characters and below 8,000; run `wc -m < <path>`, perform
+the pre-handoff inbox check, then require a durable completion receipt:
 
 ```text
 sc sprint complete-unit --sprint <id> --work-unit <id> \
   --result-file <path>
 ```
 
-Register the PR through the authoritative Sprint surface and retain ownership
-until it is green. After `register-pr` succeeds, the native registered-PR
-watcher creates an engine-wide subscription owned by your shell. It supplies
-self-describing red, green, and externally closed facts as Re-enter wakes even
-after chat rotation or outside an armed Sprint. On red, diagnose and fix the PR.
-On green, judge readiness rather than forwarding mechanically. Planner and
-Reviewer receive no PR-event wakes.
+Stop after success. A code lane continues through merge observation.
+
+## Register and observe the PR
 
 ```text
 sc sprint register-pr --sprint <id> --repository <owner/name> \
   --pr <number> --work-unit <id>
 ```
 
-If GitHub closed this registered PR externally and you reopened, rebased, and
-pushed the same PR, replay the exact `register-pr` command above. The replay
-keeps the registered PR and ownership unchanged while taking one fresh watcher
-snapshot; `created: false` is the expected registration receipt. Confirm that
-write, perform no second inbox pass, then immediately attempt the typed
-`request-review`; do not wait for a second PR-fact wake. An unchanged state at
-the same head is intentionally deduplicated, so that wake would not exist. The
-review gate consumes the fresh durable snapshot: green proceeds, while any
-other state returns the existing watcher diagnostic without a partial handoff.
-Reuse the original stable key only when retrying a request that never returned
-a durable receipt; a new review round uses a new key. Do not register a
-replacement PR or ask the Planner to bypass the observed-green gate.
+After `register-pr` succeeds, retain ownership through green. The native
+registered-PR watcher creates your engine-wide subscription and sends
+self-describing red/green/externally-closed PR-event wakes as Re-enter, even
+outside an armed Sprint. Fix red; judge green. Planner and Reviewer receive no
+PR-event wakes.
 
-Outside that reopened-PR recovery sequence, when no local implementation action
-remains, stop and await the native PR-fact wake. Use Sprint-native wakes for
-coordination. Do not start a recurring shell loop, scheduled job, manual
-watcher daemon, or external PR watcher to track the registered PR.
+If the same registered PR was externally closed, then reopened, rebased, and
+pushed, replay the exact `register-pr` command. Require `created: false`, which
+keeps identity/ownership and takes a fresh snapshot. Its one pre-handoff inbox
+check covers registration replay + the immediately following review request.
+Do not wait for a second PR-fact wake: immediately request review. Green
+proceeds; any other snapshot returns the watcher diagnostic without partial
+handoff. Never register a replacement PR or ask the Planner to bypass observed
+green.
 
-If a watcher-dependent gate has stalled, one bounded inspection is sanctioned:
+Otherwise, when no local action remains, stop for the native PR fact. Start no
+recurring loop, scheduled job, daemon, or external watcher. A stalled gate
+permits one bounded read, then stop or report its evidence:
 
 ```text
 sc sprint watcher-state --sprint <id>
 ```
 
-Run it once to distinguish a stale or never-started watcher from red, pending,
-or absent PR observation, then stop or return the evidence to the Planner. Do
-not repeat the read as a polling loop.
+Do not repeat this read as a polling loop.
 
-## Review handoff
+## Review handoff and correction
 
-Complete a review handoff in this exact order. Every review round uses
-Force-new delivery, so stop cleanly after the request confirms and let the
-Reviewer begin in a fresh chat with the full bundled request:
+Complete each round in order:
 
-1. Finish the readiness judgment and every local verification step.
-2. Perform the once-only typed-handoff inbox check above, act on newly arrived
-   messages, and mark every handled informational message read with `accept`.
-3. Choose `submit` for the first review round or `resubmit` after a
-   changes-requested verdict. The engine injects the PR URL, registered Sprint
-   PR id, exact durable green head SHA, and work-unit id into the Reviewer''s
-   canonical bare one-line locator. Create no readiness file and include no
-   scope narrative,
-   verification evidence, judgment rationale, or review-focus steering. Put
-   only the work-unit id and spec reference in the PR body, and write no PR
-   comments or annotations.
-4. As the literal final action of the turn, send the typed handoff with one
-   stable retry key:
+1. Finish readiness judgment + local verification.
+2. Perform the once-only inbox check; handle and `accept` new messages.
+3. Use `submit` first or `resubmit` after changes requested. The engine injects
+   the PR URL, registered id, exact green head, and work-unit id into the
+   Reviewer''s canonical bare one-line locator. Create no readiness file. Send
+   no scope narrative, verification evidence, rationale, or review-focus
+   steering. Put only the work-unit id and spec reference in the PR body; write
+   no PR comments or annotations.
+4. As the literal final action, run:
 
 ```text
 sc sprint request-review \
@@ -4088,69 +3907,54 @@ sc sprint request-review \
   --intent <submit|resubmit> --key <stable-key>
 ```
 
-5. When the command confirms the durable write and Reviewer wake, immediately
-   stop and await the native verdict wake. Run no trailing command.
+5. Require confirmation of the durable write + Reviewer wake; run no trailing
+   command and stop and await the native verdict wake.
 
-A changes-requested verdict returns as Re-enter to your registry chat. Apply
-every blocking finding, re-establish green, and hand back with a new stable
-review key and `--intent resubmit`. Do not narrate how prior findings were
-cleared; the Reviewer verifies that from the full diff at the engine-injected
-exact head. Record
-disagreements as judgment; the Reviewer owns scope/severity decisions and the
-Planner executes any resulting action.
+Changes requested returns by Re-enter. Apply every blocking finding,
+re-establish green, and resubmit with a new review-round key. Do not narrate
+cleared findings; the Reviewer verifies the full diff at the engine-injected
+head. Record disagreements as judgment. Reviewer owns scope/severity; Planner
+executes resulting action.
 
 ## Merge boundary
 
-Approval alone is stale evidence. Immediately before merge, ask the engine to
-re-read live GitHub state and revalidate the armed grant, ownership, work-unit
-state, approved head, and checks:
+Approval is stale evidence. Immediately before merge, re-read live GitHub,
+grant, ownership, unit state, approved head, and checks through:
 
 ```text
 sc sprint authorize-merge \
   --sprint <id> --registered-pr <registered-id>
 ```
 
-Merge only the exact repository, PR number, and head SHA returned. If the
-command refuses, do not work around it; wait for the watcher or return to the
-appropriate loop.
+Merge only the returned repository, PR, and head SHA. A refusal means wait for
+the watcher or re-enter the appropriate loop; never bypass it.
 
 ## Post-merge handoff
 
-After the exact authorized merge succeeds, complete close-out in this order:
+After the authorized merge:
 
-1. Clean the worktree and collect the merged PR identity, merge SHA, unit
-   result, verification evidence, and judgments in the handoff body file.
-2. Re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and
-   mark every handled informational message read with `accept`.
-3. Run `wc -m < <path>`; keep the report near 6,000 characters and below the
-   8,000-character hard maximum.
-4. As the literal final action of the turn, send the merged-work handoff to the
-   Planner:
+1. Clean the worktree; put merged PR + SHA, unit result, verification,
+   judgments, and departures in the handoff file.
+2. Re-run `sc sprint inbox --sprint <id>` once; handle and `accept` new items.
+3. Run `wc -m < <path>`; keep the body near 6,000 characters and below 8,000.
+4. As the literal final action, send:
 
 ```text
 sc sprint send --sprint <id> --to <planner-shortname> --body-file <path> \
   --intent handoff --key <stable-merged-handoff-key>
 ```
 
-5. When the command confirms the durable write and Planner wake, stop
-   immediately. Run no trailing Git, Sprint, inbox, cleanup, or status command.
-   Automatic merge observation records the durable PR transition; the Planner
-   uses this handoff wake to release the next wave.
+5. Require the durable message + Planner wake, then stop immediately. Run no trailing Git,
+   Sprint, inbox, cleanup, or status command. Automatic merge
+   observation records the PR transition; this handoff releases the next wave.
 
 ## Report and stop
 
 Report broken bases, destructive ambiguity, unavailable GitHub, untrustworthy
-runners, provider exhaustion, or an unrecoverable environment to the Planner
-with evidence, impact, and a recommendation. Stop at the unsafe boundary while
-the Reviewer decides whether to continue, re-plan, or pause and the Planner
-executes that decision.
-
-Stop when the unit is merged and reported, declined, awaiting Planner/FnB
-recovery, returned to review, or paused awaiting a native PR-fact or verdict
-wake. For normal review and merge handoffs, the
-ordered procedures above place inbox handling before the typed handoff and make
-that handoff the turn''s last action. Ask the Planner for later work only after
-the current editing lane is terminal.',
+runners, provider exhaustion, or unrecoverable environment with evidence,
+impact, and recommendation. Stop when merged + reported, declined, returned to
+review, paused for a native wake, or awaiting Planner/FnB recovery. Ask for
+later work only after this editing lane is terminal.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -4166,114 +3970,75 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# sprint_pln — govern the armed Sprint
 
-Use as the originating Planner after `sprint_prep` arms the Sprint. The system
-captures deterministic facts; the Reviewer decides and documents, and the
-Planner acts. Execute Reviewer decisions without taking over their judgment or
-report authorship. The FnB retains the board-level override established by
-decision #46.
+Use as originating Planner after `sprint_prep` arms a Sprint. System records
+facts; Reviewer owns review/conformance judgment + reports; Planner owns plan
+structure and executes control transitions. FnB retains board-level override
+under decision #46.
 
 Use the simplest path supported by current durable state. Treat authority,
-lifecycle preconditions, durable writes, and typed handoffs as hard boundaries;
-use judgment for investigation and execution within them. Repeat a read only
-when later activity could have changed it or the next command requires live
-revalidation.
+lifecycle preconditions, durable writes, and typed handoffs as hard boundaries.
+Repeat a read only when later activity could have changed it or the next command
+requires live revalidation.
 
 ## Route the entry
 
-Classify the entry before reading an inbox:
+Load `sprint_pln` on every entry, then classify:
 
-- For a Sprint-scoped control decision, merged-work handoff, question, blocker,
-  or other relay message, inspect the Sprint inbox once and handle that message.
-- For the self-contained engine-wide clean-completion receipt, inspect the
-  receipt and terminal Sprint state directly. It is informational: do not run
-  the Sprint inbox, accept it, or issue a close command.
-- For a live FnB instruction, act under the board-level override and name that
-  authority in the durable evidence.
+| Trigger | Route |
+|---|---|
+| Sprint decision, merged-work handoff, question, blocker, relay | Inspect `sc sprint inbox --sprint <id>` once; handle that message. |
+| Self-contained clean-completion receipt | Inspect receipt + terminal state directly; it is informational—do not run the Sprint inbox, accept it, or close again. |
+| Live FnB instruction | Act under board override; name FnB authority in durable evidence. |
 
-Load `sprint_pln` on every entry. Do not turn entry routing into a polling loop.
+Do not poll. Armed runtime owns scheduled dispatch + unread wake recovery;
+registered-PR watcher owns subscription observation. Developer-owned subscriptions send
+red/green/closed facts to Developers, never Planner.
 
-## Start from durable state
+Assignments/review requests use Force-new delivery; Planner-bound results use
+Re-enter. Delivery waits for a natural boundary; runtime owns bundling,
+rotation, recovery, and coordinate mode. Stop after a successful typed handoff.
 
-The armed runtime owns scheduled dispatch and unread wake recovery. The
-registered-PR watcher owns subscription observation. React to their durable
-facts; use the Planner turn for dispatch, plan structure, and exact execution of
-durable Reviewer decisions. The Reviewer owns review and conformance judgment
-plus the conformance and final Sprint reports. The Planner owns the plan and its
-control transitions: it may modify, repeat, recall, reassign, or reroute work on
-its own operational judgment, and it executes Reviewer decisions that cross
-those same boundaries. Clean conformance approval performs its own atomic
-terminal transition.
+## Durable running loop
 
-Assignments and review requests use Force-new delivery. Planner-bound results
-use Re-enter. Neither displaces a live turn; delivery waits for its natural
-boundary, and the runtime owns bundling, rotation, recovery, and coordinate
-mode. Stop after a successful typed handoff so delivery can proceed cleanly.
-
-Start with the durable trigger, then read only the lifecycle, work-unit,
-dependency, route, PR, expectation, or anomaly facts needed for the current
-decision. Viewing a participant conversation is observation, not activity;
-never manufacture progress from browser presence.
+Read only lifecycle, unit, dependency, route, PR, expectation, and anomaly
+facts required by the trigger. Browser presence is not progress.
 
 ```text
 sc sprint inbox --sprint <id>
 sc sprint accept --sprint <id> --message <message-id>
 sc sprint decline --sprint <id> --message <message-id> --reason <reason>
-```
-
-Release every dependency-ready lane through the production surface:
-
-```text
 sc sprint dispatch --sprint <id>
 ```
 
-The returned ids are wake identities. Work-unit disposition and messages are
-the authoritative release facts. Dispatch is safe to repeat: occupied Developer
-lanes and stable assignment generations prevent double booking.
+Dispatch every dependency-ready lane; returned ids are wake identities.
+Disposition + messages are release facts. Stable assignment generations and
+occupied lanes make dispatch repeat-safe.
 
-Accept or decline only when the inbox item is actionable. After acting on an
-informational question, answer, blocker, or evidence message, run `accept` for
-that message. For informational messages it only marks the message read; it does
-not change Sprint or work-unit state.
+Accept/decline only actionable items. After acting on an informational message,
+run `accept`; it marks the message read and does not change Sprint or work-unit
+state.
 
-## Running loop
-
-- Keep dependencies as the only hard sequence. When reality requires a re-plan,
-  restructure the current projection under Planner authority and record why.
-  Ask the Reviewer when the change depends on review or conformance judgment;
-  do not outsource ordinary assignment, capacity, or route judgment. Never
-  rewrite completed history.
-- Let Developers own their PRs through green, review, correction, and merge.
-  Let Reviewers own verdicts and Sprint decisions. Do not proxy routine
-  handoffs or substitute Planner judgment for a Reviewer decision.
-- Consume passive system facts without waking yourself into every transition.
-  Route a decision boundary to the Reviewer; act when its Re-enter decision
-  message arrives.
-- Record the Reviewer decision identity, the exact action taken, and the action
-  receipt. Do not rewrite its rationale as Planner-authored judgment evidence.
-- A mid-Sprint spec edit is allowed only by the owning Planner or FnB. Record
-  the prior and new exact revision hashes. When acting as Planner, require a
-  durable Reviewer decision before the edit. The running Sprint remains bound
-  to its approved revision unless that decision explicitly says otherwise.
-
-Use Sprint-native wakes for coordination. Do not start a recurring shell loop,
-scheduled job, manual participant boot, or external PR watcher to track Sprint
-state. When a watcher-dependent gate has stalled, use the bounded read once:
+- Keep dependencies as hard sequence; restructure current projection under
+  Planner authority, record why, and never rewrite completed history.
+- Developers own PR green/review/correction/merge. Reviewers own verdicts and
+  conformance. Do not proxy routine handoffs or judgments.
+- Record Reviewer decision id + exact action + receipt; never rewrite rationale
+  as Planner judgment.
+- Mid-Sprint spec edits require owning Planner/FnB + durable Reviewer decision.
+  Record old/new revision hashes; binding changes only when the decision says so.
+- Use native wakes. Start no recurring loop, scheduled job, manual participant
+  boot, or external watcher. One stalled-gate inspection is allowed:
 
 ```text
 sc sprint watcher-state --sprint <id>
 ```
 
-It distinguishes a stale or never-started watcher from red, pending, or absent
-PR observation and includes the newest bounded poll failures. Do not repeat it
-as a polling loop; act on the evidence, then return control to native delivery.
+Do not repeat this read as a polling loop. Act on its bounded watcher evidence,
+then return to native delivery.
 
-## Questions, answers, blockers, and failures
+## Relay contract
 
-Put one concrete question, answer, decision, blocker, or useful context item in
-a short body file. Declare the message intent and whether the required reply
-belongs to one work unit or the whole Sprint.
-
-A question or blocker about one lane requires a reply and names that unit:
+Unit question/blocker requiring reply:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
@@ -4281,66 +4046,49 @@ sc sprint send --sprint <id> --to <shortname> --body-file <path> \
   --key <stable-key>
 ```
 
-Use `--intent blocker` instead for a blocked lane. A cross-unit, closeout, or
-external-authority ruling is a Sprint-level decision:
+Use `--intent blocker` for a blocked lane. Cross-unit, closeout, or external
+authority rulings are Sprint-level:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
   --intent decision --requires-reply --sprint-level --key <stable-key>
 ```
 
-Answer the stored sender through the original message. The server inherits its
-unit or Sprint scope; never add `--work-unit` or `--sprint-level` to a reply:
+Answer through the original message; the server inherits its scope, so never
+add `--work-unit` or `--sprint-level` to a reply:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
   --intent information --reply-to <message-id> --key <stable-key>
 ```
 
-Confirm the reply write, then mark the handled incoming message read with
-`accept`. For a blocker, include evidence, impact, and the exact action needed.
-Continue safe independent governance, but stop at a decision boundary when an
-answer is required. Unread recovery owns re-waking; do not send duplicate
-reminders.
+Confirm reply, then `accept` incoming. A missing answer stops at the decision
+boundary; unread recovery re-wakes, so send no duplicate. Choose a stable key
+for recipient + body + intent + reply + scope; reuse it only for that identical
+write. When any of those fields changes, use a new key.
 
-Choose one stable key for the intended recipient, exact body, intent, reply
-linkage, and scope. Reuse it only when retrying that same write; use a new key
-when any of those fields changes.
-Keep the body near 6,000 characters and below the 8,000 hard maximum; run
-`wc -m < <path>`. A handoff is complete only when the Sprint command exits
-successfully and confirms the durable write and wake.
+Keep bodies near 6,000 characters and below the 8,000 hard maximum; run
+`wc -m < <path>`. Handoff completes only when the command exits successfully
+and confirms durable write + wake. If a command is rejected or transport fails,
+correct/retry safely. If relay itself fails, give FnB attempted command +
+durable evidence; invent no alternate protocol. Relay Developer integrity
+evidence, impact, and recommendation to Reviewer. Send required context before
+pausing because paused Sprint relay is unavailable.
 
-If a command is rejected or transport fails, the handoff is incomplete. Correct
-and retry when safe. If the relay itself fails, surface the attempted command
-and durable evidence to FnB; do not invent an alternate protocol. Relay a
-Developer integrity concern to the Reviewer with its evidence, impact, and
-recommendation. Send needed context before pausing because the Sprint relay is
-unavailable while paused.
-
-## Sprint artifact paths
-
-Sprint working artifacts (per-unit review notes, raw diffs, evidence packets,
-report drafts, and Dev scratch proof) go to the gitignored
-`shared/sprints/sprint-<n>/` directory. They are never committed, branched, or
-PR''d in the work repo; a review-notes commit is a finding.
-
-DB rows stay the durable record: judgments via `record-review`, report bodies in
-`sprint_reports`, and decisions in the durable relay. Files in the Sprint
-artifact directory are working material only.
+Keep scratch review notes, diffs, evidence, reports, and proof in gitignored
+`shared/sprints/sprint-<n>/`; never commit/branch/PR them. Durable judgment,
+reports, and decisions belong in `record-review`, `sprint_reports`, and relay.
 
 ## Reviewer decisions and Planner actions
 
-Review, conformance, re-enter, and abort judgments remain Reviewer decisions.
-Planner independently owns operational plan structure, including pause-safe
-recall, cancellation of unreleased scope, reassignment, repeated task lanes,
-and participant route changes. When an action does arrive as a durable Reviewer
-→ Planner Re-enter decision, resolve every required-reply decision through its
-original message before acting. Complete this order without reordering:
+Review/conformance/re-enter/abort judgment remains Reviewer-owned. Planner
+independently owns operational plan structure: pause-safe recall, cancellation
+of unreleased scope, reassignment, repeated task lanes, and route changes.
 
-1. Re-run `sc sprint inbox --sprint <id>`, verify the decision came from the
-   assigned Reviewer, and retain its message id.
-2. Put a short acknowledgement of the exact requested transition in a body
-   file, then send the linked reply:
+For a required-reply Reviewer→Planner Re-enter decision, keep this order:
+
+1. Re-run `sc sprint inbox --sprint <id>`; verify assigned Reviewer + retain id.
+2. Send linked acknowledgement:
 
 ```text
 sc sprint send --sprint <id> --to <reviewer-shortname> --body-file <path> \
@@ -4348,85 +4096,68 @@ sc sprint send --sprint <id> --to <reviewer-shortname> --body-file <path> \
   --key <stable-control-reply-key>
 ```
 
-3. Require the reply command to confirm its durable message and wake. Retry the
-   same command and key if it fails or does not confirm both.
-4. Mark the original decision accepted and require a successful receipt:
+3. Require the reply command to confirm its durable message and wake; retry the
+   same command/key if ambiguous.
+4. Accept the decision:
 
 ```text
 sc sprint accept --sprint <id> --message <decision-message-id>
 ```
 
-5. Only after acceptance confirms, execute the requested transition without
-   re-adjudicating the decision. The linked reply must precede any pause or
+5. Only after acceptance, execute the requested transition without
+   re-adjudicating it. The linked reply must precede any pause or
    abort that makes the Sprint relay unavailable.
 
-Record the decision message id, reply receipt, acceptance receipt, and action
-receipt together. Clean conformance instead closes atomically and sends an
-informational engine-wide completion receipt; it requires no linked reply or
-Sprint inbox acceptance.
+Record decision id + reply, acceptance, and action receipts. Clean conformance
+closes atomically and sends informational receipt; no reply/accept is needed.
 
-The FnB board-level override from decision #46 is unaffected: a live FnB
-instruction may direct or supersede any action. Name that override in the
-evidence instead of attributing it to the Reviewer.
-
-If a requested action fails a lifecycle, authority, or disposition precondition,
-do not substitute a different action. Send the refusal and current durable state
-back to the Reviewer (or surface it directly to FnB for an FnB override), then
-stop at that decision boundary.
+The FnB board-level override from decision #46 remains distinct. If action
+fails lifecycle/authority/disposition precondition, send refusal + durable state
+to Reviewer (or FnB for override), substitute nothing, and stop.
 
 ### Pause or resume
 
-Pause on a Reviewer decision or when Planner needs a safe restructuring window.
-Transition durably, stop external Sprint services, persist interrupt intent,
-preserve every partial artifact, and retain the governing judgment and evidence
-for recovery:
+Pause for Reviewer decision or safe Planner restructuring; preserve partial
+artifacts, interrupt intent, judgment, and evidence:
 
 ```text
 sc sprint pause --sprint <id> --reason <decision-or-restructure-reason>
 ```
 
-Resume after the requested recovery/restructure is fully recorded, or on a
-later Reviewer decision or FnB override. Reconcile native runs, unread messages,
-pending wakes, work units, registered PRs, capacity, and spec drift, then act
-with the supplied reason:
+Resume only after recording recovery/restructure and reconciling native runs,
+unread messages, wakes, units, PRs, capacity, and spec drift:
 
 ```text
 sc sprint resume --sprint <id> [--reason <validated-reconciliation-reason>]
 ```
 
-An exhausted recovery wake is bounded manual-recovery evidence, not a retry
-loop. Preserve the unread message and failed wake, involve FnB, and do not create
-recursive fallbacks. Drift informs; it never silently blocks resume.
+Exhausted recovery wake = bounded manual evidence: preserve unread message +
+failed wake, involve FnB, create no recursive fallback. Drift informs but never
+silently blocks resume.
 
-PR ownership inherited from an aborted Sprint is an originating-Planner repair
-boundary. Keep the replacement Sprint paused and establish the exact old and
-new ownership. The originating Planner may reconcile that identity; the FnB
-retains the same operation as a board-level override:
+Aborted-Sprint PR ownership repair belongs to the originating Planner. Keep
+replacement Sprint paused; establish old/new identity. The originating Planner
+may reconcile that identity (FnB may override):
 
 ```text
 sc sprint reconcile-pr --sprint <replacement-id> --repository <owner/repo> \
   --pr <number> --work-unit <replacement-unit-id> --reason <recovery-reason>
 ```
 
-The command refuses a live source Sprint or target Sprint, a non-originating
-Planner, a non-code or already owned target unit, and a closed unmerged PR. It
-records the old and new owners plus the live GitHub head and acting authority.
-If the PR is already merged, it also records the merge commit and completes the
-replacement unit as explicit recovery evidence. Treat the receipt as recovery
-evidence; wait for a separate Reviewer decision before resuming.
+It refuses a live source Sprint or target Sprint, a non-originating Planner,
+invalid/owned target, and closed-unmerged PR. Receipt records owners, live head,
+authority, and merged completion when applicable. Require a separate Reviewer
+decision before resuming.
 
 ### Modify, recall, repeat, reassign, or reroute
 
-Planner may cancel one unreleased work unit with its retained terminal reason.
-When cancellation executes a Reviewer decision, preserve that decision id in
-the reason and evidence:
+Cancel unreleased scope with retained terminal reason/Reviewer id:
 
 ```text
-sc sprint cancel-unit --sprint <id> --work-unit <id> --reason <cancellation-reason>
+sc sprint cancel-unit --sprint <id> --work-unit <id> --reason <reason>
 ```
 
-Edit any subset of an unreleased lane directly. Omitted fields retain their
-current values; `--clear-dependencies` is the explicit empty dependency set:
+Edit an unreleased lane; omitted fields stay, `--clear-dependencies` means none:
 
 ```text
 sc sprint replan-unit --sprint <id> --work-unit <id> \
@@ -4436,33 +4167,24 @@ sc sprint replan-unit --sprint <id> --work-unit <id> \
   [--output-kind code|report-only|no-code]
 ```
 
-Do not edit a released lane in place. To change an accepted or pending
-assignment, first pause so dispatch cannot race the edit, recall the unmerged
-lane, replan it, then resume:
+Never edit a released lane in place. Pause → recall unmerged lane → replan →
+resume:
 
 ```text
 sc sprint pause --sprint <id> --reason <restructure-reason>
-sc sprint recall-unit --sprint <id> --work-unit <id> \
-  --reason <why-the-old-assignment-is-obsolete>
+sc sprint recall-unit --sprint <id> --work-unit <id> --reason <obsolete-reason>
 sc sprint replan-unit --sprint <id> --work-unit <id> <changed-fields>
 sc sprint resume --sprint <id> --reason <validated-replan-reason>
 ```
 
-Recall preserves the old accepted/declined message and event history, returns
-only an unmerged lane to `planned`, and refuses completed, cancelled, or
-PR-bound work. For a PR-bound lane, leave it intact and plan a replacement or
-use the supported PR-ownership recovery path; never force the projection back.
-Resume dispatches a fresh assignment generation.
+Recall preserves message/event history, returns only unmerged work to planned,
+and refuses terminal/PR-bound work. PR-bound work stays; plan replacement or use
+reconciliation. Resume creates fresh assignment generation. One spec task may
+govern repeated verification/replacement lanes; each lane lists it once. Do not
+duplicate the spec task.
 
-The same governing spec task may deliberately appear in more than one work
-unit. Use this for conformance reruns, repeat verification, or replacement work
-whose scope is still governed by the original task. Do not create a duplicate
-spec task merely to satisfy lane membership. Each work unit still lists a task
-at most once.
-
-To change which model will receive future assignments or reviews, pause first
-when the Sprint is armed, clear the participant''s released expectation through
-recall or completion, then replace its exact route:
+To change future assignment/review model, pause armed Sprint, clear released
+expectation, then validate + replace route:
 
 ```text
 sc sprint reroute-participant --sprint <id> --participant-shell <id> \
@@ -4470,41 +4192,24 @@ sc sprint reroute-participant --sprint <id> --participant-shell <id> \
   [--route <display-route>]
 ```
 
-Prepared Sprints may reroute before arm. Armed Sprints must pause; Developer
-routes reject any released lane and Reviewer routes reject an in-review lane.
-The engine validates the new route before writing it. Existing chats and runs
-stay immutable history; the next Force-new assignment or review request rotates
-onto the replacement route. Only already-declared participants can be selected
-or rerouted.
-
-If a Developer or Reviewer declines, preserve the reason and choose the
-replacement assignment or route from current capacity before issuing a fresh
-assignment. Ask the Reviewer only when that choice changes review or
-conformance judgment.
+Prepared Sprints may reroute directly. Armed Developer route rejects released
+lane; Reviewer route rejects in-review lane. Existing chats/runs remain history;
+next Force-new delivery uses replacement. Reroute declared participants only.
+On decline, preserve reason and choose replacement from current capacity; ask
+Reviewer only if review/conformance judgment changes.
 
 ### Re-enter after conformance
 
-A Reviewer `re-enter` decision names the in-Sprint findings, the governing
-tasks (existing ids when scope is unchanged; new title and description when
-scope is new), and the suggested
-unit grouping, waves, dependencies, routing, and capacity rationale. The
-Reviewer should identify independent lanes, expected review overlap, and useful
-reserve. Preserve that projection; do not silently absorb extra scope, maximize
-shell occupancy, or turn post-Sprint findings into delivery work.
-
-Reuse an existing task id when the decision repeats or repairs that exact
-governing scope. Cut a new task only for genuinely new scope:
+Reviewer decision names findings; governing tasks (existing for same scope,
+new title/description for new scope); and grouping, waves, dependencies,
+routing, capacity. Preserve it; do not absorb extra/post-Sprint scope or
+maximize occupancy.
 
 ```text
 sc mem task add "<task-title>" --feature <feature-id> \
   --doc <governing-spec-document-id> --seq <next-seq> \
   --desc "<task-description>"
-```
 
-Create the requested bound work units from those task ids, wiring the Reviewer''s
-waves and dependencies directly:
-
-```text
 sc sprint plan-unit --sprint <id> \
   --developer-shell <id> --reviewer-shell <id> --title <title> \
   --expected-output-file <path> --task <task-id> \
@@ -4512,76 +4217,51 @@ sc sprint plan-unit --sprint <id> \
   [--output-kind code|report-only|no-code]
 ```
 
-After every named task is bound, confirm the routes are available and the
-dependency graph and capacity plan match the decision. Planner may reassign or
-reroute for operational capacity; send the concrete conflict back to the
-Reviewer when that adaptation changes the Reviewer''s scope or conformance
-judgment. Then release the new ready lanes with `sc sprint dispatch --sprint <id>`. When
-the added work reaches terminal disposition, the engine sends the Reviewer the
-next delivery-terminal wake; the Planner does not initiate the next conformance
-pass.
+Reuse task for exact repair/repeat; add only genuinely new scope. Bind every
+task, then confirm routes + dependency graph and capacity plan match the
+decision. Planner may reassign or reroute for operational capacity; tell
+Reviewer if conflict changes scope/judgment. Release ready lanes with
+`sc sprint dispatch --sprint <id>`. Engine sends next delivery-terminal wake;
+Planner does not initiate conformance.
 
 ### Conclude or abort
 
-The Reviewer decides when the Sprint is done. A clean `record-conformance`
-command atomically stores conformance, follow-ups, the Reviewer-authored final
-report, completed lifecycle, and an informational engine-wide Planner receipt.
-When that Re-enter arrives, confirm the receipt names the expected Sprint,
-reports, outcome, and completed state. Do not run `complete`; closure is already
-durable and the notification is informational because closure is already
-terminal.
-Successful completion also closes every other active participant chat
-immutably linked to that Sprint. The originating Planner and report-authoring
-Reviewer remain open. Do not manually close peer chats as a second closeout
-action. Pause, abort, re-entry, failed conformance, and rejected fallback
-completion retain their existing no-cleanup behavior.
+The clean `record-conformance` command atomically stores conformance, follow-ups,
+Reviewer-authored final report, completion, and informational engine-wide
+Planner receipt. On Re-enter, verify Sprint/reports/outcome/completed state.
+Do not run `complete`; notification is informational because closure is already
+terminal. Planner does not author a second report. The originating Planner and
+report-authoring Reviewer remain open. Do not manually close peer chats. Pause,
+abort, re-entry, failed conformance, and rejected fallback retain no-cleanup
+behavior.
 
-Do not run `compile-report` by default, synthesize the final report, or
-editorialize the Reviewer body. The Reviewer compiles its own evidence. A
-Planner compile remains a valid FnB-directed fallback:
+Do not compile or editorialize by default; Reviewer owns evidence/report. Only
+FnB-directed fallback may run:
 
 ```text
 sc sprint compile-report --sprint <id> --limit 50 \
   > shared/sprints/sprint-<n>/evidence.json
 ```
 
-Do not wait for or request a conclude action message after the completion receipt.
-Abort is likewise an action taken only on a Reviewer decision or FnB override;
-it is terminal and deletes nothing.
+Abort only on Reviewer decision/FnB override; it is terminal and deletes
+nothing.
 
 ## Handoffs and stop
 
-Planner → Developer assignments and Developer → Reviewer review requests use
-Force-new delivery; Developer/Reviewer → Planner results are Re-enter. Forced
-delivery waits for the prior live turn''s natural boundary; runtime delivery
-owns the rest. These are delivery guarantees, not a parent/child chat topology.
-The Planner receives no PR-event wakes; Developer-owned subscriptions carry
-red, green, and externally closed facts directly to the owning Developer.
+Planner receives no PR-event wakes. Never dispatch the next wave from merge
+observation. The merged-work handoff wake is the only normal next-wave dispatch trigger.
+On it:
 
-Never dispatch the next wave from a merge-observation turn. The Developer''s
-merged-work handoff wake is the only normal next-wave dispatch trigger. On that
-wake, complete the turn in this exact order:
+1. Run `sc sprint inbox --sprint <id>`; inspect merged handoff + unit/dependency state.
+2. Handle earlier informational items and `accept` each, including handoff.
+3. Finish reconciliation and Planner bookkeeping; no work remains.
+4. As literal final action run `sc sprint dispatch --sprint <id>`.
+5. Require durable assignments + New wakes, then stop. Run no trailing command.
+   Empty dispatch remains final; investigate only on a later durable wake.
 
-1. Run `sc sprint inbox --sprint <id>` and inspect the durable merged-work
-   handoff plus current work-unit and dependency state.
-2. Act on every earlier informational item and mark each handled item read with
-   `accept`, including the Developer handoff.
-3. Finish all reconciliation, judgment recording, and other Planner
-   bookkeeping. No work remains after this step.
-4. As the literal final action of the turn, release dependency-ready lanes:
-
-```text
-sc sprint dispatch --sprint <id>
-```
-
-5. When the command confirms the durable assignment writes and New wakes, stop
-   immediately. Run no trailing command. Empty dispatch is still the final
-   action for that handoff turn; investigate only on a later durable wake.
-
-On a clean completion receipt, verify the named Sprint is terminal and record
-the bounded receipt; run no close command. The Planner does not author a second
-report, accept an actionable handoff, or wait for another actor to finish the
-Sprint.',
+On a clean completion receipt, verify terminal Sprint + bounded receipt; run no
+close command. Planner does not author a second report, accept an actionable
+handoff, or wait for another actor to finish the Sprint.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -4784,70 +4464,53 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
   0,
   '# sprint_rev — independent review and conformance
 
-Use in one of two modes: a work-unit PR review during the loop, or the final
-whole-Sprint conformance pass. Pre-declaration QAQC is a third entry condition,
-before a Sprint exists. The evidence differs; independence does not. The
-Reviewer decides and documents review and conformance judgments; the Planner
-owns operational plan structure and acts on control transitions. The FnB
-retains the board-level override established by decision #46.
+Use for pre-declaration QAQC, one work-unit review, or whole-Sprint
+conformance. The Reviewer decides review/conformance; the Planner owns
+operational plan structure + control execution. FnB retains the board-level
+override from decision #46.
 
 Use the simplest path supported by current durable state. Treat independence,
 authority, lifecycle preconditions, durable writes, and typed handoffs as hard
-boundaries; use judgment for investigation and review within them. Repeat a
-read only when later activity could have changed it or the next command
-requires live revalidation.
+boundaries. Repeat a read only when later activity could have changed it or the
+next command requires live revalidation.
 
 ## Route the entry
 
 Classify the entry before reading an inbox:
 
-- Pre-declaration QAQC begins from an explicit Planner or FnB request through
-  the ordinary shell-to-shell channel. Read and sign the exact current spec
-  body directly; there is no Sprint id or Sprint inbox to inspect yet.
-- A work-unit review request or delivery-terminal notification is Sprint-scoped.
-  Inspect the Sprint inbox once and accept the actionable request before work.
-- For a live FnB instruction, preserve its board-level authority distinctly and
-  inspect only the durable state needed for an independent decision.
+| Entry | Route |
+|---|---|
+| Explicit pre-declaration request | Read/sign the exact current spec directly; there is no Sprint id or Sprint inbox to inspect yet. |
+| Work-unit review / `sprint.delivery_terminal` | Inspect the Sprint inbox once; accept the actionable request. |
+| Live FnB instruction | Preserve board-level authority; read only durable state needed for independent judgment. |
 
-Record pre-declaration QAQC through the authenticated surface:
+QAQC precedes all Sprint inbox commands:
 
 ```text
 sc sprint record-qaqc --document <spec-document-id> \
   --verdict pass [--findings-document <document-id>]
 ```
 
-Once a Sprint is armed, review and conformance entries arrive through durable
-wakes. Load `sprint_rev` on every entry, then use the Sprint inbox for the
-Sprint-scoped cases above:
+For an armed Sprint, load `sprint_rev` on every entry:
 
 ```text
 sc sprint inbox --sprint <id>
 sc sprint accept --sprint <id> --message <message-id>
-```
-
-Decline an actionable request you cannot take, with a concrete reason:
-
-```text
 sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 ```
 
-Use `accept` or `decline` for actionable work. After acting on an informational
-question, answer, blocker, or context message, run `accept` for that message.
-For informational messages it only marks the message read; it does not change
-Sprint or work-unit state.
+Decline actionable work only with a concrete reason. After handling an
+informational message, run `accept`; it marks the message read and does not
+change Sprint or work-unit state.
 
-Review requests use Force-new delivery. Reviewer verdicts to Developers and
-decisions to Planners use Re-enter. Neither displaces a live turn; delivery
-waits for its natural boundary, and the runtime owns bundling, rotation, and
-recovery. Stop after a successful typed handoff. Reviewers never receive
-PR-event subscription wakes.
+Review requests use Force-new delivery. Verdicts and Planner decisions use
+Re-enter. Delivery waits for a natural boundary; the runtime owns bundling,
+rotation, and recovery. Stop after a successful typed handoff. Reviewers never
+receive PR-event wakes.
 
-## Questions, answers, blockers, and failures
+## Relay contract and authority
 
-Put one concrete question, answer, blocker, or useful context item in a short
-body file. Declare the message intent and whether the required reply belongs to
-one work unit or the whole Sprint. Ask the Developer for missing PR evidence
-with a unit-scoped question:
+Ask the Developer for unit evidence with a unit-scoped question/blocker:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
@@ -4855,179 +4518,120 @@ sc sprint send --sprint <id> --to <shortname> --body-file <path> \
   --key <stable-key>
 ```
 
-Use `--intent blocker` instead when the unit cannot advance. Ask the Planner for
-durable state or action-feasibility facts without delegating Reviewer judgment.
-A cross-unit review, closeout, re-enter, abort, or safety ruling is a
-Sprint-level decision:
+Use `--intent blocker` when the unit cannot advance. Cross-unit, closeout,
+re-enter, abort, and safety rulings are Sprint-level decisions:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
   --intent decision --requires-reply --sprint-level --key <stable-key>
 ```
 
-Answer the stored sender through the original message. The server inherits its
-unit or Sprint scope; never add `--work-unit` or `--sprint-level` to a reply:
+Reply through the original message; the server inherits its scope, so never
+add `--work-unit` or `--sprint-level` to a reply:
 
 ```text
 sc sprint send --sprint <id> --to <shortname> --body-file <path> \
   --intent information --reply-to <message-id> --key <stable-key>
 ```
 
-Confirm the reply write, then mark the handled incoming message read with
-`accept`. A blocker or integrity concern is evidence for your decision. If
-action is needed, send the Planner the decision, impact, exact action, and
-recommendation. Continue safe independent review, but stop at the decision
-boundary when missing facts prevent an honest decision. Unread recovery owns
-re-waking; do not send duplicate reminders.
+Confirm a reply, then `accept` its incoming message. Missing facts stop review
+at the decision boundary; unread recovery re-wakes, so send no duplicate.
+A stable key identifies recipient + exact body + intent + reply + scope. Reuse
+it only for the same failed/ambiguous write; when any of those fields changes,
+use a new key.
 
-Choose one stable key for the intended recipient, exact body, intent, reply
-linkage, and scope. Reuse it only when retrying that same write; use a new key
-when any of those fields changes.
-
-Keep the body near 6,000 characters and below the 8,000 hard maximum; run
-`wc -m < <path>`. A handoff is complete only when the Sprint command exits
-successfully and confirms the durable write and wake.
-
-If a command is rejected or transport fails, the verdict or handoff is
-incomplete. Correct and retry when safe. If the relay itself fails, surface the
-attempted command, evidence, impact, and recommendation to FnB; do not invent an
-alternate protocol. A Reviewer decides whether review or conformance evidence
-warrants changes requested, re-entry, abort, or conclusion; the Planner
-independently decides ordinary operational replanning and executes control
-transitions. Record a live FnB override as FnB authority, not Reviewer judgment.
+Keep bodies near 6,000 characters and below the 8,000 hard maximum; run
+`wc -m < <path>`. A handoff completes only when the command exits successfully
+and confirms the durable write + wake. If a command is rejected or transport fails,
+the verdict/handoff is incomplete. Correct and retry safely. If the relay itself fails,
+give FnB the attempted command, evidence, impact, and recommendation; invent no
+alternate protocol.
 
 ## Sprint artifact paths
 
-Sprint working artifacts (per-unit review notes, raw diffs, evidence packets,
-report drafts, and Dev scratch proof) go to the gitignored
-`shared/sprints/sprint-<n>/` directory. They are never committed, branched, or
-PR''d in the work repo; a review-notes commit is a finding.
-
-DB rows stay the durable record: judgments via `record-review`, report bodies in
-`sprint_reports`, and decisions in the durable relay. Files in the Sprint
-artifact directory are working material only.
+Keep review notes, diffs, evidence, reports, and scratch proof in gitignored
+`shared/sprints/sprint-<n>/`; never commit, branch, or PR them. Durable records
+belong in `record-review`, `sprint_reports`, and the relay.
 
 ## Conformance decisions and Planner controls
 
-The Reviewer owns review, re-enter, abort, and conclude judgments. The Planner
-independently owns operational plan structure: pausing for safe edits, recalling
-unreleased work, modifying or repeating task lanes, reassigning work, changing
-participant routes, cancelling unreleased scope, and resuming after validation.
-A clean conformance approval atomically performs its own close. Base a Reviewer
-judgment on durable Sprint state,
-the exact bound revisions, current work/PR facts, progress-carrier evidence, and any
-ratified judgment; ambiguous silence is not enough to corrupt a disposition.
+Reviewer owns review, re-enter, abort, and conclude judgments. Planner
+independently owns operational plan structure: safe-edit pauses, recalling
+unreleased work, lane changes/repeats, assignment/routing, unreleased-scope
+cancellation, and validated resume. Reviewer never runs standalone pause,
+replan, recall, reroute, cancel, resume, complete, or abort actions; clean
+`record-conformance` alone performs its narrow atomic close.
 
-Send re-enter, abort, or safety-critical control recommendations through the
-durable `send` surface above. A clean conclude instead runs the atomic
-`record-conformance` close below. Every Reviewer → Planner route is Re-enter.
-The Reviewer-authored body must name:
+Base judgment on durable Sprint state, bound revisions, current work/PR facts,
+progress-carrier evidence, and ratified judgments. Every Reviewer→Planner route
+is Re-enter. A decision body names:
 
 - `decision`: `re-enter`, `abort`, or the exact safety-critical recommendation;
-- the evidence and rationale owned by the Reviewer;
-- exact Sprint/work-unit ids, reason, outcome, and complete action arguments;
-- any immediate safety impact that the FnB must see.
+- Reviewer-owned evidence + rationale;
+- exact Sprint/unit ids, reason, outcome, and complete action arguments;
+- immediate safety impact for FnB.
 
-The Planner marks the message handled, verifies the assigned Reviewer, and acts
-on the judgment without surrendering its separate authority over the concrete
-plan. The clean completion receipt is informational because the Sprint is
-already terminal. The Reviewer never runs the standalone pause, replan, recall,
-reroute, cancel, resume, complete, or abort action; its clean
-`record-conformance` command owns the narrow automatic close. If a requested
-action is rejected, inspect the returned durable state and issue a revised
-judgment only when the evidence supports one; never ask the Planner to improvise
-around a precondition.
-
-The FnB board-level override from decision #46 is unaffected. A live FnB
-instruction can direct or supersede any decision; preserve it as a distinct
-authority record.
+Planner verifies Reviewer identity and executes the transition without
+surrendering plan authority. A rejected action requires a revised judgment
+supported by returned durable state, never an improvised bypass. A live FnB
+instruction supersedes as distinct FnB board-level override authority under
+decision #46.
 
 ## Severity rubric
 
-This skill owns severity. The governing spec intentionally does not.
-
 - **Critical** — active security/authority violation, destructive corruption,
-  or a condition that makes continued operation unsafe.
+  or unsafe continued operation.
 - **Major** — wrong behavior, data loss, broken invariant, material spec
-  violation, or a loop/recovery path that can silently wedge delivery.
-- **Medium** — a concrete correctness or recovery gap likely to bite normal
-  use soon, including missing negative enforcement or an unreliable handoff.
-- **Low** — bounded cleanup, clarity, test depth, or resilience improvement that
-  does not make the delivered behavior wrong now.
+  violation, or silently wedged delivery/recovery.
+- **Medium** — concrete normal-use correctness/recovery gap, missing negative
+  enforcement, or unreliable handoff.
+- **Low** — bounded cleanup, clarity, test-depth, or resilience improvement;
+  delivered behavior remains correct.
 
-During a work-unit review, Critical/Major/Medium block approval; Low is a
-report note. During close-out conformance, severity does not decide timing: the
-Reviewer judges whether each finding requires in-Sprint patching or is an
-acceptable post-Sprint follow-up.
+Critical/Major/Medium block unit approval; Low is a report note. At closeout,
+severity does not decide timing: Reviewer judges whether each finding requires in-Sprint patching
+or acceptable post-Sprint follow-up.
 
 ## Work-unit review
 
-Accept the actionable review request and retain that exact message id as the
-identity of this review round. Its readiness body must be only the bare
-locator: submitting or resubmitting intent, PR URL, registered Sprint PR id,
-exact head SHA, and work-unit id. Treat scope narrative, verification evidence,
-judgment rationale, or review-focus steering in that body as a protocol defect;
-do not use it to frame the review. Neither party writes PR comments or
-annotations, and the PR body contains only the work-unit id and spec reference.
+Accept the request and retain that exact message id. Its body is a bare locator:
+intent, PR URL, registered PR id, exact head, work-unit id. Scope narrative,
+verification, rationale, or focus steering is a protocol defect. PR comments
+and annotations are forbidden; PR body contains only unit id + spec reference.
 
-Bind every inspection and the eventual verdict to the accepted request''s
-message id, registered PR, work unit, and exact head. Another request in the
-same delivery, another unit assigned to this Reviewer, or role activity in a
-different conversation does not belong to this round. Accept and review each
-request explicitly; never infer a review lane from Reviewer identity alone.
-
-Review the exact bound spec revision and the full diff at the request''s exact
-head, then inspect checks, tests, relevant runtime evidence, and ratified
-judgments. Each round is clean: no prior Developer evidence or prose is input,
-and prior findings are cleared only when the code at the new head proves they
-are cleared. Review code quality, edge cases/failure paths, and spec
-conformance. Trace the real path; do not trust names or PR prose.
+Bind inspection/verdict to the accepted request''s message id, registered PR,
+work unit, and exact head. Review each request explicitly. Read the exact spec
+revision + full diff at that head, then checks, tests, relevant runtime facts,
+and ratified judgments. Each round is clean: no prior Developer evidence or
+prose; prior findings clear only when the new head proves it. Trace code paths,
+failure cases, and spec behavior rather than names or PR prose.
 
 ### Red-check doctrine
 
 Accepted-red is not a legal review outcome. A departure that leaves checks
-failing is never acceptable: do not note the failure and approve anyway. The
-review handoff remains green-only, without exception or waiver.
+failing is never acceptable; the handoff remains green-only, without exception
+or waiver: do not note the failure and approve anyway.
 
-`Note it and pass anyway` is the acceptance-shaped anti-pattern. In the
-dos-arch incident, a Reviewer accepted known-failing tests as a scoped
-departure and created a deadlock: the green-only handoff gate could never pass.
-Decision #93 records why this no-waiver rule exists.
+- In-scope failure -> record `changes_requested` so the Developer fixes them and restores green.
+- Out-of-scope failure -> keep the lane unapproved and send the Planner a `replan`
+  decision naming the failures; Planner widens the lane or cuts follow-up work.
 
-When failing checks are within the lane''s ratified scope, record
-`changes_requested` so the Developer fixes them and re-establishes green. When
-the failures are outside that scope, name the blocking failures in the finding
-and send the Planner a `replan` decision through the control protocol. The
-Planner must either widen the lane explicitly or cut a follow-up work unit; the
-current lane remains unapproved until the resulting work is green.
-
-Read resolved closure evidence through the authenticated memory surface; no SQL
-or mutation is needed. Use the exact form for a cited flag and the scoped form
-to audit every resolved flag attached to the feature:
+Read cited and feature-scoped resolved flag evidence through memory, never SQL:
 
 ```text
 sc mem get flags <flag-id>
 sc mem get flags --feature <feature-id> --resolved
 ```
 
-Findings must state:
-
-- severity and concise title;
-- violated behavior or invariant;
-- exact code/evidence location;
-- a reproducible consequence; and
-- the fix boundary, without prescribing unnecessary architecture.
+Each finding pins severity/title, violated invariant, exact location/evidence,
+reproducible consequence, and fix boundary without unnecessary architecture.
 
 Complete a unit verdict in this exact order:
 
-1. Finish the review, findings, and verdict body; no inspection remains after
-   this step.
-2. Re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and
-   mark every handled informational message read with `accept`.
-3. Run `wc -m < <path>`; keep the verdict near 6,000 characters and below the
-   8,000-character hard maximum.
-4. As the literal final action of the turn, record the typed verdict through
-   the authenticated surface:
+1. Finish every inspection, finding, and verdict body.
+2. Re-run `sc sprint inbox --sprint <id>` once; handle + `accept` new items.
+3. Run `wc -m < <path>`; require near 6,000 and below 8,000 characters.
+4. As the literal final action, run:
 
 ```text
 sc sprint record-review \
@@ -5035,107 +4639,65 @@ sc sprint record-review \
   --verdict changes_requested --body-file <path> --key <stable-key>
 ```
 
-5. When the command confirms the durable write and Developer wake, stop
-   immediately. Run no trailing command.
+5. Require durable judgment evidence + Developer Re-enter wake. Run no trailing command;
+   stop.
 
-Use `approved` only when no Critical/Major/Medium finding remains. The engine
-checks that the request was accepted and still binds to the reviewed head,
-records judgment evidence and sends a Re-enter wake to the Developer. Do not
-message around this surface;
-an unrecorded verdict cannot unlock merge.
+Use `approved` only with no Critical/Major/Medium finding. Engine validation
+requires the accepted request and reviewed head. Do not message around the
+surface; an unrecorded verdict cannot unlock merge.
 
 ## Delivery-terminal closeout
 
-The `sprint.delivery_terminal` notification is the entry signal for
-whole-Sprint conformance. Retain that exact notification message id and its
-delivered wake as the closeout entry identity; another Reviewer turn or an old
-terminal notification does not carry this episode. On that wake, inspect the
-inbox, lifecycle, and current work-unit state first. If the lifecycle is already
-`completed` or `aborted`, mark the informational notification handled with
-`accept` and stop. If any non-terminal unit is visible, the wake is stale: mark
-it handled with `accept`, exit, and await the next episode''s delivery-terminal
-wake. Only an armed Sprint whose units are all terminal enters conformance.
+Retain the exact notification message id + delivered wake as this closeout
+episode''s identity. Inspect inbox, lifecycle, and units first:
 
-Compile the bounded evidence packet first and do so yourself, then judge
-integrated `main` against every governing bound revision, exact recorded
-mid-Sprint revision fact, and ratified judgment:
+- Already completed/aborted -> `accept` notification and stop.
+- If any non-terminal unit is visible, the wake is stale -> `accept`, stop, and
+  await a fresh delivery-terminal episode.
+- Only an armed Sprint whose units are all terminal enters conformance.
+
+Compile the bounded evidence packet first, yourself:
 
 ```text
 sc sprint compile-report --sprint <id> --limit 50 \
   > shared/sprints/sprint-<n>/evidence.json
 ```
 
-Increase the bound only when truncation counters show the default omitted
-needed evidence; 200 is the maximum. The packet supplies facts, not judgment.
-If every work unit was cancelled and nothing shipped, the honest decision is
-`abort`, not `conclude`.
+Increase only when truncation omitted needed evidence; maximum 200. Judge
+integrated `main` against every bound/current revision + ratified judgment. All
+units cancelled and nothing shipped -> `abort`, not `conclude`.
 
-After classifying the requirements, choose exactly one branch:
+Choose one branch:
 
-- **In-Sprint patching required.** Do not run `record-conformance`. Send the
-  Planner a durable `re-enter` decision naming every blocking finding; each
-  spec task to cut against the governing spec document, with title and
-  description; and the suggested unit grouping, waves, dependencies,
-  Developer/Reviewer routing, and capacity rationale. Identify independent
-  lanes, expected review overlap, useful reserve, and why additional capacity
-  would or would not shorten the critical path. The durable decision is the
-  failed-pass record.
-  After three re-entry episodes in one Sprint, escalate the non-convergence to
-  FnB instead of starting another patch round.
-- **Clean or post-Sprint-only findings.** Prepare the conformance report,
-  findings, final Sprint report, reason, and outcome. Submit them through the
-  atomic `record-conformance` protocol below: the engine commits the evidence,
-  completed lifecycle, informational Planner receipt, and wake together. Do not
-  send a separate conclude message.
+- **In-Sprint patching required.** Do not run `record-conformance`. Send Planner
+  a durable `re-enter` decision with every blocking finding; each spec task''s
+  title and description; grouping, waves, dependencies, routing, and capacity
+  rationale. State independent lanes, expected review overlap, useful reserve,
+  and critical-path effect. After three re-entry episodes, escalate
+  non-convergence to FnB.
+- **Clean or post-Sprint-only findings.** Prepare conformance report, findings,
+  final report, reason, and outcome; submit the atomic close below. Send no
+  conclude message.
 
 ## Whole-Sprint conformance
 
-Review the integrated system, not unit diffs. Classify each requirement as:
+Review the integrated system, not unit diffs. Classify every requirement
+`as-specced`, `deviated-intentionally` with ratified judgment,
+`deviated-silently`, or `unimplemented`; the last two are findings. Include
+spec document + work-unit ids when known.
 
-- `as-specced`;
-- `deviated-intentionally` with its ratified judgment;
-- `deviated-silently`; or
-- `unimplemented`.
+For the clean branch, write a conformance report and JSON findings array with
+`severity`, `title`, `body`, `spec_document_id`, and `work_unit_id`. Keep the
+report and each body near 6,000 and below 8,000 characters; run
+`wc -m < <report>` and validate each body.
 
-The last two are findings. Include spec document id and work-unit id when known.
-For the clean or post-Sprint-only branch, write the conformance report and a
-JSON findings array:
+Before recording conformance, author the final Sprint report. Name Reviewer as
+author and cover governing scope/revisions, shipped units/PRs, judgments +
+ratified deviations, failures/retries/recovery/anomalies, conclusion,
+follow-ups, and evidence location. Keep it near 6,000 and below 8,000; preserve
+discrepancies.
 
-```json
-[
-  {
-    "severity": "Major",
-    "title": "Integrated seam diverges",
-    "body": "Evidence and consequence.",
-    "spec_document_id": 46,
-    "work_unit_id": 9
-  }
-]
-```
-
-Keep the conformance report and each finding body at about 6,000 characters or
-fewer; 8,000 is the hard maximum for each. Run `wc -m < <report>` and length-check
-each finding body before submission.
-
-Before recording conformance, author the final Sprint report. Name the Reviewer
-as its author and answer:
-
-1. Which exact scope and revisions governed?
-2. What shipped, through which work units and PRs?
-3. Which Reviewer judgments and ratified deviations shaped the result?
-4. What failed, retried, paused, recovered, or remained anomalous?
-5. What did conformance conclude?
-6. Which follow-ups or unresolved items require FnB disposition?
-7. Where is the complete evidence?
-
-Keep the final report at about 6,000 characters or fewer and below the 8,000
-hard maximum; run `wc -m < <report>`. Do not smooth discrepancies into a
-success narrative. Keep the final report below 8,000 characters, then choose
-the exact completion reason, terminal outcome, and stable completion key. The
-engine stores the final report unchanged and generates the Planner receipt from
-the committed report and follow-up identities.
-
-Record the clean branch as one atomic final write:
+Record one atomic final write:
 
 ```text
 sc sprint record-conformance \
@@ -5144,41 +4706,27 @@ sc sprint record-conformance \
   --key <stable-pass-key>
 ```
 
-The receipt must name the conformance report id, final report id, follow-up ids,
-completed state, Planner message id, and Planner wake id. This creates
-append-only evidence, pending follow-ups, terminal lifecycle, and one
-informational engine-wide Planner Re-enter in the same transaction. Never
-record conformance first and then close around it; send no conclude message.
-On that successful commit, the engine also closes every other active chat
-immutably linked to the Sprint. The originating Planner and this
-report-authoring Reviewer remain open. Do not manually close peer chats as an
-extra closeout step. Pause, abort, re-entry, failed conformance, and rejected
-fallback completion keep their existing no-cleanup behavior.
-Never reopen an editing
-lane after recording; the re-enter branch defers the report until added scope
-reaches terminal disposition and a fresh delivery-terminal wake starts the next
-episode. Surface any immediate safety risk to FnB.
+Require receipt: conformance report id, final report id, follow-up ids,
+completed state, Planner message id, and Planner wake id. The transaction adds
+append-only evidence, follow-ups, terminal state, and one informational engine-wide Planner Re-enter;
+send no conclude message. Successful conformance also closes other Sprint-linked
+chats while the originating Planner + report-authoring Reviewer stay open. Do
+not manually close peer chats. Pause, abort, re-entry, failed conformance, and
+rejected fallback retain no-cleanup behavior. Never reopen editing after recording; a re-enter defers
+reports until new scope is terminal and a fresh delivery-terminal wake arrives.
 
 ## Stop
 
-For unit review, follow the ordered verdict procedure above: inbox handling and
-all evidence work precede `record-review`; the durable verdict is the literal
-last action, then the Reviewer stops.
+Unit review ends with the ordered `record-review` write as the literal final
+action.
 
-For the clean or post-Sprint-only branch, require both reports, findings,
-reason, and outcome to replay idempotently. For the re-enter or abort branch,
-confirm that the decision body carries the complete evidence and exact
-requested action. Then complete this final handoff order:
+For closeout, first re-run `sc sprint inbox --sprint <id>`, handle + `accept`
+new messages, then confirm every artifact/body is final and below 8,000.
 
-1. Re-run `sc sprint inbox --sprint <id>`, act on newly arrived messages, and
-   mark every handled informational message read with `accept`.
-2. Confirm every Reviewer-authored artifact and decision body is final and
-   below its 8,000-character hard maximum.
-3. For a clean conclude, run the atomic `record-conformance` command above as
-   the literal final action. When it confirms completed state and all receipt
-   identities, stop immediately; the Planner is already notified.
-4. For re-enter or abort, deliver the decision to the Planner as the literal
-   final action:
+- Clean conclude -> run the atomic `record-conformance` command above as the
+  literal final action. When it confirms completed state and all receipt
+  identities, stop immediately; Planner is notified.
+- Re-enter/abort -> as literal final action send:
 
 ```text
 sc sprint send --sprint <id> --to <planner-shortname> --body-file <path> \
@@ -5186,8 +4734,8 @@ sc sprint send --sprint <id> --to <planner-shortname> --body-file <path> \
   --key <stable-decision-handoff-key>
 ```
 
-5. When the command confirms the durable write and Planner wake, stop
-   immediately. Run no trailing command until another native wake arrives.',
+Require durable write + Planner wake, then stop immediately. Run no trailing
+command until another native wake.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET

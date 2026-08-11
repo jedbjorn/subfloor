@@ -293,6 +293,18 @@ class RunnerTest(unittest.TestCase):
             check=False,
         )
 
+    def full_environment(self, **updates: str) -> dict[str, str]:
+        environment = dict(os.environ)
+        environment["SC_DEVKIT_OUTPUT"] = "full"
+        environment.update(updates)
+        return environment
+
+    def compact_log(self, done: subprocess.CompletedProcess) -> Path:
+        line = next(
+            item for item in done.stderr.splitlines() if item.startswith("dev-kit log: ")
+        )
+        return self.root / line.removeprefix("dev-kit log: ")
+
     def test_absent_invalid_and_missing_hook_are_distinct(self):
         absent = self.run_hook("test")
         self.assertEqual(absent.returncode, 78)
@@ -327,7 +339,7 @@ class RunnerTest(unittest.TestCase):
             }
         )
         arguments = ("$(touch escaped)", "*.py", "two words", "--leading")
-        done = self.run_hook("test", *arguments)
+        done = self.run_hook("test", *arguments, env=self.full_environment())
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         payload = json.loads(done.stdout)
         self.assertEqual(payload["argv"], ["declared arg", *arguments])
@@ -347,8 +359,9 @@ class RunnerTest(unittest.TestCase):
         )
         tool.chmod(0o755)
         self.write({"version": 1, "hooks": {"lint": {"argv": ["fork-tool", "check"]}}})
-        environment = dict(os.environ)
-        environment.update({"PATH": f"{binary}:{environment['PATH']}", "SC_SANDBOX": "1"})
+        environment = self.full_environment(
+            PATH=f"{binary}:{os.environ['PATH']}", SC_SANDBOX="1"
+        )
         done = self.run_hook("lint", "literal arg", env=environment)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(done.stdout, "seat=docker args=check literal arg\n")
@@ -412,6 +425,294 @@ class RunnerTest(unittest.TestCase):
         failed = self.run_hook("test")
         self.assertEqual(failed.returncode, 137)
 
+    def test_compact_success_is_bounded_and_raw_log_is_byte_complete(self):
+        child = self.root / "huge-success"
+        child.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "for number in range(10000):\n"
+            "    prefix = b'\\x1b[31mwarning\\x1b[0m' if number == 4321 else b'line'\n"
+            "    sys.stdout.buffer.write(prefix + b'-' + str(number).encode() + b'\\n')\n"
+        )
+        child.chmod(0o755)
+        self.write({"version": 1, "hooks": {"test": {"argv": ["./huge-success"]}}})
+
+        done = self.run_hook("test")
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        displayed = done.stdout + done.stderr
+        self.assertLessEqual(len(displayed.splitlines()), 80)
+        self.assertLessEqual(len(displayed.encode()), 16 * 1024)
+        self.assertNotIn("\x1b", displayed)
+        self.assertIn("dev-kit exit status: 0", displayed)
+        self.assertIn("dev-kit output:", displayed)
+        self.assertIn("10000 lines", displayed)
+        self.assertIn("SC_DEVKIT_OUTPUT=full ./sc test", displayed)
+        log = self.compact_log(done)
+        expected = b"".join(
+            (
+                (b"\x1b[31mwarning\x1b[0m" if number == 4321 else b"line")
+                + b"-"
+                + str(number).encode()
+                + b"\n"
+            )
+            for number in range(10000)
+        )
+        self.assertEqual(log.read_bytes(), expected)
+        self.assertEqual(list(log.parent.glob("*.running")), [])
+
+    def test_compact_failure_preserves_status_bounds_and_omission_evidence(self):
+        child = self.root / "huge-failure"
+        child.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "for number in range(2000):\n"
+            "    label = 'fatal error' if number == 999 else 'detail'\n"
+            "    print(f'{label}-{number}')\n"
+            "raise SystemExit(23)\n"
+        )
+        child.chmod(0o755)
+        self.write({"version": 1, "hooks": {"lint": {"argv": ["./huge-failure"]}}})
+
+        done = self.run_hook("lint")
+
+        self.assertEqual(done.returncode, 23)
+        displayed = done.stdout + done.stderr
+        self.assertLessEqual(len(displayed.splitlines()), 240)
+        self.assertLessEqual(len(displayed.encode()), 48 * 1024)
+        self.assertIn("fatal error-999", displayed)
+        self.assertIn("excerpt omitted:", displayed)
+        self.assertIn("hook state: failed", displayed)
+        raw = self.compact_log(done).read_text()
+        self.assertTrue(raw.startswith("detail-0\n"))
+        self.assertIn("fatal error-999\n", raw)
+        self.assertTrue(raw.endswith("detail-1999\n"))
+
+    def test_compact_single_huge_line_keeps_memory_and_display_bounded(self):
+        child = self.root / "huge-line"
+        child.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stdout.buffer.write(b'x' * (2 * 1024 * 1024))\n"
+        )
+        child.chmod(0o755)
+        self.write({"version": 1, "hooks": {"test": {"argv": ["./huge-line"]}}})
+
+        done = self.run_hook("test")
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        displayed = done.stdout + done.stderr
+        self.assertLessEqual(len(displayed.splitlines()), 80)
+        self.assertLessEqual(len(displayed.encode()), 16 * 1024)
+        self.assertIn("[line truncated]", displayed)
+        self.assertEqual(self.compact_log(done).stat().st_size, 2 * 1024 * 1024)
+
+    def test_compact_display_normalizes_controls_before_enforcing_bounds(self):
+        child = self.root / "controls"
+        raw = b"raw\rreturn\bbackspace\x00nul\x1b[31mred\x1b[0m\n"
+        child.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            f"sys.stdout.buffer.write({raw!r})\n"
+        )
+        child.chmod(0o755)
+        self.write({"version": 1, "hooks": {"test": {"argv": ["./controls"]}}})
+        adversarial = "return\rback\bspace\x1b[31m" + ("metadata-line\n" * 100)
+
+        done = self.run_hook("test", adversarial)
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        displayed = done.stdout + done.stderr
+        self.assertLessEqual(len(displayed.splitlines()), 80)
+        self.assertLessEqual(len(displayed.encode()), 16 * 1024)
+        for control in ("\n", "\r", "\b", "\x00", "\x1b"):
+            if control == "\n":
+                continue
+            self.assertNotIn(control, displayed)
+        self.assertIn(r"metadata-line\n", displayed)
+        self.assertIn(r"return\rback\bspace", displayed)
+        self.assertIn(r"raw\rreturn\bbackspace\x00nulred", displayed)
+        self.assertEqual(self.compact_log(done).read_bytes(), raw)
+
+    def test_full_mode_inherits_streams_and_status_without_creating_a_log(self):
+        child = self.root / "full-failure"
+        child.write_text(
+            "#!/bin/sh\nprintf 'full-out\\n'\nprintf 'full-err\\n' >&2\nexit 17\n"
+        )
+        child.chmod(0o755)
+        self.write({"version": 1, "hooks": {"typecheck": {"argv": ["./full-failure"]}}})
+
+        done = self.run_hook("typecheck", env=self.full_environment())
+
+        self.assertEqual(done.returncode, 17)
+        self.assertEqual(done.stdout, "full-out\n")
+        self.assertIn("full-err\n", done.stderr)
+        self.assertNotIn("dev-kit log:", done.stderr)
+        self.assertFalse((self.root / ".sc-state").exists())
+
+    def test_compact_log_merges_stdout_and_stderr_without_losing_bytes(self):
+        child = self.root / "merged"
+        child.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "os.write(1, b'first-out\\n')\n"
+            "os.write(2, b'second-err\\n')\n"
+            "os.write(1, b'third-out\\n')\n"
+        )
+        child.chmod(0o755)
+        self.write({"version": 1, "hooks": {"lint": {"argv": ["./merged"]}}})
+
+        done = self.run_hook("lint")
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(
+            self.compact_log(done).read_bytes(),
+            b"first-out\nsecond-err\nthird-out\n",
+        )
+
+    def test_invalid_mode_rejects_before_child_and_deps_ignores_the_mode(self):
+        marker = self.root / "ran"
+        child = self.root / "child"
+        child.write_text(f"#!/bin/sh\ntouch '{marker}'\nprintf 'direct-output\\n'\n")
+        child.chmod(0o755)
+        self.write(
+            {
+                "version": 1,
+                "hooks": {
+                    "test": {"argv": ["./child"]},
+                    "deps": {"argv": ["./child"]},
+                },
+            }
+        )
+        environment = dict(os.environ)
+        environment["SC_DEVKIT_OUTPUT"] = "verbose"
+
+        invalid = self.run_hook("test", env=environment)
+        self.assertEqual(invalid.returncode, 64)
+        self.assertIn("must be 'compact' or 'full'", invalid.stderr)
+        self.assertFalse(marker.exists())
+
+        deps = self.run_hook("deps", env=environment)
+        self.assertEqual(deps.returncode, 0, deps.stdout + deps.stderr)
+        self.assertEqual(deps.stdout, "direct-output\n")
+        self.assertTrue(marker.exists())
+        self.assertNotIn("dev-kit log:", deps.stderr)
+
+    def test_compact_retention_keeps_newest_twenty_and_never_running_files(self):
+        child = self.root / "success"
+        child.write_text("#!/bin/sh\nprintf 'new-log\\n'\n")
+        child.chmod(0o755)
+        self.write({"version": 1, "hooks": {"test": {"argv": ["./success"]}}})
+        directory = self.root / ".sc-state" / "local" / "devkit-logs" / "test"
+        directory.mkdir(parents=True)
+        for number in range(25):
+            path = directory / f"old-{number:02d}.log"
+            path.write_text(str(number))
+            os.utime(path, ns=(number + 1, number + 1))
+        live = directory / "other-process.running"
+        live.write_text("still-live")
+
+        done = self.run_hook("test")
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        finalized = list(directory.glob("*.log"))
+        self.assertEqual(len(finalized), 20)
+        self.assertIn(self.compact_log(done), finalized)
+        self.assertEqual(live.read_text(), "still-live")
+
+    def test_concurrent_compact_runs_use_distinct_atomic_logs(self):
+        child = self.root / "capture"
+        child.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\"\n")
+        child.chmod(0o755)
+        self.write({"version": 1, "hooks": {"lint": {"argv": ["./capture"]}}})
+        commands = [
+            (sys.executable, str(RUNNER), "run", str(self.root), "lint", value)
+            for value in ("first", "second")
+        ]
+        processes = [
+            subprocess.Popen(
+                command,
+                cwd=self.root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for command in commands
+        ]
+        for process in processes:
+            process.communicate(timeout=10)
+
+        self.assertEqual([process.returncode for process in processes], [0, 0])
+        logs = list(
+            (self.root / ".sc-state" / "local" / "devkit-logs" / "lint").glob("*.log")
+        )
+        self.assertEqual(len(logs), 2)
+        self.assertEqual({path.read_text() for path in logs}, {"first\n", "second\n"})
+        self.assertEqual(
+            list(logs[0].parent.glob("*.running")),
+            [],
+        )
+
+    def test_interruption_reaps_real_child_retains_log_and_reports_path(self):
+        child = self.root / "interrupt"
+        child.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n")
+        child.chmod(0o755)
+        self.write({"version": 1, "hooks": {"test": {"argv": ["./interrupt"]}}})
+
+        real_popen = devkit.subprocess.Popen
+        spawned = []
+
+        class InterruptedProcess:
+            def __init__(self, *args, **kwargs):
+                self.child = real_popen(*args, **kwargs)
+                self.interrupted = False
+                spawned.append(self.child)
+
+            def poll(self):
+                return self.child.poll()
+
+            def terminate(self):
+                return self.child.terminate()
+
+            def kill(self):
+                return self.child.kill()
+
+            def wait(self, *args, **kwargs):
+                if not self.interrupted:
+                    self.interrupted = True
+                    raise KeyboardInterrupt
+                return self.child.wait(*args, **kwargs)
+
+        def cleanup_children():
+            for process in spawned:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+
+        self.addCleanup(cleanup_children)
+
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), mock.patch.object(
+            devkit.subprocess, "Popen", side_effect=InterruptedProcess
+        ), mock.patch.object(
+            devkit, "invoking_checkout", return_value=self.root.resolve()
+        ), mock.patch.object(
+            devkit, "_main_checkout", return_value=self.root.resolve()
+        ), self.assertRaises(KeyboardInterrupt):
+            devkit.run_hook(self.root, "test", ())
+
+        running = list(
+            (self.root / ".sc-state" / "local" / "devkit-logs" / "test").glob(
+                "*.running"
+            )
+        )
+        self.assertEqual(len(running), 1)
+        self.assertIn(str(running[0].relative_to(self.root)), output.getvalue())
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].returncode)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(spawned[0].pid, 0)
+
     def test_dangling_provision_reference_fails_before_child_execution(self):
         marker = self.root / "child-ran"
         child = self.root / "child"
@@ -462,9 +763,12 @@ class RunnerTest(unittest.TestCase):
         (linked / ".subfloor" / "dev-kit.json").write_text(
             json.dumps({"version": 1, "hooks": {"test": {"argv": ["./.subfloor/root"]}}})
         )
+        environment = dict(os.environ)
+        environment["SC_DEVKIT_OUTPUT"] = "full"
         done = subprocess.run(
             (sys.executable, str(RUNNER), "run", str(linked), "test"),
             cwd=main,
+            env=environment,
             text=True,
             capture_output=True,
             check=False,
@@ -472,6 +776,26 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(done.stdout, f"{linked.resolve()}\n")
         self.assertIn(f"dev-kit checkout: {linked.resolve()}", done.stderr)
+
+        compact_environment = dict(os.environ)
+        compact_environment.pop("SC_DEVKIT_OUTPUT", None)
+        compact = subprocess.run(
+            (sys.executable, str(RUNNER), "run", str(linked), "test"),
+            cwd=main,
+            env=compact_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(compact.returncode, 0, compact.stdout + compact.stderr)
+        log_line = next(
+            line
+            for line in compact.stderr.splitlines()
+            if line.startswith("dev-kit log: ")
+        )
+        log = main / log_line.removeprefix("dev-kit log: ")
+        self.assertEqual(log.read_text(), f"{linked.resolve()}\n")
+        self.assertFalse((linked / ".sc-state").exists())
 
     def test_dispatcher_routes_every_lifecycle_verb_through_one_adapter(self):
         dispatch = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()
@@ -660,6 +984,7 @@ class DispatcherHelpTest(unittest.TestCase):
         scripts.mkdir(parents=True)
         shutil.copy2(RUNNER, scripts / "devkit.py")
         shutil.copy2(RUNNER.with_name("cli_entry.py"), scripts / "cli_entry.py")
+        shutil.copy2(RUNNER.with_name("artifact_policy.py"), scripts / "artifact_policy.py")
         (self.root / ".subfloor").mkdir()
         capture = self.root / ".subfloor" / "capture"
         capture.write_text("#!/bin/sh\nprintf '<%s>\\n' \"$@\"\n")
@@ -674,7 +999,13 @@ class DispatcherHelpTest(unittest.TestCase):
 
     def run_dispatch(self, *arguments: str, python: str = sys.executable):
         environment = dict(os.environ)
-        environment.update({"SC_CALLER_ROOT": str(self.root), "SC_PYTHON": python})
+        environment.update(
+            {
+                "SC_CALLER_ROOT": str(self.root),
+                "SC_PYTHON": python,
+                "SC_DEVKIT_OUTPUT": "full",
+            }
+        )
         return subprocess.run(
             ("sh", str(self.dispatch), "test", *arguments),
             cwd=self.root,

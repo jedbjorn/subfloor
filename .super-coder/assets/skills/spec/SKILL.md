@@ -1,266 +1,133 @@
 ---
 name: spec
-description: Execute a spec across sessions — analyze viability, surface blockers and unclear items, break into tasks (Preparation → impl steps → Verification), and track progress in spec_tasks. Updates current_state at every step. Load when starting, implementing, or building any feature, spec, or roadmap item — before writing code.
+description: Load before implementing any feature, spec, or roadmap item. Analyze viability, surface blockers, plan Preparation → implementation → Verification, and track spec_tasks/current_state across sessions.
 category: craft
 common: false
 ---
 
 # spec — analyze and execute a spec
 
-Load at the start of any session that builds or implements a feature, whether
-or not the work is framed as a "spec". A spec governs the work -> this skill
-executes it; one should exist but doesn't -> the `docs` skill authors it first.
-Run **Analyze** before touching any code. Blockers / unclear items you can't
-resolve alone -> pause for the FnB.
+Load before implementing any feature/spec/roadmap item. A governing spec is
+missing -> use `docs` to author it first. Analyze before code; unresolved
+ambiguity goes to FnB, while hard blockers get flags. `<self>` = your shell id.
 
-`<self>` = your shell_id.
+## 1. Select the spec
 
----
+Never auto-pick the latest document. Read the complete selected body + task
+ledger:
 
-## Step 1: Load the spec
-
-A feature can hold several unfrozen specs at once (see the `docs` skill).
-NEVER auto-pick "the latest" — list the feature's open specs and choose the
-target explicitly:
-
-```
-# the feature's documents — pick an unfrozen spec (frozen=0) by id:
+```text
 sc mem get documents --feature <id>
-# load the chosen spec body:
 sc mem get documents --doc <doc_id>
-# the spec's task plan (empty = no plan yet):
 sc mem get tasks --doc <doc_id>
 ```
 
-`get documents --feature <id>` lists every spec/doc with `kind`, `seq`,
-`frozen`, `task_count`. Active spec = the unfrozen one with `task_count > 0`
-— resume it. `task_count = 0` = backlog; starting it (Step 3) makes it
-active. More than one open spec and the target unclear -> ask the FnB.
+The feature list includes `kind`, `seq`, `frozen`, and `task_count`. Resume the
+one unfrozen spec with tasks. An unfrozen zero-task spec is backlog; engaging it
+creates the plan below. Multiple plausible open specs -> ask FnB. Existing
+tasks -> skip planning and track the first unfinished one.
 
-Tasks already exist -> skip to **Step 4** (Track).
+## 2. Analyze before planning
 
-Read the entire spec body before going further. Do not skim.
+Return these findings before any code or task writes:
 
----
+| Check | Pass condition / action |
+|---|---|
+| Viability | Bounded, clear entry points, session-sized verification. Otherwise propose a verifiable slice. Missing done-condition = unclear. |
+| Current Posture | Preparation code/DB state matches the documented baseline. A mismatch stops for Planner/FnB; never redefine it silently. |
+| Scope | Every In Scope promise is planned; every Out of Scope item stays out. New/substantively revised specs contain both `## Current Posture` and `## Scope`; ambiguity stops. |
+| Anticipated User Activity | Plan stated roles, audience/reach, access, validation, recovery, authority, safety, process curation, and tenancy invariants. Older absence is allowed; ambiguity is not. |
+| Unclear item | Two plausible readings, missing target/interface, or unstated required knowledge -> ask FnB; do not flag a question they can answer. |
+| Blocker | Missing prerequisite/environment/external dependency -> open one High feature flag and stop at its boundary. |
 
-## Step 2: Analyze
-
-Surface all three before any planning or code:
-
-### Viability
-- Session-completable? Bounded + clear entry points = yes. Multiple layers /
-  migrations / unknown dependencies = no -> say so + propose a session-sized
-  slice.
-- No stated done-condition in the spec -> that is the first unclear item.
-
-### Current posture and scope
-Treat `## Current Posture` as the intended baseline and `## Scope` as the
-delivery boundary. Plan every **In Scope** promise and no **Out of Scope** item.
-If Preparation shows that documented posture and code disagree, stop and return
-the discrepancy to the Planner/FnB; do not silently redefine the baseline.
-
-New specs and substantively revised unfrozen specs must carry both sections
-(see `docs`). Frozen historical specs may predate them; absence there is not a
-blocker, but ambiguity still is.
-
-### Anticipated User Activity
-The spec's `## Anticipated User Activity` section is governing intent: its
-roles, per-surface audience posture, reach, process curation, safety hardening,
-and tenancy invariants shape the plan — access, validation, recovery, authority,
-and tenancy checks are planned tasks, not afterthoughts. Older specs predate the
-section; absence there is not a blocker.
-
-### Unclear items
-Anything you cannot act on without guessing:
-- Ambiguous between two interpretations
-- Missing a critical detail (which table? which endpoint? which component?)
-- Implies knowledge not stated in the spec
-
-List them and ask the FnB before writing the plan.
-
-### Blockers
-Hard stops — prior work not shipped, missing environment state, unresolved
-external dependency. Open one flag per blocker:
-
-```
-sc mem flag open "[Spec] <what is blocked> | Blocker for: <feature title>" --name SC-### --priority High --feature <feature_id>
+```text
+sc mem flag open "[Spec] <blocked fact> | Blocker for: <feature>" \
+  --name SC-### --priority High --feature <feature_id>
 ```
 
-NEVER open a flag for an unclear item resolvable by asking — ask first.
+## 3. Engage and plan
 
----
+Building this session moves `brainstorm|long_term|near_term` to `in_progress`;
+planning ahead moves it to `next`. Matching/later stages are no-ops. Reading
+for reference moves nothing, and unspec'd small fixes have no stage ceremony.
 
-## Step 3: Plan
-
-### Reconcile the stage first
-
-Planning a spec = engaging it to build, so the feature's `roadmap_status`
-(loaded in Step 1) must catch up to reality. Stages:
-`brainstorm · long_term · near_term · next · in_progress · shipped`.
-
-- At `brainstorm`/`long_term`/`near_term` + building this session ->
-  `sc mem roadmap status <feature_id> in_progress`
-- Planning ahead only (no build this session) -> move it to `next`.
-- Already at `in_progress` (or further) -> no-op; don't churn it.
-
-The transition fires because you *act on* the spec — reading one for
-reference moves nothing. No spec governing the work (quick UI fix, minor
-migration) -> skip all stage handling (see Stance).
-
-### Confirm the work-stream too
-
-Check the feature's work-stream (`roadmap.project_id` — the Flow-view
-grouping). Ungrouped -> assign now so the feature shows in a flow:
-
-```
-sc mem roadmap project <feature_id> <shortname>   # 'none' to clear
+```text
+sc mem roadmap status <feature_id> in_progress
 ```
 
-Stream obvious -> assign; ambiguous -> surface to the FnB; already assigned
--> no-op. Full create/assess procedure (new streams, new features) = the
-`docs` skill; this is only the engage-time confirmation.
+Confirm `roadmap.project_id`. Assign the obvious stream; ask FnB if ambiguous;
+leave an existing assignment unchanged:
 
-### Write the task plan
-
-Analysis clear + blockers resolved or accepted -> generate the task list.
-Always this shape:
-
-| seq | title | role |
-|---|---|---|
-| 0 | Preparation | Always first — read code paths, verify DB state, confirm entry points |
-| 1..N | `<impl step title>` | As many as the scope needs; each independently verifiable |
-| N+1 | Verification | Always last — run tests, smoke-test against done-condition, check the build against the spec's Anticipated User Activity section, snapshot + render |
-
-Add one task per seq with `sc mem task add` — each write is live in the
-shared DB immediately:
-
-```
-sc mem task add "Preparation"  --feature <id> --doc <doc_id> --seq 0 --desc "Read code paths, verify DB state, confirm entry points"
-sc mem task add "<Step 1>"     --feature <id> --doc <doc_id> --seq 1 --desc "<what it does>"
-sc mem task add "<Step N>"     --feature <id> --doc <doc_id> --seq <N> --desc "<what it does>"
-sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <N+1> --desc "Run tests, smoke-test every In Scope promise and done-condition, check the build against Anticipated User Activity assurance, snapshot + render"
+```text
+sc mem roadmap project <feature_id> <shortname>
 ```
 
-Then set `current_state` — nothing done yet, next = Preparation:
+Create exactly: Preparation, independently verifiable implementation steps,
+then Verification. Each write is immediately durable:
 
+```text
+sc mem task add "Preparation" --feature <id> --doc <doc_id> --seq 0 \
+  --desc "Read code paths, verify DB state, confirm entry points"
+sc mem task add "<step>" --feature <id> --doc <doc_id> --seq <n> \
+  --desc "<independently verifiable outcome>"
+sc mem task add "Verification" --feature <id> --doc <doc_id> --seq <last> \
+  --desc "Test every scope promise, done-condition, audience assurance, snapshot, and render"
+sc mem state "[<feature>] — last: —. next: Preparation."
 ```
-sc mem state "[<feature_title>] — last: —. next: Preparation."
-```
 
----
+No task plan = no implementation.
 
-## Step 4: Track session by session
+## 4. Execute one task at a time
 
-**Agents overlay:** this shell granted `agents` + FnB invoked `--agents` ->
-that skill's overlay replaces this step's one-task-at-a-time loop with
-adjudicated waves. Load it and apply it on top of this step.
+When FnB explicitly invoked `--agents`, load `agents`; its adjudicated waves
+overlay this loop. Otherwise:
 
-At each work session's start, load the plan:
-
-```
+```text
 sc mem get tasks --doc <doc_id>
-```
-
-Find the first `pending` task -> mark it in progress:
-
-```
 sc mem task start <task_id>
-```
-
-Work ONLY that task. When done:
-
-```
+# work and verify only this task
 sc mem task done <task_id>
 ```
 
-A planned task overtaken by a feature split or re-scope (its work moved to
-another feature/spec, never built here) is cancelled, not done:
+After completion, re-read the ledger. Set `current_state` to the highest done
+task + lowest pending task. Start the next only after the current task is
+verified and durably done. Work moved to another feature/spec is cancelled,
+never marked done or left pending under a shipped feature:
 
-```
+```text
 sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"
+sc mem state "[<feature>] — last: <last_done>. next: <next_up>."
 ```
 
-NEVER mark unbuilt work `done` and NEVER leave it `pending` under a shipped
-feature — the task ledger is how a planner answers "is this feature actually
-finished."
+The final Verification task runs focused/full gates, every In Scope
+done-condition, and the Anticipated User Activity contract. Unexpected reach,
+weakened hardening, or crossed tenancy is a failure. A large spec may stop
+after a verified task slice; leave later tasks pending and state the next one.
 
-Re-read the plan (`sc mem get tasks --doc <doc_id>`) and resolve from it:
-`last_done` = highest-`seq` `done` task; `next_up` = lowest-`seq` `pending`.
-Advance `current_state`:
+## 5. Ship and hand docs to Planner
 
+All tasks done + Verification green -> deliver:
+
+1. `sc mem roadmap status <feature_id> shipped`
+2. Open one Medium docs-pending feature flag.
+3. Message the planner: read shipped code, freeze the spec, write a `kind=doc`
+   document under the feature, then close the flag. Confirm the durable message.
+4. Tell FnB that code shipped and Planner owns freeze + docs. No planner shell ->
+   message nobody; tell FnB and leave the flag open.
+
+```text
+sc mem flag open "[Docs] <feature> shipped, doc pending | Blocker for: <feature> doc" \
+  --name SC-### --priority Medium --feature <feature_id>
 ```
-sc mem state "[<feature_title>] — last: <last_done>. next: <next_up>."
-```
 
-`next_up` NULL = all tasks done -> set current_state to reflect that.
+Do not freeze or author the shipped doc as Developer.
 
----
+## Scope change and stop rules
 
-## Step 5: Hand off on completion
+Small growth within the same intent -> revise the unfrozen spec with `docs`, add
+tasks, continue. A separate mental model -> stop and recommend a new feature +
+spec; never absorb it silently.
 
-Verification task passes (`next_up` NULL — the existing done-line) = feature
-delivered. As the dev: flip the horizon + hand the paperwork to the planner.
-Do NOT freeze the spec or write the doc — that's the planner (`docs` skill).
-
-1. **Flip the horizon to shipped:**
-   ```
-   sc mem roadmap status <feature_id> shipped
-   ```
-2. **Open a docs-pending flag + message the planner with full instructions.**
-   `shipped` + an open flag = the honest interim state; the message carries
-   everything the planner needs without digging:
-   ```
-   sc mem flag open "[Docs] <feature> shipped, doc pending | Blocker for: <feature> doc" --name SC-### --priority Medium --feature <feature_id>
-   sc mem message send <planner-shortname> "**[Docs pending] <feature_title> (feature <feature_id>)**
-
-   Spec <doc_id> shipped. Flag SC-### is open — your action required:
-
-   1. **Read the shipped code first.** Write the doc from what actually shipped, not from the spec. Drift happens and decisions get made in production — the spec captures the intent, the code is the truth.
-   2. Freeze the spec: \`sc mem doc freeze <doc_id>\`
-   3. Write the doc (\`kind='doc'\`) under feature <feature_id> (see the \`docs\` skill).
-   4. Close flag SC-### when the doc is live."
-   ```
-3. **Surface to the FnB:** "shipped; the planner needs to freeze the spec +
-   write the doc." The planner closes the flag when the doc lands.
-
-No planner-flavor shell in this fork -> message nobody; surface to the FnB
-directly and leave the docs-pending flag open for whoever picks up docs.
-
----
-
-## Watch for creep while you build
-
-Mid-build, the work crosses the spec's In Scope / Out of Scope boundary:
-
-- **Small growth** (same mental model, a few more tasks) -> the unfrozen spec
-  is living; edit it (`sc mem doc edit`) and carry on. No ceremony.
-- **A separate coherent intent** (a new mental-model boundary — the
-  granularity test in the `docs` skill) -> do NOT quietly absorb it.
-  Recommend a **new spec** to the FnB, authored by the planner against its
-  own feature. Significant creep = planning event, not dev improvisation.
-
----
-
-## Stance
-
-- **Analyze before acting.** Analysis finds the gap between what the spec
-  says and what the code does.
-- **One task at a time.** Start task N+1 only after task N is verified +
-  marked done.
-- **Verification is not optional.** It is the last task; skipping it makes
-  "done" meaningless.
-- **Scope and Anticipated User Activity are intent.** Verification checks every
-  In Scope promise and the audience/assurance contract — an Out of Scope
-  capability, reach beyond the stated roles, weakened hardening obligation, or
-  data crossing a tenancy line is a finding, not a nuance.
-- **Spec too large for one session** -> scope a slice at Preparation: cover
-  steps 1–K verifiable now, leave K+1–N pending. NEVER start work that can't
-  be verified before the session ends.
-- **current_state always reflects the plan.** Update after every task
-  completion — last done + next up. The next session resumes from it without
-  reading the full task list first.
-- **The stage tracks reality — spec'd work only.** Engaging a spec ->
-  `in_progress`; finishing -> `shipped`; already matching -> no-op, don't
-  churn. Work with no spec (quick UI tweaks, minor migrations) is exempt
-  entirely: no promotion, no handoff, no creep check. Stage discipline never
-  blocks small things.
+Stop for unresolved ambiguity/blocker, at the end of a verified session slice,
+or after the shipped/docs handoff. `current_state` must always point to the
+durable plan rather than reproduce its rationale.
