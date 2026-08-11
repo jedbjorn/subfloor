@@ -505,10 +505,13 @@ class CodexAdapter(ConversationAdapter):
             "thread/tokenUsage/updated",
             "turn/tokenUsage/updated",
         }:
+            token_usage = params.get("tokenUsage")
+            last = token_usage.get("last") if isinstance(token_usage, dict) else None
+            source = last if isinstance(last, dict) else params
             usage = {
                 key: value
-                for key, value in params.items()
-                if isinstance(value, (int, float))
+                for key, value in source.items()
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
             }
             return [
                 NormalizedEvent("usage", {"tokens": usage}, method)

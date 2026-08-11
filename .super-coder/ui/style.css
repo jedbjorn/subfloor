@@ -468,6 +468,10 @@ body.interface-view main {
 .chat-bubble .md > :first-child { margin-top: 0; }
 .chat-bubble .md > :last-child { margin-bottom: 0; }
 .chat-meta { color: var(--dim); font-size: .64rem; margin-top: .35rem; }
+.chat-context-tokens {
+  color: var(--dim); font-size: .64rem; margin-top: .35rem; text-align: right;
+  font-variant-numeric: tabular-nums;
+}
 .chat-retry {
   margin-top: .4rem; background: transparent; color: var(--accent);
   border: 0; padding: 0; cursor: pointer; font: inherit; font-size: .72rem;

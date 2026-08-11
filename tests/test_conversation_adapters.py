@@ -624,6 +624,24 @@ class FakeCodexRpc:
                     },
                 },
                 {
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "threadId": self.session_ref,
+                        "turnId": self.run_ref,
+                        "tokenUsage": {
+                            "last": {
+                                "inputTokens": 12000,
+                                "cachedInputTokens": 9000,
+                                "outputTokens": 345,
+                                "reasoningOutputTokens": 200,
+                                "totalTokens": 12345,
+                            },
+                            "total": {"totalTokens": 98765},
+                            "modelContextWindow": 258400,
+                        },
+                    },
+                },
+                {
                     "method": "turn/completed",
                     "params": {
                         "threadId": self.session_ref,
@@ -2233,6 +2251,20 @@ class ConversationAdapterTest(unittest.TestCase):
             "permission.requested",
             [event.type for event in events],
         )
+        usage = next(event for event in events if event.type == "usage")
+        self.assertEqual(
+            usage.payload,
+            {
+                "tokens": {
+                    "inputTokens": 12000,
+                    "cachedInputTokens": 9000,
+                    "outputTokens": 345,
+                    "reasoningOutputTokens": 200,
+                    "totalTokens": 12345,
+                }
+            },
+        )
+        self.assertNotIn("98765", repr(usage.payload))
         resumed = adapter.resume(turn.session_ref, self.context, "again")
         self.assertIn("thread/resume", [method for method, _ in rpc.requests])
         rpc.read_status = "inProgress"
