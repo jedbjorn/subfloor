@@ -93,9 +93,61 @@ class FreshForkInstallTest(unittest.TestCase):
         )
         return repo, home
 
+    def configure_dispatch_host(self, repo: Path, kernel: str, release: Path) -> None:
+        # Only this disposable dispatcher copy receives a deterministic host.
+        dispatch = repo / ".super-coder" / "scripts" / "dispatch.sh"
+        source = dispatch.read_text()
+        kernel_probe = 'SC_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"'
+        release_probe = "_platform_release=/etc/os-release"
+        self.assertIn(kernel_probe, source)
+        self.assertIn(release_probe, source)
+        dispatch.write_text(
+            source.replace(
+                kernel_probe, f"SC_PLATFORM_KERNEL={kernel!r}"
+            ).replace(release_probe, f"_platform_release={str(release)!r}")
+        )
+
+    def run_direct_host(
+        self,
+        repo: Path,
+        home: Path,
+        kernel: str,
+        release: Path,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        # The subprocess patches host probes before executing the unmodified installer.
+        install = repo / ".super-coder" / "scripts" / "install.py"
+        direct_entry = (
+            "import builtins\n"
+            "import platform\n"
+            "import runpy\n"
+            "import sys\n"
+            "original_open = builtins.open\n"
+            f"release = {str(release)!r}\n"
+            f"platform.system = lambda: {kernel!r}\n"
+            "def host_open(path, *args, **kwargs):\n"
+            "    if path == '/etc/os-release':\n"
+            "        return original_open(release, *args, **kwargs)\n"
+            "    return original_open(path, *args, **kwargs)\n"
+            "builtins.open = host_open\n"
+            f"sys.argv = [{str(install)!r}, '--harness-epoch']\n"
+            f"runpy.run_path({str(install)!r}, run_name='__main__')\n"
+        )
+        return subprocess.run(
+            [sys.executable, "-c", direct_entry],
+            cwd=repo,
+            env={
+                **os.environ,
+                "HOME": str(home),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                **(extra_env or {}),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
     def run_install(self, repo: Path, home: Path) -> subprocess.CompletedProcess[str]:
-        release = home / "os-release"
-        release.write_text("ID=ubuntu\nVERSION_ID=24.04\n")
         return subprocess.run(
             [
                 sys.executable,
@@ -110,8 +162,6 @@ class FreshForkInstallTest(unittest.TestCase):
                 "HOME": str(home),
                 "XDG_STATE_HOME": str(home / ".local/state"),
                 "NO_COLOR": "1",
-                "SC_PLATFORM_UNAME": "Linux",
-                "SC_PLATFORM_OS_RELEASE": str(release),
             },
             capture_output=True,
             text=True,
@@ -161,8 +211,6 @@ class FreshForkInstallTest(unittest.TestCase):
                 check=True,
             ).stdout
             install = repo / ".super-coder" / "scripts" / "install.py"
-            release = home / "os-release"
-            release.write_text("ID=ubuntu\nVERSION_ID=24.04\n")
             direct_entry = (
                 "import platform, runpy, sys; "
                 "sys.version_info = (3, 8, 20); "
@@ -179,8 +227,6 @@ class FreshForkInstallTest(unittest.TestCase):
                     "HOME": str(home),
                     "NO_COLOR": "1",
                     "PYTHONDONTWRITEBYTECODE": "1",
-                    "SC_PLATFORM_UNAME": "Linux",
-                    "SC_PLATFORM_OS_RELEASE": str(release),
                 },
                 capture_output=True,
                 text=True,
@@ -221,26 +267,10 @@ class FreshForkInstallTest(unittest.TestCase):
                 release = Path(raw) / "os-release"
                 if contents is not None:
                     release.write_text(contents)
+                self.configure_dispatch_host(repo, kernel, release)
                 before_repo = self.snapshot_tree(repo)
                 before_home = self.snapshot_tree(home)
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        str(repo / ".super-coder/scripts/install.py"),
-                        "--harness-epoch",
-                    ],
-                    cwd=repo,
-                    env={
-                        **os.environ,
-                        "HOME": str(home),
-                        "SC_PLATFORM_UNAME": kernel,
-                        "SC_PLATFORM_OS_RELEASE": str(release),
-                        "PYTHONDONTWRITEBYTECODE": "1",
-                    },
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
+                result = self.run_direct_host(repo, home, kernel, release)
                 if accepted:
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout.strip(), "0")
@@ -259,8 +289,6 @@ class FreshForkInstallTest(unittest.TestCase):
                             "HOME": str(home),
                             "SC_CALLER_ROOT": str(repo),
                             "SC_PYTHON": sys.executable,
-                            "SC_PLATFORM_UNAME": kernel,
-                            "SC_PLATFORM_OS_RELEASE": str(release),
                             "PYTHONDONTWRITEBYTECODE": "1",
                         },
                         capture_output=True,
@@ -273,11 +301,36 @@ class FreshForkInstallTest(unittest.TestCase):
                         repo, home, before_repo, before_home
                     )
 
+    def test_direct_installer_ignores_platform_environment_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo, home = self.prepare_repo(raw)
+            release = Path(raw) / "os-release"
+            release.write_text("ID=ubuntu\nVERSION_ID=24.04\n")
+            before_repo = self.snapshot_tree(repo)
+            before_home = self.snapshot_tree(home)
+
+            result = self.run_direct_host(
+                repo,
+                home,
+                "Darwin",
+                release,
+                {
+                    "SC_PLATFORM_UNAME": "Linux",
+                    "SC_PLATFORM_OS_RELEASE": str(release),
+                },
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("detected kernel: Darwin", result.stderr)
+            self.assert_direct_refusal_is_pristine(
+                repo, home, before_repo, before_home
+            )
+
     def test_direct_installer_refuses_unreadable_os_release_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repo, home = self.prepare_repo(raw)
             release = Path(raw) / "invalid-os-release"
-            release.write_bytes(b"\xff\n")
+            release.write_bytes(b"ID=ubuntu\nVERSION_ID=24.04\nBROKEN=\xff\n")
             sentinel = home / "python-sentinel"
             sentinel.write_text(
                 "#!/bin/sh\n"
@@ -285,6 +338,7 @@ class FreshForkInstallTest(unittest.TestCase):
                 "exit 99\n"
             )
             sentinel.chmod(sentinel.stat().st_mode | 0o100)
+            self.configure_dispatch_host(repo, "Linux", release)
             before_repo = self.snapshot_tree(repo)
             before_home = self.snapshot_tree(home)
             shell = subprocess.run(
@@ -295,32 +349,13 @@ class FreshForkInstallTest(unittest.TestCase):
                     "HOME": str(home),
                     "SC_CALLER_ROOT": str(repo),
                     "SC_PYTHON": str(sentinel),
-                    "SC_PLATFORM_UNAME": "Linux",
-                    "SC_PLATFORM_OS_RELEASE": str(release),
                     "PYTHONDONTWRITEBYTECODE": "1",
                 },
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(repo / ".super-coder/scripts/install.py"),
-                    "--harness-epoch",
-                ],
-                cwd=repo,
-                env={
-                    **os.environ,
-                    "HOME": str(home),
-                    "SC_PLATFORM_UNAME": "Linux",
-                    "SC_PLATFORM_OS_RELEASE": str(release),
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            result = self.run_direct_host(repo, home, "Linux", release)
             self.assertEqual(shell.returncode, 1)
             self.assertEqual(result.returncode, 1)
             self.assertEqual(shell.stderr, result.stderr)

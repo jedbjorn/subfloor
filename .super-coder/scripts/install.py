@@ -53,12 +53,8 @@ IS_MAC = platform.system() == "Darwin"  # guidance arms differ (colima/brew vs s
 
 def _platform_identity() -> tuple[str, str, str, str]:
     """Return the kernel and os-release identity without guessing a distro."""
-    kernel = (
-        os.environ["SC_PLATFORM_UNAME"]
-        if "SC_PLATFORM_UNAME" in os.environ
-        else platform.system()
-    )
-    release = os.environ.get("SC_PLATFORM_OS_RELEASE", "/etc/os-release")
+    kernel = platform.system()
+    release = "/etc/os-release"
     fields: dict[str, str] = {}
     try:
         with open(release, encoding="utf-8") as stream:

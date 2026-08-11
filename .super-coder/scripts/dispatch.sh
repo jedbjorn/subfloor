@@ -65,20 +65,12 @@ sc_platform_unquote() {
 }
 
 sc_platform_detect() {
-  if [ -n "${SC_PLATFORM_UNAME+x}" ]; then
-    SC_PLATFORM_KERNEL="$SC_PLATFORM_UNAME"
-  else
-    SC_PLATFORM_KERNEL="$(uname -s 2>/dev/null || true)"
-  fi
-  if [ -n "${SC_PLATFORM_OS_RELEASE+x}" ]; then
-    _platform_release="$SC_PLATFORM_OS_RELEASE"
-  else
-    _platform_release=/etc/os-release
-  fi
+  SC_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"
+  _platform_release=/etc/os-release
   SC_PLATFORM_ID=""
   SC_PLATFORM_ID_LIKE=""
   SC_PLATFORM_VERSION_ID=""
-  if [ -r "$_platform_release" ]; then
+  if [ -r "$_platform_release" ] && command -p iconv -f UTF-8 -t UTF-8 "$_platform_release" >/dev/null 2>&1; then
     while IFS='=' read -r _platform_key _platform_value || [ -n "$_platform_key" ]; do
       case "$_platform_key" in
         ID) SC_PLATFORM_ID="$(sc_platform_unquote "$_platform_value")" ;;

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -30,7 +31,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.root = Path(self.temporary.name)
         scripts = self.root / ".super-coder" / "scripts"
         scripts.mkdir(parents=True)
-        shutil.copy2(ENGINE / "scripts" / "dispatch.sh", scripts / "dispatch.sh")
+        self.dispatch_source = (ENGINE / "scripts" / "dispatch.sh").read_text()
         (scripts / "install.py").write_text(
             "from pathlib import Path\n"
             "Path(__file__).with_name('install-ran').write_text('yes')\n"
@@ -38,23 +39,33 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.dispatch = scripts / "dispatch.sh"
         self.supported_release = self.root / "os-release"
         self.supported_release.write_text("ID=ubuntu\nVERSION_ID=24.04\n")
+        self.configure_host("Linux", self.supported_release)
+
+    def configure_host(self, kernel: str, os_release: Path) -> None:
+        # Only this disposable dispatcher copy receives a deterministic host.
+        kernel_probe = 'SC_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"'
+        release_probe = "_platform_release=/etc/os-release"
+        self.assertIn(kernel_probe, self.dispatch_source)
+        self.assertIn(release_probe, self.dispatch_source)
+        self.dispatch.write_text(
+            self.dispatch_source.replace(
+                kernel_probe, f"SC_PLATFORM_KERNEL={shlex.quote(kernel)}"
+            ).replace(release_probe, f"_platform_release={shlex.quote(str(os_release))}")
+        )
 
     def invoke(
         self,
         python: str,
         *argv: str,
-        kernel: str | None = None,
-        os_release: Path | None = None,
         extra_env: dict[str, str] | None = None,
+        bare: bool = False,
     ) -> subprocess.CompletedProcess[str]:
-        command = argv or ("install",)
+        command = argv if bare else (argv or ("install",))
         environment = {
             **os.environ,
             "SC_CALLER_ROOT": str(self.root),
             "SC_PYTHON": python,
             "NO_COLOR": "1",
-            "SC_PLATFORM_UNAME": kernel or "Linux",
-            "SC_PLATFORM_OS_RELEASE": str(os_release or self.supported_release),
         }
         if extra_env:
             environment.update(extra_env)
@@ -119,12 +130,8 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         for name, contents in fixtures.items():
             with self.subTest(name=name):
                 release = self.os_release(name, contents)
-                completed = self.invoke(
-                    sys.executable,
-                    "install",
-                    kernel="Linux",
-                    os_release=release,
-                )
+                self.configure_host("Linux", release)
+                completed = self.invoke(sys.executable, "install")
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertEqual(
                     (self.root / ".super-coder/scripts/install-ran").read_text(),
@@ -141,9 +148,8 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         for name, contents in fixtures.items():
             with self.subTest(name=name):
                 release = self.os_release(name, contents)
-                completed = self.invoke(
-                    str(python), "install", kernel="Linux", os_release=release
-                )
+                self.configure_host("Linux", release)
+                completed = self.invoke(str(python), "install")
                 self.assertEqual(completed.returncode, 1)
                 self.assertIn("supported Linux VM", completed.stderr)
                 self.assertIn(
@@ -173,18 +179,13 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
             "exit 99\n"
         )
         docker.chmod(docker.stat().st_mode | stat.S_IXUSR)
+        self.configure_host("Linux", release)
         before = self.snapshot_tree(self.root)
         sentinels = {
             "PATH": f"{self.root}:{os.environ['PATH']}",
         }
-        first = self.invoke(
-            str(python), "install", kernel="Linux", os_release=release,
-            extra_env=sentinels,
-        )
-        second = self.invoke(
-            str(python), "install", kernel="Linux", os_release=release,
-            extra_env=sentinels,
-        )
+        first = self.invoke(str(python), "install", extra_env=sentinels)
+        second = self.invoke(str(python), "install", extra_env=sentinels)
         expected = (
             "✗ subfloor refused: unsupported host.\n"
             "  detected kernel: Linux\n"
@@ -202,25 +203,20 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
         self.assertEqual(self.snapshot_tree(self.root), before)
 
-    def test_unreadable_os_release_uses_the_stable_refusal(self) -> None:
+    def test_corrupt_os_release_refuses_before_python_probe(self) -> None:
         release = self.root / "invalid-os-release"
-        release.write_bytes(b"\xff\n")
+        release.write_bytes(b"ID=ubuntu\nVERSION_ID=24.04\nBROKEN=\xff\n")
         python = self.sentinel_python()
-        completed = self.invoke(
-            str(python), "install", kernel="Linux", os_release=release
-        )
+        self.configure_host("Linux", release)
+        completed = self.invoke(str(python), "install")
         self.assertEqual(completed.returncode, 1)
         self.assertIn("ID=unknown; ID_LIKE=unknown", completed.stderr)
         self.assertFalse((self.root / "python-ran").exists())
 
     def test_missing_os_release_refuses_before_the_python_probe(self) -> None:
         python = self.sentinel_python()
-        completed = self.invoke(
-            str(python),
-            "install",
-            kernel="Linux",
-            os_release=self.root / "missing-os-release",
-        )
+        self.configure_host("Linux", self.root / "missing-os-release")
+        completed = self.invoke(str(python), "install")
         self.assertEqual(completed.returncode, 1)
         self.assertIn("ID=unknown; ID_LIKE=unknown", completed.stderr)
         self.assertFalse((self.root / "python-ran").exists())
@@ -228,22 +224,22 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
     def test_help_stays_readable_but_doctor_and_make_delegate_to_the_gate(self) -> None:
         release = self.os_release("darwin", "ID=macos\n")
         python = self.sentinel_python()
-        help_result = self.invoke(
-            str(python), "help", kernel="Darwin", os_release=release
-        )
-        self.assertEqual(help_result.returncode, 0, help_result.stderr)
-        self.assertIn("super-coder", help_result.stdout)
+        self.configure_host("Darwin", release)
+        for command in ((), ("help",), ("-h",), ("--help",)):
+            with self.subTest(command=command or ("bare",)):
+                help_result = self.invoke(
+                    str(python), *command, bare=not command
+                )
+                self.assertEqual(help_result.returncode, 0, help_result.stderr)
+                self.assertIn("super-coder", help_result.stdout)
 
-        doctor = self.invoke(
-            str(python), "doctor", kernel="Darwin", os_release=release
-        )
+        doctor = self.invoke(str(python), "doctor")
         self.assertEqual(doctor.returncode, 1)
         self.assertIn("Create a supported Linux VM", doctor.stderr)
         self.assertFalse((self.root / "python-ran").exists())
 
-        windows = self.invoke(
-            str(python), "install", kernel="MINGW64_NT", os_release=release
-        )
+        self.configure_host("MINGW64_NT", release)
+        windows = self.invoke(str(python), "install")
         self.assertEqual(windows.returncode, 1)
         self.assertIn("detected kernel: MINGW64_NT", windows.stderr)
         self.assertFalse((self.root / "python-ran").exists())
@@ -251,13 +247,12 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         (self.root / "Makefile").write_text(
             "dos-l:\n\tsh .super-coder/scripts/dispatch.sh install\n"
         )
+        self.configure_host("Darwin", release)
         make_result = subprocess.run(
             ["make", "dos-l"],
             cwd=self.root,
             env={
                 **os.environ,
-                "SC_PLATFORM_UNAME": "Darwin",
-                "SC_PLATFORM_OS_RELEASE": str(release),
                 "SC_PYTHON": str(python),
             },
             text=True,
@@ -267,6 +262,25 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertNotEqual(make_result.returncode, 0)
         self.assertIn("no native compatibility path exists", make_result.stderr)
         self.assertFalse((self.root / "python-ran").exists())
+
+    def test_platform_environment_cannot_override_test_host(self) -> None:
+        release = self.os_release("ubuntu", "ID=ubuntu\nVERSION_ID=24.04\n")
+        python = self.sentinel_python()
+        self.configure_host("Darwin", release)
+
+        completed = self.invoke(
+            str(python),
+            "install",
+            extra_env={
+                "SC_PLATFORM_UNAME": "Linux",
+                "SC_PLATFORM_OS_RELEASE": str(release),
+            },
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("detected kernel: Darwin", completed.stderr)
+        self.assertFalse((self.root / "python-ran").exists())
+        self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
 
     def test_missing_explicit_interpreter_stops_before_target(self) -> None:
         selected = str(self.root / "missing-python")
