@@ -33,16 +33,12 @@ CHAT_CLEANUP_SKILLS = {"sprint_close", "sprint_pln", "sprint_rev"}
 PROGRESS_CARRIER_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
 LIVE_REPLAN_ROLE_SKILLS = {"sprint_pln", "sprint_rev"}
 
-ARTIFACT_PATH_RULE = """## Sprint artifact paths
-
-Sprint working artifacts (per-unit review notes, raw diffs, evidence packets,
-report drafts, and Dev scratch proof) go to the gitignored
-`shared/sprints/sprint-<n>/` directory. They are never committed, branched, or
-PR'd in the work repo; a review-notes commit is a finding.
-
-DB rows stay the durable record: judgments via `record-review`, report bodies in
-`sprint_reports`, and decisions in the durable relay. Files in the Sprint
-artifact directory are working material only."""
+SPEC_SKILL = ENGINE / "assets" / "skills" / "spec" / "SKILL.md"
+CONTEXT_EFFICIENT_SKILLS = ("sprint_dev", "sprint_rev", "sprint_pln", "spec")
+CONTEXT_EFFICIENT_SKILL_BYTE_CEILING = 44_361
+CONTEXT_EFFICIENT_RESEED = (
+    ENGINE / "migrations" / "0202_reseed_context_efficient_skills.sql"
+)
 
 
 class SprintSkillTest(unittest.TestCase):
@@ -88,6 +84,55 @@ class SprintSkillTest(unittest.TestCase):
                     )
                 ]
                 self.assertEqual([flavor], grants)
+
+    def test_context_efficient_terminal_reseed_is_exact_and_idempotent(self):
+        with sqlite3.connect(":memory:") as con:
+            con.executescript(
+                "CREATE TABLE skills ("
+                "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
+                "category TEXT, command TEXT, common INTEGER, content TEXT, "
+                "is_deleted INTEGER DEFAULT 0);"
+            )
+            for index, name in enumerate(CONTEXT_EFFICIENT_SKILLS, 1):
+                con.execute(
+                    "INSERT INTO skills VALUES (?,?,?,?,?,?,?,1)",
+                    (index, name, "stale", "stale", "stale", 1, "stale"),
+                )
+            con.execute(
+                "INSERT INTO skills VALUES (99,'fork_only','local','fork',NULL,0,"
+                "'bespoke body',0)"
+            )
+
+            migration = CONTEXT_EFFICIENT_RESEED.read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for name in CONTEXT_EFFICIENT_SKILLS:
+                parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                actual = con.execute(
+                    "SELECT description,category,command,common,content,is_deleted "
+                    "FROM skills WHERE name=?",
+                    (name,),
+                ).fetchone()
+                self.assertEqual(
+                    tuple(actual),
+                    (
+                        parsed["description"],
+                        parsed["category"],
+                        parsed["command"],
+                        parsed["common"],
+                        parsed["content"],
+                        0,
+                    ),
+                )
+            local = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='fork_only'"
+            ).fetchone()
+            self.assertEqual(
+                tuple(local),
+                ("local", "fork", None, 0, "bespoke body", 0),
+            )
 
     def test_handoff_migration_converges_a_drifted_existing_skill_body(self):
         con = sqlite3.connect(":memory:")
@@ -757,6 +802,11 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0198_reseed_engine_authored_review_handoff.sql":
+                    con.executescript(later_migration.read_text())
 
             parsed = seed_skills.parse_skill(ASSETS / "sprint_dev" / "SKILL.md")
             row = con.execute(
@@ -803,6 +853,11 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if later_migration.name > "0200_reseed_sprint_live_replanning.sql":
+                    con.executescript(later_migration.read_text())
 
             for name in sorted(LIVE_REPLAN_ROLE_SKILLS):
                 with self.subTest(name=name):
@@ -970,15 +1025,21 @@ class SprintSkillTest(unittest.TestCase):
             planner,
         )
 
-    def test_closeout_role_skills_share_the_exact_artifact_path_rule(self):
+    def test_closeout_role_skills_keep_artifacts_local_and_db_records_durable(self):
         for name in sorted(CLOSEOUT_ROLE_SKILLS):
             with self.subTest(name=name):
                 body = (ASSETS / name / "SKILL.md").read_text()
-                self.assertEqual(body.count(ARTIFACT_PATH_RULE), 1)
+                normalized = " ".join(body.split())
+                self.assertGreaterEqual(body.count("shared/sprints/sprint-<n>/"), 1)
+                self.assertIn("gitignored", normalized)
+                self.assertRegex(normalized, r"[Nn]ever commit|never committed")
+                self.assertIn("durable", normalized)
+                self.assertIn("record-review", normalized)
+                self.assertIn("sprint_reports", normalized)
+                self.assertIn("relay", normalized)
 
     def test_close_skill_routes_to_owning_roles_and_keeps_fallback_bounded(self):
         close = (ASSETS / "sprint_close" / "SKILL.md").read_text()
-        normalized = " ".join(close.split())
         self.assertIn("## Route the entry", close)
         self.assertIn("Load `sprint_rev`", close)
         self.assertIn("Load `sprint_pln`", close)
@@ -1328,9 +1389,12 @@ class SprintSkillTest(unittest.TestCase):
             self.assertIn(guidance, reviewer)
 
     def test_reviewer_forbids_accepted_red_and_routes_failures(self):
-        reviewer = " ".join(
-            (ASSETS / "sprint_rev" / "SKILL.md").read_text().split()
-        )
+        body = (ASSETS / "sprint_rev" / "SKILL.md").read_text()
+        reviewer = " ".join(body.split())
+        red = reviewer[
+            reviewer.index("### Red-check doctrine"):
+            reviewer.index("Complete a unit verdict in this exact order")
+        ]
         for guidance in (
             "Accepted-red is not a legal review outcome",
             "A departure that leaves checks failing is never acceptable",
@@ -1338,13 +1402,11 @@ class SprintSkillTest(unittest.TestCase):
             "send the Planner a `replan` decision",
             "remains green-only, without exception or waiver",
             "do not note the failure and approve anyway",
-            "`Note it and pass anyway` is the acceptance-shaped anti-pattern",
-            "In the dos-arch incident",
-            "created a deadlock: the green-only handoff gate could never pass",
-            "Decision #93 records why this no-waiver rule exists",
         ):
             with self.subTest(guidance=guidance):
-                self.assertIn(guidance, reviewer)
+                self.assertIn(guidance, red)
+        self.assertLess(red.index("In-scope failure"), red.index("Out-of-scope failure"))
+        self.assertNotIn("approve anyway", red.split("do not note", 1)[0].lower())
 
     def test_every_affected_file_argument_names_the_hard_ceiling(self):
         parser = sprint_cli.build_parser()
@@ -1475,6 +1537,128 @@ class SprintSkillTest(unittest.TestCase):
             (ASSETS / "sprint_pln" / "SKILL.md").read_text().split()
         )
         self.assertIn("do not run the Sprint inbox, accept it", planner)
+
+    def test_compact_developer_and_spec_keep_every_stateful_route(self):
+        developer = (ASSETS / "sprint_dev" / "SKILL.md").read_text()
+        developer_sections = [
+            "## Route the entry",
+            "## Bound the lane",
+            "## Build and verify",
+            "## Report-only or no-code completion",
+            "## Register and observe the PR",
+            "## Review handoff and correction",
+            "## Merge boundary",
+            "## Post-merge handoff",
+            "## Report and stop",
+        ]
+        positions = [developer.index(section) for section in developer_sections]
+        self.assertEqual(positions, sorted(positions))
+        for command in (
+            "sc sprint complete-unit",
+            "sc sprint register-pr",
+            "sc sprint watcher-state",
+            "sc sprint request-review",
+            "sc sprint authorize-merge",
+            "--intent handoff --key <stable-merged-handoff-key>",
+        ):
+            self.assertEqual(developer.count(command), 1)
+        self.assertIn("created: false", developer)
+        self.assertIn("--intent <submit|resubmit>", developer)
+        self.assertNotIn("sc sprint pause --sprint <id>", developer)
+
+        spec = SPEC_SKILL.read_text()
+        spec_sections = [
+            "## 1. Select the spec",
+            "## 2. Analyze before planning",
+            "## 3. Engage and plan",
+            "## 4. Execute one task at a time",
+            "## 5. Ship and hand docs to Planner",
+            "## Scope change and stop rules",
+        ]
+        positions = [spec.index(section) for section in spec_sections]
+        self.assertEqual(positions, sorted(positions))
+        for command in (
+            "sc mem get documents --feature <id>",
+            "sc mem get documents --doc <doc_id>",
+            "sc mem get tasks --doc <doc_id>",
+            "sc mem task add \"Preparation\"",
+            "sc mem task add \"Verification\"",
+            "sc mem task start <task_id>",
+            "sc mem task done <task_id>",
+            "sc mem task cancel <task_id>",
+            "sc mem roadmap status <feature_id> shipped",
+        ):
+            self.assertIn(command, spec)
+        normalized = " ".join(spec.split())
+        for invariant in (
+            "Current Posture",
+            "In Scope",
+            "Out of Scope",
+            "Anticipated User Activity",
+            "tenancy",
+            "No task plan = no implementation",
+            "Do not freeze or author the shipped doc as Developer",
+        ):
+            self.assertIn(invariant, normalized)
+        self.assertLess(spec.index("sc mem task start"), spec.index("sc mem task done"))
+        self.assertNotIn("sc mem doc freeze", spec)
+
+    def test_compact_planner_keeps_control_and_replan_routes(self):
+        planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()
+        sections = [
+            "## Route the entry",
+            "## Durable running loop",
+            "## Relay contract",
+            "## Reviewer decisions and Planner actions",
+            "### Pause or resume",
+            "### Modify, recall, repeat, reassign, or reroute",
+            "### Re-enter after conformance",
+            "### Conclude or abort",
+            "## Handoffs and stop",
+        ]
+        positions = [planner.index(section) for section in sections]
+        self.assertEqual(positions, sorted(positions))
+        for command in (
+            "sc sprint watcher-state --sprint <id>",
+            "sc sprint reconcile-pr",
+            "sc sprint cancel-unit",
+            "sc sprint replan-unit",
+            "sc sprint recall-unit",
+            "sc sprint reroute-participant",
+            "sc mem task add",
+            "sc sprint plan-unit",
+        ):
+            self.assertIn(command, planner)
+        recall_route = planner[
+            planner.index("Never edit a released lane in place"):
+            planner.index("Recall preserves message/event history")
+        ]
+        ordered = [
+            recall_route.index(command)
+            for command in (
+                "sc sprint pause",
+                "sc sprint recall-unit",
+                "sc sprint replan-unit",
+                "sc sprint resume",
+            )
+        ]
+        self.assertEqual(ordered, sorted(ordered))
+        self.assertNotIn("sc sprint monitor", planner)
+
+    def test_context_efficient_skills_meet_budget_without_auxiliary_resources(self):
+        paths = [ASSETS / name / "SKILL.md" for name in CONTEXT_EFFICIENT_SKILLS]
+        sizes = {path.parent.name: len(path.read_bytes()) for path in paths}
+
+        self.assertLessEqual(
+            sum(sizes.values()),
+            CONTEXT_EFFICIENT_SKILL_BYTE_CEILING,
+        )
+        for path in paths:
+            with self.subTest(skill=path.parent.name):
+                self.assertEqual(
+                    sorted(item.name for item in path.parent.iterdir()),
+                    ["SKILL.md"],
+                )
 
     def test_role_handoffs_are_explicitly_ordered_and_message_last(self):
         developer = (ASSETS / "sprint_dev" / "SKILL.md").read_text()

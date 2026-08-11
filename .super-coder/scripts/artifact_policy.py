@@ -92,6 +92,12 @@ def review_patch_root() -> Path:
     return LOCAL_DIR / "review-patches"
 
 
+def devkit_log_root(repo_root: Path | None = None) -> Path:
+    """Ignored logs for fork-owned dev-kit verification hooks."""
+    local_dir = LOCAL_DIR if repo_root is None else repo_root / ".sc-state" / "local"
+    return local_dir / "devkit-logs"
+
+
 @contextmanager
 def content_write_lock():
     """Serialize snapshot + flat-render pairs across API and CLI processes."""

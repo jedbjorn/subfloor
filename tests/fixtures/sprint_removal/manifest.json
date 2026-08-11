@@ -97,7 +97,8 @@
     ".super-coder/migrations/0198_reseed_engine_authored_review_handoff.sql",
     ".super-coder/migrations/0199_sprint_live_replanning.sql",
     ".super-coder/migrations/0200_reseed_sprint_live_replanning.sql",
-    ".super-coder/migrations/0201_sprint_cleanup_targets.sql"
+    ".super-coder/migrations/0201_sprint_cleanup_targets.sql",
+    ".super-coder/migrations/0202_reseed_context_efficient_skills.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,

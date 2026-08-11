@@ -61,6 +61,15 @@ class ArtifactPolicyTest(unittest.TestCase):
         self.assertEqual(
             artifact_policy.render_root(), self.state / "local" / "renders"
         )
+        self.assertEqual(
+            artifact_policy.devkit_log_root(),
+            self.state / "local" / "devkit-logs",
+        )
+        other = self.tmp / "other-checkout"
+        self.assertEqual(
+            artifact_policy.devkit_log_root(other),
+            other / ".sc-state" / "local" / "devkit-logs",
+        )
 
     def test_instance_can_opt_into_local(self):
         self.write_json(artifact_policy.INSTANCE_CONFIG, {"artifact_mode": "local"})
