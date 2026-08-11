@@ -49,6 +49,7 @@ What that buys you in practice:
 
 > [!class4]
 > **The bar: Linux, Python 3.9+ with `sqlite3`, a reachable docker daemon, and one signed-in harness CLI on PATH.**
+> Set `SC_PYTHON=/absolute/path/to/python3` to select a specific interpreter.
 > Ubuntu LTS, stable Fedora, and Arch-compatible Linux (including CachyOS) are
 > tested examples, not an exclusive list.
 > On macOS or Windows, create a Linux VM and run this flow inside the guest.
