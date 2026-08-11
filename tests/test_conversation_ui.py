@@ -328,6 +328,8 @@ def test_transcript_installs_snapshot_then_coalesces_keyed_live_updates():
     assert "if (reconcilePromise" in keyed
     assert "`run:${runId}:assistant:${anchor}`" in keyed
     assert "assistant.text += event.payload?.text || \"\"" in keyed
+    assert 'type === "usage"' in keyed
+    assert "assistant.context_tokens = contextTokens" in keyed
     assert "transcriptState.throughSequence" in keyed
     assert "/events?after=${afterSequence}" in interface
     assert "/transcript`" in keyed
@@ -532,7 +534,7 @@ def test_message_bubbles_show_local_creation_time_and_omit_invalid_values():
         APP.index("function chatShellLabel")
     ]
     bubble = APP[
-        APP.index("function chatBubble"):
+        APP.index("function chatContextTokenLabel"):
         APP.index("function chatTranscriptAtBottom")
     ]
     script = r"""
@@ -540,14 +542,18 @@ process.env.TZ = "UTC";
 function el(tag, props = {}, ...children) {
   return {
     tag, ...props, children,
+    classList: { add() {} },
     append(...items) { this.children.push(...items); },
   };
 }
 function mdBlock(body) { return el("div", { className: "md" }, body); }
 function chatShellLabel() { return "Shell"; }
+const fmt = (value) => value.toLocaleString("en-US");
 """ + helper + bubble + r"""
 const createdAt = "2026-08-06T06:17:00+02:00";
 const user = chatBubble("user", "hello", "completed", null, createdAt);
+const userWithTokens = chatBubble("user", "hello", "", null, createdAt, 12345);
+const assistant = chatBubble("assistant", "hello", "", null, createdAt, 12345);
 const activity = chatBubble("activity", "working");
 console.log(JSON.stringify({
   valid: chatMessageTimeLabel(createdAt),
@@ -562,6 +568,12 @@ console.log(JSON.stringify({
     time: user.children[0].children[1].children[0],
   },
   activityHeaderItems: activity.children[0].children.length,
+  assistantToken: {
+    className: assistant.children.at(-1).className,
+    text: assistant.children.at(-1).children[0],
+  },
+  userHasToken: userWithTokens.children.some(
+    (child) => child.className === "chat-context-tokens"),
 }));
 """
     assert run_js(script) == {
@@ -577,6 +589,11 @@ console.log(JSON.stringify({
             "time": "04:17",
         },
         "activityHeaderItems": 1,
+        "assistantToken": {
+            "className": "chat-context-tokens",
+            "text": "12,345 tok",
+        },
+        "userHasToken": False,
     }
     transcript_item = APP[
         APP.index("function chatTranscriptItemNode"):
@@ -918,6 +935,7 @@ def test_layout_retains_shell_rail_chat_history_and_bubble_transcript():
         ".chat-transcript",
         ".chat-bubble.chat-user",
         ".chat-bubble.chat-assistant",
+        ".chat-context-tokens",
         ".chat-composer",
         ".chat-jump-latest",
         ".chat-jump-latest[hidden]",

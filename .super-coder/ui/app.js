@@ -2874,7 +2874,28 @@ async function chatCloseForSwitch(conversation) {
   }
 }
 
-function chatBubble(kind, body, meta = "", conversation = null, createdAt = "") {
+function chatContextTokenLabel(value) {
+  const tokens = Number(value);
+  return Number.isSafeInteger(tokens) && tokens >= 0 ? `${fmt(tokens)} tok` : "";
+}
+
+function chatUpdateContextTokens(node, value) {
+  const text = chatContextTokenLabel(value);
+  let label = node.querySelector(".chat-context-tokens");
+  if (!text) {
+    if (label) label.remove();
+    return;
+  }
+  if (!label) {
+    label = el("div", { className: "chat-context-tokens" });
+    node.append(label);
+  }
+  label.textContent = text;
+}
+
+function chatBubble(
+  kind, body, meta = "", conversation = null, createdAt = "", contextTokens = null,
+) {
   const bubble = el("article", { className: `chat-bubble chat-${kind}` });
   const header = el("div", { className: "chat-bubble-head" },
     el("div", { className: "chat-who" },
@@ -2893,6 +2914,11 @@ function chatBubble(kind, body, meta = "", conversation = null, createdAt = "") 
   if (kind === "assistant") content.classList.add("chat-assistant-body");
   bubble.append(content);
   if (meta) bubble.append(el("div", { className: "chat-meta" }, meta));
+  if (kind === "assistant") {
+    const tokenLabel = chatContextTokenLabel(contextTokens);
+    if (tokenLabel)
+      bubble.append(el("div", { className: "chat-context-tokens" }, tokenLabel));
+  }
   return bubble;
 }
 
@@ -3749,6 +3775,7 @@ function chatTranscriptItemNode(item, conversation, retry) {
     item.kind === "user" ? item.state || "" : "",
     conversation,
     item.created_at,
+    item.context_tokens,
   );
   if (item.kind === "user" && item.state === "failed") {
     const button = el("button", {
@@ -3767,6 +3794,7 @@ function chatUpdateTranscriptNode(node, item, retry) {
     const body = node.querySelector(".chat-assistant-body");
     const rendered = mdBlock(item.text || "");
     body.replaceChildren(...rendered.childNodes);
+    chatUpdateContextTokens(node, item.context_tokens);
     return;
   }
   if (item.kind !== "user") return;
@@ -4374,6 +4402,7 @@ async function chatRenderOpen(
           segment_anchor_sequence: anchor,
           first_sequence: sequence,
           last_sequence: sequence,
+          context_tokens: null,
           text_truncated: false,
         };
         transcriptState.items.set(itemId, assistant);
@@ -4382,6 +4411,16 @@ async function chatRenderOpen(
       assistant.text += event.payload?.text || "";
       assistant.last_sequence = sequence;
       transcriptState.dirty.add(itemId);
+    } else if (type === "usage") {
+      const runId = event.run_id;
+      const assistant = [...transcriptState.order].reverse()
+        .map((itemId) => transcriptState.items.get(itemId))
+        .find((item) => item?.kind === "assistant" && item.run_id === runId);
+      const contextTokens = Number(event.payload?.context_tokens);
+      if (assistant && Number.isSafeInteger(contextTokens) && contextTokens >= 0) {
+        assistant.context_tokens = contextTokens;
+        transcriptState.dirty.add(assistant.item_id);
+      }
     } else if ([
       "permission.requested",
       "input.requested",

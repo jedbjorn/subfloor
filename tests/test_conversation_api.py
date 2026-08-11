@@ -2070,6 +2070,48 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
                 source_rows,
             )
 
+    def test_transcript_attaches_exact_context_tokens_to_assistant_only(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=701,
+                state="closed",
+            )
+            _message_id, _run_id, _through = self.seed_segmented_trace(
+                con,
+                conversation_id=conversation_id,
+                events=(
+                    ("assistant.delta", {"text": "answer"}),
+                    ("tool.started", {"tool_ref": "tool-1", "name": "Shell"}),
+                    (
+                        "usage",
+                        {
+                            "tokens": {
+                                "input_tokens": 10000,
+                                "output_tokens": 345,
+                                "cache_read_tokens": 2000,
+                                "cache_write_tokens": 0,
+                            }
+                        },
+                    ),
+                ),
+            )
+            con.commit()
+
+        status, _, transcript = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/transcript",
+        )
+
+        self.assertEqual(status, 200, transcript)
+        self.assertEqual(len(transcript["items"]), 2)
+        user, assistant = transcript["items"]
+        self.assertEqual(user["kind"], "user")
+        self.assertNotIn("context_tokens", user)
+        self.assertEqual(assistant["kind"], "assistant")
+        self.assertEqual(assistant["text"], "answer")
+        self.assertEqual(assistant["context_tokens"], 12345)
+
     def test_segmented_plain_prose_keeps_one_stable_anchor_zero_item(self) -> None:
         self.assert_historical_segment_trace("plain_prose")
 

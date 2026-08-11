@@ -14,6 +14,7 @@ import hashlib
 import http.client
 import io
 import json
+import math
 import re
 import sys
 import time
@@ -1851,10 +1852,15 @@ def _transcript_projection(
                         "code": "MALFORMED_EVENT_PAYLOAD",
                     })
                 continue
+            projected_payload = _project_event_payload(
+                row["event_type"],
+                payload,
+                secrets,
+            )
             events.append({
                 "sequence": sequence,
                 "event_type": row["event_type"],
-                "payload": _redact_event_value(payload, secrets),
+                "payload": projected_payload,
                 "message_id": row["message_id"],
                 "run_id": row["run_id"],
                 "created_at": row["created_at"],
@@ -1868,6 +1874,8 @@ def _transcript_projection(
             and event["message_id"] is not None
         }
         segments_by_run: dict[int, dict[int, list[dict]]] = {}
+        context_tokens_by_run: dict[int, dict[int, int]] = {}
+        latest_assistant_anchor_by_run: dict[int, int] = {}
         evidence_count_by_run: dict[int, int] = {}
         activities = []
         boundary_types = {
@@ -1898,6 +1906,17 @@ def _transcript_projection(
                     anchor,
                     [],
                 ).append(event)
+                latest_assistant_anchor_by_run[int(run_id)] = anchor
+            elif event["event_type"] == "usage" and run_id is not None:
+                context_tokens = event["payload"].get("context_tokens")
+                assistant_anchor = latest_assistant_anchor_by_run.get(int(run_id))
+                if isinstance(context_tokens, int) and not isinstance(
+                    context_tokens,
+                    bool,
+                ) and assistant_anchor is not None:
+                    context_tokens_by_run.setdefault(int(run_id), {})[
+                        assistant_anchor
+                    ] = context_tokens
             elif event["event_type"] in activity_types:
                 activities.append(event)
 
@@ -1963,6 +1982,10 @@ def _transcript_projection(
                         "segment_anchor_sequence": anchor,
                         "first_sequence": deltas[0]["sequence"],
                         "last_sequence": deltas[-1]["sequence"],
+                        "context_tokens": context_tokens_by_run.get(
+                            run_id,
+                            {},
+                        ).get(anchor),
                         "text_truncated": False,
                     })
 
@@ -2206,12 +2229,60 @@ def _redact_event_value(value, secrets: tuple[str, ...]):
     return value
 
 
+def _token_count(value) -> int | None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+        or int(value) != value
+    ):
+        return None
+    return int(value)
+
+
+def _usage_context_tokens(payload: dict) -> int | None:
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    for key in ("totalTokens", "total_tokens", "total"):
+        total = _token_count(tokens.get(key))
+        if total is not None:
+            return total
+    fields = (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+    )
+    values = [_token_count(tokens.get(key)) for key in fields]
+    present = [value for value in values if value is not None]
+    return sum(present) if present else None
+
+
+def _project_event_payload(
+    event_type: str,
+    payload: dict,
+    secrets: tuple[str, ...],
+) -> dict:
+    projected = _redact_event_value(payload, secrets)
+    if event_type != "usage":
+        return projected
+    context_tokens = _usage_context_tokens(projected)
+    if context_tokens is not None:
+        projected["context_tokens"] = context_tokens
+    return projected
+
+
 def _event_projection(row, secrets: tuple[str, ...]) -> dict:
+    payload = json.loads(row["payload"])
     return {
         "sequence": int(row["sequence"]),
         "event_type": row["event_type"],
         "payload_version": int(row["payload_version"]),
-        "payload": _redact_event_value(json.loads(row["payload"]), secrets),
+        "payload": _project_event_payload(row["event_type"], payload, secrets),
         "message_id": row["message_id"],
         "run_id": row["run_id"],
         "created_at": row["created_at"],
