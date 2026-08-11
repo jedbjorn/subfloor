@@ -71,9 +71,11 @@ sc_bootstrap_require_supported_host() {
     SC_BOOTSTRAP_PLATFORM_ID_LIKE=""
     SC_BOOTSTRAP_PLATFORM_VERSION_ID=""
   fi
-  if [ "$_platform_wsl" != 1 ]; then
-    case "$SC_BOOTSTRAP_PLATFORM_KERNEL:$SC_BOOTSTRAP_PLATFORM_ID:$SC_BOOTSTRAP_PLATFORM_VERSION_ID" in
-      Linux:ubuntu:26.04|Linux:fedora:44|Linux:arch:*) return 0 ;;
+  if [ "$_platform_wsl" != 1 ] && [ "$SC_BOOTSTRAP_PLATFORM_KERNEL" = Linux ]; then
+    case "$SC_BOOTSTRAP_PLATFORM_ID" in
+      ubuntu) [ "$SC_BOOTSTRAP_PLATFORM_VERSION_ID" = 26.04 ] && return 0 ;;
+      fedora) [ "$SC_BOOTSTRAP_PLATFORM_VERSION_ID" = 44 ] && return 0 ;;
+      arch) return 0 ;;
     esac
     case " $SC_BOOTSTRAP_PLATFORM_ID_LIKE " in
       *" arch ") [ "$SC_BOOTSTRAP_PLATFORM_KERNEL" = Linux ] && return 0 ;;
@@ -94,15 +96,21 @@ sc_bootstrap_require_supported_host() {
 # dispatcher body instead of the live floor's so a maintainer can test an edit
 # before repinning. No arbitrary readable body is an override candidate.
 if [ -n "${SC_DISPATCH:-}" ]; then
-  sc_bootstrap_require_supported_host
+  _bootstrap_cmd=${1:-help}
+  case "$_bootstrap_cmd" in
+    help|-h|--help) ;;
+    *) sc_bootstrap_require_supported_host ;;
+  esac
   _maintainer_dispatch="$CALLER_ROOT/.super-coder/scripts/dispatch.sh"
   _maintainer_origin="$(command -p git -C "$CALLER_ROOT" remote get-url origin 2>/dev/null || true)"
   _maintainer_origin=${_maintainer_origin%/}
-  _maintainer_repo=${_maintainer_origin##*/}
-  _maintainer_repo=${_maintainer_repo##*:}
-  _maintainer_repo=${_maintainer_repo%.git}
+  _maintainer_origin=${_maintainer_origin%.git}
   _canonical_source=0
-  case "$_maintainer_repo" in super-coder|subfloor) _canonical_source=1 ;; esac
+  case "$_maintainer_origin" in
+    https://github.com/jedbjorn/subfloor|git@github.com:jedbjorn/subfloor|ssh://git@github.com/jedbjorn/subfloor|\
+    https://github.com/jedbjorn/super-coder|git@github.com:jedbjorn/super-coder|ssh://git@github.com/jedbjorn/super-coder)
+      _canonical_source=1 ;;
+  esac
   if [ "$SC_DISPATCH" != "$_maintainer_dispatch" ] \
     || [ "$_canonical_source" != 1 ] \
     || ! command -p git -C "$CALLER_ROOT" ls-files --error-unmatch -- .super-coder/scripts/dispatch.sh >/dev/null 2>&1; then

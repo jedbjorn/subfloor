@@ -268,6 +268,23 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                     (self.root / ".super-coder/scripts/install-ran").exists()
                 )
 
+    def test_separator_bearing_arch_id_refuses_before_dispatch_target(self) -> None:
+        release = self.os_release("separator-id", "ID=arch:unknown\n")
+        python = self.sentinel_python()
+        self.configure_host("Linux", release)
+        before = self.snapshot_tree(self.root)
+
+        completed = self.invoke(str(python), "install")
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn(
+            "ID=arch:unknown; ID_LIKE=unknown; VERSION_ID=unknown",
+            completed.stderr,
+        )
+        self.assertFalse((self.root / "python-ran").exists())
+        self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
+        self.assertEqual(self.snapshot_tree(self.root), before)
+
     def test_global_help_states_linux_only_support_on_every_host(self) -> None:
         hosts = {
             "supported": ("Linux", self.supported_release),
@@ -531,6 +548,101 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertEqual(self.snapshot_tree(caller), before_caller)
         self.assertEqual(self.snapshot_tree(home), before_home)
 
+    def test_tracked_launcher_refuses_separator_id_before_dispatch_override(self) -> None:
+        source, caller, home = self.tracked_launcher_fixture(
+            "Linux", "ID=arch:unknown\n"
+        )
+        override = caller / ".super-coder" / "scripts" / "dispatch.sh"
+        override.write_text(
+            "#!/bin/sh\n"
+            f"touch {shlex.quote(str(self.root / 'override-ran'))}\n"
+            "exit 99\n"
+        )
+        before_source = self.snapshot_tree(source)
+        before_caller = self.snapshot_tree(caller)
+        before_home = self.snapshot_tree(home)
+        environment = {
+            **os.environ,
+            "HOME": str(home),
+            "SC_DISPATCH": str(override),
+        }
+        environment.pop("WSL_DISTRO_NAME", None)
+        environment.pop("WSL_INTEROP", None)
+
+        completed = subprocess.run(
+            [str(caller / "sc"), "install"],
+            cwd=caller,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn(
+            "ID=arch:unknown; ID_LIKE=unknown; VERSION_ID=unknown",
+            completed.stderr,
+        )
+        self.assertFalse((self.root / "override-ran").exists())
+        self.assertFalse((self.root / "live-dispatch-ran").exists())
+        self.assertEqual(self.snapshot_tree(source), before_source)
+        self.assertEqual(self.snapshot_tree(caller), before_caller)
+        self.assertEqual(self.snapshot_tree(home), before_home)
+
+    def test_tracked_launcher_override_keeps_global_help_readable_on_darwin(self) -> None:
+        source, caller, home = self.tracked_launcher_fixture(
+            "Darwin", "ID=macos\n"
+        )
+        override = caller / ".super-coder" / "scripts" / "dispatch.sh"
+        override.write_text(
+            "#!/bin/sh\n"
+            "case \"${1:-help}\" in\n"
+            "  help|-h|--help) printf 'override global help\\n'; exit 0 ;;\n"
+            "esac\n"
+            f"touch {shlex.quote(str(self.root / 'override-ran'))}\n"
+            "exit 99\n"
+        )
+        before_source = self.snapshot_tree(source)
+        before_caller = self.snapshot_tree(caller)
+        before_home = self.snapshot_tree(home)
+        environment = {
+            **os.environ,
+            "HOME": str(home),
+            "SC_DISPATCH": str(override),
+        }
+        environment.pop("WSL_DISTRO_NAME", None)
+        environment.pop("WSL_INTEROP", None)
+
+        for command in ((), ("help",), ("-h",), ("--help",)):
+            with self.subTest(command=command or ("bare",)):
+                completed = subprocess.run(
+                    [str(caller / "sc"), *command],
+                    cwd=caller,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(completed.stdout, "override global help\n")
+                self.assertEqual(completed.stderr, "")
+
+        action = subprocess.run(
+            [str(caller / "sc"), "install"],
+            cwd=caller,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(action.returncode, 1)
+        self.assertIn("detected kernel: Darwin", action.stderr)
+        self.assertFalse((self.root / "override-ran").exists())
+        self.assertFalse((self.root / "live-dispatch-ran").exists())
+        self.assertEqual(self.snapshot_tree(source), before_source)
+        self.assertEqual(self.snapshot_tree(caller), before_caller)
+        self.assertEqual(self.snapshot_tree(home), before_home)
+
     def test_dispatch_override_rejects_arbitrary_body_on_supported_host(self) -> None:
         _source, caller, home = self.tracked_launcher_fixture(
             "Linux", "ID=ubuntu\nVERSION_ID=26.04\n"
@@ -572,7 +684,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         _source, caller, home = self.tracked_launcher_fixture(
             "Linux",
             "ID=ubuntu\nVERSION_ID=26.04\n",
-            origin="https://github.com/example/application.git",
+            origin="https://github.com/example/subfloor.git",
         )
         override = caller / ".super-coder" / "scripts" / "dispatch.sh"
         override.write_text(

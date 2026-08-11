@@ -105,8 +105,11 @@ sc_platform_detect() {
 sc_require_supported_host() {
   sc_platform_detect
   [ "$SC_PLATFORM_WSL" = 1 ] && sc_platform_unsupported
-  case "$SC_PLATFORM_KERNEL:$SC_PLATFORM_ID:$SC_PLATFORM_VERSION_ID" in
-    Linux:ubuntu:26.04|Linux:fedora:44|Linux:arch:*) return 0 ;;
+  [ "$SC_PLATFORM_KERNEL" = Linux ] || sc_platform_unsupported
+  case "$SC_PLATFORM_ID" in
+    ubuntu) [ "$SC_PLATFORM_VERSION_ID" = 26.04 ] && return 0 ;;
+    fedora) [ "$SC_PLATFORM_VERSION_ID" = 44 ] && return 0 ;;
+    arch) return 0 ;;
   esac
   case " $SC_PLATFORM_ID_LIKE " in
     *" arch ") [ "$SC_PLATFORM_KERNEL" = Linux ] && return 0 ;;
