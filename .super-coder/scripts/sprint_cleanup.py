@@ -816,9 +816,6 @@ class SprintCleanupExecutor:
             )
 
     def _reset_worktree(self, claim: CleanupClaim) -> CleanupExecutionReceipt:
-        attempt = self.store.begin_attempt(claim)
-        if attempt is None:
-            return self._receipt(claim, "stale", "claim_superseded", None)
         repository = Path(claim.repository_root)
         target = Path(claim.canonical_path)
         try:
@@ -850,6 +847,9 @@ class SprintCleanupExecutor:
         # ownership fact immediately before the first destructive Git command.
         self._validate_under_lock(claim)
         self._renew_or_stale(claim)
+        attempt = self.store.begin_attempt(claim)
+        if attempt is None:
+            return self._receipt(claim, "stale", "claim_superseded", None)
         self._git(target, "reset", "--hard", "HEAD", code="reset_current_failed")
         self._renew_or_stale(claim)
         self._git(target, "clean", "-ffd", code="clean_current_failed")
@@ -929,9 +929,6 @@ class SprintCleanupExecutor:
         )
 
     def _delete_artifacts(self, claim: CleanupClaim) -> CleanupExecutionReceipt:
-        attempt = self.store.begin_attempt(claim)
-        if attempt is None:
-            return self._receipt(claim, "stale", "claim_superseded", None)
         target = Path(claim.canonical_path)
         existed = target.exists()
         entry_count, count_truncated = self._bounded_entry_count(target)
@@ -944,6 +941,9 @@ class SprintCleanupExecutor:
             return self._receipt(claim, "stale", "claim_superseded", None)
         self._validate_under_lock(claim)
         self._renew_or_stale(claim)
+        attempt = self.store.begin_attempt(claim)
+        if attempt is None:
+            return self._receipt(claim, "stale", "claim_superseded", None)
         if existed:
             try:
                 shutil.rmtree(target)

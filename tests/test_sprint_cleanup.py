@@ -756,7 +756,7 @@ class SprintCleanupExecutorTest(SprintDomainCase):
             self._git(self.worktree, "branch", "--show-current").stdout.strip(),
         )
         row = self._worktree_row()
-        self.assertEqual(("failed", 1), (row["state"], row["attempt_count"]))
+        self.assertEqual(("failed", 0), (row["state"], row["attempt_count"]))
         self.assertIsNotNone(row["before_evidence"])
 
     def test_live_target_waits_without_consuming_attempt(self):
@@ -775,7 +775,74 @@ class SprintCleanupExecutorTest(SprintDomainCase):
         )
         self.assertIsNone(row["last_error_code"])
 
-    def test_fetch_failures_retry_three_times_with_durable_evidence(self):
+    def test_post_fetch_live_race_preserves_all_three_mutation_attempts(self):
+        self._dirty_worktree()
+        calls = 0
+
+        def becomes_live(_claim):
+            nonlocal calls
+            calls += 1
+            return "live" if calls == 2 else "dormant"
+
+        waiting = self._executor(liveness=becomes_live).run_next("fixture", shell_id=1)
+
+        self.assertEqual(
+            ("waiting", "waiting_for_run_exit", 0),
+            (waiting.state, waiting.code, waiting.attempt_count),
+        )
+        row = self._worktree_row()
+        self.assertEqual(
+            ("pending", 0, "waiting_for_run_exit", None),
+            (
+                row["state"],
+                row["attempt_count"],
+                row["waiting_reason"],
+                row["last_error_code"],
+            ),
+        )
+        self.assertEqual(
+            "feat/disposable",
+            self._git(self.worktree, "branch", "--show-current").stdout.strip(),
+        )
+        self.assertTrue((self.worktree / "untracked.txt").is_file())
+
+        class FailEveryClean(sprint_cleanup.SprintCleanupExecutor):
+            def _git(self, repo, *args, code, timeout=None):
+                if args[:2] == ("clean", "-ffd"):
+                    raise sprint_cleanup.SprintCleanupMutationError(
+                        "clean_current_failed",
+                        "injected destructive failure",
+                    )
+                return super()._git(repo, *args, code=code, timeout=timeout)
+
+        failing = FailEveryClean(
+            self.cleanup,
+            liveness_probe=lambda _claim: "dormant",
+            branch_pruner=lambda _repo: {
+                "candidates": 0,
+                "deleted": [],
+                "failed": [],
+            },
+            lease_seconds=60,
+        )
+        failures = []
+        for _attempt in range(3):
+            failures.append(failing.run_next("fixture", shell_id=1))
+            self.now += timedelta(seconds=6)
+
+        self.assertEqual(
+            ["pending", "pending", "failed"], [item.state for item in failures]
+        )
+        self.assertEqual([1, 2, 3], [item.attempt_count for item in failures])
+        self.assertTrue(all(item.code == "clean_current_failed" for item in failures))
+        row = self._worktree_row()
+        self.assertEqual(
+            ("failed", 3, "clean_current_failed"),
+            (row["state"], row["attempt_count"], row["last_error_code"]),
+        )
+        self.assertTrue((self.worktree / "untracked.txt").is_file())
+
+    def test_fetch_failures_backoff_without_spending_destructive_budget(self):
         self._git(self.repository, "remote", "remove", "origin")
         executor = self._executor()
         receipts = []
@@ -784,17 +851,32 @@ class SprintCleanupExecutorTest(SprintDomainCase):
             self.now += timedelta(seconds=6)
 
         self.assertEqual(
-            ["pending", "pending", "failed"], [item.state for item in receipts]
+            ["pending", "pending", "pending"], [item.state for item in receipts]
         )
-        self.assertEqual([1, 2, 3], [item.attempt_count for item in receipts])
+        self.assertEqual([0, 0, 0], [item.attempt_count for item in receipts])
         self.assertTrue(all(item.code == "fetch_failed" for item in receipts))
         row = self._worktree_row()
         self.assertEqual(
-            ("failed", 3, "fetch_failed"),
-            (row["state"], row["attempt_count"], row["last_error_code"]),
+            ("pending", 0, "retry_backoff", "fetch_failed"),
+            (
+                row["state"],
+                row["attempt_count"],
+                row["waiting_reason"],
+                row["last_error_code"],
+            ),
         )
-        self.assertIn("missing remote origin", row["last_error_detail"])
-        self.assertIsNone(row["after_evidence"])
+        self.assertEqual(
+            3,
+            row["claim_generation"],
+        )
+        self.assertEqual(
+            "missing remote origin",
+            row["last_error_detail"],
+        )
+        self.assertEqual(
+            (None, None),
+            (row["before_evidence"], row["after_evidence"]),
+        )
 
     def test_partial_git_mutation_retries_to_convergence(self):
         self._dirty_worktree()
