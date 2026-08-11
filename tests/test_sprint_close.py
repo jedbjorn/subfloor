@@ -30,7 +30,9 @@ def rendered_notification(
     return (
         f"Sprint {sprint_id} completed by Reviewer conformance. "
         f"conformance_report_id={report_id}; final_report_id={final_report_id}; "
-        f"followup_ids={followups}; outcome={TERMINAL_OUTCOME}.\n\n"
+        f"followup_ids={followups}; outcome={TERMINAL_OUTCOME}; "
+        "cleanup_state=pending. Managed participant worktrees are not reusable "
+        "until the engine-authored cleanup receipt reports succeeded.\n\n"
         f"Reason: {COMPLETION_REASON}"
     )
 

@@ -68,6 +68,7 @@ import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
 import sprint_close  # noqa: E402  (Sprints v2 conformance + report evidence)
+import sprint_cleanup  # noqa: E402  (successful-close worktree cleanup recovery)
 import sprint_domain  # noqa: E402  (Sprints v2 work dispatch authority)
 import sprint_message_delivery  # noqa: E402  (Sprints v2 inbox acceptance)
 import sprint_recovery  # noqa: E402  (Sprints v2 pause/resume reconciliation)
@@ -2022,6 +2023,14 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _sprint_error(self, exc: Exception):
+        if isinstance(exc, sprint_cleanup.SprintCleanupRequestError):
+            return self._send(
+                exc.status,
+                {
+                    "error": exc.detail,
+                    "details": {"code": exc.code, **exc.context},
+                },
+            )
         if isinstance(exc, sprint_domain.SprintAuthorityError):
             return self._send(403, {"error": str(exc)})
         if isinstance(exc, sprint_domain.SprintPreflightError):
@@ -2324,6 +2333,19 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("sprint_id must be a positive integer") from exc
                 state = sprint_pr_watcher.WatcherStateStore(con).for_sprint(sprint_id)
                 return self._send(200, state)
+            if len(parts) == 4 and parts[2] == "cleanup-runs":
+                try:
+                    sprint_id = int(parts[3])
+                except ValueError as exc:
+                    raise ValueError("Sprint id must be a positive integer") from exc
+                if sprint_id <= 0:
+                    raise ValueError("Sprint id must be a positive integer")
+                return self._send(
+                    200,
+                    sprint_cleanup.SprintCleanupRecoveryStore(con).status(
+                        sprint_id, shell_id
+                    ),
+                )
             if len(parts) != 4:
                 return self._send(404, {"error": "not found"})
             if parts[2] == "approvals":
@@ -2387,6 +2409,26 @@ class Handler(BaseHTTPRequestHandler):
                 sprint_id = self._declare_sprint(con, shell_id, body)
                 return self._send(201, {"sprint_id": sprint_id})
             sprint_id = self._sprint_integer(body, "sprint_id")
+            if path == "/_sc/sprint/cleanup-runs":
+                adopt_legacy = body.get("adopt_legacy", False)
+                if not isinstance(adopt_legacy, bool):
+                    raise ValueError("adopt_legacy must be a boolean")
+                receipt = sprint_cleanup.SprintCleanupRecoveryStore(con).recover(
+                    sprint_id,
+                    shell_id,
+                    idempotency_key=body.get("idempotency_key") or "",
+                    adopt_legacy=adopt_legacy,
+                )
+                return self._send(201 if receipt.created else 200, {
+                    "cleanup_request_id": receipt.request_id,
+                    "created": receipt.created,
+                    "action": receipt.action,
+                    "sprint_id": receipt.sprint_id,
+                    "target_ids": list(receipt.target_ids),
+                    "cleanup": sprint_cleanup.SprintCleanupRecoveryStore.projection_dict(
+                        receipt.projection
+                    ),
+                })
             if path == "/_sc/sprint/plan-unit":
                 planner_shell_id = self._sprint_planner_proxy(
                     con, sprint_id, shell_id
@@ -2657,10 +2699,16 @@ class Handler(BaseHTTPRequestHandler):
                     reason=body.get("reason"),
                     terminal_outcome=body.get("terminal_outcome"),
                 )
+                cleanup_projection = sprint_cleanup.SprintCleanupTargetStore(
+                    con
+                ).project(sprint_id)
                 return self._send(200, {
                     "changed": changed,
                     "report_id": report.report_id if report else None,
                     "report_created": report.created if report else False,
+                    "cleanup": sprint_cleanup.SprintCleanupRecoveryStore.projection_dict(
+                        cleanup_projection
+                    ),
                 })
             if path == "/_sc/sprint/abort":
                 receipt = sprint_recovery.SprintRecoveryCoordinator(
@@ -2752,6 +2800,9 @@ class Handler(BaseHTTPRequestHandler):
                     terminal_outcome=body.get("terminal_outcome") or "",
                     idempotency_key=body.get("idempotency_key") or "",
                 )
+                cleanup_projection = sprint_cleanup.SprintCleanupTargetStore(
+                    con
+                ).project(sprint_id)
                 return self._send(201 if receipt.created else 200, {
                     "report_id": receipt.report_id,
                     "followup_ids": list(receipt.followup_ids),
@@ -2760,6 +2811,9 @@ class Handler(BaseHTTPRequestHandler):
                     "planner_wake_id": receipt.planner_wake_id,
                     "completed": receipt.completed,
                     "created": receipt.created,
+                    "cleanup": sprint_cleanup.SprintCleanupRecoveryStore.projection_dict(
+                        cleanup_projection
+                    ),
                 })
             if path == "/_sc/sprint/followup-disposition":
                 changed = sprint_close.SprintCloseStore(con).disposition_followup(

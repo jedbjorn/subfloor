@@ -755,7 +755,9 @@ class SprintCloseStore:
         rendered_body = (
             f"Sprint {sprint_id} completed by Reviewer conformance. "
             f"conformance_report_id={report_id}; final_report_id={final_report_id}; "
-            f"followup_ids={followups}; outcome={terminal_outcome}.\n\n"
+            f"followup_ids={followups}; outcome={terminal_outcome}; "
+            "cleanup_state=pending. Managed participant worktrees are not reusable "
+            "until the engine-authored cleanup receipt reports succeeded.\n\n"
             f"Reason: {reason}"
         )
         return SprintMessageStore(self.con).send_to_shell_in_transaction(

@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
@@ -1019,6 +1020,350 @@ class SprintCleanupExecutorTest(SprintDomainCase):
                 after["entry_count_truncated"],
             ),
         )
+
+
+class SprintCleanupRecoveryTest(SprintDomainCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.con.executemany(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (?,?,?,?,?,1)",
+            (
+                (5, "FnB", "FNB", "admin", "prompt"),
+                (6, "Outside developer", "DEV2", "dev", "prompt"),
+            ),
+        )
+        self.con.commit()
+        self.targets = sprint_cleanup.SprintCleanupTargetStore(
+            self.con,
+            identity_provider=lambda: (TEST_ROOT, TEST_COMMON_DIR),
+        )
+        self.lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            probe_harness=lambda _harness: None,
+            cleanup_store=self.targets,
+        )
+        self.sprint_id, self.unit_id = self.create_sprint()
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.transition(
+            self.sprint_id,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="recovery fixture",
+            terminal_outcome="accepted",
+        )
+        self.recovery = sprint_cleanup.SprintCleanupRecoveryStore(
+            self.con,
+            target_store=self.targets,
+        )
+
+    def test_status_is_participant_bounded_and_rejects_unrelated_shell(self):
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET before_evidence=? "
+            "WHERE sprint_id=? AND shell_id=1",
+            (
+                json.dumps(
+                    {
+                        "branch": "feat/local",
+                        "head": "a" * 40,
+                        "status_count": 1,
+                        "status_sample": ["?? secret-name.txt"],
+                    }
+                ),
+                self.sprint_id,
+            ),
+        )
+        self.con.commit()
+
+        failed_id = int(
+            self.con.execute(
+                "SELECT cleanup_target_id FROM sprint_cleanup_targets "
+                "WHERE sprint_id=? AND shell_id=2",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='failed',"
+            "last_error_code='clean_current_failed',last_error_detail=? "
+            "WHERE cleanup_target_id=?",
+            (f"command failed under {TEST_ROOT}/secret", failed_id),
+        )
+        self.con.commit()
+
+        status = self.recovery.status(self.sprint_id, 1)
+
+        self.assertEqual(
+            ("failed", 4, 3, 0, 0, 1),
+            (
+                status["aggregate_state"],
+                status["target_count"],
+                status["pending_count"],
+                status["running_count"],
+                status["succeeded_count"],
+                status["failed_count"],
+            ),
+        )
+        developer = next(
+            row for row in status["targets"] if row["shell"]["shell_id"] == 1
+        )
+        self.assertEqual(".sc-worktrees/dev1", developer["path_label"])
+        self.assertEqual(
+            {"branch": "feat/local", "head": "a" * 40, "status_count": 1},
+            developer["before"],
+        )
+        self.assertNotIn(str(TEST_ROOT), json.dumps(status))
+        self.assertNotIn("secret-name", json.dumps(status))
+        self.assertEqual(
+            {"code": "clean_current_failed"},
+            next(
+                row
+                for row in status["targets"]
+                if row["shell"]["shell_id"] == 2
+            )["error"],
+        )
+        with self.assertRaisesRegex(
+            sprint_cleanup.SprintCleanupRequestError,
+            "only a Sprint participant or FnB",
+        ) as refused:
+            self.recovery.status(self.sprint_id, 6)
+        self.assertEqual(
+            (403, "cleanup_status_forbidden"),
+            (refused.exception.status, refused.exception.code),
+        )
+
+    def test_planner_retry_is_idempotent_and_preserves_failure_evidence(self):
+        target_id = int(
+            self.con.execute(
+                "SELECT cleanup_target_id FROM sprint_cleanup_targets "
+                "WHERE sprint_id=? AND shell_id=1",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='failed',attempt_count=3,"
+            "last_error_code='clean_current_failed',"
+            "last_error_detail='bounded failure' WHERE cleanup_target_id=?",
+            (target_id,),
+        )
+        self.con.commit()
+
+        first = self.recovery.recover(
+            self.sprint_id,
+            3,
+            idempotency_key="retry-cleanup-fixture",
+            adopt_legacy=False,
+        )
+        replay = self.recovery.recover(
+            self.sprint_id,
+            3,
+            idempotency_key="retry-cleanup-fixture",
+            adopt_legacy=False,
+        )
+
+        self.assertEqual(
+            (True, False, "requeued", (target_id,), "pending"),
+            (
+                first.created,
+                replay.created,
+                first.action,
+                first.target_ids,
+                first.projection.aggregate_state,
+            ),
+        )
+        self.assertEqual(first.request_id, replay.request_id)
+        row = self.con.execute(
+            "SELECT state,attempt_count,waiting_reason,last_error_code,"
+            "last_error_detail FROM sprint_cleanup_targets "
+            "WHERE cleanup_target_id=?",
+            (target_id,),
+        ).fetchone()
+        self.assertEqual(
+            (
+                "pending",
+                3,
+                "manual_retry",
+                "clean_current_failed",
+                "bounded failure",
+            ),
+            tuple(row),
+        )
+        self.assertEqual(
+            (1, 1),
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_cleanup_requests "
+                    " WHERE idempotency_key='retry-cleanup-fixture'),"
+                    "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    " AND event_type='sprint.cleanup_requeued')",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+        with self.assertRaisesRegex(
+            sprint_cleanup.SprintCleanupRequestError,
+            "reused with different input",
+        ) as conflict:
+            self.recovery.recover(
+                self.sprint_id,
+                3,
+                idempotency_key="retry-cleanup-fixture",
+                adopt_legacy=True,
+            )
+        self.assertEqual("idempotency_key_reused", conflict.exception.code)
+
+    def test_only_fnb_can_adopt_one_completed_legacy_sprint(self):
+        legacy_sprint, _unit = self.create_sprint()
+        legacy_lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            probe_harness=lambda _harness: None,
+            cleanup_store=mock.Mock(
+                prepare_targets=mock.Mock(return_value=()),
+                schedule_in_transaction=mock.Mock(return_value=None),
+            ),
+        )
+        legacy_lifecycle.arm(legacy_sprint, 3)
+        legacy_lifecycle.transition(
+            legacy_sprint,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="historical completion before cleanup scheduling",
+            terminal_outcome="accepted",
+        )
+
+        with self.assertRaisesRegex(
+            sprint_cleanup.SprintCleanupRequestError,
+            "only FnB",
+        ) as refused:
+            self.recovery.recover(
+                legacy_sprint,
+                3,
+                idempotency_key="planner-cannot-adopt",
+                adopt_legacy=True,
+            )
+        self.assertEqual("legacy_adoption_forbidden", refused.exception.code)
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_cleanup_targets WHERE sprint_id=?",
+                (legacy_sprint,),
+            ).fetchone()[0],
+        )
+
+        adopted = self.recovery.recover(
+            legacy_sprint,
+            5,
+            idempotency_key="fnb-adopts-one-legacy-sprint",
+            adopt_legacy=True,
+        )
+        replay = self.recovery.recover(
+            legacy_sprint,
+            5,
+            idempotency_key="fnb-adopts-one-legacy-sprint",
+            adopt_legacy=True,
+        )
+
+        self.assertEqual(
+            ("adopted_legacy", True, False, 4, "pending"),
+            (
+                adopted.action,
+                adopted.created,
+                replay.created,
+                len(adopted.target_ids),
+                adopted.projection.aggregate_state,
+            ),
+        )
+        self.assertEqual(adopted.target_ids, replay.target_ids)
+        self.assertEqual(
+            (1, 1),
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_cleanup_requests "
+                    " WHERE idempotency_key='fnb-adopts-one-legacy-sprint'),"
+                    "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    " AND event_type='sprint.cleanup_adopted')",
+                    (legacy_sprint,),
+                ).fetchone()
+            ),
+        )
+
+    def test_terminal_transitions_emit_exact_planner_receipts_atomically(self):
+        failed = self.targets.claim_next("failure-fixture", shell_id=1)
+        self.assertIsNotNone(failed)
+        self.assertTrue(
+            self.targets.fail_safety(
+                failed,
+                "git_common_dir_mismatch",
+                "stored repository identity changed",
+            )
+        )
+        failure_event = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='sprint.cleanup_failed'",
+            (self.sprint_id,),
+        ).fetchone()
+        failure_message = self.con.execute(
+            "SELECT receiver_shell_id,declared_type,body FROM wake_message "
+            "WHERE idempotency_key=?",
+            (
+                f"sprint:{self.sprint_id}:cleanup-failed:"
+                f"target:{failed.cleanup_target_id}:generation:{failed.claim_generation}",
+            ),
+        ).fetchone()
+        self.assertEqual(
+            "git_common_dir_mismatch", json.loads(failure_event[0])["error_code"]
+        )
+        self.assertEqual((3, "re-enter"), tuple(failure_message[:2]))
+        self.assertIn("cleanup-status", failure_message[2])
+        self.assertIn("cleanup --sprint", failure_message[2])
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='succeeded' "
+            "WHERE sprint_id=? AND target_kind='worktree' AND state='pending'",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+
+        second_sprint, _unit = self.create_sprint()
+        self.lifecycle.arm(second_sprint, 3)
+        self.lifecycle.transition(
+            second_sprint,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="success receipt fixture",
+            terminal_outcome="accepted",
+        )
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='succeeded' "
+            "WHERE sprint_id=? AND target_kind='worktree'",
+            (second_sprint,),
+        )
+        self.con.commit()
+        artifact = self.targets.claim_next("success-fixture")
+        self.assertIsNotNone(artifact)
+        self.assertEqual("artifact_dir", artifact.target_kind)
+        self.assertTrue(self.targets.mark_succeeded(artifact, {"existed": False}))
+
+        completed_event = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='sprint.cleanup_completed'",
+            (second_sprint,),
+        ).fetchone()
+        completed_message = self.con.execute(
+            "SELECT receiver_shell_id,declared_type,body FROM wake_message "
+            "WHERE idempotency_key=?",
+            (f"sprint:{second_sprint}:cleanup-completed",),
+        ).fetchone()
+        self.assertEqual(
+            ("succeeded", 4),
+            (
+                json.loads(completed_event[0])["aggregate_state"],
+                json.loads(completed_event[0])["target_count"],
+            ),
+        )
+        self.assertEqual((3, "re-enter"), tuple(completed_message[:2]))
+        self.assertIn("worktrees are reusable", completed_message[2])
 
 
 if __name__ == "__main__":

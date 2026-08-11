@@ -386,6 +386,136 @@ class SprintBoardApiCase(unittest.TestCase):
         cancelled = next(row for row in units.values() if row["disposition"] == "cancelled")
         self.assertEqual("done", cancelled["column"])
         self.assertEqual("cancelled cleanly", cancelled["completion_result"])
+        self.assertEqual(
+            {"aggregate_state": None, "target_count": 0, "pending_count": 0,
+             "running_count": 0, "succeeded_count": 0, "failed_count": 0},
+            board["cleanup"],
+        )
+
+    def test_board_and_list_project_cleanup_aggregate_without_target_paths(self):
+        with self.connect() as con:
+            con.execute(
+                "UPDATE sprints SET lifecycle='completed',terminal_outcome='accepted',"
+                "completed_at=datetime('now') WHERE sprint_id=?",
+                (self.ids["sprint_id"],),
+            )
+            con.executemany(
+                "INSERT INTO sprint_cleanup_targets "
+                "(sprint_id,shell_id,target_kind,canonical_path,repository_root,"
+                "git_common_dir,expected_base_branch,state,last_error_code) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    (
+                        self.ids["sprint_id"], 3, "worktree",
+                        "/repo/.sc-worktrees/dev1", "/repo", "/repo/.git",
+                        "shell/dev1", "failed", "fixture_failed",
+                    ),
+                    (
+                        self.ids["sprint_id"], None, "artifact_dir",
+                        f"/repo/shared/sprints/sprint-{self.ids['sprint_id']}",
+                        "/repo", "/repo/.git", None, "pending", None,
+                    ),
+                ),
+            )
+
+        status, _, board = self.request(
+            "GET", f"/api/sprints/{self.ids['sprint_id']}"
+        )
+        self.assertEqual(200, status, board)
+        self.assertEqual(
+            {"aggregate_state": "failed", "target_count": 2, "pending_count": 1,
+             "running_count": 0, "succeeded_count": 0, "failed_count": 1},
+            board["cleanup"],
+        )
+        status, _, listing = self.request("GET", "/api/sprints?limit=100")
+        self.assertEqual(200, status, listing)
+        projected = next(
+            row for row in listing["items"]
+            if row["sprint_id"] == self.ids["sprint_id"]
+        )
+        self.assertEqual(board["cleanup"], projected["cleanup"])
+        self.assertNotIn("/repo", json.dumps(projected["cleanup"]))
+
+    def test_shell_cleanup_api_projects_bounded_status_and_stable_error_codes(self):
+        with self.connect() as con:
+            con.execute(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id,api_key) "
+                "VALUES (8,'Outsider','OUT1','dev','prompt',1,'outside-token')"
+            )
+            con.execute(
+                "UPDATE sprints SET lifecycle='completed',terminal_outcome='accepted',"
+                "completed_at=datetime('now') WHERE sprint_id=?",
+                (self.ids["sprint_id"],),
+            )
+            con.execute(
+                "INSERT INTO sprint_cleanup_targets "
+                "(sprint_id,shell_id,target_kind,canonical_path,repository_root,"
+                "git_common_dir,expected_base_branch,state,attempt_count,"
+                "last_error_code,last_error_detail,before_evidence) "
+                "VALUES (?,3,'worktree','/repo/.sc-worktrees/dev1','/repo',"
+                "'/repo/.git','shell/dev1','failed',3,'fixture_failed',"
+                "'bounded detail',?)",
+                (
+                    self.ids["sprint_id"],
+                    json.dumps(
+                        {
+                            "branch": "feat/disposable",
+                            "status_count": 1,
+                            "status_sample": ["?? private-name.txt"],
+                        }
+                    ),
+                ),
+            )
+
+        status, _, body = self.request(
+            "GET",
+            f"/_sc/sprint/cleanup-runs/{self.ids['sprint_id']}",
+            "dev-token",
+        )
+        self.assertEqual(200, status, body)
+        self.assertEqual(("failed", 1), (body["aggregate_state"], body["target_count"]))
+        self.assertEqual(".sc-worktrees/dev1", body["targets"][0]["path_label"])
+        self.assertNotIn("/repo", json.dumps(body))
+        self.assertNotIn("private-name", json.dumps(body))
+
+        status, _, denied = self.request(
+            "GET",
+            f"/_sc/sprint/cleanup-runs/{self.ids['sprint_id']}",
+            "outside-token",
+        )
+        self.assertEqual(403, status, denied)
+        self.assertEqual("cleanup_status_forbidden", denied["details"]["code"])
+
+        payload = {
+            "sprint_id": self.ids["sprint_id"],
+            "idempotency_key": "retry-board-fixture",
+            "adopt_legacy": False,
+        }
+        status, _, denied = self.request(
+            "POST", "/_sc/sprint/cleanup-runs", "dev-token", body=payload
+        )
+        self.assertEqual(403, status, denied)
+        self.assertEqual("cleanup_retry_forbidden", denied["details"]["code"])
+
+        status, _, first = self.request(
+            "POST", "/_sc/sprint/cleanup-runs", "planner-token", body=payload
+        )
+        self.assertEqual(201, status, first)
+        status, _, replay = self.request(
+            "POST", "/_sc/sprint/cleanup-runs", "planner-token", body=payload
+        )
+        self.assertEqual(200, status, replay)
+        self.assertEqual(
+            ("requeued", True, False, first["cleanup_request_id"], [first["target_ids"][0]]),
+            (
+                first["action"],
+                first["created"],
+                replay["created"],
+                replay["cleanup_request_id"],
+                replay["target_ids"],
+            ),
+        )
 
     def test_health_messages_project_exact_scoped_waits_beyond_audit_history(self):
         with self.connect() as con:
@@ -768,6 +898,48 @@ class SprintBoardApiCase(unittest.TestCase):
                     "artifact_target_ids": [4],
                     "target_count": 4,
                     "worktree_target_ids": [1, 2, 3],
+                    "secret": "hidden",
+                },
+            ),
+            (
+                "sprint.cleanup_adopted",
+                {
+                    "aggregate_state": "pending",
+                    "request_kind": "adopted_legacy",
+                    "target_count": 4,
+                    "target_ids": [1, 2, 3, 4],
+                    "secret": "hidden",
+                },
+            ),
+            (
+                "sprint.cleanup_requeued",
+                {
+                    "aggregate_state": "pending",
+                    "request_kind": "requeued",
+                    "target_count": 4,
+                    "target_ids": [2],
+                    "secret": "hidden",
+                },
+            ),
+            (
+                "sprint.cleanup_failed",
+                {
+                    "aggregate_state": "failed",
+                    "attempt_count": 3,
+                    "cleanup_target_id": 2,
+                    "claim_generation": 4,
+                    "error_code": "fetch_failed",
+                    "path_label": ".sc-worktrees/dev1",
+                    "target_kind": "worktree",
+                    "secret": "hidden",
+                },
+            ),
+            (
+                "sprint.cleanup_completed",
+                {
+                    "aggregate_state": "succeeded",
+                    "succeeded_count": 4,
+                    "target_count": 4,
                     "secret": "hidden",
                 },
             ),

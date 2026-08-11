@@ -30,6 +30,13 @@ CLOSEOUT_ROLE_SKILLS = {"sprint_close", "sprint_dev", "sprint_pln", "sprint_rev"
 FORCE_NEW_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
 POLISHED_SPRINT_SKILLS = set(SKILLS) - {"sprint_prep"}
 CHAT_CLEANUP_SKILLS = {"sprint_close", "sprint_pln", "sprint_rev"}
+CLEANUP_RECOVERY_SKILLS = {
+    "git",
+    "sprint_close",
+    "sprint_pln",
+    "sprint_prep",
+    "sprint_rev",
+}
 PROGRESS_CARRIER_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
 LIVE_REPLAN_ROLE_SKILLS = {"sprint_pln", "sprint_rev"}
 
@@ -108,6 +115,8 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(migration)
 
             for name in CONTEXT_EFFICIENT_SKILLS:
+                if name in CLEANUP_RECOVERY_SKILLS:
+                    continue  # 0203 deliberately supersedes these role bodies.
                 parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
                 actual = con.execute(
                     "SELECT description,category,command,common,content,is_deleted "
@@ -521,6 +530,11 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            con.executescript(
+                (
+                    ENGINE / "migrations" / "0203_sprint_cleanup_recovery.sql"
+                ).read_text()
+            )
 
             parsed = seed_skills.parse_skill(ASSETS / "sprint_prep" / "SKILL.md")
             row = con.execute(
@@ -676,6 +690,68 @@ class SprintSkillTest(unittest.TestCase):
                     self.assertIn("report-authoring Reviewer", normalized)
                     self.assertIn("Do not manually close peer chats", normalized)
                     self.assertIn("failed conformance", normalized)
+        finally:
+            con.close()
+
+    def test_cleanup_recovery_migration_matches_assets_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0203_sprint_cleanup_recovery.sql":
+                    break
+                con.executescript(migration.read_text())
+            placeholders = ",".join("?" for _ in CLEANUP_RECOVERY_SKILLS)
+            con.execute(
+                f"UPDATE skills SET description='stale',category='stale',"
+                f"command='stale',common=1,content='no cleanup recovery',"
+                f"is_deleted=1 WHERE name IN ({placeholders})",
+                tuple(sorted(CLEANUP_RECOVERY_SKILLS)),
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0203_sprint_cleanup_recovery.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            self.assertIsNotNone(
+                con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='sprint_cleanup_requests'"
+                ).fetchone()
+            )
+            for name in sorted(CLEANUP_RECOVERY_SKILLS):
+                with self.subTest(name=name):
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(1, len(rows))
+                    self.assertEqual(
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                        tuple(rows[0]),
+                    )
+
+            all_content = " ".join(
+                row[0]
+                for row in con.execute(
+                    f"SELECT content FROM skills WHERE name IN ({placeholders})",
+                    tuple(sorted(CLEANUP_RECOVERY_SKILLS)),
+                )
+            )
+            self.assertIn("sc sprint cleanup-status", all_content)
+            self.assertIn("--adopt-legacy", all_content)
+            self.assertIn("not reusable", all_content)
         finally:
             con.close()
 
@@ -1123,6 +1199,8 @@ class SprintSkillTest(unittest.TestCase):
             "record-conformance",
             "disposition-followup",
             "compile-report",
+            "cleanup-status",
+            "cleanup",
         }
         combined = "\n".join(
             (ASSETS / name / "SKILL.md").read_text() for name in SKILLS
@@ -1703,7 +1781,7 @@ class SprintSkillTest(unittest.TestCase):
         planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()
         wave_handoff = planner[
             planner.index("Never dispatch the next wave"):
-            planner.index("On a clean completion receipt")
+            planner.index("On an initial clean completion receipt")
         ]
         self.assertIn(
             "merged-work handoff wake is the only normal next-wave dispatch trigger",
@@ -1744,8 +1822,8 @@ class SprintSkillTest(unittest.TestCase):
         stop = reviewer[reviewer.index("## Stop"):]
         normalized_stop = " ".join(stop.lower().split())
         self.assertIn(
-            "when it confirms completed state and all receipt identities, stop "
-            "immediately",
+            "when it confirms completed state, pending cleanup, and all receipt "
+            "identities, stop immediately",
             normalized_stop,
         )
         self.assertIn("run no trailing command", normalized_stop)

@@ -27,11 +27,12 @@ changed it or the next command requires live revalidation.
   follow **Reviewer decision actions**. Inspect and handle the durable inbox
   message once, then execute the exact requested transition without
   re-adjudicating it.
-- **Planner receives the engine-wide clean-completion receipt.** Load
+- **Planner receives an engine-wide completion or cleanup receipt.** Load
   `sprint_pln` and follow **Conclude or abort**. Inspect the self-contained
-  receipt and terminal Sprint state directly. Do not run the Sprint inbox,
-  accept the receipt, compile another report, run `complete`, or wait for a
-  second close handoff.
+  receipt and terminal Sprint state directly. The completion receipt leaves
+  cleanup pending; the later cleanup receipt makes reuse or recovery explicit.
+  Do not run the Sprint inbox, accept the receipt, compile another report, or
+  run `complete`.
 - **FnB directs a fallback or follow-up disposition.** Use the bounded surfaces
   below and name FnB authority in the evidence.
 
@@ -55,6 +56,12 @@ report-authoring Reviewer. Do not manually close peer chats as an extra
 closeout step. Pause, abort, re-entry, failed conformance, and rejected fallback
 completion never invoke this cleanup.
 
+Successful close schedules exact participant-worktree and Sprint-artifact
+cleanup. No role manually resets those targets after completion. The initial
+Planner receipt reports pending cleanup; the System later sends succeeded or
+failed cleanup evidence. A failed receipt names the bounded status and retry
+commands.
+
 If a command rejects a decision, preserve the returned durable state. Do not
 substitute another transition or invent an alternate handoff. Return the
 conflict to the deciding role, or surface it to FnB when the relay itself is
@@ -74,6 +81,21 @@ Raise the limit only when truncation counters omit needed evidence; 200 is the
 maximum. The packet supplies facts, not judgment. The standalone `complete`
 surface is likewise an FnB-directed recovery fallback, never the normal clean
 close path.
+
+FnB may inspect any completed Sprint's bounded cleanup state, retry failed
+targets, or explicitly adopt exactly one historical completed Sprint that has
+no targets. Target identities are System-derived; never supply a path or add a
+confirmation handshake:
+
+```text
+sc sprint cleanup-status --sprint <id>
+sc sprint cleanup --sprint <id> --key <stable-retry-key>
+sc sprint cleanup --sprint <legacy-id> --adopt-legacy \
+  --key <stable-adoption-key>
+```
+
+Require the cleanup request id, `created`, action, exact target ids, and
+aggregate projection. Reuse a key only for the identical request.
 
 Abort remains a Planner action on a Reviewer decision or FnB override and
 deletes nothing:
