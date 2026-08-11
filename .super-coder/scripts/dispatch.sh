@@ -72,13 +72,8 @@ sc_platform_unsupported() {
 }
 
 sc_python_recovery() {
-  if [ "$(uname -s 2>/dev/null || true)" = "Darwin" ]; then
-    echo '  recovery: brew install python' >&2
-    echo '            export SC_PYTHON="$(brew --prefix)/bin/python3"' >&2
-  else
-    echo '  recovery: install Python 3.9+ with sqlite3, then:' >&2
-    echo '            export SC_PYTHON=/absolute/path/to/python3' >&2
-  fi
+  echo '  recovery: install Python 3.9+ with sqlite3, then:' >&2
+  echo '            export SC_PYTHON=/absolute/path/to/python3' >&2
 }
 
 sc_python_probe() {
@@ -1432,7 +1427,7 @@ PY
     cat <<'EOF'
 super-coder — forkable shell substrate
 
-  Host support: Linux-only — Ubuntu, Fedora, Arch, and CachyOS are tested examples.
+  Host support: Linux-only — Ubuntu LTS, stable Fedora, and Arch-compatible Linux (including CachyOS) are tested examples.
 
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
   ./sc ensure-harness      install claude + opencode + codex + vibe + kimi if missing (official native installers, no npm)

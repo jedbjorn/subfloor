@@ -34,14 +34,14 @@ The launchers must still resolve image-owned executables from
 
 Three reasons it must stay that way, each of which has already bitten someone:
 
-- **A darwin binary is fatal in a linux container.** On a macOS host, mounting
-  the host's install shadows the baked one with a Mach-O binary the container
-  cannot execute. The Dockerfile installs kimi to `/usr/local` for exactly this
-  reason — its native home, `~/.kimi-code`, is a mounted cred dir.
+- **Host binaries are not portable into the Linux container.** Mounting a host
+  install can shadow the baked executable with an incompatible binary. The
+  Dockerfile installs kimi to `/usr/local` for exactly this reason — its native
+  home, `~/.kimi-code`, is a mounted credential directory.
 - **vibe is not relocatable.** `~/.local/bin/vibe` is a script whose shebang is
   an absolute path into a host uv-managed interpreter. Mounting the binary
   without that interpreter tree gives you a dangling shebang.
-- **libc baselines differ.** We support Arch, Ubuntu and macOS hosts against a
+- **libc baselines differ.** Linux host distributions can differ from the
   Debian container. Auth is portable JSON; native binaries are not.
 - **State homes can grow packages.** Codex's installer now stores its standalone
   package under `~/.codex/packages`, inside the state tree we mount. The

@@ -209,7 +209,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
 
     def test_global_help_states_linux_only_support_on_every_host(self) -> None:
         hosts = {"supported": "Linux", "unsupported": "Darwin"}
-        support_line = "Host support: Linux-only — Ubuntu, Fedora, Arch, and CachyOS are tested examples."
+        support_line = "Host support: Linux-only — Ubuntu LTS, stable Fedora, and Arch-compatible Linux (including CachyOS) are tested examples."
         for name, kernel in hosts.items():
             self.configure_host(kernel)
             for command in ((), ("help",), ("-h",), ("--help",)):
@@ -219,6 +219,55 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn(support_line, result.stdout)
+
+    def test_native_mac_success_surfaces_are_absent(self) -> None:
+        installer = (ENGINE / "scripts" / "install.py").read_text()
+        workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text()
+        public_docs = [
+            (ROOT / "README.md").read_text(),
+            (ROOT / "docs" / "README.md").read_text(),
+            (ROOT / "docs" / "quick-start.md").read_text(),
+        ]
+
+        for retired in ("brew", "colima", "Docker Desktop"):
+            with self.subTest(retired=retired):
+                self.assertNotIn(retired.lower(), self.dispatch_source.lower())
+                self.assertNotIn(retired.lower(), installer.lower())
+                self.assertNotIn(retired.lower(), workflow.lower())
+                for document in public_docs:
+                    self.assertNotIn(retired.lower(), document.lower())
+        self.assertNotIn("macos-latest", workflow)
+        self.assertIn("create a linux vm", public_docs[0].lower())
+        self.assertIn("guest-owned storage", public_docs[1])
+        self.assertIn("make dos-l", public_docs[2])
+        self.assertIn("make dos-e", public_docs[2])
+
+    def test_installer_banner_uses_declared_make_aliases(self) -> None:
+        installer = (ENGINE / "scripts" / "install.py").read_text()
+        aliases = (ENGINE / "aliases.mk").read_text()
+
+        self.assertIn("make dos-l", installer)
+        self.assertIn("make dos-e", installer)
+        self.assertNotIn("make launch", installer)
+        self.assertNotIn("make enter", installer)
+        self.assertIn("dos-launch", aliases)
+        self.assertIn("dos-enter", aliases)
+
+    def test_active_engine_surfaces_do_not_claim_native_mac_support(self) -> None:
+        surfaces = [
+            ENGINE / "scripts" / "install.py",
+            ENGINE / "scripts" / "run.py",
+            ENGINE / "docs" / "harness-freshness.md",
+            ENGINE / "adapters" / "kimi" / "README.md",
+            ENGINE / "Dockerfile",
+        ]
+        forbidden = ("darwin", "macos", "homebrew", "brew", "colima", "docker desktop")
+
+        for path in surfaces:
+            body = path.read_text().lower()
+            for term in forbidden:
+                with self.subTest(path=path, term=term):
+                    self.assertNotIn(term, body)
 
     def test_unsupported_kernel_refuses_before_python_or_target(self) -> None:
         python = self.sentinel_python()
@@ -400,11 +449,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                     f"Usage: ./sc {command} [-h|--help]\n",
                 )
                 self.assertNotIn("host Python preflight", help_result.stderr)
-        recovery = (
-            'export SC_PYTHON="$(brew --prefix)/bin/python3"'
-            if sys.platform == "darwin"
-            else "export SC_PYTHON=/absolute/path/to/python3"
-        )
+        recovery = "export SC_PYTHON=/absolute/path/to/python3"
 
         for command in ("rebuild",):
             with self.subTest(command=command):

@@ -17,8 +17,10 @@ class FreshInstallShellContractTest(unittest.TestCase):
             commit = text.index(
                 'git commit --no-verify -m "chore: install subfloor"'
             )
-            enter = text.index("./sc enter", commit)
-            self.assertLess(commit, enter, relative)
+            launch = text.index("make dos-l", commit)
+            enter = text.index("make dos-e", launch)
+            self.assertLess(commit, launch, relative)
+            self.assertLess(launch, enter, relative)
 
     def test_rendered_api_guidance_uses_path_launcher(self) -> None:
         rendered = compose.render_api(8837, "configured")

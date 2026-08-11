@@ -48,14 +48,15 @@ What that buys you in practice:
 ## Install
 
 > [!class4]
-> **The bar: Python 3.9+ with `sqlite3`, a reachable docker daemon, and one signed-in harness CLI on PATH.**
-> `./sc doctor` reports the selected interpreter and what it finds. Set
-> `SC_PYTHON` to an exact interpreter, for example
-> `export SC_PYTHON="$(brew --prefix)/bin/python3"` on macOS. The
-> prerequisites table (Arch / macOS), docker modes, and the no-docker escape
-> hatch: [*Install*](README.md#install).
+> **The bar: Linux, Python 3.9+ with `sqlite3`, a reachable docker daemon, and one signed-in harness CLI on PATH.**
+> Set `SC_PYTHON=/absolute/path/to/python3` to select a specific interpreter.
+> Ubuntu LTS, stable Fedora, and Arch-compatible Linux (including CachyOS) are
+> tested examples, not an exclusive list.
+> On macOS or Windows, create a Linux VM and run this flow inside the guest.
+> The Linux prerequisites, guest-filesystem recommendation, docker modes, and
+> no-docker escape hatch: [*Install*](README.md#install).
 
-Five steps, from an existing git repo to a booted shell:
+Four steps, from an existing git repo to a booted shell:
 
 1. **Pull the engine in.** Add `jedbjorn/subfloor` as a git remote and check
    out `.super-coder` + `sc` — files only, no history merge. The copy-paste
@@ -63,26 +64,21 @@ Five steps, from an existing git repo to a booted shell:
    [*Install*](README.md#install).
 2. **Bootstrap the fork.** `./sc install` checks requirements, installs the
    harness CLIs, wires your `.gitignore`, builds the DB, and seeds your
-   starting team. What it does under the hood, and the flags to script it:
-   [*Install → Installer internals*](README.md#install).
-3. **Sign in once, on the host.** Each harness authenticates with your own
-   account — `claude`, `opencode auth login`, `codex login`, `vibe --setup`,
-   or `kimi login` — and the sandbox mounts the credentials in. Host, never
-   inside the sandbox: [*Install → Harness sign-in*](README.md#install).
-4. **Launch.** `./sc launch` builds and starts the sandbox container — the
-   engine server plus the Review GUI, published to `127.0.0.1` only.
-5. **Commit the install.** Only `sc`, `.sc-state/`, and config track; the
-   engine itself stays a gitignored dependency. Installation has already
-   activated the branch guard, so make the deliberate operator-owned bootstrap
-   commit with the exact command:
+   starting team. Commit the bootstrap:
 
    ```bash
    git add -A && git commit --no-verify -m "chore: install subfloor"
    ```
 
-   Later direct operator commits on a protected default branch require the same
-   deliberate bypass. Launched shells—including vibe—remain branch-first and
-   receive no bypass recipe.
+   What it does under the hood, and the flags to script it:
+   [*Install → Installer internals*](README.md#install).
+3. **Launch.** `make dos-l` builds and starts the sandbox container and Review
+   GUI, published to `127.0.0.1` only.
+4. **Sign in and enter.** Each harness authenticates with your own
+   account — `claude`, `opencode auth login`, `codex login`, `vibe --setup`,
+   or `kimi login` — and the sandbox mounts the credentials in. Host, never
+   inside the sandbox. After signing in, `make dos-e` enters a shell:
+   [*Install → Harness sign-in*](README.md#install).
 
 ## First boot
 
