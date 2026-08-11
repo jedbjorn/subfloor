@@ -390,6 +390,26 @@ def cmd_watcher_state(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cleanup_status(args: argparse.Namespace) -> int:
+    result = mem._api("GET", f"/_sc/sprint/cleanup-runs/{args.sprint}")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/cleanup-runs",
+        {
+            "sprint_id": args.sprint,
+            "idempotency_key": args.key,
+            "adopt_legacy": args.adopt_legacy,
+        },
+        idempotent=True,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_record_conformance(args: argparse.Namespace) -> int:
     result = _post(
         "/_sc/sprint/conformance",
@@ -695,6 +715,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watcher_state.add_argument("--sprint", type=int, required=True)
     watcher_state.set_defaults(fn=cmd_watcher_state)
+
+    cleanup_status = sub.add_parser(
+        "cleanup-status", help="Read bounded successful-Sprint cleanup evidence"
+    )
+    cleanup_status.add_argument("--sprint", type=int, required=True)
+    cleanup_status.set_defaults(fn=cmd_cleanup_status)
+
+    cleanup = sub.add_parser(
+        "cleanup", help="Retry failed cleanup or explicitly adopt one legacy Sprint"
+    )
+    cleanup.add_argument("--sprint", type=int, required=True)
+    cleanup.add_argument(
+        "--adopt-legacy",
+        action="store_true",
+        help="FnB only: derive targets for one completed pre-scheduling Sprint",
+    )
+    cleanup.add_argument("--key", required=True, help="stable retry identity")
+    cleanup.set_defaults(fn=cmd_cleanup)
 
     conformance = sub.add_parser(
         "record-conformance", help="Reviewer records a report and follow-ups"

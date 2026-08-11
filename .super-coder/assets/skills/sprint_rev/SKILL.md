@@ -372,6 +372,10 @@ completed state, Planner message id, and Planner wake id. This creates
 append-only evidence, pending follow-ups, terminal lifecycle, and one
 informational engine-wide Planner Re-enter in the same transaction. Never
 record conformance first and then close around it; send no conclude message.
+Require the receipt's cleanup projection to report `pending`; cleanup executes
+after participant turns exit. Do not reset a participant worktree, poll cleanup,
+or wait for cleanup before stopping. The originating Planner receives the later
+engine-authored success or failure receipt.
 On that successful commit, the engine also closes every other active chat
 immutably linked to the Sprint. The originating Planner and this
 report-authoring Reviewer remain open. Do not manually close peer chats as an
@@ -398,8 +402,9 @@ requested action. Then complete this final handoff order:
 2. Confirm every Reviewer-authored artifact and decision body is final and
    below its 8,000-character hard maximum.
 3. For a clean conclude, run the atomic `record-conformance` command above as
-   the literal final action. When it confirms completed state and all receipt
-   identities, stop immediately; the Planner is already notified.
+   the literal final action. When it confirms completed state, pending cleanup,
+   and all receipt identities, stop immediately; the Planner is already
+   notified.
 4. For re-enter or abort, deliver the decision to the Planner as the literal
    final action:
 

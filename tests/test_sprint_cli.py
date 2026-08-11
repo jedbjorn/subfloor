@@ -56,6 +56,73 @@ class SprintCliDispatcherTest(unittest.TestCase):
         self.assertIn("watcher-state", completed.stdout)
         self.assertIn("reconcile-pr", completed.stdout)
 
+    def test_worktree_sprint_help_lists_cleanup_recovery_commands(self):
+        completed = subprocess.run(
+            [sys.executable, str(ENGINE / "scripts" / "sprint.py"), "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertIn("cleanup-status", completed.stdout)
+        self.assertIn("cleanup", completed.stdout)
+
+    def test_cleanup_commands_use_bounded_get_and_idempotent_post(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(mem, "_require_api"),
+            mock.patch.object(
+                mem,
+                "_api",
+                side_effect=(
+                    {"sprint_id": 11, "aggregate_state": "pending", "targets": []},
+                    {
+                        "cleanup_request_id": 7,
+                        "created": True,
+                        "action": "adopted_legacy",
+                        "target_ids": [1, 2],
+                    },
+                ),
+            ) as api,
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(
+                0, sprint_cli.main(["cleanup-status", "--sprint", "11"])
+            )
+            self.assertEqual(
+                0,
+                sprint_cli.main(
+                    [
+                        "cleanup",
+                        "--sprint",
+                        "11",
+                        "--adopt-legacy",
+                        "--key",
+                        "legacy-11",
+                    ]
+                ),
+            )
+
+        self.assertEqual(
+            mock.call("GET", "/_sc/sprint/cleanup-runs/11"),
+            api.call_args_list[0],
+        )
+        self.assertEqual(
+            mock.call(
+                "POST",
+                "/_sc/sprint/cleanup-runs",
+                {
+                    "sprint_id": 11,
+                    "idempotency_key": "legacy-11",
+                    "adopt_legacy": True,
+                },
+                idempotent=True,
+            ),
+            api.call_args_list[1],
+        )
+
 
 class Reader:
     def get(self, number: int) -> PullRequest:

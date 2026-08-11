@@ -319,6 +319,15 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         "'shell/dev1')"
     )
     con.execute(
+        "INSERT INTO sprint_cleanup_requests "
+        "(cleanup_request_id,sprint_id,caller_shell_id,request_kind,"
+        "idempotency_key,request_hash,response_json) VALUES "
+        "(1,2,3,'adopted_legacy','snapshot-cleanup-request',"
+        "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',"
+        "'{\"action\":\"adopted_legacy\",\"projection\":{},"
+        "\"sprint_id\":2,\"target_ids\":[1]}')"
+    )
+    con.execute(
         "UPDATE sprints SET lifecycle='armed',updated_at='2026-08-01 22:02:00' "
         "WHERE sprint_id=1"
     )

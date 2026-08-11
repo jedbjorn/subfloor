@@ -25,9 +25,9 @@ Classify the entry before reading an inbox:
 
 - For a Sprint-scoped control decision, merged-work handoff, question, blocker,
   or other relay message, inspect the Sprint inbox once and handle that message.
-- For the self-contained engine-wide clean-completion receipt, inspect the
-  receipt and terminal Sprint state directly. It is informational: do not run
-  the Sprint inbox, accept it, or issue a close command.
+- For an engine-wide completion or cleanup receipt, inspect the receipt and
+  terminal Sprint state directly. It is informational: do not run the Sprint
+  inbox, accept it, or issue a close command.
 - For a live FnB instruction, act under the board-level override and name that
   authority in the durable evidence.
 
@@ -377,6 +377,23 @@ Reviewer remain open. Do not manually close peer chats as a second closeout
 action. Pause, abort, re-entry, failed conformance, and rejected fallback
 completion retain their existing no-cleanup behavior.
 
+The initial completion receipt reports `cleanup_state=pending`. Delivery is
+finished, but its managed worktrees are not reusable yet. Stop and wait for the
+engine-wide cleanup receipt; do not poll or manually reset participant trees.
+On `cleanup_state=succeeded`, record the bounded receipt and treat the slots as
+reusable. On a cleanup failure, inspect once and retry only after correcting the
+named condition:
+
+```text
+sc sprint cleanup-status --sprint <id>
+sc sprint cleanup --sprint <id> --key <stable-retry-key>
+```
+
+Require `created`, the cleanup request id, action, exact target ids, and the
+aggregate projection in the retry response. Reuse the same key only for that
+same request. FnB alone may add `--adopt-legacy` for one completed Sprint with
+no scheduled targets; neither caller supplies a path.
+
 Do not run `compile-report` by default, synthesize the final report, or
 editorialize the Reviewer body. The Reviewer compiles its own evidence. A
 Planner compile remains a valid FnB-directed fallback:
@@ -419,7 +436,8 @@ sc sprint dispatch --sprint <id>
    immediately. Run no trailing command. Empty dispatch is still the final
    action for that handoff turn; investigate only on a later durable wake.
 
-On a clean completion receipt, verify the named Sprint is terminal and record
-the bounded receipt; run no close command. The Planner does not author a second
-report, accept an actionable handoff, or wait for another actor to finish the
-Sprint.
+On an initial clean completion receipt, verify the named Sprint is terminal and
+record `cleanup_state=pending`; run no close command. Stop until the
+engine-authored cleanup success or failure receipt arrives. The Planner does
+not author a second report, accept an actionable handoff, poll cleanup, or ask
+another role to reset a worktree.
