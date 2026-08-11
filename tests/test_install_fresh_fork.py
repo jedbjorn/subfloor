@@ -116,10 +116,18 @@ class FreshForkInstallTest(unittest.TestCase):
         extra_env: dict[str, str] | None = None,
         args: list[str] | None = None,
         timeout: int | None = None,
+        python_version: tuple[int, int, int] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         # The subprocess patches host probes before executing the unmodified installer.
         install = repo / ".super-coder" / "scripts" / "install.py"
         argv = [str(install), *(args or ["--harness-epoch"])]
+        python_probe = ""
+        if python_version:
+            version_text = ".".join(str(part) for part in python_version)
+            python_probe = (
+                f"sys.version_info = {python_version!r}\n"
+                f"platform.python_version = lambda: {version_text!r}\n"
+            )
         direct_entry = (
             "import builtins\n"
             "import platform\n"
@@ -133,8 +141,9 @@ class FreshForkInstallTest(unittest.TestCase):
             "        return original_open(release, *args, **kwargs)\n"
             "    return original_open(path, *args, **kwargs)\n"
             "builtins.open = host_open\n"
-            f"sys.argv = {argv!r}\n"
-            f"runpy.run_path({str(install)!r}, run_name='__main__')\n"
+            + python_probe
+            + f"sys.argv = {argv!r}\n"
+            + f"runpy.run_path({str(install)!r}, run_name='__main__')\n"
         )
         return subprocess.run(
             [sys.executable, "-c", direct_entry],
@@ -208,27 +217,16 @@ class FreshForkInstallTest(unittest.TestCase):
                 text=True,
                 check=True,
             ).stdout
-            install = repo / ".super-coder" / "scripts" / "install.py"
-            direct_entry = (
-                "import platform, runpy, sys; "
-                "sys.version_info = (3, 8, 20); "
-                "platform.python_version = lambda: '3.8.20'; "
-                f"sys.argv = [{str(install)!r}, '--skip-harness-install']; "
-                f"runpy.run_path({str(install)!r}, run_name='__main__')"
-            )
-
-            result = subprocess.run(
-                [sys.executable, "-c", direct_entry],
-                cwd=repo,
-                env={
-                    **os.environ,
-                    "HOME": str(home),
-                    "NO_COLOR": "1",
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                },
-                capture_output=True,
-                text=True,
-                check=False,
+            release = home / "os-release"
+            release.write_text("ID=ubuntu\nVERSION_ID=24.04\n")
+            result = self.run_direct_host(
+                repo,
+                home,
+                "Linux",
+                release,
+                {"NO_COLOR": "1"},
+                args=["--skip-harness-install"],
+                python_version=(3, 8, 20),
             )
 
             self.assertNotEqual(result.returncode, 0)
