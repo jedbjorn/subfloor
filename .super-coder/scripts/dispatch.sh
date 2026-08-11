@@ -60,6 +60,7 @@ sc_platform_unquote() {
   case "$_platform_value" in
     \"*\") _platform_value=${_platform_value#\"}; _platform_value=${_platform_value%\"} ;;
     \'*\') _platform_value=${_platform_value#\'}; _platform_value=${_platform_value%\'} ;;
+    \"*|\'*|*\"|*\') return 1 ;;
   esac
   printf '%s\n' "$_platform_value"
 }
@@ -67,21 +68,33 @@ sc_platform_unquote() {
 sc_platform_detect() {
   SC_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"
   _platform_release=/etc/os-release
+  _platform_wsl_release=/proc/sys/kernel/osrelease
   SC_PLATFORM_ID=""
   SC_PLATFORM_ID_LIKE=""
   SC_PLATFORM_VERSION_ID=""
+  SC_PLATFORM_INVALID=0
   SC_PLATFORM_WSL=0
+  _platform_wsl_kernel="$(command -p cat "$_platform_wsl_release" 2>/dev/null || true)"
+  case "$_platform_wsl_kernel" in
+    *[Mm]icrosoft*|*[Ww][Ss][Ll]*) SC_PLATFORM_WSL=1 ;;
+  esac
   if [ -n "${WSL_DISTRO_NAME:-}" ] || [ -n "${WSL_INTEROP:-}" ]; then
     SC_PLATFORM_WSL=1
   fi
   if [ -r "$_platform_release" ] && command -p iconv -f UTF-8 -t UTF-8 "$_platform_release" >/dev/null 2>&1; then
     while IFS='=' read -r _platform_key _platform_value || [ -n "$_platform_key" ]; do
       case "$_platform_key" in
-        ID) SC_PLATFORM_ID="$(sc_platform_unquote "$_platform_value")" ;;
-        ID_LIKE) SC_PLATFORM_ID_LIKE="$(sc_platform_unquote "$_platform_value")" ;;
-        VERSION_ID) SC_PLATFORM_VERSION_ID="$(sc_platform_unquote "$_platform_value")" ;;
+        ID) SC_PLATFORM_ID="$(sc_platform_unquote "$_platform_value")" || SC_PLATFORM_INVALID=1 ;;
+        ID_LIKE) SC_PLATFORM_ID_LIKE="$(sc_platform_unquote "$_platform_value")" || SC_PLATFORM_INVALID=1 ;;
+        VERSION_ID) SC_PLATFORM_VERSION_ID="$(sc_platform_unquote "$_platform_value")" || SC_PLATFORM_INVALID=1 ;;
       esac
+      [ "$SC_PLATFORM_INVALID" = 1 ] && break
     done < "$_platform_release"
+  fi
+  if [ "$SC_PLATFORM_INVALID" = 1 ]; then
+    SC_PLATFORM_ID=""
+    SC_PLATFORM_ID_LIKE=""
+    SC_PLATFORM_VERSION_ID=""
   fi
 }
 
@@ -1469,6 +1482,8 @@ PY
   help|-h|--help)
     cat <<'EOF'
 super-coder — forkable shell substrate
+
+  Host support: Linux-only — Ubuntu LTS, Fedora stable, Arch-compatible Linux.
 
   ./sc install             first-launch bootstrap for a fork (requirements, harness, first shell)
   ./sc ensure-harness      install claude + opencode + codex + vibe + kimi if missing (official native installers, no npm)

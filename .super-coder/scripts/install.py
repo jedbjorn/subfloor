@@ -61,7 +61,11 @@ def _platform_identity() -> tuple[str, str, str, str]:
             for line in stream:
                 key, separator, value = line.rstrip("\n").partition("=")
                 if separator and key in {"ID", "ID_LIKE", "VERSION_ID"}:
-                    fields[key] = value.strip().strip('"').strip("'")
+                    parsed = _os_release_value(value)
+                    if parsed is None:
+                        fields.clear()
+                        break
+                    fields[key] = parsed
     except (OSError, UnicodeError):
         pass
     return (
@@ -72,8 +76,27 @@ def _platform_identity() -> tuple[str, str, str, str]:
     )
 
 
+def _os_release_value(value: str) -> str | None:
+    if value[:1] in {'"', "'"} or value[-1:] in {'"', "'"}:
+        quote = value[:1] or value[-1:]
+        if len(value) < 2 or value[0] != quote or value[-1] != quote:
+            return None
+        return value[1:-1]
+    return value
+
+
 def _is_wsl() -> bool:
-    return bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"))
+    try:
+        with open("/proc/sys/kernel/osrelease", encoding="utf-8") as stream:
+            runtime = stream.read().lower()
+    except OSError:
+        runtime = ""
+    return bool(
+        "microsoft" in runtime
+        or "wsl" in runtime
+        or os.environ.get("WSL_DISTRO_NAME")
+        or os.environ.get("WSL_INTEROP")
+    )
 
 
 def require_supported_host() -> None:

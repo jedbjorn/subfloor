@@ -41,16 +41,25 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.supported_release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
         self.configure_host("Linux", self.supported_release)
 
-    def configure_host(self, kernel: str, os_release: Path) -> None:
+    def configure_host(
+        self, kernel: str, os_release: Path, runtime: Path | None = None
+    ) -> None:
         # Only this disposable dispatcher copy receives a deterministic host.
         kernel_probe = 'SC_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"'
         release_probe = "_platform_release=/etc/os-release"
+        runtime_probe = "_platform_wsl_release=/proc/sys/kernel/osrelease"
         self.assertIn(kernel_probe, self.dispatch_source)
         self.assertIn(release_probe, self.dispatch_source)
+        self.assertIn(runtime_probe, self.dispatch_source)
         self.dispatch.write_text(
             self.dispatch_source.replace(
                 kernel_probe, f"SC_PLATFORM_KERNEL={shlex.quote(kernel)}"
-            ).replace(release_probe, f"_platform_release={shlex.quote(str(os_release))}")
+            )
+            .replace(release_probe, f"_platform_release={shlex.quote(str(os_release))}")
+            .replace(
+                runtime_probe,
+                f"_platform_wsl_release={shlex.quote(str(runtime or Path('/proc/sys/kernel/osrelease')))}",
+            )
         )
 
     def invoke(
@@ -58,6 +67,7 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         python: str,
         *argv: str,
         extra_env: dict[str, str] | None = None,
+        clear_env: tuple[str, ...] = (),
         bare: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         command = argv if bare else (argv or ("install",))
@@ -69,6 +79,8 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         }
         if extra_env:
             environment.update(extra_env)
+        for name in clear_env:
+            environment.pop(name, None)
         return subprocess.run(
             ["sh", str(self.dispatch), *command],
             cwd=self.root,
@@ -161,6 +173,25 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                     (self.root / ".super-coder/scripts/install-ran").exists()
                 )
 
+    def test_global_help_states_linux_only_support_on_every_host(self) -> None:
+        hosts = {
+            "supported": ("Linux", self.supported_release),
+            "unsupported": ("Darwin", self.os_release("darwin", "ID=macos\n")),
+        }
+        support_line = (
+            "Host support: Linux-only — Ubuntu LTS, Fedora stable, "
+            "Arch-compatible Linux."
+        )
+        for name, (kernel, release) in hosts.items():
+            self.configure_host(kernel, release)
+            for command in ((), ("help",), ("-h",), ("--help",)):
+                with self.subTest(host=name, command=command or ("bare",)):
+                    result = self.invoke(
+                        sys.executable, *command, bare=not command
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(support_line, result.stdout)
+
     def test_wsl_refuses_allowlisted_ubuntu_before_python_or_target(self) -> None:
         release = self.os_release("wsl-ubuntu", "ID=ubuntu\nVERSION_ID=26.04\n")
         python = self.sentinel_python()
@@ -178,6 +209,11 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                 )
                 self.assertEqual(help_result.returncode, 0, help_result.stderr)
                 self.assertIn("super-coder", help_result.stdout)
+                self.assertIn(
+                    "Host support: Linux-only — Ubuntu LTS, Fedora stable, "
+                    "Arch-compatible Linux.",
+                    help_result.stdout,
+                )
 
         expected = (
             "✗ subfloor refused: unsupported host.\n"
@@ -199,6 +235,26 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                     (self.root / ".super-coder/scripts/install-ran").exists()
                 )
                 self.assertEqual(self.snapshot_tree(self.root), before)
+
+    def test_wsl_runtime_signature_refuses_without_marker_variables(self) -> None:
+        release = self.os_release("wsl-ubuntu", "ID=ubuntu\nVERSION_ID=26.04\n")
+        runtime = self.os_release(
+            "wsl-runtime", "5.15.167.4-microsoft-standard-WSL2\n"
+        )
+        python = self.sentinel_python()
+        self.configure_host("Linux", release, runtime)
+        before = self.snapshot_tree(self.root)
+        completed = self.invoke(
+            str(python),
+            "install",
+            clear_env=("WSL_DISTRO_NAME", "WSL_INTEROP"),
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("ID=ubuntu; ID_LIKE=unknown; VERSION_ID=26.04", completed.stderr)
+        self.assertFalse((self.root / "python-ran").exists())
+        self.assertFalse((self.root / ".super-coder/scripts/install-ran").exists())
+        self.assertEqual(self.snapshot_tree(self.root), before)
 
     def test_unsupported_host_refuses_before_python_or_target_with_stable_bytes(self) -> None:
         release = self.os_release("misleading", "ID=notarch\nID_LIKE=notarch\n")
@@ -251,6 +307,19 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 1)
         self.assertIn("ID=unknown; ID_LIKE=unknown", completed.stderr)
         self.assertFalse((self.root / "python-ran").exists())
+
+    def test_malformed_os_release_quote_refuses_before_python_probe(self) -> None:
+        release = self.os_release("malformed-os-release", 'ID="ubuntu\nVERSION_ID=26.04\n')
+        python = self.sentinel_python()
+        self.configure_host("Linux", release)
+        before = self.snapshot_tree(self.root)
+        completed = self.invoke(str(python), "install")
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn(
+            "ID=unknown; ID_LIKE=unknown; VERSION_ID=unknown", completed.stderr
+        )
+        self.assertFalse((self.root / "python-ran").exists())
+        self.assertEqual(self.snapshot_tree(self.root), before)
 
     def test_missing_os_release_refuses_before_the_python_probe(self) -> None:
         python = self.sentinel_python()

@@ -93,18 +93,27 @@ class FreshForkInstallTest(unittest.TestCase):
         )
         return repo, home
 
-    def configure_dispatch_host(self, repo: Path, kernel: str, release: Path) -> None:
+    def configure_dispatch_host(
+        self, repo: Path, kernel: str, release: Path, runtime: Path | None = None
+    ) -> None:
         # Only this disposable dispatcher copy receives a deterministic host.
         dispatch = repo / ".super-coder" / "scripts" / "dispatch.sh"
         source = dispatch.read_text()
         kernel_probe = 'SC_PLATFORM_KERNEL="$(command -p uname -s 2>/dev/null || true)"'
         release_probe = "_platform_release=/etc/os-release"
+        runtime_probe = "_platform_wsl_release=/proc/sys/kernel/osrelease"
         self.assertIn(kernel_probe, source)
         self.assertIn(release_probe, source)
+        self.assertIn(runtime_probe, source)
         dispatch.write_text(
             source.replace(
                 kernel_probe, f"SC_PLATFORM_KERNEL={kernel!r}"
-            ).replace(release_probe, f"_platform_release={str(release)!r}")
+            )
+            .replace(release_probe, f"_platform_release={str(release)!r}")
+            .replace(
+                runtime_probe,
+                f"_platform_wsl_release={str(runtime or Path('/proc/sys/kernel/osrelease'))!r}",
+            )
         )
 
     def run_direct_host(
@@ -117,6 +126,8 @@ class FreshForkInstallTest(unittest.TestCase):
         args: list[str] | None = None,
         timeout: int | None = None,
         python_version: tuple[int, int, int] | None = None,
+        runtime: Path | None = None,
+        clear_env: tuple[str, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         # The subprocess patches host probes before executing the unmodified installer.
         install = repo / ".super-coder" / "scripts" / "install.py"
@@ -135,25 +146,31 @@ class FreshForkInstallTest(unittest.TestCase):
             "import sys\n"
             "original_open = builtins.open\n"
             f"release = {str(release)!r}\n"
+            f"runtime = {str(runtime) if runtime else None!r}\n"
             f"platform.system = lambda: {kernel!r}\n"
             "def host_open(path, *args, **kwargs):\n"
             "    if path == '/etc/os-release':\n"
             "        return original_open(release, *args, **kwargs)\n"
+            "    if path == '/proc/sys/kernel/osrelease' and runtime is not None:\n"
+            "        return original_open(runtime, *args, **kwargs)\n"
             "    return original_open(path, *args, **kwargs)\n"
             "builtins.open = host_open\n"
             + python_probe
             + f"sys.argv = {argv!r}\n"
             + f"runpy.run_path({str(install)!r}, run_name='__main__')\n"
         )
+        environment = {
+            **os.environ,
+            "HOME": str(home),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            **(extra_env or {}),
+        }
+        for name in clear_env:
+            environment.pop(name, None)
         return subprocess.run(
             [sys.executable, "-c", direct_entry],
             cwd=repo,
-            env={
-                **os.environ,
-                "HOME": str(home),
-                "PYTHONDONTWRITEBYTECODE": "1",
-                **(extra_env or {}),
-            },
+            env=environment,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -252,6 +269,7 @@ class FreshForkInstallTest(unittest.TestCase):
             "cachyos": ("Linux", "ID=cachyos\nID_LIKE=arch\n", True),
             "ubuntu-interim": ("Linux", "ID=ubuntu\nVERSION_ID=26.10\n", False),
             "fedora-rawhide": ("Linux", "ID=fedora\nVERSION_ID=rawhide\n", False),
+            "malformed-quote": ("Linux", 'ID="ubuntu\nVERSION_ID=26.04\n', False),
             "unknown-linux": ("Linux", "ID=notarch\nID_LIKE=notarch\n", False),
             "missing-os-release": ("Linux", None, False),
             "darwin": ("Darwin", "ID=macos\n", False),
@@ -277,6 +295,8 @@ class FreshForkInstallTest(unittest.TestCase):
                         self.assertIn("VERSION_ID=26.10", result.stderr)
                     if name == "fedora-rawhide":
                         self.assertIn("VERSION_ID=rawhide", result.stderr)
+                    if name == "malformed-quote":
+                        self.assertIn("ID=unknown; ID_LIKE=unknown; VERSION_ID=unknown", result.stderr)
                     shell = subprocess.run(
                         ["sh", str(repo / ".super-coder/scripts/dispatch.sh"), "install"],
                         cwd=repo,
@@ -296,6 +316,58 @@ class FreshForkInstallTest(unittest.TestCase):
                     self.assert_direct_refusal_is_pristine(
                         repo, home, before_repo, before_home
                     )
+
+    def test_wsl_runtime_signature_refuses_without_marker_variables(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo, home = self.prepare_repo(raw)
+            release = Path(raw) / "os-release"
+            runtime = Path(raw) / "wsl-runtime"
+            release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
+            runtime.write_text("5.15.167.4-microsoft-standard-WSL2\n")
+            sentinel = home / "python-sentinel"
+            sentinel.write_text(
+                "#!/bin/sh\n"
+                f"touch {home / 'python-ran'}\n"
+                "exit 99\n"
+            )
+            sentinel.chmod(sentinel.stat().st_mode | 0o100)
+            self.configure_dispatch_host(repo, "Linux", release, runtime)
+            before_repo = self.snapshot_tree(repo)
+            before_home = self.snapshot_tree(home)
+            direct = self.run_direct_host(
+                repo,
+                home,
+                "Linux",
+                release,
+                runtime=runtime,
+                clear_env=("WSL_DISTRO_NAME", "WSL_INTEROP"),
+            )
+            shell_env = {
+                **os.environ,
+                "HOME": str(home),
+                "SC_CALLER_ROOT": str(repo),
+                "SC_PYTHON": str(sentinel),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+            shell_env.pop("WSL_DISTRO_NAME", None)
+            shell_env.pop("WSL_INTEROP", None)
+            shell = subprocess.run(
+                ["sh", str(repo / ".super-coder/scripts/dispatch.sh"), "install"],
+                cwd=repo,
+                env=shell_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(direct.returncode, 1)
+            self.assertEqual(shell.returncode, 1)
+            self.assertEqual(shell.stderr, direct.stderr)
+            self.assertIn("ID=ubuntu; ID_LIKE=unknown; VERSION_ID=26.04", direct.stderr)
+            self.assertFalse((home / "python-ran").exists())
+            self.assert_direct_refusal_is_pristine(
+                repo, home, before_repo, before_home
+            )
 
     def test_wsl_ubuntu_refuses_with_dispatcher_parity_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
