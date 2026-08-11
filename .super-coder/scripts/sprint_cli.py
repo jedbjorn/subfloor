@@ -98,19 +98,61 @@ def cmd_plan_unit(args: argparse.Namespace) -> int:
 
 
 def cmd_replan_unit(args: argparse.Namespace) -> int:
+    payload = {
+        "sprint_id": args.sprint,
+        "work_unit_id": args.work_unit,
+    }
+    optional = {
+        "assigned_shell_id": args.developer_shell,
+        "reviewer_shell_id": args.reviewer_shell,
+        "title": args.title,
+        "expected_output": (
+            _text(args.expected_output_file, "expected output")
+            if args.expected_output_file
+            else None
+        ),
+        "task_ids": _integer_list(args.task) if args.task is not None else None,
+        "planned_wave": args.wave,
+        "output_kind": (
+            args.output_kind.replace("-", "_") if args.output_kind else None
+        ),
+    }
+    payload.update({key: value for key, value in optional.items() if value is not None})
+    if args.clear_dependencies:
+        payload["dependency_ids"] = []
+    elif args.depends_on is not None:
+        payload["dependency_ids"] = _integer_list(args.depends_on)
+    result = _post("/_sc/sprint/replan-unit", payload, idempotent=True)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_recall_unit(args: argparse.Namespace) -> int:
     result = _post(
-        "/_sc/sprint/replan-unit",
+        "/_sc/sprint/recall-unit",
         {
             "sprint_id": args.sprint,
             "work_unit_id": args.work_unit,
-            "assigned_shell_id": args.developer_shell,
-            "reviewer_shell_id": args.reviewer_shell,
-            "planned_wave": args.wave,
-            "dependency_ids": _integer_list(args.depends_on),
-            "output_kind": (
-                args.output_kind.replace("-", "_") if args.output_kind else None
-            ),
+            "reason": args.reason,
         },
+        idempotent=True,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_reroute_participant(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/reroute-participant",
+        {
+            "sprint_id": args.sprint,
+            "participant_shell_id": args.participant_shell,
+            "harness": args.harness,
+            "model": args.model,
+            "effort": args.effort,
+            "route": args.route,
+        },
+        idempotent=True,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
@@ -453,18 +495,44 @@ def build_parser() -> argparse.ArgumentParser:
     plan.set_defaults(fn=cmd_plan_unit)
 
     replan = sub.add_parser(
-        "replan-unit", help="Planner revises one still-planned editing lane"
+        "replan-unit", help="Planner revises any fields on one planned lane"
     )
     replan.add_argument("--sprint", type=int, required=True)
     replan.add_argument("--work-unit", type=int, required=True)
-    replan.add_argument("--developer-shell", type=int, required=True)
-    replan.add_argument("--reviewer-shell", type=int, required=True)
-    replan.add_argument("--wave", type=int, default=0)
-    replan.add_argument("--depends-on", type=int, action="append")
+    replan.add_argument("--developer-shell", type=int)
+    replan.add_argument("--reviewer-shell", type=int)
+    replan.add_argument("--title")
+    replan.add_argument("--expected-output-file")
+    replan.add_argument("--task", type=int, action="append")
+    replan.add_argument("--wave", type=int)
+    dependencies = replan.add_mutually_exclusive_group()
+    dependencies.add_argument("--depends-on", type=int, action="append")
+    dependencies.add_argument("--clear-dependencies", action="store_true")
     replan.add_argument(
         "--output-kind", choices=("code", "report-only", "no-code")
     )
     replan.set_defaults(fn=cmd_replan_unit)
+
+    recall = sub.add_parser(
+        "recall-unit",
+        help="Planner returns one paused unmerged lane to the editable plan",
+    )
+    recall.add_argument("--sprint", type=int, required=True)
+    recall.add_argument("--work-unit", type=int, required=True)
+    recall.add_argument("--reason", required=True)
+    recall.set_defaults(fn=cmd_recall_unit)
+
+    reroute = sub.add_parser(
+        "reroute-participant",
+        help="Planner changes a Developer or Reviewer route for future wakes",
+    )
+    reroute.add_argument("--sprint", type=int, required=True)
+    reroute.add_argument("--participant-shell", type=int, required=True)
+    reroute.add_argument("--harness", required=True)
+    reroute.add_argument("--model")
+    reroute.add_argument("--effort")
+    reroute.add_argument("--route")
+    reroute.set_defaults(fn=cmd_reroute_participant)
 
     arm = sub.add_parser("arm", help="Planner atomically arms an eligible plan")
     arm.add_argument("--sprint", type=int, required=True)

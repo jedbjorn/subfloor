@@ -238,6 +238,68 @@ def prepare_shell_wake_conversation(con, shell_id: int) -> PreparedShellWake:
     )
 
 
+def _prepare_participant_route(
+    row,
+    *,
+    harness: str,
+    model: str | None,
+    effort: str | None,
+) -> PreparedParticipantRoute:
+    adapter = _browser_adapter(harness)
+    try:
+        resolved = run_mod.resolve_headless_route(
+            harness=harness,
+            adapter=adapter,
+            flavor_model=row["flavor_model"],
+            model=model,
+            effort=effort,
+        )
+    except ValueError as exc:
+        raise SprintConversationError(str(exc)) from exc
+    worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
+    return PreparedParticipantRoute(
+        participant_id=int(row["participant_id"]),
+        shell_id=int(row["shell_id"]),
+        role=str(row["role"]),
+        shortname=str(row["shortname"]),
+        harness=resolved.harness,
+        provider=resolved.provider,
+        model=resolved.model,
+        effort=resolved.effort,
+        worktree=str(worktree.resolve(strict=False)),
+    )
+
+
+def prepare_participant_route(
+    con,
+    *,
+    sprint_id: int,
+    participant_id: int,
+    harness: str,
+    model: str | None,
+    effort: str | None,
+) -> PreparedParticipantRoute:
+    """Resolve one proposed participant route without mutating its Sprint."""
+    row = con.execute(
+        "SELECT p.participant_id,p.shell_id,p.role,p.harness,p.model,p.effort,"
+        "sh.shortname,sh.flavor,fd.model AS flavor_model "
+        "FROM sprint_participants p "
+        "JOIN shells sh ON sh.shell_id=p.shell_id "
+        "LEFT JOIN flavor_defaults fd "
+        "ON fd.flavor=sh.flavor AND fd.harness=? "
+        "WHERE p.sprint_id=? AND p.participant_id=?",
+        (harness, sprint_id, participant_id),
+    ).fetchone()
+    if row is None:
+        raise SprintConversationError("Sprint participant does not exist")
+    return _prepare_participant_route(
+        row,
+        harness=harness,
+        model=model,
+        effort=effort,
+    )
+
+
 def prepare_sprint_participant_routes(
     con,
     sprint_id: int,
@@ -255,35 +317,15 @@ def prepare_sprint_participant_routes(
         "p.participant_id",
         (sprint_id,),
     ).fetchall()
-    prepared: list[PreparedParticipantRoute] = []
-    for row in rows:
-        harness = str(row["harness"])
-        adapter = _browser_adapter(harness)
-        try:
-            resolved = run_mod.resolve_headless_route(
-                harness=harness,
-                adapter=adapter,
-                flavor_model=row["flavor_model"],
-                model=row["model"],
-                effort=row["effort"],
-            )
-        except ValueError as exc:
-            raise SprintConversationError(str(exc)) from exc
-        worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
-        prepared.append(
-            PreparedParticipantRoute(
-                participant_id=int(row["participant_id"]),
-                shell_id=int(row["shell_id"]),
-                role=str(row["role"]),
-                shortname=str(row["shortname"]),
-                harness=resolved.harness,
-                provider=resolved.provider,
-                model=resolved.model,
-                effort=resolved.effort,
-                worktree=str(worktree.resolve(strict=False)),
-            )
+    return tuple(
+        _prepare_participant_route(
+            row,
+            harness=str(row["harness"]),
+            model=row["model"],
+            effort=row["effort"],
         )
-    return tuple(prepared)
+        for row in rows
+    )
 
 
 def create_shell_wake_conversation(

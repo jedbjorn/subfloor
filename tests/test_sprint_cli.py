@@ -927,6 +927,218 @@ class SprintCliApiTest(unittest.TestCase):
         finally:
             con.close()
 
+    def test_planner_repeats_recalls_reassigns_and_reroutes_live_work(self):
+        self.use_isolated_db()
+        feature_id, approval_id, task_id = self.seed_declaration("live-replan")
+        participants = self.write(
+            json.dumps(
+                [
+                    {"shell_id": 3, "role": "planner", "harness": "codex"},
+                    {"shell_id": 1, "role": "developer", "harness": "codex"},
+                    {
+                        "shell_id": 4,
+                        "role": "developer",
+                        "harness": "codex",
+                        "model": "old-model",
+                    },
+                    {"shell_id": 2, "role": "reviewer", "harness": "kimi"},
+                ]
+            )
+        )
+        sprint_id = self.run_cli(
+            TOKENS["planner"],
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec-approval",
+            str(approval_id),
+            "--participants-file",
+            participants,
+            "--merge-grant",
+        )["sprint_id"]
+        first_unit = self.run_cli(
+            TOKENS["planner"],
+            "plan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--developer-shell",
+            "1",
+            "--reviewer-shell",
+            "2",
+            "--title",
+            "Original lane",
+            "--expected-output-file",
+            self.write("Original output"),
+            "--task",
+            str(task_id),
+        )["work_unit_id"]
+        repeated_unit = self.run_cli(
+            TOKENS["planner"],
+            "plan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--developer-shell",
+            "1",
+            "--reviewer-shell",
+            "2",
+            "--title",
+            "Repeat governing task",
+            "--expected-output-file",
+            self.write("Conformance rerun"),
+            "--task",
+            str(task_id),
+            "--depends-on",
+            str(first_unit),
+            "--output-kind",
+            "report-only",
+        )["work_unit_id"]
+        self.assertNotEqual(first_unit, repeated_unit)
+
+        self.run_cli(TOKENS["planner"], "arm", "--sprint", str(sprint_id))
+        con = sqlite3.connect(self.db)
+        try:
+            first_assignment_message = int(
+                con.execute(
+                    "SELECT message_id FROM wake_message WHERE sprint_id=? "
+                    "AND work_unit_id=? AND message_kind='work_assignment'",
+                    (sprint_id, first_unit),
+                ).fetchone()[0]
+            )
+        finally:
+            con.close()
+        self.deliver_message(first_assignment_message)
+        assignment = self.run_cli(
+            TOKENS["developer"], "inbox", "--sprint", str(sprint_id)
+        )["messages"][0]
+        self.run_cli(
+            TOKENS["developer"],
+            "accept",
+            "--sprint",
+            str(sprint_id),
+            "--message",
+            str(assignment["message_id"]),
+        )
+        self.run_cli(
+            TOKENS["planner"],
+            "pause",
+            "--sprint",
+            str(sprint_id),
+            "--reason",
+            "Planner is restructuring the live plan",
+        )
+        with self.assertRaisesRegex(SystemExit, "HTTP 403.*change the Sprint plan"):
+            self.run_cli(
+                TOKENS["developer"],
+                "recall-unit",
+                "--sprint",
+                str(sprint_id),
+                "--work-unit",
+                str(first_unit),
+                "--reason",
+                "unauthorized",
+            )
+        recalled = self.run_cli(
+            TOKENS["planner"],
+            "recall-unit",
+            "--sprint",
+            str(sprint_id),
+            "--work-unit",
+            str(first_unit),
+            "--reason",
+            "move work to replacement capacity",
+        )
+        self.assertTrue(recalled["changed"])
+        replanned = self.run_cli(
+            TOKENS["planner"],
+            "replan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--work-unit",
+            str(first_unit),
+            "--developer-shell",
+            "4",
+            "--title",
+            "Replacement lane",
+            "--expected-output-file",
+            self.write("Replacement output"),
+            "--task",
+            str(task_id),
+            "--wave",
+            "3",
+        )
+        self.assertTrue(replanned["changed"])
+        rerouted = self.run_cli(
+            TOKENS["planner"],
+            "reroute-participant",
+            "--sprint",
+            str(sprint_id),
+            "--participant-shell",
+            "4",
+            "--harness",
+            "codex",
+            "--model",
+            "replacement-model",
+            "--effort",
+            "medium",
+            "--route",
+            "codex/replacement-model",
+        )
+        self.assertTrue(rerouted["changed"])
+        resumed = self.run_cli(
+            TOKENS["planner"],
+            "resume",
+            "--sprint",
+            str(sprint_id),
+            "--reason",
+            "replacement plan validated",
+        )
+        self.assertTrue(resumed["changed"])
+        con = sqlite3.connect(self.db)
+        try:
+            replacement_message = int(
+                con.execute(
+                    "SELECT message_id FROM wake_message WHERE sprint_id=? "
+                    "AND work_unit_id=? AND message_kind='work_assignment' "
+                    "ORDER BY message_id DESC LIMIT 1",
+                    (sprint_id, first_unit),
+                ).fetchone()[0]
+            )
+        finally:
+            con.close()
+        self.deliver_message(replacement_message)
+        replacement_inbox = self.run_cli(
+            "dev2-token", "inbox", "--sprint", str(sprint_id)
+        )
+        self.assertEqual(first_unit, replacement_inbox["messages"][0]["work_unit_id"])
+
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                2,
+                con.execute(
+                    "SELECT COUNT(*) FROM sprint_work_unit_tasks WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                (4, "Replacement lane", 3),
+                con.execute(
+                    "SELECT assigned_shell_id,title,planned_wave "
+                    "FROM sprint_work_units WHERE work_unit_id=?",
+                    (first_unit,),
+                ).fetchone(),
+            )
+            self.assertEqual(
+                ("replacement-model", "medium", "codex/replacement-model"),
+                con.execute(
+                    "SELECT model,effort,route FROM sprint_participants "
+                    "WHERE sprint_id=? AND shell_id=4",
+                    (sprint_id,),
+                ).fetchone(),
+            )
+        finally:
+            con.close()
+
     def test_review_properties_never_change_authenticated_launch_eligibility(self):
         cases = (
             ("no-review", None, False, False, False),

@@ -1977,6 +1977,28 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError(f"{name} must be a positive integer")
         return value
 
+    @staticmethod
+    def _sprint_nonnegative_integer(body: dict, name: str) -> int:
+        value = body.get(name)
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a non-negative integer")
+        try:
+            value = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a non-negative integer") from exc
+        if value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+        return value
+
+    @staticmethod
+    def _sprint_optional_text(body: dict, name: str) -> str | None:
+        value = body.get(name)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError(f"{name} must be a string")
+        return value
+
     @classmethod
     def _sprint_integer_list(cls, body: dict, name: str) -> list[int]:
         values = body.get(name)
@@ -2413,19 +2435,63 @@ class Handler(BaseHTTPRequestHandler):
                     sprint_id,
                     self._sprint_integer(body, "work_unit_id"),
                     planner_shell_id,
-                    assigned_shell_id=self._sprint_integer(
-                        body, "assigned_shell_id"
+                    assigned_shell_id=(
+                        self._sprint_integer(body, "assigned_shell_id")
+                        if body.get("assigned_shell_id") is not None
+                        else None
                     ),
-                    reviewer_shell_id=self._sprint_integer(
-                        body, "reviewer_shell_id"
+                    reviewer_shell_id=(
+                        self._sprint_integer(body, "reviewer_shell_id")
+                        if body.get("reviewer_shell_id") is not None
+                        else None
                     ),
-                    planned_wave=int(body.get("planned_wave", 0)),
+                    title=self._sprint_optional_text(body, "title"),
+                    expected_output=self._sprint_optional_text(
+                        body, "expected_output"
+                    ),
+                    task_ids=(
+                        self._sprint_integer_list(body, "task_ids")
+                        if "task_ids" in body
+                        else None
+                    ),
+                    planned_wave=(
+                        self._sprint_nonnegative_integer(body, "planned_wave")
+                        if body.get("planned_wave") is not None
+                        else None
+                    ),
                     dependency_ids=(
-                        self._sprint_integer_list(body, "dependency_ids")
-                        if body.get("dependency_ids")
-                        else ()
+                        self._sprint_optional_integer_list(body, "dependency_ids")
+                        if "dependency_ids" in body
+                        else None
                     ),
-                    output_kind=body.get("output_kind"),
+                    output_kind=self._sprint_optional_text(body, "output_kind"),
+                )
+                return self._send(200, {"changed": changed})
+            if path == "/_sc/sprint/recall-unit":
+                planner_shell_id = self._sprint_planner_proxy(
+                    con, sprint_id, shell_id
+                )
+                changed = sprint_domain.SprintWorkUnitStore(con).recall(
+                    sprint_id,
+                    self._sprint_integer(body, "work_unit_id"),
+                    planner_shell_id,
+                    reason=self._sprint_optional_text(body, "reason") or "",
+                )
+                return self._send(200, {"changed": changed})
+            if path == "/_sc/sprint/reroute-participant":
+                planner_shell_id = self._sprint_planner_proxy(
+                    con, sprint_id, shell_id
+                )
+                changed = sprint_domain.SprintParticipantStore(con).reroute(
+                    sprint_id,
+                    planner_shell_id,
+                    participant_shell_id=self._sprint_integer(
+                        body, "participant_shell_id"
+                    ),
+                    harness=self._sprint_optional_text(body, "harness") or "",
+                    model=self._sprint_optional_text(body, "model"),
+                    effort=self._sprint_optional_text(body, "effort"),
+                    route=self._sprint_optional_text(body, "route"),
                 )
                 return self._send(200, {"changed": changed})
             if path == "/_sc/sprint/complete-unit":

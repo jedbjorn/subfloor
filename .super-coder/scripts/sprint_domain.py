@@ -2648,6 +2648,186 @@ class SprintLifecycleStore:
         )
 
 
+class SprintParticipantStore:
+    """Planner-owned participant route selection for future Sprint wakes."""
+
+    def __init__(
+        self,
+        con: sqlite3.Connection,
+        *,
+        probe_harness: Callable[[str], ProbeResult] | None = None,
+    ) -> None:
+        self.con = con
+        self.con.row_factory = sqlite3.Row
+        self.probe_harness = probe_harness or (
+            lambda harness: adapter_for(harness).probe()
+        )
+
+    def reroute(
+        self,
+        sprint_id: int,
+        planner_shell_id: int,
+        *,
+        participant_shell_id: int,
+        harness: str,
+        model: str | None,
+        effort: str | None,
+        route: str | None = None,
+    ) -> bool:
+        """Validate and replace one idle Developer/Reviewer launch selection."""
+        harness = harness.strip()
+        if not harness:
+            raise ValueError("participant harness is required")
+        if model is not None:
+            model = model.strip()
+            if not model:
+                raise ValueError("participant model must be non-empty when supplied")
+        if effort is not None:
+            effort = effort.strip()
+            if not effort:
+                raise ValueError("participant effort must be non-empty when supplied")
+        if route is not None:
+            route = route.strip()
+            if not route:
+                raise ValueError("participant display route must be non-empty")
+
+        lifecycle, _ = SprintWorkUnitStore(self.con)._require_planner(
+            sprint_id, planner_shell_id
+        )
+        if lifecycle not in {"prepared", "paused"}:
+            raise SprintInvariantError(
+                "participant routes may change only while a Sprint is prepared or paused"
+            )
+        participant = self._participant(sprint_id, participant_shell_id)
+        if participant["role"] not in {"developer", "reviewer"}:
+            raise SprintInvariantError(
+                "only Developer or Reviewer participant routes may be changed"
+            )
+        try:
+            prepared = sprint_participant_chats.prepare_participant_route(
+                self.con,
+                sprint_id=sprint_id,
+                participant_id=int(participant["participant_id"]),
+                harness=harness,
+                model=model,
+                effort=effort,
+            )
+        except sprint_participant_chats.SprintConversationError as exc:
+            raise SprintPreflightError(str(exc)) from exc
+        try:
+            self.probe_harness(prepared.harness)
+        except AdapterError as exc:
+            raise SprintPreflightError(str(exc)) from exc
+
+        before = self._projection(participant)
+        after = {
+            "harness": prepared.harness,
+            "model": prepared.model,
+            "effort": prepared.effort,
+            "route": route if route is not None else participant["route"],
+        }
+        if before == after:
+            return False
+
+        with db_driver.write_transaction(self.con, "sprint.participant.reroute"):
+            lifecycle, _ = SprintWorkUnitStore(self.con)._require_planner(
+                sprint_id, planner_shell_id
+            )
+            if lifecycle not in {"prepared", "paused"}:
+                raise SprintInvariantError(
+                    "participant routes may change only while a Sprint is prepared or paused"
+                )
+            current = self._participant(sprint_id, participant_shell_id)
+            if self._projection(current) != before:
+                raise SprintInvariantError(
+                    "participant route changed during preflight; retry reroute"
+                )
+            self._require_idle_projection(current, lifecycle)
+            self.con.execute(
+                "UPDATE sprint_participants SET harness=?,model=?,effort=?,route=?,"
+                "updated_at=datetime('now') WHERE participant_id=?",
+                (
+                    after["harness"],
+                    after["model"],
+                    after["effort"],
+                    after["route"],
+                    current["participant_id"],
+                ),
+            )
+            self.con.execute(
+                "INSERT INTO sprint_events "
+                "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+                "VALUES (?,'participant.route_changed','planner',?,?)",
+                (
+                    sprint_id,
+                    planner_shell_id,
+                    json.dumps(
+                        {
+                            "participant_id": int(current["participant_id"]),
+                            "shell_id": participant_shell_id,
+                            "role": str(current["role"]),
+                            "before": before,
+                            "after": after,
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+        return True
+
+    def _participant(self, sprint_id: int, shell_id: int) -> sqlite3.Row:
+        row = self.con.execute(
+            "SELECT participant_id,sprint_id,shell_id,role,harness,model,effort,route "
+            "FROM sprint_participants WHERE sprint_id=? AND shell_id=?",
+            (sprint_id, shell_id),
+        ).fetchone()
+        if row is None:
+            raise SprintInvariantError(
+                f"shell {shell_id} is not a participant in this Sprint"
+            )
+        return row
+
+    def _require_idle_projection(
+        self,
+        participant: sqlite3.Row,
+        lifecycle: str,
+    ) -> None:
+        if lifecycle == "prepared":
+            return
+        sprint_id = int(participant["sprint_id"])
+        shell_id = int(participant["shell_id"])
+        if participant["role"] == "developer":
+            active = self.con.execute(
+                "SELECT work_unit_id,disposition FROM sprint_work_units "
+                "WHERE sprint_id=? AND assigned_shell_id=? AND disposition IN "
+                "('ready','active','in_review','fixing','merge_ready') "
+                "ORDER BY work_unit_id LIMIT 1",
+                (sprint_id, shell_id),
+            ).fetchone()
+        else:
+            active = self.con.execute(
+                "SELECT work_unit_id,disposition FROM sprint_work_units "
+                "WHERE sprint_id=? AND reviewer_shell_id=? "
+                "AND disposition='in_review' ORDER BY work_unit_id LIMIT 1",
+                (sprint_id, shell_id),
+            ).fetchone()
+        if active is not None:
+            raise SprintInvariantError(
+                f"participant route still owns released work unit "
+                f"{int(active['work_unit_id'])} ({active['disposition']}); "
+                "recall or finish that expectation first"
+            )
+
+    @staticmethod
+    def _projection(participant: sqlite3.Row) -> dict:
+        return {
+            "harness": str(participant["harness"]),
+            "model": participant["model"],
+            "effort": participant["effort"],
+            "route": participant["route"],
+        }
+
+
 class SprintWorkUnitStore:
     """Planner-owned work-unit planning and dependency-aware dispatch."""
 
@@ -2736,38 +2916,79 @@ class SprintWorkUnitStore:
         work_unit_id: int,
         planner_shell_id: int,
         *,
-        assigned_shell_id: int,
-        reviewer_shell_id: int,
-        planned_wave: int,
-        dependency_ids: Iterable[int],
+        assigned_shell_id: int | None = None,
+        reviewer_shell_id: int | None = None,
+        title: str | None = None,
+        expected_output: str | None = None,
+        task_ids: Iterable[int] | None = None,
+        planned_wave: int | None = None,
+        dependency_ids: Iterable[int] | None = None,
         output_kind: str | None = None,
     ) -> bool:
         """Replace the editable plan projection and append its before/after fact."""
-        if planned_wave < 0:
+        if planned_wave is not None and planned_wave < 0:
             raise ValueError("planned wave must be non-negative")
-        dependencies = tuple(
-            dict.fromkeys(int(unit_id) for unit_id in dependency_ids)
-        )
         with db_driver.write_transaction(self.con, "sprint.work_unit.replan"):
             self._require_planner(sprint_id, planner_shell_id)
             unit = self._unit(sprint_id, work_unit_id)
             if unit["disposition"] != "planned":
                 raise SprintInvariantError(
-                    "only planned work units may be replanned; return assigned "
-                    "work to the ready pool first"
+                    "only planned work units may be replanned; pause and recall "
+                    "released work first"
                 )
+            before = self._plan_projection(unit)
+            assigned_shell_id = (
+                int(unit["assigned_shell_id"])
+                if assigned_shell_id is None
+                else assigned_shell_id
+            )
+            reviewer_shell_id = (
+                int(unit["reviewer_shell_id"])
+                if reviewer_shell_id is None
+                else reviewer_shell_id
+            )
+            title = str(unit["title"]) if title is None else title.strip()
+            expected_output = (
+                str(unit["expected_output"])
+                if expected_output is None
+                else expected_output.strip()
+            )
+            if not title or not expected_output:
+                raise ValueError("work unit title and expected output are required")
+            tasks = (
+                tuple(before["task_ids"])
+                if task_ids is None
+                else tuple(dict.fromkeys(int(task_id) for task_id in task_ids))
+            )
+            if task_ids is not None and not tasks:
+                raise SprintInvariantError("work units require at least one spec task")
+            dependencies = (
+                tuple(before["dependency_ids"])
+                if dependency_ids is None
+                else tuple(
+                    dict.fromkeys(int(unit_id) for unit_id in dependency_ids)
+                )
+            )
+            planned_wave = (
+                int(unit["planned_wave"])
+                if planned_wave is None
+                else planned_wave
+            )
             self._require_participant(sprint_id, assigned_shell_id, "developer")
             self._require_participant(sprint_id, reviewer_shell_id, "reviewer")
+            self._require_tasks(sprint_id, tasks)
             if output_kind is None:
                 output_kind = str(unit["output_kind"])
             if output_kind not in WORK_UNIT_OUTPUT_KINDS:
                 raise ValueError(
                     "work-unit output kind must be code, report_only, or no_code"
                 )
-            before = self._plan_projection(unit)
             after = {
                 "assigned_shell_id": assigned_shell_id,
                 "reviewer_shell_id": reviewer_shell_id,
+                "title": title,
+                "expected_output": expected_output,
+                "task_ids": sorted(tasks),
                 "planned_wave": planned_wave,
                 "output_kind": output_kind,
                 "dependency_ids": sorted(dependencies),
@@ -2776,17 +2997,31 @@ class SprintWorkUnitStore:
                 return False
             self.con.execute(
                 "UPDATE sprint_work_units SET assigned_shell_id=?,"
-                "reviewer_shell_id=?,planned_wave=?,output_kind=?,"
+                "reviewer_shell_id=?,title=?,expected_output=?,planned_wave=?,"
+                "output_kind=?,"
                 "updated_at=datetime('now') "
                 "WHERE work_unit_id=?",
                 (
                     assigned_shell_id,
                     reviewer_shell_id,
+                    title,
+                    expected_output,
                     planned_wave,
                     output_kind,
                     work_unit_id,
                 ),
             )
+            if before["task_ids"] != after["task_ids"]:
+                self.con.execute(
+                    "DELETE FROM sprint_work_unit_tasks "
+                    "WHERE sprint_id=? AND work_unit_id=?",
+                    (sprint_id, work_unit_id),
+                )
+                self.con.executemany(
+                    "INSERT INTO sprint_work_unit_tasks "
+                    "(sprint_id,work_unit_id,task_id) VALUES (?,?,?)",
+                    ((sprint_id, work_unit_id, task_id) for task_id in tasks),
+                )
             self._replace_dependencies(sprint_id, work_unit_id, dependencies)
             self._event(
                 sprint_id,
@@ -2796,6 +3031,75 @@ class SprintWorkUnitStore:
                     "work_unit_id": work_unit_id,
                     "before": before,
                     "after": after,
+                },
+            )
+        return True
+
+    def recall(
+        self,
+        sprint_id: int,
+        work_unit_id: int,
+        planner_shell_id: int,
+        *,
+        reason: str,
+    ) -> bool:
+        """Return one paused, unmerged lane to the editable plan projection."""
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("work-unit recall reason is required")
+        if len(reason) > 8000:
+            raise ValueError(
+                f"work-unit recall reason is {len(reason)} characters; maximum is 8000"
+            )
+        with db_driver.write_transaction(self.con, "sprint.work_unit.recall"):
+            lifecycle, _ = self._require_planner(sprint_id, planner_shell_id)
+            if lifecycle != "paused":
+                raise SprintInvariantError(
+                    "work units may be recalled only while the Sprint is paused"
+                )
+            unit = self._unit(sprint_id, work_unit_id)
+            before = str(unit["disposition"])
+            if before == "planned":
+                return False
+            if before in {"completed", "cancelled"}:
+                raise SprintInvariantError("terminal work units cannot be recalled")
+            registered = self.con.execute(
+                "SELECT registered_pr_id FROM sprint_pr_work_units "
+                "WHERE sprint_id=? AND work_unit_id=? "
+                "ORDER BY registered_pr_id LIMIT 1",
+                (sprint_id, work_unit_id),
+            ).fetchone()
+            if registered is not None:
+                raise SprintInvariantError(
+                    f"work unit {work_unit_id} is bound to registered PR "
+                    f"{int(registered['registered_pr_id'])}; preserve that lane and "
+                    "plan a replacement instead"
+                )
+
+            from sprint_message_delivery import SprintMessageStore
+
+            message_ids = SprintMessageStore(
+                self.con
+            ).recall_work_assignment_in_transaction(
+                sprint_id,
+                work_unit_id,
+                reason,
+            )
+            self.con.execute(
+                "UPDATE sprint_work_units SET disposition='planned',"
+                "updated_at=datetime('now') WHERE work_unit_id=?",
+                (work_unit_id,),
+            )
+            self._event(
+                sprint_id,
+                "work_unit.recalled",
+                planner_shell_id,
+                {
+                    "work_unit_id": work_unit_id,
+                    "before": before,
+                    "after": "planned",
+                    "assignment_message_ids": list(message_ids),
+                    "reason": reason,
                 },
             )
         return True
@@ -3362,6 +3666,14 @@ class SprintWorkUnitStore:
         return row
 
     def _plan_projection(self, unit: sqlite3.Row) -> dict:
+        tasks = [
+            int(row[0])
+            for row in self.con.execute(
+                "SELECT task_id FROM sprint_work_unit_tasks "
+                "WHERE sprint_id=? AND work_unit_id=? ORDER BY task_id",
+                (unit["sprint_id"], unit["work_unit_id"]),
+            )
+        ]
         dependencies = [
             int(row[0])
             for row in self.con.execute(
@@ -3375,6 +3687,9 @@ class SprintWorkUnitStore:
         return {
             "assigned_shell_id": int(unit["assigned_shell_id"]),
             "reviewer_shell_id": int(unit["reviewer_shell_id"]),
+            "title": str(unit["title"]),
+            "expected_output": str(unit["expected_output"]),
+            "task_ids": tasks,
             "planned_wave": int(unit["planned_wave"]),
             "output_kind": str(unit["output_kind"]),
             "dependency_ids": dependencies,

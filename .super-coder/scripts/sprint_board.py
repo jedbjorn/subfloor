@@ -99,12 +99,18 @@ _EVENT_FIELDS = {
         }
     ),
     "work_unit.replanned": frozenset({"work_unit_id", "before", "after"}),
+    "work_unit.recalled": frozenset(
+        {"work_unit_id", "before", "after", "assignment_message_ids", "reason"}
+    ),
     "work_unit.ready": frozenset({"work_unit_id", "message_id", "wake_id"}),
     "work_unit.accepted": frozenset({"work_unit_id", "message_id"}),
     "work_unit.completed": frozenset(
         {"work_unit_id", "result", "output_kind", "source", "transition_key"}
     ),
     "work_unit.cancelled": frozenset({"work_unit_id", "reason"}),
+    "participant.route_changed": frozenset(
+        {"participant_id", "shell_id", "role", "before", "after"}
+    ),
     "review.requested": frozenset(
         {
             "work_unit_id",
