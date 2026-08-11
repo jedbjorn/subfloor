@@ -1,6 +1,6 @@
 ---
 name: sprint_pln
-description: Run an armed Sprints v2 collaboration loop as Planner — dispatch ready lanes and execute Reviewer decisions through durable re-plan, pause, cancel, resume, and close protocols.
+description: Run an armed Sprints v2 collaboration loop as Planner — dispatch and restructure lanes, change participant routes, and execute Reviewer decisions through durable pause, resume, and close protocols.
 category: workflow
 common: false
 ---
@@ -37,10 +37,13 @@ Load `sprint_pln` on every entry. Do not turn entry routing into a polling loop.
 
 The armed runtime owns scheduled dispatch and unread wake recovery. The
 registered-PR watcher owns subscription observation. React to their durable
-facts; use the Planner turn for dispatch and exact execution of durable Reviewer
-decisions. The Reviewer owns pause, cancel, and conclude decisions plus the
-conformance and final Sprint reports. The Planner owns control transitions;
-clean conformance approval performs its own atomic terminal transition.
+facts; use the Planner turn for dispatch, plan structure, and exact execution of
+durable Reviewer decisions. The Reviewer owns review and conformance judgment
+plus the conformance and final Sprint reports. The Planner owns the plan and its
+control transitions: it may modify, repeat, recall, reassign, or reroute work on
+its own operational judgment, and it executes Reviewer decisions that cross
+those same boundaries. Clean conformance approval performs its own atomic
+terminal transition.
 
 Assignments and review requests use Force-new delivery. Planner-bound results
 use Re-enter. Neither displaces a live turn; delivery waits for its natural
@@ -76,8 +79,10 @@ not change Sprint or work-unit state.
 ## Running loop
 
 - Keep dependencies as the only hard sequence. When reality requires a re-plan,
-  give the Reviewer the current projection and evidence, then execute the exact
-  decision it returns; never rewrite completed history.
+  restructure the current projection under Planner authority and record why.
+  Ask the Reviewer when the change depends on review or conformance judgment;
+  do not outsource ordinary assignment, capacity, or route judgment. Never
+  rewrite completed history.
 - Let Developers own their PRs through green, review, correction, and merge.
   Let Reviewers own verdicts and Sprint decisions. Do not proxy routine
   handoffs or substitute Planner judgment for a Reviewer decision.
@@ -164,12 +169,13 @@ DB rows stay the durable record: judgments via `record-review`, report bodies in
 `sprint_reports`, and decisions in the durable relay. Files in the Sprint
 artifact directory are working material only.
 
-## Reviewer decision actions
+## Reviewer decisions and Planner actions
 
-Pause, cancel, re-enter, and abort are Reviewer decisions and Planner actions.
-A valid control decision arrives as a durable Reviewer → Planner Re-enter
-message and names the decision, evidence, target ids, reason, and exact
-requested transition. Resolve every required-reply control decision through its
+Review, conformance, re-enter, and abort judgments remain Reviewer decisions.
+Planner independently owns operational plan structure, including pause-safe
+recall, cancellation of unreleased scope, reassignment, repeated task lanes,
+and participant route changes. When an action does arrive as a durable Reviewer
+→ Planner Re-enter decision, resolve every required-reply decision through its
 original message before acting. Complete this order without reordering:
 
 1. Re-run `sc sprint inbox --sprint <id>`, verify the decision came from the
@@ -211,20 +217,22 @@ stop at that decision boundary.
 
 ### Pause or resume
 
-On a Reviewer pause decision, transition durably, stop external Sprint services,
-persist interrupt intent, preserve every partial artifact, and retain the
-Reviewer judgment and evidence for recovery:
+Pause on a Reviewer decision or when Planner needs a safe restructuring window.
+Transition durably, stop external Sprint services, persist interrupt intent,
+preserve every partial artifact, and retain the governing judgment and evidence
+for recovery:
 
 ```text
-sc sprint pause --sprint <id> --reason <reviewer-decision-reason>
+sc sprint pause --sprint <id> --reason <decision-or-restructure-reason>
 ```
 
-Resume only on a later Reviewer decision or an FnB override. Reconcile native
-runs, unread messages, pending wakes, work units, registered PRs, capacity, and
-spec drift, then act with the supplied reason:
+Resume after the requested recovery/restructure is fully recorded, or on a
+later Reviewer decision or FnB override. Reconcile native runs, unread messages,
+pending wakes, work units, registered PRs, capacity, and spec drift, then act
+with the supplied reason:
 
 ```text
-sc sprint resume --sprint <id> [--reason <reviewer-reconciliation-decision>]
+sc sprint resume --sprint <id> [--reason <validated-reconciliation-reason>]
 ```
 
 An exhausted recovery wake is bounded manual-recovery evidence, not a retry
@@ -248,37 +256,85 @@ If the PR is already merged, it also records the merge commit and completes the
 replacement unit as explicit recovery evidence. Treat the receipt as recovery
 evidence; wait for a separate Reviewer decision before resuming.
 
-### Cancel or re-plan
+### Modify, recall, repeat, reassign, or reroute
 
-A Reviewer cancel decision must name one unreleased work unit and its retained
-terminal reason. Execute exactly that cancellation:
+Planner may cancel one unreleased work unit with its retained terminal reason.
+When cancellation executes a Reviewer decision, preserve that decision id in
+the reason and evidence:
 
 ```text
-sc sprint cancel-unit --sprint <id> --work-unit <id> --reason <reviewer-decision-reason>
+sc sprint cancel-unit --sprint <id> --work-unit <id> --reason <cancellation-reason>
 ```
 
-For a Reviewer re-plan decision, apply its complete projection; never infer
-omitted fields or alter a released or completed lane:
+Edit any subset of an unreleased lane directly. Omitted fields retain their
+current values; `--clear-dependencies` is the explicit empty dependency set:
 
 ```text
 sc sprint replan-unit --sprint <id> --work-unit <id> \
-  --developer-shell <id> --reviewer-shell <id> --wave <n> \
-  [--depends-on <work-unit-id>] [--output-kind code|report-only|no-code]
+  [--developer-shell <id>] [--reviewer-shell <id>] [--title <title>] \
+  [--expected-output-file <path>] [--task <task-id>] [--wave <n>] \
+  [--depends-on <work-unit-id> | --clear-dependencies] \
+  [--output-kind code|report-only|no-code]
 ```
 
-If a Developer or Reviewer declines, preserve the reason and ask the Reviewer
-for the replacement routing decision before issuing a fresh assignment.
+Do not edit a released lane in place. To change an accepted or pending
+assignment, first pause so dispatch cannot race the edit, recall the unmerged
+lane, replan it, then resume:
+
+```text
+sc sprint pause --sprint <id> --reason <restructure-reason>
+sc sprint recall-unit --sprint <id> --work-unit <id> \
+  --reason <why-the-old-assignment-is-obsolete>
+sc sprint replan-unit --sprint <id> --work-unit <id> <changed-fields>
+sc sprint resume --sprint <id> --reason <validated-replan-reason>
+```
+
+Recall preserves the old accepted/declined message and event history, returns
+only an unmerged lane to `planned`, and refuses completed, cancelled, or
+PR-bound work. For a PR-bound lane, leave it intact and plan a replacement or
+use the supported PR-ownership recovery path; never force the projection back.
+Resume dispatches a fresh assignment generation.
+
+The same governing spec task may deliberately appear in more than one work
+unit. Use this for conformance reruns, repeat verification, or replacement work
+whose scope is still governed by the original task. Do not create a duplicate
+spec task merely to satisfy lane membership. Each work unit still lists a task
+at most once.
+
+To change which model will receive future assignments or reviews, pause first
+when the Sprint is armed, clear the participant's released expectation through
+recall or completion, then replace its exact route:
+
+```text
+sc sprint reroute-participant --sprint <id> --participant-shell <id> \
+  --harness <harness> [--model <model>] [--effort <effort>] \
+  [--route <display-route>]
+```
+
+Prepared Sprints may reroute before arm. Armed Sprints must pause; Developer
+routes reject any released lane and Reviewer routes reject an in-review lane.
+The engine validates the new route before writing it. Existing chats and runs
+stay immutable history; the next Force-new assignment or review request rotates
+onto the replacement route. Only already-declared participants can be selected
+or rerouted.
+
+If a Developer or Reviewer declines, preserve the reason and choose the
+replacement assignment or route from current capacity before issuing a fresh
+assignment. Ask the Reviewer only when that choice changes review or
+conformance judgment.
 
 ### Re-enter after conformance
 
-A Reviewer `re-enter` decision names the in-Sprint findings, the tasks to add
-to the governing spec document with title and description, and the suggested
+A Reviewer `re-enter` decision names the in-Sprint findings, the governing
+tasks (existing ids when scope is unchanged; new title and description when
+scope is new), and the suggested
 unit grouping, waves, dependencies, routing, and capacity rationale. The
 Reviewer should identify independent lanes, expected review overlap, and useful
 reserve. Preserve that projection; do not silently absorb extra scope, maximize
 shell occupancy, or turn post-Sprint findings into delivery work.
 
-Cut every named task against the governing spec document:
+Reuse an existing task id when the decision repeats or repairs that exact
+governing scope. Cut a new task only for genuinely new scope:
 
 ```text
 sc mem task add "<task-title>" --feature <feature-id> \
@@ -297,10 +353,11 @@ sc sprint plan-unit --sprint <id> \
   [--output-kind code|report-only|no-code]
 ```
 
-After every named task is bound, confirm the requested routes are available and
-the dependency graph and capacity plan match the decision. If they do not, send
-the concrete conflict back to the Reviewer rather than silently re-routing.
-Then release the new ready lanes with `sc sprint dispatch --sprint <id>`. When
+After every named task is bound, confirm the routes are available and the
+dependency graph and capacity plan match the decision. Planner may reassign or
+reroute for operational capacity; send the concrete conflict back to the
+Reviewer when that adaptation changes the Reviewer's scope or conformance
+judgment. Then release the new ready lanes with `sc sprint dispatch --sprint <id>`. When
 the added work reaches terminal disposition, the engine sends the Reviewer the
 next delivery-terminal wake; the Planner does not initiate the next conformance
 pass.

@@ -835,6 +835,45 @@ class SprintMessageStore:
             raise KeyError(f"unknown wake message: {message_id}")
         self._cancel_resolved_wakes(message_id)
 
+    def recall_work_assignment_in_transaction(
+        self,
+        sprint_id: int,
+        work_unit_id: int,
+        reason: str,
+    ) -> tuple[int, ...]:
+        """Retire obsolete assignment pickup while preserving message history."""
+        if not self.con.in_transaction:
+            raise RuntimeError("assignment recall requires an active transaction")
+        rows = self.con.execute(
+            "SELECT message_id,disposition FROM wake_message "
+            "WHERE sprint_id=? AND work_unit_id=? "
+            "AND message_kind='work_assignment' "
+            "AND disposition IN ('pending','accepted') ORDER BY message_id",
+            (sprint_id, work_unit_id),
+        ).fetchall()
+        message_ids = tuple(int(row["message_id"]) for row in rows)
+        if not rows:
+            return ()
+
+        from sprint_liveness import SprintLivenessMonitor
+
+        monitor = SprintLivenessMonitor(self.con)
+        for row in rows:
+            message_id = int(row["message_id"])
+            if row["disposition"] == "pending":
+                self.con.execute(
+                    "UPDATE wake_message SET disposition='declined',"
+                    "read_at=COALESCE(read_at,datetime('now')),decline_reason=? "
+                    "WHERE message_id=? AND disposition='pending'",
+                    (f"Recalled by Planner: {reason}", message_id),
+                )
+                self._cancel_resolved_wakes(message_id)
+            monitor.resolve_in_transaction(
+                message_id,
+                f"work unit recalled by Planner: {reason}",
+            )
+        return message_ids
+
 
 class SprintWakeDeliveryService:
     """Lease wake intents and resolve their chat placement at delivery time."""

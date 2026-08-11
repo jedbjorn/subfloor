@@ -31,6 +31,7 @@ FORCE_NEW_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
 POLISHED_SPRINT_SKILLS = set(SKILLS) - {"sprint_prep"}
 CHAT_CLEANUP_SKILLS = {"sprint_close", "sprint_pln", "sprint_rev"}
 PROGRESS_CARRIER_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
+LIVE_REPLAN_ROLE_SKILLS = {"sprint_pln", "sprint_rev"}
 
 ARTIFACT_PATH_RULE = """## Sprint artifact paths
 
@@ -781,6 +782,51 @@ class SprintSkillTest(unittest.TestCase):
         finally:
             con.close()
 
+    def test_live_replanning_reseed_matches_assets_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0200_reseed_sprint_live_replanning.sql":
+                    break
+                con.executescript(migration.read_text())
+            placeholders = ",".join("?" for _ in LIVE_REPLAN_ROLE_SKILLS)
+            con.execute(
+                f"UPDATE skills SET description='stale',category='stale',"
+                f"command='stale',common=1,content='immutable sprint plan',"
+                f"is_deleted=1 WHERE name IN ({placeholders})",
+                tuple(sorted(LIVE_REPLAN_ROLE_SKILLS)),
+            )
+
+            migration = (
+                ENGINE / "migrations" / "0200_reseed_sprint_live_replanning.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for name in sorted(LIVE_REPLAN_ROLE_SKILLS):
+                with self.subTest(name=name):
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(1, len(rows))
+                    self.assertEqual(
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                        tuple(rows[0]),
+                    )
+        finally:
+            con.close()
+
     def test_progress_carrier_reseed_matches_assets_and_replays_idempotently(self):
         con = sqlite3.connect(":memory:")
         try:
@@ -992,6 +1038,8 @@ class SprintSkillTest(unittest.TestCase):
             "declare",
             "plan-unit",
             "replan-unit",
+            "recall-unit",
+            "reroute-participant",
             "arm",
             "inbox",
             "send",
@@ -1120,14 +1168,17 @@ class SprintSkillTest(unittest.TestCase):
         normalized_planner = " ".join(planner.lower().split())
         normalized_reviewer = " ".join(reviewer.lower().split())
 
-        self.assertIn("## Reviewer decision actions", planner)
+        self.assertIn("## Reviewer decisions and Planner actions", planner)
         self.assertIn(
-            "pause, cancel, re-enter, and abort are reviewer decisions",
+            "planner independently owns operational plan structure",
             normalized_planner,
         )
-        self.assertIn("planner actions", normalized_planner)
+        self.assertIn("pause-safe recall", normalized_planner)
+        self.assertIn("repeated task lanes", normalized_planner)
         for command in (
             "sc sprint pause --sprint <id>",
+            "sc sprint recall-unit --sprint <id>",
+            "sc sprint reroute-participant --sprint <id>",
             "sc sprint cancel-unit --sprint <id>",
         ):
             self.assertIn(command, planner)
@@ -1136,15 +1187,20 @@ class SprintSkillTest(unittest.TestCase):
         self.assertIn("do not run `complete`", normalized_planner)
         self.assertNotIn("you decide scope, sequencing, and recovery", normalized_planner)
 
-        self.assertIn("## Control and conclude decisions", reviewer)
+        self.assertIn("## Conformance decisions and Planner controls", reviewer)
         self.assertIn(
-            "owns all pause, cancel, and conclude decisions", normalized_reviewer
+            "planner independently owns operational plan structure",
+            normalized_reviewer,
+        )
+        self.assertIn(
+            "reviewer owns review, re-enter, abort, and conclude",
+            normalized_reviewer,
         )
         self.assertIn("author the final Sprint report", reviewer)
         self.assertIn("sc sprint record-conformance", reviewer)
         self.assertIn("sc sprint compile-report", reviewer)
         self.assertIn(
-            "`decision`: `pause`, `resume`, `replan`, `re-enter`, `cancel`, or `abort`",
+            "`decision`: `re-enter`, `abort`, or the exact safety-critical recommendation",
             reviewer,
         )
         self.assertNotIn("`cancel`, `conclude`", reviewer)
@@ -1159,7 +1215,7 @@ class SprintSkillTest(unittest.TestCase):
     def test_planner_control_decisions_reply_before_accept_and_action(self):
         planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()
         control = planner[
-            planner.index("## Reviewer decision actions"):
+            planner.index("## Reviewer decisions and Planner actions"):
             planner.index("The FnB board-level override")
         ]
 
@@ -1219,7 +1275,7 @@ class SprintSkillTest(unittest.TestCase):
         planner = bodies["sprint_pln"]
         self.assertIn("outside an armed Sprint", developer)
         self.assertIn("Reviewer decides", developer)
-        self.assertIn("replan, cancel", reviewer)
+        self.assertIn("recalling unreleased work", " ".join(reviewer.split()))
         self.assertIn("Compile the bounded evidence packet first", reviewer)
         self.assertIn("Developer-owned subscriptions", planner)
 
@@ -1358,7 +1414,7 @@ class SprintSkillTest(unittest.TestCase):
         )
         planner = " ".join(bodies["sprint_pln"].split())
         self.assertIn("dependency graph and capacity plan match the decision", planner)
-        self.assertIn("rather than silently re-routing", planner)
+        self.assertIn("Planner may reassign or reroute for operational capacity", planner)
         for fact in ("scheduled dispatch", "unread wake recovery"):
             self.assertIn(fact, planner)
         self.assertIn("registered-PR watcher owns subscription observation", planner)

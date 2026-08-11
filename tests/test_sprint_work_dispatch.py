@@ -808,9 +808,12 @@ class DispatchGateTest(SprintWorkDispatchCase):
             {
                 "assigned_shell_id": 4,
                 "reviewer_shell_id": 2,
-            "planned_wave": 1,
-            "output_kind": "code",
-            "dependency_ids": [upstream],
+                "title": "Target",
+                "expected_output": "Output 2",
+                "task_ids": [2],
+                "planned_wave": 1,
+                "output_kind": "code",
+                "dependency_ids": [upstream],
             },
             payload["before"],
         )
@@ -818,9 +821,12 @@ class DispatchGateTest(SprintWorkDispatchCase):
             {
                 "assigned_shell_id": 4,
                 "reviewer_shell_id": 5,
-            "planned_wave": 7,
-            "output_kind": "code",
-            "dependency_ids": [],
+                "title": "Target",
+                "expected_output": "Output 2",
+                "task_ids": [2],
+                "planned_wave": 7,
+                "output_kind": "code",
+                "dependency_ids": [],
             },
             payload["after"],
         )

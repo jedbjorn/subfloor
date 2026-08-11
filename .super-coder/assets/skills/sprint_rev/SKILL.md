@@ -1,6 +1,6 @@
 ---
 name: sprint_rev
-description: Review Sprints v2 work and whole-Sprint conformance — own pause, cancel, and conclude decisions, author the conformance and Sprint reports, and direct Planner actions through durable messages.
+description: Review Sprints v2 work and whole-Sprint conformance — own review, re-enter, abort, and conclude judgments, author the conformance and Sprint reports, and direct safety actions through durable messages.
 category: workflow
 common: false
 ---
@@ -10,8 +10,9 @@ common: false
 Use in one of two modes: a work-unit PR review during the loop, or the final
 whole-Sprint conformance pass. Pre-declaration QAQC is a third entry condition,
 before a Sprint exists. The evidence differs; independence does not. The
-Reviewer decides and documents; the Planner acts. The FnB retains the
-board-level override established by decision #46.
+Reviewer decides and documents review and conformance judgments; the Planner
+owns operational plan structure and acts on control transitions. The FnB
+retains the board-level override established by decision #46.
 
 Use the simplest path supported by current durable state. Treat independence,
 authority, lifecycle preconditions, durable writes, and typed handoffs as hard
@@ -79,7 +80,7 @@ sc sprint send --sprint <id> --to <shortname> --body-file <path> \
 
 Use `--intent blocker` instead when the unit cannot advance. Ask the Planner for
 durable state or action-feasibility facts without delegating Reviewer judgment.
-A cross-unit, closeout, pause, replan, re-enter, cancel, or abort ruling is a
+A cross-unit review, closeout, re-enter, abort, or safety ruling is a
 Sprint-level decision:
 
 ```text
@@ -113,10 +114,10 @@ successfully and confirms the durable write and wake.
 If a command is rejected or transport fails, the verdict or handoff is
 incomplete. Correct and retry when safe. If the relay itself fails, surface the
 attempted command, evidence, impact, and recommendation to FnB; do not invent an
-alternate protocol. A Reviewer decides whether the condition warrants
-continuing, re-planning, pausing, cancellation, or conclusion; the Planner
-executes the durable decision. Record a live FnB override as FnB authority, not
-Reviewer judgment.
+alternate protocol. A Reviewer decides whether review or conformance evidence
+warrants changes requested, re-entry, abort, or conclusion; the Planner
+independently decides ordinary operational replanning and executes control
+transitions. Record a live FnB override as FnB authority, not Reviewer judgment.
 
 ## Sprint artifact paths
 
@@ -129,32 +130,36 @@ DB rows stay the durable record: judgments via `record-review`, report bodies in
 `sprint_reports`, and decisions in the durable relay. Files in the Sprint
 artifact directory are working material only.
 
-## Control and conclude decisions
+## Conformance decisions and Planner controls
 
-The Reviewer owns all pause, cancel, and conclude decisions and recommendations.
-The Planner owns control actions; clean conformance approval atomically performs
-its own close. Base a decision on durable Sprint state,
+The Reviewer owns review, re-enter, abort, and conclude judgments. The Planner
+independently owns operational plan structure: pausing for safe edits, recalling
+unreleased work, modifying or repeating task lanes, reassigning work, changing
+participant routes, cancelling unreleased scope, and resuming after validation.
+A clean conformance approval atomically performs its own close. Base a Reviewer
+judgment on durable Sprint state,
 the exact bound revisions, current work/PR facts, progress-carrier evidence, and any
 ratified judgment; ambiguous silence is not enough to corrupt a disposition.
 
-Send pause, resume, replan, re-enter, cancel, and abort decisions through the
+Send re-enter, abort, or safety-critical control recommendations through the
 durable `send` surface above. A clean conclude instead runs the atomic
 `record-conformance` close below. Every Reviewer → Planner route is Re-enter.
 The Reviewer-authored body must name:
 
-- `decision`: `pause`, `resume`, `replan`, `re-enter`, `cancel`, or `abort`;
+- `decision`: `re-enter`, `abort`, or the exact safety-critical recommendation;
 - the evidence and rationale owned by the Reviewer;
 - exact Sprint/work-unit ids, reason, outcome, and complete action arguments;
 - any immediate safety impact that the FnB must see.
 
-The Planner marks the message handled, verifies the assigned Reviewer, and
-executes exactly that control transition. The clean completion receipt is
-informational because the Sprint is already terminal. The Reviewer never runs
-the standalone pause, replan, cancel, resume, complete, or abort action; its
-clean `record-conformance` command owns the narrow automatic close. If a control
-action is rejected, inspect the returned durable state and issue
-a new decision only when the evidence supports one; never ask the Planner to
-improvise around a precondition.
+The Planner marks the message handled, verifies the assigned Reviewer, and acts
+on the judgment without surrendering its separate authority over the concrete
+plan. The clean completion receipt is informational because the Sprint is
+already terminal. The Reviewer never runs the standalone pause, replan, recall,
+reroute, cancel, resume, complete, or abort action; its clean
+`record-conformance` command owns the narrow automatic close. If a requested
+action is rejected, inspect the returned durable state and issue a revised
+judgment only when the evidence supports one; never ask the Planner to improvise
+around a precondition.
 
 The FnB board-level override from decision #46 is unaffected. A live FnB
 instruction can direct or supersede any decision; preserve it as a distinct
