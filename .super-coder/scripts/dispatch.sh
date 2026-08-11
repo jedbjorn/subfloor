@@ -70,6 +70,10 @@ sc_platform_detect() {
   SC_PLATFORM_ID=""
   SC_PLATFORM_ID_LIKE=""
   SC_PLATFORM_VERSION_ID=""
+  SC_PLATFORM_WSL=0
+  if [ -n "${WSL_DISTRO_NAME:-}" ] || [ -n "${WSL_INTEROP:-}" ]; then
+    SC_PLATFORM_WSL=1
+  fi
   if [ -r "$_platform_release" ] && command -p iconv -f UTF-8 -t UTF-8 "$_platform_release" >/dev/null 2>&1; then
     while IFS='=' read -r _platform_key _platform_value || [ -n "$_platform_key" ]; do
       case "$_platform_key" in
@@ -83,12 +87,17 @@ sc_platform_detect() {
 
 sc_require_supported_host() {
   sc_platform_detect
+  [ "$SC_PLATFORM_WSL" = 1 ] && sc_platform_unsupported
   case "$SC_PLATFORM_KERNEL:$SC_PLATFORM_ID:$SC_PLATFORM_VERSION_ID" in
     Linux:ubuntu:26.04|Linux:fedora:44|Linux:arch:*) return 0 ;;
   esac
   case " $SC_PLATFORM_ID_LIKE " in
     *" arch ") [ "$SC_PLATFORM_KERNEL" = Linux ] && return 0 ;;
   esac
+  sc_platform_unsupported
+}
+
+sc_platform_unsupported() {
   {
     echo '✗ subfloor refused: unsupported host.'
     echo "  detected kernel: ${SC_PLATFORM_KERNEL:-unknown}"

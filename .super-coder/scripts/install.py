@@ -72,10 +72,14 @@ def _platform_identity() -> tuple[str, str, str, str]:
     )
 
 
+def _is_wsl() -> bool:
+    return bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"))
+
+
 def require_supported_host() -> None:
     """Refuse unsupported hosts before installer imports or repository writes."""
     kernel, distro_id, distro_like, version_id = _platform_identity()
-    supported = kernel == "Linux" and (
+    supported = not _is_wsl() and kernel == "Linux" and (
         (distro_id == "ubuntu" and version_id == "26.04")
         or (distro_id == "fedora" and version_id == "44")
         or distro_id == "arch"

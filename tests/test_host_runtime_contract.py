@@ -161,6 +161,45 @@ class DispatcherRuntimeProbeTest(unittest.TestCase):
                     (self.root / ".super-coder/scripts/install-ran").exists()
                 )
 
+    def test_wsl_refuses_allowlisted_ubuntu_before_python_or_target(self) -> None:
+        release = self.os_release("wsl-ubuntu", "ID=ubuntu\nVERSION_ID=26.04\n")
+        python = self.sentinel_python()
+        self.configure_host("Linux", release)
+        before = self.snapshot_tree(self.root)
+        wsl = {
+            "WSL_DISTRO_NAME": "Ubuntu",
+            "WSL_INTEROP": "/run/WSL/1_interop",
+        }
+
+        for command in ((), ("help",), ("-h",), ("--help",)):
+            with self.subTest(command=command or ("bare",)):
+                help_result = self.invoke(
+                    str(python), *command, extra_env=wsl, bare=not command
+                )
+                self.assertEqual(help_result.returncode, 0, help_result.stderr)
+                self.assertIn("super-coder", help_result.stdout)
+
+        expected = (
+            "✗ subfloor refused: unsupported host.\n"
+            "  detected kernel: Linux\n"
+            "  detected distribution: ID=ubuntu; ID_LIKE=unknown; VERSION_ID=26.04\n"
+            "  supported hosts: Ubuntu LTS, Fedora stable, Arch-compatible Linux.\n"
+            "  Create a supported Linux VM, keep the checkout on the guest filesystem, then run ./sc install inside the guest.\n"
+            "  The rejected command was not run and no native compatibility path exists.\n"
+        )
+        for marker, value in wsl.items():
+            with self.subTest(marker=marker):
+                completed = self.invoke(
+                    str(python), "install", extra_env={marker: value}
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stderr, expected)
+                self.assertFalse((self.root / "python-ran").exists())
+                self.assertFalse(
+                    (self.root / ".super-coder/scripts/install-ran").exists()
+                )
+                self.assertEqual(self.snapshot_tree(self.root), before)
+
     def test_unsupported_host_refuses_before_python_or_target_with_stable_bytes(self) -> None:
         release = self.os_release("misleading", "ID=notarch\nID_LIKE=notarch\n")
         python = self.sentinel_python()

@@ -297,6 +297,59 @@ class FreshForkInstallTest(unittest.TestCase):
                         repo, home, before_repo, before_home
                     )
 
+    def test_wsl_ubuntu_refuses_with_dispatcher_parity_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo, home = self.prepare_repo(raw)
+            release = Path(raw) / "os-release"
+            release.write_text("ID=ubuntu\nVERSION_ID=26.04\n")
+            sentinel = home / "python-sentinel"
+            sentinel.write_text(
+                "#!/bin/sh\n"
+                f"touch {home / 'python-ran'}\n"
+                "exit 99\n"
+            )
+            sentinel.chmod(sentinel.stat().st_mode | 0o100)
+            self.configure_dispatch_host(repo, "Linux", release)
+            before_repo = self.snapshot_tree(repo)
+            before_home = self.snapshot_tree(home)
+            wsl = {
+                "WSL_DISTRO_NAME": "Ubuntu",
+                "WSL_INTEROP": "/run/WSL/1_interop",
+            }
+
+            for marker, value in wsl.items():
+                with self.subTest(marker=marker):
+                    direct = self.run_direct_host(
+                        repo, home, "Linux", release, {marker: value}
+                    )
+                    shell = subprocess.run(
+                        ["sh", str(repo / ".super-coder/scripts/dispatch.sh"), "install"],
+                        cwd=repo,
+                        env={
+                            **os.environ,
+                            "HOME": str(home),
+                            "SC_CALLER_ROOT": str(repo),
+                            "SC_PYTHON": str(sentinel),
+                            "PYTHONDONTWRITEBYTECODE": "1",
+                            marker: value,
+                        },
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+
+                    self.assertEqual(direct.returncode, 1)
+                    self.assertEqual(shell.returncode, 1)
+                    self.assertEqual(shell.stderr, direct.stderr)
+                    self.assertIn(
+                        "ID=ubuntu; ID_LIKE=unknown; VERSION_ID=26.04",
+                        direct.stderr,
+                    )
+                    self.assertFalse((home / "python-ran").exists())
+                    self.assert_direct_refusal_is_pristine(
+                        repo, home, before_repo, before_home
+                    )
+
     def test_direct_installer_ignores_platform_environment_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repo, home = self.prepare_repo(raw)
