@@ -447,11 +447,15 @@ class FreshForkInstallTest(unittest.TestCase):
                 repo, home, before_repo, before_home
             )
 
-    def test_direct_installer_refuses_unreadable_os_release_without_mutation(self) -> None:
+    def test_direct_installer_refuses_late_unreadable_os_release_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repo, home = self.prepare_repo(raw)
             release = Path(raw) / "invalid-os-release"
-            release.write_bytes(b"ID=ubuntu\nVERSION_ID=26.04\nBROKEN=\xff\n")
+            release.write_bytes(
+                b"ID=ubuntu\nVERSION_ID=26.04\nPADDING="
+                + b"x" * 20_000
+                + b"\nBROKEN=\xff\n"
+            )
             sentinel = home / "python-sentinel"
             sentinel.write_text(
                 "#!/bin/sh\n"

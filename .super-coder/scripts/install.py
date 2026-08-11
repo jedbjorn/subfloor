@@ -67,7 +67,7 @@ def _platform_identity() -> tuple[str, str, str, str]:
                         break
                     fields[key] = parsed
     except (OSError, UnicodeError):
-        pass
+        fields.clear()
     return (
         kernel,
         fields.get("ID", ""),
