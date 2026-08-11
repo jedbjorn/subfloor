@@ -57,6 +57,14 @@ _EVENT_FIELDS = {
     "sprint.delivery_terminal": frozenset(
         {"terminal_count", "completed_count", "cancelled_count"}
     ),
+    "sprint.cleanup_scheduled": frozenset(
+        {
+            "aggregate_state",
+            "artifact_target_ids",
+            "target_count",
+            "worktree_target_ids",
+        }
+    ),
     "lifecycle.armed": frozenset(
         {
             "from",

@@ -17,6 +17,7 @@ import active_chat_registry
 import conversation_broker
 import conversation_events
 import db_driver
+import sprint_cleanup
 import sprint_participant_chats
 from conversation_adapters import AdapterError, ProbeResult, adapter_for
 
@@ -241,6 +242,7 @@ class SprintLifecycleStore:
         interrupt_run: Callable[[int], bool] | None = None,
         notify_commit: Callable[[], bool] | None = None,
         probe_harness: Callable[[str], ProbeResult] | None = None,
+        cleanup_store: sprint_cleanup.SprintCleanupTargetStore | None = None,
     ) -> None:
         self.con = con
         self.con.row_factory = sqlite3.Row
@@ -248,6 +250,9 @@ class SprintLifecycleStore:
         self.notify_commit = notify_commit or conversation_broker.notify_commit
         self.probe_harness = probe_harness or (
             lambda harness: adapter_for(harness).probe()
+        )
+        self.cleanup_store = cleanup_store or sprint_cleanup.SprintCleanupTargetStore(
+            con
         )
 
     def armed_sprint_id(self) -> int | None:
@@ -399,6 +404,12 @@ class SprintLifecycleStore:
                 reason=reason or terminal_outcome or "aborted",
                 terminal_outcome=terminal_outcome,
             ).changed
+        cleanup_targets: tuple[sprint_cleanup.CleanupTargetDraft, ...] = ()
+        if target == "completed":
+            current = self._sprint(sprint_id)
+            if current["lifecycle"] == "completed":
+                return False
+            cleanup_targets = self.cleanup_store.prepare_targets(sprint_id)
         closed_conversation_ids: tuple[str, ...] = ()
         with db_driver.write_transaction(self.con, "sprint.transition"):
             sprint = self._sprint(sprint_id)
@@ -435,6 +446,11 @@ class SprintLifecycleStore:
                 event_payload["closed_conversation_ids"] = list(
                     closed_conversation_ids
                 )
+            if target == "completed":
+                self.cleanup_store.schedule_in_transaction(
+                    sprint_id,
+                    cleanup_targets,
+                )
             self._event(
                 sprint_id,
                 f"lifecycle.{target}",
@@ -460,6 +476,7 @@ class SprintLifecycleStore:
         reason: str,
         terminal_outcome: str,
         idempotency_key: str,
+        cleanup_targets: tuple[sprint_cleanup.CleanupTargetDraft, ...],
     ) -> tuple[str, ...]:
         """Project Reviewer conformance approval as an atomic terminal edge."""
         if not self.con.in_transaction:
@@ -495,6 +512,7 @@ class SprintLifecycleStore:
                 retained_reviewer_shell_id=reviewer_shell_id,
             )
         )
+        self.cleanup_store.schedule_in_transaction(sprint_id, cleanup_targets)
         self._event(
             sprint_id,
             "lifecycle.completed",

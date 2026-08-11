@@ -10,6 +10,7 @@ from typing import Any
 
 import conversation_events
 import db_driver
+import sprint_cleanup
 from sprint_domain import (
     SprintAuthorityError,
     SprintInvariantError,
@@ -40,9 +41,17 @@ class FinalReportReceipt:
 class SprintCloseStore:
     """Record close-out findings and compile deterministic evidence packets."""
 
-    def __init__(self, con: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        con: sqlite3.Connection,
+        *,
+        cleanup_store: sprint_cleanup.SprintCleanupTargetStore | None = None,
+    ) -> None:
         self.con = con
         self.con.row_factory = sqlite3.Row
+        self.cleanup_store = cleanup_store or sprint_cleanup.SprintCleanupTargetStore(
+            con
+        )
 
     def record_conformance(
         self,
@@ -67,6 +76,16 @@ class SprintCloseStore:
             idempotency_key, "idempotency key", maximum=220
         )
         normalized = tuple(self._normalize_finding(item) for item in findings)
+        existing_before = self.con.execute(
+            "SELECT 1 FROM sprint_reports WHERE sprint_id=? "
+            "AND report_kind='conformance' AND idempotency_key=?",
+            (sprint_id, idempotency_key),
+        ).fetchone()
+        cleanup_targets = (
+            ()
+            if existing_before is not None
+            else self.cleanup_store.prepare_targets(sprint_id)
+        )
         closed_conversation_ids: tuple[str, ...] = ()
         with db_driver.write_transaction(self.con, "sprint.close.conformance"):
             self._require_reviewer(sprint_id, reviewer_shell_id)
@@ -184,13 +203,15 @@ class SprintCloseStore:
                 },
             )
             closed_conversation_ids = SprintLifecycleStore(
-                self.con
+                self.con,
+                cleanup_store=self.cleanup_store,
             ).complete_from_conformance_in_transaction(
                 sprint_id,
                 reviewer_shell_id,
                 reason=reason,
                 terminal_outcome=terminal_outcome,
                 idempotency_key=idempotency_key,
+                cleanup_targets=cleanup_targets,
             )
         notification_error: Exception | None = None
         for conversation_id in closed_conversation_ids:

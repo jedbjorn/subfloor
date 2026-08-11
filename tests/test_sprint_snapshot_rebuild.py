@@ -293,6 +293,35 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         "VALUES (?,1,1,1,1)",
         (recovery_event_id,),
     )
+    con.execute(
+        "INSERT INTO sprints "
+        "(sprint_id,feature_id,originating_planner_shell_id,merge_grant_enabled) "
+        "SELECT 2,feature_id,originating_planner_shell_id,1 FROM sprints "
+        "WHERE sprint_id=1"
+    )
+    con.execute(
+        "UPDATE sprints SET lifecycle='paused',paused_at='2026-08-01 21:59:00' "
+        "WHERE sprint_id=1"
+    )
+    con.execute(
+        "UPDATE sprints SET lifecycle='armed',armed_at='2026-08-01 22:00:00' "
+        "WHERE sprint_id=2"
+    )
+    con.execute(
+        "UPDATE sprints SET lifecycle='completed',terminal_outcome='accepted',"
+        "completed_at='2026-08-01 22:01:00' WHERE sprint_id=2"
+    )
+    con.execute(
+        "INSERT INTO sprint_cleanup_targets "
+        "(sprint_id,shell_id,target_kind,canonical_path,repository_root,"
+        "git_common_dir,expected_base_branch) VALUES "
+        "(2,1,'worktree','/repo/.sc-worktrees/dev1','/repo','/repo/.git',"
+        "'shell/dev1')"
+    )
+    con.execute(
+        "UPDATE sprints SET lifecycle='armed',updated_at='2026-08-01 22:02:00' "
+        "WHERE sprint_id=1"
+    )
     con.commit()
 
 

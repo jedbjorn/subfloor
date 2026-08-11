@@ -762,6 +762,16 @@ class SprintBoardApiCase(unittest.TestCase):
                 },
             ),
             (
+                "sprint.cleanup_scheduled",
+                {
+                    "aggregate_state": "pending",
+                    "artifact_target_ids": [4],
+                    "target_count": 4,
+                    "worktree_target_ids": [1, 2, 3],
+                    "secret": "hidden",
+                },
+            ),
+            (
                 "review.approved",
                 {
                     "work_unit_id": self.ids["unit"],
