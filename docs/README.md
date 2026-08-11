@@ -86,20 +86,26 @@ another installation's shells or memory.
 
 **Preparation**
 
-One-time host setup — get this right and the rest is `./sc install`. subfloor
-runs the harness in a **docker sandbox**; the installer bootstraps everything
-else. The host needs a container engine, a few base tools, and one signed-in
-coding harness.
+One-time Linux host setup — get this right and the rest is `./sc install`.
+subfloor runs the harness in a **docker sandbox**; the installer bootstraps
+everything else. Ubuntu LTS, stable Fedora, and Arch-compatible Linux
+(including CachyOS) are tested/recommended examples, not an exclusive
+permission list. The Linux host needs a container engine, a few base tools, and
+one signed-in coding harness.
 
-| Need | Arch Linux | macOS |
-|---|---|---|
-| **Container engine** | `sudo pacman -S docker`, then start a daemon — rootless default: `dockerd-rootless-setuptool.sh install && systemctl --user enable --now docker` | `brew install colima docker && colima start` (or Docker Desktop) |
-| **Base tools** | `sudo pacman -S git curl python sqlite` (usually already present); Python 3.9+ with `sqlite3` is required | `xcode-select --install` (git/curl); use the bundled Python only when it is 3.9+ with `sqlite3`, otherwise `brew install python` |
-| **Harness CLI** | installed for you by `./sc install` (`claude` · `opencode` · `codex` · `vibe` · `kimi`, native installers). Repair by hand: `curl -fsSL https://claude.ai/install.sh \| bash` | same — **and put `~/.local/bin` on your PATH** (a fresh macOS shell omits it) |
-| **Harness account** | a plan for one of Claude Code · OpenCode · Codex · Vibe · Kimi Code; sign in once on the host (step 3) | same |
+| Need | Linux host |
+|---|---|
+| **Container engine** | Install Docker with your distribution's package tooling. For example, Arch uses `sudo pacman -S docker`; rootless setup is `dockerd-rootless-setuptool.sh install && systemctl --user enable --now docker`. |
+| **Base tools** | Install Git, curl, Python, and SQLite with your distribution's package tooling. Python 3.9+ with `sqlite3` is required. |
+| **Harness CLI** | `./sc install` installs `claude` · `opencode` · `codex` · `vibe` · `kimi` through their native installers. Repair a harness with its documented Linux installer if needed. |
+| **Harness account** | Have a plan for Claude Code, OpenCode, Codex, Vibe, or Kimi Code; sign in once in Linux. |
 
 > [!class4]
-> **The bar: Python 3.9+ with `sqlite3`, a reachable docker daemon, and a harness CLI on PATH.** `./sc doctor` reports the selected absolute interpreter, version, SQLite result, docker mode (rootless / rootful), and the exact next command. `SC_PYTHON`, when non-empty, selects the exact interpreter; on macOS use `export SC_PYTHON="$(brew --prefix)/bin/python3"` when `/usr/bin/python3` shadows Homebrew. **macOS PATH gotcha:** if `claude` reports *"missing or broken — run claude install to repair"*, the CLI installed fine but `~/.local/bin` isn't on your PATH. Add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile (`~/.zshrc`), open a new shell, then `claude install`. No docker at all? The `./sc serve` + `./sc boot` escape hatch runs the shell on the host.
+> **The bar: Linux, Python 3.9+ with `sqlite3`, a reachable docker daemon, and a harness CLI on PATH.** `./sc doctor` reports the selected absolute interpreter, version, SQLite result, docker mode (rootless / rootful), and the exact next command. `SC_PYTHON`, when non-empty, selects the exact interpreter. No docker at all? The `./sc serve` + `./sc boot` escape hatch runs the shell on the Linux host.
+
+On macOS or Windows, create a Linux VM, install these prerequisites in the
+guest, and keep the checkout on guest-owned storage when practical. Host-shared
+storage may work but is not certified.
 
 **Install & launch**
 
@@ -117,17 +123,15 @@ git checkout super-coder/main -- .super-coder sc
 # 2. Bootstrap the fork — installs harness CLIs, builds the DB, seeds your starting team:
 ./sc install
 
-# 3. Sign in to your harness once, on the HOST (not inside the sandbox):
-claude                          # or:  opencode auth login  ·  codex login  ·  vibe --setup  ·  kimi login
-
-# 4. Launch the sandbox (server + GUI):
-./sc launch
-
-# 5. Commit the install before creating shell worktrees:
+# 3. Commit the install before creating shell worktrees:
 git add -A && git commit --no-verify -m "chore: install subfloor"
 
-# 6. Attach a session:
-./sc enter                      # auth + pick a shell + pick a harness + boot
+# 4. Use the normal launch alias:
+make dos-l
+
+# 5. Sign in to your harness once, in Linux (not inside the sandbox), then enter:
+claude                          # or:  opencode auth login  ·  codex login  ·  vibe --setup  ·  kimi login
+make dos-e
 ```
 
 That's the happy path. Each step is covered in depth below — installer internals,

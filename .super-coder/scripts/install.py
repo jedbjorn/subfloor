@@ -48,7 +48,6 @@ from pathlib import Path
 ENGINE = Path(__file__).resolve().parents[1]
 REPO_ROOT = ENGINE.parent
 PY = sys.executable
-IS_MAC = platform.system() == "Darwin"  # guidance arms differ (colima/brew vs systemd/apt)
 
 
 def require_supported_host() -> None:
@@ -149,16 +148,16 @@ def report_host_runtime(*, report: bool = True) -> None:
     if sys.version_info < (3, 9):
         raise SystemExit(
             f"install: Python 3.9+ required; selected {executable} reports {version}.\n"
-            f"  recovery: {'brew install python; ' if IS_MAC else ''}"
-            "export SC_PYTHON=/absolute/path/to/python3"
+            "  recovery: install Python 3.9+ with sqlite3, then set "
+            "SC_PYTHON=/absolute/path/to/python3"
         )
     try:
         import sqlite3
     except ImportError:
         raise SystemExit(
             f"install: selected Python {executable} ({version}) cannot import sqlite3.\n"
-            f"  recovery: {'brew install python; ' if IS_MAC else ''}"
-            "export SC_PYTHON=/absolute/path/to/python3"
+            "  recovery: install Python 3.9+ with sqlite3, then set "
+            "SC_PYTHON=/absolute/path/to/python3"
         )
     if report:
         print(
@@ -553,20 +552,14 @@ def report_docker() -> dict:
         print("            (no claude-as-root wart). Either mode works; duser() adapts.")
     elif state == "no-daemon":
         print("  docker    ⚠ CLI present but no daemon reachable. Start one:")
-        if IS_MAC:
-            print("            colima  : colima start   (or launch Docker Desktop)")
-        else:
-            print(f"            rootful : sudo usermod -aG docker {user} && sudo systemctl enable --now docker.socket  (re-login)")
-            print("            rootless: dockerd-rootless-setuptool.sh install && systemctl --user enable --now docker")
+        print(f"            rootful : sudo usermod -aG docker {user} && sudo systemctl enable --now docker.socket  (re-login)")
+        print("            rootless: dockerd-rootless-setuptool.sh install && systemctl --user enable --now docker")
         if st.get("detail"):
             print(f"            ({st['detail']})")
     else:  # absent
         print("  docker    ⚠ not found — the default run mode is a sandbox container.")
-        if IS_MAC:
-            print("            Install it (e.g. colima: brew install colima docker && colima start),")
-            print("            then `./sc doctor`.")
-        else:
-            print("            Install it (e.g. Arch: sudo pacman -S docker), then `./sc doctor`.")
+        print("            Install it with your Linux package manager (e.g. Arch: sudo pacman -S docker),")
+        print("            then `./sc doctor`.")
         print("            Or run without docker via the escape hatch: ./sc serve + ./sc boot")
     return st
 
@@ -950,11 +943,10 @@ def main(argv: list[str]) -> int:
     # 2. Requirements ---------------------------------------------------------
     step("Checking requirements")
     report_host_runtime()
-    brew = " (brew install git curl)" if IS_MAC else ""
     if not shutil.which("git"):
-        print(f"  ⚠ git not on PATH — needed for the commit→PR flow later.{brew}")
+        print("  ⚠ git not on PATH — needed for the commit→PR flow later.")
     if not shutil.which("curl"):
-        print(f"  ⚠ curl not on PATH — needed to auto-install a missing harness.{brew}")
+        print("  ⚠ curl not on PATH — needed to auto-install a missing harness.")
     # Docker is the default run path (the sandbox); guide if it's missing or
     # under-configured. Never fatal — `./sc serve`+`boot` run without it.
     report_docker()

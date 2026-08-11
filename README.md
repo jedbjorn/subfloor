@@ -114,7 +114,7 @@ harness already ships, nothing patched, nothing forked: [*Architecture*](docs/RE
 ## Install quickstart
 
 > [!class4]
-> **The bar: Python 3.9+ with `sqlite3`, a reachable docker daemon, and one signed-in harness CLI on PATH.** `./sc doctor` reports the exact interpreter and capabilities it finds. Set `SC_PYTHON` to select a specific interpreter, for example `export SC_PYTHON="$(brew --prefix)/bin/python3"` when `/usr/bin/python3` shadows Homebrew. Full prerequisites table (Arch / macOS), docker modes, and the no-docker escape hatch: [*Install*](docs/README.md#install).
+> **The bar: Linux, Python 3.9+ with `sqlite3`, a reachable docker daemon, and one signed-in harness CLI on PATH.** Ubuntu LTS, stable Fedora, and Arch-compatible Linux (including CachyOS) are tested examples, not an exclusive list. On macOS or Windows, create a Linux VM and run this flow inside the guest. Full Linux prerequisites, the guest-filesystem recommendation, docker modes, and the no-docker escape hatch: [*Install*](docs/README.md#install).
 
 Drop subfloor into an existing git repo and boot a shell:
 
@@ -129,17 +129,15 @@ git checkout super-coder/main -- .super-coder sc
 # 2. Bootstrap the fork — installs harness CLIs, builds the DB, seeds your starting team:
 ./sc install
 
-# 3. Sign in to your harness once, on the HOST (not inside the sandbox):
-claude                          # or:  opencode auth login  ·  codex login  ·  vibe --setup  ·  kimi login
-
-# 4. Launch the sandbox (server + GUI):
-./sc launch
-
-# 5. Commit the install before creating shell worktrees:
+# 3. Commit the install before creating shell worktrees:
 git add -A && git commit --no-verify -m "chore: install subfloor"
 
-# 6. Attach a session:
-./sc enter                      # auth + pick a shell + pick a harness + boot
+# 4. Launch through the normal Make aliases:
+make dos-l
+
+# 5. Sign in to your harness once, in Linux (not inside the sandbox), then enter:
+claude                          # or:  opencode auth login  ·  codex login  ·  vibe --setup  ·  kimi login
+make dos-e
 ```
 
 That's the happy path — you're talking to a planner shell in your repo, with a
