@@ -1,22 +1,24 @@
-#!/usr/bin/env python3
 """Successful-Sprint cleanup scheduling, rollback, and replay gates."""
+
 from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 sys.path[:0] = [str(ENGINE / "scripts"), str(ROOT / "tests")]
 
-import sprint_cleanup  # noqa: E402
-import sprint_close  # noqa: E402
-import sprint_domain  # noqa: E402
-from test_sprint_v2_domain import SprintDomainCase  # noqa: E402
-
+import sprint_cleanup
+import sprint_close
+import sprint_domain
+from test_sprint_v2_domain import SprintDomainCase
 
 TEST_ROOT = Path("/srv/super-coder")
 TEST_COMMON_DIR = TEST_ROOT / ".git"
@@ -353,20 +355,20 @@ class SprintCleanupSchedulingTest(SprintDomainCase):
 
     def test_transaction_rejects_participant_identity_drift(self):
         targets = self.cleanup.prepare_targets(self.sprint_id)
-        self.con.execute(
-            "UPDATE shells SET shortname='DEV-RENAMED' WHERE shell_id=1"
-        )
-        with self.assertRaisesRegex(
-            sprint_cleanup.SprintCleanupInvariantError,
-            "participant identities changed",
+        self.con.execute("UPDATE shells SET shortname='DEV-RENAMED' WHERE shell_id=1")
+        with (
+            self.assertRaisesRegex(
+                sprint_cleanup.SprintCleanupInvariantError,
+                "participant identities changed",
+            ),
+            self.con,
         ):
-            with self.con:
-                self.con.execute(
-                    "UPDATE sprints SET lifecycle='completed',"
-                    "terminal_outcome='accepted' WHERE sprint_id=?",
-                    (self.sprint_id,),
-                )
-                self.cleanup.schedule_in_transaction(self.sprint_id, targets)
+            self.con.execute(
+                "UPDATE sprints SET lifecycle='completed',"
+                "terminal_outcome='accepted' WHERE sprint_id=?",
+                (self.sprint_id,),
+            )
+            self.cleanup.schedule_in_transaction(self.sprint_id, targets)
         self.assertEqual(
             ("armed", 0),
             tuple(
@@ -490,13 +492,402 @@ class SprintCleanupSchedulingTest(SprintDomainCase):
             "WHERE cleanup_target_id=?",
             (ids[3],),
         )
-        self.assertEqual("pending", self.cleanup.project(self.sprint_id).aggregate_state)
+        self.assertEqual(
+            "pending", self.cleanup.project(self.sprint_id).aggregate_state
+        )
         self.con.execute(
             "UPDATE sprint_cleanup_targets SET state='succeeded' "
             "WHERE cleanup_target_id=?",
             (ids[3],),
         )
-        self.assertEqual("succeeded", self.cleanup.project(self.sprint_id).aggregate_state)
+        self.assertEqual(
+            "succeeded", self.cleanup.project(self.sprint_id).aggregate_state
+        )
+
+
+class SprintCleanupExecutorTest(SprintDomainCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repository = Path(self.tmp.name) / "repository"
+        self.remote = Path(self.tmp.name) / "remote.git"
+        self._git(Path(self.tmp.name), "init", "--bare", str(self.remote))
+        self._git(Path(self.tmp.name), "init", str(self.repository))
+        self._git(self.repository, "config", "user.name", "Sprint Fixture")
+        self._git(self.repository, "config", "user.email", "fixture@example.test")
+        (self.repository / ".gitignore").write_text(
+            ".sc-worktrees/\nkeep.cache\nshared/sprints/\n",
+            encoding="utf-8",
+        )
+        (self.repository / "tracked.txt").write_text("initial\n", encoding="utf-8")
+        self._git(self.repository, "add", ".gitignore", "tracked.txt")
+        self._git(self.repository, "commit", "-m", "initial")
+        self._git(self.repository, "branch", "-M", "main")
+        self._git(self.repository, "remote", "add", "origin", str(self.remote))
+        self._git(self.repository, "push", "-u", "origin", "main")
+        self._git(self.repository, "branch", "remote-preserved")
+        self._git(self.repository, "push", "origin", "remote-preserved")
+        self.worktree = self.repository / ".sc-worktrees" / "dev1"
+        self._git(
+            self.repository,
+            "worktree",
+            "add",
+            "-b",
+            "shell/dev1",
+            str(self.worktree),
+            "main",
+        )
+        self._git(self.worktree, "config", "user.name", "Sprint Fixture")
+        self._git(self.worktree, "config", "user.email", "fixture@example.test")
+
+        self.now = datetime(2026, 8, 11, 20, 0, tzinfo=timezone.utc)
+        common_dir = (self.repository / ".git").resolve()
+        self.cleanup = sprint_cleanup.SprintCleanupTargetStore(
+            self.con,
+            identity_provider=lambda: (self.repository.resolve(), common_dir),
+            clock=lambda: self.now,
+        )
+        self.lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            probe_harness=lambda _harness: None,
+            cleanup_store=self.cleanup,
+        )
+        self.sprint_id, self.unit_id = self.create_sprint()
+        self.lifecycle.arm(self.sprint_id, 3)
+        self.lifecycle.transition(
+            self.sprint_id,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="fixture completion",
+            terminal_outcome="accepted",
+        )
+
+    def _git(
+        self,
+        cwd: Path,
+        *args: str,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if check and result.returncode != 0:
+            self.fail(
+                f"git {' '.join(args)} failed in {cwd}: "
+                f"{result.stderr or result.stdout}"
+            )
+        return result
+
+    def _executor(
+        self,
+        *,
+        liveness=None,
+        branch_pruner=None,
+    ) -> sprint_cleanup.SprintCleanupExecutor:
+        return sprint_cleanup.SprintCleanupExecutor(
+            self.cleanup,
+            liveness_probe=liveness or (lambda _claim: "dormant"),
+            branch_pruner=branch_pruner
+            or (
+                lambda _repo: {
+                    "candidates": 0,
+                    "deleted": [],
+                    "failed": [],
+                }
+            ),
+            lease_seconds=60,
+        )
+
+    def _dirty_worktree(self) -> None:
+        self._git(self.worktree, "checkout", "-b", "feat/disposable")
+        (self.worktree / "local-commit.txt").write_text("local\n", encoding="utf-8")
+        self._git(self.worktree, "add", "local-commit.txt")
+        self._git(self.worktree, "commit", "-m", "local-only")
+        (self.worktree / "tracked.txt").write_text("staged dirt\n", encoding="utf-8")
+        self._git(self.worktree, "add", "tracked.txt")
+        (self.worktree / "untracked.txt").write_text("discard\n", encoding="utf-8")
+        nested = self.worktree / "nested-repository"
+        nested.mkdir()
+        self._git(nested, "init")
+        (nested / "only-local.txt").write_text("discard nested\n", encoding="utf-8")
+        (self.worktree / "keep.cache").write_text(
+            "ignored survives\n", encoding="utf-8"
+        )
+        (self.repository / "outside.txt").write_text(
+            "adjacent survives\n", encoding="utf-8"
+        )
+
+    def _advance_remote_main(self) -> str:
+        (self.repository / "tracked.txt").write_text(
+            "refreshed main\n", encoding="utf-8"
+        )
+        self._git(self.repository, "add", "tracked.txt")
+        self._git(self.repository, "commit", "-m", "advance main")
+        self._git(self.repository, "push", "origin", "main")
+        return self._git(self.repository, "rev-parse", "HEAD").stdout.strip()
+
+    def _worktree_row(self) -> sqlite3.Row:
+        return self.con.execute(
+            "SELECT * FROM sprint_cleanup_targets WHERE sprint_id=? AND shell_id=1",
+            (self.sprint_id,),
+        ).fetchone()
+
+    def test_reset_discards_nested_and_dirty_state_at_refreshed_main(self):
+        self._dirty_worktree()
+        refreshed_main = self._advance_remote_main()
+        pruned_from = []
+
+        def prune(repo):
+            pruned_from.append(
+                (
+                    repo,
+                    self._git(self.worktree, "branch", "--show-current").stdout.strip(),
+                )
+            )
+            return {"candidates": 0, "deleted": [], "failed": []}
+
+        receipt = self._executor(branch_pruner=prune).run_next("fixture", shell_id=1)
+
+        self.assertEqual("succeeded", receipt.state)
+        self.assertEqual(
+            "shell/dev1",
+            self._git(self.worktree, "branch", "--show-current").stdout.strip(),
+        )
+        self.assertEqual(
+            refreshed_main, self._git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        )
+        self.assertEqual("", self._git(self.worktree, "status", "--porcelain").stdout)
+        self.assertEqual(
+            "refreshed main\n", (self.worktree / "tracked.txt").read_text()
+        )
+        self.assertFalse((self.worktree / "untracked.txt").exists())
+        self.assertFalse((self.worktree / "nested-repository").exists())
+        self.assertTrue((self.worktree / "keep.cache").is_file())
+        self.assertEqual(
+            "adjacent survives\n", (self.repository / "outside.txt").read_text()
+        )
+        self.assertNotEqual(
+            "",
+            self._git(
+                self.repository, "ls-remote", "origin", "refs/heads/remote-preserved"
+            ).stdout,
+        )
+        self.assertEqual([(self.repository, "shell/dev1")], pruned_from)
+        row = self._worktree_row()
+        before = json.loads(row["before_evidence"])
+        after = json.loads(row["after_evidence"])
+        self.assertEqual(
+            ("succeeded", 1, 1),
+            (row["state"], row["attempt_count"], row["claim_generation"]),
+        )
+        self.assertGreater(before["status_count"], 0)
+        self.assertEqual(0, after["status_count"])
+        self.assertEqual(refreshed_main, after["refreshed_main_sha"])
+
+    def test_substituted_repository_fails_closed_and_preserves_bytes(self):
+        self._git(self.repository, "worktree", "remove", "--force", str(self.worktree))
+        self.worktree.mkdir(parents=True)
+        self._git(self.worktree, "init")
+        sentinel = self.worktree / "substituted.txt"
+        sentinel.write_text("must survive\n", encoding="utf-8")
+
+        receipt = self._executor().run_next("fixture", shell_id=1)
+
+        self.assertEqual(
+            ("failed", "git_common_dir_mismatch"), (receipt.state, receipt.code)
+        )
+        self.assertEqual("must survive\n", sentinel.read_text())
+        row = self._worktree_row()
+        self.assertEqual(
+            ("failed", 0, "git_common_dir_mismatch"),
+            (row["state"], row["attempt_count"], row["last_error_code"]),
+        )
+        self.assertIsNone(row["before_evidence"])
+
+    def test_reclaimed_generation_cannot_mutate_or_write_terminal_state(self):
+        self._dirty_worktree()
+        first = self.cleanup.claim_next("first", shell_id=1, lease_seconds=10)
+        self.assertIsNotNone(first)
+        self.now += timedelta(seconds=11)
+        second = self.cleanup.claim_next("second", shell_id=1, lease_seconds=60)
+        self.assertIsNotNone(second)
+
+        receipt = self._executor().execute(first)
+
+        self.assertEqual(("stale", "claim_superseded"), (receipt.state, receipt.code))
+        self.assertTrue((self.worktree / "untracked.txt").is_file())
+        row = self._worktree_row()
+        self.assertEqual(
+            ("running", "second", 2, 0),
+            (
+                row["state"],
+                row["lease_owner"],
+                row["claim_generation"],
+                row["attempt_count"],
+            ),
+        )
+        self.assertIsNone(row["last_error_code"])
+
+    def test_post_lock_revalidation_refuses_newer_sprint_without_git_mutation(self):
+        self._dirty_worktree()
+        newer_sprint, _unit = self.create_sprint()
+        calls = 0
+
+        def liveness(_claim):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.lifecycle.arm(newer_sprint, 3)
+            return "dormant"
+
+        receipt = self._executor(liveness=liveness).run_next("fixture", shell_id=1)
+
+        self.assertEqual(
+            ("failed", "newer_sprint_owns_target"), (receipt.state, receipt.code)
+        )
+        self.assertTrue((self.worktree / "untracked.txt").is_file())
+        self.assertEqual(
+            "feat/disposable",
+            self._git(self.worktree, "branch", "--show-current").stdout.strip(),
+        )
+        row = self._worktree_row()
+        self.assertEqual(("failed", 1), (row["state"], row["attempt_count"]))
+        self.assertIsNotNone(row["before_evidence"])
+
+    def test_live_target_waits_without_consuming_attempt(self):
+        receipt = self._executor(liveness=lambda _claim: "live").run_next(
+            "fixture",
+            shell_id=1,
+        )
+
+        self.assertEqual(
+            ("waiting", "waiting_for_run_exit"), (receipt.state, receipt.code)
+        )
+        row = self._worktree_row()
+        self.assertEqual(
+            ("pending", 0, "waiting_for_run_exit"),
+            (row["state"], row["attempt_count"], row["waiting_reason"]),
+        )
+        self.assertIsNone(row["last_error_code"])
+
+    def test_fetch_failures_retry_three_times_with_durable_evidence(self):
+        self._git(self.repository, "remote", "remove", "origin")
+        executor = self._executor()
+        receipts = []
+        for _attempt in range(3):
+            receipts.append(executor.run_next("fixture", shell_id=1))
+            self.now += timedelta(seconds=6)
+
+        self.assertEqual(
+            ["pending", "pending", "failed"], [item.state for item in receipts]
+        )
+        self.assertEqual([1, 2, 3], [item.attempt_count for item in receipts])
+        self.assertTrue(all(item.code == "fetch_failed" for item in receipts))
+        row = self._worktree_row()
+        self.assertEqual(
+            ("failed", 3, "fetch_failed"),
+            (row["state"], row["attempt_count"], row["last_error_code"]),
+        )
+        self.assertIn("missing remote origin", row["last_error_detail"])
+        self.assertIsNone(row["after_evidence"])
+
+    def test_partial_git_mutation_retries_to_convergence(self):
+        self._dirty_worktree()
+        refreshed_main = self._advance_remote_main()
+
+        class FailFirstClean(sprint_cleanup.SprintCleanupExecutor):
+            failed = False
+
+            def _git(self, repo, *args, code, timeout=None):
+                if args[:2] == ("clean", "-ffd") and not self.failed:
+                    self.failed = True
+                    raise sprint_cleanup.SprintCleanupMutationError(
+                        "clean_current_failed",
+                        "injected partial mutation",
+                    )
+                return super()._git(repo, *args, code=code, timeout=timeout)
+
+        first_executor = FailFirstClean(
+            self.cleanup,
+            liveness_probe=lambda _claim: "dormant",
+            branch_pruner=lambda _repo: {
+                "candidates": 0,
+                "deleted": [],
+                "failed": [],
+            },
+            lease_seconds=60,
+        )
+        first = first_executor.run_next("fixture", shell_id=1)
+        self.now += timedelta(seconds=6)
+        second = self._executor().run_next("fixture", shell_id=1)
+
+        self.assertEqual(
+            ("pending", "clean_current_failed", 1),
+            (first.state, first.code, first.attempt_count),
+        )
+        self.assertEqual(("succeeded", 2), (second.state, second.attempt_count))
+        self.assertEqual(
+            refreshed_main, self._git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        )
+        self.assertFalse((self.worktree / "nested-repository").exists())
+        row = self._worktree_row()
+        retry = json.loads(row["after_evidence"])["retry_evidence"]
+        self.assertEqual(
+            (1, "clean_current_failed", "injected partial mutation"),
+            (
+                retry["failed_attempts"],
+                retry["last_error_code"],
+                retry["last_error_detail"],
+            ),
+        )
+        self.assertIsNone(row["last_error_code"])
+
+    def test_artifact_deletion_is_exact_and_records_bounded_count(self):
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='succeeded' "
+            "WHERE sprint_id=? AND target_kind='worktree'",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        artifact = self.repository / "shared" / "sprints" / f"sprint-{self.sprint_id}"
+        artifact.mkdir(parents=True)
+        (artifact / "one.txt").write_text("one\n", encoding="utf-8")
+        (artifact / "nested").mkdir()
+        (artifact / "nested" / "two.txt").write_text("two\n", encoding="utf-8")
+        adjacent = artifact.parent / "sprint-999"
+        adjacent.mkdir()
+        (adjacent / "keep.txt").write_text("keep\n", encoding="utf-8")
+
+        receipt = self._executor().run_next("fixture")
+
+        self.assertEqual("succeeded", receipt.state)
+        self.assertFalse(artifact.exists())
+        self.assertEqual("keep\n", (adjacent / "keep.txt").read_text())
+        row = self.con.execute(
+            "SELECT state,attempt_count,before_evidence,after_evidence "
+            "FROM sprint_cleanup_targets WHERE sprint_id=? "
+            "AND target_kind='artifact_dir'",
+            (self.sprint_id,),
+        ).fetchone()
+        before = json.loads(row["before_evidence"])
+        after = json.loads(row["after_evidence"])
+        self.assertEqual(
+            ("succeeded", 1, 3),
+            (row["state"], row["attempt_count"], before["entry_count"]),
+        )
+        self.assertEqual(
+            (True, 3, False),
+            (
+                after["existed"],
+                after["removed_entry_count"],
+                after["entry_count_truncated"],
+            ),
+        )
 
 
 if __name__ == "__main__":
