@@ -21,6 +21,7 @@
     ".super-coder/assets/skills/sprint_close/SKILL.md",
     ".super-coder/scripts/activity_monitor.py",
     ".super-coder/scripts/sprint_close.py",
+    ".super-coder/scripts/sprint_cleanup.py",
     ".super-coder/scripts/sprint_board.py",
     ".super-coder/scripts/sprint.py",
     ".super-coder/scripts/sprint_cli.py",
@@ -50,6 +51,7 @@
     "tests/test_sprint_recovery.py",
     "tests/test_sprint_review_loop.py",
     "tests/test_sprint_close.py",
+    "tests/test_sprint_cleanup.py",
     "tests/test_sprint_cli.py",
     "tests/test_sprint_skills.py",
     "tests/test_sprint_snapshot_rebuild.py",
@@ -94,7 +96,8 @@
     ".super-coder/migrations/0197_reseed_reopened_pr_resubscription.sql",
     ".super-coder/migrations/0198_reseed_engine_authored_review_handoff.sql",
     ".super-coder/migrations/0199_sprint_live_replanning.sql",
-    ".super-coder/migrations/0200_reseed_sprint_live_replanning.sql"
+    ".super-coder/migrations/0200_reseed_sprint_live_replanning.sql",
+    ".super-coder/migrations/0201_sprint_cleanup_targets.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
