@@ -139,6 +139,16 @@ class CleanupRecoveryReceipt:
     projection: CleanupProjection
 
 
+@dataclass(frozen=True)
+class UnresolvedCleanupTarget:
+    cleanup_target_id: int
+    sprint_id: int
+    shell_id: int
+    state: str
+    path_label: str
+    last_safe_fact: str
+
+
 IdentityProvider = Callable[[], tuple[Path, Path]]
 Clock = Callable[[], datetime]
 LivenessProbe = Callable[[CleanupClaim], str]
@@ -350,6 +360,54 @@ class SprintCleanupTargetStore:
             failed_count=counts["failed"],
         )
 
+    def unresolved_worktree(
+        self,
+        shell_ids: Iterable[int],
+        *,
+        before_sprint_id: int | None = None,
+    ) -> UnresolvedCleanupTarget | None:
+        """Return the oldest unresolved cleanup that fences shell reuse."""
+        normalized = tuple(sorted({int(shell_id) for shell_id in shell_ids}))
+        if not normalized or not self._cleanup_table_exists():
+            return None
+        placeholders = ",".join("?" for _ in normalized)
+        params: list[object] = [*normalized]
+        prior_filter = ""
+        if before_sprint_id is not None:
+            prior_filter = " AND target.sprint_id<?"
+            params.append(before_sprint_id)
+        row = self.con.execute(
+            "SELECT target.cleanup_target_id,target.sprint_id,target.shell_id,"
+            "target.state,target.waiting_reason,target.last_error_code,"
+            "shell.shortname FROM sprint_cleanup_targets target "
+            "JOIN shells shell ON shell.shell_id=target.shell_id "
+            "WHERE target.target_kind='worktree' "
+            "AND target.state<>'succeeded' "
+            f"AND target.shell_id IN ({placeholders})"
+            + prior_filter
+            + " ORDER BY target.sprint_id,target.cleanup_target_id LIMIT 1",
+            params,
+        ).fetchone()
+        if row is None:
+            return None
+        last_safe_fact = str(
+            row["last_error_code"]
+            or row["waiting_reason"]
+            or (
+                "cleanup_claim_active"
+                if row["state"] == "running"
+                else "cleanup_pending"
+            )
+        )
+        return UnresolvedCleanupTarget(
+            cleanup_target_id=int(row["cleanup_target_id"]),
+            sprint_id=int(row["sprint_id"]),
+            shell_id=int(row["shell_id"]),
+            state=str(row["state"]),
+            path_label=f".sc-worktrees/{str(row['shortname']).lower()}",
+            last_safe_fact=last_safe_fact,
+        )
+
     def claim_next(
         self,
         owner: str,
@@ -362,8 +420,16 @@ class SprintCleanupTargetStore:
             raise ValueError("cleanup lease owner is required")
         if lease_seconds <= 0:
             raise ValueError("cleanup lease duration must be positive")
+        if not self._cleanup_table_exists():
+            return None
         now = self.clock()
         now_stamp = _stamp(now)
+        if self.con.execute(
+            "SELECT 1 FROM sprint_cleanup_targets WHERE state='pending' "
+            "OR (state='running' AND lease_expires_at<=?) LIMIT 1",
+            (now_stamp,),
+        ).fetchone() is None:
+            return None
         expires_at = _stamp(now + timedelta(seconds=lease_seconds))
         self._begin_write()
         try:
@@ -781,6 +847,16 @@ class SprintCleanupTargetStore:
         if self.con.in_transaction:
             raise RuntimeError("cleanup execution requires an idle DB connection")
         self.con.execute("BEGIN IMMEDIATE")
+
+    def _cleanup_table_exists(self) -> bool:
+        row = self.con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='sprint_cleanup_targets'"
+        ).fetchone()
+        try:
+            return row is not None and row[0] == 1
+        except (KeyError, TypeError):
+            return False
 
     @staticmethod
     def _evidence(value: dict[str, Any]) -> str:

@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import socket
 import subprocess
 import sys
@@ -1053,6 +1054,33 @@ class LaunchPlan(NamedTuple):
     cli_version: "str | None"
 
 
+def cleanup_before_launch(con: sqlite3.Connection, shell: dict) -> None:
+    """Resolve one shell's older successful-Sprint cleanup before reuse."""
+    if shell.get("flavor") == "admin" or not shell.get("shortname"):
+        return
+    import sprint_cleanup
+
+    shell_id = int(shell["shell_id"])
+    store = sprint_cleanup.SprintCleanupTargetStore(con)
+    if store.unresolved_worktree((shell_id,)) is None:
+        return
+    receipt = sprint_cleanup.SprintCleanupExecutor(store).run_next(
+        f"launcher:{os.getpid()}:{shell_id}",
+        shell_id=shell_id,
+    )
+    blocker = store.unresolved_worktree((shell_id,))
+    if blocker is None:
+        return
+    raise LaunchError(
+        f"prior Sprint {blocker.sprint_id} cleanup is {blocker.state} for "
+        f"{blocker.path_label} (last_safe_fact={blocker.last_safe_fact}; "
+        f"launcher_result={receipt.state}); run `sc sprint cleanup-status "
+        f"--sprint {blocker.sprint_id}` and, after correcting a failure, "
+        f"`sc sprint cleanup --sprint {blocker.sprint_id} --key "
+        "<stable-retry-key>`; retry launch after cleanup succeeds"
+    )
+
+
 def _cli_version(binary: str) -> "str | None":
     """Best-effort `<binary> --version` first line, for the session_start
     hook's cli_version telemetry. Cheap and never load-bearing: any failure
@@ -1154,6 +1182,12 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     else:
         session_model = model or flavor_model
         session_effort = effort
+
+    try:
+        cleanup_before_launch(con, chosen)
+    except LaunchError:
+        con.close()
+        raise
 
     # Pre-session analytics sweep — same correctness dependency as main():
     # open_session's stub-reuse check relies on the previous boot's usage
@@ -1543,6 +1577,13 @@ def main() -> None:
     else:
         session_model = flavor_model
         session_effort = None
+
+    try:
+        cleanup_before_launch(con, chosen)
+    except LaunchError as exc:
+        con.close()
+        prefix = "sc run" if headless else "session launch"
+        sys.exit(f"{prefix}: {exc}")
 
     feedback = not headless and not os.environ.get("RENDER_ONLY")
     map_note = None

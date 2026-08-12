@@ -15,6 +15,7 @@ import activity_monitor
 import conversation_broker
 import conversation_events
 import db_driver
+import sprint_cleanup
 from sprint_domain import (
     ArmedServiceSwitch,
     SprintInvariantError,
@@ -243,8 +244,11 @@ class SprintRuntimeService(threading.Thread):
         switch = self._switch(con)
         serviced = switch.recover_on_startup() if startup else switch.tick()
         delivered = self._deliver_wakes(con)
+        cleanup = sprint_cleanup.SprintCleanupExecutor(
+            sprint_cleanup.SprintCleanupTargetStore(con)
+        ).run_next(f"{self.owner}:cleanup")
         self._record_heartbeat(con)
-        return delivered or serviced or monitored.changed
+        return delivered or serviced or monitored.changed or cleanup.state != "idle"
 
     def _record_heartbeat(self, con: sqlite3.Connection) -> None:
         prior = con.execute(
