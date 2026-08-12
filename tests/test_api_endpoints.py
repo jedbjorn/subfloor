@@ -212,7 +212,15 @@ class AssemblerSmokeTest(unittest.TestCase):
             (self.ids["feature_id"], shell_id),
         ).lastrowid
         self.con.execute(
-            "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?", (sprint_id,)
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness,disposition) "
+            "VALUES (?,?,'reviewer','codex','idle')",
+            (sprint_id, self.ids["bespoke_shell_id"]),
+        )
+        self.con.execute(
+            "UPDATE sprints SET conformance_reviewer_shell_id=?,"
+            "conformance_owner_generation=1,lifecycle='armed' WHERE sprint_id=?",
+            (self.ids["bespoke_shell_id"], sprint_id),
         )
         participant_id = self.con.execute(
             "INSERT INTO sprint_participants "
@@ -270,6 +278,12 @@ class AssemblerSmokeTest(unittest.TestCase):
             "VALUES (?,?,'developer','codex','active')",
             (paused_id, shell_id),
         ).lastrowid
+        self.con.execute(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness,disposition) "
+            "VALUES (?,?,'reviewer','codex','idle')",
+            (paused_id, self.ids["bespoke_shell_id"]),
+        )
         self.create_sprint_chat(
             int(paused_participant_id),
             conversation_id="cv_fixture_paused",
@@ -277,9 +291,11 @@ class AssemblerSmokeTest(unittest.TestCase):
             key="fixture:sprint:paused:participant:wake",
         )
         self.con.execute(
-            "UPDATE sprints SET lifecycle='armed',armed_at='2026-07-31 08:00:00' "
+            "UPDATE sprints SET conformance_reviewer_shell_id=?,"
+            "conformance_owner_generation=1,lifecycle='armed',"
+            "armed_at='2026-07-31 08:00:00' "
             "WHERE sprint_id=?",
-            (paused_id,),
+            (self.ids["bespoke_shell_id"], paused_id),
         )
         self.con.execute(
             "UPDATE sprints SET lifecycle='paused',paused_at='2026-07-31 10:00:00' "
@@ -306,9 +322,11 @@ class AssemblerSmokeTest(unittest.TestCase):
             key="fixture:sprint:armed:participant:wake",
         )
         self.con.execute(
-            "UPDATE sprints SET lifecycle='armed',armed_at='2026-07-31 11:00:00' "
+            "UPDATE sprints SET conformance_reviewer_shell_id=?,"
+            "conformance_owner_generation=1,lifecycle='armed',"
+            "armed_at='2026-07-31 11:00:00' "
             "WHERE sprint_id=?",
-            (armed_id,),
+            (shell_id, armed_id),
         )
         self.con.commit()
 

@@ -101,7 +101,9 @@
     ".super-coder/migrations/0201_sprint_cleanup_targets.sql",
     ".super-coder/migrations/0202_reseed_context_efficient_skills.sql",
     ".super-coder/migrations/0203_sprint_cleanup_recovery.sql",
-    ".super-coder/migrations/0204_sprint_governing_revision_evidence.sql"
+    ".super-coder/migrations/0204_sprint_governing_revision_evidence.sql",
+    ".super-coder/migrations/0205_sprint_conformance_ownership.sql",
+    ".super-coder/migrations/0206_reseed_sprint_conformance_ownership.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
