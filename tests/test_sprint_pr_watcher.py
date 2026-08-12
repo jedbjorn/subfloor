@@ -323,10 +323,53 @@ class RegistrationTest(SprintPRWatcherCase):
         )
 
     def test_exact_registration_replay_reactivates_a_reopened_subscription(self):
+        def ownership() -> tuple:
+            return tuple(
+                self.con.execute(
+                    "SELECT registered.registered_pr_id,registered.sprint_id,"
+                    "registered.owner_participant_id,subscription.subscription_id,"
+                    "subscription.owner_shell_id,link.work_unit_id "
+                    "FROM sprint_registered_prs registered "
+                    "JOIN pr_subscriptions subscription "
+                    "ON subscription.sprint_registered_pr_id="
+                    "registered.registered_pr_id "
+                    "JOIN sprint_pr_work_units link "
+                    "ON link.registered_pr_id=registered.registered_pr_id"
+                ).fetchone()
+            )
+
+        def durable_counts() -> tuple:
+            return tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM pr_subscription_transitions),"
+                    "(SELECT COUNT(*) FROM sprint_pr_transitions),"
+                    "(SELECT COUNT(*) FROM wake_message "
+                    " WHERE idempotency_key LIKE 'pr-transition:%'),"
+                    "(SELECT COUNT(*) FROM sprint_wake_messages wm "
+                    " JOIN wake_message m USING (message_id) "
+                    " WHERE m.idempotency_key LIKE 'pr-transition:%'),"
+                    "(SELECT COUNT(*) FROM sprint_wake_outbox outbox "
+                    " WHERE EXISTS (SELECT 1 FROM sprint_wake_messages wm "
+                    " JOIN wake_message m USING (message_id) "
+                    " WHERE wm.wake_id=outbox.wake_id "
+                    " AND m.idempotency_key LIKE 'pr-transition:%'))"
+                ).fetchone()
+            )
+
         self.reader.current = pull_request(
             state="CLOSED", checks=None, checks_failed=False
         )
         first = self.register()
+        expected_ownership = (
+            first.registered_pr_id,
+            self.sprint_id,
+            self.developer_id,
+            1,
+            1,
+            self.unit_id,
+        )
+        self.assertEqual(expected_ownership, ownership())
         self.assertFalse(self.watcher.poll_once())
 
         reopened_head = "d" * 40
@@ -340,19 +383,84 @@ class RegistrationTest(SprintPRWatcherCase):
         self.assertFalse(replay.created)
         self.assertEqual(first.registered_pr_id, replay.registered_pr_id)
         self.assertEqual([42, 42], self.reader.get_calls)
+        transitions = [
+            ("closed", "a" * 40, "registration"),
+            ("green", reopened_head, "registration"),
+        ]
         self.assertEqual(
-            [("closed", "a" * 40), ("green", reopened_head)],
+            transitions,
             [
-                tuple(row)
+                (
+                    row["normalized_state"],
+                    row["observed_head_sha"],
+                    json.loads(row["evidence"])["trigger"],
+                )
                 for row in self.con.execute(
-                    "SELECT normalized_state,observed_head_sha "
+                    "SELECT normalized_state,observed_head_sha,evidence "
+                    "FROM pr_subscription_transitions ORDER BY transition_id"
+                )
+            ],
+        )
+        self.assertEqual(
+            transitions,
+            [
+                (
+                    row["normalized_state"],
+                    row["observed_head_sha"],
+                    json.loads(row["evidence"])["trigger"],
+                )
+                for row in self.con.execute(
+                    "SELECT normalized_state,observed_head_sha,evidence "
                     "FROM sprint_pr_transitions ORDER BY transition_id"
                 )
             ],
         )
+        self.assertEqual(
+            [
+                (
+                    1,
+                    None,
+                    None,
+                    "re-enter",
+                    "GitHub PR event: repository=acme/repo, number=42, head_sha="
+                    + "a" * 40
+                    + ", event=closed. Your PR was closed without merge; judge it "
+                    "and inform the Planner if this is a real problem.",
+                ),
+                (
+                    1,
+                    None,
+                    None,
+                    "re-enter",
+                    "GitHub PR event: repository=acme/repo, number=42, head_sha="
+                    + reopened_head
+                    + ", event=green. Your PR is green; judge readiness and pass "
+                    "the baton to review.",
+                ),
+            ],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT receiver_shell_id,sprint_id,to_participant_id,"
+                    "declared_type,body FROM wake_message "
+                    "WHERE idempotency_key LIKE 'pr-transition:%' "
+                    "ORDER BY message_id"
+                )
+            ],
+        )
+        expected_counts = (2, 2, 2, 2, 1)
+        self.assertEqual(expected_counts, durable_counts())
+
+        unchanged = self.register()
+
+        self.assertFalse(unchanged.created)
+        self.assertEqual(first.registered_pr_id, unchanged.registered_pr_id)
+        self.assertEqual([42, 42, 42], self.reader.get_calls)
+        self.assertEqual(expected_ownership, ownership())
+        self.assertEqual(expected_counts, durable_counts())
 
         self.assertTrue(self.watcher.poll_once())
-        self.assertEqual([42, 42, 42], self.reader.get_calls)
+        self.assertEqual([42, 42, 42, 42], self.reader.get_calls)
         self.assertEqual(
             2,
             self.con.execute(
