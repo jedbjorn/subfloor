@@ -1066,6 +1066,8 @@ def patch_columns(con, table, pk_col, pk, body, allowed, commit=True):
     cols = [col for col in sorted(allowed) if col in body]
     if not cols:
         return False, "no editable fields in payload"
+    if "body" in body and not isinstance(body["body"], str):
+        return False, "body must be a string"
     vals = [body[col] for col in cols]
     sets = ", ".join(f"{col}=?" for col in cols)
     try:
@@ -1161,18 +1163,150 @@ def patch_shell(con, shell_id, body):
                          SHELL_EDITABLE)
 
 
-def patch_document(con, doc_id, body, commit=True):
-    r = con.execute("SELECT frozen FROM documents WHERE document_id=?",
-                    (doc_id,)).fetchone()
-    if r is None:
-        return False, "no such document"
-    if r["frozen"]:
-        return False, "document is frozen — open the next spec, don't edit this one"
-    # render_path is editable (#312): a doc authored without one could never
-    # be made publishable — `doc edit --render-path` advertised the option
-    # and silently dropped it, and `doc add` always INSERTs a new row.
-    return patch_columns(con, "documents", "document_id", doc_id, body,
-                         {"body", "title", "render_path"}, commit=commit)
+def patch_document(
+    con,
+    doc_id,
+    body,
+    *,
+    editor_surface,
+    editor_shell_id=None,
+):
+    """Edit one document and atomically retain active-Sprint body evidence."""
+    allowed = {"body", "title", "render_path"}
+    cols = [col for col in sorted(allowed) if col in body]
+    if not cols:
+        return False, "no editable fields in payload"
+    if "body" in body and not isinstance(body["body"], str):
+        return False, "body must be a string"
+    if editor_surface not in {"shell_api", "review_ui"}:
+        raise ValueError("unknown document editor surface")
+    try:
+        with db_driver.write_transaction(con, "document.edit"):
+            document = con.execute(
+                "SELECT feature_id,frozen,body FROM documents WHERE document_id=?",
+                (doc_id,),
+            ).fetchone()
+            if document is None:
+                return False, "no such document"
+            if document["frozen"]:
+                return (
+                    False,
+                    "document is frozen — open the next spec, don't edit this one",
+                )
+
+            before_body = document["body"] or ""
+            body_changed = "body" in body and body["body"] != document["body"]
+            authority = "fnb"
+            editor_shortname = None
+            if editor_surface == "shell_api":
+                editor = con.execute(
+                    "SELECT shortname,flavor FROM shells WHERE shell_id=? "
+                    "AND COALESCE(is_deleted,0)=0",
+                    (editor_shell_id,),
+                ).fetchone()
+                if editor is None:
+                    raise sprint_domain.SprintAuthorityError(
+                        "document editor shell is unavailable"
+                    )
+                editor_shortname = str(editor["shortname"])
+                authority = (
+                    "planner" if editor["flavor"] == "planner" else "outside_authority"
+                )
+
+            vals = [body[col] for col in cols]
+            sets = ", ".join(f"{col}=?" for col in cols)
+            con.execute(
+                f"UPDATE documents SET {sets} WHERE document_id=?",
+                tuple(vals) + (doc_id,),
+            )
+            if not body_changed:
+                return True, None
+
+            after_body = body["body"] or ""
+            before_sha256 = hashlib.sha256(before_body.encode()).hexdigest()
+            after_sha256 = hashlib.sha256(after_body.encode()).hexdigest()
+            bindings = con.execute(
+                "SELECT s.sprint_id,s.originating_planner_shell_id,"
+                "p.participant_id AS planner_participant_id,"
+                "COALESCE(sh.is_deleted,1) AS planner_deleted "
+                "FROM sprint_specs ss JOIN sprints s USING (sprint_id) "
+                "LEFT JOIN sprint_participants p ON p.sprint_id=s.sprint_id "
+                "AND p.shell_id=s.originating_planner_shell_id AND p.role='planner' "
+                "LEFT JOIN shells sh ON sh.shell_id=s.originating_planner_shell_id "
+                "WHERE ss.document_id=? AND s.lifecycle IN ('armed','paused') "
+                "ORDER BY s.sprint_id",
+                (doc_id,),
+            ).fetchall()
+            for binding in bindings:
+                notification_state = "not_required"
+                if authority == "outside_authority":
+                    notification_state = (
+                        "queued"
+                        if binding["planner_participant_id"] is not None
+                        and int(binding["planner_deleted"]) == 0
+                        else "unavailable"
+                    )
+                payload = {
+                    "document_id": doc_id,
+                    "feature_id": document["feature_id"],
+                    "before_sha256": before_sha256,
+                    "after_sha256": after_sha256,
+                    "editor_surface": editor_surface,
+                    "editor_shell_id": editor_shell_id,
+                    "editor_shortname": editor_shortname,
+                    "authority": authority,
+                    "notification_state": notification_state,
+                }
+                event_id = int(
+                    con.execute(
+                        "INSERT INTO sprint_events "
+                        "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+                        "VALUES (?,'spec.body_edited',?,?,?)",
+                        (
+                            binding["sprint_id"],
+                            authority if authority in {"planner", "fnb"} else "system",
+                            editor_shell_id if authority == "planner" else None,
+                            json.dumps(payload, sort_keys=True),
+                        ),
+                    ).lastrowid
+                )
+                if notification_state == "queued":
+                    sprint_message_delivery.SprintMessageStore(con).send_in_transaction(
+                        int(binding["sprint_id"]),
+                        to_participant_id=int(binding["planner_participant_id"]),
+                        message_kind="notification",
+                        body=(
+                            f"Sprint {binding['sprint_id']} governing document {doc_id} "
+                            f"was edited by {editor_shortname} outside Planner authority "
+                            f"({before_sha256[:12]} -> {after_sha256[:12]}). The edit was "
+                            "allowed and recorded for Planner judgment."
+                        ),
+                        idempotency_key=f"_sc:system:spec-body-edited:{event_id}",
+                        actionable=False,
+                        declared_type="re-enter",
+                    )
+                elif notification_state == "unavailable":
+                    con.execute(
+                        "INSERT INTO sprint_events "
+                        "(sprint_id,event_type,actor_kind,payload) "
+                        "VALUES (?,'spec.edit_notification_unavailable','system',?)",
+                        (
+                            binding["sprint_id"],
+                            json.dumps(
+                                {
+                                    "document_id": doc_id,
+                                    "edit_event_id": event_id,
+                                    "planner_shell_id": binding[
+                                        "originating_planner_shell_id"
+                                    ],
+                                },
+                                sort_keys=True,
+                            ),
+                        ),
+                    )
+        return True, None
+    except db_driver.IntegrityError as exc:
+        return False, str(exc)
 
 
 def create_flag(con, body):
@@ -2037,6 +2171,8 @@ class Handler(BaseHTTPRequestHandler):
                     "details": {"code": exc.code, **exc.context},
                 },
             )
+        if isinstance(exc, sprint_domain.BoundRevisionUnavailable):
+            return self._send(409, {"error": str(exc), "details": exc.details})
         if isinstance(exc, sprint_domain.SprintAuthorityError):
             return self._send(403, {"error": str(exc)})
         if isinstance(exc, sprint_domain.SprintCleanupConflictError):
@@ -2273,14 +2409,15 @@ class Handler(BaseHTTPRequestHandler):
             )
             con.executemany(
                 "INSERT INTO sprint_specs "
-                "(sprint_id,document_id,bound_revision_sha256,approval_id) "
-                "VALUES (?,?,?,?)",
+                "(sprint_id,document_id,bound_revision_sha256,approval_id,"
+                "bound_revision_body,bound_revision_legacy) VALUES (?,?,?,?,?,0)",
                 (
                     (
                         sprint_id,
                         document_id,
                         hashlib.sha256(selected["document"]["body"].encode()).hexdigest(),
                         selected["approval_id"],
+                        selected["document"]["body"],
                     )
                     for document_id, selected in selected_specs.items()
                 ),
@@ -2334,6 +2471,11 @@ class Handler(BaseHTTPRequestHandler):
         parts = path.strip("/").split("/")
         con = db()
         try:
+            if len(parts) == 5 and parts[2] == "spec-revisions":
+                result = sprint_domain.SprintSpecRevisionStore(con).read(
+                    int(parts[3]), int(parts[4]), caller_shell_id=shell_id
+                )
+                return self._send(200, result)
             if path == "/_sc/sprint/watcher-state":
                 values = parse_qs(urlparse(self.path).query).get("sprint_id", [])
                 if len(values) != 1:
@@ -3665,14 +3807,15 @@ class Handler(BaseHTTPRequestHandler):
             # PATCH /_sc/mem/docs/{id}
             if len(parts) == 4 and parts[2] == "docs":
                 did = int(parts[3])
-                if not con.execute(
-                        "SELECT 1 FROM documents WHERE document_id=?",
-                        (did,)).fetchone():
-                    return self._send(404, {"error": "no such document"})
-                ok, err = patch_document(con, did, body, commit=False)
+                ok, err = patch_document(
+                    con,
+                    did,
+                    body,
+                    editor_surface="shell_api",
+                    editor_shell_id=sid,
+                )
                 if not ok:
                     return self._send(400, {"ok": ok, "error": err})
-                con.commit()
                 return self._send(200, {
                     "ok": ok,
                     "serialize": serialize_doc_write(),
@@ -3853,7 +3996,7 @@ class Handler(BaseHTTPRequestHandler):
                     return None
                 parts = path.strip("/").split("/")
                 try:
-                    if len(parts) not in {3, 4}:
+                    if len(parts) not in {3, 4, 5}:
                         raise sprint_board.ProjectionError(
                             404, "not_found", "resource not found"
                         )
@@ -3869,7 +4012,11 @@ class Handler(BaseHTTPRequestHandler):
                 q = parse_qs(urlparse(self.path).query, keep_blank_values=True)
                 projection = sprint_board.SprintBoardProjection(con)
                 try:
-                    if len(parts) == 3:
+                    if len(parts) == 5 and parts[3] == "spec-revisions":
+                        result = sprint_domain.SprintSpecRevisionStore(con).read(
+                            sprint_id, int(parts[4]), fnb=True
+                        )
+                    elif len(parts) == 3:
                         result = projection.board(sprint_id)
                     elif parts[3] == "events":
                         result = projection.events(
@@ -3893,6 +4040,10 @@ class Handler(BaseHTTPRequestHandler):
                         raise sprint_board.ProjectionError(
                             404, "not_found", "resource not found"
                         )
+                except sprint_domain.BoundRevisionUnavailable as exc:
+                    return self._send(
+                        409, {"error": str(exc), "details": exc.details}
+                    )
                 except Exception as exc:
                     return self._sprint_board_error(exc)
                 return self._send(200, result)
@@ -4211,8 +4362,14 @@ class Handler(BaseHTTPRequestHandler):
                                         ROADMAP_EDITABLE)
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
             if path.startswith("/api/documents/"):
+                if not self._require_browser_operator(con):
+                    return None
+                if not self._require_browser_mutation_origin():
+                    return None
                 did = int(path.rsplit("/", 1)[1])
-                ok, err = patch_document(con, did, body)
+                ok, err = patch_document(
+                    con, did, body, editor_surface="review_ui"
+                )
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
             return self._send(404, {"error": "not found"})
         except Exception as e:

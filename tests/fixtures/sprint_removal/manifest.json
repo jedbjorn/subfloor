@@ -221,6 +221,7 @@
     ".super-coder/scripts/job.py",
     ".super-coder/scripts/live_model/__init__.py",
     ".super-coder/scripts/mem.py",
+    ".super-coder/scripts/migrate.py",
     ".super-coder/scripts/models.py",
     ".super-coder/scripts/pr_poller.py",
     ".super-coder/scripts/rebuild.py",

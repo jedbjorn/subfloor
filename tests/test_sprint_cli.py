@@ -197,10 +197,12 @@ class SprintCliApiTest(unittest.TestCase):
         )
         con.execute(
             "INSERT INTO sprint_specs "
-            "(sprint_id,document_id,bound_revision_sha256,approval_id) "
-            "VALUES (?,?,?,?)",
-            (cls.sprint_id, document_id, revision, approval_id),
+            "(sprint_id,document_id,bound_revision_sha256,approval_id,"
+            "bound_revision_body) VALUES (?,?,?,?,?)",
+            (cls.sprint_id, document_id, revision, approval_id, body),
         )
+        cls.document_id = document_id
+        cls.bound_body = body
         con.executemany(
             "INSERT INTO sprint_participants "
             "(sprint_id,shell_id,role,harness) VALUES (?,?,?,?)",
@@ -328,6 +330,50 @@ class SprintCliApiTest(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             self.assertEqual(0, pr_cli.main(list(argv)))
         return json.loads(output.getvalue())
+
+    def test_spec_revision_reads_exact_body_and_rejects_nonparticipant(self):
+        response = self.run_cli(
+            TOKENS["reviewer"],
+            "spec-revision",
+            "--sprint",
+            str(self.sprint_id),
+            "--document",
+            str(self.document_id),
+        )
+        self.assertEqual(self.bound_body, response["body"])
+        self.assertEqual("available", response["availability"])
+        self.assertEqual(
+            hashlib.sha256(self.bound_body.encode()).hexdigest(),
+            response["bound_revision_sha256"],
+        )
+
+        mem.SC_API_TOKEN = TOKENS["developer"]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                0,
+                sprint_cli.main(
+                    [
+                        "spec-revision",
+                        "--sprint",
+                        str(self.sprint_id),
+                        "--document",
+                        str(self.document_id),
+                        "--body-only",
+                    ]
+                ),
+            )
+        self.assertEqual(self.bound_body, output.getvalue())
+
+        with self.assertRaisesRegex(SystemExit, "HTTP 403"):
+            self.run_cli(
+                TOKENS["admin"],
+                "spec-revision",
+                "--sprint",
+                str(self.sprint_id),
+                "--document",
+                str(self.document_id),
+            )
 
     def test_engine_wide_subscription_uses_authenticated_developer_identity(self):
         with mock.patch.object(

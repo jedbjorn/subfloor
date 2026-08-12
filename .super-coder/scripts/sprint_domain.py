@@ -76,6 +76,14 @@ class SprintPreflightError(SprintInvariantError):
     """The selected participant route is incompatible with this runtime."""
 
 
+class BoundRevisionUnavailable(SprintInvariantError):
+    """A legacy binding has no hash-verified immutable governing body."""
+
+    def __init__(self, details: dict[str, object]) -> None:
+        self.details = details
+        super().__init__("bound governing revision is unavailable for this legacy binding")
+
+
 class SprintCleanupConflictError(SprintInvariantError):
     """An earlier successful Sprint still owns a participant worktree."""
 
@@ -257,6 +265,74 @@ class SprintSpecApprovalStore:
                 (document_id,),
             )
         ]
+
+
+class SprintSpecRevisionStore:
+    """Bound governing bodies exposed only to their Sprint's participants."""
+
+    def __init__(self, con: sqlite3.Connection) -> None:
+        self.con = con
+        self.con.row_factory = sqlite3.Row
+
+    def read(
+        self,
+        sprint_id: int,
+        document_id: int,
+        *,
+        caller_shell_id: int | None = None,
+        fnb: bool = False,
+    ) -> dict[str, object]:
+        sprint = self.con.execute(
+            "SELECT 1 FROM sprints WHERE sprint_id=?", (sprint_id,)
+        ).fetchone()
+        if sprint is None:
+            raise KeyError(f"unknown Sprint: {sprint_id}")
+        if not fnb:
+            participant = self.con.execute(
+                "SELECT 1 FROM sprint_participants WHERE sprint_id=? AND shell_id=?",
+                (sprint_id, caller_shell_id),
+            ).fetchone()
+            if participant is None:
+                raise SprintAuthorityError(
+                    "only a Sprint participant or the FnB may read its governing revision"
+                )
+        row = self.con.execute(
+            "SELECT ss.bound_revision_sha256,ss.bound_revision_body,d.title,d.body "
+            "FROM sprint_specs ss JOIN documents d USING (document_id) "
+            "WHERE ss.sprint_id=? AND ss.document_id=?",
+            (sprint_id, document_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(
+                f"document {document_id} is not bound to Sprint {sprint_id}"
+            )
+        current_body = row["body"] or ""
+        current_sha256 = hashlib.sha256(current_body.encode()).hexdigest()
+        bound_body = row["bound_revision_body"]
+        if bound_body is None:
+            raise BoundRevisionUnavailable(
+                {
+                    "code": "bound_revision_unavailable",
+                    "sprint_id": sprint_id,
+                    "document_id": document_id,
+                    "bound_revision_sha256": str(row["bound_revision_sha256"]),
+                    "current_revision_sha256": current_sha256,
+                    "availability": "unavailable_legacy_drift",
+                }
+            )
+        actual = hashlib.sha256(bound_body.encode()).hexdigest()
+        if actual != row["bound_revision_sha256"]:
+            raise SprintInvariantError(
+                "stored governing body does not match its immutable revision hash"
+            )
+        return {
+            "sprint_id": sprint_id,
+            "document_id": document_id,
+            "title": str(row["title"]),
+            "bound_revision_sha256": str(row["bound_revision_sha256"]),
+            "availability": "available",
+            "body": str(bound_body),
+        }
 
 
 class SprintLifecycleStore:
@@ -2406,7 +2482,8 @@ class SprintLifecycleStore:
         if int(sprint["merge_grant_enabled"]) != 1:
             raise SprintInvariantError("arming requires a committed merge grant")
         bound_specs = self.con.execute(
-            "SELECT ss.bound_revision_sha256,d.document_id,d.feature_id,d.kind,d.body "
+            "SELECT ss.bound_revision_sha256,ss.bound_revision_body,"
+            "d.document_id,d.feature_id,d.kind,d.body "
             "FROM sprint_specs ss "
             "LEFT JOIN documents d ON d.document_id=ss.document_id "
             "WHERE ss.sprint_id=?",
@@ -2419,7 +2496,13 @@ class SprintLifecycleStore:
             or int(row["feature_id"]) != int(sprint["feature_id"])
             or not isinstance(row["body"], str)
             or not row["body"].strip()
-            or hashlib.sha256(row["body"].encode()).hexdigest()
+            or hashlib.sha256(
+                (
+                    row["bound_revision_body"]
+                    if row["bound_revision_body"] is not None
+                    else row["body"]
+                ).encode()
+            ).hexdigest()
             != row["bound_revision_sha256"]
             for row in bound_specs
         )

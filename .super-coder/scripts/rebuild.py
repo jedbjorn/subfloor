@@ -292,6 +292,16 @@ def main(argv: list[str]) -> int:
             print(f"rebuild: no {SNAPSHOT.relative_to(REPO_ROOT)} — built empty "
                   "(no per-instance content).")
 
+        # A snapshot from before immutable governing bodies omits the new
+        # columns.  Its rows load into the legacy lane; recover a body only
+        # when the loaded document still proves the bound hash.
+        con = db_driver.connect(candidate)
+        try:
+            migrate_mod.reconcile_governing_revision_evidence(con)
+            con.commit()
+        finally:
+            con.close()
+
         # A downstream snapshot may predate the tombstone registry and reinsert
         # retired rows after the cleanup migration was stamped. Validate the
         # authored namespace, then reconcile the loaded candidate before any

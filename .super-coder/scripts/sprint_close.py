@@ -505,7 +505,8 @@ class SprintCloseStore:
     def _spec_revisions(self, sprint_id: int) -> list[dict[str, Any]]:
         rows = self._rows(
             "SELECT ss.document_id,ss.bound_revision_sha256,ss.approval_id,"
-            "ss.included_at,d.title,d.body,a.reviewer_shell_id,a.verdict,"
+            "ss.bound_revision_body,ss.included_at,d.title,d.body,"
+            "a.reviewer_shell_id,a.verdict,"
             "a.revision_sha256 AS reviewed_revision_sha256,"
             "a.findings_document_id,a.reviewed_at FROM sprint_specs ss "
             "JOIN documents d ON d.document_id=ss.document_id "
@@ -516,6 +517,14 @@ class SprintCloseStore:
         for row in rows:
             body = row.pop("body") or ""
             row["current_revision_sha256"] = hashlib.sha256(body.encode()).hexdigest()
+            bound_body = row.pop("bound_revision_body")
+            row["bound_body_availability"] = (
+                "available" if bound_body is not None else "unavailable_legacy_drift"
+            )
+            row["read_command"] = (
+                f"sc sprint spec-revision --sprint {sprint_id} "
+                f"--document {row['document_id']}"
+            )
         return rows
 
     def _planned_vs_actual(self, sprint_id: int) -> list[dict[str, Any]]:

@@ -173,6 +173,22 @@ _EVENT_FIELDS = {
     "conformance.recorded": frozenset({"report_id", "followup_count", "followup_ids"}),
     "final_report.recorded": frozenset({"report_id"}),
     "followup.dispositioned": frozenset({"followup_id", "disposition", "resolution"}),
+    "spec.body_edited": frozenset(
+        {
+            "document_id",
+            "feature_id",
+            "before_sha256",
+            "after_sha256",
+            "editor_surface",
+            "editor_shell_id",
+            "editor_shortname",
+            "authority",
+            "notification_state",
+        }
+    ),
+    "spec.edit_notification_unavailable": frozenset(
+        {"document_id", "edit_event_id", "planner_shell_id"}
+    ),
     "wake.pickup_exhausted": frozenset(
         {
             "sprint_id",
