@@ -427,7 +427,7 @@ class ConversationApiCase(unittest.TestCase):
             expected.append((item_id, kind, anchor if kind == "assistant" else None,
                              first, last, value))
         self.assertEqual(actual, expected)
-        self.assertEqual(transcript["projection_version"], 2)
+        self.assertEqual(transcript["projection_version"], 3)
 
     def test_creation_observation_is_post_commit_and_cannot_fail_create(self):
         def observer(db_path, conversation_id):
@@ -2042,7 +2042,7 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
         self.assertEqual(status, 200, transcript)
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(transcript["conversation_id"], conversation_id)
-        self.assertEqual(transcript["projection_version"], 2)
+        self.assertEqual(transcript["projection_version"], 3)
         self.assertEqual(transcript["through_sequence"], through_sequence)
         self.assertEqual(transcript["truncation"], None)
         self.assertEqual(
@@ -2078,6 +2078,101 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
                 ).fetchone()[0],
                 source_rows,
             )
+
+    def test_transcript_pages_twenty_complete_turns_with_scoped_cursors(
+        self,
+    ) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=704,
+                state="closed",
+            )
+            other_conversation_id = self.seed_conversation(
+                con,
+                number=705,
+                state="closed",
+            )
+            foreign_conversation_id = self.seed_conversation(
+                con,
+                number=706,
+                owner_user_id=2,
+                state="closed",
+            )
+            self.seed_transcript(
+                con,
+                conversation_id=conversation_id,
+                turns=45,
+                deltas_per_turn=1,
+            )
+            con.commit()
+
+        pages = []
+        cursor = None
+        for expected_prompts in (
+            [f"prompt {index}" for index in range(25, 45)],
+            [f"prompt {index}" for index in range(5, 25)],
+            [f"prompt {index}" for index in range(5)],
+        ):
+            suffix = f"?cursor={cursor}" if cursor else ""
+            status, _, transcript = self.request(
+                "GET",
+                f"/api/conversations/{conversation_id}/transcript{suffix}",
+            )
+            self.assertEqual(status, 200, transcript)
+            users = [
+                item for item in transcript["items"] if item["kind"] == "user"
+            ]
+            assistants = [
+                item
+                for item in transcript["items"]
+                if item["kind"] == "assistant"
+            ]
+            self.assertEqual([item["text"] for item in users], expected_prompts)
+            self.assertEqual(len(assistants), len(expected_prompts))
+            self.assertEqual(
+                [item["message_id"] for item in assistants],
+                [item["message_id"] for item in users],
+            )
+            self.assertTrue(all(item["text"] == "x" for item in assistants))
+            pages.append({item["message_id"] for item in users})
+            cursor = transcript["older_cursor"]
+
+        self.assertIsNone(cursor)
+        self.assertEqual(len(set().union(*pages)), 45)
+        self.assertTrue(all(pages[left].isdisjoint(pages[right])
+                            for left in range(3)
+                            for right in range(left + 1, 3)))
+
+        first_status, _, first_page = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/transcript",
+        )
+        self.assertEqual(first_status, 200, first_page)
+        scoped_cursor = first_page["older_cursor"]
+        for path in (
+            (
+                f"/api/conversations/{other_conversation_id}/transcript"
+                f"?cursor={scoped_cursor}"
+            ),
+            (
+                f"/api/conversations/{conversation_id}/transcript"
+                f"?cursor={scoped_cursor}&cursor={scoped_cursor}"
+            ),
+            f"/api/conversations/{conversation_id}/transcript?cursor=not-a-cursor",
+        ):
+            with self.subTest(path=path):
+                status, _, error = self.request("GET", path)
+                self.assertEqual(status, 422, error)
+                self.assertEqual(error["error"]["code"], "CURSOR_INVALID")
+
+        status, _, error = self.request(
+            "GET",
+            f"/api/conversations/{foreign_conversation_id}/transcript"
+            f"?cursor={scoped_cursor}",
+        )
+        self.assertEqual(status, 404, error)
+        self.assertEqual(error["error"]["code"], "CONVERSATION_NOT_FOUND")
 
     def test_transcript_attaches_exact_context_tokens_to_assistant_only(self) -> None:
         with closing(self.connect()) as con:

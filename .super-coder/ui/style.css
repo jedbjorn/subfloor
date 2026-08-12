@@ -350,6 +350,17 @@ body.interface-view main {
   border: 1px solid var(--line); border-radius: 7px;
   color: var(--dim); font-size: .75rem;
 }
+.chat-transcript-history {
+  align-self: center; flex: none; padding: .42rem .72rem;
+  border: 1px solid var(--line); border-radius: 7px;
+  background: transparent; color: var(--accent); cursor: pointer;
+  font: inherit; font-size: .75rem;
+}
+.chat-transcript-history:disabled { color: var(--dim); cursor: default; }
+.chat-transcript-window-gap {
+  align-self: stretch; padding: .55rem .7rem; text-align: center;
+  border-block: 1px dashed var(--line); color: var(--dim); font-size: .75rem;
+}
 .chat-transcript-reconcile.error { color: #ef9aa1; }
 .chat-transcript-error { display: grid; gap: .7rem; align-content: start; }
 .chat-state {

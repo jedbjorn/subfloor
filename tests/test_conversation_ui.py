@@ -312,8 +312,9 @@ def test_transcript_installs_snapshot_then_coalesces_keyed_live_updates():
     keyed = interface[interface.index("function chatCreateTranscriptState"):
                       interface.index("async function renderInterface")]
 
-    assert "snapshot.projection_version !== 2" in keyed
-    assert "items.has(item.item_id)" in keyed
+    assert "snapshot.projection_version !== 3" in interface
+    assert "chatTranscriptPageItems(snapshot)" in keyed
+    assert "items.has(item.item_id)" in interface
     assert "nodes: new Map()" in keyed
     assert "dirty: new Set(items.keys())" in keyed
     assert "transcript.replaceChildren(...nodes)" in keyed
@@ -339,13 +340,107 @@ def test_transcript_installs_snapshot_then_coalesces_keyed_live_updates():
     ]
 
 
+def test_transcript_window_keeps_five_twenty_turn_pages_and_live_tail():
+    helpers = APP[
+        APP.index("function chatTranscriptPageItems"):
+        APP.index("function chatTranscriptItemNode")
+    ]
+    script = r"""
+const CHAT_TRANSCRIPT_PAGE_TURNS = 20;
+const CHAT_TRANSCRIPT_MAX_PAGES = 5;
+""" + helpers + r"""
+function snapshot(conversationId, first, last, olderCursor) {
+  return {
+    conversation_id: conversationId,
+    projection_version: 3,
+    through_sequence: 140,
+    controls: {active_run_id: null},
+    older_cursor: olderCursor,
+    truncation: last < 140 ? {reason: "turn_limit"} : null,
+    items: Array.from({length: last - first + 1}, (_, offset) => {
+      const turn = first + offset;
+      return {
+        item_id: `message:${turn}`,
+        kind: "user",
+        order_sequence: turn,
+        message_id: turn,
+        run_id: null,
+        text: `prompt ${turn}`,
+        state: "completed",
+      };
+    }),
+  };
+}
+const state = chatCreateTranscriptState(snapshot("cv_test", 121, 140, "c120"));
+for (const [first, last, cursor] of [
+  [101, 120, "c100"], [81, 100, "c80"], [61, 80, "c60"],
+  [41, 60, "c40"], [21, 40, "c20"], [1, 20, null],
+]) chatMergeOlderTranscriptPage(state, snapshot("cv_test", first, last, cursor));
+
+let overlap = "";
+try {
+  chatMergeOlderTranscriptPage(state, snapshot("cv_test", 1, 20, null));
+} catch (error) { overlap = error.message; }
+
+const beforeLiveUsers = state.order.filter(
+  (id) => state.items.get(id)?.kind === "user",
+).length;
+state.items.set("message:141", {
+  item_id: "message:141", kind: "user", order_sequence: 141,
+  message_id: 141, run_id: null, text: "prompt 141", state: "queued",
+});
+chatTrackLiveTranscriptItem(state, "message:141", true);
+const users = state.order.filter((id) => state.items.get(id)?.kind === "user");
+console.log(JSON.stringify({
+  pages: state.pages.length,
+  beforeLiveUsers,
+  users: users.length,
+  hasOldest: state.items.has("message:1"),
+  hasTailStart: state.items.has("message:121"),
+  hasLive: state.items.has("message:141"),
+  displaced: state.windowDisplaced,
+  overlap,
+}));
+"""
+    assert run_js(script) == {
+        "pages": 5,
+        "beforeLiveUsers": 100,
+        "users": 81,
+        "hasOldest": False,
+        "hasTailStart": True,
+        "hasLive": True,
+        "displaced": True,
+        "overlap": "Transcript history page overlaps loaded turns.",
+    }
+
+
+def test_transcript_history_load_is_retryable_and_preserves_scroll_anchor():
+    keyed = APP[
+        APP.index("function chatCreateTranscriptState"):
+        APP.index("async function renderInterface")
+    ]
+    assert "CHAT_TRANSCRIPT_PAGE_TURNS = 20" in APP
+    assert "CHAT_TRANSCRIPT_MAX_PAGES = 5" in APP
+    assert "if (!cursor || pageState.olderLoading) return" in keyed
+    assert "chatMergeOlderTranscriptPage(pageState, snapshot)" in keyed
+    assert "pageState.olderError = error" in keyed
+    assert "state.pendingPrepend" in keyed
+    assert "anchor.offsetTop - anchorOffset" in keyed
+    assert 'className: "chat-transcript-history"' in keyed
+    assert 'className: "chat-transcript-window-gap"' in keyed
+    assert "await reconcileTranscript(true)" in keyed
+    assert ".chat-transcript-history" in STYLE
+    assert ".chat-transcript-window-gap" in STYLE
+
+
 def test_segmented_transcript_source_contract_is_versioned_and_run_scoped():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     keyed = interface[interface.index("function chatCreateTranscriptState"):
                       interface.index("async function renderInterface")]
 
-    assert "snapshot.projection_version !== 2" in keyed
+    assert "snapshot.projection_version !== 3" in interface
+    assert "chatTranscriptPageItems(snapshot)" in keyed
     assert "assistant_cursor" in keyed
     assert "segment_anchor_sequence" in keyed
     assert "tool.started" in keyed
@@ -398,10 +493,9 @@ def test_transcript_follow_pauses_for_reading_and_offers_jump_to_latest():
         "- transcript.clientHeight <= 32"
     ) in interface
     assert "const previousTop = transcript.scrollTop" in interface
-    assert (
-        "transcript.scrollTop = followTail "
-        "? transcript.scrollHeight : previousTop"
-    ) in interface
+    assert "transcript.scrollTop = followTail" in interface
+    assert "? transcript.scrollHeight" in interface
+    assert ": anchor?.isConnected ? anchor.offsetTop - anchorOffset : previousTop" in interface
     assert "const followTail = shouldFollow()" in interface
     assert 'className: "chat-jump-latest"' in interface
     assert 'ariaLabel: "Jump to latest message"' in interface

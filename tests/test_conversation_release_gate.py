@@ -589,7 +589,7 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
             f"/api/conversations/{conversation_id}/transcript",
         )
         self.assertEqual(status, 200, transcript)
-        self.assertEqual(transcript["projection_version"], 2)
+        self.assertEqual(transcript["projection_version"], 3)
         self.assertIsNone(transcript["truncation"])
         projected = []
         for item in transcript["items"]:

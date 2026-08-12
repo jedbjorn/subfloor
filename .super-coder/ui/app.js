@@ -2586,6 +2586,8 @@ const CHAT_FLAVOR_ORDER = [
 const CHAT_CONFIGURE_ROUTE = "configure";
 const CHAT_HISTORY_POLL_MS = 2000;
 const CHAT_MODES = ["chat", "diff"];
+const CHAT_TRANSCRIPT_PAGE_TURNS = 20;
+const CHAT_TRANSCRIPT_MAX_PAGES = 5;
 let chatRouteShell = "";
 let chatRouteConversation = "";
 let chatRouteMode = "chat";
@@ -3707,8 +3709,8 @@ async function chatRenderNew(host, shell, defaults, catalog) {
   host.replaceChildren(form);
 }
 
-function chatCreateTranscriptState(snapshot) {
-  if (snapshot.projection_version !== 2)
+function chatTranscriptPageItems(snapshot) {
+  if (snapshot.projection_version !== 3)
     throw new Error("Unsupported transcript projection.");
   const items = new Map();
   for (const item of snapshot.items || []) {
@@ -3722,6 +3724,11 @@ function chatCreateTranscriptState(snapshot) {
     }
     items.set(item.item_id, { ...item });
   }
+  return items;
+}
+
+function chatCreateTranscriptState(snapshot) {
+  const items = chatTranscriptPageItems(snapshot);
   const activeRunId = snapshot.controls?.active_run_id;
   const cursor = snapshot.assistant_cursor || null;
   if ((activeRunId == null) !== (cursor == null)
@@ -3743,26 +3750,104 @@ function chatCreateTranscriptState(snapshot) {
       Number(cursor.segment_anchor_sequence),
     );
   }
+  const order = [...items.keys()].sort((left, right) => {
+    const a = items.get(left);
+    const b = items.get(right);
+    return Number(a.order_sequence) - Number(b.order_sequence)
+      || left.localeCompare(right);
+  });
   return {
+    conversationId: snapshot.conversation_id,
     projectionVersion: snapshot.projection_version,
     throughSequence: Number(snapshot.through_sequence || 0),
     lastSequence: Number(snapshot.through_sequence || 0),
     items,
     assistantAnchors,
-    order: [...items.keys()].sort((left, right) => {
-      const a = items.get(left);
-      const b = items.get(right);
-      return Number(a.order_sequence) - Number(b.order_sequence)
-        || left.localeCompare(right);
-    }),
+    order,
+    pages: [{ itemIds: [...order] }],
     nodes: new Map(),
     dirty: new Set(items.keys()),
+    evicted: new Set(),
     fullBuild: true,
     hiddenDirty: false,
     frame: null,
-    truncation: snapshot.truncation || null,
+    truncation: snapshot.truncation?.reason === "turn_limit"
+      ? null : snapshot.truncation || null,
+    olderCursor: snapshot.older_cursor || null,
+    olderLoading: false,
+    olderError: null,
+    pendingPrepend: false,
+    windowDisplaced: false,
     reconcileError: null,
   };
+}
+
+function chatTranscriptEvictPage(state, index) {
+  const [page] = state.pages.splice(index, 1);
+  if (!page) return;
+  for (const id of page.itemIds) {
+    state.items.delete(id);
+    state.dirty.delete(id);
+    state.evicted.add(id);
+  }
+}
+
+function chatTranscriptRebuildOrder(state) {
+  state.order = state.pages.flatMap((page) => page.itemIds);
+}
+
+function chatMergeOlderTranscriptPage(state, snapshot) {
+  if (snapshot.conversation_id !== state.conversationId)
+    throw new Error("Transcript conversation identity changed.");
+  const incoming = chatTranscriptPageItems(snapshot);
+  const incomingOrder = [...incoming.keys()].sort((left, right) => {
+    const a = incoming.get(left);
+    const b = incoming.get(right);
+    return Number(a.order_sequence) - Number(b.order_sequence)
+      || left.localeCompare(right);
+  });
+  if (!incomingOrder.length)
+    throw new Error("Transcript history page was empty.");
+  if (incomingOrder.some((id) => state.items.has(id)))
+    throw new Error("Transcript history page overlaps loaded turns.");
+  const currentFirst = state.items.get(state.order[0]);
+  const incomingLast = incoming.get(incomingOrder.at(-1));
+  if (currentFirst && Number(incomingLast.order_sequence)
+      >= Number(currentFirst.order_sequence))
+    throw new Error("Transcript history page is out of order.");
+  for (const [id, item] of incoming) {
+    state.items.set(id, item);
+    state.dirty.add(id);
+  }
+  state.pages.unshift({ itemIds: incomingOrder });
+  state.olderCursor = snapshot.older_cursor || null;
+  state.olderError = null;
+  state.pendingPrepend = true;
+  if (snapshot.truncation?.reason !== "turn_limit")
+    state.truncation = snapshot.truncation || state.truncation;
+  while (state.pages.length > CHAT_TRANSCRIPT_MAX_PAGES) {
+    chatTranscriptEvictPage(state, state.pages.length - 2);
+    state.windowDisplaced = true;
+  }
+  chatTranscriptRebuildOrder(state);
+}
+
+function chatTrackLiveTranscriptItem(state, itemId, startsTurn = false) {
+  let page = state.pages.at(-1);
+  const turnCount = page.itemIds.filter(
+    (id) => state.items.get(id)?.kind === "user",
+  ).length;
+  if (startsTurn && turnCount >= CHAT_TRANSCRIPT_PAGE_TURNS) {
+    page = { itemIds: [] };
+    state.pages.push(page);
+  }
+  if (!page.itemIds.includes(itemId)) page.itemIds.push(itemId);
+  while (state.pages.length > CHAT_TRANSCRIPT_MAX_PAGES) {
+    chatTranscriptEvictPage(state, 0);
+    state.pendingPrepend = true;
+    state.windowDisplaced = true;
+  }
+  chatTranscriptRebuildOrder(state);
 }
 
 function chatTranscriptItemNode(item, conversation, retry) {
@@ -3844,17 +3929,69 @@ function chatReconcileBanner(state, reconcile) {
   );
 }
 
+function chatUpdateTranscriptHistoryControl(transcript, state, loadOlder) {
+  let control = transcript.querySelector(".chat-transcript-history");
+  const visible = Boolean(
+    state.olderCursor || state.olderLoading || state.olderError,
+  );
+  if (!visible) {
+    control?.remove();
+    return;
+  }
+  if (!control) {
+    control = el("button", {
+      className: "chat-transcript-history",
+      type: "button",
+    });
+  }
+  control.disabled = state.olderLoading;
+  control.textContent = state.olderLoading
+    ? "Loading earlier messages…"
+    : state.olderError ? "Retry earlier messages" : "Load earlier messages";
+  control.title = state.olderError?.message || "";
+  control.onclick = loadOlder;
+  transcript.insertBefore(control, transcript.firstChild);
+}
+
+function chatUpdateTranscriptWindowGap(transcript, state) {
+  let gap = transcript.querySelector(".chat-transcript-window-gap");
+  if (!state.windowDisplaced || state.pages.length < 2) {
+    gap?.remove();
+    return;
+  }
+  if (!gap) {
+    gap = el(
+      "div",
+      { className: "chat-transcript-window-gap", role: "status" },
+      "Newer history was unloaded to keep this chat responsive. "
+        + "Jump to latest to restore the live window.",
+    );
+  }
+  const livePage = state.pages.at(-1);
+  const liveNode = livePage.itemIds
+    .map((id) => state.nodes.get(id))
+    .find(Boolean);
+  transcript.insertBefore(gap, liveNode || null);
+}
+
 function chatFlushTranscript(
   transcript,
   state,
   conversation,
   retry,
   reconcile,
+  loadOlder,
   shouldFollow,
   onPosition,
 ) {
   const previousTop = transcript.scrollTop;
   const followTail = shouldFollow();
+  const anchor = state.pendingPrepend
+    ? [...transcript.children].find((node) =>
+      node.classList?.contains("chat-bubble")
+        && node.offsetTop + node.offsetHeight >= previousTop)
+    : null;
+  const anchorOffset = anchor ? anchor.offsetTop - previousTop : 0;
   if (state.fullBuild) {
     state.nodes.clear();
     const nodes = [];
@@ -3879,6 +4016,11 @@ function chatFlushTranscript(
     state.fullBuild = false;
     state.dirty.clear();
   } else {
+    for (const id of state.evicted) {
+      state.nodes.get(id)?.remove();
+      state.nodes.delete(id);
+    }
+    state.evicted.clear();
     if (state.order.length && state.nodes.size === 0)
       transcript.querySelector(".chat-empty")?.remove();
     for (const id of state.order) {
@@ -3901,12 +4043,17 @@ function chatFlushTranscript(
     }
     state.dirty.clear();
   }
+  chatUpdateTranscriptHistoryControl(transcript, state, loadOlder);
+  chatUpdateTranscriptWindowGap(transcript, state);
   const working = transcript.querySelector(".chat-working-indicator");
   if (conversation.state === "running" && !working)
     transcript.append(chatWorkingIndicator());
   else if (conversation.state !== "running" && working)
     working.remove();
-  transcript.scrollTop = followTail ? transcript.scrollHeight : previousTop;
+  transcript.scrollTop = followTail
+    ? transcript.scrollHeight
+    : anchor?.isConnected ? anchor.offsetTop - anchorOffset : previousTop;
+  state.pendingPrepend = false;
   onPosition();
 }
 
@@ -3978,7 +4125,14 @@ async function chatRenderOpen(
     jumpToLatest.hidden = followTranscriptTail;
   };
   transcript.onscroll = updateTranscriptFollow;
-  jumpToLatest.onclick = () => {
+  jumpToLatest.onclick = async () => {
+    if (transcriptState.windowDisplaced) {
+      await reconcileTranscript(true);
+      for (let page = 1; page < CHAT_TRANSCRIPT_MAX_PAGES; page += 1) {
+        if (!transcriptState.olderCursor || transcriptState.olderError) break;
+        await loadOlder();
+      }
+    }
     transcript.scrollTop = transcript.scrollHeight;
     updateTranscriptFollow();
   };
@@ -4023,12 +4177,41 @@ async function chatRenderOpen(
     composer.focus();
     await submit();
   };
+  async function loadOlder() {
+    const pageState = transcriptState;
+    const cursor = pageState.olderCursor;
+    if (!cursor || pageState.olderLoading) return;
+    pageState.olderLoading = true;
+    pageState.olderError = null;
+    scheduleTranscript();
+    try {
+      const snapshot = await chatApi(
+        `/conversations/${conversation.conversation_id}/transcript`
+          + `?cursor=${encodeURIComponent(cursor)}`,
+      );
+      if (generation !== chatRenderGeneration
+          || transcriptState !== pageState
+          || pageState.olderCursor !== cursor) return;
+      chatMergeOlderTranscriptPage(pageState, snapshot);
+    } catch (error) {
+      if (generation === chatRenderGeneration
+          && transcriptState === pageState
+          && pageState.olderCursor === cursor)
+        pageState.olderError = error;
+    } finally {
+      if (generation === chatRenderGeneration
+          && transcriptState === pageState)
+        pageState.olderLoading = false;
+      scheduleTranscript();
+    }
+  }
   const flushTranscript = () => chatFlushTranscript(
     transcript,
     transcriptState,
     conversation,
     retry,
     () => reconcileTranscript(true),
+    loadOlder,
     () => followTranscriptTail,
     updateTranscriptFollow,
   );
@@ -4256,7 +4439,7 @@ async function chatRenderOpen(
           completed_at: result.message.completed_at,
           text_truncated: false,
         });
-        transcriptState.order.push(userItemId);
+        chatTrackLiveTranscriptItem(transcriptState, userItemId, true);
         transcriptState.dirty.add(userItemId);
       }
       chatPendingSend = null;
@@ -4405,7 +4588,7 @@ async function chatRenderOpen(
           text_truncated: false,
         };
         transcriptState.items.set(itemId, assistant);
-        transcriptState.order.push(itemId);
+        chatTrackLiveTranscriptItem(transcriptState, itemId);
       }
       assistant.text += event.payload?.text || "";
       assistant.last_sequence = sequence;
@@ -4439,7 +4622,7 @@ async function chatRenderOpen(
         label: activityLabel(event),
         sequence,
       });
-      transcriptState.order.push(itemId);
+      chatTrackLiveTranscriptItem(transcriptState, itemId);
       transcriptState.dirty.add(itemId);
     }
 

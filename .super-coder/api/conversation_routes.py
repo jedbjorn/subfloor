@@ -75,11 +75,12 @@ _SENSITIVE_EVENT_KEYS = frozenset(
 )
 SSE_HEARTBEAT_SECONDS = 15.0
 SSE_BATCH = 200
-TRANSCRIPT_MAX_TURNS = 200
+TRANSCRIPT_PAGE_TURNS = 20
+TRANSCRIPT_MAX_TURNS = TRANSCRIPT_PAGE_TURNS
 TRANSCRIPT_MAX_SOURCE_EVENTS = 20_000
 TRANSCRIPT_MAX_SOURCE_BYTES = 8 * 1024 * 1024
 TRANSCRIPT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
-TRANSCRIPT_PROJECTION_VERSION = 2
+TRANSCRIPT_PROJECTION_VERSION = 3
 TRANSCRIPT_MAX_WARNINGS = 20
 TRANSCRIPT_MAX_ACTIVITY_LABEL_BYTES = 1024
 
@@ -303,6 +304,15 @@ def _cursor_decode(raw: str, kind: str) -> dict:
     if not isinstance(value, dict) or value.get("v") != 1:
         raise ApiError(422, "CURSOR_INVALID", f"invalid {kind} cursor")
     return value
+
+
+def _single_cursor(query, kind: str) -> str | None:
+    values = query.get("cursor")
+    if values is None:
+        return None
+    if len(values) != 1 or not values[0]:
+        raise ApiError(422, "CURSOR_INVALID", f"invalid {kind} cursor")
+    return values[0]
 
 
 def _limit(query, *, default: int = 50, maximum: int = 200) -> int:
@@ -1680,6 +1690,7 @@ def _transcript_projection(
     conversation_id: str,
     *,
     owner_user_id: int,
+    cursor: str | None = None,
     limits: TranscriptLimits = DEFAULT_TRANSCRIPT_LIMITS,
 ) -> dict:
     if con.in_transaction:
@@ -1692,6 +1703,25 @@ def _transcript_projection(
             conversation_id,
             owner_user_id,
         )
+        before_message_id = None
+        if cursor is not None:
+            decoded = _cursor_decode(cursor, "transcript")
+            before_message_id = decoded.get("before_message_id")
+            if (
+                decoded.get("kind") != "transcript"
+                or decoded.get("projection_version")
+                != TRANSCRIPT_PROJECTION_VERSION
+                or decoded.get("conversation_id") != conversation_id
+                or decoded.get("owner_user_id") != owner_user_id
+                or not isinstance(before_message_id, int)
+                or isinstance(before_message_id, bool)
+                or before_message_id <= 0
+            ):
+                raise ApiError(
+                    422,
+                    "CURSOR_INVALID",
+                    "transcript cursor does not match the requested scope",
+                )
         through_sequence = int(
             con.execute(
                 "SELECT COALESCE(MAX(sequence),0) FROM conversation_events "
@@ -1699,6 +1729,12 @@ def _transcript_projection(
                 (conversation_id,),
             ).fetchone()[0]
         )
+        message_boundary = (
+            " AND message_id<?" if before_message_id is not None else ""
+        )
+        message_params = [conversation_id]
+        if before_message_id is not None:
+            message_params.append(before_message_id)
         message_rows = con.execute(
             "WITH ranked AS ("
             " SELECT message_id,body,state,created_at,completed_at,"
@@ -1709,14 +1745,11 @@ def _transcript_projection(
             ") AS message_source_bytes "
             " FROM conversation_messages "
             " WHERE conversation_id=? AND message_kind='prompt'"
-            ") SELECT * FROM ranked WHERE source_rank<=? "
+            + message_boundary
+            + ") SELECT * FROM ranked WHERE source_rank<=? "
             "AND (message_source_bytes<=? OR source_rank=1) "
             "ORDER BY message_id",
-            (
-                conversation_id,
-                limits.max_turns,
-                limits.max_source_bytes,
-            ),
+            (*message_params, limits.max_turns, limits.max_source_bytes),
         ).fetchall()
         total_messages = (
             int(message_rows[0]["total_messages"]) if message_rows else 0
@@ -1737,6 +1770,7 @@ def _transcript_projection(
             else "0"
         )
         active_run_id = conversation["active_run_id"]
+        include_active_run = cursor is None and active_run_id is not None
         run_rows = con.execute(
             "SELECT r.run_id,r.trigger_message_id,r.state,"
             "r.started_at,r.ended_at,r.error_code,r.error_detail,"
@@ -1756,16 +1790,33 @@ def _transcript_projection(
             " AND boundary.sequence<=?) AS latest_boundary_sequence "
             "FROM conversation_runs r WHERE r.conversation_id=? AND ("
             + run_where
-            + (" OR r.run_id=?" if active_run_id is not None else "")
+            + (" OR r.run_id=?" if include_active_run else "")
             + ") ORDER BY r.run_id",
             (
                 through_sequence,
                 through_sequence,
                 conversation_id,
                 *message_ids,
-                *((int(active_run_id),) if active_run_id is not None else ()),
+                *((int(active_run_id),) if include_active_run else ()),
             ),
         ).fetchall()
+        run_ids = [int(row["run_id"]) for row in run_rows]
+        event_scope = []
+        event_scope_params: list[int] = []
+        if message_ids:
+            event_scope.append(f"message_id IN ({marks})")
+            event_scope_params.extend(message_ids)
+        if run_ids:
+            run_marks = ",".join("?" for _ in run_ids)
+            event_scope.append(f"run_id IN ({run_marks})")
+            event_scope_params.extend(run_ids)
+        if cursor is None:
+            event_scope.append(
+                "(message_id IS NULL AND run_id IS NULL AND event_type IN "
+                "('permission.requested','input.requested','run.failed',"
+                "'run.interrupted','run.unknown'))"
+            )
+        event_scope_sql = " OR ".join(event_scope) or "0"
         event_rows = con.execute(
             "WITH ranked AS ("
             " SELECT sequence,event_type,payload_version,payload,message_id,"
@@ -1787,7 +1838,9 @@ def _transcript_projection(
             " ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
             ") AS segment_anchor_sequence "
             " FROM conversation_events "
-            " WHERE conversation_id=? AND sequence<=?"
+            " WHERE conversation_id=? AND sequence<=? AND ("
+            + event_scope_sql
+            + ")"
             ") SELECT * FROM ranked "
             "WHERE source_rank<=? "
             "AND (source_bytes<=? OR source_rank=1) "
@@ -1795,6 +1848,7 @@ def _transcript_projection(
             (
                 conversation_id,
                 through_sequence,
+                *event_scope_params,
                 limits.max_source_events,
                 remaining_source_bytes,
             ),
@@ -2051,6 +2105,16 @@ def _transcript_projection(
                     default=0,
                 ),
             )
+        older_cursor = None
+        if message_rows and total_messages > len(message_rows):
+            older_cursor = _cursor_encode({
+                "v": 1,
+                "kind": "transcript",
+                "projection_version": TRANSCRIPT_PROJECTION_VERSION,
+                "conversation_id": conversation_id,
+                "owner_user_id": owner_user_id,
+                "before_message_id": min(message_ids),
+            })
         projection = {
             "conversation_id": conversation_id,
             "projection_version": TRANSCRIPT_PROJECTION_VERSION,
@@ -2065,6 +2129,7 @@ def _transcript_projection(
                 "close_requested_at": conversation["close_requested_at"],
             },
             "items": items,
+            "older_cursor": older_cursor,
             "truncation": (
                 _transcript_truncation(
                     reason=reason,
@@ -2079,7 +2144,7 @@ def _transcript_projection(
                 else None
             ),
         }
-        if active_run_id is not None and int(active_run_id) in run_by_id:
+        if include_active_run and int(active_run_id) in run_by_id:
             active_run = run_by_id[int(active_run_id)]
             projection["assistant_cursor"] = {
                 "run_id": int(active_run_id),
@@ -2157,6 +2222,7 @@ def handle(method: str, path: str, headers_raw: str, raw_body: bytes) -> tuple:
                         con,
                         transcript.group(1),
                         owner_user_id=operator["user_id"],
+                        cursor=_single_cursor(query, "transcript"),
                     ),
                 )
             interruptions = _INTERRUPTIONS_PATH.fullmatch(parsed.path)
