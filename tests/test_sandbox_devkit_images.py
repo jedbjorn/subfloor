@@ -394,6 +394,8 @@ class SandboxImagePlanTest(unittest.TestCase):
         self.assertEqual(build_images(plan, runner=docker), plan.base_tag)
 
         remaining_ids = {image["Id"] for image in docker.images.values()}
+        current_id = "sha256:" + "b" * 64
+        self.assertIn(current_id, remaining_ids)
         self.assertNotIn(prior_ids[0], remaining_ids)
         self.assertNotIn(prior_ids[1], remaining_ids)
         self.assertIn(prior_ids[2], remaining_ids)
@@ -404,6 +406,7 @@ class SandboxImagePlanTest(unittest.TestCase):
             if command[:3] == ("docker", "image", "rm")
         ]
         self.assertEqual({command[3] for command in removals}, set(prior_ids[:2]))
+        self.assertNotIn(current_id, {command[3] for command in removals})
         listing = next(
             command for command in docker.commands
             if command[:3] == ("docker", "image", "ls")
@@ -444,16 +447,28 @@ class SandboxImagePlanTest(unittest.TestCase):
             "Created": "2026-07-01T12:00:00Z",
             "Config": {"Labels": dict(plan.runtime_labels)},
         }
+        old_base_ids = []
+        for index, marker in enumerate(("1", "2", "3"), start=1):
+            image_id = "sha256:" + marker * 64
+            old_base_ids.append(image_id)
+            docker.images[f"super-coder-base:extension-prior-{marker}"] = {
+                "Id": image_id,
+                "Created": f"2026-07-0{index}T12:00:00Z",
+                "Config": {"Labels": dict(plan.base_labels)},
+            }
 
         self.assertEqual(build_images(plan, runner=docker), plan.runtime_tag)
 
         remaining_ids = {image["Id"] for image in docker.images.values()}
         self.assertNotIn(old_runtime_id, remaining_ids)
+        self.assertNotIn(old_base_ids[0], remaining_ids)
         removals = [
             command[3] for command in docker.commands
             if command[:3] == ("docker", "image", "rm")
         ]
-        self.assertEqual(removals[0], old_runtime_id)
+        self.assertEqual(removals, [old_runtime_id, old_base_ids[0]])
+        self.assertNotIn("sha256:" + "e" * 64, removals)
+        self.assertNotIn("sha256:" + "b" * 64, removals)
 
     def test_retention_skips_malformed_owned_image(self):
         plan = ImageFixture(self.base, "malformed-retention").plan()

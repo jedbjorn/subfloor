@@ -143,12 +143,27 @@ class Reader:
         )
 
 
+_SPRINT_CLI_TEMP_PATH: Path | None = None
+
+
+def tearDownModule():
+    """Prove the class cleanup removes its database tree after every suite run."""
+    if _SPRINT_CLI_TEMP_PATH is None:
+        raise AssertionError("SprintCliApiTest did not create its temporary directory")
+    if _SPRINT_CLI_TEMP_PATH.exists():
+        raise AssertionError(
+            f"SprintCliApiTest leaked temporary directory: {_SPRINT_CLI_TEMP_PATH}"
+        )
+
+
 class SprintCliApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        global _SPRINT_CLI_TEMP_PATH
         cls._temporary = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls._temporary.cleanup)
         cls.tmp = Path(cls._temporary.name)
+        _SPRINT_CLI_TEMP_PATH = cls.tmp
         cls.db = cls.tmp / "shell.db"
         con = sqlite3.connect(cls.db)
         con.row_factory = sqlite3.Row

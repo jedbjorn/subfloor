@@ -72,8 +72,21 @@ class DockerCacheGcTest(unittest.TestCase):
         runner = Runner()
         self.assertEqual(docker_cache.main(["--until", "24h"], runner=runner), 0)
         self.assertIn("until=24h", runner.commands[0])
+        invalid_runner = Runner()
         with self.assertRaises(SystemExit):
-            docker_cache.main(["--until", "yesterday"], runner=Runner())
+            docker_cache.main(["--until", "yesterday"], runner=invalid_runner)
+        self.assertEqual(invalid_runner.commands, [])
+
+    def test_help_does_not_touch_docker(self):
+        runner = Runner()
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as exit_:
+            docker_cache.main(["--help"], runner=runner)
+
+        self.assertEqual(exit_.exception.code, 0)
+        self.assertEqual(runner.commands, [])
+        self.assertIn("usage: sc docker-cache-gc", output.getvalue())
 
     def test_docker_failure_is_returned(self):
         errors = io.StringIO()
