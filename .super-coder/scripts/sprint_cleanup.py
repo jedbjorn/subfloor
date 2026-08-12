@@ -631,8 +631,6 @@ class SprintCleanupTargetStore:
         projection = self.project(claim.sprint_id)
         from sprint_message_delivery import (
             SYSTEM_IDEMPOTENCY_KEY_PREFIX,
-            SprintMessageStore,
-            WakeMessageIdempotencyConflict,
         )
 
         if row["state"] == "failed":
@@ -663,29 +661,24 @@ class SprintCleanupTargetStore:
                 if fnb_fallback
                 else ""
             )
-            try:
-                SprintMessageStore(self.con).send_to_shell_in_transaction(
-                    receiver_shell_id,
-                    message_kind="notification",
-                    body=(
-                        f"Sprint {claim.sprint_id} cleanup failed for {path_label} "
-                        f"(error_code={code}).{fallback_note} Run "
-                        f"`sc sprint cleanup-status --sprint "
-                        f"{claim.sprint_id}`; after correcting the named condition, "
-                        f"run `sc sprint cleanup --sprint {claim.sprint_id} --key "
-                        "<stable-retry-key>`. FnB may use the same status and retry "
-                        "surfaces."
-                    ),
-                    idempotency_key=(
-                        f"{SYSTEM_IDEMPOTENCY_KEY_PREFIX}"
-                        f"sprint:{claim.sprint_id}:cleanup-failed:"
-                        f"target:{claim.cleanup_target_id}:"
-                        f"generation:{claim.claim_generation}"
-                    ),
-                    declared_type="re-enter",
-                )
-            except WakeMessageIdempotencyConflict:
-                return
+            self._send_terminal_receipt_in_transaction(
+                receiver_shell_id,
+                body=(
+                    f"Sprint {claim.sprint_id} cleanup failed for {path_label} "
+                    f"(error_code={code}).{fallback_note} Run "
+                    f"`sc sprint cleanup-status --sprint "
+                    f"{claim.sprint_id}`; after correcting the named condition, "
+                    f"run `sc sprint cleanup --sprint {claim.sprint_id} --key "
+                    "<stable-retry-key>`. FnB may use the same status and retry "
+                    "surfaces."
+                ),
+                preferred_key=(
+                    f"{SYSTEM_IDEMPOTENCY_KEY_PREFIX}"
+                    f"sprint:{claim.sprint_id}:cleanup-failed:"
+                    f"target:{claim.cleanup_target_id}:"
+                    f"generation:{claim.claim_generation}"
+                ),
+            )
             return
 
         if projection.aggregate_state != "succeeded":
@@ -711,23 +704,47 @@ class SprintCleanupTargetStore:
             if fnb_fallback
             else ""
         )
-        try:
-            SprintMessageStore(self.con).send_to_shell_in_transaction(
-                receiver_shell_id,
-                message_kind="notification",
-                body=(
-                    f"Sprint {claim.sprint_id} cleanup completed. "
-                    f"cleanup_state=succeeded; target_count={projection.target_count}. "
-                    f"Its managed participant worktrees are reusable.{fallback_note}"
-                ),
-                idempotency_key=(
-                    f"{SYSTEM_IDEMPOTENCY_KEY_PREFIX}"
-                    f"sprint:{claim.sprint_id}:cleanup-completed"
-                ),
-                declared_type="re-enter",
-            )
-        except WakeMessageIdempotencyConflict:
-            return
+        self._send_terminal_receipt_in_transaction(
+            receiver_shell_id,
+            body=(
+                f"Sprint {claim.sprint_id} cleanup completed. "
+                f"cleanup_state=succeeded; target_count={projection.target_count}. "
+                f"Its managed participant worktrees are reusable.{fallback_note}"
+            ),
+            preferred_key=(
+                f"{SYSTEM_IDEMPOTENCY_KEY_PREFIX}"
+                f"sprint:{claim.sprint_id}:cleanup-completed"
+            ),
+        )
+
+    def _send_terminal_receipt_in_transaction(
+        self,
+        receiver_shell_id: int,
+        *,
+        body: str,
+        preferred_key: str,
+    ) -> None:
+        from sprint_message_delivery import (
+            SprintMessageStore,
+            WakeMessageIdempotencyConflict,
+        )
+
+        store = SprintMessageStore(self.con)
+        key = preferred_key
+        collision_index = 0
+        while True:
+            try:
+                store.send_to_shell_in_transaction(
+                    receiver_shell_id,
+                    message_kind="notification",
+                    body=body,
+                    idempotency_key=key,
+                    declared_type="re-enter",
+                )
+                return
+            except WakeMessageIdempotencyConflict:
+                collision_index += 1
+                key = f"{preferred_key}:collision:{collision_index}"
 
     def _terminal_receipt_receiver(
         self, sprint_id: int

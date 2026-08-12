@@ -1518,6 +1518,7 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
 
     def test_terminal_state_and_event_commit_across_reserved_key_collision(self):
         system_key = f"_sc:system:sprint:{self.sprint_id}:cleanup-completed"
+        fallback_key = f"{system_key}:collision:1"
         conflict = sprint_message_delivery.SprintMessageStore(
             self.con
         ).send_to_shell(
@@ -1550,9 +1551,9 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
             (self.sprint_id,),
         ).fetchall()
         messages = self.con.execute(
-            "SELECT message_id,receiver_shell_id,body FROM wake_message "
-            "WHERE idempotency_key=?",
-            (system_key,),
+            "SELECT message_id,receiver_shell_id,body,idempotency_key "
+            "FROM wake_message WHERE idempotency_key IN (?,?) ORDER BY message_id",
+            (system_key, fallback_key),
         ).fetchall()
         self.assertEqual(
             ("succeeded", evidence),
@@ -1563,18 +1564,137 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
             {"aggregate_state": "succeeded", "succeeded_count": 4, "target_count": 4},
             json.loads(events[0]["payload"]),
         )
+        self.assertEqual(2, len(messages))
         self.assertEqual(
-            [(conflict.message_id, 3, "pre-existing engine-wide conflict")],
+            [
+                (
+                    conflict.message_id,
+                    3,
+                    "pre-existing engine-wide conflict",
+                    system_key,
+                ),
+                (
+                    messages[1]["message_id"],
+                    3,
+                    f"Sprint {self.sprint_id} cleanup completed. "
+                    "cleanup_state=succeeded; target_count=4. Its managed "
+                    "participant worktrees are reusable.",
+                    fallback_key,
+                ),
+            ],
             [tuple(row) for row in messages],
         )
         self.assertEqual(
-            [(conflict.message_id, conflict.wake_id)],
+            [
+                (conflict.message_id, 3, "pending"),
+                (messages[1]["message_id"], 3, "pending"),
+            ],
             [
                 tuple(row)
                 for row in self.con.execute(
-                    "SELECT message_id,wake_id FROM sprint_wake_messages "
-                    "WHERE message_id=?",
-                    (conflict.message_id,),
+                    "SELECT wm.message_id,w.receiver_shell_id,w.state "
+                    "FROM sprint_wake_messages wm JOIN sprint_wake_outbox w "
+                    "USING (wake_id) WHERE wm.message_id IN (?,?) "
+                    "ORDER BY wm.message_id",
+                    (conflict.message_id, messages[1]["message_id"]),
+                )
+            ],
+        )
+
+    def test_terminal_failure_receipt_recovers_from_malformed_key_collision(self):
+        claim = self.targets.claim_next("malformed-failure-collision", shell_id=1)
+        self.assertEqual("worktree", claim.target_kind)
+        system_key = (
+            f"_sc:system:sprint:{self.sprint_id}:cleanup-failed:"
+            f"target:{claim.cleanup_target_id}:generation:{claim.claim_generation}"
+        )
+        fallback_key = f"{system_key}:collision:1"
+        malformed_id = int(
+            self.con.execute(
+                "INSERT INTO wake_message "
+                "(receiver_shell_id,message_kind,body,declared_type,actionable,"
+                "idempotency_key) VALUES (3,'notification',?, 're-enter',0,?)",
+                ("malformed engine-wide conflict", system_key),
+            ).lastrowid
+        )
+        self.con.commit()
+
+        self.assertTrue(
+            self.targets.fail_safety(
+                claim,
+                "git_common_dir_mismatch",
+                "stored repository identity changed",
+            )
+        )
+        self.assertFalse(
+            self.targets.fail_safety(
+                claim,
+                "git_common_dir_mismatch",
+                "stored repository identity changed",
+            )
+        )
+
+        target = self.con.execute(
+            "SELECT state,last_error_code,last_error_detail "
+            "FROM sprint_cleanup_targets WHERE cleanup_target_id=?",
+            (claim.cleanup_target_id,),
+        ).fetchone()
+        events = self.con.execute(
+            "SELECT payload FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='sprint.cleanup_failed'",
+            (self.sprint_id,),
+        ).fetchall()
+        messages = self.con.execute(
+            "SELECT message_id,receiver_shell_id,body,idempotency_key "
+            "FROM wake_message WHERE idempotency_key IN (?,?) ORDER BY message_id",
+            (system_key, fallback_key),
+        ).fetchall()
+        self.assertEqual(
+            (
+                "failed",
+                "git_common_dir_mismatch",
+                "stored repository identity changed",
+            ),
+            tuple(target),
+        )
+        self.assertEqual(1, len(events))
+        self.assertEqual(
+            {
+                "aggregate_state": "failed",
+                "attempt_count": 0,
+                "claim_generation": claim.claim_generation,
+                "cleanup_target_id": claim.cleanup_target_id,
+                "error_code": "git_common_dir_mismatch",
+                "path_label": ".sc-worktrees/dev1",
+                "target_kind": "worktree",
+            },
+            json.loads(events[0]["payload"]),
+        )
+        self.assertEqual(2, len(messages))
+        self.assertEqual(
+            (malformed_id, 3, "malformed engine-wide conflict", system_key),
+            tuple(messages[0]),
+        )
+        self.assertEqual(
+            (messages[1]["message_id"], 3, fallback_key),
+            (
+                messages[1]["message_id"],
+                messages[1]["receiver_shell_id"],
+                messages[1]["idempotency_key"],
+            ),
+        )
+        self.assertIn("cleanup failed", messages[1]["body"])
+        self.assertIn("cleanup-status", messages[1]["body"])
+        self.assertEqual(
+            [(messages[1]["message_id"], 3, "pending")],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT wm.message_id,w.receiver_shell_id,w.state "
+                    "FROM sprint_wake_messages wm JOIN sprint_wake_outbox w "
+                    "USING (wake_id) WHERE wm.message_id IN (?,?) "
+                    "ORDER BY wm.message_id",
+                    (malformed_id, messages[1]["message_id"]),
                 )
             ],
         )
