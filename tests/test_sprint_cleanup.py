@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ sys.path[:0] = [
     str(ROOT / "tests"),
 ]
 
+import run
 import server
 import sprint_cleanup
 import sprint_cli
@@ -31,7 +33,6 @@ import sprint_close
 import sprint_domain
 import sprint_message_delivery
 import sprint_runtime
-import run
 from conversation_adapters import NativeTurn, NormalizedEvent
 from conversation_broker import ConversationBroker
 from conversation_launch import ConversationLaunchPreparer
@@ -166,6 +167,61 @@ class SprintCleanupSchedulingTest(SprintDomainCase):
                 "AND event_type='sprint.cleanup_scheduled'",
                 (self.sprint_id,),
             ).fetchone()[0],
+        )
+
+    def test_pause_abort_and_abort_replay_never_schedule_cleanup(self):
+        paused = self.store.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="fixture pause must preserve every worktree",
+        )
+
+        self.assertTrue(paused.changed)
+        self.assertEqual(
+            ("paused", 0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT lifecycle,"
+                    "(SELECT COUNT(*) FROM sprint_cleanup_targets WHERE sprint_id=?),"
+                    "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='sprint.cleanup_scheduled'),"
+                    "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='lifecycle.completed') "
+                    "FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,) * 4,
+                ).fetchone()
+            ),
+        )
+
+        aborted = self.store.abort(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="fixture abort must preserve every worktree",
+            terminal_outcome="aborted",
+        )
+        replay = self.store.abort(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="fixture abort must preserve every worktree",
+            terminal_outcome="aborted",
+        )
+
+        self.assertTrue(aborted.changed)
+        self.assertFalse(replay.changed)
+        self.assertEqual(
+            ("aborted", 0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT lifecycle,"
+                    "(SELECT COUNT(*) FROM sprint_cleanup_targets WHERE sprint_id=?),"
+                    "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='sprint.cleanup_scheduled'),"
+                    "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='lifecycle.completed') "
+                    "FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,) * 4,
+                ).fetchone()
+            ),
         )
 
     def test_admin_participant_is_excluded_from_target_authority(self):
@@ -992,6 +1048,62 @@ class SprintCleanupExecutorTest(SprintDomainCase):
         )
         self.assertIsNone(row["before_evidence"])
 
+    def test_symlinked_worktree_refuses_escape_and_preserves_outside_bytes(self):
+        self._git(self.repository, "worktree", "remove", "--force", str(self.worktree))
+        outside = Path(self.tmp.name) / "outside-repository"
+        self._git(Path(self.tmp.name), "init", str(outside))
+        sentinel = outside / "must-survive.txt"
+        sentinel.write_text("outside authority\n", encoding="utf-8")
+        self.worktree.symlink_to(outside, target_is_directory=True)
+
+        receipt = self._executor().run_next("fixture", shell_id=1)
+
+        self.assertEqual(
+            ("failed", "symlink_component_refused", 0),
+            (receipt.state, receipt.code, receipt.attempt_count),
+        )
+        self.assertTrue(self.worktree.is_symlink())
+        self.assertEqual("outside authority\n", sentinel.read_text())
+        row = self._worktree_row()
+        self.assertEqual(
+            ("failed", 0, "symlink_component_refused", None),
+            (
+                row["state"],
+                row["attempt_count"],
+                row["last_error_code"],
+                row["before_evidence"],
+            ),
+        )
+
+    def test_main_checkout_substitution_is_refused_before_mutation(self):
+        self._dirty_worktree()
+        main_sentinel = self.repository / "main-must-survive.txt"
+        main_sentinel.write_text("main authority\n", encoding="utf-8")
+        claim = self.cleanup.claim_next("fixture", shell_id=1, lease_seconds=60)
+        self.assertIsInstance(claim, sprint_cleanup.CleanupClaim)
+
+        receipt = self._executor().execute(
+            replace(claim, canonical_path=str(self.repository.resolve()))
+        )
+
+        self.assertEqual(
+            ("failed", "managed_path_mismatch", 0),
+            (receipt.state, receipt.code, receipt.attempt_count),
+        )
+        self.assertEqual("main authority\n", main_sentinel.read_text())
+        self.assertEqual("staged dirt\n", (self.worktree / "tracked.txt").read_text())
+        self.assertEqual("discard\n", (self.worktree / "untracked.txt").read_text())
+        row = self._worktree_row()
+        self.assertEqual(
+            ("failed", 0, "managed_path_mismatch", None),
+            (
+                row["state"],
+                row["attempt_count"],
+                row["last_error_code"],
+                row["before_evidence"],
+            ),
+        )
+
     def test_reclaimed_generation_cannot_mutate_or_write_terminal_state(self):
         self._dirty_worktree()
         first = self.cleanup.claim_next("first", shell_id=1, lease_seconds=10)
@@ -1176,6 +1288,39 @@ class SprintCleanupExecutorTest(SprintDomainCase):
             (row["state"], row["attempt_count"], row["waiting_reason"]),
         )
         self.assertIsNone(row["last_error_code"])
+
+    def test_indeterminate_liveness_fails_closed_without_mutation_attempt(self):
+        self._dirty_worktree()
+
+        receipt = self._executor(liveness=lambda _claim: "indeterminate").run_next(
+            "fixture",
+            shell_id=1,
+        )
+
+        self.assertEqual(
+            ("failed", "liveness_indeterminate", 0),
+            (receipt.state, receipt.code, receipt.attempt_count),
+        )
+        self.assertEqual(
+            "feat/disposable",
+            self._git(self.worktree, "branch", "--show-current").stdout.strip(),
+        )
+        self.assertEqual("staged dirt\n", (self.worktree / "tracked.txt").read_text())
+        self.assertEqual("discard\n", (self.worktree / "untracked.txt").read_text())
+        self.assertEqual(
+            "discard nested\n",
+            (self.worktree / "nested-repository" / "only-local.txt").read_text(),
+        )
+        row = self._worktree_row()
+        self.assertEqual(
+            ("failed", 0, "liveness_indeterminate", None),
+            (
+                row["state"],
+                row["attempt_count"],
+                row["last_error_code"],
+                row["before_evidence"],
+            ),
+        )
 
     def test_runtime_pulse_defers_live_target_without_mutation_attempt(self):
         runtime = sprint_runtime.SprintRuntimeService(
@@ -2117,6 +2262,108 @@ class SprintCleanupExecutorTest(SprintDomainCase):
             ),
         )
 
+    def test_absent_artifact_target_succeeds_once_without_adjacent_mutation(self):
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='succeeded' "
+            "WHERE sprint_id=? AND target_kind='worktree'",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        adjacent = self.repository / "shared" / "sprints" / "sprint-999"
+        adjacent.mkdir(parents=True)
+        sentinel = adjacent / "keep.txt"
+        sentinel.write_text("keep\n", encoding="utf-8")
+
+        receipt = self._executor().run_next("fixture")
+        replay = self._executor().run_next("fixture")
+
+        self.assertEqual(("succeeded", 1), (receipt.state, receipt.attempt_count))
+        self.assertEqual("idle", replay.state)
+        self.assertEqual("keep\n", sentinel.read_text())
+        row = self.con.execute(
+            "SELECT state,attempt_count,before_evidence,after_evidence "
+            "FROM sprint_cleanup_targets WHERE sprint_id=? "
+            "AND target_kind='artifact_dir'",
+            (self.sprint_id,),
+        ).fetchone()
+        self.assertEqual(("succeeded", 1), (row["state"], row["attempt_count"]))
+        self.assertEqual(
+            {"existed": False, "entry_count": 0, "entry_count_truncated": False},
+            json.loads(row["before_evidence"]),
+        )
+        self.assertEqual(
+            {
+                "existed": False,
+                "removed_entry_count": 0,
+                "entry_count_truncated": False,
+            },
+            json.loads(row["after_evidence"]),
+        )
+
+    def test_artifact_delete_failure_retries_to_exact_convergence(self):
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='succeeded' "
+            "WHERE sprint_id=? AND target_kind='worktree'",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        artifact = self.repository / "shared" / "sprints" / f"sprint-{self.sprint_id}"
+        artifact.mkdir(parents=True)
+        sentinel = artifact / "retry.txt"
+        sentinel.write_text("retry\n", encoding="utf-8")
+        adjacent = artifact.parent / "sprint-999"
+        adjacent.mkdir()
+        adjacent_sentinel = adjacent / "keep.txt"
+        adjacent_sentinel.write_text("keep\n", encoding="utf-8")
+
+        with mock.patch.object(
+            sprint_cleanup.shutil,
+            "rmtree",
+            side_effect=OSError("injected artifact refusal"),
+        ):
+            first = self._executor().run_next("fixture")
+
+        self.assertEqual(
+            ("pending", "artifact_delete_failed", 1),
+            (first.state, first.code, first.attempt_count),
+        )
+        self.assertEqual("retry\n", sentinel.read_text())
+        self.assertEqual("keep\n", adjacent_sentinel.read_text())
+        failed_row = self.con.execute(
+            "SELECT state,attempt_count,last_error_code,after_evidence "
+            "FROM sprint_cleanup_targets WHERE sprint_id=? "
+            "AND target_kind='artifact_dir'",
+            (self.sprint_id,),
+        ).fetchone()
+        self.assertEqual(
+            ("pending", 1, "artifact_delete_failed", None),
+            tuple(failed_row),
+        )
+
+        self.now += timedelta(seconds=6)
+        second = self._executor().run_next("fixture")
+
+        self.assertEqual(("succeeded", 2), (second.state, second.attempt_count))
+        self.assertFalse(artifact.exists())
+        self.assertEqual("keep\n", adjacent_sentinel.read_text())
+        row = self.con.execute(
+            "SELECT state,attempt_count,last_error_code,before_evidence,after_evidence "
+            "FROM sprint_cleanup_targets WHERE sprint_id=? "
+            "AND target_kind='artifact_dir'",
+            (self.sprint_id,),
+        ).fetchone()
+        retry = json.loads(row["after_evidence"])["retry_evidence"]
+        self.assertEqual(
+            ("succeeded", 2, None, 1, "artifact_delete_failed"),
+            (
+                row["state"],
+                row["attempt_count"],
+                row["last_error_code"],
+                retry["failed_attempts"],
+                retry["last_error_code"],
+            ),
+        )
+
 
 class SprintCleanupRecoveryTest(SprintDomainCase):
     def setUp(self) -> None:
@@ -2673,9 +2920,11 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
                 (
                     messages[1]["message_id"],
                     3,
-                    f"Sprint {self.sprint_id} cleanup completed. "
-                    "cleanup_state=succeeded; target_count=4. Its managed "
-                    "participant worktrees are reusable.",
+                    (
+                        f"Sprint {self.sprint_id} cleanup completed. "
+                        "cleanup_state=succeeded; target_count=4. Its managed "
+                        "participant worktrees are reusable."
+                    ),
                     fallback_key,
                 ),
             ],
@@ -2923,8 +3172,11 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
             "SELECT receiver_shell_id,declared_type,body FROM wake_message "
             "WHERE idempotency_key=?",
             (
-                f"_sc:system:sprint:{self.sprint_id}:cleanup-failed:"
-                f"target:{failed.cleanup_target_id}:generation:{failed.claim_generation}",
+                (
+                    f"_sc:system:sprint:{self.sprint_id}:cleanup-failed:"
+                    f"target:{failed.cleanup_target_id}:"
+                    f"generation:{failed.claim_generation}"
+                ),
             ),
         ).fetchone()
         self.assertEqual(
