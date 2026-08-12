@@ -45,6 +45,7 @@ from typing import Any, Protocol
 RECEIPT_VERSION = 1
 WORKSPACE_PREFIX = "subfloor-dos-app-canary-"
 REMOTE_PREFIX = "subfloor-canary"
+ENGINE_REMOTE = "super-coder"
 MIN_GITHUB_REMAINING = 100
 MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
 FORK_PREPARATION_PATHS = {
@@ -809,7 +810,7 @@ class HostBackend:
             facts.workspace,
             "remote",
             "add",
-            "subfloor-canary",
+            ENGINE_REMOTE,
             str(config.source_repo.resolve()),
             label="add exact engine source",
         )
@@ -817,14 +818,14 @@ class HostBackend:
             facts.workspace,
             "fetch",
             "--no-tags",
-            "subfloor-canary",
-            f"{facts.candidate_sha}:refs/remotes/subfloor-canary/main",
+            ENGINE_REMOTE,
+            f"{facts.candidate_sha}:refs/remotes/{ENGINE_REMOTE}/main",
             label="fetch exact candidate engine",
         )
         self._git(
             facts.workspace,
             "checkout",
-            "refs/remotes/subfloor-canary/main",
+            f"refs/remotes/{ENGINE_REMOTE}/main",
             "--",
             ".super-coder",
             "sc",
