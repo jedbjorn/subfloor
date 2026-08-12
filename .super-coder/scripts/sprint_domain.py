@@ -638,6 +638,7 @@ class SprintLifecycleStore:
                 )
             self._require_edge(current, "armed")
             self._authorize(sprint, "armed", actor)
+            self._require_prior_cleanup_resolved(sprint_id)
 
             # Armed is not externally visible until this transaction commits.
             # That permits active reconciliation notifications to be created

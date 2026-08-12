@@ -687,6 +687,106 @@ class SprintCleanupSchedulingTest(SprintDomainCase):
             board_body["error"]["details"]["retry_command"],
         )
 
+    def test_resume_rejects_later_completed_cleanup_then_succeeds_when_clear(self):
+        def paused_counts():
+            return tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM wake_message WHERE sprint_id=?),"
+                    "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='lifecycle.reconciled'),"
+                    "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='lifecycle.armed')",
+                    (paused_sprint, paused_sprint, paused_sprint),
+                ).fetchone()
+            )
+
+        def completed_targets():
+            return [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT cleanup_target_id,state,attempt_count,claim_generation,"
+                    "lease_owner,waiting_reason FROM sprint_cleanup_targets "
+                    "WHERE sprint_id=? AND target_kind='worktree' "
+                    "ORDER BY cleanup_target_id",
+                    (completed_sprint,),
+                )
+            ]
+
+        paused_sprint = self.sprint_id
+        self.store.pause(
+            paused_sprint,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="later Sprint temporarily owns the participant slots",
+        )
+        completed_sprint, _unit_id = self.create_sprint()
+        self.store.arm(completed_sprint, 3)
+        self.store.transition(
+            completed_sprint,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="later Sprint completed first",
+            terminal_outcome="accepted",
+        )
+        before_targets = completed_targets()
+        self.assertEqual(
+            [("pending", 0, 0, None, None)] * 3,
+            [target[1:] for target in before_targets],
+        )
+        before_counts = paused_counts()
+        reconciled = False
+
+        def reconcile(_con):
+            nonlocal reconciled
+            reconciled = True
+
+        with self.assertRaises(sprint_domain.SprintCleanupConflictError) as raised:
+            self.store.resume(
+                paused_sprint,
+                sprint_domain.LifecycleActor("planner", 3),
+                reason="resume after later Sprint",
+                reconcile_in_transaction=reconcile,
+            )
+
+        self.assertEqual(completed_sprint, raised.exception.details["prior_sprint_id"])
+        self.assertFalse(reconciled)
+        self.assertEqual(
+            "paused",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (paused_sprint,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(before_counts, paused_counts())
+        self.assertEqual(before_targets, completed_targets())
+
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='succeeded' "
+            "WHERE sprint_id=? AND target_kind='worktree'",
+            (completed_sprint,),
+        )
+        self.con.commit()
+        receipt = self.store.resume(
+            paused_sprint,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="cleanup authority is terminal",
+            reconcile_in_transaction=reconcile,
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertTrue(reconciled)
+        self.assertEqual(
+            "armed",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (paused_sprint,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            (before_counts[1] + 1, before_counts[2] + 1),
+            paused_counts()[1:],
+        )
+
 
 class SprintCleanupExecutorTest(SprintDomainCase):
     def setUp(self) -> None:
