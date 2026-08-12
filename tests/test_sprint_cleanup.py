@@ -56,6 +56,12 @@ class SprintCleanupSchedulingTest(SprintDomainCase):
         )
         self.sprint_id, self.unit_id = self.create_sprint()
         self.store.arm(self.sprint_id, 3)
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.commit()
 
     def cleanup_rows(self) -> list[sqlite3.Row]:
         return self.con.execute(
@@ -685,6 +691,12 @@ class SprintCleanupSchedulingTest(SprintDomainCase):
         older_sprint, _older_unit = self.create_sprint()
         later_sprint, _later_unit = self.create_sprint()
         self.store.arm(later_sprint, 3)
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE sprint_id=?",
+            (later_sprint,),
+        )
+        self.con.commit()
         self.store.transition(
             later_sprint,
             "completed",
@@ -777,6 +789,12 @@ class SprintCleanupSchedulingTest(SprintDomainCase):
         )
         completed_sprint, _unit_id = self.create_sprint()
         self.store.arm(completed_sprint, 3)
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE sprint_id=?",
+            (completed_sprint,),
+        )
+        self.con.commit()
         self.store.transition(
             completed_sprint,
             "completed",
@@ -894,6 +912,12 @@ class SprintCleanupExecutorTest(SprintDomainCase):
         )
         self.sprint_id, self.unit_id = self.create_sprint()
         self.lifecycle.arm(self.sprint_id, 3)
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.commit()
         self.lifecycle.transition(
             self.sprint_id,
             "completed",
@@ -1138,7 +1162,9 @@ class SprintCleanupExecutorTest(SprintDomainCase):
             calls += 1
             if calls == 2:
                 self.con.execute(
-                    "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?",
+                    "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                    "conformance_owner_generation=1,lifecycle='armed' "
+                    "WHERE sprint_id=?",
                     (newer_sprint,),
                 )
                 self.con.execute(
@@ -1173,6 +1199,12 @@ class SprintCleanupExecutorTest(SprintDomainCase):
         older_sprint, _older_unit = self.create_sprint()
         later_sprint, _later_unit = self.create_sprint()
         self.lifecycle.arm(later_sprint, 3)
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE sprint_id=?",
+            (later_sprint,),
+        )
+        self.con.commit()
         self.lifecycle.transition(
             later_sprint,
             "completed",
@@ -1183,8 +1215,9 @@ class SprintCleanupExecutorTest(SprintDomainCase):
         with self.assertRaises(sprint_domain.SprintCleanupConflictError):
             self.lifecycle.arm(older_sprint, 3)
         self.con.execute(
-            "UPDATE sprints SET lifecycle='armed',armed_at=datetime('now') "
-            "WHERE sprint_id=?",
+            "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+            "conformance_owner_generation=1,lifecycle='armed',"
+            "armed_at=datetime('now') WHERE sprint_id=?",
             (older_sprint,),
         )
         self.con.execute(
@@ -2389,6 +2422,12 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
         )
         self.sprint_id, self.unit_id = self.create_sprint()
         self.lifecycle.arm(self.sprint_id, 3)
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.commit()
         self.lifecycle.transition(
             self.sprint_id,
             "completed",
@@ -2568,6 +2607,12 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
             ),
         )
         legacy_lifecycle.arm(legacy_sprint, 3)
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE sprint_id=?",
+            (legacy_sprint,),
+        )
+        self.con.commit()
         legacy_lifecycle.transition(
             legacy_sprint,
             "completed",
@@ -2645,6 +2690,12 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
             ),
         )
         lifecycle.arm(legacy_sprint, 3)
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE sprint_id=?",
+            (legacy_sprint,),
+        )
+        self.con.commit()
         lifecycle.transition(
             legacy_sprint,
             "completed",
@@ -3200,6 +3251,12 @@ class SprintCleanupRecoveryTest(SprintDomainCase):
 
         second_sprint, _unit = self.create_sprint()
         self.lifecycle.arm(second_sprint, 3)
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE sprint_id=?",
+            (second_sprint,),
+        )
+        self.con.commit()
         self.lifecycle.transition(
             second_sprint,
             "completed",

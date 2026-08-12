@@ -206,8 +206,10 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         ((3, "cv_plan"), (1, "cv_dev"), (2, "cv_rev")),
     )
     con.execute(
-        "UPDATE sprints SET lifecycle='armed',armed_at='2026-08-01 21:00:00',"
-        "updated_at='2026-08-01 21:00:00',version=2 WHERE sprint_id=1"
+        "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+        "conformance_owner_generation=1,lifecycle='armed',"
+        "armed_at='2026-08-01 21:00:00',updated_at='2026-08-01 21:00:00',"
+        "version=2 WHERE sprint_id=1"
     )
     con.execute(
         "UPDATE sprint_work_units SET disposition='active',"
@@ -315,12 +317,18 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         "WHERE sprint_id=1"
     )
     con.execute(
+        "INSERT INTO sprint_participants "
+        "(participant_id,sprint_id,shell_id,role,harness) "
+        "VALUES (4,2,2,'reviewer','claude')"
+    )
+    con.execute(
         "UPDATE sprints SET lifecycle='paused',paused_at='2026-08-01 21:59:00' "
         "WHERE sprint_id=1"
     )
     con.execute(
-        "UPDATE sprints SET lifecycle='armed',armed_at='2026-08-01 22:00:00' "
-        "WHERE sprint_id=2"
+        "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+        "conformance_owner_generation=1,lifecycle='armed',"
+        "armed_at='2026-08-01 22:00:00' WHERE sprint_id=2"
     )
     con.execute(
         "UPDATE sprints SET lifecycle='completed',terminal_outcome='accepted',"
@@ -569,17 +577,24 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
                     (4, 0, "2026-08-01 18:00:00", "2026-08-01 18:01:00"),
                 ),
             )
+            con.executemany(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness) VALUES (?,2,'reviewer','claude')",
+                ((2,), (3,)),
+            )
             con.execute(
-                "UPDATE sprints SET lifecycle='armed',armed_at='2026-08-01 20:01:00' "
-                "WHERE sprint_id=2"
+                "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=1,lifecycle='armed',"
+                "armed_at='2026-08-01 20:01:00' WHERE sprint_id=2"
             )
             con.execute(
                 "UPDATE sprints SET lifecycle='paused',paused_at='2026-08-01 20:03:00' "
                 "WHERE sprint_id=2"
             )
             con.execute(
-                "UPDATE sprints SET lifecycle='armed',armed_at='2026-08-01 19:01:00' "
-                "WHERE sprint_id=3"
+                "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=1,lifecycle='armed',"
+                "armed_at='2026-08-01 19:01:00' WHERE sprint_id=3"
             )
             con.execute(
                 "UPDATE sprints SET lifecycle='completed',"
@@ -613,9 +628,20 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
                     (3, "2026-08-01 20:00:00", "2026-08-01 20:03:00"),
                 ),
             )
-            con.execute("UPDATE sprints SET lifecycle='armed' WHERE sprint_id=2")
+            con.executemany(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness) VALUES (?,2,'reviewer','claude')",
+                ((2,), (3,)),
+            )
+            con.execute(
+                "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=1,lifecycle='armed' WHERE sprint_id=2"
+            )
             con.execute("UPDATE sprints SET lifecycle='paused' WHERE sprint_id=2")
-            con.execute("UPDATE sprints SET lifecycle='armed' WHERE sprint_id=3")
+            con.execute(
+                "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=1,lifecycle='armed' WHERE sprint_id=3"
+            )
             con.execute("UPDATE sprints SET lifecycle='paused' WHERE sprint_id=3")
             con.execute("UPDATE sprints SET lifecycle='armed' WHERE sprint_id=2")
             con.commit()

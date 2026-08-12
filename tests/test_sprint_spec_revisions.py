@@ -92,8 +92,9 @@ class GoverningRevisionCase(unittest.TestCase):
             ),
         )
         self.con.execute(
-            "UPDATE sprints SET lifecycle='armed',armed_at=datetime('now') "
-            "WHERE sprint_id=?",
+            "UPDATE sprints SET conformance_reviewer_shell_id=3,"
+            "conformance_owner_generation=1,lifecycle='armed',"
+            "armed_at=datetime('now') WHERE sprint_id=?",
             (self.sprint_id,),
         )
         self.con.commit()

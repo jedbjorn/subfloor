@@ -529,7 +529,14 @@ class SprintLiveProof(unittest.TestCase):
 
     def test_serial_sprint_runs_correction_merge_dispatch_and_close(self) -> None:
         sprint_id, document_id, units = self.prepare(((1, 2, ()), (1, 2, (0,))))
-        initial_wakes = self.run_cli(3, "arm", "--sprint", str(sprint_id))["wake_ids"]
+        initial_wakes = self.run_cli(
+            3,
+            "arm",
+            "--sprint",
+            str(sprint_id),
+            "--conformance-reviewer-shell",
+            "2",
+        )["wake_ids"]
         self.assertEqual(2, len(initial_wakes))
         self.assertEqual(
             [(units[0], "ready"), (units[1], "planned")],
@@ -599,7 +606,14 @@ class SprintLiveProof(unittest.TestCase):
 
     def test_parallel_sprint_completes_out_of_order_without_lane_overlap(self) -> None:
         sprint_id, document_id, units = self.prepare(((1, 2, ()), (4, 5, ())))
-        initial_wakes = self.run_cli(3, "arm", "--sprint", str(sprint_id))["wake_ids"]
+        initial_wakes = self.run_cli(
+            3,
+            "arm",
+            "--sprint",
+            str(sprint_id),
+            "--conformance-reviewer-shell",
+            "2",
+        )["wake_ids"]
         self.assertEqual(3, len(initial_wakes))
         self.deliver_browser_turns()
         self.accept_assignment(units[0], 1)
@@ -655,7 +669,7 @@ class SprintLiveProof(unittest.TestCase):
         sprint_id, _document_id, units = self.prepare(((1, 2, ()),))
         sprint_domain.SprintLifecycleStore(
             self.con, probe_harness=lambda _harness: None
-        ).arm(sprint_id, 3)
+        ).arm(sprint_id, 3, conformance_reviewer_shell_id=2)
         self.deliver_browser_turns()
         self.accept_assignment(units[0], 1)
         self.github.set(3001, "OPEN", checks="PENDING")
@@ -738,7 +752,14 @@ class SprintLiveProof(unittest.TestCase):
         self,
     ) -> None:
         sprint_id, _document_id, units = self.prepare(((1, 2, ()),))
-        self.run_cli(3, "arm", "--sprint", str(sprint_id))
+        self.run_cli(
+            3,
+            "arm",
+            "--sprint",
+            str(sprint_id),
+            "--conformance-reviewer-shell",
+            "2",
+        )
         self.deliver_browser_turns()
         assignment_id = self.assignment_message(units[0])
         developer_start = self.run_cli(1, "inbox", "--sprint", str(sprint_id))

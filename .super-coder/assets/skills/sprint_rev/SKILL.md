@@ -192,7 +192,10 @@ surface; an unrecorded verdict cannot unlock merge.
 ## Delivery-terminal closeout
 
 Retain the exact notification message id + delivered wake as this closeout
-episode's identity. Inspect inbox, lifecycle, and units first:
+episode's identity. Proceed only when the notification names this shell as the
+selected conformance owner for its current ownership generation. A different
+Reviewer accepts the informational notification if received and records no
+conformance. Inspect inbox, lifecycle, and units first:
 
 - Already completed/aborted -> `accept` notification and stop.
 - If any non-terminal unit is visible, the wake is stale -> `accept`, stop, and

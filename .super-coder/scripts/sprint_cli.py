@@ -246,7 +246,13 @@ def cmd_cancel_unit(args: argparse.Namespace) -> int:
 
 
 def cmd_arm(args: argparse.Namespace) -> int:
-    result = _post("/_sc/sprint/arm", {"sprint_id": args.sprint})
+    result = _post(
+        "/_sc/sprint/arm",
+        {
+            "sprint_id": args.sprint,
+            "conformance_reviewer_shell_id": args.conformance_reviewer_shell,
+        },
+    )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
@@ -293,7 +299,11 @@ def cmd_pause(args: argparse.Namespace) -> int:
 def cmd_resume(args: argparse.Namespace) -> int:
     result = _post(
         "/_sc/sprint/resume",
-        {"sprint_id": args.sprint, "reason": args.reason},
+        {
+            "sprint_id": args.sprint,
+            "reason": args.reason,
+            "conformance_reviewer_shell_id": args.conformance_reviewer_shell,
+        },
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
@@ -567,6 +577,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     arm = sub.add_parser("arm", help="Planner atomically arms an eligible plan")
     arm.add_argument("--sprint", type=int, required=True)
+    arm.add_argument(
+        "--conformance-reviewer-shell", type=int, required=True
+    )
     arm.set_defaults(fn=cmd_arm)
 
     inbox = sub.add_parser("inbox", help="Read unread messages addressed to this shell")
@@ -670,6 +683,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume = sub.add_parser("resume", help="Planner or FnB reconciles and re-arms")
     resume.add_argument("--sprint", type=int, required=True)
     resume.add_argument("--reason")
+    resume.add_argument("--conformance-reviewer-shell", type=int)
     resume.set_defaults(fn=cmd_resume)
 
     complete = sub.add_parser("complete", help="Planner or FnB closes successfully")

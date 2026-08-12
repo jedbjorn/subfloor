@@ -19,10 +19,12 @@ changed it or the next command requires live revalidation.
 
 ## Route the entry
 
-- **Reviewer receives `sprint.delivery_terminal`.** Load `sprint_rev` and follow
-  **Delivery-terminal closeout**. Inspect the Sprint inbox once, compile bounded
-  evidence, and choose between in-Sprint re-entry, abort, or the atomic clean
-  `record-conformance` path. The Planner does not initiate this pass.
+- **Selected conformance Reviewer receives `sprint.delivery_terminal`.** Confirm
+  the notification's owner shell and generation match the current Sprint.
+  Load `sprint_rev` and follow **Delivery-terminal closeout**. Inspect the Sprint
+  inbox once, compile bounded evidence, and choose between in-Sprint re-entry,
+  abort, or the atomic clean `record-conformance` path. Any other Reviewer
+  records no conformance. The Planner does not initiate this pass.
 - **Planner receives a Sprint-scoped Reviewer decision.** Load `sprint_pln` and
   follow **Reviewer decision actions**. Inspect and handle the durable inbox
   message once, then execute the exact requested transition without

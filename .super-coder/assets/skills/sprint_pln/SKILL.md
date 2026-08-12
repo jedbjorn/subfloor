@@ -168,6 +168,19 @@ unread messages, wakes, units, PRs, capacity, and spec drift:
 sc sprint resume --sprint <id> [--reason <validated-reconciliation-reason>]
 ```
 
+Preserve the current conformance owner on ordinary resume. Replace that owner
+only while paused, only with an eligible participating Reviewer, and always
+record a reason:
+
+```text
+sc sprint resume --sprint <id> \
+  --conformance-reviewer-shell <replacement-shell-id> \
+  --reason <ownership-replacement-reason>
+```
+
+Require the receipt and board projection to show the replacement owner and a
+new ownership generation before treating the Sprint as resumed.
+
 Exhausted recovery wake = bounded manual evidence: preserve unread message +
 failed wake, involve FnB, create no recursive fallback. Drift informs but never
 silently blocks resume.

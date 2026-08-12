@@ -157,7 +157,16 @@ class ConversationApiCase(unittest.TestCase):
                 "(sprint_id,feature_id,originating_planner_shell_id,"
                 "merge_grant_enabled) VALUES (7,31,1,1)"
             )
-            con.execute("UPDATE sprints SET lifecycle='armed' WHERE sprint_id=7")
+            con.execute(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness,model,effort,disposition) "
+                "VALUES (7,2,'reviewer','codex','gpt-test','high','idle')"
+            )
+            con.execute(
+                "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=1,lifecycle='armed' "
+                "WHERE sprint_id=7"
+            )
             participant_id = con.execute(
                 "INSERT INTO sprint_participants "
                 "(sprint_id,shell_id,role,harness,model,effort,disposition) "

@@ -2169,6 +2169,12 @@ Pass = tree clean, or on a pushed branch with a PR. A dirty/unpushed tree forces
 
 Only after the PR is merged:
 
+A managed worktree whose Sprint is already `completed` is the exception: the
+Sprint cleanup service owns its reset after live turns exit. Do not race that
+service with manual Git cleanup. A pending or failed cleanup makes the slot
+unavailable until `sc sprint cleanup-status --sprint <id>` reports succeeded;
+the originating Planner or FnB uses the Sprint retry surface.
+
 1. Re-pin the base. In a worktree `git checkout main` fails (main is checked out at the repo root; git refuses a branch checked out elsewhere) -> `git checkout shell/<shortname> && git fetch origin && git reset --hard origin/main`. Admin at repo root: `git pull --ff-only` on main.
 2. `git branch -d <branch>`. Squash-merged -> `-d` refuses (commits aren''t ancestors of main); confirm the PR shows *merged* on the remote -> `git branch -D <branch>`.
 3. `git fetch --prune`.
@@ -3636,19 +3642,22 @@ changed it or the next command requires live revalidation.
 
 ## Route the entry
 
-- **Reviewer receives `sprint.delivery_terminal`.** Load `sprint_rev` and follow
-  **Delivery-terminal closeout**. Inspect the Sprint inbox once, compile bounded
-  evidence, and choose between in-Sprint re-entry, abort, or the atomic clean
-  `record-conformance` path. The Planner does not initiate this pass.
+- **Selected conformance Reviewer receives `sprint.delivery_terminal`.** Confirm
+  the notification''s owner shell and generation match the current Sprint.
+  Load `sprint_rev` and follow **Delivery-terminal closeout**. Inspect the Sprint
+  inbox once, compile bounded evidence, and choose between in-Sprint re-entry,
+  abort, or the atomic clean `record-conformance` path. Any other Reviewer
+  records no conformance. The Planner does not initiate this pass.
 - **Planner receives a Sprint-scoped Reviewer decision.** Load `sprint_pln` and
   follow **Reviewer decision actions**. Inspect and handle the durable inbox
   message once, then execute the exact requested transition without
   re-adjudicating it.
-- **Planner receives the engine-wide clean-completion receipt.** Load
+- **Planner receives an engine-wide completion or cleanup receipt.** Load
   `sprint_pln` and follow **Conclude or abort**. Inspect the self-contained
-  receipt and terminal Sprint state directly. Do not run the Sprint inbox,
-  accept the receipt, compile another report, run `complete`, or wait for a
-  second close handoff.
+  receipt and terminal Sprint state directly. The completion receipt leaves
+  cleanup pending; the later cleanup receipt makes reuse or recovery explicit.
+  Do not run the Sprint inbox, accept the receipt, compile another report, or
+  run `complete`.
 - **FnB directs a fallback or follow-up disposition.** Use the bounded surfaces
   below and name FnB authority in the evidence.
 
@@ -3672,6 +3681,12 @@ report-authoring Reviewer. Do not manually close peer chats as an extra
 closeout step. Pause, abort, re-entry, failed conformance, and rejected fallback
 completion never invoke this cleanup.
 
+Successful close schedules exact participant-worktree and Sprint-artifact
+cleanup. No role manually resets those targets after completion. The initial
+Planner receipt reports pending cleanup; the System later sends succeeded or
+failed cleanup evidence. A failed receipt names the bounded status and retry
+commands.
+
 If a command rejects a decision, preserve the returned durable state. Do not
 substitute another transition or invent an alternate handoff. Return the
 conflict to the deciding role, or surface it to FnB when the relay itself is
@@ -3691,6 +3706,21 @@ Raise the limit only when truncation counters omit needed evidence; 200 is the
 maximum. The packet supplies facts, not judgment. The standalone `complete`
 surface is likewise an FnB-directed recovery fallback, never the normal clean
 close path.
+
+FnB may inspect any completed Sprint''s bounded cleanup state, retry failed
+targets, or explicitly adopt exactly one historical completed Sprint that has
+no targets. Target identities are System-derived; never supply a path or add a
+confirmation handshake:
+
+```text
+sc sprint cleanup-status --sprint <id>
+sc sprint cleanup --sprint <id> --key <stable-retry-key>
+sc sprint cleanup --sprint <legacy-id> --adopt-legacy \
+  --key <stable-adoption-key>
+```
+
+Require the cleanup request id, `created`, action, exact target ids, and
+aggregate projection. Reuse a key only for the identical request.
 
 Abort remains a Planner action on a Reviewer decision or FnB override and
 deletes nothing:
@@ -3987,7 +4017,7 @@ Load `sprint_pln` on every entry, then classify:
 | Trigger | Route |
 |---|---|
 | Sprint decision, merged-work handoff, question, blocker, relay | Inspect `sc sprint inbox --sprint <id>` once; handle that message. |
-| Self-contained clean-completion receipt | Inspect receipt + terminal state directly; it is informational—do not run the Sprint inbox, accept it, or close again. |
+| Engine-wide completion or cleanup receipt | Inspect receipt + terminal state directly; it is informational—do not run the Sprint inbox, accept it, or close again. |
 | Live FnB instruction | Act under board override; name FnB authority in durable evidence. |
 
 Do not poll. Armed runtime owns scheduled dispatch + unread wake recovery;
@@ -4131,6 +4161,19 @@ unread messages, wakes, units, PRs, capacity, and spec drift:
 sc sprint resume --sprint <id> [--reason <validated-reconciliation-reason>]
 ```
 
+Preserve the current conformance owner on ordinary resume. Replace that owner
+only while paused, only with an eligible participating Reviewer, and always
+record a reason:
+
+```text
+sc sprint resume --sprint <id> \
+  --conformance-reviewer-shell <replacement-shell-id> \
+  --reason <ownership-replacement-reason>
+```
+
+Require the receipt and board projection to show the replacement owner and a
+new ownership generation before treating the Sprint as resumed.
+
 Exhausted recovery wake = bounded manual evidence: preserve unread message +
 failed wake, involve FnB, create no recursive fallback. Drift informs but never
 silently blocks resume.
@@ -4235,6 +4278,22 @@ report-authoring Reviewer remain open. Do not manually close peer chats. Pause,
 abort, re-entry, failed conformance, and rejected fallback retain no-cleanup
 behavior.
 
+The initial completion receipt reports `cleanup_state=pending`. Delivery is
+finished, but managed worktrees are not reusable. Stop for the engine-wide
+cleanup receipt; do not poll or manually reset participant trees. On
+`cleanup_state=succeeded`, treat the slots as reusable. On failure, inspect once
+and retry only after correcting the named condition:
+
+```text
+sc sprint cleanup-status --sprint <id>
+sc sprint cleanup --sprint <id> --key <stable-retry-key>
+```
+
+Require `created`, cleanup request id, action, exact target ids, and aggregate
+projection. Reuse the key only for the same request. FnB alone may add
+`--adopt-legacy` for a completed Sprint with no scheduled targets; neither caller
+supplies a path.
+
 Do not compile or editorialize by default; Reviewer owns evidence/report. Only
 FnB-directed fallback may run:
 
@@ -4259,9 +4318,11 @@ On it:
 5. Require durable assignments + New wakes, then stop. Run no trailing command.
    Empty dispatch remains final; investigate only on a later durable wake.
 
-On a clean completion receipt, verify terminal Sprint + bounded receipt; run no
-close command. Planner does not author a second report, accept an actionable
-handoff, or wait for another actor to finish the Sprint.',
+On an initial clean completion receipt, verify the named Sprint is terminal and
+record `cleanup_state=pending`; run no close command. Stop until the
+engine-authored cleanup success or failure receipt arrives. The Planner does
+not author a second report, accept an actionable handoff, poll cleanup, or ask
+another role to reset a worktree.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -4341,6 +4402,7 @@ Refuse arming when any of these is true:
 - a dependency cycle exists;
 - a work unit lacks an assigned Developer or Reviewer;
 - participant routes or required capacity are unavailable;
+- a selected shell has an unresolved cleanup target from an earlier Sprint;
 - another Sprint is armed, or a selected shell already participates in an armed
   Sprint; or
 - the merge grant was not committed as part of the final plan.
@@ -4417,22 +4479,38 @@ for the originating Planner. Keep the Sprint prepared while shaping the plan.
 
 ## Final arming check
 
-Immediately before arming, re-read the exact spec revision hashes, available
-QA/QC evidence, task coverage, participant routes and capacity, single-armed
-invariant, repository access, and merge grant. Review evidence is summarized,
-never interpreted as authorization. The final read and durable plan commit
-belong to the authoritative arming transaction; external harness and GitHub
-work occurs after it commits.
+Immediately before arming, select exactly one participating Reviewer as the
+whole-Sprint conformance owner. Then re-read the exact spec revision hashes,
+available QA/QC evidence, task coverage, participant routes and capacity,
+single-armed invariant, repository access, prior-Sprint cleanup state, and
+merge grant.
+Review evidence is summarized, never interpreted as authorization. The final
+read and durable plan commit belong to the authoritative arming transaction;
+external harness and GitHub work occurs after it commits.
+
+If arming reports an unresolved cleanup target, inspect it once and act on its
+named recovery instead of manually changing that worktree:
+
+```text
+sc sprint cleanup-status --sprint <prior-sprint-id>
+sc sprint cleanup --sprint <prior-sprint-id> --key <stable-retry-key>
+```
+
+Only the originating Planner or FnB retries a failed scheduled cleanup. Only
+FnB may add `--adopt-legacy` for one completed Sprint that predates scheduling.
+Successful retry writes return cleanup to `pending`; native runtime and launch
+preflight own execution.
 
 Arming succeeds only when the first assignments and wake intents are durable.
 A process crash after commit is outbox recovery; a crash before commit exposes
 no partial Sprint.
 
 ```text
-sc sprint arm --sprint <id>
+sc sprint arm --sprint <id> --conformance-reviewer-shell <shell-id>
 ```
 
-After `arm` succeeds, participant pickup belongs to native delivery. The armed
+Require the receipt to identify the selected owner. After `arm` succeeds,
+participant pickup belongs to native delivery. The armed
 runtime dispatches ready work and wake recovery reconciles unread pickup; the
 preparing Planner does not manually boot participants or create a second wake
 path. Initial assignments use Force-new delivery; a live turn reaches its
@@ -4649,7 +4727,10 @@ surface; an unrecorded verdict cannot unlock merge.
 ## Delivery-terminal closeout
 
 Retain the exact notification message id + delivered wake as this closeout
-episode''s identity. Inspect inbox, lifecycle, and units first:
+episode''s identity. Proceed only when the notification names this shell as the
+selected conformance owner for its current ownership generation. A different
+Reviewer accepts the informational notification if received and records no
+conformance. Inspect inbox, lifecycle, and units first:
 
 - Already completed/aborted -> `accept` notification and stop.
 - If any non-terminal unit is visible, the wake is stale -> `accept`, stop, and
@@ -4709,7 +4790,10 @@ sc sprint record-conformance \
 Require receipt: conformance report id, final report id, follow-up ids,
 completed state, Planner message id, and Planner wake id. The transaction adds
 append-only evidence, follow-ups, terminal state, and one informational engine-wide Planner Re-enter;
-send no conclude message. Successful conformance also closes other Sprint-linked
+send no conclude message. Require cleanup projection `pending`; cleanup runs
+after participant turns exit. Do not reset a worktree, poll cleanup, or wait
+before stopping. The Planner receives the later engine-authored receipt.
+Successful conformance also closes other Sprint-linked
 chats while the originating Planner + report-authoring Reviewer stay open. Do
 not manually close peer chats. Pause, abort, re-entry, failed conformance, and
 rejected fallback retain no-cleanup behavior. Never reopen editing after recording; a re-enter defers
@@ -4724,8 +4808,8 @@ For closeout, first re-run `sc sprint inbox --sprint <id>`, handle + `accept`
 new messages, then confirm every artifact/body is final and below 8,000.
 
 - Clean conclude -> run the atomic `record-conformance` command above as the
-  literal final action. When it confirms completed state and all receipt
-  identities, stop immediately; Planner is notified.
+  literal final action. When it confirms completed state, pending cleanup, and
+  all receipt identities, stop immediately; Planner is notified.
 - Re-enter/abort -> as literal final action send:
 
 ```text

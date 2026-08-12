@@ -1590,16 +1590,22 @@ class WakeDeliveryTest(SprintMessageCase):
                 (feature_id,),
             ).lastrowid
         )
-        self.con.execute(
-            "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?",
-            (armed_sprint_id,),
-        )
         armed_planner_id = int(
             self.con.execute(
                 "INSERT INTO sprint_participants "
                 "(sprint_id,shell_id,role,harness) VALUES (?,3,'planner','codex')",
                 (armed_sprint_id,),
             ).lastrowid
+        )
+        self.con.execute(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness) VALUES (?,2,'reviewer','codex')",
+            (armed_sprint_id,),
+        )
+        self.con.execute(
+            "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+            "conformance_owner_generation=1,lifecycle='armed' WHERE sprint_id=?",
+            (armed_sprint_id,),
         )
         self.con.commit()
 
@@ -1726,7 +1732,13 @@ class WakeDeliveryTest(SprintMessageCase):
             ).lastrowid
         )
         self.con.execute(
-            "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?",
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness) VALUES (?,2,'reviewer','codex')",
+            (armed_sprint_id,),
+        )
+        self.con.execute(
+            "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+            "conformance_owner_generation=1,lifecycle='armed' WHERE sprint_id=?",
             (armed_sprint_id,),
         )
         self.con.commit()

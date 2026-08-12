@@ -72,6 +72,14 @@ class SprintInvariantError(SprintLifecycleError):
     """The durable Sprint plan is not eligible for the requested transition."""
 
 
+class SprintConflictError(SprintInvariantError):
+    """A bounded durable-state conflict prevents the requested transition."""
+
+    def __init__(self, message: str, details: dict) -> None:
+        self.details = details
+        super().__init__(message)
+
+
 class SprintPreflightError(SprintInvariantError):
     """The selected participant route is incompatible with this runtime."""
 
@@ -364,7 +372,13 @@ class SprintLifecycleStore:
         ).fetchone()
         return int(row[0]) if row is not None else None
 
-    def arm(self, sprint_id: int, planner_shell_id: int) -> list[int]:
+    def arm(
+        self,
+        sprint_id: int,
+        planner_shell_id: int,
+        *,
+        conformance_reviewer_shell_id: int | None = None,
+    ) -> list[int]:
         """Arm an eligible prepared Sprint and release initial work atomically.
 
         The returned IDs name the committed wake intents.  A uniqueness failure
@@ -375,6 +389,7 @@ class SprintLifecycleStore:
         preflight_fingerprint = self._preflight_arm(
             sprint_id,
             actor,
+            conformance_reviewer_shell_id=conformance_reviewer_shell_id,
         )
         with db_driver.write_transaction(self.con, "sprint.arm"):
             sprint = self._sprint(sprint_id)
@@ -385,6 +400,11 @@ class SprintLifecycleStore:
             self._require_edge(sprint["lifecycle"], "armed")
             self._authorize(sprint, "armed", actor)
             planner_participant, selections = self._validate_arm_plan(sprint)
+            selected_owner = self._resolve_conformance_owner(
+                sprint_id,
+                conformance_reviewer_shell_id,
+                allow_single_reviewer_default=True,
+            )
             self._require_prior_cleanup_resolved(sprint_id)
             current_fingerprint = self._participant_selection_fingerprint(
                 sprint_id
@@ -394,6 +414,12 @@ class SprintLifecycleStore:
                     "participant launch selections changed during harness "
                     "preflight; retry arm"
                 )
+            self._set_conformance_owner(
+                sprint,
+                selected_owner,
+                actor,
+                reason="selected while arming",
+            )
             self._update_lifecycle(
                 sprint_id,
                 current="prepared",
@@ -427,6 +453,8 @@ class SprintLifecycleStore:
         self,
         sprint_id: int,
         actor: LifecycleActor,
+        *,
+        conformance_reviewer_shell_id: int | None,
     ) -> str:
         """Probe one immutable route snapshot before arm takes a write lock."""
         if self.con.in_transaction:
@@ -441,6 +469,11 @@ class SprintLifecycleStore:
         self._require_edge(sprint["lifecycle"], "armed")
         self._authorize(sprint, "armed", actor)
         self._validate_arm_plan(sprint)
+        self._resolve_conformance_owner(
+            sprint_id,
+            conformance_reviewer_shell_id,
+            allow_single_reviewer_default=True,
+        )
         self._require_prior_cleanup_resolved(sprint_id)
         try:
             routes = sprint_participant_chats.prepare_sprint_participant_routes(
@@ -529,8 +562,8 @@ class SprintLifecycleStore:
             ).changed
         cleanup_targets: tuple[sprint_cleanup.CleanupTargetDraft, ...] = ()
         if target == "completed":
-            current = self._sprint(sprint_id)
-            if current["lifecycle"] == "completed":
+            current_sprint = self._sprint(sprint_id)
+            if current_sprint["lifecycle"] == "completed":
                 return False
             cleanup_targets = self.cleanup_store.prepare_targets(sprint_id)
         closed_conversation_ids: tuple[str, ...] = ()
@@ -549,37 +582,28 @@ class SprintLifecycleStore:
                 raise SprintInvariantError(
                     f"{target} transition requires terminal_outcome"
                 )
-            self._update_lifecycle(
-                sprint_id,
-                current=current,
-                target=target,
-                outcome=terminal_outcome,
-            )
             if target == "completed":
-                closed_conversation_ids = (
-                    self._close_completed_participant_chats_in_transaction(sprint_id)
-                )
-                self._clear_coordinate_mode(
+                assert terminal_outcome is not None
+                closed_conversation_ids = self.complete_in_transaction(
                     sprint_id,
                     actor,
-                    reason="Sprint closed by FnB",
+                    reason=reason or "Sprint completed",
+                    terminal_outcome=terminal_outcome,
+                    cleanup_targets=cleanup_targets,
                 )
-            event_payload = {"from": current, "reason": reason}
-            if target == "completed":
-                event_payload["closed_conversation_ids"] = list(
-                    closed_conversation_ids
-                )
-            if target == "completed":
-                self.cleanup_store.schedule_in_transaction(
+            else:
+                self._update_lifecycle(
                     sprint_id,
-                    cleanup_targets,
+                    current=current,
+                    target=target,
+                    outcome=terminal_outcome,
                 )
-            self._event(
-                sprint_id,
-                f"lifecycle.{target}",
-                actor,
-                event_payload,
-            )
+                self._event(
+                    sprint_id,
+                    f"lifecycle.{target}",
+                    actor,
+                    {"from": current, "reason": reason},
+                )
         notification_error: Exception | None = None
         for conversation_id in closed_conversation_ids:
             try:
@@ -590,6 +614,52 @@ class SprintLifecycleStore:
         if notification_error is not None:
             raise notification_error
         return True
+
+    def complete_in_transaction(
+        self,
+        sprint_id: int,
+        actor: LifecycleActor,
+        *,
+        reason: str,
+        terminal_outcome: str,
+        cleanup_targets: tuple[sprint_cleanup.CleanupTargetDraft, ...],
+    ) -> tuple[str, ...]:
+        """Complete one terminal Sprint inside the caller's write transaction."""
+        if not self.con.in_transaction:
+            raise RuntimeError("Sprint completion requires an active transaction")
+        reason = self._required_text(reason, "completion reason", 2000)
+        terminal_outcome = self._required_text(
+            terminal_outcome, "terminal outcome", 2000
+        )
+        sprint = self._sprint(sprint_id)
+        current = str(sprint["lifecycle"])
+        self._require_edge(current, "completed")
+        self._authorize(sprint, "completed", actor)
+        self._assert_terminal_work_in_transaction(sprint_id)
+        self._update_lifecycle(
+            sprint_id,
+            current=current,
+            target="completed",
+            outcome=terminal_outcome,
+        )
+        closed = self._close_completed_participant_chats_in_transaction(sprint_id)
+        self.cleanup_store.schedule_in_transaction(sprint_id, cleanup_targets)
+        self._clear_coordinate_mode(
+            sprint_id,
+            actor,
+            reason="Sprint closed by FnB",
+        )
+        self._event(
+            sprint_id,
+            "lifecycle.completed",
+            actor,
+            {
+                "from": current,
+                "reason": reason,
+                "closed_conversation_ids": list(closed),
+            },
+        )
+        return closed
 
     def complete_from_conformance_in_transaction(
         self,
@@ -614,15 +684,13 @@ class SprintLifecycleStore:
         sprint = self._sprint(sprint_id)
         current = str(sprint["lifecycle"])
         self._require_edge(current, "completed")
-        reviewer = self.con.execute(
-            "SELECT 1 FROM sprint_participants WHERE sprint_id=? AND shell_id=? "
-            "AND role='reviewer'",
-            (sprint_id, reviewer_shell_id),
-        ).fetchone()
-        if reviewer is None:
+        if sprint["conformance_reviewer_shell_id"] is None or int(
+            sprint["conformance_reviewer_shell_id"]
+        ) != reviewer_shell_id:
             raise SprintAuthorityError(
-                "only a participating Reviewer may complete through conformance"
+                "only the selected conformance Reviewer may complete through conformance"
             )
+        self._assert_terminal_work_in_transaction(sprint_id)
         self._update_lifecycle(
             sprint_id,
             current=current,
@@ -692,6 +760,7 @@ class SprintLifecycleStore:
         actor: LifecycleActor,
         *,
         reason: str | None = None,
+        conformance_reviewer_shell_id: int | None = None,
         reconcile_in_transaction: Callable[[sqlite3.Connection], None] | None = None,
         external_anomalies: Iterable[str] = (),
     ) -> ResumeReceipt:
@@ -707,6 +776,15 @@ class SprintLifecycleStore:
             sprint = self._sprint(sprint_id)
             current = str(sprint["lifecycle"])
             if current == "armed":
+                if conformance_reviewer_shell_id is not None and (
+                    sprint["conformance_reviewer_shell_id"] is None
+                    or int(sprint["conformance_reviewer_shell_id"])
+                    != conformance_reviewer_shell_id
+                ):
+                    raise SprintConflictError(
+                        "conformance ownership changes require a paused Sprint",
+                        {"code": "conformance_owner_change_requires_pause"},
+                    )
                 return ResumeReceipt(False, (), (), (), (), (), anomalies)
             if current == "prepared":
                 raise SprintInvariantError(
@@ -715,6 +793,17 @@ class SprintLifecycleStore:
             self._require_edge(current, "armed")
             self._authorize(sprint, "armed", actor)
             self._require_prior_cleanup_resolved(sprint_id)
+            selected_owner = self._resolve_resume_conformance_owner(
+                sprint,
+                conformance_reviewer_shell_id,
+                reason=reason,
+            )
+            self._set_conformance_owner(
+                sprint,
+                selected_owner,
+                actor,
+                reason=reason or "preserved while resuming",
+            )
 
             # Armed is not externally visible until this transaction commits.
             # That permits active reconciliation notifications to be created
@@ -739,11 +828,17 @@ class SprintLifecycleStore:
                 sorted(set(reset_wake_ids) | set(reconciliation.wake_ids))
             )
             pause_receipt = reconciliation.pause_receipt
+            merge_pause_receipts: list[PauseReceipt] = []
             projected, resolved = (
-                self._reconcile_registered_prs_in_transaction(sprint_id)
+                self._reconcile_registered_prs_in_transaction(
+                    sprint_id,
+                    pause_receipts=merge_pause_receipts,
+                )
                 if pause_receipt is None
                 else ((), ())
             )
+            if pause_receipt is None and merge_pause_receipts:
+                pause_receipt = merge_pause_receipts[0]
             drift = self._spec_drift(sprint_id)
             all_anomalies = tuple(
                 dict.fromkeys((*anomalies, *self._local_reconciliation_anomalies(sprint_id)))
@@ -778,25 +873,27 @@ class SprintLifecycleStore:
                 )
             dispatched: tuple[int, ...] = ()
             if pause_receipt is None:
-                SprintWorkUnitStore(self.con)._queue_delivery_terminal(sprint_id)
-                planner = self._planner_participant_id(sprint_id)
-                dispatched = tuple(
-                    SprintWorkUnitStore(self.con)._dispatch_ready_locked(
-                        sprint_id,
-                        planner_participant_id=planner,
+                units = SprintWorkUnitStore(self.con, lifecycle_store=self)
+                pause_receipt = units._queue_delivery_terminal(sprint_id)
+                if pause_receipt is None:
+                    planner = self._planner_participant_id(sprint_id)
+                    dispatched = tuple(
+                        units._dispatch_ready_locked(
+                            sprint_id,
+                            planner_participant_id=planner,
+                        )
                     )
-                )
-                self._event(
-                    sprint_id,
-                    "lifecycle.armed",
-                    actor,
-                    {
-                        "from": current,
-                        "reason": reason,
-                        "reconciled": True,
-                        "dispatched_wake_ids": list(dispatched),
-                    },
-                )
+                    self._event(
+                        sprint_id,
+                        "lifecycle.armed",
+                        actor,
+                        {
+                            "from": current,
+                            "reason": reason,
+                            "reconciled": True,
+                            "dispatched_wake_ids": list(dispatched),
+                        },
+                    )
         if pause_receipt is not None:
             self._signal_interrupts_and_notifications(pause_receipt)
         else:
@@ -826,6 +923,7 @@ class SprintLifecycleStore:
             return ()
         pause = json.loads(str(report["body"]))
         pause_reason = pause.get("reason")
+        wake_ids: tuple[int, ...]
         if pause_reason == "wake_contention_exhausted":
             wake_ids = (int(pause["detail"]["wake_id"]),)
             classification = "contention_episode_reset"
@@ -1221,7 +1319,17 @@ class SprintLifecycleStore:
                         )
                         pause_receipt = reconciliation.pause_receipt
                         if pause_receipt is None:
-                            self._reconcile_registered_prs_in_transaction(sprint_id)
+                            merge_pause_receipts: list[PauseReceipt] = []
+                            self._reconcile_registered_prs_in_transaction(
+                                sprint_id,
+                                pause_receipts=merge_pause_receipts,
+                            )
+                            if merge_pause_receipts:
+                                pause_receipt = merge_pause_receipts[0]
+                            else:
+                                pause_receipt = SprintWorkUnitStore(
+                                    self.con, lifecycle_store=self
+                                )._queue_delivery_terminal(sprint_id)
             if pause_receipt is not None:
                 self._signal_interrupts_and_notifications(pause_receipt)
             elif run_ids or conversations:
@@ -1438,7 +1546,10 @@ class SprintLifecycleStore:
         }
 
     def _reconcile_registered_prs_in_transaction(
-        self, sprint_id: int
+        self,
+        sprint_id: int,
+        *,
+        pause_receipts: list[PauseReceipt] | None = None,
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         if not self.con.in_transaction:
             raise RuntimeError("PR reconciliation requires an active transaction")
@@ -1492,6 +1603,7 @@ class SprintLifecycleStore:
                         unit_ids,
                         transition_key=str(row["transition_key"]),
                         dispatch=False,
+                        pause_receipts=pause_receipts,
                     )
                     projected.extend(merge_ready)
             elif row["normalized_state"] == "closed":
@@ -2380,6 +2492,8 @@ class SprintLifecycleStore:
         self, receipt: PauseReceipt | AbortReceipt
     ) -> None:
         self._signal_notifications(receipt.notification_conversation_ids)
+        if receipt.changed and not receipt.notification_conversation_ids:
+            self.notify_commit()
         for run_id in receipt.interrupt_run_ids:
             try:
                 self.interrupt_run(run_id)
@@ -2402,6 +2516,12 @@ class SprintLifecycleStore:
                         LifecycleActor("system"),
                         {"run_id": run_id, "error": str(exc)[:2000]},
                     )
+
+    def signal_pause_receipt(self, receipt: PauseReceipt) -> None:
+        """Deliver one committed pause receipt to live runtime consumers."""
+        if self.con.in_transaction:
+            raise RuntimeError("pause signals require a committed transaction")
+        self._signal_interrupts_and_notifications(receipt)
 
     def _signal_notifications(self, conversation_ids: Iterable[str]) -> None:
         for conversation_id in sorted(set(conversation_ids)):
@@ -2449,9 +2569,7 @@ class SprintLifecycleStore:
             allowed = {"planner"}
         elif target == "paused":
             allowed = {"planner", "fnb", "participant", "system"}
-        elif edge == ("paused", "armed"):
-            allowed = {"planner", "fnb"}
-        elif target in {"completed", "aborted"}:
+        elif edge == ("paused", "armed") or target in {"completed", "aborted"}:
             allowed = {"planner", "fnb"}
         else:
             allowed = set()
@@ -2579,6 +2697,147 @@ class SprintLifecycleStore:
                 "arming requires recorded model selections for every participant"
             )
         return int(planner[0]), selections
+
+    def _eligible_conformance_reviewers(self, sprint_id: int) -> tuple[int, ...]:
+        return tuple(
+            int(row[0])
+            for row in self.con.execute(
+                "SELECT participant.shell_id FROM sprint_participants participant "
+                "JOIN shells shell ON shell.shell_id=participant.shell_id "
+                "WHERE participant.sprint_id=? AND participant.role='reviewer' "
+                "AND participant.disposition<>'declined' "
+                "AND COALESCE(shell.is_deleted,0)=0 ORDER BY participant.shell_id",
+                (sprint_id,),
+            )
+        )
+
+    def _resolve_conformance_owner(
+        self,
+        sprint_id: int,
+        requested_shell_id: int | None,
+        *,
+        allow_single_reviewer_default: bool,
+    ) -> int:
+        eligible = self._eligible_conformance_reviewers(sprint_id)
+        if requested_shell_id is None and allow_single_reviewer_default and len(eligible) == 1:
+            return eligible[0]
+        if requested_shell_id is None:
+            raise SprintPreflightError("arming requires a selected conformance Reviewer")
+        if requested_shell_id not in eligible:
+            raise SprintPreflightError(
+                f"shell {requested_shell_id} is not an active Reviewer participant"
+            )
+        return requested_shell_id
+
+    def _resolve_resume_conformance_owner(
+        self,
+        sprint: sqlite3.Row,
+        requested_shell_id: int | None,
+        *,
+        reason: str | None,
+    ) -> int:
+        sprint_id = int(sprint["sprint_id"])
+        eligible = self._eligible_conformance_reviewers(sprint_id)
+        current = sprint["conformance_reviewer_shell_id"]
+        current_owner = int(current) if current is not None else None
+        if requested_shell_id is None and current_owner in eligible:
+            return current_owner
+        if requested_shell_id is None:
+            command = (
+                f"sc sprint resume --sprint {sprint_id} "
+                "--conformance-reviewer-shell <shell_id> "
+                '--reason "replace closeout owner"'
+            )
+            raise SprintConflictError(
+                "Sprint has no eligible conformance owner; select one while paused",
+                {
+                    "code": "conformance_owner_required",
+                    "eligible_reviewer_shell_ids": list(eligible),
+                    "recovery_command": command,
+                },
+            )
+        if requested_shell_id not in eligible:
+            raise SprintPreflightError(
+                f"shell {requested_shell_id} is not an active Reviewer participant"
+            )
+        if current_owner is not None and requested_shell_id != current_owner:
+            self._required_text(reason or "", "ownership replacement reason", 2000)
+        return requested_shell_id
+
+    def _set_conformance_owner(
+        self,
+        sprint: sqlite3.Row,
+        shell_id: int,
+        actor: LifecycleActor,
+        *,
+        reason: str,
+    ) -> bool:
+        current = sprint["conformance_reviewer_shell_id"]
+        previous = int(current) if current is not None else None
+        if previous == shell_id:
+            return False
+        generation = int(sprint["conformance_owner_generation"]) + 1
+        self.con.execute(
+            "UPDATE sprints SET conformance_reviewer_shell_id=?,"
+            "conformance_owner_generation=?,updated_at=datetime('now'),"
+            "version=version WHERE sprint_id=?",
+            (shell_id, generation, int(sprint["sprint_id"])),
+        )
+        self._event(
+            int(sprint["sprint_id"]),
+            "conformance_owner.changed",
+            actor,
+            {
+                "previous_shell_id": previous,
+                "new_shell_id": shell_id,
+                "generation": generation,
+                "reason": reason,
+            },
+        )
+        return True
+
+    def _assert_terminal_work_in_transaction(self, sprint_id: int) -> None:
+        if not self.con.in_transaction:
+            raise RuntimeError("Sprint terminality requires an active transaction")
+        total = int(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_work_units WHERE sprint_id=?",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        rows = self.con.execute(
+            "SELECT work_unit_id,disposition FROM sprint_work_units "
+            "WHERE sprint_id=? AND disposition NOT IN ('completed','cancelled') "
+            "ORDER BY work_unit_id LIMIT 50",
+            (sprint_id,),
+        ).fetchall()
+        if total and not rows:
+            return
+        nonterminal_total = int(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_work_units WHERE sprint_id=? "
+                "AND disposition NOT IN ('completed','cancelled')",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        details = {
+            "code": "sprint_work_nonterminal" if total else "sprint_work_missing",
+            "work_unit_count": total,
+            "nonterminal_count": nonterminal_total,
+            "nonterminal_work_units": [
+                {
+                    "work_unit_id": int(row["work_unit_id"]),
+                    "disposition": str(row["disposition"]),
+                }
+                for row in rows
+            ],
+            "truncated": nonterminal_total > len(rows),
+        }
+        raise SprintConflictError(
+            "successful Sprint completion requires at least one work unit and "
+            "every work unit completed or cancelled",
+            details,
+        )
 
     def _queue_arming_planner_wake(
         self,
@@ -2980,9 +3239,15 @@ class SprintParticipantStore:
 class SprintWorkUnitStore:
     """Planner-owned work-unit planning and dependency-aware dispatch."""
 
-    def __init__(self, con: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        con: sqlite3.Connection,
+        *,
+        lifecycle_store: SprintLifecycleStore | None = None,
+    ) -> None:
         self.con = con
         self.con.row_factory = sqlite3.Row
+        self.lifecycle = lifecycle_store or SprintLifecycleStore(con)
 
     def create(
         self,
@@ -3255,6 +3520,8 @@ class SprintWorkUnitStore:
 
     def dispatch_ready(self, sprint_id: int) -> list[int]:
         """Release every dependency-ready unit that has shell capacity."""
+        pause_receipt: PauseReceipt | None = None
+        dispatched: list[int] = []
         with db_driver.write_transaction(self.con, "sprint.work_unit.dispatch"):
             sprint = self.con.execute(
                 "SELECT lifecycle,originating_planner_shell_id FROM sprints "
@@ -3263,17 +3530,21 @@ class SprintWorkUnitStore:
             ).fetchone()
             if sprint is None:
                 raise KeyError(f"unknown Sprint: {sprint_id}")
-            if sprint["lifecycle"] != "armed":
-                return []
-            planner = self._require_participant(
-                sprint_id,
-                int(sprint["originating_planner_shell_id"]),
-                "planner",
-            )
-            return self._dispatch_ready_locked(
-                sprint_id,
-                planner_participant_id=planner,
-            )
+            if sprint["lifecycle"] == "armed":
+                pause_receipt = self._queue_delivery_terminal(sprint_id)
+                if pause_receipt is None:
+                    planner = self._require_participant(
+                        sprint_id,
+                        int(sprint["originating_planner_shell_id"]),
+                        "planner",
+                    )
+                    dispatched = self._dispatch_ready_locked(
+                        sprint_id,
+                        planner_participant_id=planner,
+                    )
+        if pause_receipt is not None:
+            self.lifecycle.signal_pause_receipt(pause_receipt)
+        return dispatched
 
     def complete(
         self,
@@ -3292,6 +3563,8 @@ class SprintWorkUnitStore:
                 f"work-unit completion result is {len(result)} characters; "
                 "maximum is 8000"
             )
+        pause_receipt: PauseReceipt | None = None
+        dispatched: list[int] = []
         with db_driver.write_transaction(self.con, "sprint.work_unit.complete"):
             unit = self._unit(sprint_id, work_unit_id)
             if int(unit["assigned_shell_id"]) != shell_id:
@@ -3301,7 +3574,7 @@ class SprintWorkUnitStore:
                     raise SprintInvariantError(
                         "work unit was already completed with a different result"
                     )
-                return []
+                return dispatched
             if unit["output_kind"] not in {"report_only", "no_code"}:
                 raise SprintInvariantError(
                     "code work units complete only through the merge judgment chain"
@@ -3333,18 +3606,24 @@ class SprintWorkUnitStore:
                 "WHERE sprint_id=?",
                 (sprint_id,),
             ).fetchone()
-            self._queue_delivery_terminal(sprint_id)
-            if sprint["lifecycle"] != "armed":
-                return []
-            planner = self._require_participant(
-                sprint_id,
-                int(sprint["originating_planner_shell_id"]),
-                "planner",
-            )
-            return self._dispatch_ready_locked(
-                sprint_id,
-                planner_participant_id=planner,
-            )
+            pause_receipt = self._queue_delivery_terminal(sprint_id)
+            lifecycle = self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (sprint_id,),
+            ).fetchone()[0]
+            if lifecycle == "armed":
+                planner = self._require_participant(
+                    sprint_id,
+                    int(sprint["originating_planner_shell_id"]),
+                    "planner",
+                )
+                dispatched = self._dispatch_ready_locked(
+                    sprint_id,
+                    planner_participant_id=planner,
+                )
+        if pause_receipt is not None:
+            self.lifecycle.signal_pause_receipt(pause_receipt)
+        return dispatched
 
     def cancel(
         self,
@@ -3363,6 +3642,7 @@ class SprintWorkUnitStore:
                 f"work-unit cancellation reason is {len(reason)} characters; "
                 "maximum is 8000"
             )
+        pause_receipt: PauseReceipt | None = None
         with db_driver.write_transaction(self.con, "sprint.work_unit.cancel"):
             self._require_planner(sprint_id, planner_shell_id)
             unit = self._unit(sprint_id, work_unit_id)
@@ -3386,7 +3666,9 @@ class SprintWorkUnitStore:
                 planner_shell_id,
                 {"work_unit_id": work_unit_id, "reason": reason},
             )
-            self._queue_delivery_terminal(sprint_id)
+            pause_receipt = self._queue_delivery_terminal(sprint_id)
+        if pause_receipt is not None:
+            self.lifecycle.signal_pause_receipt(pause_receipt)
         return True
 
     def complete_from_merge_in_transaction(
@@ -3396,6 +3678,7 @@ class SprintWorkUnitStore:
         *,
         transition_key: str,
         dispatch: bool = True,
+        pause_receipts: list[PauseReceipt] | None = None,
     ) -> list[int]:
         """Project an observed merge, then release newly ready work atomically."""
         if not self.con.in_transaction:
@@ -3473,8 +3756,14 @@ class SprintWorkUnitStore:
                 actor_kind="system",
             )
         if changed:
-            self._queue_delivery_terminal(sprint_id)
-        if not changed or not dispatch or sprint["lifecycle"] != "armed":
+            pause_receipt = self._queue_delivery_terminal(sprint_id)
+            if pause_receipt is not None and pause_receipts is not None:
+                pause_receipts.append(pause_receipt)
+        lifecycle = self.con.execute(
+            "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+            (sprint_id,),
+        ).fetchone()[0]
+        if not changed or not dispatch or lifecycle != "armed":
             return []
         planner = self._require_participant(
             sprint_id,
@@ -3486,11 +3775,12 @@ class SprintWorkUnitStore:
             planner_participant_id=planner,
         )
 
-    def _queue_delivery_terminal(self, sprint_id: int) -> None:
+    def _queue_delivery_terminal(self, sprint_id: int) -> PauseReceipt | None:
         state = self.con.execute(
             "SELECT s.lifecycle,COUNT(u.work_unit_id) AS total,"
             "COALESCE(SUM(u.disposition='completed'),0) AS completed,"
-            "COALESCE(SUM(u.disposition='cancelled'),0) AS cancelled "
+            "COALESCE(SUM(u.disposition='cancelled'),0) AS cancelled,"
+            "s.conformance_reviewer_shell_id,s.conformance_owner_generation "
             "FROM sprints s LEFT JOIN sprint_work_units u USING (sprint_id) "
             "WHERE s.sprint_id=? GROUP BY s.lifecycle",
             (sprint_id,),
@@ -3501,21 +3791,67 @@ class SprintWorkUnitStore:
             or not state["total"]
             or state["total"] != state["completed"] + state["cancelled"]
         ):
-            return
+            return None
         total = int(state["total"])
+        owner_shell_id = state["conformance_reviewer_shell_id"]
+        owner = None
+        if owner_shell_id is not None:
+            owner = self.con.execute(
+                "SELECT participant.participant_id FROM sprint_participants participant "
+                "JOIN shells shell ON shell.shell_id=participant.shell_id "
+                "WHERE participant.sprint_id=? AND participant.shell_id=? "
+                "AND participant.role='reviewer' "
+                "AND participant.disposition<>'declined' "
+                "AND COALESCE(shell.is_deleted,0)=0",
+                (sprint_id, int(owner_shell_id)),
+            ).fetchone()
+        if owner is None:
+            lifecycle = self.lifecycle
+            eligible = lifecycle._eligible_conformance_reviewers(sprint_id)
+            command = (
+                f"sc sprint resume --sprint {sprint_id} "
+                "--conformance-reviewer-shell <shell_id> "
+                '--reason "replace closeout owner"'
+            )
+            detail = {
+                "code": "conformance_owner_required",
+                "eligible_reviewer_shell_ids": list(eligible),
+                "recovery_command": command,
+            }
+            sprint = lifecycle._sprint(sprint_id)
+            receipt = lifecycle._pause_in_transaction(
+                sprint,
+                LifecycleActor("system"),
+                reason="conformance_owner_required",
+                detail=detail,
+                notice_body=(
+                    f"Sprint {sprint_id} reached delivery terminal without an "
+                    "eligible conformance owner. Eligible Reviewer shell IDs: "
+                    f"{list(eligible)}. Recover with `{command}`."
+                ),
+            )
+            lifecycle._event(
+                sprint_id,
+                "conformance_owner.required",
+                LifecycleActor("system"),
+                detail,
+            )
+            return receipt
+        owner_shell_id = int(owner_shell_id)
+        generation = int(state["conformance_owner_generation"])
         if self.con.execute(
             "SELECT 1 FROM sprint_events WHERE sprint_id=? "
             "AND event_type='sprint.delivery_terminal' "
-            "AND json_extract(payload,'$.terminal_count')=?",
-            (sprint_id, total),
+            "AND json_extract(payload,'$.terminal_count')=? "
+            "AND json_extract(payload,'$.conformance_reviewer_shell_id')=? "
+            "AND json_extract(payload,'$.conformance_owner_generation')=?",
+            (sprint_id, total, owner_shell_id, generation),
         ).fetchone():
-            return
-        reviewers = self.con.execute(
-            "SELECT participant_id FROM sprint_participants "
-            "WHERE sprint_id=? AND role='reviewer' ORDER BY participant_id",
-            (sprint_id,),
-        ).fetchall()
-        base_key = f"sprint:{sprint_id}:delivery-terminal:{total}"
+            return None
+        base_key = (
+            f"sprint:{sprint_id}:delivery-terminal:{total}:"
+            f"owner:{owner_shell_id}:generation:{generation}"
+        )
         body = (
             f"All planned delivery work for Sprint {sprint_id} is terminal "
             f"({total} units: {int(state['completed'])} completed, "
@@ -3527,22 +3863,15 @@ class SprintWorkUnitStore:
         from sprint_message_delivery import SprintMessageStore
 
         messages = SprintMessageStore(self.con)
-        for reviewer in reviewers:
-            participant_id = int(reviewer["participant_id"])
-            key = (
-                base_key
-                if len(reviewers) == 1
-                else f"{base_key}:reviewer:{participant_id}"
-            )
-            messages.send_in_transaction(
-                sprint_id,
-                to_participant_id=participant_id,
-                message_kind="notification",
-                body=body,
-                actionable=False,
-                declared_type="new",
-                idempotency_key=key,
-            )
+        messages.send_in_transaction(
+            sprint_id,
+            to_participant_id=int(owner["participant_id"]),
+            message_kind="notification",
+            body=body,
+            actionable=False,
+            declared_type="new",
+            idempotency_key=base_key,
+        )
         self._event(
             sprint_id,
             "sprint.delivery_terminal",
@@ -3551,9 +3880,12 @@ class SprintWorkUnitStore:
                 "terminal_count": total,
                 "completed_count": int(state["completed"]),
                 "cancelled_count": int(state["cancelled"]),
+                "conformance_reviewer_shell_id": owner_shell_id,
+                "conformance_owner_generation": generation,
             },
             actor_kind="system",
         )
+        return None
 
     def _queue_planner_merge_bypass(
         self,

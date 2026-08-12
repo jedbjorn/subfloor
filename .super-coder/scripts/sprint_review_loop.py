@@ -12,6 +12,7 @@ import db_driver
 import sprint_liveness
 from github_pull_requests import GitHubPullRequestReader, PullRequest
 from sprint_domain import (
+    PauseReceipt,
     SprintAuthorityError,
     SprintInvariantError,
     SprintWorkUnitStore,
@@ -298,6 +299,7 @@ class SprintReviewLoopStore:
         *,
         transition_key: str,
         dispatch: bool = True,
+        pause_receipts: list[PauseReceipt] | None = None,
     ) -> list[int]:
         if not self.con.in_transaction:
             raise RuntimeError("merge observation requires an active transaction")
@@ -320,6 +322,7 @@ class SprintReviewLoopStore:
             unit_ids,
             transition_key=transition_key,
             dispatch=dispatch,
+            pause_receipts=pause_receipts,
         )
 
     def _lane(self, sprint_id: int, registered_pr_id: int) -> sqlite3.Row:
