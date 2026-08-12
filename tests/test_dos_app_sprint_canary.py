@@ -105,6 +105,7 @@ class FakeBackend:
         for name in (
             "planner_prepare",
             "kimi_qaqc",
+            "force_new_barrier",
             "declare_and_arm",
             "force_new_pre_delivery",
             "force_new_delivery",
@@ -249,6 +250,8 @@ def gate_board(
 class GateApi:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.barrier_active = True
+        self.delivery_attempts: list[tuple[str, bool]] = []
         self.boards = iter(
             [
                 gate_board(review="absent", column="dev"),
@@ -303,9 +306,13 @@ class GateApi:
         )
         self.conversations = iter([{"state": "queued"}, {"state": "running"}])
 
+    def attempt_delivery(self, boundary: str) -> None:
+        self.delivery_attempts.append((boundary, self.barrier_active))
+
     def request(self, method, path, *, body=None, key=None):
         self.calls.append((method, path))
         if method == "GET" and path == "/api/sprints/12":
+            self.attempt_delivery("board_observation")
             return next(self.boards)
         if method == "GET" and path == "/api/conversations/cv-review-qaqc":
             return {"version": 7, "state": "idle"}
@@ -327,17 +334,26 @@ class GateApi:
 
 
 class GateBackend(canary.HostBackend):
-    def _force_new_probe(
+    def _target_force_new_probe(
         self,
-        api,
-        config,
         facts,
+        probe,
         *,
-        reviewer_id,
+        sprint_id,
+        message_id,
+    ) -> None:
+        self.probe = (probe.reviewer_id, sprint_id, message_id)
+        self.gate_api.attempt_delivery("target_write")
+
+    def _collect_force_new_probe(
+        self,
+        facts,
+        probe,
+        *,
         sprint_id,
         message_id,
     ):
-        self.probe = (reviewer_id, sprint_id, message_id)
+        self.gate_api.attempt_delivery("proof_collection")
         return {
             "message_id": message_id,
             "inbox_absent": True,
@@ -346,6 +362,49 @@ class GateBackend(canary.HostBackend):
             "decline_rejected": True,
             "decline_http_status": 409,
         }
+
+    def _close_force_new_barrier(self, api, probe) -> None:
+        self.gate_api.attempt_delivery("before_close")
+        self.gate_api.barrier_active = False
+        self.closed_probe = probe.reviewer_id
+
+
+class SameChatGateApi(GateApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.boards = iter(
+            [
+                gate_board(review="absent", column="dev"),
+                gate_board(),
+                gate_board(),
+                gate_board(conversation_id="cv-review-qaqc"),
+            ]
+        )
+
+
+class MissingRecoveryGateApi(GateApi):
+    def __init__(self) -> None:
+        super().__init__()
+        exhausted = {
+            "event_id": 11,
+            "type": "wake.pickup_exhausted",
+            "details": {
+                "message_id": 680,
+                "conversation_id": "cv-review-first",
+                "run_state": "cancelled",
+                "error_code": "WAKE_PICKUP_EVIDENCE_INVALID",
+                "failure_class": "evidence_invalid",
+                "attempt_count": 1,
+            },
+        }
+        self.events = iter(
+            [
+                {"items": [{"event_id": 10, "type": "review.requested", "details": {}}]},
+                {"items": [exhausted]},
+                {"items": [exhausted]},
+                {"items": [exhausted]},
+            ]
+        )
 
 
 class DosAppSprintCanaryTest(unittest.TestCase):
@@ -457,6 +516,7 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             [
                 "stage:planner_prepare",
                 "stage:kimi_qaqc",
+                "stage:force_new_barrier",
                 "stage:declare_and_arm",
                 "stage:force_new_pre_delivery",
                 "stage:force_new_delivery",
@@ -600,14 +660,20 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         deadline = canary.Deadline(100, 50, clock=clock)
         backend = GateBackend(deadline, sleep=clock.advance)
         api = GateApi()
+        backend.gate_api = api
         stages: list[str] = []
+        probe = canary.ForceNewProbe(
+            reviewer_id="cv-review-qaqc",
+            target_path="/tmp/target",
+            proof_path="/tmp/proof",
+        )
 
         evidence, observed = backend._exercise_review_delivery_gates(
             cast(canary.JsonHttp, api),
             self.config,
             self.facts,
             sprint_id=12,
-            reviewer_id="cv-review-qaqc",
+            probe=probe,
             stage=lambda name: (deadline.enter(name), stages.append(name)),
         )
 
@@ -622,8 +688,17 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         )
         self.assertEqual(["dev", "review"], observed)
         self.assertEqual(("cv-review-qaqc", 12, 680), backend.probe)
+        self.assertEqual("cv-review-qaqc", backend.closed_probe)
         self.assertEqual(
-            {"version": 7, "state": "closed"}, api.closed_body
+            [
+                ("board_observation", True),
+                ("board_observation", True),
+                ("target_write", True),
+                ("proof_collection", True),
+                ("board_observation", True),
+                ("before_close", True),
+            ],
+            api.delivery_attempts[:6],
         )
         self.assertEqual({}, api.interruption_body)
         self.assertEqual(
@@ -658,6 +733,137 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         self.assertEqual(
             44, evidence["pickup_recovery"]["replacement_wake_id"]
         )
+
+    def test_force_new_barrier_is_running_before_orchestration_continues(self) -> None:
+        clock = FakeClock()
+        deadline = canary.Deadline(100, 50, clock=clock)
+        backend = canary.HostBackend(deadline, sleep=clock.advance)
+
+        class StartApi:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+                self.states = iter(["queued", "running"])
+
+            def request(self, method, path, *, body=None, key=None):
+                self.calls.append((method, path))
+                if method == "POST" and path.endswith("/messages"):
+                    self.body = body
+                    self.key = key
+                    return {"message": {"state": "queued"}}
+                if method == "GET" and path == "/api/conversations/cv-review-qaqc":
+                    return {"state": next(self.states)}
+                raise AssertionError(f"unexpected API call: {method} {path}")
+
+        api = StartApi()
+        probe = backend._start_force_new_barrier(
+            cast(canary.JsonHttp, api),
+            self.config,
+            reviewer_id="cv-review-qaqc",
+        )
+
+        self.assertEqual("cv-review-qaqc", probe.reviewer_id)
+        self.assertEqual(
+            [
+                ("POST", "/api/conversations/cv-review-qaqc/messages"),
+                ("GET", "/api/conversations/cv-review-qaqc"),
+                ("GET", "/api/conversations/cv-review-qaqc"),
+            ],
+            api.calls,
+        )
+        self.assertIn("wait_for(TARGET)", api.body["text"])
+        self.assertIn("controller did not close", api.body["text"])
+
+    def test_force_new_barrier_closes_while_running_and_fails_closed(self) -> None:
+        deadline = canary.Deadline(100, 50, clock=FakeClock())
+        backend = canary.HostBackend(deadline, sleep=lambda _: None)
+        probe = canary.ForceNewProbe(
+            "cv-review-qaqc", "/tmp/target", "/tmp/proof"
+        )
+
+        class CloseApi:
+            def __init__(self, state="running", closed_state="closed") -> None:
+                self.state = state
+                self.closed_state = closed_state
+                self.calls = []
+
+            def request(self, method, path, *, body=None, key=None):
+                self.calls.append((method, path, body))
+                if method == "GET":
+                    return {"state": self.state, "version": 9}
+                if method == "PATCH":
+                    return {"state": self.closed_state}
+                raise AssertionError(f"unexpected API call: {method} {path}")
+
+        api = CloseApi()
+        backend._close_force_new_barrier(cast(canary.JsonHttp, api), probe)
+        self.assertEqual(
+            {
+                "version": 9,
+                "state": "closed",
+            },
+            api.calls[-1][2],
+        )
+
+        for label, failed_api in {
+            "control turn stopped": CloseApi(state="idle"),
+            "close not durable": CloseApi(closed_state="running"),
+        }.items():
+            with self.subTest(label=label), self.assertRaises(
+                canary.CanaryError
+            ) as raised:
+                backend._close_force_new_barrier(
+                    cast(canary.JsonHttp, failed_api), probe
+                )
+            self.assertEqual("CANARY_FORCE_NEW_BARRIER_FAILED", raised.exception.code)
+
+    def test_force_new_gate_rejects_same_chat_delivery(self) -> None:
+        clock = FakeClock()
+        deadline = canary.Deadline(100, 50, clock=clock)
+        backend = GateBackend(deadline, sleep=clock.advance)
+        api = SameChatGateApi()
+        backend.gate_api = api
+        probe = canary.ForceNewProbe(
+            "cv-review-qaqc", "/tmp/target", "/tmp/proof"
+        )
+
+        with self.assertRaisesRegex(
+            canary.CanaryError, "retained the pre-delivery Reviewer chat"
+        ) as raised:
+            backend._exercise_review_delivery_gates(
+                cast(canary.JsonHttp, api),
+                self.config,
+                self.facts,
+                sprint_id=12,
+                probe=probe,
+                stage=lambda name: deadline.enter(name),
+            )
+
+        self.assertEqual("CANARY_FORCE_NEW_DELIVERY_FAILED", raised.exception.code)
+        self.assertTrue(all(active for _, active in api.delivery_attempts[:6]))
+
+    def test_pickup_gate_rejects_acceptance_without_requeue_evidence(self) -> None:
+        clock = FakeClock()
+        deadline = canary.Deadline(100, 50, clock=clock)
+        backend = GateBackend(deadline, sleep=clock.advance)
+        api = MissingRecoveryGateApi()
+        backend.gate_api = api
+        probe = canary.ForceNewProbe(
+            "cv-review-qaqc", "/tmp/target", "/tmp/proof"
+        )
+
+        with self.assertRaisesRegex(
+            canary.CanaryError, "without durable requeue evidence"
+        ) as raised:
+            backend._exercise_review_delivery_gates(
+                cast(canary.JsonHttp, api),
+                self.config,
+                self.facts,
+                sprint_id=12,
+                probe=probe,
+                stage=lambda name: deadline.enter(name),
+            )
+
+        self.assertEqual("CANARY_PICKUP_RECOVERY_FAILED", raised.exception.code)
 
     def test_partial_orchestration_failure_still_cleans_and_redacts_receipt(
         self,

@@ -156,6 +156,13 @@ class CommandResult:
     returncode: int
 
 
+@dataclasses.dataclass(frozen=True)
+class ForceNewProbe:
+    reviewer_id: str
+    target_path: str
+    proof_path: str
+
+
 class Backend(Protocol):
     """Side-effect boundary used by the live backend and hermetic tests."""
 
@@ -1248,24 +1255,54 @@ class HostBackend:
         if isinstance(column, str) and (not observed or observed[-1] != column):
             observed.append(column)
 
-    def _force_new_probe(
+    def _wait_running(
         self,
         api: JsonHttp,
         config: CanaryConfig,
-        facts: Preflight,
+        conversation_id: str,
+    ) -> None:
+        while True:
+            conversation = api.request("GET", f"/api/conversations/{conversation_id}")
+            state = conversation.get("state")
+            if state == "running":
+                return
+            if state in {"idle", "error", "closed"}:
+                raise CanaryError(
+                    "CANARY_FORCE_NEW_BARRIER_FAILED",
+                    "Reviewer control turn terminalized before establishing the barrier",
+                    details={"conversation_id": conversation_id, "state": state},
+                )
+            self.deadline.remaining()
+            self.sleep(min(0.05, self.deadline.remaining()))
+
+    def _start_force_new_barrier(
+        self,
+        api: JsonHttp,
+        config: CanaryConfig,
         *,
         reviewer_id: str,
-        sprint_id: int,
-        message_id: int,
-    ) -> dict[str, Any]:
-        proof_path = f"/tmp/subfloor-canary-{config.run_id}-force-new.json"
-        probe_program = f'''from pathlib import Path
+    ) -> ForceNewProbe:
+        prefix = f"/tmp/subfloor-canary-{config.run_id}-force-new"
+        probe = ForceNewProbe(
+            reviewer_id=reviewer_id,
+            target_path=prefix + "-target.json",
+            proof_path=prefix + "-proof.json",
+        )
+        program = f'''from pathlib import Path
 import json
 import re
 import subprocess
+import time
 
-SPRINT_ID = {sprint_id}
-MESSAGE_ID = {message_id}
+TARGET = Path({probe.target_path!r})
+PROOF = Path({probe.proof_path!r})
+DEADLINE = time.monotonic() + {max(1.0, config.whole_timeout_s)!r}
+
+def wait_for(path):
+    while not path.is_file():
+        if time.monotonic() >= DEADLINE:
+            raise TimeoutError(f"timed out waiting for {{path.name}}")
+        time.sleep(0.05)
 
 def run(*args):
     result = subprocess.run(
@@ -1283,6 +1320,14 @@ def run(*args):
         "stdout": result.stdout,
     }}
 
+wait_for(TARGET)
+target = json.loads(TARGET.read_text())
+SPRINT_ID = target["sprint_id"]
+MESSAGE_ID = target["message_id"]
+if not isinstance(SPRINT_ID, int) or SPRINT_ID <= 0:
+    raise ValueError("invalid Sprint id")
+if not isinstance(MESSAGE_ID, int) or MESSAGE_ID <= 0:
+    raise ValueError("invalid review message id")
 inbox = run("inbox", "--sprint", str(SPRINT_ID))
 inbox_parsed = False
 try:
@@ -1290,9 +1335,7 @@ try:
     inbox_parsed = isinstance(inbox_payload.get("messages"), list)
 except json.JSONDecodeError:
     inbox_payload = {{}}
-accept = run(
-    "accept", "--sprint", str(SPRINT_ID), "--message", str(MESSAGE_ID)
-)
+accept = run("accept", "--sprint", str(SPRINT_ID), "--message", str(MESSAGE_ID))
 decline = run(
     "decline", "--sprint", str(SPRINT_ID), "--message", str(MESSAGE_ID),
     "--reason", "canary pre-delivery rejection probe",
@@ -1308,25 +1351,38 @@ proof = {{
     "accept": {{key: accept[key] for key in ("returncode", "http_status", "not_delivered")}},
     "decline": {{key: decline[key] for key in ("returncode", "http_status", "not_delivered")}},
 }}
-Path({proof_path!r}).write_text(json.dumps(proof, sort_keys=True) + "\\n")
+temporary = PROOF.with_suffix(".tmp")
+temporary.write_text(json.dumps(proof, sort_keys=True) + "\\n")
+temporary.replace(PROOF)
+while time.monotonic() < DEADLINE:
+    time.sleep(0.05)
+raise TimeoutError("controller did not close the Force-new barrier")
 '''
         self._message(
             api,
             reviewer_id,
             (
                 "This is the exact-ref canary's pre-delivery control turn, not the "
-                "pending review wake. Do not review or rotate this chat. Run the Python "
-                "program below exactly once; it performs one Sprint inbox read and the "
-                "direct accept and decline probes through public CLI surfaces, writes only "
-                "bounded status evidence, and changes no Sprint state on success. Then stop.\n\n"
-                "```python\n"
-                + probe_program
-                + "```"
+                "pending review wake. Run the Python program below exactly once. It "
+                "establishes a live barrier, waits for the controller's message identity, "
+                "runs the public Sprint inbox/accept/decline probes, writes bounded proof, "
+                "and stays live until the controller releases it.\n\n"
+                "```python\n" + program + "```"
             ),
-            f"{config.run_id}:reviewer:force-new-probe",
+            f"{config.run_id}:reviewer:force-new-barrier",
         )
-        self._wait_idle(api, reviewer_id, config)
-        result = self._run(
+        self._wait_running(api, config, reviewer_id)
+        return probe
+
+    def _write_probe_file(
+        self,
+        facts: Preflight,
+        path: str,
+        content: str,
+        *,
+        label: str,
+    ) -> None:
+        self._run(
             [
                 "docker",
                 "exec",
@@ -1335,17 +1391,103 @@ Path({proof_path!r}).write_text(json.dumps(proof, sort_keys=True) + "\\n")
                 "-c",
                 (
                     "from pathlib import Path; import sys; "
-                    "sys.stdout.write(Path(sys.argv[1]).read_text())"
+                    "target=Path(sys.argv[1]); temporary=target.with_suffix('.tmp'); "
+                    "temporary.write_text(sys.argv[2]); temporary.replace(target)"
                 ),
-                proof_path,
+                path,
+                content,
             ],
-            label="read bounded Force-new gate proof",
+            label=label,
         )
+
+    def _target_force_new_probe(
+        self,
+        facts: Preflight,
+        probe: ForceNewProbe,
+        *,
+        sprint_id: int,
+        message_id: int,
+    ) -> None:
+        body = json.dumps(
+            {"sprint_id": sprint_id, "message_id": message_id},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        self._write_probe_file(
+            facts,
+            probe.target_path,
+            body + "\n",
+            label="target active Force-new gate probe",
+        )
+
+    def _collect_force_new_probe(
+        self,
+        facts: Preflight,
+        probe: ForceNewProbe,
+        *,
+        sprint_id: int,
+        message_id: int,
+    ) -> dict[str, Any]:
+        while True:
+            result = self._run(
+                [
+                    "docker",
+                    "exec",
+                    facts.container,
+                    "python3",
+                    "-c",
+                    (
+                        "from pathlib import Path; import sys; path=Path(sys.argv[1]); "
+                        "sys.stdout.write(path.read_text()) if path.is_file() "
+                        "else sys.exit(3)"
+                    ),
+                    probe.proof_path,
+                ],
+                check=False,
+                label="read bounded Force-new gate proof",
+            )
+            if result.returncode == 0:
+                break
+            if result.returncode != 3:
+                raise CanaryError(
+                    "CANARY_FORCE_NEW_BARRIER_FAILED",
+                    "cannot read the active Reviewer gate proof",
+                    details={"returncode": result.returncode},
+                )
+            self.deadline.remaining()
+            self.sleep(min(0.05, self.deadline.remaining()))
         return self._validate_force_new_probe(
             _json_output(result, label="read bounded Force-new gate proof"),
             sprint_id=sprint_id,
             message_id=message_id,
         )
+
+    def _close_force_new_barrier(
+        self,
+        api: JsonHttp,
+        probe: ForceNewProbe,
+    ) -> None:
+        reviewer = api.request("GET", f"/api/conversations/{probe.reviewer_id}")
+        if reviewer.get("state") != "running":
+            raise CanaryError(
+                "CANARY_FORCE_NEW_BARRIER_FAILED",
+                "Reviewer control turn stopped before the barrier was closed",
+                details={
+                    "conversation_id": probe.reviewer_id,
+                    "state": reviewer.get("state"),
+                },
+            )
+        closed = api.request(
+            "PATCH",
+            f"/api/conversations/{probe.reviewer_id}",
+            body={"version": reviewer["version"], "state": "closed"},
+        )
+        if closed.get("state") != "closed":
+            raise CanaryError(
+                "CANARY_FORCE_NEW_BARRIER_FAILED",
+                "public close did not terminate the Reviewer control turn",
+                details={"conversation_id": probe.reviewer_id},
+            )
 
     def _exercise_review_delivery_gates(
         self,
@@ -1354,7 +1496,7 @@ Path({proof_path!r}).write_text(json.dumps(proof, sort_keys=True) + "\\n")
         facts: Preflight,
         *,
         sprint_id: int,
-        reviewer_id: str,
+        probe: ForceNewProbe,
         stage: Callable[[str], None],
     ) -> tuple[dict[str, Any], list[str]]:
         observed_columns: list[str] = []
@@ -1387,7 +1529,7 @@ Path({proof_path!r}).write_text(json.dumps(proof, sort_keys=True) + "\\n")
         )
         if (
             not isinstance(reviewer, dict)
-            or reviewer.get("current_conversation_id") != reviewer_id
+            or reviewer.get("current_conversation_id") != probe.reviewer_id
             or review_message.get("disposition") != "pending"
             or review_message.get("read_at") is not None
         ):
@@ -1396,20 +1538,34 @@ Path({proof_path!r}).write_text(json.dumps(proof, sort_keys=True) + "\\n")
                 "Force-new review rotated or became readable before the negative gate",
                 details={"message_id": message_id},
             )
-        force_new = self._force_new_probe(
-            api,
-            config,
+        self._target_force_new_probe(
             facts,
-            reviewer_id=reviewer_id,
+            probe,
+            sprint_id=sprint_id,
+            message_id=message_id,
+        )
+        force_new = self._collect_force_new_probe(
+            facts,
+            probe,
             sprint_id=sprint_id,
             message_id=message_id,
         )
         board = api.request("GET", f"/api/sprints/{sprint_id}")
         review_message = self._review_message(board, message_id)
+        reviewer = next(
+            (
+                row
+                for row in board.get("participants") or []
+                if row.get("role") == "reviewer"
+            ),
+            None,
+        )
         if (
             review_message is None
             or review_message.get("disposition") != "pending"
             or review_message.get("read_at") is not None
+            or not isinstance(reviewer, dict)
+            or reviewer.get("current_conversation_id") != probe.reviewer_id
         ):
             raise CanaryError(
                 "CANARY_FORCE_NEW_GATE_FAILED",
@@ -1417,12 +1573,7 @@ Path({proof_path!r}).write_text(json.dumps(proof, sort_keys=True) + "\\n")
                 details={"message_id": message_id},
             )
 
-        reviewer_latest = api.request("GET", f"/api/conversations/{reviewer_id}")
-        api.request(
-            "PATCH",
-            f"/api/conversations/{reviewer_id}",
-            body={"version": reviewer_latest["version"], "state": "closed"},
-        )
+        self._close_force_new_barrier(api, probe)
 
         stage("force_new_delivery")
         delivery_id: str | None = None
@@ -1455,7 +1606,13 @@ Path({proof_path!r}).write_text(json.dumps(proof, sort_keys=True) + "\\n")
                 ),
                 None,
             )
-            if isinstance(current, str) and current != reviewer_id:
+            if current == probe.reviewer_id:
+                raise CanaryError(
+                    "CANARY_FORCE_NEW_DELIVERY_FAILED",
+                    "Force-new delivery retained the pre-delivery Reviewer chat",
+                    details={"conversation_id": current},
+                )
+            if isinstance(current, str) and current != probe.reviewer_id:
                 delivery_id = current
                 break
             self.deadline.remaining()
@@ -1621,14 +1778,27 @@ Path({proof_path!r}).write_text(json.dumps(proof, sort_keys=True) + "\\n")
                     event_type="wake.requeued",
                     after_event_id=int(exhausted_event["event_id"]),
                 )
-            if (
-                replacement_event is not None
-                and message is not None
+            accepted = (
+                message is not None
                 and message.get("disposition") == "accepted"
                 and message.get("read_at") is not None
-                and isinstance(current, str)
-                and current not in {reviewer_id, delivery_id}
-            ):
+            )
+            if accepted:
+                if not isinstance(current, str) or current in {
+                    probe.reviewer_id,
+                    delivery_id,
+                }:
+                    raise CanaryError(
+                        "CANARY_PICKUP_RECOVERY_FAILED",
+                        "recovered review was accepted outside a fresh chat",
+                        details={"conversation_id": current},
+                    )
+                if replacement_event is None:
+                    raise CanaryError(
+                        "CANARY_PICKUP_RECOVERY_FAILED",
+                        "recovered review was accepted without durable requeue evidence",
+                        details={"message_id": message_id},
+                    )
                 recovery_id = current
                 break
             self.deadline.remaining()
@@ -1643,9 +1813,9 @@ Path({proof_path!r}).write_text(json.dumps(proof, sort_keys=True) + "\\n")
             )
         force_new.update(
             {
-                "prior_conversation_id": reviewer_id,
+                "prior_conversation_id": probe.reviewer_id,
                 "delivery_conversation_id": delivery_id,
-                "fresh_chat": delivery_id != reviewer_id,
+                "fresh_chat": delivery_id != probe.reviewer_id,
             }
         )
         return (
@@ -1768,6 +1938,13 @@ Path({proof_path!r}).write_text(json.dumps(proof, sort_keys=True) + "\\n")
         self._wait_idle(api, reviewer_id, config)
         approval_id = self._approval(facts, document_id)
 
+        stage("force_new_barrier")
+        force_new_probe = self._start_force_new_barrier(
+            api,
+            config,
+            reviewer_id=reviewer_id,
+        )
+
         stage("declare_and_arm")
         participants = [
             {
@@ -1839,7 +2016,7 @@ Path({proof_path!r}).write_text(json.dumps(proof, sort_keys=True) + "\\n")
             config,
             facts,
             sprint_id=sprint_id,
-            reviewer_id=reviewer_id,
+            probe=force_new_probe,
             stage=stage,
         )
 
