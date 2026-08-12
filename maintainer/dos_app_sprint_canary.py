@@ -57,6 +57,7 @@ FORK_PREPARATION_PATHS = {
 }
 TERMINAL_LIFECYCLES = {"completed", "aborted"}
 FAILURE_LIFECYCLES = {"paused", "aborted"}
+PICKUP_INJECTION_PAUSE_REASON = "wake_pickup_evidence_invalid"
 HEX_SHA = re.compile(r"^[0-9a-f]{40}$")
 RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{5,47}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -1126,6 +1127,549 @@ class HostBackend:
             }
         )
 
+    @staticmethod
+    def _review_message(
+        board: Mapping[str, Any], message_id: int | None = None
+    ) -> dict[str, Any] | None:
+        units = board.get("work_units") or []
+        if len(units) != 1:
+            raise CanaryError(
+                "CANARY_FORCE_NEW_GATE_FAILED",
+                "canary Sprint does not have exactly one work unit",
+            )
+        matches = [
+            message
+            for message in units[0].get("messages") or []
+            if message.get("kind") == "review_request"
+            and (message_id is None or message.get("message_id") == message_id)
+        ]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise CanaryError(
+                "CANARY_FORCE_NEW_GATE_FAILED",
+                "canary Sprint has ambiguous review-request messages",
+            )
+        return matches[0]
+
+    @staticmethod
+    def _validate_force_new_probe(
+        payload: Any, *, sprint_id: int, message_id: int
+    ) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise CanaryError(
+                "CANARY_FORCE_NEW_GATE_FAILED",
+                "REV1 Force-new gate proof is not a JSON object",
+            )
+        inbox_ids = payload.get("inbox_message_ids")
+        inbox = payload.get("inbox")
+        accept = payload.get("accept")
+        decline = payload.get("decline")
+        valid_identity = (
+            payload.get("sprint_id") == sprint_id
+            and payload.get("message_id") == message_id
+        )
+        valid_inbox = (
+            isinstance(inbox, dict)
+            and inbox.get("returncode") == 0
+            and inbox.get("parsed") is True
+            and isinstance(inbox_ids, list)
+            and all(isinstance(item, int) for item in inbox_ids)
+            and message_id not in inbox_ids
+        )
+
+        def rejected(result: Any) -> bool:
+            return (
+                isinstance(result, dict)
+                and isinstance(result.get("returncode"), int)
+                and result["returncode"] != 0
+                and result.get("http_status") == 409
+                and result.get("not_delivered") is True
+            )
+
+        if not valid_identity or not valid_inbox or not rejected(accept) or not rejected(
+            decline
+        ):
+            raise CanaryError(
+                "CANARY_FORCE_NEW_GATE_FAILED",
+                "undelivered Force-new message did not reject inbox acceptance",
+                details={
+                    "sprint_id": sprint_id,
+                    "message_id": message_id,
+                    "identity_matched": valid_identity,
+                    "inbox_absent": valid_inbox,
+                    "accept_rejected": rejected(accept),
+                    "decline_rejected": rejected(decline),
+                },
+            )
+        return {
+            "message_id": message_id,
+            "inbox_absent": True,
+            "accept_rejected": True,
+            "accept_http_status": 409,
+            "decline_rejected": True,
+            "decline_http_status": 409,
+        }
+
+    @staticmethod
+    def _event_after(
+        payload: Mapping[str, Any],
+        *,
+        event_type: str,
+        after_event_id: int,
+        message_id: int | None = None,
+        conversation_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        matches = []
+        for event in payload.get("items") or []:
+            event_id = event.get("event_id")
+            details = event.get("details") or {}
+            if (
+                isinstance(event_id, int)
+                and event_id > after_event_id
+                and event.get("type") == event_type
+                and (message_id is None or details.get("message_id") == message_id)
+                and (
+                    conversation_id is None
+                    or details.get("conversation_id") == conversation_id
+                )
+            ):
+                matches.append(event)
+        if not matches:
+            return None
+        return min(matches, key=lambda event: int(event["event_id"]))
+
+    @staticmethod
+    def _observe_column(board: Mapping[str, Any], observed: list[str]) -> None:
+        units = board.get("work_units") or []
+        if len(units) != 1:
+            return
+        column = units[0].get("column")
+        if isinstance(column, str) and (not observed or observed[-1] != column):
+            observed.append(column)
+
+    def _force_new_probe(
+        self,
+        api: JsonHttp,
+        config: CanaryConfig,
+        facts: Preflight,
+        *,
+        reviewer_id: str,
+        sprint_id: int,
+        message_id: int,
+    ) -> dict[str, Any]:
+        proof_path = f"/tmp/subfloor-canary-{config.run_id}-force-new.json"
+        probe_program = f'''from pathlib import Path
+import json
+import re
+import subprocess
+
+SPRINT_ID = {sprint_id}
+MESSAGE_ID = {message_id}
+
+def run(*args):
+    result = subprocess.run(
+        ["./sc", "sprint", *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    combined = result.stdout + "\\n" + result.stderr
+    match = re.search(r"HTTP\\s+(\\d{{3}})", combined)
+    return {{
+        "returncode": result.returncode,
+        "http_status": int(match.group(1)) if match else None,
+        "not_delivered": "not been delivered" in combined.lower(),
+        "stdout": result.stdout,
+    }}
+
+inbox = run("inbox", "--sprint", str(SPRINT_ID))
+inbox_parsed = False
+try:
+    inbox_payload = json.loads(inbox["stdout"]) if inbox["returncode"] == 0 else {{}}
+    inbox_parsed = isinstance(inbox_payload.get("messages"), list)
+except json.JSONDecodeError:
+    inbox_payload = {{}}
+accept = run(
+    "accept", "--sprint", str(SPRINT_ID), "--message", str(MESSAGE_ID)
+)
+decline = run(
+    "decline", "--sprint", str(SPRINT_ID), "--message", str(MESSAGE_ID),
+    "--reason", "canary pre-delivery rejection probe",
+)
+proof = {{
+    "sprint_id": SPRINT_ID,
+    "message_id": MESSAGE_ID,
+    "inbox": {{"returncode": inbox["returncode"], "parsed": inbox_parsed}},
+    "inbox_message_ids": [
+        item.get("message_id") for item in inbox_payload.get("messages", [])
+        if isinstance(item.get("message_id"), int)
+    ],
+    "accept": {{key: accept[key] for key in ("returncode", "http_status", "not_delivered")}},
+    "decline": {{key: decline[key] for key in ("returncode", "http_status", "not_delivered")}},
+}}
+Path({proof_path!r}).write_text(json.dumps(proof, sort_keys=True) + "\\n")
+'''
+        self._message(
+            api,
+            reviewer_id,
+            (
+                "This is the exact-ref canary's pre-delivery control turn, not the "
+                "pending review wake. Do not review or rotate this chat. Run the Python "
+                "program below exactly once; it performs one Sprint inbox read and the "
+                "direct accept and decline probes through public CLI surfaces, writes only "
+                "bounded status evidence, and changes no Sprint state on success. Then stop.\n\n"
+                "```python\n"
+                + probe_program
+                + "```"
+            ),
+            f"{config.run_id}:reviewer:force-new-probe",
+        )
+        self._wait_idle(api, reviewer_id, config)
+        result = self._run(
+            [
+                "docker",
+                "exec",
+                facts.container,
+                "python3",
+                "-c",
+                (
+                    "from pathlib import Path; import sys; "
+                    "sys.stdout.write(Path(sys.argv[1]).read_text())"
+                ),
+                proof_path,
+            ],
+            label="read bounded Force-new gate proof",
+        )
+        return self._validate_force_new_probe(
+            _json_output(result, label="read bounded Force-new gate proof"),
+            sprint_id=sprint_id,
+            message_id=message_id,
+        )
+
+    def _exercise_review_delivery_gates(
+        self,
+        api: JsonHttp,
+        config: CanaryConfig,
+        facts: Preflight,
+        *,
+        sprint_id: int,
+        reviewer_id: str,
+        stage: Callable[[str], None],
+    ) -> tuple[dict[str, Any], list[str]]:
+        observed_columns: list[str] = []
+        stage("force_new_pre_delivery")
+        review_message: dict[str, Any] | None = None
+        board: dict[str, Any] = {}
+        while review_message is None:
+            board = api.request("GET", f"/api/sprints/{sprint_id}")
+            self._observe_column(board, observed_columns)
+            lifecycle = (board.get("sprint") or {}).get("lifecycle")
+            if lifecycle != "armed":
+                raise CanaryError(
+                    "CANARY_FORCE_NEW_GATE_FAILED",
+                    "Sprint left armed before the Force-new review gate",
+                    details={"lifecycle": lifecycle},
+                )
+            review_message = self._review_message(board)
+            if review_message is None:
+                self.deadline.remaining()
+                self.sleep(min(0.1, self.deadline.remaining()))
+
+        message_id = int(review_message["message_id"])
+        reviewer = next(
+            (
+                row
+                for row in board.get("participants") or []
+                if row.get("role") == "reviewer"
+            ),
+            None,
+        )
+        if (
+            not isinstance(reviewer, dict)
+            or reviewer.get("current_conversation_id") != reviewer_id
+            or review_message.get("disposition") != "pending"
+            or review_message.get("read_at") is not None
+        ):
+            raise CanaryError(
+                "CANARY_FORCE_NEW_GATE_MISSED",
+                "Force-new review rotated or became readable before the negative gate",
+                details={"message_id": message_id},
+            )
+        force_new = self._force_new_probe(
+            api,
+            config,
+            facts,
+            reviewer_id=reviewer_id,
+            sprint_id=sprint_id,
+            message_id=message_id,
+        )
+        board = api.request("GET", f"/api/sprints/{sprint_id}")
+        review_message = self._review_message(board, message_id)
+        if (
+            review_message is None
+            or review_message.get("disposition") != "pending"
+            or review_message.get("read_at") is not None
+        ):
+            raise CanaryError(
+                "CANARY_FORCE_NEW_GATE_FAILED",
+                "negative probes changed the undelivered review request",
+                details={"message_id": message_id},
+            )
+
+        reviewer_latest = api.request("GET", f"/api/conversations/{reviewer_id}")
+        api.request(
+            "PATCH",
+            f"/api/conversations/{reviewer_id}",
+            body={"version": reviewer_latest["version"], "state": "closed"},
+        )
+
+        stage("force_new_delivery")
+        delivery_id: str | None = None
+        while delivery_id is None:
+            board = api.request("GET", f"/api/sprints/{sprint_id}")
+            self._observe_column(board, observed_columns)
+            message = self._review_message(board, message_id)
+            sprint = board.get("sprint") or {}
+            if sprint.get("lifecycle") != "armed":
+                raise CanaryError(
+                    "CANARY_FORCE_NEW_DELIVERY_FAILED",
+                    "Sprint left armed before Force-new delivery",
+                    details={"lifecycle": sprint.get("lifecycle")},
+                )
+            if (
+                message is None
+                or message.get("disposition") != "pending"
+                or message.get("read_at") is not None
+            ):
+                raise CanaryError(
+                    "CANARY_FORCE_NEW_GATE_MISSED",
+                    "review request was accepted before pickup injection",
+                    details={"message_id": message_id},
+                )
+            current = next(
+                (
+                    row.get("current_conversation_id")
+                    for row in board.get("participants") or []
+                    if row.get("role") == "reviewer"
+                ),
+                None,
+            )
+            if isinstance(current, str) and current != reviewer_id:
+                delivery_id = current
+                break
+            self.deadline.remaining()
+            self.sleep(min(0.1, self.deadline.remaining()))
+
+        stage("pickup_failure")
+        interruption: dict[str, Any] | None = None
+        while interruption is None:
+            conversation = api.request("GET", f"/api/conversations/{delivery_id}")
+            state = conversation.get("state")
+            if state == "running":
+                board = api.request("GET", f"/api/sprints/{sprint_id}")
+                message = self._review_message(board, message_id)
+                if message is None or message.get("read_at") is not None:
+                    raise CanaryError(
+                        "CANARY_PICKUP_INJECTION_MISSED",
+                        "review request was read before pickup interruption",
+                        details={"message_id": message_id},
+                    )
+                events_before = api.request(
+                    "GET", f"/api/sprints/{sprint_id}/events?limit=100"
+                )
+                before_event_id = max(
+                    [
+                        int(item["event_id"])
+                        for item in events_before.get("items") or []
+                        if isinstance(item.get("event_id"), int)
+                    ],
+                    default=0,
+                )
+                interruption = api.request(
+                    "POST",
+                    f"/api/conversations/{delivery_id}/interruptions",
+                    body={},
+                    key=f"{config.run_id}:reviewer:pickup-interrupt",
+                )
+                break
+            if state in {"idle", "error", "closed"}:
+                raise CanaryError(
+                    "CANARY_PICKUP_INJECTION_MISSED",
+                    "Force-new pickup terminalized before interruption",
+                    details={"conversation_id": delivery_id, "state": state},
+                )
+            self.deadline.remaining()
+            self.sleep(min(0.05, self.deadline.remaining()))
+
+        run_id = interruption.get("run_id")
+        if not isinstance(run_id, int):
+            raise CanaryError(
+                "CANARY_PICKUP_INJECTION_FAILED",
+                "public interruption returned no run identity",
+            )
+
+        exhausted_event: dict[str, Any] | None = None
+        paused_board: dict[str, Any] | None = None
+        while exhausted_event is None:
+            board = api.request("GET", f"/api/sprints/{sprint_id}")
+            self._observe_column(board, observed_columns)
+            message = self._review_message(board, message_id)
+            if message is None or message.get("read_at") is not None:
+                raise CanaryError(
+                    "CANARY_PICKUP_RECOVERY_FAILED",
+                    "interrupted review request became read before recovery",
+                    details={"message_id": message_id},
+                )
+            lifecycle = (board.get("sprint") or {}).get("lifecycle")
+            if lifecycle == "paused":
+                pickup = board.get("pickup") or {}
+                if pickup.get("pause_reason") != PICKUP_INJECTION_PAUSE_REASON:
+                    raise CanaryError(
+                        "CANARY_PICKUP_RECOVERY_FAILED",
+                        "pickup interruption paused for an unexpected reason",
+                        details={"pause_reason": pickup.get("pause_reason")},
+                    )
+                events = api.request(
+                    "GET", f"/api/sprints/{sprint_id}/events?limit=100"
+                )
+                exhausted_event = self._event_after(
+                    events,
+                    event_type="wake.pickup_exhausted",
+                    after_event_id=before_event_id,
+                    message_id=message_id,
+                    conversation_id=delivery_id,
+                )
+                if exhausted_event is not None:
+                    paused_board = board
+                    break
+            elif lifecycle != "armed":
+                raise CanaryError(
+                    "CANARY_PICKUP_RECOVERY_FAILED",
+                    "Sprint reached an unexpected lifecycle after pickup interruption",
+                    details={"lifecycle": lifecycle},
+                )
+            self.deadline.remaining()
+            self.sleep(min(config.poll_interval_s, self.deadline.remaining()))
+
+        assert paused_board is not None
+        exhausted = exhausted_event.get("details") or {}
+        if (
+            exhausted.get("run_state") != "cancelled"
+            or exhausted.get("error_code") != "WAKE_PICKUP_EVIDENCE_INVALID"
+            or exhausted.get("failure_class") != "evidence_invalid"
+            or exhausted.get("attempt_count") != 1
+        ):
+            raise CanaryError(
+                "CANARY_PICKUP_RECOVERY_FAILED",
+                "pickup pause receipt does not match the induced interruption",
+                details={
+                    key: exhausted.get(key)
+                    for key in (
+                        "run_state",
+                        "error_code",
+                        "failure_class",
+                        "attempt_count",
+                    )
+                },
+            )
+
+        stage("pickup_recovery")
+        resume = api.request(
+            "PATCH",
+            f"/api/sprints/{sprint_id}",
+            body={
+                "lifecycle": "armed",
+                "reason": "exact-ref canary pickup interruption repaired",
+            },
+        )
+        if resume.get("changed") is not True or (
+            resume.get("sprint") or {}
+        ).get("lifecycle") != "armed":
+            raise CanaryError(
+                "CANARY_PICKUP_RECOVERY_FAILED",
+                "public Sprint resume did not durably re-arm the canary",
+            )
+
+        replacement_event: dict[str, Any] | None = None
+        recovery_id: str | None = None
+        while recovery_id is None:
+            board = api.request("GET", f"/api/sprints/{sprint_id}")
+            self._observe_column(board, observed_columns)
+            sprint = board.get("sprint") or {}
+            if sprint.get("lifecycle") != "armed":
+                raise CanaryError(
+                    "CANARY_PICKUP_RECOVERY_FAILED",
+                    "Sprint left armed during pickup recovery",
+                    details={"lifecycle": sprint.get("lifecycle")},
+                )
+            message = self._review_message(board, message_id)
+            current = next(
+                (
+                    row.get("current_conversation_id")
+                    for row in board.get("participants") or []
+                    if row.get("role") == "reviewer"
+                ),
+                None,
+            )
+            events = api.request(
+                "GET", f"/api/sprints/{sprint_id}/events?limit=100"
+            )
+            if replacement_event is None:
+                replacement_event = self._event_after(
+                    events,
+                    event_type="wake.requeued",
+                    after_event_id=int(exhausted_event["event_id"]),
+                )
+            if (
+                replacement_event is not None
+                and message is not None
+                and message.get("disposition") == "accepted"
+                and message.get("read_at") is not None
+                and isinstance(current, str)
+                and current not in {reviewer_id, delivery_id}
+            ):
+                recovery_id = current
+                break
+            self.deadline.remaining()
+            self.sleep(min(config.poll_interval_s, self.deadline.remaining()))
+
+        replacement = replacement_event.get("details") or {}
+        replacement_wake_id = replacement.get("replacement_wake_id")
+        if not isinstance(replacement_wake_id, int):
+            raise CanaryError(
+                "CANARY_PICKUP_RECOVERY_FAILED",
+                "resume recovery event contains no replacement wake identity",
+            )
+        force_new.update(
+            {
+                "prior_conversation_id": reviewer_id,
+                "delivery_conversation_id": delivery_id,
+                "fresh_chat": delivery_id != reviewer_id,
+            }
+        )
+        return (
+            {
+                "force_new": force_new,
+                "pickup_recovery": {
+                    "induced": True,
+                    "interrupted_run_id": run_id,
+                    "interrupted_conversation_id": delivery_id,
+                    "pause_reason": PICKUP_INJECTION_PAUSE_REASON,
+                    "pause_event_id": int(exhausted_event["event_id"]),
+                    "error_code": "WAKE_PICKUP_EVIDENCE_INVALID",
+                    "failure_class": "evidence_invalid",
+                    "attempt_count": 1,
+                    "resume_changed": True,
+                    "replacement_wake_id": replacement_wake_id,
+                    "recovery_conversation_id": recovery_id,
+                    "message_id": message_id,
+                    "final_disposition": "accepted",
+                },
+            },
+            observed_columns,
+        )
+
     def orchestrate(
         self,
         config: CanaryConfig,
@@ -1223,12 +1767,6 @@ class HostBackend:
         )
         self._wait_idle(api, reviewer_id, config)
         approval_id = self._approval(facts, document_id)
-        reviewer_latest = api.request("GET", f"/api/conversations/{reviewer_id}")
-        api.request(
-            "PATCH",
-            f"/api/conversations/{reviewer_id}",
-            body={"version": reviewer_latest["version"], "state": "closed"},
-        )
 
         stage("declare_and_arm")
         participants = [
@@ -1296,9 +1834,17 @@ class HostBackend:
             body={"version": planner_latest["version"], "state": "closed"},
         )
 
+        gate_evidence, observed_columns = self._exercise_review_delivery_gates(
+            api,
+            config,
+            facts,
+            sprint_id=sprint_id,
+            reviewer_id=reviewer_id,
+            stage=stage,
+        )
+
         stage("sprint_execution")
         last_signature: tuple[Any, ...] | None = None
-        observed_columns: list[str] = []
         final_board: dict[str, Any] | None = None
         while True:
             board = api.request("GET", f"/api/sprints/{sprint_id}")
@@ -1317,7 +1863,9 @@ class HostBackend:
                 self.deadline.enter("sprint_execution")
                 last_signature = signature
                 column = unit.get("column")
-                if isinstance(column, str):
+                if isinstance(column, str) and (
+                    not observed_columns or observed_columns[-1] != column
+                ):
                     observed_columns.append(column)
             if prs and isinstance(prs[0].get("pr_number"), int):
                 observed_pr = int(prs[0]["pr_number"])
@@ -1481,6 +2029,7 @@ class HostBackend:
                 "pickup": final_board.get("pickup"),
                 "evidence": self._bounded_board(final_board),
                 "events": sanitize(events.get("items") or []),
+                **gate_evidence,
             },
             "routes": {
                 "planner_initial": planner_route,
