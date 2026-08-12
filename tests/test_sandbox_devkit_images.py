@@ -2,7 +2,9 @@
 """Behavioral coverage for fork-extension sandbox image identity."""
 from __future__ import annotations
 
+import contextlib
 import fcntl
+import io
 import json
 import os
 import subprocess
@@ -31,6 +33,7 @@ from sandbox_devkit import (  # noqa: E402
     provisioning_fingerprint,
     provisioning_payload,
     readiness,
+    retire_superseded_base_images,
     volume_plans,
 )
 
@@ -41,6 +44,8 @@ class FakeDocker:
         self.images: dict[str, dict] = {}
         self.volumes: dict[str, dict] = {}
         self.containers: dict[str, str] = {}
+        self.image_remove_failures: set[str] = set()
+        self.build_counter = 0
         self.hook_status = 0
         self.hook_delay = 0.0
 
@@ -56,8 +61,10 @@ class FakeDocker:
                     key, label_value = command[index + 1].split("=", 1)
                     labels[key] = label_value
             image_id = "sha256:" + ("b" if "-base:" in tag else "e") * 64
+            self.build_counter += 1
             self.images[tag] = {
                 "Id": image_id,
+                "Created": f"2026-08-12T12:00:{self.build_counter:02d}Z",
                 "Config": {"Labels": labels},
             }
             return subprocess.CompletedProcess(command, 0, "", "")
@@ -122,6 +129,8 @@ class FakeDocker:
             return subprocess.CompletedProcess(command, 0, "\n".join(ids), "")
         if command[:3] == ("docker", "image", "rm"):
             image_id = command[3]
+            if image_id in self.image_remove_failures:
+                return subprocess.CompletedProcess(command, 1, "", "image is in use")
             self.images = {
                 tag: image for tag, image in self.images.items() if image["Id"] != image_id
             }
@@ -356,6 +365,142 @@ class SandboxImagePlanTest(unittest.TestCase):
         self.assertEqual(result, plan.base_tag)
         self.assertEqual(len(docker.builds()), 1)
         self.assertEqual(plan.runtime_labels["sc.image_kind"], "engine-base")
+
+    def test_build_retires_only_old_owned_base_generations(self):
+        plan = ImageFixture(self.base, "retention", sandbox=False).plan()
+        docker = FakeDocker()
+        prior_ids = []
+        for index in range(4):
+            image_id = "sha256:" + str(index + 1) * 64
+            prior_ids.append(image_id)
+            docker.images[f"super-coder-base:prior-{index}"] = {
+                "Id": image_id,
+                "Created": f"2026-08-0{index + 1}T12:00:00Z",
+                "Config": {"Labels": {
+                    **plan.base_labels,
+                    "sc.engine_ref": str(index + 1) * 40,
+                }},
+            }
+        foreign_id = "sha256:" + "f" * 64
+        docker.images["super-coder-base:foreign"] = {
+            "Id": foreign_id,
+            "Created": "2026-07-01T12:00:00Z",
+            "Config": {"Labels": {
+                **plan.base_labels,
+                "sc.build_identity": "foreign",
+            }},
+        }
+
+        self.assertEqual(build_images(plan, runner=docker), plan.base_tag)
+
+        remaining_ids = {image["Id"] for image in docker.images.values()}
+        current_id = "sha256:" + "b" * 64
+        self.assertIn(current_id, remaining_ids)
+        self.assertNotIn(prior_ids[0], remaining_ids)
+        self.assertNotIn(prior_ids[1], remaining_ids)
+        self.assertIn(prior_ids[2], remaining_ids)
+        self.assertIn(prior_ids[3], remaining_ids)
+        self.assertIn(foreign_id, remaining_ids)
+        removals = [
+            command for command in docker.commands
+            if command[:3] == ("docker", "image", "rm")
+        ]
+        self.assertEqual({command[3] for command in removals}, set(prior_ids[:2]))
+        self.assertNotIn(current_id, {command[3] for command in removals})
+        listing = next(
+            command for command in docker.commands
+            if command[:3] == ("docker", "image", "ls")
+        )
+        self.assertIn("label=sc.image_kind=engine-base", listing)
+        self.assertIn(
+            f"label=sc.build_identity={plan.base_labels['sc.build_identity']}",
+            listing,
+        )
+
+    def test_retention_keeps_in_use_image_and_does_not_fail_build(self):
+        plan = ImageFixture(self.base, "retention-race", sandbox=False).plan()
+        docker = FakeDocker()
+        old_id = "sha256:" + "1" * 64
+        for index, marker in enumerate(("1", "2", "3"), start=1):
+            image_id = "sha256:" + marker * 64
+            docker.images[f"super-coder-base:race-{marker}"] = {
+                "Id": image_id,
+                "Created": f"2026-07-0{index}T12:00:00Z",
+                "Config": {"Labels": dict(plan.base_labels)},
+            }
+        docker.image_remove_failures.add(old_id)
+        errors = io.StringIO()
+
+        with contextlib.redirect_stderr(errors):
+            result = build_images(plan, runner=docker)
+
+        self.assertEqual(result, plan.base_tag)
+        self.assertIn("image is in use", errors.getvalue())
+        self.assertIn(old_id, {image["Id"] for image in docker.images.values()})
+
+    def test_extension_build_retires_prior_fork_image(self):
+        plan = ImageFixture(self.base, "extension-retention").plan()
+        docker = FakeDocker()
+        old_runtime_id = "sha256:" + "a" * 64
+        docker.images["super-coder-sandbox-old:latest"] = {
+            "Id": old_runtime_id,
+            "Created": "2026-07-01T12:00:00Z",
+            "Config": {"Labels": dict(plan.runtime_labels)},
+        }
+        old_base_ids = []
+        for index, marker in enumerate(("1", "2", "3"), start=1):
+            image_id = "sha256:" + marker * 64
+            old_base_ids.append(image_id)
+            docker.images[f"super-coder-base:extension-prior-{marker}"] = {
+                "Id": image_id,
+                "Created": f"2026-07-0{index}T12:00:00Z",
+                "Config": {"Labels": dict(plan.base_labels)},
+            }
+
+        self.assertEqual(build_images(plan, runner=docker), plan.runtime_tag)
+
+        remaining_ids = {image["Id"] for image in docker.images.values()}
+        self.assertNotIn(old_runtime_id, remaining_ids)
+        self.assertNotIn(old_base_ids[0], remaining_ids)
+        removals = [
+            command[3] for command in docker.commands
+            if command[:3] == ("docker", "image", "rm")
+        ]
+        self.assertEqual(removals, [old_runtime_id, old_base_ids[0]])
+        self.assertNotIn("sha256:" + "e" * 64, removals)
+        self.assertNotIn("sha256:" + "b" * 64, removals)
+
+    def test_retention_skips_malformed_owned_image(self):
+        plan = ImageFixture(self.base, "malformed-retention").plan()
+        docker = FakeDocker()
+        malformed_id = "sha256:" + "9" * 64
+        docker.images["super-coder-base:malformed"] = {
+            "Id": malformed_id,
+            "Config": {"Labels": dict(plan.base_labels)},
+        }
+        errors = io.StringIO()
+
+        with contextlib.redirect_stderr(errors):
+            removed = retire_superseded_base_images(
+                plan,
+                "sha256:" + "b" * 64,
+                keep_prior=0,
+                runner=docker,
+            )
+
+        self.assertEqual(removed, [])
+        self.assertIn("no creation timestamp", errors.getvalue())
+        self.assertIn(malformed_id, {image["Id"] for image in docker.images.values()})
+
+    def test_retention_rejects_negative_history(self):
+        plan = ImageFixture(self.base, "negative-retention", sandbox=False).plan()
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            retire_superseded_base_images(
+                plan,
+                "sha256:" + "b" * 64,
+                keep_prior=-1,
+                runner=FakeDocker(),
+            )
 
     def test_declared_volumes_are_install_and_target_scoped(self):
         left_fixture = ImageFixture(self.base, "left", mounts=True)

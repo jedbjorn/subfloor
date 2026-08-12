@@ -44,6 +44,7 @@ class SupervisionFixture:
             "callable_floor.py",
             "db_backup.py",
             "cli_entry.py",
+            "docker_cache.py",
             "engine_manifest.py",
             "global_pointer.py",
             "install.py",
@@ -380,6 +381,24 @@ class RestrictedLaunchTests(unittest.TestCase):
         )
         self.assertIn(" --init ", sandbox_run)
         self.assertFalse(any(line.startswith("docker build ") for line in calls))
+
+    def test_docker_cache_gc_is_explicit_and_age_bounded_by_default(self):
+        result = self.fx.run("docker-cache-gc")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("host-global cache older than 168h", result.stdout)
+        self.assertIn(
+            "docker builder prune --all --force --filter until=168h",
+            self.fx.calls(),
+        )
+
+    def test_docker_cache_gc_all_drops_the_age_filter(self):
+        result = self.fx.run("docker-cache-gc", "--all")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("all unused host-global cache", result.stdout)
+        self.assertIn("docker builder prune --all --force", self.fx.calls())
+        self.assertFalse(any("until=" in line for line in self.fx.calls()))
 
     def test_successful_provision_reports_hook_output_and_ready_state(self):
         self.fx.configure_provision()

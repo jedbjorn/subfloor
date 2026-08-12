@@ -23,6 +23,7 @@ from typing import Any
 from devkit import Declaration, DevkitConfigError, load_declaration
 
 IMAGE_PREFIX = "super-coder"
+BASE_IMAGE_HISTORY = 2
 HEX_REF = re.compile(r"\A[0-9a-f]{40,64}\Z")
 SAFE_EPOCH = re.compile(r"\A[0-9A-Za-z_.:-]+\Z")
 BASE_LABELS = (
@@ -297,6 +298,7 @@ def _inspect(image: str, *, runner: Runner) -> dict[str, Any]:
         value = json.loads(raw)
         item = value[0]
         image_id = item["Id"]
+        created = item.get("Created")
         labels = item.get("Config", {}).get("Labels") or {}
     except (json.JSONDecodeError, IndexError, KeyError, TypeError) as exc:
         raise SandboxImageError(f"docker returned invalid inspection for {image}") from exc
@@ -304,7 +306,7 @@ def _inspect(image: str, *, runner: Runner) -> dict[str, Any]:
         raise SandboxImageError(f"docker returned invalid image ID for {image}")
     if not isinstance(labels, dict):
         raise SandboxImageError(f"docker returned invalid labels for {image}")
-    return {"id": image_id, "labels": labels}
+    return {"id": image_id, "created": created, "labels": labels}
 
 
 def _require_labels(image: str, expected: dict[str, str], *, runner: Runner) -> str:
@@ -319,6 +321,120 @@ def _require_labels(image: str, expected: dict[str, str], *, runner: Runner) -> 
         )
         raise SandboxImageError(f"sandbox image {image!r} is stale or foreign: {detail}")
     return str(inspected["id"])
+
+
+def _retire_superseded_images(
+    *,
+    image_kind: str,
+    identity_label: str,
+    identity_value: str,
+    current_id: str,
+    keep_prior: int,
+    runner: Runner = subprocess.run,
+) -> list[str]:
+    """Best-effort retirement of superseded images in one ownership scope."""
+    if keep_prior < 0:
+        raise ValueError("keep_prior must be non-negative")
+    try:
+        raw = _run(
+            (
+                "docker", "image", "ls", "--all",
+                "--filter", f"label=sc.image_kind={image_kind}",
+                "--filter", f"label={identity_label}={identity_value}",
+                "--format", "{{.ID}}",
+            ),
+            runner=runner,
+            capture=True,
+        )
+        candidates: dict[str, str] = {}
+        for listed_id in sorted(set(filter(None, raw.splitlines()))):
+            inspected = _inspect(listed_id, runner=runner)
+            labels = inspected["labels"]
+            if (
+                labels.get("sc.image_kind") != image_kind
+                or labels.get(identity_label) != identity_value
+            ):
+                print(
+                    "dev-kit image retention: skipped image whose ownership "
+                    f"labels changed: {listed_id}",
+                    file=sys.stderr,
+                )
+                continue
+            image_id = str(inspected["id"])
+            if image_id == current_id:
+                continue
+            created = inspected.get("created")
+            if not isinstance(created, str) or not created:
+                print(
+                    "dev-kit image retention: skipped image with no creation "
+                    f"timestamp: {image_id}",
+                    file=sys.stderr,
+                )
+                continue
+            candidates[image_id] = created
+
+        newest_first = sorted(
+            candidates.items(), key=lambda item: (item[1], item[0]), reverse=True
+        )
+        removed = []
+        for image_id, _created in newest_first[keep_prior:]:
+            try:
+                _run(
+                    ("docker", "image", "rm", image_id),
+                    runner=runner,
+                    capture=True,
+                )
+            except SandboxImageError as exc:
+                print(
+                    f"dev-kit image retention: kept {image_id}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            removed.append(image_id)
+        if removed:
+            print(
+                f"dev-kit image retention: removed {len(removed)} "
+                f"superseded {image_kind} image(s)"
+            )
+        return removed
+    except SandboxImageError as exc:
+        print(f"dev-kit image retention: skipped: {exc}", file=sys.stderr)
+        return []
+
+
+def retire_superseded_base_images(
+    plan: ImagePlan,
+    current_id: str,
+    *,
+    keep_prior: int = BASE_IMAGE_HISTORY,
+    runner: Runner = subprocess.run,
+) -> list[str]:
+    """Retain current and recent shared engine-base generations."""
+    return _retire_superseded_images(
+        image_kind="engine-base",
+        identity_label="sc.build_identity",
+        identity_value=plan.base_labels["sc.build_identity"],
+        current_id=current_id,
+        keep_prior=keep_prior,
+        runner=runner,
+    )
+
+
+def retire_superseded_runtime_images(
+    plan: ImagePlan,
+    current_id: str,
+    *,
+    runner: Runner = subprocess.run,
+) -> list[str]:
+    """Retire old extension generations owned by this exact fork."""
+    return _retire_superseded_images(
+        image_kind="fork-extension",
+        identity_label="sc.fork_identity",
+        identity_value=plan.runtime_labels["sc.fork_identity"],
+        current_id=current_id,
+        keep_prior=0,
+        runner=runner,
+    )
 
 
 def build_images(plan: ImagePlan, *, runner: Runner = subprocess.run) -> str:
@@ -343,6 +459,7 @@ def build_images(plan: ImagePlan, *, runner: Runner = subprocess.run) -> str:
     _run(base_command, runner=runner)
     base_id = _require_labels(plan.base_tag, plan.base_labels, runner=runner)
     if not plan.extends_base:
+        retire_superseded_base_images(plan, base_id, runner=runner)
         return plan.base_tag
 
     assert plan.declaration is not None
@@ -361,7 +478,10 @@ def build_images(plan: ImagePlan, *, runner: Runner = subprocess.run) -> str:
         str(sandbox.context),
     ]
     _run(extension_command, runner=runner)
-    _require_labels(plan.runtime_tag, plan.runtime_labels, runner=runner)
+    runtime_id = _require_labels(plan.runtime_tag, plan.runtime_labels, runner=runner)
+    # Retire extension children before their now-unreferenced base parents.
+    retire_superseded_runtime_images(plan, runtime_id, runner=runner)
+    retire_superseded_base_images(plan, base_id, runner=runner)
     return plan.runtime_tag
 
 
