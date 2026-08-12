@@ -1375,6 +1375,7 @@ class SprintCleanupExecutor:
         store: SprintCleanupTargetStore,
         *,
         liveness_probe: LivenessProbe | None = None,
+        current_leased_run_id: int | None = None,
         branch_pruner: PruneBranches | None = None,
         fetch_timeout: int = 30,
         command_timeout: int = 30,
@@ -1384,6 +1385,7 @@ class SprintCleanupExecutor:
     ) -> None:
         self.store = store
         self.con = store.con
+        self.current_leased_run_id = current_leased_run_id
         self.liveness_probe = liveness_probe or self._default_liveness
         self.branch_pruner = branch_pruner or (
             lambda repo: git_prune.prune(repo=repo, fetch=False)
@@ -1814,11 +1816,22 @@ class SprintCleanupExecutor:
     def _default_liveness(self, claim: CleanupClaim) -> str:
         if claim.shell_id is None:
             return "dormant"
-        live_run = self.con.execute(
+        live_run_sql = (
             "SELECT run.run_id FROM conversation_runs run "
             "WHERE run.shell_id=? AND run.state IN ('leased','starting','running') "
-            "LIMIT 1",
-            (claim.shell_id,),
+        )
+        live_run_params: list[int] = [claim.shell_id]
+        if self.current_leased_run_id is not None:
+            # Browser dispatch reserves this exact run before launcher
+            # preflight. Only that still-leased reservation is self-owned;
+            # every other live row, and this row after starting, still blocks.
+            live_run_sql += (
+                "AND NOT (run.run_id=? AND run.state='leased') "
+            )
+            live_run_params.append(self.current_leased_run_id)
+        live_run = self.con.execute(
+            live_run_sql + "LIMIT 1",
+            live_run_params,
         ).fetchone()
         if live_run is not None:
             return "live"

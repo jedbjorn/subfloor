@@ -118,6 +118,7 @@ def test_preparer_returns_canonical_environment_and_archive(launch_case):
         "model": "gpt-test",
         "effort": "high",
         "headless_prompt": "Do the work",
+        "current_leased_run_id": 7,
     }]
 
 

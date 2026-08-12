@@ -12,6 +12,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,9 @@ import sprint_domain
 import sprint_message_delivery
 import sprint_runtime
 import run
+from conversation_adapters import NativeTurn, NormalizedEvent
+from conversation_broker import ConversationBroker
+from conversation_launch import ConversationLaunchPreparer
 from test_sprint_v2_domain import SprintDomainCase
 
 TEST_ROOT = Path("/srv/super-coder")
@@ -1486,6 +1490,232 @@ class SprintCleanupExecutorTest(SprintDomainCase):
         self.assertFalse((self.worktree / "local-commit.txt").exists())
         self.assertFalse((self.worktree / "untracked.txt").exists())
         self.assertFalse((self.worktree / "nested-repository").exists())
+
+    def test_broker_leased_turn_cleans_then_binds_archive_and_dispatches(self):
+        self._dirty_worktree()
+        database = Path(self.tmp.name) / "broker-launch.db"
+        with sqlite3.connect(database) as target:
+            self.con.backup(target)
+        with sqlite3.connect(database) as con:
+            conversation_id = con.execute(
+                "INSERT INTO conversations "
+                "(shell_id,owner_user_id,harness,provider,model,effort,worktree,"
+                "state,creation_idempotency_key,creation_request_hash) "
+                "VALUES (1,1,'codex','openai','gpt-test','high',?,'queued',"
+                "'cleanup-launch','cleanup-launch-hash') RETURNING conversation_id",
+                (str(self.worktree),),
+            ).fetchone()[0]
+            con.execute(
+                "INSERT INTO active_shell_chats (shell_id,chat_id) VALUES (1,?)",
+                (conversation_id,),
+            )
+            message_id = con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'user','1','prompt','clean then dispatch',"
+                "'cleanup-message','cleanup-message-hash','queued')",
+                (conversation_id,),
+            ).lastrowid
+            con.execute(
+                "INSERT INTO conversation_outbox (conversation_id,message_id) "
+                "VALUES (?,?)",
+                (conversation_id, message_id),
+            )
+            con.commit()
+
+        leased_ids: list[int] = []
+
+        def prepare(**kwargs):
+            leased_ids.append(kwargs["current_leased_run_id"])
+            with sqlite3.connect(database) as con:
+                con.row_factory = sqlite3.Row
+                run.cleanup_before_launch(
+                    con,
+                    {"shell_id": 1, "shortname": "DEV1", "flavor": "dev"},
+                    current_leased_run_id=kwargs["current_leased_run_id"],
+                )
+                archive_id = con.execute(
+                    "INSERT INTO shell_memory_archives "
+                    "(shell_id,session_id,date,full_narrative) "
+                    "VALUES (1,'9001','2026-08-12','prepared')"
+                ).lastrowid
+                con.commit()
+            return SimpleNamespace(
+                cwd=str(self.worktree),
+                archive_id=archive_id,
+                harness="codex",
+                model="gpt-test",
+                effort="high",
+                env={},
+            )
+
+        class DispatchAdapter:
+            harness = "codex"
+
+            def __init__(self):
+                self.started = 0
+
+            def start(self, context, _message):
+                self.started += 1
+                return NativeTurn(
+                    "codex",
+                    "native-session",
+                    "native-run",
+                    context.checked_worktree(),
+                )
+
+            def stream(self, _turn):
+                yield NormalizedEvent(
+                    "session.started", {"session_ref": "native-session"}
+                )
+                yield NormalizedEvent("run.started", {"status": "running"})
+                yield NormalizedEvent("run.completed", {"status": "completed"})
+
+            def close(self):
+                return None
+
+        adapter = DispatchAdapter()
+        preparer = ConversationLaunchPreparer(
+            database,
+            prepare_launch=prepare,
+            liveness=lambda: {"supported": True, "processes": []},
+        )
+        broker = ConversationBroker(
+            database,
+            adapter_factory=lambda _harness: adapter,
+            launch_preparer=preparer,
+            owner="cleanup-launch-broker",
+            heartbeat_seconds=60,
+            recovery_seconds=60,
+        )
+        snapshot = {
+            "supported": True,
+            "repo": {"root": str(self.repository.resolve())},
+            "indeterminate": False,
+            "active_other_shells": [],
+            "claimed_pids": {},
+        }
+        try:
+            with mock.patch.object(
+                sprint_cleanup.shell_liveness, "compute", return_value=snapshot
+            ), mock.patch.object(
+                sprint_cleanup.git_prune,
+                "prune",
+                return_value={"candidates": 0, "deleted": [], "failed": []},
+            ):
+                broker.start()
+                self.assertTrue(broker.wait_started(timeout=2))
+                broker.notify()
+                deadline = time.monotonic() + 5
+                durable = None
+                while time.monotonic() < deadline:
+                    with sqlite3.connect(database) as con:
+                        durable = con.execute(
+                            "SELECT run_id,state,archive_id FROM conversation_runs "
+                            "WHERE trigger_message_id=?",
+                            (message_id,),
+                        ).fetchone()
+                    if durable is not None and durable[1] == "succeeded":
+                        break
+                    time.sleep(0.01)
+                self.assertIsNotNone(durable)
+                self.assertEqual("succeeded", durable[1])
+        finally:
+            broker.stop()
+            broker.join(timeout=2)
+            self.assertFalse(broker.is_alive())
+            self.assertTrue(broker.wait_idle(timeout=2))
+
+        with sqlite3.connect(database) as con:
+            cleanup_row = con.execute(
+                "SELECT state,attempt_count,claim_generation,waiting_reason "
+                "FROM sprint_cleanup_targets WHERE sprint_id=? AND shell_id=1",
+                (self.sprint_id,),
+            ).fetchone()
+            durable = con.execute(
+                "SELECT run.run_id,run.state,run.archive_id,"
+                "run.harness_session_after,archive.session_id "
+                "FROM conversation_runs run "
+                "JOIN shell_memory_archives archive "
+                "ON archive.archive_id=run.archive_id "
+                "WHERE run.trigger_message_id=?",
+                (message_id,),
+            ).fetchone()
+        self.assertEqual([durable[0]], leased_ids)
+        self.assertEqual(("succeeded", 1, 1, None), tuple(cleanup_row))
+        self.assertEqual(
+            ("succeeded", "native-session"),
+            (durable[1], durable[3]),
+        )
+        self.assertEqual((1, "9001"), (durable[2], durable[4]))
+        self.assertEqual(1, adapter.started)
+        self.assertEqual(
+            ("shell/dev1", ""),
+            (
+                self._git(self.worktree, "branch", "--show-current").stdout.strip(),
+                self._git(self.worktree, "status", "--porcelain").stdout,
+            ),
+        )
+        self.assertFalse((self.worktree / "untracked.txt").exists())
+
+    def test_launcher_excludes_only_its_exact_leased_run(self):
+        self._dirty_worktree()
+        self.con.execute("DROP INDEX idx_conversation_runs_live_conversation")
+        self.con.execute("DROP INDEX idx_conversation_runs_live_shell")
+        conversation_id = self.con.execute(
+            "INSERT INTO conversations "
+            "(shell_id,owner_user_id,harness,worktree,state,"
+            "creation_idempotency_key,creation_request_hash) "
+            "VALUES (1,1,'codex',?,'running','lease-race','lease-race-hash') "
+            "RETURNING conversation_id",
+            (str(self.worktree),),
+        ).fetchone()[0]
+
+        def leased_run(key: str) -> int:
+            message_id = self.con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'user','1','prompt',?,?,?,'running')",
+                (conversation_id, key, key, f"{key}-hash"),
+            ).lastrowid
+            return int(self.con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                "lease_expires_at,heartbeat_at) "
+                "VALUES (?,1,?,'leased',?,'2099-01-01 00:00:00',datetime('now'))",
+                (conversation_id, message_id, key),
+            ).lastrowid)
+
+        current_run_id = leased_run("current-launch")
+        other_run_id = leased_run("different-owner")
+        self.con.commit()
+
+        with self.assertRaises(run.LaunchError):
+            run.cleanup_before_launch(
+                self.con,
+                {"shell_id": 1, "shortname": "DEV1", "flavor": "dev"},
+                current_leased_run_id=current_run_id,
+            )
+
+        row = self._worktree_row()
+        self.assertEqual(
+            ("pending", 0, 1, "waiting_for_run_exit"),
+            (
+                row["state"],
+                row["attempt_count"],
+                row["claim_generation"],
+                row["waiting_reason"],
+            ),
+        )
+        self.assertEqual(current_run_id + 1, other_run_id)
+        self.assertEqual(
+            "feat/disposable",
+            self._git(self.worktree, "branch", "--show-current").stdout.strip(),
+        )
+        self.assertEqual("staged dirt\n", (self.worktree / "tracked.txt").read_text())
+        self.assertEqual("discard\n", (self.worktree / "untracked.txt").read_text())
 
     def test_launcher_refuses_target_held_by_runtime_claim(self):
         claim = self.cleanup.claim_next(

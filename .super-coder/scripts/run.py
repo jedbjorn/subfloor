@@ -1054,7 +1054,12 @@ class LaunchPlan(NamedTuple):
     cli_version: "str | None"
 
 
-def cleanup_before_launch(con: sqlite3.Connection, shell: dict) -> None:
+def cleanup_before_launch(
+    con: sqlite3.Connection,
+    shell: dict,
+    *,
+    current_leased_run_id: "int | None" = None,
+) -> None:
     """Resolve one shell's older successful-Sprint cleanup before reuse."""
     if (
         os.environ.get("RENDER_ONLY")
@@ -1068,7 +1073,10 @@ def cleanup_before_launch(con: sqlite3.Connection, shell: dict) -> None:
     store = sprint_cleanup.SprintCleanupTargetStore(con)
     if store.unresolved_worktree((shell_id,)) is None:
         return
-    receipt = sprint_cleanup.SprintCleanupExecutor(store).run_next(
+    receipt = sprint_cleanup.SprintCleanupExecutor(
+        store,
+        current_leased_run_id=current_leased_run_id,
+    ).run_next(
         f"launcher:{os.getpid()}:{shell_id}",
         shell_id=shell_id,
     )
@@ -1103,7 +1111,8 @@ def _cli_version(binary: str) -> "str | None":
 
 def prepare_launch(*, shell_id: int, harness: "str | None" = None,
                    model: "str | None" = None, effort: "str | None" = None,
-                   headless_prompt: "str | None" = None) -> LaunchPlan:
+                   headless_prompt: "str | None" = None,
+                   current_leased_run_id: "int | None" = None) -> LaunchPlan:
     """Prepare a launch exactly as main() would, without any TTY.
 
     A browser chat uses the normal harness, model, effort, permission,
@@ -1188,7 +1197,11 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
         session_effort = effort
 
     try:
-        cleanup_before_launch(con, chosen)
+        cleanup_before_launch(
+            con,
+            chosen,
+            current_leased_run_id=current_leased_run_id,
+        )
     except LaunchError:
         con.close()
         raise
