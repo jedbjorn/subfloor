@@ -55,6 +55,7 @@
     "tests/test_sprint_cli.py",
     "tests/test_sprint_skills.py",
     "tests/test_sprint_snapshot_rebuild.py",
+    "tests/test_sprint_spec_revisions.py",
     "tests/test_sprint_live_proof.py",
     "tests/test_sprint_board_api.py",
     "tests/test_sprint_board_ui.py",
@@ -99,7 +100,8 @@
     ".super-coder/migrations/0200_reseed_sprint_live_replanning.sql",
     ".super-coder/migrations/0201_sprint_cleanup_targets.sql",
     ".super-coder/migrations/0202_reseed_context_efficient_skills.sql",
-    ".super-coder/migrations/0203_sprint_cleanup_recovery.sql"
+    ".super-coder/migrations/0203_sprint_cleanup_recovery.sql",
+    ".super-coder/migrations/0204_sprint_governing_revision_evidence.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
