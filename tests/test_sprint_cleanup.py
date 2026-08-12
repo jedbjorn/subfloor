@@ -593,6 +593,49 @@ class SprintCleanupSchedulingTest(SprintDomainCase):
             ),
         )
 
+    def test_older_prepared_sprint_cannot_arm_over_later_cleanup(self):
+        self.store.transition(
+            self.sprint_id,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="fixture completion",
+            terminal_outcome="accepted",
+        )
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='succeeded' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        older_sprint, _older_unit = self.create_sprint()
+        later_sprint, _later_unit = self.create_sprint()
+        self.store.arm(later_sprint, 3)
+        self.store.transition(
+            later_sprint,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="later Sprint completed first",
+            terminal_outcome="accepted",
+        )
+
+        with self.assertRaises(sprint_domain.SprintCleanupConflictError) as raised:
+            self.store.arm(older_sprint, 3)
+
+        self.assertEqual(later_sprint, raised.exception.details["prior_sprint_id"])
+        self.assertLess(older_sprint, later_sprint)
+        self.assertEqual(
+            ("prepared", 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT lifecycle,"
+                    "(SELECT COUNT(*) FROM wake_message WHERE sprint_id=?),"
+                    "(SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='lifecycle.armed') "
+                    "FROM sprints WHERE sprint_id=?",
+                    (older_sprint, older_sprint, older_sprint),
+                ).fetchone()
+            ),
+        )
+
     def test_cleanup_arm_conflict_projects_actionable_details(self):
         blocker = sprint_cleanup.UnresolvedCleanupTarget(
             cleanup_target_id=91,
@@ -857,6 +900,12 @@ class SprintCleanupExecutorTest(SprintDomainCase):
                     "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?",
                     (newer_sprint,),
                 )
+                self.con.execute(
+                    "INSERT INTO sprint_events "
+                    "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+                    "VALUES (?,'lifecycle.armed','fnb',3,'{}')",
+                    (newer_sprint,),
+                )
                 self.con.commit()
             return "dormant"
 
@@ -874,6 +923,61 @@ class SprintCleanupExecutorTest(SprintDomainCase):
         self.assertEqual(("failed", 0), (row["state"], row["attempt_count"]))
         self.assertIsNotNone(row["before_evidence"])
 
+    def test_cleanup_refuses_lower_id_sprint_armed_after_authority(self):
+        self.con.execute(
+            "UPDATE sprint_cleanup_targets SET state='succeeded' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        older_sprint, _older_unit = self.create_sprint()
+        later_sprint, _later_unit = self.create_sprint()
+        self.lifecycle.arm(later_sprint, 3)
+        self.lifecycle.transition(
+            later_sprint,
+            "completed",
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="later Sprint completed first",
+            terminal_outcome="accepted",
+        )
+        with self.assertRaises(sprint_domain.SprintCleanupConflictError):
+            self.lifecycle.arm(older_sprint, 3)
+        self.con.execute(
+            "UPDATE sprints SET lifecycle='armed',armed_at=datetime('now') "
+            "WHERE sprint_id=?",
+            (older_sprint,),
+        )
+        self.con.execute(
+            "INSERT INTO sprint_events "
+            "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+            "VALUES (?,'lifecycle.armed','fnb',3,'{}')",
+            (older_sprint,),
+        )
+        self.con.commit()
+        self._dirty_worktree()
+
+        receipt = self._executor().run_next("fixture", shell_id=1)
+
+        self.assertLess(older_sprint, later_sprint)
+        self.assertEqual(
+            ("failed", "newer_sprint_owns_target", 0),
+            (receipt.state, receipt.code, receipt.attempt_count),
+        )
+        self.assertEqual(
+            "feat/disposable",
+            self._git(self.worktree, "branch", "--show-current").stdout.strip(),
+        )
+        self.assertEqual("staged dirt\n", (self.worktree / "tracked.txt").read_text())
+        self.assertTrue((self.worktree / "untracked.txt").is_file())
+        row = self.con.execute(
+            "SELECT state,attempt_count,last_error_code "
+            "FROM sprint_cleanup_targets WHERE sprint_id=? AND shell_id=1",
+            (later_sprint,),
+        ).fetchone()
+        self.assertEqual(
+            ("failed", 0, "newer_sprint_owns_target"),
+            tuple(row),
+        )
+
     def test_newer_aborted_sprint_preserves_work_without_attempt(self):
         self._dirty_worktree()
         newer_sprint, _unit = self.create_sprint()
@@ -886,6 +990,12 @@ class SprintCleanupExecutorTest(SprintDomainCase):
                 self.con.execute(
                     "UPDATE sprints SET lifecycle='aborted',"
                     "terminal_outcome='aborted' WHERE sprint_id=?",
+                    (newer_sprint,),
+                )
+                self.con.execute(
+                    "INSERT INTO sprint_events "
+                    "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+                    "VALUES (?,'lifecycle.aborted','fnb',3,'{}')",
                     (newer_sprint,),
                 )
                 self.con.commit()
@@ -976,6 +1086,82 @@ class SprintCleanupExecutorTest(SprintDomainCase):
             "",
             self._git(self.worktree, "status", "--porcelain").stdout,
         )
+
+    def test_runtime_pulses_advance_past_live_target_to_dormant_worktree(self):
+        planner_worktree = self.repository / ".sc-worktrees" / "pln1"
+        self._git(
+            self.repository,
+            "worktree",
+            "add",
+            "-b",
+            "shell/pln1",
+            str(planner_worktree),
+            "main",
+        )
+        (self.worktree / "live-state.txt").write_text("preserve\n", encoding="utf-8")
+        (planner_worktree / "dormant-state.txt").write_text(
+            "discard\n", encoding="utf-8"
+        )
+        runtime = sprint_runtime.SprintRuntimeService(
+            ":memory:", owner="runtime-fixture"
+        )
+        switch = mock.Mock()
+        switch.tick.return_value = False
+        executor = self._executor(
+            liveness=lambda claim: "live" if claim.shell_id == 1 else "dormant"
+        )
+
+        with mock.patch.object(
+            sprint_runtime.activity_monitor.ActivityMonitor,
+            "tick",
+            return_value=mock.Mock(changed=False),
+        ), mock.patch.object(runtime, "_switch", return_value=switch), mock.patch.object(
+            runtime, "_deliver_wakes", return_value=False
+        ), mock.patch.object(runtime, "_record_heartbeat"), mock.patch.object(
+            sprint_runtime.sprint_cleanup,
+            "SprintCleanupExecutor",
+            return_value=executor,
+        ):
+            first_changed = runtime._pulse(self.con, startup=False)
+            second_changed = runtime._pulse(self.con, startup=False)
+
+        rows = {
+            row["shell_id"]: row
+            for row in self.con.execute(
+                "SELECT shell_id,target_kind,state,attempt_count,claim_generation,"
+                "lease_expires_at,waiting_reason FROM sprint_cleanup_targets "
+                "WHERE sprint_id=? ORDER BY cleanup_target_id",
+                (self.sprint_id,),
+            )
+            if row["target_kind"] == "worktree"
+        }
+        artifact = self.con.execute(
+            "SELECT state,claim_generation FROM sprint_cleanup_targets "
+            "WHERE sprint_id=? AND target_kind='artifact_dir'",
+            (self.sprint_id,),
+        ).fetchone()
+        self.assertEqual((True, True), (first_changed, second_changed))
+        self.assertEqual(
+            ("pending", 0, 1, "2026-08-11 20:00:05", "waiting_for_run_exit"),
+            tuple(rows[1][field] for field in (
+                "state",
+                "attempt_count",
+                "claim_generation",
+                "lease_expires_at",
+                "waiting_reason",
+            )),
+        )
+        self.assertEqual(
+            ("succeeded", 1, 1),
+            tuple(rows[3][field] for field in (
+                "state",
+                "attempt_count",
+                "claim_generation",
+            )),
+        )
+        self.assertEqual(("pending", 0), tuple(artifact))
+        self.assertTrue((self.worktree / "live-state.txt").is_file())
+        self.assertFalse((planner_worktree / "dormant-state.txt").exists())
 
     def test_launcher_refuses_target_held_by_runtime_claim(self):
         claim = self.cleanup.claim_next(
@@ -1106,6 +1292,7 @@ class SprintCleanupExecutorTest(SprintDomainCase):
             },
             lease_seconds=60,
         )
+        self.now += timedelta(seconds=6)
         failures = []
         for _attempt in range(3):
             failures.append(failing.run_next("fixture", shell_id=1))

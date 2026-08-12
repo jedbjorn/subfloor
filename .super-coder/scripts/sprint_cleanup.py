@@ -153,6 +153,7 @@ IdentityProvider = Callable[[], tuple[Path, Path]]
 Clock = Callable[[], datetime]
 LivenessProbe = Callable[[CleanupClaim], str]
 PruneBranches = Callable[[Path], dict[str, Any]]
+CLEANUP_WAIT_RETRY_SECONDS = 5
 
 
 def _utc_now() -> datetime:
@@ -363,19 +364,12 @@ class SprintCleanupTargetStore:
     def unresolved_worktree(
         self,
         shell_ids: Iterable[int],
-        *,
-        before_sprint_id: int | None = None,
     ) -> UnresolvedCleanupTarget | None:
-        """Return the oldest unresolved cleanup that fences shell reuse."""
+        """Return one unresolved completed-Sprint cleanup fencing shell reuse."""
         normalized = tuple(sorted({int(shell_id) for shell_id in shell_ids}))
         if not normalized or not self._cleanup_table_exists():
             return None
         placeholders = ",".join("?" for _ in normalized)
-        params: list[object] = [*normalized]
-        prior_filter = ""
-        if before_sprint_id is not None:
-            prior_filter = " AND target.sprint_id<?"
-            params.append(before_sprint_id)
         row = self.con.execute(
             "SELECT target.cleanup_target_id,target.sprint_id,target.shell_id,"
             "target.state,target.waiting_reason,target.last_error_code,"
@@ -384,9 +378,8 @@ class SprintCleanupTargetStore:
             "WHERE target.target_kind='worktree' "
             "AND target.state<>'succeeded' "
             f"AND target.shell_id IN ({placeholders})"
-            + prior_filter
-            + " ORDER BY target.sprint_id,target.cleanup_target_id LIMIT 1",
-            params,
+            " ORDER BY target.created_at,target.cleanup_target_id LIMIT 1",
+            normalized,
         ).fetchone()
         if row is None:
             return None
@@ -425,9 +418,11 @@ class SprintCleanupTargetStore:
         now = self.clock()
         now_stamp = _stamp(now)
         if self.con.execute(
-            "SELECT 1 FROM sprint_cleanup_targets WHERE state='pending' "
+            "SELECT 1 FROM sprint_cleanup_targets WHERE "
+            "(state='pending' AND "
+            " (lease_expires_at IS NULL OR lease_expires_at<=?)) "
             "OR (state='running' AND lease_expires_at<=?) LIMIT 1",
-            (now_stamp,),
+            (now_stamp, now_stamp),
         ).fetchone() is None:
             return None
         expires_at = _stamp(now + timedelta(seconds=lease_seconds))
@@ -1423,7 +1418,11 @@ class SprintCleanupExecutor:
                     return self._delete_artifacts(claim)
                 return self._reset_worktree(claim)
         except SprintCleanupWaiting as exc:
-            changed = self.store.release_waiting(claim, exc.code)
+            changed = self.store.release_waiting(
+                claim,
+                exc.code,
+                retry_after_seconds=CLEANUP_WAIT_RETRY_SECONDS,
+            )
             return self._receipt(
                 claim,
                 "waiting" if changed else "stale",
@@ -1649,19 +1648,34 @@ class SprintCleanupExecutor:
                 "liveness_indeterminate",
                 "target process liveness could not be proven dormant",
             )
-        newer = self.con.execute(
-            "SELECT sprint.sprint_id FROM sprints sprint "
+        authority = self.con.execute(
+            "SELECT event_id FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='lifecycle.completed' "
+            "ORDER BY event_id DESC LIMIT 1",
+            (claim.sprint_id,),
+        ).fetchone()
+        if authority is None:
+            raise SprintCleanupSafetyError(
+                "cleanup_authority_unverifiable",
+                "cleanup Sprint has no durable completion boundary",
+            )
+        subsequent = self.con.execute(
+            "SELECT sprint.sprint_id,usage.event_id FROM sprints sprint "
             "JOIN sprint_participants participant "
             "ON participant.sprint_id=sprint.sprint_id "
-            "WHERE participant.shell_id=? AND sprint.sprint_id>? "
-            "AND sprint.lifecycle<>'prepared' "
-            "ORDER BY sprint.sprint_id LIMIT 1",
-            (claim.shell_id, claim.sprint_id),
+            "JOIN sprint_events usage ON usage.sprint_id=sprint.sprint_id "
+            "AND usage.event_type IN ('lifecycle.armed','lifecycle.paused',"
+            "'lifecycle.completed','lifecycle.aborted') "
+            "WHERE participant.shell_id=? AND sprint.sprint_id<>? "
+            "AND sprint.lifecycle<>'prepared' AND usage.event_id>? "
+            "ORDER BY usage.event_id LIMIT 1",
+            (claim.shell_id, claim.sprint_id, authority["event_id"]),
         ).fetchone()
-        if newer is not None:
+        if subsequent is not None:
             raise SprintCleanupSafetyError(
                 "newer_sprint_owns_target",
-                f"newer Sprint {newer['sprint_id']} has used the cleanup shell",
+                f"Sprint {subsequent['sprint_id']} used the cleanup shell after "
+                "cleanup authority was created",
             )
 
     def _validate_repository_identity(self, claim: CleanupClaim) -> None:

@@ -392,7 +392,6 @@ class SprintLifecycleStore:
         ]
         blocker = self.cleanup_store.unresolved_worktree(
             shell_ids,
-            before_sprint_id=sprint_id,
         )
         if blocker is not None:
             raise SprintCleanupConflictError(blocker)
