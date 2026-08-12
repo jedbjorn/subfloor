@@ -139,10 +139,21 @@ class CleanupRecoveryReceipt:
     projection: CleanupProjection
 
 
+@dataclass(frozen=True)
+class UnresolvedCleanupTarget:
+    cleanup_target_id: int
+    sprint_id: int
+    shell_id: int
+    state: str
+    path_label: str
+    last_safe_fact: str
+
+
 IdentityProvider = Callable[[], tuple[Path, Path]]
 Clock = Callable[[], datetime]
 LivenessProbe = Callable[[CleanupClaim], str]
 PruneBranches = Callable[[Path], dict[str, Any]]
+CLEANUP_WAIT_RETRY_SECONDS = 5
 
 
 def _utc_now() -> datetime:
@@ -350,6 +361,46 @@ class SprintCleanupTargetStore:
             failed_count=counts["failed"],
         )
 
+    def unresolved_worktree(
+        self,
+        shell_ids: Iterable[int],
+    ) -> UnresolvedCleanupTarget | None:
+        """Return one unresolved completed-Sprint cleanup fencing shell reuse."""
+        normalized = tuple(sorted({int(shell_id) for shell_id in shell_ids}))
+        if not normalized or not self._cleanup_table_exists():
+            return None
+        placeholders = ",".join("?" for _ in normalized)
+        row = self.con.execute(
+            "SELECT target.cleanup_target_id,target.sprint_id,target.shell_id,"
+            "target.state,target.waiting_reason,target.last_error_code,"
+            "shell.shortname FROM sprint_cleanup_targets target "
+            "JOIN shells shell ON shell.shell_id=target.shell_id "
+            "WHERE target.target_kind='worktree' "
+            "AND target.state<>'succeeded' "
+            f"AND target.shell_id IN ({placeholders})"
+            " ORDER BY target.created_at,target.cleanup_target_id LIMIT 1",
+            normalized,
+        ).fetchone()
+        if row is None:
+            return None
+        last_safe_fact = str(
+            row["last_error_code"]
+            or row["waiting_reason"]
+            or (
+                "cleanup_claim_active"
+                if row["state"] == "running"
+                else "cleanup_pending"
+            )
+        )
+        return UnresolvedCleanupTarget(
+            cleanup_target_id=int(row["cleanup_target_id"]),
+            sprint_id=int(row["sprint_id"]),
+            shell_id=int(row["shell_id"]),
+            state=str(row["state"]),
+            path_label=f".sc-worktrees/{str(row['shortname']).lower()}",
+            last_safe_fact=last_safe_fact,
+        )
+
     def claim_next(
         self,
         owner: str,
@@ -362,8 +413,18 @@ class SprintCleanupTargetStore:
             raise ValueError("cleanup lease owner is required")
         if lease_seconds <= 0:
             raise ValueError("cleanup lease duration must be positive")
+        if not self._cleanup_table_exists():
+            return None
         now = self.clock()
         now_stamp = _stamp(now)
+        if self.con.execute(
+            "SELECT 1 FROM sprint_cleanup_targets WHERE "
+            "(state='pending' AND "
+            " (lease_expires_at IS NULL OR lease_expires_at<=?)) "
+            "OR (state='running' AND lease_expires_at<=?) LIMIT 1",
+            (now_stamp, now_stamp),
+        ).fetchone() is None:
+            return None
         expires_at = _stamp(now + timedelta(seconds=lease_seconds))
         self._begin_write()
         try:
@@ -386,6 +447,7 @@ class SprintCleanupTargetStore:
                 "AND worktree.target_kind='worktree' "
                 "AND worktree.state<>'succeeded')) "
                 "ORDER BY CASE target.target_kind WHEN 'worktree' THEN 0 ELSE 1 END,"
+                "target.claim_generation,target.attempt_count DESC,"
                 "target.sprint_id,target.cleanup_target_id LIMIT 1",
                 params,
             ).fetchone()
@@ -781,6 +843,16 @@ class SprintCleanupTargetStore:
         if self.con.in_transaction:
             raise RuntimeError("cleanup execution requires an idle DB connection")
         self.con.execute("BEGIN IMMEDIATE")
+
+    def _cleanup_table_exists(self) -> bool:
+        row = self.con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='sprint_cleanup_targets'"
+        ).fetchone()
+        try:
+            return row is not None and row[0] == 1
+        except (KeyError, TypeError):
+            return False
 
     @staticmethod
     def _evidence(value: dict[str, Any]) -> str:
@@ -1303,6 +1375,7 @@ class SprintCleanupExecutor:
         store: SprintCleanupTargetStore,
         *,
         liveness_probe: LivenessProbe | None = None,
+        current_leased_run_id: int | None = None,
         branch_pruner: PruneBranches | None = None,
         fetch_timeout: int = 30,
         command_timeout: int = 30,
@@ -1312,6 +1385,7 @@ class SprintCleanupExecutor:
     ) -> None:
         self.store = store
         self.con = store.con
+        self.current_leased_run_id = current_leased_run_id
         self.liveness_probe = liveness_probe or self._default_liveness
         self.branch_pruner = branch_pruner or (
             lambda repo: git_prune.prune(repo=repo, fetch=False)
@@ -1347,7 +1421,11 @@ class SprintCleanupExecutor:
                     return self._delete_artifacts(claim)
                 return self._reset_worktree(claim)
         except SprintCleanupWaiting as exc:
-            changed = self.store.release_waiting(claim, exc.code)
+            changed = self.store.release_waiting(
+                claim,
+                exc.code,
+                retry_after_seconds=CLEANUP_WAIT_RETRY_SECONDS,
+            )
             return self._receipt(
                 claim,
                 "waiting" if changed else "stale",
@@ -1573,19 +1651,34 @@ class SprintCleanupExecutor:
                 "liveness_indeterminate",
                 "target process liveness could not be proven dormant",
             )
-        newer = self.con.execute(
-            "SELECT sprint.sprint_id FROM sprints sprint "
+        authority = self.con.execute(
+            "SELECT event_id FROM sprint_events WHERE sprint_id=? "
+            "AND event_type='lifecycle.completed' "
+            "ORDER BY event_id DESC LIMIT 1",
+            (claim.sprint_id,),
+        ).fetchone()
+        if authority is None:
+            raise SprintCleanupSafetyError(
+                "cleanup_authority_unverifiable",
+                "cleanup Sprint has no durable completion boundary",
+            )
+        subsequent = self.con.execute(
+            "SELECT sprint.sprint_id,usage.event_id FROM sprints sprint "
             "JOIN sprint_participants participant "
             "ON participant.sprint_id=sprint.sprint_id "
-            "WHERE participant.shell_id=? AND sprint.sprint_id>? "
-            "AND sprint.lifecycle<>'prepared' "
-            "ORDER BY sprint.sprint_id LIMIT 1",
-            (claim.shell_id, claim.sprint_id),
+            "JOIN sprint_events usage ON usage.sprint_id=sprint.sprint_id "
+            "AND usage.event_type IN ('lifecycle.armed','lifecycle.paused',"
+            "'lifecycle.completed','lifecycle.aborted') "
+            "WHERE participant.shell_id=? AND sprint.sprint_id<>? "
+            "AND sprint.lifecycle<>'prepared' AND usage.event_id>? "
+            "ORDER BY usage.event_id LIMIT 1",
+            (claim.shell_id, claim.sprint_id, authority["event_id"]),
         ).fetchone()
-        if newer is not None:
+        if subsequent is not None:
             raise SprintCleanupSafetyError(
                 "newer_sprint_owns_target",
-                f"newer Sprint {newer['sprint_id']} has used the cleanup shell",
+                f"Sprint {subsequent['sprint_id']} used the cleanup shell after "
+                "cleanup authority was created",
             )
 
     def _validate_repository_identity(self, claim: CleanupClaim) -> None:
@@ -1723,11 +1816,22 @@ class SprintCleanupExecutor:
     def _default_liveness(self, claim: CleanupClaim) -> str:
         if claim.shell_id is None:
             return "dormant"
-        live_run = self.con.execute(
+        live_run_sql = (
             "SELECT run.run_id FROM conversation_runs run "
             "WHERE run.shell_id=? AND run.state IN ('leased','starting','running') "
-            "LIMIT 1",
-            (claim.shell_id,),
+        )
+        live_run_params: list[int] = [claim.shell_id]
+        if self.current_leased_run_id is not None:
+            # Browser dispatch reserves this exact run before launcher
+            # preflight. Only that still-leased reservation is self-owned;
+            # every other live row, and this row after starting, still blocks.
+            live_run_sql += (
+                "AND NOT (run.run_id=? AND run.state='leased') "
+            )
+            live_run_params.append(self.current_leased_run_id)
+        live_run = self.con.execute(
+            live_run_sql + "LIMIT 1",
+            live_run_params,
         ).fetchone()
         if live_run is not None:
             return "live"

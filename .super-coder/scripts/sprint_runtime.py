@@ -15,6 +15,7 @@ import activity_monitor
 import conversation_broker
 import conversation_events
 import db_driver
+import sprint_cleanup
 from sprint_domain import (
     ArmedServiceSwitch,
     SprintInvariantError,
@@ -218,6 +219,8 @@ class SprintRuntimeService(threading.Thread):
         self._stop_event = threading.Event()
         self._started_once = threading.Event()
         self._ready = threading.Event()
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_thread: threading.Thread | None = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -226,7 +229,7 @@ class SprintRuntimeService(threading.Thread):
         return self._started_once.wait(timeout)
 
     def wait_ready(self, timeout: float = 5.0) -> bool:
-        """Wait until the first complete successful cycle is durable."""
+        """Wait until the first operational cycle and heartbeat are durable."""
         return self._ready.wait(timeout)
 
     def pulse_once(self, *, startup: bool = False) -> bool:
@@ -236,15 +239,54 @@ class SprintRuntimeService(threading.Thread):
         finally:
             con.close()
 
-    def _pulse(self, con: sqlite3.Connection, *, startup: bool) -> bool:
+    def _pulse(
+        self,
+        con: sqlite3.Connection,
+        *,
+        startup: bool,
+        run_cleanup: bool = True,
+    ) -> bool:
         monitored = activity_monitor.ActivityMonitor(
             con, config=self.activity_config
         ).tick()
         switch = self._switch(con)
         serviced = switch.recover_on_startup() if startup else switch.tick()
         delivered = self._deliver_wakes(con)
+        cleanup_changed = False
+        if run_cleanup:
+            cleanup = sprint_cleanup.SprintCleanupExecutor(
+                sprint_cleanup.SprintCleanupTargetStore(con)
+            ).run_next(f"{self.owner}:cleanup")
+            cleanup_changed = cleanup.state != "idle"
         self._record_heartbeat(con)
-        return delivered or serviced or monitored.changed
+        return delivered or serviced or monitored.changed or cleanup_changed
+
+    def _start_cleanup_worker(self) -> bool:
+        """Start at most one non-daemon cleanup claim owned by this runtime."""
+        if self._stop_event.is_set():
+            return False
+        with self._cleanup_lock:
+            if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
+                return False
+            worker = threading.Thread(
+                target=self._run_cleanup_worker,
+                name="sprint-runtime-cleanup",
+                daemon=False,
+            )
+            self._cleanup_thread = worker
+            worker.start()
+        return True
+
+    def _run_cleanup_worker(self) -> None:
+        con = db_driver.connect(self.db_path)
+        try:
+            sprint_cleanup.SprintCleanupExecutor(
+                sprint_cleanup.SprintCleanupTargetStore(con)
+            ).run_next(f"{self.owner}:cleanup")
+        except Exception as exc:  # noqa: BLE001 - runtime stays available for retry
+            print(f"sprint-runtime: cleanup error ({exc})", flush=True)
+        finally:
+            con.close()
 
     def _record_heartbeat(self, con: sqlite3.Connection) -> None:
         prior = con.execute(
@@ -304,14 +346,16 @@ class SprintRuntimeService(threading.Thread):
                 if self._stop_event.is_set():
                     return
                 try:
-                    self._pulse(con, startup=True)
+                    self._pulse(con, startup=True, run_cleanup=False)
                 except Exception as exc:  # noqa: BLE001 - startup must fail closed
                     print(f"sprint-runtime: startup error ({exc})", flush=True)
                     return
                 self._ready.set()
+                self._start_cleanup_worker()
                 while not self._stop_event.wait(self.pulse_seconds):
                     try:
-                        self._pulse(con, startup=False)
+                        self._pulse(con, startup=False, run_cleanup=False)
+                        self._start_cleanup_worker()
                     except Exception as exc:  # noqa: BLE001 - keep inspection alive
                         print(f"sprint-runtime: pulse error ({exc})", flush=True)
             except Exception as exc:  # noqa: BLE001 - service faults stay visible

@@ -103,6 +103,7 @@ class ConversationLaunchPreparer:
                 model=broker_run.model,
                 effort=broker_run.effort,
                 headless_prompt=broker_run.body,
+                current_leased_run_id=broker_run.run_id,
             )
         except (run_mod.LaunchError, SystemExit) as exc:
             raise ConversationLaunchError(

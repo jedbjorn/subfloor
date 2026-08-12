@@ -76,6 +76,33 @@ class SprintPreflightError(SprintInvariantError):
     """The selected participant route is incompatible with this runtime."""
 
 
+class SprintCleanupConflictError(SprintInvariantError):
+    """An earlier successful Sprint still owns a participant worktree."""
+
+    def __init__(self, blocker: sprint_cleanup.UnresolvedCleanupTarget) -> None:
+        self.details = {
+            "code": "prior_cleanup_unresolved",
+            "prior_sprint_id": blocker.sprint_id,
+            "cleanup_target_id": blocker.cleanup_target_id,
+            "target_state": blocker.state,
+            "path_label": blocker.path_label,
+            "last_safe_fact": blocker.last_safe_fact,
+            "status_command": (
+                f"sc sprint cleanup-status --sprint {blocker.sprint_id}"
+            ),
+            "retry_command": (
+                f"sc sprint cleanup --sprint {blocker.sprint_id} "
+                "--key <stable-retry-key>"
+            ),
+        }
+        super().__init__(
+            f"prior Sprint {blocker.sprint_id} cleanup is {blocker.state} for "
+            f"{blocker.path_label} (last_safe_fact={blocker.last_safe_fact}); "
+            f"run `{self.details['status_command']}` and, after correcting a "
+            f"failure, `{self.details['retry_command']}`"
+        )
+
+
 @dataclass(frozen=True)
 class LifecycleActor:
     kind: str
@@ -282,6 +309,7 @@ class SprintLifecycleStore:
             self._require_edge(sprint["lifecycle"], "armed")
             self._authorize(sprint, "armed", actor)
             planner_participant, selections = self._validate_arm_plan(sprint)
+            self._require_prior_cleanup_resolved(sprint_id)
             current_fingerprint = self._participant_selection_fingerprint(
                 sprint_id
             )
@@ -337,6 +365,7 @@ class SprintLifecycleStore:
         self._require_edge(sprint["lifecycle"], "armed")
         self._authorize(sprint, "armed", actor)
         self._validate_arm_plan(sprint)
+        self._require_prior_cleanup_resolved(sprint_id)
         try:
             routes = sprint_participant_chats.prepare_sprint_participant_routes(
                 self.con,
@@ -351,6 +380,24 @@ class SprintLifecycleStore:
             except AdapterError as exc:
                 raise SprintPreflightError(str(exc)) from exc
         return fingerprint
+
+    def _require_prior_cleanup_resolved(self, sprint_id: int) -> None:
+        shell_ids = [
+            int(row["shell_id"])
+            for row in self.con.execute(
+                "SELECT participant.shell_id FROM sprint_participants participant "
+                "JOIN shells shell ON shell.shell_id=participant.shell_id "
+                "WHERE participant.sprint_id=? "
+                "AND COALESCE(shell.flavor,'')<>'admin' "
+                "ORDER BY participant.shell_id",
+                (sprint_id,),
+            )
+        ]
+        blocker = self.cleanup_store.unresolved_worktree(
+            shell_ids,
+        )
+        if blocker is not None:
+            raise SprintCleanupConflictError(blocker)
 
     def _participant_selection_fingerprint(self, sprint_id: int) -> str:
         try:
@@ -591,6 +638,7 @@ class SprintLifecycleStore:
                 )
             self._require_edge(current, "armed")
             self._authorize(sprint, "armed", actor)
+            self._require_prior_cleanup_resolved(sprint_id)
 
             # Armed is not externally visible until this transaction commits.
             # That permits active reconciliation notifications to be created

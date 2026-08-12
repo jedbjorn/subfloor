@@ -1949,18 +1949,24 @@ class Handler(BaseHTTPRequestHandler):
     def _sprint_board_mutation_error(self, exc: Exception):
         if isinstance(exc, sprint_domain.SprintAuthorityError):
             status, code = 403, "forbidden"
+            details = {}
+        elif isinstance(exc, sprint_domain.SprintCleanupConflictError):
+            status, code = 409, "lifecycle_conflict"
+            details = exc.details
         elif isinstance(
             exc, (sprint_domain.SprintStateError, sprint_domain.SprintInvariantError)
         ):
             status, code = 409, "lifecycle_conflict"
+            details = {}
         elif isinstance(exc, KeyError):
             status, code = 404, "sprint_not_found"
+            details = {}
         else:
             return self._fail(exc)
         return self._send(status, {"error": {
             "code": code,
             "message": str(exc).strip("'"),
-            "details": {},
+            "details": details,
         }})
 
     # -- /sprint/* token-scoped collaboration endpoints --
@@ -2033,6 +2039,11 @@ class Handler(BaseHTTPRequestHandler):
             )
         if isinstance(exc, sprint_domain.SprintAuthorityError):
             return self._send(403, {"error": str(exc)})
+        if isinstance(exc, sprint_domain.SprintCleanupConflictError):
+            return self._send(
+                409,
+                {"error": str(exc), "details": exc.details},
+            )
         if isinstance(exc, sprint_domain.SprintPreflightError):
             return self._send(422, {"error": str(exc)})
         if isinstance(exc, sprint_domain.SprintInvariantError):
