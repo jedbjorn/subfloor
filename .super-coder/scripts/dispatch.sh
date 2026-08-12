@@ -926,7 +926,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|update|update-harnesses|harness-status|rollback|feature|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|map-sql|map-sql-rw|render|render-check|map|map-setup|analytics|models|seed-skills|skill|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health)
+  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|map-sql|map-sql-rw|render|render-check|map|map-setup|analytics|models|seed-skills|skill|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -962,6 +962,7 @@ case "$cmd" in
       "$PY" "$S/install.py" --update-harnesses
     fi ;;
   harness-status)  sc_harness_status ;;
+  docker-cache-gc) exec "$PY" "$S/docker_cache.py" "$@" ;;
   rollback)     exec "$PY" "$S/rollback.py" "$@" ;;
   feature)      exec "$PY" "$S/feature.py" "$@" ;;
   artifact-mode) exec "$PY" "$S/artifact_policy.py" "$@" ;;
@@ -1442,6 +1443,8 @@ super-coder — forkable shell substrate
                              without docker, updates this host's CLIs instead — there the host IS the runtime
   ./sc harness-status      report the harness CLI versions inside the sandbox + whether the image owes a harness rebuild
                              (a model the shells cannot reach is nearly always this — see .super-coder/docs/harness-freshness.md)
+  ./sc docker-cache-gc     remove unused host-global Docker build cache older than seven days
+                             --until <duration> changes the age · --all removes all unused cache
   ./sc rollback            sound undo of a bad update — restore the DB + engine (engine.ref.prev) together
                              --engine-only repairs a new-engine / unchanged-old-DB half floor without restoring a DB backup
   ./sc feature             list the opt-in features (pg · windows · tailnet · pm2 · app-deploy) and the state of both halves (config block + skill grants)

@@ -146,7 +146,9 @@ class Reader:
 class SprintCliApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp = Path(tempfile.mkdtemp())
+        cls._temporary = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._temporary.cleanup)
+        cls.tmp = Path(cls._temporary.name)
         cls.db = cls.tmp / "shell.db"
         con = sqlite3.connect(cls.db)
         con.row_factory = sqlite3.Row
