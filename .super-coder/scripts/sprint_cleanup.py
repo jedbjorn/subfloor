@@ -447,7 +447,7 @@ class SprintCleanupTargetStore:
                 "AND worktree.target_kind='worktree' "
                 "AND worktree.state<>'succeeded')) "
                 "ORDER BY CASE target.target_kind WHEN 'worktree' THEN 0 ELSE 1 END,"
-                "CASE WHEN target.waiting_reason IS NULL THEN 0 ELSE 1 END,"
+                "target.claim_generation,target.attempt_count DESC,"
                 "target.sprint_id,target.cleanup_target_id LIMIT 1",
                 params,
             ).fetchone()

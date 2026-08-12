@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1163,6 +1164,228 @@ class SprintCleanupExecutorTest(SprintDomainCase):
         self.assertEqual(("pending", 0), tuple(artifact))
         self.assertTrue((self.worktree / "live-state.txt").is_file())
         self.assertFalse((planner_worktree / "dormant-state.txt").exists())
+
+    def test_runtime_fairness_advances_dormant_retry_before_live_waiter(self):
+        planner_worktree = self.repository / ".sc-worktrees" / "pln1"
+        reviewer_worktree = self.repository / ".sc-worktrees" / "rev1"
+        self._git(
+            self.repository,
+            "worktree",
+            "add",
+            "-b",
+            "shell/pln1",
+            str(planner_worktree),
+            "main",
+        )
+        self._git(
+            self.repository,
+            "worktree",
+            "add",
+            "-b",
+            "shell/rev1",
+            str(reviewer_worktree),
+            "main",
+        )
+        (self.worktree / "live-state.txt").write_text("preserve\n", encoding="utf-8")
+        (planner_worktree / "retry-state.txt").write_text(
+            "discard\n", encoding="utf-8"
+        )
+        (reviewer_worktree / "dormant-state.txt").write_text(
+            "discard\n", encoding="utf-8"
+        )
+
+        class FailPlannerOnce(sprint_cleanup.SprintCleanupExecutor):
+            failed = False
+
+            def _git(self, repo, *args, code, timeout=None):
+                if (
+                    Path(repo) == planner_worktree
+                    and args[:2] == ("clean", "-ffd")
+                    and not self.failed
+                ):
+                    self.failed = True
+                    raise sprint_cleanup.SprintCleanupMutationError(
+                        "clean_current_failed",
+                        "injected dormant retry",
+                    )
+                return super()._git(repo, *args, code=code, timeout=timeout)
+
+        executor = FailPlannerOnce(
+            self.cleanup,
+            liveness_probe=lambda claim: (
+                "live" if claim.shell_id == 1 else "dormant"
+            ),
+            branch_pruner=lambda _repo: {
+                "candidates": 0,
+                "deleted": [],
+                "failed": [],
+            },
+            lease_seconds=60,
+        )
+        runtime = sprint_runtime.SprintRuntimeService(
+            ":memory:", owner="runtime-fixture"
+        )
+        switch = mock.Mock()
+        switch.tick.return_value = False
+
+        with mock.patch.object(
+            sprint_runtime.activity_monitor.ActivityMonitor,
+            "tick",
+            return_value=mock.Mock(changed=False),
+        ), mock.patch.object(runtime, "_switch", return_value=switch), mock.patch.object(
+            runtime, "_deliver_wakes", return_value=False
+        ), mock.patch.object(runtime, "_record_heartbeat"), mock.patch.object(
+            sprint_runtime.sprint_cleanup,
+            "SprintCleanupExecutor",
+            return_value=executor,
+        ):
+            changed = []
+            for _pulse in range(4):
+                changed.append(runtime._pulse(self.con, startup=False))
+                self.now += timedelta(seconds=5)
+
+        rows = {
+            row["shell_id"]: row
+            for row in self.con.execute(
+                "SELECT shell_id,target_kind,state,attempt_count,claim_generation,"
+                "waiting_reason,last_error_code FROM sprint_cleanup_targets "
+                "WHERE sprint_id=? ORDER BY cleanup_target_id",
+                (self.sprint_id,),
+            )
+            if row["target_kind"] == "worktree"
+        }
+        artifact = self.con.execute(
+            "SELECT state,claim_generation FROM sprint_cleanup_targets "
+            "WHERE sprint_id=? AND target_kind='artifact_dir'",
+            (self.sprint_id,),
+        ).fetchone()
+        self.assertEqual([True, True, True, True], changed)
+        self.assertEqual(
+            ("pending", 0, 1, "waiting_for_run_exit", None),
+            tuple(rows[1][field] for field in (
+                "state",
+                "attempt_count",
+                "claim_generation",
+                "waiting_reason",
+                "last_error_code",
+            )),
+        )
+        self.assertEqual(
+            ("succeeded", 2, 2, None, None),
+            tuple(rows[3][field] for field in (
+                "state",
+                "attempt_count",
+                "claim_generation",
+                "waiting_reason",
+                "last_error_code",
+            )),
+        )
+        self.assertEqual(
+            ("succeeded", 1, 1),
+            tuple(rows[2][field] for field in (
+                "state",
+                "attempt_count",
+                "claim_generation",
+            )),
+        )
+        self.assertEqual(("pending", 0), tuple(artifact))
+        self.assertTrue((self.worktree / "live-state.txt").is_file())
+        self.assertFalse((planner_worktree / "retry-state.txt").exists())
+        self.assertFalse((reviewer_worktree / "dormant-state.txt").exists())
+
+    def test_runtime_startup_stays_ready_during_blocked_cleanup(self):
+        database = Path(self.tmp.name) / "runtime-startup.db"
+        with sqlite3.connect(database) as target:
+            self.con.backup(target)
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        claims: list[sprint_cleanup.CleanupClaim] = []
+
+        class BlockingCleanupExecutor:
+            def __init__(self, store):
+                self.store = store
+
+            def run_next(self, owner):
+                claim = self.store.claim_next(owner, lease_seconds=60)
+                if claim is None:
+                    return sprint_cleanup.CleanupExecutionReceipt(None, None, "idle")
+                claims.append(claim)
+                started.set()
+                release.wait(timeout=10)
+                changed = self.store.mark_succeeded(claim, {"blocked": False})
+                finished.set()
+                return sprint_cleanup.CleanupExecutionReceipt(
+                    claim.cleanup_target_id,
+                    claim.sprint_id,
+                    "succeeded" if changed else "stale",
+                    claim_generation=claim.claim_generation,
+                    attempt_count=0,
+                )
+
+        runtime = sprint_runtime.SprintRuntimeService(
+            database,
+            owner="startup-runtime",
+            pulse_seconds=0.05,
+        )
+        self.addCleanup(release.set)
+        self.addCleanup(runtime.stop)
+
+        with mock.patch.object(
+            sprint_runtime.sprint_cleanup,
+            "SprintCleanupExecutor",
+            BlockingCleanupExecutor,
+        ), mock.patch.object(
+            server.conversation_broker,
+            "start_service",
+            return_value=mock.Mock(interrupt=mock.Mock()),
+        ), mock.patch.object(
+            server.conversation_reaper, "start_service"
+        ), mock.patch.object(
+            server.sprint_runtime,
+            "start_service",
+            side_effect=lambda *_args, **_kwargs: (runtime.start() or runtime),
+        ), mock.patch.object(server.sprint_pr_watcher, "start_service"):
+            server.start_runtime_services()
+            self.assertTrue(started.wait(timeout=1))
+            blocked_at = time.monotonic()
+            time.sleep(5.2)
+            self.assertGreaterEqual(time.monotonic() - blocked_at, 5)
+            with sqlite3.connect(database) as con:
+                con.row_factory = sqlite3.Row
+                health = sprint_runtime.runtime_status(con)
+                row = con.execute(
+                    "SELECT state,lease_owner,claim_generation,attempt_count "
+                    "FROM sprint_cleanup_targets WHERE sprint_id=? AND shell_id=1",
+                    (self.sprint_id,),
+                ).fetchone()
+            self.assertTrue(runtime.wait_ready(timeout=0))
+            self.assertTrue(runtime.is_alive())
+            self.assertEqual("live", health["state"])
+            self.assertEqual(1, len(claims))
+            self.assertEqual(
+                ("running", "startup-runtime:cleanup", 1, 0),
+                tuple(row),
+            )
+            worker = runtime._cleanup_thread
+            self.assertIsInstance(worker, threading.Thread)
+            self.assertFalse(worker.daemon)
+            runtime.stop()
+            runtime.join(timeout=1)
+            self.assertFalse(runtime.is_alive())
+            self.assertTrue(worker.is_alive())
+            release.set()
+            self.assertTrue(finished.wait(timeout=1))
+            worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
+
+        with sqlite3.connect(database) as con:
+            final = con.execute(
+                "SELECT state,lease_owner,claim_generation,attempt_count "
+                "FROM sprint_cleanup_targets WHERE sprint_id=? AND shell_id=1",
+                (self.sprint_id,),
+            ).fetchone()
+        self.assertEqual(("succeeded", None, 1, 0), tuple(final))
 
     def test_render_only_launcher_preserves_pending_dirty_worktree(self):
         self._dirty_worktree()
