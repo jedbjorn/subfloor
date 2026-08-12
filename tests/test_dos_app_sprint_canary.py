@@ -105,7 +105,12 @@ class FakeBackend:
         for name in (
             "planner_prepare",
             "kimi_qaqc",
+            "force_new_barrier",
             "declare_and_arm",
+            "force_new_pre_delivery",
+            "force_new_delivery",
+            "pickup_failure",
+            "pickup_recovery",
             "sprint_execution",
         ):
             stage(name)
@@ -146,6 +151,32 @@ class FakeBackend:
                 "sprint_id": 9,
                 "lifecycle": "completed",
                 "observed_columns": ["waiting", "dev", "review", "done"],
+                "force_new": {
+                    "message_id": 81,
+                    "inbox_absent": True,
+                    "accept_rejected": True,
+                    "accept_http_status": 409,
+                    "decline_rejected": True,
+                    "decline_http_status": 409,
+                    "prior_conversation_id": "cv-review-qaqc",
+                    "delivery_conversation_id": "cv-review-interrupted",
+                    "fresh_chat": True,
+                },
+                "pickup_recovery": {
+                    "induced": True,
+                    "interrupted_run_id": 91,
+                    "interrupted_conversation_id": "cv-review-interrupted",
+                    "pause_reason": "wake_pickup_evidence_invalid",
+                    "pause_event_id": 101,
+                    "error_code": "WAKE_PICKUP_EVIDENCE_INVALID",
+                    "failure_class": "evidence_invalid",
+                    "attempt_count": 1,
+                    "resume_changed": True,
+                    "replacement_wake_id": 111,
+                    "recovery_conversation_id": "cv-review-recovered",
+                    "message_id": 81,
+                    "final_disposition": "accepted",
+                },
             },
             "pull_request": {
                 "number": 77,
@@ -177,6 +208,203 @@ class FakeBackend:
             {"action": "delete_base_branch", "ok": True},
             {"action": "remove_workspace", "ok": True},
         ]
+
+
+def gate_board(
+    *,
+    lifecycle: str = "armed",
+    conversation_id: str | None = "cv-review-qaqc",
+    review: str = "pending",
+    column: str = "review",
+    pickup: dict | None = None,
+) -> dict:
+    messages = []
+    if review != "absent":
+        messages.append(
+            {
+                "message_id": 680,
+                "kind": "review_request",
+                "disposition": review,
+                "read_at": "2026-08-12 12:00:00" if review == "accepted" else None,
+            }
+        )
+    return {
+        "sprint": {"sprint_id": 12, "lifecycle": lifecycle},
+        "participants": [
+            {
+                "role": "reviewer",
+                "current_conversation_id": conversation_id,
+            }
+        ],
+        "work_units": [
+            {
+                "work_unit_id": 55,
+                "column": column,
+                "messages": messages,
+            }
+        ],
+        "pickup": pickup or {},
+    }
+
+
+class GateApi:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.barrier_active = True
+        self.delivery_attempts: list[tuple[str, bool]] = []
+        self.boards = iter(
+            [
+                gate_board(review="absent", column="dev"),
+                gate_board(),
+                gate_board(),
+                gate_board(conversation_id=None),
+                gate_board(conversation_id="cv-review-first"),
+                gate_board(conversation_id="cv-review-first"),
+                gate_board(conversation_id="cv-review-first"),
+                gate_board(
+                    lifecycle="paused",
+                    conversation_id="cv-review-first",
+                    pickup={
+                        "action": "paused",
+                        "pause_reason": "wake_pickup_evidence_invalid",
+                    },
+                ),
+                gate_board(conversation_id="cv-review-first"),
+                gate_board(
+                    conversation_id="cv-review-recovered", review="accepted"
+                ),
+            ]
+        )
+        exhausted = {
+            "event_id": 11,
+            "type": "wake.pickup_exhausted",
+            "details": {
+                "message_id": 680,
+                "conversation_id": "cv-review-first",
+                "run_state": "cancelled",
+                "error_code": "WAKE_PICKUP_EVIDENCE_INVALID",
+                "failure_class": "evidence_invalid",
+                "attempt_count": 1,
+            },
+        }
+        self.events = iter(
+            [
+                {"items": [{"event_id": 10, "type": "review.requested", "details": {}}]},
+                {"items": [exhausted]},
+                {"items": [exhausted]},
+                {
+                    "items": [
+                        exhausted,
+                        {
+                            "event_id": 12,
+                            "type": "wake.requeued",
+                            "details": {"replacement_wake_id": 44},
+                        },
+                    ]
+                },
+            ]
+        )
+        self.conversations = iter([{"state": "queued"}, {"state": "running"}])
+
+    def attempt_delivery(self, boundary: str) -> None:
+        self.delivery_attempts.append((boundary, self.barrier_active))
+
+    def request(self, method, path, *, body=None, key=None):
+        self.calls.append((method, path))
+        if method == "GET" and path == "/api/sprints/12":
+            self.attempt_delivery("board_observation")
+            return next(self.boards)
+        if method == "GET" and path == "/api/conversations/cv-review-qaqc":
+            return {"version": 7, "state": "idle"}
+        if method == "PATCH" and path == "/api/conversations/cv-review-qaqc":
+            self.closed_body = body
+            return {"state": "closed"}
+        if method == "GET" and path == "/api/conversations/cv-review-first":
+            return next(self.conversations)
+        if method == "POST" and path.endswith("/interruptions"):
+            self.interruption_body = body
+            self.interruption_key = key
+            return {"run_id": 91}
+        if method == "GET" and path == "/api/sprints/12/events?limit=100":
+            return next(self.events)
+        if method == "PATCH" and path == "/api/sprints/12":
+            self.resume_body = body
+            return {"changed": True, "sprint": {"lifecycle": "armed"}}
+        raise AssertionError(f"unexpected API call: {method} {path}")
+
+
+class GateBackend(canary.HostBackend):
+    def _target_force_new_probe(
+        self,
+        facts,
+        probe,
+        *,
+        sprint_id,
+        message_id,
+    ) -> None:
+        self.probe = (probe.reviewer_id, sprint_id, message_id)
+        self.gate_api.attempt_delivery("target_write")
+
+    def _collect_force_new_probe(
+        self,
+        facts,
+        probe,
+        *,
+        sprint_id,
+        message_id,
+    ):
+        self.gate_api.attempt_delivery("proof_collection")
+        return {
+            "message_id": message_id,
+            "inbox_absent": True,
+            "accept_rejected": True,
+            "accept_http_status": 409,
+            "decline_rejected": True,
+            "decline_http_status": 409,
+        }
+
+    def _close_force_new_barrier(self, api, probe) -> None:
+        self.gate_api.attempt_delivery("before_close")
+        self.gate_api.barrier_active = False
+        self.closed_probe = probe.reviewer_id
+
+
+class SameChatGateApi(GateApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.boards = iter(
+            [
+                gate_board(review="absent", column="dev"),
+                gate_board(),
+                gate_board(),
+                gate_board(conversation_id="cv-review-qaqc"),
+            ]
+        )
+
+
+class MissingRecoveryGateApi(GateApi):
+    def __init__(self) -> None:
+        super().__init__()
+        exhausted = {
+            "event_id": 11,
+            "type": "wake.pickup_exhausted",
+            "details": {
+                "message_id": 680,
+                "conversation_id": "cv-review-first",
+                "run_state": "cancelled",
+                "error_code": "WAKE_PICKUP_EVIDENCE_INVALID",
+                "failure_class": "evidence_invalid",
+                "attempt_count": 1,
+            },
+        }
+        self.events = iter(
+            [
+                {"items": [{"event_id": 10, "type": "review.requested", "details": {}}]},
+                {"items": [exhausted]},
+                {"items": [exhausted]},
+                {"items": [exhausted]},
+            ]
+        )
 
 
 class DosAppSprintCanaryTest(unittest.TestCase):
@@ -259,6 +487,28 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             ["waiting", "dev", "review", "done"],
             result["sprint"]["observed_columns"],
         )
+        self.assertEqual(
+            {
+                "message_id": 81,
+                "inbox_absent": True,
+                "accept_rejected": True,
+                "accept_http_status": 409,
+                "decline_rejected": True,
+                "decline_http_status": 409,
+                "prior_conversation_id": "cv-review-qaqc",
+                "delivery_conversation_id": "cv-review-interrupted",
+                "fresh_chat": True,
+            },
+            result["sprint"]["force_new"],
+        )
+        self.assertEqual(
+            "accepted",
+            result["sprint"]["pickup_recovery"]["final_disposition"],
+        )
+        self.assertEqual(
+            "WAKE_PICKUP_EVIDENCE_INVALID",
+            result["sprint"]["pickup_recovery"]["error_code"],
+        )
         self.assertTrue(result["cleanup"]["complete"])
         self.assertEqual("cleanup", backend.calls[-1])
         self.assertIn(f"materialize:{SHA}", backend.calls)
@@ -266,11 +516,354 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             [
                 "stage:planner_prepare",
                 "stage:kimi_qaqc",
+                "stage:force_new_barrier",
                 "stage:declare_and_arm",
+                "stage:force_new_pre_delivery",
+                "stage:force_new_delivery",
+                "stage:pickup_failure",
+                "stage:pickup_recovery",
                 "stage:sprint_execution",
             ],
             [item for item in backend.calls if item.startswith("stage:")],
         )
+
+    def test_force_new_probe_requires_absence_and_both_direct_rejections(self) -> None:
+        proof = {
+            "sprint_id": 12,
+            "message_id": 680,
+            "inbox": {"returncode": 0, "parsed": True},
+            "inbox_message_ids": [],
+            "accept": {
+                "returncode": 1,
+                "http_status": 409,
+                "not_delivered": True,
+            },
+            "decline": {
+                "returncode": 1,
+                "http_status": 409,
+                "not_delivered": True,
+            },
+        }
+
+        bounded = canary.HostBackend._validate_force_new_probe(
+            proof, sprint_id=12, message_id=680
+        )
+
+        self.assertEqual(
+            {
+                "message_id": 680,
+                "inbox_absent": True,
+                "accept_rejected": True,
+                "accept_http_status": 409,
+                "decline_rejected": True,
+                "decline_http_status": 409,
+            },
+            bounded,
+        )
+
+        invalid = {
+            "message visible": {**proof, "inbox_message_ids": [680]},
+            "inbox failed": {
+                **proof,
+                "inbox": {"returncode": 1, "parsed": False},
+            },
+            "accept succeeded": {
+                **proof,
+                "accept": {
+                    "returncode": 0,
+                    "http_status": None,
+                    "not_delivered": False,
+                },
+            },
+            "decline wrong failure": {
+                **proof,
+                "decline": {
+                    "returncode": 1,
+                    "http_status": 503,
+                    "not_delivered": False,
+                },
+            },
+            "identity mismatch": {**proof, "message_id": 681},
+        }
+        for label, payload in invalid.items():
+            with self.subTest(label=label), self.assertRaisesRegex(
+                canary.CanaryError, "did not reject inbox acceptance"
+            ) as raised:
+                canary.HostBackend._validate_force_new_probe(
+                    payload, sprint_id=12, message_id=680
+                )
+            self.assertEqual("CANARY_FORCE_NEW_GATE_FAILED", raised.exception.code)
+
+    def test_pickup_event_retry_matches_only_the_exact_failed_conversation(self) -> None:
+        first = {
+            "items": [
+                {
+                    "event_id": 40,
+                    "type": "wake.pickup_exhausted",
+                    "details": {
+                        "message_id": 680,
+                        "conversation_id": "cv-old",
+                    },
+                }
+            ]
+        }
+        self.assertIsNone(
+            canary.HostBackend._event_after(
+                first,
+                event_type="wake.pickup_exhausted",
+                after_event_id=40,
+                message_id=680,
+                conversation_id="cv-failed",
+            )
+        )
+
+        retried = {
+            "items": [
+                *first["items"],
+                {
+                    "event_id": 41,
+                    "type": "wake.pickup_exhausted",
+                    "details": {
+                        "message_id": 680,
+                        "conversation_id": "cv-other",
+                    },
+                },
+                {
+                    "event_id": 42,
+                    "type": "wake.pickup_exhausted",
+                    "details": {
+                        "message_id": 680,
+                        "conversation_id": "cv-failed",
+                        "run_state": "cancelled",
+                        "error_code": "WAKE_PICKUP_EVIDENCE_INVALID",
+                    },
+                },
+            ]
+        }
+        matched = canary.HostBackend._event_after(
+            retried,
+            event_type="wake.pickup_exhausted",
+            after_event_id=40,
+            message_id=680,
+            conversation_id="cv-failed",
+        )
+
+        self.assertEqual(42, matched["event_id"])
+        self.assertEqual(
+            "WAKE_PICKUP_EVIDENCE_INVALID", matched["details"]["error_code"]
+        )
+
+    def test_review_delivery_gate_retries_then_resumes_through_public_surfaces(
+        self,
+    ) -> None:
+        clock = FakeClock()
+        deadline = canary.Deadline(100, 50, clock=clock)
+        backend = GateBackend(deadline, sleep=clock.advance)
+        api = GateApi()
+        backend.gate_api = api
+        stages: list[str] = []
+        probe = canary.ForceNewProbe(
+            reviewer_id="cv-review-qaqc",
+            target_path="/tmp/target",
+            proof_path="/tmp/proof",
+        )
+
+        evidence, observed = backend._exercise_review_delivery_gates(
+            cast(canary.JsonHttp, api),
+            self.config,
+            self.facts,
+            sprint_id=12,
+            probe=probe,
+            stage=lambda name: (deadline.enter(name), stages.append(name)),
+        )
+
+        self.assertEqual(
+            [
+                "force_new_pre_delivery",
+                "force_new_delivery",
+                "pickup_failure",
+                "pickup_recovery",
+            ],
+            stages,
+        )
+        self.assertEqual(["dev", "review"], observed)
+        self.assertEqual(("cv-review-qaqc", 12, 680), backend.probe)
+        self.assertEqual("cv-review-qaqc", backend.closed_probe)
+        self.assertEqual(
+            [
+                ("board_observation", True),
+                ("board_observation", True),
+                ("target_write", True),
+                ("proof_collection", True),
+                ("board_observation", True),
+                ("before_close", True),
+            ],
+            api.delivery_attempts[:6],
+        )
+        self.assertEqual({}, api.interruption_body)
+        self.assertEqual(
+            "unit-test-0001:reviewer:pickup-interrupt", api.interruption_key
+        )
+        self.assertEqual(
+            {
+                "lifecycle": "armed",
+                "reason": "exact-ref canary pickup interruption repaired",
+            },
+            api.resume_body,
+        )
+        self.assertEqual(
+            1,
+            sum(
+                method == "POST" and path.endswith("/interruptions")
+                for method, path in api.calls
+            ),
+        )
+        self.assertEqual(
+            1,
+            sum(
+                method == "PATCH" and path == "/api/sprints/12"
+                for method, path in api.calls
+            ),
+        )
+        self.assertTrue(evidence["force_new"]["fresh_chat"])
+        self.assertEqual(
+            "cv-review-recovered",
+            evidence["pickup_recovery"]["recovery_conversation_id"],
+        )
+        self.assertEqual(
+            44, evidence["pickup_recovery"]["replacement_wake_id"]
+        )
+
+    def test_force_new_barrier_is_running_before_orchestration_continues(self) -> None:
+        clock = FakeClock()
+        deadline = canary.Deadline(100, 50, clock=clock)
+        backend = canary.HostBackend(deadline, sleep=clock.advance)
+
+        class StartApi:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+                self.states = iter(["queued", "running"])
+
+            def request(self, method, path, *, body=None, key=None):
+                self.calls.append((method, path))
+                if method == "POST" and path.endswith("/messages"):
+                    self.body = body
+                    self.key = key
+                    return {"message": {"state": "queued"}}
+                if method == "GET" and path == "/api/conversations/cv-review-qaqc":
+                    return {"state": next(self.states)}
+                raise AssertionError(f"unexpected API call: {method} {path}")
+
+        api = StartApi()
+        probe = backend._start_force_new_barrier(
+            cast(canary.JsonHttp, api),
+            self.config,
+            reviewer_id="cv-review-qaqc",
+        )
+
+        self.assertEqual("cv-review-qaqc", probe.reviewer_id)
+        self.assertEqual(
+            [
+                ("POST", "/api/conversations/cv-review-qaqc/messages"),
+                ("GET", "/api/conversations/cv-review-qaqc"),
+                ("GET", "/api/conversations/cv-review-qaqc"),
+            ],
+            api.calls,
+        )
+        self.assertIn("wait_for(TARGET)", api.body["text"])
+        self.assertIn("controller did not close", api.body["text"])
+
+    def test_force_new_barrier_closes_while_running_and_fails_closed(self) -> None:
+        deadline = canary.Deadline(100, 50, clock=FakeClock())
+        backend = canary.HostBackend(deadline, sleep=lambda _: None)
+        probe = canary.ForceNewProbe(
+            "cv-review-qaqc", "/tmp/target", "/tmp/proof"
+        )
+
+        class CloseApi:
+            def __init__(self, state="running", closed_state="closed") -> None:
+                self.state = state
+                self.closed_state = closed_state
+                self.calls = []
+
+            def request(self, method, path, *, body=None, key=None):
+                self.calls.append((method, path, body))
+                if method == "GET":
+                    return {"state": self.state, "version": 9}
+                if method == "PATCH":
+                    return {"state": self.closed_state}
+                raise AssertionError(f"unexpected API call: {method} {path}")
+
+        api = CloseApi()
+        backend._close_force_new_barrier(cast(canary.JsonHttp, api), probe)
+        self.assertEqual(
+            {
+                "version": 9,
+                "state": "closed",
+            },
+            api.calls[-1][2],
+        )
+
+        for label, failed_api in {
+            "control turn stopped": CloseApi(state="idle"),
+            "close not durable": CloseApi(closed_state="running"),
+        }.items():
+            with self.subTest(label=label), self.assertRaises(
+                canary.CanaryError
+            ) as raised:
+                backend._close_force_new_barrier(
+                    cast(canary.JsonHttp, failed_api), probe
+                )
+            self.assertEqual("CANARY_FORCE_NEW_BARRIER_FAILED", raised.exception.code)
+
+    def test_force_new_gate_rejects_same_chat_delivery(self) -> None:
+        clock = FakeClock()
+        deadline = canary.Deadline(100, 50, clock=clock)
+        backend = GateBackend(deadline, sleep=clock.advance)
+        api = SameChatGateApi()
+        backend.gate_api = api
+        probe = canary.ForceNewProbe(
+            "cv-review-qaqc", "/tmp/target", "/tmp/proof"
+        )
+
+        with self.assertRaisesRegex(
+            canary.CanaryError, "retained the pre-delivery Reviewer chat"
+        ) as raised:
+            backend._exercise_review_delivery_gates(
+                cast(canary.JsonHttp, api),
+                self.config,
+                self.facts,
+                sprint_id=12,
+                probe=probe,
+                stage=lambda name: deadline.enter(name),
+            )
+
+        self.assertEqual("CANARY_FORCE_NEW_DELIVERY_FAILED", raised.exception.code)
+        self.assertTrue(all(active for _, active in api.delivery_attempts[:6]))
+
+    def test_pickup_gate_rejects_acceptance_without_requeue_evidence(self) -> None:
+        clock = FakeClock()
+        deadline = canary.Deadline(100, 50, clock=clock)
+        backend = GateBackend(deadline, sleep=clock.advance)
+        api = MissingRecoveryGateApi()
+        backend.gate_api = api
+        probe = canary.ForceNewProbe(
+            "cv-review-qaqc", "/tmp/target", "/tmp/proof"
+        )
+
+        with self.assertRaisesRegex(
+            canary.CanaryError, "without durable requeue evidence"
+        ) as raised:
+            backend._exercise_review_delivery_gates(
+                cast(canary.JsonHttp, api),
+                self.config,
+                self.facts,
+                sprint_id=12,
+                probe=probe,
+                stage=lambda name: deadline.enter(name),
+            )
+
+        self.assertEqual("CANARY_PICKUP_RECOVERY_FAILED", raised.exception.code)
 
     def test_partial_orchestration_failure_still_cleans_and_redacts_receipt(
         self,
