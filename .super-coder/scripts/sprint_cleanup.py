@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -53,6 +54,24 @@ class SprintCleanupWaiting(RuntimeError):
         super().__init__(detail)
         self.code = code
         self.detail = detail
+
+
+class SprintCleanupRequestError(RuntimeError):
+    """One authenticated cleanup request failed with a stable API code."""
+
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        detail: str,
+        *,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.code = code
+        self.detail = detail
+        self.context = context or {}
 
 
 @dataclass(frozen=True)
@@ -108,6 +127,16 @@ class CleanupExecutionReceipt:
     detail: str | None = None
     claim_generation: int | None = None
     attempt_count: int | None = None
+
+
+@dataclass(frozen=True)
+class CleanupRecoveryReceipt:
+    request_id: int
+    created: bool
+    action: str
+    sprint_id: int
+    target_ids: tuple[int, ...]
+    projection: CleanupProjection
 
 
 IdentityProvider = Callable[[], tuple[Path, Path]]
@@ -479,6 +508,7 @@ class SprintCleanupTargetStore:
             "waiting_reason=NULL,after_evidence=?,last_error_code=NULL,"
             "last_error_detail=NULL,completed_at=?,updated_at=?",
             (self._evidence(evidence), now_stamp, now_stamp),
+            publish_terminal=True,
         )
 
     def fail_safety(
@@ -498,6 +528,7 @@ class SprintCleanupTargetStore:
                 self._bounded(detail, 2000),
                 now_stamp,
             ),
+            publish_terminal=True,
         )
 
     def fail_mutation(
@@ -534,6 +565,7 @@ class SprintCleanupTargetStore:
                 self._bounded(detail, 2000),
                 _stamp(now),
             ),
+            publish_terminal=terminal,
         )
         return changed, state if changed else "stale", attempts
 
@@ -558,6 +590,8 @@ class SprintCleanupTargetStore:
         claim: CleanupClaim,
         assignments: str,
         values: tuple[object, ...],
+        *,
+        publish_terminal: bool = False,
     ) -> bool:
         if self.con.in_transaction:
             raise RuntimeError("cleanup fenced writes own their transaction")
@@ -577,11 +611,171 @@ class SprintCleanupTargetStore:
                     now_stamp,
                 ),
             ).rowcount
+            if changed == 1 and publish_terminal:
+                self._publish_terminal_receipt_in_transaction(claim)
             self.con.commit()
             return changed == 1
         except Exception:
             self.con.rollback()
             raise
+
+    def _publish_terminal_receipt_in_transaction(self, claim: CleanupClaim) -> None:
+        row = self.con.execute(
+            "SELECT target.*,shell.shortname FROM sprint_cleanup_targets target "
+            "LEFT JOIN shells shell ON shell.shell_id=target.shell_id "
+            "WHERE target.cleanup_target_id=?",
+            (claim.cleanup_target_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("terminal cleanup target disappeared")
+        projection = self.project(claim.sprint_id)
+        from sprint_message_delivery import (
+            SYSTEM_IDEMPOTENCY_KEY_PREFIX,
+        )
+
+        if row["state"] == "failed":
+            path_label = self.safe_path_label(row)
+            code = str(row["last_error_code"] or "cleanup_failed")
+            payload = {
+                "aggregate_state": projection.aggregate_state,
+                "attempt_count": int(row["attempt_count"]),
+                "cleanup_target_id": claim.cleanup_target_id,
+                "claim_generation": claim.claim_generation,
+                "error_code": code,
+                "path_label": path_label,
+                "target_kind": str(row["target_kind"]),
+            }
+            self.con.execute(
+                "INSERT INTO sprint_events "
+                "(sprint_id,event_type,actor_kind,payload) "
+                "VALUES (?,'sprint.cleanup_failed','system',?)",
+                (claim.sprint_id, json.dumps(payload, sort_keys=True)),
+            )
+            receiver_shell_id, fnb_fallback = self._terminal_receipt_receiver(
+                claim.sprint_id
+            )
+            if receiver_shell_id is None:
+                return
+            fallback_note = (
+                " Originating Planner is inactive; this is the FnB fallback receipt."
+                if fnb_fallback
+                else ""
+            )
+            self._send_terminal_receipt_in_transaction(
+                receiver_shell_id,
+                body=(
+                    f"Sprint {claim.sprint_id} cleanup failed for {path_label} "
+                    f"(error_code={code}).{fallback_note} Run "
+                    f"`sc sprint cleanup-status --sprint "
+                    f"{claim.sprint_id}`; after correcting the named condition, "
+                    f"run `sc sprint cleanup --sprint {claim.sprint_id} --key "
+                    "<stable-retry-key>`. FnB may use the same status and retry "
+                    "surfaces."
+                ),
+                preferred_key=(
+                    f"{SYSTEM_IDEMPOTENCY_KEY_PREFIX}"
+                    f"sprint:{claim.sprint_id}:cleanup-failed:"
+                    f"target:{claim.cleanup_target_id}:"
+                    f"generation:{claim.claim_generation}"
+                ),
+            )
+            return
+
+        if projection.aggregate_state != "succeeded":
+            return
+        payload = {
+            "aggregate_state": "succeeded",
+            "succeeded_count": projection.succeeded_count,
+            "target_count": projection.target_count,
+        }
+        self.con.execute(
+            "INSERT INTO sprint_events "
+            "(sprint_id,event_type,actor_kind,payload) "
+            "VALUES (?,'sprint.cleanup_completed','system',?)",
+            (claim.sprint_id, json.dumps(payload, sort_keys=True)),
+        )
+        receiver_shell_id, fnb_fallback = self._terminal_receipt_receiver(
+            claim.sprint_id
+        )
+        if receiver_shell_id is None:
+            return
+        fallback_note = (
+            " Originating Planner is inactive; this is the FnB fallback receipt."
+            if fnb_fallback
+            else ""
+        )
+        self._send_terminal_receipt_in_transaction(
+            receiver_shell_id,
+            body=(
+                f"Sprint {claim.sprint_id} cleanup completed. "
+                f"cleanup_state=succeeded; target_count={projection.target_count}. "
+                f"Its managed participant worktrees are reusable.{fallback_note}"
+            ),
+            preferred_key=(
+                f"{SYSTEM_IDEMPOTENCY_KEY_PREFIX}"
+                f"sprint:{claim.sprint_id}:cleanup-completed"
+            ),
+        )
+
+    def _send_terminal_receipt_in_transaction(
+        self,
+        receiver_shell_id: int,
+        *,
+        body: str,
+        preferred_key: str,
+    ) -> None:
+        from sprint_message_delivery import (
+            SprintMessageStore,
+            WakeMessageIdempotencyConflict,
+        )
+
+        store = SprintMessageStore(self.con)
+        key = preferred_key
+        collision_index = 0
+        while True:
+            try:
+                store.send_to_shell_in_transaction(
+                    receiver_shell_id,
+                    message_kind="notification",
+                    body=body,
+                    idempotency_key=key,
+                    declared_type="re-enter",
+                )
+                return
+            except WakeMessageIdempotencyConflict:
+                collision_index += 1
+                key = f"{preferred_key}:collision:{collision_index}"
+
+    def _terminal_receipt_receiver(
+        self, sprint_id: int
+    ) -> tuple[int | None, bool]:
+        planner = self.con.execute(
+            "SELECT sprint.originating_planner_shell_id,"
+            "COALESCE(shell.is_deleted,1) planner_deleted "
+            "FROM sprints sprint LEFT JOIN shells shell "
+            "ON shell.shell_id=sprint.originating_planner_shell_id "
+            "WHERE sprint.sprint_id=?",
+            (sprint_id,),
+        ).fetchone()
+        if planner is None:
+            raise RuntimeError("terminal cleanup Sprint disappeared")
+        if not int(planner["planner_deleted"]):
+            return int(planner["originating_planner_shell_id"]), False
+
+        admins = self.con.execute(
+            "SELECT shell_id FROM shells WHERE flavor='admin' "
+            "AND COALESCE(is_deleted,0)=0 ORDER BY shell_id"
+        ).fetchall()
+        if len(admins) == 1:
+            return int(admins[0]["shell_id"]), True
+        return None, False
+
+    @staticmethod
+    def safe_path_label(row: sqlite3.Row) -> str:
+        if row["target_kind"] == "artifact_dir":
+            return f"shared/sprints/sprint-{int(row['sprint_id'])}"
+        shortname = str(row["shortname"] or "unknown").lower()
+        return f".sc-worktrees/{shortname}"
 
     def _begin_write(self) -> None:
         if self.con.in_transaction:
@@ -729,6 +923,376 @@ class SprintCleanupTargetStore:
     @staticmethod
     def _lexical_absolute(path: Path) -> str:
         return os.path.abspath(os.path.normpath(str(path)))
+
+
+class SprintCleanupRecoveryStore:
+    """Authorize and project bounded cleanup recovery without accepting paths."""
+
+    _EVIDENCE_FIELDS = frozenset(
+        {
+            "branch",
+            "entry_count",
+            "entry_count_truncated",
+            "existed",
+            "final_origin_main_sha",
+            "head",
+            "prune_candidates",
+            "refreshed_main_sha",
+            "removed_entry_count",
+            "status_count",
+            "status_sample_truncated",
+        }
+    )
+
+    def __init__(
+        self,
+        con: sqlite3.Connection,
+        *,
+        target_store: SprintCleanupTargetStore | None = None,
+    ) -> None:
+        self.con = con
+        self.con.row_factory = sqlite3.Row
+        self.target_store = target_store or SprintCleanupTargetStore(con)
+
+    def status(self, sprint_id: int, caller_shell_id: int) -> dict[str, Any]:
+        self._authorize_status(sprint_id, caller_shell_id)
+        projection = self.target_store.project(sprint_id)
+        targets = []
+        for row in self._target_rows(sprint_id):
+            targets.append(
+                {
+                    "cleanup_target_id": int(row["cleanup_target_id"]),
+                    "target_kind": str(row["target_kind"]),
+                    "shell": (
+                        {
+                            "shell_id": int(row["shell_id"]),
+                            "shortname": str(row["shortname"]),
+                        }
+                        if row["shell_id"] is not None
+                        else None
+                    ),
+                    "path_label": SprintCleanupTargetStore.safe_path_label(row),
+                    "state": str(row["state"]),
+                    "attempt_count": int(row["attempt_count"]),
+                    "claim_generation": int(row["claim_generation"]),
+                    "waiting_reason": row["waiting_reason"],
+                    "error": (
+                        {"code": str(row["last_error_code"])}
+                        if row["last_error_code"] is not None
+                        else None
+                    ),
+                    "before": self._bounded_evidence(row["before_evidence"]),
+                    "after": self._bounded_evidence(row["after_evidence"]),
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                    "claimed_at": row["claimed_at"],
+                    "completed_at": row["completed_at"],
+                }
+            )
+        return {
+            "sprint_id": sprint_id,
+            "aggregate_state": projection.aggregate_state,
+            "target_count": projection.target_count,
+            "pending_count": projection.pending_count,
+            "running_count": projection.running_count,
+            "succeeded_count": projection.succeeded_count,
+            "failed_count": projection.failed_count,
+            "targets": targets,
+        }
+
+    def recover(
+        self,
+        sprint_id: int,
+        caller_shell_id: int,
+        *,
+        idempotency_key: str,
+        adopt_legacy: bool,
+    ) -> CleanupRecoveryReceipt:
+        key = idempotency_key.strip()
+        if not 1 <= len(key) <= 255:
+            raise ValueError("idempotency key must contain 1 to 255 characters")
+        request_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "adopt_legacy": bool(adopt_legacy),
+                    "caller_shell_id": caller_shell_id,
+                    "sprint_id": sprint_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        existing = self._request(key)
+        if existing is not None:
+            return self._replay(existing, request_hash)
+
+        caller = self._caller(sprint_id, caller_shell_id)
+        if caller["lifecycle"] != "completed":
+            raise SprintCleanupRequestError(
+                409,
+                "sprint_not_completed",
+                "cleanup recovery requires a completed Sprint",
+            )
+        if adopt_legacy:
+            if caller["flavor"] != "admin":
+                raise SprintCleanupRequestError(
+                    403,
+                    "legacy_adoption_forbidden",
+                    "only FnB may explicitly adopt a historical Sprint cleanup",
+                )
+            if self.target_store.project(sprint_id).target_count:
+                raise SprintCleanupRequestError(
+                    409,
+                    "cleanup_already_scheduled",
+                    "Sprint already has cleanup targets; retry without --adopt-legacy",
+                )
+            try:
+                targets = self.target_store.prepare_targets(sprint_id)
+            except SprintCleanupInvariantError as exc:
+                raise SprintCleanupRequestError(
+                    422,
+                    "cleanup_target_invalid",
+                    str(exc),
+                ) from exc
+        else:
+            if (
+                caller["flavor"] != "admin"
+                and int(caller["originating_planner_shell_id"]) != caller_shell_id
+            ):
+                raise SprintCleanupRequestError(
+                    403,
+                    "cleanup_retry_forbidden",
+                    "only the originating Planner or FnB may retry cleanup",
+                )
+            targets = ()
+            projection = self.target_store.project(sprint_id)
+            if not projection.target_count:
+                raise SprintCleanupRequestError(
+                    409,
+                    "cleanup_not_scheduled",
+                    "Sprint has no cleanup targets; FnB may use --adopt-legacy",
+                )
+            if not projection.failed_count:
+                raise SprintCleanupRequestError(
+                    409,
+                    "cleanup_not_failed",
+                    "Sprint has no failed cleanup targets to retry",
+                )
+
+        self.con.execute("BEGIN IMMEDIATE")
+        try:
+            raced = self._request(key)
+            if raced is not None:
+                self.con.rollback()
+                return self._replay(raced, request_hash)
+            if adopt_legacy:
+                if self.target_store.project(sprint_id).target_count:
+                    raise SprintCleanupRequestError(
+                        409,
+                        "cleanup_already_scheduled",
+                        "Sprint already has cleanup targets; retry without --adopt-legacy",
+                    )
+                try:
+                    schedule = self.target_store.schedule_in_transaction(
+                        sprint_id, targets
+                    )
+                except SprintCleanupInvariantError as exc:
+                    raise SprintCleanupRequestError(
+                        422,
+                        "cleanup_target_invalid",
+                        str(exc),
+                    ) from exc
+                target_ids = schedule.target_ids
+                action = "adopted_legacy"
+            else:
+                rows = self.con.execute(
+                    "SELECT cleanup_target_id FROM sprint_cleanup_targets "
+                    "WHERE sprint_id=? AND state='failed' "
+                    "ORDER BY cleanup_target_id",
+                    (sprint_id,),
+                ).fetchall()
+                if not rows:
+                    raise SprintCleanupRequestError(
+                        409,
+                        "cleanup_not_failed",
+                        "Sprint has no failed cleanup targets to retry",
+                    )
+                target_ids = tuple(int(row[0]) for row in rows)
+                placeholders = ",".join("?" for _ in target_ids)
+                self.con.execute(
+                    "UPDATE sprint_cleanup_targets SET state='pending',"
+                    "lease_owner=NULL,lease_expires_at=NULL,waiting_reason='manual_retry',"
+                    "updated_at=datetime('now') WHERE sprint_id=? AND state='failed' "
+                    f"AND cleanup_target_id IN ({placeholders})",
+                    (sprint_id, *target_ids),
+                )
+                action = "requeued"
+            projection = self.target_store.project(sprint_id)
+            event_payload = {
+                "aggregate_state": projection.aggregate_state,
+                "request_kind": action,
+                "target_count": projection.target_count,
+                "target_ids": list(target_ids),
+            }
+            actor_kind = "fnb" if caller["flavor"] == "admin" else "planner"
+            if adopt_legacy:
+                self._event(
+                    sprint_id,
+                    "sprint.cleanup_adopted",
+                    caller_shell_id,
+                    actor_kind,
+                    event_payload,
+                )
+            else:
+                self._event(
+                    sprint_id,
+                    "sprint.cleanup_requeued",
+                    caller_shell_id,
+                    actor_kind,
+                    event_payload,
+                )
+            response = {
+                "action": action,
+                "sprint_id": sprint_id,
+                "target_ids": list(target_ids),
+                "projection": self.projection_dict(projection),
+            }
+            request_id = int(
+                self.con.execute(
+                    "INSERT INTO sprint_cleanup_requests "
+                    "(sprint_id,caller_shell_id,request_kind,idempotency_key,"
+                    "request_hash,response_json) VALUES (?,?,?,?,?,?)",
+                    (
+                        sprint_id,
+                        caller_shell_id,
+                        action,
+                        key,
+                        request_hash,
+                        json.dumps(response, sort_keys=True),
+                    ),
+                ).lastrowid
+            )
+            self.con.commit()
+        except Exception:
+            self.con.rollback()
+            raise
+        return CleanupRecoveryReceipt(
+            request_id,
+            True,
+            action,
+            sprint_id,
+            tuple(target_ids),
+            projection,
+        )
+
+    def _authorize_status(self, sprint_id: int, caller_shell_id: int) -> None:
+        caller = self._caller(sprint_id, caller_shell_id)
+        if caller["flavor"] != "admin" and not caller["participates"]:
+            raise SprintCleanupRequestError(
+                403,
+                "cleanup_status_forbidden",
+                "only a Sprint participant or FnB may read cleanup status",
+            )
+
+    def _caller(self, sprint_id: int, caller_shell_id: int) -> sqlite3.Row:
+        row = self.con.execute(
+            "SELECT sprint.lifecycle,sprint.originating_planner_shell_id,"
+            "caller.flavor,EXISTS(SELECT 1 FROM sprint_participants participant "
+            "WHERE participant.sprint_id=sprint.sprint_id "
+            "AND participant.shell_id=caller.shell_id) participates "
+            "FROM sprints sprint JOIN shells caller ON caller.shell_id=? "
+            "WHERE sprint.sprint_id=? AND COALESCE(caller.is_deleted,0)=0",
+            (caller_shell_id, sprint_id),
+        ).fetchone()
+        if row is None:
+            sprint = self.con.execute(
+                "SELECT 1 FROM sprints WHERE sprint_id=?", (sprint_id,)
+            ).fetchone()
+            if sprint is None:
+                raise SprintCleanupRequestError(
+                    404, "sprint_not_found", f"unknown Sprint: {sprint_id}"
+                )
+            raise SprintCleanupRequestError(
+                403, "cleanup_caller_forbidden", "cleanup caller is not active"
+            )
+        return row
+
+    def _target_rows(self, sprint_id: int) -> list[sqlite3.Row]:
+        return self.con.execute(
+            "SELECT target.*,shell.shortname FROM sprint_cleanup_targets target "
+            "LEFT JOIN shells shell ON shell.shell_id=target.shell_id "
+            "WHERE target.sprint_id=? ORDER BY "
+            "CASE target.target_kind WHEN 'worktree' THEN 0 ELSE 1 END,"
+            "target.cleanup_target_id",
+            (sprint_id,),
+        ).fetchall()
+
+    def _request(self, key: str) -> sqlite3.Row | None:
+        return self.con.execute(
+            "SELECT * FROM sprint_cleanup_requests WHERE idempotency_key=?", (key,)
+        ).fetchone()
+
+    def _event(
+        self,
+        sprint_id: int,
+        event_type: str,
+        caller_shell_id: int,
+        actor_kind: str,
+        payload: dict[str, Any],
+    ) -> None:
+        self.con.execute(
+            "INSERT INTO sprint_events "
+            "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+            "VALUES (?,?,?,?,?)",
+            (
+                sprint_id,
+                event_type,
+                actor_kind,
+                caller_shell_id,
+                json.dumps(payload, sort_keys=True),
+            ),
+        )
+
+    @staticmethod
+    def _replay(
+        row: sqlite3.Row, request_hash: str
+    ) -> CleanupRecoveryReceipt:
+        if row["request_hash"] != request_hash:
+            raise SprintCleanupRequestError(
+                409,
+                "idempotency_key_reused",
+                "cleanup idempotency key was reused with different input",
+            )
+        response = json.loads(row["response_json"])
+        projection = CleanupProjection(**response["projection"])
+        return CleanupRecoveryReceipt(
+            int(row["cleanup_request_id"]),
+            False,
+            str(response["action"]),
+            int(response["sprint_id"]),
+            tuple(int(value) for value in response["target_ids"]),
+            projection,
+        )
+
+    @classmethod
+    def _bounded_evidence(cls, raw: str | None) -> dict[str, Any] | None:
+        if raw is None:
+            return None
+        value = json.loads(raw)
+        return {key: value[key] for key in cls._EVIDENCE_FIELDS if key in value}
+
+    @staticmethod
+    def projection_dict(projection: CleanupProjection) -> dict[str, Any]:
+        return {
+            "aggregate_state": projection.aggregate_state,
+            "target_count": projection.target_count,
+            "worktree_count": projection.worktree_count,
+            "artifact_count": projection.artifact_count,
+            "pending_count": projection.pending_count,
+            "running_count": projection.running_count,
+            "succeeded_count": projection.succeeded_count,
+            "failed_count": projection.failed_count,
+        }
 
 
 class SprintCleanupExecutor:

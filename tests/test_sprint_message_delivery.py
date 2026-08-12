@@ -2964,6 +2964,36 @@ class ParticipantRelayTest(SprintMessageCase):
             ).fetchone()[0],
         )
 
+    def test_relay_rejects_reserved_system_idempotency_namespace(self) -> None:
+        before = tuple(
+            self.con.execute(
+                "SELECT (SELECT COUNT(*) FROM wake_message),"
+                "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+            ).fetchone()
+        )
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "cannot use the reserved System namespace",
+        ):
+            self.messages.relay(
+                self.sprint_id,
+                from_shell_id=1,
+                to_shortname="PLN1",
+                body="attempt to occupy a System identity",
+                idempotency_key="_sc:system:sprint:1:cleanup-completed",
+            )
+
+        self.assertEqual(
+            before,
+            tuple(
+                self.con.execute(
+                    "SELECT (SELECT COUNT(*) FROM wake_message),"
+                    "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+                ).fetchone()
+            ),
+        )
+
     def test_relay_rejects_nonparticipant_sender_without_any_write(self) -> None:
         self.con.execute(
             "INSERT INTO shells "

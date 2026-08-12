@@ -13,6 +13,7 @@ import sqlite3
 from collections import defaultdict
 from typing import Any
 
+import sprint_cleanup
 import sprint_health
 import sprint_runtime
 
@@ -64,6 +65,26 @@ _EVENT_FIELDS = {
             "target_count",
             "worktree_target_ids",
         }
+    ),
+    "sprint.cleanup_adopted": frozenset(
+        {"aggregate_state", "request_kind", "target_count", "target_ids"}
+    ),
+    "sprint.cleanup_requeued": frozenset(
+        {"aggregate_state", "request_kind", "target_count", "target_ids"}
+    ),
+    "sprint.cleanup_failed": frozenset(
+        {
+            "aggregate_state",
+            "attempt_count",
+            "cleanup_target_id",
+            "claim_generation",
+            "error_code",
+            "path_label",
+            "target_kind",
+        }
+    ),
+    "sprint.cleanup_completed": frozenset(
+        {"aggregate_state", "succeeded_count", "target_count"}
     ),
     "lifecycle.armed": frozenset(
         {
@@ -450,7 +471,9 @@ class SprintBoardProjection:
         has_more = len(rows) > limit
         rows = rows[:limit]
         items = []
+        cleanup_store = sprint_cleanup.SprintCleanupTargetStore(self.con)
         for row in rows:
+            cleanup = cleanup_store.project(int(row["sprint_id"]))
             items.append(
                 {
                     "sprint_id": int(row["sprint_id"]),
@@ -469,6 +492,14 @@ class SprintBoardProjection:
                     "completed_at": row["completed_at"],
                     "aborted_at": row["aborted_at"],
                     "terminal_outcome": row["terminal_outcome"],
+                    "cleanup": {
+                        "aggregate_state": cleanup.aggregate_state,
+                        "target_count": cleanup.target_count,
+                        "pending_count": cleanup.pending_count,
+                        "running_count": cleanup.running_count,
+                        "succeeded_count": cleanup.succeeded_count,
+                        "failed_count": cleanup.failed_count,
+                    },
                     "column_counts": {
                         "done": int(row["done_count"]),
                         "review": int(row["review_count"]),
@@ -861,6 +892,7 @@ class SprintBoardProjection:
             "(SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=?) report_count",
             (sprint_id, sprint_id, sprint_id),
         ).fetchone()
+        cleanup = sprint_cleanup.SprintCleanupTargetStore(self.con).project(sprint_id)
         return {
             "sprint": {
                 "sprint_id": int(sprint["sprint_id"]),
@@ -890,6 +922,14 @@ class SprintBoardProjection:
             "pickup": pickup,
             "health": health["health"],
             "health_messages": health_messages,
+            "cleanup": {
+                "aggregate_state": cleanup.aggregate_state,
+                "target_count": cleanup.target_count,
+                "pending_count": cleanup.pending_count,
+                "running_count": cleanup.running_count,
+                "succeeded_count": cleanup.succeeded_count,
+                "failed_count": cleanup.failed_count,
+            },
             "feed_counts": {
                 "events": int(feed_counts["event_count"]),
                 "summaries": int(feed_counts["judgment_count"])

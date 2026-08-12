@@ -24,7 +24,7 @@ Load `sprint_pln` on every entry, then classify:
 | Trigger | Route |
 |---|---|
 | Sprint decision, merged-work handoff, question, blocker, relay | Inspect `sc sprint inbox --sprint <id>` once; handle that message. |
-| Self-contained clean-completion receipt | Inspect receipt + terminal state directly; it is informational—do not run the Sprint inbox, accept it, or close again. |
+| Engine-wide completion or cleanup receipt | Inspect receipt + terminal state directly; it is informational—do not run the Sprint inbox, accept it, or close again. |
 | Live FnB instruction | Act under board override; name FnB authority in durable evidence. |
 
 Do not poll. Armed runtime owns scheduled dispatch + unread wake recovery;
@@ -272,6 +272,22 @@ report-authoring Reviewer remain open. Do not manually close peer chats. Pause,
 abort, re-entry, failed conformance, and rejected fallback retain no-cleanup
 behavior.
 
+The initial completion receipt reports `cleanup_state=pending`. Delivery is
+finished, but managed worktrees are not reusable. Stop for the engine-wide
+cleanup receipt; do not poll or manually reset participant trees. On
+`cleanup_state=succeeded`, treat the slots as reusable. On failure, inspect once
+and retry only after correcting the named condition:
+
+```text
+sc sprint cleanup-status --sprint <id>
+sc sprint cleanup --sprint <id> --key <stable-retry-key>
+```
+
+Require `created`, cleanup request id, action, exact target ids, and aggregate
+projection. Reuse the key only for the same request. FnB alone may add
+`--adopt-legacy` for a completed Sprint with no scheduled targets; neither caller
+supplies a path.
+
 Do not compile or editorialize by default; Reviewer owns evidence/report. Only
 FnB-directed fallback may run:
 
@@ -296,6 +312,8 @@ On it:
 5. Require durable assignments + New wakes, then stop. Run no trailing command.
    Empty dispatch remains final; investigate only on a later durable wake.
 
-On a clean completion receipt, verify terminal Sprint + bounded receipt; run no
-close command. Planner does not author a second report, accept an actionable
-handoff, or wait for another actor to finish the Sprint.
+On an initial clean completion receipt, verify the named Sprint is terminal and
+record `cleanup_state=pending`; run no close command. Stop until the
+engine-authored cleanup success or failure receipt arrives. The Planner does
+not author a second report, accept an actionable handoff, poll cleanup, or ask
+another role to reset a worktree.

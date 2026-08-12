@@ -252,7 +252,10 @@ sc sprint record-conformance \
 Require receipt: conformance report id, final report id, follow-up ids,
 completed state, Planner message id, and Planner wake id. The transaction adds
 append-only evidence, follow-ups, terminal state, and one informational engine-wide Planner Re-enter;
-send no conclude message. Successful conformance also closes other Sprint-linked
+send no conclude message. Require cleanup projection `pending`; cleanup runs
+after participant turns exit. Do not reset a worktree, poll cleanup, or wait
+before stopping. The Planner receives the later engine-authored receipt.
+Successful conformance also closes other Sprint-linked
 chats while the originating Planner + report-authoring Reviewer stay open. Do
 not manually close peer chats. Pause, abort, re-entry, failed conformance, and
 rejected fallback retain no-cleanup behavior. Never reopen editing after recording; a re-enter defers
@@ -267,8 +270,8 @@ For closeout, first re-run `sc sprint inbox --sprint <id>`, handle + `accept`
 new messages, then confirm every artifact/body is final and below 8,000.
 
 - Clean conclude -> run the atomic `record-conformance` command above as the
-  literal final action. When it confirms completed state and all receipt
-  identities, stop immediately; Planner is notified.
+  literal final action. When it confirms completed state, pending cleanup, and
+  all receipt identities, stop immediately; Planner is notified.
 - Re-enter/abort -> as literal final action send:
 
 ```text

@@ -98,7 +98,8 @@
     ".super-coder/migrations/0199_sprint_live_replanning.sql",
     ".super-coder/migrations/0200_reseed_sprint_live_replanning.sql",
     ".super-coder/migrations/0201_sprint_cleanup_targets.sql",
-    ".super-coder/migrations/0202_reseed_context_efficient_skills.sql"
+    ".super-coder/migrations/0202_reseed_context_efficient_skills.sql",
+    ".super-coder/migrations/0203_sprint_cleanup_recovery.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
@@ -118,6 +119,7 @@
     ".super-coder/api/transport.py",
     ".super-coder/assets/skills/authoring_syntax/SKILL.md",
     ".super-coder/assets/skills/docs/SKILL.md",
+    ".super-coder/assets/skills/git/SKILL.md",
     ".super-coder/assets/skills/memory/SKILL.md",
     ".super-coder/assets/skills/messaging/SKILL.md",
     ".super-coder/assets/skills/sprint_cond/SKILL.md",
