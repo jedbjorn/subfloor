@@ -4013,9 +4013,37 @@ class Handler(BaseHTTPRequestHandler):
                 projection = sprint_board.SprintBoardProjection(con)
                 try:
                     if len(parts) == 5 and parts[3] == "spec-revisions":
-                        result = sprint_domain.SprintSpecRevisionStore(con).read(
-                            sprint_id, int(parts[4]), fnb=True
-                        )
+                        try:
+                            document_id = int(parts[4])
+                            if document_id <= 0:
+                                raise ValueError
+                        except ValueError as exc:
+                            raise sprint_board.ProjectionError(
+                                422,
+                                "validation_error",
+                                "document_id must be a positive integer",
+                                {"document_id": parts[4]},
+                            ) from exc
+                        if con.execute(
+                            "SELECT 1 FROM sprints WHERE sprint_id=?", (sprint_id,)
+                        ).fetchone() is None:
+                            raise sprint_board.ProjectionError(
+                                404, "sprint_not_found", "Sprint not found"
+                            )
+                        try:
+                            result = sprint_domain.SprintSpecRevisionStore(con).read(
+                                sprint_id, document_id, fnb=True
+                            )
+                        except KeyError as exc:
+                            raise sprint_board.ProjectionError(
+                                404,
+                                "spec_revision_not_found",
+                                "governing revision not found",
+                                {
+                                    "sprint_id": sprint_id,
+                                    "document_id": document_id,
+                                },
+                            ) from exc
                     elif len(parts) == 3:
                         result = projection.board(sprint_id)
                     elif parts[3] == "events":
@@ -4041,9 +4069,13 @@ class Handler(BaseHTTPRequestHandler):
                             404, "not_found", "resource not found"
                         )
                 except sprint_domain.BoundRevisionUnavailable as exc:
-                    return self._send(
-                        409, {"error": str(exc), "details": exc.details}
-                    )
+                    details = dict(exc.details)
+                    code = str(details.pop("code"))
+                    return self._send(409, {"error": {
+                        "code": code,
+                        "message": str(exc),
+                        "details": details,
+                    }})
                 except Exception as exc:
                     return self._sprint_board_error(exc)
                 return self._send(200, result)

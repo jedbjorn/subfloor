@@ -928,9 +928,16 @@ class SprintCliApiTest(unittest.TestCase):
         con = sqlite3.connect(self.db)
         try:
             self.assertEqual(
-                (document_id, hashlib.sha256(body.encode()).hexdigest(), None),
+                (
+                    document_id,
+                    hashlib.sha256(body.encode()).hexdigest(),
+                    None,
+                    body,
+                    0,
+                ),
                 con.execute(
-                    "SELECT document_id,bound_revision_sha256,approval_id "
+                    "SELECT document_id,bound_revision_sha256,approval_id,"
+                    "bound_revision_body,bound_revision_legacy "
                     "FROM sprint_specs WHERE sprint_id=?",
                     (sprint_id,),
                 ).fetchone(),
