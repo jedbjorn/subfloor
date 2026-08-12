@@ -1215,6 +1215,12 @@ class RecoveryAndFailureTest(SprintPRWatcherCase):
 
     def test_terminal_sprint_does_not_gate_an_active_subscription(self):
         self.register()
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.commit()
         lifecycle = sprint_domain.SprintLifecycleStore(self.con)
         lifecycle.transition(
             self.sprint_id,

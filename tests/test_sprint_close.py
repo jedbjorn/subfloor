@@ -48,6 +48,12 @@ class SprintCloseCase(SprintDomainCase):
         super().setUp()
         self.sprint_id, self.unit_id = self.create_sprint()
         self.store.arm(self.sprint_id, 3)
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        self.con.commit()
         self.close = sprint_close.SprintCloseStore(self.con)
         self.document_id = int(
             self.con.execute(
@@ -249,6 +255,181 @@ class SprintCloseMigrationTest(unittest.TestCase):
 
 
 class ConformanceFollowupTest(SprintCloseCase):
+    def test_nonterminal_conformance_rolls_back_every_closeout_write(self):
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='active',completed_at=NULL "
+            "WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        self.con.commit()
+
+        with self.assertRaises(sprint_domain.SprintConflictError) as caught:
+            self.record_conformance(
+                self.sprint_id,
+                2,
+                body="Must roll back",
+                findings=[self.finding()],
+                final_report=FINAL_REPORT,
+                idempotency_key="nonterminal-conformance",
+            )
+
+        self.assertEqual(
+            {
+                "code": "sprint_work_nonterminal",
+                "work_unit_count": 1,
+                "nonterminal_count": 1,
+                "nonterminal_work_units": [
+                    {"work_unit_id": self.unit_id, "disposition": "active"}
+                ],
+                "truncated": False,
+            },
+            caught.exception.details,
+        )
+        self.assertEqual(
+            ("armed", 0, 0, 0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT sprint.lifecycle,"
+                    "(SELECT COUNT(*) FROM sprint_reports report "
+                    " WHERE report.sprint_id=sprint.sprint_id),"
+                    "(SELECT COUNT(*) FROM sprint_followups followup "
+                    " WHERE followup.sprint_id=sprint.sprint_id),"
+                    "(SELECT COUNT(*) FROM wake_message message "
+                    " WHERE message.idempotency_key="
+                    " 'nonterminal-conformance:planner-completed'),"
+                    "(SELECT COUNT(*) FROM sprint_events event "
+                    " WHERE event.sprint_id=sprint.sprint_id "
+                    " AND event.event_type IN "
+                    " ('conformance.recorded','lifecycle.completed')) ,"
+                    "(SELECT COUNT(*) FROM sprint_cleanup_targets target "
+                    " WHERE target.sprint_id=sprint.sprint_id) "
+                    "FROM sprints sprint WHERE sprint.sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_fallback_completion_rolls_back_report_then_retries_cleanly(self):
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='active',completed_at=NULL "
+            "WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        self.con.commit()
+
+        with self.assertRaises(sprint_domain.SprintConflictError) as caught:
+            self.close.complete(
+                self.sprint_id,
+                3,
+                reason="FnB fallback",
+                terminal_outcome="accepted",
+                final_report="Fallback final report",
+                idempotency_key="nonterminal-fallback",
+            )
+
+        self.assertEqual("sprint_work_nonterminal", caught.exception.details["code"])
+        self.assertEqual(
+            ("armed", 0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT sprint.lifecycle,"
+                    "(SELECT COUNT(*) FROM sprint_reports report "
+                    " WHERE report.sprint_id=sprint.sprint_id "
+                    " AND report.idempotency_key='nonterminal-fallback'),"
+                    "(SELECT COUNT(*) FROM sprint_events event "
+                    " WHERE event.sprint_id=sprint.sprint_id "
+                    " AND event.event_type IN "
+                    " ('final_report.recorded','lifecycle.completed')) ,"
+                    "(SELECT COUNT(*) FROM sprint_cleanup_targets target "
+                    " WHERE target.sprint_id=sprint.sprint_id) "
+                    "FROM sprints sprint WHERE sprint.sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        self.con.commit()
+        receipt = self.close.complete(
+            self.sprint_id,
+            3,
+            reason="FnB fallback",
+            terminal_outcome="accepted",
+            final_report="Fallback final report",
+            idempotency_key="nonterminal-fallback",
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertTrue(receipt.report_created)
+        self.assertEqual(
+            ("completed", "accepted", "Fallback final report"),
+            tuple(
+                self.con.execute(
+                    "SELECT sprint.lifecycle,sprint.terminal_outcome,report.body "
+                    "FROM sprints sprint JOIN sprint_reports report "
+                    "ON report.sprint_id=sprint.sprint_id "
+                    "WHERE sprint.sprint_id=? "
+                    "AND report.idempotency_key='nonterminal-fallback'",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+
+    def test_completion_refuses_armed_sprint_without_work_units(self):
+        self.store.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="isolate empty Sprint fixture",
+        )
+        sprint_id, unit_id = self.create_sprint()
+        self.con.execute(
+            "DELETE FROM sprint_work_units WHERE work_unit_id=?",
+            (unit_id,),
+        )
+        self.con.execute(
+            "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+            "conformance_owner_generation=1,lifecycle='armed' WHERE sprint_id=?",
+            (sprint_id,),
+        )
+        self.con.commit()
+
+        with self.assertRaises(sprint_domain.SprintConflictError) as caught:
+            self.close.complete(
+                sprint_id,
+                3,
+                reason="No work",
+                terminal_outcome="accepted",
+            )
+
+        self.assertEqual(
+            {
+                "code": "sprint_work_missing",
+                "work_unit_count": 0,
+                "nonterminal_count": 0,
+                "nonterminal_work_units": [],
+                "truncated": False,
+            },
+            caught.exception.details,
+        )
+        self.assertEqual(
+            ("armed", 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT sprint.lifecycle,"
+                    "(SELECT COUNT(*) FROM sprint_reports report "
+                    " WHERE report.sprint_id=sprint.sprint_id),"
+                    "(SELECT COUNT(*) FROM sprint_cleanup_targets target "
+                    " WHERE target.sprint_id=sprint.sprint_id) "
+                    "FROM sprints sprint WHERE sprint.sprint_id=?",
+                    (sprint_id,),
+                ).fetchone()
+            ),
+        )
+
     def test_close_payloads_accept_8000_and_reject_8001_without_partial_writes(self):
         with self.assertRaisesRegex(
             ValueError,
@@ -1045,12 +1226,13 @@ class ConformanceFollowupTest(SprintCloseCase):
         )
 
     def test_wrong_role_and_cross_sprint_links_leave_no_report(self):
+        self.add_participant(5, "reviewer")
         before = self.con.execute(
             "SELECT COUNT(*) FROM sprint_reports WHERE sprint_id=?",
             (self.sprint_id,),
         ).fetchone()[0]
         with self.assertRaisesRegex(
-            sprint_domain.SprintAuthorityError, "participating Reviewer"
+            sprint_domain.SprintAuthorityError, "selected conformance Reviewer"
         ):
             self.record_conformance(
                 self.sprint_id,
@@ -1059,6 +1241,17 @@ class ConformanceFollowupTest(SprintCloseCase):
                 findings=[],
                 final_report=FINAL_REPORT,
                 idempotency_key="wrong-role",
+            )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintAuthorityError, "selected conformance Reviewer"
+        ):
+            self.record_conformance(
+                self.sprint_id,
+                5,
+                body="Competing Reviewer",
+                findings=[],
+                final_report=FINAL_REPORT,
+                idempotency_key="competing-reviewer",
             )
         with self.assertRaisesRegex(
             sprint_domain.SprintInvariantError, "not bound"

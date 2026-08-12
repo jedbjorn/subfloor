@@ -2460,6 +2460,18 @@ class SprintRecoveryCase(SprintPRWatcherCase):
 
     def test_resume_surfaces_native_and_capacity_anomalies_without_blocking(self):
         run_id = self.add_live_run()
+        self.con.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (5,'Replacement Reviewer','REV5','reviewer','prompt',1)"
+        )
+        self.con.execute(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness,model,effort) "
+            "VALUES (?,5,'reviewer','codex','model','high')",
+            (self.sprint_id,),
+        )
+        self.con.commit()
         coordinator = self.coordinator()
         coordinator.pause(
             self.sprint_id,
@@ -2472,6 +2484,8 @@ class SprintRecoveryCase(SprintPRWatcherCase):
         receipt = coordinator.resume(
             self.sprint_id,
             sprint_domain.LifecycleActor("planner", 3),
+            reason="replace unavailable closeout owner",
+            conformance_reviewer_shell_id=5,
         )
 
         self.assertEqual(
@@ -2581,6 +2595,14 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
         quiet_env.start()
         self.addCleanup(quiet_env.stop)
         super().setUp()
+
+    def terminalize(self, sprint_id: int) -> None:
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='completed',"
+            "completed_at=datetime('now') WHERE sprint_id=?",
+            (sprint_id,),
+        )
+        self.con.commit()
 
     def coordinator(self) -> sprint_recovery.SprintRecoveryCoordinator:
         def no_reader(_repository: str):
@@ -2741,6 +2763,7 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
             notify_commit=lambda: True,
         )
         notified: list[str] = []
+        self.terminalize(sprint_id)
 
         def notify_after_commit(conversation_id: str) -> int:
             self.assertFalse(self.con.in_transaction)
@@ -2937,6 +2960,7 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
             (sprint_id,),
         )
         self.con.commit()
+        self.terminalize(sprint_id)
 
         self.store.transition(
             sprint_id,
@@ -2994,7 +3018,9 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
             (sprint_id,),
         )
         self.con.commit()
-        self.store.arm(sprint_id, 3)
+        self.store.arm(
+            sprint_id, 3, conformance_reviewer_shell_id=2
+        )
         chats = {
             shell_id: self.ensure_wake_chat(sprint_id, shell_id)
             for shell_id in (1, 2, 3, 5)
@@ -3027,6 +3053,7 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
             ),
         )
         self.con.commit()
+        self.terminalize(sprint_id)
 
         self.store.transition(
             sprint_id,
@@ -3083,6 +3110,7 @@ class LifecycleExitAndRestartTest(SprintDomainCase):
         self.store.arm(sprint_id, 3)
         developer_chat = self.ensure_wake_chat(sprint_id, 1)
         reviewer_chat = self.ensure_wake_chat(sprint_id, 2)
+        self.terminalize(sprint_id)
         with (
             mock.patch.object(
                 sprint_domain.conversation_events,

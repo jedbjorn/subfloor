@@ -148,9 +148,11 @@ for the originating Planner. Keep the Sprint prepared while shaping the plan.
 
 ## Final arming check
 
-Immediately before arming, re-read the exact spec revision hashes, available
-QA/QC evidence, task coverage, participant routes and capacity, single-armed
-invariant, repository access, prior-Sprint cleanup state, and merge grant.
+Immediately before arming, select exactly one participating Reviewer as the
+whole-Sprint conformance owner. Then re-read the exact spec revision hashes,
+available QA/QC evidence, task coverage, participant routes and capacity,
+single-armed invariant, repository access, prior-Sprint cleanup state, and
+merge grant.
 Review evidence is summarized, never interpreted as authorization. The final
 read and durable plan commit belong to the authoritative arming transaction;
 external harness and GitHub work occurs after it commits.
@@ -173,10 +175,11 @@ A process crash after commit is outbox recovery; a crash before commit exposes
 no partial Sprint.
 
 ```text
-sc sprint arm --sprint <id>
+sc sprint arm --sprint <id> --conformance-reviewer-shell <shell-id>
 ```
 
-After `arm` succeeds, participant pickup belongs to native delivery. The armed
+Require the receipt to identify the selected owner. After `arm` succeeds,
+participant pickup belongs to native delivery. The armed
 runtime dispatches ready work and wake recovery reconciles unread pickup; the
 preparing Planner does not manually boot participants or create a second wake
 path. Initial assignments use Force-new delivery; a live turn reaches its

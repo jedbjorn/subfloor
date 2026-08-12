@@ -39,12 +39,21 @@ CLEANUP_RECOVERY_SKILLS = {
 }
 PROGRESS_CARRIER_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
 LIVE_REPLAN_ROLE_SKILLS = {"sprint_pln", "sprint_rev"}
+CONFORMANCE_OWNER_SKILLS = {
+    "sprint_close",
+    "sprint_pln",
+    "sprint_prep",
+    "sprint_rev",
+}
 
 SPEC_SKILL = ENGINE / "assets" / "skills" / "spec" / "SKILL.md"
 CONTEXT_EFFICIENT_SKILLS = ("sprint_dev", "sprint_rev", "sprint_pln", "spec")
 CONTEXT_EFFICIENT_SKILL_BYTE_CEILING = 44_361
 CONTEXT_EFFICIENT_RESEED = (
     ENGINE / "migrations" / "0202_reseed_context_efficient_skills.sql"
+)
+CONFORMANCE_OWNER_RESEED = (
+    ENGINE / "migrations" / "0206_reseed_sprint_conformance_ownership.sql"
 )
 
 
@@ -141,6 +150,58 @@ class SprintSkillTest(unittest.TestCase):
             self.assertEqual(
                 tuple(local),
                 ("local", "fork", None, 0, "bespoke body", 0),
+            )
+
+    def test_conformance_owner_reseed_is_exact_and_idempotent(self):
+        with sqlite3.connect(":memory:") as con:
+            con.executescript(
+                "CREATE TABLE skills ("
+                "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
+                "category TEXT, command TEXT, common INTEGER, content TEXT, "
+                "is_deleted INTEGER DEFAULT 0);"
+            )
+            for index, name in enumerate(sorted(CONFORMANCE_OWNER_SKILLS), 1):
+                con.execute(
+                    "INSERT INTO skills VALUES (?,?,?,?,?,?,?,1)",
+                    (index, name, "stale", "stale", "stale", 1, "stale"),
+                )
+            con.execute(
+                "INSERT INTO skills VALUES "
+                "(99,'fork_only','local','fork',NULL,0,'bespoke body',0)"
+            )
+
+            migration = CONFORMANCE_OWNER_RESEED.read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for name in sorted(CONFORMANCE_OWNER_SKILLS):
+                with self.subTest(name=name):
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    rows = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchall()
+                    self.assertEqual(1, len(rows))
+                    self.assertEqual(
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                        tuple(rows[0]),
+                    )
+            self.assertEqual(
+                ("fork", "bespoke body", 0),
+                tuple(
+                    con.execute(
+                        "SELECT category,content,is_deleted FROM skills "
+                        "WHERE name='fork_only'"
+                    ).fetchone()
+                ),
             )
 
     def test_handoff_migration_converges_a_drifted_existing_skill_body(self):
@@ -535,6 +596,7 @@ class SprintSkillTest(unittest.TestCase):
                     ENGINE / "migrations" / "0203_sprint_cleanup_recovery.sql"
                 ).read_text()
             )
+            con.executescript(CONFORMANCE_OWNER_RESEED.read_text())
 
             parsed = seed_skills.parse_skill(ASSETS / "sprint_prep" / "SKILL.md")
             row = con.execute(
@@ -714,6 +776,7 @@ class SprintSkillTest(unittest.TestCase):
             ).read_text()
             con.executescript(migration)
             con.executescript(migration)
+            con.executescript(CONFORMANCE_OWNER_RESEED.read_text())
 
             self.assertIsNotNone(
                 con.execute(
@@ -1081,6 +1144,33 @@ class SprintSkillTest(unittest.TestCase):
             normalized.index("do not run `record-conformance`"),
             normalized.index("clean or post-sprint-only findings"),
         )
+
+    def test_role_guidance_selects_and_recovers_one_conformance_owner(self):
+        prep = " ".join(
+            (ASSETS / "sprint_prep" / "SKILL.md").read_text().split()
+        )
+        planner = " ".join(
+            (ASSETS / "sprint_pln" / "SKILL.md").read_text().split()
+        )
+        reviewer = " ".join(
+            (ASSETS / "sprint_rev" / "SKILL.md").read_text().split()
+        )
+        close = " ".join(
+            (ASSETS / "sprint_close" / "SKILL.md").read_text().split()
+        )
+
+        self.assertIn(
+            "sc sprint arm --sprint <id> --conformance-reviewer-shell <shell-id>",
+            prep,
+        )
+        self.assertIn("select exactly one participating Reviewer", prep)
+        self.assertIn("Replace that owner only while paused", planner)
+        self.assertIn("--conformance-reviewer-shell <replacement-shell-id>", planner)
+        self.assertIn("new ownership generation", planner)
+        self.assertIn("selected conformance owner", reviewer)
+        self.assertIn("different Reviewer", reviewer)
+        self.assertIn("owner shell and generation match", close)
+        self.assertIn("Any other Reviewer records no conformance", close)
 
     def test_planner_executes_reenter_and_does_not_initiate_conformance(self):
         planner = (ASSETS / "sprint_pln" / "SKILL.md").read_text()

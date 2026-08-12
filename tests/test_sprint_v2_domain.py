@@ -12,7 +12,6 @@ from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
-
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
@@ -21,6 +20,9 @@ FOUNDATION = MIGRATIONS / "0146_sprint_v2_domain.sql"
 GENERATION_MIGRATION = MIGRATIONS / "0155_sprint_conversation_generations.sql"
 OPTIONAL_QAQC_MIGRATION = MIGRATIONS / "0185_optional_sprint_qaqc.sql"
 LIVE_REPLAN_MIGRATION = MIGRATIONS / "0199_sprint_live_replanning.sql"
+CONFORMANCE_OWNER_MIGRATION = (
+    MIGRATIONS / "0205_sprint_conformance_ownership.sql"
+)
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import db_driver  # noqa: E402
@@ -217,6 +219,127 @@ class MigrationAndShapeTest(SprintDomainCase):
             )
             self.assertEqual(2, con.execute("SELECT COUNT(*) FROM sprint_specs").fetchone()[0])
             self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
+
+    def test_conformance_owner_migration_backfills_only_unambiguous_history(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as con:
+            con.row_factory = sqlite3.Row
+            apply_schema(con, through="0204_sprint_governing_revision_evidence.sql")
+            con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
+            con.executemany(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                "VALUES (?,?,?,?,?,1)",
+                (
+                    (2, "Reviewer one", "REV1", "reviewer", "prompt"),
+                    (3, "Planner", "PLN1", "planner", "prompt"),
+                    (5, "Reviewer two", "REV2", "reviewer", "prompt"),
+                ),
+            )
+            feature_id = int(
+                con.execute("INSERT INTO roadmap (title) VALUES ('Feature')").lastrowid
+            )
+            unambiguous = int(
+                con.execute(
+                    "INSERT INTO sprints "
+                    "(feature_id,originating_planner_shell_id) VALUES (?,3)",
+                    (feature_id,),
+                ).lastrowid
+            )
+            ambiguous = int(
+                con.execute(
+                    "INSERT INTO sprints "
+                    "(feature_id,originating_planner_shell_id) VALUES (?,3)",
+                    (feature_id,),
+                ).lastrowid
+            )
+            con.executemany(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness) VALUES (?,?,?,'codex')",
+                (
+                    (unambiguous, 3, "planner"),
+                    (unambiguous, 2, "reviewer"),
+                    (ambiguous, 3, "planner"),
+                    (ambiguous, 2, "reviewer"),
+                    (ambiguous, 5, "reviewer"),
+                ),
+            )
+            con.commit()
+
+            con.executescript(CONFORMANCE_OWNER_MIGRATION.read_text())
+
+            self.assertEqual(
+                [(unambiguous, 2, 1), (ambiguous, None, 0)],
+                [
+                    tuple(row)
+                    for row in con.execute(
+                        "SELECT sprint_id,conformance_reviewer_shell_id,"
+                        "conformance_owner_generation FROM sprints "
+                        "ORDER BY sprint_id"
+                    )
+                ],
+            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "active Reviewer participant",
+            ):
+                con.execute(
+                    "UPDATE sprints SET conformance_reviewer_shell_id=3,"
+                    "conformance_owner_generation=2 WHERE sprint_id=?",
+                    (unambiguous,),
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "generation is invalid"):
+                con.execute(
+                    "UPDATE sprints SET conformance_owner_generation=2 "
+                    "WHERE sprint_id=?",
+                    (unambiguous,),
+                )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "arming requires a Sprint conformance owner",
+            ):
+                con.execute(
+                    "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?",
+                    (ambiguous,),
+                )
+            con.execute(
+                "UPDATE sprints SET conformance_reviewer_shell_id=5,"
+                "conformance_owner_generation=1,merge_grant_enabled=1 "
+                "WHERE sprint_id=?",
+                (ambiguous,),
+            )
+            con.execute(
+                "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?",
+                (ambiguous,),
+            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "reassigned only while paused",
+            ):
+                con.execute(
+                    "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                    "conformance_owner_generation=2 WHERE sprint_id=?",
+                    (ambiguous,),
+                )
+            con.execute(
+                "UPDATE sprints SET lifecycle='paused' WHERE sprint_id=?",
+                (ambiguous,),
+            )
+            con.execute(
+                "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=2 WHERE sprint_id=?",
+                (ambiguous,),
+            )
+            self.assertEqual(
+                (2, 2, "paused"),
+                tuple(
+                    con.execute(
+                        "SELECT conformance_reviewer_shell_id,"
+                        "conformance_owner_generation,lifecycle FROM sprints "
+                        "WHERE sprint_id=?",
+                        (ambiguous,),
+                    ).fetchone()
+                ),
+            )
 
     def test_live_replanning_migration_preserves_and_repeats_task_binding(self) -> None:
         with closing(sqlite3.connect(":memory:")) as con:

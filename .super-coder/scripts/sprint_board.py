@@ -56,7 +56,13 @@ _EVENT_FIELDS = {
         }
     ),
     "sprint.delivery_terminal": frozenset(
-        {"terminal_count", "completed_count", "cancelled_count"}
+        {
+            "terminal_count",
+            "completed_count",
+            "cancelled_count",
+            "conformance_reviewer_shell_id",
+            "conformance_owner_generation",
+        }
     ),
     "sprint.cleanup_scheduled": frozenset(
         {
@@ -97,7 +103,17 @@ _EVENT_FIELDS = {
         }
     ),
     "lifecycle.paused": frozenset(
-        {"from", "reason", "report_id", "interrupt_run_ids", "wake_id", "attempts"}
+        {
+            "from",
+            "reason",
+            "report_id",
+            "interrupt_run_ids",
+            "wake_id",
+            "attempts",
+            "code",
+            "eligible_reviewer_shell_ids",
+            "recovery_command",
+        }
     ),
     "lifecycle.aborted": frozenset(
         {"from", "reason", "report_id", "interrupt_run_ids"}
@@ -115,6 +131,12 @@ _EVENT_FIELDS = {
     ),
     "coordinate_mode.enabled": frozenset({"conversation_id", "reason"}),
     "coordinate_mode.cleared": frozenset({"reason"}),
+    "conformance_owner.changed": frozenset(
+        {"previous_shell_id", "new_shell_id", "generation", "reason"}
+    ),
+    "conformance_owner.required": frozenset(
+        {"code", "eligible_reviewer_shell_ids", "recovery_command"}
+    ),
     "pause.interrupt_delivery_failed": frozenset({"run_id"}),
     "work_unit.created": frozenset(
         {
@@ -357,7 +379,7 @@ def pickup_projection(
             )
         )
     action = "paused" if pause_reason else "requeued" if current_requeues else "none"
-    result = {
+    result: dict[str, Any] = {
         "action": action,
         "requeued_wake_ids": list(current_requeues),
         "pause_reason": pause_reason,
@@ -470,6 +492,8 @@ class SprintBoardProjection:
         rows = self.con.execute(
             "SELECT sp.sprint_id,sp.feature_id,r.title feature_title,"
             "sp.originating_planner_shell_id,planner.shortname planner_shortname,"
+            "sp.conformance_reviewer_shell_id,sp.conformance_owner_generation,"
+            "owner.shortname conformance_owner_shortname,"
             "sp.lifecycle,sp.created_at,sp.armed_at,sp.paused_at,sp.completed_at,"
             "sp.aborted_at,sp.terminal_outcome,"
             "SUM(CASE WHEN u.disposition IN ('completed','cancelled') THEN 1 ELSE 0 END) done_count,"
@@ -479,6 +503,7 @@ class SprintBoardProjection:
             "SUM(CASE WHEN u.disposition='blocked' THEN 1 ELSE 0 END) blocked_count "
             "FROM sprints sp JOIN roadmap r ON r.feature_id=sp.feature_id "
             "JOIN shells planner ON planner.shell_id=sp.originating_planner_shell_id "
+            "LEFT JOIN shells owner ON owner.shell_id=sp.conformance_reviewer_shell_id "
             "LEFT JOIN sprint_work_units u ON u.sprint_id=sp.sprint_id"
             f"{clause} GROUP BY sp.sprint_id ORDER BY sp.created_at DESC,sp.sprint_id DESC "
             "LIMIT ?",
@@ -501,6 +526,15 @@ class SprintBoardProjection:
                         "shell_id": int(row["originating_planner_shell_id"]),
                         "shortname": row["planner_shortname"],
                     },
+                    "conformance_owner": (
+                        {
+                            "shell_id": int(row["conformance_reviewer_shell_id"]),
+                            "shortname": row["conformance_owner_shortname"],
+                            "generation": int(row["conformance_owner_generation"]),
+                        }
+                        if row["conformance_reviewer_shell_id"] is not None
+                        else None
+                    ),
                     "lifecycle": row["lifecycle"],
                     "created_at": row["created_at"],
                     "armed_at": row["armed_at"],
@@ -920,6 +954,18 @@ class SprintBoardProjection:
                     "shell_id": int(sprint["originating_planner_shell_id"]),
                     "shortname": sprint["planner_shortname"],
                 },
+                "conformance_owner": (
+                    {
+                        "shell_id": int(sprint["conformance_reviewer_shell_id"]),
+                        "shortname": self.con.execute(
+                            "SELECT shortname FROM shells WHERE shell_id=?",
+                            (int(sprint["conformance_reviewer_shell_id"]),),
+                        ).fetchone()[0],
+                        "generation": int(sprint["conformance_owner_generation"]),
+                    }
+                    if sprint["conformance_reviewer_shell_id"] is not None
+                    else None
+                ),
                 "lifecycle": sprint["lifecycle"],
                 "created_at": sprint["created_at"],
                 "armed_at": sprint["armed_at"],

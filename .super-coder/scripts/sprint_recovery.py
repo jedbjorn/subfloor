@@ -80,6 +80,7 @@ class SprintRecoveryCoordinator:
         actor: LifecycleActor,
         *,
         reason: str | None = None,
+        conformance_reviewer_shell_id: int | None = None,
     ) -> ResumeReceipt:
         native_run_ids = tuple(
             int(row[0])
@@ -116,6 +117,7 @@ class SprintRecoveryCoordinator:
             sprint_id,
             actor,
             reason=reason,
+            conformance_reviewer_shell_id=conformance_reviewer_shell_id,
             reconcile_in_transaction=reconcile,
             external_anomalies=anomalies,
         )

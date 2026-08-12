@@ -12,6 +12,7 @@ import conversation_events
 import db_driver
 import sprint_cleanup
 from sprint_domain import (
+    LifecycleActor,
     SprintAuthorityError,
     SprintInvariantError,
     SprintLifecycleStore,
@@ -36,6 +37,13 @@ class ConformanceReceipt:
 class FinalReportReceipt:
     report_id: int
     created: bool
+
+
+@dataclass(frozen=True)
+class CompletionReceipt:
+    changed: bool
+    report_id: int | None
+    report_created: bool
 
 
 class SprintCloseStore:
@@ -246,41 +254,129 @@ class SprintCloseStore:
             idempotency_key, "idempotency key", maximum=220
         )
         with db_driver.write_transaction(self.con, "sprint.close.final_report"):
-            sprint = self._require_close_authority(sprint_id, caller_shell_id)
-            existing = self.con.execute(
-                "SELECT report_id,body,idempotency_key FROM sprint_reports "
-                "WHERE sprint_id=? AND report_kind='final' ORDER BY report_id LIMIT 1",
-                (sprint_id,),
-            ).fetchone()
-            if existing is not None:
-                if (
-                    existing["body"] != body
-                    or existing["idempotency_key"] != idempotency_key
-                ):
-                    raise SprintInvariantError(
-                        "Sprint already has a different final report"
-                    )
-                return FinalReportReceipt(int(existing["report_id"]), False)
-            if sprint["lifecycle"] != "armed":
-                raise SprintInvariantError(
-                    f"final report requires an armed Sprint, not {sprint['lifecycle']}"
-                )
-            report_id = int(
-                self.con.execute(
-                    "INSERT INTO sprint_reports "
-                    "(sprint_id,report_kind,author_shell_id,body,idempotency_key) "
-                    "VALUES (?,'final',?,?,?)",
-                    (sprint_id, caller_shell_id, body, idempotency_key),
-                ).lastrowid
-            )
-            actor_kind = "fnb" if sprint["caller_flavor"] == "admin" else "planner"
-            self._event(
+            return self._record_final_report_in_transaction(
                 sprint_id,
-                "final_report.recorded",
                 caller_shell_id,
-                {"report_id": report_id},
-                actor_kind=actor_kind,
+                body=body,
+                idempotency_key=idempotency_key,
             )
+
+    def complete(
+        self,
+        sprint_id: int,
+        caller_shell_id: int,
+        *,
+        reason: str,
+        terminal_outcome: str,
+        final_report: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> CompletionReceipt:
+        """Atomically record an optional final report and complete the Sprint."""
+        reason = self._required(reason, "completion reason", maximum=2000)
+        terminal_outcome = self._required(
+            terminal_outcome, "terminal outcome", maximum=2000
+        )
+        if (final_report is None) != (idempotency_key is None):
+            raise ValueError(
+                "final_report and idempotency_key must be provided together"
+            )
+        if final_report is not None:
+            final_report = self._required(final_report, "final report body")
+            idempotency_key = self._required(
+                idempotency_key or "", "idempotency key", maximum=220
+            )
+        lifecycle = self._lifecycle(sprint_id)
+        cleanup_targets = (
+            ()
+            if lifecycle == "completed"
+            else self.cleanup_store.prepare_targets(sprint_id)
+        )
+        closed_conversation_ids: tuple[str, ...] = ()
+        with db_driver.write_transaction(self.con, "sprint.close.complete"):
+            sprint = self._require_close_authority(sprint_id, caller_shell_id)
+            report = None
+            if final_report is not None and idempotency_key is not None:
+                report = self._record_final_report_in_transaction(
+                    sprint_id,
+                    caller_shell_id,
+                    body=final_report,
+                    idempotency_key=idempotency_key,
+                )
+            if sprint["lifecycle"] == "completed":
+                return CompletionReceipt(
+                    False,
+                    report.report_id if report else None,
+                    report.created if report else False,
+                )
+            actor_kind = "fnb" if sprint["caller_flavor"] == "admin" else "planner"
+            closed_conversation_ids = SprintLifecycleStore(
+                self.con,
+                cleanup_store=self.cleanup_store,
+            ).complete_in_transaction(
+                sprint_id,
+                LifecycleActor(actor_kind, caller_shell_id),
+                reason=reason,
+                terminal_outcome=terminal_outcome,
+                cleanup_targets=cleanup_targets,
+            )
+        notification_error: Exception | None = None
+        for conversation_id in closed_conversation_ids:
+            try:
+                conversation_events.notify(conversation_id)
+            except Exception as exc:  # noqa: BLE001 - finish post-commit fanout
+                if notification_error is None:
+                    notification_error = exc
+        if notification_error is not None:
+            raise notification_error
+        return CompletionReceipt(
+            True,
+            report.report_id if report else None,
+            report.created if report else False,
+        )
+
+    def _record_final_report_in_transaction(
+        self,
+        sprint_id: int,
+        caller_shell_id: int,
+        *,
+        body: str,
+        idempotency_key: str,
+    ) -> FinalReportReceipt:
+        if not self.con.in_transaction:
+            raise RuntimeError("final report requires an active transaction")
+        sprint = self._require_close_authority(sprint_id, caller_shell_id)
+        existing = self.con.execute(
+            "SELECT report_id,body,idempotency_key FROM sprint_reports "
+            "WHERE sprint_id=? AND report_kind='final' ORDER BY report_id LIMIT 1",
+            (sprint_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                existing["body"] != body
+                or existing["idempotency_key"] != idempotency_key
+            ):
+                raise SprintInvariantError("Sprint already has a different final report")
+            return FinalReportReceipt(int(existing["report_id"]), False)
+        if sprint["lifecycle"] != "armed":
+            raise SprintInvariantError(
+                f"final report requires an armed Sprint, not {sprint['lifecycle']}"
+            )
+        report_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_reports "
+                "(sprint_id,report_kind,author_shell_id,body,idempotency_key) "
+                "VALUES (?,'final',?,?,?)",
+                (sprint_id, caller_shell_id, body, idempotency_key),
+            ).lastrowid
+        )
+        actor_kind = "fnb" if sprint["caller_flavor"] == "admin" else "planner"
+        self._event(
+            sprint_id,
+            "final_report.recorded",
+            caller_shell_id,
+            {"report_id": report_id},
+            actor_kind=actor_kind,
+        )
         return FinalReportReceipt(report_id, True)
 
     def disposition_followup(
@@ -461,6 +557,14 @@ class SprintCloseStore:
                 "lifecycle": sprint["lifecycle"],
                 "originating_planner_shell_id": int(
                     sprint["originating_planner_shell_id"]
+                ),
+                "conformance_reviewer_shell_id": (
+                    int(sprint["conformance_reviewer_shell_id"])
+                    if sprint["conformance_reviewer_shell_id"] is not None
+                    else None
+                ),
+                "conformance_owner_generation": int(
+                    sprint["conformance_owner_generation"]
                 ),
                 "created_at": sprint["created_at"],
                 "armed_at": sprint["armed_at"],
@@ -720,13 +824,20 @@ class SprintCloseStore:
 
     def _require_reviewer(self, sprint_id: int, shell_id: int) -> int:
         role = self.con.execute(
-            "SELECT participant_id,role FROM sprint_participants "
-            "WHERE sprint_id=? AND shell_id=?",
+            "SELECT participant.participant_id,sprint.conformance_reviewer_shell_id "
+            "FROM sprints sprint JOIN sprint_participants participant "
+            "ON participant.sprint_id=sprint.sprint_id "
+            "WHERE sprint.sprint_id=? AND participant.shell_id=? "
+            "AND participant.role='reviewer'",
             (sprint_id, shell_id),
         ).fetchone()
-        if role is None or role["role"] != "reviewer":
+        if (
+            role is None
+            or role["conformance_reviewer_shell_id"] is None
+            or int(role["conformance_reviewer_shell_id"]) != shell_id
+        ):
             raise SprintAuthorityError(
-                "only a participating Reviewer may record conformance"
+                "only the selected conformance Reviewer may record conformance"
             )
         return int(role["participant_id"])
 

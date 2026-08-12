@@ -2084,6 +2084,9 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(exc, sprint_domain.SprintAuthorityError):
             status, code = 403, "forbidden"
             details = {}
+        elif isinstance(exc, sprint_domain.SprintConflictError):
+            status, code = 409, "lifecycle_conflict"
+            details = exc.details
         elif isinstance(exc, sprint_domain.SprintCleanupConflictError):
             status, code = 409, "lifecycle_conflict"
             details = exc.details
@@ -2175,6 +2178,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(409, {"error": str(exc), "details": exc.details})
         if isinstance(exc, sprint_domain.SprintAuthorityError):
             return self._send(403, {"error": str(exc)})
+        if isinstance(exc, sprint_domain.SprintConflictError):
+            return self._send(
+                409,
+                {"error": str(exc), "details": exc.details},
+            )
         if isinstance(exc, sprint_domain.SprintCleanupConflictError):
             return self._send(
                 409,
@@ -2613,7 +2621,11 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 try:
                     wake_ids = sprint_domain.SprintLifecycleStore(con).arm(
-                        sprint_id, planner_shell_id
+                        sprint_id,
+                        planner_shell_id,
+                        conformance_reviewer_shell_id=self._sprint_integer(
+                            body, "conformance_reviewer_shell_id"
+                        ),
                     )
                 except sqlite3.IntegrityError as exc:
                     if "idx_sprints_single_armed" not in str(exc):
@@ -2814,6 +2826,11 @@ class Handler(BaseHTTPRequestHandler):
                     sprint_id,
                     self._sprint_actor(con, sprint_id, shell_id),
                     reason=body.get("reason"),
+                    conformance_reviewer_shell_id=(
+                        self._sprint_integer(body, "conformance_reviewer_shell_id")
+                        if body.get("conformance_reviewer_shell_id") is not None
+                        else None
+                    ),
                 )
                 return self._send(200, {
                     "changed": receipt.changed,
@@ -2837,28 +2854,21 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError(
                         "final_report and idempotency_key must be provided together"
                     )
-                report = None
-                if report_body is not None:
-                    report = sprint_close.SprintCloseStore(con).record_final_report(
-                        sprint_id,
-                        shell_id,
-                        body=report_body,
-                        idempotency_key=report_key,
-                    )
-                changed = sprint_domain.SprintLifecycleStore(con).transition(
+                receipt = sprint_close.SprintCloseStore(con).complete(
                     sprint_id,
-                    "completed",
-                    self._sprint_actor(con, sprint_id, shell_id),
+                    shell_id,
                     reason=body.get("reason"),
                     terminal_outcome=body.get("terminal_outcome"),
+                    final_report=report_body,
+                    idempotency_key=report_key,
                 )
                 cleanup_projection = sprint_cleanup.SprintCleanupTargetStore(
                     con
                 ).project(sprint_id)
                 return self._send(200, {
-                    "changed": changed,
-                    "report_id": report.report_id if report else None,
-                    "report_created": report.created if report else False,
+                    "changed": receipt.changed,
+                    "report_id": receipt.report_id,
+                    "report_created": receipt.report_created,
                     "cleanup": sprint_cleanup.SprintCleanupRecoveryStore.projection_dict(
                         cleanup_projection
                     ),

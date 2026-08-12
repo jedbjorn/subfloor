@@ -104,7 +104,9 @@ class SprintHealthCase(unittest.TestCase):
             )
         if lifecycle != "prepared":
             self.con.execute(
-                "UPDATE sprints SET lifecycle='armed',armed_at=? WHERE sprint_id=?",
+                "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+                "conformance_owner_generation=1,lifecycle='armed',armed_at=? "
+                "WHERE sprint_id=?",
                 (armed_at, sprint_id),
             )
         if lifecycle == "paused":

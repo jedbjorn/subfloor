@@ -56,10 +56,6 @@ class SprintCoordinateModeTest(unittest.TestCase):
                 (feature_id,),
             ).lastrowid
         )
-        self.con.execute(
-            "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?",
-            (self.sprint_id,),
-        )
         self.con.executemany(
             "INSERT INTO sprint_participants "
             "(sprint_id,shell_id,role,harness,model,effort) VALUES (?,?,?,?,?,?)",
@@ -68,6 +64,18 @@ class SprintCoordinateModeTest(unittest.TestCase):
                 (self.sprint_id, 1, "developer", "codex", "gpt-test", "high"),
                 (self.sprint_id, 2, "reviewer", "codex", "gpt-test", "high"),
             ),
+        )
+        self.con.execute(
+            "UPDATE sprints SET conformance_reviewer_shell_id=2,"
+            "conformance_owner_generation=1,lifecycle='armed' WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        self.con.execute(
+            "INSERT INTO sprint_work_units "
+            "(sprint_id,assigned_shell_id,reviewer_shell_id,title,expected_output,"
+            "disposition,completed_at) VALUES "
+            "(?,1,2,'Terminal fixture','No delivery work','completed',datetime('now'))",
+            (self.sprint_id,),
         )
         participants = {
             str(row["role"]): int(row["participant_id"])

@@ -163,7 +163,9 @@ class SprintBoardApiCase(unittest.TestCase):
                 (sprint_id, shell_id),
             )
         con.execute(
-            "UPDATE sprints SET lifecycle='armed',armed_at='2026-08-01 10:01:00' "
+            "UPDATE sprints SET conformance_reviewer_shell_id=4,"
+            "conformance_owner_generation=1,lifecycle='armed',"
+            "armed_at='2026-08-01 10:01:00' "
             "WHERE sprint_id=?",
             (sprint_id,),
         )
