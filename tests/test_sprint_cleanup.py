@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -25,6 +26,7 @@ sys.path[:0] = [
 
 import server
 import sprint_cleanup
+import sprint_cli
 import sprint_close
 import sprint_domain
 import sprint_message_delivery
@@ -543,9 +545,22 @@ class SprintCleanupSchedulingTest(SprintDomainCase):
                 "status_command": (
                     f"sc sprint cleanup-status --sprint {self.sprint_id}"
                 ),
-                "retry_command": f"sc sprint cleanup --sprint {self.sprint_id}",
+                "retry_command": (
+                    f"sc sprint cleanup --sprint {self.sprint_id} "
+                    "--key <stable-retry-key>"
+                ),
             },
             raised.exception.details,
+        )
+        command = shlex.split(raised.exception.details["retry_command"])
+        parsed = sprint_cli.build_parser().parse_args(command[2:])
+        self.assertEqual(
+            ("cleanup", self.sprint_id, "<stable-retry-key>", False),
+            (parsed.command, parsed.sprint, parsed.key, parsed.adopt_legacy),
+        )
+        self.assertEqual(
+            1,
+            str(raised.exception).count("--key <stable-retry-key>"),
         )
         self.assertEqual(
             ("prepared", 0, 0),
@@ -659,9 +674,18 @@ class SprintCleanupSchedulingTest(SprintDomainCase):
 
         self.assertEqual(409, token_status)
         self.assertEqual(conflict.details, token_body["details"])
+        self.assertEqual(
+            f"sc sprint cleanup --sprint {self.sprint_id} "
+            "--key <stable-retry-key>",
+            token_body["details"]["retry_command"],
+        )
         self.assertEqual(409, board_status)
         self.assertEqual("lifecycle_conflict", board_body["error"]["code"])
         self.assertEqual(conflict.details, board_body["error"]["details"])
+        self.assertEqual(
+            token_body["details"]["retry_command"],
+            board_body["error"]["details"]["retry_command"],
+        )
 
 
 class SprintCleanupExecutorTest(SprintDomainCase):

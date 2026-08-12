@@ -90,13 +90,16 @@ class SprintCleanupConflictError(SprintInvariantError):
             "status_command": (
                 f"sc sprint cleanup-status --sprint {blocker.sprint_id}"
             ),
-            "retry_command": f"sc sprint cleanup --sprint {blocker.sprint_id}",
+            "retry_command": (
+                f"sc sprint cleanup --sprint {blocker.sprint_id} "
+                "--key <stable-retry-key>"
+            ),
         }
         super().__init__(
             f"prior Sprint {blocker.sprint_id} cleanup is {blocker.state} for "
             f"{blocker.path_label} (last_safe_fact={blocker.last_safe_fact}); "
             f"run `{self.details['status_command']}` and, after correcting a "
-            f"failure, `{self.details['retry_command']} --key <stable-retry-key>`"
+            f"failure, `{self.details['retry_command']}`"
         )
 
 
