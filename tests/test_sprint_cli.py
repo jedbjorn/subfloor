@@ -851,6 +851,8 @@ class SprintCliApiTest(unittest.TestCase):
             "2",
         )
         self.assertEqual(2, len(armed["wake_ids"]))
+        self.assertEqual(2, armed["conformance_reviewer_shell_id"])
+        self.assertEqual(1, armed["conformance_owner_generation"])
 
         with mock.patch.object(
             server.sprint_pr_watcher,
@@ -897,6 +899,8 @@ class SprintCliApiTest(unittest.TestCase):
                 "7",
             )
         self.assertTrue(resumed["changed"])
+        self.assertEqual(7, resumed["conformance_reviewer_shell_id"])
+        self.assertEqual(2, resumed["conformance_owner_generation"])
         con = sqlite3.connect(self.db)
         try:
             con.execute(

@@ -906,6 +906,84 @@ class RegistrationRecoveryTest(SprintPRWatcherCase):
 
 
 class TransitionRoutingTest(SprintPRWatcherCase):
+    def test_owner_loss_on_final_merge_carries_pause_receipt_past_commit(self):
+        self.register()
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='merge_ready' "
+            "WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        trigger_message_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'engine','test','prompt','active merge turn',"
+                "'owner-loss-merge','owner-loss-merge','running')",
+                (self.developer_conversation_id,),
+            ).lastrowid
+        )
+        run_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                "lease_expires_at,started_at,heartbeat_at) "
+                "VALUES (?,1,?,'running','test-broker','2999-01-01 00:00:00',"
+                "'2026-08-01 00:00:00','2026-08-01 00:00:00')",
+                (self.developer_conversation_id, trigger_message_id),
+            ).lastrowid
+        )
+        self.con.execute(
+            "UPDATE sprint_participants SET disposition='declined' "
+            "WHERE sprint_id=? AND shell_id=2",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        self.reader.current = pull_request(
+            state="MERGED", checks="SUCCESS", checks_failed=False
+        )
+        delivered: list[sprint_domain.PauseReceipt] = []
+
+        def capture_pause(
+            store: sprint_domain.SprintLifecycleStore,
+            receipt: sprint_domain.PauseReceipt,
+        ) -> None:
+            self.assertIs(store.con, self.con)
+            self.assertFalse(self.con.in_transaction)
+            self.assertEqual(
+                "paused",
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0],
+            )
+            delivered.append(receipt)
+
+        with mock.patch.object(
+            sprint_domain.SprintLifecycleStore,
+            "signal_pause_receipt",
+            new=capture_pause,
+        ):
+            self.assertTrue(self.watcher.poll_once())
+
+        self.assertEqual(1, len(delivered))
+        self.assertEqual((run_id,), delivered[0].interrupt_run_ids)
+        self.assertEqual(
+            (self.developer_conversation_id,),
+            delivered[0].notification_conversation_ids,
+        )
+        self.assertEqual(
+            ("paused", "completed"),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,u.disposition FROM sprints s "
+                    "JOIN sprint_work_units u USING (sprint_id) "
+                    "WHERE s.sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+
     def test_queued_checkrun_stays_pending_without_green_owner_wake(self):
         raw = {
             "number": 42,

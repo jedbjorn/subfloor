@@ -28,7 +28,13 @@ from github_pull_requests import (
     GitHubReadError,
     PullRequest,
 )
-from sprint_domain import LifecycleActor, SprintAuthorityError, SprintInvariantError
+from sprint_domain import (
+    LifecycleActor,
+    PauseReceipt,
+    SprintAuthorityError,
+    SprintInvariantError,
+    SprintLifecycleStore,
+)
 from sprint_message_delivery import SprintMessageStore
 from sprint_review_loop import SprintReviewLoopStore
 
@@ -1097,12 +1103,17 @@ class SprintPRWatcher:
                 GitHubReadError("GitHub returned a different PR identity"),
             )
             return None
+        pause_receipts: list[PauseReceipt] = []
         with db_driver.write_transaction(self.con, "sprint.pr.observe"):
             receipt = self.observe_in_transaction(
                 int(registered["subscription_id"]),
                 pull_request,
                 trigger=trigger,
+                pause_receipts=pause_receipts,
             )
+        lifecycle = SprintLifecycleStore(self.con)
+        for pause_receipt in pause_receipts:
+            lifecycle.signal_pause_receipt(pause_receipt)
         self._backoff.pop(int(registered["subscription_id"]), None)
         return receipt
 
@@ -1113,6 +1124,7 @@ class SprintPRWatcher:
         *,
         trigger: str,
         dispatch: bool = True,
+        pause_receipts: list[PauseReceipt] | None = None,
     ) -> TransitionReceipt | None:
         """Apply a pre-read observation inside an owner reconciliation commit."""
         if not self.con.in_transaction:
@@ -1226,6 +1238,7 @@ class SprintPRWatcher:
                 int(registered_pr_id),
                 transition_key=transition_key,
                 dispatch=dispatch,
+                pause_receipts=pause_receipts,
             )
         if current["sprint_id"] is not None:
             self.con.execute(

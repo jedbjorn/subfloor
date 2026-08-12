@@ -123,6 +123,95 @@ class SprintDomainCase(unittest.TestCase):
 
 class MigrationAndShapeTest(SprintDomainCase):
     @staticmethod
+    def _pre_owner_terminal_db(*, reviewer_shell_ids: tuple[int, ...]):
+        con = sqlite3.connect(":memory:")
+        con.row_factory = sqlite3.Row
+        apply_schema(con, through="0204_sprint_governing_revision_evidence.sql")
+        con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
+        con.executemany(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (?,?,?,?,?,1)",
+            (
+                (1, "Developer", "DEV1", "dev", "prompt"),
+                (2, "Reviewer one", "REV1", "reviewer", "prompt"),
+                (3, "Planner", "PLN1", "planner", "prompt"),
+                (5, "Reviewer two", "REV2", "reviewer", "prompt"),
+            ),
+        )
+        feature_id = int(
+            con.execute("INSERT INTO roadmap (title) VALUES ('Feature')").lastrowid
+        )
+        sprint_id = int(
+            con.execute(
+                "INSERT INTO sprints "
+                "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+                "VALUES (?,3,1)",
+                (feature_id,),
+            ).lastrowid
+        )
+        participants = [(sprint_id, 3, "planner"), (sprint_id, 1, "developer")]
+        participants.extend(
+            (sprint_id, reviewer_shell_id, "reviewer")
+            for reviewer_shell_id in reviewer_shell_ids
+        )
+        con.executemany(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness) VALUES (?,?,?,'codex')",
+            participants,
+        )
+        reviewer_shell_id = reviewer_shell_ids[0]
+        con.execute(
+            "INSERT INTO sprint_work_units "
+            "(sprint_id,assigned_shell_id,reviewer_shell_id,title,expected_output,"
+            "disposition,completed_at) "
+            "VALUES (?,1,?,'Historical lane','Historical output','completed',"
+            "'2026-08-01 00:00:00')",
+            (sprint_id, reviewer_shell_id),
+        )
+        participant_id = int(
+            con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=?",
+                (sprint_id, reviewer_shell_id),
+            ).fetchone()[0]
+        )
+        con.execute(
+            "INSERT INTO wake_message "
+            "(sprint_id,receiver_shell_id,to_participant_id,message_kind,body,"
+            "declared_type,actionable,read_at,delivered_at,idempotency_key) "
+            "VALUES (?,?,?,'notification','Old broadcast closeout','new',0,"
+            "'2026-08-01 00:00:00','2026-08-01 00:00:00',?)",
+            (
+                sprint_id,
+                reviewer_shell_id,
+                participant_id,
+                f"historical:{sprint_id}:delivery-terminal",
+            ),
+        )
+        con.execute(
+            "INSERT INTO sprint_events "
+            "(sprint_id,event_type,actor_kind,payload) "
+            "VALUES (?,'sprint.delivery_terminal','system',?)",
+            (
+                sprint_id,
+                json.dumps(
+                    {
+                        "terminal_count": 1,
+                        "completed_count": 1,
+                        "cancelled_count": 0,
+                    }
+                ),
+            ),
+        )
+        con.execute(
+            "UPDATE sprints SET lifecycle='armed' WHERE sprint_id=?",
+            (sprint_id,),
+        )
+        con.commit()
+        return con, sprint_id
+
+    @staticmethod
     def _seed_prechange_binding(con: sqlite3.Connection) -> tuple[int, int, str, int]:
         con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
         con.executemany(
@@ -340,6 +429,127 @@ class MigrationAndShapeTest(SprintDomainCase):
                     ).fetchone()
                 ),
             )
+
+    def test_conformance_owner_upgrade_reconciles_terminal_history_once(self) -> None:
+        for reviewers, expected_owner in (((2,), 2), ((2, 5), None)):
+            with self.subTest(reviewers=reviewers), closing(
+                self._pre_owner_terminal_db(reviewer_shell_ids=reviewers)[0]
+            ) as con:
+                sprint_id = int(con.execute("SELECT sprint_id FROM sprints").fetchone()[0])
+                con.executescript(CONFORMANCE_OWNER_MIGRATION.read_text())
+                notifications: list[bool] = []
+                store = sprint_domain.SprintLifecycleStore(
+                    con,
+                    probe_harness=lambda _harness: None,
+                    notify_commit=lambda: notifications.append(con.in_transaction)
+                    or True,
+                )
+
+                self.assertEqual(((sprint_id, "armed"),), store.recover_on_startup())
+                before_retry = (
+                    con.total_changes,
+                    con.execute(
+                        "SELECT COUNT(*) FROM wake_message"
+                    ).fetchone()[0],
+                    con.execute(
+                        "SELECT COUNT(*) FROM sprint_events"
+                    ).fetchone()[0],
+                    con.execute(
+                        "SELECT COUNT(*) FROM sprint_reports"
+                    ).fetchone()[0],
+                )
+                store.recover_on_startup()
+                after_retry = (
+                    con.total_changes,
+                    con.execute(
+                        "SELECT COUNT(*) FROM wake_message"
+                    ).fetchone()[0],
+                    con.execute(
+                        "SELECT COUNT(*) FROM sprint_events"
+                    ).fetchone()[0],
+                    con.execute(
+                        "SELECT COUNT(*) FROM sprint_reports"
+                    ).fetchone()[0],
+                )
+
+                self.assertEqual(
+                    1,
+                    con.execute(
+                        "SELECT COUNT(*) FROM wake_message "
+                        "WHERE body='Old broadcast closeout' AND read_at IS NOT NULL "
+                        "AND delivered_at IS NOT NULL"
+                    ).fetchone()[0],
+                )
+                if expected_owner is not None:
+                    self.assertEqual(
+                        ("armed", expected_owner, 1),
+                        tuple(
+                            con.execute(
+                                "SELECT lifecycle,conformance_reviewer_shell_id,"
+                                "conformance_owner_generation FROM sprints "
+                                "WHERE sprint_id=?",
+                                (sprint_id,),
+                            ).fetchone()
+                        ),
+                    )
+                    self.assertEqual(
+                        1,
+                        con.execute(
+                            "SELECT COUNT(*) FROM wake_message "
+                            "WHERE sprint_id=? AND idempotency_key=?",
+                            (
+                                sprint_id,
+                                f"sprint:{sprint_id}:delivery-terminal:1:"
+                                "owner:2:generation:1",
+                            ),
+                        ).fetchone()[0],
+                    )
+                    self.assertEqual(
+                        1,
+                        con.execute(
+                            "SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                            "AND event_type='sprint.delivery_terminal' "
+                            "AND json_extract(payload,'$.conformance_reviewer_shell_id')=2 "
+                            "AND json_extract(payload,'$.conformance_owner_generation')=1",
+                            (sprint_id,),
+                        ).fetchone()[0],
+                    )
+                    self.assertEqual([], notifications)
+                else:
+                    self.assertEqual(
+                        ("paused", None, 0),
+                        tuple(
+                            con.execute(
+                                "SELECT lifecycle,conformance_reviewer_shell_id,"
+                                "conformance_owner_generation FROM sprints "
+                                "WHERE sprint_id=?",
+                                (sprint_id,),
+                            ).fetchone()
+                        ),
+                    )
+                    self.assertEqual(
+                        (1, 1, 1),
+                        tuple(
+                            con.execute(
+                                "SELECT "
+                                "(SELECT COUNT(*) FROM sprint_reports "
+                                " WHERE sprint_id=? AND report_kind='pause'),"
+                                "(SELECT COUNT(*) FROM sprint_events "
+                                " WHERE sprint_id=? "
+                                " AND event_type='conformance_owner.required'),"
+                                "(SELECT COUNT(*) FROM wake_message "
+                                " WHERE sprint_id IS NULL AND receiver_shell_id=3 "
+                                " AND body LIKE ?)",
+                                (
+                                    sprint_id,
+                                    sprint_id,
+                                    f"Sprint {sprint_id} reached delivery terminal%",
+                                ),
+                            ).fetchone()
+                        ),
+                    )
+                    self.assertEqual([False], notifications)
+                self.assertEqual(before_retry[1:], after_retry[1:])
 
     def test_live_replanning_migration_preserves_and_repeats_task_binding(self) -> None:
         with closing(sqlite3.connect(":memory:")) as con:

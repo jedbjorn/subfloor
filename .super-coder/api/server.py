@@ -2633,7 +2633,16 @@ class Handler(BaseHTTPRequestHandler):
                     raise sprint_domain.SprintInvariantError(
                         "another Sprint is already armed"
                     ) from exc
-                return self._send(200, {"wake_ids": wake_ids})
+                owner = con.execute(
+                    "SELECT conformance_reviewer_shell_id,"
+                    "conformance_owner_generation FROM sprints WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone()
+                return self._send(200, {
+                    "wake_ids": wake_ids,
+                    "conformance_reviewer_shell_id": int(owner[0]),
+                    "conformance_owner_generation": int(owner[1]),
+                })
             if path == "/_sc/sprint/replan-unit":
                 planner_shell_id = self._sprint_planner_proxy(
                     con, sprint_id, shell_id
@@ -2832,8 +2841,15 @@ class Handler(BaseHTTPRequestHandler):
                         else None
                     ),
                 )
+                owner = con.execute(
+                    "SELECT conformance_reviewer_shell_id,"
+                    "conformance_owner_generation FROM sprints WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone()
                 return self._send(200, {
                     "changed": receipt.changed,
+                    "conformance_reviewer_shell_id": int(owner[0]),
+                    "conformance_owner_generation": int(owner[1]),
                     "dispatched_wake_ids": list(receipt.dispatched_wake_ids),
                     "requeued_wake_ids": list(receipt.requeued_wake_ids),
                     "projected_work_unit_ids": list(

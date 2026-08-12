@@ -696,7 +696,7 @@ class SprintRecoveryCase(SprintPRWatcherCase):
                 trigger="attempt-5-exhausted",
             ),
         )
-        self.assertEqual([], notifications)
+        self.assertEqual(["notified"], notifications)
         self.assertEqual(
             ("paused", 5, "DEV1", "orphan"),
             tuple(

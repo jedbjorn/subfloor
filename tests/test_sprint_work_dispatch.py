@@ -916,6 +916,42 @@ class DispatchGateTest(SprintWorkDispatchCase):
 
 
 class DeliveryTerminalTest(SprintWorkDispatchCase):
+    def add_live_run(self, shell_id: int = 1) -> tuple[int, str]:
+        conversation_id = str(
+            self.con.execute(
+                "SELECT pc.conversation_id FROM sprint_participant_conversations pc "
+                "JOIN sprint_participants p "
+                "ON p.participant_id=pc.sprint_participant_id "
+                "WHERE p.sprint_id=? AND p.shell_id=?",
+                (self.sprint_id, shell_id),
+            ).fetchone()[0]
+        )
+        token = int(
+            self.con.execute("SELECT COUNT(*)+1 FROM conversation_runs").fetchone()[0]
+        )
+        message_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                "idempotency_key,request_hash,state) "
+                "VALUES (?,'engine','test','prompt','active Sprint turn',?,?,"
+                "'running')",
+                (conversation_id, f"terminal:{token}", f"terminal:{token}"),
+            ).lastrowid
+        )
+        run_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                "lease_expires_at,started_at,heartbeat_at) "
+                "VALUES (?,?,?,'running','test-broker','2999-01-01 00:00:00',"
+                "'2026-08-01 00:00:00','2026-08-01 00:00:00')",
+                (conversation_id, shell_id, message_id),
+            ).lastrowid
+        )
+        self.con.commit()
+        return run_id, conversation_id
+
     def accept_arming_notification(self) -> None:
         message_id = int(
             self.con.execute(
@@ -1280,6 +1316,166 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
             [str(row["idempotency_key"]) for row in messages],
         )
         self.assertEqual(2, len(self.terminal_events()))
+
+    def test_owner_loss_terminal_pause_signals_only_after_commit(self) -> None:
+        report = self.create_unit(developer=1, output_kind="report_only")
+        interrupts: list[tuple[int, bool, str]] = []
+        notifications: list[tuple[str, bool, str]] = []
+        commits: list[tuple[bool, str]] = []
+
+        def interrupt(run_id: int) -> bool:
+            lifecycle = str(
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0]
+            )
+            interrupts.append((run_id, self.con.in_transaction, lifecycle))
+            return True
+
+        def notify_commit() -> bool:
+            lifecycle = str(
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0]
+            )
+            commits.append((self.con.in_transaction, lifecycle))
+            return True
+
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            probe_harness=lambda _harness: None,
+            interrupt_run=interrupt,
+            notify_commit=notify_commit,
+        )
+        units = sprint_domain.SprintWorkUnitStore(
+            self.con, lifecycle_store=lifecycle
+        )
+        lifecycle.arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
+        self.deliver_pending_wakes()
+        self.messages.mark_read(self.assignment_message(report), 1)
+        run_id, conversation_id = self.add_live_run()
+        self.con.execute(
+            "UPDATE sprint_participants SET disposition='declined' "
+            "WHERE sprint_id=? AND shell_id=2",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+
+        with mock.patch.object(
+            sprint_domain.conversation_events,
+            "notify",
+            side_effect=lambda value: notifications.append(
+                (
+                    value,
+                    self.con.in_transaction,
+                    str(
+                        self.con.execute(
+                            "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                            (self.sprint_id,),
+                        ).fetchone()[0]
+                    ),
+                )
+            ),
+        ):
+            self.assertEqual(
+                [], units.complete(self.sprint_id, report, 1, result="Done")
+            )
+
+        self.assertEqual([(run_id, False, "paused")], interrupts)
+        self.assertEqual([(conversation_id, False, "paused")], notifications)
+        self.assertEqual([(False, "paused")], commits)
+        self.assertEqual(
+            ("paused", "completed", "conformance_owner_required"),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,u.disposition,"
+                    "json_extract(r.body,'$.reason') "
+                    "FROM sprints s JOIN sprint_work_units u USING (sprint_id) "
+                    "JOIN sprint_reports r USING (sprint_id) "
+                    "WHERE s.sprint_id=? AND r.report_kind='pause'",
+                    (self.sprint_id,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            1,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message WHERE sprint_id IS NULL "
+                "AND receiver_shell_id=3 AND body LIKE ?",
+                (f"Sprint {self.sprint_id} reached delivery terminal%",),
+            ).fetchone()[0],
+        )
+
+    def test_owner_loss_terminal_pause_delivers_nothing_on_rollback(self) -> None:
+        report = self.create_unit(developer=1, output_kind="report_only")
+        interrupts: list[int] = []
+        notifications: list[str] = []
+        commits: list[bool] = []
+        lifecycle = sprint_domain.SprintLifecycleStore(
+            self.con,
+            probe_harness=lambda _harness: None,
+            interrupt_run=lambda run_id: interrupts.append(run_id) or True,
+            notify_commit=lambda: commits.append(self.con.in_transaction) or True,
+        )
+        units = sprint_domain.SprintWorkUnitStore(
+            self.con, lifecycle_store=lifecycle
+        )
+        lifecycle.arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
+        self.deliver_pending_wakes()
+        self.messages.mark_read(self.assignment_message(report), 1)
+        self.add_live_run()
+        self.con.execute(
+            "UPDATE sprint_participants SET disposition='declined' "
+            "WHERE sprint_id=? AND shell_id=2",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        original_event = lifecycle._event
+
+        def fail_after_pause(
+            sprint_id: int,
+            event_type: str,
+            actor: sprint_domain.LifecycleActor,
+            payload: dict,
+        ) -> int:
+            if event_type == "conformance_owner.required":
+                raise RuntimeError("injected owner recovery rollback")
+            return original_event(sprint_id, event_type, actor, payload)
+
+        with mock.patch.object(lifecycle, "_event", side_effect=fail_after_pause), mock.patch.object(
+            sprint_domain.conversation_events,
+            "notify",
+            side_effect=lambda value: notifications.append(value),
+        ), self.assertRaisesRegex(RuntimeError, "injected owner recovery rollback"):
+            units.complete(self.sprint_id, report, 1, result="Done")
+
+        self.assertEqual([], interrupts)
+        self.assertEqual([], notifications)
+        self.assertEqual([], commits)
+        self.assertEqual(
+            ("armed", "active", 0, 0, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,u.disposition,"
+                    "(SELECT COUNT(*) FROM sprint_reports r "
+                    " WHERE r.sprint_id=s.sprint_id AND r.report_kind='pause'),"
+                    "(SELECT COUNT(*) FROM sprint_events e "
+                    " WHERE e.sprint_id=s.sprint_id "
+                    " AND e.event_type='conformance_owner.required'),"
+                    "(SELECT COUNT(*) FROM wake_message m "
+                    " WHERE m.sprint_id IS NULL AND m.receiver_shell_id=3 "
+                    " AND m.body LIKE ?) "
+                    "FROM sprints s JOIN sprint_work_units u USING (sprint_id) "
+                    "WHERE s.sprint_id=?",
+                    (
+                        f"Sprint {self.sprint_id} reached delivery terminal%",
+                        self.sprint_id,
+                    ),
+                ).fetchone()
+            ),
+        )
 
 
 class ProductionPulseTest(SprintWorkDispatchCase):
