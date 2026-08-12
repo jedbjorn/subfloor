@@ -1123,6 +1123,7 @@ class SprintCleanupExecutorTest(SprintDomainCase):
             return_value=executor,
         ):
             first_changed = runtime._pulse(self.con, startup=False)
+            self.now += timedelta(seconds=5)
             second_changed = runtime._pulse(self.con, startup=False)
 
         rows = {
@@ -1162,6 +1163,106 @@ class SprintCleanupExecutorTest(SprintDomainCase):
         self.assertEqual(("pending", 0), tuple(artifact))
         self.assertTrue((self.worktree / "live-state.txt").is_file())
         self.assertFalse((planner_worktree / "dormant-state.txt").exists())
+
+    def test_render_only_launcher_preserves_pending_dirty_worktree(self):
+        self._dirty_worktree()
+        before_row = tuple(
+            self._worktree_row()[field]
+            for field in (
+                "state",
+                "attempt_count",
+                "claim_generation",
+                "lease_owner",
+                "lease_expires_at",
+                "waiting_reason",
+            )
+        )
+        before_branch = self._git(
+            self.worktree, "branch", "--show-current"
+        ).stdout.strip()
+        before_head = self._git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+
+        with mock.patch.dict(run.os.environ, {"RENDER_ONLY": "1"}), mock.patch.object(
+            sprint_cleanup, "SprintCleanupExecutor"
+        ) as executor_class:
+            run.cleanup_before_launch(
+                self.con,
+                {"shell_id": 1, "shortname": "DEV1", "flavor": "dev"},
+            )
+
+        executor_class.assert_not_called()
+        after_row = tuple(
+            self._worktree_row()[field]
+            for field in (
+                "state",
+                "attempt_count",
+                "claim_generation",
+                "lease_owner",
+                "lease_expires_at",
+                "waiting_reason",
+            )
+        )
+        self.assertEqual(
+            ("pending", 0, 0, None, None, None),
+            before_row,
+        )
+        self.assertEqual(before_row, after_row)
+        self.assertEqual(
+            ("feat/disposable", before_head),
+            (
+                self._git(self.worktree, "branch", "--show-current").stdout.strip(),
+                self._git(self.worktree, "rev-parse", "HEAD").stdout.strip(),
+            ),
+        )
+        self.assertEqual("feat/disposable", before_branch)
+        self.assertEqual("staged dirt\n", (self.worktree / "tracked.txt").read_text())
+        self.assertEqual("discard\n", (self.worktree / "untracked.txt").read_text())
+        self.assertEqual(
+            "discard nested\n",
+            (self.worktree / "nested-repository" / "only-local.txt").read_text(),
+        )
+
+    def test_real_launcher_resets_pending_dirty_worktree(self):
+        self._dirty_worktree()
+        executor = self._executor()
+
+        with mock.patch.dict(run.os.environ, {}, clear=True), mock.patch.object(
+            sprint_cleanup,
+            "SprintCleanupExecutor",
+            return_value=executor,
+        ) as executor_class:
+            run.cleanup_before_launch(
+                self.con,
+                {"shell_id": 1, "shortname": "DEV1", "flavor": "dev"},
+            )
+
+        executor_class.assert_called_once()
+        row = self._worktree_row()
+        self.assertEqual(
+            ("succeeded", 1, 1, None, None),
+            tuple(row[field] for field in (
+                "state",
+                "attempt_count",
+                "claim_generation",
+                "lease_owner",
+                "lease_expires_at",
+            )),
+        )
+        self.assertEqual(
+            "shell/dev1",
+            self._git(self.worktree, "branch", "--show-current").stdout.strip(),
+        )
+        self.assertEqual(
+            self._git(self.repository, "rev-parse", "origin/main").stdout.strip(),
+            self._git(self.worktree, "rev-parse", "HEAD").stdout.strip(),
+        )
+        self.assertEqual(
+            "",
+            self._git(self.worktree, "status", "--porcelain").stdout,
+        )
+        self.assertFalse((self.worktree / "local-commit.txt").exists())
+        self.assertFalse((self.worktree / "untracked.txt").exists())
+        self.assertFalse((self.worktree / "nested-repository").exists())
 
     def test_launcher_refuses_target_held_by_runtime_claim(self):
         claim = self.cleanup.claim_next(

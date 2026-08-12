@@ -1056,7 +1056,11 @@ class LaunchPlan(NamedTuple):
 
 def cleanup_before_launch(con: sqlite3.Connection, shell: dict) -> None:
     """Resolve one shell's older successful-Sprint cleanup before reuse."""
-    if shell.get("flavor") == "admin" or not shell.get("shortname"):
+    if (
+        os.environ.get("RENDER_ONLY")
+        or shell.get("flavor") == "admin"
+        or not shell.get("shortname")
+    ):
         return
     import sprint_cleanup
 
