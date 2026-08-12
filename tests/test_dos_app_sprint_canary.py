@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import cast
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -1026,15 +1030,15 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             (
                 "fetch",
                 "--no-tags",
-                "subfloor-canary",
-                f"{SHA}:refs/remotes/subfloor-canary/main",
+                canary.ENGINE_REMOTE,
+                f"{SHA}:refs/remotes/{canary.ENGINE_REMOTE}/main",
             ),
             git_calls,
         )
         self.assertIn(
             (
                 "checkout",
-                "refs/remotes/subfloor-canary/main",
+                f"refs/remotes/{canary.ENGINE_REMOTE}/main",
                 "--",
                 ".super-coder",
                 "sc",
@@ -1065,6 +1069,119 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         self.assertIn("verify callable exact engine ref", run_labels)
         self.assertTrue(checkpoints)
         self.assertEqual(self.facts.workspace, Path(checkpoints[0]["workspace"]))
+
+    def test_local_exact_source_install_replaces_a_stale_pin(self) -> None:
+        source = self.root / "candidate-cache"
+        dos_app = self.root / "host-project"
+        home = self.root / "home"
+        source.mkdir()
+        dos_app.mkdir()
+        home.mkdir()
+        shutil.copytree(
+            ROOT / ".super-coder",
+            source / ".super-coder",
+            ignore=shutil.ignore_patterns(
+                "shell_db.db*",
+                "instance.json",
+                "run",
+                "logs",
+                "__pycache__",
+            ),
+        )
+        shutil.copy2(ROOT / "sc", source / "sc")
+        (source / "README.md").write_text("# isolated engine candidate\n")
+        stale_sha = "c" * 40
+        (dos_app / ".sc-state").mkdir()
+        (dos_app / ".sc-state" / "engine.ref").write_text(stale_sha + "\n")
+        (dos_app / ".github" / "workflows").mkdir(parents=True)
+        (dos_app / ".github" / "workflows" / "existing.yml").write_text("name: existing\n")
+        (dos_app / "shared" / "redlines").mkdir(parents=True)
+        (dos_app / "shared" / ".gitkeep").write_text("")
+        (dos_app / "shared" / "redlines" / ".gitkeep").write_text("")
+        (dos_app / "README.md").write_text("# disposable host project\n")
+
+        def git(repo: Path, *args: str) -> str:
+            completed = subprocess.run(
+                ["git", "-C", str(repo), *args],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return completed.stdout.strip()
+
+        for repo in (source, dos_app):
+            git(repo, "init", "-b", "main")
+            git(repo, "config", "user.name", "Canary Install Test")
+            git(repo, "config", "user.email", "canary-install@noreply.local")
+            git(repo, "config", "maintenance.auto", "false")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "fixture")
+
+        candidate_sha = git(source, "rev-parse", "HEAD")
+        base_sha = git(dos_app, "rev-parse", "HEAD")
+        self.assertNotIn("subfloor", str(source))
+        self.assertNotIn("super-coder", str(source))
+        self.assertNotIn("subfloor", str(dos_app))
+        self.assertNotIn("super-coder", str(dos_app))
+
+        workspace = self.root / f"{canary.WORKSPACE_PREFIX}local-install"
+        config = canary.CanaryConfig(
+            source_repo=source,
+            engine_ref=candidate_sha,
+            dos_app_repo=dos_app,
+            dos_app_ref=base_sha,
+            repository="acme/host-project",
+            receipt_path=self.receipt_path,
+            temp_parent=self.root,
+            run_id="local-install",
+            stage_timeout_s=120,
+            whole_timeout_s=180,
+            poll_interval_s=0.01,
+        )
+        facts = canary.Preflight(
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            repository="acme/host-project",
+            remote_url=str(dos_app.resolve()),
+            workspace=workspace,
+            base_branch=f"{canary.REMOTE_PREFIX}/local-install/base",
+            head_branch=f"{canary.REMOTE_PREFIX}/local-install/head",
+            container="unused-local-install",
+            network="unused-local-install",
+            api_port=8883,
+            dev_port=8884,
+            github_remaining=4999,
+        )
+        deadline = canary.Deadline(180, 120)
+        deadline.enter("materialize")
+        backend = canary.HostBackend(deadline)
+        ledger = canary.ResourceLedger()
+        environment = {
+            **os.environ,
+            "HOME": str(home),
+            "XDG_STATE_HOME": str(home / ".local/state"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "NO_COLOR": "1",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            try:
+                backend.create_disposable(config, facts, ledger, lambda: None)
+            except canary.CanaryError as exc:
+                self.fail(f"{exc.code}: {exc.message}; details={exc.details}")
+            callable_ref = subprocess.run(
+                [str(workspace / "sc"), "engine-ref"],
+                cwd=workspace,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+
+        installed_ref = (workspace / ".sc-state" / "engine.ref").read_text().strip()
+        self.assertEqual(candidate_sha, installed_ref)
+        self.assertEqual(candidate_sha, callable_ref)
+        self.assertNotEqual(stale_sha, installed_ref)
+        self.assertNotEqual(stale_sha, callable_ref)
 
     def test_cleanup_is_idempotent_when_resources_are_already_absent(self) -> None:
         clock = FakeClock()
