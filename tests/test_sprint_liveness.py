@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 MIGRATIONS = ENGINE / "migrations"
 RETIREMENT_MIGRATION = MIGRATIONS / "0193_retire_sprint_liveness_acceptance.sql"
+REVISION_MIGRATION = MIGRATIONS / "0204_sprint_governing_revision_evidence.sql"
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import sprint_domain
@@ -31,6 +32,7 @@ def apply_schema(con: sqlite3.Connection) -> None:
     con.executescript(
         (MIGRATIONS / "0194_sprint_scoped_reply_waits.sql").read_text()
     )
+    con.executescript(REVISION_MIGRATION.read_text())
     con.execute("PRAGMA foreign_keys=ON")
 
 
@@ -108,9 +110,9 @@ class SprintLivenessCase(unittest.TestCase):
         )
         self.con.execute(
             "INSERT INTO sprint_specs "
-            "(sprint_id,document_id,bound_revision_sha256,approval_id) "
-            "VALUES (?,?,?,?)",
-            (self.sprint_id, document_id, revision, approval_id),
+            "(sprint_id,document_id,bound_revision_sha256,approval_id,"
+            "bound_revision_body,bound_revision_legacy) VALUES (?,?,?,?,?,0)",
+            (self.sprint_id, document_id, revision, approval_id, body),
         )
         self.con.executemany(
             "INSERT INTO sprint_participants "

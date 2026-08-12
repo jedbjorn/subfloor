@@ -20,11 +20,13 @@ import rebuild  # noqa: E402
 import snapshot  # noqa: E402
 
 
-def apply_engine_schema(path: Path) -> None:
+def apply_engine_schema(path: Path, *, through: str | None = None) -> None:
     con = sqlite3.connect(path)
     try:
         con.executescript(SCHEMA.read_text())
         for migration in sorted(MIGRATIONS.glob("*.sql")):
+            if through is not None and migration.name > through:
+                break
             con.executescript(migration.read_text())
         con.execute("PRAGMA foreign_keys=ON")
         con.commit()
@@ -46,7 +48,12 @@ def rows_by_table(path: Path, tables: list[str]) -> dict[str, list[tuple]]:
         con.close()
 
 
-def seed_prepared(con: sqlite3.Connection, *, reviewed: bool = True) -> int:
+def seed_prepared(
+    con: sqlite3.Connection,
+    *,
+    reviewed: bool = True,
+    immutable_body: bool = True,
+) -> int:
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
     con.executemany(
@@ -84,12 +91,20 @@ def seed_prepared(con: sqlite3.Connection, *, reviewed: bool = True) -> int:
         "VALUES (1,?,3,1)",
         (feature_id,),
     ).lastrowid
-    con.execute(
-        "INSERT INTO sprint_specs "
-        "(sprint_id,document_id,bound_revision_sha256,approval_id) "
-        "VALUES (?,?,?,?)",
-        (sprint_id, document_id, revision, approval_id),
-    )
+    if immutable_body:
+        con.execute(
+            "INSERT INTO sprint_specs "
+            "(sprint_id,document_id,bound_revision_sha256,approval_id,"
+            "bound_revision_body,bound_revision_legacy) VALUES (?,?,?,?,?,0)",
+            (sprint_id, document_id, revision, approval_id, body),
+        )
+    else:
+        con.execute(
+            "INSERT INTO sprint_specs "
+            "(sprint_id,document_id,bound_revision_sha256,approval_id) "
+            "VALUES (?,?,?,?)",
+            (sprint_id, document_id, revision, approval_id),
+        )
     con.executemany(
         "INSERT INTO sprint_participants "
         "(participant_id,sprint_id,shell_id,role,harness,model,effort,route) "
@@ -426,6 +441,29 @@ class SprintSnapshotRebuildTest(unittest.TestCase):
             self.assertEqual([], con.execute("PRAGMA foreign_key_check").fetchall())
         finally:
             con.close()
+
+    def test_pre_revision_snapshot_hash_matches_and_recovers_exact_body(self) -> None:
+        self.db.unlink()
+        apply_engine_schema(
+            self.db, through="0203_sprint_cleanup_recovery.sql"
+        )
+        con = sqlite3.connect(self.db)
+        try:
+            seed_prepared(con, immutable_body=False)
+        finally:
+            con.close()
+
+        self.snapshot_and_rebuild()
+
+        con = sqlite3.connect(self.db)
+        try:
+            row = con.execute(
+                "SELECT bound_revision_body,bound_revision_legacy "
+                "FROM sprint_specs"
+            ).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(("# Exact Sprint governing spec\n\nOne bounded unit.", 1), row)
 
     def test_armed_in_flight_sprint_roundtrips_every_v2_table_exactly(self) -> None:
         self.assert_roundtrip(armed=True)

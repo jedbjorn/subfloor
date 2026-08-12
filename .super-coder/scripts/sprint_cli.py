@@ -164,6 +164,17 @@ def cmd_inbox(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_spec_revision(args: argparse.Namespace) -> int:
+    result = mem._api(
+        "GET", f"/_sc/sprint/spec-revisions/{args.sprint}/{args.document}"
+    )
+    if args.body_only:
+        sys.stdout.write(result["body"])
+        return 0
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     result = _post(
         "/_sc/sprint/send",
@@ -561,6 +572,16 @@ def build_parser() -> argparse.ArgumentParser:
     inbox = sub.add_parser("inbox", help="Read unread messages addressed to this shell")
     inbox.add_argument("--sprint", type=int, required=True)
     inbox.set_defaults(fn=cmd_inbox)
+
+    spec_revision = sub.add_parser(
+        "spec-revision", help="Read one immutable governing Sprint revision"
+    )
+    spec_revision.add_argument("--sprint", type=int, required=True)
+    spec_revision.add_argument("--document", type=int, required=True)
+    spec_revision.add_argument(
+        "--body-only", action="store_true", help="write the exact body only"
+    )
+    spec_revision.set_defaults(fn=cmd_spec_revision)
 
     send = sub.add_parser(
         "send", help="Send one typed relay to another Sprint participant"

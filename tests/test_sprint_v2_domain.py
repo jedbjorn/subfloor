@@ -95,9 +95,9 @@ class SprintDomainCase(unittest.TestCase):
         ).lastrowid
         self.con.execute(
             "INSERT INTO sprint_specs "
-            "(sprint_id,document_id,bound_revision_sha256,approval_id) "
-            "VALUES (?,?,?,?)",
-            (sprint_id, document_id, revision, approval_id),
+            "(sprint_id,document_id,bound_revision_sha256,approval_id,"
+            "bound_revision_body) VALUES (?,?,?,?,?)",
+            (sprint_id, document_id, revision, approval_id, body),
         )
         self.con.executemany(
             "INSERT INTO sprint_participants "
@@ -1304,7 +1304,7 @@ class LifecycleTest(SprintDomainCase):
             ),
         )
 
-    def test_arm_rejects_spec_edited_after_approval_without_effect(self) -> None:
+    def test_arm_uses_immutable_bound_spec_after_current_document_edit(self) -> None:
         sprint_id, unit_id = self.create_sprint()
         self.con.execute(
             "UPDATE documents SET body='edited after QAQC' "
@@ -1314,13 +1314,10 @@ class LifecycleTest(SprintDomainCase):
         )
         self.con.commit()
 
-        with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError, "exact current governing spec"
-        ):
-            self.store.arm(sprint_id, 3)
+        self.store.arm(sprint_id, 3)
 
         self.assertEqual(
-            ("prepared", "planned", 0),
+            ("armed", "ready", 2),
             (
                 self.con.execute(
                     "SELECT lifecycle FROM sprints WHERE sprint_id=?", (sprint_id,)
@@ -1335,6 +1332,15 @@ class LifecycleTest(SprintDomainCase):
                 ).fetchone()[0],
             ),
         )
+        document_id = int(
+            self.con.execute(
+                "SELECT document_id FROM sprint_specs WHERE sprint_id=?", (sprint_id,)
+            ).fetchone()[0]
+        )
+        evidence = sprint_domain.SprintSpecRevisionStore(self.con).read(
+            sprint_id, document_id, caller_shell_id=1
+        )
+        self.assertEqual("governing spec revision 1", evidence["body"])
 
     def test_transition_authority_and_database_backstop(self) -> None:
         sprint_id, _ = self.create_sprint()
@@ -1499,8 +1505,11 @@ class ArmedServiceSwitchTest(SprintDomainCase):
                     "merge_grant_enabled) VALUES (1,1,3,1)"
                 )
                 seed.execute(
-                    "INSERT INTO sprint_specs VALUES (1,1,?,1,datetime('now'))",
-                    (revision,),
+                    "INSERT INTO sprint_specs "
+                    "(sprint_id,document_id,bound_revision_sha256,approval_id,"
+                    "included_at,bound_revision_body) "
+                    "VALUES (1,1,?,1,datetime('now'),?)",
+                    (revision, body),
                 )
                 seed.executemany(
                     "INSERT INTO sprint_participants "

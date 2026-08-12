@@ -1351,6 +1351,14 @@ class EvidenceCompilerTest(SprintCloseCase):
             hashlib.sha256(b"governing spec revision 1").hexdigest(),
             spec["bound_revision_sha256"],
         )
+        self.assertEqual("available", spec["bound_body_availability"])
+        self.assertEqual(
+            f"sc sprint spec-revision --sprint {self.sprint_id} "
+            f"--document {self.document_id}",
+            spec["read_command"],
+        )
+        self.assertNotIn("body", spec)
+        self.assertNotIn("bound_revision_body", spec)
         edit = packet["spec_revisions"]["mid_sprint_edits"]["items"][0]
         self.assertEqual("b" * 64, edit["payload"]["to_revision_sha256"])
         self.assertEqual(

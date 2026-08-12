@@ -16,6 +16,7 @@ Usage:
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import sys
 from pathlib import Path
@@ -35,6 +36,7 @@ import db_driver  # noqa: E402
 _TXN_BEGIN = re.compile(r"^\s*BEGIN(\s+TRANSACTION)?\s*;\s*$", re.IGNORECASE)
 _TXN_COMMIT = re.compile(r"^\s*(COMMIT|END\s+TRANSACTION)\s*;\s*$", re.IGNORECASE)
 _FOREIGN_KEYS_OFF = "-- migrate: foreign-keys-off"
+_GOVERNING_REVISION_MIGRATION = "0204_sprint_governing_revision_evidence.sql"
 
 
 def applied_set(con) -> set[str]:
@@ -68,6 +70,42 @@ def _strip_outer_txn(sql: str) -> str:
     return "\n".join(lines)
 
 
+def reconcile_governing_revision_evidence(con) -> None:
+    """Backfill exact legacy bodies, including rows loaded from old snapshots."""
+    rows = con.execute(
+        "SELECT ss.sprint_id,ss.document_id,ss.bound_revision_sha256,d.body "
+        "FROM sprint_specs ss JOIN documents d USING (document_id) "
+        "WHERE ss.bound_revision_body IS NULL ORDER BY ss.sprint_id,ss.document_id"
+    ).fetchall()
+    for row in rows:
+        body = row["body"] or ""
+        if hashlib.sha256(body.encode()).hexdigest() != row["bound_revision_sha256"]:
+            continue
+        con.execute(
+            "INSERT OR IGNORE INTO governing_revision_backfill_permits "
+            "(sprint_id,document_id) VALUES (?,?)",
+            (row["sprint_id"], row["document_id"]),
+        )
+        con.execute(
+            "UPDATE sprint_specs SET bound_revision_body=? "
+            "WHERE sprint_id=? AND document_id=? AND bound_revision_body IS NULL",
+            (body, row["sprint_id"], row["document_id"]),
+        )
+        con.execute(
+            "DELETE FROM governing_revision_backfill_permits "
+            "WHERE sprint_id=? AND document_id=?",
+            (row["sprint_id"], row["document_id"]),
+        )
+
+
+def _run_data_hook(con, path: Path) -> None:
+    """Run the one data migration that SQLite cannot express faithfully."""
+    if path.name != _GOVERNING_REVISION_MIGRATION:
+        return
+    con.execute("UPDATE sprint_specs SET bound_revision_legacy=1")
+    reconcile_governing_revision_evidence(con)
+
+
 def apply(con, path: Path) -> None:
     """Apply one migration file and stamp the ledger ATOMICALLY.
 
@@ -79,17 +117,16 @@ def apply(con, path: Path) -> None:
     whole, leaving the migration unstamped and cleanly re-runnable."""
     sql = path.read_text()
     foreign_keys_off = _FOREIGN_KEYS_OFF in sql
-    stamp = path.name.replace("'", "''")
-    script = (
-        "BEGIN;\n"
-        f"{_strip_outer_txn(sql).strip()}\n"
-        f"INSERT INTO schema_migrations (filename) VALUES ('{stamp}');\n"
-        "COMMIT;"
-    )
+    script = "BEGIN;\n" f"{_strip_outer_txn(sql).strip()}\n"
     try:
         if foreign_keys_off:
             con.execute("PRAGMA foreign_keys=OFF")
         con.executescript(script)
+        _run_data_hook(con, path)
+        con.execute(
+            "INSERT INTO schema_migrations (filename) VALUES (?)", (path.name,)
+        )
+        con.commit()
     except Exception:
         con.rollback()
         raise

@@ -1179,6 +1179,7 @@ class SprintSkillTest(unittest.TestCase):
             "reroute-participant",
             "arm",
             "inbox",
+            "spec-revision",
             "send",
             "accept",
             "decline",
@@ -1205,7 +1206,7 @@ class SprintSkillTest(unittest.TestCase):
         combined = "\n".join(
             (ASSETS / name / "SKILL.md").read_text() for name in SKILLS
         )
-        for command in expected - {"monitor"}:
+        for command in expected - {"monitor", "spec-revision"}:
             self.assertIn(f"sc sprint {command}", combined)
         self.assertNotIn("sc sprint monitor", combined)
         dispatcher = (ROOT / ".super-coder" / "scripts" / "dispatch.sh").read_text()

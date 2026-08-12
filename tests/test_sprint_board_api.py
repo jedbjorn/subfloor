@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import re
 import sqlite3
@@ -111,6 +112,8 @@ class SprintBoardApiCase(unittest.TestCase):
                 (feature_id,),
             ).lastrowid
         )
+        bound_body = "body"
+        bound_revision = hashlib.sha256(bound_body.encode()).hexdigest()
         task_ids = [
             int(
                 con.execute(
@@ -125,8 +128,8 @@ class SprintBoardApiCase(unittest.TestCase):
             con.execute(
                 "INSERT INTO sprint_spec_approvals "
                 "(document_id,revision_sha256,reviewer_shell_id,verdict) "
-                "VALUES (?,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',4,'pass')",
-                (document_id,),
+                "VALUES (?,?,4,'pass')",
+                (document_id, bound_revision),
             ).lastrowid
         )
         sprint_id = int(
@@ -139,9 +142,9 @@ class SprintBoardApiCase(unittest.TestCase):
         )
         con.execute(
             "INSERT INTO sprint_specs "
-            "(sprint_id,document_id,bound_revision_sha256,approval_id) "
-            "VALUES (?,?,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',?)",
-            (sprint_id, document_id, approval_id),
+            "(sprint_id,document_id,bound_revision_sha256,approval_id,"
+            "bound_revision_body) VALUES (?,?,?,?,?)",
+            (sprint_id, document_id, bound_revision, approval_id, bound_body),
         )
         participant_ids = {}
         for shell_id, role in ((2, "planner"), (3, "developer"), (4, "reviewer")):
@@ -1047,6 +1050,165 @@ class SprintBoardApiCase(unittest.TestCase):
         status, _, body = self.request("GET", "/api/sprints", "wrong-token")
         self.assertEqual(status, 401, body)
         self.assertEqual("unauthorized", body["error"]["code"])
+
+    def test_browser_reads_exact_bound_revision_without_current_substitution(self):
+        with self.connect() as con:
+            con.execute(
+                "UPDATE documents SET body='current drift' WHERE document_id=?",
+                (self.ids["document_id"],),
+            )
+            con.commit()
+        status, _, body = self.request(
+            "GET",
+            f"/api/sprints/{self.ids['sprint_id']}/spec-revisions/"
+            f"{self.ids['document_id']}",
+        )
+        self.assertEqual(200, status, body)
+        self.assertEqual("body", body["body"])
+        self.assertEqual("available", body["availability"])
+        self.assertEqual(
+            hashlib.sha256(b"body").hexdigest(), body["bound_revision_sha256"]
+        )
+
+    def test_browser_bound_revision_rejects_malformed_document_id(self):
+        for document_id in ("not-an-int", "0", "-1"):
+            with self.subTest(document_id=document_id):
+                status, _, body = self.request(
+                    "GET",
+                    f"/api/sprints/{self.ids['sprint_id']}/spec-revisions/"
+                    f"{document_id}",
+                )
+                self.assertEqual(422, status, body)
+                self.assertEqual(
+                    {
+                        "code": "validation_error",
+                        "message": "document_id must be a positive integer",
+                        "details": {"document_id": document_id},
+                    },
+                    body["error"],
+                )
+                self.assertNotIn("body", json.dumps(body))
+
+    def test_browser_bound_revision_rejects_unbound_document_id(self):
+        with self.connect() as con:
+            unbound_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',99,'Unbound','unbound current body')",
+                    (self.ids["feature_id"],),
+                ).lastrowid
+            )
+            con.commit()
+        status, _, body = self.request(
+            "GET",
+            f"/api/sprints/{self.ids['sprint_id']}/spec-revisions/{unbound_id}",
+        )
+        self.assertEqual(404, status, body)
+        self.assertEqual(
+            {
+                "code": "spec_revision_not_found",
+                "message": "governing revision not found",
+                "details": {
+                    "sprint_id": self.ids["sprint_id"],
+                    "document_id": unbound_id,
+                },
+            },
+            body["error"],
+        )
+        self.assertNotIn("unbound current body", json.dumps(body))
+
+    def test_browser_bound_revision_reports_legacy_unavailability(self):
+        current_body = "legacy current body must remain unavailable"
+        with self.connect() as con:
+            con.execute(
+                "UPDATE sprint_specs SET bound_revision_body=NULL "
+                "WHERE sprint_id=? AND document_id=?",
+                (self.ids["sprint_id"], self.ids["document_id"]),
+            )
+            con.execute(
+                "UPDATE documents SET body=? WHERE document_id=?",
+                (current_body, self.ids["document_id"]),
+            )
+            con.commit()
+        status, _, body = self.request(
+            "GET",
+            f"/api/sprints/{self.ids['sprint_id']}/spec-revisions/"
+            f"{self.ids['document_id']}",
+        )
+        self.assertEqual(409, status, body)
+        error = body["error"]
+        self.assertEqual("bound_revision_unavailable", error["code"])
+        self.assertEqual(
+            "bound governing revision is unavailable for this legacy binding",
+            error["message"],
+        )
+        self.assertEqual(
+            {
+                "sprint_id": self.ids["sprint_id"],
+                "document_id": self.ids["document_id"],
+                "bound_revision_sha256": hashlib.sha256(b"body").hexdigest(),
+                "current_revision_sha256": hashlib.sha256(
+                    current_body.encode()
+                ).hexdigest(),
+                "availability": "unavailable_legacy_drift",
+            },
+            error["details"],
+        )
+        self.assertNotIn(current_body, json.dumps(body))
+
+    def test_browser_document_edit_requires_origin_and_records_fnb_evidence(self):
+        path = f"/api/documents/{self.ids['document_id']}"
+        status, _, denied = self.request(
+            "PATCH",
+            path,
+            body={"body": "attacker text"},
+            extra_headers={"Origin": "https://attacker.example"},
+        )
+        self.assertEqual(403, status, denied)
+        with self.connect() as con:
+            self.assertEqual(
+                "body",
+                con.execute(
+                    "SELECT body FROM documents WHERE document_id=?",
+                    (self.ids["document_id"],),
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                con.execute(
+                    "SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='spec.body_edited'"
+                ).fetchone()[0],
+            )
+
+        status, _, response = self.request(
+            "PATCH",
+            path,
+            body={"body": "FnB edit"},
+            extra_headers={
+                "Origin": "http://127.0.0.1:8800",
+                "Sec-Fetch-Site": "same-origin",
+            },
+        )
+        self.assertEqual(200, status, response)
+        with self.connect() as con:
+            event = con.execute(
+                "SELECT actor_kind,actor_shell_id,payload FROM sprint_events "
+                "WHERE event_type='spec.body_edited'"
+            ).fetchone()
+            self.assertEqual(("fnb", None), event[:2])
+            payload = json.loads(event["payload"])
+            self.assertEqual("fnb", payload["authority"])
+            self.assertEqual("review_ui", payload["editor_surface"])
+            self.assertEqual("not_required", payload["notification_state"])
+            self.assertEqual(
+                0,
+                con.execute(
+                    "SELECT COUNT(*) FROM wake_message "
+                    "WHERE message_kind='notification' "
+                    "AND body LIKE '%governing document%'"
+                ).fetchone()[0],
+            )
 
     def test_board_snapshot_opens_and_closes_one_read_transaction(self):
         with self.connect() as con:
