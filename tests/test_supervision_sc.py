@@ -50,7 +50,6 @@ class SupervisionFixture:
             "install.py",
             "devkit.py",
             "sandbox_devkit.py",
-            "sandbox_github_auth.py",
         ):
             shutil.copy2(
                 ROOT / ".super-coder" / "scripts" / script,
@@ -125,22 +124,6 @@ class SupervisionFixture:
                 """
             )
         )
-        (self.scripts / "github_auth.py").write_text(
-            textwrap.dedent(
-                """\
-                import json
-                import os
-
-                default = {
-                    "origin_transport": None,
-                    "validated_agent_socket": None,
-                    "validated_selected_token": None,
-                }
-                print(os.environ.get("SC_TEST_GITHUB_DISCOVERY", json.dumps(default)))
-                raise SystemExit(int(os.environ.get("SC_TEST_GITHUB_DISCOVERY_RC", "0")))
-                """
-            )
-        )
         broker = textwrap.dedent(
             """\
             import os
@@ -169,10 +152,7 @@ class SupervisionFixture:
             printf ' %s' "$@" >> "$SC_TEST_LOG"
             printf '\\n' >> "$SC_TEST_LOG"
             state_dir="$SC_TEST_DOCKER_STATE"
-            if [ "$1" = info ]; then
-              [ "${SC_TEST_ROOTLESS:-}" = 1 ] && echo rootless
-              exit 0
-            fi
+            if [ "$1" = info ]; then exit 0; fi
             if [ "$1" = image ] && [ "$2" = inspect ]; then
               [ "$SC_TEST_IMAGE" = present ] || exit 1
               case " $* " in
@@ -218,9 +198,6 @@ class SupervisionFixture:
               exit 0
             fi
             if [ "$1" = run ]; then
-              printf 'docker-auth GH_TOKEN=%s GITHUB_TOKEN=%s SSH_AUTH_SOCK=%s\\n' \\
-                "${GH_TOKEN:+set}" "${GITHUB_TOKEN:+set}" "${SSH_AUTH_SOCK:-unset}" \\
-                >> "$SC_TEST_LOG"
               shift
               name=""
               while [ "$#" -gt 0 ]; do
@@ -404,117 +381,6 @@ class RestrictedLaunchTests(unittest.TestCase):
         )
         self.assertIn(" --init ", sandbox_run)
         self.assertFalse(any(line.startswith("docker build ") for line in calls))
-
-    def test_launch_injects_validated_token_by_name_without_value(self):
-        secret = "github_pat_must-not-enter-argv"
-        self.fx.env["SC_TEST_GITHUB_DISCOVERY"] = json.dumps({
-            "origin_transport": "https",
-            "validated_agent_socket": None,
-            "validated_selected_token": secret,
-        })
-
-        result = self.fx.run("launch", "--no-build")
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        sandbox_run = next(
-            line for line in self.fx.calls()
-            if line.startswith("docker run -d")
-            and f"--name sc-{self.fx.root.name}" in line
-        )
-        self.assertIn(" -e GH_TOKEN ", sandbox_run)
-        self.assertNotIn(secret, sandbox_run)
-        self.assertNotIn("GITHUB_TOKEN", sandbox_run)
-        self.assertIn(
-            "docker-auth GH_TOKEN=set GITHUB_TOKEN= SSH_AUTH_SOCK=unset",
-            self.fx.calls(),
-        )
-
-    def test_rootful_launch_forwards_only_validated_agent_socket(self):
-        agent = self.fx.add_socket("github-agent")
-        self.fx.env["SC_TEST_GITHUB_DISCOVERY"] = json.dumps({
-            "origin_transport": "ssh",
-            "validated_agent_socket": str(agent),
-            "validated_selected_token": None,
-        })
-
-        result = self.fx.run("launch", "--no-build")
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        sandbox_run = next(
-            line for line in self.fx.calls()
-            if line.startswith("docker run -d")
-            and f"--name sc-{self.fx.root.name}" in line
-        )
-        self.assertIn(f" --user {os.getuid()}:{os.getgid()} ", sandbox_run)
-        self.assertIn(
-            f"type=bind,src={agent},dst=/run/super-coder/ssh-agent,readonly",
-            sandbox_run,
-        )
-        self.assertIn(" -e SSH_AUTH_SOCK=/run/super-coder/ssh-agent ", sandbox_run)
-        self.assertNotIn(".ssh", sandbox_run)
-
-    def test_rootless_launch_maps_agent_to_container_root(self):
-        agent = self.fx.add_socket("rootless-github-agent")
-        self.fx.env["SC_TEST_ROOTLESS"] = "1"
-        self.fx.env["SC_TEST_GITHUB_DISCOVERY"] = json.dumps({
-            "origin_transport": "ssh",
-            "validated_agent_socket": str(agent),
-            "validated_selected_token": None,
-        })
-
-        result = self.fx.run("launch", "--no-build")
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        sandbox_run = next(
-            line for line in self.fx.calls()
-            if line.startswith("docker run -d")
-            and f"--name sc-{self.fx.root.name}" in line
-        )
-        self.assertIn(" --user 0:0 ", sandbox_run)
-        self.assertIn(
-            f"type=bind,src={agent},dst=/run/super-coder/ssh-agent,readonly",
-            sandbox_run,
-        )
-
-    def test_no_validated_auth_clears_stale_host_values(self):
-        self.fx.env.update({
-            "GH_TOKEN": "stale-gh",
-            "GITHUB_TOKEN": "stale-github",
-            "SSH_AUTH_SOCK": "/stale/agent",
-        })
-
-        result = self.fx.run("launch", "--no-build")
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        sandbox_run = next(
-            line for line in self.fx.calls()
-            if line.startswith("docker run -d")
-            and f"--name sc-{self.fx.root.name}" in line
-        )
-        self.assertNotIn("GH_TOKEN", sandbox_run)
-        self.assertNotIn("GITHUB_TOKEN", sandbox_run)
-        self.assertNotIn("SSH_AUTH_SOCK", sandbox_run)
-        self.assertIn(
-            "docker-auth GH_TOKEN= GITHUB_TOKEN= SSH_AUTH_SOCK=unset",
-            self.fx.calls(),
-        )
-
-    def test_discovery_fault_refuses_before_container_replacement(self):
-        self.fx.env["SC_TEST_GITHUB_DISCOVERY"] = json.dumps({
-            "origin_transport": "https",
-            "validated_agent_socket": None,
-            "validated_selected_token": "must-not-launch",
-        })
-        self.fx.env["SC_TEST_GITHUB_DISCOVERY_RC"] = "17"
-
-        result = self.fx.run("launch", "--no-build")
-
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("capability discovery failed", result.stderr)
-        self.assertNotIn("must-not-launch", result.stdout + result.stderr)
-        self.assertFalse(
-            [line for line in self.fx.calls() if line.startswith("docker run ")]
-        )
 
     def test_docker_cache_gc_is_explicit_and_age_bounded_by_default(self):
         result = self.fx.run("docker-cache-gc")
