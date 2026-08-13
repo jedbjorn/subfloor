@@ -159,6 +159,7 @@ class ParsedDiscovery:
     github_api_state: str | None = None
     github_api_reason: str | None = None
     selected_token_source: str | None = None
+    credential_attempts: tuple[tuple[str, str], ...] = ()
 
 
 def _optional_state(value: Mapping[str, object], name: str) -> str | None:
@@ -177,6 +178,26 @@ def _optional_diagnostic(value: Mapping[str, object], name: str) -> str | None:
     if not isinstance(diagnostic, str) or not _SAFE_DIAGNOSTIC.fullmatch(diagnostic):
         raise ValueError(f"{name} must be a safe diagnostic identifier")
     return diagnostic
+
+
+def _credential_attempts(value: Mapping[str, object]) -> tuple[tuple[str, str], ...]:
+    raw_attempts = value.get("credential_attempts")
+    if not isinstance(raw_attempts, list):
+        return ()
+    attempts: list[tuple[str, str]] = []
+    for raw_attempt in raw_attempts:
+        if not isinstance(raw_attempt, Mapping):
+            continue
+        state = raw_attempt.get("state")
+        reason = raw_attempt.get("reason")
+        if (
+            isinstance(state, str)
+            and state in _CAPABILITY_STATES
+            and isinstance(reason, str)
+            and _SAFE_DIAGNOSTIC.fullmatch(reason)
+        ):
+            attempts.append((state, reason))
+    return tuple(attempts)
 
 
 def parse_discovery(raw: str) -> ParsedDiscovery:
@@ -215,6 +236,7 @@ def parse_discovery(raw: str) -> ParsedDiscovery:
         github_api_state=_optional_state(value, "github_api_state"),
         github_api_reason=_optional_diagnostic(value, "github_api_reason"),
         selected_token_source=_optional_diagnostic(value, "selected_token_source"),
+        credential_attempts=_credential_attempts(value),
     )
 
 
@@ -302,13 +324,32 @@ def render_capability_summary(
         )
 
     unavailable_reasons = {git_reason, api_reason, origin_reason}
+    unverified_attempt_reasons = {
+        reason
+        for state, reason in getattr(discovery, "credential_attempts", ())
+        if state == "unverified"
+    }
+    credential_probe_blocked_by_network = (
+        bool(unverified_attempt_reasons)
+        and unverified_attempt_reasons == {"network_unavailable"}
+    )
     if (
         "network_unavailable" in unavailable_reasons
-        or "ssh_agent_unverified" in unavailable_reasons
+        or credential_probe_blocked_by_network
     ):
         lines.append(
             "  host remedy: restore GitHub/network access, then run ./sc launch "
             "or ./sc restart"
+        )
+    elif origin_reason == "origin_inspection_timed_out":
+        lines.append(
+            "  host remedy: repair or retry host Git origin inspection, then run "
+            "./sc launch or ./sc restart"
+        )
+    elif git_reason == "ssh_agent_unverified":
+        lines.append(
+            "  host remedy (Git): restart or repair the host ssh-agent, then run "
+            "./sc launch or ./sc restart"
         )
     elif origin_reason in {
         "origin_missing",

@@ -388,21 +388,91 @@ class SandboxGitHubCapabilitySummaryTest(unittest.TestCase):
         self.assertIn("every sandbox process can use it", summary)
         self.assertIn("running sandbox auth remains unchanged", summary)
 
-    def test_offline_summary_never_calls_unverified_capabilities_ready(self) -> None:
+    def test_https_offline_aggregate_reports_connectivity_remedy(self) -> None:
         summary = self.summary(
             self.parsed(
                 validated_selected_token=None,
                 selected_token_source=None,
                 git_transport_state="unverified",
-                git_transport_reason="network_unavailable",
+                git_transport_reason="api_credential_not_ready",
                 github_api_state="unverified",
-                github_api_reason="network_unavailable",
+                github_api_reason="credential_validation_unverified",
+                credential_attempts=[
+                    {
+                        "source": "sc_gh_token",
+                        "state": "unverified",
+                        "reason": "network_unavailable",
+                    },
+                    {
+                        "source": "gh_oauth",
+                        "state": "unavailable",
+                        "reason": "stored_oauth_unavailable",
+                    },
+                ],
             )
         )
 
         self.assertEqual(summary.count(": unverified"), 2)
         self.assertNotIn(": ready", summary)
         self.assertIn("restore GitHub/network access", summary)
+        self.assertNotIn("host remedy (API)", summary)
+
+    def test_ssh_offline_aggregate_reports_connectivity_remedy(self) -> None:
+        summary = self.summary(
+            self.parsed(
+                origin_transport="ssh",
+                validated_agent_socket=None,
+                validated_selected_token=None,
+                selected_token_source=None,
+                git_transport_state="unverified",
+                git_transport_reason="network_unavailable",
+                github_api_state="unavailable",
+                github_api_reason="no_credential_candidate",
+                credential_attempts=[
+                    {
+                        "source": "gh_oauth",
+                        "state": "unavailable",
+                        "reason": "stored_oauth_unavailable",
+                    }
+                ],
+            )
+        )
+
+        self.assertIn("Git transport: unverified", summary)
+        self.assertIn("GitHub API: unavailable", summary)
+        self.assertIn("restore GitHub/network access", summary)
+        self.assertNotIn("host remedy (API)", summary)
+
+    def test_origin_inspection_timeout_reports_origin_remedy(self) -> None:
+        summary = self.summary(
+            self.parsed(
+                origin_transport=None,
+                validated_selected_token=None,
+                origin_state="unverified",
+                origin_reason="origin_inspection_timed_out",
+                git_transport_state="unverified",
+                git_transport_reason="origin_inspection_timed_out",
+                github_api_state="unverified",
+                github_api_reason="github_discovery_skipped",
+                selected_token_source=None,
+            )
+        )
+
+        self.assertIn("repair or retry host Git origin inspection", summary)
+        self.assertNotIn("host remedy (API)", summary)
+
+    def test_ssh_agent_timeout_reports_local_agent_remedy(self) -> None:
+        summary = self.summary(
+            self.parsed(
+                origin_transport="ssh",
+                validated_agent_socket=None,
+                git_transport_state="unverified",
+                git_transport_reason="ssh_agent_unverified",
+            )
+        )
+
+        self.assertIn("restart or repair the host ssh-agent", summary)
+        self.assertNotIn("restore GitHub/network access", summary)
 
     def test_vanished_agent_downgrades_the_current_launch_summary(self) -> None:
         vanished = Path(self.temporary.name) / "vanished.sock"
