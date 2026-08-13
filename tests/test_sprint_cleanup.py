@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import sqlite3
 import subprocess
@@ -1051,6 +1052,189 @@ class SprintCleanupExecutorTest(SprintDomainCase):
         self.assertGreater(before["status_count"], 0)
         self.assertEqual(0, after["status_count"])
         self.assertEqual(refreshed_main, after["refreshed_main_sha"])
+
+    def test_cleanup_clears_only_obstructed_uninitialized_gitlink_mount(self):
+        child = Path(self.tmp.name) / "child source"
+        self._git(Path(self.tmp.name), "init", str(child))
+        self._git(child, "config", "user.name", "Sprint Fixture")
+        self._git(child, "config", "user.email", "fixture@example.test")
+        (child / "pinned.txt").write_text("pinned child\n", encoding="utf-8")
+        self._git(child, "add", "pinned.txt")
+        self._git(child, "commit", "-m", "pinned child")
+        leaf = Path(self.tmp.name) / "leaf source"
+        self._git(Path(self.tmp.name), "init", str(leaf))
+        self._git(leaf, "config", "user.name", "Sprint Fixture")
+        self._git(leaf, "config", "user.email", "fixture@example.test")
+        (leaf / "leaf.txt").write_text("pinned leaf\n", encoding="utf-8")
+        self._git(leaf, "add", "leaf.txt")
+        self._git(leaf, "commit", "-m", "pinned leaf")
+        leaf_pinned = self._git(leaf, "rev-parse", "HEAD").stdout.strip()
+        with (child / ".gitignore").open("w", encoding="utf-8") as handle:
+            handle.write("nested/leaf/.svelte-kit/\n")
+        self._git(
+            child,
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--",
+            str(leaf),
+            "nested/leaf",
+        )
+        self._git(child, "add", ".gitignore", ".gitmodules", "nested/leaf")
+        self._git(child, "commit", "-m", "add pinned leaf")
+        pinned = self._git(child, "rev-parse", "HEAD").stdout.strip()
+
+        mount_name = "modules/child with space"
+        with (self.repository / ".gitignore").open("a", encoding="utf-8") as handle:
+            handle.write(f"{mount_name}/.svelte-kit/\n")
+        self._git(
+            self.repository,
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--",
+            str(child),
+            mount_name,
+        )
+        self._git(self.repository, "add", ".gitignore", ".gitmodules", mount_name)
+        self._git(self.repository, "commit", "-m", "add pinned child")
+        self._git(self.repository, "push", "origin", "main")
+
+        self._git(self.worktree, "config", "protocol.file.allow", "always")
+        self._git(self.worktree, "fetch", "origin", "main")
+        self._git(self.worktree, "reset", "--hard", "origin/main")
+        mount = self.worktree / mount_name
+        with mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file"}):
+            self._git(
+                self.worktree,
+                "submodule",
+                "update",
+                "--init",
+                "--",
+                mount_name,
+            )
+        nested_mount = mount / "nested" / "leaf"
+        nested_mount.mkdir(parents=True, exist_ok=True)
+        residue = nested_mount / ".svelte-kit"
+        residue.mkdir()
+        (residue / "generated.txt").write_text("obstruction\n", encoding="utf-8")
+        unrelated = self.worktree / "keep.cache"
+        unrelated.write_text("unrelated ignored content\n", encoding="utf-8")
+
+        with mock.patch.dict(os.environ, {"GIT_ALLOW_PROTOCOL": "file"}):
+            receipt = self._executor().run_next("fixture", shell_id=1)
+
+        self.assertEqual("succeeded", receipt.state, receipt.detail)
+        self.assertIsNone(receipt.code)
+        self.assertFalse(residue.exists())
+        self.assertEqual("pinned child\n", (mount / "pinned.txt").read_text())
+        self.assertEqual(
+            pinned, self._git(mount, "rev-parse", "HEAD").stdout.strip()
+        )
+        self.assertEqual("pinned leaf\n", (nested_mount / "leaf.txt").read_text())
+        self.assertEqual(
+            leaf_pinned, self._git(nested_mount, "rev-parse", "HEAD").stdout.strip()
+        )
+        self.assertEqual("unrelated ignored content\n", unrelated.read_text())
+        after = json.loads(self._worktree_row()["after_evidence"])
+        self.assertEqual(
+            (1, [f"{mount_name}/nested/leaf"], False),
+            (
+                after["cleared_submodule_mount_count"],
+                after["cleared_submodule_mounts"],
+                after["cleared_submodule_mounts_truncated"],
+            ),
+        )
+
+    def test_git_detail_preserves_bounded_causal_head_and_terminal_tail(self):
+        causal = "destination path exists and is not empty"
+        terminal = "failed a second time, aborting"
+        result = subprocess.CompletedProcess(
+            ["git"],
+            1,
+            stdout="ignored stdout",
+            stderr=causal + "\n" + ("x" * 2500) + "\n" + terminal,
+        )
+
+        detail = self._executor()._git_detail(result)
+
+        self.assertEqual(2000, len(detail))
+        self.assertTrue(detail.startswith(causal))
+        self.assertIn("\n...[truncated]...\n", detail)
+        self.assertTrue(detail.endswith(terminal))
+
+    def test_direct_submodule_validation_rejects_unsafe_paths_before_lookup(self):
+        executor = self._executor()
+        (self.worktree / ".gitmodules").write_text("fixture\n", encoding="utf-8")
+        unsafe = ("/absolute", "../escape", "a/../escape", "a//unnormalized", ".")
+        for declared in unsafe:
+            with self.subTest(declared=declared), mock.patch.object(
+                executor,
+                "_git_stdout",
+                return_value=f"submodule.child.path\n{declared}\0",
+            ) as git_stdout:
+                with self.assertRaisesRegex(
+                    sprint_cleanup.SprintCleanupSafetyError,
+                    "invalid submodule declaration",
+                ) as raised:
+                    executor._direct_submodules(self.worktree, self.worktree)
+                self.assertEqual("submodule_mount_invalid", raised.exception.code)
+                self.assertEqual(1, git_stdout.call_count)
+
+    def test_direct_submodule_queries_magic_path_with_literal_semantics(self):
+        executor = self._executor()
+        (self.worktree / ".gitmodules").write_text("fixture\n", encoding="utf-8")
+        declared = "-:(glob) child"
+        sha = "1" * 40
+        outputs = iter(
+            (
+                f"submodule.child.path\n{declared}\0",
+                f"160000 {sha} 0\t{declared}\0",
+                f"-{sha} {declared}",
+            )
+        )
+        with mock.patch.object(
+            executor, "_git_stdout", side_effect=lambda *_args, **_kwargs: next(outputs)
+        ) as git_stdout:
+            direct = executor._direct_submodules(self.worktree, self.worktree)
+
+        self.assertEqual(
+            [
+                sprint_cleanup.DirectSubmodule(
+                    "child", declared, self.worktree / declared, False
+                )
+            ],
+            direct,
+        )
+        index_args = git_stdout.call_args_list[1].args
+        status_args = git_stdout.call_args_list[2].args
+        self.assertIn("--literal-pathspecs", index_args)
+        self.assertEqual(("--", declared), index_args[-2:])
+        self.assertIn("--literal-pathspecs", status_args)
+        self.assertEqual(("--", declared), status_args[-2:])
+
+    def test_submodule_traversal_limits_fail_before_mutation(self):
+        executor = self._executor()
+        claim = SimpleNamespace()
+        too_many = [
+            sprint_cleanup.DirectSubmodule(
+                f"child-{index}",
+                f"child-{index}",
+                self.worktree / f"child-{index}",
+                False,
+            )
+            for index in range(257)
+        ]
+        with (
+            mock.patch.object(executor, "_direct_submodules", return_value=too_many),
+            mock.patch.object(executor, "_git") as git_mutation,
+            self.assertRaises(sprint_cleanup.SprintCleanupSafetyError) as raised,
+        ):
+            executor._restore_submodules(self.worktree, claim)
+        self.assertEqual("submodule_traversal_limit", raised.exception.code)
+        git_mutation.assert_not_called()
 
     def test_substituted_repository_fails_closed_and_preserves_bytes(self):
         self._git(self.repository, "worktree", "remove", "--force", str(self.worktree))
@@ -2205,6 +2389,18 @@ class SprintCleanupExecutorTest(SprintDomainCase):
     def test_partial_git_mutation_retries_to_convergence(self):
         self._dirty_worktree()
         refreshed_main = self._advance_remote_main()
+        diagnostic = sprint_cleanup.SprintCleanupExecutor._git_detail(
+            subprocess.CompletedProcess(
+                ["git"],
+                1,
+                stdout="",
+                stderr=(
+                    "destination path exists and is not empty\n"
+                    + ("x" * 2500)
+                    + "\nfailed a second time, aborting"
+                ),
+            )
+        )
 
         class FailFirstClean(sprint_cleanup.SprintCleanupExecutor):
             failed = False
@@ -2214,7 +2410,7 @@ class SprintCleanupExecutorTest(SprintDomainCase):
                     self.failed = True
                     raise sprint_cleanup.SprintCleanupMutationError(
                         "clean_current_failed",
-                        "injected partial mutation",
+                        diagnostic,
                     )
                 return super()._git(repo, *args, code=code, timeout=timeout)
 
@@ -2244,7 +2440,7 @@ class SprintCleanupExecutorTest(SprintDomainCase):
         row = self._worktree_row()
         retry = json.loads(row["after_evidence"])["retry_evidence"]
         self.assertEqual(
-            (1, "clean_current_failed", "injected partial mutation"),
+            (1, "clean_current_failed", diagnostic),
             (
                 retry["failed_attempts"],
                 retry["last_error_code"],
