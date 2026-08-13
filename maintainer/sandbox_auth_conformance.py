@@ -700,8 +700,12 @@ ENV GIT_TERMINAL_PROMPT=0
             },
             "restart_refresh": {
                 "status": "passed",
-                "before_source": stale.runtime.token_source,
-                "after_source": empty.runtime.token_source,
+                "before_transport": ssh_oauth.origin.transport,
+                "before_source": ssh_oauth.runtime.token_source,
+                "before_agent_selected": ssh_oauth.runtime.ssh_auth_sock is not None,
+                "after_transport": explicit.origin.transport,
+                "after_source": explicit.runtime.token_source,
+                "after_agent_selected": explicit.runtime.ssh_auth_sock is not None,
                 "replacement_api": "passed",
             },
         }
