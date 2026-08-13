@@ -7,13 +7,14 @@ RENDERED from the DB (documents/roadmap/skills; a skill's source is
 without re-rendering leaves the local browsable copy stale.
 
 HERMETIC by construction: this builds a throwaway DB from authored engine text
-(schema + migrations) plus the local instance snapshot, renders the mirror from THAT
-into a temp tree, and diffs it against the active local `_sc` files. It never opens
-the live `shell_db.db` and never writes into the working tree. So — unlike the
-old version, which rendered from the live DB *into the tree* and then told you to
-`git add` whatever fell out — a stale or dirty local cache DB can no longer make
-this pass or fail wrongly, and can never trick you into committing a regression.
-A local `./sc render-check` is now byte-identical to CI; no `./sc rebuild` first.
+(schema + migrations), the local instance snapshot, and the fork skill-retire
+list, renders the mirror from THAT into a temp tree, and diffs it against the
+active local `_sc` files. It never opens the live `shell_db.db` and never writes
+into the working tree. So — unlike the old version, which rendered from the live
+DB *into the tree* and then told you to `git add` whatever fell out — a stale or
+dirty local cache DB can no longer make this pass or fail wrongly, and can never
+trick you into committing a regression. A local `./sc render-check` is now
+byte-identical to CI; no `./sc rebuild` first.
 
     ./sc render-check
 """
@@ -35,6 +36,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import flat  # noqa: E402
 import artifact_policy  # noqa: E402
 import migrate as migrate_mod  # noqa: E402
+import seed_skills  # noqa: E402
 
 CONTENT = artifact_policy.content_path()
 ACTIVE_ROOT = artifact_policy.render_root()
@@ -42,20 +44,23 @@ ACTIVE_ROOT = artifact_policy.render_root()
 
 def _build_tracked_db(path: Path) -> None:
     """Materialize a DB from authored engine text plus local instance state:
-    content.sql. No map step (the dr_* cache isn't part of the mirror) and no
-    touch of the live DB. This is what a fresh `./sc rebuild` would produce, so
-    its engine skills are always current — the mirror is a pure function of the
-    sources about to be committed."""
+    content.sql plus the fork skill-retire list. No map step (the dr_* cache
+    isn't part of the mirror) and no touch of the live DB. This is what a fresh
+    `./sc rebuild` would produce, so its engine skills are always current — the
+    mirror is a pure function of the sources about to be committed."""
     con = sqlite3.connect(path)
     con.executescript(SCHEMA.read_text())
     con.commit()
     con.close()
     migrate_mod.migrate(str(path))
     content = CONTENT if CONTENT.exists() else CONTENT_LEGACY
-    if content.exists():
-        con = sqlite3.connect(path)
-        con.executescript(content.read_text())
-        con.commit()
+    con = sqlite3.connect(path)
+    try:
+        if content.exists():
+            con.executescript(content.read_text())
+            con.commit()
+        seed_skills.apply_retired(con)
+    finally:
         con.close()
 
 
