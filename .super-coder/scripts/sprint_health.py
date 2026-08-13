@@ -46,7 +46,9 @@ _EVENT_STAGE = {
     "active": frozenset({"work_unit.accepted"}),
     "blocked": frozenset(),
     "in_review": frozenset({"review.requested"}),
-    "fixing": frozenset({"review.changes_requested"}),
+    "fixing": frozenset(
+        {"review.changes_requested", "review.request_invalidated"}
+    ),
     "merge_ready": frozenset({"review.approved"}),
     "completed": frozenset({"work_unit.completed"}),
     "cancelled": frozenset({"work_unit.cancelled"}),

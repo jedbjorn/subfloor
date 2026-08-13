@@ -178,6 +178,15 @@ _EVENT_FIELDS = {
     "review.changes_requested": frozenset(
         {"work_unit_id", "registered_pr_id", "message_id", "conversation_id", "head_sha"}
     ),
+    "review.request_invalidated": frozenset(
+        {
+            "work_unit_id",
+            "registered_pr_id",
+            "invalidated_message_id",
+            "head_sha",
+            "previous_head_sha",
+        }
+    ),
     "review.approval_invalidated": frozenset(
         {
             "work_unit_id",

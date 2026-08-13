@@ -46,6 +46,14 @@ class MergeAuthorization:
     head_sha: str
 
 
+@dataclass(frozen=True)
+class _ReviewRequestEvidence:
+    message_id: int
+    disposition: str
+    head_sha: str
+    transition_id: int | None
+
+
 class SprintReviewLoopStore:
     """Compose review state from the existing authoritative Sprint records."""
 
@@ -94,6 +102,11 @@ class SprintReviewLoopStore:
                 str(transition["observed_head_sha"]),
                 intent,
             )
+            previous_request = (
+                self._latest_review_request(lane)
+                if lane["disposition"] == "in_review"
+                else None
+            )
             receipt = self.messages.send_in_transaction(
                 sprint_id,
                 to_participant_id=int(lane["reviewer_participant_id"]),
@@ -109,7 +122,22 @@ class SprintReviewLoopStore:
                 raise SprintInvariantError("active review request has no wake")
             if not receipt.created:
                 return self._handoff_receipt(lane, receipt)
-            if lane["disposition"] not in {"active", "fixing"}:
+            if lane["disposition"] == "in_review":
+                if previous_request is None:
+                    raise SprintInvariantError(
+                        "in-review lane has no durable review request"
+                    )
+                if previous_request.head_sha == transition["observed_head_sha"]:
+                    raise SprintInvariantError(
+                        "review handoff already targets the current PR head"
+                    )
+                self._invalidate_review_request_in_transaction(
+                    lane,
+                    previous_request,
+                    str(transition["observed_head_sha"]),
+                    actor_shell_id=developer_shell_id,
+                )
+            elif lane["disposition"] not in {"active", "fixing"}:
                 raise SprintInvariantError(
                     f"review handoff cannot start from {lane['disposition']}"
                 )
@@ -132,6 +160,31 @@ class SprintReviewLoopStore:
                 },
             )
             return self._handoff_receipt(lane, receipt)
+
+    def invalidate_review_request_for_head_change_in_transaction(
+        self,
+        sprint_id: int,
+        registered_pr_id: int,
+        head_sha: str,
+    ) -> int | None:
+        """Return an in-review lane to its Developer when its PR head moves."""
+        if not self.con.in_transaction:
+            raise RuntimeError("review invalidation requires an active transaction")
+        lane = self._lane(sprint_id, registered_pr_id)
+        if lane["disposition"] != "in_review":
+            return None
+        request = self._latest_review_request(lane)
+        if request is None:
+            raise SprintInvariantError("in-review lane has no durable review request")
+        if request.head_sha == head_sha:
+            return None
+        self._invalidate_review_request_in_transaction(
+            lane,
+            request,
+            head_sha,
+            actor_shell_id=None,
+        )
+        return request.message_id
 
     def record_review(
         self,
@@ -483,6 +536,14 @@ class SprintReviewLoopStore:
     def _accepted_review_request(
         self, lane: sqlite3.Row
     ) -> tuple[int, str, int | None]:
+        latest = self._latest_review_request(lane)
+        if latest is None or latest.disposition != "accepted":
+            raise SprintInvariantError("review verdict requires an accepted request")
+        return latest.message_id, latest.head_sha, latest.transition_id
+
+    def _latest_review_request(
+        self, lane: sqlite3.Row
+    ) -> _ReviewRequestEvidence | None:
         latest = self.con.execute(
             "SELECT message_id,disposition FROM wake_message WHERE sprint_id=? "
             "AND work_unit_id=? AND to_participant_id=? "
@@ -494,8 +555,8 @@ class SprintReviewLoopStore:
                 lane["reviewer_participant_id"],
             ),
         ).fetchone()
-        if latest is None or latest["disposition"] != "accepted":
-            raise SprintInvariantError("review verdict requires an accepted request")
+        if latest is None:
+            return None
         event = self.con.execute(
             "SELECT payload FROM sprint_events WHERE sprint_id=? "
             "AND event_type='review.requested' "
@@ -509,10 +570,59 @@ class SprintReviewLoopStore:
         if not isinstance(head_sha, str) or not head_sha:
             raise SprintInvariantError("accepted review request has no exact head")
         transition_id = json.loads(event["payload"]).get("transition_id")
-        return (
-            int(latest["message_id"]),
-            head_sha,
-            transition_id if isinstance(transition_id, int) else None,
+        return _ReviewRequestEvidence(
+            message_id=int(latest["message_id"]),
+            disposition=str(latest["disposition"]),
+            head_sha=head_sha,
+            transition_id=(
+                transition_id if isinstance(transition_id, int) else None
+            ),
+        )
+
+    def _invalidate_review_request_in_transaction(
+        self,
+        lane: sqlite3.Row,
+        request: _ReviewRequestEvidence,
+        head_sha: str,
+        *,
+        actor_shell_id: int | None,
+    ) -> None:
+        self.messages.supersede_actionable_in_transaction(
+            request.message_id,
+            "superseded by PR head change",
+        )
+        sprint_liveness.SprintLivenessMonitor(self.con).resolve_in_transaction(
+            request.message_id,
+            "review request invalidated by PR head change",
+        )
+        changed = self.con.execute(
+            "UPDATE sprint_work_units SET disposition='fixing',"
+            "updated_at=datetime('now') WHERE work_unit_id=? "
+            "AND disposition='in_review'",
+            (lane["work_unit_id"],),
+        ).rowcount
+        if changed != 1:
+            raise SprintInvariantError("review lane changed during head invalidation")
+        actor_kind = "participant" if actor_shell_id is not None else "system"
+        self.con.execute(
+            "INSERT INTO sprint_events "
+            "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+            "VALUES (?,'review.request_invalidated',?,?,?)",
+            (
+                lane["sprint_id"],
+                actor_kind,
+                actor_shell_id,
+                json.dumps(
+                    {
+                        "head_sha": head_sha,
+                        "invalidated_message_id": request.message_id,
+                        "previous_head_sha": request.head_sha,
+                        "registered_pr_id": int(lane["registered_pr_id"]),
+                        "work_unit_id": int(lane["work_unit_id"]),
+                    },
+                    sort_keys=True,
+                ),
+            ),
         )
 
     def _record_judgment(
