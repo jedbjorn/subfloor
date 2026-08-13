@@ -1970,9 +1970,12 @@ class SprintCleanupExecutor:
                     else:
                         child.mount.unlink()
                 except OSError as exc:
+                    error_name = exc.strerror or type(exc).__name__
+                    error_number = f" errno={exc.errno}" if exc.errno is not None else ""
                     raise SprintCleanupMutationError(
                         "submodule_mount_remove_failed",
-                        f"could not clear submodule mount {child.mount.relative_to(target)}: {exc}",
+                        f"could not clear submodule mount "
+                        f"{child.mount.relative_to(target)}:{error_number} {error_name}",
                     ) from exc
                 cleared.append(child.mount.relative_to(target).as_posix())
                 self._renew_or_stale(claim)
@@ -2145,7 +2148,12 @@ class SprintCleanupExecutor:
     def _is_exact_git_worktree(self, mount: Path) -> bool:
         if not mount.is_dir():
             return False
-        result = self._run_git(mount, "rev-parse", "--show-toplevel")
+        try:
+            result = self._run_git(mount, "rev-parse", "--show-toplevel")
+        except SprintCleanupMutationError as exc:
+            raise SprintCleanupSafetyError(
+                "submodule_worktree_probe_failed", exc.detail
+            ) from exc
         if result.returncode != 0:
             raise SprintCleanupSafetyError(
                 "submodule_worktree_probe_failed",

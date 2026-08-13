@@ -1215,6 +1215,125 @@ class SprintCleanupExecutorTest(SprintDomainCase):
         self.assertIn("--literal-pathspecs", status_args)
         self.assertEqual(("--", declared), status_args[-2:])
 
+    def test_git_config_decodes_quoted_and_escaped_submodule_path(self):
+        quoted = "quoted child"
+        escaped = r"escaped\child"
+        (self.worktree / ".gitmodules").write_text(
+            '[submodule "quoted"]\n\tpath = "quoted child"\n'
+            '[submodule "escaped"]\n\tpath = "escaped\\\\child"\n',
+            encoding="utf-8",
+        )
+        output = self._executor()._git_stdout(
+            self.worktree,
+            "config",
+            "-z",
+            "--file",
+            ".gitmodules",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+            code="submodule_config_failed",
+            allowed=(0, 1),
+        )
+
+        self.assertEqual(
+            f"submodule.quoted.path\n{quoted}\0"
+            f"submodule.escaped.path\n{escaped}\0",
+            output,
+        )
+
+    def test_worktree_probe_transport_failure_is_terminal_safety(self):
+        executor = self._executor()
+        mount = self.worktree / "probe mount"
+        mount.mkdir()
+        with mock.patch.object(
+            executor,
+            "_run_git",
+            side_effect=sprint_cleanup.SprintCleanupMutationError(
+                "git_command_unavailable", "probe timed out"
+            ),
+        ), self.assertRaises(sprint_cleanup.SprintCleanupSafetyError) as raised:
+            executor._is_exact_git_worktree(mount)
+
+        self.assertEqual("submodule_worktree_probe_failed", raised.exception.code)
+        self.assertEqual("probe timed out", raised.exception.detail)
+
+    def test_mount_removal_error_records_only_relative_mount(self):
+        executor = self._executor()
+        mount = self.worktree / "modules" / "child"
+        mount.mkdir(parents=True)
+        (mount / "secret-generated.txt").write_text("secret\n", encoding="utf-8")
+        child = sprint_cleanup.DirectSubmodule("child", "modules/child", mount, False)
+        claim = SimpleNamespace()
+        leaked = mount / "secret-generated.txt"
+        with (
+            mock.patch.object(executor, "_direct_submodules", return_value=[child]),
+            mock.patch.object(executor, "_is_exact_git_worktree", return_value=False),
+            mock.patch.object(executor, "_renew_or_stale"),
+            mock.patch.object(
+                sprint_cleanup.shutil,
+                "rmtree",
+                side_effect=PermissionError(13, "Permission denied", leaked),
+            ),
+            self.assertRaises(sprint_cleanup.SprintCleanupMutationError) as raised,
+        ):
+            executor._restore_submodules(self.worktree, claim)
+
+        self.assertEqual("submodule_mount_remove_failed", raised.exception.code)
+        self.assertEqual(
+            "could not clear submodule mount modules/child: errno=13 Permission denied",
+            raised.exception.detail,
+        )
+        self.assertNotIn(str(self.worktree), raised.exception.detail)
+        self.assertNotIn("secret-generated.txt", raised.exception.detail)
+
+    def test_submodule_restore_retry_converges_after_cleared_mount_clone_failure(self):
+        executor = self._executor()
+        mount = self.worktree / "modules" / "child"
+        mount.mkdir(parents=True)
+        (mount / "generated.txt").write_text("obstruction\n", encoding="utf-8")
+        unrelated = self.worktree / "keep.cache"
+        unrelated.write_text("preserve\n", encoding="utf-8")
+        child = sprint_cleanup.DirectSubmodule("child", "modules/child", mount, False)
+        claim = SimpleNamespace()
+        level_calls = 0
+
+        def direct(parent, _root):
+            nonlocal level_calls
+            level_calls += 1
+            return [child] if parent == self.worktree else []
+
+        failed = False
+
+        def git(repo, *args, code, timeout=None):
+            nonlocal failed
+            if "update" in args and not failed:
+                failed = True
+                raise sprint_cleanup.SprintCleanupMutationError(
+                    "submodule_update_failed", "injected clone failure"
+                )
+            if "update" in args:
+                mount.mkdir(parents=True)
+            return subprocess.CompletedProcess(["git"], 0, "", "")
+
+        with (
+            mock.patch.object(executor, "_direct_submodules", side_effect=direct),
+            mock.patch.object(
+                executor, "_is_exact_git_worktree", side_effect=[False, True]
+            ),
+            mock.patch.object(executor, "_renew_or_stale"),
+            mock.patch.object(executor, "_git", side_effect=git),
+        ):
+            with self.assertRaises(sprint_cleanup.SprintCleanupMutationError) as raised:
+                executor._restore_submodules(self.worktree, claim)
+            second = executor._restore_submodules(self.worktree, claim)
+
+        self.assertEqual("submodule_update_failed", raised.exception.code)
+        self.assertTrue(mount.is_dir())
+        self.assertFalse((mount / "generated.txt").exists())
+        self.assertEqual("preserve\n", unrelated.read_text())
+        self.assertEqual(0, second["cleared_submodule_mount_count"])
+        self.assertEqual(3, level_calls)
+
     def test_submodule_traversal_limits_fail_before_mutation(self):
         executor = self._executor()
         claim = SimpleNamespace()
@@ -1235,6 +1354,50 @@ class SprintCleanupExecutorTest(SprintDomainCase):
             executor._restore_submodules(self.worktree, claim)
         self.assertEqual("submodule_traversal_limit", raised.exception.code)
         git_mutation.assert_not_called()
+
+    def test_submodule_depth_sixteen_passes_and_seventeen_fails(self):
+        executor = self._executor()
+        claim = SimpleNamespace()
+
+        def declarations(parent, _root, *, over_limit=False):
+            depth = len(parent.relative_to(self.worktree).parts)
+            if depth < 16 or (over_limit and depth == 16):
+                child = parent / f"level-{depth + 1}"
+                return [
+                    sprint_cleanup.DirectSubmodule(
+                        f"level-{depth + 1}", f"level-{depth + 1}", child, True
+                    )
+                ]
+            return []
+
+        with (
+            mock.patch.object(
+                executor,
+                "_direct_submodules",
+                side_effect=lambda parent, root: declarations(parent, root),
+            ),
+            mock.patch.object(executor, "_is_exact_git_worktree", return_value=True),
+            mock.patch.object(executor, "_renew_or_stale"),
+            mock.patch.object(executor, "_git"),
+        ):
+            evidence = executor._restore_submodules(self.worktree, claim)
+        self.assertEqual(0, evidence["cleared_submodule_mount_count"])
+
+        with (
+            mock.patch.object(
+                executor,
+                "_direct_submodules",
+                side_effect=lambda parent, root: declarations(
+                    parent, root, over_limit=True
+                ),
+            ),
+            mock.patch.object(executor, "_is_exact_git_worktree", return_value=True),
+            mock.patch.object(executor, "_renew_or_stale"),
+            mock.patch.object(executor, "_git"),
+            self.assertRaises(sprint_cleanup.SprintCleanupSafetyError) as raised,
+        ):
+            executor._restore_submodules(self.worktree, claim)
+        self.assertEqual("submodule_traversal_limit", raised.exception.code)
 
     def test_substituted_repository_fails_closed_and_preserves_bytes(self):
         self._git(self.repository, "worktree", "remove", "--force", str(self.worktree))
