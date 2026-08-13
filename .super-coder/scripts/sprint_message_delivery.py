@@ -847,6 +847,24 @@ class SprintMessageStore:
             raise KeyError(f"unknown wake message: {message_id}")
         self._cancel_resolved_wakes(message_id)
 
+    def supersede_actionable_in_transaction(
+        self,
+        message_id: int,
+        reason: str,
+    ) -> None:
+        """Retire an actionable message made obsolete by newer workflow facts."""
+        if not self.con.in_transaction:
+            raise RuntimeError("message supersession requires an active transaction")
+        changed = self.con.execute(
+            "UPDATE wake_message SET disposition='declined',"
+            "read_at=COALESCE(read_at,datetime('now')),decline_reason=? "
+            "WHERE message_id=?",
+            (reason, message_id),
+        ).rowcount
+        if changed != 1:
+            raise KeyError(f"unknown wake message: {message_id}")
+        self._cancel_resolved_wakes(message_id)
+
     def recall_work_assignment_in_transaction(
         self,
         sprint_id: int,

@@ -545,6 +545,30 @@ class SprintHealthCase(unittest.TestCase):
         self.assertEqual("terminal", projected[units["completed"]]["condition"])
         self.assertEqual("terminal", projected[units["cancelled"]]["condition"])
 
+    def test_review_request_invalidation_starts_the_fixing_stage_clock(self) -> None:
+        self.con.execute(
+            "UPDATE sprints SET armed_at='2026-08-10 09:00:00' "
+            "WHERE sprint_id=?",
+            (self.sprint_id,),
+        )
+        unit = self.add_unit(
+            "fixing",
+            developer=3,
+            updated_at="2026-08-10 10:00:00",
+        )
+        self.add_event(
+            "review.request_invalidated",
+            at="2026-08-10 11:55:00",
+            work_unit_id=unit,
+        )
+
+        projected = self.project()["work_units"][unit]
+
+        self.assertEqual(
+            ("waiting_external", "no_progress_grace", "2026-08-10T11:55:00Z"),
+            (projected["condition"], projected["cause"], projected["since"]),
+        )
+
     def test_runtime_and_watcher_fail_only_when_applicable(self) -> None:
         planned = self.add_unit("planned", developer=3)
         active_without_pr = self.add_unit("active", developer=4)

@@ -971,6 +971,17 @@ class SprintBoardApiCase(unittest.TestCase):
                 },
             ),
             (
+                "review.request_invalidated",
+                {
+                    "work_unit_id": self.ids["unit"],
+                    "registered_pr_id": 1,
+                    "invalidated_message_id": 8,
+                    "head_sha": "replacement-head",
+                    "previous_head_sha": "stale-head",
+                    "secret": "hidden",
+                },
+            ),
+            (
                 "conformance.recorded",
                 {
                     "report_id": 4,

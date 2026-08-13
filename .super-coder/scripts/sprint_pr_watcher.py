@@ -1336,6 +1336,24 @@ class SprintPRWatcher:
         )
         if (
             head_changed
+            and pull_request.head_sha is not None
+            and state not in {"merged", "closed"}
+            and sprint_id is not None
+            and registered_pr_id is not None
+            and len(unit_rows) == 1
+            and unit_rows[0]["disposition"] == "in_review"
+        ):
+            invalidated_message_id = (
+                self.review_loop.invalidate_review_request_for_head_change_in_transaction(
+                    int(sprint_id),
+                    int(registered_pr_id),
+                    pull_request.head_sha,
+                )
+            )
+            if invalidated_message_id is not None:
+                resolved_review_message_ids = (invalidated_message_id,)
+        if (
+            head_changed
             and state not in {"merged", "closed"}
             and len(unit_rows) == 1
             and unit_rows[0]["disposition"] == "merge_ready"
