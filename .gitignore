@@ -87,7 +87,7 @@ __pycache__/
 node_modules/
 .svelte-kit/
 
-# super-coder — rebuilt/derived; never commit
+# >>> subfloor managed ignores >>>
 # The engine is a materialized, gitignored DEPENDENCY (B7) — fetched from
 # upstream, refreshed by `./sc update`, never committed to the fork. Your project
 # is everything ELSE in this repo.
@@ -122,3 +122,4 @@ node_modules/
 /.sc-state/map.db-wal
 /.sc-state/map.db-shm
 /.sc-state/db_backups/
+# <<< subfloor managed ignores <<<

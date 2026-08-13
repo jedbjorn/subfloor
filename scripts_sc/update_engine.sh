@@ -5,6 +5,8 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 SUBFLOOR="${SC_SUBFLOOR_DIR:-$HOME/Repos/subfloor}"
 REMOTE=sc-engine-local
+PIN="$ROOT/.sc-state/engine.ref"
+PY="${SC_PYTHON:-python3}"
 
 # The upstream make recipe invokes "$SC update ...".
 [ "${1:-}" = update ] && shift
@@ -46,15 +48,26 @@ if git -C "$ROOT" ls-files --error-unmatch .super-coder/schema.sql >/dev/null 2>
 fi
 
 echo "→ updating materialized engine to ${TARGET}"
+sh "$ROOT/scripts_sc/host_sc.sh" down
 if [ "$CONVERTED" -eq 1 ]; then
   # The old source-shaped floor intentionally differs from the first
   # materialized pin. Only this one-time boundary crossing is forced.
-  "$ROOT/sc" update --ref "$TARGET" --force "$@"
+  "$PY" "$ROOT/scripts_sc/installed_update.py" --ref "$TARGET" --force "$@"
 else
-  "$ROOT/sc" update --ref "$TARGET" "$@"
+  "$PY" "$ROOT/scripts_sc/installed_update.py" --ref "$TARGET" "$@"
 fi
 
-# The standard updater reconciles the DB and generated surfaces. Restart the
-# install-owned host server afterward so it executes the newly pinned code.
+# Never turn a green engine no-op into a false host-level success. A failed or
+# mismatched update leaves the runtime stopped for diagnosis.
+ACTUAL="$(sed -n '1p' "$PIN" 2>/dev/null || true)"
+[ "$ACTUAL" = "$TARGET" ] || {
+  echo "update_engine: engine pin mismatch after update" >&2
+  echo "  expected: $TARGET" >&2
+  echo "  actual:   ${ACTUAL:-<missing>}" >&2
+  exit 1
+}
+
+# The engine updater reconciles the DB and generated surfaces. Restart the
+# install-owned host server only after the exact target pin is published.
 sh "$ROOT/scripts_sc/host_sc.sh" restart
 echo "✓ sc-cachy engine aligned with subfloor origin/main at ${TARGET}"

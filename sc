@@ -4,9 +4,9 @@
 # materialized by `./sc update` (.super-coder/scripts/dispatch.sh), so every
 # checkout of an install — the main checkout or any linked worktree, on any
 # branch age — dispatches the LIVE engine floor. This file only resolves WHERE
-# that floor is: it carries no verbs, no help text, and never writes. A stale
-# committed copy of this file is harmless; any historical bootstrap still
-# execs the current body. Run from the repo root:  ./sc <command> [args]
+# that floor is during normal dispatch: it carries no verbs or help text and
+# never writes. A stale committed copy remains harmless for ordinary dispatch.
+# Run from the repo root:  ./sc <command> [args]
 set -e
 here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 CALLER_ROOT="$here"
@@ -21,11 +21,10 @@ _root="$(cd "$here" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/n
 
 DISPATCH="$LIVE_ROOT/.super-coder/scripts/dispatch.sh"
 
-# Maintainer override (canonical repo): exec a named body instead of the live
-# floor's — how an edited dispatcher is tested from a feature branch without
-# repinning. Set-but-unreadable is an error, never a silent fallback.
+# SC_DISPATCH is an operator-owned maintainer test seam. The selected body owns
+# its own host boundary, just as any locally edited checkout does.
 if [ -n "${SC_DISPATCH:-}" ]; then
-  if [ ! -f "$SC_DISPATCH" ]; then
+  if [ ! -f "$SC_DISPATCH" ] || [ ! -r "$SC_DISPATCH" ]; then
     echo "✗ ./sc: SC_DISPATCH is set but not readable: $SC_DISPATCH" >&2
     exit 1
   fi

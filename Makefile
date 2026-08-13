@@ -19,8 +19,9 @@ include .super-coder/aliases.mk
 
 # sc-cachy is an installation, not an engine-source fork. Keep its two local
 # policy choices outside the replaceable .super-coder tree: engine updates come
-# from the sibling subfloor clone, and lifecycle/session commands run directly
-# on this host. Target-specific SC values reuse the upstream alias recipes.
+# from the sibling subfloor clone through an installed-mode adapter, and
+# lifecycle/session commands run directly on this host. Target-specific SC
+# values reuse the upstream alias recipes.
 SC_ENGINE_UPDATE := sh scripts_sc/update_engine.sh
 SC_HOST := sh scripts_sc/host_sc.sh
 
