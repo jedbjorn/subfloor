@@ -58,6 +58,9 @@ CONFORMANCE_OWNER_RESEED = (
 INFORMATIONAL_RECEIPT_RESEED = (
     ENGINE / "migrations" / "0207_reseed_sprint_receipt_recovery.sql"
 )
+DISPOSABLE_SHELL_BASE_RESEED = (
+    ENGINE / "migrations" / "0208_reseed_disposable_shell_base.sql"
+)
 
 
 class SprintSkillTest(unittest.TestCase):
@@ -858,6 +861,7 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(migration)
             con.executescript(CONFORMANCE_OWNER_RESEED.read_text())
             con.executescript(INFORMATIONAL_RECEIPT_RESEED.read_text())
+            con.executescript(DISPOSABLE_SHELL_BASE_RESEED.read_text())
 
             self.assertIsNotNone(
                 con.execute(
