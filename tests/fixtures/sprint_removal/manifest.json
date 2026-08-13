@@ -105,7 +105,8 @@
     ".super-coder/migrations/0205_sprint_conformance_ownership.sql",
     ".super-coder/migrations/0206_reseed_sprint_conformance_ownership.sql",
     ".super-coder/migrations/0207_reseed_sprint_receipt_recovery.sql",
-    ".super-coder/migrations/0208_reseed_disposable_shell_base.sql"
+    ".super-coder/migrations/0208_reseed_disposable_shell_base.sql",
+    ".super-coder/migrations/0209_reseed_git_github_capabilities.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
