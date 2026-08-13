@@ -230,13 +230,11 @@ dcreds() {
   [ -e "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
 }
 
-# Which in-container uid writes the bind-mounted repo as YOU on the host.
-# Rootless docker maps container-root → host-you, so run as root (it is not real
-# root — just your user inside the namespace). Rootful maps uid 1:1, so run as
-# your uid. Get this wrong and the mount is read-only-ish (EACCES on write).
-duser() {
-  if docker info 2>/dev/null | grep -qi rootless; then echo "0:0"
-  else echo "$(id -u):$(id -g)"; fi
+# Rootless Docker maps container-root to the host user. The GitHub launch
+# adapter owns the exact --user selection because it also validates whether an
+# agent socket can be forwarded for that mapping.
+drootless() {
+  docker info 2>/dev/null | grep -qi rootless
 }
 
 # Ensure the shared inter-fork network exists (idempotent — created once, reused
@@ -1146,7 +1144,8 @@ case "$cmd" in
         --no-build) no_build=1 ;;
         -h|--help)
           echo "usage: ./sc launch [--no-build]"
-          echo "  --no-build  reuse only the current install's exactly labeled image"
+          echo "  default     build the image, refresh host GitHub capabilities, then launch"
+          echo "  --no-build  reuse the labeled image but still refresh host GitHub capabilities"
           exit 0 ;;
         *)
           echo "sc launch: unknown argument '$1' (usage: ./sc launch [--no-build])" >&2
@@ -1161,12 +1160,8 @@ case "$cmd" in
     p="$(port)"
     dp="$(devport)"
     dnet
-    # Forward GitHub auth for shells opening their own feature PRs. Prefer a
-    # repo-scoped SC_GH_TOKEN; else reuse the
-    # host's gh login. NOTE: this widens the sandbox — anything in the container
-    # can act as you on GitHub within the token's scope. A fine-grained,
-    # single-repo PAT in SC_GH_TOKEN is the tighter option.
-    gh_token="${SC_GH_TOKEN:-$(gh auth token 2>/dev/null || true)}"
+    github_auth_rootless=""
+    drootless && github_auth_rootless="--rootless"
     # Forward a Mistral key for vibe's API-key auth path — ONLY when set, so an
     # empty value can't shadow the mounted ~/.vibe creds (vibe --setup stores its
     # key + .env there; the mount below carries them in like every other harness).
@@ -1227,31 +1222,34 @@ case "$cmd" in
     # container's PID limit with zombies (flag #323).
     epoch="$(harness_epoch)"
     provision_rc=0
-    "$PY" "$S/sandbox_devkit.py" launch-container \
-      "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)" \
-      "$CNAME" -- \
-      -d --name "$CNAME" --restart unless-stopped --init \
-      --network "$SC_NET" \
-      --user "$(duser)" \
-      -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
-      -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
-      -e GH_TOKEN="$gh_token" $mistral_env $pg_env \
-      -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" \
-      -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
-      -w "$here" \
-      -v "$here:$here" \
-      $py_mount \
-      -v "$HOME/.claude:$HOME/.claude" \
-      -v "$HOME/.claude.json:$HOME/.claude.json" \
-      -v "$HOME/.config/opencode:$HOME/.config/opencode" \
-      -v "$HOME/.local/share/opencode:$HOME/.local/share/opencode" \
-      -v "$HOME/.codex:$HOME/.codex" \
-      -v "$HOME/.vibe:$HOME/.vibe" \
-      -v "$HOME/.kimi-code:$HOME/.kimi-code" \
-      -p "127.0.0.1:$p:$p" \
-      -p "127.0.0.1:$dp:$dp" \
-      SC_DEVKIT_MOUNTS \
-      "$IMG" ./sc serve --port "$p" || provision_rc=$?
+    "$PY" "$S/github_auth.py" discover --repo-root "$CALLER_ROOT" | \
+      "$PY" "$S/sandbox_github_auth.py" $github_auth_rootless \
+        --uid "$(id -u)" --gid "$(id -g)" -- \
+        "$PY" "$S/sandbox_devkit.py" launch-container \
+        "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)" \
+        "$CNAME" -- \
+        -d --name "$CNAME" --restart unless-stopped --init \
+        --network "$SC_NET" \
+        SC_GITHUB_AUTH_ARGS \
+        -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
+        -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
+        $mistral_env $pg_env \
+        -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" \
+        -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
+        -w "$here" \
+        -v "$here:$here" \
+        $py_mount \
+        -v "$HOME/.claude:$HOME/.claude" \
+        -v "$HOME/.claude.json:$HOME/.claude.json" \
+        -v "$HOME/.config/opencode:$HOME/.config/opencode" \
+        -v "$HOME/.local/share/opencode:$HOME/.local/share/opencode" \
+        -v "$HOME/.codex:$HOME/.codex" \
+        -v "$HOME/.vibe:$HOME/.vibe" \
+        -v "$HOME/.kimi-code:$HOME/.kimi-code" \
+        -p "127.0.0.1:$p:$p" \
+        -p "127.0.0.1:$dp:$dp" \
+        SC_DEVKIT_MOUNTS \
+        "$IMG" ./sc serve --port "$p" || provision_rc=$?
     if [ "$provision_rc" -ne 0 ]; then
       echo "✗ dev-kit state: failed — retained sandbox '$CNAME' and local evidence." >&2
       echo "  retry:  ./sc launch --no-build" >&2
@@ -1339,8 +1337,8 @@ case "$cmd" in
         --no-build) no_build=1 ;;
         -h|--help)
           echo "usage: ./sc restart [-y|--yes] [--no-build]"
-          echo "  default     refresh harness CLIs, rebuild the image, then bounce"
-          echo "  --no-build  reuse the current exactly labeled image; preflight before down"
+          echo "  default     refresh harness CLIs and host GitHub capabilities, rebuild, then bounce"
+          echo "  --no-build  reuse the image but still refresh host GitHub capabilities"
           exit 0 ;;
         *)
           echo "sc restart: unknown argument '$1' (usage: ./sc restart [-y|--yes] [--no-build])" >&2
@@ -1507,7 +1505,8 @@ super-coder — forkable shell substrate
   container only sees this repo + your harness creds):
   ./sc launch              build the exact base/fork image, start the sandbox, and run declared provisioning
                              states: absent · invalid · failed · stale · ready; failed setup retains container + evidence
-                             --no-build reuses only a ready labeled image
+                             every launch refreshes configured-origin Git + GitHub API capabilities;
+                             --no-build reuses only a ready labeled image but still refreshes auth
   ./sc admin               boot the sole active Admin directly on the host (no Docker or API required)
   ./sc enter               boot an interactive shell only when declared provisioning is ready
                              --devkit-repair enters state repair without claiming readiness
@@ -1521,8 +1520,8 @@ super-coder — forkable shell substrate
                              refuses a shell that already has a live session
   ./sc down                stop + remove the sandbox container
   ./sc restart             confirm + WAL-safe backup, fully bounce, then health-check managed services
-                             default refreshes every image-owned harness before teardown
-                             --yes skips the prompt · --no-build preflights/reuses the existing image without refreshing
+                             default refreshes image-owned harnesses; every restart refreshes host GitHub capabilities
+                             --yes skips the prompt · --no-build reuses the image without skipping auth refresh
   ./sc build               (re)build the sandbox image · --harnesses also expires the baked harness CLIs so they reinstall
   ./sc logs                tail the sandbox server logs
 

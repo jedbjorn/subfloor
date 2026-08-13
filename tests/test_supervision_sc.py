@@ -49,6 +49,8 @@ class SupervisionFixture:
             "global_pointer.py",
             "install.py",
             "devkit.py",
+            "github_auth.py",
+            "sandbox_github_auth.py",
             "sandbox_devkit.py",
         ):
             shutil.copy2(
