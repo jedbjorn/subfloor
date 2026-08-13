@@ -392,6 +392,68 @@ class SprintCliApiTest(unittest.TestCase):
                 str(self.document_id),
             )
 
+    def test_informational_accept_returns_durable_idempotent_read_receipt(self):
+        con = sqlite3.connect(self.db)
+        con.row_factory = sqlite3.Row
+        try:
+            receipt = sprint_message_delivery.SprintMessageStore(con).relay(
+                self.sprint_id,
+                from_shell_id=2,
+                to_shortname="DEV1",
+                body="Review approved; continue through the live merge gate.",
+                idempotency_key="informational-read-receipt",
+                work_unit_id=self.unit_id,
+            )
+            message_id = receipt.message_id
+        finally:
+            con.close()
+
+        inbox = self.run_cli(
+            TOKENS["developer"], "inbox", "--sprint", str(self.sprint_id)
+        )
+        self.assertIn(message_id, [item["message_id"] for item in inbox["messages"]])
+
+        expected = {
+            "message_id": message_id,
+            "read": True,
+            "disposition": None,
+        }
+        first = self.run_cli(
+            TOKENS["developer"],
+            "accept",
+            "--sprint",
+            str(self.sprint_id),
+            "--message",
+            str(message_id),
+        )
+        replay = self.run_cli(
+            TOKENS["developer"],
+            "accept",
+            "--sprint",
+            str(self.sprint_id),
+            "--message",
+            str(message_id),
+        )
+        self.assertEqual(expected, first)
+        self.assertEqual(expected, replay)
+
+        after = self.run_cli(
+            TOKENS["developer"], "inbox", "--sprint", str(self.sprint_id)
+        )
+        self.assertNotIn(
+            message_id, [item["message_id"] for item in after["messages"]]
+        )
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertIsNotNone(
+                con.execute(
+                    "SELECT read_at FROM wake_message WHERE message_id=?",
+                    (message_id,),
+                ).fetchone()[0]
+            )
+        finally:
+            con.close()
+
     def test_engine_wide_subscription_uses_authenticated_developer_identity(self):
         with mock.patch.object(
             server.sprint_pr_watcher,
@@ -1982,6 +2044,8 @@ class SprintCliApiTest(unittest.TestCase):
             "--message",
             str(report_message),
         )
+        self.assertEqual(report_message, accepted["message_id"])
+        self.assertTrue(accepted["read"])
         self.assertEqual("accepted", accepted["disposition"])
         declined_inbox = self.run_cli(
             "dev2-token", "inbox", "--sprint", str(sprint_id)

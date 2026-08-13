@@ -55,6 +55,9 @@ CONTEXT_EFFICIENT_RESEED = (
 CONFORMANCE_OWNER_RESEED = (
     ENGINE / "migrations" / "0206_reseed_sprint_conformance_ownership.sql"
 )
+INFORMATIONAL_RECEIPT_RESEED = (
+    ENGINE / "migrations" / "0207_reseed_sprint_receipt_recovery.sql"
+)
 
 
 class SprintSkillTest(unittest.TestCase):
@@ -124,8 +127,8 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(migration)
 
             for name in CONTEXT_EFFICIENT_SKILLS:
-                if name in CLEANUP_RECOVERY_SKILLS:
-                    continue  # 0203 deliberately supersedes these role bodies.
+                if name in HANDOFF_ROLE_SKILLS:
+                    continue  # Later reseeds deliberately supersede role bodies.
                 parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
                 actual = con.execute(
                     "SELECT description,category,command,common,content,is_deleted "
@@ -173,6 +176,7 @@ class SprintSkillTest(unittest.TestCase):
             migration = CONFORMANCE_OWNER_RESEED.read_text()
             con.executescript(migration)
             con.executescript(migration)
+            con.executescript(INFORMATIONAL_RECEIPT_RESEED.read_text())
 
             for name in sorted(CONFORMANCE_OWNER_SKILLS):
                 with self.subTest(name=name):
@@ -203,6 +207,82 @@ class SprintSkillTest(unittest.TestCase):
                     ).fetchone()
                 ),
             )
+
+    def test_informational_receipt_reseed_is_exact_and_idempotent(self):
+        with sqlite3.connect(":memory:") as con:
+            con.executescript(
+                "CREATE TABLE skills ("
+                "skill_id INTEGER PRIMARY KEY, name TEXT UNIQUE, description TEXT, "
+                "category TEXT, command TEXT, common INTEGER, content TEXT, "
+                "is_deleted INTEGER DEFAULT 0);"
+            )
+            for index, name in enumerate(sorted(HANDOFF_ROLE_SKILLS), 1):
+                con.execute(
+                    "INSERT INTO skills VALUES (?,?,?,?,?,?,?,1)",
+                    (index, name, "stale", "stale", "stale", 1, "stale"),
+                )
+            con.execute(
+                "INSERT INTO skills VALUES "
+                "(99,'fork_only','local','fork',NULL,0,'bespoke body',0)"
+            )
+
+            migration = INFORMATIONAL_RECEIPT_RESEED.read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+
+            for name in sorted(HANDOFF_ROLE_SKILLS):
+                with self.subTest(name=name):
+                    parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
+                    row = con.execute(
+                        "SELECT description,category,command,common,content,is_deleted "
+                        "FROM skills WHERE name=?",
+                        (name,),
+                    ).fetchone()
+                    self.assertEqual(
+                        (
+                            parsed["description"],
+                            parsed["category"],
+                            parsed["command"],
+                            parsed["common"],
+                            parsed["content"],
+                            0,
+                        ),
+                        tuple(row),
+                    )
+            self.assertEqual(
+                ("fork", "bespoke body", 0),
+                tuple(
+                    con.execute(
+                        "SELECT category,content,is_deleted FROM skills "
+                        "WHERE name='fork_only'"
+                    ).fetchone()
+                ),
+            )
+
+    def test_role_skills_bound_unusable_receipt_recovery(self):
+        for name in sorted(HANDOFF_ROLE_SKILLS):
+            with self.subTest(name=name):
+                body = " ".join(
+                    (ASSETS / name / "SKILL.md").read_text().lower().split()
+                )
+                self.assertIn("retry the exact command once", body)
+                self.assertIn("normal read surface once", body)
+                self.assertIn(
+                    "prior inbox presence + absence of that exact message id proves "
+                    "the read landed",
+                    body,
+                )
+                for forbidden_inference in (
+                    "assignment ownership",
+                    "review outcome",
+                    "merge authorization",
+                    "lifecycle/work-unit transition",
+                    "governing revision",
+                    "pr head/green state",
+                    "cleanup authority",
+                ):
+                    self.assertIn(forbidden_inference, body)
+                self.assertIn("an unproved postcondition stops", body)
 
     def test_handoff_migration_converges_a_drifted_existing_skill_body(self):
         con = sqlite3.connect(":memory:")
@@ -777,6 +857,7 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(migration)
             con.executescript(migration)
             con.executescript(CONFORMANCE_OWNER_RESEED.read_text())
+            con.executescript(INFORMATIONAL_RECEIPT_RESEED.read_text())
 
             self.assertIsNotNone(
                 con.execute(
