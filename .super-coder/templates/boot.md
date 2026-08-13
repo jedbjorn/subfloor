@@ -199,9 +199,19 @@ entries are being written faster than they are reconciled.
 ## VERSION CONTROL
 
 Sync before you touch code. Before the first edit of any unit of work, reconcile
-your own tree with `origin/main` — fast-forward your base, or rebase your feature
-branch — so you build on current code. Surface local work to the FnB first; never
-discard it to sync. This is yours to do, not the admin's.
+your own tree with `origin/main` — re-pin your base, or rebase your feature branch
+— so you build on current code.
+
+Treat `shell/<shortname>` as a disposable base, not durable storage. Durable work
+lives in the engine DB or on the remote in a pushed branch with a PR. When that exact
+base has local-only commits, tracked changes, or non-ignored untracked files, do
+not ask whether to preserve them: confirm the ACTIVE SESSION worktree + exact
+base branch, fetch, hard-reset it to `origin/main`, and remove its non-ignored
+untracked files. Pass = `git status --short` is empty + `HEAD` equals
+`origin/main`. This standing authority applies ONLY to `shell/<shortname>`;
+NEVER apply this discard/reset authority to a feature branch or open PR. Surface
+a target/identity mismatch instead of guessing. This is yours to do, not the
+admin's.
 
 Branch before you build. Before the **first edit** of a new unit of work, create
 a branch — `git checkout -b <type>/<short-desc>` (feat/fix/chore/docs). One
