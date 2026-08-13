@@ -100,6 +100,7 @@ class Ledger:
     image: str | None = None
     agent_pid: int | None = None
     agent_socket: str | None = None
+    agent_acl_uid: int | None = None
     dind_container: str | None = None
     branches: list[str] = dataclasses.field(default_factory=list)
     pull_requests: list[int] = dataclasses.field(default_factory=list)
@@ -317,6 +318,24 @@ def _ssh_failure_category(result: CommandResult) -> str:
     )
 
 
+def _mapped_host_uid(uid_map: str, container_uid: int) -> int:
+    for raw_line in uid_map.splitlines():
+        fields = raw_line.split()
+        if len(fields) != 3:
+            continue
+        try:
+            container_start, host_start, length = map(int, fields)
+        except ValueError:
+            continue
+        if container_start <= container_uid < container_start + length:
+            return host_start + (container_uid - container_start)
+    raise CanaryError(
+        "CANARY_CONTAINER_FAILED",
+        "rootful test UID is absent from the outer daemon mapping",
+        stage="rootful dind",
+    )
+
+
 class HostBackend:
     def __init__(self, config: Config, workspace: Path) -> None:
         self.config = config
@@ -368,6 +387,7 @@ class HostBackend:
             "ssh",
             "ssh-add",
             "ssh-agent",
+            "setfacl",
         ):
             if shutil.which(executable) is None:
                 raise CanaryError(
@@ -870,6 +890,25 @@ ENV GIT_TERMINAL_PROMPT=0
                 "nested rootful daemon did not become ready",
                 stage="rootful dind",
             )
+        uid_map = self._docker(
+            "exec",
+            ledger.dind_container,
+            "cat",
+            "/proc/self/uid_map",
+            stage="rootful dind uid mapping",
+        ).stdout
+        mapped_uid = _mapped_host_uid(uid_map, os.getuid())
+        self._run(
+            (
+                "setfacl",
+                "--modify",
+                f"u:{mapped_uid}:rw",
+                ledger.agent_socket,
+            ),
+            stage="rootful agent ownership bridge",
+        )
+        ledger.agent_acl_uid = mapped_uid
+        receipt.checkpoint(ledger)
         self._docker(
             "exec",
             ledger.dind_container,
@@ -1279,6 +1318,7 @@ ENV GIT_TERMINAL_PROMPT=0
             if removed:
                 ledger.agent_pid = None
                 ledger.agent_socket = None
+                ledger.agent_acl_uid = None
         return actions
 
     def _remote_branch_exists(self, branch: str, *, token: str | None) -> bool:
@@ -1358,6 +1398,7 @@ def run(config: Config, *, backend: Backend | None = None) -> dict[str, Any]:
             and ledger.dind_container is None
             and ledger.image is None
             and ledger.agent_pid is None
+            and ledger.agent_acl_uid is None
         )
         receipt.data["resources"] = dataclasses.asdict(ledger)
         receipt.data["cleanup"] = {
