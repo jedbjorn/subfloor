@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
+import os
 import sys
 import tempfile
 import unittest
 from itertools import pairwise
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "maintainer" / "sandbox_auth_conformance.py"
@@ -21,8 +24,7 @@ SPEC.loader.exec_module(canary)
 
 def complete_matrix() -> dict[str, dict[str, str]]:
     return {
-        name: {"status": "passed", "proof": name}
-        for name in canary.REQUIRED_MATRIX
+        name: {"status": "passed", "proof": name} for name in canary.REQUIRED_MATRIX
     }
 
 
@@ -45,6 +47,9 @@ class FakeBackend:
         ledger.agent_socket = "/tmp/disposable-agent.sock"
         ledger.dind_container = "disposable-dind"
         ledger.branches.append("subfloor-auth-canary/test-branch")
+        ledger.denied_branches.append(
+            {"repository": "cli/cli", "branch": "subfloor-auth-denied-test"}
+        )
         ledger.pull_requests.append(991)
         receipt.data["candidate_sha"] = "a" * 40
         receipt.checkpoint(ledger)
@@ -57,12 +62,14 @@ class FakeBackend:
         actions = [
             {"resource": "pr:991", "removed": True},
             {"resource": "branch:test", "removed": True},
+            {"resource": "branch:cli/cli:test", "removed": True},
             {"resource": "rootful_dind", "removed": True},
             {"resource": "canary_image", "removed": True},
             {"resource": "ssh_agent", "removed": True},
         ]
         ledger.pull_requests.clear()
         ledger.branches.clear()
+        ledger.denied_branches.clear()
         ledger.dind_container = None
         ledger.image = None
         ledger.agent_pid = None
@@ -96,12 +103,13 @@ class SandboxAuthCanaryControllerTest(unittest.TestCase):
         self.assertEqual(set(result["matrix"]), canary.REQUIRED_MATRIX)
         self.assertEqual(result["candidate_sha"], "a" * 40)
         self.assertTrue(result["cleanup"]["complete"])
-        self.assertEqual(len(result["cleanup"]["actions"]), 5)
+        self.assertEqual(len(result["cleanup"]["actions"]), 6)
         self.assertEqual(backend.execute_calls, 1)
         self.assertEqual(backend.cleanup_calls, 1)
         durable = self.read_receipt()
         self.assertEqual(durable, result)
         self.assertEqual(durable["resources"]["branches"], [])
+        self.assertEqual(durable["resources"]["denied_branches"], [])
         self.assertEqual(durable["resources"]["pull_requests"], [])
 
     def test_missing_case_fails_closed_after_cleanup(self) -> None:
@@ -153,6 +161,19 @@ class SandboxAuthCanaryControllerTest(unittest.TestCase):
 
 
 class SandboxAuthCanaryContractTest(unittest.TestCase):
+    def make_backend(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        config = canary.Config(
+            source_repo=ROOT,
+            repository="example/project",
+            ssh_key=root / "id_ed25519",
+            receipt=root / "receipt.json",
+            run_id="auth-test-001",
+        )
+        return canary.HostBackend(config, root / "workspace")
+
     def test_required_matrix_pins_every_spec_case(self) -> None:
         self.assertEqual(
             canary.REQUIRED_MATRIX,
@@ -222,7 +243,9 @@ class SandboxAuthCanaryContractTest(unittest.TestCase):
         self.assertIn("[REDACTED]", serialized)
         self.assertIn("repository_unreachable", serialized)
 
-    def test_live_script_never_places_private_key_or_token_value_in_docker_argv(self) -> None:
+    def test_live_script_never_places_private_key_or_token_value_in_docker_argv(
+        self,
+    ) -> None:
         source = SCRIPT.read_text()
 
         self.assertNotIn("-e GH_TOKEN=", source)
@@ -230,6 +253,82 @@ class SandboxAuthCanaryContractTest(unittest.TestCase):
         self.assertNotRegex(source, r"--mount[^\n]+(?:id_rsa|id_ed25519|/\.ssh)")
         self.assertIn('"-e", "GH_TOKEN"', source)
         self.assertIn('"SC_GH_TOKEN",', source)
+
+    def test_rootful_dind_listens_on_its_unix_socket_only(self) -> None:
+        source = inspect.getsource(canary.HostBackend._start_rootful_dind)
+
+        self.assertIn(
+            '"dockerd",\n            "--host=unix:///var/run/docker.sock"', source
+        )
+        self.assertNotIn("tcp://", source)
+        self.assertNotIn("--tls=false", source)
+
+    def test_rootful_agent_runs_as_uid_matched_user_and_records_socket_owner(
+        self,
+    ) -> None:
+        backend = self.make_backend()
+        ledger = canary.Ledger(
+            image="disposable-image", dind_container="disposable-dind"
+        )
+        ownership = f"{os.getuid()}:{os.getgid()}:600"
+        command_result = canary.CommandResult(
+            1,
+            ownership + "\n",
+            "Hi canary! You've successfully authenticated, but GitHub does not provide shell access.\n",
+        )
+
+        with patch.object(backend, "_run", return_value=command_result) as run:
+            result = backend._rootful_agent(ledger)
+
+        argv = run.call_args.args[0]
+        self.assertIn(("--user", f"{os.getuid()}:{os.getgid()}"), tuple(pairwise(argv)))
+        self.assertNotIn(("--user", "0:0"), tuple(pairwise(argv)))
+        self.assertIn(
+            "type=bind,src=/rootful-agent.sock,dst=/run/super-coder/ssh-agent,readonly",
+            argv,
+        )
+        self.assertEqual(result["container_user"], f"{os.getuid()}:{os.getgid()}")
+        self.assertEqual(result["socket_ownership"], ownership)
+        self.assertEqual(
+            result["ownership_model"],
+            "uid_matched_container_via_operator_owned_unix_relay",
+        )
+
+    def test_denied_target_branch_is_cleaned_even_after_rejected_delete(self) -> None:
+        backend = self.make_backend()
+        resource = {
+            "repository": "cli/cli",
+            "branch": "subfloor-auth-denied-auth-test-001",
+        }
+        ledger = canary.Ledger(denied_branches=[resource])
+
+        with (
+            patch.object(
+                backend,
+                "_run",
+                return_value=canary.CommandResult(1, "", "not found"),
+            ),
+            patch.object(
+                backend, "_remote_branch_exists", return_value=False
+            ) as branch_exists,
+        ):
+            actions = backend.cleanup(ledger)
+
+        self.assertEqual(
+            actions,
+            [
+                {
+                    "resource": ("branch:cli/cli:subfloor-auth-denied-auth-test-001"),
+                    "removed": True,
+                }
+            ],
+        )
+        self.assertEqual(ledger.denied_branches, [])
+        branch_exists.assert_called_once_with(
+            "subfloor-auth-denied-auth-test-001",
+            token=None,
+            repository="cli/cli",
+        )
 
 
 if __name__ == "__main__":

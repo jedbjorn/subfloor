@@ -102,6 +102,7 @@ class Ledger:
     agent_socket: str | None = None
     dind_container: str | None = None
     branches: list[str] = dataclasses.field(default_factory=list)
+    denied_branches: list[dict[str, str]] = dataclasses.field(default_factory=list)
     pull_requests: list[int] = dataclasses.field(default_factory=list)
 
 
@@ -202,7 +203,9 @@ class Runner:
     ) -> CommandResult:
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
-            raise CanaryError("CANARY_TIMEOUT", "whole-run deadline exceeded", stage=stage)
+            raise CanaryError(
+                "CANARY_TIMEOUT", "whole-run deadline exceeded", stage=stage
+            )
         try:
             completed = subprocess.run(
                 list(argv),
@@ -323,7 +326,9 @@ class HostBackend:
         self.workspace = workspace
         self.runner = Runner(time.monotonic() + config.timeout_seconds)
         scripts = config.source_repo / ".super-coder" / "scripts"
-        self.github_auth = _load_module(scripts / "github_auth.py", "canary_github_auth")
+        self.github_auth = _load_module(
+            scripts / "github_auth.py", "canary_github_auth"
+        )
         self.github_login: str | None = None
 
     def _run(
@@ -335,14 +340,12 @@ class HostBackend:
         env: Mapping[str, str] | None = None,
         check: bool = True,
     ) -> CommandResult:
-        return self.runner.run(
-            argv, cwd=cwd, env=env, check=check, stage=stage
-        )
+        return self.runner.run(argv, cwd=cwd, env=env, check=check, stage=stage)
 
-    def _git(self, repo: Path, *args: str, stage: str, check: bool = True) -> CommandResult:
-        return self._run(
-            ("git", "-C", str(repo), *args), stage=stage, check=check
-        )
+    def _git(
+        self, repo: Path, *args: str, stage: str, check: bool = True
+    ) -> CommandResult:
+        return self._run(("git", "-C", str(repo), *args), stage=stage, check=check)
 
     def _docker(
         self,
@@ -356,10 +359,14 @@ class HostBackend:
     def _preflight(self, ledger: Ledger, receipt: Receipt) -> tuple[str, str]:
         config = self.config
         if not RUN_ID_RE.fullmatch(config.run_id):
-            raise CanaryError("CANARY_INPUT_INVALID", "run_id is invalid", stage="preflight")
+            raise CanaryError(
+                "CANARY_INPUT_INVALID", "run_id is invalid", stage="preflight"
+            )
         if not REPOSITORY_RE.fullmatch(config.repository):
             raise CanaryError(
-                "CANARY_INPUT_INVALID", "repository must be owner/name", stage="preflight"
+                "CANARY_INPUT_INVALID",
+                "repository must be owner/name",
+                stage="preflight",
             )
         for executable in (
             "docker",
@@ -425,7 +432,9 @@ class HostBackend:
                 "GitHub credential cannot push to the target repository",
                 stage="preflight",
             )
-        token = self._run(("gh", "auth", "token"), stage="stored OAuth preflight").stdout.strip()
+        token = self._run(
+            ("gh", "auth", "token"), stage="stored OAuth preflight"
+        ).stdout.strip()
         if not token:
             raise CanaryError(
                 "CANARY_PREFLIGHT_FAILED",
@@ -453,7 +462,11 @@ class HostBackend:
                 stage="preflight",
             )
         dind_collision = self._docker(
-            "container", "inspect", dind, stage="container collision preflight", check=False
+            "container",
+            "inspect",
+            dind,
+            stage="container collision preflight",
+            check=False,
         )
         if dind_collision.returncode == 0:
             raise CanaryError(
@@ -512,9 +525,7 @@ class HostBackend:
             )
         context = self.workspace / "image"
         context.mkdir()
-        key_arguments = " ".join(
-            f"'github.com {kind} {key}'" for kind, key in keys
-        )
+        key_arguments = " ".join(f"'github.com {kind} {key}'" for kind, key in keys)
         dockerfile = f"""FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends git gh openssh-client ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN install -d -m 0755 /etc/ssh/ssh_config.d && printf '%s\\n' {key_arguments} > /etc/ssh/ssh_known_hosts && chmod 0644 /etc/ssh/ssh_known_hosts && printf '%s\\n' 'Host github.com' '    StrictHostKeyChecking yes' '    GlobalKnownHostsFile /etc/ssh/ssh_known_hosts' '    UserKnownHostsFile /dev/null' > /etc/ssh/ssh_config.d/99-super-coder-github.conf
@@ -585,9 +596,7 @@ ENV GIT_TERMINAL_PROMPT=0
         return path
 
     def _discovery(self, repo: Path, environment: Mapping[str, str]) -> Any:
-        return self.github_auth.discover_github_capabilities(
-            repo, environ=environment
-        )
+        return self.github_auth.discover_github_capabilities(repo, environ=environment)
 
     @staticmethod
     def _capability_evidence(result: Any) -> dict[str, Any]:
@@ -600,7 +609,9 @@ ENV GIT_TERMINAL_PROMPT=0
             "agent_selected": result.runtime.ssh_auth_sock is not None,
         }
 
-    def _container_api_identity(self, token: str, ledger: Ledger, *, stage: str) -> None:
+    def _container_api_identity(
+        self, token: str, ledger: Ledger, *, stage: str
+    ) -> None:
         assert ledger.image and self.github_login
         environment = _clean_environment({"GH_TOKEN": token})
         result = self._docker(
@@ -730,9 +741,7 @@ ENV GIT_TERMINAL_PROMPT=0
             "BatchMode=yes",
             "git@github.com",
         ]
-        result = self._run(
-            args, stage=f"container SSH probe ({user})", check=False
-        )
+        result = self._run(args, stage=f"container SSH probe ({user})", check=False)
         return result.returncode in {0, 1} and bool(
             SSH_SUCCESS.search(f"{result.stdout}\n{result.stderr}")
         )
@@ -740,7 +749,10 @@ ENV GIT_TERMINAL_PROMPT=0
     def _strict_trust(self, ledger: Ledger) -> dict[str, Any]:
         assert ledger.image and ledger.agent_socket
         if not self._container_ssh(
-            image=ledger.image, socket_path=ledger.agent_socket, user="0:0", docker_prefix=("docker",)
+            image=ledger.image,
+            socket_path=ledger.agent_socket,
+            user="0:0",
+            docker_prefix=("docker",),
         ):
             raise CanaryError(
                 "CANARY_CONTAINER_FAILED",
@@ -827,7 +839,11 @@ ENV GIT_TERMINAL_PROMPT=0
                 f"{discovery.get('validated_selected_token') is not None}",
                 stage="offline",
             )
-        return {"status": "passed", "git_transport": "unverified", "github_api": "unverified"}
+        return {
+            "status": "passed",
+            "git_transport": "unverified",
+            "github_api": "unverified",
+        }
 
     def _start_rootful_dind(self, ledger: Ledger, receipt: Receipt) -> None:
         assert ledger.agent_socket and ledger.image
@@ -844,8 +860,8 @@ ENV GIT_TERMINAL_PROMPT=0
             "--mount",
             f"type=bind,src={self.workspace / 'image'},dst=/context,readonly",
             "docker:29-dind",
-            "--host=tcp://0.0.0.0:2375",
-            "--tls=false",
+            "dockerd",
+            "--host=unix:///var/run/docker.sock",
             stage="start rootful dind",
         )
         for _attempt in range(60):
@@ -884,9 +900,59 @@ ENV GIT_TERMINAL_PROMPT=0
             "/context",
             stage="build nested auth image",
         )
+        self._docker(
+            "exec",
+            ledger.dind_container,
+            "apk",
+            "add",
+            "--no-cache",
+            "socat",
+            stage="install rootful agent relay",
+        )
+        self._docker(
+            "exec",
+            "--detach",
+            ledger.dind_container,
+            "socat",
+            "UNIX-LISTEN:/rootful-agent.sock,fork,mode=0600",
+            "UNIX-CONNECT:/agent.sock",
+            stage="start rootful agent relay",
+        )
+        for _attempt in range(20):
+            relay = self._docker(
+                "exec",
+                ledger.dind_container,
+                "test",
+                "-S",
+                "/rootful-agent.sock",
+                stage="rootful agent relay readiness",
+                check=False,
+            )
+            if relay.returncode == 0:
+                break
+            time.sleep(0.1)
+        else:
+            raise CanaryError(
+                "CANARY_CONTAINER_FAILED",
+                "rootful agent relay did not become ready",
+                stage="rootful agent",
+            )
+        self._docker(
+            "exec",
+            ledger.dind_container,
+            "chown",
+            f"{os.getuid()}:{os.getgid()}",
+            "/rootful-agent.sock",
+            stage="own rootful agent relay",
+        )
 
     def _rootful_agent(self, ledger: Ledger) -> dict[str, Any]:
         assert ledger.image and ledger.dind_container
+        container_user = f"{os.getuid()}:{os.getgid()}"
+        probe = (
+            "stat -c '%u:%g:%a' \"$SSH_AUTH_SOCK\"; "
+            "ssh -T -o BatchMode=yes git@github.com"
+        )
         args = (
             "docker",
             "exec",
@@ -895,17 +961,15 @@ ENV GIT_TERMINAL_PROMPT=0
             "run",
             "--rm",
             "--user",
-            "0:0",
+            container_user,
             "--mount",
-            "type=bind,src=/agent.sock,dst=/run/super-coder/ssh-agent,readonly",
+            "type=bind,src=/rootful-agent.sock,dst=/run/super-coder/ssh-agent,readonly",
             "-e",
             "SSH_AUTH_SOCK=/run/super-coder/ssh-agent",
             ledger.image,
-            "ssh",
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "git@github.com",
+            "sh",
+            "-c",
+            probe,
         )
         result = self._run(args, stage="rootful agent probe", check=False)
         if result.returncode not in {0, 1} or not SSH_SUCCESS.search(
@@ -917,13 +981,22 @@ ENV GIT_TERMINAL_PROMPT=0
                 f"{_ssh_failure_category(result)}",
                 stage="rootful agent",
             )
+        ownership = result.stdout.splitlines()[0] if result.stdout else ""
+        expected_ownership = f"{container_user}:600"
+        if ownership != expected_ownership:
+            raise CanaryError(
+                "CANARY_CONTAINER_FAILED",
+                "rootful agent socket ownership did not match the container user",
+                stage="rootful agent",
+            )
         return {
             "status": "passed",
             "daemon": "rootful_dind",
-            "container_user": "0:0",
+            "container_user": container_user,
+            "socket_ownership": ownership,
             "kernel_peer_uid": os.getuid(),
-            "ownership_model": "outer_rootless_maps_container_root_to_host_operator",
-            "native_rootful_uid_path": "focused_runtime_test_only",
+            "ownership_model": "uid_matched_container_via_operator_owned_unix_relay",
+            "lab_adaptation": "outer_rootless_daemon_preserves_host_agent_peer_uid_via_relay",
         }
 
     def _container_command(
@@ -1037,7 +1110,9 @@ ENV GIT_TERMINAL_PROMPT=0
             self._container_command(
                 ledger, token, workspace, command, ssh=ssh, stage=stage
             )
-        origin_after = self._git(repo, "remote", "get-url", "origin", stage="origin preservation").stdout.strip()
+        origin_after = self._git(
+            repo, "remote", "get-url", "origin", stage="origin preservation"
+        ).stdout.strip()
         if origin_after != remote:
             raise CanaryError(
                 "CANARY_GITHUB_FAILED",
@@ -1091,7 +1166,11 @@ ENV GIT_TERMINAL_PROMPT=0
             stage=f"{transport} PR verify",
         )
         projection = json.loads(state.stdout)
-        if projection != {"baseRefName": "main", "headRefName": branch, "state": "OPEN"}:
+        if projection != {
+            "baseRefName": "main",
+            "headRefName": branch,
+            "state": "OPEN",
+        }:
             raise CanaryError(
                 "CANARY_GITHUB_FAILED",
                 "created pull request did not match the disposable branch",
@@ -1113,9 +1192,26 @@ ENV GIT_TERMINAL_PROMPT=0
         ledger.pull_requests.remove(pr_number)
         ledger.branches.remove(branch)
         receipt.checkpoint(ledger)
-        return {"status": "passed", "pull_request": pr_number, "closed": True, "branch_deleted": True}
+        return {
+            "status": "passed",
+            "pull_request": pr_number,
+            "closed": True,
+            "branch_deleted": True,
+        }
 
-    def _insufficient_push(self, token: str, ledger: Ledger) -> dict[str, Any]:
+    def _insufficient_push(
+        self, token: str, ledger: Ledger, receipt: Receipt
+    ) -> dict[str, Any]:
+        target_repository = "cli/cli"
+        branch = f"subfloor-auth-denied-{self.config.run_id}"
+        if self._remote_branch_exists(
+            branch, token=token, repository=target_repository
+        ):
+            raise CanaryError(
+                "CANARY_COLLISION",
+                "the insufficient-access target branch already exists",
+                stage="insufficient access",
+            )
         workspace = self.workspace / "insufficient"
         workspace.mkdir()
         repo = workspace / "repo"
@@ -1126,7 +1222,7 @@ ENV GIT_TERMINAL_PROMPT=0
             "remote",
             "add",
             "origin",
-            "https://github.com/cli/cli.git",
+            f"https://github.com/{target_repository}.git",
             stage="insufficient origin",
         )
         (repo / "proof.txt").write_text("must not reach remote\n")
@@ -1142,6 +1238,9 @@ ENV GIT_TERMINAL_PROMPT=0
             "test: denied push",
             stage="insufficient commit",
         )
+        resource = {"repository": target_repository, "branch": branch}
+        ledger.denied_branches.append(resource)
+        receipt.checkpoint(ledger)
         result = self._container_command(
             ledger,
             token,
@@ -1152,18 +1251,23 @@ ENV GIT_TERMINAL_PROMPT=0
                 "/workspace/repo",
                 "push",
                 "origin",
-                f"HEAD:refs/heads/subfloor-auth-denied-{self.config.run_id}",
+                f"HEAD:refs/heads/{branch}",
             ),
             ssh=False,
             stage="insufficient push",
             check=False,
         )
-        if result.returncode == 0:
+        branch_exists = self._remote_branch_exists(
+            branch, token=token, repository=target_repository
+        )
+        if result.returncode == 0 or branch_exists:
             raise CanaryError(
                 "CANARY_GITHUB_FAILED",
                 "a push unexpectedly succeeded against an ungranted repository",
                 stage="insufficient access",
             )
+        ledger.denied_branches.remove(resource)
+        receipt.checkpoint(ledger)
         return {"status": "passed", "readiness_claim": "read_only", "push": "rejected"}
 
     def execute(self, receipt: Receipt, ledger: Ledger) -> dict[str, Any]:
@@ -1193,7 +1297,9 @@ ENV GIT_TERMINAL_PROMPT=0
         matrix["offline"] = self._offline(token, ledger)
         self._start_rootful_dind(ledger, receipt)
         matrix["rootful_agent_access"] = self._rootful_agent(ledger)
-        matrix["insufficient_push_access"] = self._insufficient_push(token, ledger)
+        matrix["insufficient_push_access"] = self._insufficient_push(
+            token, ledger, receipt
+        )
         matrix["ssh_push_and_pr"] = self._real_pr(
             token, ledger, receipt, transport="ssh"
         )
@@ -1238,7 +1344,9 @@ ENV GIT_TERMINAL_PROMPT=0
                     stage="verify pull-request cleanup",
                     check=False,
                 )
-                removed = observed.returncode == 0 and observed.stdout.strip() == "CLOSED"
+                removed = (
+                    observed.returncode == 0 and observed.stdout.strip() == "CLOSED"
+                )
             actions.append({"resource": f"pr:{pr_number}", "removed": removed})
             if removed:
                 ledger.pull_requests.remove(pr_number)
@@ -1261,18 +1369,54 @@ ENV GIT_TERMINAL_PROMPT=0
             actions.append({"resource": f"branch:{branch}", "removed": removed})
             if removed:
                 ledger.branches.remove(branch)
+        for resource in list(reversed(ledger.denied_branches)):
+            repository = resource["repository"]
+            branch = resource["branch"]
+            result = self._run(
+                (
+                    "gh",
+                    "api",
+                    "--method",
+                    "DELETE",
+                    f"repos/{repository}/git/refs/heads/{branch}",
+                ),
+                env=environment,
+                stage="cleanup denied branch",
+                check=False,
+            )
+            removed = result.returncode == 0 or not self._remote_branch_exists(
+                branch, token=None, repository=repository
+            )
+            actions.append(
+                {"resource": f"branch:{repository}:{branch}", "removed": removed}
+            )
+            if removed:
+                ledger.denied_branches.remove(resource)
         if ledger.dind_container:
             result = self._docker(
-                "rm", "--force", ledger.dind_container, stage="cleanup dind", check=False
+                "rm",
+                "--force",
+                ledger.dind_container,
+                stage="cleanup dind",
+                check=False,
             )
-            actions.append({"resource": "rootful_dind", "removed": result.returncode == 0})
+            actions.append(
+                {"resource": "rootful_dind", "removed": result.returncode == 0}
+            )
             if result.returncode == 0:
                 ledger.dind_container = None
         if ledger.image:
             result = self._docker(
-                "image", "rm", "--force", ledger.image, stage="cleanup image", check=False
+                "image",
+                "rm",
+                "--force",
+                ledger.image,
+                stage="cleanup image",
+                check=False,
             )
-            actions.append({"resource": "canary_image", "removed": result.returncode == 0})
+            actions.append(
+                {"resource": "canary_image", "removed": result.returncode == 0}
+            )
             if result.returncode == 0:
                 ledger.image = None
         if ledger.agent_pid:
@@ -1292,13 +1436,22 @@ ENV GIT_TERMINAL_PROMPT=0
                 ledger.agent_socket = None
         return actions
 
-    def _remote_branch_exists(self, branch: str, *, token: str | None) -> bool:
-        environment = _clean_environment({"GH_TOKEN": token}) if token else _clean_environment()
+    def _remote_branch_exists(
+        self,
+        branch: str,
+        *,
+        token: str | None,
+        repository: str | None = None,
+    ) -> bool:
+        environment = (
+            _clean_environment({"GH_TOKEN": token}) if token else _clean_environment()
+        )
+        target_repository = repository or self.config.repository
         result = self._run(
             (
                 "gh",
                 "api",
-                f"repos/{self.config.repository}/git/matching-refs/heads/{branch}",
+                f"repos/{target_repository}/git/matching-refs/heads/{branch}",
                 "--jq",
                 "length",
             ),
@@ -1365,6 +1518,7 @@ def run(config: Config, *, backend: Backend | None = None) -> dict[str, Any]:
         cleanup_complete = (
             all(action.get("removed") is True for action in actions)
             and not ledger.branches
+            and not ledger.denied_branches
             and not ledger.pull_requests
             and ledger.dind_container is None
             and ledger.image is None
@@ -1422,7 +1576,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = run(config)
     except CanaryError as exc:
-        print(f"sandbox auth canary: {exc.code} at {exc.stage}; receipt: {config.receipt}", file=sys.stderr)
+        print(
+            f"sandbox auth canary: {exc.code} at {exc.stage}; receipt: {config.receipt}",
+            file=sys.stderr,
+        )
         return 1
     print(
         "sandbox auth canary: passed; "
