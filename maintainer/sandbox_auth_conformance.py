@@ -796,7 +796,13 @@ ENV GIT_TERMINAL_PROMPT=0
         ):
             raise CanaryError(
                 "CANARY_CONTAINER_FAILED",
-                "offline discovery made an invalid readiness claim",
+                "offline discovery made an invalid readiness claim: "
+                f"git={discovery.get('git_transport_state')}/"
+                f"{discovery.get('git_transport_reason')}, "
+                f"api={discovery.get('github_api_state')}/"
+                f"{discovery.get('github_api_reason')}, "
+                "token_selected="
+                f"{discovery.get('validated_selected_token') is not None}",
                 stage="offline",
             )
         return {"status": "passed", "git_transport": "unverified", "github_api": "unverified"}
