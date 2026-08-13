@@ -34,6 +34,15 @@ reason when unable to accept. After handling an informational message, run
 `accept`; it marks the message read and does not change Sprint or work-unit
 state.
 
+An unusable success receipt from idempotent bookkeeping does not stall the
+Sprint. Retry the exact command once, then use its normal read surface once to
+prove the exact postcondition. For informational `accept`, prior inbox presence
++ absence of that exact message id proves the read landed. Continue under that
+proof + name the receipt defect in the next normal handoff. NEVER use this
+recovery to infer assignment ownership, review outcome, merge authorization,
+lifecycle/work-unit transition, governing revision, PR head/green state, or
+cleanup authority. An unproved postcondition stops.
+
 Assignments and review requests use Force-new delivery; verdicts and PR-event
 wakes use Re-enter. Delivery waits for a natural boundary; the runtime owns
 bundling, rotation, and recovery. Stop after a successful typed handoff.

@@ -2730,14 +2730,22 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self._send(200, {"changed": changed})
             if path == "/_sc/sprint/inbox-read":
+                message_id = self._sprint_integer(body, "message_id")
                 disposition = sprint_message_delivery.SprintMessageStore(
                     con
                 ).mark_read(
-                    self._sprint_integer(body, "message_id"),
+                    message_id,
                     shell_id,
                     sprint_id=sprint_id,
                 )
-                return self._send(200, {"disposition": disposition})
+                return self._send(
+                    200,
+                    {
+                        "message_id": message_id,
+                        "read": True,
+                        "disposition": disposition,
+                    },
+                )
             if path == "/_sc/sprint/inbox-decline":
                 message_id = sprint_message_delivery.SprintMessageStore(con).decline(
                     self._sprint_integer(body, "message_id"),
