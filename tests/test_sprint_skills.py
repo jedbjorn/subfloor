@@ -61,6 +61,9 @@ INFORMATIONAL_RECEIPT_RESEED = (
 DISPOSABLE_SHELL_BASE_RESEED = (
     ENGINE / "migrations" / "0208_reseed_disposable_shell_base.sql"
 )
+GITHUB_CAPABILITY_RESEED = (
+    ENGINE / "migrations" / "0209_reseed_git_github_capabilities.sql"
+)
 
 
 class SprintSkillTest(unittest.TestCase):
@@ -862,6 +865,7 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(CONFORMANCE_OWNER_RESEED.read_text())
             con.executescript(INFORMATIONAL_RECEIPT_RESEED.read_text())
             con.executescript(DISPOSABLE_SHELL_BASE_RESEED.read_text())
+            con.executescript(GITHUB_CAPABILITY_RESEED.read_text())
 
             self.assertIsNotNone(
                 con.execute(

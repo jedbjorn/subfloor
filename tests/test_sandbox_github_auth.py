@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import re
 import socket
@@ -24,6 +25,7 @@ from sandbox_github_auth import (
     build_runtime_arguments,
     launch_with_discovery,
     parse_discovery,
+    render_capability_summary,
 )
 
 
@@ -95,6 +97,36 @@ class SandboxGitHubLaunchSourceTest(unittest.TestCase):
         self.assertNotRegex(dispatch, r'-v\s+"?\$HOME/\.ssh')
         self.assertNotRegex(dispatch, r"(?i)(id_rsa|id_ed25519)")
         self.assertNotIn("git remote set-url", dispatch)
+
+    def test_every_launch_path_discovers_immediately_before_runtime_creation(self) -> None:
+        dispatch = DISPATCH.read_text()
+        launch = dispatch.split("  launch)", 1)[1].split("  enter)", 1)[0]
+
+        self.assertEqual(
+            launch.count(
+                '"$S/github_auth.py" discover --repo-root "$CALLER_ROOT"'
+            ),
+            1,
+        )
+        self.assertLess(
+            launch.index('if [ -n "$no_build" ]'),
+            launch.index('"$S/github_auth.py" discover'),
+        )
+        self.assertIn('"$S/sandbox_github_auth.py" $github_auth_rootless', launch)
+        self.assertEqual(launch.count(AUTH_ARGUMENTS_MARKER), 1)
+        self.assertNotIn('GH_TOKEN="$gh_token"', launch)
+        self.assertNotRegex(launch, r"-e\s+GH_TOKEN=")
+
+    def test_restart_reuses_the_launch_refresh_without_a_stale_side_path(self) -> None:
+        dispatch = DISPATCH.read_text()
+        restart = dispatch.split("  restart)", 1)[1].split("  build)", 1)[0]
+
+        self.assertEqual(restart.count('"$0" launch --no-build'), 1)
+        self.assertNotIn("github_auth.py", restart)
+        self.assertIn(
+            "--no-build  reuse the image but still refresh host GitHub capabilities",
+            restart,
+        )
 
 
 class SandboxGitHubRuntimeArgumentsTest(unittest.TestCase):
@@ -251,6 +283,232 @@ class SandboxGitHubRuntimeArgumentsTest(unittest.TestCase):
         self.assertEqual(observed["env"].get("GH_TOKEN"), secret)
         self.assertNotIn("GITHUB_TOKEN", observed["env"])
         self.assertFalse(observed["check"])
+
+    def test_each_lifecycle_call_replaces_stale_candidates_with_current_selection(self) -> None:
+        observed: list[dict[str, str]] = []
+
+        def run(argv, *, env, check):
+            observed.append(env)
+            return subprocess.CompletedProcess(argv, 0)
+
+        command = ["launcher", AUTH_ARGUMENTS_MARKER, "after"]
+        first = FakeRuntimeSelection("https", None, "first-selected-token")
+        second = FakeRuntimeSelection("https", None, "fallback-oauth-token")
+        base = {
+            "GH_TOKEN": "stale-standard-token",
+            "GITHUB_TOKEN": "stale-lower-precedence-token",
+        }
+
+        launch_with_discovery(
+            first,
+            command,
+            rootless=False,
+            uid=1234,
+            gid=5678,
+            environ=base,
+            runner=run,
+        )
+        launch_with_discovery(
+            second,
+            command,
+            rootless=False,
+            uid=1234,
+            gid=5678,
+            environ=base,
+            runner=run,
+        )
+
+        self.assertEqual(
+            [environment.get("GH_TOKEN") for environment in observed],
+            ["first-selected-token", "fallback-oauth-token"],
+        )
+        self.assertTrue(
+            all("GITHUB_TOKEN" not in environment for environment in observed)
+        )
+        self.assertNotIn("first-selected-token", observed[1].values())
+
+
+class SandboxGitHubCapabilitySummaryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.socket_path = Path(self.temporary.name) / "agent.sock"
+        self.agent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(self.agent.close)
+        self.agent.bind(str(self.socket_path))
+
+    def parsed(self, **overrides: object):
+        value: dict[str, object] = {
+            "origin_transport": "https",
+            "validated_agent_socket": None,
+            "validated_selected_token": "selected-token",
+            "origin_state": "ready",
+            "origin_reason": "supported_origin",
+            "git_transport_state": "ready",
+            "git_transport_reason": "repository_read_verified",
+            "github_api_state": "ready",
+            "github_api_reason": "repository_read_verified",
+            "selected_token_source": "gh_oauth",
+        }
+        value.update(overrides)
+        return parse_discovery(json.dumps(value))
+
+    def summary(self, discovery) -> str:
+        runtime = build_runtime_arguments(
+            discovery,
+            rootless=False,
+            uid=1000,
+            gid=1000,
+        )
+        return render_capability_summary(discovery, runtime)
+
+    def test_ready_summary_names_oauth_fallback_and_unproven_mutation(self) -> None:
+        summary = self.summary(self.parsed())
+
+        self.assertIn("Git transport: ready", summary)
+        self.assertIn("GitHub API: ready — host gh OAuth", summary)
+        self.assertIn("mutation scope unproven", summary)
+        self.assertNotIn("selected-token", summary)
+
+    def test_partial_summary_keeps_ssh_ready_and_reports_api_host_remedy(self) -> None:
+        summary = self.summary(
+            self.parsed(
+                origin_transport="ssh",
+                validated_agent_socket=str(self.socket_path),
+                validated_selected_token=None,
+                selected_token_source=None,
+                github_api_state="unavailable",
+                github_api_reason="no_credential_candidate",
+            )
+        )
+
+        self.assertIn("Git transport: ready", summary)
+        self.assertIn("GitHub API: unavailable", summary)
+        self.assertIn("host remedy (API)", summary)
+        self.assertIn("every sandbox process can use it", summary)
+        self.assertIn("running sandbox auth remains unchanged", summary)
+
+    def test_https_offline_aggregate_reports_connectivity_remedy(self) -> None:
+        summary = self.summary(
+            self.parsed(
+                validated_selected_token=None,
+                selected_token_source=None,
+                git_transport_state="unverified",
+                git_transport_reason="api_credential_not_ready",
+                github_api_state="unverified",
+                github_api_reason="credential_validation_unverified",
+                credential_attempts=[
+                    {
+                        "source": "sc_gh_token",
+                        "state": "unverified",
+                        "reason": "network_unavailable",
+                    },
+                    {
+                        "source": "gh_oauth",
+                        "state": "unavailable",
+                        "reason": "stored_oauth_unavailable",
+                    },
+                ],
+            )
+        )
+
+        self.assertEqual(summary.count(": unverified"), 2)
+        self.assertNotIn(": ready", summary)
+        self.assertIn("restore GitHub/network access", summary)
+        self.assertNotIn("host remedy (API)", summary)
+
+    def test_ssh_offline_aggregate_reports_connectivity_remedy(self) -> None:
+        summary = self.summary(
+            self.parsed(
+                origin_transport="ssh",
+                validated_agent_socket=None,
+                validated_selected_token=None,
+                selected_token_source=None,
+                git_transport_state="unverified",
+                git_transport_reason="network_unavailable",
+                github_api_state="unavailable",
+                github_api_reason="no_credential_candidate",
+                credential_attempts=[
+                    {
+                        "source": "gh_oauth",
+                        "state": "unavailable",
+                        "reason": "stored_oauth_unavailable",
+                    }
+                ],
+            )
+        )
+
+        self.assertIn("Git transport: unverified", summary)
+        self.assertIn("GitHub API: unavailable", summary)
+        self.assertIn("restore GitHub/network access", summary)
+        self.assertNotIn("host remedy (API)", summary)
+
+    def test_origin_inspection_timeout_reports_origin_remedy(self) -> None:
+        summary = self.summary(
+            self.parsed(
+                origin_transport=None,
+                validated_selected_token=None,
+                origin_state="unverified",
+                origin_reason="origin_inspection_timed_out",
+                git_transport_state="unverified",
+                git_transport_reason="origin_inspection_timed_out",
+                github_api_state="unverified",
+                github_api_reason="github_discovery_skipped",
+                selected_token_source=None,
+            )
+        )
+
+        self.assertIn("repair or retry host Git origin inspection", summary)
+        self.assertNotIn("host remedy (API)", summary)
+
+    def test_ssh_agent_timeout_reports_local_agent_remedy(self) -> None:
+        summary = self.summary(
+            self.parsed(
+                origin_transport="ssh",
+                validated_agent_socket=None,
+                git_transport_state="unverified",
+                git_transport_reason="ssh_agent_unverified",
+            )
+        )
+
+        self.assertIn("restart or repair the host ssh-agent", summary)
+        self.assertNotIn("restore GitHub/network access", summary)
+
+    def test_vanished_agent_downgrades_the_current_launch_summary(self) -> None:
+        vanished = Path(self.temporary.name) / "vanished.sock"
+        summary = self.summary(
+            self.parsed(
+                origin_transport="ssh",
+                validated_agent_socket=str(vanished),
+                validated_selected_token=None,
+                selected_token_source=None,
+                github_api_state="unavailable",
+                github_api_reason="no_credential_candidate",
+            )
+        )
+
+        self.assertIn("Git transport: unavailable", summary)
+        self.assertIn("agent socket not live", summary)
+        self.assertNotIn("Git transport: ready", summary)
+
+    def test_non_github_origin_reports_skip_without_forwarding_claim(self) -> None:
+        summary = self.summary(
+            self.parsed(
+                origin_transport=None,
+                validated_selected_token=None,
+                origin_state="unavailable",
+                origin_reason="non_github_origin",
+                git_transport_state="unavailable",
+                git_transport_reason="non_github_origin",
+                github_api_state="unavailable",
+                github_api_reason="github_discovery_skipped",
+                selected_token_source=None,
+            )
+        )
+
+        self.assertIn("skipped", summary)
+        self.assertIn("no GitHub token or SSH agent was forwarded", summary)
+        self.assertNotIn(": ready", summary)
 
 
 if __name__ == "__main__":
