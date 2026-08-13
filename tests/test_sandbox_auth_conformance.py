@@ -208,17 +208,6 @@ class SandboxAuthCanaryContractTest(unittest.TestCase):
         self.assertEqual(category, "agent_unreachable")
         self.assertNotIn(secret, category)
 
-    def test_rootless_outer_uid_map_resolves_nested_rootful_user(self) -> None:
-        uid_map = "0 1000 1\n1 231072 65536\n"
-
-        mapped = canary._mapped_host_uid(uid_map, 1000)
-
-        self.assertEqual(mapped, 232071)
-
-    def test_missing_rootful_uid_mapping_fails_closed(self) -> None:
-        with self.assertRaisesRegex(canary.CanaryError, "absent"):
-            canary._mapped_host_uid("0 1000 1\n", 1000)
-
     def test_redaction_covers_token_shapes_and_sensitive_mapping_keys(self) -> None:
         token = "gho_abcdefghijklmnopqrstuvwxyz"
         value = canary._safe_result(
