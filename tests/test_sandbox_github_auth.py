@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,18 +18,20 @@ DOCKERFILE = ROOT / ".super-coder" / "Dockerfile"
 DISPATCH = ROOT / ".super-coder" / "scripts" / "dispatch.sh"
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 
-from sandbox_github_auth import AGENT_TARGET, build_runtime_arguments
+from sandbox_github_auth import (
+    AGENT_TARGET,
+    AUTH_ARGUMENTS_MARKER,
+    build_runtime_arguments,
+    launch_with_discovery,
+    parse_discovery,
+)
 
 
 @dataclass(frozen=True)
 class FakeRuntimeSelection:
-    gh_token: str | None = None
-    ssh_auth_sock: str | None = None
-
-
-@dataclass(frozen=True)
-class FakeDiscoveryResult:
-    runtime: FakeRuntimeSelection
+    origin_transport: str | None = None
+    validated_agent_socket: str | None = None
+    validated_selected_token: str | None = None
 
 
 class SandboxGitHubImageTest(unittest.TestCase):
@@ -91,6 +94,7 @@ class SandboxGitHubLaunchSourceTest(unittest.TestCase):
         dispatch = DISPATCH.read_text()
         self.assertNotRegex(dispatch, r'-v\s+"?\$HOME/\.ssh')
         self.assertNotRegex(dispatch, r"(?i)(id_rsa|id_ed25519)")
+        self.assertNotIn("git remote set-url", dispatch)
 
 
 class SandboxGitHubRuntimeArgumentsTest(unittest.TestCase):
@@ -103,9 +107,15 @@ class SandboxGitHubRuntimeArgumentsTest(unittest.TestCase):
         self.agent.bind(str(self.socket_path))
 
     def discovery(
-        self, *, token: str | None = None, agent: str | None = None
-    ) -> FakeDiscoveryResult:
-        return FakeDiscoveryResult(FakeRuntimeSelection(token, agent))
+        self,
+        *,
+        token: str | None = None,
+        agent: str | None = None,
+        transport: str | None = None,
+    ) -> FakeRuntimeSelection:
+        if transport is None:
+            transport = "ssh" if agent else "https"
+        return FakeRuntimeSelection(transport, agent, token)
 
     def test_rootful_forwards_only_the_validated_socket_and_token_name(self) -> None:
         secret = "github_pat_test-secret"
@@ -128,6 +138,18 @@ class SandboxGitHubRuntimeArgumentsTest(unittest.TestCase):
         self.assertNotIn(secret, repr(result))
         self.assertNotIn(secret, repr(result.diagnostic_dict()))
         self.assertEqual(result.host_environment({})["GH_TOKEN"], secret)
+
+    def test_selected_token_value_is_injected_byte_for_byte(self) -> None:
+        token = "  exact-selected-token  "
+        result = build_runtime_arguments(
+            self.discovery(token=token),
+            rootless=False,
+            uid=1000,
+            gid=1000,
+        )
+
+        self.assertEqual(result.host_environment({})["GH_TOKEN"], token)
+        self.assertNotIn(token, result.docker_args)
 
     def test_rootless_uses_container_root_with_the_same_narrow_mount(self) -> None:
         result = build_runtime_arguments(
@@ -156,7 +178,7 @@ class SandboxGitHubRuntimeArgumentsTest(unittest.TestCase):
         self.assertEqual(result.docker_args, ("--user", "1000:1000"))
         self.assertFalse(result.token_injected)
         self.assertFalse(result.agent_forwarded)
-        self.assertEqual(result.agent_reason, "not_selected")
+        self.assertEqual(result.agent_reason, "origin_transport_not_ssh")
         self.assertEqual(
             result.host_environment(
                 {
@@ -181,6 +203,54 @@ class SandboxGitHubRuntimeArgumentsTest(unittest.TestCase):
         self.assertFalse(result.agent_forwarded)
         self.assertEqual(result.agent_reason, "socket_not_live")
         self.assertNotIn("--mount", result.docker_args)
+
+    def test_https_ignores_even_a_non_null_agent_contract_violation(self) -> None:
+        result = build_runtime_arguments(
+            FakeRuntimeSelection("https", str(self.socket_path), None),
+            rootless=False,
+            uid=1000,
+            gid=1000,
+        )
+
+        self.assertFalse(result.agent_forwarded)
+        self.assertEqual(result.agent_reason, "origin_transport_not_ssh")
+        self.assertNotIn("--mount", result.docker_args)
+
+    def test_flat_json_contract_parses_without_nesting_or_renaming(self) -> None:
+        parsed = parse_discovery(
+            '{"origin_transport":"ssh","validated_agent_socket":"/agent",'
+            '"validated_selected_token":"token","sanitized_reason":"ready"}'
+        )
+
+        self.assertEqual(parsed.origin_transport, "ssh")
+        self.assertEqual(parsed.validated_agent_socket, "/agent")
+        self.assertEqual(parsed.validated_selected_token, "token")
+
+    def test_launch_inserts_auth_at_marker_without_secret_in_argv(self) -> None:
+        secret = "github_pat_never-in-argv"
+        observed: dict[str, object] = {}
+
+        def run(argv, *, env, check):
+            observed["argv"] = argv
+            observed["env"] = env
+            observed["check"] = check
+            return subprocess.CompletedProcess(argv, 23)
+
+        status = launch_with_discovery(
+            self.discovery(token=secret, agent=str(self.socket_path)),
+            ["launcher", "before", AUTH_ARGUMENTS_MARKER, "after"],
+            rootless=False,
+            uid=1234,
+            gid=5678,
+            environ={"GH_TOKEN": "stale", "GITHUB_TOKEN": "also-stale"},
+            runner=run,
+        )
+
+        self.assertEqual(status, 23)
+        self.assertNotIn(secret, observed["argv"])
+        self.assertEqual(observed["env"].get("GH_TOKEN"), secret)
+        self.assertNotIn("GITHUB_TOKEN", observed["env"])
+        self.assertFalse(observed["check"])
 
 
 if __name__ == "__main__":

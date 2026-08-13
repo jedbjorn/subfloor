@@ -1161,12 +1161,12 @@ case "$cmd" in
     p="$(port)"
     dp="$(devport)"
     dnet
-    # Forward GitHub auth for shells opening their own feature PRs. Prefer a
-    # repo-scoped SC_GH_TOKEN; else reuse the
-    # host's gh login. NOTE: this widens the sandbox — anything in the container
-    # can act as you on GitHub within the token's scope. A fine-grained,
-    # single-repo PAT in SC_GH_TOKEN is the tighter option.
-    gh_token="${SC_GH_TOKEN:-$(gh auth token 2>/dev/null || true)}"
+    # Discovery and launch are one secret-safe pipeline. Discovery emits one
+    # JSON result; the launch wrapper consumes it on stdin, revalidates the
+    # selected socket, and keeps any selected token in the Docker client's
+    # environment. The value never enters shell or Docker argv.
+    rootless_arg=""
+    [ "$(duser)" = "0:0" ] && rootless_arg="--rootless"
     # Forward a Mistral key for vibe's API-key auth path — ONLY when set, so an
     # empty value can't shadow the mounted ~/.vibe creds (vibe --setup stores its
     # key + .env there; the mount below carries them in like every other harness).
@@ -1227,15 +1227,23 @@ case "$cmd" in
     # container's PID limit with zombies (flag #323).
     epoch="$(harness_epoch)"
     provision_rc=0
+    github_auth_result=""
+    if ! github_auth_result="$("$PY" "$S/github_auth.py" discover --repo-root "$CALLER_ROOT")"; then
+      echo "✗ GitHub capability discovery failed; sandbox was not replaced." >&2
+      exit 1
+    fi
+    printf '%s' "$github_auth_result" | \
+    "$PY" "$S/sandbox_github_auth.py" $rootless_arg \
+      --uid "$(id -u)" --gid "$(id -g)" -- \
     "$PY" "$S/sandbox_devkit.py" launch-container \
       "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)" \
       "$CNAME" -- \
       -d --name "$CNAME" --restart unless-stopped --init \
       --network "$SC_NET" \
-      --user "$(duser)" \
+      SC_GITHUB_AUTH_ARGS \
       -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
       -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
-      -e GH_TOKEN="$gh_token" $mistral_env $pg_env \
+      $mistral_env $pg_env \
       -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" \
       -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
       -w "$here" \
@@ -1252,6 +1260,7 @@ case "$cmd" in
       -p "127.0.0.1:$dp:$dp" \
       SC_DEVKIT_MOUNTS \
       "$IMG" ./sc serve --port "$p" || provision_rc=$?
+    github_auth_result=""
     if [ "$provision_rc" -ne 0 ]; then
       echo "✗ dev-kit state: failed — retained sandbox '$CNAME' and local evidence." >&2
       echo "  retry:  ./sc launch --no-build" >&2
