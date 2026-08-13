@@ -2049,6 +2049,11 @@ class SprintLifecycleStore:
         error_code = turn["error_code"]
         if run_state == "succeeded":
             return message_state == "completed" and error_code is None
+        if run_state == "cancelled":
+            return (
+                message_state == "cancelled"
+                and turn["interrupt_requested"] is True
+            )
         if run_state in {"failed", "unknown"}:
             return (
                 message_state == "failed"
@@ -2263,6 +2268,7 @@ class SprintLifecycleStore:
                 "run_state": None,
                 "error_code": None,
                 "error_detail": None,
+                "interrupt_requested": False,
                 "turn_live": False,
             }
         message = self.con.execute(
@@ -2275,6 +2281,7 @@ class SprintLifecycleStore:
         run_state = None
         error_code = None
         error_detail = None
+        interrupt_requested = False
         turn_live = False
         if message is not None:
             run = self.con.execute(
@@ -2287,6 +2294,11 @@ class SprintLifecycleStore:
                 run_state = str(run["state"])
                 error_code = run["error_code"]
                 error_detail = run["error_detail"]
+                interrupt_requested = self.con.execute(
+                    "SELECT 1 FROM conversation_events WHERE run_id=? "
+                    "AND event_type='run.interrupt.requested' LIMIT 1",
+                    (run["run_id"],),
+                ).fetchone() is not None
             if str(message["conversation_state"]) in {
                 "idle",
                 "queued",
@@ -2318,6 +2330,7 @@ class SprintLifecycleStore:
             "run_state": run_state,
             "error_code": error_code,
             "error_detail": error_detail,
+            "interrupt_requested": interrupt_requested,
             "turn_live": turn_live,
         }
 
