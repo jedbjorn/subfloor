@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -15,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import active_chat_registry
@@ -127,6 +128,14 @@ class CleanupExecutionReceipt:
     detail: str | None = None
     claim_generation: int | None = None
     attempt_count: int | None = None
+
+
+@dataclass(frozen=True)
+class DirectSubmodule:
+    name: str
+    declared_path: str
+    mount: Path
+    initialized: bool
 
 
 @dataclass(frozen=True)
@@ -561,7 +570,7 @@ class SprintCleanupTargetStore:
             evidence["retry_evidence"] = {
                 "failed_attempts": max(0, int(row["attempt_count"]) - 1),
                 "last_error_code": str(row["last_error_code"]),
-                "last_error_detail": str(row["last_error_detail"] or "")[:1000],
+                "last_error_detail": str(row["last_error_detail"] or "")[:2000],
             }
         now_stamp = _stamp(self.clock())
         return self._fenced_update(
@@ -1514,7 +1523,7 @@ class SprintCleanupExecutor:
         self._renew_or_stale(claim)
         self._git(target, "clean", "-ffd", code="clean_base_failed")
         self._renew_or_stale(claim)
-        self._restore_submodules(target, claim)
+        submodule_evidence = self._restore_submodules(target, claim)
         self._renew_or_stale(claim)
 
         try:
@@ -1542,6 +1551,7 @@ class SprintCleanupExecutor:
                 "prune_error": bool(prune_result.get("error")),
                 "pruned_branches": list(prune_result.get("deleted", []))[:25],
                 "prune_failures": list(prune_result.get("failed", []))[:25],
+                **submodule_evidence,
             }
         )
         if after["branch"] != claim.expected_base_branch:
@@ -1907,71 +1917,277 @@ class SprintCleanupExecutor:
             finally:
                 flock(handle.fileno(), LOCK_UN)
 
-    def _restore_submodules(self, target: Path, claim: CleanupClaim) -> None:
-        modules = target / ".gitmodules"
-        if not modules.is_file():
-            return
-        self._git(
-            target,
-            "submodule",
-            "sync",
-            "--recursive",
-            code="submodule_sync_failed",
-        )
-        self._git(
-            target,
-            "submodule",
-            "update",
-            "--init",
-            "--recursive",
-            "--force",
-            code="submodule_update_failed",
-            timeout=max(self.command_timeout, self.fetch_timeout),
-        )
-        self._renew_or_stale(claim)
-        for submodule in self._submodule_paths(target):
+    def _restore_submodules(
+        self, target: Path, claim: CleanupClaim
+    ) -> dict[str, Any]:
+        cleared: list[str] = []
+        seen_mounts: set[Path] = set()
+        declaration_count = 0
+
+        def restore_level(parent: Path, depth: int) -> None:
+            nonlocal declaration_count
+            direct = self._direct_submodules(parent, target)
+            if direct and depth >= 16:
+                raise SprintCleanupSafetyError(
+                    "submodule_traversal_limit",
+                    f"submodule depth limit exceeded at {parent.relative_to(target) or '.'}",
+                )
+            if declaration_count + len(direct) > 256:
+                raise SprintCleanupSafetyError(
+                    "submodule_traversal_limit",
+                    "submodule declaration limit exceeded",
+                )
+            declaration_count += len(direct)
+
+            for child in direct:
+                identity = child.mount.absolute()
+                if identity in seen_mounts:
+                    raise SprintCleanupSafetyError(
+                        "submodule_traversal_limit",
+                        f"repeated submodule mount: {child.mount.relative_to(target)}",
+                    )
+                seen_mounts.add(identity)
+
+            # Determine every removal candidate before deleting any sibling.
+            obstructed: list[DirectSubmodule] = []
+            for child in direct:
+                if child.initialized or not child.mount.exists():
+                    continue
+                if self._is_exact_git_worktree(child.mount):
+                    raise SprintCleanupSafetyError(
+                        "submodule_mount_invalid",
+                        f"uninitialized mount is an actual Git worktree: {child.mount.relative_to(target)}",
+                    )
+                if child.mount.is_dir() and not any(child.mount.iterdir()):
+                    continue
+                obstructed.append(child)
+
+            for child in obstructed:
+                self._renew_or_stale(claim)
+                try:
+                    if child.mount.is_dir():
+                        shutil.rmtree(child.mount)
+                    else:
+                        child.mount.unlink()
+                except OSError as exc:
+                    error_name = exc.strerror or type(exc).__name__
+                    error_number = f" errno={exc.errno}" if exc.errno is not None else ""
+                    raise SprintCleanupMutationError(
+                        "submodule_mount_remove_failed",
+                        f"could not clear submodule mount "
+                        f"{child.mount.relative_to(target)}:{error_number} {error_name}",
+                    ) from exc
+                cleared.append(child.mount.relative_to(target).as_posix())
+                self._renew_or_stale(claim)
+
+            if not direct:
+                return
+            paths = [child.declared_path for child in direct]
+            self._renew_or_stale(claim)
             self._git(
-                submodule, "reset", "--hard", "HEAD", code="submodule_reset_failed"
+                parent,
+                "--literal-pathspecs",
+                "submodule",
+                "sync",
+                "--",
+                *paths,
+                code="submodule_sync_failed",
             )
             self._renew_or_stale(claim)
-            self._git(submodule, "clean", "-ffd", code="submodule_clean_failed")
+            self._git(
+                parent,
+                "--literal-pathspecs",
+                "submodule",
+                "update",
+                "--init",
+                "--force",
+                "--",
+                *paths,
+                code="submodule_update_failed",
+                timeout=max(self.command_timeout, self.fetch_timeout),
+            )
             self._renew_or_stale(claim)
 
-    def _submodule_paths(self, root: Path) -> list[Path]:
-        found: list[Path] = []
-        pending = [root]
-        while pending:
-            parent = pending.pop()
-            config = parent / ".gitmodules"
-            if not config.is_file():
-                continue
-            output = self._git_stdout(
-                parent,
-                "config",
-                "--file",
-                str(config),
-                "--get-regexp",
-                r"^submodule\..*\.path$",
-                code="submodule_config_failed",
-                allowed=(0, 1),
-                mutation=True,
+            for child in direct:
+                if not self._is_exact_git_worktree(child.mount):
+                    raise SprintCleanupSafetyError(
+                        "submodule_mount_invalid",
+                        f"initialized submodule identity mismatch: {child.mount.relative_to(target)}",
+                    )
+                self._git(
+                    child.mount,
+                    "reset",
+                    "--hard",
+                    "HEAD",
+                    code="submodule_reset_failed",
+                )
+                self._renew_or_stale(claim)
+                self._git(
+                    child.mount, "clean", "-ffd", code="submodule_clean_failed"
+                )
+                self._renew_or_stale(claim)
+                restore_level(child.mount, depth + 1)
+
+        restore_level(target, 0)
+        return {
+            "cleared_submodule_mount_count": len(cleared),
+            "cleared_submodule_mounts": cleared[:25],
+            "cleared_submodule_mounts_truncated": len(cleared) > 25,
+        }
+
+    def _direct_submodules(self, parent: Path, root: Path) -> list[DirectSubmodule]:
+        config = parent / ".gitmodules"
+        if not config.is_file():
+            return []
+        output = self._git_stdout(
+            parent,
+            "config",
+            "-z",
+            "--file",
+            ".gitmodules",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+            code="submodule_config_failed",
+            allowed=(0, 1),
+        )
+        records = output.split("\0") if output else []
+        if records and records[-1] == "":
+            records.pop()
+        declarations: list[tuple[str, str]] = []
+        names: set[str] = set()
+        paths: set[str] = set()
+        for record in records:
+            if "\n" not in record:
+                raise SprintCleanupSafetyError(
+                    "submodule_config_failed", "malformed NUL-delimited submodule declaration"
+                )
+            key, declared = record.split("\n", 1)
+            if not key.startswith("submodule.") or not key.endswith(".path"):
+                raise SprintCleanupSafetyError(
+                    "submodule_config_failed", "malformed submodule declaration key"
+                )
+            name = key[len("submodule.") : -len(".path")]
+            pure = PurePosixPath(declared)
+            invalid = (
+                not name
+                or not declared
+                or declared == "."
+                or pure.is_absolute()
+                or str(pure) != declared
+                or any(part in ("", ".", "..") for part in pure.parts)
+                or name in names
+                or declared in paths
             )
-            for line in output.splitlines():
-                parts = line.split(maxsplit=1)
-                if len(parts) != 2:
-                    continue
-                child = parent / parts[1]
-                try:
-                    resolved = child.resolve(strict=True)
-                    resolved.relative_to(root)
-                except (FileNotFoundError, RuntimeError, ValueError) as exc:
-                    raise SprintCleanupMutationError(
-                        "submodule_path_invalid",
-                        f"tracked submodule path escaped the worktree: {parts[1]}",
-                    ) from exc
-                found.append(resolved)
-                pending.append(resolved)
-        return found
+            if invalid:
+                raise SprintCleanupSafetyError(
+                    "submodule_mount_invalid",
+                    f"invalid submodule declaration: {declared or '<empty>'}",
+                )
+            names.add(name)
+            paths.add(declared)
+            declarations.append((name, declared))
+
+        direct: list[DirectSubmodule] = []
+        for name, declared in declarations:
+            mount = parent.joinpath(*PurePosixPath(declared).parts)
+            try:
+                mount.absolute().relative_to(root.absolute())
+            except ValueError as exc:
+                raise SprintCleanupSafetyError(
+                    "submodule_mount_invalid",
+                    f"submodule mount escapes worktree: {declared}",
+                ) from exc
+            self._reject_submodule_symlinks(mount, root)
+            index = self._git_stdout(
+                parent,
+                "--literal-pathspecs",
+                "ls-files",
+                "--stage",
+                "-z",
+                "--",
+                declared,
+                code="submodule_mount_invalid",
+            )
+            expected_suffix = f"\t{declared}\0"
+            entries = [entry for entry in index.split("\0") if entry]
+            if len(entries) != 1 or not entries[0].startswith("160000 ") or not (
+                entries[0] + "\0"
+            ).endswith(expected_suffix):
+                raise SprintCleanupSafetyError(
+                    "submodule_mount_invalid",
+                    f"submodule index entry mismatch: {declared}",
+                )
+            status = self._git_stdout(
+                parent,
+                "--literal-pathspecs",
+                "-c",
+                "core.quotePath=false",
+                "submodule",
+                "status",
+                "--",
+                declared,
+                code="submodule_mount_invalid",
+            )
+            lines = status.splitlines()
+            if len(lines) != 1 or not lines[0] or lines[0][0] not in "-+ U":
+                raise SprintCleanupSafetyError(
+                    "submodule_mount_invalid",
+                    f"submodule status malformed: {declared}",
+                )
+            rest = lines[0][1:].split(" ", 1)
+            if len(rest) != 2 or not (
+                rest[1] == declared or rest[1].startswith(f"{declared} (")
+            ):
+                raise SprintCleanupSafetyError(
+                    "submodule_mount_invalid",
+                    f"submodule status path mismatch: {declared}",
+                )
+            direct.append(DirectSubmodule(name, declared, mount, lines[0][0] != "-"))
+        return direct
+
+    def _is_exact_git_worktree(self, mount: Path) -> bool:
+        if not mount.is_dir():
+            return False
+        try:
+            result = self._run_git(mount, "rev-parse", "--show-toplevel")
+        except SprintCleanupMutationError as exc:
+            raise SprintCleanupSafetyError(
+                "submodule_worktree_probe_failed", exc.detail
+            ) from exc
+        if result.returncode != 0:
+            raise SprintCleanupSafetyError(
+                "submodule_worktree_probe_failed",
+                f"could not classify existing submodule mount: {mount.name}",
+            )
+        try:
+            actual = Path(result.stdout.strip()).resolve(strict=True)
+            expected = mount.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise SprintCleanupSafetyError(
+                "submodule_worktree_probe_failed",
+                f"could not resolve existing submodule mount: {mount.name}",
+            ) from exc
+        return actual == expected
+
+    @staticmethod
+    def _reject_submodule_symlinks(mount: Path, root: Path) -> None:
+        current = mount
+        while current != root:
+            if current.is_symlink():
+                raise SprintCleanupSafetyError(
+                    "submodule_mount_invalid",
+                    f"submodule mount has a symlink component: {mount.relative_to(root)}",
+                )
+            if current.exists() and not current.is_dir() and current != mount:
+                raise SprintCleanupSafetyError(
+                    "submodule_mount_invalid",
+                    f"submodule mount parent is not a directory: {mount.relative_to(root)}",
+                )
+            current = current.parent
+        if current != root:
+            raise SprintCleanupSafetyError(
+                "submodule_mount_invalid", "submodule mount escaped worktree"
+            )
 
     def _git_evidence(self, repo: Path) -> dict[str, Any]:
         branch_result = self._run_git(
@@ -2011,11 +2227,7 @@ class SprintCleanupExecutor:
     ) -> subprocess.CompletedProcess[str]:
         result = self._run_git(repo, *args, timeout=timeout)
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip().splitlines()
-            suffix = (
-                detail[-1][:1000] if detail else "Git command failed without detail"
-            )
-            raise SprintCleanupMutationError(code, suffix)
+            raise SprintCleanupMutationError(code, self._git_detail(result))
         return result
 
     def _git_stdout(
@@ -2033,15 +2245,25 @@ class SprintCleanupExecutor:
                 raise
             raise SprintCleanupSafetyError(code, exc.detail) from exc
         if result.returncode not in allowed:
-            detail = (result.stderr or result.stdout).strip().splitlines()
-            suffix = (
-                detail[-1][:1000] if detail else "Git command failed without detail"
-            )
             error_type = (
                 SprintCleanupMutationError if mutation else SprintCleanupSafetyError
             )
-            raise error_type(code, suffix)
-        return result.stdout.strip()
+            raise error_type(code, self._git_detail(result))
+        return result.stdout.rstrip("\n")
+
+    @staticmethod
+    def _git_detail(result: subprocess.CompletedProcess[str]) -> str:
+        detail = result.stderr if result.stderr.strip() else result.stdout
+        detail = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", detail)
+        detail = detail.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not detail:
+            return "Git command failed without detail"
+        if len(detail) <= 2000:
+            return detail
+        marker = "\n...[truncated]...\n"
+        remaining = 2000 - len(marker)
+        head = remaining // 2
+        return detail[:head] + marker + detail[-(remaining - head) :]
 
     def _renew_or_stale(self, claim: CleanupClaim) -> None:
         if not self.store.renew(claim, lease_seconds=self.lease_seconds):
