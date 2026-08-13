@@ -160,7 +160,13 @@ class DiscoveryResult:
         }
 
     def output_dict(self) -> dict[str, object]:
-        """Return the confidential machine schema captured by launch code."""
+        """Return the confidential, ephemeral machine schema for launch.
+
+        ``validated_selected_token`` is a live secret.  Consumers must capture
+        stdout without echoing it, use the value only to construct the current
+        replacement process environment, and never persist this object or the
+        token in a state file, receipt, diagnostic, argv, or log.
+        """
         return {
             "schema_version": self.schema_version,
             "observed_at": self.observed_at,
@@ -203,13 +209,19 @@ def _timestamp(now: datetime | None) -> str:
 
 
 def _clean_environment(environ: Mapping[str, str]) -> dict[str, str]:
-    clean = dict(environ)
+    clean = {
+        name: value
+        for name, value in environ.items()
+        if not name.startswith("GIT_CONFIG_")
+    }
     for name in _TOKEN_VARIABLES:
         clean.pop(name, None)
     clean.pop("GH_HOST", None)
     clean.pop("GITHUB_HOST", None)
     clean["GH_PROMPT_DISABLED"] = "1"
     clean["GIT_TERMINAL_PROMPT"] = "0"
+    clean["GIT_CONFIG_GLOBAL"] = os.devnull
+    clean["GIT_CONFIG_SYSTEM"] = os.devnull
     return clean
 
 
@@ -280,6 +292,11 @@ def _parse_remote(url: str) -> _ParsedRemote:
             repository=repository,
             reason="supported_origin" if repository else "unsupported_github_url",
         )
+    if "://" not in value and ":" in value:
+        authority, _separator, _path = value.partition(":")
+        _user, at, host = authority.partition("@")
+        if at and host.casefold() == "github.com":
+            return _ParsedRemote(True, None, None, "unsupported_github_url")
 
     try:
         parsed = urlsplit(value)
@@ -304,18 +321,120 @@ def _parse_remote(url: str) -> _ParsedRemote:
     return _ParsedRemote(True, None, None, "unsupported_github_url")
 
 
-def _remote_urls(
+def _configured_urls(
     repo: Path,
     *,
-    push: bool,
+    key: str,
     environ: Mapping[str, str],
     runner: Runner,
 ) -> _CommandResult:
-    command = ["git", "-C", str(repo), "remote", "get-url"]
-    if push:
-        command.append("--push")
-    command.extend(("--all", "origin"))
+    command = ["git", "-C", str(repo), "config", "--get-all", key]
     return _run(command, cwd=repo, env=_clean_environment(environ), runner=runner)
+
+
+def _inspect_origin(
+    root: Path,
+    *,
+    environ: Mapping[str, str],
+    runner: Runner,
+) -> tuple[OriginResult, str | None]:
+    fetch = _configured_urls(
+        root,
+        key="remote.origin.url",
+        environ=environ,
+        runner=runner,
+    )
+    if fetch.failure == "timeout":
+        return (
+            OriginResult(
+                UNVERIFIED, False, None, None, "origin_inspection_timed_out"
+            ),
+            None,
+        )
+    if fetch.failure == "tool_unavailable":
+        return OriginResult(UNAVAILABLE, False, None, None, "git_unavailable"), None
+    if fetch.returncode != 0:
+        return OriginResult(UNAVAILABLE, False, None, None, "origin_missing"), None
+    fetch_urls = [line.strip() for line in fetch.stdout.splitlines() if line.strip()]
+    if len(fetch_urls) != 1:
+        return (
+            OriginResult(
+                UNAVAILABLE, False, None, None, "multiple_origin_fetch_urls"
+            ),
+            None,
+        )
+
+    push = _configured_urls(
+        root,
+        key="remote.origin.pushurl",
+        environ=environ,
+        runner=runner,
+    )
+    if push.failure == "timeout":
+        return (
+            OriginResult(
+                UNVERIFIED, False, None, None, "origin_inspection_timed_out"
+            ),
+            None,
+        )
+    if push.failure == "tool_unavailable":
+        return OriginResult(UNAVAILABLE, False, None, None, "git_unavailable"), None
+    if push.returncode == 1 and not push.stdout.strip():
+        push_urls = fetch_urls
+    elif push.returncode != 0:
+        return (
+            OriginResult(
+                UNAVAILABLE, False, None, None, "origin_push_config_unavailable"
+            ),
+            None,
+        )
+    else:
+        push_urls = [line.strip() for line in push.stdout.splitlines() if line.strip()]
+    if len(push_urls) != 1:
+        return (
+            OriginResult(
+                UNAVAILABLE, False, None, None, "multiple_origin_push_urls"
+            ),
+            None,
+        )
+
+    fetched = _parse_remote(fetch_urls[0])
+    pushed = _parse_remote(push_urls[0])
+    if not fetched.github and not pushed.github:
+        return (
+            OriginResult(UNAVAILABLE, False, None, None, "non_github_origin"),
+            None,
+        )
+    if (
+        fetched.transport is None
+        or pushed.transport is None
+        or fetched.repository is None
+        or pushed.repository is None
+    ):
+        return (
+            OriginResult(
+                UNAVAILABLE, False, None, None, "unsupported_origin_topology"
+            ),
+            None,
+        )
+    if (
+        fetched.transport != pushed.transport
+        or fetched.repository.casefold() != pushed.repository.casefold()
+    ):
+        return (
+            OriginResult(UNAVAILABLE, False, None, None, "divergent_origin_push"),
+            None,
+        )
+    return (
+        OriginResult(
+            READY,
+            True,
+            fetched.transport,
+            fetched.repository,
+            "supported_origin",
+        ),
+        fetch_urls[0],
+    )
 
 
 def inspect_origin(
@@ -324,50 +443,11 @@ def inspect_origin(
     environ: Mapping[str, str] | None = None,
     runner: Runner = subprocess.run,
 ) -> OriginResult:
-    """Classify only the literal origin's effective fetch/push topology."""
+    """Classify only the literal origin's configured fetch/push topology."""
     root = Path(repo).resolve()
-    env = environ or os.environ
-    fetch = _remote_urls(root, push=False, environ=env, runner=runner)
-    if fetch.failure == "timeout" or _is_network_failure(fetch):
-        return OriginResult(UNVERIFIED, False, None, None, "origin_inspection_timed_out")
-    if fetch.failure or fetch.returncode != 0:
-        return OriginResult(UNAVAILABLE, False, None, None, "origin_missing")
-    fetch_urls = [line.strip() for line in fetch.stdout.splitlines() if line.strip()]
-    if len(fetch_urls) != 1:
-        return OriginResult(UNAVAILABLE, False, None, None, "multiple_origin_fetch_urls")
-
-    push = _remote_urls(root, push=True, environ=env, runner=runner)
-    if push.failure == "timeout" or _is_network_failure(push):
-        return OriginResult(UNVERIFIED, False, None, None, "origin_inspection_timed_out")
-    if push.failure or push.returncode != 0:
-        return OriginResult(UNAVAILABLE, False, None, None, "origin_push_unavailable")
-    push_urls = [line.strip() for line in push.stdout.splitlines() if line.strip()]
-    if len(push_urls) != 1:
-        return OriginResult(UNAVAILABLE, False, None, None, "multiple_origin_push_urls")
-
-    fetched = _parse_remote(fetch_urls[0])
-    pushed = _parse_remote(push_urls[0])
-    if not fetched.github and not pushed.github:
-        return OriginResult(UNAVAILABLE, False, None, None, "non_github_origin")
-    if (
-        fetched.transport is None
-        or pushed.transport is None
-        or fetched.repository is None
-        or pushed.repository is None
-    ):
-        return OriginResult(UNAVAILABLE, False, None, None, "unsupported_origin_topology")
-    if (
-        fetched.transport != pushed.transport
-        or fetched.repository.casefold() != pushed.repository.casefold()
-    ):
-        return OriginResult(UNAVAILABLE, False, None, None, "divergent_origin_push")
-    return OriginResult(
-        READY,
-        True,
-        fetched.transport,
-        fetched.repository,
-        "supported_origin",
-    )
+    env = os.environ if environ is None else environ
+    result, _fetch_url = _inspect_origin(root, environ=env, runner=runner)
+    return result
 
 
 def _capability(
@@ -528,6 +608,7 @@ def _select_api_token(
 
 def _probe_https_transport(
     root: Path,
+    remote_url: str,
     api: CapabilityResult,
     token: str | None,
     source: str | None,
@@ -551,7 +632,7 @@ def _probe_https_transport(
             "credential.https://github.com.helper=!gh auth git-credential",
             "ls-remote",
             "--symref",
-            "origin",
+            remote_url,
             "HEAD",
         ),
         cwd=root,
@@ -581,6 +662,7 @@ def _is_unix_socket(path: str) -> bool:
 
 def _probe_ssh_transport(
     root: Path,
+    remote_url: str,
     *,
     environ: Mapping[str, str],
     runner: Runner,
@@ -597,10 +679,16 @@ def _probe_ssh_transport(
     env = _clean_environment(environ)
     env["SSH_AUTH_SOCK"] = agent_socket
     identities = _run(("ssh-add", "-L"), cwd=root, env=env, runner=runner)
-    if identities.returncode != 0 or not identities.stdout.strip():
-        state = UNVERIFIED if identities.failure == "timeout" else UNAVAILABLE
-        reason = "ssh_agent_unverified" if state == UNVERIFIED else "ssh_agent_no_identities"
-        return _capability(state, reason=reason), None
+    if identities.failure == "timeout":
+        return _capability(UNVERIFIED, reason="ssh_agent_unverified"), None
+    if identities.failure == "tool_unavailable":
+        return _capability(UNAVAILABLE, reason="ssh_add_unavailable"), None
+    if identities.returncode != 0:
+        if "agent has no identities" in _failure_text(identities):
+            return _capability(UNAVAILABLE, reason="ssh_agent_no_identities"), None
+        return _capability(UNAVAILABLE, reason="ssh_agent_unreachable"), None
+    if not identities.stdout.strip():
+        return _capability(UNAVAILABLE, reason="ssh_agent_no_identities"), None
 
     identity = _run(
         (
@@ -634,7 +722,7 @@ def _probe_ssh_transport(
     git_env = dict(env)
     git_env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes"
     reach = _run(
-        ("git", "-C", str(root), "ls-remote", "--symref", "origin", "HEAD"),
+        ("git", "-C", str(root), "ls-remote", "--symref", remote_url, "HEAD"),
         cwd=root,
         env=git_env,
         runner=runner,
@@ -653,6 +741,8 @@ def _probe_ssh_transport(
         return _capability(UNVERIFIED, reason="network_unavailable"), None
     if _is_host_trust_failure(reach):
         return _capability(UNAVAILABLE, reason="ssh_host_trust_rejected"), None
+    if reach.failure == "tool_unavailable":
+        return _capability(UNAVAILABLE, reason="git_unavailable"), None
     return _capability(UNAVAILABLE, reason="repository_unreachable"), None
 
 
@@ -667,7 +757,7 @@ def discover_github_capabilities(
     """Resolve current host capabilities without mutating Git or auth state."""
     root = Path(repo).resolve()
     env = dict(os.environ if environ is None else environ)
-    origin = inspect_origin(root, environ=env, runner=runner)
+    origin, remote_url = _inspect_origin(root, environ=env, runner=runner)
     if origin.state != READY:
         git_result = _capability(origin.state, reason=origin.reason)
         api_state = UNVERIFIED if origin.state == UNVERIFIED else UNAVAILABLE
@@ -682,6 +772,7 @@ def discover_github_capabilities(
         )
 
     assert origin.repository is not None
+    assert remote_url is not None
     api_result, attempts, token, token_source = _select_api_token(
         root,
         origin.repository,
@@ -692,6 +783,7 @@ def discover_github_capabilities(
     if origin.transport == HTTPS:
         git_result = _probe_https_transport(
             root,
+            remote_url,
             api_result,
             token,
             token_source,
@@ -701,6 +793,7 @@ def discover_github_capabilities(
     else:
         git_result, ssh_socket = _probe_ssh_transport(
             root,
+            remote_url,
             environ=env,
             runner=runner,
             socket_checker=socket_checker,

@@ -67,10 +67,9 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
             "git",
             "-C",
             str(self.repo),
-            "remote",
-            "get-url",
-            "--all",
-            "origin",
+            "config",
+            "--get-all",
+            "remote.origin.url",
         )
 
     @property
@@ -79,11 +78,9 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
             "git",
             "-C",
             str(self.repo),
-            "remote",
-            "get-url",
-            "--push",
-            "--all",
-            "origin",
+            "config",
+            "--get-all",
+            "remote.origin.pushurl",
         )
 
     @property
@@ -98,7 +95,7 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
             "credential.https://github.com.helper=!gh auth git-credential",
             "ls-remote",
             "--symref",
-            "origin",
+            "https://github.com/Owner/Repo.git",
             "HEAD",
         )
 
@@ -110,13 +107,16 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
             str(self.repo),
             "ls-remote",
             "--symref",
-            "origin",
+            "git@github.com:Owner/Repo.git",
             "HEAD",
         )
 
     def add_origin(self, fetch: str, push: str | None = None) -> None:
         self.runner.add(self.fetch_command, stdout=f"{fetch}\n")
-        self.runner.add(self.push_command, stdout=f"{push or fetch}\n")
+        if push is None:
+            self.runner.add(self.push_command, returncode=1)
+        else:
+            self.runner.add(self.push_command, stdout=f"{push}\n")
 
     def add_token_success(self) -> None:
         self.runner.add(("gh", "api", "user", "--jq", ".login"), stdout="octocat\n")
@@ -244,6 +244,19 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
         self.assertFalse(result.runtime.diagnostic_dict()["gh_token_selected"])
         self.runner.assert_consumed(self)
 
+    def test_origin_topology_rejects_divergent_transport(self) -> None:
+        self.add_origin(
+            "git@github.com:Owner/Repo.git",
+            "https://github.com/Owner/Repo.git",
+        )
+
+        result = self.discover({"GH_TOKEN": "must-not-be-used"})
+
+        self.assertEqual("divergent_origin_push", result.origin.reason)
+        self.assertIsNone(result.origin.transport)
+        self.assertEqual((), result.credential_attempts)
+        self.runner.assert_consumed(self)
+
     def test_non_github_origin_skips_all_github_discovery(self) -> None:
         self.add_origin("git@gitlab.com:Owner/Repo.git")
 
@@ -279,6 +292,79 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
         self.assertEqual("ssh", result.transport)
         self.assertEqual("Owner/Repo", result.repository)
         self.runner.assert_consumed(self)
+
+    def test_raw_origin_and_probes_ignore_host_git_url_rewrites(self) -> None:
+        self.add_origin("git@github.com:Owner/Repo.git")
+        self.add_token_success()
+        self.runner.add(("ssh-add", "-L"), stdout="ssh-ed25519 AAAA test\n")
+        self.runner.add(
+            (
+                "ssh",
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "git@github.com",
+            ),
+            returncode=1,
+            stderr="Successfully authenticated, but GitHub does not provide shell access.\n",
+        )
+        self.runner.add(self.ssh_probe_command)
+
+        result = self.discover(
+            {
+                "SC_GH_TOKEN": "api-secret",
+                "SSH_AUTH_SOCK": "/run/agent.sock",
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "url.https://github.com/.insteadOf",
+                "GIT_CONFIG_VALUE_0": "git@github.com:",
+                "GIT_CONFIG_GLOBAL": "/host/global.gitconfig",
+                "GIT_CONFIG_SYSTEM": "/host/system.gitconfig",
+            },
+            socket_ok=True,
+        )
+
+        self.assertEqual("ssh", result.origin.transport)
+        self.assertEqual("ready", result.git_transport.state)
+        self.assertEqual("/run/agent.sock", result.runtime.ssh_auth_sock)
+        self.assertIn(self.ssh_probe_command, [command for command, _ in self.runner.calls])
+        for command, kwargs in self.runner.calls:
+            if command[0] != "git":
+                continue
+            environment = kwargs["env"]
+            self.assertEqual("/dev/null", environment["GIT_CONFIG_GLOBAL"])
+            self.assertEqual("/dev/null", environment["GIT_CONFIG_SYSTEM"])
+            self.assertNotIn("GIT_CONFIG_COUNT", environment)
+            self.assertNotIn("GIT_CONFIG_KEY_0", environment)
+            self.assertNotIn("GIT_CONFIG_VALUE_0", environment)
+        self.runner.assert_consumed(self)
+
+    def test_case_variant_github_scp_url_is_unsupported_not_non_github(self) -> None:
+        self.add_origin("Git@Github.com:Owner/Repo.git")
+
+        result = self.discover({})
+
+        self.assertEqual("unsupported_origin_topology", result.origin.reason)
+        self.assertEqual("unavailable", result.github_api.state)
+        self.runner.assert_consumed(self)
+
+    def test_unsupported_github_url_forms_do_not_trigger_auth(self) -> None:
+        unsupported = (
+            "ssh://git@github.com:2222/Owner/Repo.git",
+            "https://github.com/Owner/Repo.git?ref=main",
+            "https://operator@github.com/Owner/Repo.git",
+        )
+        for url in unsupported:
+            with self.subTest(url=url):
+                self.runner = FakeRunner()
+                self.add_origin(url)
+
+                result = self.discover({"SC_GH_TOKEN": "must-not-be-used"})
+
+                self.assertEqual("unsupported_origin_topology", result.origin.reason)
+                self.assertEqual((), result.credential_attempts)
+                self.runner.assert_consumed(self)
 
     def test_invalid_explicit_token_falls_through_to_isolated_standard_token(self) -> None:
         self.add_origin("https://github.com/Owner/Repo.git")
@@ -317,6 +403,64 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
         for environment in api_calls:
             self.assertNotIn("SC_GH_TOKEN", environment)
             self.assertNotIn("GITHUB_TOKEN", environment)
+        self.runner.assert_consumed(self)
+
+    def test_github_token_is_selected_when_it_is_the_only_environment_candidate(self) -> None:
+        self.add_origin("https://github.com/Owner/Repo.git")
+        self.add_token_success()
+        self.runner.add(self.https_probe_command)
+
+        result = self.discover({"GITHUB_TOKEN": "github-only-secret"})
+
+        self.assertEqual("github_token", result.github_api.source)
+        self.assertEqual("github-only-secret", result.runtime.gh_token)
+        self.assertEqual(
+            [github.CredentialAttempt("github_token", "ready", "repository_read_verified")],
+            list(result.credential_attempts),
+        )
+        self.runner.assert_consumed(self)
+
+    def test_empty_and_whitespace_token_variables_are_absent(self) -> None:
+        self.add_origin("https://github.com/Owner/Repo.git")
+        self.runner.add(
+            ("gh", "auth", "token", "--hostname", "github.com"),
+            returncode=1,
+            stderr="not logged in",
+        )
+
+        result = self.discover(
+            {"SC_GH_TOKEN": "", "GH_TOKEN": "   ", "GITHUB_TOKEN": "\t"}
+        )
+
+        self.assertEqual("unavailable", result.github_api.state)
+        self.assertEqual("no_credential_candidate", result.github_api.reason)
+        self.assertEqual(
+            [github.CredentialAttempt("gh_oauth", "unavailable", "stored_oauth_unavailable")],
+            list(result.credential_attempts),
+        )
+        self.assertFalse(
+            any(command[:3] == ("gh", "api", "user") for command, _ in self.runner.calls)
+        )
+        self.runner.assert_consumed(self)
+
+    def test_repository_identity_mismatch_rejects_candidate(self) -> None:
+        self.add_origin("https://github.com/Owner/Repo.git")
+        self.runner.add(("gh", "api", "user", "--jq", ".login"), stdout="octocat\n")
+        self.runner.add(
+            ("gh", "api", "repos/Owner/Repo", "--jq", ".full_name"),
+            stdout="Owner/Different\n",
+        )
+        self.runner.add(
+            ("gh", "auth", "token", "--hostname", "github.com"),
+            returncode=1,
+            stderr="not logged in",
+        )
+
+        result = self.discover({"SC_GH_TOKEN": "wrong-repository-secret"})
+
+        self.assertEqual("repository_identity_mismatch", result.credential_attempts[0].reason)
+        self.assertEqual("unavailable", result.github_api.state)
+        self.assertIsNone(result.runtime.gh_token)
         self.runner.assert_consumed(self)
 
     def test_repository_denial_falls_through_to_stored_oauth(self) -> None:
@@ -406,6 +550,109 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
         self.assertEqual("unverified", result.git_transport.state)
         self.assertEqual("network_unavailable", result.git_transport.reason)
         self.assertEqual("valid-secret", result.runtime.gh_token)
+        self.runner.assert_consumed(self)
+
+    def test_ssh_host_trust_mismatch_is_distinguishable(self) -> None:
+        self.add_origin("git@github.com:Owner/Repo.git")
+        self.add_token_success()
+        self.runner.add(("ssh-add", "-L"), stdout="ssh-ed25519 AAAA test\n")
+        self.runner.add(
+            (
+                "ssh",
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "git@github.com",
+            ),
+            returncode=255,
+            stderr="Host key verification failed.",
+        )
+
+        result = self.discover(
+            {"SC_GH_TOKEN": "api-secret", "SSH_AUTH_SOCK": "/run/agent.sock"},
+            socket_ok=True,
+        )
+
+        self.assertEqual("ssh_host_trust_rejected", result.git_transport.reason)
+        self.assertEqual("ready", result.github_api.state)
+        self.assertIsNone(result.runtime.ssh_auth_sock)
+        self.runner.assert_consumed(self)
+
+    def test_missing_git_has_a_precise_reason(self) -> None:
+        self.runner.add_exception(self.fetch_command, FileNotFoundError("git"))
+
+        result = self.discover({})
+
+        self.assertEqual("git_unavailable", result.origin.reason)
+        self.assertEqual("git_unavailable", result.git_transport.reason)
+        self.runner.assert_consumed(self)
+
+    def test_missing_ssh_add_has_a_precise_reason(self) -> None:
+        self.add_origin("git@github.com:Owner/Repo.git")
+        self.add_token_success()
+        self.runner.add_exception(("ssh-add", "-L"), FileNotFoundError("ssh-add"))
+
+        result = self.discover(
+            {"SC_GH_TOKEN": "api-secret", "SSH_AUTH_SOCK": "/run/agent.sock"},
+            socket_ok=True,
+        )
+
+        self.assertEqual("ssh_add_unavailable", result.git_transport.reason)
+        self.assertIsNone(result.runtime.ssh_auth_sock)
+        self.runner.assert_consumed(self)
+
+    def test_dead_agent_is_not_classified_as_empty_agent(self) -> None:
+        self.add_origin("git@github.com:Owner/Repo.git")
+        self.add_token_success()
+        self.runner.add(
+            ("ssh-add", "-L"),
+            returncode=2,
+            stderr="Could not open a connection to your authentication agent.",
+        )
+
+        result = self.discover(
+            {"SC_GH_TOKEN": "api-secret", "SSH_AUTH_SOCK": "/run/agent.sock"},
+            socket_ok=True,
+        )
+
+        self.assertEqual("ssh_agent_unreachable", result.git_transport.reason)
+        self.assertNotEqual("ssh_agent_no_identities", result.git_transport.reason)
+        self.runner.assert_consumed(self)
+
+    def test_agent_without_identities_is_distinct_from_dead_agent(self) -> None:
+        self.add_origin("git@github.com:Owner/Repo.git")
+        self.add_token_success()
+        self.runner.add(
+            ("ssh-add", "-L"),
+            returncode=1,
+            stderr="The agent has no identities.",
+        )
+
+        result = self.discover(
+            {"SC_GH_TOKEN": "api-secret", "SSH_AUTH_SOCK": "/run/agent.sock"},
+            socket_ok=True,
+        )
+
+        self.assertEqual("ssh_agent_no_identities", result.git_transport.reason)
+        self.assertNotEqual("ssh_agent_unreachable", result.git_transport.reason)
+        self.runner.assert_consumed(self)
+
+    def test_empty_environment_does_not_fall_back_to_ambient_values(self) -> None:
+        self.add_origin("https://github.com/Owner/Repo.git")
+
+        with mock.patch.dict(
+            "os.environ",
+            {"SC_GH_TOKEN": "ambient-secret", "GIT_CONFIG_COUNT": "99"},
+            clear=True,
+        ):
+            result = github.inspect_origin(self.repo, environ={}, runner=self.runner)
+
+        self.assertEqual("ready", result.state)
+        for _command, kwargs in self.runner.calls:
+            self.assertNotIn("SC_GH_TOKEN", kwargs["env"])
+            self.assertNotIn("GIT_CONFIG_COUNT", kwargs["env"])
         self.runner.assert_consumed(self)
 
     def test_diagnostic_schema_and_representations_are_secret_free(self) -> None:
