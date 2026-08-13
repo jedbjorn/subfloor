@@ -2,19 +2,23 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import stat
 import subprocess
 import sys
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 AGENT_TARGET = "/run/super-coder/ssh-agent"
 AUTH_ARGUMENTS_MARKER = "SC_GITHUB_AUTH_ARGS"
+IMAGE_KNOWN_HOSTS = "/etc/ssh/ssh_known_hosts"
+TRUST_LABEL = "sc.github_host_trust_sha256"
+PINNED_KNOWN_HOSTS = Path(__file__).resolve().parents[1] / "assets" / "github_known_hosts"
 _CLEARED_HOST_VARIABLES = ("GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK")
 _NUMERIC_ID = re.compile(r"\A[0-9]+\Z")
 _SAFE_DIAGNOSTIC = re.compile(r"\A[a-z0-9_]+\Z")
@@ -162,6 +166,108 @@ class ParsedDiscovery:
     credential_attempts: tuple[tuple[str, str], ...] = ()
 
 
+@dataclass(frozen=True)
+class ImageTrustResult:
+    state: str
+    reason: str
+
+
+def _pinned_trust_digest(path: str | Path) -> str | None:
+    try:
+        value = Path(path).read_bytes()
+    except OSError:
+        return None
+    if not value.strip():
+        return None
+    return hashlib.sha256(value).hexdigest()
+
+
+def verify_selected_image_trust(
+    image: str,
+    *,
+    pinned_known_hosts: str | Path = PINNED_KNOWN_HOSTS,
+    runner: Any = subprocess.run,
+) -> ImageTrustResult:
+    """Verify the exact selected image carries the current tracked trust bytes."""
+    expected = _pinned_trust_digest(pinned_known_hosts)
+    if expected is None:
+        return ImageTrustResult("unavailable", "ssh_pinned_trust_missing")
+    try:
+        inspected = runner(
+            (
+                "docker",
+                "image",
+                "inspect",
+                image,
+                "--format",
+                f'{{{{index .Config.Labels "{TRUST_LABEL}"}}}}',
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return ImageTrustResult("unverified", "ssh_selected_image_trust_unverified")
+    if inspected.returncode != 0:
+        return ImageTrustResult("unverified", "ssh_selected_image_trust_unverified")
+    label = str(inspected.stdout or "").strip()
+    if not label or label == "<no value>":
+        return ImageTrustResult("unavailable", "ssh_selected_image_trust_missing")
+    if label != expected:
+        return ImageTrustResult("unavailable", "ssh_selected_image_trust_stale")
+
+    try:
+        checked = runner(
+            (
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--entrypoint",
+                "sha256sum",
+                image,
+                IMAGE_KNOWN_HOSTS,
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return ImageTrustResult("unverified", "ssh_selected_image_trust_unverified")
+    if checked.returncode != 0:
+        failure = f"{checked.stderr or ''}\n{checked.stdout or ''}".lower()
+        reason = (
+            "ssh_selected_image_trust_missing"
+            if "no such file" in failure
+            else "ssh_selected_image_trust_mismatch"
+        )
+        return ImageTrustResult("unavailable", reason)
+    output = str(checked.stdout or "").strip().split(maxsplit=1)
+    actual = output[0].lower() if output else ""
+    if actual != expected:
+        return ImageTrustResult("unavailable", "ssh_selected_image_trust_mismatch")
+    return ImageTrustResult("ready", "ssh_selected_image_trust_verified")
+
+
+def enforce_selected_image_trust(
+    discovery: ParsedDiscovery,
+    trust: ImageTrustResult,
+) -> ParsedDiscovery:
+    if (
+        discovery.origin_transport != "ssh"
+        or discovery.git_transport_state != "ready"
+        or trust.state == "ready"
+    ):
+        return discovery
+    return replace(
+        discovery,
+        validated_agent_socket=None,
+        git_transport_state=trust.state,
+        git_transport_reason=trust.reason,
+    )
+
+
 def _optional_state(value: Mapping[str, object], name: str) -> str | None:
     state = value.get(name)
     if state is None:
@@ -250,7 +356,7 @@ def _source_label(source: str | None) -> str:
         "gh_token": "host GH_TOKEN",
         "github_token": "host GITHUB_TOKEN",
         "gh_oauth": "host gh OAuth",
-    }.get(source, "validated host credential")
+    }.get(source or "", "validated host credential")
 
 
 def _capability_line(
@@ -276,12 +382,10 @@ def render_capability_summary(
     """Render only safe, current-lifecycle capability evidence and remedies."""
     origin_reason = getattr(discovery, "origin_reason", None)
     if origin_reason == "non_github_origin":
-        return "\n".join(
-            (
-                "→ GitHub capabilities refreshed for this launch",
-                "  skipped — origin is not a supported github.com repository; "
-                "no GitHub token or SSH agent was forwarded",
-            )
+        return (
+            "→ GitHub capabilities refreshed for this launch\n"
+            "  skipped — origin is not a supported github.com repository; "
+            "no GitHub token or SSH agent was forwarded"
         )
 
     git_state = getattr(discovery, "git_transport_state", None)
@@ -381,7 +485,14 @@ def render_capability_summary(
                 "  host remedy (Git): start a live ssh-agent with a GitHub identity "
                 "that can read origin, then run ./sc launch or ./sc restart"
             )
-        elif git_state != "ready" and git_reason == "ssh_host_trust_rejected":
+        elif git_state != "ready" and git_reason in {
+            "ssh_host_trust_rejected",
+            "ssh_pinned_trust_missing",
+            "ssh_selected_image_trust_missing",
+            "ssh_selected_image_trust_mismatch",
+            "ssh_selected_image_trust_stale",
+            "ssh_selected_image_trust_unverified",
+        }:
             lines.append(
                 "  host remedy (Git): update the engine-pinned GitHub host keys and "
                 "rebuild with ./sc launch; --no-build retains current trust"
@@ -411,24 +522,41 @@ def launch_with_discovery(
     discovery: RuntimeSelection,
     command: list[str],
     *,
+    image: str,
     rootless: bool,
     uid: int,
     gid: int,
     environ: Mapping[str, str],
     runner: Any = subprocess.run,
+    trust_runner: Any = subprocess.run,
+    pinned_known_hosts: str | Path = PINNED_KNOWN_HOSTS,
     summary_writer: Callable[[str], None] | None = None,
 ) -> int:
     """Run the launch command with auth inserted only at its explicit marker."""
     if command.count(AUTH_ARGUMENTS_MARKER) != 1:
         raise ValueError("launch command must contain one auth argument marker")
+    selected = discovery
+    if (
+        isinstance(discovery, ParsedDiscovery)
+        and discovery.origin_transport == "ssh"
+        and discovery.git_transport_state == "ready"
+    ):
+        selected = enforce_selected_image_trust(
+            discovery,
+            verify_selected_image_trust(
+                image,
+                pinned_known_hosts=pinned_known_hosts,
+                runner=trust_runner,
+            ),
+        )
     runtime = build_runtime_arguments(
-        discovery,
+        selected,
         rootless=rootless,
         uid=uid,
         gid=gid,
     )
     if summary_writer is not None:
-        summary_writer(render_capability_summary(discovery, runtime))
+        summary_writer(render_capability_summary(selected, runtime))
     marker = command.index(AUTH_ARGUMENTS_MARKER)
     argv = command[:marker] + list(runtime.docker_args) + command[marker + 1 :]
     completed = runner(argv, env=runtime.host_environment(environ), check=False)
@@ -440,6 +568,7 @@ def _parser() -> argparse.ArgumentParser:
         description="Apply validated GitHub discovery to one sandbox launch"
     )
     parser.add_argument("--rootless", action="store_true")
+    parser.add_argument("--image", required=True)
     parser.add_argument("--uid", type=int, required=True)
     parser.add_argument("--gid", type=int, required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -458,6 +587,7 @@ def main(argv: list[str] | None = None) -> int:
         return launch_with_discovery(
             discovery,
             command,
+            image=args.image,
             rootless=args.rootless,
             uid=args.uid,
             gid=args.gid,

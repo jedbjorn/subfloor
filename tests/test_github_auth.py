@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -111,6 +112,25 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
             "HEAD",
         )
 
+    @property
+    def pinned_ssh_arguments(self) -> tuple[str, ...]:
+        return (
+            "-F",
+            os.devnull,
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            f"GlobalKnownHostsFile={github.PINNED_KNOWN_HOSTS}",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+        )
+
+    @property
+    def ssh_identity_command(self) -> tuple[str, ...]:
+        return ("ssh", "-T", *self.pinned_ssh_arguments, "git@github.com")
+
     def add_origin(self, fetch: str, push: str | None = None) -> None:
         self.runner.add(self.fetch_command, stdout=f"{fetch}\n")
         if push is None:
@@ -130,12 +150,14 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
         environ: dict[str, str],
         *,
         socket_ok: bool = False,
+        known_hosts_path: Path = github.PINNED_KNOWN_HOSTS,
     ) -> github.DiscoveryResult:
         return github.discover_github_capabilities(
             self.repo,
             environ={"PATH": "/usr/bin", "HOME": "/host/home", **environ},
             runner=self.runner,
             socket_checker=lambda value: socket_ok and value == "/run/agent.sock",
+            known_hosts_path=known_hosts_path,
             now=self.now,
         )
 
@@ -148,15 +170,7 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
         )
         self.runner.add(("ssh-add", "-L"), stdout="ssh-ed25519 AAAA test\n")
         self.runner.add(
-            (
-                "ssh",
-                "-T",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=yes",
-                "git@github.com",
-            ),
+            self.ssh_identity_command,
             returncode=1,
             stderr="Hi operator! You've successfully authenticated, but GitHub does not provide shell access.\n",
         )
@@ -298,15 +312,7 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
         self.add_token_success()
         self.runner.add(("ssh-add", "-L"), stdout="ssh-ed25519 AAAA test\n")
         self.runner.add(
-            (
-                "ssh",
-                "-T",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=yes",
-                "git@github.com",
-            ),
+            self.ssh_identity_command,
             returncode=1,
             stderr="Successfully authenticated, but GitHub does not provide shell access.\n",
         )
@@ -321,6 +327,8 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
                 "GIT_CONFIG_VALUE_0": "git@github.com:",
                 "GIT_CONFIG_GLOBAL": "/host/global.gitconfig",
                 "GIT_CONFIG_SYSTEM": "/host/system.gitconfig",
+                "GIT_SSH_COMMAND": "ssh -o StrictHostKeyChecking=no",
+                "GIT_SSH_VARIANT": "plink",
             },
             socket_ok=True,
         )
@@ -329,6 +337,22 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
         self.assertEqual("ready", result.git_transport.state)
         self.assertEqual("/run/agent.sock", result.runtime.ssh_auth_sock)
         self.assertIn(self.ssh_probe_command, [command for command, _ in self.runner.calls])
+        identity_call = next(
+            command for command, _ in self.runner.calls if command[:2] == ("ssh", "-T")
+        )
+        self.assertEqual(identity_call, self.ssh_identity_command)
+        git_probe_env = next(
+            kwargs["env"]
+            for command, kwargs in self.runner.calls
+            if command == self.ssh_probe_command
+        )
+        self.assertIn("-F /dev/null", git_probe_env["GIT_SSH_COMMAND"])
+        self.assertIn(
+            f"GlobalKnownHostsFile={github.PINNED_KNOWN_HOSTS}",
+            git_probe_env["GIT_SSH_COMMAND"],
+        )
+        self.assertNotIn("StrictHostKeyChecking=no", git_probe_env["GIT_SSH_COMMAND"])
+        self.assertNotIn("GIT_SSH_VARIANT", git_probe_env)
         for command, kwargs in self.runner.calls:
             if command[0] != "git":
                 continue
@@ -338,6 +362,24 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
             self.assertNotIn("GIT_CONFIG_COUNT", environment)
             self.assertNotIn("GIT_CONFIG_KEY_0", environment)
             self.assertNotIn("GIT_CONFIG_VALUE_0", environment)
+        self.runner.assert_consumed(self)
+
+    def test_missing_engine_pinned_trust_blocks_ssh_without_touching_api(self) -> None:
+        self.add_origin("git@github.com:Owner/Repo.git")
+        self.add_token_success()
+        self.runner.add(("ssh-add", "-L"), stdout="ssh-ed25519 AAAA test\n")
+
+        result = self.discover(
+            {"SC_GH_TOKEN": "api-secret", "SSH_AUTH_SOCK": "/run/agent.sock"},
+            socket_ok=True,
+            known_hosts_path=self.repo / "missing-known-hosts",
+        )
+
+        self.assertEqual("unavailable", result.git_transport.state)
+        self.assertEqual("ssh_pinned_trust_missing", result.git_transport.reason)
+        self.assertIsNone(result.runtime.ssh_auth_sock)
+        self.assertEqual("ready", result.github_api.state)
+        self.assertEqual("api-secret", result.runtime.gh_token)
         self.runner.assert_consumed(self)
 
     def test_case_variant_github_scp_url_is_unsupported_not_non_github(self) -> None:
@@ -592,15 +634,7 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
         self.add_token_success()
         self.runner.add(("ssh-add", "-L"), stdout="ssh-ed25519 AAAA test\n")
         self.runner.add(
-            (
-                "ssh",
-                "-T",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=yes",
-                "git@github.com",
-            ),
+            self.ssh_identity_command,
             returncode=255,
             stderr="Host key verification failed.",
         )
@@ -695,15 +729,7 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
         self.add_token_success()
         self.runner.add(("ssh-add", "-L"), stdout="ssh-ed25519 VERY-SECRET-PUBLIC-MATERIAL\n")
         self.runner.add(
-            (
-                "ssh",
-                "-T",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "StrictHostKeyChecking=yes",
-                "git@github.com",
-            ),
+            self.ssh_identity_command,
             returncode=1,
             stderr="Hi secret-user! You've successfully authenticated, but GitHub does not provide shell access.\n",
         )

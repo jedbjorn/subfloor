@@ -11,7 +11,8 @@ import tempfile
 import unittest
 from itertools import pairwise
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "maintainer" / "sandbox_auth_conformance.py"
@@ -186,6 +187,7 @@ class SandboxAuthCanaryContractTest(unittest.TestCase):
                 "insufficient_push_access",
                 "offline",
                 "strict_host_trust",
+                "selected_image_trust",
                 "rootless_agent_access",
                 "rootful_agent_access",
                 "relaunch_refresh",
@@ -293,6 +295,41 @@ class SandboxAuthCanaryContractTest(unittest.TestCase):
             result["ownership_model"],
             "uid_matched_container_via_operator_owned_unix_relay",
         )
+
+    def test_selected_image_canary_verifies_current_and_rejects_stale(self) -> None:
+        backend = self.make_backend()
+        backend.workspace.mkdir()
+        ledger = canary.Ledger(image="disposable-image")
+        receipt = Mock()
+        verified = SimpleNamespace(
+            state="ready", reason="ssh_selected_image_trust_verified"
+        )
+        stale = SimpleNamespace(
+            state="unavailable", reason="ssh_selected_image_trust_missing"
+        )
+
+        with (
+            patch.object(
+                backend.sandbox_auth,
+                "verify_selected_image_trust",
+                side_effect=(verified, stale),
+            ) as verify,
+            patch.object(
+                backend,
+                "_docker",
+                return_value=canary.CommandResult(0, "", ""),
+            ) as docker,
+        ):
+            result = backend._selected_image_trust(ledger, receipt)
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["selected_image"], "verified")
+        self.assertEqual(result["stale_image"], "rejected")
+        self.assertEqual(result["stale_reason"], "ssh_selected_image_trust_missing")
+        self.assertEqual(verify.call_count, 2)
+        self.assertEqual(ledger.stale_image, "subfloor-auth-canary-stale:auth-test-001")
+        receipt.checkpoint.assert_called_once_with(ledger)
+        self.assertIn("build", docker.call_args.args)
 
     def test_denied_target_branch_is_cleaned_even_after_rejected_delete(self) -> None:
         backend = self.make_backend()

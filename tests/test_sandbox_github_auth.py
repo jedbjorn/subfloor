@@ -17,15 +17,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / ".super-coder" / "Dockerfile"
 DISPATCH = ROOT / ".super-coder" / "scripts" / "dispatch.sh"
+TRUST_FILE = ROOT / ".super-coder" / "assets" / "github_known_hosts"
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 
 from sandbox_github_auth import (
     AGENT_TARGET,
     AUTH_ARGUMENTS_MARKER,
+    IMAGE_KNOWN_HOSTS,
+    TRUST_LABEL,
+    ImageTrustResult,
     build_runtime_arguments,
+    enforce_selected_image_trust,
     launch_with_discovery,
     parse_discovery,
     render_capability_summary,
+    verify_selected_image_trust,
 )
 
 
@@ -40,6 +46,7 @@ class SandboxGitHubImageTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.dockerfile = DOCKERFILE.read_text()
+        cls.known_hosts = TRUST_FILE.read_text()
 
     def test_image_installs_ssh_without_private_key_material(self) -> None:
         install = re.search(
@@ -60,8 +67,9 @@ class SandboxGitHubImageTest(unittest.TestCase):
             "ssh-rsa": "SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s=",
         }
         lines = re.findall(
-            r"'github\.com (ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa) ([A-Za-z0-9+/=]+)'",
-            self.dockerfile,
+            r"^github\.com (ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa) ([A-Za-z0-9+/=]+)$",
+            self.known_hosts,
+            re.MULTILINE,
         )
         self.assertEqual({kind for kind, _ in lines}, set(expected))
         actual = {
@@ -80,6 +88,8 @@ class SandboxGitHubImageTest(unittest.TestCase):
             "GlobalKnownHostsFile /etc/ssh/ssh_known_hosts", self.dockerfile
         )
         self.assertIn("UserKnownHostsFile /dev/null", self.dockerfile)
+        self.assertIn("SC_GITHUB_HOST_TRUST_B64", self.dockerfile)
+        self.assertIn(f'LABEL {TRUST_LABEL}=', self.dockerfile)
         self.assertNotRegex(
             self.dockerfile,
             r"StrictHostKeyChecking(?:=|\s+)(?:no|accept-new)",
@@ -113,6 +123,7 @@ class SandboxGitHubLaunchSourceTest(unittest.TestCase):
             launch.index('"$S/github_auth.py" discover'),
         )
         self.assertIn('"$S/sandbox_github_auth.py" $github_auth_rootless', launch)
+        self.assertIn('--image "$IMG"', launch)
         self.assertEqual(launch.count(AUTH_ARGUMENTS_MARKER), 1)
         self.assertNotIn('GH_TOKEN="$gh_token"', launch)
         self.assertNotRegex(launch, r"-e\s+GH_TOKEN=")
@@ -127,6 +138,118 @@ class SandboxGitHubLaunchSourceTest(unittest.TestCase):
             "--no-build  reuse the image but still refresh host GitHub capabilities",
             restart,
         )
+
+
+class SelectedImageTrustTest(unittest.TestCase):
+    def runner(
+        self,
+        *,
+        label: str | None,
+        actual: str | None,
+    ):
+        calls: list[tuple[str, ...]] = []
+
+        def run(command, *, check, capture_output, text):
+            self.assertFalse(check)
+            self.assertTrue(capture_output)
+            self.assertTrue(text)
+            command = tuple(command)
+            calls.append(command)
+            if command[:3] == ("docker", "image", "inspect"):
+                value = "<no value>" if label is None else label
+                return subprocess.CompletedProcess(command, 0, value + "\n", "")
+            self.assertEqual(
+                command,
+                (
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--network",
+                    "none",
+                    "--entrypoint",
+                    "sha256sum",
+                    "selected-image",
+                    IMAGE_KNOWN_HOSTS,
+                ),
+            )
+            if actual is None:
+                return subprocess.CompletedProcess(command, 1, "", "No such file")
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                f"{actual}  {IMAGE_KNOWN_HOSTS}\n",
+                "",
+            )
+
+        return run, calls
+
+    def test_exact_selected_image_trust_is_verified(self) -> None:
+        digest = hashlib.sha256(TRUST_FILE.read_bytes()).hexdigest()
+        runner, calls = self.runner(label=digest, actual=digest)
+
+        result = verify_selected_image_trust("selected-image", runner=runner)
+
+        self.assertEqual(result.state, "ready")
+        self.assertEqual(result.reason, "ssh_selected_image_trust_verified")
+        self.assertEqual(len(calls), 2)
+
+    def test_missing_stale_and_mismatched_image_trust_are_distinct(self) -> None:
+        digest = hashlib.sha256(TRUST_FILE.read_bytes()).hexdigest()
+        cases = (
+            (None, digest, "ssh_selected_image_trust_missing", 1),
+            ("0" * 64, digest, "ssh_selected_image_trust_stale", 1),
+            (digest, None, "ssh_selected_image_trust_missing", 2),
+            (digest, "", "ssh_selected_image_trust_mismatch", 2),
+            (digest, "f" * 64, "ssh_selected_image_trust_mismatch", 2),
+        )
+        for label, actual, reason, call_count in cases:
+            with self.subTest(reason=reason, calls=call_count):
+                runner, calls = self.runner(label=label, actual=actual)
+                result = verify_selected_image_trust(
+                    "selected-image", runner=runner
+                )
+                self.assertEqual(result.state, "unavailable")
+                self.assertEqual(result.reason, reason)
+                self.assertEqual(len(calls), call_count)
+
+    def test_stale_image_degrades_only_ssh_and_blocks_agent_forwarding(self) -> None:
+        discovery = parse_discovery(
+            json.dumps(
+                {
+                    "origin_transport": "ssh",
+                    "validated_agent_socket": "/host/agent.sock",
+                    "validated_selected_token": "api-token",
+                    "origin_state": "ready",
+                    "origin_reason": "supported_origin",
+                    "git_transport_state": "ready",
+                    "git_transport_reason": "repository_read_verified",
+                    "github_api_state": "ready",
+                    "github_api_reason": "repository_read_verified",
+                    "selected_token_source": "gh_oauth",
+                }
+            )
+        )
+
+        selected = enforce_selected_image_trust(
+            discovery,
+            ImageTrustResult("unavailable", "ssh_selected_image_trust_stale"),
+        )
+
+        self.assertEqual(selected.git_transport_state, "unavailable")
+        self.assertEqual(
+            selected.git_transport_reason, "ssh_selected_image_trust_stale"
+        )
+        self.assertIsNone(selected.validated_agent_socket)
+        self.assertEqual(selected.validated_selected_token, "api-token")
+        runtime = build_runtime_arguments(
+            selected, rootless=False, uid=1000, gid=1000
+        )
+        self.assertFalse(runtime.agent_forwarded)
+        self.assertTrue(runtime.token_injected)
+        summary = render_capability_summary(selected, runtime)
+        self.assertIn("selected image trust stale", summary)
+        self.assertIn("rebuild with ./sc launch", summary)
+        self.assertIn("GitHub API: ready", summary)
 
 
 class SandboxGitHubRuntimeArgumentsTest(unittest.TestCase):
@@ -271,6 +394,7 @@ class SandboxGitHubRuntimeArgumentsTest(unittest.TestCase):
         status = launch_with_discovery(
             self.discovery(token=secret, agent=str(self.socket_path)),
             ["launcher", "before", AUTH_ARGUMENTS_MARKER, "after"],
+            image="selected-image",
             rootless=False,
             uid=1234,
             gid=5678,
@@ -302,6 +426,7 @@ class SandboxGitHubRuntimeArgumentsTest(unittest.TestCase):
         launch_with_discovery(
             first,
             command,
+            image="selected-image",
             rootless=False,
             uid=1234,
             gid=5678,
@@ -311,6 +436,7 @@ class SandboxGitHubRuntimeArgumentsTest(unittest.TestCase):
         launch_with_discovery(
             second,
             command,
+            image="selected-image",
             rootless=False,
             uid=1234,
             gid=5678,
@@ -326,6 +452,54 @@ class SandboxGitHubRuntimeArgumentsTest(unittest.TestCase):
             all("GITHUB_TOKEN" not in environment for environment in observed)
         )
         self.assertNotIn("first-selected-token", observed[1].values())
+
+    def test_stale_selected_image_launch_keeps_api_and_omits_agent_mount(self) -> None:
+        discovery = parse_discovery(
+            json.dumps(
+                {
+                    "origin_transport": "ssh",
+                    "validated_agent_socket": str(self.socket_path),
+                    "validated_selected_token": "api-token",
+                    "origin_state": "ready",
+                    "origin_reason": "supported_origin",
+                    "git_transport_state": "ready",
+                    "git_transport_reason": "repository_read_verified",
+                    "github_api_state": "ready",
+                    "github_api_reason": "repository_read_verified",
+                    "selected_token_source": "gh_oauth",
+                }
+            )
+        )
+        observed: dict[str, object] = {}
+        summaries: list[str] = []
+
+        def trust_run(command, *, check, capture_output, text):
+            return subprocess.CompletedProcess(command, 0, "0" * 64 + "\n", "")
+
+        def launch_run(argv, *, env, check):
+            observed["argv"] = argv
+            observed["env"] = env
+            return subprocess.CompletedProcess(argv, 0)
+
+        status = launch_with_discovery(
+            discovery,
+            ["launcher", AUTH_ARGUMENTS_MARKER, "selected-image"],
+            image="selected-image",
+            rootless=False,
+            uid=1000,
+            gid=1000,
+            environ={},
+            runner=launch_run,
+            trust_runner=trust_run,
+            summary_writer=summaries.append,
+        )
+
+        self.assertEqual(status, 0)
+        self.assertNotIn("--mount", observed["argv"])
+        self.assertEqual(observed["env"].get("GH_TOKEN"), "api-token")
+        self.assertIn("Git transport: unavailable", summaries[0])
+        self.assertIn("GitHub API: ready", summaries[0])
+        self.assertIn("rebuild with ./sc launch", summaries[0])
 
 
 class SandboxGitHubCapabilitySummaryTest(unittest.TestCase):

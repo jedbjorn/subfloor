@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import dataclasses
 import datetime as dt
+import hashlib
 import importlib.util
 import json
 import os
@@ -45,8 +46,9 @@ SSH_SUCCESS = re.compile(
     r"successfully authenticated.*does not provide shell access", re.IGNORECASE
 )
 GITHUB_KEYS = re.compile(
-    r"'github\.com (ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa) "
-    r"([A-Za-z0-9+/=]+)'"
+    r"^github\.com (ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa) "
+    r"([A-Za-z0-9+/=]+)$",
+    re.MULTILINE,
 )
 REQUIRED_MATRIX = frozenset(
     {
@@ -58,6 +60,7 @@ REQUIRED_MATRIX = frozenset(
         "insufficient_push_access",
         "offline",
         "strict_host_trust",
+        "selected_image_trust",
         "rootless_agent_access",
         "rootful_agent_access",
         "relaunch_refresh",
@@ -98,6 +101,7 @@ class Config:
 @dataclasses.dataclass
 class Ledger:
     image: str | None = None
+    stale_image: str | None = None
     agent_pid: int | None = None
     agent_socket: str | None = None
     dind_container: str | None = None
@@ -329,6 +333,9 @@ class HostBackend:
         self.github_auth = _load_module(
             scripts / "github_auth.py", "canary_github_auth"
         )
+        self.sandbox_auth = _load_module(
+            scripts / "sandbox_github_auth.py", "canary_sandbox_github_auth"
+        )
         self.github_login: str | None = None
 
     def _run(
@@ -451,6 +458,7 @@ class HostBackend:
                 stage="preflight",
             )
         image = f"subfloor-auth-canary:{config.run_id}"
+        stale_image = f"subfloor-auth-canary-stale:{config.run_id}"
         dind = f"subfloor-auth-dind-{config.run_id}"
         image_collision = self._docker(
             "image", "inspect", image, stage="image collision preflight", check=False
@@ -459,6 +467,19 @@ class HostBackend:
             raise CanaryError(
                 "CANARY_COLLISION",
                 "the disposable image tag already exists",
+                stage="preflight",
+            )
+        stale_collision = self._docker(
+            "image",
+            "inspect",
+            stale_image,
+            stage="stale image collision preflight",
+            check=False,
+        )
+        if stale_collision.returncode == 0:
+            raise CanaryError(
+                "CANARY_COLLISION",
+                "the disposable stale image tag already exists",
                 stage="preflight",
             )
         dind_collision = self._docker(
@@ -511,8 +532,14 @@ class HostBackend:
         return token, candidate
 
     def _build_image(self, ledger: Ledger, receipt: Receipt) -> None:
-        source = (self.config.source_repo / ".super-coder" / "Dockerfile").read_text()
-        keys = GITHUB_KEYS.findall(source)
+        trust_path = (
+            self.config.source_repo
+            / ".super-coder"
+            / "assets"
+            / "github_known_hosts"
+        )
+        trust_bytes = trust_path.read_bytes()
+        keys = GITHUB_KEYS.findall(trust_bytes.decode("ascii"))
         if {kind for kind, _key in keys} != {
             "ssh-ed25519",
             "ecdsa-sha2-nistp256",
@@ -520,18 +547,21 @@ class HostBackend:
         }:
             raise CanaryError(
                 "CANARY_SOURCE_INVALID",
-                "Dockerfile does not contain the exact three pinned GitHub key types",
+                "tracked trust does not contain the exact three pinned GitHub key types",
                 stage="build image",
             )
         context = self.workspace / "image"
         context.mkdir()
-        key_arguments = " ".join(f"'github.com {kind} {key}'" for kind, key in keys)
+        (context / "github_known_hosts").write_bytes(trust_bytes)
+        trust_digest = hashlib.sha256(trust_bytes).hexdigest()
         dockerfile = f"""FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends git gh openssh-client ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN install -d -m 0755 /etc/ssh/ssh_config.d && printf '%s\\n' {key_arguments} > /etc/ssh/ssh_known_hosts && chmod 0644 /etc/ssh/ssh_known_hosts && printf '%s\\n' 'Host github.com' '    StrictHostKeyChecking yes' '    GlobalKnownHostsFile /etc/ssh/ssh_known_hosts' '    UserKnownHostsFile /dev/null' > /etc/ssh/ssh_config.d/99-super-coder-github.conf
+COPY github_known_hosts /etc/ssh/ssh_known_hosts
+RUN install -d -m 0755 /etc/ssh/ssh_config.d && chmod 0644 /etc/ssh/ssh_known_hosts && printf '%s\\n' 'Host github.com' '    StrictHostKeyChecking yes' '    GlobalKnownHostsFile /etc/ssh/ssh_known_hosts' '    UserKnownHostsFile /dev/null' > /etc/ssh/ssh_config.d/99-super-coder-github.conf
 RUN git config --system credential.helper '' && git config --system credential.https://github.com.helper '!gh auth git-credential'
 RUN if ! getent group {os.getgid()} >/dev/null; then groupadd -g {os.getgid()} authcanary; fi && useradd -m -u {os.getuid()} -g {os.getgid()} -s /bin/sh authcanary
 ENV GIT_TERMINAL_PROMPT=0
+LABEL sc.github_host_trust_sha256="{trust_digest}"
 """
         (context / "Dockerfile").write_text(dockerfile)
         image = f"subfloor-auth-canary:{self.config.run_id}"
@@ -569,10 +599,16 @@ ENV GIT_TERMINAL_PROMPT=0
             (
                 "ssh",
                 "-T",
+                "-F",
+                os.devnull,
                 "-o",
                 "BatchMode=yes",
                 "-o",
                 "StrictHostKeyChecking=yes",
+                "-o",
+                f"GlobalKnownHostsFile={self.config.source_repo / '.super-coder' / 'assets' / 'github_known_hosts'}",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
                 "git@github.com",
             ),
             env=environment,
@@ -787,6 +823,74 @@ ENV GIT_TERMINAL_PROMPT=0
                 stage="strict host trust",
             )
         return {"status": "passed", "known_host": "accepted", "empty_trust": "rejected"}
+
+    def _selected_image_trust(
+        self, ledger: Ledger, receipt: Receipt
+    ) -> dict[str, Any]:
+        assert ledger.image
+
+        def trust_runner(command, *, check, capture_output, text):
+            result = self._run(
+                command, stage="selected image trust", check=False
+            )
+            return subprocess.CompletedProcess(
+                command, result.returncode, result.stdout, result.stderr
+            )
+
+        current = self.sandbox_auth.verify_selected_image_trust(
+            ledger.image,
+            pinned_known_hosts=(
+                self.config.source_repo
+                / ".super-coder"
+                / "assets"
+                / "github_known_hosts"
+            ),
+            runner=trust_runner,
+        )
+        if current.state != "ready":
+            raise CanaryError(
+                "CANARY_CONTAINER_FAILED",
+                "selected image trust did not verify",
+                stage="selected image trust",
+            )
+
+        stale_context = self.workspace / "stale-image"
+        stale_context.mkdir()
+        (stale_context / "Dockerfile").write_text(
+            f"FROM {ledger.image}\n"
+            f"LABEL {self.sandbox_auth.TRUST_LABEL}=",
+        )
+        ledger.stale_image = f"subfloor-auth-canary-stale:{self.config.run_id}"
+        receipt.checkpoint(ledger)
+        self._docker(
+            "build",
+            "--tag",
+            ledger.stale_image,
+            str(stale_context),
+            stage="build stale auth canary image",
+        )
+        stale = self.sandbox_auth.verify_selected_image_trust(
+            ledger.stale_image,
+            pinned_known_hosts=(
+                self.config.source_repo
+                / ".super-coder"
+                / "assets"
+                / "github_known_hosts"
+            ),
+            runner=trust_runner,
+        )
+        if stale.reason != "ssh_selected_image_trust_missing":
+            raise CanaryError(
+                "CANARY_CONTAINER_FAILED",
+                "stale selected image trust was not rejected",
+                stage="selected image trust",
+            )
+        return {
+            "status": "passed",
+            "selected_image": "verified",
+            "stale_image": "rejected",
+            "stale_reason": stale.reason,
+        }
 
     def _offline(self, token: str, ledger: Ledger) -> dict[str, Any]:
         assert ledger.image
@@ -1294,6 +1398,9 @@ ENV GIT_TERMINAL_PROMPT=0
             "user": "0:0",
         }
         matrix["strict_host_trust"] = self._strict_trust(ledger)
+        matrix["selected_image_trust"] = self._selected_image_trust(
+            ledger, receipt
+        )
         matrix["offline"] = self._offline(token, ledger)
         self._start_rootful_dind(ledger, receipt)
         matrix["rootful_agent_access"] = self._rootful_agent(ledger)
@@ -1405,6 +1512,20 @@ ENV GIT_TERMINAL_PROMPT=0
             )
             if result.returncode == 0:
                 ledger.dind_container = None
+        if ledger.stale_image:
+            result = self._docker(
+                "image",
+                "rm",
+                "--force",
+                ledger.stale_image,
+                stage="cleanup stale image",
+                check=False,
+            )
+            actions.append(
+                {"resource": "stale_canary_image", "removed": result.returncode == 0}
+            )
+            if result.returncode == 0:
+                ledger.stale_image = None
         if ledger.image:
             result = self._docker(
                 "image",
@@ -1522,6 +1643,7 @@ def run(config: Config, *, backend: Backend | None = None) -> dict[str, Any]:
             and not ledger.pull_requests
             and ledger.dind_container is None
             and ledger.image is None
+            and ledger.stale_image is None
             and ledger.agent_pid is None
         )
         receipt.data["resources"] = dataclasses.asdict(ledger)
