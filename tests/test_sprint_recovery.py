@@ -1430,6 +1430,133 @@ class SprintRecoveryCase(SprintPRWatcherCase):
             )["reason"],
         )
 
+    def test_resume_requeues_linked_reply_interrupted_by_required_pause(self):
+        blocker = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=1,
+            to_shortname="PLN1",
+            body="Released work must be recalled before replanning.",
+            idempotency_key="participant-send:pause-blocker",
+            intent="blocker",
+            requires_reply=True,
+            work_unit_id=self.unit_id,
+        )
+        self.deliver_wake_with_turn(int(blocker.wake_id), terminal=True)
+        self.assertIsNone(self.messages.mark_read(blocker.message_id, 3))
+        reply = self.messages.relay(
+            self.sprint_id,
+            from_shell_id=3,
+            to_shortname="DEV1",
+            body="Acknowledged; pausing before the recall and replan.",
+            idempotency_key="participant-send:pause-acknowledgement",
+            intent="information",
+            reply_to_message_id=blocker.message_id,
+        )
+        _, wake_key = self.deliver_wake_with_turn(
+            int(reply.wake_id),
+            terminal=False,
+        )
+        trigger_message_id = int(
+            self.con.execute(
+                "SELECT message_id FROM conversation_messages "
+                "WHERE idempotency_key=?",
+                (wake_key,),
+            ).fetchone()[0]
+        )
+        self.con.execute(
+            "UPDATE conversation_messages SET state='running' WHERE message_id=?",
+            (trigger_message_id,),
+        )
+        run_id = int(
+            self.con.execute(
+                "INSERT INTO conversation_runs "
+                "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                "lease_expires_at,started_at,heartbeat_at) "
+                "VALUES (?,1,?,'running','test-broker','2999-01-01 00:00:00',"
+                "'2026-08-01 00:00:00','2026-08-01 00:00:00')",
+                (self.developer_conversation_id, trigger_message_id),
+            ).lastrowid
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='running' WHERE conversation_id=?",
+            (self.developer_conversation_id,),
+        )
+        self.con.commit()
+
+        pause = self.coordinator().pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="required restructuring pause",
+        )
+        self.assertEqual((run_id,), pause.interrupt_run_ids)
+        self.con.execute(
+            "UPDATE conversation_runs SET state='cancelled',ended_at=datetime('now') "
+            "WHERE run_id=?",
+            (run_id,),
+        )
+        self.con.execute(
+            "UPDATE conversation_messages SET state='cancelled',"
+            "completed_at=datetime('now') WHERE message_id=?",
+            (trigger_message_id,),
+        )
+        self.con.execute(
+            "UPDATE conversations SET state='idle' WHERE conversation_id=?",
+            (self.developer_conversation_id,),
+        )
+        self.con.commit()
+
+        resumed = self.coordinator().resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="replan complete",
+        )
+
+        self.assertTrue(resumed.changed)
+        self.assertEqual(1, len(resumed.requeued_wake_ids))
+        replacement_wake_id = resumed.requeued_wake_ids[0]
+        self.assertEqual(
+            (
+                "armed",
+                blocker.message_id,
+                reply.message_id,
+                blocker.message_id,
+                replacement_wake_id,
+                "pending",
+                None,
+            ),
+            tuple(
+                self.con.execute(
+                    "SELECT s.lifecycle,original.message_id,reply.message_id,"
+                    "reply.reply_to_message_id,wm.wake_id,w.state,reply.delivered_at "
+                    "FROM sprints s JOIN wake_message original "
+                    "ON original.message_id=? JOIN wake_message reply "
+                    "ON reply.message_id=? JOIN sprint_wake_messages wm "
+                    "ON wm.message_id=reply.message_id JOIN sprint_wake_outbox w "
+                    "ON w.wake_id=wm.wake_id WHERE s.sprint_id=?",
+                    (blocker.message_id, reply.message_id, self.sprint_id),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            [(reply.wake_id, replacement_wake_id, reply.message_id)],
+            [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT prior_wake_id,replacement_wake_id,message_id "
+                    "FROM sprint_wake_recovery_messages WHERE sprint_id=?",
+                    (self.sprint_id,),
+                )
+            ],
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='wake.pickup_exhausted'",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+
     def test_resume_resets_exhausted_pickup_as_one_fresh_bounded_episode(self):
         first = self.send(
             "resume-exhausted-first",
