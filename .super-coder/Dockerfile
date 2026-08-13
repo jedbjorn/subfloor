@@ -29,12 +29,36 @@ ARG SC_UID=1000
 ARG SC_GID=1000
 
 # sqlite3 CLI + git + curl + bash + ca-certs (installers pipe-to-bash over https).
+# openssh-client is transport-only: runtime may forward a validated agent socket,
+# but no private key or host ~/.ssh tree is copied into the image.
 # ripgrep (rg) — the fast code search shells reach for when working a repo; the
 # mapping flow and a shell grepping its tree both expect `rg` on PATH.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      sqlite3 git curl bash ca-certificates ripgrep \
+      sqlite3 git curl bash ca-certificates ripgrep openssh-client \
  && rm -rf /var/lib/apt/lists/*
+
+# GitHub host trust is image-owned and pinned to GitHub's published host keys.
+# The build context is deliberately empty, so keep the tracked key material in
+# this Dockerfile. A key rotation ships as a reviewed source change + rebuilt
+# image; --no-build intentionally retains the keys from its selected image.
+# UserKnownHostsFile=/dev/null prevents an ad-hoc per-user acceptance from
+# widening this host-specific policy. Strict checking never prompts or falls
+# back to trust-on-first-use.
+RUN install -d -m 0755 /etc/ssh/ssh_config.d \
+ && printf '%s\n' \
+      'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
+      'github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=' \
+      'github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=' \
+      > /etc/ssh/ssh_known_hosts \
+ && chmod 0644 /etc/ssh/ssh_known_hosts \
+ && printf '%s\n' \
+      'Host github.com' \
+      '    StrictHostKeyChecking yes' \
+      '    GlobalKnownHostsFile /etc/ssh/ssh_known_hosts' \
+      '    UserKnownHostsFile /dev/null' \
+      > /etc/ssh/ssh_config.d/99-super-coder-github.conf \
+ && chmod 0644 /etc/ssh/ssh_config.d/99-super-coder-github.conf
 
 # websockets 16.1.1 (BSD-3-Clause) — the sans-io WS layer for the one-port
 # HTTP+WS transport (api/transport.py; WS upgrades currently answer
@@ -192,17 +216,13 @@ RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
 # says so when the image predates the stored epoch (i.e. a build is owed).
 LABEL sc.harness_epoch="${SC_HARNESS_EPOCH}"
 
-# Safe in-container git auth — structurally prevents a token in a URL. The
-# sandbox has no ssh, so `git@github.com:` remotes (e.g. a fork's default
-# origin) fail and tempt a `https://x-access-token:$TOK@github.com/...` fallback
-# that leaks the token to logs / `push -u` upstream output. Two configs close
-# that: (1) rewrite GitHub SSH remotes to HTTPS so plain `git push origin`
-# works; (2) hand credentials to git via `gh`, which serves them from the
-# runtime GH_TOKEN on demand — never on the command line, never in a URL. With
-# this, `git push origin <branch>` and `gh pr create` need zero manual token
-# handling; absent a token they fail closed (no prompt-loop, no leak).
-RUN git config --global url."https://github.com/".insteadOf "git@github.com:" \
- && git config --global credential."https://github.com".helper "!gh auth git-credential"
+# Safe in-container HTTPS auth — `gh` serves the validated runtime GH_TOKEN to
+# Git without putting it in a remote URL, Git config, or process argv. Missing
+# credentials fail promptly rather than opening a terminal prompt. SSH remotes
+# are deliberately not rewritten: the repository's configured transport is an
+# operator choice and remains byte-for-byte unchanged.
+ENV GIT_TERMINAL_PROMPT=0
+RUN git config --global credential."https://github.com".helper "!gh auth git-credential"
 
 WORKDIR /home/${SC_USER}/super-coder
 
