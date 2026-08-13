@@ -8,9 +8,12 @@ projection plus a separately redacted runtime selection for launch code.
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import stat
 import subprocess
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -156,6 +159,27 @@ class DiscoveryResult:
             "runtime": self.runtime.diagnostic_dict(),
         }
 
+    def output_dict(self) -> dict[str, object]:
+        """Return the confidential machine schema captured by launch code."""
+        return {
+            "schema_version": self.schema_version,
+            "observed_at": self.observed_at,
+            "origin_transport": self.origin.transport,
+            "validated_agent_socket": self.runtime.ssh_auth_sock,
+            "validated_selected_token": self.runtime.gh_token,
+            "origin_repository": self.origin.repository,
+            "origin_state": self.origin.state,
+            "origin_reason": self.origin.reason,
+            "git_transport_state": self.git_transport.state,
+            "git_transport_reason": self.git_transport.reason,
+            "github_api_state": self.github_api.state,
+            "github_api_reason": self.github_api.reason,
+            "selected_token_source": self.runtime.token_source,
+            "credential_attempts": [
+                asdict(attempt) for attempt in self.credential_attempts
+            ],
+        }
+
 
 @dataclass(frozen=True)
 class _CommandResult:
@@ -257,8 +281,11 @@ def _parse_remote(url: str) -> _ParsedRemote:
             reason="supported_origin" if repository else "unsupported_github_url",
         )
 
-    parsed = urlsplit(value)
-    host = (parsed.hostname or "").lower()
+    try:
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return _ParsedRemote(True, None, None, "unsupported_github_url")
     if host != "github.com":
         return _ParsedRemote(False, None, None, "non_github_origin")
     try:
@@ -427,14 +454,14 @@ def _select_api_token(
     runner: Runner,
 ) -> tuple[CapabilityResult, tuple[CredentialAttempt, ...], str | None, str | None]:
     candidates = [
-        ("sc_gh_token", environ.get("SC_GH_TOKEN", "").strip()),
-        ("gh_token", environ.get("GH_TOKEN", "").strip()),
-        ("github_token", environ.get("GITHUB_TOKEN", "").strip()),
+        ("sc_gh_token", environ.get("SC_GH_TOKEN", "")),
+        ("gh_token", environ.get("GH_TOKEN", "")),
+        ("github_token", environ.get("GITHUB_TOKEN", "")),
     ]
     attempts: list[CredentialAttempt] = []
     probed_candidate = False
     for source, token in candidates:
-        if not token:
+        if not token.strip():
             continue
         probed_candidate = True
         attempt = _probe_token(
@@ -559,9 +586,11 @@ def _probe_ssh_transport(
     runner: Runner,
     socket_checker: SocketChecker,
 ) -> tuple[CapabilityResult, str | None]:
-    agent_socket = environ.get("SSH_AUTH_SOCK", "").strip()
-    if not agent_socket:
+    agent_socket = environ.get("SSH_AUTH_SOCK", "")
+    if not agent_socket.strip():
         return _capability(UNAVAILABLE, reason="ssh_agent_missing"), None
+    if not Path(agent_socket).is_absolute():
+        return _capability(UNAVAILABLE, reason="ssh_agent_socket_invalid"), None
     if not socket_checker(agent_socket):
         return _capability(UNAVAILABLE, reason="ssh_agent_socket_invalid"), None
 
@@ -689,3 +718,32 @@ def discover_github_capabilities(
             ssh_auth_sock=ssh_socket,
         ),
     )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="github_auth.py",
+        description="Discover host GitHub capabilities for one repository origin.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    discover = commands.add_parser("discover")
+    discover.add_argument("--repo-root", required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.command != "discover":
+        return 2
+    try:
+        result = discover_github_capabilities(args.repo_root)
+    except Exception:  # noqa: BLE001 - CLI boundary emits no exception secrets
+        print("github auth discovery: internal fault", file=sys.stderr)
+        return 1
+    json.dump(result.output_dict(), sys.stdout, sort_keys=True, separators=(",", ":"))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,7 +1,7 @@
 """Focused host-side GitHub capability-discovery coverage."""
 
-from __future__ import annotations
-
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -10,11 +10,12 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 
-import github_capabilities as github
+import github_auth as github
 
 
 class FakeRunner:
@@ -185,6 +186,34 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
         self.assertEqual("sc_gh_token", result.github_api.source)
         self.assertEqual("api-secret", result.runtime.gh_token)
         self.assertIsNone(result.runtime.ssh_auth_sock)
+        self.runner.assert_consumed(self)
+
+    def test_validated_token_value_is_returned_exactly(self) -> None:
+        self.add_origin("https://github.com/Owner/Repo.git")
+        self.add_token_success()
+        self.runner.add(self.https_probe_command)
+        exact = " token-value-preserved "
+
+        result = self.discover({"SC_GH_TOKEN": exact})
+
+        self.assertEqual(exact, result.runtime.gh_token)
+        probe_env = next(
+            kwargs["env"]
+            for command, kwargs in self.runner.calls
+            if command[:3] == ("gh", "api", "user")
+        )
+        self.assertEqual(exact, probe_env["GH_TOKEN"])
+        self.runner.assert_consumed(self)
+
+    def test_relative_agent_socket_is_never_selected(self) -> None:
+        self.add_origin("git@github.com:Owner/Repo.git")
+        self.add_token_success()
+
+        result = self.discover({"SC_GH_TOKEN": "api-secret", "SSH_AUTH_SOCK": "agent.sock"})
+
+        self.assertEqual("ssh_agent_socket_invalid", result.git_transport.reason)
+        self.assertIsNone(result.runtime.ssh_auth_sock)
+        self.assertEqual("api-secret", result.runtime.gh_token)
         self.runner.assert_consumed(self)
 
     def test_origin_topology_rejects_multiple_fetch_urls_without_auth_probes(self) -> None:
@@ -461,6 +490,131 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
         self.assertEqual("top-secret-token", result.runtime.gh_token)
         self.assertEqual("2026-08-13T18:30:00+00:00", result.observed_at)
         self.runner.assert_consumed(self)
+
+
+class GitHubAuthCliTest(unittest.TestCase):
+    def result(
+        self,
+        *,
+        git_state: str = "ready",
+        api_state: str = "ready",
+    ) -> github.DiscoveryResult:
+        return github.DiscoveryResult(
+            observed_at="2026-08-13T18:30:00+00:00",
+            origin=github.OriginResult(
+                state="ready",
+                applies_to_github=True,
+                transport="ssh",
+                repository="Owner/Repo",
+                reason="supported_origin",
+            ),
+            git_transport=github.CapabilityResult(
+                state=git_state,
+                mechanism="ssh_agent" if git_state == "ready" else None,
+                source="ssh_auth_sock" if git_state == "ready" else None,
+                reason=(
+                    "repository_read_verified"
+                    if git_state == "ready"
+                    else "network_unavailable"
+                ),
+                repository_read=git_state == "ready",
+                mutation_authority=(
+                    "unverified" if git_state == "ready" else "not_claimed"
+                ),
+            ),
+            github_api=github.CapabilityResult(
+                state=api_state,
+                mechanism="token" if api_state == "ready" else None,
+                source="sc_gh_token" if api_state == "ready" else None,
+                reason=(
+                    "repository_read_verified"
+                    if api_state == "ready"
+                    else "no_credential_candidate"
+                ),
+                repository_read=api_state == "ready",
+                mutation_authority=(
+                    "unverified" if api_state == "ready" else "not_claimed"
+                ),
+            ),
+            credential_attempts=(
+                github.CredentialAttempt(
+                    "sc_gh_token", "ready", "repository_read_verified"
+                ),
+            ),
+            runtime=github.RuntimeSelection(
+                gh_token="validated-secret",
+                token_source="sc_gh_token",
+                ssh_auth_sock="/host/agent.sock",
+            ),
+        )
+
+    def invoke(self, result: github.DiscoveryResult) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                github, "discover_github_capabilities", return_value=result
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            status = github.main(
+                ["discover", "--repo-root", "/checkout/that/need/not/exist"]
+            )
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_discover_emits_one_json_object_with_stable_consumer_fields(self) -> None:
+        status, stdout, stderr = self.invoke(self.result())
+
+        self.assertEqual(0, status)
+        self.assertEqual("", stderr)
+        self.assertEqual(1, len(stdout.splitlines()))
+        payload = json.loads(stdout)
+        self.assertEqual("ssh", payload["origin_transport"])
+        self.assertEqual("/host/agent.sock", payload["validated_agent_socket"])
+        self.assertEqual("validated-secret", payload["validated_selected_token"])
+        self.assertEqual("ready", payload["git_transport_state"])
+        self.assertEqual("ready", payload["github_api_state"])
+
+    def test_unavailable_and_unverified_states_are_successful_results(self) -> None:
+        status, stdout, stderr = self.invoke(
+            self.result(git_state="unverified", api_state="unavailable")
+        )
+
+        self.assertEqual(0, status)
+        self.assertEqual("", stderr)
+        payload = json.loads(stdout)
+        self.assertEqual("unverified", payload["git_transport_state"])
+        self.assertEqual("unavailable", payload["github_api_state"])
+
+    def test_internal_fault_is_nonzero_and_secret_free(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                github,
+                "discover_github_capabilities",
+                side_effect=RuntimeError("fault carried top-secret-token"),
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            status = github.main(["discover", "--repo-root", "/checkout"])
+
+        self.assertEqual(1, status)
+        self.assertEqual("", stdout.getvalue())
+        self.assertEqual("github auth discovery: internal fault\n", stderr.getvalue())
+        self.assertNotIn("top-secret-token", stderr.getvalue())
+
+    def test_malformed_invocation_is_nonzero(self) -> None:
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            github.main(["discover"])
+        self.assertEqual(2, raised.exception.code)
+        self.assertIn("--repo-root", stderr.getvalue())
 
 
 if __name__ == "__main__":
