@@ -299,6 +299,24 @@ def _container_auth_args(
     return tuple(arguments)
 
 
+def _ssh_failure_category(result: CommandResult) -> str:
+    output = f"{result.stdout}\n{result.stderr}".casefold()
+    categories = (
+        ("no user exists for uid", "container_user_missing"),
+        ("host key verification failed", "host_trust_rejected"),
+        ("error connecting to agent", "agent_unreachable"),
+        ("permission denied", "permission_denied"),
+        ("bind source path does not exist", "socket_mount_missing"),
+        ("invalid mount config", "socket_mount_invalid"),
+        ("network is unreachable", "network_unavailable"),
+        ("could not resolve hostname", "network_unavailable"),
+    )
+    return next(
+        (category for marker, category in categories if marker in output),
+        f"unexpected_exit_{result.returncode}",
+    )
+
+
 class HostBackend:
     def __init__(self, config: Config, workspace: Path) -> None:
         self.config = config
@@ -891,7 +909,8 @@ ENV GIT_TERMINAL_PROMPT=0
         ):
             raise CanaryError(
                 "CANARY_CONTAINER_FAILED",
-                "rootful daemon container user could not use the agent",
+                "rootful daemon container user could not use the agent: "
+                f"{_ssh_failure_category(result)}",
                 stage="rootful agent",
             )
         return {"status": "passed", "daemon": "rootful_dind", "user": f"{os.getuid()}:{os.getgid()}"}

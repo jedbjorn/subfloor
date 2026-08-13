@@ -195,6 +195,19 @@ class SandboxAuthCanaryContractTest(unittest.TestCase):
         self.assertNotIn("GH_TOKEN", arguments)
         self.assertNotIn("SSH_AUTH_SOCK", arguments)
 
+    def test_ssh_failure_category_is_bounded_and_secret_free(self) -> None:
+        secret = "github_pat_not-retained"
+        result = canary.CommandResult(
+            255,
+            "",
+            f"ssh: error connecting to agent; token={secret}",
+        )
+
+        category = canary._ssh_failure_category(result)
+
+        self.assertEqual(category, "agent_unreachable")
+        self.assertNotIn(secret, category)
+
     def test_redaction_covers_token_shapes_and_sensitive_mapping_keys(self) -> None:
         token = "gho_abcdefghijklmnopqrstuvwxyz"
         value = canary._safe_result(
