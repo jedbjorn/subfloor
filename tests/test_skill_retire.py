@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -27,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 import seed_skills
 import skill as skill_cli
+import render_check
 
 ENGINE_SKILLS = ("test_authoring", "review", "git")
 
@@ -260,6 +262,43 @@ class RetireTest(unittest.TestCase):
         skill_cli.cmd_retire(self.con, "test_authoring")
         with self.assertRaises(SystemExit):
             skill_cli.resolve_skill(self.con, "test_authoring")
+
+
+class RenderCheckRetirementTest(unittest.TestCase):
+    def test_hermetic_build_applies_retire_list_after_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            schema = root / "schema.sql"
+            content = root / "content.sql"
+            retired = root / "skills_retired.json"
+            db = root / "hermetic.db"
+            schema.write_text(
+                "CREATE TABLE skills (skill_id INTEGER PRIMARY KEY, "
+                "name TEXT NOT NULL UNIQUE, description TEXT, category TEXT, "
+                "content TEXT, command TEXT, common INTEGER NOT NULL DEFAULT 1, "
+                "is_deleted INTEGER NOT NULL DEFAULT 0);"
+            )
+            content.write_text(SEED_SQL)
+            retired.write_text(json.dumps(["test_authoring"]))
+
+            with (
+                mock.patch.object(render_check, "SCHEMA", schema),
+                mock.patch.object(render_check, "CONTENT", content),
+                mock.patch.object(
+                    render_check, "CONTENT_LEGACY", root / "missing.sql"
+                ),
+                mock.patch.object(render_check.migrate_mod, "migrate"),
+                mock.patch.object(seed_skills, "RETIRED_FILE", retired),
+                mock.patch.object(seed_skills, "OUT", content),
+            ):
+                render_check._build_tracked_db(db)
+
+            with closing(sqlite3.connect(db)) as con:
+                rows = con.execute(
+                    "SELECT name, is_deleted FROM skills "
+                    "WHERE name IN ('review', 'test_authoring') ORDER BY name"
+                ).fetchall()
+            self.assertEqual(rows, [("review", 0), ("test_authoring", 1)])
 
 
 class SkillCliConnectionTest(unittest.TestCase):
