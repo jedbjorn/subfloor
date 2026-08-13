@@ -514,6 +514,41 @@ class GitHubCapabilityDiscoveryTest(unittest.TestCase):
         self.assertEqual("api_credential_not_ready", result.git_transport.reason)
         self.runner.assert_consumed(self)
 
+    def test_github_cli_offline_wording_is_unverified_not_rejected(self) -> None:
+        self.add_origin("https://github.com/Owner/Repo.git")
+        self.runner.add(
+            ("gh", "api", "user", "--jq", ".login"),
+            returncode=1,
+            stderr=(
+                "error connecting to api.github.com\n"
+                "check your internet connection or https://githubstatus.com"
+            ),
+        )
+        self.runner.add(
+            ("gh", "auth", "token", "--hostname", "github.com"),
+            returncode=1,
+            stderr="not logged in",
+        )
+
+        result = self.discover({"SC_GH_TOKEN": "offline-secret"})
+
+        self.assertEqual("unverified", result.github_api.state)
+        self.assertEqual("credential_validation_unverified", result.github_api.reason)
+        self.assertEqual("unverified", result.git_transport.state)
+        self.assertEqual("api_credential_not_ready", result.git_transport.reason)
+        self.assertEqual(
+            [
+                github.CredentialAttempt(
+                    "sc_gh_token", "unverified", "network_unavailable"
+                ),
+                github.CredentialAttempt(
+                    "gh_oauth", "unavailable", "stored_oauth_unavailable"
+                ),
+            ],
+            list(result.credential_attempts),
+        )
+        self.runner.assert_consumed(self)
+
     def test_rejected_credentials_are_unavailable_not_unverified(self) -> None:
         self.add_origin("https://github.com/Owner/Repo.git")
         self.runner.add(

@@ -44,6 +44,7 @@ _NETWORK_MARKERS = (
     "connection reset",
     "connection timed out",
     "failed to connect",
+    "error connecting to api.github.com",
     "network is unreachable",
     "no route to host",
     "operation timed out",
