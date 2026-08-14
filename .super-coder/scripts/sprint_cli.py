@@ -227,6 +227,7 @@ def cmd_complete_unit(args: argparse.Namespace) -> int:
             "work_unit_id": args.work_unit,
             "result": _text(args.result_file, "completion result"),
         },
+        idempotent=True,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0

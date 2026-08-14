@@ -546,11 +546,25 @@ class DispatchGateTest(SprintWorkDispatchCase):
         )
         self.assertEqual("active", self.dispositions()[0][1])
 
-        released = self.units.complete(
+        receipt = self.units.complete(
             self.sprint_id, first, 1, result="Durable non-code result"
         )
 
-        self.assertEqual(2, len(released))
+        self.assertEqual(self.sprint_id, receipt.sprint_id)
+        self.assertEqual(first, receipt.work_unit_id)
+        self.assertEqual("completed", receipt.disposition)
+        self.assertEqual("no_code", receipt.output_kind)
+        self.assertEqual(23, receipt.stored_result_length)
+        self.assertEqual(
+            hashlib.sha256(b"Durable non-code result").hexdigest(),
+            receipt.stored_result_sha256,
+        )
+        self.assertTrue(receipt.completed_at)
+        self.assertTrue(receipt.changed)
+        self.assertFalse(receipt.idempotent)
+        self.assertEqual(2, len(receipt.wake_ids))
+        self.assertEqual(receipt.wake_ids, receipt.created_wake_ids)
+        self.assertEqual((), receipt.reused_wake_ids)
         self.assertEqual(
             [(first, "completed"), (same_shell, "ready"), (blocked, "ready")],
             self.dispositions(),
@@ -603,24 +617,199 @@ class DispatchGateTest(SprintWorkDispatchCase):
             ).fetchone()[0]
         )
 
-        self.assertEqual(
-            [],
-            self.units.complete(
-                self.sprint_id, report, 4, result="Published conformance report #77"
-            ),
+        receipt = self.units.complete(
+            self.sprint_id, report, 4, result="Published conformance report #77"
         )
+        self.assertEqual((), receipt.wake_ids)
+        self.assertTrue(receipt.changed)
+        self.assertFalse(receipt.idempotent)
         row = self.con.execute(
-            "SELECT disposition,completion_result FROM sprint_work_units "
+            "SELECT disposition,completion_result,completed_at FROM sprint_work_units "
             "WHERE work_unit_id=?",
             (report,),
         ).fetchone()
-        self.assertEqual(("completed", "Published conformance report #77"), tuple(row))
+        self.assertEqual(
+            ("completed", "Published conformance report #77", receipt.completed_at),
+            tuple(row),
+        )
         event = self.con.execute(
             "SELECT payload FROM sprint_events WHERE event_type='work_unit.completed' "
             "AND actor_shell_id=4"
         ).fetchone()
+        event_payload = json.loads(event[0])
         self.assertEqual(
-            "Published conformance report #77", json.loads(event[0])["result"]
+            {
+                "output_kind": "report_only",
+                "stored_result_length": 32,
+                "stored_result_sha256": hashlib.sha256(
+                    b"Published conformance report #77"
+                ).hexdigest(),
+                "wake_ids": [],
+                "work_unit_id": report,
+            },
+            event_payload,
+        )
+        self.assertNotIn("Published conformance report #77", json.dumps(receipt.__dict__))
+
+        counts_before_retry = tuple(
+            self.con.execute(
+                "SELECT "
+                "(SELECT COUNT(*) FROM sprint_events),"
+                "(SELECT COUNT(*) FROM wake_message),"
+                "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+            ).fetchone()
+        )
+        retry = self.units.complete(
+            self.sprint_id, report, 4, result="Published conformance report #77"
+        )
+        self.assertFalse(retry.changed)
+        self.assertTrue(retry.idempotent)
+        self.assertEqual(receipt.completed_at, retry.completed_at)
+        self.assertEqual(receipt.stored_result_sha256, retry.stored_result_sha256)
+        self.assertEqual((), retry.created_wake_ids)
+        self.assertEqual(receipt.wake_ids, retry.reused_wake_ids)
+        self.assertEqual(
+            counts_before_retry,
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events),"
+                    "(SELECT COUNT(*) FROM wake_message),"
+                    "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+                ).fetchone()
+            ),
+        )
+
+    def test_completion_receipt_tracks_created_and_retry_reused_terminal_wake(self):
+        report = self.create_unit(developer=1, output_kind="report_only")
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        self.deliver_pending_wakes()
+        self.messages.mark_read(self.assignment_message(report), 1)
+
+        receipt = self.units.complete(
+            self.sprint_id, report, 1, result="Terminal report"
+        )
+
+        self.assertEqual(1, len(receipt.wake_ids))
+        self.assertEqual(receipt.wake_ids, receipt.created_wake_ids)
+        self.assertEqual((), receipt.reused_wake_ids)
+        counts = tuple(
+            self.con.execute(
+                "SELECT "
+                "(SELECT COUNT(*) FROM sprint_events),"
+                "(SELECT COUNT(*) FROM wake_message),"
+                "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+            ).fetchone()
+        )
+
+        retry = self.units.complete(
+            self.sprint_id, report, 1, result="Terminal report"
+        )
+
+        self.assertFalse(retry.changed)
+        self.assertTrue(retry.idempotent)
+        self.assertEqual(receipt.wake_ids, retry.wake_ids)
+        self.assertEqual((), retry.created_wake_ids)
+        self.assertEqual(receipt.wake_ids, retry.reused_wake_ids)
+        self.assertEqual(
+            counts,
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events),"
+                    "(SELECT COUNT(*) FROM wake_message),"
+                    "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+                ).fetchone()
+            ),
+        )
+
+    def test_completion_receipt_identifies_coalesced_terminal_wake_as_reused(self):
+        report = self.create_unit(developer=1, output_kind="report_only")
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        self.deliver_pending_wakes()
+        self.messages.mark_read(self.assignment_message(report), 1)
+        reviewer = int(
+            self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=2",
+                (self.sprint_id,),
+            ).fetchone()[0]
+        )
+        pending = self.messages.send(
+            self.sprint_id,
+            to_participant_id=reviewer,
+            message_kind="notification",
+            body="Already pending",
+            idempotency_key="existing-reviewer-wake",
+        )
+        self.assertIsNotNone(pending.wake_id)
+
+        receipt = self.units.complete(
+            self.sprint_id, report, 1, result="Coalesced report"
+        )
+
+        self.assertEqual((), receipt.created_wake_ids)
+        self.assertEqual((pending.wake_id,), receipt.reused_wake_ids)
+        self.assertEqual((pending.wake_id,), receipt.wake_ids)
+        self.assertEqual(
+            2,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_wake_messages WHERE wake_id=?",
+                (pending.wake_id,),
+            ).fetchone()[0],
+        )
+
+    def test_completion_failure_rolls_back_report_transition_event_and_wake(self):
+        report = self.create_unit(developer=1, output_kind="report_only")
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        self.deliver_pending_wakes()
+        self.messages.mark_read(self.assignment_message(report), 1)
+        before = tuple(
+            self.con.execute(
+                "SELECT "
+                "(SELECT COUNT(*) FROM sprint_events),"
+                "(SELECT COUNT(*) FROM wake_message),"
+                "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+            ).fetchone()
+        )
+        original_event = self.units._event
+
+        def fail_completion_event(sprint_id, event_type, actor, payload, **kwargs):
+            if event_type == "work_unit.completed":
+                raise RuntimeError("injected receipt failure")
+            return original_event(sprint_id, event_type, actor, payload, **kwargs)
+
+        with mock.patch.object(
+            self.units, "_event", side_effect=fail_completion_event
+        ), self.assertRaisesRegex(RuntimeError, "injected receipt failure"):
+            self.units.complete(self.sprint_id, report, 1, result="Must roll back")
+
+        self.assertEqual(
+            ("active", None, None),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,completion_result,completed_at "
+                    "FROM sprint_work_units WHERE work_unit_id=?",
+                    (report,),
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            before,
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events),"
+                    "(SELECT COUNT(*) FROM wake_message),"
+                    "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+                ).fetchone()
+            ),
         )
 
     def test_non_code_result_accepts_8000_and_rejects_8001_without_state_change(self):
@@ -651,10 +840,11 @@ class DispatchGateTest(SprintWorkDispatchCase):
             ),
         )
 
-        self.assertEqual(
-            [],
-            self.units.complete(self.sprint_id, report, 1, result="x" * 8000),
+        receipt = self.units.complete(
+            self.sprint_id, report, 1, result="x" * 8000
         )
+        self.assertEqual(1, len(receipt.wake_ids))
+        self.assertEqual(receipt.wake_ids, receipt.created_wake_ids)
         self.assertEqual(
             ("completed", 8000),
             tuple(
@@ -1379,9 +1569,9 @@ class DeliveryTerminalTest(SprintWorkDispatchCase):
                 )
             ),
         ):
-            self.assertEqual(
-                [], units.complete(self.sprint_id, report, 1, result="Done")
-            )
+            receipt = units.complete(self.sprint_id, report, 1, result="Done")
+            self.assertEqual((), receipt.wake_ids)
+            self.assertTrue(receipt.changed)
 
         self.assertEqual([(run_id, False, "paused")], interrupts)
         self.assertEqual([(conversation_id, False, "paused")], notifications)
