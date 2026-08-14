@@ -421,6 +421,9 @@ class SandboxImagePlanTest(unittest.TestCase):
             "SC_GITHUB_HOST_TRUST_SHA256=" + hashlib.sha256(trust).hexdigest(),
             base,
         )
+        self.assertIn("SC_PARENT_IMAGE=python:3.12-slim", base)
+        self.assertNotIn("SC_PARENT_IMAGE=sha256:" + "a" * 64, base)
+        self.assertIn("sc.parent_id=sha256:" + "a" * 64, base)
         self.assertIn("SC_BASE_IMAGE=sha256:" + "b" * 64, extension)
         for key, value in plan.runtime_labels.items():
             self.assertIn(f"{key}={value}", extension)

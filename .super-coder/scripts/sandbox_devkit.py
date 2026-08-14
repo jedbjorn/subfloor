@@ -1294,7 +1294,7 @@ def build_images(
         "--build-arg",
         f"SC_HARNESS_EPOCH={plan.harness_epoch}",
         "--build-arg",
-        f"SC_PARENT_IMAGE={parent_id}",
+        f"SC_PARENT_IMAGE={plan.parent_ref}",
         "--build-arg",
         f"SC_GITHUB_HOST_TRUST_B64={trust_b64}",
         "--build-arg",
