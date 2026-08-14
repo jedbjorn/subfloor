@@ -146,9 +146,16 @@ def _render_roadmap(con, written, skipped, root: Path) -> None:
         "ORDER BY r.sort_order, r.feature_id"
     ).fetchall()
     flags_by_feature: dict[int, list] = {}
+    flag_columns = {row[1] for row in con.execute("PRAGMA table_info(flags)")}
+    runtime_filter = (
+        " AND COALESCE(blocks_runtime,1)=1"
+        if "blocks_runtime" in flag_columns
+        else ""
+    )
     for f in con.execute(
         "SELECT feature_id, display_name, description FROM flags "
-        "WHERE resolved=0 AND COALESCE(is_deleted,0)=0 AND feature_id IS NOT NULL "
+        "WHERE resolved=0 AND COALESCE(is_deleted,0)=0 "
+        "AND feature_id IS NOT NULL" + runtime_filter + " "
         "ORDER BY flag_id"
     ).fetchall():
         flags_by_feature.setdefault(f["feature_id"], []).append(f)

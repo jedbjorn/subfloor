@@ -67,6 +67,7 @@ import conversation_reaper  # noqa: E402  (Feature #31 orphan process ladder)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
+import runtime_flags  # noqa: E402  (system-managed non-blocking runtime advisories)
 import sprint_close  # noqa: E402  (Sprints v2 conformance + report evidence)
 import sprint_cleanup  # noqa: E402  (successful-close worktree cleanup recovery)
 import sprint_domain  # noqa: E402  (Sprints v2 work dispatch authority)
@@ -585,7 +586,8 @@ def get_roadmap(con) -> dict:
     flags_by: dict[int, list] = {}
     for f in rows(con.execute(
             "SELECT flag_id, feature_id, display_name, description FROM flags "
-            "WHERE resolved=0 AND COALESCE(is_deleted,0)=0 AND feature_id IS NOT NULL")):
+            "WHERE resolved=0 AND COALESCE(is_deleted,0)=0 "
+            "AND COALESCE(blocks_runtime,1)=1 AND feature_id IS NOT NULL")):
         flags_by.setdefault(f["feature_id"], []).append(f)
     # Spec tasks (implementation plan) attach per feature, ordered by spec then
     # seq so a multi-spec feature lists each spec's plan in order. Drives the
@@ -661,12 +663,24 @@ def get_map() -> dict:
 
 
 def get_flags(con) -> dict:
+    runtime_flags.reconcile_pending(con, REPO_ROOT)
     flags = rows(con.execute(
         "SELECT f.flag_id, f.display_name, f.priority, f.description, f.created_date, "
         "f.resolved, f.resolved_date, f.resolution_notes, f.feature_id, "
+        "f.source_kind, f.source_key, f.source_generation, f.evidence_digest, "
+        "f.management_state, f.severity, f.blocking_scope, f.blocks_runtime, "
+        "f.source_payload, "
         "r.title AS feature_title FROM flags f LEFT JOIN roadmap r "
         "ON r.feature_id=f.feature_id WHERE COALESCE(f.is_deleted,0)=0 "
         "ORDER BY f.resolved, f.flag_id DESC"))
+    for flag in flags:
+        raw = flag.get("source_payload")
+        if raw:
+            try:
+                flag["evidence"] = json.loads(raw)
+            except json.JSONDecodeError:
+                flag["evidence"] = None
+        flag.pop("source_payload", None)
     features = rows(con.execute(
         "SELECT feature_id, title FROM roadmap ORDER BY sort_order, feature_id"))
     return {"flags": flags, "features": features}
@@ -3228,7 +3242,10 @@ class Handler(BaseHTTPRequestHandler):
                 fs = rows(con.execute(
                     "SELECT f.flag_id, f.display_name, f.priority, f.description, "
                     "f.feature_id, f.created_date, f.resolved, f.resolved_date, "
-                    "f.resolution_notes, s.shortname AS owner, r.title AS feature_title "
+                    "f.resolution_notes, f.source_kind, f.source_key, "
+                    "f.source_generation, f.evidence_digest, f.management_state, "
+                    "f.severity, f.blocking_scope, f.blocks_runtime, "
+                    "s.shortname AS owner, r.title AS feature_title "
                     "FROM flags f "
                     "LEFT JOIN shells s ON s.shell_id=f.shell_id "
                     "LEFT JOIN roadmap r ON r.feature_id=f.feature_id "
@@ -3246,7 +3263,9 @@ class Handler(BaseHTTPRequestHandler):
                 r = con.execute(
                     "SELECT f.flag_id, f.display_name, f.priority, f.description, "
                     "f.feature_id, f.created_date, f.resolved, f.resolved_date, "
-                    "f.resolution_notes, "
+                    "f.resolution_notes, f.source_kind, f.source_key, "
+                    "f.source_generation, f.evidence_digest, f.management_state, "
+                    "f.severity, f.blocking_scope, f.blocks_runtime, "
                     "(SELECT s.shortname FROM shells s WHERE s.shell_id=f.shell_id) "
                     " AS owner, "
                     "(SELECT title FROM roadmap WHERE feature_id=f.feature_id) "
@@ -3735,10 +3754,17 @@ class Handler(BaseHTTPRequestHandler):
             # on the row's shell_id (set at open).
             if len(parts) == 4 and parts[2] == "flags":
                 fid = int(parts[3])
-                if not con.execute(
-                        "SELECT 1 FROM flags WHERE flag_id=? "
-                        "AND COALESCE(is_deleted,0)=0", (fid,)).fetchone():
+                target = con.execute(
+                        "SELECT management_state FROM flags WHERE flag_id=? "
+                        "AND COALESCE(is_deleted,0)=0", (fid,)).fetchone()
+                if not target:
                     return self._send(404, {"error": "no such flag"})
+                if target["management_state"] == "system":
+                    return self._send(409, {"error": {
+                        "code": "managed_flag",
+                        "message": "runtime advisories can be cleared only by lifecycle evidence",
+                        "details": {"flag_id": fid},
+                    }})
                 if body.get("resolved"):
                     body.setdefault("resolved_date", date.today().isoformat())
                 # Append to the description in ONE statement (#288 follow-on).
@@ -4431,6 +4457,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200 if ok else 400, {"ok": ok, "error": err})
             if path.startswith("/api/flags/"):
                 fid = int(path.rsplit("/", 1)[1])
+                target = con.execute(
+                    "SELECT management_state FROM flags WHERE flag_id=? "
+                    "AND COALESCE(is_deleted,0)=0",
+                    (fid,),
+                ).fetchone()
+                if target is None:
+                    return self._send(404, {"error": "no such flag"})
+                if target["management_state"] == "system":
+                    return self._send(409, {"error": {
+                        "code": "managed_flag",
+                        "message": "runtime advisories can be cleared only by lifecycle evidence",
+                        "details": {"flag_id": fid},
+                    }})
                 if body.get("resolved"):
                     from datetime import date
                     body.setdefault("resolved_date", date.today().isoformat())
@@ -4469,6 +4508,17 @@ class Handler(BaseHTTPRequestHandler):
         parts = path.strip("/").split("/")
         con = db()
         try:
+            if len(parts) == 3 and parts[:2] == ["_sc", "runtime-flags"]:
+                supplied = self.headers.get(runtime_flags.TOKEN_HEADER, "")
+                if not runtime_flags.token_matches(REPO_ROOT, supplied):
+                    return self._send(401, runtime_flags.error(
+                        "unauthorized",
+                        "managed runtime advisory authorization is required",
+                    ))
+                status, payload = runtime_flags.put_runtime_flag(
+                    con, parts[2], self._body()
+                )
+                return self._send(status, payload)
             if len(parts) == 5 and parts[1] == "flavors" and parts[3] == "skills":
                 ok, err = set_flavor_grant(
                     con, parts[2], int(parts[4]),

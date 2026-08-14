@@ -31,7 +31,7 @@ DEVKIT_RESEED = (
     ROOT
     / ".super-coder"
     / "migrations"
-    / "0191_reseed_target_aware_dev_kit.sql"
+    / "0211_reseed_native_package_dev_kit.sql"
 )
 
 
@@ -186,6 +186,93 @@ class DeclarationTest(unittest.TestCase):
         self.assertEqual(declaration.sandbox.dockerfile, dockerfile.resolve())
         self.assertEqual(declaration.sandbox.context, dockerfile.parent.resolve())
         self.assertEqual(declaration.sandbox.mounts[0].target, (self.root / ".venv").resolve())
+
+    def test_native_apt_packages_are_exact_sorted_atoms(self):
+        self.write(
+            {
+                "version": 1,
+                "sandbox": {
+                    "packages": {
+                        "apt": ["zlib1g=1:1.2.13.dfsg-1", "ca-certificates", "git+all"],
+                    }
+                },
+            }
+        )
+        packages = load_declaration(self.root).sandbox.packages
+        self.assertEqual(
+            packages.canonical_atoms,
+            ("ca-certificates", "git+all", "zlib1g=1:1.2.13.dfsg-1"),
+        )
+        self.assertEqual(packages.apt[2].version, "1:1.2.13.dfsg-1")
+
+    def test_native_apt_invalidity_is_package_local_and_never_inferred(self):
+        invalid = (
+            [],
+            ["a"],
+            ["Curl"],
+            ["curl amd64"],
+            ["curl:amd64"],
+            ["--no-install-recommends"],
+            ["https://example.invalid/pkg.deb"],
+            ["curl;rm"],
+            ["curl="],
+            ["curl=latest"],
+            ["curl=1=2"],
+            ["curl", "curl=1.0"],
+            ["aa"] * 65,
+        )
+        for index, atoms in enumerate(invalid):
+            with self.subTest(index=index, atoms=atoms[:2]):
+                self.write(
+                    {"version": 1, "sandbox": {"packages": {"apt": atoms}}}
+                )
+                sandbox = load_declaration(self.root).sandbox
+                self.assertIsNone(sandbox.packages)
+                self.assertIsNotNone(sandbox.package_error)
+
+        self.write(
+            {
+                "version": 1,
+                "sandbox": {"packages": {"apt": ["curl"], "pip": ["x"]}},
+            }
+        )
+        sandbox = load_declaration(self.root).sandbox
+        self.assertIsNone(sandbox.packages)
+        self.assertIn("unknown key 'pip'", sandbox.package_error)
+
+    def test_native_apt_name_length_boundary_is_exact(self):
+        name_128 = "a" * 128
+        self.write(
+            {"version": 1, "sandbox": {"packages": {"apt": [name_128]}}}
+        )
+        self.assertEqual(
+            load_declaration(self.root).sandbox.packages.canonical_atoms,
+            (name_128,),
+        )
+
+        self.write(
+            {"version": 1, "sandbox": {"packages": {"apt": ["a" * 129]}}}
+        )
+        self.assertIn(
+            "name must match", load_declaration(self.root).sandbox.package_error
+        )
+
+    def test_native_apt_aggregate_byte_limit_is_exact(self):
+        exact = [f"p{index:02d}" + "a" * 125 for index in range(64)]
+        self.assertEqual(sum(len(atom.encode()) for atom in exact), 8192)
+        self.write(
+            {"version": 1, "sandbox": {"packages": {"apt": exact}}}
+        )
+        self.assertEqual(len(load_declaration(self.root).sandbox.packages.apt), 64)
+
+        over = [atom + "=1" for atom in exact]
+        self.write(
+            {"version": 1, "sandbox": {"packages": {"apt": over}}}
+        )
+        self.assertIn(
+            "at most 8192 UTF-8 bytes",
+            load_declaration(self.root).sandbox.package_error,
+        )
 
     def test_sandbox_mount_names_are_bounded_safe_identifiers(self):
         dockerfile = self.root / ".subfloor" / "Dockerfile"
@@ -911,9 +998,10 @@ class SourcePolicyTest(unittest.TestCase):
         )
         self.assertNotIn("## You are in a container", skill)
         self.assertIn("boot document's execution-context section", skill)
-        for state in ("absent", "invalid", "failed", "stale", "ready", "repair"):
+        for state in ("absent", "invalid", "failed", "stale", "advisory", "ready", "repair"):
             self.assertIn(f"| **{state}** |", skill)
         self.assertIn("Engine baseline", skill)
+        self.assertIn("Native packages", skill)
         self.assertIn("Fork extension", skill)
         self.assertIn("Checkout setup", skill)
         self.assertIn("Host prerequisites", skill)
@@ -969,7 +1057,6 @@ class DevKitReseedConformanceTest(unittest.TestCase):
             (ROOT / ".super-coder" / "migrations").glob("[0-9][0-9][0-9][0-9]_*.sql")
         )
         later = migrations[migrations.index(DEVKIT_RESEED) + 1 :]
-        self.assertTrue(later)
         for migration in later:
             with self.subTest(migration=migration.name):
                 self.assertNotIn("  'dev_kit',", migration.read_text())

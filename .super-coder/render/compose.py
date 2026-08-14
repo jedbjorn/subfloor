@@ -354,6 +354,12 @@ LNS_CURATION_DUE = 5
 def fetch_counts(con, shell_id: int) -> dict:
     def one(q, params=None):
         return con.execute(q, params if params is not None else (shell_id,)).fetchone()[0]
+    flag_columns = {row[1] for row in con.execute("PRAGMA table_info(flags)")}
+    runtime_filter = (
+        " AND COALESCE(blocks_runtime,1)=1"
+        if "blocks_runtime" in flag_columns
+        else ""
+    )
     return {
         "seed": one("SELECT COUNT(*) FROM shell_identity_entries WHERE shell_id=? AND kind='seed' AND is_deleted=0 AND retired_at IS NULL"),
         "lns": one("SELECT COUNT(*) FROM shell_identity_entries WHERE shell_id=? AND kind='lns' AND is_deleted=0 AND retired_at IS NULL"),
@@ -378,7 +384,10 @@ def fetch_counts(con, shell_id: int) -> dict:
             "  AND created_at > COALESCE("
             "        (SELECT lns_curated_at FROM shells WHERE shell_id=?), '')",
             (shell_id, shell_id)),
-        "flags": one("SELECT COUNT(*) FROM flags WHERE shell_id=? AND resolved=0 AND is_deleted=0"),
+        "flags": one(
+            "SELECT COUNT(*) FROM flags WHERE shell_id=? AND resolved=0 "
+            "AND is_deleted=0" + runtime_filter
+        ),
         "unread": one("SELECT COUNT(*) FROM shell_messages WHERE to_shell_id=? AND read_at IS NULL"),
     }
 

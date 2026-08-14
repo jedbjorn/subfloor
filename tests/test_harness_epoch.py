@@ -214,6 +214,7 @@ class ScFixture:
             "artifact_policy.py",
             "harness_versions.py",
             "devkit.py",
+            "runtime_flags.py",
             "sandbox_devkit.py",
             "cli_entry.py",
         ):
@@ -226,6 +227,8 @@ class ScFixture:
         (self.engine / "Dockerfile").write_text("FROM scratch\n")
         (self.root / ".sc-state").mkdir()
         (self.root / ".sc-state" / "engine.ref").write_text("a" * 40 + "\n")
+        (self.root / ".gitignore").write_text("/.sc-state/local/\n")
+        subprocess.run(("git", "init", "-q", str(self.root)), check=True)
         self._write_fake_docker()
         # Stub curl too. The no-docker branch of update-harnesses runs the real
         # vendor installers; a regression that took that branch under docker
@@ -264,7 +267,10 @@ class ScFixture:
         self.image_state.parent.mkdir(parents=True, exist_ok=True)
         self.image_state.write_text(json.dumps([{
             "Id": "sha256:" + "b" * 64,
-            "Config": {"Labels": plan.runtime_labels},
+            "Config": {"Labels": {
+                **plan.runtime_labels,
+                "sc.parent_id": "sha256:" + "a" * 64,
+            }},
         }]))
 
     def close(self) -> None:
@@ -310,6 +316,8 @@ class ScFixture:
               image)
                 case " $* " in
                   *" --format "*) printf '%s\\n' "$SC_TEST_LABEL" ;;
+                  *" python:3.12-slim "*)
+                    printf '[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Config":{"Labels":{}}}]\\n' ;;
                   *) cat "$SC_TEST_IMAGE_STATE" ;;
                 esac
                 exit 0 ;;

@@ -794,6 +794,24 @@ keeps its shell-observable status. `SC_DEVKIT_ROOT`, `SC_DEVKIT_SEAT`, and
 fork-owned dependency hook should treat an out-of-repo interpreter as a
 host-managed shared tree: verify it, but never pip-install into it.
 
+A fork may also declare exact native Debian packages without maintaining an
+extension Dockerfile:
+
+```json
+{"version":1,"sandbox":{"packages":{"apt":["libexample1","tool=1.2-3"]}}}
+```
+
+The list is bounded, canonical, and literal: no architecture qualifiers,
+repository options, inferred names, fallback names, or relaxed pins. The engine
+builds packages over an immutably identified baseline, proves the final image
+with `dpkg-query` and no network, and writes one format-version-2 capability
+receipt. Package-specific validation/build/proof failure leaves a healthy
+sandbox untouched or selects the proven engine baseline. CLI and Flags then
+show `native_packages=advisory` / `fork_readiness=degraded`; this advisory never
+blocks core shell entry, roadmap completion, or runtime. Run `make dos-admin`
+from the fork root to inspect evidence and prepare a reviewed tracked fix. The
+FnB retains downstream update and live restart approval.
+
 One boundary trips people up: **you work inside the sandbox container**, and the
 app the FnB watches in their browser is a *separate*, host-supervised instance. To
 see your own changes, start a dev server **inside** the container on

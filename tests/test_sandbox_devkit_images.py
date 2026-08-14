@@ -43,26 +43,55 @@ from sandbox_devkit import (  # noqa: E402
 class FakeDocker:
     def __init__(self) -> None:
         self.commands: list[tuple[str, ...]] = []
-        self.images: dict[str, dict] = {}
+        self.inputs: list[str | bytes | None] = []
+        self.images: dict[str, dict] = {
+            "python:3.12-slim": {
+                "Id": "sha256:" + "a" * 64,
+                "Created": "2026-08-01T00:00:00Z",
+                "Config": {"Labels": {}},
+            }
+        }
         self.volumes: dict[str, dict] = {}
         self.containers: dict[str, str] = {}
         self.image_remove_failures: set[str] = set()
         self.build_counter = 0
+        self.package_build_status = 0
+        self.package_versions: dict[str, str] = {}
+        self.package_architectures: dict[str, str] = {}
+        self.package_statuses: dict[str, str] = {}
         self.hook_status = 0
         self.hook_delay = 0.0
 
-    def __call__(self, command, *, check, text, capture_output=False):
+    def __call__(
+        self, command, *, check, text, capture_output=False, input=None, timeout=None
+    ):
         self.assert_protocol(check, text)
         command = tuple(command)
         self.commands.append(command)
+        self.inputs.append(input)
+        if command[:2] == ("docker", "pull"):
+            return subprocess.CompletedProcess(command, 0, "pulled\n", "")
         if command[:2] == ("docker", "build"):
             tag = command[command.index("-t") + 1]
+            if "-package-layer-" in tag and self.package_build_status:
+                return subprocess.CompletedProcess(
+                    command, self.package_build_status, "", "package build failed"
+                )
             labels = {}
             for index, value in enumerate(command):
                 if value == "--label":
                     key, label_value = command[index + 1].split("=", 1)
                     labels[key] = label_value
-            image_id = "sha256:" + ("b" if "-base:" in tag else "e") * 64
+            kind = (
+                "b"
+                if "-base:" in tag
+                else "k"
+                if "-package-layer-" in tag
+                else "p"
+                if "-packages-" in tag
+                else "e"
+            )
+            image_id = "sha256:" + kind * 64
             self.build_counter += 1
             self.images[tag] = {
                 "Id": image_id,
@@ -138,6 +167,23 @@ class FakeDocker:
             }
             return subprocess.CompletedProcess(command, 0, image_id + "\n", "")
         if command[:2] == ("docker", "run"):
+            if "/usr/bin/dpkg-query" in command:
+                format_index = next(
+                    index
+                    for index, value in enumerate(command)
+                    if value.startswith("--showformat=")
+                )
+                names = command[format_index + 1 :]
+                rows = [
+                    "\t".join((
+                        name,
+                        self.package_architectures.get(name, "amd64"),
+                        self.package_versions.get(name, "1.0"),
+                        self.package_statuses.get(name, "install ok installed"),
+                    ))
+                    for name in names
+                ]
+                return subprocess.CompletedProcess(command, 0, "\n".join(rows) + "\n", "")
             if "--name" in command:
                 name = command[command.index("--name") + 1]
                 image = next(
@@ -155,7 +201,8 @@ class FakeDocker:
             image = self.containers.get(command[4])
             if image is None:
                 return subprocess.CompletedProcess(command, 1, "", "not found")
-            return subprocess.CompletedProcess(command, 0, image + "\n", "")
+            value = "true\t" + image if "State.Running" in command[3] else image
+            return subprocess.CompletedProcess(command, 0, value + "\n", "")
         if command[:2] == ("docker", "exec"):
             if self.hook_delay:
                 time.sleep(self.hook_delay)
@@ -169,7 +216,7 @@ class FakeDocker:
 
     @staticmethod
     def assert_protocol(check, text) -> None:
-        if check is not False or text is not True:
+        if check is not False or text not in {True, False}:
             raise AssertionError("runner protocol changed")
 
     def builds(self) -> list[tuple[str, ...]]:
@@ -185,12 +232,13 @@ class ImageFixture:
         sandbox: bool = True,
         mounts: bool = False,
         provision: bool = False,
+        packages: list[str] | None = None,
     ) -> None:
         self.root = parent / name
         self.engine = self.root / ".super-coder"
         self.subfloor = self.root / ".subfloor"
         self.state = self.root / ".sc-state"
-        self.context = self.root / "container" / "context"
+        self.context = self.root / "container"
         self.engine.mkdir(parents=True)
         (self.engine / "assets").mkdir()
         self.subfloor.mkdir()
@@ -215,7 +263,7 @@ class ImageFixture:
                 "inputs": ["requirements.lock"],
             }
         if sandbox:
-            dockerfile = self.root / "container" / "Fork.Dockerfile"
+            dockerfile = self.context / "Fork.Dockerfile"
             dockerfile.write_text(
                 "ARG SC_BASE_IMAGE\n"
                 "FROM busybox AS source\n"
@@ -225,16 +273,25 @@ class ImageFixture:
             )
             declaration["sandbox"] = {
                 "dockerfile": "container/Fork.Dockerfile",
-                "context": "container/context",
+                "context": "container",
             }
             if mounts:
                 declaration["sandbox"]["mounts"] = [
                     {"name": "python-env", "target": ".venv"}
                 ]
+        if packages is not None:
+            declaration.setdefault("sandbox", {})["packages"] = {"apt": packages}
         (self.subfloor / "dev-kit.json").write_text(json.dumps(declaration))
-        if provision:
-            (self.root / ".gitignore").write_text("/.sc-state/local/\n")
-            subprocess.run(("git", "init", "-q", str(self.root)), check=True)
+        (self.root / ".gitignore").write_text("/.sc-state/local/\n")
+        subprocess.run(("git", "init", "-q", str(self.root)), check=True)
+        subprocess.run(("git", "-C", str(self.root), "add", "."), check=True)
+        subprocess.run(
+            (
+                "git", "-C", str(self.root), "-c", "user.name=Test",
+                "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture",
+            ),
+            check=True,
+        )
 
     def plan(self):
         return image_plan(
@@ -244,6 +301,16 @@ class ImageFixture:
             user="tester",
             uid="1000",
             gid="1000",
+        )
+
+    def commit(self, message: str) -> None:
+        subprocess.run(("git", "-C", str(self.root), "add", "."), check=True)
+        subprocess.run(
+            (
+                "git", "-C", str(self.root), "-c", "user.name=Test",
+                "-c", "user.email=test@example.invalid", "commit", "-qm", message,
+            ),
+            check=True,
         )
 
 
@@ -265,7 +332,7 @@ class SandboxImagePlanTest(unittest.TestCase):
 
     def test_extension_contract_is_validated_before_any_docker_command(self):
         fixture = ImageFixture(self.base, "invalid")
-        dockerfile = fixture.root / "container" / "Fork.Dockerfile"
+        dockerfile = fixture.context / "Fork.Dockerfile"
         for text in (
             "FROM python:3.12\n",
             "ARG SC_BASE_IMAGE\nFROM python:3.12\n",
@@ -338,7 +405,10 @@ class SandboxImagePlanTest(unittest.TestCase):
         self.assertEqual(len(docker.builds()), 2)
         base, extension = docker.builds()
         self.assertEqual(base[-1], str(fixture.root.resolve()))
-        self.assertEqual(extension[-1], str(fixture.context.resolve()))
+        self.assertEqual(extension[-1], "-")
+        extension_input = docker.inputs[docker.commands.index(extension)]
+        self.assertIsInstance(extension_input, bytes)
+        self.assertGreater(len(extension_input), 1024)
         trust = (fixture.engine / "assets" / "github_known_hosts").read_bytes()
         self.assertIn(
             "SC_GITHUB_HOST_TRUST_B64=" + base64.b64encode(trust).decode("ascii"),
@@ -360,6 +430,11 @@ class SandboxImagePlanTest(unittest.TestCase):
                 "sc.declaration_digest",
                 "sc.fork_identity",
                 "sc.dockerfile_digest",
+                "sc.package_digest",
+                "sc.build_identity",
+                "sc.readiness_contract",
+                "sc.package_contract",
+                "sc.context_contract",
             },
         )
 
@@ -367,11 +442,270 @@ class SandboxImagePlanTest(unittest.TestCase):
         plan = ImageFixture(self.base, "fork").plan()
         docker = FakeDocker()
         build_images(plan, runner=docker)
+        exact_labels = dict(docker.images[plan.runtime_tag]["Config"]["Labels"])
         docker.images[plan.runtime_tag]["Config"]["Labels"]["sc.fork_identity"] = "other"
         with self.assertRaisesRegex(SandboxImageError, "stale or foreign"):
             preflight_image(plan, runner=docker)
-        docker.images[plan.runtime_tag]["Config"]["Labels"] = dict(plan.runtime_labels)
+        docker.images[plan.runtime_tag]["Config"]["Labels"] = exact_labels
         self.assertEqual(preflight_image(plan, runner=docker), plan.runtime_tag)
+
+    def test_package_only_build_uses_canonical_argv_and_writes_exact_proof(self):
+        fixture = ImageFixture(
+            self.base,
+            "packages",
+            sandbox=False,
+            packages=["jq=1.6-2.1", "curl"],
+        )
+        plan = fixture.plan()
+        docker = FakeDocker()
+        docker.package_versions.update({"curl": "7.88.1-10", "jq": "1.6-2.1"})
+
+        selected = build_images(plan, runner=docker)
+
+        self.assertEqual(selected, plan.package_tag)
+        self.assertEqual([package.atom for package in plan.packages], ["curl", "jq=1.6-2.1"])
+        package_build = next(
+            command for command in docker.builds() if "-package-layer-" in command[command.index("-t") + 1]
+        )
+        self.assertIn("SC_BASE_IMAGE=sha256:" + "b" * 64, package_build)
+        dockerfile = docker.inputs[docker.commands.index(package_build)]
+        self.assertEqual(
+            dockerfile,
+            "ARG SC_BASE_IMAGE\n"
+            "FROM ${SC_BASE_IMAGE}\n"
+            'RUN ["apt-get", "update"]\n'
+            'RUN ["apt-get","install","-y","--no-install-recommends","curl","jq=1.6-2.1"]\n'
+            'RUN ["sh", "-c", "rm -rf /var/lib/apt/lists/*"]\n',
+        )
+        runtime_build = next(
+            command for command in docker.builds() if "-packages-" in command[command.index("-t") + 1]
+        )
+        self.assertIn("SC_BASE_IMAGE=sha256:" + "k" * 64, runtime_build)
+        self.assertIn("sc.package_layer_id=sha256:" + "k" * 64, runtime_build)
+        proof_command = next(
+            command
+            for command in docker.commands
+            if "/usr/bin/dpkg-query" in command
+        )
+        self.assertEqual(proof_command[-2:], ("curl", "jq"))
+        artifact = next(
+            (fixture.state / "local" / "dev-kit").glob("*/package-proof.json")
+        )
+        proof = json.loads(artifact.read_text())
+        self.assertEqual(proof["requested"], ["curl", "jq=1.6-2.1"])
+        self.assertEqual(
+            [row["version"] for row in proof["observed"]],
+            ["7.88.1-10", "1.6-2.1"],
+        )
+        receipt = json.loads(artifact.with_name("ready.json").read_text())
+        self.assertEqual(receipt["format_version"], 2)
+        self.assertTrue(receipt["source_tracked_clean"])
+        self.assertEqual(preflight_image(plan, runner=docker), plan.package_tag)
+
+    def test_pinned_version_mismatch_falls_back_to_fresh_engine_baseline(self):
+        fixture = ImageFixture(
+            self.base,
+            "pin-mismatch",
+            sandbox=False,
+            packages=["curl=8.0"],
+        )
+        plan = fixture.plan()
+        docker = FakeDocker()
+        docker.package_versions["curl"] = "7.0"
+
+        selected = build_images(plan, runner=docker)
+
+        self.assertEqual(selected, plan.base_tag)
+        status_path = next(
+            (fixture.state / "local" / "dev-kit").glob("*/status.json")
+        )
+        status = json.loads(status_path.read_text())
+        self.assertEqual(status["core_runtime"], "ready")
+        self.assertEqual(status["native_packages"], "advisory")
+        self.assertEqual(status["selected_runtime"], "engine_baseline")
+        self.assertEqual(status["cutover"], "baseline_fallback")
+        self.assertIn("version mismatch", status["detail"])
+        self.assertTrue(
+            list((fixture.state / "local" / "runtime-flags" / "pending").glob("*.json"))
+        )
+
+    def test_package_failure_preserves_a_healthy_running_runtime_without_cutover(self):
+        fixture = ImageFixture(
+            self.base,
+            "preserve-runtime",
+            sandbox=False,
+            packages=["curl"],
+        )
+        plan = fixture.plan()
+        docker = FakeDocker()
+        existing_id = "sha256:" + "9" * 64
+        docker.containers["sandbox"] = existing_id
+        docker.package_build_status = 100
+
+        selected = build_images(plan, runner=docker, container="sandbox")
+
+        self.assertEqual(selected, plan.runtime_tag)
+        status_path = next(
+            (fixture.state / "local" / "dev-kit").glob("*/status.json")
+        )
+        status = json.loads(status_path.read_text())
+        self.assertEqual(status["selected_runtime"], "existing_unchanged")
+        self.assertEqual(status["selected_image_id"], existing_id)
+        self.assertEqual(status["cutover"], "unchanged")
+        self.assertNotIn(("docker", "rm", "-f", "sandbox"), docker.commands)
+        self.assertFalse(
+            [
+                command
+                for command in docker.commands
+                if command[:2] == ("docker", "run") and "--name" in command
+            ]
+        )
+
+    def test_invalid_package_contract_is_advisory_after_baseline_proof(self):
+        fixture = ImageFixture(
+            self.base,
+            "invalid-packages",
+            sandbox=False,
+            packages=["curl:amd64"],
+        )
+        plan = fixture.plan()
+        self.assertTrue(plan.has_package_contract)
+        self.assertEqual(plan.package_digest, "invalid")
+        self.assertIn("name must match", plan.candidate_error)
+        docker = FakeDocker()
+
+        self.assertEqual(build_images(plan, runner=docker), plan.base_tag)
+        self.assertEqual(len(docker.builds()), 1)
+        self.assertTrue(
+            [
+                command
+                for command in docker.commands
+                if command[:2] == ("docker", "run") and "--network" in command
+            ]
+        )
+
+    def test_no_build_ignores_untracked_context_but_rejects_tracked_drift(self):
+        fixture = ImageFixture(self.base, "context-packages", packages=["curl"])
+        plan = fixture.plan()
+        docker = FakeDocker()
+        build_images(plan, runner=docker)
+        (fixture.context / "untracked.tmp").write_text("ignored by identity\n")
+        self.assertEqual(preflight_image(plan, runner=docker), plan.runtime_tag)
+
+        tracked = fixture.context / "Fork.Dockerfile"
+        tracked.write_text(tracked.read_text() + "RUN echo changed\n")
+        changed = fixture.plan()
+        self.assertEqual(preflight_image(changed, runner=docker), changed.base_tag)
+        status_path = next(
+            (fixture.state / "local" / "dev-kit").glob("*/status.json")
+        )
+        status = json.loads(status_path.read_text())
+        self.assertEqual(status["native_packages"], "advisory")
+        self.assertEqual(status["classification"], "stale_no_build")
+
+    def test_combined_packages_and_provision_require_both_receipt_layers(self):
+        fixture = ImageFixture(
+            self.base,
+            "packages-provision",
+            sandbox=False,
+            packages=["curl"],
+            provision=True,
+        )
+        plan = fixture.plan()
+        docker = FakeDocker()
+
+        selected = build_images(plan, runner=docker)
+        status_path = next(
+            (fixture.state / "local" / "dev-kit").glob("*/status.json")
+        )
+        self.assertEqual(json.loads(status_path.read_text())["package_receipt"], "pending")
+        self.assertFalse(status_path.with_name("ready.json").exists())
+
+        result = launch_container(
+            plan,
+            "sandbox",
+            ("-d", "--name", "sandbox", MOUNT_MARKER, selected, "serve"),
+            runner=docker,
+            emit=False,
+        )
+        self.assertEqual(result["state"], "ready")
+        receipt = json.loads(Path(result["receipt"]).read_text())
+        self.assertEqual(receipt["packages"]["requested"], ["curl"])
+        self.assertEqual(receipt["provision"]["name"], "deps")
+        self.assertEqual(
+            len([command for command in docker.commands if command[:2] == ("docker", "exec")]),
+            1,
+        )
+
+    def test_package_advisory_skips_dependent_provision_but_runs_core_baseline(self):
+        fixture = ImageFixture(
+            self.base,
+            "packages-provision-failure",
+            sandbox=False,
+            packages=["curl"],
+            provision=True,
+        )
+        plan = fixture.plan()
+        docker = FakeDocker()
+        docker.package_build_status = 100
+        docker.hook_status = 23
+
+        self.assertEqual(build_images(plan, runner=docker), plan.base_tag)
+        result = launch_container(
+            plan,
+            "sandbox",
+            ("-d", "--name", "sandbox", MOUNT_MARKER, plan.base_tag, "serve"),
+            runner=docker,
+            emit=False,
+        )
+        self.assertEqual(result["state"], "advisory")
+        self.assertEqual(result["core_runtime"], "ready")
+        self.assertFalse(
+            [command for command in docker.commands if command[:2] == ("docker", "exec")]
+        )
+
+    def test_package_evidence_persistence_failure_does_not_block_core(self):
+        fixture = ImageFixture(
+            self.base,
+            "package-evidence-failure",
+            sandbox=False,
+            packages=["curl"],
+        )
+        (fixture.root / ".gitignore").write_text("# managed rule removed\n")
+        fixture.commit("remove local evidence ignore rule")
+        plan = fixture.plan()
+        errors = io.StringIO()
+
+        with contextlib.redirect_stderr(errors):
+            selected = build_images(plan, runner=FakeDocker())
+
+        self.assertEqual(selected, plan.base_tag)
+        self.assertIn("advisory persistence", errors.getvalue())
+        self.assertFalse((fixture.state / "local" / "dev-kit").exists())
+
+    def test_success_after_advisory_writes_higher_generation_clearance_intent(self):
+        fixture = ImageFixture(
+            self.base,
+            "package-clearance",
+            sandbox=False,
+            packages=["curl"],
+        )
+        plan = fixture.plan()
+        docker = FakeDocker()
+        docker.package_build_status = 100
+        self.assertEqual(build_images(plan, runner=docker), plan.base_tag)
+
+        docker.package_build_status = 0
+        self.assertEqual(build_images(plan, runner=docker), plan.package_tag)
+
+        pending = sorted(
+            (fixture.state / "local" / "runtime-flags" / "pending").glob("*.json")
+        )
+        self.assertEqual(len(pending), 2)
+        bodies = [json.loads(path.read_text())["body"] for path in pending]
+        self.assertEqual([body["generation"] for body in bodies], [1, 2])
+        self.assertEqual([body["state"] for body in bodies], ["open", "resolved"])
+        self.assertEqual(bodies[1]["clearance"]["failed_generation"], 1)
 
     def test_declaration_without_sandbox_runs_on_one_labeled_base(self):
         plan = ImageFixture(self.base, "baseline", sandbox=False).plan()
@@ -456,7 +790,7 @@ class SandboxImagePlanTest(unittest.TestCase):
     def test_extension_build_retires_prior_fork_image(self):
         plan = ImageFixture(self.base, "extension-retention").plan()
         docker = FakeDocker()
-        old_runtime_id = "sha256:" + "a" * 64
+        old_runtime_id = "sha256:" + "d" * 64
         docker.images["super-coder-sandbox-old:latest"] = {
             "Id": old_runtime_id,
             "Created": "2026-07-01T12:00:00Z",
@@ -597,6 +931,13 @@ class SandboxImagePlanTest(unittest.TestCase):
 
     @staticmethod
     def _seed_runtime_image(plan, docker: FakeDocker, image_id: str = "e") -> None:
+        docker.images[plan.base_tag] = {
+            "Id": "sha256:" + "b" * 64,
+            "Config": {"Labels": {
+                **plan.base_labels,
+                "sc.parent_id": "sha256:" + "a" * 64,
+            }},
+        }
         docker.images[plan.runtime_tag] = {
             "Id": "sha256:" + image_id * 64,
             "Config": {"Labels": dict(plan.runtime_labels)},
@@ -788,6 +1129,7 @@ class SandboxImagePlanTest(unittest.TestCase):
         current = readiness(plan, runner=docker)
         self.assertTrue(current["ready"])
         (fixture.root / "requirements.lock").write_text("stale\n")
+        fixture.commit("reviewed input update")
         stale_plan = fixture.plan()
         self._seed_runtime_image(stale_plan, docker)
         stale = readiness(stale_plan, runner=docker)
@@ -840,7 +1182,7 @@ class SandboxImagePlanTest(unittest.TestCase):
         fixture = ImageFixture(self.base, "fork")
         original = fixture.plan()
         docker = FakeDocker()
-        self._seed_runtime_image(original, docker)
+        build_images(original, runner=docker)
         self.assertEqual(preflight_image(original, runner=docker), original.runtime_tag)
 
         (fixture.state / "engine.ref").write_text("c" * 40 + "\n")
@@ -860,7 +1202,7 @@ class SandboxImagePlanTest(unittest.TestCase):
         with self.assertRaises(SandboxImageError):
             preflight_image(changed_epoch, runner=docker)
 
-        dockerfile = fixture.root / "container" / "Fork.Dockerfile"
+        dockerfile = fixture.context / "Fork.Dockerfile"
         dockerfile.write_text(dockerfile.read_text() + "RUN echo changed\n")
         with self.assertRaises(SandboxImageError):
             preflight_image(fixture.plan(), runner=docker)
@@ -879,6 +1221,7 @@ class SandboxImagePlanTest(unittest.TestCase):
         self._seed_runtime_image(plan, docker)
         provision_checkout(plan, "sandbox", runner=docker, emit=False)
         (fixture.root / "requirements.lock").write_text("stale\n")
+        fixture.commit("reviewed lock update")
         stale = fixture.plan()
         self._seed_runtime_image(stale, docker)
         lock = next(
