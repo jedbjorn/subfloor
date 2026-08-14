@@ -1572,20 +1572,28 @@ function flagRow(f, features) {
   // Expandable: collapsed row shows the priority badge + title + #id;
   // expanding reveals the full description, linked items as cards, and the
   // resolution note (resolved) or the resolve action (open).
-  const row = el("details", { className: "flag" + (f.resolved ? " resolved" : "") });
+  const managed = f.management_state === "system";
+  const advisory = f.severity === "advisory";
+  const row = el("details", { className: "flag" + (f.resolved ? " resolved" : "")
+    + (advisory ? " advisory" : "") });
   const head = el("summary", { className: "flag-head" });
   const prio = f.priority || "—";
-  head.append(el("span", { className: "pill prio-" + prio.toLowerCase() }, prio));
+  head.append(advisory
+    ? el("span", { className: "pill info" }, "Advisory")
+    : el("span", { className: "pill prio-" + prio.toLowerCase() }, prio));
   const d = el("span", { className: "desc" });
   d.append(el("b", {}, f.display_name || "Flag"),
     el("span", { className: "flag-num" }, " #" + f.flag_id));
   head.append(d);
+  if (managed) head.append(el("span", { className: "pill" }, "System-managed"));
   row.append(head);
 
   const body = el("div", { className: "flag-body" });
 
   // Longer description, full text (no longer shown on the collapsed row).
   if (f.description) body.append(el("div", { className: "flag-desc" }, f.description));
+  if (advisory) body.append(el("div", { className: "tag" },
+    "Does not block runtime or shell entry"));
 
   // Linked items as small cards. Today a flag links to at most one feature.
   const links = [];
@@ -1600,7 +1608,7 @@ function flagRow(f, features) {
   const actions = el("div", { className: "flag-actions" });
   if (f.resolved) {
     body.append(el("div", { className: "tag" }, `resolved ${f.resolved_date || ""} — ${f.resolution_notes || ""}`));
-  } else {
+  } else if (!managed) {
     const btn = el("button", { className: "act", type: "button", textContent: "resolve" });
     btn.onclick = async () => {
       const notes = prompt("Resolution notes:");
@@ -1610,12 +1618,14 @@ function flagRow(f, features) {
     };
     actions.append(btn);
   }
-  const edit = el("button", { className: "act flag-edit", type: "button", textContent: "edit" });
-  edit.onclick = (e) => {
-    e.preventDefault(); e.stopPropagation();
-    openFlagModal(features, f);
-  };
-  actions.append(edit);
+  if (!managed) {
+    const edit = el("button", { className: "act flag-edit", type: "button", textContent: "edit" });
+    edit.onclick = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      openFlagModal(features, f);
+    };
+    actions.append(edit);
+  }
   body.append(actions);
   row.append(body);
   return row;

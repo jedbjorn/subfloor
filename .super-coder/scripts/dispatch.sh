@@ -273,6 +273,12 @@ sc_devkit_ready() {
     "$CNAME"
 }
 
+sc_devkit_cutover() {
+  epoch="$(harness_epoch)"
+  "$PY" "$S/sandbox_devkit.py" cutover \
+    "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)"
+}
+
 # What the CURRENT image was actually built with, read back from the label the
 # Dockerfile stamps. Empty for an image built before this seam existed (or none
 # at all) — callers treat that as "unknown", never as "current".
@@ -290,14 +296,18 @@ dbuild() {
   epoch="$(harness_epoch)"
   IMG="$(sc_devkit_image_name "$epoch")" || return 1
   "$PY" "$S/sandbox_devkit.py" build \
-    "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)"
+    "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)" \
+    "$CNAME" || return 1
+  IMG="$(sc_devkit_image_name "$epoch")" || return 1
 }
 
 dimage_preflight() {
   epoch="$(harness_epoch)"
   IMG="$(sc_devkit_image_name "$epoch")" || return 1
   "$PY" "$S/sandbox_devkit.py" preflight \
-    "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)"
+    "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)" \
+    "$CNAME" || return 1
+  IMG="$(sc_devkit_image_name "$epoch")" || return 1
 }
 
 drunning() { [ "$(docker inspect -f '{{.State.Running}}' "$CNAME" 2>/dev/null || echo false)" = true ]; }
@@ -1362,6 +1372,11 @@ case "$cmd" in
       epoch="$(harness_epoch_roll)"
       echo "→ refresh harnesses for restart (epoch $epoch)"
       dbuild
+    fi
+    cutover="$(sc_devkit_cutover)" || exit 1
+    if [ "$cutover" = "unchanged" ] && drunning; then
+      echo "→ restart preserved healthy sandbox '$CNAME' — native package capability remains advisory"
+      exit 0
     fi
     backup_dir="$(sc_db_backup_preflight)"
     sc_db_backup prerestart "$backup_dir"

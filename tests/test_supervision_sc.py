@@ -51,6 +51,7 @@ class SupervisionFixture:
             "devkit.py",
             "github_auth.py",
             "sandbox_github_auth.py",
+            "runtime_flags.py",
             "sandbox_devkit.py",
         ):
             shutil.copy2(
@@ -65,6 +66,8 @@ class SupervisionFixture:
         (self.engine / "Dockerfile").write_text("FROM scratch\n")
         (self.root / ".sc-state").mkdir()
         (self.root / ".sc-state" / "engine.ref").write_text("a" * 40 + "\n")
+        (self.root / ".gitignore").write_text("/.sc-state/local/\n")
+        subprocess.run(("git", "init", "-q", str(self.root)), check=True)
         self._write_scripts()
         self._write_fake_commands()
         for directory in (
@@ -108,7 +111,10 @@ class SupervisionFixture:
         )
         (self.docker_state / "image.json").write_text(json.dumps([{
             "Id": "sha256:" + "b" * 64,
-            "Config": {"Labels": plan.runtime_labels},
+            "Config": {"Labels": {
+                **plan.runtime_labels,
+                "sc.parent_id": "sha256:" + "a" * 64,
+            }},
         }]))
         self._sockets: list[socket.socket] = []
 
@@ -164,6 +170,8 @@ class SupervisionFixture:
               [ "$SC_TEST_IMAGE" = present ] || exit 1
               case " $* " in
                 *" --format "*) echo 0 ;;
+                *" python:3.12-slim "*)
+                  printf '[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Config":{"Labels":{}}}]\\n' ;;
                 *) cat "$state_dir/image.json" ;;
               esac
               exit 0
@@ -355,6 +363,15 @@ class SupervisionFixture:
         }))
         (self.root / ".gitignore").write_text("/.sc-state/local/\n")
         subprocess.run(("git", "init", "-q", str(self.root)), check=True)
+        subprocess.run(("git", "-C", str(self.root), "add", "."), check=True)
+        subprocess.run(
+            (
+                "git", "-C", str(self.root), "-c", "user.name=Test",
+                "-c", "user.email=test@example.invalid", "commit", "-qm",
+                "provision fixture",
+            ),
+            check=True,
+        )
 
     def pg_identity(self) -> str:
         return (
@@ -378,8 +395,11 @@ class RestrictedLaunchTests(unittest.TestCase):
         image_inspects = [
             line for line in calls if line.startswith("docker image inspect ")
         ]
-        self.assertEqual(len(image_inspects), 1)
-        self.assertIn("super-coder-base:", image_inspects[0])
+        self.assertEqual(len(image_inspects), 4)
+        self.assertEqual(
+            sum("python:3.12-slim" in line for line in image_inspects), 1
+        )
+        self.assertTrue(any("super-coder-base:" in line for line in image_inspects))
         sandbox_run = next(
             line
             for line in calls

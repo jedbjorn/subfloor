@@ -196,3 +196,33 @@ console.log(JSON.stringify({
         "stopped": True,
     }
     assert ".flag-actions .flag-edit { margin-left: auto; }" in STYLE
+
+
+def test_managed_advisory_is_labeled_nonblocking_and_has_no_human_actions():
+    script = ELEMENT_HARNESS + r"""
+function openFlagModal() { throw new Error("managed advisory must not be editable"); }
+function prompt() { throw new Error("managed advisory must not be resolvable"); }
+async function api() { throw new Error("managed advisory must not mutate through UI"); }
+function setStatus() {}
+function load() {}
+function toast() {}
+""" + FLAG_ROW + r"""
+const row = flagRow({
+  flag_id: 77, display_name: "Native sandbox readiness advisory", priority: "Low",
+  description: "exact evidence", resolved: 0, management_state: "system",
+  severity: "advisory", blocking_scope: "none", blocks_runtime: 0,
+}, []);
+const head = row.children[0], body = row.children[1];
+console.log(JSON.stringify({
+  rowClass: row.className,
+  headText: head.textContent,
+  bodyText: body.textContent,
+  actionCount: body.children.at(-1).children.length,
+}));
+"""
+    result = run_js(script)
+    assert result["rowClass"] == "flag advisory"
+    assert "Advisory" in result["headText"]
+    assert "System-managed" in result["headText"]
+    assert "Does not block runtime or shell entry" in result["bodyText"]
+    assert result["actionCount"] == 0

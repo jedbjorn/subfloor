@@ -28,6 +28,11 @@ from artifact_policy import devkit_log_root
 DECLARATION_PATH = Path(".subfloor/dev-kit.json")
 HOOK_NAMES = frozenset(("deps", "test", "lint", "typecheck"))
 MOUNT_NAME = re.compile(r"\A[a-z0-9][a-z0-9_-]{0,47}\Z")
+APT_NAME = re.compile(r"\A[a-z0-9][a-z0-9+.-]{1,127}\Z")
+APT_VERSION = re.compile(r"\A(?:[0-9]+:)?[0-9][A-Za-z0-9.+~-]{0,126}\Z")
+APT_PACKAGE_LIMIT = 64
+APT_ENTRY_BYTE_LIMIT = 256
+APT_TOTAL_BYTE_LIMIT = 8192
 COMPACT_HOOKS = frozenset(("test", "lint", "typecheck"))
 OUTPUT_MODES = frozenset(("compact", "full"))
 LOG_RETENTION = 20
@@ -77,12 +82,37 @@ class SandboxMount:
 
 
 @dataclass(frozen=True)
+class AptPackage:
+    name: str
+    version: str | None
+
+    @property
+    def atom(self) -> str:
+        return self.name if self.version is None else f"{self.name}={self.version}"
+
+
+@dataclass(frozen=True)
+class SandboxPackages:
+    apt: tuple[AptPackage, ...]
+
+    @property
+    def canonical_atoms(self) -> tuple[str, ...]:
+        return tuple(package.atom for package in self.apt)
+
+
+@dataclass(frozen=True)
 class Sandbox:
-    dockerfile_declared: str
-    dockerfile: Path
-    context_declared: str
-    context: Path
+    dockerfile_declared: str | None
+    dockerfile: Path | None
+    context_declared: str | None
+    context: Path | None
     mounts: tuple[SandboxMount, ...]
+    packages: SandboxPackages | None
+    package_error: str | None
+
+    @property
+    def has_extension(self) -> bool:
+        return self.dockerfile is not None
 
 
 @dataclass(frozen=True)
@@ -213,25 +243,91 @@ def _provision(
     return Provision(hook, tuple(declared), tuple(resolved))
 
 
+def _sandbox_packages(value: Any) -> SandboxPackages:
+    field = "$.sandbox.packages"
+    item = _object(value, field)
+    _keys(item, field, allowed=("apt",), required=("apt",))
+    raw = item["apt"]
+    if type(raw) is not list or not raw:
+        raise _error(f"{field}.apt", "must be an array with 1-64 entries")
+    if len(raw) > APT_PACKAGE_LIMIT:
+        raise _error(f"{field}.apt", "must contain at most 64 entries")
+
+    parsed: list[AptPackage] = []
+    names: set[str] = set()
+    total_bytes = 0
+    for index, raw_atom in enumerate(raw):
+        atom_field = f"{field}.apt[{index}]"
+        atom = _string(raw_atom, atom_field)
+        try:
+            encoded = atom.encode("utf-8")
+        except UnicodeError as exc:
+            raise _error(atom_field, "must be valid UTF-8") from exc
+        if len(encoded) < 2 or len(encoded) > APT_ENTRY_BYTE_LIMIT:
+            raise _error(atom_field, "must contain 2-256 UTF-8 bytes")
+        total_bytes += len(encoded)
+        if total_bytes > APT_TOTAL_BYTE_LIMIT:
+            raise _error(f"{field}.apt", "must contain at most 8192 UTF-8 bytes")
+        if atom.count("=") > 1:
+            raise _error(atom_field, "must contain at most one '='")
+        name, separator, version = atom.partition("=")
+        if not APT_NAME.fullmatch(name):
+            raise _error(
+                atom_field,
+                "name must match [a-z0-9][a-z0-9+.-]{1,127}",
+            )
+        if separator and not APT_VERSION.fullmatch(version):
+            raise _error(
+                atom_field,
+                "version must match ([0-9]+:)?[0-9][A-Za-z0-9.+~-]{0,126}",
+            )
+        if name in names:
+            raise _error(atom_field, f"duplicate package name {name!r}")
+        names.add(name)
+        parsed.append(AptPackage(name, version if separator else None))
+    parsed.sort(key=lambda package: package.name.encode("ascii"))
+    return SandboxPackages(tuple(parsed))
+
+
 def _sandbox(checkout: Path, value: Any) -> Sandbox:
     field = "$.sandbox"
     item = _object(value, field)
     _keys(
         item,
         field,
-        allowed=("dockerfile", "context", "mounts"),
-        required=("dockerfile",),
+        allowed=("dockerfile", "context", "mounts", "packages"),
     )
-    dockerfile_declared, dockerfile = _repo_path(
-        checkout, item["dockerfile"], f"{field}.dockerfile", kind="file"
-    )
-    default_context = str(Path(dockerfile_declared).parent)
-    context_declared, context = _repo_path(
-        checkout,
-        item.get("context", default_context),
-        f"{field}.context",
-        kind="directory",
-    )
+    if "dockerfile" not in item and "packages" not in item:
+        raise _error(field, "must contain 'dockerfile' or 'packages'")
+    if "context" in item and "dockerfile" not in item:
+        raise _error(f"{field}.context", "requires sandbox.dockerfile")
+
+    dockerfile_declared: str | None = None
+    dockerfile: Path | None = None
+    context_declared: str | None = None
+    context: Path | None = None
+    if "dockerfile" in item:
+        dockerfile_declared, dockerfile = _repo_path(
+            checkout, item["dockerfile"], f"{field}.dockerfile", kind="file"
+        )
+        default_context = str(Path(dockerfile_declared).parent)
+        context_declared, context = _repo_path(
+            checkout,
+            item.get("context", default_context),
+            f"{field}.context",
+            kind="directory",
+        )
+
+    packages: SandboxPackages | None = None
+    package_error: str | None = None
+    if "packages" in item:
+        try:
+            packages = _sandbox_packages(item["packages"])
+        except DevkitConfigError as exc:
+            # Package-local invalidity is a capability advisory under Decision
+            # #199.  Preserve the validated non-package envelope so the engine
+            # baseline can still be built and selected without inference.
+            package_error = str(exc)
     mounts_value = item.get("mounts", [])
     if type(mounts_value) is not list:
         raise _error(f"{field}.mounts", "must be an array")
@@ -288,6 +384,8 @@ def _sandbox(checkout: Path, value: Any) -> Sandbox:
         context_declared,
         context,
         tuple(mounts),
+        packages,
+        package_error,
     )
 
 
