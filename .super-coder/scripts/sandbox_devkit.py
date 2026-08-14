@@ -6,6 +6,7 @@ module deliberately knows nothing about the packages in that Dockerfile.
 """
 from __future__ import annotations
 
+import base64
 import fcntl
 import hashlib
 import json
@@ -42,6 +43,7 @@ EXTENSION_LABELS = (
     "sc.dockerfile_digest",
 )
 MOUNT_MARKER = "SC_DEVKIT_MOUNTS"
+GITHUB_HOST_TRUST = Path("assets/github_known_hosts")
 
 
 class SandboxImageError(RuntimeError):
@@ -438,6 +440,17 @@ def retire_superseded_runtime_images(
 
 
 def build_images(plan: ImagePlan, *, runner: Runner = subprocess.run) -> str:
+    trust_path = plan.engine / GITHUB_HOST_TRUST
+    try:
+        trust_bytes = trust_path.read_bytes()
+    except OSError as exc:
+        raise SandboxImageError(
+            f"engine GitHub host trust: cannot read {trust_path}: {exc}"
+        ) from exc
+    if not trust_bytes.strip():
+        raise SandboxImageError("engine GitHub host trust is empty")
+    trust_digest = _sha256_bytes(trust_bytes)
+    trust_b64 = base64.b64encode(trust_bytes).decode("ascii")
     base_command = [
         "docker",
         "build",
@@ -453,6 +466,10 @@ def build_images(plan: ImagePlan, *, runner: Runner = subprocess.run) -> str:
         f"SC_GID={plan.gid}",
         "--build-arg",
         f"SC_HARNESS_EPOCH={plan.harness_epoch}",
+        "--build-arg",
+        f"SC_GITHUB_HOST_TRUST_B64={trust_b64}",
+        "--build-arg",
+        f"SC_GITHUB_HOST_TRUST_SHA256={trust_digest}",
         *_label_arguments(plan.base_labels),
         str(plan.checkout),
     ]

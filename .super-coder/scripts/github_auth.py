@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -30,6 +31,7 @@ UNVERIFIED = "unverified"
 
 SSH = "ssh"
 HTTPS = "https"
+PINNED_KNOWN_HOSTS = Path(__file__).resolve().parents[1] / "assets" / "github_known_hosts"
 
 _TOKEN_VARIABLES = (
     "SC_GH_TOKEN",
@@ -216,6 +218,8 @@ def _clean_environment(environ: Mapping[str, str]) -> dict[str, str]:
         if not name.startswith("GIT_CONFIG_")
     }
     for name in _TOKEN_VARIABLES:
+        clean.pop(name, None)
+    for name in ("GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT"):
         clean.pop(name, None)
     clean.pop("GH_HOST", None)
     clean.pop("GITHUB_HOST", None)
@@ -661,6 +665,28 @@ def _is_unix_socket(path: str) -> bool:
         return False
 
 
+def _pinned_ssh_arguments(path: str | Path) -> tuple[str, ...] | None:
+    """Return strict options for the tracked trust file, never host SSH policy."""
+    try:
+        pinned = Path(path).resolve(strict=True)
+        if not pinned.is_file() or not pinned.read_bytes().strip():
+            return None
+    except OSError:
+        return None
+    return (
+        "-F",
+        os.devnull,
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        f"GlobalKnownHostsFile={pinned}",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+    )
+
+
 def _probe_ssh_transport(
     root: Path,
     remote_url: str,
@@ -668,6 +694,7 @@ def _probe_ssh_transport(
     environ: Mapping[str, str],
     runner: Runner,
     socket_checker: SocketChecker,
+    known_hosts_path: str | Path,
 ) -> tuple[CapabilityResult, str | None]:
     agent_socket = environ.get("SSH_AUTH_SOCK", "")
     if not agent_socket.strip():
@@ -691,14 +718,15 @@ def _probe_ssh_transport(
     if not identities.stdout.strip():
         return _capability(UNAVAILABLE, reason="ssh_agent_no_identities"), None
 
+    ssh_arguments = _pinned_ssh_arguments(known_hosts_path)
+    if ssh_arguments is None:
+        return _capability(UNAVAILABLE, reason="ssh_pinned_trust_missing"), None
+
     identity = _run(
         (
             "ssh",
             "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
+            *ssh_arguments,
             "git@github.com",
         ),
         cwd=root,
@@ -721,7 +749,7 @@ def _probe_ssh_transport(
         return _capability(UNAVAILABLE, reason="ssh_identity_rejected"), None
 
     git_env = dict(env)
-    git_env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes"
+    git_env["GIT_SSH_COMMAND"] = shlex.join(("ssh", *ssh_arguments))
     reach = _run(
         ("git", "-C", str(root), "ls-remote", "--symref", remote_url, "HEAD"),
         cwd=root,
@@ -753,6 +781,7 @@ def discover_github_capabilities(
     environ: Mapping[str, str] | None = None,
     runner: Runner = subprocess.run,
     socket_checker: SocketChecker = _is_unix_socket,
+    known_hosts_path: str | Path = PINNED_KNOWN_HOSTS,
     now: datetime | None = None,
 ) -> DiscoveryResult:
     """Resolve current host capabilities without mutating Git or auth state."""
@@ -798,6 +827,7 @@ def discover_github_capabilities(
             environ=env,
             runner=runner,
             socket_checker=socket_checker,
+            known_hosts_path=known_hosts_path,
         )
 
     return DiscoveryResult(

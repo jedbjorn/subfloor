@@ -27,6 +27,8 @@ FROM python:3.12-slim
 ARG SC_USER=j3d1
 ARG SC_UID=1000
 ARG SC_GID=1000
+ARG SC_GITHUB_HOST_TRUST_B64
+ARG SC_GITHUB_HOST_TRUST_SHA256
 
 # sqlite3 CLI + git + curl + bash + ca-certs (installers pipe-to-bash over https).
 # openssh-client is transport-only: runtime may forward a validated agent socket,
@@ -39,18 +41,18 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # GitHub host trust is image-owned and pinned to GitHub's published host keys.
-# The build context is deliberately empty, so keep the tracked key material in
-# this Dockerfile. A key rotation ships as a reviewed source change + rebuilt
-# image; --no-build intentionally retains the keys from its selected image.
+# The build context is deliberately empty. sandbox_devkit.py supplies the
+# tracked assets/github_known_hosts bytes and digest as build arguments. A key
+# rotation ships as a reviewed source change + rebuilt image; --no-build
+# intentionally retains the keys from its selected image.
 # UserKnownHostsFile=/dev/null prevents an ad-hoc per-user acceptance from
 # widening this host-specific policy. Strict checking never prompts or falls
 # back to trust-on-first-use.
 RUN install -d -m 0755 /etc/ssh/ssh_config.d \
- && printf '%s\n' \
-      'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' \
-      'github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=' \
-      'github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=' \
-      > /etc/ssh/ssh_known_hosts \
+ && test -n "${SC_GITHUB_HOST_TRUST_B64}" \
+ && test -n "${SC_GITHUB_HOST_TRUST_SHA256}" \
+ && printf '%s' "${SC_GITHUB_HOST_TRUST_B64}" | base64 -d > /etc/ssh/ssh_known_hosts \
+ && printf '%s  %s\n' "${SC_GITHUB_HOST_TRUST_SHA256}" /etc/ssh/ssh_known_hosts | sha256sum -c - \
  && chmod 0644 /etc/ssh/ssh_known_hosts \
  && printf '%s\n' \
       'Host github.com' \
@@ -59,6 +61,8 @@ RUN install -d -m 0755 /etc/ssh/ssh_config.d \
       '    UserKnownHostsFile /dev/null' \
       > /etc/ssh/ssh_config.d/99-super-coder-github.conf \
  && chmod 0644 /etc/ssh/ssh_config.d/99-super-coder-github.conf
+
+LABEL sc.github_host_trust_sha256="${SC_GITHUB_HOST_TRUST_SHA256}"
 
 # websockets 16.1.1 (BSD-3-Clause) — the sans-io WS layer for the one-port
 # HTTP+WS transport (api/transport.py; WS upgrades currently answer

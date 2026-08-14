@@ -2,8 +2,10 @@
 """Behavioral coverage for fork-extension sandbox image identity."""
 from __future__ import annotations
 
+import base64
 import contextlib
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -190,10 +192,14 @@ class ImageFixture:
         self.state = self.root / ".sc-state"
         self.context = self.root / "container" / "context"
         self.engine.mkdir(parents=True)
+        (self.engine / "assets").mkdir()
         self.subfloor.mkdir()
         self.state.mkdir()
         self.context.mkdir(parents=True)
         (self.engine / "Dockerfile").write_text("FROM scratch\n")
+        (self.engine / "assets" / "github_known_hosts").write_text(
+            "github.com ssh-ed25519 AAAATEST\n"
+        )
         (self.state / "engine.ref").write_text("a" * 40 + "\n")
         declaration: dict = {"version": 1}
         if provision:
@@ -333,6 +339,15 @@ class SandboxImagePlanTest(unittest.TestCase):
         base, extension = docker.builds()
         self.assertEqual(base[-1], str(fixture.root.resolve()))
         self.assertEqual(extension[-1], str(fixture.context.resolve()))
+        trust = (fixture.engine / "assets" / "github_known_hosts").read_bytes()
+        self.assertIn(
+            "SC_GITHUB_HOST_TRUST_B64=" + base64.b64encode(trust).decode("ascii"),
+            base,
+        )
+        self.assertIn(
+            "SC_GITHUB_HOST_TRUST_SHA256=" + hashlib.sha256(trust).hexdigest(),
+            base,
+        )
         self.assertIn("SC_BASE_IMAGE=sha256:" + "b" * 64, extension)
         for key, value in plan.runtime_labels.items():
             self.assertIn(f"{key}={value}", extension)

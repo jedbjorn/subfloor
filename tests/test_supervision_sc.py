@@ -57,6 +57,11 @@ class SupervisionFixture:
                 ROOT / ".super-coder" / "scripts" / script,
                 self.scripts / script,
             )
+        (self.engine / "assets").mkdir()
+        shutil.copy2(
+            ROOT / ".super-coder" / "assets" / "github_known_hosts",
+            self.engine / "assets" / "github_known_hosts",
+        )
         (self.engine / "Dockerfile").write_text("FROM scratch\n")
         (self.root / ".sc-state").mkdir()
         (self.root / ".sc-state" / "engine.ref").write_text("a" * 40 + "\n")

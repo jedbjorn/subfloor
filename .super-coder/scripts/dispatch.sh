@@ -1224,7 +1224,7 @@ case "$cmd" in
     provision_rc=0
     "$PY" "$S/github_auth.py" discover --repo-root "$CALLER_ROOT" | \
       "$PY" "$S/sandbox_github_auth.py" $github_auth_rootless \
-        --uid "$(id -u)" --gid "$(id -g)" -- \
+        --image "$IMG" --uid "$(id -u)" --gid "$(id -g)" -- \
         "$PY" "$S/sandbox_devkit.py" launch-container \
         "$CALLER_ROOT" "$ENGINE" "$epoch" "$(id -un)" "$(id -u)" "$(id -g)" \
         "$CNAME" -- \
