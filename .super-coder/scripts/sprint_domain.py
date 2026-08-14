@@ -172,6 +172,25 @@ class SpecApprovalReceipt:
     created: bool
 
 
+@dataclass(frozen=True)
+class WorkUnitCompletionReceipt:
+    sprint_id: int
+    work_unit_id: int
+    disposition: str
+    completed_at: str
+    output_kind: str
+    stored_result_length: int
+    stored_result_sha256: str
+    changed: bool
+    idempotent: bool
+    created_wake_ids: tuple[int, ...]
+    reused_wake_ids: tuple[int, ...]
+
+    @property
+    def wake_ids(self) -> tuple[int, ...]:
+        return tuple(dict.fromkeys((*self.created_wake_ids, *self.reused_wake_ids)))
+
+
 def transition_allowed(current: str, target: str) -> bool:
     return (
         current in SPRINT_TRANSITIONS
@@ -3566,7 +3585,7 @@ class SprintWorkUnitStore:
         shell_id: int,
         *,
         result: str,
-    ) -> list[int]:
+    ) -> WorkUnitCompletionReceipt:
         """Record a non-code Developer result and release newly unblocked work."""
         result = result.strip()
         if not result:
@@ -3577,7 +3596,7 @@ class SprintWorkUnitStore:
                 "maximum is 8000"
             )
         pause_receipt: PauseReceipt | None = None
-        dispatched: list[int] = []
+        receipt: WorkUnitCompletionReceipt
         with db_driver.write_transaction(self.con, "sprint.work_unit.complete"):
             unit = self._unit(sprint_id, work_unit_id)
             if int(unit["assigned_shell_id"]) != shell_id:
@@ -3587,7 +3606,11 @@ class SprintWorkUnitStore:
                     raise SprintInvariantError(
                         "work unit was already completed with a different result"
                     )
-                return dispatched
+                return self._completion_receipt(
+                    sprint_id,
+                    work_unit_id,
+                    changed=False,
+                )
             if unit["output_kind"] not in {"report_only", "no_code"}:
                 raise SprintInvariantError(
                     "code work units complete only through the merge judgment chain"
@@ -3603,23 +3626,20 @@ class SprintWorkUnitStore:
                 "WHERE work_unit_id=?",
                 (result, work_unit_id),
             )
-            self._event(
-                sprint_id,
-                "work_unit.completed",
-                shell_id,
-                {
-                    "work_unit_id": work_unit_id,
-                    "output_kind": str(unit["output_kind"]),
-                    "result": result,
-                },
-                actor_kind="participant",
-            )
+            existing_wake_ids = {
+                int(row[0])
+                for row in self.con.execute("SELECT wake_id FROM sprint_wake_outbox")
+            }
+            completion_wake_ids: list[int] = []
             sprint = self.con.execute(
                 "SELECT lifecycle,originating_planner_shell_id FROM sprints "
                 "WHERE sprint_id=?",
                 (sprint_id,),
             ).fetchone()
-            pause_receipt = self._queue_delivery_terminal(sprint_id)
+            pause_receipt = self._queue_delivery_terminal(
+                sprint_id,
+                completion_wake_ids=completion_wake_ids,
+            )
             lifecycle = self.con.execute(
                 "SELECT lifecycle FROM sprints WHERE sprint_id=?",
                 (sprint_id,),
@@ -3630,13 +3650,42 @@ class SprintWorkUnitStore:
                     int(sprint["originating_planner_shell_id"]),
                     "planner",
                 )
-                dispatched = self._dispatch_ready_locked(
-                    sprint_id,
-                    planner_participant_id=planner,
+                completion_wake_ids.extend(
+                    self._dispatch_ready_locked(
+                        sprint_id,
+                        planner_participant_id=planner,
+                    )
                 )
+            wake_ids = tuple(dict.fromkeys(completion_wake_ids))
+            created_wake_ids = tuple(
+                wake_id for wake_id in wake_ids if wake_id not in existing_wake_ids
+            )
+            reused_wake_ids = tuple(
+                wake_id for wake_id in wake_ids if wake_id in existing_wake_ids
+            )
+            self._event(
+                sprint_id,
+                "work_unit.completed",
+                shell_id,
+                {
+                    "work_unit_id": work_unit_id,
+                    "output_kind": str(unit["output_kind"]),
+                    "stored_result_length": len(result),
+                    "stored_result_sha256": hashlib.sha256(result.encode()).hexdigest(),
+                    "wake_ids": list(wake_ids),
+                },
+                actor_kind="participant",
+            )
+            receipt = self._completion_receipt(
+                sprint_id,
+                work_unit_id,
+                changed=True,
+                created_wake_ids=created_wake_ids,
+                reused_wake_ids=reused_wake_ids,
+            )
         if pause_receipt is not None:
             self.lifecycle.signal_pause_receipt(pause_receipt)
-        return dispatched
+        return receipt
 
     def cancel(
         self,
@@ -3788,7 +3837,12 @@ class SprintWorkUnitStore:
             planner_participant_id=planner,
         )
 
-    def _queue_delivery_terminal(self, sprint_id: int) -> PauseReceipt | None:
+    def _queue_delivery_terminal(
+        self,
+        sprint_id: int,
+        *,
+        completion_wake_ids: list[int] | None = None,
+    ) -> PauseReceipt | None:
         state = self.con.execute(
             "SELECT s.lifecycle,COUNT(u.work_unit_id) AS total,"
             "COALESCE(SUM(u.disposition='completed'),0) AS completed,"
@@ -3876,7 +3930,7 @@ class SprintWorkUnitStore:
         from sprint_message_delivery import SprintMessageStore
 
         messages = SprintMessageStore(self.con)
-        messages.send_in_transaction(
+        message_receipt = messages.send_in_transaction(
             sprint_id,
             to_participant_id=int(owner["participant_id"]),
             message_kind="notification",
@@ -3885,6 +3939,8 @@ class SprintWorkUnitStore:
             declared_type="new",
             idempotency_key=base_key,
         )
+        if completion_wake_ids is not None and message_receipt.wake_id is not None:
+            completion_wake_ids.append(int(message_receipt.wake_id))
         self._event(
             sprint_id,
             "sprint.delivery_terminal",
@@ -3899,6 +3955,47 @@ class SprintWorkUnitStore:
             actor_kind="system",
         )
         return None
+
+    def _completion_receipt(
+        self,
+        sprint_id: int,
+        work_unit_id: int,
+        *,
+        changed: bool,
+        created_wake_ids: tuple[int, ...] = (),
+        reused_wake_ids: tuple[int, ...] = (),
+    ) -> WorkUnitCompletionReceipt:
+        unit = self._unit(sprint_id, work_unit_id)
+        result = str(unit["completion_result"])
+        completed_at = unit["completed_at"]
+        if unit["disposition"] != "completed" or completed_at is None:
+            raise SprintInvariantError("work-unit completion receipt requires completed state")
+        if not changed:
+            event = self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='work_unit.completed' "
+                "AND json_extract(payload,'$.work_unit_id')=? "
+                "ORDER BY event_id DESC LIMIT 1",
+                (sprint_id, work_unit_id),
+            ).fetchone()
+            prior_wake_ids: tuple[int, ...] = ()
+            if event is not None:
+                payload = json.loads(event["payload"])
+                prior_wake_ids = tuple(int(value) for value in payload.get("wake_ids", ()))
+            reused_wake_ids = prior_wake_ids
+        return WorkUnitCompletionReceipt(
+            sprint_id=sprint_id,
+            work_unit_id=work_unit_id,
+            disposition=str(unit["disposition"]),
+            completed_at=str(completed_at),
+            output_kind=str(unit["output_kind"]),
+            stored_result_length=len(result),
+            stored_result_sha256=hashlib.sha256(result.encode()).hexdigest(),
+            changed=changed,
+            idempotent=not changed,
+            created_wake_ids=created_wake_ids,
+            reused_wake_ids=reused_wake_ids,
+        )
 
     def _queue_planner_merge_bypass(
         self,

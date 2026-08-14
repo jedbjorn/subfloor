@@ -2083,7 +2083,73 @@ class SprintCliApiTest(unittest.TestCase):
             "--result-file",
             self.write("Report document #77"),
         )
-        self.assertEqual([], completed_unit["wake_ids"])
+        self.assertEqual(sprint_id, completed_unit["sprint_id"])
+        self.assertEqual(report_unit, completed_unit["work_unit_id"])
+        self.assertEqual("completed", completed_unit["disposition"])
+        self.assertEqual("report_only", completed_unit["output_kind"])
+        self.assertEqual(19, completed_unit["stored_result_length"])
+        self.assertEqual(
+            hashlib.sha256(b"Report document #77").hexdigest(),
+            completed_unit["stored_result_sha256"],
+        )
+        self.assertIsInstance(completed_unit["completed_at"], str)
+        self.assertTrue(completed_unit["changed"])
+        self.assertFalse(completed_unit["idempotent"])
+        self.assertEqual(1, len(completed_unit["wake_ids"]))
+        self.assertEqual(
+            completed_unit["wake_ids"], completed_unit["created_wake_ids"]
+        )
+        self.assertEqual([], completed_unit["reused_wake_ids"])
+        self.assertNotIn("Report document #77", json.dumps(completed_unit))
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            counts_before_retry = tuple(
+                con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events),"
+                    "(SELECT COUNT(*) FROM wake_message),"
+                    "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+                ).fetchone()
+            )
+        completed_retry = self.run_cli(
+            TOKENS["developer"],
+            "complete-unit",
+            "--sprint",
+            str(sprint_id),
+            "--work-unit",
+            str(report_unit),
+            "--result-file",
+            self.write("Report document #77"),
+        )
+        for field in (
+            "sprint_id",
+            "work_unit_id",
+            "disposition",
+            "completed_at",
+            "output_kind",
+            "stored_result_length",
+            "stored_result_sha256",
+            "wake_ids",
+        ):
+            self.assertEqual(completed_unit[field], completed_retry[field])
+        self.assertFalse(completed_retry["changed"])
+        self.assertTrue(completed_retry["idempotent"])
+        self.assertEqual([], completed_retry["created_wake_ids"])
+        self.assertEqual(
+            completed_unit["wake_ids"], completed_retry["reused_wake_ids"]
+        )
+        self.assertNotIn("Report document #77", json.dumps(completed_retry))
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            self.assertEqual(
+                counts_before_retry,
+                tuple(
+                    con.execute(
+                        "SELECT "
+                        "(SELECT COUNT(*) FROM sprint_events),"
+                        "(SELECT COUNT(*) FROM wake_message),"
+                        "(SELECT COUNT(*) FROM sprint_wake_outbox)"
+                    ).fetchone()
+                ),
+            )
 
         conformance = self.run_cli(
             TOKENS["reviewer"],

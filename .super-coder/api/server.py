@@ -2711,13 +2711,28 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self._send(200, {"changed": changed})
             if path == "/_sc/sprint/complete-unit":
-                wake_ids = sprint_domain.SprintWorkUnitStore(con).complete(
+                completion_receipt = sprint_domain.SprintWorkUnitStore(
+                    con
+                ).complete(
                     sprint_id,
                     self._sprint_integer(body, "work_unit_id"),
                     shell_id,
                     result=body.get("result") or "",
                 )
-                return self._send(200, {"wake_ids": wake_ids})
+                return self._send(200, {
+                    "sprint_id": completion_receipt.sprint_id,
+                    "work_unit_id": completion_receipt.work_unit_id,
+                    "disposition": completion_receipt.disposition,
+                    "completed_at": completion_receipt.completed_at,
+                    "output_kind": completion_receipt.output_kind,
+                    "stored_result_length": completion_receipt.stored_result_length,
+                    "stored_result_sha256": completion_receipt.stored_result_sha256,
+                    "changed": completion_receipt.changed,
+                    "idempotent": completion_receipt.idempotent,
+                    "wake_ids": list(completion_receipt.wake_ids),
+                    "created_wake_ids": list(completion_receipt.created_wake_ids),
+                    "reused_wake_ids": list(completion_receipt.reused_wake_ids),
+                })
             if path == "/_sc/sprint/cancel-unit":
                 planner_shell_id = self._sprint_planner_proxy(
                     con, sprint_id, shell_id
