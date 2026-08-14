@@ -564,6 +564,36 @@ _LABEL = {"brainstorm": "Brainstorm", "in_progress": "In Progress", "next": "Nex
           "near_term": "Near Term", "long_term": "Long Term", "shipped": "Shipped",
           "retired": "Retired"}
 
+_RUNTIME_FLAG_DEFAULTS = {
+    "source_kind": "NULL",
+    "source_key": "NULL",
+    "source_generation": "NULL",
+    "evidence_digest": "NULL",
+    "management_state": "'human'",
+    "severity": "'tracker'",
+    "blocking_scope": "'feature'",
+    "blocks_runtime": "1",
+    "source_payload": "NULL",
+}
+
+
+def _flag_columns(con) -> set[str]:
+    return {row[1] for row in con.execute("PRAGMA table_info(flags)")}
+
+
+def _runtime_flag_projection(
+    columns: set[str], *, alias: str = "f", include_payload: bool = False
+) -> str:
+    names = list(_RUNTIME_FLAG_DEFAULTS)
+    if not include_payload:
+        names.remove("source_payload")
+    return ", ".join(
+        f"{alias}.{name}"
+        if name in columns
+        else f"{_RUNTIME_FLAG_DEFAULTS[name]} AS {name}"
+        for name in names
+    )
+
 
 def get_roadmap(con) -> dict:
     feats = rows(con.execute(
@@ -584,10 +614,16 @@ def get_roadmap(con) -> dict:
             "ORDER BY feature_id, kind DESC, seq")):
         docs_by.setdefault(d["feature_id"], []).append(d)
     flags_by: dict[int, list] = {}
+    runtime_filter = (
+        "AND COALESCE(blocks_runtime,1)=1 "
+        if "blocks_runtime" in _flag_columns(con)
+        else ""
+    )
     for f in rows(con.execute(
             "SELECT flag_id, feature_id, display_name, description FROM flags "
             "WHERE resolved=0 AND COALESCE(is_deleted,0)=0 "
-            "AND COALESCE(blocks_runtime,1)=1 AND feature_id IS NOT NULL")):
+            + runtime_filter
+            + "AND feature_id IS NOT NULL")):
         flags_by.setdefault(f["feature_id"], []).append(f)
     # Spec tasks (implementation plan) attach per feature, ordered by spec then
     # seq so a multi-spec feature lists each spec's plan in order. Drives the
@@ -663,13 +699,16 @@ def get_map() -> dict:
 
 
 def get_flags(con) -> dict:
-    runtime_flags.reconcile_pending(con, REPO_ROOT)
+    flag_columns = _flag_columns(con)
+    if set(_RUNTIME_FLAG_DEFAULTS).issubset(flag_columns):
+        runtime_flags.reconcile_pending(con, REPO_ROOT)
+    runtime_projection = _runtime_flag_projection(
+        flag_columns, include_payload=True
+    )
     flags = rows(con.execute(
         "SELECT f.flag_id, f.display_name, f.priority, f.description, f.created_date, "
         "f.resolved, f.resolved_date, f.resolution_notes, f.feature_id, "
-        "f.source_kind, f.source_key, f.source_generation, f.evidence_digest, "
-        "f.management_state, f.severity, f.blocking_scope, f.blocks_runtime, "
-        "f.source_payload, "
+        + runtime_projection + ", "
         "r.title AS feature_title FROM flags f LEFT JOIN roadmap r "
         "ON r.feature_id=f.feature_id WHERE COALESCE(f.is_deleted,0)=0 "
         "ORDER BY f.resolved, f.flag_id DESC"))
@@ -3239,12 +3278,11 @@ class Handler(BaseHTTPRequestHandler):
                         })
                     where = "f.feature_id=? AND COALESCE(f.resolved,0)=1"
                     params = (int(raw_feature),)
+                runtime_projection = _runtime_flag_projection(_flag_columns(con))
                 fs = rows(con.execute(
                     "SELECT f.flag_id, f.display_name, f.priority, f.description, "
                     "f.feature_id, f.created_date, f.resolved, f.resolved_date, "
-                    "f.resolution_notes, f.source_kind, f.source_key, "
-                    "f.source_generation, f.evidence_digest, f.management_state, "
-                    "f.severity, f.blocking_scope, f.blocks_runtime, "
+                    "f.resolution_notes, " + runtime_projection + ", "
                     "s.shortname AS owner, r.title AS feature_title "
                     "FROM flags f "
                     "LEFT JOIN shells s ON s.shell_id=f.shell_id "
@@ -3260,12 +3298,11 @@ class Handler(BaseHTTPRequestHandler):
                 # a row that is already resolved carries the notes the closer
                 # would otherwise overwrite.
                 fid = int(parts[3])
+                runtime_projection = _runtime_flag_projection(_flag_columns(con))
                 r = con.execute(
                     "SELECT f.flag_id, f.display_name, f.priority, f.description, "
                     "f.feature_id, f.created_date, f.resolved, f.resolved_date, "
-                    "f.resolution_notes, f.source_kind, f.source_key, "
-                    "f.source_generation, f.evidence_digest, f.management_state, "
-                    "f.severity, f.blocking_scope, f.blocks_runtime, "
+                    "f.resolution_notes, " + runtime_projection + ", "
                     "(SELECT s.shortname FROM shells s WHERE s.shell_id=f.shell_id) "
                     " AS owner, "
                     "(SELECT title FROM roadmap WHERE feature_id=f.feature_id) "
@@ -3754,8 +3791,13 @@ class Handler(BaseHTTPRequestHandler):
             # on the row's shell_id (set at open).
             if len(parts) == 4 and parts[2] == "flags":
                 fid = int(parts[3])
+                management_state = (
+                    "management_state"
+                    if "management_state" in _flag_columns(con)
+                    else "'human' AS management_state"
+                )
                 target = con.execute(
-                        "SELECT management_state FROM flags WHERE flag_id=? "
+                        f"SELECT {management_state} FROM flags WHERE flag_id=? "
                         "AND COALESCE(is_deleted,0)=0", (fid,)).fetchone()
                 if not target:
                     return self._send(404, {"error": "no such flag"})

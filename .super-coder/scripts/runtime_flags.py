@@ -420,7 +420,12 @@ def put_via_api(
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.status, json.loads(response.read())
+            try:
+                return response.status, json.loads(response.read())
+            except (ValueError, OSError) as exc:
+                raise RuntimeFlagError(
+                    "runtime advisory API returned a malformed success response"
+                ) from exc
     except urllib.error.HTTPError as exc:
         try:
             payload = json.loads(exc.read())

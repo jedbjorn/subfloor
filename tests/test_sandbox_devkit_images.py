@@ -16,15 +16,18 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".super-coder" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import sandbox_devkit  # noqa: E402
 from sandbox_devkit import (  # noqa: E402
     MOUNT_MARKER,
     ProvisionFailed,
     SandboxImageError,
+    _emit_image_state,
     build_images,
     cleanup_owned_resources,
     docker_run,
@@ -528,6 +531,15 @@ class SandboxImagePlanTest(unittest.TestCase):
         self.assertTrue(
             list((fixture.state / "local" / "runtime-flags" / "pending").glob("*.json"))
         )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            _emit_image_state(plan, selected, "built")
+        self.assertIn(
+            "dev-kit image state: advisory — native_package_candidate; "
+            f"selected engine_baseline {plan.base_tag}",
+            output.getvalue(),
+        )
+        self.assertNotIn("image state: ready", output.getvalue())
 
     def test_package_failure_preserves_a_healthy_running_runtime_without_cutover(self):
         fixture = ImageFixture(
@@ -682,6 +694,42 @@ class SandboxImagePlanTest(unittest.TestCase):
         self.assertEqual(selected, plan.base_tag)
         self.assertIn("advisory persistence", errors.getvalue())
         self.assertFalse((fixture.state / "local" / "dev-kit").exists())
+
+    def test_malformed_advisory_api_success_remains_pending_without_blocking_core(
+        self,
+    ):
+        fixture = ImageFixture(
+            self.base,
+            "malformed-advisory-api",
+            sandbox=False,
+            packages=["curl"],
+        )
+        (fixture.engine / "instance.json").write_text(json.dumps({"port": 8837}))
+        plan = fixture.plan()
+        docker = FakeDocker()
+        docker.package_build_status = 100
+
+        with mock.patch.object(
+            sandbox_devkit.runtime_flags,
+            "put_via_api",
+            side_effect=sandbox_devkit.runtime_flags.RuntimeFlagError(
+                "runtime advisory API returned a malformed success response"
+            ),
+        ):
+            selected = build_images(plan, runner=docker)
+
+        self.assertEqual(selected, plan.base_tag)
+        pending = list(
+            (fixture.state / "local" / "runtime-flags" / "pending").glob("*.json")
+        )
+        self.assertEqual(len(pending), 1)
+        status_path = next(
+            (fixture.state / "local" / "dev-kit").glob("*/status.json")
+        )
+        status = json.loads(status_path.read_text())
+        self.assertEqual(status["core_runtime"], "ready")
+        self.assertEqual(status["native_packages"], "advisory")
+        self.assertEqual(status["advisory"]["state"], "pending")
 
     def test_success_after_advisory_writes_higher_generation_clearance_intent(self):
         fixture = ImageFixture(
@@ -976,6 +1024,51 @@ class SandboxImagePlanTest(unittest.TestCase):
             text=True,
         ).stdout
         self.assertEqual(after, before)
+
+    def test_provision_only_receipt_sets_and_restores_ready_status(self):
+        fixture = ImageFixture(
+            self.base,
+            "provision-only-status",
+            sandbox=False,
+            provision=True,
+        )
+        plan = fixture.plan()
+        docker = FakeDocker()
+        selected = build_images(plan, runner=docker)
+        status_path = next(
+            (fixture.state / "local" / "dev-kit").glob("*/status.json")
+        )
+        before = json.loads(status_path.read_text())
+        self.assertEqual(selected, plan.base_tag)
+        self.assertEqual(before["fork_readiness"], "degraded")
+        self.assertEqual(before["package_receipt"], "pending")
+        docker.containers["sandbox"] = docker.images[plan.base_tag]["Id"]
+
+        first = provision_checkout(plan, "sandbox", runner=docker, emit=False)
+        ready = json.loads(status_path.read_text())
+        self.assertFalse(first["reused"])
+        self.assertEqual(ready["fork_readiness"], "ready")
+        self.assertEqual(
+            ready["package_receipt"],
+            {"fingerprint": first["fingerprint"], "path": first["receipt"]},
+        )
+
+        ready["fork_readiness"] = "not_declared"
+        status_path.write_text(json.dumps(ready))
+        second = provision_checkout(plan, "sandbox", runner=docker, emit=False)
+        restored = json.loads(status_path.read_text())
+        self.assertTrue(second["reused"])
+        self.assertEqual(restored["fork_readiness"], "ready")
+        self.assertEqual(
+            len(
+                [
+                    command
+                    for command in docker.commands
+                    if command[:2] == ("docker", "exec")
+                ]
+            ),
+            1,
+        )
 
     def test_failed_provision_retains_evidence_but_never_writes_success(self):
         fixture = ImageFixture(self.base, "fork", provision=True)

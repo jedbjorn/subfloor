@@ -49,6 +49,19 @@ def build_db() -> sqlite3.Connection:
     return con
 
 
+def build_legacy_db(path: str = ":memory:") -> sqlite3.Connection:
+    """The schema floor immediately before runtime-advisory migration 0210."""
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    con.executescript(SCHEMA.read_text())
+    for migration in sorted(MIGRATIONS.glob("*.sql")):
+        if migration.name.startswith("0210_"):
+            break
+        con.executescript(migration.read_text())
+    con.execute("PRAGMA foreign_keys=ON")
+    return con
+
+
 def seed(con: sqlite3.Connection) -> dict:
     """Minimal but trigger-complete fixture. Returns the ids it created."""
     cur = con.execute(
@@ -412,6 +425,90 @@ class AssemblerSmokeTest(unittest.TestCase):
         self.assertTrue(out["flags"])
         self.assertTrue(any(f["feature_title"] == "Feature A"
                             for f in out["flags"]))
+
+    def test_flag_and_roadmap_assemblers_tolerate_pre_advisory_schema(
+        self,
+    ) -> None:
+        legacy = build_legacy_db()
+        try:
+            ids = seed(legacy)
+            with mock.patch.object(
+                server.runtime_flags, "reconcile_pending"
+            ) as reconcile:
+                flags = server.get_flags(legacy)["flags"]
+            reconcile.assert_not_called()
+            flag = next(
+                row for row in flags if row["feature_id"] == ids["feature_id"]
+            )
+            self.assertEqual(flag["management_state"], "human")
+            self.assertEqual(flag["severity"], "tracker")
+            self.assertEqual(flag["blocking_scope"], "feature")
+            self.assertEqual(flag["blocks_runtime"], 1)
+            self.assertIsNone(flag["source_kind"])
+            roadmap = server.get_roadmap(legacy)
+            feature = next(
+                row
+                for bucket in roadmap["buckets"]
+                for row in bucket["features"]
+                if row["feature_id"] == ids["feature_id"]
+            )
+            self.assertEqual(
+                [row["display_name"] for row in feature["open_flags"]],
+                ["CC-001"],
+            )
+        finally:
+            legacy.close()
+
+    def test_mem_flag_reads_and_patch_tolerate_pre_advisory_schema(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "legacy.db"
+            legacy = build_legacy_db(str(db_path))
+            ids = seed(legacy)
+            flag_id = legacy.execute(
+                "SELECT flag_id FROM flags WHERE feature_id=?",
+                (ids["feature_id"],),
+            ).fetchone()[0]
+            legacy.close()
+            with mock.patch.object(server, "DB_PATH", db_path), mock.patch.object(
+                server.Handler,
+                "_require_shell_auth",
+                return_value=ids["shell_id"],
+            ):
+                status, _headers, raw = server.dispatch_http(
+                    "GET", "/_sc/mem/flags", "", b""
+                )
+                self.assertEqual(status, 200)
+                listed = json.loads(raw)["flags"]
+                self.assertEqual(len(listed), 1)
+                self.assertEqual(listed[0]["management_state"], "human")
+                self.assertEqual(listed[0]["blocks_runtime"], 1)
+
+                status, _headers, raw = server.dispatch_http(
+                    "GET", f"/_sc/mem/flags/{flag_id}", "", b""
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(raw)["flag"]["severity"], "tracker")
+
+                body = json.dumps({"description": "updated legacy flag"}).encode()
+                headers = (
+                    "Content-Type: application/json\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                )
+                status, _headers, raw = server.dispatch_http(
+                    "PATCH", f"/_sc/mem/flags/{flag_id}", headers, body
+                )
+                self.assertEqual(status, 200)
+                self.assertTrue(json.loads(raw)["ok"])
+            check = sqlite3.connect(db_path)
+            try:
+                description = check.execute(
+                    "SELECT description FROM flags WHERE flag_id=?", (flag_id,)
+                ).fetchone()[0]
+                self.assertEqual(description, "updated legacy flag")
+            finally:
+                check.close()
 
     def test_get_skills_origin_and_grants(self) -> None:
         out = server.get_skills(self.con)

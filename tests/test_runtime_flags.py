@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -225,6 +226,35 @@ class RuntimeFlagStoreTest(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.con.execute(
                 "INSERT INTO flags (display_name,management_state) VALUES ('bad','system')"
+            )
+
+    def test_malformed_success_response_is_a_retryable_persistence_failure(self):
+        class MalformedResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read():
+                return b"not-json"
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            runtime_flags.urllib.request,
+            "urlopen",
+            return_value=MalformedResponse(),
+        ), self.assertRaisesRegex(
+            runtime_flags.RuntimeFlagError,
+            "malformed success response",
+        ):
+            runtime_flags.put_via_api(
+                Path(directory),
+                8837,
+                self.source,
+                open_request(1),
             )
 
     def test_flags_projection_exposes_advisory_without_blocker_semantics(self):

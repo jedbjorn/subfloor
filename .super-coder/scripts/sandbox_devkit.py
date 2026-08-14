@@ -1307,11 +1307,16 @@ def build_images(
     base_id = _require_labels(plan.base_tag, base_labels, runner=runner)
     _prove_baseline(base_id, runner=runner)
     if not plan.extends_base and not plan.has_package_contract:
+        provision_declared = bool(
+            plan.declaration is not None and plan.declaration.provision is not None
+        )
         ready = _write_status(plan, {
             "core_runtime": "ready", "native_packages": "not_declared",
-            "fork_readiness": "not_declared", "selected_runtime": "engine_baseline",
+            "fork_readiness": "degraded" if provision_declared else "not_declared",
+            "selected_runtime": "engine_baseline",
             "selected_tag": plan.base_tag, "selected_image_id": base_id,
-            "package_receipt": "none", "cutover": "baseline",
+            "package_receipt": "pending" if provision_declared else "none",
+            "cutover": "baseline",
             "parent_id": parent_id, "engine_base_id": base_id,
             "advisory": previous_status.get("advisory"),
             "advisory_declaration_digest": previous_status.get("declaration_digest"),
@@ -2018,6 +2023,62 @@ def _classification(status: int) -> str:
     }.get(status, "hook_failure")
 
 
+def _record_ready_status(
+    plan: ImagePlan,
+    payload: dict[str, Any],
+    fingerprint: str,
+    receipt_path: Path,
+    *,
+    runner: Runner,
+    container: str | None,
+) -> None:
+    status_payload = _read_status(plan) or {
+        "core_runtime": "ready",
+        "native_packages": "ready" if plan.has_package_contract else "not_declared",
+        "selected_runtime": (
+            "package_complete" if plan.has_package_contract else "engine_baseline"
+        ),
+        "selected_tag": payload["image"]["tag"],
+        "selected_image_id": payload["image"]["id"],
+        "cutover": "package_complete" if plan.has_package_contract else "baseline",
+        "parent_id": payload["image"]["parent_id"],
+        "engine_base_id": payload["image"]["engine_base_id"],
+        "package_layer_id": payload["image"]["package_layer_id"],
+        "context_digest": payload["extension"]["context_digest"],
+    }
+    status_payload["fork_readiness"] = "ready"
+    status_payload["package_receipt"] = {
+        "fingerprint": fingerprint,
+        "path": str(receipt_path),
+    }
+    clearance = _maybe_clear_advisory(
+        plan,
+        status_payload,
+        receipt_path=str(receipt_path),
+        runner=runner,
+        container=container,
+    )
+    if clearance is not None:
+        status_payload["advisory"] = None
+        status_payload["clearance"] = clearance
+    _write_status(
+        plan,
+        {
+            key: value
+            for key, value in status_payload.items()
+            if key
+            not in {
+                "format_version",
+                "checkout_identity",
+                "updated_at",
+                "engine_ref",
+                "declaration_digest",
+                "package_digest",
+            }
+        },
+    )
+
+
 def provision_checkout(
     plan: ImagePlan,
     container: str | None,
@@ -2058,6 +2119,14 @@ def provision_checkout(
             and receipt.get("state") == "ready"
             and receipt.get("fingerprint") == fingerprint
         ):
+            _record_ready_status(
+                plan,
+                payload,
+                fingerprint,
+                receipt_path,
+                runner=runner,
+                container=container,
+            )
             return {
                 "state": "ready",
                 "reused": True,
@@ -2149,48 +2218,13 @@ def provision_checkout(
             "attempt": attempt_reference,
         }
         _atomic_json(receipt_path, receipt)
-        status_payload = _read_status(plan) or {
-            "core_runtime": "ready",
-            "native_packages": "ready" if plan.has_package_contract else "not_declared",
-            "fork_readiness": "ready",
-            "selected_runtime": "package_complete" if plan.has_package_contract else "engine_baseline",
-            "selected_tag": payload["image"]["tag"],
-            "selected_image_id": payload["image"]["id"],
-            "cutover": "package_complete" if plan.has_package_contract else "baseline",
-            "parent_id": payload["image"]["parent_id"],
-            "engine_base_id": payload["image"]["engine_base_id"],
-            "package_layer_id": payload["image"]["package_layer_id"],
-            "context_digest": payload["extension"]["context_digest"],
-        }
-        status_payload["package_receipt"] = {
-            "fingerprint": fingerprint,
-            "path": str(receipt_path),
-        }
-        clearance = _maybe_clear_advisory(
+        _record_ready_status(
             plan,
-            status_payload,
-            receipt_path=str(receipt_path),
+            payload,
+            fingerprint,
+            receipt_path,
             runner=runner,
             container=container,
-        )
-        if clearance is not None:
-            status_payload["advisory"] = None
-            status_payload["clearance"] = clearance
-        _write_status(
-            plan,
-            {
-                key: value
-                for key, value in status_payload.items()
-                if key
-                not in {
-                    "format_version",
-                    "checkout_identity",
-                    "updated_at",
-                    "engine_ref",
-                    "declaration_digest",
-                    "package_digest",
-                }
-            },
         )
         return {
             "state": "ready",
@@ -2471,6 +2505,18 @@ def _emit_lifecycle_status(plan: ImagePlan) -> None:
         print(runtime_flags.REMEDY)
 
 
+def _emit_image_state(plan: ImagePlan, selected: str, action: str) -> None:
+    status = _read_status(plan) or {}
+    if status.get("native_packages") == "advisory":
+        print(
+            "dev-kit image state: advisory — "
+            f"{status.get('classification', 'unknown')}; "
+            f"selected {status.get('selected_runtime', 'unknown')} {selected}"
+        )
+        return
+    print(f"dev-kit image state: ready — {action} {selected}")
+
+
 def main(argv: Sequence[str]) -> int:
     command, checkout, engine, epoch, user, uid, gid, extra = _arguments(argv)
     plan = image_plan(checkout, engine, epoch, user=user, uid=uid, gid=gid)
@@ -2485,13 +2531,13 @@ def main(argv: Sequence[str]) -> int:
         if len(extra) > 1:
             raise SandboxImageError("build accepts at most one container name")
         selected = build_images(plan, container=extra[0] if extra else None)
-        print(f"dev-kit image state: ready — built {selected}")
+        _emit_image_state(plan, selected, "built")
         _emit_lifecycle_status(plan)
     elif command == "preflight":
         if len(extra) > 1:
             raise SandboxImageError("preflight accepts at most one container name")
         selected = preflight_image(plan, container=extra[0] if extra else None)
-        print(f"dev-kit image state: ready — current {selected}")
+        _emit_image_state(plan, selected, "current")
         _emit_lifecycle_status(plan)
     elif command == "docker-run":
         if not extra or extra[0] != "--":
