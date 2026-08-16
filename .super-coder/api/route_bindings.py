@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -15,6 +16,7 @@ from typing import Any
 
 CONTRACT_VERSION = 2
 FRESH_HOURS = 24
+COMPATIBLE_HARNESS_STATES = frozenset({"verified", "supported"})
 BINDING_KEYS = (
     "contract_version",
     "control_state",
@@ -128,6 +130,11 @@ def _normalize_model(model: str | None) -> str | None:
     return model
 
 
+def _parsed_version(value: Any) -> str | None:
+    match = re.search(r"\d+\.\d+\.\d+", value) if isinstance(value, str) else None
+    return match.group(0) if match else None
+
+
 def _uncontrolled_binding(harness: str, model: str | None, effort: str | None) -> dict:
     if effort is not None:
         raise RouteResolutionError(
@@ -199,6 +206,24 @@ def resolve_v2(
             {"harness": harness, "model": model, "remediation": "sc models refresh"},
         )
 
+    row_harness = row.get("harness")
+    row_selector = row.get("selector")
+    if (
+        not isinstance(row_harness, str)
+        or row_harness.strip().lower() != harness
+        or row_selector != model
+    ):
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            "Route evidence does not match the requested exact route",
+            {
+                "requested_harness": harness,
+                "requested_model": model,
+                "evidence_harness": row_harness,
+                "evidence_model": row_selector,
+            },
+        )
+
     allowed = CONTROLLED_EVIDENCE.get(harness)
     evidence_kind = row.get("evidence_kind")
     if not allowed or evidence_kind not in allowed:
@@ -206,6 +231,23 @@ def resolve_v2(
             "thinking_evidence_missing",
             f"No controlled-thinking evidence for {harness}/{model}",
             {"harness": harness, "model": model, "evidence_kind": evidence_kind},
+        )
+    captured_version = row.get("harness_version")
+    compatibility = row.get("harness_compatibility")
+    if (
+        compatibility not in COMPATIBLE_HARNESS_STATES
+        or not captured_version
+        or _parsed_version(row.get("cli_version")) != captured_version
+    ):
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            f"Route {harness}/{model} has no version-verified adapter transport",
+            {
+                "harness": harness,
+                "model": model,
+                "harness_version": captured_version,
+                "compatibility": compatibility,
+            },
         )
     if row.get("availability") != "available" or not row.get("headless_supported"):
         raise RouteResolutionError(
@@ -234,7 +276,7 @@ def resolve_v2(
             {"harness": harness, "model": model, "remediation": "sc models refresh"},
         )
     stored_fingerprint = row.get("source_fingerprint")
-    if current_source_fingerprint is not None and current_source_fingerprint != stored_fingerprint:
+    if not stored_fingerprint or current_source_fingerprint != stored_fingerprint:
         raise RouteResolutionError(
             "thinking_evidence_stale",
             "Installed route source changed after refresh",

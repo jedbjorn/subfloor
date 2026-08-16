@@ -57,6 +57,9 @@ class BindingIdentityTest(unittest.TestCase):
             "generation_id": "1" * 32,
             "evidence_kind": "codex-model-cache",
             "source_fingerprint": "2" * 64,
+            "cli_version": "codex-cli 0.145.0",
+            "harness_version": "0.145.0",
+            "harness_compatibility": "verified",
             "supported_efforts": '["low","high"]',
             "effort_metadata": json.dumps({
                 "supported": ["low", "high"],
@@ -71,10 +74,12 @@ class BindingIdentityTest(unittest.TestCase):
 
     def test_controlled_omitted_and_explicit_high_have_same_fixed_identity(self):
         implicit, implicit_digest = route_bindings.resolve_v2(
-            self.controlled_row(), "Codex", "gpt-test", now=self.NOW
+            self.controlled_row(), "Codex", "gpt-test", now=self.NOW,
+            current_source_fingerprint="2" * 64,
         )
         explicit, explicit_digest = route_bindings.resolve_v2(
-            self.controlled_row(), "codex", "gpt-test", " HIGH ", now=self.NOW
+            self.controlled_row(), "codex", "gpt-test", " HIGH ", now=self.NOW,
+            current_source_fingerprint="2" * 64,
         )
 
         self.assertEqual(tuple(implicit), route_bindings.BINDING_KEYS)
@@ -120,7 +125,7 @@ class BindingIdentityTest(unittest.TestCase):
     def test_stale_unsupported_and_source_drift_fail_with_distinct_codes(self):
         cases = (
             ({"stale": 1}, "high", None, "thinking_evidence_stale"),
-            ({}, "medium", None, "unsupported_thinking_level"),
+            ({}, "medium", "2" * 64, "unsupported_thinking_level"),
             ({}, "high", "9" * 64, "thinking_evidence_stale"),
         )
         for overrides, effort, fingerprint, code in cases:
@@ -131,6 +136,44 @@ class BindingIdentityTest(unittest.TestCase):
                         now=self.NOW, current_source_fingerprint=fingerprint,
                     )
                 self.assertEqual(raised.exception.code, code)
+
+    def test_exact_route_rejects_other_harness_and_selector_evidence(self):
+        cases = (
+            (self.controlled_row(harness="claude"), "codex", "gpt-test"),
+            (self.controlled_row(selector="catalog-model"),
+             "codex", "different-model"),
+        )
+        for row, harness, model in cases:
+            with self.subTest(evidence=(row["harness"], row["selector"])):
+                with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+                    route_bindings.resolve_v2(
+                        row, harness, model, "high", now=self.NOW,
+                        current_source_fingerprint="2" * 64,
+                    )
+                self.assertEqual(raised.exception.code, "thinking_evidence_missing")
+                self.assertIn("does not match", raised.exception.message)
+
+    def test_controlled_route_requires_matching_compatible_harness_version(self):
+        cases = (
+            {"harness_compatibility": None},
+            {"harness_compatibility": "newer-unverified"},
+            {"harness_version": "0.144.0"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+                    route_bindings.resolve_v2(
+                        self.controlled_row(**overrides), "codex", "gpt-test",
+                        now=self.NOW, current_source_fingerprint="2" * 64,
+                    )
+                self.assertEqual(raised.exception.code, "thinking_evidence_missing")
+
+    def test_controlled_route_requires_current_source_fingerprint(self):
+        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+            route_bindings.resolve_v2(
+                self.controlled_row(), "codex", "gpt-test", now=self.NOW
+            )
+        self.assertEqual(raised.exception.code, "thinking_evidence_stale")
 
     def test_legacy_gate_requires_a_proven_version_one_row(self):
         self.assertEqual(
@@ -156,7 +199,19 @@ class GenerationPersistenceTest(unittest.TestCase):
         self.addCleanup(self.headless.stop)
 
     @staticmethod
-    def payload(selector: str = "gpt-test") -> dict:
+    def status(*, version="0.145.0", compatibility="verified", error=None) -> dict:
+        return {
+            "version": version,
+            "compatibility": compatibility,
+            "minimum_version": "0.145.0",
+            "maximum_version_exclusive": "0.147.0",
+            "verified_version": "0.145.0",
+            "error": error,
+        }
+
+    @classmethod
+    def payload(cls, selector: str = "gpt-test", *, cli_version="codex-cli 0.145.0",
+                status: dict | None = None) -> dict:
         return {
             "v": model_catalog.PAYLOAD_VERSION,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -171,10 +226,10 @@ class GenerationPersistenceTest(unittest.TestCase):
                 provider_model=selector,
                 supported_efforts=["low", "high"],
                 default_effort="high",
-                cli_version="codex-cli 1.0",
+                cli_version=cli_version,
             )]}},
             "verification": {"runtime": "host", "harnesses": {
-                "codex": {"version": "codex-cli 1.0"}
+                "codex": status or cls.status(),
             }},
         }
 
@@ -183,16 +238,23 @@ class GenerationPersistenceTest(unittest.TestCase):
         model_catalog.persist_routes(self.con, payload)
 
         generation = self.con.execute(
-            "SELECT generation_id,state,payload_version FROM model_catalog_generations"
+            "SELECT generation_id,state,payload_version,harness_versions "
+            "FROM model_catalog_generations"
         ).fetchone()
         route = self.con.execute(
             "SELECT generation_id,evidence_kind,evidence_digest,source_fingerprint,"
-            "selector_binding,effort_metadata,stale FROM model_routes"
+            "harness_version,harness_compatibility,selector_binding,"
+            "effort_metadata,stale FROM model_routes"
         ).fetchone()
         self.assertEqual(generation["state"], "successful")
         self.assertEqual(generation["payload_version"], model_catalog.PAYLOAD_VERSION)
         self.assertEqual(route["generation_id"], generation["generation_id"])
         self.assertEqual(route["evidence_kind"], "codex-model-cache")
+        self.assertEqual(route["harness_version"], "0.145.0")
+        self.assertEqual(route["harness_compatibility"], "verified")
+        self.assertEqual(
+            json.loads(generation["harness_versions"])["codex"], self.status()
+        )
         self.assertEqual(route["stale"], 0)
         self.assertEqual(len(route["evidence_digest"]), 64)
         self.assertEqual(json.loads(route["selector_binding"])["selector"], "gpt-test")
@@ -226,6 +288,87 @@ class GenerationPersistenceTest(unittest.TestCase):
         self.assertEqual(stable["stale"], 1)
         self.assertIn("models.dev", stable["last_error"])
         self.assertIsNone(partial_row)
+
+    def test_incompatible_harnesses_never_publish_controlled_routes(self):
+        cases = (
+            ("missing", None, self.status(
+                version=None, compatibility=None, error="HARNESS_UNAVAILABLE"
+            )),
+            ("below", "codex-cli 0.144.0", self.status(
+                version="0.144.0", compatibility=None,
+                error="HARNESS_VERSION_UNSUPPORTED",
+            )),
+            ("newer", "codex-cli 0.147.0", self.status(
+                version="0.147.0", compatibility="newer-unverified",
+            )),
+        )
+        for selector, cli_version, status in cases:
+            model_catalog.persist_routes(
+                self.con,
+                self.payload(selector, cli_version=cli_version, status=status),
+            )
+
+        generations = self.con.execute(
+            "SELECT state,harness_versions FROM model_catalog_generations "
+            "ORDER BY rowid"
+        ).fetchall()
+        routes = self.con.execute(
+            "SELECT harness,selector FROM model_routes ORDER BY selector"
+        ).fetchall()
+        self.assertEqual([row["state"] for row in generations],
+                         ["successful", "successful", "successful"])
+        self.assertEqual(
+            [json.loads(row["harness_versions"])["codex"]["version"]
+             for row in generations],
+            [None, "0.144.0", "0.147.0"],
+        )
+        self.assertEqual(routes, [])
+
+    def test_incompatible_refresh_stales_prior_compatible_route(self):
+        first = self.payload("carried")
+        model_catalog.persist_routes(self.con, first)
+        old_fingerprint = self.con.execute(
+            "SELECT source_fingerprint FROM model_routes WHERE selector='carried'"
+        ).fetchone()[0]
+
+        model_catalog.persist_routes(
+            self.con,
+            self.payload(
+                "carried",
+                cli_version="codex-cli 0.147.0",
+                status=self.status(
+                    version="0.147.0", compatibility="newer-unverified"
+                ),
+            ),
+        )
+
+        row = dict(self.con.execute(
+            "SELECT * FROM model_routes WHERE selector='carried'"
+        ).fetchone())
+        self.assertEqual(row["stale"], 1)
+        self.assertIn("newer-unverified", row["last_error"])
+        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+            route_bindings.resolve_v2(
+                row, "codex", "carried",
+                current_source_fingerprint=old_fingerprint,
+            )
+        self.assertEqual(raised.exception.code, "thinking_evidence_stale")
+
+    def test_live_fingerprint_refuses_unverified_installed_version(self):
+        entry = model_catalog._entry(
+            "gpt-test", source="codex-cache", availability="available",
+            supported_efforts=["high"], cli_version="codex-cli 0.147.0",
+        )
+        with mock.patch.object(
+            model_catalog, "_from_codex_cache", return_value=[entry]
+        ):
+            fingerprint = model_catalog.current_source_fingerprint(
+                "codex", "gpt-test", env={}, run=mock.Mock(),
+                harness_probe=lambda: {"codex": self.status(
+                    version="0.147.0", compatibility="newer-unverified"
+                )},
+            )
+        self.assertIsNone(fingerprint)
 
 
 class ParticipantRevisionTest(unittest.TestCase):

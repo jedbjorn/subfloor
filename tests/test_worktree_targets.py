@@ -84,11 +84,14 @@ class _CatalogApiHandler(BaseHTTPRequestHandler):
     route = {
         "harness": "codex", "selector": "wt-live-model", "source": "live-api",
         "availability": "available", "stale": 0, "headless_supported": 1,
-        "high_effort_supported": 1, "cli_version": "test",
+        "high_effort_supported": 1, "cli_version": "codex-cli 0.145.0",
+        "harness_version": "0.145.0", "harness_compatibility": "verified",
         "supported_efforts": '["high"]',
         "last_seen_at": "2099-01-01T00:00:00+00:00",
         "generation_id": "1" * 32,
         "evidence_kind": "codex-model-cache",
+        "source_fingerprint": "3" * 64,
+        "current_source_fingerprint": "3" * 64,
         "effort_metadata": json.dumps({
             "supported": ["high"], "default": "high",
             "digests": {"high": "2" * 64}, "native_variant_ids": {},

@@ -838,7 +838,14 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         headers = "Host: 127.0.0.1"
         if token is not None:
             headers += f"\r\nAuthorization: Bearer {token}"
-        with mock.patch.object(server, "db", side_effect=self.connect):
+        with (
+            mock.patch.object(server, "db", side_effect=self.connect),
+            mock.patch.object(
+                server.model_catalog,
+                "current_source_fingerprint",
+                return_value="current-fingerprint",
+            ),
+        ):
             status, _headers, body = server.dispatch_http("GET", path, headers, b"")
         return status, json.loads(body)
 
@@ -852,6 +859,10 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(len(body["routes"]), 1)
         self.assertEqual(body["routes"][0]["source"], "api-source-v1")
+        self.assertEqual(
+            body["routes"][0]["current_source_fingerprint"],
+            "current-fingerprint",
+        )
 
         con = self.connect()
         con.execute(

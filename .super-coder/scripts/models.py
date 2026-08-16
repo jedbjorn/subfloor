@@ -75,6 +75,10 @@ def resolve(con, harness: str, selector: str | None = None, *,
             now=None, current_source_fingerprint: str | None = None) -> dict:
     row = None if selector is None or harness.strip().lower() == "vibe" \
         else _route(con, harness.strip().lower(), selector)
+    if row and current_source_fingerprint is None:
+        current_source_fingerprint = model_catalog.current_source_fingerprint(
+            harness, selector
+        ) or ""
     return resolve_row(
         row, harness, selector, shell=shell, effort=effort, now=now,
         current_source_fingerprint=current_source_fingerprint,
@@ -201,8 +205,8 @@ def main(argv: list[str] | None = None) -> int:
         harness, selector, effort, shell, as_json = _resolve_args(args)
         routes = _api_routes(harness=harness, selector=selector) \
             if selector is not None and harness.strip().lower() != "vibe" else []
-        fingerprint = (model_catalog.current_source_fingerprint(harness, selector) or "") \
-            if routes and routes[0].get("source_fingerprint") else None
+        fingerprint = (routes[0].get("current_source_fingerprint") or "") \
+            if routes else None
         data = resolve_row(
             routes[0] if routes else None, harness, selector, shell=shell,
             effort=effort, current_source_fingerprint=fingerprint,

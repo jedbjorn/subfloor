@@ -466,7 +466,15 @@ def get_model_routes(con, *, harness: str | None = None,
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY harness, availability='available' DESC, selector"
-    return {"routes": rows(con.execute(sql, tuple(params)))}
+    routes = rows(con.execute(sql, tuple(params)))
+    if selector is not None:
+        for route in routes:
+            route["current_source_fingerprint"] = (
+                model_catalog.current_source_fingerprint(
+                    route["harness"], route["selector"]
+                )
+            )
+    return {"routes": routes}
 
 
 def known_harnesses() -> list[str]:

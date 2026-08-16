@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import urllib.request
@@ -367,7 +368,39 @@ def _evidence_kind(harness: str, source: str) -> str | None:
     }.get((harness, source))
 
 
-def _entry_evidence(harness: str, entry: dict) -> dict:
+def _parsed_version(value: object) -> str | None:
+    match = re.search(r"\d+\.\d+\.\d+", value) if isinstance(value, str) else None
+    return match.group(0) if match else None
+
+
+def _compatible_route_status(harness: str, entry: dict,
+                             status: dict) -> bool:
+    """Require one exact adapter-compatible binary for controlled evidence."""
+    if _evidence_kind(harness, entry.get("source") or "unknown") is None:
+        return True
+    if not isinstance(status, dict):
+        return False
+    return bool(
+        not status.get("error")
+        and status.get("compatibility")
+        in route_bindings.COMPATIBLE_HARNESS_STATES
+        and status.get("version")
+        and _parsed_version(entry.get("cli_version")) == status.get("version")
+    )
+
+
+def _compatibility_error(harness: str, entry: dict, status: dict) -> str:
+    status = status if isinstance(status, dict) else {}
+    return (
+        f"harness compatibility rejected {harness}/{entry['id']}: "
+        f"version={status.get('version') or 'unknown'} "
+        f"compatibility={status.get('compatibility') or 'none'} "
+        f"error={status.get('error') or 'none'}"
+    )
+
+
+def _entry_evidence(harness: str, entry: dict,
+                    status: dict | None = None) -> dict:
     source = entry.get("source") or "unknown"
     selector_binding = entry.get("selector_binding") or {
         "kind": {
@@ -392,6 +425,13 @@ def _entry_evidence(harness: str, entry: dict) -> dict:
         "cli_version": entry.get("cli_version"),
         "selector_binding": selector_binding,
         "adapter_metadata": entry.get("adapter_metadata") or {},
+        "harness_version": (status or {}).get("version"),
+        "harness_compatibility": (status or {}).get("compatibility"),
+        "adapter_minimum_version": (status or {}).get("minimum_version"),
+        "adapter_maximum_version_exclusive": (status or {}).get(
+            "maximum_version_exclusive"
+        ),
+        "adapter_verified_version": (status or {}).get("verified_version"),
     }
     source_fingerprint = route_bindings.digest_json({
         **base,
@@ -414,6 +454,8 @@ def _entry_evidence(harness: str, entry: dict) -> dict:
             **base, "effort_metadata": effort_metadata
         }),
         "source_fingerprint": source_fingerprint,
+        "harness_version": (status or {}).get("version"),
+        "harness_compatibility": (status or {}).get("compatibility"),
         "selector_binding": selector_binding,
         "effort_metadata": effort_metadata,
         "adapter_metadata": entry.get("adapter_metadata") or {},
@@ -474,20 +516,27 @@ def persist_routes(con, payload: dict) -> None:
     generation_id = uuid.uuid4().hex
     failed = bool(payload.get("stale") or payload.get("partial"))
     state = "failed" if failed else "successful"
+    verification = payload.get("verification") or {}
+    harness_statuses = verification.get("harnesses") or {}
     source_fingerprints: dict[str, str] = {}
     evidence_by_route: dict[tuple[str, str], dict] = {}
+    rejected_routes: dict[tuple[str, str], str] = {}
     for harness, block in (payload.get("harnesses") or {}).items():
         for entry in block.get("models") or []:
-            evidence = _entry_evidence(harness, entry)
+            status = harness_statuses.get(harness) or {}
+            if not _compatible_route_status(harness, entry, status):
+                rejected_routes[(harness, entry["id"])] = _compatibility_error(
+                    harness, entry, status
+                )
+                continue
+            evidence_status = status if _evidence_kind(
+                harness, entry.get("source") or "unknown"
+            ) else None
+            evidence = _entry_evidence(harness, entry, evidence_status)
             evidence_by_route[(harness, entry["id"])] = evidence
             source_fingerprints[f"{harness}/{entry['id']}"] = evidence[
                 "source_fingerprint"
             ]
-    verification = payload.get("verification") or {}
-    harness_versions = {
-        harness: status.get("version")
-        for harness, status in (verification.get("harnesses") or {}).items()
-    }
     error_summary = {
         "error": payload.get("error"),
         "errors": payload.get("errors") or [],
@@ -497,6 +546,7 @@ def persist_routes(con, payload: dict) -> None:
         "fetched_at": payload.get("fetched_at"),
         "sources": payload.get("sources") or [],
         "harnesses": payload.get("harnesses") or {},
+        "harness_versions": harness_statuses,
         "state": state,
     })
 
@@ -513,7 +563,7 @@ def persist_routes(con, payload: dict) -> None:
                     "sandbox" if os.environ.get("SC_SANDBOX") else "host"
                 ),
                 route_bindings.canonical_json(payload.get("sources") or []),
-                route_bindings.canonical_json(harness_versions),
+                route_bindings.canonical_json(harness_statuses),
                 route_bindings.canonical_json(source_fingerprints),
                 route_bindings.canonical_json(error_summary) if error_summary else None,
                 payload_digest,
@@ -532,7 +582,15 @@ def persist_routes(con, payload: dict) -> None:
             for harness, block in (payload.get("harnesses") or {}).items():
                 headless = int(_headless_supported(harness))
                 for entry in block.get("models") or []:
-                    evidence = evidence_by_route[(harness, entry["id"])]
+                    route_key = (harness, entry["id"])
+                    if route_key in rejected_routes:
+                        con.execute(
+                            "UPDATE model_routes SET stale=1,last_error=? "
+                            "WHERE harness=? AND selector=?",
+                            (rejected_routes[route_key], harness, entry["id"]),
+                        )
+                        continue
+                    evidence = evidence_by_route[route_key]
                     efforts = evidence["supported_efforts"]
                     con.execute(
                         "INSERT INTO model_routes ("
@@ -540,9 +598,10 @@ def persist_routes(con, payload: dict) -> None:
                         "source,availability,headless_supported,high_effort_supported,"
                         "default_effort,supported_efforts,cli_version,last_seen_at,stale,"
                         "last_error,generation_id,evidence_kind,evidence_digest,"
-                        "source_fingerprint,selector_binding,effort_metadata,"
+                        "source_fingerprint,harness_version,harness_compatibility,"
+                        "selector_binding,effort_metadata,"
                         "adapter_metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                        "?,?,?,?,?,?,?) ON CONFLICT(harness,selector) DO UPDATE SET "
+                        "?,?,?,?,?,?,?,?,?) ON CONFLICT(harness,selector) DO UPDATE SET "
                         "provider=excluded.provider,provider_model=excluded.provider_model,"
                         "display_name=excluded.display_name,family=excluded.family,"
                         "source=excluded.source,availability=excluded.availability,"
@@ -555,6 +614,8 @@ def persist_routes(con, payload: dict) -> None:
                         "evidence_kind=excluded.evidence_kind,"
                         "evidence_digest=excluded.evidence_digest,"
                         "source_fingerprint=excluded.source_fingerprint,"
+                        "harness_version=excluded.harness_version,"
+                        "harness_compatibility=excluded.harness_compatibility,"
                         "selector_binding=excluded.selector_binding,"
                         "effort_metadata=excluded.effort_metadata,"
                         "adapter_metadata=excluded.adapter_metadata",
@@ -568,6 +629,8 @@ def persist_routes(con, payload: dict) -> None:
                             entry.get("cli_version"), completed_at, 0, None,
                             generation_id, evidence["evidence_kind"],
                             evidence["evidence_digest"], evidence["source_fingerprint"],
+                            evidence["harness_version"],
+                            evidence["harness_compatibility"],
                             route_bindings.canonical_json(evidence["selector_binding"]),
                             route_bindings.canonical_json(evidence["effort_metadata"]),
                             route_bindings.canonical_json(evidence["adapter_metadata"]),
@@ -600,6 +663,12 @@ def _default_route_verification(con, harnesses: dict[str, dict]) -> list[dict]:
         harness_error = status.get("error")
         if status.get("version") is None:
             harness_error = harness_error or "HARNESS_UNAVAILABLE"
+        elif (
+            harness in route_bindings.CONTROLLED_EVIDENCE
+            and status.get("compatibility")
+            not in route_bindings.COMPATIBLE_HARNESS_STATES
+        ):
+            harness_error = "HARNESS_VERSION_UNVERIFIED"
 
         route = None
         if model is not None:
@@ -677,8 +746,14 @@ def runtime_verification(con, *, env=os.environ,
     report["harnesses"] = harnesses
     report["summary"]["harnesses_checked"] = len(harnesses)
     report["summary"]["harnesses_ready"] = sum(
-        1 for status in harnesses.values()
-        if status.get("version") is not None and not status.get("error")
+        1 for harness, status in harnesses.items()
+        if status.get("version") is not None
+        and not status.get("error")
+        and (
+            harness not in route_bindings.CONTROLLED_EVIDENCE
+            or status.get("compatibility")
+            in route_bindings.COMPATIBLE_HARNESS_STATES
+        )
     )
     try:
         defaults = _default_route_verification(con, harnesses)
@@ -749,38 +824,50 @@ def _with_live_opencode(payload: dict, provider_models) -> dict:
 
 def current_source_fingerprint(harness: str, selector: str, *, env=os.environ,
                                run=subprocess.run,
-                               opencode_provider=opencode_connected_models) -> str | None:
+                               opencode_provider=opencode_connected_models,
+                               harness_probe=harness_versions.compatibility_status,
+                               ) -> str | None:
     """Recompute one no-token local source fingerprint for drift detection."""
     harness = (harness or "").strip().lower()
     entries: list[dict]
-    if harness == "claude":
-        entries = _from_claude_cli(run)
-    elif harness == "codex":
-        entries = _from_codex_cache(env, run)
-    elif harness == "kimi":
-        entries = _from_kimi_config(env, run)
-    elif harness == "opencode":
-        if not shutil.which("opencode"):
+    try:
+        if harness == "claude":
+            entries = _from_claude_cli(run)
+        elif harness == "codex":
+            entries = _from_codex_cache(env, run)
+        elif harness == "kimi":
+            entries = _from_kimi_config(env, run)
+        elif harness == "opencode":
+            if not shutil.which("opencode"):
+                return None
+            entries = [
+                _entry(
+                    model["id"], model.get("release_date") or "",
+                    model.get("name") or model["id"], model.get("family"),
+                    source="opencode-provider-api", availability="available",
+                    provider=model.get("provider"),
+                    provider_model=model.get("provider_model"),
+                    supported_efforts=model.get("supported_efforts") or [],
+                    default_effort=model.get("default_effort"),
+                    cli_version=model.get("cli_version"),
+                    selector_binding=model.get("selector_binding"),
+                    adapter_metadata=model.get("adapter_metadata"),
+                    native_variant_ids=model.get("native_variant_ids"),
+                )
+                for model in opencode_provider()
+            ]
+        else:
             return None
-        entries = [
-            _entry(
-                model["id"], model.get("release_date") or "",
-                model.get("name") or model["id"], model.get("family"),
-                source="opencode-provider-api", availability="available",
-                provider=model.get("provider"),
-                provider_model=model.get("provider_model"),
-                supported_efforts=model.get("supported_efforts") or [],
-                default_effort=model.get("default_effort"),
-                selector_binding=model.get("selector_binding"),
-                adapter_metadata=model.get("adapter_metadata"),
-                native_variant_ids=model.get("native_variant_ids"),
-            )
-            for model in opencode_provider()
-        ]
-    else:
+        statuses = harness_probe()
+    except Exception:  # noqa: BLE001 (unreadable live evidence is stale)
         return None
     entry = next((item for item in entries if item["id"] == selector), None)
-    return _entry_evidence(harness, entry)["source_fingerprint"] if entry else None
+    if entry is None:
+        return None
+    status = (statuses.get(harness) or {})
+    if not _compatible_route_status(harness, entry, status):
+        return None
+    return _entry_evidence(harness, entry, status)["source_fingerprint"]
 
 
 def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,

@@ -32,6 +32,10 @@ ALTER TABLE model_routes ADD COLUMN generation_id TEXT;
 ALTER TABLE model_routes ADD COLUMN evidence_kind TEXT;
 ALTER TABLE model_routes ADD COLUMN evidence_digest TEXT;
 ALTER TABLE model_routes ADD COLUMN source_fingerprint TEXT;
+ALTER TABLE model_routes ADD COLUMN harness_version TEXT;
+ALTER TABLE model_routes ADD COLUMN harness_compatibility TEXT CHECK (
+    harness_compatibility IS NULL OR
+    harness_compatibility IN ('verified','supported'));
 ALTER TABLE model_routes ADD COLUMN selector_binding TEXT;
 ALTER TABLE model_routes ADD COLUMN effort_metadata TEXT;
 ALTER TABLE model_routes ADD COLUMN adapter_metadata TEXT;

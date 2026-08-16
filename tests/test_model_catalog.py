@@ -227,13 +227,26 @@ class RoutePersistenceTest(unittest.TestCase):
     def tearDown(self):
         self.con.close()
 
+    @staticmethod
+    def verification(harness: str, version: str) -> dict:
+        return {"verification": {"runtime": "host", "harnesses": {
+            harness: {
+                "version": version, "compatibility": "verified",
+                "minimum_version": version,
+                "maximum_version_exclusive": "99.0.0",
+                "verified_version": version, "error": None,
+            }
+        }}}
+
     def test_persist_marks_exact_high_effort_route_runnable(self):
         payload = {
             "fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
             "harnesses": {"kimi": {"models": [mc._entry(
                 "kimi-code/k3", source="kimi-config", availability="available",
                 provider="managed:kimi-code", provider_model="k3",
-                supported_efforts=["low", "high"])]}},
+                supported_efforts=["low", "high"],
+                cli_version="kimi 0.33.0")]}},
+            **self.verification("kimi", "0.33.0"),
         }
         mc.persist_routes(self.con, payload)
         row = self.con.execute(
@@ -245,7 +258,9 @@ class RoutePersistenceTest(unittest.TestCase):
         fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
                  "harnesses": {"claude": {"models": [mc._entry(
                      "fable", source="claude-cli", availability="available",
-                     supported_efforts=["high"])]}}}
+                     supported_efforts=["high"],
+                     cli_version="claude 2.1.222")]}},
+                 **self.verification("claude", "2.1.222")}
         mc.persist_routes(self.con, fresh)
         mc.persist_routes(self.con, {"fetched_at": None, "stale": True,
                                      "error": "network down", "harnesses": {}})
@@ -257,10 +272,17 @@ class RoutePersistenceTest(unittest.TestCase):
         fresh = {"fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
                  "harnesses": {"codex": {"models": [mc._entry(
                      "gpt-5.6-sol", source="codex-cache",
-                     availability="available", supported_efforts=["high"])]}}}
+                     availability="available", supported_efforts=["high"],
+                     cli_version="codex-cli 0.145.0")]}},
+                 **self.verification("codex", "0.145.0")}
         mc.persist_routes(self.con, fresh)
+        fingerprint = self.con.execute(
+            "SELECT source_fingerprint FROM model_routes WHERE harness='codex' "
+            "AND selector='gpt-5.6-sol'"
+        ).fetchone()[0]
         got = routes_cli.resolve(
-            self.con, "codex", "gpt-5.6-sol", shell="DEV3")
+            self.con, "codex", "gpt-5.6-sol", shell="DEV3",
+            current_source_fingerprint=fingerprint)
         self.assertTrue(got["ok"])
         self.assertEqual(
             got["command"],
@@ -271,9 +293,18 @@ class RoutePersistenceTest(unittest.TestCase):
         fresh = {"fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
                  "harnesses": {"kimi": {"models": [mc._entry(
                      "kimi-code/legacy", source="kimi-config",
-                     availability="available", supported_efforts=[])]}}}
+                     availability="available", supported_efforts=[],
+                     cli_version="kimi 0.33.0")]}},
+                 **self.verification("kimi", "0.33.0")}
         mc.persist_routes(self.con, fresh)
-        got = routes_cli.resolve(self.con, "kimi", "kimi-code/legacy")
+        fingerprint = self.con.execute(
+            "SELECT source_fingerprint FROM model_routes WHERE harness='kimi' "
+            "AND selector='kimi-code/legacy'"
+        ).fetchone()[0]
+        got = routes_cli.resolve(
+            self.con, "kimi", "kimi-code/legacy",
+            current_source_fingerprint=fingerprint,
+        )
         self.assertFalse(got["ok"])
         self.assertEqual(got["code"], "unsupported_thinking_level")
 
@@ -341,13 +372,16 @@ class RuntimeVerificationTest(unittest.TestCase):
             "harnesses": {
                 "codex": {"models": [mc._entry(
                     "gpt-ready", source="codex-cache",
-                    availability="available", supported_efforts=["high"]
+                    availability="available", supported_efforts=["high"],
+                    cli_version="codex-cli 2.0.0",
                 )]},
                 "opencode": {"models": [mc._entry(
                     "openai/local", source="opencode-provider-api",
-                    availability="available"
+                    availability="available", cli_version="opencode 1.6.0",
                 )]},
             },
+            "verification": {"runtime": "sandbox",
+                             "harnesses": self.harnesses()},
         })
 
         report = mc.runtime_verification(
@@ -359,9 +393,9 @@ class RuntimeVerificationTest(unittest.TestCase):
                          "newer-unverified")
         self.assertEqual(report["summary"], {
             "harnesses_checked": 4,
-            "harnesses_ready": 3,
+            "harnesses_ready": 2,
             "exact_routes": 4,
-            "exact_routes_runnable": 2,
+            "exact_routes_runnable": 1,
             "harness_defaults": 1,
         })
         by_key = {
@@ -370,11 +404,11 @@ class RuntimeVerificationTest(unittest.TestCase):
         }
         self.assertEqual(by_key[("dev", "codex")], {
             "flavor": "dev", "harness": "codex", "model": "gpt-ready",
-            "is_default": True, "state": "runnable", "runnable": True,
-            "reason": None,
+            "is_default": True, "state": "harness-error", "runnable": False,
+            "reason": "HARNESS_VERSION_UNVERIFIED",
         })
         self.assertEqual(by_key[("planner", "codex")]["state"],
-                         "route-missing")
+                         "harness-error")
         self.assertFalse(by_key[("planner", "codex")]["runnable"])
         self.assertEqual(by_key[("reviewer", "claude")]["state"],
                          "harness-default")
@@ -437,6 +471,10 @@ class RuntimeVerificationTest(unittest.TestCase):
             "WHERE harness='codex' AND selector='gpt-stale'"
         )
         statuses = self.harnesses()
+        statuses["codex"] = {
+            **statuses["claude"], "version": "1.6.0",
+            "compatibility": "supported",
+        }
         statuses["vibe"] = {
             "version": "vibe 1.0.0", "compatibility": None,
             "minimum_version": None, "maximum_version_exclusive": None,
@@ -518,7 +556,7 @@ class RuntimeVerificationTest(unittest.TestCase):
         self.assertEqual(got["sources"], ["static"])
         self.assertEqual(got["verification"]["summary"], {
             "harnesses_checked": 4,
-            "harnesses_ready": 3,
+            "harnesses_ready": 2,
             "exact_routes": 0,
             "exact_routes_runnable": 0,
             "harness_defaults": 0,
@@ -531,11 +569,14 @@ class RouteCliConnectionTest(unittest.TestCase):
     ROUTE = {
         "harness": "codex", "selector": "api-model", "source": "live-api",
         "availability": "available", "stale": 0, "headless_supported": 1,
-        "high_effort_supported": 1, "cli_version": "1",
+        "high_effort_supported": 1, "cli_version": "codex-cli 0.145.0",
+        "harness_version": "0.145.0", "harness_compatibility": "verified",
         "supported_efforts": '["high"]',
         "last_seen_at": datetime.now(timezone.utc).isoformat(),
         "generation_id": "1" * 32,
         "evidence_kind": "codex-model-cache",
+        "source_fingerprint": "3" * 64,
+        "current_source_fingerprint": "3" * 64,
         "effort_metadata": json.dumps({
             "supported": ["high"], "default": "high",
             "digests": {"high": "2" * 64}, "native_variant_ids": {},
