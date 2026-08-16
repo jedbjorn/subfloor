@@ -342,18 +342,49 @@ def require_fresh_route(
     *,
     now: datetime | None = None,
     current_source_fingerprint: str | None = None,
-) -> None:
-    """Validate and durably publish one exact route's live freshness state."""
+) -> dict | None:
+    """Validate and stage one exact route's freshness in the caller's write."""
     harness = normalize_harness(harness)
     model = _normalize_model(model)
     if model is None or harness == "vibe":
-        return
+        return row
     if row is None or row.get("harness") != harness or row.get("selector") != model:
         raise RouteResolutionError(
             "thinking_evidence_missing",
             f"No local route evidence for {harness}/{model}",
             {"harness": harness, "model": model, "remediation": "sc models refresh"},
         )
+    if not con.in_transaction:
+        raise RuntimeError(
+            "require_fresh_route requires a caller-owned write transaction"
+        )
+
+    def identity(value: dict) -> tuple[Any, Any]:
+        return value.get("generation_id"), value.get("source_fingerprint")
+
+    def changed() -> RouteResolutionError:
+        return RouteResolutionError(
+            "thinking_evidence_stale",
+            "Route evidence changed during resolution; retry",
+            {"harness": harness, "model": model,
+             "remediation": "retry route resolution"},
+        )
+
+    authoritative = con.execute(
+        "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+        (harness, model),
+    ).fetchone()
+    if authoritative is None:
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            f"No local route evidence for {harness}/{model}",
+            {"harness": harness, "model": model,
+             "remediation": "sc models refresh"},
+        )
+    authoritative = dict(authoritative)
+    if identity(authoritative) != identity(row):
+        raise changed()
+    row = authoritative
 
     check_time = now or datetime.now(timezone.utc)
     try:
@@ -391,13 +422,27 @@ def require_fresh_route(
         if exc.code == "thinking_evidence_stale" and not row.get("stale"):
             remediation = exc.details.get("remediation") or "sc models refresh"
             reason = f"{exc.code}: {exc.message}; remediation: {remediation}"
-            con.execute(
+            updated = con.execute(
                 "UPDATE model_routes SET stale=1,last_error=? "
-                "WHERE harness=? AND selector=?",
-                (reason, harness, model),
+                "WHERE harness=? AND selector=? AND generation_id IS ? "
+                "AND source_fingerprint IS ? AND stale=0",
+                (reason, harness, model, row.get("generation_id"),
+                 row.get("source_fingerprint")),
             )
-            con.commit()
+            if updated.rowcount != 1:
+                current = con.execute(
+                    "SELECT generation_id,source_fingerprint,stale "
+                    "FROM model_routes WHERE harness=? AND selector=?",
+                    (harness, model),
+                ).fetchone()
+                if (
+                    current is None
+                    or identity(dict(current)) != identity(row)
+                    or not current["stale"]
+                ):
+                    raise changed() from exc
         raise
+    return row
 
 
 def resolve_persisted_v2(
@@ -411,12 +456,12 @@ def resolve_persisted_v2(
     current_source_fingerprint: str | None = None,
 ) -> tuple[dict, str]:
     """Resolve through the shared durable freshness boundary."""
-    require_fresh_route(
+    fresh_row = require_fresh_route(
         con, row, harness, model, now=now,
         current_source_fingerprint=current_source_fingerprint,
     )
     return resolve_v2(
-        row, harness, model, effort, now=now,
+        fresh_row, harness, model, effort, now=now,
         current_source_fingerprint=current_source_fingerprint,
     )
 

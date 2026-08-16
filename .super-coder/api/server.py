@@ -468,22 +468,39 @@ def get_model_routes(con, *, harness: str | None = None,
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY harness, availability='available' DESC, selector"
     routes = rows(con.execute(sql, tuple(params)))
-    if selector is not None:
-        for route in routes:
-            fingerprint = model_catalog.current_source_fingerprint(
-                route["harness"], route["selector"]
-            ) or ""
-            try:
-                route_bindings.require_fresh_route(
-                    con, route, route["harness"], route["selector"],
-                    current_source_fingerprint=fingerprint,
-                )
-            except route_bindings.RouteResolutionError:
-                route.update(dict(con.execute(
+    if selector is not None and routes:
+        fingerprints = {
+            (route["harness"], route["selector"]):
+                model_catalog.current_source_fingerprint(
+                    route["harness"], route["selector"]
+                ) or ""
+            for route in routes
+        }
+        refreshed = []
+        with db_driver.write_transaction(con, "model_route.exact_read"):
+            for route in routes:
+                key = route["harness"], route["selector"]
+                current = con.execute(
                     "SELECT * FROM model_routes WHERE harness=? AND selector=?",
-                    (route["harness"], route["selector"]),
-                ).fetchone()))
-            route["current_source_fingerprint"] = fingerprint
+                    key,
+                ).fetchone()
+                if current is None:
+                    continue
+                current = dict(current)
+                try:
+                    route_bindings.require_fresh_route(
+                        con, current, *key,
+                        current_source_fingerprint=fingerprints[key],
+                    )
+                except route_bindings.RouteResolutionError:
+                    current = dict(con.execute(
+                        "SELECT * FROM model_routes "
+                        "WHERE harness=? AND selector=?",
+                        key,
+                    ).fetchone())
+                current["current_source_fingerprint"] = fingerprints[key]
+                refreshed.append(current)
+        routes = refreshed
     return {"routes": routes}
 
 
@@ -513,8 +530,9 @@ def get_flavor_defaults(con) -> dict:
     return {"flavors": flavors, "harnesses": known_harnesses()}
 
 
-def model_route_available(con, harness: str, selector: str) -> bool:
-    """True only for an exact route proved available by the local catalogue."""
+def _model_route_available_in_transaction(
+    con, harness: str, selector: str, fingerprint: str,
+) -> bool:
     row = con.execute(
         "SELECT * FROM model_routes WHERE harness=? AND selector=?",
         (harness, selector)).fetchone()
@@ -523,7 +541,6 @@ def model_route_available(con, harness: str, selector: str) -> bool:
     if harness == "vibe":
         return True
     route = dict(row)
-    fingerprint = model_catalog.current_source_fingerprint(harness, selector) or ""
     try:
         route_bindings.require_fresh_route(
             con, route, harness, selector,
@@ -532,6 +549,30 @@ def model_route_available(con, harness: str, selector: str) -> bool:
     except route_bindings.RouteResolutionError:
         return False
     return True
+
+
+def model_route_available(
+    con, harness: str, selector: str, *,
+    current_source_fingerprint: str | None = None,
+) -> bool:
+    """True only for an exact route proved available by the local catalogue."""
+    if harness != "vibe" and current_source_fingerprint is None:
+        if con.in_transaction:
+            raise RuntimeError(
+                "transactional route checks require a precomputed fingerprint"
+            )
+        current_source_fingerprint = (
+            model_catalog.current_source_fingerprint(harness, selector) or ""
+        )
+    fingerprint = current_source_fingerprint or ""
+    if con.in_transaction:
+        return _model_route_available_in_transaction(
+            con, harness, selector, fingerprint
+        )
+    with db_driver.write_transaction(con, "model_route.available"):
+        return _model_route_available_in_transaction(
+            con, harness, selector, fingerprint
+        )
 
 
 def set_flavor_default(con, body) -> tuple[bool, str | None]:
@@ -561,23 +602,29 @@ def set_flavor_default(con, body) -> tuple[bool, str | None]:
                 "invalid_model_route: model must be null for Harness default "
                 "or an exact non-empty available route")
         model = raw_model.strip() if isinstance(raw_model, str) else None
+    fingerprint = None
+    if model is not None and harness != "vibe":
+        fingerprint = (
+            model_catalog.current_source_fingerprint(harness, model) or ""
+        )
+    with db_driver.write_transaction(con, "flavor_default.set"):
         if model is not None and not model_route_available(
-                con, harness, model):
+                con, harness, model,
+                current_source_fingerprint=fingerprint):
             return False, (
                 f"invalid_model_route: {model!r} is not an exact currently "
                 f"available route for {harness}; choose an available "
                 "model or Harness default")
-    con.execute(
-        "INSERT INTO flavor_defaults (flavor, harness, model, is_default) "
-        "VALUES (?, ?, NULL, 0) ON CONFLICT(flavor, harness) DO NOTHING",
-        (flavor, harness))
-    if "model" in body:
-        con.execute("UPDATE flavor_defaults SET model=? "
-                    "WHERE flavor=? AND harness=?", (model, flavor, harness))
-    if body.get("is_default"):
-        con.execute("UPDATE flavor_defaults SET is_default = (harness = ?) "
-                    "WHERE flavor = ?", (harness, flavor))
-    con.commit()
+        con.execute(
+            "INSERT INTO flavor_defaults (flavor, harness, model, is_default) "
+            "VALUES (?, ?, NULL, 0) ON CONFLICT(flavor, harness) DO NOTHING",
+            (flavor, harness))
+        if "model" in body:
+            con.execute("UPDATE flavor_defaults SET model=? "
+                        "WHERE flavor=? AND harness=?", (model, flavor, harness))
+        if body.get("is_default"):
+            con.execute("UPDATE flavor_defaults SET is_default = (harness = ?) "
+                        "WHERE flavor = ?", (harness, flavor))
     return True, None
 
 

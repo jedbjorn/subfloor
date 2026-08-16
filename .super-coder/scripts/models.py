@@ -82,22 +82,28 @@ def resolve(con, harness: str, selector: str | None = None, *,
         harness = route_bindings.normalize_harness(harness)
     except route_bindings.RouteResolutionError as exc:
         return _resolution_error(exc)
-    row = None if selector is None or harness == "vibe" \
-        else _route(con, harness, selector)
-    if row and current_source_fingerprint is None:
+    if selector is None or harness == "vibe":
+        return resolve_row(
+            None, harness, selector, shell=shell, effort=effort, now=now,
+            current_source_fingerprint=current_source_fingerprint,
+        )
+    if current_source_fingerprint is None:
         current_source_fingerprint = model_catalog.current_source_fingerprint(
             harness, selector
         ) or ""
-    return resolve_row(
-        row, harness, selector, shell=shell, effort=effort, now=now,
-        current_source_fingerprint=current_source_fingerprint, con=con,
-    )
+    with db_driver.write_transaction(con, "model_route.resolve"):
+        row = _route(con, harness, selector)
+        return resolve_row(
+            row, harness, selector, shell=shell, effort=effort, now=now,
+            current_source_fingerprint=current_source_fingerprint, con=con,
+        )
 
 
 def resolve_row(row: dict | None, harness: str, selector: str | None, *,
                 shell: str = "<shell>", effort: str | None = None,
                 now=None, current_source_fingerprint: str | None = None,
                 con=None) -> dict:
+    """Resolve inside ``con``'s caller-owned write, or purely when omitted."""
     try:
         if con is not None:
             binding, binding_digest = route_bindings.resolve_persisted_v2(

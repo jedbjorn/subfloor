@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 import model_catalog  # noqa: E402
 import route_bindings  # noqa: E402
 import models as routes_cli  # noqa: E402
+import db_driver  # noqa: E402
 
 
 def route_schema() -> sqlite3.Connection:
@@ -535,6 +536,87 @@ class GenerationPersistenceTest(unittest.TestCase):
             "thinking_evidence_stale: Route does not belong to the latest "
             "successful generation; remediation: sc models refresh",
         ))
+
+    def test_obsolete_resolution_cannot_stale_successor_generation(self):
+        first = self.payload("generation-race")
+        model_catalog.persist_routes(self.con, first)
+        old = dict(self.con.execute(
+            "SELECT * FROM model_routes WHERE selector='generation-race'"
+        ).fetchone())
+        second = self.payload("generation-race")
+        second["fetched_at"] = (
+            datetime.now(timezone.utc) + timedelta(minutes=1)
+        ).isoformat()
+        model_catalog.persist_routes(self.con, second)
+        successor = dict(self.con.execute(
+            "SELECT * FROM model_routes WHERE selector='generation-race'"
+        ).fetchone())
+
+        with db_driver.write_transaction(self.con, "test.obsolete_resolution"):
+            with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+                route_bindings.require_fresh_route(
+                    self.con, old, "codex", "generation-race",
+                    current_source_fingerprint=successor["source_fingerprint"],
+                )
+
+        stored = dict(self.con.execute(
+            "SELECT * FROM model_routes WHERE selector='generation-race'"
+        ).fetchone())
+        resolved = routes_cli.resolve(
+            self.con, "codex", "generation-race",
+            current_source_fingerprint=successor["source_fingerprint"],
+        )
+        self.assertEqual(raised.exception.code, "thinking_evidence_stale")
+        self.assertEqual(
+            raised.exception.message,
+            "Route evidence changed during resolution; retry",
+        )
+        self.assertNotEqual(old["generation_id"], successor["generation_id"])
+        self.assertEqual(stored["generation_id"], successor["generation_id"])
+        self.assertEqual(stored["source_fingerprint"],
+                         successor["source_fingerprint"])
+        self.assertEqual(stored["stale"], 0)
+        self.assertIsNone(stored["last_error"])
+        self.assertTrue(resolved["ok"])
+        self.assertEqual(
+            resolved["binding"]["catalogue_generation"],
+            successor["generation_id"],
+        )
+
+    def test_freshness_failure_respects_outer_rollback(self):
+        model_catalog.persist_routes(self.con, self.payload("rollback-route"))
+        row = dict(self.con.execute(
+            "SELECT * FROM model_routes WHERE selector='rollback-route'"
+        ).fetchone())
+        self.con.execute("INSERT INTO sprints VALUES (99,'prepared')")
+
+        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+            route_bindings.require_fresh_route(
+                self.con, row, "codex", "rollback-route",
+                current_source_fingerprint="wrong-fingerprint",
+            )
+        staged = self.con.execute(
+            "SELECT stale,last_error FROM model_routes "
+            "WHERE selector='rollback-route'"
+        ).fetchone()
+        self.assertEqual(raised.exception.code, "thinking_evidence_stale")
+        self.assertEqual(staged["stale"], 1)
+        self.assertEqual(
+            staged["last_error"],
+            "thinking_evidence_stale: Installed route source changed after "
+            "refresh; remediation: sc models refresh",
+        )
+
+        self.con.rollback()
+        stored = self.con.execute(
+            "SELECT stale,last_error FROM model_routes "
+            "WHERE selector='rollback-route'"
+        ).fetchone()
+        unrelated = self.con.execute(
+            "SELECT COUNT(*) FROM sprints WHERE sprint_id=99"
+        ).fetchone()[0]
+        self.assertEqual(tuple(stored), (0, None))
+        self.assertEqual(unrelated, 0)
 
 
 class ParticipantRevisionTest(unittest.TestCase):
