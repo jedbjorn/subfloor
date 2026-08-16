@@ -21,7 +21,7 @@ Fetched server-side (no CORS), cached under the gitignored .super-coder/logs/
 dirty the tree and trip the publish guard) with a TTL; a failed refresh serves
 the stale cache and says so.
 
-Payload v4 exposes the flat `models` list consumed by the shared searchable
+Payload v6 exposes the flat `models` list consumed by the shared searchable
 picker. Legacy `families` metadata remains for API compatibility but is not a
 selection surface: the harness is the only picker prefilter, and family-null
 local routes are ordinary results. Entries carry their route source, local
@@ -34,11 +34,13 @@ import os
 import shutil
 import subprocess
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import toml_compat
 import harness_versions
+import route_bindings
 from conversation_adapters.opencode import (
     connected_models as opencode_connected_models,
 )
@@ -72,7 +74,7 @@ CLAUDE_ALIASES = ["fable", "opus", "sonnet", "haiku"]
 # Bump when the response/cache shape changes — a cached payload from another
 # version is ignored (treated as no cache) instead of being served to a
 # client that expects the new shape.
-PAYLOAD_VERSION = 5
+PAYLOAD_VERSION = 6
 
 # provider APIs, keyed by harness: (env var, url, header builder). Responses
 # are the OpenAI-style {"data": [{"id": ...}, ...]} shape on all three.
@@ -110,13 +112,19 @@ def _entry(mid: str, release_date: str = "", name: str = "",
            provider_model: str | None = None,
            supported_efforts: list[str] | None = None,
            default_effort: str | None = None,
-           cli_version: str | None = None) -> dict:
+           cli_version: str | None = None,
+           selector_binding: dict | None = None,
+           adapter_metadata: dict | None = None,
+           native_variant_ids: dict[str, str] | None = None) -> dict:
     return {"id": mid, "release_date": release_date, "name": name or mid,
             "family": family, "source": source,
             "availability": availability, "provider": provider,
             "provider_model": provider_model or mid,
             "supported_efforts": supported_efforts or [],
-            "default_effort": default_effort, "cli_version": cli_version}
+            "default_effort": default_effort, "cli_version": cli_version,
+            "selector_binding": selector_binding,
+            "adapter_metadata": adapter_metadata or {},
+            "native_variant_ids": native_variant_ids or {}}
 
 
 def _from_models_dev(fetch) -> dict[str, list[dict]]:
@@ -203,7 +211,7 @@ def _from_claude_cli(run) -> list[dict]:
         _entry(alias, name=f"Claude {alias.title()} (alias)",
                family=f"claude-{alias}", source="claude-cli",
                availability="available", provider="anthropic",
-               supported_efforts=["low", "medium", "high", "max"],
+               supported_efforts=["low", "medium", "high"],
                default_effort="high", cli_version=version)
         for alias in CLAUDE_ALIASES
     ]
@@ -304,6 +312,8 @@ def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
     return {"v": PAYLOAD_VERSION,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "sources": sources,
+            "partial": bool(errors),
+            **({"errors": errors} if errors else {}),
             "harnesses": {h: {"families": _families(h, entries),
                               "models": entries}
                           for h, entries in harnesses.items()}}
@@ -348,13 +358,71 @@ def _headless_supported(harness: str) -> bool:
     return bool((cfg.get("headless") or {}).get("launch"))
 
 
-def persist_routes(con, payload: dict) -> None:
-    """Upsert a refresh payload into the disposable runtime route table.
+def _evidence_kind(harness: str, source: str) -> str | None:
+    return {
+        ("claude", "claude-cli"): "claude-portable-manifest",
+        ("codex", "codex-cache"): "codex-model-cache",
+        ("kimi", "kimi-config"): "kimi-alias-config",
+        ("opencode", "opencode-provider-api"): "opencode-connected-variant",
+    }.get((harness, source))
 
-    A failed refresh marks carried-forward rows stale but never deletes them.
-    Older DBs mid-update simply lack the table; the advisory picker continues
-    to work from the JSON payload until migrations land.
-    """
+
+def _entry_evidence(harness: str, entry: dict) -> dict:
+    source = entry.get("source") or "unknown"
+    selector_binding = entry.get("selector_binding") or {
+        "kind": {
+            "claude": "portable-alias",
+            "codex": "exact-model",
+            "kimi": "configured-alias",
+            "opencode": "connected-model",
+        }.get(harness, "advisory"),
+        "selector": entry["id"],
+        "provider_model": entry.get("provider_model"),
+    }
+    efforts = list(dict.fromkeys(
+        value for value in (entry.get("supported_efforts") or [])
+        if isinstance(value, str) and value == value.strip().lower() and value
+    ))
+    base = {
+        "harness": harness,
+        "selector": entry["id"],
+        "provider": entry.get("provider"),
+        "provider_model": entry.get("provider_model"),
+        "source": source,
+        "cli_version": entry.get("cli_version"),
+        "selector_binding": selector_binding,
+        "adapter_metadata": entry.get("adapter_metadata") or {},
+    }
+    source_fingerprint = route_bindings.digest_json({
+        **base,
+        "supported_efforts": efforts,
+        "default_effort": entry.get("default_effort"),
+        "native_variant_ids": entry.get("native_variant_ids") or {},
+    })
+    effort_metadata = {
+        "supported": efforts,
+        "default": entry.get("default_effort"),
+        "digests": {
+            effort: route_bindings.digest_json({**base, "effort": effort})
+            for effort in efforts
+        },
+        "native_variant_ids": entry.get("native_variant_ids") or {},
+    }
+    return {
+        "evidence_kind": _evidence_kind(harness, source),
+        "evidence_digest": route_bindings.digest_json({
+            **base, "effort_metadata": effort_metadata
+        }),
+        "source_fingerprint": source_fingerprint,
+        "selector_binding": selector_binding,
+        "effort_metadata": effort_metadata,
+        "adapter_metadata": entry.get("adapter_metadata") or {},
+        "supported_efforts": efforts,
+    }
+
+
+def _legacy_persist_routes(con, payload: dict) -> None:
+    """Compatibility for an engine process crossing the 0212 migration."""
     try:
         con.execute("UPDATE model_routes SET stale=1, last_error=?",
                     (payload.get("error"),))
@@ -390,6 +458,123 @@ def persist_routes(con, payload: dict) -> None:
                  json.dumps(efforts), entry.get("cli_version"), seen_at, stale,
                  payload.get("error")))
     con.commit()
+
+
+def persist_routes(con, payload: dict) -> None:
+    """Publish one complete refresh generation or record one failed attempt."""
+    try:
+        con.execute("SELECT 1 FROM model_catalog_generations LIMIT 1")
+    except Exception:
+        _legacy_persist_routes(con, payload)
+        return
+
+    started_at = payload.get("refresh_started_at") or payload.get("fetched_at") \
+        or datetime.now(timezone.utc).isoformat()
+    completed_at = payload.get("fetched_at") or datetime.now(timezone.utc).isoformat()
+    generation_id = uuid.uuid4().hex
+    failed = bool(payload.get("stale") or payload.get("partial"))
+    state = "failed" if failed else "successful"
+    source_fingerprints: dict[str, str] = {}
+    evidence_by_route: dict[tuple[str, str], dict] = {}
+    for harness, block in (payload.get("harnesses") or {}).items():
+        for entry in block.get("models") or []:
+            evidence = _entry_evidence(harness, entry)
+            evidence_by_route[(harness, entry["id"])] = evidence
+            source_fingerprints[f"{harness}/{entry['id']}"] = evidence[
+                "source_fingerprint"
+            ]
+    verification = payload.get("verification") or {}
+    harness_versions = {
+        harness: status.get("version")
+        for harness, status in (verification.get("harnesses") or {}).items()
+    }
+    error_summary = {
+        "error": payload.get("error"),
+        "errors": payload.get("errors") or [],
+    } if failed else None
+    payload_digest = route_bindings.digest_json({
+        "v": payload.get("v", PAYLOAD_VERSION),
+        "fetched_at": payload.get("fetched_at"),
+        "sources": payload.get("sources") or [],
+        "harnesses": payload.get("harnesses") or {},
+        "state": state,
+    })
+
+    with con:
+        con.execute(
+            "INSERT INTO model_catalog_generations ("
+            "generation_id,payload_version,contract_version,started_at,completed_at,"
+            "state,runtime,source_summary,harness_versions,source_fingerprints,"
+            "error_summary,payload_digest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                generation_id, payload.get("v", PAYLOAD_VERSION), 2,
+                started_at, completed_at, state,
+                verification.get("runtime") or (
+                    "sandbox" if os.environ.get("SC_SANDBOX") else "host"
+                ),
+                route_bindings.canonical_json(payload.get("sources") or []),
+                route_bindings.canonical_json(harness_versions),
+                route_bindings.canonical_json(source_fingerprints),
+                route_bindings.canonical_json(error_summary) if error_summary else None,
+                payload_digest,
+            ),
+        )
+        if failed:
+            con.execute(
+                "UPDATE model_routes SET stale=1,last_error=?",
+                (payload.get("error") or "; ".join(payload.get("errors") or [])
+                 or "partial model refresh",),
+            )
+        else:
+            con.execute(
+                "UPDATE model_routes SET stale=1,last_error='not observed in latest generation'"
+            )
+            for harness, block in (payload.get("harnesses") or {}).items():
+                headless = int(_headless_supported(harness))
+                for entry in block.get("models") or []:
+                    evidence = evidence_by_route[(harness, entry["id"])]
+                    efforts = evidence["supported_efforts"]
+                    con.execute(
+                        "INSERT INTO model_routes ("
+                        "harness,selector,provider,provider_model,display_name,family,"
+                        "source,availability,headless_supported,high_effort_supported,"
+                        "default_effort,supported_efforts,cli_version,last_seen_at,stale,"
+                        "last_error,generation_id,evidence_kind,evidence_digest,"
+                        "source_fingerprint,selector_binding,effort_metadata,"
+                        "adapter_metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
+                        "?,?,?,?,?,?,?) ON CONFLICT(harness,selector) DO UPDATE SET "
+                        "provider=excluded.provider,provider_model=excluded.provider_model,"
+                        "display_name=excluded.display_name,family=excluded.family,"
+                        "source=excluded.source,availability=excluded.availability,"
+                        "headless_supported=excluded.headless_supported,"
+                        "high_effort_supported=excluded.high_effort_supported,"
+                        "default_effort=excluded.default_effort,"
+                        "supported_efforts=excluded.supported_efforts,"
+                        "cli_version=excluded.cli_version,last_seen_at=excluded.last_seen_at,"
+                        "stale=0,last_error=NULL,generation_id=excluded.generation_id,"
+                        "evidence_kind=excluded.evidence_kind,"
+                        "evidence_digest=excluded.evidence_digest,"
+                        "source_fingerprint=excluded.source_fingerprint,"
+                        "selector_binding=excluded.selector_binding,"
+                        "effort_metadata=excluded.effort_metadata,"
+                        "adapter_metadata=excluded.adapter_metadata",
+                        (
+                            harness, entry["id"], entry.get("provider"),
+                            entry.get("provider_model"), entry.get("name"),
+                            entry.get("family"), entry.get("source") or "unknown",
+                            entry.get("availability") or "advisory", headless,
+                            int("high" in efforts), entry.get("default_effort"),
+                            route_bindings.canonical_json(efforts),
+                            entry.get("cli_version"), completed_at, 0, None,
+                            generation_id, evidence["evidence_kind"],
+                            evidence["evidence_digest"], evidence["source_fingerprint"],
+                            route_bindings.canonical_json(evidence["selector_binding"]),
+                            route_bindings.canonical_json(evidence["effort_metadata"]),
+                            route_bindings.canonical_json(evidence["adapter_metadata"]),
+                        ),
+                    )
+    payload["catalogue_generation"] = generation_id
+    payload["generation_state"] = state
 
 
 def _requires_high_effort(harness: str) -> bool:
@@ -514,8 +699,8 @@ def runtime_verification(con, *, env=os.environ,
     return report
 
 
-def _served(payload: dict, con=None) -> dict:
-    if con is not None:
+def _served(payload: dict, con=None, *, publish: bool = False) -> dict:
+    if con is not None and publish:
         persist_routes(con, payload)
     return payload
 
@@ -555,7 +740,47 @@ def _with_live_opencode(payload: dict, provider_models) -> dict:
     }
     result["harnesses"] = harnesses
     result["sources"] = sources
+    if error:
+        result["partial"] = True
+        result["errors"] = [*(result.get("errors") or []),
+                            f"opencode-provider-api: {error}"]
     return result
+
+
+def current_source_fingerprint(harness: str, selector: str, *, env=os.environ,
+                               run=subprocess.run,
+                               opencode_provider=opencode_connected_models) -> str | None:
+    """Recompute one no-token local source fingerprint for drift detection."""
+    harness = (harness or "").strip().lower()
+    entries: list[dict]
+    if harness == "claude":
+        entries = _from_claude_cli(run)
+    elif harness == "codex":
+        entries = _from_codex_cache(env, run)
+    elif harness == "kimi":
+        entries = _from_kimi_config(env, run)
+    elif harness == "opencode":
+        if not shutil.which("opencode"):
+            return None
+        entries = [
+            _entry(
+                model["id"], model.get("release_date") or "",
+                model.get("name") or model["id"], model.get("family"),
+                source="opencode-provider-api", availability="available",
+                provider=model.get("provider"),
+                provider_model=model.get("provider_model"),
+                supported_efforts=model.get("supported_efforts") or [],
+                default_effort=model.get("default_effort"),
+                selector_binding=model.get("selector_binding"),
+                adapter_metadata=model.get("adapter_metadata"),
+                native_variant_ids=model.get("native_variant_ids"),
+            )
+            for model in opencode_provider()
+        ]
+    else:
+        return None
+    entry = next((item for item in entries if item["id"] == selector), None)
+    return _entry_evidence(harness, entry)["source_fingerprint"] if entry else None
 
 
 def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
@@ -570,15 +795,16 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     cached = _load_cache()
     if cached and not refresh and _fresh(cached):
         return _served(_with_live_opencode(
-            {**cached, "stale": False}, opencode_provider), con)
+            {**cached, "stale": bool(cached.get("partial"))},
+            opencode_provider), con)
     try:
         fresh = build(fetch, env, run)
     except Exception as e:  # noqa: BLE001
         if cached:
-            response = _served(_with_live_opencode(
+            response = _with_live_opencode(
                 {**cached, "stale": True, "error": str(e)},
                 opencode_provider,
-            ), con)
+            )
             if refresh and con is not None:
                 verification = runtime_verification(
                     con, env=env, harness_probe=harness_probe
@@ -587,15 +813,15 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
                 CACHE.write_text(json.dumps(
                     {**cached, "verification": verification}, indent=1
                 ) + "\n")
-            return response
+            return _served(response, con, publish=refresh)
         fallback = {
             "v": PAYLOAD_VERSION, "fetched_at": None,
             "sources": ["static"], "stale": True,
             "error": str(e), "harnesses": _floor(),
         }
-        response = _served(_with_live_opencode(
+        response = _with_live_opencode(
             fallback, opencode_provider,
-        ), con)
+        )
         if refresh and con is not None:
             verification = runtime_verification(
                 con, env=env, harness_probe=harness_probe
@@ -604,15 +830,42 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             response["verification"] = verification
             CACHE.parent.mkdir(parents=True, exist_ok=True)
             CACHE.write_text(json.dumps(fallback, indent=1) + "\n")
-        return response
-    response = _served(_with_live_opencode(
-        {**fresh, "stale": False}, opencode_provider), con)
+        return _served(response, con, publish=refresh)
+    response = _with_live_opencode(
+        {**fresh, "stale": bool(fresh.get("partial"))}, opencode_provider
+    )
     if refresh and con is not None:
+        probe_error = None
+        try:
+            harnesses = harness_probe()
+        except Exception as exc:  # noqa: BLE001
+            harnesses = {}
+            probe_error = str(exc)
+            response["partial"] = True
+            response["stale"] = True
+            response["errors"] = [*(response.get("errors") or []),
+                                  f"harness verification: {probe_error}"]
+        response["verification"] = {
+            "runtime": "sandbox" if env.get("SC_SANDBOX") else "host",
+            "harnesses": harnesses,
+        }
+        response = _served(response, con, publish=True)
+
+        def captured_probe():
+            if probe_error is not None:
+                raise RuntimeError(probe_error)
+            return harnesses
+
         verification = runtime_verification(
-            con, env=env, harness_probe=harness_probe
+            con, env=env, harness_probe=captured_probe
         )
         fresh["verification"] = verification
         response["verification"] = verification
+    else:
+        response = _served(response, con)
+    if response.get("partial"):
+        fresh["partial"] = True
+        fresh["errors"] = response.get("errors") or fresh.get("errors") or []
     CACHE.parent.mkdir(parents=True, exist_ok=True)
     CACHE.write_text(json.dumps(fresh, indent=1) + "\n")
     return response

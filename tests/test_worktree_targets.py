@@ -86,6 +86,17 @@ class _CatalogApiHandler(BaseHTTPRequestHandler):
         "availability": "available", "stale": 0, "headless_supported": 1,
         "high_effort_supported": 1, "cli_version": "test",
         "supported_efforts": '["high"]',
+        "last_seen_at": "2099-01-01T00:00:00+00:00",
+        "generation_id": "1" * 32,
+        "evidence_kind": "codex-model-cache",
+        "effort_metadata": json.dumps({
+            "supported": ["high"], "default": "high",
+            "digests": {"high": "2" * 64}, "native_variant_ids": {},
+        }),
+        "selector_binding": json.dumps({
+            "kind": "exact-model", "selector": "wt-live-model",
+        }),
+        "adapter_metadata": "{}",
     }
     skill = {
         "skill_id": 999, "name": "wt-live-skill", "common": 0,

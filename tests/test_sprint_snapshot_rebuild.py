@@ -15,8 +15,10 @@ ENGINE = ROOT / ".super-coder"
 SCHEMA = ENGINE / "schema.sql"
 MIGRATIONS = ENGINE / "migrations"
 sys.path.insert(0, str(ENGINE / "scripts"))
+sys.path.insert(0, str(ENGINE / "api"))
 import db_driver  # noqa: E402
 import rebuild  # noqa: E402
+import route_bindings  # noqa: E402
 import snapshot  # noqa: E402
 
 
@@ -153,6 +155,46 @@ def seed_prepared(
 
 
 def arm_with_representative_state(con: sqlite3.Connection) -> None:
+    binding = {
+        "contract_version": 2,
+        "control_state": "controlled",
+        "harness": "kimi",
+        "requested_model": "kimi-code/k3",
+        "provider_model": "k3",
+        "requested_effort": "high",
+        "effective_effort": "high",
+        "native_variant_id": None,
+        "transport": "kimi-effort-environment",
+        "catalogue_generation": "a" * 32,
+        "evidence_digest": "b" * 64,
+        "selector_binding": {"kind": "configured-alias",
+                             "selector": "kimi-code/k3"},
+        "adapter_metadata": {},
+    }
+    binding_digest = route_bindings.digest_json(binding)
+    binding_id = con.execute(
+        "INSERT INTO sprint_participant_route_bindings ("
+        "participant_id,route_revision,contract_version,control_state,harness,"
+        "requested_model,provider_model,requested_effort,effective_effort,"
+        "native_variant_id,transport,catalogue_generation,evidence_digest,"
+        "selector_binding,adapter_metadata,binding_json,binding_digest) "
+        "VALUES (2,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            binding["contract_version"], binding["control_state"],
+            binding["harness"], binding["requested_model"],
+            binding["provider_model"], binding["requested_effort"],
+            binding["effective_effort"], binding["native_variant_id"],
+            binding["transport"], binding["catalogue_generation"],
+            binding["evidence_digest"],
+            route_bindings.canonical_json(binding["selector_binding"]),
+            route_bindings.canonical_json(binding["adapter_metadata"]),
+            route_bindings.canonical_json(binding), binding_digest,
+        ),
+    ).lastrowid
+    con.execute(
+        "UPDATE sprint_participants SET active_route_binding_id=? "
+        "WHERE participant_id=2", (binding_id,)
+    )
     conversations = (
         ("cv_plan", 3, "planner-work"),
         ("cv_dev", 1, "developer-work"),

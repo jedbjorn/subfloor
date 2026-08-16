@@ -3,7 +3,7 @@
 
 The catalog is layered and best-effort: models.dev (keyless, all five
 harnesses) → provider APIs (only with env keys) → OpenCode's connected-provider
-projection → cache → static floor. Payload v5 retains family metadata
+    projection → cache → static floor. Payload v6 retains family metadata
 (newest-first; claude families with a CLI alias resolve `latest` to the
 alias), the flat `models` list for sub-version search, and fork-local harness
 and configured-route verification. These tests pin
@@ -22,6 +22,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -213,6 +214,15 @@ class RoutePersistenceTest(unittest.TestCase):
         self.con.row_factory = sqlite3.Row
         migration = ROOT / ".super-coder" / "migrations" / "0075_model_routes.sql"
         self.con.executescript(migration.read_text())
+        self.con.executescript(
+            "CREATE TABLE sprints (sprint_id INTEGER PRIMARY KEY,lifecycle TEXT);"
+            "CREATE TABLE sprint_participants ("
+            "participant_id INTEGER PRIMARY KEY,sprint_id INTEGER);"
+        )
+        self.con.executescript((
+            ROOT / ".super-coder" / "migrations" /
+            "0212_route_binding_foundation.sql"
+        ).read_text())
 
     def tearDown(self):
         self.con.close()
@@ -244,7 +254,7 @@ class RoutePersistenceTest(unittest.TestCase):
         self.assertEqual(tuple(row), (1, "network down"))
 
     def test_resolver_returns_exact_high_effort_sc_run_call(self):
-        fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
+        fresh = {"fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
                  "harnesses": {"codex": {"models": [mc._entry(
                      "gpt-5.6-sol", source="codex-cache",
                      availability="available", supported_efforts=["high"])]}}}
@@ -258,14 +268,14 @@ class RoutePersistenceTest(unittest.TestCase):
              "gpt-5.6-sol", "--effort", "high"])
 
     def test_resolver_rejects_unverified_high_effort(self):
-        fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
+        fresh = {"fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
                  "harnesses": {"kimi": {"models": [mc._entry(
                      "kimi-code/legacy", source="kimi-config",
                      availability="available", supported_efforts=[])]}}}
         mc.persist_routes(self.con, fresh)
         got = routes_cli.resolve(self.con, "kimi", "kimi-code/legacy")
         self.assertFalse(got["ok"])
-        self.assertIn("high-effort", got["error"])
+        self.assertEqual(got["code"], "unsupported_thinking_level")
 
 
 class RuntimeVerificationTest(unittest.TestCase):
@@ -523,6 +533,15 @@ class RouteCliConnectionTest(unittest.TestCase):
         "availability": "available", "stale": 0, "headless_supported": 1,
         "high_effort_supported": 1, "cli_version": "1",
         "supported_efforts": '["high"]',
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+        "generation_id": "1" * 32,
+        "evidence_kind": "codex-model-cache",
+        "effort_metadata": json.dumps({
+            "supported": ["high"], "default": "high",
+            "digests": {"high": "2" * 64}, "native_variant_ids": {},
+        }),
+        "selector_binding": '{"kind":"exact-model","selector":"api-model"}',
+        "adapter_metadata": "{}",
     }
 
     def test_list_and_resolve_use_shell_api_without_opening_database(self):

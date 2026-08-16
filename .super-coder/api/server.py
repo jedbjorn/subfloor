@@ -454,11 +454,7 @@ def get_cli_skills(con) -> dict:
 def get_model_routes(con, *, harness: str | None = None,
                      selector: str | None = None) -> dict:
     """Small exact-route projection for authenticated shell CLI reads."""
-    sql = (
-        "SELECT harness, selector, source, availability, stale, "
-        "headless_supported, high_effort_supported, cli_version, "
-        "supported_efforts FROM model_routes"
-    )
+    sql = "SELECT * FROM model_routes"
     clauses = []
     params = []
     if harness is not None:

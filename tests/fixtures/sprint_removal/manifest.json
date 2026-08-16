@@ -33,6 +33,7 @@
     ".super-coder/scripts/sprint_pr_watcher.py",
     ".super-coder/scripts/sprint_recovery.py",
     ".super-coder/scripts/sprint_review_loop.py",
+    ".super-coder/api/route_bindings.py",
     ".super-coder/migrations/0144_remove_sprint_v1.sql",
     "tests/fixtures/sprint_removal/build_pre_removal_fixture.py",
     "tests/fixtures/sprint_removal/manifest.json",
@@ -55,6 +56,8 @@
     "tests/test_sprint_cli.py",
     "tests/test_sprint_skills.py",
     "tests/test_sprint_snapshot_rebuild.py",
+    "tests/test_route_bindings.py",
+    "tests/test_model_catalog.py",
     "tests/test_sprint_spec_revisions.py",
     "tests/test_sprint_live_proof.py",
     "tests/test_sprint_board_api.py",
@@ -106,7 +109,8 @@
     ".super-coder/migrations/0206_reseed_sprint_conformance_ownership.sql",
     ".super-coder/migrations/0207_reseed_sprint_receipt_recovery.sql",
     ".super-coder/migrations/0208_reseed_disposable_shell_base.sql",
-    ".super-coder/migrations/0209_reseed_git_github_capabilities.sql"
+    ".super-coder/migrations/0209_reseed_git_github_capabilities.sql",
+    ".super-coder/migrations/0212_route_binding_foundation.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,

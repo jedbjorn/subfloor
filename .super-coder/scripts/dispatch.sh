@@ -1494,7 +1494,7 @@ super-coder — forkable shell substrate
   ./sc job wait <id>       bounded foreground wait, ≤550s slice — exit 0 done · 2 still running
                              (drain your inbox between slices); list/status/tail/kill complete the set
   ./sc models refresh      refresh local model routes (same action as Shells → Refresh models)
-  ./sc models resolve <h> <model> [--shell <shortname>]
+  ./sc models resolve <h> [<model>] [--effort <level>] [--shell <shortname>]
                              print one exact, locally runnable high-effort call; list [harness] shows routes
   ./sc visual-qa <mode>    viewport screenshot QA: ci boots/captures · run captures a local app · init scaffolds config
   sc sql "<query>"         read-only passthrough to the engine DB (schema/skills/flags) — absolute path, cwd-independent (no `cd` to root)
