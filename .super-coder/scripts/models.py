@@ -173,6 +173,8 @@ def _resolve_args(args: list[str]) -> tuple[str, str | None, str | None, str, bo
         if value in {"--effort", "--shell"}:
             if i + 1 >= len(values) or values[i + 1].startswith("--"):
                 raise SystemExit(f"models: {value} requires a value")
+            if value == "--shell" and not values[i + 1].strip():
+                raise SystemExit("models: --shell requires a non-blank value")
             if value == "--effort":
                 effort = values[i + 1]
             else:

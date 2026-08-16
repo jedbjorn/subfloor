@@ -512,7 +512,8 @@ def persist_routes(con, payload: dict) -> None:
 
     started_at = payload.get("refresh_started_at") or payload.get("fetched_at") \
         or datetime.now(timezone.utc).isoformat()
-    completed_at = payload.get("fetched_at") or datetime.now(timezone.utc).isoformat()
+    completed_at = payload.get("refresh_completed_at") or payload.get("fetched_at") \
+        or datetime.now(timezone.utc).isoformat()
     generation_id = uuid.uuid4().hex
     failed = bool(payload.get("stale") or payload.get("partial"))
     state = "failed" if failed else "successful"
@@ -882,14 +883,24 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     cached = _load_cache()
     if cached and not refresh and _fresh(cached):
         return _served(_with_live_opencode(
-            {**cached, "stale": bool(cached.get("partial"))},
+            {**cached, "stale": bool(
+                cached.get("stale") or cached.get("partial")
+            )},
             opencode_provider), con)
+    refresh_started_at = datetime.now(timezone.utc).isoformat()
     try:
         fresh = build(fetch, env, run)
     except Exception as e:  # noqa: BLE001
+        refresh_completed_at = datetime.now(timezone.utc).isoformat()
         if cached:
             response = _with_live_opencode(
-                {**cached, "stale": True, "error": str(e)},
+                {
+                    **cached,
+                    "stale": True,
+                    "error": str(e),
+                    "refresh_started_at": refresh_started_at,
+                    "refresh_completed_at": refresh_completed_at,
+                },
                 opencode_provider,
             )
             if refresh and con is not None:
@@ -897,14 +908,27 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
                     con, env=env, harness_probe=harness_probe
                 )
                 response["verification"] = verification
+            if refresh:
+                cached_failure = {
+                    **cached,
+                    "stale": True,
+                    "error": str(e),
+                    "refresh_started_at": refresh_started_at,
+                    "refresh_completed_at": refresh_completed_at,
+                }
+                if "verification" in response:
+                    cached_failure["verification"] = response["verification"]
+                CACHE.parent.mkdir(parents=True, exist_ok=True)
                 CACHE.write_text(json.dumps(
-                    {**cached, "verification": verification}, indent=1
+                    cached_failure, indent=1
                 ) + "\n")
             return _served(response, con, publish=refresh)
         fallback = {
             "v": PAYLOAD_VERSION, "fetched_at": None,
             "sources": ["static"], "stale": True,
             "error": str(e), "harnesses": _floor(),
+            "refresh_started_at": refresh_started_at,
+            "refresh_completed_at": refresh_completed_at,
         }
         response = _with_live_opencode(
             fallback, opencode_provider,
@@ -921,6 +945,8 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     response = _with_live_opencode(
         {**fresh, "stale": bool(fresh.get("partial"))}, opencode_provider
     )
+    response["refresh_started_at"] = refresh_started_at
+    response["refresh_completed_at"] = datetime.now(timezone.utc).isoformat()
     if refresh and con is not None:
         probe_error = None
         try:

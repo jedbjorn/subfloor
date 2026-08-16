@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -289,6 +290,58 @@ class GenerationPersistenceTest(unittest.TestCase):
         self.assertIn("models.dev", stable["last_error"])
         self.assertIsNone(partial_row)
 
+    def test_failed_explicit_refresh_stays_stale_on_followup_cache_read(self):
+        fresh = self.payload()
+        fresh["fetched_at"] = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).isoformat()
+        fresh.pop("verification")
+        statuses = {"codex": self.status()}
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            model_catalog, "CACHE", Path(tmp) / "model_catalog.json"
+        ), mock.patch.object(
+            model_catalog, "build", side_effect=[fresh, RuntimeError("network down")]
+        ) as build:
+            first = model_catalog.catalog(
+                refresh=True, con=self.con, opencode_provider=lambda: [],
+                harness_probe=lambda: statuses,
+            )
+            before_failure = datetime.now(timezone.utc)
+            failed = model_catalog.catalog(
+                refresh=True, con=self.con, opencode_provider=lambda: [],
+                harness_probe=lambda: statuses,
+            )
+            cached = model_catalog.catalog(
+                con=self.con, opencode_provider=lambda: [],
+                harness_probe=lambda: (_ for _ in ()).throw(
+                    AssertionError("ordinary cache read reprobed")
+                ),
+            )
+            cache_payload = json.loads(model_catalog.CACHE.read_text())
+
+        route = self.con.execute(
+            "SELECT stale,last_error FROM model_routes WHERE selector='gpt-test'"
+        ).fetchone()
+        generation = self.con.execute(
+            "SELECT state,started_at,completed_at FROM model_catalog_generations "
+            "ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        self.assertFalse(first["stale"])
+        self.assertTrue(failed["stale"])
+        self.assertTrue(cached["stale"])
+        self.assertTrue(cache_payload["stale"])
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(tuple(route), (1, "network down"))
+        self.assertEqual(generation["state"], "failed")
+        self.assertGreaterEqual(
+            datetime.fromisoformat(generation["started_at"]), before_failure
+        )
+        self.assertGreaterEqual(
+            datetime.fromisoformat(generation["completed_at"]),
+            datetime.fromisoformat(generation["started_at"]),
+        )
+
     def test_incompatible_harnesses_never_publish_controlled_routes(self):
         cases = (
             ("missing", None, self.status(
@@ -383,6 +436,65 @@ class ParticipantRevisionTest(unittest.TestCase):
             None, "vibe", "devstral-latest", None
         )
 
+    @staticmethod
+    def controlled_binding() -> dict:
+        binding, _ = route_bindings.resolve_v2(
+            BindingIdentityTest.controlled_row(), "codex", "gpt-test", "high",
+            now=BindingIdentityTest.NOW,
+            current_source_fingerprint="2" * 64,
+        )
+        return binding
+
+    def insert_raw(self, binding: dict, binding_digest: str | None = None) -> None:
+        values = [binding[key] for key in route_bindings.BINDING_KEYS]
+        self.con.execute(
+            "INSERT INTO sprint_participant_route_bindings ("
+            "participant_id,route_revision,contract_version,control_state,harness,"
+            "requested_model,provider_model,requested_effort,effective_effort,"
+            "native_variant_id,transport,catalogue_generation,evidence_digest,"
+            "selector_binding,adapter_metadata,binding_json,binding_digest"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                10, 1, *values[:11],
+                route_bindings.canonical_json(binding["selector_binding"])
+                if binding["selector_binding"] is not None else None,
+                route_bindings.canonical_json(binding["adapter_metadata"]),
+                route_bindings.canonical_json(binding),
+                binding_digest or route_bindings.digest_json(binding),
+            ),
+        )
+
+    @staticmethod
+    def invalid_bindings() -> list[tuple[str, dict]]:
+        controlled = ParticipantRevisionTest.controlled_binding()
+        uncontrolled, _ = route_bindings.resolve_v2(
+            None, "vibe", "devstral-latest", None
+        )
+        return [
+            ("controlled-vibe", {**controlled, "harness": "vibe"}),
+            ("wrong-transport", {**controlled, "transport": "native-default"}),
+            ("wrong-native-variant", {**controlled, "native_variant_id": "high"}),
+            ("missing-selector", {**controlled, "selector_binding": None}),
+            ("opencode-missing-native-variant", {
+                **controlled,
+                "harness": "opencode",
+                "transport": "opencode-route-agent",
+                "native_variant_id": None,
+            }),
+            ("uncontrolled-selector", {
+                **uncontrolled, "selector_binding": {"selector": "smuggled"},
+            }),
+            ("uncontrolled-adapter", {
+                **uncontrolled, "adapter_metadata": {"effort": "high"},
+            }),
+            ("malformed-generation", {
+                **controlled, "catalogue_generation": "not-a-generation",
+            }),
+            ("malformed-evidence", {
+                **controlled, "evidence_digest": "abcd",
+            }),
+        ]
+
     def test_arm_then_paused_reroute_appends_and_switches_only_owner(self):
         first = self.store.bind(10, self.binding, self.digest, transition="arm")
         self.con.execute("UPDATE sprints SET lifecycle='paused' WHERE sprint_id=1")
@@ -430,6 +542,73 @@ class ParticipantRevisionTest(unittest.TestCase):
                 "UPDATE sprint_participant_route_bindings SET route_revision=9 "
                 "WHERE binding_id=?", (first["binding_id"],)
             )
+
+    def test_store_rejects_invalid_bindings_without_row_or_active_pointer(self):
+        for name, binding in self.invalid_bindings():
+            with self.subTest(name=name):
+                with self.assertRaises(route_bindings.RouteResolutionError):
+                    self.store.bind(
+                        10, binding, route_bindings.digest_json(binding),
+                        transition="arm",
+                    )
+                self.assertEqual(
+                    self.con.execute(
+                        "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertIsNone(self.con.execute(
+                    "SELECT active_route_binding_id FROM sprint_participants "
+                    "WHERE participant_id=10"
+                ).fetchone()[0])
+
+        controlled = self.controlled_binding()
+        with self.assertRaisesRegex(ValueError, "canonical v2 contract"):
+            self.store.bind(10, controlled, "abcd", transition="arm")
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertIsNone(self.con.execute(
+            "SELECT active_route_binding_id FROM sprint_participants "
+            "WHERE participant_id=10"
+        ).fetchone()[0])
+
+    def test_database_independently_rejects_invalid_binding_states(self):
+        for name, binding in self.invalid_bindings():
+            with self.subTest(name=name):
+                self.con.execute("SAVEPOINT invalid_binding")
+                try:
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        self.insert_raw(binding)
+                    self.assertEqual(
+                        self.con.execute(
+                            "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+                        ).fetchone()[0],
+                        0,
+                    )
+                    self.assertIsNone(self.con.execute(
+                        "SELECT active_route_binding_id FROM sprint_participants "
+                        "WHERE participant_id=10"
+                    ).fetchone()[0])
+                finally:
+                    self.con.execute("ROLLBACK TO invalid_binding")
+                    self.con.execute("RELEASE invalid_binding")
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_raw(self.controlled_binding(), binding_digest="abcd")
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertIsNone(self.con.execute(
+            "SELECT active_route_binding_id FROM sprint_participants "
+            "WHERE participant_id=10"
+        ).fetchone()[0])
 
 
 if __name__ == "__main__":

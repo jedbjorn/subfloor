@@ -618,6 +618,15 @@ class RouteCliConnectionTest(unittest.TestCase):
             self.assertEqual(routes_cli.main(["list"]), 0)
         opened.assert_called_once_with()
 
+    def test_resolve_rejects_an_explicitly_blank_shell(self):
+        for value in ("", "   "):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                SystemExit, "--shell requires a non-blank value"
+            ):
+                routes_cli._resolve_args([
+                    "resolve", "codex", "api-model", "--shell", value,
+                ])
+
     def test_refresh_keeps_the_wal_enabled_write_lane(self):
         con = mock.Mock()
         payload = {"stale": False, "sources": ["test-source"]}

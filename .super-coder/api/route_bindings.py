@@ -47,6 +47,9 @@ TRANSPORTS = {
     "opencode": "opencode-route-agent",
 }
 
+LOWER_HEX_32 = re.compile(r"^[0-9a-f]{32}$")
+LOWER_HEX_64 = re.compile(r"^[0-9a-f]{64}$")
+
 
 @dataclass(frozen=True)
 class RouteResolutionError(Exception):
@@ -130,6 +133,95 @@ def _normalize_model(model: str | None) -> str | None:
     return model
 
 
+def _exact_nonblank(value: Any) -> bool:
+    return isinstance(value, str) and bool(value) and value == value.strip()
+
+
+def _lower_hex(value: Any, pattern: re.Pattern[str]) -> bool:
+    return isinstance(value, str) and pattern.fullmatch(value) is not None
+
+
+def _binding_error(reason: str) -> RouteResolutionError:
+    return RouteResolutionError(
+        "thinking_evidence_missing",
+        "Invalid version-two route binding",
+        {"reason": reason},
+    )
+
+
+def validate_v2_binding(binding: dict) -> None:
+    """Enforce the one semantic state contract accepted by every v2 consumer."""
+    if not isinstance(binding, dict) or tuple(binding) != BINDING_KEYS:
+        raise _binding_error("binding must contain the canonical fixed key sequence")
+    if binding["contract_version"] != CONTRACT_VERSION:
+        raise _binding_error("contract_version must be 2")
+
+    harness = binding["harness"]
+    if not _exact_nonblank(harness) or harness != harness.lower():
+        raise _binding_error("harness must be a normalized non-blank identifier")
+    state = binding["control_state"]
+    adapter_metadata = binding["adapter_metadata"]
+    if not isinstance(adapter_metadata, dict):
+        raise _binding_error("adapter_metadata must be an object")
+
+    if state == "controlled":
+        if harness not in TRANSPORTS:
+            raise _binding_error("controlled bindings require a supported harness")
+        for field in (
+            "requested_model", "provider_model", "requested_effort",
+            "effective_effort",
+        ):
+            if not _exact_nonblank(binding[field]):
+                raise _binding_error(f"controlled {field} must be exact and non-blank")
+        requested_effort = binding["requested_effort"]
+        if requested_effort != requested_effort.lower():
+            raise _binding_error("controlled effort must be canonical lowercase")
+        if binding["effective_effort"] != requested_effort:
+            raise _binding_error("requested and effective effort must match")
+        if binding["transport"] != TRANSPORTS[harness]:
+            raise _binding_error("controlled transport does not match harness")
+        if not _lower_hex(binding["catalogue_generation"], LOWER_HEX_32):
+            raise _binding_error(
+                "catalogue_generation must be 32 lowercase hex characters"
+            )
+        if not _lower_hex(binding["evidence_digest"], LOWER_HEX_64):
+            raise _binding_error("evidence_digest must be a SHA-256 hex digest")
+        selector_binding = binding["selector_binding"]
+        if not isinstance(selector_binding, dict) or not selector_binding:
+            raise _binding_error("controlled selector_binding must be a non-empty object")
+        native_variant = binding["native_variant_id"]
+        if harness == "opencode":
+            if native_variant != requested_effort:
+                raise _binding_error(
+                    "OpenCode native variant must equal the canonical effort"
+                )
+        elif native_variant is not None:
+            raise _binding_error("native variants are exclusive to OpenCode")
+        return
+
+    if state not in {"harness-default", "native-uncontrolled"}:
+        raise _binding_error("control_state is not recognized")
+    if binding["transport"] != "native-default":
+        raise _binding_error("uncontrolled bindings require native-default transport")
+    for field in (
+        "provider_model", "requested_effort", "effective_effort",
+        "native_variant_id", "catalogue_generation", "evidence_digest",
+        "selector_binding",
+    ):
+        if binding[field] is not None:
+            raise _binding_error(f"uncontrolled {field} must be null")
+    if adapter_metadata != {}:
+        raise _binding_error("uncontrolled adapter_metadata must be empty")
+    if state == "harness-default":
+        if binding["requested_model"] is not None:
+            raise _binding_error("harness-default requested_model must be null")
+        return
+    if harness != "vibe" or not _exact_nonblank(binding["requested_model"]):
+        raise _binding_error(
+            "native-uncontrolled bindings require an exact Vibe model"
+        )
+
+
 def _parsed_version(value: Any) -> str | None:
     match = re.search(r"\d+\.\d+\.\d+", value) if isinstance(value, str) else None
     return match.group(0) if match else None
@@ -190,6 +282,7 @@ def resolve_v2(
     model = _normalize_model(model)
     if model is None or harness == "vibe":
         binding = _uncontrolled_binding(harness, model, effort)
+        validate_v2_binding(binding)
         return binding, digest_json(binding)
 
     requested = "high" if effort is None else effort.strip().lower()
@@ -334,6 +427,7 @@ def resolve_v2(
     }
     if tuple(binding) != BINDING_KEYS:
         raise AssertionError("route binding key order drifted")
+    validate_v2_binding(binding)
     return binding, digest_json(binding)
 
 
@@ -358,7 +452,9 @@ class ParticipantRouteBindingStore:
 
     def bind(self, participant_id: int, binding: dict, binding_digest: str, *,
              transition: str) -> dict:
-        if tuple(binding) != BINDING_KEYS or digest_json(binding) != binding_digest:
+        validate_v2_binding(binding)
+        if (not _lower_hex(binding_digest, LOWER_HEX_64)
+                or digest_json(binding) != binding_digest):
             raise ValueError("binding does not match the canonical v2 contract")
         row = self.con.execute(
             "SELECT participant.active_route_binding_id,sprint.lifecycle "

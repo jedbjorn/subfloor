@@ -52,7 +52,8 @@ CREATE TABLE sprint_participant_route_bindings (
     control_state        TEXT NOT NULL
                          CHECK (control_state IN
                            ('controlled','harness-default','native-uncontrolled')),
-    harness              TEXT NOT NULL CHECK (trim(harness)<>''),
+    harness              TEXT NOT NULL CHECK (
+                           trim(harness)<>'' AND harness=lower(trim(harness))),
     requested_model      TEXT,
     provider_model       TEXT,
     requested_effort     TEXT,
@@ -62,9 +63,15 @@ CREATE TABLE sprint_participant_route_bindings (
     catalogue_generation TEXT,
     evidence_digest      TEXT,
     selector_binding     TEXT CHECK (
-                           selector_binding IS NULL OR json_valid(selector_binding)),
-    adapter_metadata     TEXT NOT NULL CHECK (json_valid(adapter_metadata)),
-    binding_json         TEXT NOT NULL CHECK (json_valid(binding_json)),
+                           selector_binding IS NULL OR
+                           (json_valid(selector_binding)
+                            AND json_type(selector_binding)='object')),
+    adapter_metadata     TEXT NOT NULL CHECK (
+                           json_valid(adapter_metadata)
+                           AND json_type(adapter_metadata)='object'),
+    binding_json         TEXT NOT NULL CHECK (
+                           json_valid(binding_json)
+                           AND json_type(binding_json)='object'),
     binding_digest       TEXT NOT NULL
                          CHECK (length(binding_digest)=64
                            AND binding_digest NOT GLOB '*[^0-9a-f]*'),
@@ -72,12 +79,35 @@ CREATE TABLE sprint_participant_route_bindings (
     UNIQUE (participant_id, route_revision),
     CHECK (
       (control_state='controlled'
+       AND harness IN ('claude','codex','kimi','opencode')
        AND requested_model IS NOT NULL
+       AND trim(requested_model)<>''
+       AND requested_model=trim(requested_model)
        AND provider_model IS NOT NULL
+       AND trim(provider_model)<>''
+       AND provider_model=trim(provider_model)
        AND requested_effort IS NOT NULL
+       AND trim(requested_effort)<>''
+       AND requested_effort=lower(trim(requested_effort))
+       AND effective_effort IS NOT NULL
        AND effective_effort=requested_effort
+       AND transport=CASE harness
+         WHEN 'claude' THEN 'claude-effort-argument'
+         WHEN 'codex' THEN 'codex-reasoning-config'
+         WHEN 'kimi' THEN 'kimi-effort-environment'
+         WHEN 'opencode' THEN 'opencode-route-agent'
+       END
        AND catalogue_generation IS NOT NULL
-       AND evidence_digest IS NOT NULL)
+       AND length(catalogue_generation)=32
+       AND catalogue_generation NOT GLOB '*[^0-9a-f]*'
+       AND evidence_digest IS NOT NULL
+       AND length(evidence_digest)=64
+       AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+       AND selector_binding IS NOT NULL
+       AND json(selector_binding)<>'{}'
+       AND ((harness='opencode' AND native_variant_id IS NOT NULL
+             AND native_variant_id=requested_effort)
+         OR (harness<>'opencode' AND native_variant_id IS NULL)))
       OR
       (control_state='harness-default'
        AND requested_model IS NULL
@@ -87,17 +117,23 @@ CREATE TABLE sprint_participant_route_bindings (
        AND native_variant_id IS NULL
        AND catalogue_generation IS NULL
        AND evidence_digest IS NULL
+       AND selector_binding IS NULL
+       AND json(adapter_metadata)='{}'
        AND transport='native-default')
       OR
       (control_state='native-uncontrolled'
        AND harness='vibe'
        AND requested_model IS NOT NULL
+       AND trim(requested_model)<>''
+       AND requested_model=trim(requested_model)
        AND provider_model IS NULL
        AND requested_effort IS NULL
        AND effective_effort IS NULL
        AND native_variant_id IS NULL
        AND catalogue_generation IS NULL
        AND evidence_digest IS NULL
+       AND selector_binding IS NULL
+       AND json(adapter_metadata)='{}'
        AND transport='native-default')
     )
 );
