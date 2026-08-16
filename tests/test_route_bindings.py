@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 
 import model_catalog  # noqa: E402
 import route_bindings  # noqa: E402
+import models as routes_cli  # noqa: E402
 
 
 def route_schema() -> sqlite3.Connection:
@@ -156,18 +157,19 @@ class BindingIdentityTest(unittest.TestCase):
 
     def test_controlled_route_requires_matching_compatible_harness_version(self):
         cases = (
-            {"harness_compatibility": None},
-            {"harness_compatibility": "newer-unverified"},
-            {"harness_version": "0.144.0"},
+            ({"harness_compatibility": None}, "thinking_evidence_missing"),
+            ({"harness_compatibility": "newer-unverified"},
+             "thinking_evidence_missing"),
+            ({"harness_version": "0.144.0"}, "thinking_evidence_stale"),
         )
-        for overrides in cases:
+        for overrides, code in cases:
             with self.subTest(overrides=overrides):
                 with self.assertRaises(route_bindings.RouteResolutionError) as raised:
                     route_bindings.resolve_v2(
                         self.controlled_row(**overrides), "codex", "gpt-test",
                         now=self.NOW, current_source_fingerprint="2" * 64,
                     )
-                self.assertEqual(raised.exception.code, "thinking_evidence_missing")
+                self.assertEqual(raised.exception.code, code)
 
     def test_controlled_route_requires_current_source_fingerprint(self):
         with self.assertRaises(route_bindings.RouteResolutionError) as raised:
@@ -422,6 +424,117 @@ class GenerationPersistenceTest(unittest.TestCase):
                 )},
             )
         self.assertIsNone(fingerprint)
+
+    def test_authoritative_resolution_durably_stales_drift_and_expiry(self):
+        cases = (
+            (
+                "fingerprint-drift",
+                datetime.now(timezone.utc).isoformat(),
+                "wrong-fingerprint",
+                "Installed route source changed after refresh",
+            ),
+            (
+                "age-expired",
+                (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(),
+                None,
+                "Route evidence is older than 24 hours",
+            ),
+        )
+        for name, fetched_at, supplied_fingerprint, message in cases:
+            with self.subTest(name=name):
+                con = route_schema()
+                self.addCleanup(con.close)
+                payload = self.payload(name)
+                payload["fetched_at"] = fetched_at
+                model_catalog.persist_routes(con, payload)
+                row = dict(con.execute(
+                    "SELECT * FROM model_routes WHERE selector=?", (name,)
+                ).fetchone())
+                fingerprint = supplied_fingerprint or row["source_fingerprint"]
+
+                got = routes_cli.resolve(
+                    con, "Codex", name, now=datetime.now(timezone.utc),
+                    current_source_fingerprint=fingerprint,
+                )
+                stored = con.execute(
+                    "SELECT stale,last_error FROM model_routes WHERE selector=?",
+                    (name,),
+                ).fetchone()
+
+                self.assertFalse(got["ok"])
+                self.assertEqual(got["code"], "thinking_evidence_stale")
+                self.assertEqual(stored["stale"], 1)
+                self.assertEqual(
+                    stored["last_error"],
+                    f"thinking_evidence_stale: {message}; "
+                    "remediation: sc models refresh",
+                )
+                refused_again = routes_cli.resolve(
+                    con, "codex", name,
+                    current_source_fingerprint=row["source_fingerprint"],
+                )
+                self.assertFalse(refused_again["ok"])
+                self.assertEqual(refused_again["code"], "thinking_evidence_stale")
+
+    def test_authoritative_resolution_stales_version_drift(self):
+        payload = self.payload("version-drift")
+        model_catalog.persist_routes(self.con, payload)
+        self.con.execute(
+            "UPDATE model_routes SET cli_version='codex-cli 0.146.0' "
+            "WHERE selector='version-drift'"
+        )
+        self.con.commit()
+        row = dict(self.con.execute(
+            "SELECT * FROM model_routes WHERE selector='version-drift'"
+        ).fetchone())
+
+        got = routes_cli.resolve(
+            self.con, "codex", "version-drift",
+            current_source_fingerprint=row["source_fingerprint"],
+        )
+        stored = self.con.execute(
+            "SELECT stale,last_error FROM model_routes "
+            "WHERE selector='version-drift'"
+        ).fetchone()
+
+        self.assertEqual(got["code"], "thinking_evidence_stale")
+        self.assertEqual(tuple(stored), (
+            1,
+            "thinking_evidence_stale: Installed harness version changed after "
+            "refresh; remediation: sc models refresh",
+        ))
+
+    def test_authoritative_resolution_requires_latest_successful_generation(self):
+        payload = self.payload("superseded")
+        model_catalog.persist_routes(self.con, payload)
+        row = dict(self.con.execute(
+            "SELECT * FROM model_routes WHERE selector='superseded'"
+        ).fetchone())
+        later = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+        self.con.execute(
+            "INSERT INTO model_catalog_generations ("
+            "generation_id,payload_version,contract_version,started_at,"
+            "completed_at,state,runtime,source_summary,harness_versions,"
+            "source_fingerprints,error_summary,payload_digest"
+            ") VALUES (?,?,?,?,?,'successful','host','[]','{}','{}',NULL,?)",
+            ("f" * 32, 6, 2, later, later, "e" * 64),
+        )
+        self.con.commit()
+
+        got = routes_cli.resolve(
+            self.con, "codex", "superseded",
+            current_source_fingerprint=row["source_fingerprint"],
+        )
+        stored = self.con.execute(
+            "SELECT stale,last_error FROM model_routes WHERE selector='superseded'"
+        ).fetchone()
+
+        self.assertEqual(got["code"], "thinking_evidence_stale")
+        self.assertEqual(tuple(stored), (
+            1,
+            "thinking_evidence_stale: Route does not belong to the latest "
+            "successful generation; remediation: sc models refresh",
+        ))
 
 
 class ParticipantRevisionTest(unittest.TestCase):

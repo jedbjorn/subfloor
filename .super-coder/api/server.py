@@ -87,6 +87,7 @@ import snapshot as snapshot_mod  # noqa: E402  (engine_skill_names — origin ru
 import sprint_participant_chats  # noqa: E402  (registry-backed Sprint wake chats)
 import sprint_pr_watcher  # noqa: E402  (engine-wide PR subscription observation)
 import model_catalog  # noqa: E402  (live model-id suggestions, sibling module)
+import route_bindings  # noqa: E402  (shared durable model-route freshness gate)
 import analytics  # noqa: E402  (token & session analytics sweep — doc #11)
 import token_parsers  # noqa: E402  (harness roster + per-parser data dirs)
 from quota_probes import dispatch as quota_dispatch  # noqa: E402  (account quota probes — doc #49)
@@ -469,11 +470,20 @@ def get_model_routes(con, *, harness: str | None = None,
     routes = rows(con.execute(sql, tuple(params)))
     if selector is not None:
         for route in routes:
-            route["current_source_fingerprint"] = (
-                model_catalog.current_source_fingerprint(
-                    route["harness"], route["selector"]
+            fingerprint = model_catalog.current_source_fingerprint(
+                route["harness"], route["selector"]
+            ) or ""
+            try:
+                route_bindings.require_fresh_route(
+                    con, route, route["harness"], route["selector"],
+                    current_source_fingerprint=fingerprint,
                 )
-            )
+            except route_bindings.RouteResolutionError:
+                route.update(dict(con.execute(
+                    "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+                    (route["harness"], route["selector"]),
+                ).fetchone()))
+            route["current_source_fingerprint"] = fingerprint
     return {"routes": routes}
 
 
@@ -506,10 +516,22 @@ def get_flavor_defaults(con) -> dict:
 def model_route_available(con, harness: str, selector: str) -> bool:
     """True only for an exact route proved available by the local catalogue."""
     row = con.execute(
-        "SELECT 1 FROM model_routes WHERE harness=? AND selector=? "
-        "AND availability='available' AND stale=0",
+        "SELECT * FROM model_routes WHERE harness=? AND selector=?",
         (harness, selector)).fetchone()
-    return row is not None
+    if row is None or row["availability"] != "available" or row["stale"]:
+        return False
+    if harness == "vibe":
+        return True
+    route = dict(row)
+    fingerprint = model_catalog.current_source_fingerprint(harness, selector) or ""
+    try:
+        route_bindings.require_fresh_route(
+            con, route, harness, selector,
+            current_source_fingerprint=fingerprint,
+        )
+    except route_bindings.RouteResolutionError:
+        return False
+    return True
 
 
 def set_flavor_default(con, body) -> tuple[bool, str | None]:

@@ -112,7 +112,7 @@ def _supported_efforts(row: dict) -> tuple[list[str], dict]:
     return supported, metadata
 
 
-def _normalize_harness(harness: str) -> str:
+def normalize_harness(harness: str) -> str:
     normalized = (harness or "").strip().lower()
     if not normalized:
         raise RouteResolutionError(
@@ -268,6 +268,159 @@ def _age_hours(value: str, now: datetime) -> float:
     return (now - seen.astimezone(timezone.utc)).total_seconds() / 3600
 
 
+def _validate_route_freshness(
+    row: dict,
+    harness: str,
+    model: str,
+    *,
+    now: datetime,
+    current_source_fingerprint: str | None,
+) -> None:
+    captured_version = row.get("harness_version")
+    compatibility = row.get("harness_compatibility")
+    if compatibility not in COMPATIBLE_HARNESS_STATES or not captured_version:
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            f"Route {harness}/{model} has no version-verified adapter transport",
+            {
+                "harness": harness,
+                "model": model,
+                "harness_version": captured_version,
+                "compatibility": compatibility,
+            },
+        )
+    if _parsed_version(row.get("cli_version")) != captured_version:
+        raise RouteResolutionError(
+            "thinking_evidence_stale",
+            "Installed harness version changed after refresh",
+            {"harness": harness, "model": model, "remediation": "sc models refresh"},
+        )
+    if row.get("availability") != "available" or not row.get("headless_supported"):
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            f"Route {harness}/{model} is not locally callable",
+            {"harness": harness, "model": model},
+        )
+    if not row.get("generation_id"):
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            "Route has no successful catalogue generation",
+            {"harness": harness, "model": model, "remediation": "sc models refresh"},
+        )
+    if row.get("stale"):
+        raise RouteResolutionError(
+            "thinking_evidence_stale",
+            row.get("last_error") or "Route evidence is stale",
+            {"harness": harness, "model": model, "remediation": "sc models refresh"},
+        )
+    if _age_hours(row.get("last_seen_at"), now) > FRESH_HOURS:
+        raise RouteResolutionError(
+            "thinking_evidence_stale",
+            "Route evidence is older than 24 hours",
+            {"harness": harness, "model": model, "remediation": "sc models refresh"},
+        )
+    stored_fingerprint = row.get("source_fingerprint")
+    if not stored_fingerprint:
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            "Route has no local source fingerprint",
+            {"harness": harness, "model": model, "remediation": "sc models refresh"},
+        )
+    if current_source_fingerprint != stored_fingerprint:
+        raise RouteResolutionError(
+            "thinking_evidence_stale",
+            "Installed route source changed after refresh",
+            {"harness": harness, "model": model, "remediation": "sc models refresh"},
+        )
+
+
+def require_fresh_route(
+    con,
+    row: dict | None,
+    harness: str,
+    model: str | None,
+    *,
+    now: datetime | None = None,
+    current_source_fingerprint: str | None = None,
+) -> None:
+    """Validate and durably publish one exact route's live freshness state."""
+    harness = normalize_harness(harness)
+    model = _normalize_model(model)
+    if model is None or harness == "vibe":
+        return
+    if row is None or row.get("harness") != harness or row.get("selector") != model:
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            f"No local route evidence for {harness}/{model}",
+            {"harness": harness, "model": model, "remediation": "sc models refresh"},
+        )
+
+    check_time = now or datetime.now(timezone.utc)
+    try:
+        _validate_route_freshness(
+            row, harness, model, now=check_time,
+            current_source_fingerprint=current_source_fingerprint,
+        )
+        latest = con.execute(
+            "SELECT generation_id,completed_at FROM model_catalog_generations "
+            "WHERE state='successful' "
+            "ORDER BY completed_at DESC,generation_id DESC LIMIT 1"
+        ).fetchone()
+        if latest is None:
+            raise RouteResolutionError(
+                "thinking_evidence_missing",
+                "No successful catalogue generation is available",
+                {"harness": harness, "model": model,
+                 "remediation": "sc models refresh"},
+            )
+        if row["generation_id"] != latest["generation_id"]:
+            raise RouteResolutionError(
+                "thinking_evidence_stale",
+                "Route does not belong to the latest successful generation",
+                {"harness": harness, "model": model,
+                 "remediation": "sc models refresh"},
+            )
+        if _age_hours(latest["completed_at"], check_time) > FRESH_HOURS:
+            raise RouteResolutionError(
+                "thinking_evidence_stale",
+                "Latest successful catalogue generation is older than 24 hours",
+                {"harness": harness, "model": model,
+                 "remediation": "sc models refresh"},
+            )
+    except RouteResolutionError as exc:
+        if exc.code == "thinking_evidence_stale" and not row.get("stale"):
+            remediation = exc.details.get("remediation") or "sc models refresh"
+            reason = f"{exc.code}: {exc.message}; remediation: {remediation}"
+            con.execute(
+                "UPDATE model_routes SET stale=1,last_error=? "
+                "WHERE harness=? AND selector=?",
+                (reason, harness, model),
+            )
+            con.commit()
+        raise
+
+
+def resolve_persisted_v2(
+    con,
+    row: dict | None,
+    harness: str,
+    model: str | None,
+    effort: str | None = None,
+    *,
+    now: datetime | None = None,
+    current_source_fingerprint: str | None = None,
+) -> tuple[dict, str]:
+    """Resolve through the shared durable freshness boundary."""
+    require_fresh_route(
+        con, row, harness, model, now=now,
+        current_source_fingerprint=current_source_fingerprint,
+    )
+    return resolve_v2(
+        row, harness, model, effort, now=now,
+        current_source_fingerprint=current_source_fingerprint,
+    )
+
+
 def resolve_v2(
     row: dict | None,
     harness: str,
@@ -278,7 +431,7 @@ def resolve_v2(
     current_source_fingerprint: str | None = None,
 ) -> tuple[dict, str]:
     """Resolve one v2 intent to a fixed-key immutable binding and digest."""
-    harness = _normalize_harness(harness)
+    harness = normalize_harness(harness)
     model = _normalize_model(model)
     if model is None or harness == "vibe":
         binding = _uncontrolled_binding(harness, model, effort)
@@ -325,56 +478,12 @@ def resolve_v2(
             f"No controlled-thinking evidence for {harness}/{model}",
             {"harness": harness, "model": model, "evidence_kind": evidence_kind},
         )
-    captured_version = row.get("harness_version")
-    compatibility = row.get("harness_compatibility")
-    if (
-        compatibility not in COMPATIBLE_HARNESS_STATES
-        or not captured_version
-        or _parsed_version(row.get("cli_version")) != captured_version
-    ):
-        raise RouteResolutionError(
-            "thinking_evidence_missing",
-            f"Route {harness}/{model} has no version-verified adapter transport",
-            {
-                "harness": harness,
-                "model": model,
-                "harness_version": captured_version,
-                "compatibility": compatibility,
-            },
-        )
-    if row.get("availability") != "available" or not row.get("headless_supported"):
-        raise RouteResolutionError(
-            "thinking_evidence_missing",
-            f"Route {harness}/{model} is not locally callable",
-            {"harness": harness, "model": model},
-        )
     generation = row.get("generation_id")
-    if not generation:
-        raise RouteResolutionError(
-            "thinking_evidence_missing",
-            "Route has no successful catalogue generation",
-            {"harness": harness, "model": model, "remediation": "sc models refresh"},
-        )
-    if row.get("stale"):
-        raise RouteResolutionError(
-            "thinking_evidence_stale",
-            row.get("last_error") or "Route evidence is stale",
-            {"harness": harness, "model": model, "remediation": "sc models refresh"},
-        )
     check_time = now or datetime.now(timezone.utc)
-    if _age_hours(row.get("last_seen_at"), check_time) > FRESH_HOURS:
-        raise RouteResolutionError(
-            "thinking_evidence_stale",
-            "Route evidence is older than 24 hours",
-            {"harness": harness, "model": model, "remediation": "sc models refresh"},
-        )
-    stored_fingerprint = row.get("source_fingerprint")
-    if not stored_fingerprint or current_source_fingerprint != stored_fingerprint:
-        raise RouteResolutionError(
-            "thinking_evidence_stale",
-            "Installed route source changed after refresh",
-            {"harness": harness, "model": model, "remediation": "sc models refresh"},
-        )
+    _validate_route_freshness(
+        row, harness, model, now=check_time,
+        current_source_fingerprint=current_source_fingerprint,
+    )
 
     supported, effort_metadata = _supported_efforts(row)
     if requested not in supported:

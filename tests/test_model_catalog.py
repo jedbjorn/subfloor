@@ -17,6 +17,8 @@ Run:
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sqlite3
 import sys
@@ -626,6 +628,39 @@ class RouteCliConnectionTest(unittest.TestCase):
                 routes_cli._resolve_args([
                     "resolve", "codex", "api-model", "--shell", value,
                 ])
+
+    def test_authenticated_resolve_normalizes_harness_before_lookup(self):
+        api = mock.Mock(return_value={"routes": [self.ROUTE]})
+
+        def resolve(harness: str) -> dict:
+            output = io.StringIO()
+            with (
+                mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+                mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+                mock.patch.object(routes_cli.mem, "_api", api),
+                mock.patch.object(
+                    routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(routes_cli.main([
+                    "resolve", harness, "api-model", "--json",
+                ]), 0)
+            return json.loads(output.getvalue())
+
+        mixed = resolve("Codex")
+        lower = resolve("codex")
+
+        self.assertEqual(api.call_args_list, [
+            mock.call(
+                "GET", "/_sc/model-routes?harness=codex&selector=api-model"
+            ),
+            mock.call(
+                "GET", "/_sc/model-routes?harness=codex&selector=api-model"
+            ),
+        ])
+        self.assertEqual(mixed["binding"], lower["binding"])
+        self.assertEqual(mixed["binding_digest"], lower["binding_digest"])
 
     def test_refresh_keeps_the_wal_enabled_write_lane(self):
         con = mock.Mock()

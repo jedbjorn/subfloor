@@ -27,6 +27,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -632,18 +633,50 @@ class FlavorDefaultsTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.con = build_db()
+        self.addCleanup(self.con.close)
+        fingerprint = mock.patch.object(
+            server.model_catalog,
+            "current_source_fingerprint",
+            return_value="f" * 64,
+        )
+        fingerprint.start()
+        self.addCleanup(fingerprint.stop)
 
     def _row(self, flavor, harness):
         return self.con.execute(
             "SELECT model, is_default FROM flavor_defaults "
             "WHERE flavor=? AND harness=?", (flavor, harness)).fetchone()
 
-    def _route(self, harness, selector, *, availability="available", stale=0):
+    def _route(self, harness, selector, *, availability="available", stale=0,
+               seen_at=None):
+        seen_at = seen_at or datetime.now(timezone.utc).isoformat()
+        if harness != "vibe":
+            self.con.execute(
+                "INSERT OR IGNORE INTO model_catalog_generations ("
+                "generation_id,payload_version,contract_version,started_at,"
+                "completed_at,state,runtime,source_summary,harness_versions,"
+                "source_fingerprints,error_summary,payload_digest"
+                ") VALUES (?,?,?,?,?,'successful','host','[]','{}','{}',NULL,?)",
+                ("a" * 32, 6, 2, seen_at, seen_at, "b" * 64),
+            )
+            self.con.execute(
+                "INSERT INTO model_routes ("
+                "harness,selector,source,availability,headless_supported,"
+                "high_effort_supported,supported_efforts,cli_version,last_seen_at,"
+                "stale,generation_id,source_fingerprint,harness_version,"
+                "harness_compatibility) VALUES (?,?,?,?,1,1,'[\"high\"]',?,?,?,?,?,?,?)",
+                (
+                    harness, selector, "test", availability, f"{harness} 1.5.0",
+                    seen_at, stale, "a" * 32, "f" * 64, "1.5.0", "verified",
+                ),
+            )
+            self.con.commit()
+            return
         self.con.execute(
             "INSERT INTO model_routes "
             "(harness, selector, source, availability, last_seen_at, stale) "
-            "VALUES (?, ?, 'test', ?, datetime('now'), ?)",
-            (harness, selector, availability, stale))
+            "VALUES (?, ?, 'test', ?, ?, ?)",
+            (harness, selector, availability, seen_at, stale))
         self.con.commit()
 
     def test_matrix_includes_template_flavors_and_harnesses(self) -> None:
@@ -723,6 +756,61 @@ class FlavorDefaultsTest(unittest.TestCase):
                        "model": "opus-next"})
         self.assertFalse(ok)
         self.assertIn("invalid_model_route", err)
+
+    def test_fingerprint_drift_stales_route_and_refuses_selection(self) -> None:
+        self._route("codex", "gpt-drift")
+        with mock.patch.object(
+            server.model_catalog,
+            "current_source_fingerprint",
+            return_value="changed-fingerprint",
+        ):
+            ok, err = server.set_flavor_default(
+                self.con,
+                {"flavor": "planner", "harness": "codex", "model": "gpt-drift"},
+            )
+
+        route = self.con.execute(
+            "SELECT stale,last_error FROM model_routes "
+            "WHERE harness='codex' AND selector='gpt-drift'"
+        ).fetchone()
+        self.assertFalse(ok)
+        self.assertIn("invalid_model_route", err)
+        self.assertEqual(route["stale"], 1)
+        self.assertEqual(
+            route["last_error"],
+            "thinking_evidence_stale: Installed route source changed after "
+            "refresh; remediation: sc models refresh",
+        )
+        self.assertFalse(server.model_route_available(
+            self.con, "codex", "gpt-drift"
+        ))
+        self.assertNotEqual(self._row("planner", "codex")["model"], "gpt-drift")
+
+    def test_age_expiry_stales_route_and_refuses_selection(self) -> None:
+        old = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        self._route("claude", "old-opus", seen_at=old)
+
+        ok, err = server.set_flavor_default(
+            self.con,
+            {"flavor": "planner", "harness": "claude", "model": "old-opus"},
+        )
+
+        route = self.con.execute(
+            "SELECT stale,last_error FROM model_routes "
+            "WHERE harness='claude' AND selector='old-opus'"
+        ).fetchone()
+        self.assertFalse(ok)
+        self.assertIn("invalid_model_route", err)
+        self.assertEqual(route["stale"], 1)
+        self.assertEqual(
+            route["last_error"],
+            "thinking_evidence_stale: Route evidence is older than 24 hours; "
+            "remediation: sc models refresh",
+        )
+        self.assertFalse(server.model_route_available(
+            self.con, "claude", "old-opus"
+        ))
+        self.assertNotEqual(self._row("planner", "claude")["model"], "old-opus")
 
     def test_unknown_names_and_empty_writes_are_loud(self) -> None:
         self.assertFalse(server.set_flavor_default(
@@ -817,11 +905,21 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
             (ids["shell_id"],),
         )
         source.execute(
+            "INSERT INTO model_catalog_generations (generation_id,payload_version,"
+            "contract_version,started_at,completed_at,state,runtime,source_summary,"
+            "harness_versions,source_fingerprints,error_summary,payload_digest) "
+            "VALUES (? ,6,2,datetime('now'),datetime('now'),'successful','host',"
+            "'[]','{}','{}',NULL,?)",
+            ("a" * 32, "b" * 64),
+        )
+        source.execute(
             "INSERT INTO model_routes (harness,selector,source,availability,"
             "headless_supported,high_effort_supported,supported_efforts,"
-            "last_seen_at) VALUES "
+            "cli_version,last_seen_at,generation_id,source_fingerprint,"
+            "harness_version,harness_compatibility) VALUES "
             "('codex','api-model','api-source-v1','available',1,1,'[\"high\"]',"
-            "datetime('now'))"
+            "'codex 1.5.0',datetime('now'),?,?, '1.5.0','verified')",
+            ("a" * 32, "current-fingerprint"),
         )
         source.commit()
         target = sqlite3.connect(self.path)
@@ -834,7 +932,8 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         con.row_factory = sqlite3.Row
         return con
 
-    def request(self, path: str, token: str | None = "shell-token"):
+    def request(self, path: str, token: str | None = "shell-token", *,
+                fingerprint: str = "current-fingerprint"):
         headers = "Host: 127.0.0.1"
         if token is not None:
             headers += f"\r\nAuthorization: Bearer {token}"
@@ -843,7 +942,7 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
             mock.patch.object(
                 server.model_catalog,
                 "current_source_fingerprint",
-                return_value="current-fingerprint",
+                return_value=fingerprint,
             ),
         ):
             status, _headers, body = server.dispatch_http("GET", path, headers, b"")
@@ -887,6 +986,27 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         self.assertEqual(
             skill["grant_scopes"], ["flavor:dev", "shell:custom"]
         )
+
+    def test_exact_route_read_durably_publishes_fingerprint_drift(self) -> None:
+        status, body = self.request(
+            "/_sc/model-routes?harness=codex&selector=api-model",
+            fingerprint="changed-fingerprint",
+        )
+        route = body["routes"][0]
+        with self.connect() as con:
+            stored = con.execute(
+                "SELECT stale,last_error FROM model_routes "
+                "WHERE harness='codex' AND selector='api-model'"
+            ).fetchone()
+
+        self.assertEqual(status, 200, body)
+        self.assertEqual(route["stale"], 1)
+        self.assertEqual(route["current_source_fingerprint"], "changed-fingerprint")
+        self.assertEqual(tuple(stored), (
+            1,
+            "thinking_evidence_stale: Installed route source changed after "
+            "refresh; remediation: sc models refresh",
+        ))
 
     def test_catalogue_filters_reject_unknown_or_repeated_input(self) -> None:
         self.assertEqual(

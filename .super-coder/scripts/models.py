@@ -70,32 +70,47 @@ def _command(binding: dict, shell: str) -> list[str]:
     return command
 
 
+def _resolution_error(exc: route_bindings.RouteResolutionError) -> dict:
+    return {"ok": False, "code": exc.code, "error": exc.message,
+            "details": exc.details}
+
+
 def resolve(con, harness: str, selector: str | None = None, *,
             shell: str = "<shell>", effort: str | None = None,
             now=None, current_source_fingerprint: str | None = None) -> dict:
-    row = None if selector is None or harness.strip().lower() == "vibe" \
-        else _route(con, harness.strip().lower(), selector)
+    try:
+        harness = route_bindings.normalize_harness(harness)
+    except route_bindings.RouteResolutionError as exc:
+        return _resolution_error(exc)
+    row = None if selector is None or harness == "vibe" \
+        else _route(con, harness, selector)
     if row and current_source_fingerprint is None:
         current_source_fingerprint = model_catalog.current_source_fingerprint(
             harness, selector
         ) or ""
     return resolve_row(
         row, harness, selector, shell=shell, effort=effort, now=now,
-        current_source_fingerprint=current_source_fingerprint,
+        current_source_fingerprint=current_source_fingerprint, con=con,
     )
 
 
 def resolve_row(row: dict | None, harness: str, selector: str | None, *,
                 shell: str = "<shell>", effort: str | None = None,
-                now=None, current_source_fingerprint: str | None = None) -> dict:
+                now=None, current_source_fingerprint: str | None = None,
+                con=None) -> dict:
     try:
-        binding, binding_digest = route_bindings.resolve_v2(
-            row, harness, selector, effort, now=now,
-            current_source_fingerprint=current_source_fingerprint,
-        )
+        if con is not None:
+            binding, binding_digest = route_bindings.resolve_persisted_v2(
+                con, row, harness, selector, effort, now=now,
+                current_source_fingerprint=current_source_fingerprint,
+            )
+        else:
+            binding, binding_digest = route_bindings.resolve_v2(
+                row, harness, selector, effort, now=now,
+                current_source_fingerprint=current_source_fingerprint,
+            )
     except route_bindings.RouteResolutionError as exc:
-        return {"ok": False, "code": exc.code, "error": exc.message,
-                "details": exc.details}
+        return _resolution_error(exc)
     return {
         "ok": True,
         "harness": binding["harness"],
@@ -205,8 +220,12 @@ def main(argv: list[str] | None = None) -> int:
         ))
     if command == "resolve" and _shell_api_enabled():
         harness, selector, effort, shell, as_json = _resolve_args(args)
+        try:
+            harness = route_bindings.normalize_harness(harness)
+        except route_bindings.RouteResolutionError as exc:
+            return _print_resolved(_resolution_error(exc), as_json)
         routes = _api_routes(harness=harness, selector=selector) \
-            if selector is not None and harness.strip().lower() != "vibe" else []
+            if selector is not None and harness != "vibe" else []
         fingerprint = (routes[0].get("current_source_fingerprint") or "") \
             if routes else None
         data = resolve_row(
@@ -228,13 +247,8 @@ def main(argv: list[str] | None = None) -> int:
         if args[0] != "resolve":
             raise SystemExit("models: expected refresh, list, or resolve")
         harness, selector, effort, shell, as_json = _resolve_args(args)
-        row = None if selector is None or harness.strip().lower() == "vibe" \
-            else _route(con, harness.strip().lower(), selector)
-        fingerprint = (model_catalog.current_source_fingerprint(harness, selector) or "") \
-            if row and row.get("source_fingerprint") else None
-        data = resolve_row(
-            row, harness, selector, shell=shell, effort=effort,
-            current_source_fingerprint=fingerprint,
+        data = resolve(
+            con, harness, selector, shell=shell, effort=effort,
         )
         return _print_resolved(data, as_json)
     finally:
