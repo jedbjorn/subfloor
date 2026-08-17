@@ -106,7 +106,7 @@ def default_headless_effort(adapter: dict) -> "str | None":
 class ResolvedHeadlessRoute(NamedTuple):
     harness: str
     provider: str | None
-    model: str
+    model: str | None
     effort: str | None
 
 
@@ -145,6 +145,39 @@ def resolve_headless_route(
         provider=session_provider(harness, resolved_model),
         model=resolved_model,
         effort=resolved_effort,
+    )
+
+
+def resolve_bound_headless_route(
+    *,
+    harness: str,
+    model: "str | None",
+    effort: "str | None",
+    binding: dict,
+    binding_digest: str,
+) -> ResolvedHeadlessRoute:
+    """Consume one already-resolved v2 binding without applying defaults."""
+    route_transport.route_bindings.validate_v2_binding(binding)
+    if route_transport.route_bindings.digest_json(binding) != binding_digest:
+        raise route_transport.route_bindings.RouteResolutionError(
+            "thinking_evidence_missing",
+            "Route binding digest does not match its canonical content",
+            {},
+        )
+    if (
+        binding["harness"] != harness
+        or binding["requested_model"] != model
+        or binding["requested_effort"] != effort
+    ):
+        raise ValueError(
+            "version-two route binding disagrees with the requested "
+            "harness, model, or effort"
+        )
+    return ResolvedHeadlessRoute(
+        harness=harness,
+        provider=session_provider(harness, binding["requested_model"]),
+        model=binding["requested_model"],
+        effort=binding["effective_effort"],
     )
 
 
@@ -795,20 +828,29 @@ def require_host_harness(adapter: dict, harness: str) -> None:
 
 
 def flavor_defaults(con) -> dict:
-    """flavor -> {'default_harness', 'models': {harness: model}} launch defaults.
+    """Flavor launch defaults with per-harness model and Thinking intent.
     The (flavor, harness) matrix: each flavor names a model per harness, and one
     harness is the picker default (is_default). Empty if the table is absent
     (older fork mid-migration) so the launcher degrades to its prior behavior
     rather than failing."""
+    has_effort = True
     try:
         rows = con.execute(
-            "SELECT flavor, harness, model, is_default FROM flavor_defaults")
+            "SELECT flavor,harness,model,effort,is_default FROM flavor_defaults")
     except db_driver.OperationalError:
-        return {}
+        has_effort = False
+        try:
+            rows = con.execute(
+                "SELECT flavor,harness,model,is_default FROM flavor_defaults")
+        except db_driver.OperationalError:
+            return {}
     out: dict = {}
     for r in rows:
-        fd = out.setdefault(r["flavor"], {"default_harness": None, "models": {}})
+        fd = out.setdefault(r["flavor"], {
+            "default_harness": None, "models": {}, "efforts": {},
+        })
         fd["models"][r["harness"]] = r["model"]
+        fd["efforts"][r["harness"]] = r["effort"] if has_effort else None
         if r["is_default"]:
             fd["default_harness"] = r["harness"]
     return out
@@ -1138,7 +1180,9 @@ def _cli_version(binary: str) -> "str | None":
 def prepare_launch(*, shell_id: int, harness: "str | None" = None,
                    model: "str | None" = None, effort: "str | None" = None,
                    headless_prompt: "str | None" = None,
-                   current_leased_run_id: "int | None" = None) -> LaunchPlan:
+                   current_leased_run_id: "int | None" = None,
+                   route_binding: "dict | None" = None,
+                   binding_digest: "str | None" = None) -> LaunchPlan:
     """Prepare a launch exactly as main() would, without any TTY.
 
     A browser chat uses the normal harness, model, effort, permission,
@@ -1200,18 +1244,38 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     adapter = load_adapter(harness)
 
     # Model route: an explicit model wins; else the (flavor, harness) cell,
-    # exactly main()'s flavor_defaults routing. Effort mirrors main(): a
-    # headless plan defaults to high only when the adapter can transport it;
-    # OpenCode's no-effort seam stays unset instead of failing before launch.
+    # exactly main()'s flavor_defaults routing. An explicit effort wins; the
+    # persisted flavor effort is the next fallback before the adapter default.
     flavor_model = fdef["models"].get(harness) if fdef else None
-    if headless:
+    flavor_effort = (fdef.get("efforts") or {}).get(harness) if fdef else None
+    if (route_binding is None) != (binding_digest is None):
+        con.close()
+        raise LaunchError("route binding and digest must be supplied together")
+    if headless and route_binding is not None:
+        try:
+            resolved_route = resolve_bound_headless_route(
+                harness=harness,
+                model=model,
+                effort=effort,
+                binding=route_binding,
+                binding_digest=binding_digest,
+            )
+        except (
+            ValueError,
+            route_transport.route_bindings.RouteResolutionError,
+        ) as exc:
+            con.close()
+            raise LaunchError(str(exc)) from exc
+        session_model = resolved_route.model
+        session_effort = resolved_route.effort
+    elif headless:
         try:
             resolved_route = resolve_headless_route(
                 harness=harness,
                 adapter=adapter,
                 flavor_model=flavor_model,
                 model=model,
-                effort=effort,
+                effort=effort if effort is not None else flavor_effort,
             )
         except ValueError as e:
             con.close()
@@ -1303,6 +1367,22 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     apply_managed_mcp(adapter, work_dir)
     apply_sandbox(adapter, work_dir)
 
+    route_projection = None
+    if headless and route_binding is not None:
+        try:
+            route_projection = route_transport.project(
+                route_binding,
+                binding_digest,
+                expected_harness=harness,
+                worktree=work_dir,
+                interface="headless",
+            )
+        except (
+            route_transport.route_bindings.RouteResolutionError,
+            opencode_config.OpenCodeConfigError,
+        ) as exc:
+            raise LaunchError(str(exc)) from exc
+
     # Interactive model routing (main()'s non-headless block): the adapter
     # declares a launch flag or a config-file key for the resolved model.
     model_args: list[str] = []
@@ -1345,7 +1425,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     if headless:
         argv = headless_command(
             adapter, headless_prompt, session_model,
-            sandbox_flags, session_effort,
+            sandbox_flags, session_effort, transport=route_projection,
         )
         if argv is None:
             raise LaunchError(f"harness '{harness}' has no headless adapter")
@@ -1359,7 +1439,11 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
 
     # Env injection, verbatim from main()'s exec block: adapter env, sandbox
     # env, effort env, then the engine's own SC_* contract + PATH prepend.
-    effort_env = headless_effort_env(adapter, session_effort) if headless else {}
+    effort_env = (
+        route_projection.env()
+        if route_projection is not None
+        else (headless_effort_env(adapter, session_effort) if headless else {})
+    )
     env = {**os.environ, **{k: str(v) for k, v in adapter.get("env", {}).items()},
            **sandbox_env, **effort_env}
     env["SC_SHELL_FLAVOR"] = chosen["flavor"] or ""
@@ -1600,9 +1684,9 @@ def main() -> None:
                or default_harness)
 
     # Resolve + validate the complete headless route before opening a session.
-    # High effort is the default where the harness exposes an effort seam.
-    # OpenCode exposes none and keeps the model's own default.
+    # Explicit CLI intent wins over the persisted per-flavor Thinking level.
     flavor_model = fdef["models"].get(harness) if fdef else None
+    flavor_effort = (fdef.get("efforts") or {}).get(harness) if fdef else None
     adapter = load_adapter(harness)
     if host_admin:
         try:
@@ -1619,7 +1703,9 @@ def main() -> None:
                 adapter=adapter,
                 flavor_model=flavor_model,
                 model=flag_model,
-                effort=flag_effort,
+                effort=(
+                    flag_effort if flag_effort is not None else flavor_effort
+                ),
             )
         except ValueError as e:
             sys.exit(f"sc run: {e}")

@@ -281,13 +281,19 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
     assert "await chatRenderNew(pane, shell, defaults, catalog)" in interface
     assert "Use shell default" in interface
     assert "Use harness default" in interface
-    assert 'harness !== "opencode" || connectedDefault' in interface
+    assert 'const CHAT_HARNESS_DEFAULT_VALUE = "__sc_harness_default__"' in interface
     assert "No connected provider models available" in interface
-    assert "providers connected in OpenCode" in interface
-    assert "submit.disabled = !ready" in interface
+    assert "connected providers" in interface
+    assert 'ariaLabel: "Thinking level"' in interface
+    assert 'el("label", { className: "k" }, "Thinking level")' in interface
+    assert "thinkingLevelState(harness, catalog, model, preferred)" in interface
+    assert "submit.disabled = Boolean(model && (state.disabled || !state.selected))" in interface
+    assert "Refresh & verify Default Models before saving this route." in APP
     assert '"Start chat"' in interface
     assert "harness: harnessSelect.value" in interface
     assert "if (modelSelect.value) body.model = modelSelect.value" in interface
+    assert "body.model = null" in interface
+    assert "if (effortSelect.value) body.effort = effortSelect.value" in interface
     assert "xterm" not in interface.lower()
     assert "tmux" not in interface.lower()
     assert "attach" not in interface.lower()

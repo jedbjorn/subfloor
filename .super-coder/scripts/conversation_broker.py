@@ -32,6 +32,7 @@ import active_chat_registry
 import conversation_events
 import conversation_git_targets
 import db_driver
+import route_transport
 from conversation_adapters import (
     ConversationAdapter,
     ConversationContext,
@@ -87,6 +88,9 @@ class BrokerRun:
     runner_ref: str | None
     state: str
     interrupt_requested: bool = False
+    route_contract_version: int = 1
+    route_binding: Mapping[str, Any] | None = None
+    binding_digest: str | None = None
 
     def context(self) -> ConversationContext:
         # Browser conversations run with worktree command access.
@@ -99,6 +103,8 @@ class BrokerRun:
             effort=self.effort,
             permission_mode="unrestricted",
             title=self.title,
+            route_binding=self.route_binding,
+            binding_digest=self.binding_digest,
         )
 
 
@@ -192,7 +198,48 @@ class BrokerStore:
         return int(sequence)
 
     @staticmethod
+    def _route_from_row(
+        row,
+    ) -> tuple[int, dict[str, Any] | None, str | None]:
+        contract_version = int(row["route_contract_version"])
+        if contract_version == 1:
+            return contract_version, None, None
+        if contract_version != route_transport.route_bindings.CONTRACT_VERSION:
+            raise BrokerInvariantError(
+                "CONVERSATION_ROUTE_INVALID",
+                f"unsupported conversation route contract: {contract_version}",
+            )
+        try:
+            binding = json.loads(row["route_binding"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise BrokerInvariantError(
+                "CONVERSATION_ROUTE_INVALID",
+                "version-two conversation route binding is not valid JSON",
+            ) from exc
+        if not isinstance(binding, dict):
+            raise BrokerInvariantError(
+                "CONVERSATION_ROUTE_INVALID",
+                "version-two conversation route binding must be an object",
+            )
+        try:
+            route_transport.route_bindings.validate_v2_binding(binding)
+        except (
+            TypeError,
+            route_transport.route_bindings.RouteResolutionError,
+        ) as exc:
+            raise BrokerInvariantError(
+                "CONVERSATION_ROUTE_INVALID",
+                "version-two conversation route binding is invalid",
+            ) from exc
+        return (
+            contract_version,
+            binding,
+            route_transport.route_bindings.digest_json(binding),
+        )
+
+    @staticmethod
     def _run_from_row(row) -> BrokerRun:
+        contract_version, binding, binding_digest = BrokerStore._route_from_row(row)
         return BrokerRun(
             run_id=int(row["run_id"]),
             conversation_id=row["conversation_id"],
@@ -210,6 +257,9 @@ class BrokerStore:
             runner_ref=row["runner_ref"],
             state=row["run_state"],
             interrupt_requested=bool(row["interrupt_requested"]),
+            route_contract_version=contract_version,
+            route_binding=binding,
+            binding_digest=binding_digest,
         )
 
     @staticmethod
@@ -218,6 +268,7 @@ class BrokerStore:
             "SELECT r.run_id,r.conversation_id,r.trigger_message_id,r.shell_id,"
             "r.harness_session_before,r.harness_session_after,r.runner_ref,"
             "r.state AS run_state,c.harness,c.provider,c.model,c.effort,"
+            "c.route_contract_version,c.route_binding,"
             "c.worktree,c.title,m.body,"
             "EXISTS(SELECT 1 FROM conversation_events ie "
             " WHERE ie.run_id=r.run_id "
@@ -241,7 +292,8 @@ class BrokerStore:
             with db_driver.write_transaction(con, "conversation.broker.claim"):
                 row = con.execute(
                     "SELECT o.outbox_id,o.conversation_id,o.message_id,o.attempts,"
-                    "c.shell_id,c.harness,c.provider,c.model,c.effort,c.worktree,"
+                    "c.shell_id,c.harness,c.provider,c.model,c.effort,"
+                    "c.route_contract_version,c.route_binding,c.worktree,"
                     "c.title,c.harness_session_ref,m.body,m.state AS message_state "
                     "FROM conversation_outbox o "
                     "JOIN conversations c "
@@ -330,6 +382,7 @@ class BrokerStore:
                     "WHERE conversation_id=?",
                     (now, row["conversation_id"]),
                 )
+                contract_version, binding, binding_digest = self._route_from_row(row)
                 return BrokerRun(
                     run_id=run_id,
                     conversation_id=row["conversation_id"],
@@ -346,6 +399,9 @@ class BrokerStore:
                     session_after=None,
                     runner_ref=None,
                     state="leased",
+                    route_contract_version=contract_version,
+                    route_binding=binding,
+                    binding_digest=binding_digest,
                 )
         except db_driver.IntegrityError as exc:
             # A second broker can race the eligibility read. BEGIN IMMEDIATE

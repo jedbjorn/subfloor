@@ -692,7 +692,7 @@ class FlavorDefaultsTest(unittest.TestCase):
 
     def _row(self, flavor, harness):
         return self.con.execute(
-            "SELECT model, is_default FROM flavor_defaults "
+            "SELECT model,effort,is_default FROM flavor_defaults "
             "WHERE flavor=? AND harness=?", (flavor, harness)).fetchone()
 
     def _route(self, harness, selector, *, availability="available", stale=0,
@@ -712,12 +712,24 @@ class FlavorDefaultsTest(unittest.TestCase):
                 "INSERT INTO model_routes ("
                 "harness,selector,source,availability,headless_supported,"
                 "high_effort_supported,supported_efforts,cli_version,last_seen_at,"
-                "stale,generation_id,source_fingerprint,harness_version,"
-                "harness_compatibility) VALUES (?,?,?,?,1,1,'[\"high\"]',?,?,?,?,?,?,?)",
+                "stale,generation_id,evidence_kind,evidence_digest,"
+                "source_fingerprint,harness_version,harness_compatibility,"
+                "selector_binding,effort_metadata,adapter_metadata,default_effort"
+                ") VALUES (?,?,?,?,1,1,'[\"low\",\"high\"]',?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     harness, selector, "test", availability,
                     f"{harness} {version}", seen_at, stale, "a" * 32,
-                    "f" * 64, version, "verified",
+                    {"claude": "claude-portable-manifest",
+                     "codex": "codex-model-cache"}[harness],
+                    "e" * 64, "f" * 64, version, "verified",
+                    json.dumps({"kind": "exact-model", "selector": selector}),
+                    json.dumps({
+                        "supported": ["low", "high"],
+                        "default": "high",
+                        "digests": {"low": "d" * 64, "high": "e" * 64},
+                        "native_variant_ids": {},
+                    }),
+                    "{}", "high",
                 ),
             )
             self.con.commit()
@@ -742,6 +754,74 @@ class FlavorDefaultsTest(unittest.TestCase):
             self.con, {"flavor": "planner", "harness": "claude", "model": "opus"})
         self.assertTrue(ok, err)
         self.assertEqual(self._row("planner", "claude")["model"], "opus")
+        self.assertEqual(self._row("planner", "claude")["effort"], "high")
+
+    def test_effort_is_canonical_and_saved_with_the_complete_route(self) -> None:
+        self._route("claude", "opus-next")
+        ok, err = server.set_flavor_default(
+            self.con,
+            {"flavor": "planner", "harness": "claude",
+             "model": "opus-next", "effort": " LOW "},
+        )
+        self.assertTrue(ok, err)
+        row = self._row("planner", "claude")
+        self.assertEqual((row["model"], row["effort"]), ("opus-next", "low"))
+
+    def test_unsupported_effort_writes_nothing(self) -> None:
+        before = tuple(self._row("planner", "claude"))
+        self._route("claude", "opus-next")
+        ok, err = server.set_flavor_default(
+            self.con,
+            {"flavor": "planner", "harness": "claude",
+             "model": "opus-next", "effort": "max"},
+        )
+        self.assertFalse(ok)
+        self.assertEqual(err["code"], "unsupported_thinking_level")
+        self.assertEqual(tuple(self._row("planner", "claude")), before)
+
+    def test_uncontrolled_states_reject_effort_and_clear_both_fields(self) -> None:
+        self._route("claude", "opus")
+        self.assertTrue(server.set_flavor_default(
+            self.con,
+            {"flavor": "planner", "harness": "claude",
+             "model": "opus", "effort": "low"},
+        )[0])
+        ok, err = server.set_flavor_default(
+            self.con,
+            {"flavor": "planner", "harness": "claude",
+             "model": None, "effort": "low"},
+        )
+        self.assertFalse(ok)
+        self.assertEqual(err["code"], "unsupported_thinking_level")
+        self.assertEqual(
+            (self._row("planner", "claude")["model"],
+             self._row("planner", "claude")["effort"]),
+            ("opus", "low"),
+        )
+        self.assertTrue(server.set_flavor_default(
+            self.con,
+            {"flavor": "planner", "harness": "claude",
+             "model": None, "effort": None},
+        )[0])
+        row = self._row("planner", "claude")
+        self.assertEqual((row["model"], row["effort"]), (None, None))
+
+    def test_projection_covers_controlled_and_uncontrolled_states(self) -> None:
+        self._route("claude", "legacy-opus")
+        self.con.execute(
+            "UPDATE flavor_defaults SET model='legacy-opus',effort=NULL "
+            "WHERE flavor='planner' AND harness='claude'"
+        )
+        self.con.execute(
+            "INSERT INTO flavor_defaults (flavor,harness,model,effort,is_default) "
+            "VALUES ('planner','vibe',NULL,NULL,0)"
+        )
+        projection = server.get_flavor_defaults(self.con)["flavors"]["planner"]
+        by_harness = {row["harness"]: row for row in projection}
+        self.assertEqual(by_harness["claude"]["effort_state"], "legacy-default")
+        self.assertEqual(by_harness["claude"]["effective_effort"], "high")
+        self.assertEqual(by_harness["vibe"]["effort_state"], "unavailable")
+        self.assertIsNone(by_harness["vibe"]["effective_effort"])
 
     def test_star_is_transactional_across_the_flavor(self) -> None:
         self.assertTrue(server.set_flavor_default(
@@ -778,7 +858,7 @@ class FlavorDefaultsTest(unittest.TestCase):
         ok, err = server.set_flavor_default(
             self.con, {"flavor": "planner", "harness": "claude", "model": ""})
         self.assertFalse(ok)
-        self.assertIn("invalid_model_route", err)
+        self.assertEqual(err["code"], "invalid_model_route")
 
     def test_invalid_model_does_not_create_missing_cell(self) -> None:
         self.assertIsNone(self._row("planner", "vibe"))
@@ -786,7 +866,7 @@ class FlavorDefaultsTest(unittest.TestCase):
             self.con, {"flavor": "planner", "harness": "vibe",
                        "model": "not-local"})
         self.assertFalse(ok)
-        self.assertIn("invalid_model_route", err)
+        self.assertEqual(err["code"], "invalid_model_route")
         self.assertIsNone(self._row("planner", "vibe"))
 
     def test_model_requires_exact_available_route_for_harness(self) -> None:
@@ -795,7 +875,7 @@ class FlavorDefaultsTest(unittest.TestCase):
             self.con, {"flavor": "planner", "harness": "claude",
                        "model": "gpt-5.6-sol"})
         self.assertFalse(ok)
-        self.assertIn("invalid_model_route", err)
+        self.assertEqual(err["code"], "invalid_model_route")
         self.assertNotEqual(self._row("planner", "claude")["model"],
                             "gpt-5.6-sol")
 
@@ -805,7 +885,7 @@ class FlavorDefaultsTest(unittest.TestCase):
             self.con, {"flavor": "planner", "harness": "claude",
                        "model": "opus-next"})
         self.assertFalse(ok)
-        self.assertIn("invalid_model_route", err)
+        self.assertEqual(err["code"], "thinking_evidence_stale")
 
     def test_fingerprint_drift_stales_route_and_refuses_selection(self) -> None:
         self._route("codex", "gpt-drift")
@@ -825,7 +905,7 @@ class FlavorDefaultsTest(unittest.TestCase):
             "WHERE harness='codex' AND selector='gpt-drift'"
         ).fetchone()
         self.assertFalse(ok)
-        self.assertIn("invalid_model_route", err)
+        self.assertEqual(err["code"], "thinking_evidence_stale")
         self.assertEqual(route["stale"], 1)
         self.assertEqual(
             route["last_error"],
@@ -851,7 +931,7 @@ class FlavorDefaultsTest(unittest.TestCase):
             "WHERE harness='claude' AND selector='old-opus'"
         ).fetchone()
         self.assertFalse(ok)
-        self.assertIn("invalid_model_route", err)
+        self.assertEqual(err["code"], "thinking_evidence_stale")
         self.assertEqual(route["stale"], 1)
         self.assertEqual(
             route["last_error"],
@@ -1295,7 +1375,7 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
             "WHERE flavor='planner' AND harness='codex'"
         ).fetchone()[0]
         self.assertFalse(ok)
-        self.assertIn("invalid_model_route", err)
+        self.assertEqual(err["code"], "thinking_evidence_stale")
         self.assertEqual(tuple(stored), ("f" * 32, successor, 0, None))
         self.assertEqual(unchanged, before)
 

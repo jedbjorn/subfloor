@@ -485,12 +485,58 @@ def get_flavor_defaults(con) -> dict:
     no rows yet are included empty so the GUI matrix is complete; missing
     cells are created on first write (see set_flavor_default)."""
     flavors: dict[str, list] = {}
+    route_rows = {
+        (r["harness"], r["selector"]): r
+        for r in rows(con.execute("SELECT * FROM model_routes"))
+    }
+    latest_generation = con.execute(
+        "SELECT generation_id FROM model_catalog_generations "
+        "WHERE state='successful' "
+        "ORDER BY completed_at DESC,generation_id DESC LIMIT 1"
+    ).fetchone()
+    latest_generation_id = (
+        latest_generation["generation_id"] if latest_generation else None
+    )
     for r in rows(con.execute(
-            "SELECT flavor, harness, model, is_default FROM flavor_defaults "
-            "ORDER BY flavor, harness")):
-        flavors.setdefault(r["flavor"], []).append(
-            {"harness": r["harness"], "model": r["model"],
-             "is_default": bool(r["is_default"])})
+            "SELECT flavor,harness,model,effort,is_default "
+            "FROM flavor_defaults ORDER BY flavor,harness")):
+        harness = r["harness"]
+        model = r["model"]
+        effort = r["effort"]
+        if harness == "vibe":
+            effort_state = "unavailable"
+            effective_effort = None
+        elif model is None:
+            effort_state = "harness-default"
+            effective_effort = None
+        elif effort is not None:
+            effort_state = "controlled"
+            effective_effort = effort
+        else:
+            effort_state = "legacy-default"
+            route = route_rows.get((harness, model)) or {}
+            try:
+                supported = json.loads(route.get("supported_efforts") or "[]")
+                route_bindings._validate_route_freshness(
+                    route, harness, model, now=datetime.now(timezone.utc))
+            except (TypeError, json.JSONDecodeError):
+                supported = []
+            except route_bindings.RouteResolutionError:
+                supported = []
+            effective_effort = (
+                "high"
+                if route.get("generation_id") == latest_generation_id
+                and "high" in supported
+                else None
+            )
+        flavors.setdefault(r["flavor"], []).append({
+            "harness": harness,
+            "model": model,
+            "effort": effort,
+            "effective_effort": effective_effort,
+            "effort_state": effort_state,
+            "is_default": bool(r["is_default"]),
+        })
     for t in shell_factory.flavors():
         flavors.setdefault(t.get("flavor"), [])
     return {"flavors": flavors, "harnesses": known_harnesses()}
@@ -551,7 +597,21 @@ def model_route_available(
         )
 
 
-def set_flavor_default(con, body) -> tuple[bool, str | None]:
+def _flavor_default_error(code: str, message: str, details=None) -> dict:
+    return {"code": code, "message": message, "details": details or {}}
+
+
+def _stored_supported_efforts(route: dict | None) -> list[str]:
+    if route is None:
+        return []
+    try:
+        values = json.loads(route.get("supported_efforts") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [value for value in values if isinstance(value, str)]
+
+
+def set_flavor_default(con, body) -> tuple[bool, dict | None]:
     """One write to the launch-defaults matrix: set a (flavor, harness) cell's
     model, and/or star the harness as the flavor's default. Starring is
     transactional across the flavor's rows — exactly one is_default=1 after.
@@ -560,48 +620,137 @@ def set_flavor_default(con, body) -> tuple[bool, str | None]:
     flavor = (body.get("flavor") or "").strip()
     harness = (body.get("harness") or "").strip()
     if not flavor or not harness:
-        return False, "flavor and harness required"
+        return False, _flavor_default_error(
+            "validation_error", "flavor and harness required")
     if harness not in known_harnesses():
-        return False, f"unknown harness '{harness}'"
+        return False, _flavor_default_error(
+            "validation_error", f"unknown harness '{harness}'")
     known_flavors = {t.get("flavor") for t in shell_factory.flavors()} | {
         r[0] for r in con.execute("SELECT DISTINCT flavor FROM flavor_defaults")}
     if flavor not in known_flavors:
-        return False, f"unknown flavor '{flavor}'"
-    if "model" not in body and not body.get("is_default"):
-        return False, "nothing to set — pass model and/or is_default"
-    model = None
-    if "model" in body:
+        return False, _flavor_default_error(
+            "validation_error", f"unknown flavor '{flavor}'")
+    model_supplied = "model" in body
+    effort_supplied = "effort" in body
+    if not model_supplied and not effort_supplied and not body.get("is_default"):
+        return False, _flavor_default_error(
+            "validation_error",
+            "nothing to set — pass model, effort, and/or is_default")
+
+    current = con.execute(
+        "SELECT model,effort FROM flavor_defaults "
+        "WHERE flavor=? AND harness=?", (flavor, harness),
+    ).fetchone()
+    model = current["model"] if current is not None else None
+    effort = current["effort"] if current is not None else None
+    if model_supplied:
         raw_model = body.get("model")
         if raw_model is not None and (
                 not isinstance(raw_model, str) or not raw_model.strip()):
-            return False, (
-                "invalid_model_route: model must be null for Harness default "
-                "or an exact non-empty available route")
+            return False, _flavor_default_error(
+                "invalid_model_route",
+                "model must be null for Harness default or an exact "
+                "non-empty available route")
         model = raw_model.strip() if isinstance(raw_model, str) else None
-    route_proof = None
+        if model is None:
+            effort = None
+    if effort_supplied:
+        raw_effort = body.get("effort")
+        if raw_effort is not None and (
+                not isinstance(raw_effort, str) or not raw_effort.strip()):
+            return False, _flavor_default_error(
+                "unsupported_thinking_level",
+                "Thinking level must be null or a non-blank string",
+                {"harness": harness, "model": model})
+        effort = raw_effort.strip() if isinstance(raw_effort, str) else None
+    if model is None and effort is not None:
+        return False, _flavor_default_error(
+            "unsupported_thinking_level",
+            "Thinking control is unavailable for Harness default",
+            {"harness": harness, "model": None,
+             "requested_effort": effort})
+    if harness == "vibe" and effort is not None:
+        return False, _flavor_default_error(
+            "unsupported_thinking_level",
+            "Thinking control is unavailable for Vibe",
+            {"harness": harness, "model": model,
+             "requested_effort": effort})
+
     observed_route = None
+    route_proof = None
     if model is not None:
         row = con.execute(
             "SELECT * FROM model_routes WHERE harness=? AND selector=?",
             (harness, model),
         ).fetchone()
         observed_route = dict(row) if row else None
-        if harness != "vibe":
-            route_proof = route_bindings._probe_controlled_route(harness, model)
+        if harness != "vibe" and (model_supplied or effort_supplied):
+            if observed_route is None or (
+                    observed_route.get("availability") != "available"):
+                return False, _flavor_default_error(
+                    "invalid_model_route",
+                    f"{model!r} is not an exact currently available route "
+                    f"for {harness}; choose an available model or Harness "
+                    "default")
+            supported = _stored_supported_efforts(observed_route)
+            if not effort_supplied and effort not in supported:
+                effort = "high" if "high" in supported else None
+                if effort is None:
+                    return False, _flavor_default_error(
+                        "unsupported_thinking_level",
+                        "Select an explicit supported Thinking level before "
+                        "saving this model",
+                        {"harness": harness, "model": model,
+                         "requested_effort": None,
+                         "supported_efforts": supported,
+                         "remediation": "select a supported Thinking level"})
+            try:
+                route_proof = route_bindings._probe_controlled_route(
+                    harness, model)
+            except route_bindings.RouteResolutionError as exc:
+                return False, _flavor_default_error(
+                    exc.code, exc.message, exc.details)
     with db_driver.write_transaction(con, "flavor_default.set"):
-        if model is not None and not _model_route_available_in_transaction(
-                con, observed_route, harness, model, route_proof):
-            return False, (
-                f"invalid_model_route: {model!r} is not an exact currently "
-                f"available route for {harness}; choose an available "
-                "model or Harness default")
+        if model is not None and (model_supplied or effort_supplied):
+            if harness == "vibe":
+                if not _model_route_available_in_transaction(
+                        con, observed_route, harness, model, None):
+                    return False, _flavor_default_error(
+                        "invalid_model_route",
+                        f"{model!r} is not an exact currently available route "
+                        f"for {harness}; choose an available model or Harness "
+                        "default")
+            else:
+                try:
+                    fresh_route = route_bindings._require_fresh_route(
+                        con, observed_route, harness, model,
+                        route_proof=route_proof,
+                    )
+                    resolved_binding, _ = route_bindings._resolve_v2(
+                        fresh_route, harness, model, effort,
+                        route_proof=route_proof,
+                        runtime_status=route_proof._runtime_status,
+                        runtime_scope={
+                            "runtime": route_proof._runtime,
+                            "runtime_identity": route_proof._runtime_identity,
+                        },
+                    )
+                    effort = resolved_binding["requested_effort"]
+                except route_bindings.RouteResolutionError as exc:
+                    return False, _flavor_default_error(
+                        exc.code, exc.message, exc.details)
         con.execute(
-            "INSERT INTO flavor_defaults (flavor, harness, model, is_default) "
-            "VALUES (?, ?, NULL, 0) ON CONFLICT(flavor, harness) DO NOTHING",
+            "INSERT INTO flavor_defaults "
+            "(flavor,harness,model,effort,is_default) "
+            "VALUES (?,?,NULL,NULL,0) "
+            "ON CONFLICT(flavor,harness) DO NOTHING",
             (flavor, harness))
-        if "model" in body:
-            con.execute("UPDATE flavor_defaults SET model=? "
-                        "WHERE flavor=? AND harness=?", (model, flavor, harness))
+        if model_supplied or effort_supplied:
+            con.execute(
+                "UPDATE flavor_defaults SET model=?,effort=? "
+                "WHERE flavor=? AND harness=?",
+                (model, effort, flavor, harness),
+            )
         if body.get("is_default"):
             con.execute("UPDATE flavor_defaults SET is_default = (harness = ?) "
                         "WHERE flavor = ?", (harness, flavor))
@@ -4359,11 +4508,13 @@ class Handler(BaseHTTPRequestHandler):
                 ok, err = set_flavor_default(con, self._body())
                 if ok:
                     return self._send(200, {"ok": True})
-                if err and err.startswith("invalid_model_route:"):
-                    return self._send(422, {"error": {
-                        "code": "invalid_model_route",
-                        "message": err.split(":", 1)[1].strip()}})
-                return self._send(400, {"error": err})
+                status = 422 if err["code"] in {
+                    "invalid_model_route",
+                    "unsupported_thinking_level",
+                    "thinking_evidence_missing",
+                    "thinking_evidence_stale",
+                } else 400
+                return self._send(status, {"error": err})
             if path == "/api/analytics/sweep":
                 # GUI Analytics tab load — incremental, so steady-state is
                 # cheap; sweep opens its own connection.

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import db_driver
+import route_transport
 import run as run_mod
 import shell_liveness
 from conversation_adapters import ConversationContext
@@ -67,6 +68,47 @@ class ConversationLaunchPreparer:
 
     def __call__(self, broker_run) -> tuple[ConversationContext, int]:
         shortname, flavor = self._shell(broker_run.shell_id)
+        binding = None
+        binding_digest = None
+        if (
+            broker_run.route_contract_version
+            == route_transport.route_bindings.CONTRACT_VERSION
+        ):
+            binding = broker_run.route_binding
+            binding_digest = broker_run.binding_digest
+            try:
+                route_transport.route_bindings.validate_v2_binding(binding)
+                if (
+                    route_transport.route_bindings.digest_json(binding)
+                    != binding_digest
+                ):
+                    raise route_transport.route_bindings.RouteResolutionError(
+                        "thinking_evidence_missing",
+                        "stored route binding digest does not match",
+                        {},
+                    )
+            except (
+                TypeError,
+                route_transport.route_bindings.RouteResolutionError,
+            ) as exc:
+                raise ConversationLaunchError(
+                    "CONVERSATION_ROUTE_INVALID",
+                    "stored version-two conversation route binding is invalid",
+                ) from exc
+            if (
+                binding["harness"] != broker_run.harness
+                or binding["requested_model"] != broker_run.model
+                or binding["requested_effort"] != broker_run.effort
+            ):
+                raise ConversationLaunchError(
+                    "CONVERSATION_ROUTE_INVALID",
+                    "stored version-two binding disagrees with conversation route",
+                )
+        elif broker_run.route_contract_version != 1:
+            raise ConversationLaunchError(
+                "CONVERSATION_ROUTE_INVALID",
+                "unsupported stored conversation route contract",
+            )
 
         def occupying_state() -> str | None:
             snapshot = self.liveness()
@@ -97,13 +139,19 @@ class ConversationLaunchPreparer:
             )
 
         try:
+            launch_args = {
+                "shell_id": broker_run.shell_id,
+                "harness": broker_run.harness,
+                "model": broker_run.model,
+                "effort": broker_run.effort,
+                "headless_prompt": broker_run.body,
+                "current_leased_run_id": broker_run.run_id,
+            }
+            if binding is not None:
+                launch_args["route_binding"] = binding
+                launch_args["binding_digest"] = binding_digest
             plan = self.prepare_launch(
-                shell_id=broker_run.shell_id,
-                harness=broker_run.harness,
-                model=broker_run.model,
-                effort=broker_run.effort,
-                headless_prompt=broker_run.body,
-                current_leased_run_id=broker_run.run_id,
+                **launch_args,
             )
         except (run_mod.LaunchError, SystemExit) as exc:
             raise ConversationLaunchError(
@@ -149,6 +197,8 @@ class ConversationLaunchPreparer:
                 permission_mode="unrestricted",
                 title=broker_run.title,
                 env=plan.env,
+                route_binding=binding,
+                binding_digest=binding_digest,
             ),
             int(plan.archive_id),
         )
