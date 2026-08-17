@@ -60,7 +60,7 @@ jobs:
       - name: Install exact OpenCode compatibility binary
         run: npm install --global opencode-ai@1.18.9
       - name: Run the suite
-        run: pytest tests/ -q
+        run: ./sc test tests/ -q
         env:
           SC_REQUIRE_OPENCODE_CANARY: '1'
 
