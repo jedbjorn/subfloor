@@ -217,6 +217,8 @@ class ParticipantBindingCandidate:
     evidence_snapshot: dict | None
     runtime_status: dict | None
     runtime_scope: dict | None
+    source_fingerprint: str | None
+    harness_version: str | None
 
 
 @dataclass(frozen=True)
@@ -284,6 +286,7 @@ def _participant_binding_candidate(
     runtime_status = None
     runtime_scope = None
     evidence_snapshot = None
+    source_fingerprint = None
     if model is None or harness == "vibe":
         runtime_scope = model_catalog.harness_versions.runtime_scope()
         runtime_status = model_catalog.harness_runtime_status(harness)
@@ -295,6 +298,7 @@ def _participant_binding_candidate(
             runtime_status=runtime_status,
             runtime_scope=runtime_scope,
         )
+        harness_version = runtime_status.get("version")
     else:
         evidence = con.execute(
             "SELECT * FROM model_routes WHERE harness=? AND selector=?",
@@ -310,6 +314,10 @@ def _participant_binding_candidate(
         )
         if evidence_dict is not None:
             evidence_snapshot = _route_evidence_snapshot(evidence_dict)
+            source_fingerprint = evidence_dict.get("source_fingerprint")
+            harness_version = evidence_dict.get("harness_version")
+        else:
+            harness_version = None
     return ParticipantBindingCandidate(
         participant_id=participant_id,
         binding=binding,
@@ -317,6 +325,8 @@ def _participant_binding_candidate(
         evidence_snapshot=evidence_snapshot,
         runtime_status=runtime_status,
         runtime_scope=runtime_scope,
+        source_fingerprint=source_fingerprint,
+        harness_version=harness_version,
     )
 
 
@@ -766,6 +776,8 @@ class SprintLifecycleStore:
                 transition=transition,
                 runtime_status=candidate.runtime_status,
                 runtime_scope=candidate.runtime_scope,
+                source_fingerprint=candidate.source_fingerprint,
+                harness_version=candidate.harness_version,
             )
             receipt.update(
                 {
@@ -3509,6 +3521,8 @@ class SprintParticipantStore:
                     transition="reroute",
                     runtime_status=candidate.runtime_status,
                     runtime_scope=candidate.runtime_scope,
+                    source_fingerprint=candidate.source_fingerprint,
+                    harness_version=candidate.harness_version,
                 )
             self.con.execute(
                 "UPDATE sprint_participants SET harness=?,model=?,effort=?,route=?,"

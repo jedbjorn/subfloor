@@ -177,8 +177,9 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
         "participant_id,route_revision,contract_version,control_state,harness,"
         "requested_model,provider_model,requested_effort,effective_effort,"
         "native_variant_id,transport,catalogue_generation,evidence_digest,"
-        "selector_binding,adapter_metadata,binding_json,binding_digest) "
-        "VALUES (2,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "selector_binding,adapter_metadata,binding_json,binding_digest,"
+        "source_fingerprint,harness_version) "
+        "VALUES (2,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             binding["contract_version"], binding["control_state"],
             binding["harness"], binding["requested_model"],
@@ -189,6 +190,7 @@ def arm_with_representative_state(con: sqlite3.Connection) -> None:
             route_bindings.canonical_json(binding["selector_binding"]),
             route_bindings.canonical_json(binding["adapter_metadata"]),
             route_bindings.canonical_json(binding), binding_digest,
+            "c" * 64, "0.33.0",
         ),
     ).lastrowid
     con.execute(

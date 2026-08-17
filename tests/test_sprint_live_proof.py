@@ -109,6 +109,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
     GENERATION = "1" * 32
     SUCCESSOR_GENERATION = "2" * 32
     FINGERPRINT = "3" * 64
+    SUCCESSOR_FINGERPRINT = "8" * 64
     BOUND_DIGEST = "4" * 64
     SUCCESSOR_DIGEST = "5" * 64
     SELECTOR = "openai/sprint-bound-model"
@@ -270,6 +271,45 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
         }
         return json.dumps(effort_metadata), json.dumps(adapter_metadata)
 
+    @classmethod
+    def _retained_high_metadata(cls) -> tuple[str, str]:
+        low = {
+            "compatibility_manifest": "opencode-1.18.9-v1",
+            "provider_family": "openai-ai-sdk",
+            "variant_options": {
+                "reasoningEffort": "low",
+                "textVerbosity": "low",
+            },
+        }
+        high = {
+            "compatibility_manifest": "opencode-1.18.9-v1",
+            "provider_family": "openai-ai-sdk",
+            "variant_options": {
+                "reasoningEffort": "high",
+                "textVerbosity": "low",
+            },
+        }
+        return (
+            json.dumps({
+                "supported": ["low", "high"],
+                "default": "low",
+                "digests": {
+                    "low": cls.SUCCESSOR_DIGEST,
+                    "high": cls.BOUND_DIGEST,
+                },
+                "native_variant_ids": {"low": "low", "high": "high"},
+                "adapter_metadata_by_effort": {"low": low, "high": high},
+            }),
+            json.dumps({
+                "compatibility_manifest": "opencode-1.18.9-v1",
+                "provider_family": "openai-ai-sdk",
+                "variant_options_by_effort": {
+                    "low": low["variant_options"],
+                    "high": high["variant_options"],
+                },
+            }),
+        )
+
     def _seed_opencode_catalogue(self) -> dict:
         status, scope = self._runtime("opencode")
         now = datetime.now(timezone.utc).isoformat()
@@ -318,9 +358,18 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             "source_fingerprint": self.FINGERPRINT,
         }
 
-    def _publish_successor_catalogue(self) -> None:
+    def _publish_successor_catalogue(self, *, retain_high: bool = False) -> None:
         now = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
-        effort_metadata, adapter_metadata = self._variant_metadata("xhigh", "high")
+        if retain_high:
+            effort_metadata, adapter_metadata = self._retained_high_metadata()
+            default_effort = "low"
+            supported_efforts = '["low","high"]'
+        else:
+            effort_metadata, adapter_metadata = self._variant_metadata(
+                "xhigh", "high"
+            )
+            default_effort = "xhigh"
+            supported_efforts = '["xhigh"]'
         runtime = self.con.execute(
             "SELECT runtime FROM model_catalog_generations WHERE generation_id=?",
             (self.GENERATION,),
@@ -334,13 +383,16 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             (self.SUCCESSOR_GENERATION, now, now, runtime, "7" * 64),
         )
         self.con.execute(
-            "UPDATE model_routes SET generation_id=?,default_effort='xhigh',"
-            "supported_efforts='[\"xhigh\"]',evidence_digest=?,"
+            "UPDATE model_routes SET generation_id=?,default_effort=?,"
+            "supported_efforts=?,evidence_digest=?,source_fingerprint=?,"
             "last_seen_at=?,effort_metadata=?,adapter_metadata=? "
             "WHERE harness='opencode' AND selector=?",
             (
                 self.SUCCESSOR_GENERATION,
+                default_effort,
+                supported_efforts,
                 self.SUCCESSOR_DIGEST,
+                self.SUCCESSOR_FINGERPRINT,
                 now,
                 effort_metadata,
                 adapter_metadata,
@@ -547,7 +599,20 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             model_catalog, "controlled_route_evidence", return_value=observation
         ):
             wake_id = self._arm(sprint_id)
-            self._publish_successor_catalogue()
+            stored_provenance = tuple(
+                self.con.execute(
+                    "SELECT source_fingerprint,harness_version FROM "
+                    "sprint_participant_route_bindings binding "
+                    "JOIN sprint_participants participant "
+                    "ON participant.active_route_binding_id=binding.binding_id "
+                    "JOIN sprint_wake_outbox wake "
+                    "ON wake.participant_id=participant.participant_id "
+                    "WHERE wake.wake_id=?",
+                    (wake_id,),
+                ).fetchone()
+            )
+            self._publish_successor_catalogue(retain_high=True)
+            observation["source_fingerprint"] = self.SUCCESSOR_FINGERPRINT
             deliveries: list[tuple[str, str, str]] = []
             outcome = sprint_message_delivery.SprintWakeDeliveryService(
                 self.con, force_new_quiet_seconds=0
@@ -559,12 +624,23 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             )
 
         self.assertIsNotNone(outcome)
+        self.assertEqual(stored_provenance, (self.FINGERPRINT, "1.18.9"))
         self.assertEqual((wake_id, "pending", 1), (
             outcome.wake_id,
             outcome.state,
             outcome.attempt_number,
         ))
         self.assertEqual(deliveries, [])
+        current = json.loads(
+            self.con.execute(
+                "SELECT effort_metadata FROM model_routes "
+                "WHERE harness='opencode' AND selector=?",
+                (self.SELECTOR,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(current["supported"], ["low", "high"])
+        self.assertEqual(current["default"], "low")
+        self.assertEqual(current["digests"]["high"], self.BOUND_DIGEST)
         self.assertEqual(
             tuple(
                 tuple(row)

@@ -51,6 +51,7 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
     model = participant["model"]
     effort = participant["effort"]
     runtime_status = runtime_scope = None
+    source_fingerprint = None
     if model is None or harness == "vibe":
         runtime_status, runtime_scope = _runtime(harness)
         binding, digest = route_bindings.resolve_v2(
@@ -61,6 +62,7 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
             runtime_status=runtime_status,
             runtime_scope=runtime_scope,
         )
+        harness_version = runtime_status["version"]
     else:
         selected = "high" if effort is None else str(effort).strip().lower()
         binding = {
@@ -80,6 +82,13 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
         }
         route_bindings.validate_v2_binding(binding)
         digest = route_bindings.digest_json(binding)
+        source_fingerprint = "3" * 64
+        harness_version = {
+            "claude": "2.1.223",
+            "codex": "0.146.0",
+            "kimi": "0.33.0",
+            "opencode": "1.18.9",
+        }[harness]
     return sprint_domain.ParticipantBindingCandidate(
         participant_id=int(participant["participant_id"]),
         binding=binding,
@@ -87,4 +96,6 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
         evidence_snapshot=None,
         runtime_status=runtime_status,
         runtime_scope=runtime_scope,
+        source_fingerprint=source_fingerprint,
+        harness_version=harness_version,
     )

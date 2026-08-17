@@ -1045,7 +1045,13 @@ def legacy_route(*, row_contract_version: int, harness: str, model: str | None,
             "effort": effort, "legacy": True}
 
 
-def verify_stored_v2_before_first_turn(con, binding: dict) -> None:
+def verify_stored_v2_before_first_turn(
+    _con,
+    binding: dict,
+    *,
+    source_fingerprint: str | None,
+    harness_version: str | None,
+) -> None:
     """Refuse drift without replacing an immutable stored binding.
 
     Armed routes retain their recorded generation.  This check observes the
@@ -1055,71 +1061,65 @@ def verify_stored_v2_before_first_turn(con, binding: dict) -> None:
     validate_v2_binding(binding)
     harness = binding["harness"]
     model = binding["requested_model"]
+    if (
+        not _exact_nonblank(harness_version)
+        or _parsed_version(harness_version) != harness_version
+    ):
+        raise RouteResolutionError(
+            "route_evidence_stale",
+            "Stored Sprint route has no immutable harness-version evidence",
+            {"harness": harness, "model": model, "remediation": "pause and reroute"},
+        )
     if binding["control_state"] != "controlled":
         import model_catalog  # noqa: PLC0415
 
-        _require_runtime(
+        runtime = _require_runtime(
             harness,
             model,
             model_catalog.harness_runtime_status(harness),
             harness_versions.runtime_scope(),
             error_code="route_evidence_stale",
         )
+        if source_fingerprint is not None or runtime.version != harness_version:
+            raise RouteResolutionError(
+                "route_evidence_stale",
+                "Stored Sprint route evidence changed before its first native turn",
+                {
+                    "harness": harness,
+                    "model": model,
+                    "captured_harness_version": harness_version,
+                    "installed_harness_version": runtime.version,
+                    "remediation": "pause and reroute",
+                },
+            )
         return
 
-    row = con.execute(
-        "SELECT * FROM model_routes WHERE harness=? AND selector=?",
-        (harness, model),
-    ).fetchone()
-    if row is None:
+    if not _lower_hex(source_fingerprint, LOWER_HEX_64):
         raise RouteResolutionError(
             "route_evidence_stale",
-            "Stored Sprint route no longer has local source evidence",
+            "Stored Sprint route has no immutable source fingerprint",
             {"harness": harness, "model": model, "remediation": "pause and reroute"},
         )
-    row = dict(row)
     proof = _probe_controlled_route(harness, model)
-    runtime = _require_controlled_runtime(
-        row,
+    runtime = _require_runtime(
         harness,
         model,
         proof._runtime_status,
         {"runtime": proof._runtime, "runtime_identity": proof._runtime_identity},
         error_code="route_evidence_stale",
     )
-    _require_controlled_source(
-        row, harness, model, runtime, proof, error_code="route_evidence_stale"
-    )
-    supported, effort_metadata = _supported_efforts(row)
-    effort = binding["effective_effort"]
-    adapter_metadata = _json_object(
-        row.get("adapter_metadata"), field="adapter_metadata"
-    )
-    if harness == "opencode":
-        adapter_metadata = (
-            effort_metadata.get("adapter_metadata_by_effort") or {}
-        ).get(effort)
-    current = {
-        "provider_model": row.get("provider_model") or model,
-        "evidence_digest": (effort_metadata.get("digests") or {}).get(effort),
-        "selector_binding": _json_object(
-            row.get("selector_binding"), field="selector_binding"
-        ),
-        "adapter_metadata": adapter_metadata,
-        "native_variant_id": (
-            (effort_metadata.get("native_variant_ids") or {}).get(effort)
-            if harness == "opencode" else None
-        ),
-    }
-    expected = {field: binding[field] for field in current}
-    if effort not in supported or current != expected:
+    if (
+        runtime.version != harness_version
+        or proof._source_fingerprint != source_fingerprint
+    ):
         raise RouteResolutionError(
             "route_evidence_stale",
             "Stored Sprint route evidence changed before its first native turn",
             {
                 "harness": harness,
                 "model": model,
-                "requested_effort": effort,
+                "captured_harness_version": harness_version,
+                "installed_harness_version": runtime.version,
                 "remediation": "pause and reroute",
             },
         )
@@ -1133,16 +1133,32 @@ class ParticipantRouteBindingStore:
 
     def bind(self, participant_id: int, binding: dict, binding_digest: str, *,
              transition: str, runtime_status: dict | None = None,
-             runtime_scope: dict | None = None) -> dict:
+             runtime_scope: dict | None = None,
+             source_fingerprint: str | None = None,
+             harness_version: str | None = None) -> dict:
         validate_v2_binding(binding)
-        if binding["control_state"] != "controlled":
-            _require_uncontrolled_runtime(
-                binding["harness"], binding["requested_model"], runtime_status,
-                runtime_scope,
-            )
         if (not _lower_hex(binding_digest, LOWER_HEX_64)
                 or digest_json(binding) != binding_digest):
             raise ValueError("binding does not match the canonical v2 contract")
+        if binding["control_state"] == "controlled":
+            if (
+                not _lower_hex(source_fingerprint, LOWER_HEX_64)
+                or not _exact_nonblank(harness_version)
+                or _parsed_version(harness_version) != harness_version
+            ):
+                raise ValueError(
+                    "controlled Sprint bindings require immutable source provenance"
+                )
+        else:
+            runtime = _require_runtime(
+                binding["harness"], binding["requested_model"], runtime_status,
+                runtime_scope,
+            )
+            if source_fingerprint is not None:
+                raise ValueError(
+                    "uncontrolled Sprint bindings cannot store a source fingerprint"
+                )
+            harness_version = runtime.version
         row = self.con.execute(
             "SELECT participant.active_route_binding_id,sprint.lifecycle "
             "FROM sprint_participants participant "
@@ -1174,14 +1190,16 @@ class ParticipantRouteBindingStore:
             "participant_id,route_revision,contract_version,control_state,harness,"
             "requested_model,provider_model,requested_effort,effective_effort,"
             "native_variant_id,transport,catalogue_generation,evidence_digest,"
-            "selector_binding,adapter_metadata,binding_json,binding_digest"
-            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "selector_binding,adapter_metadata,binding_json,binding_digest,"
+            "source_fingerprint,harness_version"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 participant_id, revision, *values[:11],
                 canonical_json(binding["selector_binding"])
                 if binding["selector_binding"] is not None else None,
                 canonical_json(binding["adapter_metadata"]),
                 canonical_json(binding), binding_digest,
+                source_fingerprint, harness_version,
             ),
         )
         binding_id = int(cursor.lastrowid)

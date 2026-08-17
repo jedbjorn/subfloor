@@ -420,12 +420,24 @@ def prepare_wake_conversation(
         "SELECT 1 FROM sqlite_master WHERE type='table' "
         "AND name='sprint_participant_route_bindings'"
     ).fetchone() is not None
+    binding_columns = {
+        str(column["name"])
+        for column in con.execute(
+            "PRAGMA table_info(sprint_participant_route_bindings)"
+        )
+    } if binding_schema else set()
+    provenance_projection = (
+        "binding.source_fingerprint,binding.harness_version "
+        if {"source_fingerprint", "harness_version"} <= binding_columns
+        else "NULL AS source_fingerprint,NULL AS harness_version "
+    )
     binding_projection = (
         "p.active_route_binding_id,binding.route_revision,binding.binding_json,"
-        "binding.binding_digest "
+        "binding.binding_digest," + provenance_projection
         if binding_schema
         else "NULL AS active_route_binding_id,NULL AS route_revision,"
-        "NULL AS binding_json,NULL AS binding_digest "
+        "NULL AS binding_json,NULL AS binding_digest,"
+        "NULL AS source_fingerprint,NULL AS harness_version "
     )
     binding_join = (
         "LEFT JOIN sprint_participant_route_bindings binding "
@@ -516,7 +528,12 @@ def prepare_wake_conversation(
         ).fetchone()
         if prior_turn is None:
             try:
-                route_bindings.verify_stored_v2_before_first_turn(con, binding)
+                route_bindings.verify_stored_v2_before_first_turn(
+                    con,
+                    binding,
+                    source_fingerprint=row["source_fingerprint"],
+                    harness_version=row["harness_version"],
+                )
             except route_bindings.RouteResolutionError as exc:
                 raise SprintConversationError(
                     f"{exc.code}: {exc.message}"
