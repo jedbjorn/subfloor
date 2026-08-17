@@ -947,7 +947,7 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         return con
 
     def request(self, path: str, token: str | None = "shell-token", *,
-                fingerprint="current-fingerprint"):
+                fingerprint="current-fingerprint", harness_ready=True):
         headers = "Host: 127.0.0.1"
         if token is not None:
             headers += f"\r\nAuthorization: Bearer {token}"
@@ -960,6 +960,11 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
                 server.model_catalog,
                 "current_source_fingerprint",
                 **probe,
+            ),
+            mock.patch.object(
+                server.model_catalog,
+                "harness_launch_ready",
+                return_value=harness_ready,
             ),
         ):
             status, _headers, body = server.dispatch_http("GET", path, headers, b"")
@@ -1013,6 +1018,33 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         )
         self.assertEqual(status, 200, current)
         self.assertEqual(current["routes"][0]["source"], "api-source-v2")
+
+    def test_uncontrolled_route_projection_reports_launch_readiness(self) -> None:
+        status, unavailable = self.request(
+            "/_sc/model-routes?harness=claude", harness_ready=False
+        )
+        with self.connect() as con:
+            con.execute(
+                "INSERT INTO model_routes (harness,selector,source,availability,"
+                "headless_supported,high_effort_supported,supported_efforts,"
+                "provider_model,cli_version,last_seen_at,stale,adapter_metadata) "
+                "VALUES ('vibe','vibe-local','vibe-local','available',0,0,'[]',"
+                "'vibe-local','vibe 2.22.0',datetime('now'),0,'{}')"
+            )
+        vibe_status, vibe = self.request(
+            "/_sc/model-routes?harness=vibe&selector=vibe-local",
+            harness_ready=True,
+        )
+
+        self.assertEqual(status, 200, unavailable)
+        self.assertFalse(unavailable["harness_ready"])
+        self.assertEqual(unavailable["routes"], [])
+        self.assertEqual(vibe_status, 200, vibe)
+        self.assertTrue(vibe["harness_ready"])
+        self.assertEqual(len(vibe["routes"]), 1)
+        self.assertEqual(vibe["routes"][0]["selector"], "vibe-local")
+        self.assertIsNone(vibe["routes"][0]["current_source_fingerprint"])
+        self.assertNotIn("route_resolution_error", vibe["routes"][0])
 
     def test_skill_catalogue_requires_auth_and_includes_grant_scopes(self) -> None:
         self.assertEqual(self.request("/_sc/skills", None)[0], 401)

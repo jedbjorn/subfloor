@@ -474,23 +474,24 @@ def get_model_routes(con, *, harness: str | None = None,
                 model_catalog.current_source_fingerprint(
                     route["harness"], route["selector"]
                 ) or ""
-            for route in routes
+            for route in routes if route["harness"] != "vibe"
         }
         refreshed = []
         with db_driver.write_transaction(con, "model_route.exact_read"):
             for route in routes:
                 key = route["harness"], route["selector"]
                 resolution_error = None
-                try:
-                    route_bindings.require_fresh_route(
-                        con, route, *key,
-                        current_source_fingerprint=fingerprints[key],
-                    )
-                except route_bindings.RouteResolutionError as exc:
-                    resolution_error = {
-                        "code": exc.code, "error": exc.message,
-                        "details": exc.details,
-                    }
+                if route["harness"] != "vibe":
+                    try:
+                        route_bindings.require_fresh_route(
+                            con, route, *key,
+                            current_source_fingerprint=fingerprints[key],
+                        )
+                    except route_bindings.RouteResolutionError as exc:
+                        resolution_error = {
+                            "code": exc.code, "error": exc.message,
+                            "details": exc.details,
+                        }
                 current = con.execute(
                     "SELECT * FROM model_routes WHERE harness=? AND selector=?",
                     key,
@@ -498,12 +499,15 @@ def get_model_routes(con, *, harness: str | None = None,
                 if current is None:
                     continue
                 current = dict(current)
-                current["current_source_fingerprint"] = fingerprints[key]
+                current["current_source_fingerprint"] = fingerprints.get(key)
                 if resolution_error is not None:
                     current["route_resolution_error"] = resolution_error
                 refreshed.append(current)
         routes = refreshed
-    return {"routes": routes}
+    result = {"routes": routes}
+    if harness is not None:
+        result["harness_ready"] = model_catalog.harness_launch_ready(harness)
+    return result
 
 
 def known_harnesses() -> list[str]:

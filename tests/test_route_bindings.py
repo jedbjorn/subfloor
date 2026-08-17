@@ -422,6 +422,78 @@ class GenerationPersistenceTest(unittest.TestCase):
             datetime.fromisoformat(generation["started_at"]),
         )
 
+    def test_rebuilt_empty_ledger_requires_refresh_before_fresh_cache(self):
+        cached = self.payload("cached-only")
+        cached.update({
+            "catalogue_generation": "a" * 32,
+            "generation_state": "successful",
+            "generation_published": True,
+        })
+        ordinary_payload = self.payload("ordinary-advisory")
+        explicit_payload = self.payload("explicit-route")
+        ordinary_payload.pop("verification")
+        explicit_payload.pop("verification")
+        statuses = {"codex": self.status()}
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            model_catalog, "CACHE", Path(tmp) / "model_catalog.json"
+        ), mock.patch.object(
+            model_catalog, "build",
+            side_effect=[ordinary_payload, explicit_payload],
+        ) as build:
+            model_catalog.CACHE.write_text(json.dumps(cached))
+            ordinary = model_catalog.catalog(
+                con=self.con, opencode_provider=lambda: [],
+                harness_probe=lambda: statuses,
+            )
+            ordinary_cache = json.loads(model_catalog.CACHE.read_text())
+            ordinary_generations = self.con.execute(
+                "SELECT COUNT(*) FROM model_catalog_generations"
+            ).fetchone()[0]
+            ordinary_routes = self.con.execute(
+                "SELECT COUNT(*) FROM model_routes"
+            ).fetchone()[0]
+
+            explicit = model_catalog.catalog(
+                refresh=True, con=self.con, opencode_provider=lambda: [],
+                harness_probe=lambda: statuses,
+            )
+            explicit_cache = json.loads(model_catalog.CACHE.read_text())
+
+        generation = self.con.execute(
+            "SELECT generation_id,state FROM model_catalog_generations"
+        ).fetchone()
+        route = self.con.execute(
+            "SELECT selector,generation_id,stale,last_error FROM model_routes"
+        ).fetchone()
+        self.assertEqual(build.call_count, 2)
+        self.assertTrue(ordinary["stale"])
+        self.assertEqual(
+            ordinary["error"],
+            "Catalogue refresh required after runtime evidence rebuild",
+        )
+        self.assertEqual(
+            ordinary["harnesses"]["codex"]["models"][0]["id"],
+            "ordinary-advisory",
+        )
+        self.assertNotIn("catalogue_generation", ordinary)
+        self.assertTrue(ordinary_cache["stale"])
+        self.assertNotIn("catalogue_generation", ordinary_cache)
+        self.assertEqual(ordinary_generations, 0)
+        self.assertEqual(ordinary_routes, 0)
+        self.assertFalse(explicit["stale"])
+        self.assertEqual(
+            explicit["catalogue_generation"], generation["generation_id"]
+        )
+        self.assertEqual(
+            explicit_cache["catalogue_generation"], generation["generation_id"]
+        )
+        self.assertEqual(generation["state"], "successful")
+        self.assertEqual(
+            tuple(route),
+            ("explicit-route", generation["generation_id"], 0, None),
+        )
+
     def test_incompatible_harnesses_never_publish_controlled_routes(self):
         cases = (
             ("missing", None, self.status(

@@ -40,15 +40,22 @@ def _shell_api_enabled() -> bool:
     return True
 
 
-def _api_routes(*, harness: str | None = None,
-                selector: str | None = None) -> list[dict]:
+def _api_route_projection(*, harness: str | None = None,
+                          selector: str | None = None) -> dict:
     query = urlencode({
         name: value for name, value in (
             ("harness", harness), ("selector", selector)
         ) if value is not None
     })
     path = "/_sc/model-routes" + (f"?{query}" if query else "")
-    return mem._api("GET", path).get("routes") or []
+    return mem._api("GET", path)
+
+
+def _api_routes(*, harness: str | None = None,
+                selector: str | None = None) -> list[dict]:
+    return _api_route_projection(harness=harness, selector=selector).get(
+        "routes"
+    ) or []
 
 
 def _route(con, harness: str, selector: str):
@@ -75,6 +82,32 @@ def _resolution_error(exc: route_bindings.RouteResolutionError) -> dict:
             "details": exc.details}
 
 
+def _uncontrolled_readiness_error(
+    row: dict | None, harness: str, selector: str | None, harness_ready: bool,
+) -> dict | None:
+    if selector is not None and harness != "vibe":
+        return None
+    if not harness_ready:
+        return _resolution_error(route_bindings.RouteResolutionError(
+            "thinking_evidence_missing",
+            f"Harness '{harness}' is not available for launch on this machine",
+            {"harness": harness, "model": selector,
+             "remediation": "install or repair the harness runtime"},
+        ))
+    if selector is not None and (
+        row is None
+        or row.get("availability") != "available"
+        or bool(row.get("stale"))
+    ):
+        return _resolution_error(route_bindings.RouteResolutionError(
+            "thinking_evidence_missing",
+            f"Route '{harness}/{selector}' is not currently available",
+            {"harness": harness, "model": selector,
+             "remediation": "sc models refresh"},
+        ))
+    return None
+
+
 def resolve(con, harness: str, selector: str | None = None, *,
             shell: str = "<shell>", effort: str | None = None,
             now=None, current_source_fingerprint: str | None = None) -> dict:
@@ -83,9 +116,11 @@ def resolve(con, harness: str, selector: str | None = None, *,
     except route_bindings.RouteResolutionError as exc:
         return _resolution_error(exc)
     if selector is None or harness == "vibe":
+        row = _route(con, harness, selector) if selector is not None else None
         return resolve_row(
-            None, harness, selector, shell=shell, effort=effort, now=now,
+            row, harness, selector, shell=shell, effort=effort, now=now,
             current_source_fingerprint=current_source_fingerprint,
+            harness_ready=model_catalog.harness_launch_ready(harness),
         )
     observed_row = _route(con, harness, selector)
     if current_source_fingerprint is None:
@@ -102,8 +137,13 @@ def resolve(con, harness: str, selector: str | None = None, *,
 def resolve_row(row: dict | None, harness: str, selector: str | None, *,
                 shell: str = "<shell>", effort: str | None = None,
                 now=None, current_source_fingerprint: str | None = None,
-                con=None) -> dict:
+                con=None, harness_ready: bool = False) -> dict:
     """Resolve inside ``con``'s caller-owned write, or purely when omitted."""
+    readiness_error = _uncontrolled_readiness_error(
+        row, harness, selector, harness_ready
+    )
+    if readiness_error is not None:
+        return readiness_error
     try:
         if con is not None:
             binding, binding_digest = route_bindings.resolve_persisted_v2(
@@ -230,8 +270,10 @@ def main(argv: list[str] | None = None) -> int:
             harness = route_bindings.normalize_harness(harness)
         except route_bindings.RouteResolutionError as exc:
             return _print_resolved(_resolution_error(exc), as_json)
-        routes = _api_routes(harness=harness, selector=selector) \
-            if selector is not None and harness != "vibe" else []
+        projection = _api_route_projection(
+            harness=harness, selector=selector
+        )
+        routes = projection.get("routes") or []
         route = routes[0] if routes else None
         resolution_error = (route or {}).get("route_resolution_error")
         if resolution_error:
@@ -242,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
             data = resolve_row(
                 route, harness, selector, shell=shell,
                 effort=effort, current_source_fingerprint=fingerprint,
+                harness_ready=bool(projection.get("harness_ready")),
             )
         return _print_resolved(data, as_json)
 

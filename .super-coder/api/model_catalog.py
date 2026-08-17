@@ -79,6 +79,7 @@ CLAUDE_ALIASES = ["fable", "opus", "sonnet", "haiku"]
 # version is ignored (treated as no cache) instead of being served to a
 # client that expects the new shape.
 PAYLOAD_VERSION = 6
+_GENERATION_TABLE_UNAVAILABLE = object()
 
 # provider APIs, keyed by harness: (env var, url, header builder). Responses
 # are the OpenAI-style {"data": [{"id": ...}, ...]} shape on all three.
@@ -333,9 +334,9 @@ def _load_cache() -> dict | None:
     return cached if cached.get("v") == PAYLOAD_VERSION else None
 
 
-def _authoritative_generation(con) -> str | None:
+def _authoritative_generation(con):
     if con is None:
-        return None
+        return _GENERATION_TABLE_UNAVAILABLE
     try:
         row = con.execute(
             "SELECT generation_id FROM model_catalog_generations "
@@ -343,14 +344,17 @@ def _authoritative_generation(con) -> str | None:
         ).fetchone()
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).lower():
-            return None
+            return _GENERATION_TABLE_UNAVAILABLE
         raise
     return row[0] if row is not None else None
 
 
 def _cache_matches_authority(cached: dict, con) -> bool:
     generation = _authoritative_generation(con)
-    return generation is None or cached.get("catalogue_generation") == generation
+    return (
+        generation is _GENERATION_TABLE_UNAVAILABLE
+        or cached.get("catalogue_generation") == generation
+    )
 
 
 @contextmanager
@@ -376,7 +380,7 @@ def _publish_cache_locked(payload: dict, con=None) -> bool:
             os.fsync(stream.fileno())
         authoritative = _authoritative_generation(con)
         if (
-            authoritative is not None
+            authoritative is not _GENERATION_TABLE_UNAVAILABLE
             and payload.get("catalogue_generation") != authoritative
         ):
             return False
@@ -447,6 +451,16 @@ def _headless_supported(harness: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return bool((cfg.get("headless") or {}).get("launch"))
+
+
+def harness_launch_ready(harness: str) -> bool:
+    """Match the launcher's ordinary adapter + executable readiness rule."""
+    try:
+        cfg = json.loads((ADAPTERS / harness / "adapter.json").read_text())
+        command = (cfg.get("launch") or [harness])[0]
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(shutil.which(command))
 
 
 def _evidence_kind(harness: str, source: str) -> str | None:
@@ -983,9 +997,17 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     carries `stale` + `fetched_at` so the GUI can say how current it is."""
     with _publication_lock():
         cached = _load_cache()
+        authority = (
+            _GENERATION_TABLE_UNAVAILABLE
+            if refresh else _authoritative_generation(con)
+        )
+        refresh_required = not refresh and con is not None and authority is None
         serve_cached = bool(
-            cached and not refresh and _fresh(cached)
-            and _cache_matches_authority(cached, con)
+            cached and not refresh and not refresh_required and _fresh(cached)
+            and (
+                authority is _GENERATION_TABLE_UNAVAILABLE
+                or cached.get("catalogue_generation") == authority
+            )
         )
     if serve_cached:
         return _served(_with_live_opencode(
@@ -1072,6 +1094,12 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     )
     response["refresh_started_at"] = refresh_started_at
     response["refresh_completed_at"] = datetime.now(timezone.utc).isoformat()
+    if refresh_required and not refresh:
+        message = "Catalogue refresh required after runtime evidence rebuild"
+        response["stale"] = True
+        response["error"] = message
+        fresh["stale"] = True
+        fresh["error"] = message
     if refresh and con is not None:
         probe_error = None
         try:

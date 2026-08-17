@@ -674,8 +674,11 @@ class RouteCliConnectionTest(unittest.TestCase):
                 status = routes_cli.main(["resolve", harness, "--json"])
             return status, json.loads(output.getvalue()), con
 
-        refused_status, refused, refused_con = resolve("not-a-harness")
-        accepted_status, accepted, accepted_con = resolve("ClAuDe")
+        with mock.patch.object(
+            routes_cli.model_catalog, "harness_launch_ready", return_value=True
+        ):
+            refused_status, refused, refused_con = resolve("not-a-harness")
+            accepted_status, accepted, accepted_con = resolve("ClAuDe")
 
         self.assertEqual(refused_status, 2)
         self.assertEqual(refused["code"], "unsupported_thinking_level")
@@ -695,6 +698,161 @@ class RouteCliConnectionTest(unittest.TestCase):
             ["./sc", "run", "<shell>", "--harness", "claude"],
         )
         accepted_con.close.assert_called_once_with()
+
+    def test_local_uncontrolled_resolve_requires_launch_readiness(self):
+        con = mock.Mock()
+        with mock.patch.object(
+            routes_cli.model_catalog, "harness_launch_ready", return_value=False
+        ):
+            unavailable_harness = routes_cli.resolve(con, "claude")
+        with (
+            mock.patch.object(
+                routes_cli.model_catalog, "harness_launch_ready",
+                return_value=True,
+            ),
+            mock.patch.object(routes_cli, "_route", return_value=None),
+        ):
+            unavailable_vibe = routes_cli.resolve(
+                con, "vibe", "definitely-not-local"
+            )
+
+        for result in (unavailable_harness, unavailable_vibe):
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["code"], "thinking_evidence_missing")
+            self.assertNotIn("binding", result)
+            self.assertNotIn("binding_digest", result)
+            self.assertNotIn("command", result)
+        self.assertIn("not available for launch", unavailable_harness["error"])
+        self.assertEqual(
+            unavailable_vibe["error"],
+            "Route 'vibe/definitely-not-local' is not currently available",
+        )
+
+    def test_local_ready_uncontrolled_routes_keep_typed_null_identity(self):
+        con = mock.Mock()
+        vibe_row = {
+            "harness": "vibe", "selector": "vibe-local",
+            "source": "vibe-local", "availability": "available",
+            "stale": 0, "cli_version": "vibe 2.22.0",
+            "supported_efforts": "[]",
+        }
+        with (
+            mock.patch.object(
+                routes_cli.model_catalog, "harness_launch_ready",
+                return_value=True,
+            ),
+            mock.patch.object(routes_cli, "_route", return_value=vibe_row),
+        ):
+            default_first = routes_cli.resolve(con, "claude")
+            default_replay = routes_cli.resolve(con, "claude")
+            vibe_first = routes_cli.resolve(con, "vibe", "vibe-local")
+            vibe_replay = routes_cli.resolve(con, "vibe", "vibe-local")
+
+        for result, state in (
+            (default_first, "harness-default"),
+            (vibe_first, "native-uncontrolled"),
+        ):
+            binding = result["binding"]
+            self.assertTrue(result["ok"])
+            self.assertEqual(binding["control_state"], state)
+            self.assertIsNone(binding["requested_effort"])
+            self.assertIsNone(binding["effective_effort"])
+            self.assertIsNone(binding["catalogue_generation"])
+            self.assertIsNone(binding["evidence_digest"])
+            self.assertNotIn("--effort", result["command"])
+        self.assertEqual(
+            default_first["binding_digest"], default_replay["binding_digest"]
+        )
+        self.assertEqual(
+            vibe_first["binding_digest"], vibe_replay["binding_digest"]
+        )
+
+    def test_authenticated_uncontrolled_resolve_applies_server_readiness(self):
+        cases = (
+            (
+                ["resolve", "claude", "--json"],
+                {"routes": [], "harness_ready": False},
+                "/_sc/model-routes?harness=claude",
+            ),
+            (
+                ["resolve", "vibe", "missing-vibe", "--json"],
+                {"routes": [], "harness_ready": True},
+                "/_sc/model-routes?harness=vibe&selector=missing-vibe",
+            ),
+        )
+        for argv, projection, path in cases:
+            with self.subTest(argv=argv):
+                output = io.StringIO()
+                api = mock.Mock(return_value=projection)
+                with (
+                    mock.patch.object(
+                        routes_cli.mem, "SC_API_TOKEN", "shell-token"
+                    ),
+                    mock.patch.object(
+                        routes_cli.mem, "SC_API_BASE", "http://engine"
+                    ),
+                    mock.patch.object(routes_cli.mem, "_api", api),
+                    mock.patch.object(
+                        routes_cli, "_open_db",
+                        side_effect=AssertionError("opened DB"),
+                    ),
+                    contextlib.redirect_stdout(output),
+                ):
+                    status = routes_cli.main(argv)
+                result = json.loads(output.getvalue())
+                self.assertEqual(status, 2)
+                self.assertEqual(result["code"], "thinking_evidence_missing")
+                self.assertNotIn("binding", result)
+                self.assertNotIn("binding_digest", result)
+                self.assertNotIn("command", result)
+                api.assert_called_once_with("GET", path)
+
+    def test_authenticated_ready_uncontrolled_binding_is_stable(self):
+        vibe_row = {
+            "harness": "vibe", "selector": "vibe-local",
+            "source": "vibe-local", "availability": "available",
+            "stale": 0, "cli_version": "vibe 2.22.0",
+            "supported_efforts": "[]", "current_source_fingerprint": None,
+        }
+        projections = {
+            "/_sc/model-routes?harness=claude": {
+                "routes": [], "harness_ready": True,
+            },
+            "/_sc/model-routes?harness=vibe&selector=vibe-local": {
+                "routes": [vibe_row], "harness_ready": True,
+            },
+        }
+
+        def resolve(argv):
+            output = io.StringIO()
+            with (
+                mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+                mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+                mock.patch.object(
+                    routes_cli.mem, "_api",
+                    side_effect=lambda _method, path: projections[path],
+                ),
+                mock.patch.object(
+                    routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(routes_cli.main(argv), 0)
+            return json.loads(output.getvalue())
+
+        for argv in (
+            ["resolve", "claude", "--json"],
+            ["resolve", "vibe", "vibe-local", "--json"],
+        ):
+            with self.subTest(argv=argv):
+                first = resolve(argv)
+                replay = resolve(argv)
+                self.assertEqual(first["binding_digest"], replay["binding_digest"])
+                self.assertIsNone(first["binding"]["requested_effort"])
+                self.assertIsNone(first["binding"]["effective_effort"])
+                self.assertIsNone(first["binding"]["catalogue_generation"])
+                self.assertIsNone(first["binding"]["evidence_digest"])
+                self.assertNotIn("--effort", first["command"])
 
     def test_refresh_keeps_the_wal_enabled_write_lane(self):
         con = mock.Mock()
