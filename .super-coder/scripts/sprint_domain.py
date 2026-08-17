@@ -10,8 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from pathlib import Path
 
 import active_chat_registry
 import conversation_broker
@@ -20,6 +22,11 @@ import db_driver
 import sprint_cleanup
 import sprint_participant_chats
 from conversation_adapters import AdapterError, ProbeResult, adapter_for
+
+ENGINE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ENGINE / "api"))
+import model_catalog  # noqa: E402  (canonical local route evidence)
+import route_bindings  # noqa: E402  (versioned participant route contract)
 
 SPRINT_TRANSITIONS = {
     "prepared": frozenset({"armed", "aborted"}),
@@ -82,6 +89,17 @@ class SprintConflictError(SprintInvariantError):
 
 class SprintPreflightError(SprintInvariantError):
     """The selected participant route is incompatible with this runtime."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        details: dict | None = None,
+    ) -> None:
+        self.code = code
+        self.details = details or {}
+        super().__init__(message)
 
 
 class BoundRevisionUnavailable(SprintInvariantError):
@@ -189,6 +207,127 @@ class WorkUnitCompletionReceipt:
     @property
     def wake_ids(self) -> tuple[int, ...]:
         return tuple(dict.fromkeys((*self.created_wake_ids, *self.reused_wake_ids)))
+
+
+@dataclass(frozen=True)
+class ParticipantBindingCandidate:
+    participant_id: int
+    binding: dict
+    binding_digest: str
+    evidence_snapshot: dict | None
+    runtime_status: dict | None
+    runtime_scope: dict | None
+    source_fingerprint: str | None
+    harness_version: str | None
+
+
+@dataclass(frozen=True)
+class ArmBindingPreflight:
+    intent_fingerprint: str
+    candidates: tuple[ParticipantBindingCandidate, ...]
+
+
+@dataclass(frozen=True)
+class ParticipantRerouteReceipt:
+    changed: bool
+    binding_status: str
+    control_state: str
+    route_revision: int | None
+    binding_digest: str | None
+
+    def __bool__(self) -> bool:
+        return self.changed
+
+
+_ROUTE_EVIDENCE_FIELDS = (
+    "harness",
+    "selector",
+    "generation_id",
+    "evidence_kind",
+    "evidence_digest",
+    "source_fingerprint",
+    "harness_version",
+    "harness_compatibility",
+    "supported_efforts",
+    "selector_binding",
+    "effort_metadata",
+    "adapter_metadata",
+    "availability",
+    "headless_supported",
+    "stale",
+    "last_seen_at",
+)
+
+
+def _route_evidence_snapshot(row: dict | sqlite3.Row) -> dict:
+    return {field: row[field] for field in _ROUTE_EVIDENCE_FIELDS}
+
+
+def _route_binding_schema_available(con: sqlite3.Connection) -> bool:
+    if con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='sprint_participant_route_bindings'"
+    ).fetchone() is None:
+        return False
+    return "active_route_binding_id" in {
+        str(row["name"]) for row in con.execute("PRAGMA table_info(sprint_participants)")
+    }
+
+
+def _participant_binding_candidate(
+    con: sqlite3.Connection,
+    participant: sqlite3.Row,
+) -> ParticipantBindingCandidate:
+    """Resolve one raw participant intent without persisting Sprint state."""
+    harness = route_bindings.normalize_harness(str(participant["harness"]))
+    model = participant["model"]
+    effort = participant["effort"]
+    participant_id = int(participant["participant_id"])
+    runtime_status = None
+    runtime_scope = None
+    evidence_snapshot = None
+    source_fingerprint = None
+    if model is None or harness == "vibe":
+        runtime_scope = model_catalog.harness_versions.runtime_scope()
+        runtime_status = model_catalog.harness_runtime_status(harness)
+        binding, binding_digest = route_bindings.resolve_v2(
+            None,
+            harness,
+            model,
+            effort,
+            runtime_status=runtime_status,
+            runtime_scope=runtime_scope,
+        )
+        harness_version = runtime_status.get("version")
+    else:
+        evidence = con.execute(
+            "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+            (harness, model),
+        ).fetchone()
+        evidence_dict = dict(evidence) if evidence is not None else None
+        binding, binding_digest = route_bindings.resolve_persisted_v2(
+            con,
+            evidence_dict,
+            harness,
+            model,
+            effort,
+        )
+        if evidence_dict is not None:
+            evidence_snapshot = _route_evidence_snapshot(evidence_dict)
+            source_fingerprint = evidence_dict.get("source_fingerprint")
+            harness_version = evidence_dict.get("harness_version")
+        else:
+            harness_version = None
+    return ParticipantBindingCandidate(
+        participant_id=participant_id,
+        binding=binding,
+        binding_digest=binding_digest,
+        evidence_snapshot=evidence_snapshot,
+        runtime_status=runtime_status,
+        runtime_scope=runtime_scope,
+        source_fingerprint=source_fingerprint,
+        harness_version=harness_version,
+    )
 
 
 def transition_allowed(current: str, target: str) -> bool:
@@ -405,7 +544,7 @@ class SprintLifecycleStore:
         and work-unit dispositions together.
         """
         actor = LifecycleActor("planner", planner_shell_id)
-        preflight_fingerprint = self._preflight_arm(
+        preflight = self._preflight_arm(
             sprint_id,
             actor,
             conformance_reviewer_shell_id=conformance_reviewer_shell_id,
@@ -425,14 +564,19 @@ class SprintLifecycleStore:
                 allow_single_reviewer_default=True,
             )
             self._require_prior_cleanup_resolved(sprint_id)
-            current_fingerprint = self._participant_selection_fingerprint(
-                sprint_id
-            )
-            if current_fingerprint != preflight_fingerprint:
+            current_fingerprint = self._participant_intent_fingerprint(sprint_id)
+            if current_fingerprint != preflight.intent_fingerprint:
                 raise SprintInvariantError(
-                    "participant launch selections changed during harness "
-                    "preflight; retry arm"
+                    "participant route intents changed during binding preflight; "
+                    "retry arm"
                 )
+            self._require_candidate_evidence(preflight.candidates)
+            binding_receipts = self._bind_candidates(
+                preflight.candidates,
+                transition="arm",
+                actor=actor,
+                sprint_id=sprint_id,
+            )
             self._set_conformance_owner(
                 sprint,
                 selected_owner,
@@ -463,6 +607,7 @@ class SprintLifecycleStore:
                     "initial_wake_ids": wake_ids,
                     "planner_wake_id": planner_wake_id,
                     "work_wake_ids": work_wake_ids,
+                    "participant_bindings": binding_receipts,
                 },
             )
             SprintWorkUnitStore(self.con)._queue_delivery_terminal(sprint_id)
@@ -474,7 +619,7 @@ class SprintLifecycleStore:
         actor: LifecycleActor,
         *,
         conformance_reviewer_shell_id: int | None,
-    ) -> str:
+    ) -> ArmBindingPreflight:
         """Probe one immutable route snapshot before arm takes a write lock."""
         if self.con.in_transaction:
             raise SprintInvariantError(
@@ -494,20 +639,57 @@ class SprintLifecycleStore:
             allow_single_reviewer_default=True,
         )
         self._require_prior_cleanup_resolved(sprint_id)
-        try:
-            routes = sprint_participant_chats.prepare_sprint_participant_routes(
-                self.con,
-                sprint_id,
+        participants = self._participant_intent_rows(sprint_id)
+        if not _route_binding_schema_available(self.con):
+            try:
+                routes = sprint_participant_chats.prepare_sprint_participant_routes(
+                    self.con, sprint_id
+                )
+            except sprint_participant_chats.SprintConversationError as exc:
+                raise SprintPreflightError(str(exc)) from exc
+            for harness in dict.fromkeys(route.harness for route in routes):
+                try:
+                    self.probe_harness(harness)
+                except AdapterError as exc:
+                    raise SprintPreflightError(str(exc)) from exc
+            return ArmBindingPreflight(
+                intent_fingerprint=self._intent_fingerprint(participants),
+                candidates=(),
             )
-        except sprint_participant_chats.SprintConversationError as exc:
-            raise SprintPreflightError(str(exc)) from exc
-        fingerprint = self._route_fingerprint(routes)
-        for harness in dict.fromkeys(route.harness for route in routes):
+        candidates = []
+        for participant in participants:
+            try:
+                candidates.append(
+                    _participant_binding_candidate(self.con, participant)
+                )
+            except route_bindings.RouteResolutionError as exc:
+                raise SprintPreflightError(
+                    exc.message,
+                    code=exc.code,
+                    details=exc.details,
+                ) from exc
+        controlled_generations = {
+            candidate.binding["catalogue_generation"]
+            for candidate in candidates
+            if candidate.binding["control_state"] == "controlled"
+        }
+        if len(controlled_generations) > 1:
+            raise SprintPreflightError(
+                "controlled participant routes do not share one catalogue generation",
+                code="thinking_evidence_stale",
+                details={"catalogue_generations": sorted(controlled_generations)},
+            )
+        for harness in dict.fromkeys(
+            candidate.binding["harness"] for candidate in candidates
+        ):
             try:
                 self.probe_harness(harness)
             except AdapterError as exc:
                 raise SprintPreflightError(str(exc)) from exc
-        return fingerprint
+        return ArmBindingPreflight(
+            intent_fingerprint=self._intent_fingerprint(participants),
+            candidates=tuple(candidates),
+        )
 
     def _require_prior_cleanup_resolved(self, sprint_id: int) -> None:
         shell_ids = [
@@ -527,36 +709,92 @@ class SprintLifecycleStore:
         if blocker is not None:
             raise SprintCleanupConflictError(blocker)
 
-    def _participant_selection_fingerprint(self, sprint_id: int) -> str:
-        try:
-            routes = sprint_participant_chats.prepare_sprint_participant_routes(
-                self.con,
-                sprint_id,
-            )
-        except sprint_participant_chats.SprintConversationError as exc:
-            raise SprintInvariantError(str(exc)) from exc
-        return self._route_fingerprint(routes)
+    def _participant_intent_rows(self, sprint_id: int) -> list[sqlite3.Row]:
+        return self.con.execute(
+            "SELECT p.participant_id,p.shell_id,p.role,p.harness,p.model,p.effort,"
+            "p.route,sh.shortname FROM sprint_participants p "
+            "JOIN shells sh ON sh.shell_id=p.shell_id WHERE p.sprint_id=? "
+            "ORDER BY CASE p.role WHEN 'planner' THEN 0 "
+            "WHEN 'developer' THEN 1 ELSE 2 END,p.participant_id",
+            (sprint_id,),
+        ).fetchall()
+
+    def _participant_intent_fingerprint(self, sprint_id: int) -> str:
+        return self._intent_fingerprint(self._participant_intent_rows(sprint_id))
 
     @staticmethod
-    def _route_fingerprint(
-        routes: tuple[sprint_participant_chats.PreparedParticipantRoute, ...],
-    ) -> str:
+    def _intent_fingerprint(participants: Iterable[sqlite3.Row]) -> str:
         snapshot = [
             {
-                "participant_id": route.participant_id,
-                "shell_id": route.shell_id,
-                "role": route.role,
-                "shortname": route.shortname,
-                "harness": route.harness,
-                "provider": route.provider,
-                "model": route.model,
-                "effort": route.effort,
-                "worktree": route.worktree,
+                "participant_id": int(participant["participant_id"]),
+                "shell_id": int(participant["shell_id"]),
+                "role": participant["role"],
+                "shortname": participant["shortname"],
+                "harness": participant["harness"],
+                "model": participant["model"],
+                "effort": participant["effort"],
+                "route": participant["route"],
             }
-            for route in routes
+            for participant in participants
         ]
         payload = json.dumps(snapshot, separators=(",", ":"), sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()
+
+    def _require_candidate_evidence(
+        self,
+        candidates: Iterable[ParticipantBindingCandidate],
+    ) -> None:
+        for candidate in candidates:
+            expected = candidate.evidence_snapshot
+            if expected is None:
+                continue
+            current = self.con.execute(
+                "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+                (candidate.binding["harness"], candidate.binding["requested_model"]),
+            ).fetchone()
+            if current is None or _route_evidence_snapshot(current) != expected:
+                raise SprintInvariantError(
+                    "participant route evidence changed during binding preflight; "
+                    "retry arm"
+                )
+
+    def _bind_candidates(
+        self,
+        candidates: Iterable[ParticipantBindingCandidate],
+        *,
+        transition: str,
+        actor: LifecycleActor,
+        sprint_id: int,
+    ) -> list[dict]:
+        store = route_bindings.ParticipantRouteBindingStore(self.con)
+        receipts = []
+        for candidate in candidates:
+            receipt = store.bind(
+                candidate.participant_id,
+                candidate.binding,
+                candidate.binding_digest,
+                transition=transition,
+                runtime_status=candidate.runtime_status,
+                runtime_scope=candidate.runtime_scope,
+                source_fingerprint=candidate.source_fingerprint,
+                harness_version=candidate.harness_version,
+            )
+            receipt.update(
+                {
+                    "control_state": candidate.binding["control_state"],
+                    "effective_effort": candidate.binding["effective_effort"],
+                }
+            )
+            receipts.append(receipt)
+            if transition == "arm":
+                self._event(
+                    sprint_id, "participant.route_bound", actor, receipt
+                )
+            else:
+                self._event(
+                    sprint_id, "participant.route_revised", actor, receipt
+                )
+        return receipts
 
     def transition(
         self,
@@ -2709,7 +2947,7 @@ class SprintLifecycleStore:
                 "arming requires routed work units with assigned reviewers"
             )
         selections = self.con.execute(
-            "SELECT p.participant_id,p.role,p.harness,p.model,p.effort,"
+            "SELECT p.participant_id,p.role,p.harness,p.model,p.effort,p.route,"
             "sh.shortname FROM sprint_participants p "
             "JOIN shells sh ON sh.shell_id=p.shell_id "
             "WHERE p.sprint_id=? ORDER BY "
@@ -2728,6 +2966,28 @@ class SprintLifecycleStore:
             raise SprintInvariantError(
                 "arming requires recorded model selections for every participant"
             )
+        if _route_binding_schema_available(self.con):
+            if any(
+                row["active_route_binding_id"] is not None
+                for row in self.con.execute(
+                    "SELECT active_route_binding_id FROM sprint_participants "
+                    "WHERE sprint_id=?",
+                    (sprint_id,),
+                )
+            ):
+                raise SprintInvariantError(
+                    "prepared Sprint participants must remain unbound until arm"
+                )
+            if self.con.execute(
+                "SELECT 1 FROM sprint_participant_route_bindings binding "
+                "JOIN sprint_participants participant "
+                "ON participant.participant_id=binding.participant_id "
+                "WHERE participant.sprint_id=? LIMIT 1",
+                (sprint_id,),
+            ).fetchone() is not None:
+                raise SprintInvariantError(
+                    "prepared Sprint cannot contain participant route binding history"
+                )
         return int(planner[0]), selections
 
     def _eligible_conformance_reviewers(self, sprint_id: int) -> tuple[int, ...]:
@@ -2879,9 +3139,31 @@ class SprintLifecycleStore:
         selections: list[sqlite3.Row],
     ) -> int:
         lines = [
-            f"Sprint {sprint_id} armed. Recorded participant launch selections:"
+            f"Sprint {sprint_id} armed. Bound participant routes:"
         ]
+        bindings_available = _route_binding_schema_available(self.con)
         for selection in selections:
+            binding = None
+            if bindings_available:
+                binding = self.con.execute(
+                    "SELECT binding.control_state,binding.requested_model,"
+                    "binding.effective_effort,binding.route_revision "
+                    "FROM sprint_participants participant "
+                    "JOIN sprint_participant_route_bindings binding "
+                    "ON binding.binding_id=participant.active_route_binding_id "
+                    "WHERE participant.participant_id=?",
+                    (selection["participant_id"],),
+                ).fetchone()
+            if binding is not None:
+                model = binding["requested_model"] or "Harness default"
+                effort = binding["effective_effort"] or "uncontrolled"
+                lines.append(
+                    f"- {selection['role']} {selection['shortname']}: "
+                    f"{selection['harness']} · model={model} · "
+                    f"Thinking level={effort} · {binding['control_state']} · "
+                    f"route revision {binding['route_revision']}"
+                )
+                continue
             model = selection["model"] or "default"
             effort = selection["effort"] or "default"
             lines.append(
@@ -3113,18 +3395,21 @@ class SprintParticipantStore:
         model: str | None,
         effort: str | None,
         route: str | None = None,
-    ) -> bool:
+    ) -> ParticipantRerouteReceipt:
         """Validate and replace one idle Developer/Reviewer launch selection."""
-        harness = harness.strip()
-        if not harness:
-            raise ValueError("participant harness is required")
+        try:
+            harness = route_bindings.normalize_harness(harness)
+        except route_bindings.RouteResolutionError as exc:
+            raise SprintPreflightError(
+                exc.message, code=exc.code, details=exc.details
+            ) from exc
         if model is not None:
-            model = model.strip()
-            if not model:
-                raise ValueError("participant model must be non-empty when supplied")
+            if not isinstance(model, str) or not model or model != model.strip():
+                raise ValueError(
+                    "participant model must be an exact non-empty selector"
+                )
         if effort is not None:
-            effort = effort.strip()
-            if not effort:
+            if not isinstance(effort, str) or not effort.strip():
                 raise ValueError("participant effort must be non-empty when supplied")
         if route is not None:
             route = route.strip()
@@ -3143,32 +3428,54 @@ class SprintParticipantStore:
             raise SprintInvariantError(
                 "only Developer or Reviewer participant routes may be changed"
             )
+        proposed = {
+            "participant_id": int(participant["participant_id"]),
+            "harness": harness,
+            "model": model,
+            "effort": effort,
+        }
         try:
-            prepared = sprint_participant_chats.prepare_participant_route(
-                self.con,
-                sprint_id=sprint_id,
-                participant_id=int(participant["participant_id"]),
-                harness=harness,
-                model=model,
-                effort=effort,
-            )
-        except sprint_participant_chats.SprintConversationError as exc:
-            raise SprintPreflightError(str(exc)) from exc
+            candidate = _participant_binding_candidate(self.con, proposed)
+        except route_bindings.RouteResolutionError as exc:
+            raise SprintPreflightError(
+                exc.message, code=exc.code, details=exc.details
+            ) from exc
         try:
-            self.probe_harness(prepared.harness)
+            self.probe_harness(candidate.binding["harness"])
         except AdapterError as exc:
             raise SprintPreflightError(str(exc)) from exc
 
         before = self._projection(participant)
         after = {
-            "harness": prepared.harness,
-            "model": prepared.model,
-            "effort": prepared.effort,
+            "harness": candidate.binding["harness"],
+            "model": candidate.binding["requested_model"],
+            "effort": (
+                candidate.binding["requested_effort"]
+                if effort is not None else None
+            ),
             "route": route if route is not None else participant["route"],
         }
         if before == after:
-            return False
+            active = self._active_binding(participant)
+            return ParticipantRerouteReceipt(
+                changed=False,
+                binding_status=(
+                    "unbound-intent" if lifecycle == "prepared"
+                    else ("bound" if active is not None else "legacy")
+                ),
+                control_state=(
+                    str(active["control_state"])
+                    if active is not None else candidate.binding["control_state"]
+                ),
+                route_revision=(
+                    int(active["route_revision"]) if active is not None else None
+                ),
+                binding_digest=(
+                    str(active["binding_digest"]) if active is not None else None
+                ),
+            )
 
+        binding_receipt = None
         with db_driver.write_transaction(self.con, "sprint.participant.reroute"):
             lifecycle, _ = SprintWorkUnitStore(self.con)._require_planner(
                 sprint_id, planner_shell_id
@@ -3178,11 +3485,45 @@ class SprintParticipantStore:
                     "participant routes may change only while a Sprint is prepared or paused"
                 )
             current = self._participant(sprint_id, participant_shell_id)
-            if self._projection(current) != before:
+            if (
+                self._projection(current) != before
+                or current["active_route_binding_id"]
+                != participant["active_route_binding_id"]
+            ):
                 raise SprintInvariantError(
                     "participant route changed during preflight; retry reroute"
                 )
             self._require_idle_projection(current, lifecycle)
+            if lifecycle == "paused":
+                expected = candidate.evidence_snapshot
+                if expected is not None:
+                    current_evidence = self.con.execute(
+                        "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+                        (
+                            candidate.binding["harness"],
+                            candidate.binding["requested_model"],
+                        ),
+                    ).fetchone()
+                    if (
+                        current_evidence is None
+                        or _route_evidence_snapshot(current_evidence) != expected
+                    ):
+                        raise SprintInvariantError(
+                            "participant route evidence changed during reroute "
+                            "preflight; retry reroute"
+                        )
+                binding_receipt = route_bindings.ParticipantRouteBindingStore(
+                    self.con
+                ).bind(
+                    int(current["participant_id"]),
+                    candidate.binding,
+                    candidate.binding_digest,
+                    transition="reroute",
+                    runtime_status=candidate.runtime_status,
+                    runtime_scope=candidate.runtime_scope,
+                    source_fingerprint=candidate.source_fingerprint,
+                    harness_version=candidate.harness_version,
+                )
             self.con.execute(
                 "UPDATE sprint_participants SET harness=?,model=?,effort=?,route=?,"
                 "updated_at=datetime('now') WHERE participant_id=?",
@@ -3207,18 +3548,75 @@ class SprintParticipantStore:
                             "shell_id": participant_shell_id,
                             "role": str(current["role"]),
                             "before": before,
-                            "after": after,
+                            "after": {
+                                **after,
+                                "binding_status": (
+                                    "bound" if binding_receipt is not None
+                                    else "unbound-intent"
+                                ),
+                                "control_state": candidate.binding["control_state"],
+                                "route_revision": (
+                                    binding_receipt["route_revision"]
+                                    if binding_receipt is not None else None
+                                ),
+                                "binding_digest": (
+                                    candidate.binding_digest
+                                    if binding_receipt is not None else None
+                                ),
+                            },
                         },
                         sort_keys=True,
                     ),
                 ),
             )
-        return True
+            if binding_receipt is not None:
+                self.con.execute(
+                    "INSERT INTO sprint_events "
+                    "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+                    "VALUES (?,'participant.route_revised','planner',?,?)",
+                    (
+                        sprint_id,
+                        planner_shell_id,
+                        json.dumps(
+                            {
+                                **binding_receipt,
+                                "control_state": candidate.binding["control_state"],
+                                "before_binding_digest": (
+                                    str(participant["binding_digest"])
+                                    if participant["binding_digest"] is not None
+                                    else None
+                                ),
+                            },
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+        return ParticipantRerouteReceipt(
+            changed=True,
+            binding_status=(
+                "bound" if binding_receipt is not None else "unbound-intent"
+            ),
+            control_state=candidate.binding["control_state"],
+            route_revision=(
+                binding_receipt["route_revision"]
+                if binding_receipt is not None else None
+            ),
+            binding_digest=(
+                candidate.binding_digest if binding_receipt is not None else None
+            ),
+        )
 
     def _participant(self, sprint_id: int, shell_id: int) -> sqlite3.Row:
         row = self.con.execute(
-            "SELECT participant_id,sprint_id,shell_id,role,harness,model,effort,route "
-            "FROM sprint_participants WHERE sprint_id=? AND shell_id=?",
+            "SELECT participant.participant_id,participant.sprint_id,"
+            "participant.shell_id,participant.role,participant.harness,"
+            "participant.model,participant.effort,participant.route,"
+            "participant.active_route_binding_id,binding.control_state,"
+            "binding.route_revision,binding.binding_digest "
+            "FROM sprint_participants participant "
+            "LEFT JOIN sprint_participant_route_bindings binding "
+            "ON binding.binding_id=participant.active_route_binding_id "
+            "WHERE participant.sprint_id=? AND participant.shell_id=?",
             (sprint_id, shell_id),
         ).fetchone()
         if row is None:
@@ -3226,6 +3624,14 @@ class SprintParticipantStore:
                 f"shell {shell_id} is not a participant in this Sprint"
             )
         return row
+
+    @staticmethod
+    def _active_binding(participant: sqlite3.Row) -> sqlite3.Row | None:
+        return (
+            participant
+            if participant["active_route_binding_id"] is not None
+            else None
+        )
 
     def _require_idle_projection(
         self,
@@ -3256,6 +3662,37 @@ class SprintParticipantStore:
                 f"participant route still owns released work unit "
                 f"{int(active['work_unit_id'])} ({active['disposition']}); "
                 "recall or finish that expectation first"
+            )
+        wake = self.con.execute(
+            "SELECT wake_id,state FROM sprint_wake_outbox "
+            "WHERE participant_id=? AND state IN ('pending','delivering') "
+            "ORDER BY wake_id LIMIT 1",
+            (participant["participant_id"],),
+        ).fetchone()
+        if wake is not None:
+            raise SprintInvariantError(
+                f"participant route still owns wake {int(wake['wake_id'])} "
+                f"({wake['state']}); finish delivery before reroute"
+            )
+        run = self.con.execute(
+            "SELECT run.run_id,run.state FROM sprint_participant_conversations link "
+            "JOIN conversation_runs run "
+            "ON run.conversation_id=link.conversation_id "
+            "WHERE link.sprint_participant_id=? "
+            "AND run.state IN ('leased','starting','running') "
+            "ORDER BY run.run_id LIMIT 1",
+            (participant["participant_id"],),
+        ).fetchone()
+        if run is not None:
+            raise SprintInvariantError(
+                f"participant route still owns run {int(run['run_id'])} "
+                f"({run['state']}); finish the run before reroute"
+            )
+        chat = active_chat_registry.get(self.con, shell_id)
+        if chat is not None:
+            raise SprintInvariantError(
+                f"participant route still owns active chat {chat.chat_id}; "
+                "close and unregister it before reroute"
             )
 
     @staticmethod

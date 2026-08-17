@@ -25,6 +25,7 @@ import sprint_message_delivery as delivery
 import sprint_runtime
 from conversation_adapters import AdapterError
 from conversation_adapters.base import AdapterCapabilities, checked_probe_result
+from sprint_route_binding_support import candidate as route_candidate
 
 
 def apply_schema(con: sqlite3.Connection) -> None:
@@ -36,6 +37,17 @@ def apply_schema(con: sqlite3.Connection) -> None:
 
 class SprintWorkDispatchCase(unittest.TestCase):
     def setUp(self) -> None:
+        route_patch = mock.patch.object(
+            sprint_domain, "_participant_binding_candidate", side_effect=route_candidate
+        )
+        route_patch.start()
+        self.addCleanup(route_patch.stop)
+        evidence_patch = mock.patch.object(
+            sprint_domain.route_bindings,
+            "verify_stored_v2_before_first_turn",
+        )
+        evidence_patch.start()
+        self.addCleanup(evidence_patch.stop)
         quiet_env = mock.patch.dict(
             "os.environ", {"SC_SPRINT_FORCE_NEW_QUIET_SECONDS": "0"}
         )
@@ -224,6 +236,228 @@ class DispatchGateTest(SprintWorkDispatchCase):
 
         self.assertEqual([("codex", False), ("kimi", False)], observed)
 
+    def test_arm_binds_every_participant_once_and_preserves_generation(self) -> None:
+        self.create_unit(developer=1)
+        self.con.execute(
+            "UPDATE sprint_participants SET model='gpt-test',effort='high' "
+            "WHERE sprint_id=? AND shell_id=3",
+            (self.sprint_id,),
+        )
+        self.con.execute(
+            "UPDATE sprint_participants SET harness='vibe',model='devstral',"
+            "effort=NULL WHERE sprint_id=? AND shell_id=1",
+            (self.sprint_id,),
+        )
+        self.con.execute(
+            "UPDATE sprint_participants SET model='kimi-test',effort='medium' "
+            "WHERE sprint_id=? AND role='reviewer'",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+        generation = self.con.execute(
+            "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
+            (self.sprint_id,),
+        ).fetchone()[0]
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+        )
+
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+
+        rows = self.con.execute(
+            "SELECT participant.shell_id,binding.route_revision,"
+            "binding.control_state,binding.requested_model,"
+            "binding.requested_effort,binding.effective_effort,"
+            "binding.catalogue_generation,binding.evidence_digest "
+            "FROM sprint_participants participant "
+            "JOIN sprint_participant_route_bindings binding "
+            "ON binding.binding_id=participant.active_route_binding_id "
+            "WHERE participant.sprint_id=? ORDER BY participant.shell_id",
+            (self.sprint_id,),
+        ).fetchall()
+        self.assertEqual(5, len(rows))
+        self.assertEqual({1, 2, 3, 4, 5}, {int(row[0]) for row in rows})
+        self.assertTrue(all(int(row[1]) == 1 for row in rows))
+        vibe = next(row for row in rows if int(row[0]) == 1)
+        default = next(row for row in rows if int(row[0]) == 4)
+        self.assertEqual(
+            ("native-uncontrolled", "devstral", None, None, None, None),
+            tuple(vibe)[2:],
+        )
+        self.assertEqual(
+            ("harness-default", None, None, None, None, None),
+            tuple(default)[2:],
+        )
+        controlled = [row for row in rows if row[2] == "controlled"]
+        self.assertEqual(3, len(controlled))
+        self.assertTrue(all(row[6] == "1" * 32 for row in controlled))
+        self.assertTrue(all(row[7] == "2" * 64 for row in controlled))
+        self.assertEqual(
+            generation,
+            self.con.execute(
+                "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+
+    def test_arm_binding_failure_rolls_back_every_binding_wake_and_state(self) -> None:
+        self.create_unit(developer=1)
+        original = sprint_domain.route_bindings.ParticipantRouteBindingStore.bind
+        calls = 0
+
+        def fail_second(store, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise ValueError("injected second binding failure")
+            return original(store, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                sprint_domain.route_bindings.ParticipantRouteBindingStore,
+                "bind",
+                new=fail_second,
+            ),
+            self.assertRaisesRegex(ValueError, "second binding failure"),
+        ):
+            self.lifecycle.arm(
+                self.sprint_id, 3, conformance_reviewer_shell_id=2
+            )
+
+        self.assertEqual(
+            ("prepared", 0, 0, 0),
+            (
+                self.con.execute(
+                    "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+                ).fetchone()[0],
+                self.con.execute("SELECT COUNT(*) FROM wake_message").fetchone()[0],
+                self.con.execute(
+                    "SELECT COUNT(*) FROM sprint_participants "
+                    "WHERE active_route_binding_id IS NOT NULL"
+                ).fetchone()[0],
+            ),
+        )
+
+    def test_prepared_reroute_stays_unbound_then_paused_reroute_advances_only_target(
+        self,
+    ) -> None:
+        unit_id = self.create_unit(developer=1)
+        participants = sprint_domain.SprintParticipantStore(
+            self.con, probe_harness=lambda _harness: None
+        )
+        prepared = participants.reroute(
+            self.sprint_id,
+            3,
+            participant_shell_id=4,
+            harness="vibe",
+            model="devstral",
+            effort=None,
+            route="Vibe devstral",
+        )
+        self.assertEqual(
+            (True, "unbound-intent", "native-uncontrolled", None, None),
+            (
+                prepared.changed,
+                prepared.binding_status,
+                prepared.control_state,
+                prepared.route_revision,
+                prepared.binding_digest,
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+        )
+        generation = self.con.execute(
+            "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
+            (self.sprint_id,),
+        ).fetchone()[0]
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        before = {
+            int(row[0]): (int(row[1]), str(row[2]))
+            for row in self.con.execute(
+                "SELECT participant.shell_id,binding.route_revision,"
+                "binding.binding_digest FROM sprint_participants participant "
+                "JOIN sprint_participant_route_bindings binding "
+                "ON binding.binding_id=participant.active_route_binding_id "
+                "WHERE participant.sprint_id=?",
+                (self.sprint_id,),
+            )
+        }
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="reroute idle reserve",
+        )
+        revised = participants.reroute(
+            self.sprint_id,
+            3,
+            participant_shell_id=4,
+            harness="vibe",
+            model="codestral",
+            effort=None,
+            route="Vibe codestral",
+        )
+        self.assertEqual("bound", revised.binding_status)
+        self.assertEqual(2, revised.route_revision)
+        after = {
+            int(row[0]): (int(row[1]), str(row[2]))
+            for row in self.con.execute(
+                "SELECT participant.shell_id,binding.route_revision,"
+                "binding.binding_digest FROM sprint_participants participant "
+                "JOIN sprint_participant_route_bindings binding "
+                "ON binding.binding_id=participant.active_route_binding_id "
+                "WHERE participant.sprint_id=?",
+                (self.sprint_id,),
+            )
+        }
+        self.assertNotEqual(before[4], after[4])
+        self.assertEqual((2, revised.binding_digest), after[4])
+        self.assertEqual(
+            {shell: value for shell, value in before.items() if shell != 4},
+            {shell: value for shell, value in after.items() if shell != 4},
+        )
+        self.assertEqual(
+            generation,
+            self.con.execute(
+                "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError, "still owns released work unit"
+        ):
+            participants.reroute(
+                self.sprint_id,
+                3,
+                participant_shell_id=1,
+                harness="vibe",
+                model="blocked",
+                effort=None,
+            )
+        self.assertEqual(
+            "ready",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (unit_id,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(1, before[1][0])
+        self.assertEqual(before[1], after[1])
+
     def test_arm_default_preflight_uses_the_conversation_adapter_probe(self) -> None:
         self.create_unit(developer=1)
         adapters = {
@@ -287,7 +521,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
 
         with self.assertRaisesRegex(
             sprint_domain.SprintInvariantError,
-            "unknown-harness.*no browser conversation adapter",
+            "Harness is not supported",
         ) as caught:
             self.lifecycle.arm(
                 self.sprint_id, 3, conformance_reviewer_shell_id=2
@@ -382,7 +616,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
 
         with self.assertRaisesRegex(
             sprint_domain.SprintInvariantError,
-            "changed during harness preflight; retry arm",
+            "route intents changed during binding preflight; retry arm",
         ) as caught:
             sprint_domain.SprintLifecycleStore(
                 self.con, probe_harness=mutate_once
@@ -396,7 +630,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
                 409,
                 {
                     "error": (
-                        "participant launch selections changed during harness "
+                        "participant route intents changed during binding "
                         "preflight; retry arm"
                     )
                 },
@@ -453,12 +687,17 @@ class DispatchGateTest(SprintWorkDispatchCase):
             ),
         )
         self.assertEqual(
-            "Sprint 1 armed. Recorded participant launch selections:\n"
-            "- planner PLN1: codex · model=default · effort=default\n"
-            "- developer DEV1: codex · model=default · effort=default\n"
-            "- developer DEV2: codex · model=default · effort=default\n"
-            "- reviewer REV1: kimi · model=default · effort=default\n"
-            "- reviewer REV2: kimi · model=default · effort=default",
+            "Sprint 1 armed. Bound participant routes:\n"
+            "- planner PLN1: codex · model=Harness default · "
+            "Thinking level=uncontrolled · harness-default · route revision 1\n"
+            "- developer DEV1: codex · model=Harness default · "
+            "Thinking level=uncontrolled · harness-default · route revision 1\n"
+            "- developer DEV2: codex · model=Harness default · "
+            "Thinking level=uncontrolled · harness-default · route revision 1\n"
+            "- reviewer REV1: kimi · model=Harness default · "
+            "Thinking level=uncontrolled · harness-default · route revision 1\n"
+            "- reviewer REV2: kimi · model=Harness default · "
+            "Thinking level=uncontrolled · harness-default · route revision 1",
             planner_wake["body"],
         )
 

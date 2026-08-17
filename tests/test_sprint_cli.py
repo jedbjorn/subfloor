@@ -29,6 +29,7 @@ import sprint_domain
 import sprint_message_delivery
 import sprint_pr_watcher
 from github_pull_requests import PullRequest
+from sprint_route_binding_support import candidate as route_candidate
 from test_sprint_v2_domain import apply_schema
 
 TOKENS = {
@@ -160,6 +161,17 @@ class SprintCliApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         global _SPRINT_CLI_TEMP_PATH
+        cls._route_patch = mock.patch.object(
+            sprint_domain, "_participant_binding_candidate", side_effect=route_candidate
+        )
+        cls._route_patch.start()
+        cls.addClassCleanup(cls._route_patch.stop)
+        cls._evidence_patch = mock.patch.object(
+            sprint_domain.route_bindings,
+            "verify_stored_v2_before_first_turn",
+        )
+        cls._evidence_patch.start()
+        cls.addClassCleanup(cls._evidence_patch.stop)
         cls._temporary = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls._temporary.cleanup)
         cls.tmp = Path(cls._temporary.name)
@@ -1247,13 +1259,18 @@ class SprintCliApiTest(unittest.TestCase):
         )["work_unit_id"]
         self.assertNotEqual(first_unit, repeated_unit)
 
-        self.run_cli(
+        armed = self.run_cli(
             TOKENS["planner"],
             "arm",
             "--sprint",
             str(sprint_id),
             "--conformance-reviewer-shell",
             "2",
+        )
+        self.assertEqual(4, len(armed["participant_bindings"]))
+        self.assertEqual(
+            {1},
+            {binding["route_revision"] for binding in armed["participant_bindings"]},
         )
         con = sqlite3.connect(self.db)
         try:
@@ -1343,7 +1360,16 @@ class SprintCliApiTest(unittest.TestCase):
             "--route",
             "codex/replacement-model",
         )
-        self.assertTrue(rerouted["changed"])
+        self.assertEqual(
+            (True, "bound", "controlled", 2, 64),
+            (
+                rerouted["changed"],
+                rerouted["binding_status"],
+                rerouted["control_state"],
+                rerouted["route_revision"],
+                len(rerouted["binding_digest"]),
+            ),
+        )
         resumed = self.run_cli(
             TOKENS["planner"],
             "resume",

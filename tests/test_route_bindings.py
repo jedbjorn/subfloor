@@ -110,6 +110,10 @@ def route_schema(path: str | Path = ":memory:") -> sqlite3.Connection:
         ROOT / ".super-coder" / "migrations" /
         "0212_route_binding_foundation.sql"
     ).read_text())
+    con.executescript((
+        ROOT / ".super-coder" / "migrations" /
+        "0216_sprint_binding_provenance.sql"
+    ).read_text())
     return con
 
 
@@ -1471,6 +1475,9 @@ class GenerationPersistenceTest(unittest.TestCase):
 
 
 class ParticipantRevisionTest(unittest.TestCase):
+    CONTROLLED_SOURCE_FINGERPRINT = "2" * 64
+    CONTROLLED_HARNESS_VERSION = "0.145.0"
+
     def setUp(self):
         self.con = route_schema()
         self.addCleanup(self.con.close)
@@ -1514,7 +1521,7 @@ class ParticipantRevisionTest(unittest.TestCase):
     def stored_binding(self, binding_id: int) -> tuple[sqlite3.Row, dict]:
         rows = self.con.execute(
             "SELECT participant_id,route_revision,control_state,harness,"
-            "binding_json,binding_digest FROM "
+            "binding_json,binding_digest,source_fingerprint,harness_version FROM "
             "sprint_participant_route_bindings WHERE binding_id=?",
             (binding_id,),
         ).fetchall()
@@ -1795,7 +1802,14 @@ class ParticipantRevisionTest(unittest.TestCase):
     def test_controlled_binding_survives_store_json_round_trip(self):
         binding = self.controlled_binding()
         digest = route_bindings.digest_json(binding)
-        receipt = self.store.bind(10, binding, digest, transition="arm")
+        receipt = self.store.bind(
+            10,
+            binding,
+            digest,
+            transition="arm",
+            source_fingerprint=self.CONTROLLED_SOURCE_FINGERPRINT,
+            harness_version=self.CONTROLLED_HARNESS_VERSION,
+        )
 
         row, decoded = self.stored_binding(receipt["binding_id"])
         self.assertEqual(
@@ -1804,6 +1818,13 @@ class ParticipantRevisionTest(unittest.TestCase):
             (10, 1, "controlled", "codex", digest),
         )
         self.assertEqual(decoded, binding)
+        self.assertEqual(
+            (row["source_fingerprint"], row["harness_version"]),
+            (
+                self.CONTROLLED_SOURCE_FINGERPRINT,
+                self.CONTROLLED_HARNESS_VERSION,
+            ),
+        )
         self.assertEqual(
             self.con.execute(
                 "SELECT active_route_binding_id FROM sprint_participants "
@@ -1835,6 +1856,8 @@ class ParticipantRevisionTest(unittest.TestCase):
             (10, 1, "native-uncontrolled", "vibe", self.digest),
         )
         self.assertEqual(decoded, self.binding)
+        self.assertIsNone(row["source_fingerprint"])
+        self.assertEqual(row["harness_version"], "2.22.0")
         self.assertEqual(
             self.con.execute(
                 "SELECT active_route_binding_id FROM sprint_participants "
@@ -1852,6 +1875,26 @@ class ParticipantRevisionTest(unittest.TestCase):
             "SELECT active_route_binding_id FROM sprint_participants "
             "WHERE participant_id=11"
         ).fetchone()[0])
+
+    def test_controlled_binding_requires_immutable_source_provenance(self):
+        binding = self.controlled_binding()
+        digest = route_bindings.digest_json(binding)
+
+        with self.assertRaisesRegex(ValueError, "immutable source provenance"):
+            self.store.bind(10, binding, digest, transition="arm")
+
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT active_route_binding_id FROM sprint_participants "
+                "WHERE participant_id=10"
+            ).fetchone()[0]
+        )
 
     def test_validator_accepts_reordered_exact_keys_and_rejects_key_drift(self):
         controlled = self.controlled_binding()

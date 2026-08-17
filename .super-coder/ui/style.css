@@ -102,6 +102,15 @@ main { padding: 1.2rem; flex: 1 0 auto; min-height: 0; }
 .sprint-header-context { grid-area: context; }
 .sprint-header-times { grid-area: times; }
 .sprint-header-context, .sprint-header-times { margin-top: .45rem; font-size: .76rem; color: var(--dim); }
+.sprint-participant-bindings {
+  grid-column: 1 / -1; display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: .5rem; margin-top: .7rem;
+}
+.sprint-participant-binding {
+  display: grid; gap: .15rem; padding: .5rem .65rem;
+  border: 1px solid var(--line); border-radius: 7px; font-size: .76rem;
+}
 .sprint-spec-links { display: inline-flex; gap: .45rem; }
 .sprint-terminal-outcome { grid-column: 1 / -1; margin-top: .7rem; padding-top: .6rem; border-top: 1px solid var(--line); }
 .workflow-health-alert, .workflow-recovery-alert {

@@ -29,6 +29,7 @@ import db_driver  # noqa: E402
 import migrate  # noqa: E402
 import sprint_domain  # noqa: E402
 import sprint_message_delivery  # noqa: E402
+from sprint_route_binding_support import candidate as route_candidate  # noqa: E402
 
 
 def apply_schema(con: sqlite3.Connection, *, through: str | None = None) -> None:
@@ -42,6 +43,17 @@ def apply_schema(con: sqlite3.Connection, *, through: str | None = None) -> None
 
 class SprintDomainCase(unittest.TestCase):
     def setUp(self) -> None:
+        route_patch = mock.patch.object(
+            sprint_domain, "_participant_binding_candidate", side_effect=route_candidate
+        )
+        route_patch.start()
+        self.addCleanup(route_patch.stop)
+        evidence_patch = mock.patch.object(
+            sprint_domain.route_bindings,
+            "verify_stored_v2_before_first_turn",
+        )
+        evidence_patch.start()
+        self.addCleanup(evidence_patch.stop)
         self.con = sqlite3.connect(":memory:")
         self.addCleanup(self.con.close)
         self.con.row_factory = sqlite3.Row

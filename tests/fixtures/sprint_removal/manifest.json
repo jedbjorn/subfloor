@@ -57,6 +57,7 @@
     "tests/test_sprint_skills.py",
     "tests/test_sprint_snapshot_rebuild.py",
     "tests/test_route_bindings.py",
+    "tests/sprint_route_binding_support.py",
     "tests/test_model_catalog.py",
     "tests/test_sprint_spec_revisions.py",
     "tests/test_sprint_live_proof.py",
@@ -110,7 +111,9 @@
     ".super-coder/migrations/0207_reseed_sprint_receipt_recovery.sql",
     ".super-coder/migrations/0208_reseed_disposable_shell_base.sql",
     ".super-coder/migrations/0209_reseed_git_github_capabilities.sql",
-    ".super-coder/migrations/0212_route_binding_foundation.sql"
+    ".super-coder/migrations/0212_route_binding_foundation.sql",
+    ".super-coder/migrations/0215_reseed_sprint_binding_guidance.sql",
+    ".super-coder/migrations/0216_sprint_binding_provenance.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
@@ -577,6 +580,7 @@
         "const page = await api(`/sprints/${requestedSprintId}/${kind}?limit=50${suffix}`);",
         "const result = await api(`/sprints/${sprint.sprint_id}`, \"PATCH\", {",
         "const row = el(\"div\", { className: \"sprint-actions\" });",
+        "const rows = el(\"div\", { className: \"sprint-participant-bindings\" });",
         "const scroll = el(\"div\", { className: \"sprint-board-scroll\" });",
         "const scroll = root.querySelector?.(\".sprint-board-scroll\");",
         "const section = el(\"div\", { className: \"sprint-audit-section\" }, el(\"h3\", {}, title));",
@@ -597,6 +601,7 @@
         "el(\"div\", { className: \"sprint-long-text\" }, message.body))));",
         "el(\"div\", { className: \"sprint-long-text\" }, unit.completion_result));",
         "el(\"div\", { className: \"sprint-message-audit\" },",
+        "rows.append(el(\"div\", { className: \"sprint-participant-binding\" },",
         "el(\"div\", { className: \"sprint-terminal-outcome\" }, `Outcome: ${sprint.terminal_outcome}`));",
         "el(\"div\", { className: \"sprint-toolbar\" }, selector), content),",
         "el(\"div\", { className: \"sprint-unit-deps\" },",
@@ -717,6 +722,8 @@
         ".sprint-board-head {",
         ".sprint-board-scroll { overflow-x: auto; padding: .9rem 1rem 1rem; border-top: 1px solid var(--line); background: var(--bg); }",
         ".sprint-board-view {",
+        ".sprint-participant-binding {",
+        ".sprint-participant-bindings {",
         ".sprint-cancelled-note { color: var(--warn); font-size: .7rem; }",
         ".sprint-column > h3 { display: flex; align-items: center; gap: .4rem; margin: 0 0 .55rem; padding: 0 .25rem .45rem; border-bottom: 1px solid var(--line); text-transform: uppercase; letter-spacing: .08em; font-size: .72rem; }",
         ".sprint-column { min-width: 0; }",

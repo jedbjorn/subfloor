@@ -18,7 +18,9 @@ sys.path[:0] = [str(ENGINE / "api"), str(ENGINE / "scripts")]
 
 import server
 import sprint_board
+import route_bindings
 from github_pull_requests import PullRequest
+from sprint_route_binding_support import candidate as route_candidate
 
 _DYNAMIC_EVENT_CALLS = {
     ("sprint_domain.py", "f'lifecycle.{target}'"): {"lifecycle.completed"},
@@ -1234,6 +1236,129 @@ class SprintBoardApiCase(unittest.TestCase):
             self.assertFalse(con.in_transaction)
             self.assertEqual(1, sum(sql == "BEGIN" for sql in statements))
             self.assertEqual(1, sum(sql == "ROLLBACK" for sql in statements))
+
+    def test_board_projects_prepared_legacy_and_bound_route_contracts(self):
+        sprint_id = self.ids["sprint_id"]
+        with self.connect() as con:
+            prepared_sprint_id = int(
+                con.execute(
+                    "INSERT INTO sprints "
+                    "(feature_id,originating_planner_shell_id,lifecycle) "
+                    "SELECT feature_id,originating_planner_shell_id,'prepared' "
+                    "FROM sprints WHERE sprint_id=?",
+                    (sprint_id,),
+                ).lastrowid
+            )
+            con.executemany(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness,model,effort,disposition) "
+                "VALUES (?,?,'developer',?,?,?,'idle')",
+                (
+                    (prepared_sprint_id, 5, "codex", "gpt-5.4", "high"),
+                    (prepared_sprint_id, 6, "vibe", "vibe-model", None),
+                    (prepared_sprint_id, 7, "codex", None, None),
+                ),
+            )
+            prepared = sprint_board.SprintBoardProjection(con).board(
+                prepared_sprint_id
+            )
+            self.assertEqual(
+                {"unbound-intent"},
+                {row["binding_status"] for row in prepared["participants"]},
+            )
+            prepared_by_shell = {
+                row["shortname"]: row for row in prepared["participants"]
+            }
+            self.assertEqual(
+                (
+                    None,
+                    None,
+                    "controlled",
+                    "high",
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    prepared_by_shell["DEV2"]["control_state"],
+                    prepared_by_shell["DEV2"]["effective_effort"],
+                    prepared_by_shell["DEV2"]["intent_control_state"],
+                    prepared_by_shell["DEV2"]["intent_effective_effort"],
+                    prepared_by_shell["DEV2"]["route_revision"],
+                    prepared_by_shell["DEV2"]["binding_digest"],
+                    prepared_by_shell["DEV2"]["catalogue_generation"],
+                ),
+            )
+            self.assertEqual(
+                ("native-uncontrolled", None),
+                (
+                    prepared_by_shell["DEV3"]["intent_control_state"],
+                    prepared_by_shell["DEV3"]["intent_effective_effort"],
+                ),
+            )
+            self.assertEqual(
+                ("harness-default", None),
+                (
+                    prepared_by_shell["DEV4"]["intent_control_state"],
+                    prepared_by_shell["DEV4"]["intent_effective_effort"],
+                ),
+            )
+            participant = con.execute(
+                "SELECT participant_id,harness,model,effort "
+                "FROM sprint_participants WHERE sprint_id=? AND role='developer' "
+                "ORDER BY participant_id LIMIT 1",
+                (sprint_id,),
+            ).fetchone()
+            con.execute(
+                "UPDATE sprints SET lifecycle='paused',paused_at=datetime('now') "
+                "WHERE sprint_id=?",
+                (sprint_id,),
+            )
+            resolved = route_candidate(con, participant)
+            receipt = route_bindings.ParticipantRouteBindingStore(con).bind(
+                int(participant["participant_id"]),
+                resolved.binding,
+                resolved.binding_digest,
+                transition="reroute",
+                runtime_status=resolved.runtime_status,
+                runtime_scope=resolved.runtime_scope,
+            )
+            con.commit()
+
+            armed = sprint_board.SprintBoardProjection(con).board(sprint_id)
+            bound = next(
+                row for row in armed["participants"]
+                if row["participant_id"] == int(participant["participant_id"])
+            )
+            legacy = next(
+                row for row in armed["participants"]
+                if row["participant_id"] != int(participant["participant_id"])
+            )
+            self.assertEqual(
+                (
+                    "bound",
+                    2,
+                    "harness-default",
+                    1,
+                    receipt["binding_digest"],
+                ),
+                (
+                    bound["binding_status"],
+                    bound["route_contract_version"],
+                    bound["control_state"],
+                    bound["route_revision"],
+                    bound["binding_digest"],
+                ),
+            )
+            self.assertEqual(
+                ("legacy", 1, None, None),
+                (
+                    legacy["binding_status"],
+                    legacy["route_contract_version"],
+                    legacy["route_revision"],
+                    legacy["binding_digest"],
+                ),
+            )
 
     def test_every_read_surface_is_side_effect_free_and_never_reads_external_prs(self):
         sprint_id = self.ids["sprint_id"]
