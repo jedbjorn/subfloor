@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -62,6 +63,79 @@ class _DisconnectingWriter:
 
 
 class ConversationApiCase(unittest.TestCase):
+    @staticmethod
+    def runtime_status(harness: str) -> dict:
+        versions = {
+            "claude": ("2.1.222", "2.1.220", "2.2.0"),
+            "codex": ("0.145.0", "0.145.0", "0.147.0"),
+            "kimi": ("0.33.0", "0.30.0", "0.34.0"),
+            "opencode": ("1.18.9", "1.18.9", "1.19.0"),
+        }
+        version, minimum, maximum = versions[harness]
+        scope = conversation_routes.model_catalog.harness_versions.runtime_scope()
+        return {
+            "harness": harness, **scope, "version": version,
+            "compatibility": "verified", "minimum_version": minimum,
+            "maximum_version_exclusive": maximum,
+            "verified_version": version, "error": None,
+        }
+
+    @classmethod
+    def controlled_evidence(cls, harness: str, _selector: str) -> dict:
+        status = cls.runtime_status(harness)
+        return {
+            "runtime_status": status,
+            "runtime_scope": {
+                "runtime": status["runtime"],
+                "runtime_identity": status["runtime_identity"],
+            },
+            "source_fingerprint": "f" * 64,
+        }
+
+    @classmethod
+    def seed_controlled_route(
+        cls, con: sqlite3.Connection, harness: str, model: str,
+    ) -> None:
+        status = cls.runtime_status(harness)
+        now = datetime.now(timezone.utc).isoformat()
+        con.execute(
+            "INSERT OR IGNORE INTO model_catalog_generations ("
+            "generation_id,payload_version,contract_version,started_at,"
+            "completed_at,state,runtime,source_summary,harness_versions,"
+            "source_fingerprints,error_summary,payload_digest"
+            ") VALUES (?,?,?,?,?,'successful',?,'[]','{}','{}',NULL,?)",
+            ("a" * 32, 6, 2, now, now, status["runtime"], "b" * 64),
+        )
+        opencode = harness == "opencode"
+        con.execute(
+            "INSERT INTO model_routes ("
+            "harness,selector,provider_model,source,availability,"
+            "headless_supported,high_effort_supported,supported_efforts,"
+            "default_effort,cli_version,last_seen_at,stale,generation_id,"
+            "evidence_kind,evidence_digest,source_fingerprint,harness_version,"
+            "harness_compatibility,selector_binding,effort_metadata,"
+            "adapter_metadata) VALUES (?,?,?,?,?,1,1,'[\"low\",\"high\"]',"
+            "'high',?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                harness, model, model,
+                "opencode-provider-api" if opencode else "codex-cache",
+                "available", f"{harness} {status['version']}", now, 0,
+                "a" * 32,
+                "opencode-connected-variant" if opencode
+                else "codex-model-cache",
+                "e" * 64, "f" * 64, status["version"], "verified",
+                json.dumps({"kind": "exact-model", "selector": model}),
+                json.dumps({
+                    "supported": ["low", "high"], "default": "high",
+                    "digests": {"low": "d" * 64, "high": "e" * 64},
+                    "native_variant_ids": {"low": "low", "high": "high"}
+                    if opencode else {},
+                }),
+                json.dumps({"variant_options": {"reasoningEffort": "high"}})
+                if opencode else "{}",
+            ),
+        )
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -81,6 +155,11 @@ class ConversationApiCase(unittest.TestCase):
             "(2,'Review','review','dev','prompt',1,'review-token'),"
             "(3,'Admin','ADM1','admin','prompt',1,'admin-token')"
         )
+        default_model = con.execute(
+            "SELECT model FROM flavor_defaults "
+            "WHERE flavor='dev' AND harness='codex'"
+        ).fetchone()[0]
+        self.seed_controlled_route(con, "codex", default_model)
         con.commit()
         con.close()
         (self.root / ".sc-worktrees" / "dev").mkdir(parents=True)
@@ -103,6 +182,16 @@ class ConversationApiCase(unittest.TestCase):
                 conversation_routes,
                 "_live_shell_session",
                 return_value=None,
+            ),
+            mock.patch.object(
+                conversation_routes.model_catalog,
+                "harness_runtime_status",
+                side_effect=self.runtime_status,
+            ),
+            mock.patch.object(
+                conversation_routes.model_catalog,
+                "controlled_route_evidence",
+                side_effect=self.controlled_evidence,
             ),
         )
         for patch in patches:
@@ -973,7 +1062,7 @@ class ConversationResourceTest(ConversationApiCase):
             ],
         )
 
-    def test_opencode_uses_the_common_unresolved_model_refusal(self) -> None:
+    def test_opencode_harness_default_and_exact_model_bind_v2(self) -> None:
         with mock.patch.object(
             conversation_routes.run_mod,
             "flavor_defaults",
@@ -990,13 +1079,13 @@ class ConversationResourceTest(ConversationApiCase):
                 body={"shell_id": 1, "harness": "opencode"},
                 key="opencode-no-model",
             )
-        self.assertEqual(status, 422)
-        self.assertEqual(error["error"]["code"], "HARNESS_ROUTE_INVALID")
-        self.assertEqual(
-            error["error"]["message"],
-            "harness 'opencode' cannot resolve a model: no model was supplied "
-            "and no flavor default exists for it; supply an explicit model",
-        )
+        self.assertEqual(status, 201, error)
+        self.assertEqual(error["route"]["control_state"], "harness-default")
+        self.assertIsNone(error["route"]["model"])
+        self.assertIsNone(error["route"]["effort"])
+
+        with self.connect() as con:
+            self.seed_controlled_route(con, "opencode", "openai/gpt-connected")
 
         status, _, created = self.request(
             "POST",
@@ -1010,11 +1099,13 @@ class ConversationResourceTest(ConversationApiCase):
         )
         self.assertEqual(status, 201, created)
         self.assertEqual(created["route"]["model"], "openai/gpt-connected")
+        self.assertEqual(created["route"]["effort"], "high")
+        self.assertEqual(created["route"]["control_state"], "controlled")
+        self.assertEqual(created["route"]["native_variant_id"], "high")
 
-    def test_kimi_create_refuses_unresolved_model_before_writing_a_chat(
+    def test_kimi_create_binds_typed_harness_default_without_catalogue(
         self,
     ) -> None:
-        resolver = conversation_routes.run_mod.resolve_headless_route
         with mock.patch.object(
             conversation_routes.run_mod,
             "flavor_defaults",
@@ -1024,38 +1115,22 @@ class ConversationResourceTest(ConversationApiCase):
                     "models": {},
                 }
             },
-        ), mock.patch.object(
-            conversation_routes.run_mod,
-            "resolve_headless_route",
-            wraps=resolver,
-        ) as resolve:
+        ):
             status, _, error = self.request(
                 "POST",
                 "/api/conversations",
                 body={"shell_id": 1, "harness": "kimi"},
                 key="kimi-unresolved-model",
             )
-        self.assertEqual(status, 422, error)
-        self.assertEqual(
-            error["error"]["code"],
-            "HARNESS_ROUTE_INVALID",
-        )
-        self.assertEqual(
-            error["error"]["message"],
-            "harness 'kimi' cannot resolve a model: no model was supplied and "
-            "no flavor default exists for it; supply an explicit model",
-        )
-        resolve.assert_called_once_with(
-            harness="kimi",
-            adapter=mock.ANY,
-            flavor_model=None,
-            model=None,
-            effort=None,
-        )
+        self.assertEqual(status, 201, error)
+        self.assertEqual(error["route"]["contract_version"], 2)
+        self.assertEqual(error["route"]["control_state"], "harness-default")
+        self.assertIsNone(error["route"]["model"])
+        self.assertIsNone(error["route"]["effort"])
         with closing(self.connect()) as con:
             self.assertEqual(
                 con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
-                0,
+                1,
             )
 
     def test_create_is_idempotent_and_never_exposes_native_identity(self) -> None:
@@ -1066,6 +1141,10 @@ class ConversationResourceTest(ConversationApiCase):
         self.assertNotIn("harness_session_ref", json.dumps(first))
         self.assertNotIn("mode", first)
         self.assertEqual(first["route"]["harness"], "codex")
+        self.assertEqual(first["route"]["contract_version"], 2)
+        self.assertEqual(first["route"]["control_state"], "controlled")
+        self.assertFalse(first["route"]["legacy"])
+        self.assertRegex(first["route"]["binding_digest"], r"^[0-9a-f]{64}$")
 
         status, _, error = self.request(
             "POST",
@@ -1084,6 +1163,129 @@ class ConversationResourceTest(ConversationApiCase):
         con.close()
         self.assertEqual(count, 1)
         self.assertEqual(tuple(event), (1, "conversation.created"))
+
+    def test_controlled_replay_uses_stored_binding_after_catalogue_drift(self) -> None:
+        first = self.create(key="controlled-replay")
+        with self.connect() as con:
+            con.execute("UPDATE model_routes SET stale=1")
+        with mock.patch.object(
+            conversation_routes.model_catalog,
+            "harness_runtime_status",
+            side_effect=AssertionError("replay must not probe today's runtime"),
+        ) as runtime_probe:
+            status, _, replay = self.request(
+                "POST",
+                "/api/conversations",
+                body={"shell_id": 1, "harness": "codex", "effort": " HIGH "},
+                key="controlled-replay",
+            )
+        self.assertEqual(status, 201, replay)
+        self.assertEqual(replay, first)
+        runtime_probe.assert_not_called()
+
+    def test_explicit_model_omission_means_high_on_replay(self) -> None:
+        with self.connect() as con:
+            model = con.execute(
+                "SELECT model FROM flavor_defaults "
+                "WHERE flavor='dev' AND harness='codex'"
+            ).fetchone()[0]
+        status, _, first = self.request(
+            "POST", "/api/conversations",
+            body={"shell_id": 1, "harness": "codex",
+                  "model": model, "effort": "low"},
+            key="explicit-low",
+        )
+        self.assertEqual(status, 201, first)
+        self.assertEqual(first["route"]["effort"], "low")
+
+        status, _, error = self.request(
+            "POST", "/api/conversations",
+            body={"shell_id": 1, "harness": "codex", "model": model},
+            key="explicit-low",
+        )
+        self.assertEqual(status, 409, error)
+        self.assertEqual(
+            error["error"]["code"], "CONVERSATION_IDEMPOTENCY_CONFLICT")
+
+    def test_harness_default_null_replay_and_nonnull_refusal(self) -> None:
+        body = {"shell_id": 1, "harness": "kimi", "model": None}
+        status, _, first = self.request(
+            "POST", "/api/conversations", body=body, key="default-replay",
+        )
+        self.assertEqual(status, 201, first)
+        self.assertEqual(first["route"]["control_state"], "harness-default")
+
+        status, _, replay = self.request(
+            "POST", "/api/conversations",
+            body={**body, "effort": None}, key="default-replay",
+        )
+        self.assertEqual(status, 201, replay)
+        self.assertEqual(replay, first)
+
+        status, _, error = self.request(
+            "POST", "/api/conversations",
+            body={**body, "effort": "high"}, key="default-replay",
+        )
+        self.assertEqual(status, 422, error)
+        self.assertEqual(
+            error["error"]["code"], "unsupported_thinking_level")
+        with self.connect() as con:
+            rows = con.execute(
+                "SELECT route_contract_version,route_binding,model,effort "
+                "FROM conversations WHERE creation_idempotency_key=?",
+                ("default-replay",),
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["route_contract_version"], rows[0]["model"],
+                          rows[0]["effort"]), (2, None, None))
+        self.assertEqual(
+            json.loads(rows[0]["route_binding"])["control_state"],
+            "harness-default",
+        )
+
+    def test_unsupported_controlled_effort_persists_no_conversation(self) -> None:
+        status, _, error = self.request(
+            "POST", "/api/conversations",
+            body={"shell_id": 1, "harness": "codex", "effort": "max"},
+            key="unsupported-effort",
+        )
+        self.assertEqual(status, 422, error)
+        self.assertEqual(
+            error["error"]["code"], "unsupported_thinking_level")
+        with self.connect() as con:
+            self.assertEqual(
+                con.execute(
+                    "SELECT COUNT(*) FROM conversations "
+                    "WHERE creation_idempotency_key='unsupported-effort'"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_legacy_creation_key_replays_without_v2_resolution(self) -> None:
+        with self.connect() as con:
+            con.execute(
+                "INSERT INTO conversations "
+                "(conversation_id,shell_id,owner_user_id,harness,model,effort,"
+                "worktree,title,creation_idempotency_key,creation_request_hash) "
+                "VALUES ('cv_11111111111111111111111111111111',1,1,'codex',"
+                "'historical-model','MiXeD',?,'Legacy','legacy-key','old-hash')",
+                (str(self.root / ".sc-worktrees" / "dev"),),
+            )
+        with mock.patch.object(
+            conversation_routes.model_catalog,
+            "harness_runtime_status",
+            side_effect=AssertionError("legacy replay must not resolve v2"),
+        ) as runtime_probe:
+            status, _, replay = self.request(
+                "POST", "/api/conversations",
+                body={"shell_id": 1, "harness": "codex", "title": "Legacy"},
+                key="legacy-key",
+            )
+        self.assertEqual(status, 201, replay)
+        self.assertTrue(replay["route"]["legacy"])
+        self.assertEqual(replay["route"]["effort"], "MiXeD")
+        self.assertIsNone(replay["route"]["binding_digest"])
+        runtime_probe.assert_not_called()
 
     def test_fnb_close_closes_sprint_chat_and_enables_coordinate_mode(
         self,

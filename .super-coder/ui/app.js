@@ -415,7 +415,38 @@ async function renderShells(root) {
 // value. Arrow keys move the highlight, Enter chooses it, and Escape/outside
 // click closes without changing the current selection.
 
-function dmModelPicker(harness, cat, row, save) {
+function thinkingLevelState(harness, catalog, model, preferred = null) {
+  if (harness === "vibe") return {
+    disabled: true, selected: "", supported: [],
+    label: "Thinking control unavailable",
+    guidance: "Vibe uses its native thinking behavior.",
+  };
+  if (!model) return {
+    disabled: true, selected: "", supported: [], label: "Harness default",
+    guidance: "The harness chooses both model and thinking level.",
+  };
+  const route = (catalog.harnesses?.[harness]?.models || [])
+    .find((candidate) => candidate.id === model);
+  const supported = [...new Set(route?.supported_efforts || [])];
+  const fresh = Boolean(
+    route && route.availability === "available" && !catalog.stale);
+  const selected = supported.includes(preferred)
+    ? preferred : supported.includes("high") ? "high" : "";
+  if (!fresh) return {
+    disabled: true, selected, supported,
+    label: selected || "Refresh required",
+    guidance: "Refresh & verify Default Models before saving this route.",
+  };
+  return {
+    disabled: false, selected, supported,
+    label: selected || "Choose Thinking level",
+    guidance: selected
+      ? `Thinking level ${selected} is proven for ${model}.`
+      : "Choose a supported Thinking level before saving.",
+  };
+}
+
+function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
   const data = cat.harnesses?.[harness] || { models: [] };
   const currentRoute = (data.models || []).find((m) => m.id === row.model);
   const currentAvailable = !row.model || (
@@ -453,7 +484,11 @@ function dmModelPicker(harness, cat, row, save) {
   };
   const pick = async (value) => {
     try {
-      await save(value);
+      const result = await save(value);
+      if (result && Object.prototype.hasOwnProperty.call(result, "effort")) {
+        row.effort = result.effort;
+        row.effective_effort = result.effort;
+      }
     } catch (e) {
       current.title = e.message;
       return;
@@ -462,6 +497,7 @@ function dmModelPicker(harness, cat, row, save) {
     current.textContent = value || "Harness default";
     current.classList.toggle("dm-unset", !value);
     current.classList.remove("dm-stale");
+    onRouteChanged();
     close();
   };
   const routeSub = (m) => {
@@ -645,15 +681,89 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
         } catch (e) { toast("error: " + e.message); }
         renderDefaultModels(root, s);   // reflect the sibling un-star
       };
+      const thinking = el("select", {
+        className: "dm-thinking",
+        ariaLabel: `Thinking level for ${flavor} ${h}`,
+      });
+      const paintThinking = () => {
+        const preferred = row.effort ?? row.effective_effort;
+        const state = thinkingLevelState(h, cat, row.model, preferred);
+        thinking.replaceChildren();
+        if (!state.supported.length) {
+          thinking.append(el("option", {
+            value: "", textContent: state.label, selected: true,
+          }));
+        } else {
+          if (!state.selected) thinking.append(el("option", {
+            value: "", textContent: "Choose Thinking level", selected: true,
+            disabled: true,
+          }));
+          for (const effort of state.supported) thinking.append(el("option", {
+            value: effort,
+            textContent: effort,
+            selected: effort === state.selected,
+          }));
+        }
+        thinking.disabled = state.disabled;
+        thinking.title = state.guidance;
+      };
+      thinking.onchange = async () => {
+        const effort = thinking.value;
+        if (!row.model || !effort) return;
+        thinking.disabled = true;
+        try {
+          await api("/flavor-defaults", "POST", {
+            flavor, harness: h, model: row.model, effort,
+          });
+          row.effort = effort;
+          row.effective_effort = effort;
+          row.effort_state = "controlled";
+          toast(`${flavor} · ${h} · Thinking level → ${effort}`);
+        } catch (e) {
+          toast("error: " + e.message);
+        }
+        paintThinking();
+      };
       const picker = dmModelPicker(h, cat, row, async (value) => {
         try {
-          await api("/flavor-defaults", "POST", { flavor, harness: h, model: value });
-          toast(`${flavor} · ${h} → ${value || "(harness default)"}`);
+          if (!value) {
+            await api("/flavor-defaults", "POST", {
+              flavor, harness: h, model: null, effort: null,
+            });
+            row.effort_state = "harness-default";
+            toast(`${flavor} · ${h} → (harness default)`);
+            return { effort: null };
+          }
+          if (h === "vibe") {
+            await api("/flavor-defaults", "POST", {
+              flavor, harness: h, model: value, effort: null,
+            });
+            row.effort_state = "unavailable";
+            toast(`${flavor} · ${h} → ${value}`);
+            return { effort: null };
+          }
+          const state = thinkingLevelState(
+            h, cat, value, row.effort ?? row.effective_effort);
+          if (state.disabled) throw new Error(state.guidance);
+          if (!state.selected) {
+            row.effort = null;
+            row.effective_effort = null;
+            row.effort_state = "selection-required";
+            toast(`Select a Thinking level to save ${value}.`);
+            return { effort: null, pending: true };
+          }
+          await api("/flavor-defaults", "POST", {
+            flavor, harness: h, model: value, effort: state.selected,
+          });
+          row.effort_state = "controlled";
+          toast(`${flavor} · ${h} → ${value} · ${state.selected}`);
+          return { effort: state.selected };
         } catch (e) { toast("error: " + e.message); throw e; }
-      });
+      }, paintThinking);
+      paintThinking();
       panel.append(el("div", { className: "dm-row" },
         star, el("span", { className: "dm-harness" }, h),
-        picker.current, picker.input));
+        picker.current, picker.input, thinking));
       panel.append(picker.results);   // full-width, collapsed until typed into
     }
     root.append(panel);
@@ -2594,6 +2704,7 @@ const CHAT_FLAVOR_ORDER = [
   "cartographer", "admin", "planner", "dev", "reviewer", "devops",
 ];
 const CHAT_CONFIGURE_ROUTE = "configure";
+const CHAT_HARNESS_DEFAULT_VALUE = "__sc_harness_default__";
 const CHAT_HISTORY_POLL_MS = 2000;
 const CHAT_MODES = ["chat", "diff"];
 const CHAT_TRANSCRIPT_PAGE_TURNS = 20;
@@ -2654,7 +2765,10 @@ function chatModeHash(shortname, conversationId, mode = "chat") {
 }
 
 function chatModelLabel(conversation) {
-  return conversation.route?.model || "harness default";
+  const route = conversation.route || {};
+  if (route.control_state === "harness-default") return "harness default";
+  const model = route.model || "harness default";
+  return route.effort ? `${model} · ${route.effort}` : model;
 }
 
 function chatStartedLabel(conversation) {
@@ -2978,16 +3092,16 @@ function chatModelOptions(select, catalog, harness, defaultModel) {
   select.replaceChildren();
   const models = catalog.harnesses?.[harness]?.models || [];
   const available = models.filter((model) => model.availability === "available");
-  const connectedDefault = Boolean(
-    defaultModel && available.some((model) => model.id === defaultModel));
-  if (harness !== "opencode" || connectedDefault) {
-    select.append(el("option", {
-      value: "",
-      textContent: defaultModel
-        ? `Use shell default — ${defaultModel}`
-        : "Use harness default",
-    }));
-  }
+  select.append(el("option", {
+    value: "",
+    textContent: defaultModel
+      ? `Use shell default — ${defaultModel}`
+      : "Use harness default",
+  }));
+  if (defaultModel) select.append(el("option", {
+    value: CHAT_HARNESS_DEFAULT_VALUE,
+    textContent: "Use harness default",
+  }));
   for (const model of available) {
     select.append(el("option", { value: model.id, textContent: model.id }));
   }
@@ -2999,7 +3113,7 @@ function chatModelOptions(select, catalog, harness, defaultModel) {
       selected: true,
     }));
   }
-  return harness !== "opencode" || available.length > 0;
+  return true;
 }
 
 function chatCreateConversation(shell, fields = {}) {
@@ -3665,6 +3779,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     }));
   }
   const modelSelect = el("select");
+  const effortSelect = el("select", { ariaLabel: "Thinking level" });
   const title = el("input", {
     type: "text",
     placeholder: "Optional chat title",
@@ -3676,16 +3791,45 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     textContent: "Start chat",
   });
   const routeNote = el("div", { className: "chat-route-note" });
+  const paintEfforts = () => {
+    const row = byHarness[harness] || {};
+    const harnessDefault = modelSelect.value === CHAT_HARNESS_DEFAULT_VALUE;
+    const model = harnessDefault ? null : modelSelect.value || row.model || null;
+    const preferred = modelSelect.value && !harnessDefault
+      ? effortSelect.value || null
+      : row.effort ?? row.effective_effort;
+    const state = thinkingLevelState(harness, catalog, model, preferred);
+    effortSelect.replaceChildren();
+    if (!state.supported.length) {
+      effortSelect.append(el("option", {
+        value: "", textContent: state.label, selected: true,
+      }));
+    } else {
+      if (!state.selected) effortSelect.append(el("option", {
+        value: "", textContent: "Choose Thinking level", selected: true,
+        disabled: true,
+      }));
+      for (const effort of state.supported) effortSelect.append(el("option", {
+        value: effort,
+        textContent: effort,
+        selected: effort === state.selected,
+      }));
+    }
+    effortSelect.disabled = state.disabled;
+    effortSelect.title = state.guidance;
+    submit.disabled = Boolean(model && (state.disabled || !state.selected));
+    const transport = harness === "opencode"
+      ? " OpenCode models come only from connected providers." : "";
+    routeNote.textContent = state.guidance + transport;
+  };
   const paintModels = () => {
     harness = harnessSelect.value;
-    const ready = chatModelOptions(
-      modelSelect, catalog, harness, byHarness[harness]?.model);
-    submit.disabled = !ready;
-    routeNote.textContent = harness === "opencode"
-      ? "OpenCode models come only from providers connected in OpenCode."
-      : "Choose an exact installed model, or keep the shell/harness default.";
+    chatModelOptions(modelSelect, catalog, harness, byHarness[harness]?.model);
+    paintEfforts();
   };
   harnessSelect.onchange = paintModels;
+  modelSelect.onchange = paintEfforts;
+  effortSelect.onchange = paintEfforts;
   paintModels();
   form.append(
     el("div", { className: "chat-new-copy" },
@@ -3694,6 +3838,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
         "This prepares the shell through its normal CLI path, then runs each turn headlessly.")),
     el("label", { className: "k" }, "Harness"), harnessSelect,
     el("label", { className: "k" }, "Model"), modelSelect,
+    el("label", { className: "k" }, "Thinking level"), effortSelect,
     routeNote,
     el("label", { className: "k" }, "Title"), title,
     submit,
@@ -3706,7 +3851,9 @@ async function chatRenderNew(host, shell, defaults, catalog) {
       harness: harnessSelect.value,
       title: title.value.trim() || null,
     };
-    if (modelSelect.value) body.model = modelSelect.value;
+    if (modelSelect.value === CHAT_HARNESS_DEFAULT_VALUE) body.model = null;
+    else if (modelSelect.value) body.model = modelSelect.value;
+    if (effortSelect.value) body.effort = effortSelect.value;
     try {
       const conversation = await chatCreateConversation(shell, body);
       location.hash = chatHash(shell.shortname, conversation.conversation_id);

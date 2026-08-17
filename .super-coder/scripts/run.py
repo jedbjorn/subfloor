@@ -795,20 +795,29 @@ def require_host_harness(adapter: dict, harness: str) -> None:
 
 
 def flavor_defaults(con) -> dict:
-    """flavor -> {'default_harness', 'models': {harness: model}} launch defaults.
+    """Flavor launch defaults with per-harness model and Thinking intent.
     The (flavor, harness) matrix: each flavor names a model per harness, and one
     harness is the picker default (is_default). Empty if the table is absent
     (older fork mid-migration) so the launcher degrades to its prior behavior
     rather than failing."""
+    has_effort = True
     try:
         rows = con.execute(
-            "SELECT flavor, harness, model, is_default FROM flavor_defaults")
+            "SELECT flavor,harness,model,effort,is_default FROM flavor_defaults")
     except db_driver.OperationalError:
-        return {}
+        has_effort = False
+        try:
+            rows = con.execute(
+                "SELECT flavor,harness,model,is_default FROM flavor_defaults")
+        except db_driver.OperationalError:
+            return {}
     out: dict = {}
     for r in rows:
-        fd = out.setdefault(r["flavor"], {"default_harness": None, "models": {}})
+        fd = out.setdefault(r["flavor"], {
+            "default_harness": None, "models": {}, "efforts": {},
+        })
         fd["models"][r["harness"]] = r["model"]
+        fd["efforts"][r["harness"]] = r["effort"] if has_effort else None
         if r["is_default"]:
             fd["default_harness"] = r["harness"]
     return out
@@ -1200,10 +1209,10 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     adapter = load_adapter(harness)
 
     # Model route: an explicit model wins; else the (flavor, harness) cell,
-    # exactly main()'s flavor_defaults routing. Effort mirrors main(): a
-    # headless plan defaults to high only when the adapter can transport it;
-    # OpenCode's no-effort seam stays unset instead of failing before launch.
+    # exactly main()'s flavor_defaults routing. An explicit effort wins; the
+    # persisted flavor effort is the next fallback before the adapter default.
     flavor_model = fdef["models"].get(harness) if fdef else None
+    flavor_effort = (fdef.get("efforts") or {}).get(harness) if fdef else None
     if headless:
         try:
             resolved_route = resolve_headless_route(
@@ -1211,7 +1220,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
                 adapter=adapter,
                 flavor_model=flavor_model,
                 model=model,
-                effort=effort,
+                effort=effort if effort is not None else flavor_effort,
             )
         except ValueError as e:
             con.close()
@@ -1600,9 +1609,9 @@ def main() -> None:
                or default_harness)
 
     # Resolve + validate the complete headless route before opening a session.
-    # High effort is the default where the harness exposes an effort seam.
-    # OpenCode exposes none and keeps the model's own default.
+    # Explicit CLI intent wins over the persisted per-flavor Thinking level.
     flavor_model = fdef["models"].get(harness) if fdef else None
+    flavor_effort = (fdef.get("efforts") or {}).get(harness) if fdef else None
     adapter = load_adapter(harness)
     if host_admin:
         try:
@@ -1619,7 +1628,9 @@ def main() -> None:
                 adapter=adapter,
                 flavor_model=flavor_model,
                 model=flag_model,
-                effort=flag_effort,
+                effort=(
+                    flag_effort if flag_effort is not None else flavor_effort
+                ),
             )
         except ValueError as e:
             sys.exit(f"sc run: {e}")

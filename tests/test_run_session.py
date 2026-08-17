@@ -59,6 +59,32 @@ INSERT INTO lock_probe (probe_id, value) VALUES (1, 0);
 """
 
 
+class FlavorRouteDefaultsTest(unittest.TestCase):
+    def test_loader_projects_nullable_per_harness_effort(self) -> None:
+        con = sqlite3.connect(":memory:")
+        con.row_factory = sqlite3.Row
+        self.addCleanup(con.close)
+        con.execute(
+            "CREATE TABLE flavor_defaults ("
+            "flavor TEXT,harness TEXT,model TEXT,effort TEXT,is_default INTEGER)"
+        )
+        con.executemany(
+            "INSERT INTO flavor_defaults VALUES (?,?,?,?,?)",
+            [
+                ("dev", "codex", "gpt-test", "low", 1),
+                ("dev", "kimi", None, None, 0),
+            ],
+        )
+        self.assertEqual(
+            run.flavor_defaults(con),
+            {"dev": {
+                "default_harness": "codex",
+                "models": {"codex": "gpt-test", "kimi": None},
+                "efforts": {"codex": "low", "kimi": None},
+            }},
+        )
+
+
 class _FailAfterArchive:
     """Connection proxy that injects a lock after the archive INSERT."""
 

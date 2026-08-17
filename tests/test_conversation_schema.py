@@ -68,6 +68,59 @@ class ConversationDbCase(unittest.TestCase):
         self.serial += 1
         return f"{prefix}-{self.serial}"
 
+    def test_thinking_route_migration_preserves_legacy_and_gates_v2(self) -> None:
+        conversation = self.add_conversation()
+        legacy = self.con.execute(
+            "SELECT route_contract_version,route_binding FROM conversations "
+            "WHERE conversation_id=?", (conversation,),
+        ).fetchone()
+        preset = self.con.execute(
+            "SELECT effort FROM flavor_defaults LIMIT 1"
+        ).fetchone()
+        self.assertEqual(tuple(legacy), (1, None))
+        self.assertEqual(preset["effort"], None)
+
+        values = (
+            1, 1, "codex", "/tmp/v2", "v2-null", "hash-v2-null",
+        )
+        with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "conversation route contract and binding disagree"):
+            self.con.execute(
+                "INSERT INTO conversations "
+                "(shell_id,owner_user_id,harness,worktree,"
+                "creation_idempotency_key,creation_request_hash,"
+                "route_contract_version,route_binding) "
+                "VALUES (?,?,?,?,?,?,2,NULL)", values,
+            )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM conversations "
+                "WHERE creation_idempotency_key='v2-null'"
+            ).fetchone()[0],
+            0,
+        )
+
+        self.con.execute(
+            "INSERT INTO conversations "
+            "(shell_id,owner_user_id,harness,worktree,"
+            "creation_idempotency_key,creation_request_hash,"
+            "route_contract_version,route_binding) "
+            "VALUES (?,?,?,?,?,?,2,'{}')",
+            (2, 1, "codex", "/tmp/v2", "v2-bound", "hash-v2-bound"),
+        )
+        with self.assertRaisesRegex(
+                sqlite3.IntegrityError, "conversation route identity is immutable"):
+            self.con.execute(
+                "UPDATE conversations SET effort='low' "
+                "WHERE creation_idempotency_key='v2-bound'"
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.con.execute(
+                "UPDATE flavor_defaults SET effort=' HIGH ' "
+                "WHERE rowid=(SELECT rowid FROM flavor_defaults LIMIT 1)"
+            )
+
     def add_conversation(
         self,
         *,

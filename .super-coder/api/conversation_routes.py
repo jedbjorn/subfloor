@@ -34,6 +34,8 @@ import conversation_broker
 import conversation_events
 import conversation_git_targets
 import db_driver
+import model_catalog
+import route_bindings
 import run as run_mod
 from conversation_adapters import ADAPTER_TYPES
 
@@ -403,7 +405,8 @@ _CLOSE_REQUESTED_AFTER_REOPEN = (
 def _conversation_row(con, conversation_id: str, owner_user_id: int):
     return con.execute(
         "SELECT c.conversation_id,c.shell_id,c.owner_user_id,c.harness,"
-        "c.provider,c.model,c.effort,c.state,c.title,c.starred,"
+        "c.provider,c.model,c.effort,c.route_contract_version,c.route_binding,"
+        "c.state,c.title,c.starred,"
         "c.conversation_scope,c.created_at,"
         "c.last_activity_at,c.closed_at,c.version,c.harness_session_ref,"
         "s.display_name,s.shortname,"
@@ -429,6 +432,26 @@ def _conversation_row(con, conversation_id: str, owner_user_id: int):
 
 
 def _conversation_projection(row) -> dict:
+    contract_version = int(row["route_contract_version"])
+    binding = None
+    binding_digest = None
+    control_state = None
+    native_variant_id = None
+    if contract_version == route_bindings.CONTRACT_VERSION:
+        try:
+            binding = json.loads(row["route_binding"])
+            route_bindings.validate_v2_binding(binding)
+        except (TypeError, json.JSONDecodeError,
+                route_bindings.RouteResolutionError) as exc:
+            raise ApiError(
+                500,
+                "CONVERSATION_ROUTE_INVALID",
+                "stored conversation route binding is invalid",
+                {"conversation_id": row["conversation_id"]},
+            ) from exc
+        binding_digest = route_bindings.digest_json(binding)
+        control_state = binding["control_state"]
+        native_variant_id = binding["native_variant_id"]
     return {
         "conversation_id": row["conversation_id"],
         "shell": {
@@ -441,6 +464,11 @@ def _conversation_projection(row) -> dict:
             "provider": row["provider"],
             "model": row["model"],
             "effort": row["effort"],
+            "contract_version": contract_version,
+            "control_state": control_state,
+            "native_variant_id": native_variant_id,
+            "binding_digest": binding_digest,
+            "legacy": contract_version == 1,
         },
         "scope": row["conversation_scope"],
         "state": row["state"],
@@ -768,20 +796,99 @@ def _wait_for_cli_release(shell) -> str | None:
     return state
 
 
+def _stored_v2_binding(row) -> dict:
+    try:
+        binding = json.loads(row["route_binding"])
+        route_bindings.validate_v2_binding(binding)
+    except (TypeError, json.JSONDecodeError,
+            route_bindings.RouteResolutionError) as exc:
+        raise ApiError(
+            500,
+            "CONVERSATION_ROUTE_INVALID",
+            "stored conversation route binding is invalid",
+            {"conversation_id": row["conversation_id"]},
+        ) from exc
+    return binding
+
+
+def _conversation_creation_replay(
+    con, operator: dict, conversation_id: str, body: dict,
+    *, shell_id: int, title: str | None,
+):
+    row = _require_conversation(con, conversation_id, operator["user_id"])
+    matches = int(row["shell_id"]) == shell_id and row["title"] == title
+    if "harness" in body:
+        matches = matches and _nonblank(
+            body.get("harness"), "harness", maximum=64
+        ) == row["harness"]
+    if "model" in body:
+        matches = matches and _nonblank(
+            body.get("model"), "model", maximum=255, optional=True
+        ) == row["model"]
+    if "effort" in body:
+        requested_effort = _nonblank(
+            body.get("effort"), "effort", maximum=64, optional=True
+        )
+        if int(row["route_contract_version"]) == 1:
+            matches = matches and requested_effort == row["effort"]
+        else:
+            binding = _stored_v2_binding(row)
+            if binding["control_state"] != "controlled":
+                if requested_effort is not None:
+                    raise ApiError(
+                        422,
+                        "unsupported_thinking_level",
+                        "Thinking control is unavailable for this route",
+                        {"harness": binding["harness"],
+                         "model": binding["requested_model"],
+                         "requested_effort": requested_effort},
+                    )
+                canonical_effort = None
+            elif requested_effort is None:
+                canonical_effort = "high"
+            elif binding["harness"] == "opencode":
+                canonical_effort = requested_effort.translate(
+                    route_bindings.ASCII_LOWER_TRANSLATION)
+            else:
+                canonical_effort = requested_effort.lower()
+            matches = matches and canonical_effort == binding["requested_effort"]
+    elif "model" in body and int(row["route_contract_version"]) == 2:
+        binding = _stored_v2_binding(row)
+        if binding["control_state"] == "controlled":
+            matches = matches and binding["requested_effort"] == "high"
+    if not matches:
+        raise ApiError(
+            409,
+            "CONVERSATION_IDEMPOTENCY_CONFLICT",
+            "Idempotency-Key was reused with a different request",
+        )
+    return _json(
+        201,
+        _conversation_projection(row),
+        [("Location", f"/api/conversations/{row['conversation_id']}")],
+    )
+
+
 def _create_conversation(con, operator: dict, headers, body: dict):
     _only_fields(body, {"shell_id", "title", "harness", "model", "effort"})
     key = _idempotency_key(headers)
     shell_id = _integer(body.get("shell_id"), "shell_id")
+    title = _nonblank(body.get("title"), "title", maximum=200, optional=True)
 
-    # Read a possible replay before preparation, but compare it only after the
-    # request has been resolved to the same canonical route stored for a new
-    # conversation. The transaction repeats every authoritative DB read.
+    # Existing keys resolve before today's catalogue or flavor defaults.  A v2
+    # replay compares request intent with its immutable stored binding; v1 keeps
+    # the historical raw route semantics without rewriting its hash.
     existing = con.execute(
-        "SELECT conversation_id,creation_request_hash FROM conversations "
+        "SELECT conversation_id FROM conversations "
         "WHERE owner_user_id=? "
         "AND creation_idempotency_key=?",
         (operator["user_id"], key),
     ).fetchone()
+    if existing is not None:
+        return _conversation_creation_replay(
+            con, operator, existing["conversation_id"], body,
+            shell_id=shell_id, title=title,
+        )
 
     shell = con.execute(
         "SELECT shell_id,display_name,shortname,flavor FROM shells "
@@ -812,30 +919,62 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             "HARNESS_CONVERSATION_UNSUPPORTED",
             f"harness {harness!r} has no browser conversation adapter",
         )
-    selected_model = _nonblank(
-        body.get("model"), "model", maximum=255, optional=True
-    )
-    effort = _nonblank(body.get("effort"), "effort", maximum=64, optional=True)
-    adapter = run_mod.load_adapter(harness)
-    try:
-        resolved = run_mod.resolve_headless_route(
-            harness=harness,
-            adapter=adapter,
-            flavor_model=(
-                (defaults.get("models") or {}).get(harness)
-                if defaults
-                else None
-            ),
-            model=selected_model,
-            effort=effort,
+    if "model" in body:
+        selected_model = _nonblank(
+            body.get("model"), "model", maximum=255, optional=True
         )
-    except ValueError as exc:
-        raise ApiError(422, "HARNESS_ROUTE_INVALID", str(exc)) from exc
-    harness = resolved.harness
-    provider = resolved.provider
-    model = resolved.model
-    effort = resolved.effort
-    title = _nonblank(body.get("title"), "title", maximum=200, optional=True)
+    else:
+        selected_model = (
+            (defaults.get("models") or {}).get(harness)
+            if defaults
+            else None
+        )
+    if "effort" in body:
+        selected_effort = _nonblank(
+            body.get("effort"), "effort", maximum=64, optional=True
+        )
+    elif "model" not in body:
+        selected_effort = (
+            (defaults.get("efforts") or {}).get(harness)
+            if defaults
+            else None
+        )
+    else:
+        selected_effort = None
+
+    runtime_status = model_catalog.harness_runtime_status(harness)
+    runtime_scope = model_catalog.harness_versions.runtime_scope()
+    try:
+        if selected_model is not None and harness != "vibe":
+            route = con.execute(
+                "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+                (harness, selected_model),
+            ).fetchone()
+            binding, binding_digest = route_bindings.resolve_persisted_v2(
+                con,
+                dict(route) if route is not None else None,
+                harness,
+                selected_model,
+                selected_effort,
+                runtime_status=runtime_status,
+                runtime_scope=runtime_scope,
+            )
+        else:
+            binding, binding_digest = route_bindings.resolve_v2(
+                None,
+                harness,
+                selected_model,
+                selected_effort,
+                runtime_status=runtime_status,
+                runtime_scope=runtime_scope,
+            )
+    except route_bindings.RouteResolutionError as exc:
+        raise ApiError(422, exc.code, exc.message, exc.details) from exc
+    harness = binding["harness"]
+    model = binding["requested_model"]
+    effort = binding["requested_effort"]
+    provider = run_mod.session_provider(harness, model)
+    route_binding_json = route_bindings.canonical_json(binding)
     worktree = run_mod.shell_work_dir(shell["shortname"], shell["flavor"])
     worktree = worktree.resolve(strict=False)
     if worktree.exists() and not worktree.is_dir():
@@ -853,24 +992,11 @@ def _create_conversation(con, operator: dict, headers, body: dict):
             "provider": provider,
             "model": model,
             "effort": effort,
+            "route_contract_version": route_bindings.CONTRACT_VERSION,
+            "binding_digest": binding_digest,
             "worktree": str(worktree),
         }
     )
-    if existing is not None:
-        if existing["creation_request_hash"] != request_hash:
-            raise ApiError(
-                409,
-                "CONVERSATION_IDEMPOTENCY_CONFLICT",
-                "Idempotency-Key was reused with a different request",
-            )
-        row = _require_conversation(
-            con, existing["conversation_id"], operator["user_id"]
-        )
-        return _json(
-            201,
-            _conversation_projection(row),
-            [("Location", f"/api/conversations/{row['conversation_id']}")],
-        )
 
     if active_chat_registry.get(con, shell_id) is None:
         live_state = _wait_for_cli_release(shell)
@@ -887,25 +1013,15 @@ def _create_conversation(con, operator: dict, headers, body: dict):
     closed_id = None
     with db_driver.write_transaction(con, "conversation.create.close_active"):
         existing = con.execute(
-            "SELECT conversation_id,creation_request_hash FROM conversations "
+            "SELECT conversation_id FROM conversations "
             "WHERE owner_user_id=? "
             "AND creation_idempotency_key=?",
             (operator["user_id"], key),
         ).fetchone()
         if existing is not None:
-            if existing["creation_request_hash"] != request_hash:
-                raise ApiError(
-                    409,
-                    "CONVERSATION_IDEMPOTENCY_CONFLICT",
-                    "Idempotency-Key was reused with a different request",
-                )
-            row = _require_conversation(
-                con, existing["conversation_id"], operator["user_id"]
-            )
-            return _json(
-                201,
-                _conversation_projection(row),
-                [("Location", f"/api/conversations/{row['conversation_id']}")],
+            return _conversation_creation_replay(
+                con, operator, existing["conversation_id"], body,
+                shell_id=shell_id, title=title,
             )
 
         current_shell = con.execute(
@@ -972,24 +1088,14 @@ def _create_conversation(con, operator: dict, headers, body: dict):
 
     with db_driver.write_transaction(con, "conversation.create.register"):
         existing = con.execute(
-            "SELECT conversation_id,creation_request_hash FROM conversations "
+            "SELECT conversation_id FROM conversations "
             "WHERE owner_user_id=? AND creation_idempotency_key=?",
             (operator["user_id"], key),
         ).fetchone()
         if existing is not None:
-            if existing["creation_request_hash"] != request_hash:
-                raise ApiError(
-                    409,
-                    "CONVERSATION_IDEMPOTENCY_CONFLICT",
-                    "Idempotency-Key was reused with a different request",
-                )
-            row = _require_conversation(
-                con, existing["conversation_id"], operator["user_id"]
-            )
-            return _json(
-                201,
-                _conversation_projection(row),
-                [("Location", f"/api/conversations/{row['conversation_id']}")],
+            return _conversation_creation_replay(
+                con, operator, existing["conversation_id"], body,
+                shell_id=shell_id, title=title,
             )
         if active_chat_registry.get(con, shell_id) is not None:
             raise ApiError(
@@ -1001,8 +1107,9 @@ def _create_conversation(con, operator: dict, headers, body: dict):
         con.execute(
             "INSERT INTO conversations "
             "(conversation_id,shell_id,owner_user_id,harness,provider,model,"
-            "effort,worktree,title,creation_idempotency_key,"
-            "creation_request_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "effort,route_contract_version,route_binding,worktree,title,"
+            "creation_idempotency_key,creation_request_hash) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 conversation_id,
                 shell_id,
@@ -1011,6 +1118,8 @@ def _create_conversation(con, operator: dict, headers, body: dict):
                 provider,
                 model,
                 effort,
+                route_bindings.CONTRACT_VERSION,
+                route_binding_json,
                 str(worktree),
                 title,
                 key,
@@ -1026,6 +1135,9 @@ def _create_conversation(con, operator: dict, headers, body: dict):
                 "harness": harness,
                 "model": model,
                 "effort": effort,
+                "route_contract_version": route_bindings.CONTRACT_VERSION,
+                "control_state": binding["control_state"],
+                "binding_digest": binding_digest,
             },
         )
         active_chat_registry.register(con, shell_id, conversation_id)
@@ -1101,7 +1213,8 @@ def _list_conversations(con, operator: dict, query):
         params.extend((decoded["a"], decoded["a"], decoded["id"]))
     rows = con.execute(
         "SELECT c.conversation_id,c.shell_id,c.owner_user_id,c.harness,"
-        "c.provider,c.model,c.effort,c.state,c.title,c.starred,"
+        "c.provider,c.model,c.effort,c.route_contract_version,c.route_binding,"
+        "c.state,c.title,c.starred,"
         "c.conversation_scope,c.created_at,"
         "c.last_activity_at,c.closed_at,c.version,s.display_name,s.shortname,"
         "CASE WHEN c.state!='closed' THEN ("

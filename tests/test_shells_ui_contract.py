@@ -17,7 +17,7 @@ SHELL_STATE = APP[APP.index("let selectedShell ="):
                   APP.index("// Rough token estimator")]
 SHELL_RENDER = APP[APP.index("async function renderShells(root)"):
                    APP.index("// Default Models — the flavor_defaults")]
-DEFAULT_MODELS = APP[APP.index("async function renderDefaultModels(root, s,"):
+DEFAULT_MODELS = APP[APP.index("function thinkingLevelState"):
                      APP.index("// Harness — the shell's surfaces")]
 ROUTER_AT = APP.index("function routeFromHash()")
 ROUTER = APP[ROUTER_AT:
@@ -35,6 +35,45 @@ def run_js(script: str) -> dict:
     )
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_thinking_selector_state_matrix_is_route_aware():
+    helper = APP[
+        APP.index("function thinkingLevelState"):
+        APP.index("function dmModelPicker")
+    ]
+    script = helper + r"""
+const catalog = {stale: false, harnesses: {codex: {models: [
+  {id: "gpt-high", availability: "available", supported_efforts: ["low", "high"]},
+  {id: "gpt-explicit", availability: "available", supported_efforts: ["low", "medium"]},
+]}}};
+console.log(JSON.stringify({
+  controlled: thinkingLevelState("codex", catalog, "gpt-high", "low"),
+  defaulted: thinkingLevelState("codex", catalog, "gpt-high", null),
+  explicit: thinkingLevelState("codex", catalog, "gpt-explicit", null),
+  harnessDefault: thinkingLevelState("codex", catalog, null, null),
+  vibe: thinkingLevelState("vibe", catalog, "devstral", null),
+  stale: thinkingLevelState("codex", {...catalog, stale: true}, "gpt-high", "high"),
+}));
+"""
+    result = run_js(script)
+    assert result["controlled"]["selected"] == "low"
+    assert result["defaulted"]["selected"] == "high"
+    assert result["explicit"]["selected"] == ""
+    assert result["explicit"]["disabled"] is False
+    assert result["harnessDefault"]["label"] == "Harness default"
+    assert result["harnessDefault"]["disabled"] is True
+    assert result["vibe"]["label"] == "Thinking control unavailable"
+    assert result["stale"]["disabled"] is True
+    assert "Refresh & verify" in result["stale"]["guidance"]
+
+
+def test_default_models_saves_model_and_effort_atomically():
+    assert 'model: null, effort: null' in DEFAULT_MODELS
+    assert 'model: value, effort: state.selected' in DEFAULT_MODELS
+    assert 'model: row.model, effort' in DEFAULT_MODELS
+    assert 'row.effort_state = "selection-required"' in DEFAULT_MODELS
+    assert 'ariaLabel: `Thinking level for ${flavor} ${h}`' in DEFAULT_MODELS
 
 
 def test_skills_is_nested_under_shells_instead_of_global_navigation():
