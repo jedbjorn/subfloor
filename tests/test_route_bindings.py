@@ -768,6 +768,22 @@ class ParticipantRevisionTest(unittest.TestCase):
             ),
         )
 
+    def stored_binding(self, binding_id: int) -> tuple[sqlite3.Row, dict]:
+        rows = self.con.execute(
+            "SELECT participant_id,route_revision,control_state,harness,"
+            "binding_json,binding_digest FROM "
+            "sprint_participant_route_bindings WHERE binding_id=?",
+            (binding_id,),
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        decoded = json.loads(row["binding_json"])
+        self.assertEqual(tuple(decoded), tuple(sorted(route_bindings.BINDING_KEYS)))
+        self.assertNotEqual(tuple(decoded), route_bindings.BINDING_KEYS)
+        self.assertEqual(route_bindings.digest_json(decoded), row["binding_digest"])
+        route_bindings.validate_v2_binding(decoded)
+        return row, decoded
+
     @staticmethod
     def invalid_bindings() -> list[tuple[str, dict]]:
         controlled = ParticipantRevisionTest.controlled_binding()
@@ -828,6 +844,90 @@ class ParticipantRevisionTest(unittest.TestCase):
                          ["devstral-latest", "codestral-latest"])
         self.assertEqual(active, second["binding_id"])
         self.assertIsNone(sibling)
+
+    def test_controlled_binding_survives_store_json_round_trip(self):
+        binding = self.controlled_binding()
+        digest = route_bindings.digest_json(binding)
+        receipt = self.store.bind(10, binding, digest, transition="arm")
+
+        row, decoded = self.stored_binding(receipt["binding_id"])
+        self.assertEqual(
+            (row["participant_id"], row["route_revision"],
+             row["control_state"], row["harness"], row["binding_digest"]),
+            (10, 1, "controlled", "codex", digest),
+        )
+        self.assertEqual(decoded, binding)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT active_route_binding_id FROM sprint_participants "
+                "WHERE participant_id=10"
+            ).fetchone()[0],
+            receipt["binding_id"],
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertIsNone(self.con.execute(
+            "SELECT active_route_binding_id FROM sprint_participants "
+            "WHERE participant_id=11"
+        ).fetchone()[0])
+
+    def test_typed_uncontrolled_binding_survives_store_json_round_trip(self):
+        receipt = self.store.bind(
+            10, self.binding, self.digest, transition="arm"
+        )
+
+        row, decoded = self.stored_binding(receipt["binding_id"])
+        self.assertEqual(
+            (row["participant_id"], row["route_revision"],
+             row["control_state"], row["harness"], row["binding_digest"]),
+            (10, 1, "native-uncontrolled", "vibe", self.digest),
+        )
+        self.assertEqual(decoded, self.binding)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT active_route_binding_id FROM sprint_participants "
+                "WHERE participant_id=10"
+            ).fetchone()[0],
+            receipt["binding_id"],
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertIsNone(self.con.execute(
+            "SELECT active_route_binding_id FROM sprint_participants "
+            "WHERE participant_id=11"
+        ).fetchone()[0])
+
+    def test_validator_accepts_reordered_exact_keys_and_rejects_key_drift(self):
+        controlled = self.controlled_binding()
+        reordered = dict(reversed(tuple(controlled.items())))
+
+        route_bindings.validate_v2_binding(reordered)
+        self.assertEqual(
+            route_bindings.digest_json(reordered),
+            route_bindings.digest_json(controlled),
+        )
+        invalid = (
+            ("missing", {key: value for key, value in controlled.items()
+                         if key != "adapter_metadata"}),
+            ("extra", {**controlled, "unexpected": None}),
+        )
+        for name, binding in invalid:
+            with self.subTest(name=name):
+                with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+                    route_bindings.validate_v2_binding(binding)
+                self.assertEqual(raised.exception.code, "thinking_evidence_missing")
+                self.assertEqual(
+                    raised.exception.details,
+                    {"reason": "binding must contain exactly the canonical fixed keys"},
+                )
 
     def test_prepared_reroute_paused_arm_cross_owner_and_mutation_are_refused(self):
         first = self.store.bind(10, self.binding, self.digest, transition="arm")

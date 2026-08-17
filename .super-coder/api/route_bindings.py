@@ -151,8 +151,8 @@ def _binding_error(reason: str) -> RouteResolutionError:
 
 def validate_v2_binding(binding: dict) -> None:
     """Enforce the one semantic state contract accepted by every v2 consumer."""
-    if not isinstance(binding, dict) or tuple(binding) != BINDING_KEYS:
-        raise _binding_error("binding must contain the canonical fixed key sequence")
+    if not isinstance(binding, dict) or set(binding) != set(BINDING_KEYS):
+        raise _binding_error("binding must contain exactly the canonical fixed keys")
     if binding["contract_version"] != CONTRACT_VERSION:
         raise _binding_error("contract_version must be 2")
 
