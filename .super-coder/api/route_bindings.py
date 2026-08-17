@@ -1092,15 +1092,20 @@ def verify_stored_v2_before_first_turn(con, binding: dict) -> None:
     )
     supported, effort_metadata = _supported_efforts(row)
     effort = binding["effective_effort"]
+    adapter_metadata = _json_object(
+        row.get("adapter_metadata"), field="adapter_metadata"
+    )
+    if harness == "opencode":
+        adapter_metadata = (
+            effort_metadata.get("adapter_metadata_by_effort") or {}
+        ).get(effort)
     current = {
         "provider_model": row.get("provider_model") or model,
         "evidence_digest": (effort_metadata.get("digests") or {}).get(effort),
         "selector_binding": _json_object(
             row.get("selector_binding"), field="selector_binding"
         ),
-        "adapter_metadata": _json_object(
-            row.get("adapter_metadata"), field="adapter_metadata"
-        ),
+        "adapter_metadata": adapter_metadata,
         "native_variant_id": (
             (effort_metadata.get("native_variant_ids") or {}).get(effort)
             if harness == "opencode" else None

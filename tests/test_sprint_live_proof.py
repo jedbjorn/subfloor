@@ -11,8 +11,10 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,12 +31,20 @@ sys.path[:0] = [
 
 import db_driver
 import mem
+import model_catalog
+import route_bindings
+import route_transport
+import run as run_mod
 import server
+import sprint_participant_chats
 import sprint_cli
 import sprint_domain
 import sprint_message_delivery
 import sprint_pr_watcher
 import sprint_runtime
+from conversation_adapters.opencode import OpenCodeAdapter
+from conversation_broker import BrokerStore
+from conversation_launch import ConversationLaunchPreparer
 from github_pull_requests import PullRequest
 from sprint_route_binding_support import candidate as route_candidate
 from test_sprint_v2_domain import apply_schema
@@ -91,6 +101,498 @@ class ScenarioGitHub:
     def list(self) -> list[PullRequest]:
         self.list_calls += 1
         return [self.pull_requests[number] for number in sorted(self.pull_requests)]
+
+
+class SprintBoundRouteDispatchProof(unittest.TestCase):
+    """Cross-layer proof from arm-time binding through native dispatch."""
+
+    GENERATION = "1" * 32
+    SUCCESSOR_GENERATION = "2" * 32
+    FINGERPRINT = "3" * 64
+    BOUND_DIGEST = "4" * 64
+    SUCCESSOR_DIGEST = "5" * 64
+    SELECTOR = "openai/sprint-bound-model"
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.db_path = self.root / "sprint-bound-dispatch.db"
+        seed = sqlite3.connect(self.db_path)
+        try:
+            apply_schema(seed)
+        finally:
+            seed.close()
+        self.con = db_driver.connect(self.db_path)
+        self.addCleanup(self.con.close)
+        self.con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
+        self.con.executemany(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (?,?,?,?,?,1)",
+            (
+                (1, "Developer", "DEV1", "dev", "prompt"),
+                (2, "Reviewer", "REV1", "reviewer", "prompt"),
+                (3, "Planner", "PLN1", "planner", "prompt"),
+            ),
+        )
+        self.con.commit()
+        worktrees = self.root / "worktrees"
+
+        def shell_work_dir(shortname: str, _flavor: str | None) -> Path:
+            path = worktrees / shortname.lower()
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+
+        route_path_patch = mock.patch.object(
+            sprint_participant_chats.run_mod,
+            "shell_work_dir",
+            side_effect=shell_work_dir,
+        )
+        route_path_patch.start()
+        self.addCleanup(route_path_patch.stop)
+
+    @staticmethod
+    def _runtime(harness: str) -> tuple[dict, dict]:
+        versions = {"kimi": "0.33.0", "opencode": "1.18.9"}
+        compatibility = route_bindings._runtime_manifest_compatibility(
+            harness, versions[harness]
+        )
+        scope = route_bindings.harness_versions.runtime_scope()
+        return (
+            {
+                "harness": harness,
+                **scope,
+                "version": compatibility.version,
+                "compatibility": compatibility.compatibility,
+                "minimum_version": compatibility.minimum_version,
+                "maximum_version_exclusive": (
+                    compatibility.maximum_version_exclusive
+                ),
+                "verified_version": compatibility.verified_version,
+                "error": None,
+            },
+            scope,
+        )
+
+    def _seed_sprint(
+        self,
+        *,
+        harness: str,
+        model: str | None,
+        effort: str | None,
+    ) -> int:
+        feature_id = int(
+            self.con.execute(
+                "INSERT INTO roadmap (title,roadmap_status) "
+                "VALUES ('Bound dispatch proof','in_progress')"
+            ).lastrowid
+        )
+        body = f"bound dispatch proof for {harness}"
+        document_id = int(
+            self.con.execute(
+                "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                "VALUES (?,'spec',1,'Bound dispatch proof',?)",
+                (feature_id, body),
+            ).lastrowid
+        )
+        revision = hashlib.sha256(body.encode()).hexdigest()
+        approval_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_spec_approvals "
+                "(document_id,revision_sha256,reviewer_shell_id,verdict) "
+                "VALUES (?,?,2,'pass')",
+                (document_id, revision),
+            ).lastrowid
+        )
+        sprint_id = int(
+            self.con.execute(
+                "INSERT INTO sprints "
+                "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+                "VALUES (?,3,1)",
+                (feature_id,),
+            ).lastrowid
+        )
+        self.con.execute(
+            "INSERT INTO sprint_specs "
+            "(sprint_id,document_id,bound_revision_sha256,approval_id,"
+            "bound_revision_body) VALUES (?,?,?,?,?)",
+            (sprint_id, document_id, revision, approval_id, body),
+        )
+        self.con.executemany(
+            "INSERT INTO sprint_participants "
+            "(sprint_id,shell_id,role,harness,model,effort) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                (sprint_id, 3, "planner", harness, model, effort),
+                (sprint_id, 1, "developer", harness, model, effort),
+                (sprint_id, 2, "reviewer", harness, model, effort),
+            ),
+        )
+        self.con.execute(
+            "INSERT INTO sprint_work_units "
+            "(sprint_id,assigned_shell_id,reviewer_shell_id,title,expected_output) "
+            "VALUES (?,1,2,'Bound delivery','Dispatch the bound route')",
+            (sprint_id,),
+        )
+        self.con.commit()
+        return sprint_id
+
+    @staticmethod
+    def _variant_metadata(effort: str, verbosity: str) -> tuple[str, str]:
+        selected = {
+            "compatibility_manifest": "opencode-1.18.9-v1",
+            "provider_family": "openai-ai-sdk",
+            "variant_options": {
+                "reasoningEffort": effort,
+                "textVerbosity": verbosity,
+            },
+        }
+        effort_metadata = {
+            "supported": [effort],
+            "default": effort,
+            "digests": {
+                effort: (
+                    SprintBoundRouteDispatchProof.BOUND_DIGEST
+                    if effort == "high"
+                    else SprintBoundRouteDispatchProof.SUCCESSOR_DIGEST
+                )
+            },
+            "native_variant_ids": {effort: effort},
+            "adapter_metadata_by_effort": {effort: selected},
+        }
+        adapter_metadata = {
+            "compatibility_manifest": "opencode-1.18.9-v1",
+            "provider_family": "openai-ai-sdk",
+            "variant_options_by_effort": {
+                effort: selected["variant_options"],
+            },
+        }
+        return json.dumps(effort_metadata), json.dumps(adapter_metadata)
+
+    def _seed_opencode_catalogue(self) -> dict:
+        status, scope = self._runtime("opencode")
+        now = datetime.now(timezone.utc).isoformat()
+        effort_metadata, adapter_metadata = self._variant_metadata("high", "low")
+        self.con.execute(
+            "INSERT INTO model_catalog_generations "
+            "(generation_id,payload_version,contract_version,started_at,"
+            "completed_at,state,runtime,source_summary,harness_versions,"
+            "source_fingerprints,error_summary,payload_digest) "
+            "VALUES (?,6,2,?,?,'successful',?,'[]','{}','{}',NULL,?)",
+            (
+                self.GENERATION,
+                now,
+                now,
+                scope["runtime"],
+                "6" * 64,
+            ),
+        )
+        self.con.execute(
+            "INSERT INTO model_routes "
+            "(harness,selector,provider,provider_model,source,availability,"
+            "headless_supported,high_effort_supported,default_effort,"
+            "supported_efforts,cli_version,last_seen_at,stale,generation_id,"
+            "evidence_kind,evidence_digest,source_fingerprint,harness_version,"
+            "harness_compatibility,selector_binding,effort_metadata,"
+            "adapter_metadata) VALUES "
+            "('opencode',?,'openai',?,'opencode-provider-api','available',1,1,"
+            "'high','[\"high\"]','opencode 1.18.9',?,0,?,"
+            "'opencode-connected-variant',?,?,'1.18.9','verified',?,?,?)",
+            (
+                self.SELECTOR,
+                self.SELECTOR,
+                now,
+                self.GENERATION,
+                self.BOUND_DIGEST,
+                self.FINGERPRINT,
+                json.dumps({"kind": "exact-model", "selector": self.SELECTOR}),
+                effort_metadata,
+                adapter_metadata,
+            ),
+        )
+        self.con.commit()
+        return {
+            "runtime_status": status,
+            "runtime_scope": scope,
+            "source_fingerprint": self.FINGERPRINT,
+        }
+
+    def _publish_successor_catalogue(self) -> None:
+        now = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
+        effort_metadata, adapter_metadata = self._variant_metadata("xhigh", "high")
+        runtime = self.con.execute(
+            "SELECT runtime FROM model_catalog_generations WHERE generation_id=?",
+            (self.GENERATION,),
+        ).fetchone()[0]
+        self.con.execute(
+            "INSERT INTO model_catalog_generations "
+            "(generation_id,payload_version,contract_version,started_at,"
+            "completed_at,state,runtime,source_summary,harness_versions,"
+            "source_fingerprints,error_summary,payload_digest) "
+            "VALUES (?,6,2,?,?,'successful',?,'[]','{}','{}',NULL,?)",
+            (self.SUCCESSOR_GENERATION, now, now, runtime, "7" * 64),
+        )
+        self.con.execute(
+            "UPDATE model_routes SET generation_id=?,default_effort='xhigh',"
+            "supported_efforts='[\"xhigh\"]',evidence_digest=?,"
+            "last_seen_at=?,effort_metadata=?,adapter_metadata=? "
+            "WHERE harness='opencode' AND selector=?",
+            (
+                self.SUCCESSOR_GENERATION,
+                self.SUCCESSOR_DIGEST,
+                now,
+                effort_metadata,
+                adapter_metadata,
+                self.SELECTOR,
+            ),
+        )
+        self.con.commit()
+
+    def _arm(self, sprint_id: int) -> int:
+        sprint_domain.SprintLifecycleStore(
+            self.con, probe_harness=lambda _harness: None
+        ).arm(sprint_id, 3)
+        row = self.con.execute(
+            "SELECT wake.wake_id FROM sprint_wake_outbox wake "
+            "JOIN sprint_wake_messages joined USING (wake_id) "
+            "JOIN wake_message message USING (message_id) "
+            "WHERE message.sprint_id=? AND wake.state='pending' "
+            "ORDER BY wake.wake_id LIMIT 1",
+            (sprint_id,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        return int(row["wake_id"])
+
+    def _deliver_and_claim(self, wake_id: int):
+        outcome = sprint_message_delivery.SprintWakeDeliveryService(
+            self.con, force_new_quiet_seconds=0
+        ).deliver_once(
+            "bound-route-proof",
+            lambda conversation_id, prompt, key: (
+                sprint_runtime.enqueue_conversation_turn(
+                    self.db_path, conversation_id, prompt, key
+                )
+            ),
+        )
+        self.assertIsNotNone(outcome)
+        self.assertEqual((wake_id, "delivered", 1), (
+            outcome.wake_id,
+            outcome.state,
+            outcome.attempt_number,
+        ))
+        broker_run = BrokerStore(self.db_path).claim_next("bound-route-broker")
+        self.assertIsNotNone(broker_run)
+        return broker_run
+
+    def _prepare(self, broker_run):
+        prepared: list[dict] = []
+
+        def prepare_launch(**kwargs):
+            prepared.append(kwargs)
+            return SimpleNamespace(
+                cwd=str(broker_run.worktree),
+                archive_id=42,
+                harness=kwargs["harness"],
+                model=kwargs["model"],
+                effort=kwargs["effort"],
+                env={"SC_BOUND_ROUTE_PROOF": "1"},
+            )
+
+        context, archive_id = ConversationLaunchPreparer(
+            self.db_path,
+            prepare_launch=prepare_launch,
+            liveness=lambda: {"supported": True, "processes": []},
+        )(broker_run)
+        self.assertEqual(archive_id, 42)
+        self.assertEqual(len(prepared), 1)
+        return context, prepared[0]
+
+    def test_harness_default_survives_arm_queue_broker_and_launch(self) -> None:
+        status, _scope = self._runtime("kimi")
+        self.con.execute(
+            "UPDATE flavor_defaults SET model='current-flavor-default',"
+            "effort='high' WHERE harness='kimi'"
+        )
+        self.con.commit()
+        sprint_id = self._seed_sprint(harness="kimi", model=None, effort=None)
+
+        with mock.patch.object(
+            model_catalog, "harness_runtime_status", return_value=status
+        ):
+            wake_id = self._arm(sprint_id)
+            broker_run = self._deliver_and_claim(wake_id)
+        context, launch = self._prepare(broker_run)
+        projection = route_transport.context_projection(context, "kimi")
+
+        self.assertEqual(broker_run.route_contract_version, 2)
+        self.assertIsNone(broker_run.model)
+        self.assertIsNone(broker_run.effort)
+        self.assertEqual(broker_run.route_binding["transport"], "native-default")
+        self.assertEqual(broker_run.route_binding["control_state"], "harness-default")
+        self.assertEqual(
+            tuple(
+                self.con.execute(
+                    "SELECT defaults.model,defaults.effort FROM flavor_defaults "
+                    "defaults JOIN shells shell ON shell.flavor=defaults.flavor "
+                    "WHERE shell.shell_id=? AND defaults.harness='kimi'",
+                    (broker_run.shell_id,),
+                ).fetchone()
+            ),
+            ("current-flavor-default", "high"),
+        )
+        self.assertIsNone(launch["model"])
+        self.assertIsNone(launch["effort"])
+        self.assertEqual(launch["route_binding"], broker_run.route_binding)
+        self.assertEqual(launch["binding_digest"], broker_run.binding_digest)
+        self.assertIsNone(context.model)
+        self.assertIsNone(context.effort)
+        self.assertIsNone(projection.model)
+        self.assertIsNone(projection.effort)
+        self.assertEqual(projection.argument_tail, ())
+
+    def test_opencode_dispatch_uses_bound_variant_after_catalogue_changes(self) -> None:
+        observation = self._seed_opencode_catalogue()
+        sprint_id = self._seed_sprint(
+            harness="opencode", model=self.SELECTOR, effort="high"
+        )
+        with mock.patch.object(
+            model_catalog, "controlled_route_evidence", return_value=observation
+        ):
+            wake_id = self._arm(sprint_id)
+            outcome = sprint_message_delivery.SprintWakeDeliveryService(
+                self.con, force_new_quiet_seconds=0
+            ).deliver_once(
+                "bound-opencode-proof",
+                lambda conversation_id, prompt, key: (
+                    sprint_runtime.enqueue_conversation_turn(
+                        self.db_path, conversation_id, prompt, key
+                    )
+                ),
+            )
+        self.assertIsNotNone(outcome)
+        self.assertEqual((wake_id, "delivered"), (outcome.wake_id, outcome.state))
+
+        self._publish_successor_catalogue()
+        broker_run = BrokerStore(self.db_path).claim_next("bound-opencode-broker")
+        self.assertIsNotNone(broker_run)
+        context, launch = self._prepare(broker_run)
+        projection = route_transport.context_projection(context, "opencode")
+
+        class RecordingTransport:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str, dict | None]] = []
+
+            def request(self, method, path, *, query=None, body=None):
+                self.calls.append((method, path, body))
+                return {}
+
+            def stream(self, *_args, **_kwargs):
+                return iter(())
+
+        transport = RecordingTransport()
+        adapter = OpenCodeAdapter(
+            transport=transport,
+            shell_runtime_dir=self.root / "opencode-shells",
+        )
+        adapter._prepare_shell_environment(context)
+        adapter._prompt("native-session", context, "Dispatch stored route")
+        config = json.loads((broker_run.worktree / "opencode.json").read_text())
+        current = json.loads(
+            self.con.execute(
+                "SELECT effort_metadata FROM model_routes "
+                "WHERE harness='opencode' AND selector=?",
+                (self.SELECTOR,),
+            ).fetchone()[0]
+        )
+
+        self.assertEqual(
+            broker_run.route_binding["catalogue_generation"], self.GENERATION
+        )
+        self.assertEqual(broker_run.route_binding["native_variant_id"], "high")
+        self.assertEqual(
+            broker_run.route_binding["adapter_metadata"]["variant_options"],
+            {"reasoningEffort": "high", "textVerbosity": "low"},
+        )
+        self.assertEqual(launch["route_binding"], broker_run.route_binding)
+        self.assertEqual(projection.native_variant_id, "high")
+        self.assertEqual(
+            config["agent"][projection.route_agent],
+            {
+                "mode": "primary",
+                "model": self.SELECTOR,
+                "reasoningEffort": "high",
+                "textVerbosity": "low",
+            },
+        )
+        self.assertEqual(current["native_variant_ids"], {"xhigh": "xhigh"})
+        self.assertEqual(
+            transport.calls[-1][2],
+            {
+                "parts": [{"type": "text", "text": "Dispatch stored route"}],
+                "model": {
+                    "providerID": "openai",
+                    "modelID": "sprint-bound-model",
+                },
+                "agent": projection.route_agent,
+            },
+        )
+
+    def test_stale_binding_refuses_before_conversation_or_prompt_dispatch(self) -> None:
+        observation = self._seed_opencode_catalogue()
+        sprint_id = self._seed_sprint(
+            harness="opencode", model=self.SELECTOR, effort="high"
+        )
+        with mock.patch.object(
+            model_catalog, "controlled_route_evidence", return_value=observation
+        ):
+            wake_id = self._arm(sprint_id)
+            self._publish_successor_catalogue()
+            deliveries: list[tuple[str, str, str]] = []
+            outcome = sprint_message_delivery.SprintWakeDeliveryService(
+                self.con, force_new_quiet_seconds=0
+            ).deliver_once(
+                "stale-bound-route-proof",
+                lambda conversation_id, prompt, key: deliveries.append(
+                    (conversation_id, prompt, key)
+                ),
+            )
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual((wake_id, "pending", 1), (
+            outcome.wake_id,
+            outcome.state,
+            outcome.attempt_number,
+        ))
+        self.assertEqual(deliveries, [])
+        self.assertEqual(
+            tuple(
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT COUNT(*) FROM conversations UNION ALL "
+                    "SELECT COUNT(*) FROM conversation_messages UNION ALL "
+                    "SELECT COUNT(*) FROM conversation_outbox UNION ALL "
+                    "SELECT COUNT(*) FROM conversation_runs UNION ALL "
+                    "SELECT COUNT(*) FROM active_shell_chats"
+                ).fetchall()
+            ),
+            ((0,), (0,), (0,), (0,), (0,)),
+        )
+        self.assertEqual(
+            tuple(
+                self.con.execute(
+                    "SELECT state,attempt_count,last_error "
+                    "FROM sprint_wake_outbox WHERE wake_id=?",
+                    (wake_id,),
+                ).fetchone()
+            ),
+            (
+                "pending",
+                1,
+                "route_evidence_stale: Stored Sprint route evidence changed "
+                "before its first native turn",
+            ),
+        )
 
 
 class SprintLiveProof(unittest.TestCase):
