@@ -100,33 +100,28 @@ def resolve(con, harness: str, selector: str | None = None, *,
             runtime_status=runtime_status, runtime_scope=runtime_scope,
         )
     observed_row = _route(con, harness, selector)
-    route_proof = route_bindings.probe_controlled_route(harness, selector)
-    with db_driver.write_transaction(con, "model_route.resolve"):
-        return resolve_row(
-            observed_row, harness, selector, shell=shell, effort=effort, now=now,
-            route_proof=route_proof, con=con,
-        )
+    return resolve_row(
+        observed_row, harness, selector, shell=shell, effort=effort, now=now,
+        con=con,
+    )
 
 
 def resolve_row(row: dict | None, harness: str, selector: str | None, *,
                 shell: str = "<shell>", effort: str | None = None,
                 now=None,
-                route_proof=None,
                 con=None, runtime_status: dict | None = None,
                 runtime_scope: dict | None = None) -> dict:
-    """Resolve inside ``con``'s caller-owned write, or purely when omitted."""
+    """Resolve through ``con``'s owned freshness write, or purely if omitted."""
     try:
         if con is not None:
             binding, binding_digest = route_bindings.resolve_persisted_v2(
                 con, row, harness, selector, effort, now=now,
-                route_proof=route_proof,
                 runtime_status=runtime_status,
                 runtime_scope=runtime_scope,
             )
         else:
             binding, binding_digest = route_bindings.resolve_v2(
                 row, harness, selector, effort, now=now,
-                route_proof=route_proof,
                 runtime_status=runtime_status,
                 runtime_scope=runtime_scope,
             )

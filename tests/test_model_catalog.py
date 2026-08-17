@@ -120,18 +120,6 @@ def controlled_bundle(
     }
 
 
-def controlled_proof(
-    harness: str, selector: str, status: dict, fingerprint: str | None
-):
-    with mock.patch.object(
-        mc, "controlled_route_evidence",
-        return_value=controlled_bundle(harness, selector, status, fingerprint),
-    ) as collector:
-        proof = route_bindings.probe_controlled_route(harness, selector)
-    collector.assert_called_once_with(harness, selector)
-    return proof
-
-
 def controlled_row(
     harness: str, selector: str, status: dict, fingerprint: str
 ) -> dict:

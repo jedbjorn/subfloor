@@ -94,7 +94,7 @@ _CONTROLLED_PROOF_ISSUER = object()
 
 
 class _ControlledRouteProof:
-    """Opaque result of one resolver-owned runtime and source observation."""
+    """Private result of one resolver-owned runtime and source observation."""
 
     __slots__ = (
         "_harness", "_selector", "_runtime_status", "_runtime",
@@ -447,11 +447,11 @@ def _require_controlled_runtime(
     return status
 
 
-def probe_controlled_route(harness: str, model: str) -> _ControlledRouteProof:
+def _probe_controlled_route(harness: str, model: str) -> _ControlledRouteProof:
     """Collect one indivisible execution-seat proof for an exact route.
 
-    The public resolver accepts only this opaque result, never caller-authored
-    runtime labels or a source digest copied from durable catalogue state.
+    Only the owning resolution/availability operation carries this result;
+    public resolvers never accept a reusable source observation from callers.
     Importing lazily avoids the catalogue's binding-schema import cycle.
     """
     harness = normalize_harness(harness)
@@ -487,7 +487,7 @@ def _controlled_proof(
     collect: bool,
 ) -> _ControlledRouteProof:
     if proof is None and collect:
-        proof = probe_controlled_route(harness, model)
+        proof = _probe_controlled_route(harness, model)
     if (
         not isinstance(proof, _ControlledRouteProof)
         or proof._issuer is not _CONTROLLED_PROOF_ISSUER
@@ -651,14 +651,14 @@ def _validate_route_freshness(
         )
 
 
-def require_fresh_route(
+def _require_fresh_route(
     con,
     row: dict | None,
     harness: str,
     model: str | None,
     *,
     now: datetime | None = None,
-    route_proof: _ControlledRouteProof | None = None,
+    route_proof: _ControlledRouteProof | None,
 ) -> dict | None:
     """Validate and stage one exact route's freshness in the caller's write."""
     harness = normalize_harness(harness)
@@ -775,6 +775,34 @@ def require_fresh_route(
     return row
 
 
+def require_fresh_route(
+    con,
+    row: dict | None,
+    harness: str,
+    model: str | None,
+    *,
+    now: datetime | None = None,
+) -> dict | None:
+    """Validate freshness using a current canonical execution-seat probe.
+
+    Callers cannot supply or replay a prior source observation.  The helper is
+    composable with a caller-owned transaction; standalone binding resolution
+    uses :func:`resolve_persisted_v2` so its probe stays outside the write.
+    """
+    normalized_harness = normalize_harness(harness)
+    normalized_model = _normalize_model(model)
+    if normalized_model is None or normalized_harness == "vibe":
+        return _require_fresh_route(
+            con, row, normalized_harness, normalized_model, now=now,
+            route_proof=None,
+        )
+    proof = _probe_controlled_route(normalized_harness, normalized_model)
+    return _require_fresh_route(
+        con, row, normalized_harness, normalized_model, now=now,
+        route_proof=proof,
+    )
+
+
 def resolve_persisted_v2(
     con,
     row: dict | None,
@@ -783,21 +811,44 @@ def resolve_persisted_v2(
     effort: str | None = None,
     *,
     now: datetime | None = None,
-    route_proof: _ControlledRouteProof | None = None,
     runtime_status: dict | None = None,
     runtime_scope: dict | None = None,
 ) -> tuple[dict, str]:
-    """Resolve through the shared durable freshness boundary."""
-    fresh_row = require_fresh_route(
-        con, row, harness, model, now=now,
-        route_proof=route_proof,
-    )
-    return resolve_v2(
-        fresh_row, harness, model, effort, now=now,
-        route_proof=route_proof,
-        runtime_status=runtime_status,
-        runtime_scope=runtime_scope,
-    )
+    """Probe and resolve through one transaction-owned freshness operation."""
+    harness = normalize_harness(harness)
+    model = _normalize_model(model)
+    if con.in_transaction:
+        raise RuntimeError(
+            "resolve_persisted_v2 owns its write transaction"
+        )
+    proof = None
+    if model is not None and harness != "vibe":
+        proof = _probe_controlled_route(harness, model)
+
+    import db_driver  # noqa: PLC0415
+
+    result = None
+    resolution_error = None
+    with db_driver.write_transaction(con, "model_route.resolve"):
+        try:
+            fresh_row = _require_fresh_route(
+                con, row, harness, model, now=now, route_proof=proof,
+            )
+            result = _resolve_v2(
+                fresh_row, harness, model, effort, now=now,
+                route_proof=proof,
+                runtime_status=runtime_status,
+                runtime_scope=runtime_scope,
+            )
+        except RouteResolutionError as exc:
+            # Freshness rejection may stage stale=1.  Commit that projection,
+            # then raise outside the generator-based transaction context so
+            # frozen typed errors remain safe on Python 3.14.
+            resolution_error = exc
+    if resolution_error is not None:
+        raise resolution_error
+    assert result is not None
+    return result
 
 
 def resolve_v2(
@@ -807,11 +858,30 @@ def resolve_v2(
     effort: str | None = None,
     *,
     now: datetime | None = None,
-    route_proof: _ControlledRouteProof | None = None,
     runtime_status: dict | None = None,
     runtime_scope: dict | None = None,
 ) -> tuple[dict, str]:
-    """Resolve one v2 intent to a fixed-key immutable binding and digest."""
+    """Resolve one intent after collecting current execution-seat evidence."""
+    return _resolve_v2(
+        row, harness, model, effort, now=now,
+        route_proof=None,
+        runtime_status=runtime_status,
+        runtime_scope=runtime_scope,
+    )
+
+
+def _resolve_v2(
+    row: dict | None,
+    harness: str,
+    model: str | None,
+    effort: str | None = None,
+    *,
+    now: datetime | None = None,
+    route_proof: _ControlledRouteProof | None,
+    runtime_status: dict | None = None,
+    runtime_scope: dict | None = None,
+) -> tuple[dict, str]:
+    """Build a binding from proof private to this resolution operation."""
     harness = normalize_harness(harness)
     model = _normalize_model(model)
     if model is None or harness == "vibe":

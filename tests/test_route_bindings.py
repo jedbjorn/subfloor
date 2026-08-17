@@ -45,27 +45,6 @@ def compatible_runtime(version: str = "2.22.0", *, harness: str | None = None,
     }
 
 
-def controlled_proof(
-    fingerprint: str | None = "2" * 64,
-    *,
-    harness: str = "codex",
-    selector: str = "gpt-test",
-    version: str | None = None,
-    scope: dict | None = None,
-) -> object:
-    scope = scope or route_bindings.harness_versions.runtime_scope()
-    observation = controlled_observation(
-        fingerprint, harness=harness, version=version,
-        scope=scope,
-    )
-    with mock.patch.object(
-        model_catalog, "controlled_route_evidence", return_value=observation
-    ) as collector:
-        proof = route_bindings.probe_controlled_route(harness, selector)
-    collector.assert_called_once_with(harness, selector)
-    return proof
-
-
 def controlled_observation(
     fingerprint: str | None = "2" * 64,
     *,
@@ -86,6 +65,31 @@ def controlled_observation(
         "runtime_scope": scope,
         "source_fingerprint": fingerprint,
     }
+
+
+def resolve_controlled_v2(
+    row: dict,
+    harness: str,
+    selector: str,
+    effort: str | None = None,
+    *,
+    fingerprint: str | None = "2" * 64,
+    version: str | None = None,
+    scope: dict | None = None,
+    **kwargs,
+) -> tuple[dict, str]:
+    normalized = harness.strip().lower()
+    observation = controlled_observation(
+        fingerprint, harness=normalized, version=version, scope=scope,
+    )
+    with mock.patch.object(
+        model_catalog, "controlled_route_evidence", return_value=observation
+    ) as collector:
+        result = route_bindings.resolve_v2(
+            row, harness, selector, effort, **kwargs
+        )
+    collector.assert_called_once_with(normalized, selector)
+    return result
 
 
 def route_schema(path: str | Path = ":memory:") -> sqlite3.Connection:
@@ -190,14 +194,12 @@ class BindingIdentityTest(unittest.TestCase):
         )
 
     def test_controlled_omitted_and_explicit_high_have_same_fixed_identity(self):
-        implicit, implicit_digest = route_bindings.resolve_v2(
+        implicit, implicit_digest = resolve_controlled_v2(
             self.controlled_row(), "Codex", "gpt-test", now=self.NOW,
-            route_proof=controlled_proof(),
             runtime_status=compatible_runtime("0.145.0", harness="codex"),
         )
-        explicit, explicit_digest = route_bindings.resolve_v2(
+        explicit, explicit_digest = resolve_controlled_v2(
             self.controlled_row(), "codex", "gpt-test", " HIGH ", now=self.NOW,
-            route_proof=controlled_proof(),
             runtime_status=compatible_runtime("0.145.0", harness="codex"),
         )
 
@@ -247,18 +249,14 @@ class BindingIdentityTest(unittest.TestCase):
         )
 
     def test_opencode_ascii_lookup_accepts_case_without_aliasing_unicode(self):
-        canonical, canonical_digest = route_bindings.resolve_v2(
+        canonical, canonical_digest = resolve_controlled_v2(
             self.opencode_row(), "opencode", "provider/model", "k",
-            now=self.NOW, route_proof=controlled_proof(
-                harness="opencode", selector="provider/model"
-            ),
+            now=self.NOW,
             runtime_status=compatible_runtime("1.18.9", harness="opencode"),
         )
-        mixed_case, mixed_case_digest = route_bindings.resolve_v2(
+        mixed_case, mixed_case_digest = resolve_controlled_v2(
             self.opencode_row(), "opencode", "provider/model", " K ",
-            now=self.NOW, route_proof=controlled_proof(
-                harness="opencode", selector="provider/model"
-            ),
+            now=self.NOW,
             runtime_status=compatible_runtime("1.18.9", harness="opencode"),
         )
 
@@ -271,12 +269,9 @@ class BindingIdentityTest(unittest.TestCase):
                 with self.assertRaises(
                     route_bindings.RouteResolutionError
                 ) as raised:
-                    route_bindings.resolve_v2(
+                    resolve_controlled_v2(
                         self.opencode_row(), "opencode", "provider/model",
                         confusable, now=self.NOW,
-                        route_proof=controlled_proof(
-                            harness="opencode", selector="provider/model"
-                        ),
                         runtime_status=compatible_runtime(
                             "1.18.9", harness="opencode"
                         ),
@@ -306,10 +301,10 @@ class BindingIdentityTest(unittest.TestCase):
         for overrides, effort, fingerprint, code in cases:
             with self.subTest(code=code, overrides=overrides):
                 with self.assertRaises(route_bindings.RouteResolutionError) as raised:
-                    route_bindings.resolve_v2(
+                    resolve_controlled_v2(
                         self.controlled_row(**overrides), "codex", "gpt-test", effort,
                         now=self.NOW,
-                        route_proof=controlled_proof(fingerprint),
+                        fingerprint=fingerprint,
                         runtime_status=compatible_runtime(
                             "0.145.0", harness="codex"
                         ),
@@ -364,9 +359,9 @@ class BindingIdentityTest(unittest.TestCase):
 
     def test_controlled_route_requires_exact_execution_runtime_evidence(self):
         scope = {"runtime": "sandbox", "runtime_identity": "sandbox:image-a"}
-        binding, digest = route_bindings.resolve_v2(
+        binding, digest = resolve_controlled_v2(
             self.controlled_row(), "codex", "gpt-test", now=self.NOW,
-            route_proof=controlled_proof(scope=scope),
+            scope=scope,
         )
         self.assertEqual(binding["harness"], "codex")
         self.assertRegex(digest, r"^[0-9a-f]{64}$")
@@ -401,57 +396,65 @@ class BindingIdentityTest(unittest.TestCase):
                 mock.patch.object(
                     model_catalog, "controlled_route_evidence",
                     return_value=observation,
-                ),
-            ):
-                proof = route_bindings.probe_controlled_route(
-                    "codex", "gpt-test"
-                )
-                with self.assertRaises(
-                    route_bindings.RouteResolutionError
-                ) as raised:
-                    route_bindings.resolve_v2(
-                        self.controlled_row(), "codex", "gpt-test",
-                        now=self.NOW, route_proof=proof,
-                    )
-                self.assertEqual(
-                    raised.exception.code, "thinking_evidence_stale"
-                )
-
-    def test_controlled_proof_must_be_issued_and_match_the_exact_route(self):
-        scope = {"runtime": "sandbox", "runtime_identity": "sandbox:image-a"}
-        cases = {
-            "untyped-stored-fingerprint": {
-                "harness": "codex",
-                "selector": "gpt-test",
-                **scope,
-                "harness_version": "0.145.0",
-                "fingerprint": "2" * 64,
-            },
-            "other-harness": controlled_proof(
-                harness="claude", selector="gpt-test", scope=scope
-            ),
-            "other-selector": controlled_proof(
-                selector="other-model", scope=scope
-            ),
-        }
-        for name, source in cases.items():
-            with (
-                self.subTest(name=name),
-                mock.patch.object(
-                    model_catalog, "controlled_route_evidence",
-                    side_effect=AssertionError("collector must not run"),
                 ) as collector,
-                self.assertRaises(route_bindings.RouteResolutionError) as raised,
+                self.assertRaises(
+                    route_bindings.RouteResolutionError
+                ) as raised,
             ):
                 route_bindings.resolve_v2(
                     self.controlled_row(), "codex", "gpt-test",
-                    now=self.NOW, route_proof=source,
+                    now=self.NOW,
                 )
-            self.assertEqual(collector.call_count, 0)
-            self.assertEqual(raised.exception.code, "thinking_evidence_stale")
-            self.assertFalse(raised.exception.details["persist_route_stale"])
+            collector.assert_called_once_with("codex", "gpt-test")
+            self.assertEqual(
+                raised.exception.code, "thinking_evidence_stale"
+            )
 
-        proof = controlled_proof(scope=scope)
+    def test_public_resolver_does_not_accept_caller_supplied_route_proof(self):
+        with self.assertRaises(TypeError) as raised:
+            route_bindings.resolve_v2(
+                self.controlled_row(), "codex", "gpt-test", now=self.NOW,
+                route_proof={"source_fingerprint": "2" * 64},
+            )
+        self.assertIn("route_proof", str(raised.exception))
+
+    def test_retained_canonical_proof_cannot_bypass_current_source_drift(self):
+        scope = {"runtime": "sandbox", "runtime_identity": "sandbox:image-a"}
+        with mock.patch.object(
+            model_catalog, "controlled_route_evidence",
+            return_value=controlled_observation(scope=scope),
+        ) as initial_collector:
+            proof = route_bindings._probe_controlled_route(
+                "codex", "gpt-test"
+            )
+        initial_collector.assert_called_once_with("codex", "gpt-test")
+
+        binding = digest = None
+        with mock.patch.object(
+            model_catalog, "controlled_route_evidence",
+            return_value=controlled_observation(None, scope=scope),
+        ) as current_collector:
+            with self.assertRaises(
+                route_bindings.RouteResolutionError
+            ) as raised:
+                binding, digest = route_bindings.resolve_v2(
+                    self.controlled_row(), "codex", "gpt-test", now=self.NOW,
+                )
+            preview = routes_cli.resolve_row(
+                self.controlled_row(), "codex", "gpt-test", now=self.NOW,
+            )
+        self.assertEqual(
+            current_collector.call_args_list,
+            [mock.call("codex", "gpt-test"), mock.call("codex", "gpt-test")],
+        )
+        self.assertEqual(raised.exception.code, "thinking_evidence_stale")
+        self.assertIsNone(binding)
+        self.assertIsNone(digest)
+        self.assertEqual(preview["code"], "thinking_evidence_stale")
+        self.assertNotIn("binding", preview)
+        self.assertNotIn("binding_digest", preview)
+        self.assertNotIn("command", preview)
+
         with self.assertRaises(AttributeError):
             proof._source_fingerprint = self.controlled_row()[
                 "source_fingerprint"
@@ -1361,13 +1364,19 @@ class GenerationPersistenceTest(unittest.TestCase):
         ).fetchone())
         self.con.execute("INSERT INTO sprints VALUES (99,'prepared')")
 
-        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+        with (
+            mock.patch.object(
+                model_catalog, "controlled_route_evidence",
+                return_value=controlled_observation(
+                    "wrong-fingerprint"
+                ),
+            ) as collector,
+            self.assertRaises(route_bindings.RouteResolutionError) as raised,
+        ):
             route_bindings.require_fresh_route(
                 self.con, row, "codex", "rollback-route",
-                route_proof=controlled_proof(
-                    "wrong-fingerprint", selector="rollback-route"
-                ),
             )
+        collector.assert_called_once_with("codex", "rollback-route")
         staged = self.con.execute(
             "SELECT stale,last_error FROM model_routes "
             "WHERE selector='rollback-route'"
@@ -1407,10 +1416,9 @@ class ParticipantRevisionTest(unittest.TestCase):
 
     @staticmethod
     def controlled_binding() -> dict:
-        binding, _ = route_bindings.resolve_v2(
+        binding, _ = resolve_controlled_v2(
             BindingIdentityTest.controlled_row(), "codex", "gpt-test", "high",
             now=BindingIdentityTest.NOW,
-            route_proof=controlled_proof(),
             runtime_status=compatible_runtime("0.145.0", harness="codex"),
         )
         return binding

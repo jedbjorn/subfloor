@@ -496,9 +496,6 @@ def get_flavor_defaults(con) -> dict:
     return {"flavors": flavors, "harnesses": known_harnesses()}
 
 
-_ROUTE_NOT_OBSERVED = object()
-
-
 def _model_route_available_in_transaction(
     con, observed_route: dict | None, harness: str, selector: str,
     route_proof,
@@ -521,7 +518,7 @@ def _model_route_available_in_transaction(
             and not current["stale"]
         )
     try:
-        route_bindings.require_fresh_route(
+        route_bindings._require_fresh_route(
             con, observed_route, harness, selector,
             route_proof=route_proof,
         )
@@ -531,30 +528,22 @@ def _model_route_available_in_transaction(
 
 
 def model_route_available(
-    con, harness: str, selector: str, *,
-    route_proof=None,
-    observed_route=_ROUTE_NOT_OBSERVED,
+    con, harness: str, selector: str,
 ) -> bool:
     """True only for an exact route proved available by the local catalogue."""
-    if observed_route is _ROUTE_NOT_OBSERVED:
-        if con.in_transaction:
-            raise RuntimeError(
-                "transactional route checks require a pre-lock route observation"
-            )
-        row = con.execute(
-            "SELECT * FROM model_routes WHERE harness=? AND selector=?",
-            (harness, selector),
-        ).fetchone()
-        observed_route = dict(row) if row else None
-    if harness != "vibe" and route_proof is None:
-        if con.in_transaction:
-            raise RuntimeError(
-                "transactional route checks require precomputed route evidence"
-            )
-        route_proof = route_bindings.probe_controlled_route(harness, selector)
     if con.in_transaction:
-        return _model_route_available_in_transaction(
-            con, observed_route, harness, selector, route_proof,
+        raise RuntimeError(
+            "model_route_available owns its write transaction"
+        )
+    row = con.execute(
+        "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+        (harness, selector),
+    ).fetchone()
+    observed_route = dict(row) if row else None
+    route_proof = None
+    if harness != "vibe":
+        route_proof = route_bindings._probe_controlled_route(
+            harness, selector
         )
     with db_driver.write_transaction(con, "model_route.available"):
         return _model_route_available_in_transaction(
@@ -598,12 +587,10 @@ def set_flavor_default(con, body) -> tuple[bool, str | None]:
         ).fetchone()
         observed_route = dict(row) if row else None
         if harness != "vibe":
-            route_proof = route_bindings.probe_controlled_route(harness, model)
+            route_proof = route_bindings._probe_controlled_route(harness, model)
     with db_driver.write_transaction(con, "flavor_default.set"):
-        if model is not None and not model_route_available(
-                con, harness, model,
-                route_proof=route_proof,
-                observed_route=observed_route):
+        if model is not None and not _model_route_available_in_transaction(
+                con, observed_route, harness, model, route_proof):
             return False, (
                 f"invalid_model_route: {model!r} is not an exact currently "
                 f"available route for {harness}; choose an available "
