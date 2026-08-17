@@ -18,7 +18,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
 
@@ -49,6 +49,17 @@ RECONCILE_OUTCOMES = frozenset(
     {"running", "succeeded", "failed", "cancelled", "unknown"}
 )
 PERMISSION_MODES = frozenset({"unrestricted", "interactive"})
+SEMVER_TOKEN = re.compile(
+    r"(?:^|(?<=\s))v?((\d+\.\d+\.\d+)(?:-[0-9A-Za-z.-]+)?"
+    r"(?:\+[0-9A-Za-z.-]+)?)(?=$|\s|\()"
+)
+MAINTAINED_OBSERVED_VERSIONS = {
+    "claude": "2.1.223 (Claude Code)",
+    "codex": "codex-cli 0.147.0",
+    "opencode": "1.18.9",
+    "vibe": "vibe 2.22.0",
+    "kimi": "0.33.0",
+}
 
 
 class AdapterError(RuntimeError):
@@ -329,13 +340,50 @@ class ConversationAdapter(abc.ABC):
     ) -> ReconcileResult:
         raise NotImplementedError
 
-    def _probe_result(self, version: str) -> ProbeResult:
-        return checked_probe_result(
+    def _probe_result(self, observed_version: str) -> ProbeResult:
+        match = SEMVER_TOKEN.search(observed_version)
+        if match is None:
+            conversation = self.manifest.get("conversation") or {}
+            checked = checked_version_compatibility(
+                harness=self.harness,
+                compatibility=conversation,
+                version=conversation.get("verified_cli_version"),
+            )
+            return ProbeResult(
+                harness=self.harness,
+                version=observed_version,
+                minimum_version=checked.minimum_version,
+                capabilities=self.capabilities,
+                maximum_version_exclusive=checked.maximum_version_exclusive,
+                verified_version=checked.verified_version,
+                compatibility="non-semver",
+            )
+        result = checked_probe_result(
             harness=self.harness,
             manifest=self.manifest,
             capabilities=self.capabilities,
-            version=version,
+            version=match.group(2),
         )
+        if match.group(1) != match.group(2):
+            return replace(
+                result,
+                version=match.group(1),
+                compatibility=(
+                    "prerelease-unverified"
+                    if result.compatibility == "verified"
+                    else result.compatibility
+                ),
+            )
+        if (
+            result.compatibility == "verified"
+            and observed_version != MAINTAINED_OBSERVED_VERSIONS.get(self.harness)
+        ):
+            return replace(
+                result,
+                version=observed_version,
+                compatibility="custom-unverified",
+            )
+        return result
 
 
 class HttpTransport(Protocol):
@@ -692,13 +740,13 @@ def command_version(argv: list[str]) -> str:
             f"cannot probe {' '.join(argv)}: {exc}",
             retryable=True,
         ) from exc
-    match = re.search(r"\d+\.\d+\.\d+", result.stdout + result.stderr)
-    if not match:
+    output = (result.stdout or result.stderr or "").strip().splitlines()
+    if not output:
         raise AdapterError(
             "HARNESS_PROTOCOL_ERROR",
-            f"version probe returned no semantic version: {' '.join(argv)}",
+            f"version probe returned no output: {' '.join(argv)}",
         )
-    return match.group(0)
+    return output[0].strip()
 
 
 def version_tuple(version: str) -> tuple[int, int, int]:

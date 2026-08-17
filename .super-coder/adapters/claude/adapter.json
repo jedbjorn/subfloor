@@ -30,7 +30,7 @@
     "contract_version": 1,
     "minimum_cli_version": "2.1.220",
     "maximum_cli_version_exclusive": "2.2.0",
-    "verified_cli_version": "2.1.222",
+    "verified_cli_version": "2.1.223",
     "driver": "claude-print",
     "session_ref": { "source": "system.init", "field": "session_id" },
     "start": {

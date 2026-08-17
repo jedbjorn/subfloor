@@ -135,6 +135,10 @@ def resolve_row(row: dict | None, harness: str, selector: str | None, *,
         "availability": row.get("availability") if row else None,
         "stale": False,
         "cli_version": row.get("cli_version") if row else None,
+        "harness_version": row.get("harness_version") if row else None,
+        "harness_support_state": (
+            row.get("harness_support_state") if row else None
+        ),
         "supported_efforts": json.loads(row["supported_efforts"] or "[]")
         if row and isinstance(row.get("supported_efforts"), str)
         else (row.get("supported_efforts") if row else []),
@@ -169,13 +173,20 @@ def _print_routes(rows) -> int:
         state = "runnable" if runnable else r["availability"]
         if r["stale"]:
             state += "/stale"
-        print(f"{r['harness']}/{r['selector']}\t{state}\t{r['source']}")
+        support = r.get("harness_support_state") if isinstance(r, dict) \
+            else r["harness_support_state"]
+        observed = r.get("harness_version") if isinstance(r, dict) \
+            else r["harness_version"]
+        detail = " · ".join(value for value in (support, observed) if value)
+        print(f"{r['harness']}/{r['selector']}\t{state}\t{r['source']}"
+              + (f"\t{detail}" if detail else ""))
     return 0
 
 
 def _list(con, harness: str | None) -> int:
     sql = ("SELECT harness, selector, source, availability, stale, "
-           "headless_supported, high_effort_supported FROM model_routes")
+           "headless_supported, high_effort_supported,harness_version,"
+           "harness_support_state FROM model_routes")
     params: tuple = ()
     if harness:
         sql += " WHERE harness=?"

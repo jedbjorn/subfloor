@@ -113,12 +113,14 @@ const rows = sprintParticipantRoutes([
     binding_status: "bound", control_state: "controlled", effective_effort: "xhigh",
     intent_control_state: "controlled", intent_effective_effort: "xhigh",
     route_revision: 2, binding_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    harness_support_state: "tested", harness_version: "codex-cli 0.147.0",
   },
   {
     role: "developer", shortname: "DEV3", harness: "vibe", model: "vibe-model",
-    binding_status: "unbound-intent", control_state: null, effective_effort: null,
+    binding_status: "bound", control_state: "native-uncontrolled", effective_effort: null,
     intent_control_state: "native-uncontrolled", intent_effective_effort: null,
-    route_revision: null, binding_digest: null,
+    route_revision: 1, binding_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    harness_support_state: "best-effort", harness_version: "vibe dev-build",
   },
   {
     role: "developer", shortname: "DEV4", harness: "codex", model: null,
@@ -131,8 +133,8 @@ console.log(JSON.stringify(rows.children.map((row) => row.textContent)));
 """
     assert run_js(script) == [
         "developer DEV2codex · gpt-5.4Thinking level: high · unbound intent",
-        "reviewer REV1codex · gpt-5.4Thinking level: xhigh · route r2 · aaaaaaaaaaaa…",
-        "developer DEV3vibe · vibe-modelThinking control unavailable · unbound intent",
+        "reviewer REV1codex · gpt-5.4Thinking level: xhigh · route r2 · aaaaaaaaaaaa… · Support: tested (codex-cli 0.147.0)",
+        "developer DEV3vibe · vibe-modelThinking control unavailable · route r1 · bbbbbbbbbbbb… · Support: best-effort (vibe dev-build)",
         "developer DEV4codex · Harness defaultThinking control unavailable · unbound intent",
     ]
 

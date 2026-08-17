@@ -3,7 +3,7 @@
 
 The catalog is layered and best-effort: models.dev (keyless, all five
 harnesses) → provider APIs (only with env keys) → OpenCode's connected-provider
-    projection → cache → static floor. Payload v6 retains family metadata
+    projection → cache → static floor. Payload v7 retains family metadata
 (newest-first; claude families with a CLI alias resolve `latest` to the
 alias), the flat `models` list for sub-version search, and fork-local harness
 and configured-route verification. These tests pin
@@ -563,6 +563,10 @@ class RoutePersistenceTest(unittest.TestCase):
             ROOT / ".super-coder" / "migrations" /
             "0212_route_binding_foundation.sql"
         ).read_text())
+        self.con.executescript((
+            ROOT / ".super-coder" / "migrations" /
+            "0217_harness_support_metadata.sql"
+        ).read_text())
 
     def tearDown(self):
         self.con.close()
@@ -715,7 +719,7 @@ class RuntimeVerificationTest(unittest.TestCase):
             (flavor, harness, model, is_default),
         )
 
-    def test_report_combines_harness_compatibility_and_exact_route_evidence(self):
+    def test_report_projects_best_effort_route_as_runnable(self):
         self.insert_default("dev", "codex", "gpt-ready", 1)
         self.insert_default("planner", "codex", "gpt-missing", 1)
         self.insert_default("reviewer", "claude", None, 1)
@@ -748,9 +752,9 @@ class RuntimeVerificationTest(unittest.TestCase):
                          "newer-unverified")
         self.assertEqual(report["summary"], {
             "harnesses_checked": 4,
-            "harnesses_ready": 2,
+            "harnesses_ready": 3,
             "exact_routes": 4,
-            "exact_routes_runnable": 1,
+            "exact_routes_runnable": 2,
             "harness_defaults": 1,
         })
         by_key = {
@@ -759,11 +763,11 @@ class RuntimeVerificationTest(unittest.TestCase):
         }
         self.assertEqual(by_key[("dev", "codex")], {
             "flavor": "dev", "harness": "codex", "model": "gpt-ready",
-            "is_default": True, "state": "harness-error", "runnable": False,
-            "reason": "HARNESS_VERSION_UNVERIFIED",
+            "is_default": True, "state": "runnable", "runnable": True,
+            "reason": None,
         })
         self.assertEqual(by_key[("planner", "codex")]["state"],
-                         "harness-error")
+                         "route-missing")
         self.assertFalse(by_key[("planner", "codex")]["runnable"])
         self.assertEqual(by_key[("reviewer", "claude")]["state"],
                          "harness-default")
@@ -911,7 +915,7 @@ class RuntimeVerificationTest(unittest.TestCase):
         self.assertEqual(got["sources"], ["static"])
         self.assertEqual(got["verification"]["summary"], {
             "harnesses_checked": 4,
-            "harnesses_ready": 2,
+            "harnesses_ready": 3,
             "exact_routes": 0,
             "exact_routes_runnable": 0,
             "harness_defaults": 0,
@@ -926,6 +930,7 @@ class RouteCliConnectionTest(unittest.TestCase):
         "availability": "available", "stale": 0, "headless_supported": 1,
         "high_effort_supported": 1, "cli_version": "codex-cli 0.145.0",
         "harness_version": "0.145.0", "harness_compatibility": "verified",
+        "harness_support_state": "tested",
         "supported_efforts": '["high"]',
         "last_seen_at": datetime.now(timezone.utc).isoformat(),
         "generation_id": "1" * 32,
@@ -1184,7 +1189,7 @@ class RouteCliConnectionTest(unittest.TestCase):
         )
         accepted_con.close.assert_called_once_with()
 
-    def test_local_uncontrolled_resolve_requires_compatible_runtime(self):
+    def test_local_uncontrolled_resolve_requires_runtime_but_not_version_range(self):
         con = mock.Mock()
         with mock.patch.object(
             routes_cli.model_catalog, "harness_runtime_status",
@@ -1204,14 +1209,16 @@ class RouteCliConnectionTest(unittest.TestCase):
                 con, "vibe", "devstral-latest"
             )
 
-        for result in (unavailable_harness, incompatible_vibe):
-            self.assertFalse(result["ok"])
-            self.assertEqual(result["code"], "thinking_evidence_missing")
-            self.assertNotIn("binding", result)
-            self.assertNotIn("binding_digest", result)
-            self.assertNotIn("command", result)
+        self.assertFalse(unavailable_harness["ok"])
+        self.assertEqual(unavailable_harness["code"], "thinking_evidence_missing")
+        self.assertNotIn("binding", unavailable_harness)
+        self.assertNotIn("binding_digest", unavailable_harness)
+        self.assertNotIn("command", unavailable_harness)
         self.assertIn("no compatible installed runtime", unavailable_harness["error"])
-        self.assertIn("no compatible installed runtime", incompatible_vibe["error"])
+        self.assertTrue(incompatible_vibe["ok"])
+        self.assertEqual(
+            incompatible_vibe["binding"]["control_state"], "native-uncontrolled"
+        )
 
     def test_local_ready_uncontrolled_routes_keep_typed_null_identity(self):
         con = mock.Mock()
@@ -1245,7 +1252,7 @@ class RouteCliConnectionTest(unittest.TestCase):
             vibe_first["binding_digest"], vibe_replay["binding_digest"]
         )
 
-    def test_authenticated_uncontrolled_resolve_applies_runtime_compatibility(self):
+    def test_authenticated_uncontrolled_resolve_requires_runtime_not_version_range(self):
         cases = (
             (
                 ["resolve", "claude", "--json"],
@@ -1292,11 +1299,16 @@ class RouteCliConnectionTest(unittest.TestCase):
                 ):
                     status = routes_cli.main(argv)
                 result = json.loads(output.getvalue())
-                self.assertEqual(status, 2)
-                self.assertEqual(result["code"], "thinking_evidence_missing")
-                self.assertNotIn("binding", result)
-                self.assertNotIn("binding_digest", result)
-                self.assertNotIn("command", result)
+                accepted = local_status.get("error") is None
+                self.assertEqual(status, 0 if accepted else 2)
+                self.assertEqual(result["ok"], accepted)
+                if accepted:
+                    self.assertEqual(
+                        result["binding"]["control_state"], "native-uncontrolled"
+                    )
+                else:
+                    self.assertEqual(result["code"], "thinking_evidence_missing")
+                    self.assertNotIn("binding", result)
                 api.assert_called_once_with("GET", path)
 
     def test_authenticated_ready_uncontrolled_binding_is_stable(self):
@@ -1369,8 +1381,8 @@ class RouteCliConnectionTest(unittest.TestCase):
              sandbox, False),
             ("host-missing-container-ready", host_missing, sandbox_ready,
              sandbox, True),
-            ("incompatible-image-version", host_ready, sandbox_incompatible,
-             sandbox, False),
+            ("best-effort-image-version", host_ready, sandbox_incompatible,
+             sandbox, True),
             ("matching-bare-metal", host_ready, host_ready, host, True),
         )
 

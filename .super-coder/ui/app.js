@@ -432,6 +432,10 @@ function thinkingLevelState(harness, catalog, model, preferred = null) {
     route && route.availability === "available" && !catalog.stale);
   const selected = supported.includes(preferred)
     ? preferred : supported.includes("high") ? "high" : "";
+  const support = route?.harness_support_state
+    ? ` Support: ${route.harness_support_state}`
+      + (route.harness_version ? ` (${route.harness_version}).` : ".")
+    : "";
   if (!fresh) return {
     disabled: true, selected, supported,
     label: selected || "Refresh required",
@@ -441,7 +445,7 @@ function thinkingLevelState(harness, catalog, model, preferred = null) {
     disabled: false, selected, supported,
     label: selected || "Choose Thinking level",
     guidance: selected
-      ? `Thinking level ${selected} is proven for ${model}.`
+      ? `Thinking level ${selected} is proven for ${model}.${support}`
       : "Choose a supported Thinking level before saving.",
   };
 }
@@ -504,7 +508,8 @@ function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
     const efforts = m.supported_efforts || [];
     const route = efforts.includes("high")
       ? "local · high-effort route" : "local route";
-    return [route, m.source, m.release_date].filter(Boolean).join(" · ");
+    return [route, m.harness_support_state, m.harness_version, m.source, m.release_date]
+      .filter(Boolean).join(" · ");
   };
 
   const paint = () => {
@@ -599,7 +604,7 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
       const verification = refreshed.verification || {};
       const warnings = refreshed.stale || verification.error || verification.route_error
         || Object.values(verification.harnesses || {}).some(
-          (status) => status.error || status.compatibility === "newer-unverified")
+          (status) => status.error || status.support_state === "best-effort")
         || (verification.defaults || []).some((route) => route.runnable === false);
       setStatus(warnings
         ? "refresh complete — review verification warnings"
@@ -633,14 +638,16 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
     ])];
     for (const harness of harnessOrder) {
       const status = (verification.harnesses || {})[harness] || {};
-      const verdict = status.error || status.compatibility
-        || (status.version ? "detected" : "not checked");
+      const verdict = status.error || [status.compatibility, status.support_state]
+        .filter(Boolean).join(" · ") || (status.observed_version || status.version
+          ? "detected" : "not checked");
       const stateClass = status.error ? "dm-verify-bad"
-        : status.compatibility === "newer-unverified" ? "dm-verify-warn"
+        : status.support_state === "best-effort" ? "dm-verify-warn"
           : "dm-verify-ok";
       panel.append(el("div", { className: "dm-verify-row" },
         el("span", { className: "dm-harness" }, harness),
-        el("span", { className: "dm-current" }, status.version || "not installed"),
+        el("span", { className: "dm-current" },
+          status.observed_version || status.version || "not installed"),
         el("span", { className: `dm-verify-state ${stateClass}` }, verdict)));
     }
     const summary = verification.summary || {};
@@ -3103,7 +3110,9 @@ function chatModelOptions(select, catalog, harness, defaultModel) {
     textContent: "Use harness default",
   }));
   for (const model of available) {
-    select.append(el("option", { value: model.id, textContent: model.id }));
+    const support = model.harness_support_state
+      ? ` — ${model.harness_support_state}` : "";
+    select.append(el("option", { value: model.id, textContent: model.id + support }));
   }
   if (!select.options.length) {
     select.append(el("option", {
@@ -6242,10 +6251,14 @@ function sprintParticipantRoutes(participants) {
     const binding = participant.binding_status === "bound"
       ? `route r${participant.route_revision} · ${participant.binding_digest.slice(0, 12)}…`
       : participant.binding_status.replaceAll("-", " ");
+    const support = participant.harness_support_state
+      ? ` · Support: ${participant.harness_support_state}`
+        + (participant.harness_version ? ` (${participant.harness_version})` : "")
+      : "";
     rows.append(el("div", { className: "sprint-participant-binding" },
       el("strong", {}, `${participant.role} ${participant.shortname}`),
       el("span", {}, `${participant.harness} · ${model}`),
-      el("span", { className: "muted" }, `${thinking} · ${binding}`)));
+      el("span", { className: "muted" }, `${thinking} · ${binding}${support}`)));
   }
   return rows;
 }

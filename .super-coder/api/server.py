@@ -503,6 +503,7 @@ def get_flavor_defaults(con) -> dict:
         harness = r["harness"]
         model = r["model"]
         effort = r["effort"]
+        route = route_rows.get((harness, model)) or {}
         if harness == "vibe":
             effort_state = "unavailable"
             effective_effort = None
@@ -514,7 +515,6 @@ def get_flavor_defaults(con) -> dict:
             effective_effort = effort
         else:
             effort_state = "legacy-default"
-            route = route_rows.get((harness, model)) or {}
             try:
                 supported = json.loads(route.get("supported_efforts") or "[]")
                 route_bindings._validate_route_freshness(
@@ -535,6 +535,8 @@ def get_flavor_defaults(con) -> dict:
             "effort": effort,
             "effective_effort": effective_effort,
             "effort_state": effort_state,
+            "harness_version": route.get("harness_version"),
+            "harness_support_state": route.get("harness_support_state"),
             "is_default": bool(r["is_default"]),
         })
     for t in shell_factory.flavors():
@@ -2932,10 +2934,15 @@ class Handler(BaseHTTPRequestHandler):
                         "control_state": str(row["control_state"]),
                         "route_revision": int(row["route_revision"]),
                         "binding_digest": str(row["binding_digest"]),
+                        "harness_version": str(row["harness_version"]),
+                        "harness_support_state": str(
+                            row["harness_support_state"]
+                        ),
                     }
                     for row in con.execute(
                         "SELECT participant.participant_id,binding.control_state,"
-                        "binding.route_revision,binding.binding_digest "
+                        "binding.route_revision,binding.binding_digest,"
+                        "binding.harness_version,binding.harness_support_state "
                         "FROM sprint_participants participant "
                         "JOIN sprint_participant_route_bindings binding "
                         "ON binding.binding_id=participant.active_route_binding_id "
@@ -3022,6 +3029,8 @@ class Handler(BaseHTTPRequestHandler):
                     "control_state": receipt.control_state,
                     "route_revision": receipt.route_revision,
                     "binding_digest": receipt.binding_digest,
+                    "harness_version": receipt.harness_version,
+                    "harness_support_state": receipt.harness_support_state,
                 })
             if path == "/_sc/sprint/complete-unit":
                 completion_receipt = sprint_domain.SprintWorkUnitStore(

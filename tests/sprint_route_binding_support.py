@@ -98,4 +98,5 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
         runtime_scope=runtime_scope,
         source_fingerprint=source_fingerprint,
         harness_version=harness_version,
+        harness_support_state="tested",
     )
