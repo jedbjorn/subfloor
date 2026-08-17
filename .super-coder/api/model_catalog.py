@@ -42,9 +42,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-import toml_compat
 import harness_versions
 import route_bindings
+import toml_compat
 from conversation_adapters.opencode import (
     connected_models as opencode_connected_models,
 )
@@ -529,6 +529,24 @@ def _entry_evidence(harness: str, entry: dict,
         value for value in (entry.get("supported_efforts") or [])
         if isinstance(value, str) and value == value.strip().lower() and value
     ))
+    catalogue_adapter_metadata = entry.get("adapter_metadata") or {}
+    variants_by_effort = (
+        catalogue_adapter_metadata.get("variant_options_by_effort") or {}
+        if isinstance(catalogue_adapter_metadata, dict)
+        else {}
+    )
+
+    def binding_adapter_metadata(effort: str) -> dict:
+        if harness != "opencode" or not variants_by_effort:
+            return catalogue_adapter_metadata
+        return {
+            "compatibility_manifest": catalogue_adapter_metadata.get(
+                "compatibility_manifest"
+            ),
+            "provider_family": catalogue_adapter_metadata.get("provider_family"),
+            "variant_options": variants_by_effort.get(effort),
+        }
+
     base = {
         "harness": harness,
         "selector": entry["id"],
@@ -537,7 +555,7 @@ def _entry_evidence(harness: str, entry: dict,
         "source": source,
         "cli_version": entry.get("cli_version"),
         "selector_binding": selector_binding,
-        "adapter_metadata": entry.get("adapter_metadata") or {},
+        "adapter_metadata": catalogue_adapter_metadata,
         "harness_version": (status or {}).get("version"),
         "harness_compatibility": (status or {}).get("compatibility"),
         "adapter_minimum_version": (status or {}).get("minimum_version"),
@@ -556,10 +574,17 @@ def _entry_evidence(harness: str, entry: dict,
         "supported": efforts,
         "default": entry.get("default_effort"),
         "digests": {
-            effort: route_bindings.digest_json({**base, "effort": effort})
+            effort: route_bindings.digest_json({
+                **base,
+                "effort": effort,
+                "binding_adapter_metadata": binding_adapter_metadata(effort),
+            })
             for effort in efforts
         },
         "native_variant_ids": entry.get("native_variant_ids") or {},
+        "adapter_metadata_by_effort": {
+            effort: binding_adapter_metadata(effort) for effort in efforts
+        },
     }
     return {
         "evidence_kind": _evidence_kind(harness, source),
@@ -927,6 +952,12 @@ def _with_live_opencode(payload: dict, provider_models) -> dict:
                     availability="available",
                     provider=model.get("provider"),
                     provider_model=model.get("provider_model"),
+                    supported_efforts=model.get("supported_efforts") or [],
+                    default_effort=model.get("default_effort"),
+                    cli_version=model.get("cli_version"),
+                    selector_binding=model.get("selector_binding"),
+                    adapter_metadata=model.get("adapter_metadata"),
+                    native_variant_ids=model.get("native_variant_ids"),
                 )
                 for model in provider_models()
             ]

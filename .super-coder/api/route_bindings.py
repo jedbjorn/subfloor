@@ -979,6 +979,32 @@ def _resolve_v2(
             {"harness": harness, "model": model, "requested_effort": requested},
         )
 
+    adapter_metadata = _json_object(
+        row.get("adapter_metadata"), field="adapter_metadata"
+    )
+    if harness == "opencode":
+        metadata_by_effort = effort_metadata.get("adapter_metadata_by_effort") or {}
+        selected_metadata = metadata_by_effort.get(requested)
+        if (
+            not isinstance(selected_metadata, dict)
+            or selected_metadata.get("compatibility_manifest")
+            != "opencode-1.18.9-v1"
+            or selected_metadata.get("provider_family")
+            not in {"openai-ai-sdk", "anthropic-ai-sdk"}
+            or not isinstance(selected_metadata.get("variant_options"), dict)
+            or not selected_metadata["variant_options"]
+        ):
+            raise RouteResolutionError(
+                "thinking_evidence_missing",
+                "OpenCode route has no admitted variant option overlay",
+                {
+                    "harness": harness,
+                    "model": model,
+                    "requested_effort": requested,
+                },
+            )
+        adapter_metadata = selected_metadata
+
     binding = {
         "contract_version": CONTRACT_VERSION,
         "control_state": "controlled",
@@ -994,9 +1020,7 @@ def _resolve_v2(
         "selector_binding": _json_object(
             row.get("selector_binding"), field="selector_binding"
         ),
-        "adapter_metadata": _json_object(
-            row.get("adapter_metadata"), field="adapter_metadata"
-        ),
+        "adapter_metadata": adapter_metadata,
     }
     if tuple(binding) != BINDING_KEYS:
         raise AssertionError("route binding key order drifted")

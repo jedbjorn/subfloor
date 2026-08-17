@@ -130,20 +130,147 @@ class OpenCodeServerTest(unittest.TestCase):
                 ],
             }
         )
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["id"], "openai/gpt-live")
+        self.assertEqual(got[0]["provider_model"], "gpt-live")
+        self.assertEqual(got[0]["status"], "active")
+        self.assertEqual(got[0]["supported_efforts"], [])
+        self.assertEqual(got[0]["native_variant_ids"], {})
+        self.assertNotEqual(got[0]["id"], "openai/gpt-retired")
+        self.assertNotEqual(got[0]["provider"], "not-connected")
+
+    def test_connected_models_admits_only_canonical_safe_openai_variants(self):
+        got = opencode.connected_models({
+            "_sc_cli_version": "1.18.9",
+            "connected": ["openai"],
+            "all": [{
+                "id": "openai",
+                "npm": "@ai-sdk/openai",
+                "models": {
+                    "gpt-live": {
+                        "name": "GPT Live",
+                        "variants": {
+                            "low": {"reasoningEffort": "low"},
+                            "high": {
+                                "disabled": False,
+                                "reasoningEffort": "high",
+                                "reasoningSummary": "detailed",
+                            },
+                        },
+                    }
+                },
+            }],
+        })
+
+        self.assertEqual(len(got), 1)
+        model = got[0]
+        self.assertEqual(model["supported_efforts"], ["low", "high"])
+        self.assertEqual(model["default_effort"], "high")
+        self.assertEqual(model["native_variant_ids"], {
+            "low": "low", "high": "high",
+        })
         self.assertEqual(
-            got,
-            [
-                {
-                    "id": "openai/gpt-live",
-                    "provider": "openai",
-                    "provider_model": "gpt-live",
-                    "name": "GPT Live",
-                    "family": "gpt",
-                    "release_date": "",
-                    "status": "active",
-                }
-            ],
+            model["adapter_metadata"]["variant_options_by_effort"],
+            {
+                "low": {"reasoningEffort": "low"},
+                "high": {
+                    "reasoningEffort": "high",
+                    "reasoningSummary": "detailed",
+                },
+            },
         )
+        self.assertEqual(model["cli_version"], "1.18.9")
+
+    def test_variant_id_collision_rejects_every_member_before_value_admission(self):
+        admitted = opencode.admitted_variants(
+            {
+                "high": {"reasoningEffort": "high"},
+                "HIGH": {"reasoningEffort": "high"},
+                " low ": {"reasoningEffort": "low"},
+                "ｍｅｄｉｕｍ": {"reasoningEffort": "medium"},
+                "safe": {"reasoningEffort": "medium"},
+            },
+            provider_family="openai-ai-sdk",
+            model={},
+        )
+
+        self.assertEqual(admitted, {"safe": {"reasoningEffort": "medium"}})
+        self.assertNotIn("high", admitted)
+        self.assertNotIn("HIGH", admitted)
+        self.assertNotIn(" low ", admitted)
+        self.assertNotIn("ｍｅｄｉｕｍ", admitted)
+
+    def test_variant_id_admission_rejects_every_noncanonical_shape(self):
+        overlay = {"reasoningEffort": "high"}
+        admitted = opencode.admitted_variants(
+            {
+                "": overlay,
+                ".leading": overlay,
+                "slash/value": overlay,
+                "a" * 33: overlay,
+                "café": overlay,
+                "valid.id_1-low": overlay,
+            },
+            provider_family="openai-ai-sdk",
+            model={},
+        )
+
+        self.assertEqual(admitted, {
+            "valid.id_1-low": {"reasoningEffort": "high"},
+        })
+
+    def test_variant_value_manifest_rejects_disabled_unknown_and_sensitive_fields(self):
+        rejected = {
+            "disabled": {"disabled": True, "reasoningEffort": "high"},
+            "bad-disabled": {"disabled": "false", "reasoningEffort": "high"},
+            "unknown": {"reasoningEffort": "high", "temperature": 1},
+            "credential": {"reasoningEffort": "high", "ApiKey": "secret"},
+            "substitution": {"reasoningSummary": "{env:SECRET}"},
+            "wrong-type": {"reasoningEffort": ["high"]},
+            "non-object": "high",
+        }
+
+        admitted = opencode.admitted_variants(
+            rejected,
+            provider_family="openai-ai-sdk",
+            model={},
+        )
+
+        self.assertEqual(admitted, {})
+
+    def test_anthropic_variant_requires_exact_bounded_thinking_shape(self):
+        admitted = opencode.admitted_variants(
+            {
+                "valid": {
+                    "thinking": {"type": "enabled", "budgetTokens": 4096}
+                },
+                "over-limit": {
+                    "thinking": {"type": "enabled", "budgetTokens": 8193}
+                },
+                "extra": {
+                    "thinking": {
+                        "type": "enabled", "budgetTokens": 10, "extra": True
+                    }
+                },
+            },
+            provider_family="anthropic-ai-sdk",
+            model={"limit": {"output": 8192}},
+        )
+
+        self.assertEqual(admitted, {
+            "valid": {
+                "thinking": {"type": "enabled", "budgetTokens": 4096}
+            }
+        })
+
+    def test_unknown_provider_family_admits_no_variant(self):
+        admitted = opencode.admitted_variants(
+            {"high": {"reasoningEffort": "high"}},
+            provider_family=None,
+            model={},
+        )
+
+        self.assertEqual(admitted, {})
 
     def test_default_adapter_uses_managed_server_password(self):
         with mock.patch.object(

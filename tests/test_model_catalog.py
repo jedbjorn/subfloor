@@ -140,6 +140,21 @@ def controlled_row(
             {"high": "high"} if harness == "opencode" else {}
         ),
     }
+    adapter_metadata = {}
+    if harness == "opencode":
+        selected = {
+            "compatibility_manifest": "opencode-1.18.9-v1",
+            "provider_family": "openai-ai-sdk",
+            "variant_options": {"reasoningEffort": "high"},
+        }
+        metadata["adapter_metadata_by_effort"] = {"high": selected}
+        adapter_metadata = {
+            "compatibility_manifest": "opencode-1.18.9-v1",
+            "provider_family": "openai-ai-sdk",
+            "variant_options_by_effort": {
+                "high": {"reasoningEffort": "high"},
+            },
+        }
     return {
         "harness": harness,
         "selector": selector,
@@ -159,7 +174,7 @@ def controlled_row(
         "supported_efforts": ["high"],
         "effort_metadata": metadata,
         "selector_binding": {"kind": "exact-model", "selector": selector},
-        "adapter_metadata": {},
+        "adapter_metadata": adapter_metadata,
     }
 
 
@@ -233,7 +248,13 @@ class ControlledRouteEvidenceTest(unittest.TestCase):
                 "selector_binding": {
                     "kind": "connected-model", "selector": "provider/model",
                 },
-                "adapter_metadata": {"provider_family": "openai"},
+                "adapter_metadata": {
+                    "compatibility_manifest": "opencode-1.18.9-v1",
+                    "provider_family": "openai-ai-sdk",
+                    "variant_options_by_effort": {
+                        "high": {"reasoningEffort": "high"},
+                    },
+                },
                 "native_variant_ids": {"high": "high"},
             }]
 
@@ -450,6 +471,35 @@ class BuildTest(NoCLI):
             lambda: self.fail("provider API must not run without opencode"),
         )
         self.assertEqual(ids(got["harnesses"]["opencode"]), [])
+
+    def test_opencode_live_overlay_preserves_admitted_variant_evidence(self):
+        connected = mc.opencode_connected_models({
+            "_sc_cli_version": "1.18.9",
+            "connected": ["openai"],
+            "all": [{
+                "id": "openai",
+                "npm": "@ai-sdk/openai",
+                "models": {"gpt-connected": {
+                    "variants": {
+                        "high": {"reasoningEffort": "high"},
+                    }
+                }},
+            }],
+        })
+        with mock.patch.object(mc.shutil, "which", return_value="/usr/bin/opencode"):
+            got = mc._with_live_opencode(
+                mc.build(fetch=fetch_ok, env={}, run=None),
+                lambda: connected,
+            )
+
+        model = got["harnesses"]["opencode"]["models"][0]
+        self.assertEqual(model["supported_efforts"], ["high"])
+        self.assertEqual(model["default_effort"], "high")
+        self.assertEqual(model["native_variant_ids"], {"high": "high"})
+        self.assertEqual(
+            model["adapter_metadata"]["variant_options_by_effort"],
+            {"high": {"reasoningEffort": "high"}},
+        )
 
     def test_all_sources_down_raises(self):
         with self.assertRaises(RuntimeError):
@@ -913,6 +963,20 @@ class RouteCliConnectionTest(unittest.TestCase):
                 "supported": ["high"], "default": "high",
                 "digests": {"high": "2" * 64},
                 "native_variant_ids": {"high": "high"},
+                "adapter_metadata_by_effort": {
+                    "high": {
+                        "compatibility_manifest": "opencode-1.18.9-v1",
+                        "provider_family": "openai-ai-sdk",
+                        "variant_options": {"reasoningEffort": "high"},
+                    },
+                },
+            })
+            row["adapter_metadata"] = json.dumps({
+                "compatibility_manifest": "opencode-1.18.9-v1",
+                "provider_family": "openai-ai-sdk",
+                "variant_options_by_effort": {
+                    "high": {"reasoningEffort": "high"},
+                },
             })
         return row
 

@@ -28,7 +28,10 @@
     }
   },
   "model": { "file": "opencode.json", "key": "model" },
-  "headless": { "launch": ["opencode", "run"], "model_flag": "-m" },
+  "headless": {
+    "launch": ["opencode", "run"],
+    "model_flag": "--model"
+  },
   "conversation": {
     "contract_version": 1,
     "minimum_cli_version": "1.18.9",

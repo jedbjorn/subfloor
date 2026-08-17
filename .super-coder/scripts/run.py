@@ -35,8 +35,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import sqlite3
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -49,25 +49,27 @@ REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
 
 sys.path.insert(0, str(ENGINE / "render"))
-from compose import compose_boot  # noqa: E402
 import flat  # noqa: E402
+from compose import compose_boot  # noqa: E402
 
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
 import callable_floor  # noqa: E402
 import db_driver  # noqa: E402
-import global_pointer  # noqa: E402
 import git_freshness  # noqa: E402
-import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
+import global_pointer  # noqa: E402
+import install  # noqa: E402  — reuse its canonical HARNESS_BIN (one source of truth)
+import opencode_config  # noqa: E402  — one locked owner for opencode.json
 import ports as ports_mod  # noqa: E402  — derive the per-fork API base URL
-import style  # noqa: E402  — launcher ANSI; degrades to plain text off-TTY
 import seed_skills  # noqa: E402  — boot-time self-heal of stale engine skills
 import shell_liveness  # noqa: E402  — headless boot's one-shell-one-session guard
 import skill_projection  # noqa: E402  — exact bounded harness skill mirrors
+import style  # noqa: E402  — launcher ANSI; degrades to plain text off-TTY
 
 sys.path.insert(0, str(ENGINE / "api"))
 import model_catalog  # noqa: E402  — HARNESS_PROVIDER: one source for harness → provider
+import route_transport  # noqa: E402  — binding-to-harness transport projection
 
 ADAPTERS = ENGINE / "adapters"
 PROC_SELF_STAT = Path("/proc/self/stat")   # H-25: our own start ticks, pre-exec
@@ -158,9 +160,14 @@ def validate_headless_request(adapter: dict, model: "str | None",
     _headless_effort_args(hcfg, effort, harness)
 
 
-def headless_command(adapter: dict, prompt: str, model: "str | None" = None,
-                     sandbox_flags: "list[str] | None" = None,
-                     effort: "str | None" = None) -> "list[str] | None":
+def headless_command(
+    adapter: dict,
+    prompt: str,
+    model: "str | None" = None,
+    sandbox_flags: "list[str] | None" = None,
+    effort: "str | None" = None,
+    transport: "route_transport.TransportProjection | None" = None,
+) -> "list[str] | None":
     """The non-interactive exec argv from the adapter's `headless` block —
     launch prefix + model flag + sandbox flags + the prompt as the final
     positional. None when the harness declares no headless block (e.g. vibe,
@@ -168,14 +175,23 @@ def headless_command(adapter: dict, prompt: str, model: "str | None" = None,
     hcfg = adapter.get("headless")
     if not hcfg or not hcfg.get("launch"):
         return None
-    validate_headless_request(adapter, model, effort)
+    if transport is not None:
+        if transport.harness != adapter.get("harness"):
+            raise ValueError("route transport does not match the selected harness")
+        model = transport.model
+        effort = transport.effort
+    validate_headless_request(adapter, model, None if transport else effort)
     cmd = list(hcfg["launch"])
     managed_mcp = managed_mcp_injection(adapter)
     if managed_mcp:
         cmd += list(managed_mcp.get("launch_args") or [])
     if model:
         cmd += [hcfg["model_flag"], model]
-    cmd += _headless_effort_args(hcfg, effort, adapter.get("harness", "?"))
+    cmd += (
+        list(transport.argument_tail)
+        if transport is not None
+        else _headless_effort_args(hcfg, effort, adapter.get("harness", "?"))
+    )
     cmd += list(sandbox_flags or [])
     if hcfg.get("prompt_flag"):
         cmd += [hcfg["prompt_flag"], prompt]
@@ -241,7 +257,17 @@ def emit_adapter(adapter: dict, root: Path = REPO_ROOT) -> list[str]:
         if src.exists():
             dst = root / fname
             dst.parent.mkdir(parents=True, exist_ok=True)  # fname may be nested (e.g. .codex/hooks.json)
-            atomic_write(dst, src.read_text())
+            if adapter["harness"] == "opencode" and fname == "opencode.json":
+                try:
+                    template = json.loads(src.read_text())
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise opencode_config.OpenCodeConfigError(
+                        "HARNESS_CONFIG_INVALID",
+                        f"OpenCode template is invalid: {exc}",
+                    ) from exc
+                opencode_config.emit_template(root, template)
+            else:
+                atomic_write(dst, src.read_text())
             written.append(fname)
     return written
 
@@ -272,27 +298,21 @@ def resolve_opencode_plugins(work_dir: Path) -> None:
     resolve to the installed engine (verified: opencode loads plugins by absolute
     path). No-op when no engine-relative plugin entry is present (e.g. the source
     repo, where the relative path already resolves)."""
-    cfg_path = work_dir / "opencode.json"
-    if not cfg_path.exists():
+    if not (work_dir / "opencode.json").exists():
         return
-    try:
-        cfg = json.loads(cfg_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return
-    plugins = cfg.get("plugin")
-    if not isinstance(plugins, list):
-        return
-    changed = False
-    resolved = []
-    for p in plugins:
-        if isinstance(p, str) and ".super-coder/" in p:
-            resolved.append(str(ENGINE / p.split(".super-coder/", 1)[1]))
-            changed = True
-        else:
-            resolved.append(p)
-    if changed:
-        cfg["plugin"] = resolved
-        atomic_write(cfg_path, json.dumps(cfg, indent=2) + "\n")
+
+    def update(cfg: dict) -> None:
+        plugins = cfg.get("plugin")
+        if not isinstance(plugins, list):
+            return
+        cfg["plugin"] = [
+            str(ENGINE / plugin.split(".super-coder/", 1)[1])
+            if isinstance(plugin, str) and ".super-coder/" in plugin
+            else plugin
+            for plugin in plugins
+        ]
+
+    opencode_config.mutate(work_dir, "resolve-plugins", update)
 
 
 def _deep_merge(base: dict, patch: dict) -> dict:
@@ -314,6 +334,12 @@ def _merge_json_spec(spec: dict, root: Path = REPO_ROOT) -> list[str]:
     touched = []
     for rel, patch in (spec or {}).items():
         dst = root / rel
+        if rel == "opencode.json":
+            opencode_config.merge_json(
+                root, patch, operation="merge-json"
+            )
+            touched.append(rel)
+            continue
         cur: dict = {}
         if dst.exists():
             try:
@@ -1288,12 +1314,18 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     elif session_model and mcfg.get("file"):
         mfile = work_dir / mcfg["file"]
         if mfile.exists():
-            try:
-                cfg = json.loads(mfile.read_text())
-            except (json.JSONDecodeError, OSError):
-                cfg = {}
-            cfg[mcfg.get("key", "model")] = session_model
-            atomic_write(mfile, json.dumps(cfg, indent=2) + "\n")
+            key = mcfg.get("key", "model")
+            if mfile.name == "opencode.json":
+                opencode_config.merge_json(
+                    work_dir, {key: session_model}, operation="set-model"
+                )
+            else:
+                try:
+                    cfg = json.loads(mfile.read_text())
+                except (json.JSONDecodeError, OSError):
+                    cfg = {}
+                cfg[key] = session_model
+                atomic_write(mfile, json.dumps(cfg, indent=2) + "\n")
 
     # Sandbox elevation, main()'s split kept: launch_flags for the TUI,
     # headless_flags for a non-interactive plan, plus sandbox-only env.
@@ -1311,8 +1343,10 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
         name_args = [ncfg["flag"], full["display_name"]]
 
     if headless:
-        argv = headless_command(adapter, headless_prompt, session_model,
-                                sandbox_flags, session_effort)
+        argv = headless_command(
+            adapter, headless_prompt, session_model,
+            sandbox_flags, session_effort,
+        )
         if argv is None:
             raise LaunchError(f"harness '{harness}' has no headless adapter")
     else:
@@ -1767,12 +1801,18 @@ def main() -> None:
     elif flavor_model and mcfg.get("file"):
         mfile = work_dir / mcfg["file"]
         if mfile.exists():
-            try:
-                cfg = json.loads(mfile.read_text())
-            except (json.JSONDecodeError, OSError):
-                cfg = {}
-            cfg[mcfg.get("key", "model")] = flavor_model
-            atomic_write(mfile, json.dumps(cfg, indent=2) + "\n")
+            key = mcfg.get("key", "model")
+            if mfile.name == "opencode.json":
+                opencode_config.merge_json(
+                    work_dir, {key: flavor_model}, operation="set-model"
+                )
+            else:
+                try:
+                    cfg = json.loads(mfile.read_text())
+                except (json.JSONDecodeError, OSError):
+                    cfg = {}
+                cfg[key] = flavor_model
+                atomic_write(mfile, json.dumps(cfg, indent=2) + "\n")
             print(f"→ model: {flavor_model} (flavor default for {chosen['flavor']})")
     merged = apply_merge_json(adapter, work_dir)
     if merged:

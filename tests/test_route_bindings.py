@@ -17,8 +17,8 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "api"))
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 
 import model_catalog  # noqa: E402
-import route_bindings  # noqa: E402
 import models as routes_cli  # noqa: E402
+import route_bindings  # noqa: E402
 
 
 def compatible_runtime(version: str = "2.22.0", *, harness: str | None = None,
@@ -184,12 +184,23 @@ class BindingIdentityTest(unittest.TestCase):
                 "default": "k",
                 "digests": {"k": "5" * 64},
                 "native_variant_ids": {"k": "k"},
+                "adapter_metadata_by_effort": {
+                    "k": {
+                        "compatibility_manifest": "opencode-1.18.9-v1",
+                        "provider_family": "openai-ai-sdk",
+                        "variant_options": {"reasoningEffort": "high"},
+                    },
+                },
             }),
             selector_binding=json.dumps({
                 "kind": "exact-model", "selector": "provider/model",
             }),
             adapter_metadata=json.dumps({
-                "variant_options": {"reasoningEffort": "high"},
+                "compatibility_manifest": "opencode-1.18.9-v1",
+                "provider_family": "openai-ai-sdk",
+                "variant_options_by_effort": {
+                    "k": {"reasoningEffort": "high"},
+                },
             }),
         )
 
@@ -209,6 +220,64 @@ class BindingIdentityTest(unittest.TestCase):
         self.assertEqual(implicit["requested_effort"], "high")
         self.assertEqual(implicit["evidence_digest"], "4" * 64)
         self.assertEqual(implicit["control_state"], "controlled")
+
+    def test_opencode_binding_keeps_only_the_selected_admitted_overlay(self):
+        row = self.opencode_row()
+        row["supported_efforts"] = '["low","high"]'
+        row["effort_metadata"] = json.dumps({
+            "supported": ["low", "high"],
+            "default": "high",
+            "digests": {"low": "3" * 64, "high": "4" * 64},
+            "native_variant_ids": {"low": "low", "high": "high"},
+            "adapter_metadata_by_effort": {
+                "low": {
+                    "compatibility_manifest": "opencode-1.18.9-v1",
+                    "provider_family": "openai-ai-sdk",
+                    "variant_options": {"reasoningEffort": "low"},
+                },
+                "high": {
+                    "compatibility_manifest": "opencode-1.18.9-v1",
+                    "provider_family": "openai-ai-sdk",
+                    "variant_options": {"reasoningEffort": "high"},
+                },
+            },
+        })
+
+        binding, _digest = resolve_controlled_v2(
+            row,
+            "opencode",
+            "provider/model",
+            "high",
+            now=self.NOW,
+            runtime_status=compatible_runtime("1.18.9", harness="opencode"),
+        )
+
+        self.assertEqual(binding["native_variant_id"], "high")
+        self.assertEqual(binding["adapter_metadata"], {
+            "compatibility_manifest": "opencode-1.18.9-v1",
+            "provider_family": "openai-ai-sdk",
+            "variant_options": {"reasoningEffort": "high"},
+        })
+
+    def test_opencode_binding_refuses_missing_selected_overlay(self):
+        row = self.opencode_row()
+        metadata = json.loads(row["effort_metadata"])
+        metadata.pop("adapter_metadata_by_effort")
+        row["effort_metadata"] = json.dumps(metadata)
+
+        with self.assertRaises(route_bindings.RouteResolutionError) as refused:
+            resolve_controlled_v2(
+                row,
+                "opencode",
+                "provider/model",
+                "k",
+                now=self.NOW,
+                runtime_status=compatible_runtime(
+                    "1.18.9", harness="opencode"
+                ),
+            )
+
+        self.assertEqual(refused.exception.code, "thinking_evidence_missing")
 
     def test_uncontrolled_bindings_encode_every_inapplicable_value_as_null(self):
         default, default_digest = route_bindings.resolve_v2(

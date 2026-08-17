@@ -2,6 +2,7 @@
 """Shared and native contract tests for Feature #24 conversation adapters."""
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import unittest
 from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -34,13 +36,70 @@ from conversation_adapters import (  # noqa: E402
     ReconcileResult,
     adapter_for,
 )
+from conversation_adapters import base as base_adapter
 from conversation_adapters import codex as codex_adapter
 from conversation_adapters import opencode as opencode_adapter
-from conversation_adapters import base as base_adapter
 from conversation_adapters.base import SubprocessRunner
 
 KIMI_FIXTURES = ROOT / "tests" / "fixtures" / "conversations" / "kimi"
 KIMI_V2_STATE = KIMI_FIXTURES / "state-v2.json"
+
+
+def v2_context(
+    root: Path,
+    harness: str,
+    *,
+    provider: str | None = "openrouter",
+    model: str = "test-model",
+    effort: str = "high",
+    env: Mapping[str, str] | None = None,
+) -> ConversationContext:
+    requested_model = (
+        f"{provider}/{model}" if harness == "opencode" and provider else model
+    )
+    adapter_metadata = {}
+    native_variant_id = None
+    if harness == "opencode":
+        native_variant_id = effort
+        adapter_metadata = {
+            "compatibility_manifest": "opencode-1.18.9-v1",
+            "provider_family": "openai-ai-sdk",
+            "variant_options": {"reasoningEffort": effort},
+        }
+    binding = {
+        "contract_version": 2,
+        "control_state": "controlled",
+        "harness": harness,
+        "requested_model": requested_model,
+        "provider_model": model,
+        "requested_effort": effort,
+        "effective_effort": effort,
+        "native_variant_id": native_variant_id,
+        "transport": {
+            "claude": "claude-effort-argument",
+            "codex": "codex-reasoning-config",
+            "kimi": "kimi-effort-environment",
+            "opencode": "opencode-route-agent",
+        }[harness],
+        "catalogue_generation": "1" * 32,
+        "evidence_digest": "2" * 64,
+        "selector_binding": {"kind": "exact-test-route"},
+        "adapter_metadata": adapter_metadata,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            binding, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    return ConversationContext(
+        worktree=root,
+        provider=provider,
+        model=requested_model,
+        effort=effort,
+        env=env or {},
+        route_binding=binding,
+        binding_digest=digest,
+    )
 
 
 def kimi_step_event(
@@ -1006,6 +1065,167 @@ class ConversationAdapterTest(unittest.TestCase):
         self.assertNotIn(
             "KIMI_MODEL_THINKING_EFFORT",
             no_effort_native.calls[-1][2],
+        )
+
+    def test_v2_binding_drives_each_native_effort_transport_exactly_once(self):
+        claude, claude_native = self.build("claude")
+        claude_context = replace(
+            v2_context(self.root, "claude"), model=None, effort=None
+        )
+        claude.start(claude_context, "work")
+        claude_argv = claude_native.calls[-1][0]
+        self.assertEqual(claude_argv.count("--effort"), 1)
+        self.assertEqual(
+            claude_argv[claude_argv.index("--effort") + 1], "high"
+        )
+        self.assertEqual(
+            claude_argv[claude_argv.index("--model") + 1], "test-model"
+        )
+
+        codex, codex_native = self.build("codex")
+        codex_context = replace(
+            v2_context(self.root, "codex"), model=None, effort=None
+        )
+        codex.start(codex_context, "work")
+        turn_params = next(
+            params for method, params in codex_native.requests
+            if method == "turn/start"
+        )
+        self.assertEqual(turn_params["effort"], "high")
+        self.assertEqual(turn_params["model"], "test-model")
+
+        kimi, kimi_native = self.build("kimi")
+        kimi_context = replace(
+            v2_context(
+                self.root,
+                "kimi",
+                env={"KIMI_MODEL_THINKING_EFFORT": "ambient"},
+            ),
+            model=None,
+            effort=None,
+        )
+        kimi.start(
+            kimi_context,
+            "work",
+        )
+        kimi_argv, _cwd, kimi_env = kimi_native.calls[-1]
+        self.assertEqual(kimi_env["KIMI_MODEL_THINKING_EFFORT"], "high")
+        self.assertEqual(kimi_argv.count("-m"), 1)
+        self.assertEqual(kimi_argv[kimi_argv.index("-m") + 1], "test-model")
+
+    def test_opencode_v2_binding_uses_full_agent_on_start_resume_and_prompt(self):
+        native = FakeOpenCode()
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        context = replace(
+            v2_context(
+                self.root, "opencode", provider="openai", model="gpt-test"
+            ),
+            provider="stale-provider",
+            model=None,
+            effort=None,
+        )
+        expected_agent = f"sc-route-{context.binding_digest}"
+
+        first = adapter.start(context, "first")
+        list(adapter.stream(first))
+        resumed = adapter.resume(first.session_ref, context, "second")
+        list(adapter.stream(resumed))
+
+        prompts = [
+            request for request in native.requests
+            if request[1].endswith("/message")
+        ]
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(
+            [request[3]["agent"] for request in prompts],
+            [expected_agent, expected_agent],
+        )
+        self.assertEqual(
+            [request[3]["model"] for request in prompts],
+            [
+                {"providerID": "openai", "modelID": "gpt-test"},
+                {"providerID": "openai", "modelID": "gpt-test"},
+            ],
+        )
+        configured = json.loads((self.root / "opencode.json").read_text())
+        self.assertEqual(configured["agent"][expected_agent], {
+            "mode": "primary",
+            "model": "openai/gpt-test",
+            "reasoningEffort": "high",
+        })
+        self.assertIn("shell", configured)
+
+    def test_opencode_stale_route_agent_refuses_before_native_identity(self):
+        native = FakeOpenCode()
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        context = v2_context(
+            self.root, "opencode", provider="openai", model="gpt-test"
+        )
+        agent = f"sc-route-{context.binding_digest}"
+        (self.root / "opencode.json").write_text(json.dumps({
+            "agent": {agent: {
+                "mode": "primary",
+                "model": "openai/gpt-test",
+                "reasoningEffort": "low",
+            }}
+        }))
+
+        with self.assertRaises(AdapterError) as refused:
+            adapter.start(context, "must not dispatch")
+
+        self.assertEqual(refused.exception.code, "HARNESS_CONFIG_INVALID")
+        self.assertEqual(native.requests, [])
+
+    def test_opencode_transport_rejection_is_one_terminal_dispatch(self):
+        native = FakeOpenCode()
+        native.stream = mock.Mock(return_value=iter([
+            {
+                "type": "session.status",
+                "properties": {
+                    "sessionID": native.session_ref,
+                    "status": {"type": "busy"},
+                },
+            },
+            {
+                "type": "session.error",
+                "properties": {
+                    "sessionID": native.session_ref,
+                    "error": {"name": "UnsupportedVariantError"},
+                },
+            },
+        ]))
+        adapter = OpenCodeAdapter(
+            transport=native,
+            shell_runtime_dir=self.root / "runtime-shells",
+        )
+        context = v2_context(
+            self.root, "opencode", provider="openai", model="gpt-test"
+        )
+
+        turn = adapter.start(context, "dispatch once")
+        events = list(adapter.stream(turn))
+        prompts = [
+            request for request in native.requests
+            if request[1].endswith("/message")
+        ]
+
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(prompts[0][3]["parts"], [
+            {"type": "text", "text": "dispatch once"}
+        ])
+        self.assertEqual(events[-1].type, "run.failed")
+        self.assertEqual(events[-1].payload["error"], "UnsupportedVariantError")
+        self.assertEqual(
+            len([request for request in native.requests if request[:2] == (
+                "POST", "/session"
+            )]),
+            1,
         )
 
     def test_opencode_exact_resources_filtering_and_unknown_recovery(
