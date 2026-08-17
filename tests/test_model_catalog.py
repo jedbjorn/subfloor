@@ -83,6 +83,9 @@ def runtime_status(version="2.22.0", compatibility=_AUTO_COMPATIBILITY,
     )
     ranges = {
         "claude": ("2.1.220", "2.2.0", "2.1.222"),
+        "codex": ("0.145.0", "0.147.0", "0.145.0"),
+        "kimi": ("0.30.0", "0.34.0", "0.33.0"),
+        "opencode": ("1.18.9", "1.19.0", "1.18.9"),
         "vibe": ("2.22.0", "2.23.0", "2.22.0"),
     }
     minimum, maximum, verified = ranges[harness]
@@ -324,7 +327,8 @@ class RoutePersistenceTest(unittest.TestCase):
         ).fetchone()[0]
         got = routes_cli.resolve(
             self.con, "codex", "gpt-5.6-sol", shell="DEV3",
-            current_source_fingerprint=fingerprint)
+            current_source_fingerprint=fingerprint,
+            runtime_status=runtime_status("0.145.0", harness="codex"))
         self.assertTrue(got["ok"])
         self.assertEqual(
             got["command"],
@@ -346,6 +350,7 @@ class RoutePersistenceTest(unittest.TestCase):
         got = routes_cli.resolve(
             self.con, "kimi", "kimi-code/legacy",
             current_source_fingerprint=fingerprint,
+            runtime_status=runtime_status("0.33.0", harness="kimi"),
         )
         self.assertFalse(got["ok"])
         self.assertEqual(got["code"], "unsupported_thinking_level")
@@ -618,7 +623,6 @@ class RouteCliConnectionTest(unittest.TestCase):
         "generation_id": "1" * 32,
         "evidence_kind": "codex-model-cache",
         "source_fingerprint": "3" * 64,
-        "current_source_fingerprint": "3" * 64,
         "effort_metadata": json.dumps({
             "supported": ["high"], "default": "high",
             "digests": {"high": "2" * 64}, "native_variant_ids": {},
@@ -626,6 +630,119 @@ class RouteCliConnectionTest(unittest.TestCase):
         "selector_binding": '{"kind":"exact-model","selector":"api-model"}',
         "adapter_metadata": "{}",
     }
+
+    @classmethod
+    def controlled_route(cls, harness: str) -> dict:
+        versions = {
+            "claude": "2.1.222", "codex": "0.145.0",
+            "kimi": "0.33.0", "opencode": "1.18.9",
+        }
+        evidence = {
+            "claude": "claude-portable-manifest",
+            "codex": "codex-model-cache",
+            "kimi": "kimi-alias-config",
+            "opencode": "opencode-connected-variant",
+        }
+        row = {
+            **cls.ROUTE,
+            "harness": harness,
+            "cli_version": f"{harness} {versions[harness]}",
+            "harness_version": versions[harness],
+            "evidence_kind": evidence[harness],
+        }
+        if harness == "opencode":
+            row["effort_metadata"] = json.dumps({
+                "supported": ["high"], "default": "high",
+                "digests": {"high": "2" * 64},
+                "native_variant_ids": {"high": "high"},
+            })
+        return row
+
+    def authenticated_controlled(self, harness: str, row: dict, *,
+                                 status: dict, fingerprint: str) -> tuple[int, dict]:
+        output = io.StringIO()
+        with (
+            mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+            mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+            mock.patch.object(
+                routes_cli.mem, "_api", return_value={"routes": [row]}
+            ),
+            mock.patch.object(
+                routes_cli.model_catalog, "harness_runtime_status",
+                return_value=status,
+            ),
+            mock.patch.object(
+                routes_cli.model_catalog.harness_versions, "runtime_scope",
+                return_value={
+                    "runtime": status["runtime"],
+                    "runtime_identity": status["runtime_identity"],
+                },
+            ),
+            mock.patch.object(
+                routes_cli.model_catalog, "current_source_fingerprint",
+                return_value=fingerprint,
+            ) as source_probe,
+            mock.patch.object(
+                routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = routes_cli.main([
+                "resolve", harness, "api-model", "--json",
+            ])
+        source_probe.assert_called_once_with(harness, "api-model")
+        return exit_code, json.loads(output.getvalue())
+
+    def test_authenticated_controlled_routes_use_execution_seat_proof(self):
+        sandbox = {
+            "runtime": "sandbox", "runtime_identity": "sandbox:test-image",
+        }
+        versions = {
+            "claude": "2.1.222", "codex": "0.145.0",
+            "kimi": "0.33.0", "opencode": "1.18.9",
+        }
+        for harness, version in versions.items():
+            row = self.controlled_route(harness)
+            good = runtime_status(
+                version, harness=harness, scope=sandbox
+            )
+            with self.subTest(harness=harness, case="matching-sandbox"):
+                exit_code, result = self.authenticated_controlled(
+                    harness, row, status=good, fingerprint="3" * 64,
+                )
+                self.assertEqual(exit_code, 0, result)
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["binding"]["harness"], harness)
+            with self.subTest(harness=harness, case="source-mismatch"):
+                exit_code, result = self.authenticated_controlled(
+                    harness, row, status=good, fingerprint="9" * 64,
+                )
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(result["code"], "thinking_evidence_stale")
+                self.assertNotIn("binding", result)
+                self.assertNotIn("binding_digest", result)
+                self.assertNotIn("command", result)
+
+        codex = self.controlled_route("codex")
+        cases = {
+            "container-missing": runtime_status(
+                None, compatibility=None, error="HARNESS_UNAVAILABLE",
+                harness="codex", scope=sandbox,
+            ),
+            "container-version-mismatch": runtime_status(
+                "0.146.0", harness="codex", scope=sandbox,
+            ),
+        }
+        for name, status in cases.items():
+            with self.subTest(case=name):
+                exit_code, result = self.authenticated_controlled(
+                    "codex", codex, status=status, fingerprint="3" * 64,
+                )
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(result["code"], "thinking_evidence_stale")
+                self.assertNotIn("binding", result)
+                self.assertNotIn("binding_digest", result)
+                self.assertNotIn("command", result)
 
     def test_list_and_resolve_use_shell_api_without_opening_database(self):
         with (
@@ -636,6 +753,14 @@ class RouteCliConnectionTest(unittest.TestCase):
             ) as api,
             mock.patch.object(
                 routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+            ),
+            mock.patch.object(
+                routes_cli.model_catalog, "harness_runtime_status",
+                return_value=runtime_status("0.145.0", harness="codex"),
+            ),
+            mock.patch.object(
+                routes_cli.model_catalog, "current_source_fingerprint",
+                return_value="3" * 64,
             ),
         ):
             self.assertEqual(routes_cli.main(["list", "codex"]), 0)
@@ -680,6 +805,14 @@ class RouteCliConnectionTest(unittest.TestCase):
                 mock.patch.object(routes_cli.mem, "_api", api),
                 mock.patch.object(
                     routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+                ),
+                mock.patch.object(
+                    routes_cli.model_catalog, "harness_runtime_status",
+                    return_value=runtime_status("0.145.0", harness="codex"),
+                ),
+                mock.patch.object(
+                    routes_cli.model_catalog, "current_source_fingerprint",
+                    return_value="3" * 64,
                 ),
                 contextlib.redirect_stdout(output),
             ):

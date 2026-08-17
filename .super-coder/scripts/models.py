@@ -84,20 +84,28 @@ def _resolution_error(exc: route_bindings.RouteResolutionError) -> dict:
 
 def resolve(con, harness: str, selector: str | None = None, *,
             shell: str = "<shell>", effort: str | None = None,
-            now=None, current_source_fingerprint: str | None = None) -> dict:
+            now=None, current_source_fingerprint: str | None = None,
+            runtime_status: dict | None = None,
+            runtime_scope: dict | None = None) -> dict:
     try:
         harness = route_bindings.normalize_harness(harness)
     except route_bindings.RouteResolutionError as exc:
         return _resolution_error(exc)
     if selector is None or harness == "vibe":
-        scope = model_catalog.harness_versions.runtime_scope()
+        if runtime_scope is None:
+            runtime_scope = model_catalog.harness_versions.runtime_scope()
+        if runtime_status is None:
+            runtime_status = model_catalog.harness_runtime_status(harness)
         return resolve_row(
             None, harness, selector, shell=shell, effort=effort, now=now,
             current_source_fingerprint=current_source_fingerprint,
-            runtime_status=model_catalog.harness_runtime_status(harness),
-            runtime_scope=scope,
+            runtime_status=runtime_status, runtime_scope=runtime_scope,
         )
     observed_row = _route(con, harness, selector)
+    if runtime_scope is None:
+        runtime_scope = model_catalog.harness_versions.runtime_scope()
+    if runtime_status is None:
+        runtime_status = model_catalog.harness_runtime_status(harness)
     if current_source_fingerprint is None:
         current_source_fingerprint = model_catalog.current_source_fingerprint(
             harness, selector
@@ -106,6 +114,7 @@ def resolve(con, harness: str, selector: str | None = None, *,
         return resolve_row(
             observed_row, harness, selector, shell=shell, effort=effort, now=now,
             current_source_fingerprint=current_source_fingerprint, con=con,
+            runtime_status=runtime_status, runtime_scope=runtime_scope,
         )
 
 
@@ -250,21 +259,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         routes = projection.get("routes") or []
         route = routes[0] if routes else None
-        resolution_error = (route or {}).get("route_resolution_error")
-        if resolution_error:
-            data = {"ok": False, **resolution_error}
-        else:
-            fingerprint = (route.get("current_source_fingerprint") or "") \
-                if route else None
-            data = resolve_row(
-                route, harness, selector, shell=shell,
-                effort=effort, current_source_fingerprint=fingerprint,
-                runtime_status=(
-                    model_catalog.harness_runtime_status(harness)
-                    if selector is None or harness == "vibe" else None
-                ),
-                runtime_scope=model_catalog.harness_versions.runtime_scope(),
+        runtime_scope = model_catalog.harness_versions.runtime_scope()
+        runtime_status = model_catalog.harness_runtime_status(harness)
+        fingerprint = None
+        if selector is not None and harness != "vibe":
+            fingerprint = (
+                model_catalog.current_source_fingerprint(harness, selector) or ""
             )
+        data = resolve_row(
+            route, harness, selector, shell=shell,
+            effort=effort, current_source_fingerprint=fingerprint,
+            runtime_status=runtime_status,
+            runtime_scope=runtime_scope,
+        )
         return _print_resolved(data, as_json)
 
     con = _open_db()

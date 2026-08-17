@@ -467,44 +467,7 @@ def get_model_routes(con, *, harness: str | None = None,
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY harness, availability='available' DESC, selector"
-    routes = rows(con.execute(sql, tuple(params)))
-    if selector is not None and routes:
-        fingerprints = {
-            (route["harness"], route["selector"]):
-                model_catalog.current_source_fingerprint(
-                    route["harness"], route["selector"]
-                ) or ""
-            for route in routes if route["harness"] != "vibe"
-        }
-        refreshed = []
-        with db_driver.write_transaction(con, "model_route.exact_read"):
-            for route in routes:
-                key = route["harness"], route["selector"]
-                resolution_error = None
-                if route["harness"] != "vibe":
-                    try:
-                        route_bindings.require_fresh_route(
-                            con, route, *key,
-                            current_source_fingerprint=fingerprints[key],
-                        )
-                    except route_bindings.RouteResolutionError as exc:
-                        resolution_error = {
-                            "code": exc.code, "error": exc.message,
-                            "details": exc.details,
-                        }
-                current = con.execute(
-                    "SELECT * FROM model_routes WHERE harness=? AND selector=?",
-                    key,
-                ).fetchone()
-                if current is None:
-                    continue
-                current = dict(current)
-                current["current_source_fingerprint"] = fingerprints.get(key)
-                if resolution_error is not None:
-                    current["route_resolution_error"] = resolution_error
-                refreshed.append(current)
-        routes = refreshed
-    return {"routes": routes}
+    return {"routes": rows(con.execute(sql, tuple(params)))}
 
 
 def known_harnesses() -> list[str]:
@@ -538,7 +501,7 @@ _ROUTE_NOT_OBSERVED = object()
 
 def _model_route_available_in_transaction(
     con, observed_route: dict | None, harness: str, selector: str,
-    fingerprint: str,
+    fingerprint: str, runtime_status: dict | None, runtime_scope: dict | None,
 ) -> bool:
     if (
         observed_route is None
@@ -561,6 +524,8 @@ def _model_route_available_in_transaction(
         route_bindings.require_fresh_route(
             con, observed_route, harness, selector,
             current_source_fingerprint=fingerprint,
+            runtime_status=runtime_status,
+            runtime_scope=runtime_scope,
         )
     except route_bindings.RouteResolutionError:
         return False
@@ -571,6 +536,8 @@ def model_route_available(
     con, harness: str, selector: str, *,
     current_source_fingerprint: str | None = None,
     observed_route=_ROUTE_NOT_OBSERVED,
+    runtime_status: dict | None = None,
+    runtime_scope: dict | None = None,
 ) -> bool:
     """True only for an exact route proved available by the local catalogue."""
     if observed_route is _ROUTE_NOT_OBSERVED:
@@ -591,14 +558,23 @@ def model_route_available(
         current_source_fingerprint = (
             model_catalog.current_source_fingerprint(harness, selector) or ""
         )
+    if harness != "vibe" and runtime_status is None:
+        if con.in_transaction:
+            raise RuntimeError(
+                "transactional route checks require precomputed runtime evidence"
+            )
+        runtime_scope = model_catalog.harness_versions.runtime_scope()
+        runtime_status = model_catalog.harness_runtime_status(harness)
     fingerprint = current_source_fingerprint or ""
     if con.in_transaction:
         return _model_route_available_in_transaction(
-            con, observed_route, harness, selector, fingerprint
+            con, observed_route, harness, selector, fingerprint,
+            runtime_status, runtime_scope,
         )
     with db_driver.write_transaction(con, "model_route.available"):
         return _model_route_available_in_transaction(
-            con, observed_route, harness, selector, fingerprint
+            con, observed_route, harness, selector, fingerprint,
+            runtime_status, runtime_scope,
         )
 
 
@@ -630,6 +606,8 @@ def set_flavor_default(con, body) -> tuple[bool, str | None]:
                 "or an exact non-empty available route")
         model = raw_model.strip() if isinstance(raw_model, str) else None
     fingerprint = None
+    runtime_status = None
+    runtime_scope = None
     observed_route = None
     if model is not None:
         row = con.execute(
@@ -638,6 +616,8 @@ def set_flavor_default(con, body) -> tuple[bool, str | None]:
         ).fetchone()
         observed_route = dict(row) if row else None
         if harness != "vibe":
+            runtime_scope = model_catalog.harness_versions.runtime_scope()
+            runtime_status = model_catalog.harness_runtime_status(harness)
             fingerprint = (
                 model_catalog.current_source_fingerprint(harness, model) or ""
             )
@@ -645,7 +625,9 @@ def set_flavor_default(con, body) -> tuple[bool, str | None]:
         if model is not None and not model_route_available(
                 con, harness, model,
                 current_source_fingerprint=fingerprint,
-                observed_route=observed_route):
+                observed_route=observed_route,
+                runtime_status=runtime_status,
+                runtime_scope=runtime_scope):
             return False, (
                 f"invalid_model_route: {model!r} is not an exact currently "
                 f"available route for {harness}; choose an available "

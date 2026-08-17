@@ -298,13 +298,15 @@ def _runtime_manifest_compatibility(harness: str, version: str):
         ) from exc
 
 
-def _require_uncontrolled_runtime(
+def _require_runtime(
     harness: str,
     model: str | None,
     runtime_status: dict | RuntimeEvidence | None,
     runtime_scope: dict | None = None,
-) -> None:
-    """Admit typed-uncontrolled identity only for the exact execution seat."""
+    *,
+    error_code: str = "thinking_evidence_missing",
+) -> RuntimeEvidence:
+    """Validate harness compatibility evidence for the exact execution seat."""
     status = runtime_status if isinstance(runtime_status, RuntimeEvidence) \
         else RuntimeEvidence.from_value(runtime_status)
     scope = runtime_scope if isinstance(runtime_scope, dict) \
@@ -325,7 +327,7 @@ def _require_uncontrolled_runtime(
         or _parsed_version(version) != version
     ):
         raise RouteResolutionError(
-            "thinking_evidence_missing",
+            error_code,
             f"Harness '{harness}' has no compatible installed runtime",
             {
                 "harness": harness,
@@ -351,7 +353,7 @@ def _require_uncontrolled_runtime(
     )
     if not coherent:
         raise RouteResolutionError(
-            "thinking_evidence_missing",
+            error_code,
             f"Harness '{harness}' has no compatible installed runtime",
             {
                 "harness": harness,
@@ -360,6 +362,45 @@ def _require_uncontrolled_runtime(
                 "compatibility": status.compatibility,
                 "runtime_error": "HARNESS_COMPATIBILITY_EVIDENCE_INVALID",
                 "remediation": "re-probe the harness in the execution runtime",
+            },
+        )
+    return status
+
+
+def _require_uncontrolled_runtime(
+    harness: str,
+    model: str | None,
+    runtime_status: dict | RuntimeEvidence | None,
+    runtime_scope: dict | None = None,
+) -> None:
+    """Admit typed-uncontrolled identity only for the exact execution seat."""
+    _require_runtime(harness, model, runtime_status, runtime_scope)
+
+
+def _require_controlled_runtime(
+    row: dict,
+    harness: str,
+    model: str,
+    runtime_status: dict | RuntimeEvidence | None,
+    runtime_scope: dict | None = None,
+) -> None:
+    """Bind controlled evidence to the runtime that will execute the route."""
+    status = _require_runtime(
+        harness, model, runtime_status, runtime_scope,
+        error_code="thinking_evidence_stale",
+    )
+    if status.version != row.get("harness_version"):
+        raise RouteResolutionError(
+            "thinking_evidence_stale",
+            "Installed harness version changed after refresh",
+            {
+                "harness": harness,
+                "model": model,
+                "harness_version": row.get("harness_version"),
+                "installed_version": status.version,
+                "runtime": status.runtime,
+                "runtime_identity": status.runtime_identity,
+                "remediation": "sc models refresh",
             },
         )
 
@@ -479,6 +520,8 @@ def require_fresh_route(
     *,
     now: datetime | None = None,
     current_source_fingerprint: str | None = None,
+    runtime_status: dict | RuntimeEvidence | None = None,
+    runtime_scope: dict | None = None,
 ) -> dict | None:
     """Validate and stage one exact route's freshness in the caller's write."""
     harness = normalize_harness(harness)
@@ -529,6 +572,10 @@ def require_fresh_route(
             row, harness, model, now=check_time,
             current_source_fingerprint=current_source_fingerprint,
         )
+        if runtime_status is not None or runtime_scope is not None:
+            _require_controlled_runtime(
+                row, harness, model, runtime_status, runtime_scope
+            )
         latest = con.execute(
             "SELECT generation_id,completed_at FROM model_catalog_generations "
             "WHERE state='successful' "
@@ -598,6 +645,8 @@ def resolve_persisted_v2(
     fresh_row = require_fresh_route(
         con, row, harness, model, now=now,
         current_source_fingerprint=current_source_fingerprint,
+        runtime_status=runtime_status,
+        runtime_scope=runtime_scope,
     )
     return resolve_v2(
         fresh_row, harness, model, effort, now=now,
@@ -678,6 +727,9 @@ def resolve_v2(
     _validate_route_freshness(
         row, harness, model, now=check_time,
         current_source_fingerprint=current_source_fingerprint,
+    )
+    _require_controlled_runtime(
+        row, harness, model, runtime_status, runtime_scope
     )
 
     supported, effort_metadata = _supported_efforts(row)
