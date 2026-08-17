@@ -57,6 +57,7 @@
     "tests/test_sprint_skills.py",
     "tests/test_sprint_snapshot_rebuild.py",
     "tests/test_route_bindings.py",
+    "tests/sprint_route_binding_support.py",
     "tests/test_model_catalog.py",
     "tests/test_sprint_spec_revisions.py",
     "tests/test_sprint_live_proof.py",
@@ -110,7 +111,8 @@
     ".super-coder/migrations/0207_reseed_sprint_receipt_recovery.sql",
     ".super-coder/migrations/0208_reseed_disposable_shell_base.sql",
     ".super-coder/migrations/0209_reseed_git_github_capabilities.sql",
-    ".super-coder/migrations/0212_route_binding_foundation.sql"
+    ".super-coder/migrations/0212_route_binding_foundation.sql",
+    ".super-coder/migrations/0215_reseed_sprint_binding_guidance.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
