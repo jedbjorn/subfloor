@@ -374,6 +374,17 @@ def _publish_cache(payload: dict, con=None) -> bool:
             ):
                 return False
             os.replace(temporary, CACHE)
+            authoritative = _authoritative_generation(con)
+            if (
+                authoritative is not None
+                and payload.get("catalogue_generation") != authoritative
+            ):
+                cached = _load_cache()
+                if cached and cached.get("catalogue_generation") == payload.get(
+                    "catalogue_generation"
+                ):
+                    CACHE.unlink(missing_ok=True)
+                return False
             return True
     finally:
         temporary.unlink(missing_ok=True)

@@ -39,6 +39,7 @@ CONTROLLED_EVIDENCE = {
     "kimi": {"kimi-alias-config"},
     "opencode": {"opencode-connected-variant"},
 }
+SUPPORTED_HARNESSES = frozenset((*CONTROLLED_EVIDENCE, "vibe"))
 
 TRANSPORTS = {
     "claude": "claude-effort-argument",
@@ -121,6 +122,12 @@ def normalize_harness(harness: str) -> str:
         raise RouteResolutionError(
             "unsupported_thinking_level", "harness is required", {"harness": harness}
         )
+    if normalized not in SUPPORTED_HARNESSES:
+        raise RouteResolutionError(
+            "unsupported_thinking_level",
+            "Harness is not supported",
+            {"harness": normalized},
+        )
     return normalized
 
 
@@ -166,6 +173,8 @@ def validate_v2_binding(binding: dict) -> None:
     harness = binding["harness"]
     if not _exact_nonblank(harness) or harness != harness.lower():
         raise _binding_error("harness must be a normalized non-blank identifier")
+    if harness not in SUPPORTED_HARNESSES:
+        raise _binding_error("harness must identify a shipped adapter")
     state = binding["control_state"]
     adapter_metadata = binding["adapter_metadata"]
     if not isinstance(adapter_metadata, dict):

@@ -116,7 +116,7 @@ class BindingIdentityTest(unittest.TestCase):
 
     def test_uncontrolled_bindings_encode_every_inapplicable_value_as_null(self):
         default, default_digest = route_bindings.resolve_v2(
-            None, "claude", None, None, now=self.NOW
+            None, "ClAuDe", None, None, now=self.NOW
         )
         vibe, vibe_digest = route_bindings.resolve_v2(
             None, "vibe", "devstral-latest", None, now=self.NOW
@@ -130,6 +130,7 @@ class BindingIdentityTest(unittest.TestCase):
         self.assertEqual(default_digest, replay_digest)
         self.assertNotEqual(default_digest, vibe_digest)
         self.assertEqual(default["control_state"], "harness-default")
+        self.assertEqual(default["harness"], "claude")
         self.assertEqual(vibe["control_state"], "native-uncontrolled")
         for binding in (default, vibe):
             self.assertIsNone(binding["requested_effort"])
@@ -137,6 +138,16 @@ class BindingIdentityTest(unittest.TestCase):
             self.assertIsNone(binding["catalogue_generation"])
             self.assertIsNone(binding["evidence_digest"])
             self.assertEqual(binding["transport"], "native-default")
+
+    def test_unknown_harness_is_refused_before_binding_identity_exists(self):
+        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+            route_bindings.resolve_v2(None, "not-a-harness", None)
+
+        self.assertEqual(raised.exception.code, "unsupported_thinking_level")
+        self.assertEqual(raised.exception.message, "Harness is not supported")
+        self.assertEqual(
+            raised.exception.details, {"harness": "not-a-harness"}
+        )
 
     def test_opencode_ascii_lookup_accepts_case_without_aliasing_unicode(self):
         canonical, canonical_digest = route_bindings.resolve_v2(
@@ -946,6 +957,90 @@ class GenerationPersistenceTest(unittest.TestCase):
             ("winner-route", winner_generation, 0, None),
         )
 
+    def test_replace_seam_rejects_newer_success_or_failure_generation(self):
+        cases = ("successful", "failed")
+        for challenger_state in cases:
+            with self.subTest(challenger_state=challenger_state):
+                older_con, challenger_con = self.shared_connections()
+                older = self.payload("replace-older")
+                older.pop("verification")
+                later = datetime.now(timezone.utc) + timedelta(minutes=5)
+                if challenger_state == "successful":
+                    challenger = self.payload("replace-newer")
+                    challenger["refresh_started_at"] = later.isoformat()
+                    challenger["refresh_completed_at"] = (
+                        later + timedelta(seconds=1)
+                    ).isoformat()
+                else:
+                    challenger = {
+                        "v": model_catalog.PAYLOAD_VERSION,
+                        "fetched_at": later.isoformat(),
+                        "refresh_started_at": later.isoformat(),
+                        "refresh_completed_at": (
+                            later + timedelta(seconds=1)
+                        ).isoformat(),
+                        "stale": True,
+                        "partial": False,
+                        "error": "newer refresh failed",
+                        "harnesses": {},
+                        "verification": {
+                            "runtime": "host", "harnesses": {},
+                        },
+                    }
+                statuses = {"codex": self.status()}
+                real_replace = model_catalog.os.replace
+
+                def commit_challenger_then_replace(source, destination):
+                    model_catalog.persist_routes(challenger_con, challenger)
+                    real_replace(source, destination)
+
+                with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+                    model_catalog, "CACHE", Path(tmp) / "model_catalog.json"
+                ), mock.patch.object(
+                    model_catalog, "build", return_value=older
+                ), mock.patch.object(
+                    model_catalog.os, "replace",
+                    side_effect=commit_challenger_then_replace,
+                ) as replace:
+                    response = model_catalog.catalog(
+                        refresh=True, con=older_con,
+                        opencode_provider=lambda: [],
+                        harness_probe=lambda: statuses,
+                    )
+                    cache_exists = model_catalog.CACHE.exists()
+
+                generations = older_con.execute(
+                    "SELECT generation_id,state FROM model_catalog_generations "
+                    "ORDER BY completed_at,generation_id"
+                ).fetchall()
+                fresh_routes = older_con.execute(
+                    "SELECT selector,generation_id,stale,last_error "
+                    "FROM model_routes WHERE stale=0 ORDER BY selector"
+                ).fetchall()
+                authority = generations[-1]
+                self.assertEqual(replace.call_count, 1)
+                self.assertFalse(response["generation_published"])
+                self.assertTrue(response["stale"])
+                self.assertEqual(
+                    response["error"],
+                    "Catalogue changed during refresh; retry",
+                )
+                self.assertFalse(cache_exists)
+                self.assertEqual(len(generations), 2)
+                self.assertEqual(authority["state"], challenger_state)
+                self.assertEqual(
+                    authority["generation_id"],
+                    challenger["catalogue_generation"],
+                )
+                if challenger_state == "successful":
+                    self.assertEqual(len(fresh_routes), 1)
+                    self.assertEqual(
+                        tuple(fresh_routes[0]),
+                        ("replace-newer", authority["generation_id"], 0, None),
+                    )
+                else:
+                    self.assertEqual(fresh_routes, [])
+
     def test_freshness_failure_respects_outer_rollback(self):
         model_catalog.persist_routes(self.con, self.payload("rollback-route"))
         row = dict(self.con.execute(
@@ -1044,6 +1139,9 @@ class ParticipantRevisionTest(unittest.TestCase):
         uncontrolled, _ = route_bindings.resolve_v2(
             None, "vibe", "devstral-latest", None
         )
+        harness_default, _ = route_bindings.resolve_v2(
+            None, "claude", None, None
+        )
         return [
             ("controlled-vibe", {**controlled, "harness": "vibe"}),
             ("wrong-transport", {**controlled, "transport": "native-default"}),
@@ -1060,6 +1158,9 @@ class ParticipantRevisionTest(unittest.TestCase):
             }),
             ("uncontrolled-adapter", {
                 **uncontrolled, "adapter_metadata": {"effort": "high"},
+            }),
+            ("unknown-harness-default", {
+                **harness_default, "harness": "not-a-harness",
             }),
             ("malformed-generation", {
                 **controlled, "catalogue_generation": "not-a-generation",

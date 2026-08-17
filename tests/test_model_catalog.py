@@ -662,6 +662,40 @@ class RouteCliConnectionTest(unittest.TestCase):
         self.assertEqual(mixed["binding"], lower["binding"])
         self.assertEqual(mixed["binding_digest"], lower["binding_digest"])
 
+    def test_local_resolve_rejects_unknown_harness_and_accepts_mixed_case(self):
+        def resolve(harness: str) -> tuple[int, dict, mock.Mock]:
+            output = io.StringIO()
+            con = mock.Mock()
+            with (
+                mock.patch.object(routes_cli.mem, "SC_API_TOKEN", ""),
+                mock.patch.object(routes_cli, "_open_db", return_value=con),
+                contextlib.redirect_stdout(output),
+            ):
+                status = routes_cli.main(["resolve", harness, "--json"])
+            return status, json.loads(output.getvalue()), con
+
+        refused_status, refused, refused_con = resolve("not-a-harness")
+        accepted_status, accepted, accepted_con = resolve("ClAuDe")
+
+        self.assertEqual(refused_status, 2)
+        self.assertEqual(refused["code"], "unsupported_thinking_level")
+        self.assertEqual(refused["error"], "Harness is not supported")
+        self.assertNotIn("binding", refused)
+        self.assertNotIn("binding_digest", refused)
+        self.assertNotIn("command", refused)
+        refused_con.close.assert_called_once_with()
+        self.assertEqual(accepted_status, 0)
+        self.assertEqual(accepted["harness"], "claude")
+        self.assertEqual(accepted["binding"]["harness"], "claude")
+        self.assertEqual(
+            accepted["binding"]["control_state"], "harness-default"
+        )
+        self.assertEqual(
+            accepted["command"],
+            ["./sc", "run", "<shell>", "--harness", "claude"],
+        )
+        accepted_con.close.assert_called_once_with()
+
     def test_refresh_keeps_the_wal_enabled_write_lane(self):
         con = mock.Mock()
         payload = {"stale": False, "sources": ["test-source"]}

@@ -110,6 +110,7 @@ CREATE TABLE sprint_participant_route_bindings (
          OR (harness<>'opencode' AND native_variant_id IS NULL)))
       OR
       (control_state='harness-default'
+       AND harness IN ('claude','codex','kimi','opencode','vibe')
        AND requested_model IS NULL
        AND provider_model IS NULL
        AND requested_effort IS NULL
