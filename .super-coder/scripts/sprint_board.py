@@ -783,6 +783,19 @@ class SprintBoardProjection:
                 ),
                 "control_state": row["control_state"],
                 "effective_effort": row["effective_effort"],
+                "intent_control_state": (
+                    "harness-default"
+                    if row["model"] is None
+                    else (
+                        "native-uncontrolled"
+                        if row["harness"] == "vibe" else "controlled"
+                    )
+                ),
+                "intent_effective_effort": (
+                    row["effort"] or "high"
+                    if row["model"] is not None and row["harness"] != "vibe"
+                    else None
+                ),
                 "native_variant_id": row["native_variant_id"],
                 "route_revision": (
                     int(row["route_revision"])

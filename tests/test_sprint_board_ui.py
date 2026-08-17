@@ -99,6 +99,44 @@ def test_sprint_modals_follow_action_and_viewer_footer_contracts():
     assert "footNodes" not in action + detail
 
 
+def test_prepared_controlled_route_keeps_its_thinking_level_without_a_binding():
+    script = HEALTH_BOARD_HARNESS + SPRINT_BLOCK + r"""
+const rows = sprintParticipantRoutes([
+  {
+    role: "developer", shortname: "DEV2", harness: "codex", model: "gpt-5.4",
+    binding_status: "unbound-intent", control_state: null, effective_effort: null,
+    intent_control_state: "controlled", intent_effective_effort: "high",
+    route_revision: null, binding_digest: null,
+  },
+  {
+    role: "reviewer", shortname: "REV1", harness: "codex", model: "gpt-5.4",
+    binding_status: "bound", control_state: "controlled", effective_effort: "xhigh",
+    intent_control_state: "controlled", intent_effective_effort: "xhigh",
+    route_revision: 2, binding_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  },
+  {
+    role: "developer", shortname: "DEV3", harness: "vibe", model: "vibe-model",
+    binding_status: "unbound-intent", control_state: null, effective_effort: null,
+    intent_control_state: "native-uncontrolled", intent_effective_effort: null,
+    route_revision: null, binding_digest: null,
+  },
+  {
+    role: "developer", shortname: "DEV4", harness: "codex", model: null,
+    binding_status: "unbound-intent", control_state: null, effective_effort: null,
+    intent_control_state: "harness-default", intent_effective_effort: null,
+    route_revision: null, binding_digest: null,
+  },
+]);
+console.log(JSON.stringify(rows.children.map((row) => row.textContent)));
+"""
+    assert run_js(script) == [
+        "developer DEV2codex · gpt-5.4Thinking level: high · unbound intent",
+        "reviewer REV1codex · gpt-5.4Thinking level: xhigh · route r2 · aaaaaaaaaaaa…",
+        "developer DEV3vibe · vibe-modelThinking control unavailable · unbound intent",
+        "developer DEV4codex · Harness defaultThinking control unavailable · unbound intent",
+    ]
+
+
 def test_priority_selection_is_armed_then_latest_paused_then_prepared_then_terminal():
     script = SPRINT_BLOCK + r"""
 const base = [

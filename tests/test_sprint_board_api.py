@@ -1249,11 +1249,15 @@ class SprintBoardApiCase(unittest.TestCase):
                     (sprint_id,),
                 ).lastrowid
             )
-            con.execute(
+            con.executemany(
                 "INSERT INTO sprint_participants "
-                "(sprint_id,shell_id,role,harness,disposition) "
-                "VALUES (?,5,'developer','codex','idle')",
-                (prepared_sprint_id,),
+                "(sprint_id,shell_id,role,harness,model,effort,disposition) "
+                "VALUES (?,?,'developer',?,?,?,'idle')",
+                (
+                    (prepared_sprint_id, 5, "codex", "gpt-5.4", "high"),
+                    (prepared_sprint_id, 6, "vibe", "vibe-model", None),
+                    (prepared_sprint_id, 7, "codex", None, None),
+                ),
             )
             prepared = sprint_board.SprintBoardProjection(con).board(
                 prepared_sprint_id
@@ -1261,6 +1265,43 @@ class SprintBoardApiCase(unittest.TestCase):
             self.assertEqual(
                 {"unbound-intent"},
                 {row["binding_status"] for row in prepared["participants"]},
+            )
+            prepared_by_shell = {
+                row["shortname"]: row for row in prepared["participants"]
+            }
+            self.assertEqual(
+                (
+                    None,
+                    None,
+                    "controlled",
+                    "high",
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    prepared_by_shell["DEV2"]["control_state"],
+                    prepared_by_shell["DEV2"]["effective_effort"],
+                    prepared_by_shell["DEV2"]["intent_control_state"],
+                    prepared_by_shell["DEV2"]["intent_effective_effort"],
+                    prepared_by_shell["DEV2"]["route_revision"],
+                    prepared_by_shell["DEV2"]["binding_digest"],
+                    prepared_by_shell["DEV2"]["catalogue_generation"],
+                ),
+            )
+            self.assertEqual(
+                ("native-uncontrolled", None),
+                (
+                    prepared_by_shell["DEV3"]["intent_control_state"],
+                    prepared_by_shell["DEV3"]["intent_effective_effort"],
+                ),
+            )
+            self.assertEqual(
+                ("harness-default", None),
+                (
+                    prepared_by_shell["DEV4"]["intent_control_state"],
+                    prepared_by_shell["DEV4"]["intent_effective_effort"],
+                ),
             )
             participant = con.execute(
                 "SELECT participant_id,harness,model,effort "

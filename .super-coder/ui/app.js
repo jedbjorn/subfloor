@@ -6230,9 +6230,15 @@ function sprintParticipantRoutes(participants) {
   const rows = el("div", { className: "sprint-participant-bindings" });
   for (const participant of participants || []) {
     const model = participant.model || "Harness default";
-    const thinking = participant.control_state === "controlled"
+    const boundControlled = participant.binding_status === "bound"
+      && participant.control_state === "controlled";
+    const pendingControlled = participant.binding_status === "unbound-intent"
+      && participant.intent_control_state === "controlled";
+    const thinking = boundControlled
       ? `Thinking level: ${participant.effective_effort}`
-      : "Thinking control unavailable";
+      : pendingControlled
+        ? `Thinking level: ${participant.intent_effective_effort}`
+        : "Thinking control unavailable";
     const binding = participant.binding_status === "bound"
       ? `route r${participant.route_revision} · ${participant.binding_digest.slice(0, 12)}…`
       : participant.binding_status.replaceAll("-", " ");
