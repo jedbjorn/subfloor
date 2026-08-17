@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
 
-
 SCRIPTS = Path(__file__).resolve().parents[1]
 ENGINE = SCRIPTS.parent
 ADAPTERS = ENGINE / "adapters"
@@ -179,6 +178,8 @@ class ConversationContext:
     permission_mode: str = "unrestricted"
     title: str | None = None
     env: Mapping[str, str] = field(default_factory=dict)
+    route_binding: Mapping[str, Any] | None = None
+    binding_digest: str | None = None
 
     def checked_worktree(self) -> Path:
         if self.permission_mode not in PERMISSION_MODES:

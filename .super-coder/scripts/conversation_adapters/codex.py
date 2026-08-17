@@ -10,7 +10,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
 
+import route_transport
+
 from .base import (
+    TERMINAL_EVENTS,
     AdapterError,
     ConversationAdapter,
     ConversationContext,
@@ -20,7 +23,6 @@ from .base import (
     ProbeResult,
     ReconcileResult,
     SessionInspection,
-    TERMINAL_EVENTS,
     cleanup_owned_process,
     command_version,
     ensure_exact_session,
@@ -250,11 +252,18 @@ class CodexAdapter(ConversationAdapter):
 
     @staticmethod
     def _thread_params(context: ConversationContext) -> dict[str, Any]:
+        try:
+            projection = route_transport.context_projection(context, "codex")
+        except route_transport.route_bindings.RouteResolutionError as exc:
+            raise AdapterError(
+                getattr(exc, "code", "HARNESS_ROUTE_INVALID"), str(exc)
+            ) from exc
+        model = projection.model if projection is not None else context.model
         params: dict[str, Any] = {
             "cwd": str(context.checked_worktree()),
         }
-        if context.model:
-            params["model"] = context.model
+        if model:
+            params["model"] = model
         if context.provider:
             params["modelProvider"] = context.provider
         if context.permission_mode == "unrestricted":
@@ -272,16 +281,24 @@ class CodexAdapter(ConversationAdapter):
         context: ConversationContext,
         message: str,
     ) -> dict[str, Any]:
+        try:
+            projection = route_transport.context_projection(context, "codex")
+        except route_transport.route_bindings.RouteResolutionError as exc:
+            raise AdapterError(
+                getattr(exc, "code", "HARNESS_ROUTE_INVALID"), str(exc)
+            ) from exc
+        model = projection.model if projection is not None else context.model
+        effort = projection.effort if projection is not None else context.effort
         params: dict[str, Any] = {
             "threadId": session_ref,
             "input": [{"type": "text", "text": message}],
             "cwd": str(context.checked_worktree()),
             "clientUserMessageId": str(uuid.uuid4()),
         }
-        if context.model:
-            params["model"] = context.model
-        if context.effort:
-            params["effort"] = context.effort
+        if model:
+            params["model"] = model
+        if effort:
+            params["effort"] = effort
         if context.permission_mode == "unrestricted":
             params["approvalPolicy"] = "never"
         return params

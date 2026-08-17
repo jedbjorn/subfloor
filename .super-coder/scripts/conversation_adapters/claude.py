@@ -10,7 +10,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
+import route_transport
+
 from .base import (
+    TERMINAL_EVENTS,
     AdapterError,
     ConversationAdapter,
     ConversationContext,
@@ -22,7 +25,6 @@ from .base import (
     ReconcileResult,
     SessionInspection,
     SubprocessRunner,
-    TERMINAL_EVENTS,
     command_version,
     ensure_exact_session,
     ensure_nonempty_message,
@@ -70,22 +72,30 @@ class ClaudeAdapter(ConversationAdapter):
             "resume" if resume else "start"
         ]["session_flag"]
         command.extend([session, session_ref])
-        if context.model:
+        try:
+            projection = route_transport.context_projection(context, self.harness)
+        except route_transport.route_bindings.RouteResolutionError as exc:
+            raise AdapterError(
+                getattr(exc, "code", "HARNESS_ROUTE_INVALID"), str(exc)
+            ) from exc
+        model = projection.model if projection is not None else context.model
+        effort_value = projection.effort if projection is not None else context.effort
+        if model:
             model_flag = hcfg.get("model_flag")
             if not model_flag:
                 raise AdapterError(
                     "HARNESS_MODEL_ROUTE_INVALID",
                     "Claude adapter cannot apply a model",
                 )
-            command.extend([model_flag, context.model])
-        if context.effort:
+            command.extend([model_flag, model])
+        if effort_value:
             effort = hcfg.get("effort") or {}
             if not effort.get("flag"):
                 raise AdapterError(
                     "HARNESS_EFFORT_UNSUPPORTED",
                     "Claude adapter cannot apply effort",
                 )
-            command.extend([effort["flag"], context.effort])
+            command.extend([effort["flag"], effort_value])
         if context.permission_mode == "unrestricted":
             command.append("--dangerously-skip-permissions")
         return command

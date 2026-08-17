@@ -11,6 +11,8 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
+import route_transport
+
 from .base import (
     TERMINAL_EVENTS,
     AdapterError,
@@ -84,11 +86,18 @@ class KimiAdapter(ConversationAdapter):
         self,
         context: ConversationContext,
     ) -> tuple[dict[str, str], Path]:
+        try:
+            projection = route_transport.context_projection(context, self.harness)
+        except route_transport.route_bindings.RouteResolutionError as exc:
+            raise AdapterError(
+                getattr(exc, "code", "HARNESS_ROUTE_INVALID"), str(exc)
+            ) from exc
+        effort_value = projection.effort if projection is not None else context.effort
         env = merged_env(self.manifest, context)
         effort_env = self.manifest["headless"].get("effort", {}).get("env")
         if effort_env:
-            if context.effort:
-                env[effort_env] = context.effort
+            if effort_value:
+                env[effort_env] = effort_value
             else:
                 env.pop(effort_env, None)
         if self.sessions_root is not None:
@@ -118,6 +127,13 @@ class KimiAdapter(ConversationAdapter):
         message: str,
         session_ref: str | None,
     ) -> list[str]:
+        try:
+            projection = route_transport.context_projection(context, self.harness)
+        except route_transport.route_bindings.RouteResolutionError as exc:
+            raise AdapterError(
+                getattr(exc, "code", "HARNESS_ROUTE_INVALID"), str(exc)
+            ) from exc
+        model = projection.model if projection is not None else context.model
         hcfg = self.manifest["headless"]
         command = list(hcfg["launch"])
         command.extend([hcfg.get("prompt_flag", "-p"), message])
@@ -127,14 +143,14 @@ class KimiAdapter(ConversationAdapter):
                 "session_flag"
             ]
             command.extend([resume_flag, session_ref])
-        if context.model:
+        if model:
             model_flag = hcfg.get("model_flag")
             if not model_flag:
                 raise AdapterError(
                     "HARNESS_MODEL_ROUTE_INVALID",
                     "Kimi adapter cannot apply a model",
                 )
-            command.extend([model_flag, context.model])
+            command.extend([model_flag, model])
         return command
 
     @staticmethod

@@ -6,16 +6,21 @@ import atexit
 import hashlib
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
 import subprocess
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
+
+import opencode_config
+import route_transport
 
 from .base import (
     TERMINAL_EVENTS,
@@ -45,6 +50,18 @@ _SERVER_LOCK = threading.RLock()
 _SERVER_PROCESS: subprocess.Popen | None = None
 _SERVER_PASSWORD: str | None = None
 _SERVER_LOG_HANDLE = None
+
+VARIANT_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
+VARIANT_MANIFEST = opencode_config.VARIANT_MANIFEST
+FORBIDDEN_VARIANT_KEYS = frozenset({
+    "apikey", "key", "token", "secret", "credential", "authorization",
+    "headers", "baseurl", "npm", "provider", "model", "prompt",
+    "instructions", "permission", "tools", "plugin", "mcp", "shell",
+})
+OPENAI_PROVIDER_PACKAGES = frozenset({
+    "@ai-sdk/openai", "@ai-sdk/openai-compatible", "@ai-sdk/azure",
+})
+ANTHROPIC_PROVIDER_PACKAGES = frozenset({"@ai-sdk/anthropic"})
 
 
 def _server_healthy(password: str | None) -> bool:
@@ -177,17 +194,130 @@ def stop_server() -> None:
 def provider_state() -> dict[str, Any]:
     """Return OpenCode's authoritative provider/model connection projection."""
     password = ensure_server()
-    result = UrlHttpTransport(
+    transport = UrlHttpTransport(
         SERVER_ENDPOINT,
         password=password,
         timeout=10.0,
-    ).request("GET", "/provider")
+    )
+    result = transport.request("GET", "/provider")
     if not isinstance(result, dict):
         raise AdapterError(
             "HARNESS_PROTOCOL_ERROR",
             "OpenCode provider response was not an object",
         )
-    return result
+    health = transport.request("GET", "/global/health")
+    version = health.get("version") if isinstance(health, dict) else None
+    return {**result, "_sc_cli_version": version}
+
+
+def _collision_identity(value: str) -> str:
+    return unicodedata.normalize("NFKC", value.strip()).casefold()
+
+
+def _provider_family(provider: Mapping[str, Any]) -> str | None:
+    package = provider.get("npm")
+    if package in OPENAI_PROVIDER_PACKAGES:
+        return "openai-ai-sdk"
+    if package in ANTHROPIC_PROVIDER_PACKAGES:
+        return "anthropic-ai-sdk"
+    return None
+
+
+def _contains_forbidden_key(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    for key, nested in value.items():
+        if isinstance(key, str) and key.casefold() in FORBIDDEN_VARIANT_KEYS:
+            return True
+        if _contains_forbidden_key(nested):
+            return True
+    return False
+
+
+def _contains_substitution(value: Any) -> bool:
+    if isinstance(value, str):
+        lowered = value.casefold()
+        return "{env:" in lowered or "{file:" in lowered
+    if isinstance(value, dict):
+        return any(_contains_substitution(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_substitution(item) for item in value)
+    return False
+
+
+def _output_limit(model: Mapping[str, Any]) -> int | None:
+    for field in ("limit", "limits"):
+        limits = model.get(field)
+        if isinstance(limits, dict):
+            value = limits.get("output") or limits.get("output_tokens")
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+    value = model.get("output_limit")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _sanitize_variant(
+    value: Any,
+    *,
+    provider_family: str | None,
+    model: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or not value or _contains_forbidden_key(value):
+        return None
+    disabled = value.get("disabled", False)
+    if not isinstance(disabled, bool) or disabled:
+        return None
+    candidate = {key: item for key, item in value.items() if key != "disabled"}
+    if not candidate or _contains_substitution(candidate):
+        return None
+
+    canonical = opencode_config.canonical_variant_options(
+        candidate, provider_family=provider_family
+    )
+    if canonical is None:
+        return None
+    if provider_family == "anthropic-ai-sdk":
+        thinking = canonical["thinking"]
+        budget = thinking.get("budgetTokens")
+        limit = _output_limit(model)
+        if (
+            limit is None
+            or budget > limit
+        ):
+            return None
+    return canonical
+
+
+def admitted_variants(
+    variants: Any,
+    *,
+    provider_family: str | None,
+    model: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Return only unique, already-canonical IDs with closed safe overlays."""
+    if not isinstance(variants, dict):
+        return {}
+    groups: dict[str, list[str]] = {}
+    for raw_id in variants:
+        if isinstance(raw_id, str):
+            groups.setdefault(_collision_identity(raw_id), []).append(raw_id)
+    admitted: dict[str, dict[str, Any]] = {}
+    for identity, raw_ids in groups.items():
+        if len(raw_ids) != 1:
+            continue
+        raw_id = raw_ids[0]
+        if (
+            raw_id != identity
+            or not raw_id.isascii()
+            or VARIANT_ID.fullmatch(raw_id) is None
+        ):
+            continue
+        overlay = _sanitize_variant(
+            variants[raw_id], provider_family=provider_family, model=model
+        )
+        if overlay is not None:
+            admitted[raw_id] = overlay
+    return admitted
 
 
 def connected_models(state: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -201,12 +331,31 @@ def connected_models(state: Mapping[str, Any] | None = None) -> list[dict[str, A
         if not isinstance(provider, dict) or provider.get("id") not in connected:
             continue
         provider_id = provider["id"]
+        provider_family = _provider_family(provider)
         for model_id, model in (provider.get("models") or {}).items():
             if not isinstance(model_id, str) or not isinstance(model, dict):
                 continue
             status = model.get("status")
             if status not in (None, "active"):
                 continue
+            variants = admitted_variants(
+                model.get("variants"), provider_family=provider_family, model=model
+            )
+            projection = {
+                "provider": provider_id,
+                "provider_model": model_id,
+                "provider_family": provider_family,
+                "manifest": VARIANT_MANIFEST,
+                "variants": variants,
+            }
+            projection_fingerprint = hashlib.sha256(
+                json.dumps(
+                    projection,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
             models.append(
                 {
                     "id": f"{provider_id}/{model_id}",
@@ -216,6 +365,24 @@ def connected_models(state: Mapping[str, Any] | None = None) -> list[dict[str, A
                     "family": model.get("family"),
                     "release_date": model.get("release_date") or "",
                     "status": status or "active",
+                    "supported_efforts": list(variants),
+                    "default_effort": "high" if "high" in variants else None,
+                    "native_variant_ids": {
+                        variant_id: variant_id for variant_id in variants
+                    },
+                    "selector_binding": {
+                        "kind": "connected-model",
+                        "selector": f"{provider_id}/{model_id}",
+                        "provider_model": model_id,
+                        "provider_family": provider_family,
+                        "projection_fingerprint": projection_fingerprint,
+                    },
+                    "adapter_metadata": {
+                        "compatibility_manifest": VARIANT_MANIFEST,
+                        "provider_family": provider_family,
+                        "variant_options_by_effort": variants,
+                    },
+                    "cli_version": state.get("_sc_cli_version"),
                 }
             )
     return sorted(models, key=lambda item: (item["provider"], item["id"]))
@@ -264,20 +431,38 @@ class OpenCodeAdapter(ConversationAdapter):
         return self._probe_result(version)
 
     @staticmethod
-    def _route(context: ConversationContext) -> tuple[str, str] | None:
-        if not context.model:
+    def _bound_model(context: ConversationContext) -> str | None:
+        binding = context.route_binding
+        if isinstance(binding, Mapping):
+            model = binding.get("requested_model")
+            return model if isinstance(model, str) else None
+        return context.model
+
+    @classmethod
+    def _route(cls, context: ConversationContext) -> tuple[str, str] | None:
+        selected_model = cls._bound_model(context)
+        if not selected_model:
             return None
+        if isinstance(context.route_binding, Mapping):
+            if "/" in selected_model:
+                provider, model = selected_model.split("/", 1)
+                if provider and model:
+                    return provider, model
+            raise AdapterError(
+                "HARNESS_MODEL_ROUTE_INVALID",
+                "Bound OpenCode models require an exact provider/model selector",
+            )
         if context.provider:
             prefix = f"{context.provider}/"
             model = (
-                context.model.removeprefix(prefix)
-                if context.model.startswith(prefix)
-                else context.model
+                selected_model.removeprefix(prefix)
+                if selected_model.startswith(prefix)
+                else selected_model
             )
             if model:
                 return context.provider, model
-        if "/" in context.model:
-            provider, model = context.model.split("/", 1)
+        if "/" in selected_model:
+            provider, model = selected_model.split("/", 1)
             if provider and model:
                 return provider, model
         raise AdapterError(
@@ -322,6 +507,15 @@ class OpenCodeAdapter(ConversationAdapter):
         runtime directory.
         """
         worktree = context.checked_worktree()
+        try:
+            route_transport.context_projection(context, self.harness)
+        except (
+            route_transport.route_bindings.RouteResolutionError,
+            opencode_config.OpenCodeConfigError,
+        ) as exc:
+            raise AdapterError(
+                getattr(exc, "code", "HARNESS_ROUTE_INVALID"), str(exc)
+            ) from exc
         identity = hashlib.sha256(str(worktree).encode()).hexdigest()[:20]
         self.shell_runtime_dir.mkdir(parents=True, exist_ok=True)
         wrapper = self.shell_runtime_dir / f"{identity}.sh"
@@ -343,23 +537,16 @@ class OpenCodeAdapter(ConversationAdapter):
         temporary.chmod(0o700)
         os.replace(temporary, wrapper)
 
-        config_path = worktree / "opencode.json"
         try:
-            config = json.loads(config_path.read_text())
-        except FileNotFoundError:
-            config = {}
-        except (OSError, json.JSONDecodeError) as exc:
-            raise AdapterError(
-                "HARNESS_CONFIG_INVALID",
-                f"cannot prepare OpenCode shell config: {exc}",
-            ) from exc
-        if not isinstance(config, dict):
-            raise AdapterError(
-                "HARNESS_CONFIG_INVALID",
-                "OpenCode project config must be a JSON object",
+            opencode_config.merge_json(
+                worktree,
+                {"shell": str(wrapper)},
+                operation="set-shell-wrapper",
             )
-        config["shell"] = str(wrapper)
-        config_path.write_text(json.dumps(config, indent=2) + "\n")
+        except opencode_config.OpenCodeConfigError as exc:
+            raise AdapterError(
+                exc.code, str(exc)
+            ) from exc
         return wrapper
 
     def _prompt(
@@ -377,6 +564,10 @@ class OpenCodeAdapter(ConversationAdapter):
                 "providerID": route[0],
                 "modelID": route[1],
             }
+        if context.route_binding is not None:
+            body["agent"] = opencode_config.route_agent_name(
+                context.binding_digest or ""
+            )
         self.transport.request(
             "POST",
             f"/session/{session_ref}/message",
