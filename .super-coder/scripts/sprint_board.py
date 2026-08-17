@@ -162,6 +162,26 @@ _EVENT_FIELDS = {
     "participant.route_changed": frozenset(
         {"participant_id", "shell_id", "role", "before", "after"}
     ),
+    "participant.route_bound": frozenset(
+        {
+            "binding_id",
+            "participant_id",
+            "route_revision",
+            "binding_digest",
+            "control_state",
+            "effective_effort",
+        }
+    ),
+    "participant.route_revised": frozenset(
+        {
+            "binding_id",
+            "participant_id",
+            "route_revision",
+            "binding_digest",
+            "control_state",
+            "before_binding_digest",
+        }
+    ),
     "review.requested": frozenset(
         {
             "work_unit_id",
@@ -749,15 +769,42 @@ class SprintBoardProjection:
                 "harness": row["harness"],
                 "model": row["model"],
                 "effort": row["effort"],
+                "route": row["route"],
+                "binding_status": (
+                    "bound"
+                    if row["active_route_binding_id"] is not None
+                    else (
+                        "unbound-intent"
+                        if sprint["lifecycle"] == "prepared" else "legacy"
+                    )
+                ),
+                "route_contract_version": (
+                    2 if row["active_route_binding_id"] is not None else 1
+                ),
+                "control_state": row["control_state"],
+                "effective_effort": row["effective_effort"],
+                "native_variant_id": row["native_variant_id"],
+                "route_revision": (
+                    int(row["route_revision"])
+                    if row["route_revision"] is not None else None
+                ),
+                "binding_digest": row["binding_digest"],
+                "catalogue_generation": row["catalogue_generation"],
                 "disposition": row["disposition"],
                 "current_conversation_id": row["current_conversation_id"],
             }
             for row in self.con.execute(
                 "SELECT p.participant_id,p.shell_id,sh.shortname,sh.display_name,"
-                "p.role,p.harness,p.model,p.effort,p.disposition,"
+                "p.role,p.harness,p.model,p.effort,p.route,p.disposition,"
+                "p.active_route_binding_id,binding.control_state,"
+                "binding.effective_effort,binding.native_variant_id,"
+                "binding.route_revision,binding.binding_digest,"
+                "binding.catalogue_generation,"
                 "active.chat_id AS current_conversation_id "
                 "FROM sprint_participants p "
                 "JOIN shells sh ON sh.shell_id=p.shell_id "
+                "LEFT JOIN sprint_participant_route_bindings binding "
+                "ON binding.binding_id=p.active_route_binding_id "
                 "LEFT JOIN active_shell_chats active ON active.shell_id=p.shell_id "
                 "WHERE p.sprint_id=? "
                 "ORDER BY p.participant_id",

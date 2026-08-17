@@ -22,6 +22,7 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 import active_chat_registry  # noqa: E402
 import sprint_domain  # noqa: E402
 import sprint_message_delivery as delivery  # noqa: E402
+from sprint_route_binding_support import candidate as route_candidate  # noqa: E402
 
 
 def apply_schema(con: sqlite3.Connection, *, through: str | None = None) -> None:
@@ -319,6 +320,17 @@ class ScopedReplyMigrationTest(unittest.TestCase):
 
 class SprintMessageCase(unittest.TestCase):
     def setUp(self) -> None:
+        route_patch = mock.patch.object(
+            sprint_domain, "_participant_binding_candidate", side_effect=route_candidate
+        )
+        route_patch.start()
+        self.addCleanup(route_patch.stop)
+        evidence_patch = mock.patch.object(
+            sprint_domain.route_bindings,
+            "verify_stored_v2_before_first_turn",
+        )
+        evidence_patch.start()
+        self.addCleanup(evidence_patch.stop)
         quiet_env = mock.patch.dict(
             os.environ, {"SC_SPRINT_FORCE_NEW_QUIET_SECONDS": "0"}
         )
@@ -2839,7 +2851,7 @@ class ParticipantRelayTest(SprintMessageCase):
                     (self.sprint_id,),
                 ).fetchone()[0]
             )
-            + ":wake:"
+            + f":participant:{self.planner_id}:route:1:wake:"
             + str(
                 self.con.execute(
                     "SELECT wm.wake_id FROM sprint_wake_messages wm "
@@ -2864,9 +2876,8 @@ class ParticipantRelayTest(SprintMessageCase):
         ).fetchone()
         self.assertEqual("codex", original["harness"])
         self.assertEqual("openai", original["provider"])
-        self.assertIsInstance(original["model"], str)
-        self.assertNotEqual("", original["model"])
-        self.assertEqual("high", original["effort"])
+        self.assertIsNone(original["model"])
+        self.assertIsNone(original["effort"])
 
         with self.con:
             closed = active_chat_registry.close_for_wake(self.con, 3)

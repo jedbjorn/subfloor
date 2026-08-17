@@ -6226,6 +6226,24 @@ function sprintWireGraph(wrap, canvas, svg, cardById, dependencies, units) {
   }
 }
 
+function sprintParticipantRoutes(participants) {
+  const rows = el("div", { className: "sprint-participant-bindings" });
+  for (const participant of participants || []) {
+    const model = participant.model || "Harness default";
+    const thinking = participant.control_state === "controlled"
+      ? `Thinking level: ${participant.effective_effort}`
+      : "Thinking control unavailable";
+    const binding = participant.binding_status === "bound"
+      ? `route r${participant.route_revision} · ${participant.binding_digest.slice(0, 12)}…`
+      : participant.binding_status.replaceAll("-", " ");
+    rows.append(el("div", { className: "sprint-participant-binding" },
+      el("strong", {}, `${participant.role} ${participant.shortname}`),
+      el("span", {}, `${participant.harness} · ${model}`),
+      el("span", { className: "muted" }, `${thinking} · ${binding}`)));
+  }
+  return rows;
+}
+
 function sprintBoardNode(snapshot) {
   const sprint = snapshot.sprint;
   const health = snapshot.health;
@@ -6261,6 +6279,7 @@ function sprintBoardNode(snapshot) {
       ...times.map(([label, value]) => el("span", {}, `${label}: ${sprintTimestamp(value)}`)),
       el("span", {}, `Elapsed: ${sprintElapsed(sprint)}`)),
     sprintActionButtons(sprint));
+  header.append(sprintParticipantRoutes(snapshot.participants));
   if (sprint.terminal_outcome) header.append(
     el("div", { className: "sprint-terminal-outcome" }, `Outcome: ${sprint.terminal_outcome}`));
   if (snapshot.runtime?.state !== "live") {

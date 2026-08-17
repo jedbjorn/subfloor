@@ -10,12 +10,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import active_chat_registry
 import run as run_mod
+
+ENGINE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ENGINE / "api"))
+import route_bindings
 
 _WAKE_ROLES = {
     "developer": ("Developer", "sprint_dev"),
@@ -57,6 +63,11 @@ class PreparedSprintWake:
     effort: str | None
     generation: str
     worktree: str
+    route_contract_version: int
+    route_revision: int | None
+    control_state: str | None
+    binding_digest: str | None
+    binding: dict | None
 
 
 @dataclass(frozen=True)
@@ -405,16 +416,33 @@ def prepare_wake_conversation(
     participant_id: int,
 ) -> PreparedSprintWake:
     """Resolve a Sprint participant route before any active chat is closed."""
+    binding_schema = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='sprint_participant_route_bindings'"
+    ).fetchone() is not None
+    binding_projection = (
+        "p.active_route_binding_id,binding.route_revision,binding.binding_json,"
+        "binding.binding_digest "
+        if binding_schema
+        else "NULL AS active_route_binding_id,NULL AS route_revision,"
+        "NULL AS binding_json,NULL AS binding_digest "
+    )
+    binding_join = (
+        "LEFT JOIN sprint_participant_route_bindings binding "
+        "ON binding.binding_id=p.active_route_binding_id "
+        if binding_schema else ""
+    )
     row = con.execute(
         "SELECT p.participant_id,p.sprint_id,p.shell_id,p.harness,p.model,p.effort,"
         "s.conversation_generation,sh.shortname,sh.flavor,owner.user_id,"
-        "fd.model AS flavor_model "
+        "fd.model AS flavor_model," + binding_projection +
         "FROM sprint_participants p "
         "JOIN sprints s ON s.sprint_id=p.sprint_id "
         "JOIN shells sh ON sh.shell_id=p.shell_id "
         "JOIN shells owner ON owner.shell_id=s.originating_planner_shell_id "
         "LEFT JOIN flavor_defaults fd "
         "ON fd.flavor=sh.flavor AND fd.harness=p.harness "
+        + binding_join +
         "WHERE p.participant_id=? AND p.sprint_id=?",
         (participant_id, sprint_id),
     ).fetchone()
@@ -427,18 +455,72 @@ def prepare_wake_conversation(
         "Sprint conversation generation",
         maximum=32,
     )
-    harness = str(row["harness"])
-    adapter = _browser_adapter(harness)
-    try:
-        resolved = run_mod.resolve_headless_route(
-            harness=harness,
-            adapter=adapter,
-            flavor_model=row["flavor_model"],
-            model=row["model"],
-            effort=row["effort"],
-        )
-    except ValueError as exc:
-        raise SprintConversationError(str(exc)) from exc
+    binding = None
+    route_revision = None
+    binding_digest = None
+    control_state = None
+    if row["active_route_binding_id"] is None:
+        harness = str(row["harness"])
+        adapter = _browser_adapter(harness)
+        try:
+            resolved = run_mod.resolve_headless_route(
+                harness=harness,
+                adapter=adapter,
+                flavor_model=row["flavor_model"],
+                model=row["model"],
+                effort=row["effort"],
+            )
+        except ValueError as exc:
+            raise SprintConversationError(str(exc)) from exc
+        provider = resolved.provider
+        model = resolved.model
+        effort = resolved.effort
+        route_contract_version = 1
+    else:
+        try:
+            binding = json.loads(row["binding_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise SprintConversationError(
+                "active Sprint route binding is invalid"
+            ) from exc
+        try:
+            route_bindings.validate_v2_binding(binding)
+        except route_bindings.RouteResolutionError as exc:
+            raise SprintConversationError(exc.message) from exc
+        binding_digest = str(row["binding_digest"])
+        if route_bindings.digest_json(binding) != binding_digest:
+            raise SprintConversationError(
+                "active Sprint route binding digest does not match its content"
+            )
+        harness = binding["harness"]
+        _browser_adapter(harness)
+        provider = run_mod.session_provider(harness, binding["requested_model"])
+        model = binding["requested_model"]
+        effort = binding["effective_effort"]
+        route_revision = int(row["route_revision"])
+        control_state = binding["control_state"]
+        route_contract_version = 2
+        prior_turn = con.execute(
+            "SELECT 1 FROM sprint_participant_conversations link "
+            "JOIN conversations conversation "
+            "ON conversation.conversation_id=link.conversation_id "
+            "JOIN conversation_runs run "
+            "ON run.conversation_id=conversation.conversation_id "
+            "WHERE link.sprint_participant_id=? "
+            "AND conversation.creation_idempotency_key LIKE ? LIMIT 1",
+            (
+                row["participant_id"],
+                f"generation:%:participant:{row['participant_id']}:"
+                f"route:{route_revision}:wake:%",
+            ),
+        ).fetchone()
+        if prior_turn is None:
+            try:
+                route_bindings.verify_stored_v2_before_first_turn(con, binding)
+            except route_bindings.RouteResolutionError as exc:
+                raise SprintConversationError(
+                    f"{exc.code}: {exc.message}"
+                ) from exc
     worktree = run_mod.shell_work_dir(row["shortname"], row["flavor"])
     return PreparedSprintWake(
         participant_id=int(row["participant_id"]),
@@ -446,12 +528,17 @@ def prepare_wake_conversation(
         shell_id=int(row["shell_id"]),
         owner_user_id=int(row["user_id"]),
         shortname=str(row["shortname"]),
-        harness=resolved.harness,
-        provider=resolved.provider,
-        model=resolved.model,
-        effort=resolved.effort,
+        harness=harness,
+        provider=provider,
+        model=model,
+        effort=effort,
         generation=generation,
         worktree=str(worktree.resolve(strict=False)),
+        route_contract_version=route_contract_version,
+        route_revision=route_revision,
+        control_state=control_state,
+        binding_digest=binding_digest,
+        binding=binding,
     )
 
 
@@ -467,7 +554,12 @@ def create_prepared_wake_conversation(
     if active_chat_registry.get(con, route.shell_id) is not None:
         raise WakeConversationBusy("another chat became active before wake creation")
 
-    key = f"generation:{route.generation}:wake:{wake_id}"
+    key = (
+        f"generation:{route.generation}:participant:{route.participant_id}:"
+        f"route:{route.route_revision}:wake:{wake_id}"
+        if route.route_contract_version == 2
+        else f"generation:{route.generation}:wake:{wake_id}"
+    )
     request = {
         "effort": route.effort,
         "harness": route.harness,
@@ -478,6 +570,14 @@ def create_prepared_wake_conversation(
         "wake_id": wake_id,
         "worktree": route.worktree,
     }
+    if route.route_contract_version == 2:
+        request.update(
+            {
+                "binding_digest": route.binding_digest,
+                "route_contract_version": 2,
+                "route_revision": route.route_revision,
+            }
+        )
     request_hash = _request_hash(request)
     existing = con.execute(
         "SELECT conversation_id,state,creation_request_hash FROM conversations "
@@ -500,25 +600,56 @@ def create_prepared_wake_conversation(
         return conversation_id
 
     conversation_id = "cv_" + uuid.uuid4().hex
-    con.execute(
-        "INSERT INTO conversations "
-        "(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,"
-        "worktree,title,creation_idempotency_key,creation_request_hash,"
-        "conversation_scope) VALUES (?,?,?,?,?,?,?,?,?,?,?,'sprint')",
-        (
-            conversation_id,
-            route.shell_id,
-            route.owner_user_id,
-            route.harness,
-            request["provider"],
-            route.model,
-            route.effort,
-            request["worktree"],
-            f"Sprint {route.sprint_id} · Wake {wake_id} · {route.shortname}",
-            key,
-            request_hash,
-        ),
-    )
+    route_columns = {
+        str(row["name"])
+        for row in con.execute("PRAGMA table_info(conversations)")
+    }
+    if {"route_contract_version", "route_binding"} <= route_columns:
+        con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,"
+            "worktree,title,creation_idempotency_key,creation_request_hash,"
+            "conversation_scope,route_contract_version,route_binding) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,'sprint',?,?)",
+            (
+                conversation_id,
+                route.shell_id,
+                route.owner_user_id,
+                route.harness,
+                request["provider"],
+                route.model,
+                route.effort,
+                request["worktree"],
+                f"Sprint {route.sprint_id} · Wake {wake_id} · {route.shortname}",
+                key,
+                request_hash,
+                route.route_contract_version,
+                (
+                    route_bindings.canonical_json(route.binding)
+                    if route.binding is not None else None
+                ),
+            ),
+        )
+    else:
+        con.execute(
+            "INSERT INTO conversations "
+            "(conversation_id,shell_id,owner_user_id,harness,provider,model,effort,"
+            "worktree,title,creation_idempotency_key,creation_request_hash,"
+            "conversation_scope) VALUES (?,?,?,?,?,?,?,?,?,?,?,'sprint')",
+            (
+                conversation_id,
+                route.shell_id,
+                route.owner_user_id,
+                route.harness,
+                request["provider"],
+                route.model,
+                route.effort,
+                request["worktree"],
+                f"Sprint {route.sprint_id} · Wake {wake_id} · {route.shortname}",
+                key,
+                request_hash,
+            ),
+        )
     _append_created_event(
         con,
         conversation_id=conversation_id,

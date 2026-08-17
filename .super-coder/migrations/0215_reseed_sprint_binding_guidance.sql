@@ -1,11 +1,15 @@
----
-name: sprint_prep
-description: Prepare and arm a Sprints v2 run — bind exact current specs, optionally gather QA/QC evidence, shape work units and dependencies, and enforce every launch invariant.
-category: workflow
-common: false
----
+-- 0215 — reseed Sprint binding and Thinking-level preparation guidance.
+-- Full-body UPSERT converges existing installations to the versioned binding contract.
 
-# sprint_prep — declare the riverbed
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_prep',
+  'Prepare and arm a Sprints v2 run — bind exact current specs, optionally gather QA/QC evidence, shape work units and dependencies, and enforce every launch invariant.',
+  'workflow',
+  NULL,
+  '0',
+  '# sprint_prep — declare the riverbed
 
 Use as the owning Planner while a Sprint is `prepared`. Preparation ends at one
 atomic arming decision; it does not launch participants piecemeal.
@@ -95,7 +99,7 @@ comparison; they do not forbid safe out-of-order completion. Reviews are not
 editing lanes.
 
 Prefer the smallest dependency graph that preserves correctness. Record the
-expected output in outcome language. Do not encode a shell's implementation
+expected output in outcome language. Do not encode a shell''s implementation
 steps into the durable plan when its role skill and judgment can decide them.
 
 ### Balance capacity and parallelism
@@ -209,4 +213,12 @@ accepted risks. State whether pre-Sprint QA/QC was performed and summarize any
 available evidence without treating it as an eligibility result.
 
 Stop when the Sprint is armed or when one concrete eligibility blocker has been
-surfaced. Do not dispatch from a partially prepared plan.
+surfaced. Do not dispatch from a partially prepared plan.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;

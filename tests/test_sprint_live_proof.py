@@ -36,6 +36,7 @@ import sprint_message_delivery
 import sprint_pr_watcher
 import sprint_runtime
 from github_pull_requests import PullRequest
+from sprint_route_binding_support import candidate as route_candidate
 from test_sprint_v2_domain import apply_schema
 
 TOKENS = {
@@ -106,6 +107,17 @@ class SprintLiveProof(unittest.TestCase):
         cls.httpd.server_close()
 
     def setUp(self) -> None:
+        route_patch = mock.patch.object(
+            sprint_domain, "_participant_binding_candidate", side_effect=route_candidate
+        )
+        route_patch.start()
+        self.addCleanup(route_patch.stop)
+        evidence_patch = mock.patch.object(
+            sprint_domain.route_bindings,
+            "verify_stored_v2_before_first_turn",
+        )
+        evidence_patch.start()
+        self.addCleanup(evidence_patch.stop)
         quiet_env = mock.patch.dict(
             "os.environ", {"SC_SPRINT_FORCE_NEW_QUIET_SECONDS": "0"}
         )

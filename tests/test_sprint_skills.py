@@ -64,6 +64,9 @@ DISPOSABLE_SHELL_BASE_RESEED = (
 GITHUB_CAPABILITY_RESEED = (
     ENGINE / "migrations" / "0209_reseed_git_github_capabilities.sql"
 )
+BINDING_GUIDANCE_RESEED = (
+    ENGINE / "migrations" / "0215_reseed_sprint_binding_guidance.sql"
+)
 
 
 class SprintSkillTest(unittest.TestCase):
@@ -183,6 +186,7 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(migration)
             con.executescript(migration)
             con.executescript(INFORMATIONAL_RECEIPT_RESEED.read_text())
+            con.executescript(BINDING_GUIDANCE_RESEED.read_text())
 
             for name in sorted(CONFORMANCE_OWNER_SKILLS):
                 with self.subTest(name=name):
@@ -683,6 +687,7 @@ class SprintSkillTest(unittest.TestCase):
                 ).read_text()
             )
             con.executescript(CONFORMANCE_OWNER_RESEED.read_text())
+            con.executescript(BINDING_GUIDANCE_RESEED.read_text())
 
             parsed = seed_skills.parse_skill(ASSETS / "sprint_prep" / "SKILL.md")
             row = con.execute(
@@ -866,6 +871,7 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(INFORMATIONAL_RECEIPT_RESEED.read_text())
             con.executescript(DISPOSABLE_SHELL_BASE_RESEED.read_text())
             con.executescript(GITHUB_CAPABILITY_RESEED.read_text())
+            con.executescript(BINDING_GUIDANCE_RESEED.read_text())
 
             self.assertIsNotNone(
                 con.execute(

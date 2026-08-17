@@ -424,15 +424,17 @@ def _require_controlled_runtime(
     model: str,
     runtime_status: dict | RuntimeEvidence | None,
     runtime_scope: dict | None = None,
+    *,
+    error_code: str = "thinking_evidence_stale",
 ) -> RuntimeEvidence:
     """Bind controlled evidence to the runtime that will execute the route."""
     status = _require_runtime(
         harness, model, runtime_status, runtime_scope,
-        error_code="thinking_evidence_stale",
+        error_code=error_code,
     )
     if status.version != row.get("harness_version"):
         raise RouteResolutionError(
-            "thinking_evidence_stale",
+            error_code,
             "Installed harness version changed after refresh",
             {
                 "harness": harness,
@@ -513,6 +515,8 @@ def _require_controlled_source(
     model: str,
     runtime: RuntimeEvidence,
     proof: _ControlledRouteProof,
+    *,
+    error_code: str = "thinking_evidence_stale",
 ) -> None:
     """Require the canonical probe's source to match its runtime and the row."""
     coherent = (
@@ -524,7 +528,7 @@ def _require_controlled_source(
     )
     if not coherent:
         raise RouteResolutionError(
-            "thinking_evidence_stale",
+            error_code,
             "Route source evidence does not match the execution runtime",
             {
                 "harness": harness,
@@ -544,14 +548,14 @@ def _require_controlled_source(
     stored_fingerprint = row.get("source_fingerprint")
     if not stored_fingerprint:
         raise RouteResolutionError(
-            "thinking_evidence_missing",
+            error_code,
             "Route has no local source fingerprint",
             {"harness": harness, "model": model,
              "remediation": "sc models refresh"},
         )
     if proof._source_fingerprint != stored_fingerprint:
         raise RouteResolutionError(
-            "thinking_evidence_stale",
+            error_code,
             "Installed route source changed after refresh",
             {"harness": harness, "model": model,
              "remediation": "sc models refresh"},
@@ -1039,6 +1043,81 @@ def legacy_route(*, row_contract_version: int, harness: str, model: str | None,
         )
     return {"contract_version": 1, "harness": harness, "model": model,
             "effort": effort, "legacy": True}
+
+
+def verify_stored_v2_before_first_turn(con, binding: dict) -> None:
+    """Refuse drift without replacing an immutable stored binding.
+
+    Armed routes retain their recorded generation.  This check observes the
+    current execution seat and source, but never rebuilds or updates the
+    binding from a newer catalogue generation.
+    """
+    validate_v2_binding(binding)
+    harness = binding["harness"]
+    model = binding["requested_model"]
+    if binding["control_state"] != "controlled":
+        import model_catalog  # noqa: PLC0415
+
+        _require_runtime(
+            harness,
+            model,
+            model_catalog.harness_runtime_status(harness),
+            harness_versions.runtime_scope(),
+            error_code="route_evidence_stale",
+        )
+        return
+
+    row = con.execute(
+        "SELECT * FROM model_routes WHERE harness=? AND selector=?",
+        (harness, model),
+    ).fetchone()
+    if row is None:
+        raise RouteResolutionError(
+            "route_evidence_stale",
+            "Stored Sprint route no longer has local source evidence",
+            {"harness": harness, "model": model, "remediation": "pause and reroute"},
+        )
+    row = dict(row)
+    proof = _probe_controlled_route(harness, model)
+    runtime = _require_controlled_runtime(
+        row,
+        harness,
+        model,
+        proof._runtime_status,
+        {"runtime": proof._runtime, "runtime_identity": proof._runtime_identity},
+        error_code="route_evidence_stale",
+    )
+    _require_controlled_source(
+        row, harness, model, runtime, proof, error_code="route_evidence_stale"
+    )
+    supported, effort_metadata = _supported_efforts(row)
+    effort = binding["effective_effort"]
+    current = {
+        "provider_model": row.get("provider_model") or model,
+        "evidence_digest": (effort_metadata.get("digests") or {}).get(effort),
+        "selector_binding": _json_object(
+            row.get("selector_binding"), field="selector_binding"
+        ),
+        "adapter_metadata": _json_object(
+            row.get("adapter_metadata"), field="adapter_metadata"
+        ),
+        "native_variant_id": (
+            (effort_metadata.get("native_variant_ids") or {}).get(effort)
+            if harness == "opencode" else None
+        ),
+    }
+    expected = {field: binding[field] for field in current}
+    if effort not in supported or current != expected:
+        raise RouteResolutionError(
+            "route_evidence_stale",
+            "Stored Sprint route evidence changed before its first native turn",
+            {
+                "harness": harness,
+                "model": model,
+                "requested_effort": effort,
+                "remediation": "pause and reroute",
+            },
+        )
 
 
 class ParticipantRouteBindingStore:

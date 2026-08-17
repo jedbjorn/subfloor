@@ -2444,7 +2444,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": str(exc), "details": exc.details},
             )
         if isinstance(exc, sprint_domain.SprintPreflightError):
-            return self._send(422, {"error": str(exc)})
+            body = {"error": str(exc)}
+            if exc.code:
+                body["details"] = {"code": exc.code, **exc.details}
+            return self._send(422, body)
         if isinstance(exc, sprint_domain.SprintInvariantError):
             return self._send(409, {"error": str(exc)})
         if isinstance(exc, KeyError):
@@ -2560,13 +2563,43 @@ class Handler(BaseHTTPRequestHandler):
                 participant, "shell_id"
             )
             role = participant.get("role")
-            harness = participant.get("harness")
+            raw_harness = participant.get("harness")
             if role not in {"planner", "developer", "reviewer"}:
                 raise ValueError(
                     "participant role must be planner, developer, or reviewer"
                 )
-            if not isinstance(harness, str) or not harness.strip():
+            if not isinstance(raw_harness, str) or not raw_harness.strip():
                 raise ValueError("participant harness is required")
+            try:
+                harness = route_bindings.normalize_harness(raw_harness)
+            except route_bindings.RouteResolutionError as exc:
+                raise sprint_domain.SprintPreflightError(
+                    exc.message, code=exc.code, details=exc.details
+                ) from exc
+            model = participant.get("model")
+            if model is not None and (
+                not isinstance(model, str) or not model or model != model.strip()
+            ):
+                raise ValueError(
+                    "participant model must be an exact non-empty selector"
+                )
+            effort = participant.get("effort")
+            if effort is not None:
+                if not isinstance(effort, str) or not effort.strip():
+                    raise ValueError(
+                        "participant effort must be non-empty when supplied"
+                    )
+                effort = effort.strip().lower()
+            if effort is not None and (model is None or harness == "vibe"):
+                raise sprint_domain.SprintPreflightError(
+                    "Thinking control is unavailable for this route",
+                    code="unsupported_thinking_level",
+                    details={
+                        "harness": harness,
+                        "model": model,
+                        "requested_effort": effort,
+                    },
+                )
             if participant_shell_id in seen_shells:
                 raise ValueError("participant shells must be unique")
             seen_shells.add(participant_shell_id)
@@ -2574,9 +2607,9 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "shell_id": participant_shell_id,
                     "role": role,
-                    "harness": harness.strip(),
-                    "model": participant.get("model"),
-                    "effort": participant.get("effort"),
+                    "harness": harness,
+                    "model": model,
+                    "effort": effort,
                     "route": participant.get("route"),
                 }
             )
@@ -2893,10 +2926,29 @@ class Handler(BaseHTTPRequestHandler):
                     "conformance_owner_generation FROM sprints WHERE sprint_id=?",
                     (sprint_id,),
                 ).fetchone()
+                bindings = [
+                    {
+                        "participant_id": int(row["participant_id"]),
+                        "control_state": str(row["control_state"]),
+                        "route_revision": int(row["route_revision"]),
+                        "binding_digest": str(row["binding_digest"]),
+                    }
+                    for row in con.execute(
+                        "SELECT participant.participant_id,binding.control_state,"
+                        "binding.route_revision,binding.binding_digest "
+                        "FROM sprint_participants participant "
+                        "JOIN sprint_participant_route_bindings binding "
+                        "ON binding.binding_id=participant.active_route_binding_id "
+                        "WHERE participant.sprint_id=? "
+                        "ORDER BY participant.participant_id",
+                        (sprint_id,),
+                    )
+                ]
                 return self._send(200, {
                     "wake_ids": wake_ids,
                     "conformance_reviewer_shell_id": int(owner[0]),
                     "conformance_owner_generation": int(owner[1]),
+                    "participant_bindings": bindings,
                 })
             if path == "/_sc/sprint/replan-unit":
                 planner_shell_id = self._sprint_planner_proxy(
@@ -2953,7 +3005,7 @@ class Handler(BaseHTTPRequestHandler):
                 planner_shell_id = self._sprint_planner_proxy(
                     con, sprint_id, shell_id
                 )
-                changed = sprint_domain.SprintParticipantStore(con).reroute(
+                receipt = sprint_domain.SprintParticipantStore(con).reroute(
                     sprint_id,
                     planner_shell_id,
                     participant_shell_id=self._sprint_integer(
@@ -2964,7 +3016,13 @@ class Handler(BaseHTTPRequestHandler):
                     effort=self._sprint_optional_text(body, "effort"),
                     route=self._sprint_optional_text(body, "route"),
                 )
-                return self._send(200, {"changed": changed})
+                return self._send(200, {
+                    "changed": receipt.changed,
+                    "binding_status": receipt.binding_status,
+                    "control_state": receipt.control_state,
+                    "route_revision": receipt.route_revision,
+                    "binding_digest": receipt.binding_digest,
+                })
             if path == "/_sc/sprint/complete-unit":
                 completion_receipt = sprint_domain.SprintWorkUnitStore(
                     con
