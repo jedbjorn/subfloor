@@ -90,6 +90,15 @@ class RuntimeEvidence:
         })
 
 
+@dataclass(frozen=True)
+class SourceEvidence:
+    harness: str | None
+    selector: str | None
+    runtime: str | None
+    runtime_identity: str | None
+    harness_version: str | None
+    fingerprint: str | None
+
 def canonical_json(value: Any) -> str:
     return json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -383,7 +392,7 @@ def _require_controlled_runtime(
     model: str,
     runtime_status: dict | RuntimeEvidence | None,
     runtime_scope: dict | None = None,
-) -> None:
+) -> RuntimeEvidence:
     """Bind controlled evidence to the runtime that will execute the route."""
     status = _require_runtime(
         harness, model, runtime_status, runtime_scope,
@@ -402,6 +411,60 @@ def _require_controlled_runtime(
                 "runtime_identity": status.runtime_identity,
                 "remediation": "sc models refresh",
             },
+        )
+    return status
+
+
+def _require_controlled_source(
+    row: dict,
+    harness: str,
+    model: str,
+    runtime: RuntimeEvidence,
+    source_evidence: SourceEvidence | None,
+) -> None:
+    """Require source evidence captured in the same execution seat."""
+    source = source_evidence if isinstance(source_evidence, SourceEvidence) \
+        else SourceEvidence(None, None, None, None, None, None)
+    coherent = (
+        source.harness == harness
+        and source.selector == model
+        and source.runtime == runtime.runtime
+        and source.runtime_identity == runtime.runtime_identity
+        and source.harness_version == runtime.version
+    )
+    if not coherent:
+        raise RouteResolutionError(
+            "thinking_evidence_stale",
+            "Route source evidence does not match the execution runtime",
+            {
+                "harness": harness,
+                "model": model,
+                "evidence_harness": source.harness,
+                "evidence_model": source.selector,
+                "evidence_runtime": source.runtime,
+                "evidence_runtime_identity": source.runtime_identity,
+                "evidence_harness_version": source.harness_version,
+                "runtime": runtime.runtime,
+                "runtime_identity": runtime.runtime_identity,
+                "runtime_harness_version": runtime.version,
+                "persist_route_stale": False,
+                "remediation": "re-probe the route in the execution runtime",
+            },
+        )
+    stored_fingerprint = row.get("source_fingerprint")
+    if not stored_fingerprint:
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            "Route has no local source fingerprint",
+            {"harness": harness, "model": model,
+             "remediation": "sc models refresh"},
+        )
+    if source.fingerprint != stored_fingerprint:
+        raise RouteResolutionError(
+            "thinking_evidence_stale",
+            "Installed route source changed after refresh",
+            {"harness": harness, "model": model,
+             "remediation": "sc models refresh"},
         )
 
 
@@ -452,7 +515,6 @@ def _validate_route_freshness(
     model: str,
     *,
     now: datetime,
-    current_source_fingerprint: str | None,
 ) -> None:
     captured_version = row.get("harness_version")
     compatibility = row.get("harness_compatibility")
@@ -497,19 +559,6 @@ def _validate_route_freshness(
             "Route evidence is older than 24 hours",
             {"harness": harness, "model": model, "remediation": "sc models refresh"},
         )
-    stored_fingerprint = row.get("source_fingerprint")
-    if not stored_fingerprint:
-        raise RouteResolutionError(
-            "thinking_evidence_missing",
-            "Route has no local source fingerprint",
-            {"harness": harness, "model": model, "remediation": "sc models refresh"},
-        )
-    if current_source_fingerprint != stored_fingerprint:
-        raise RouteResolutionError(
-            "thinking_evidence_stale",
-            "Installed route source changed after refresh",
-            {"harness": harness, "model": model, "remediation": "sc models refresh"},
-        )
 
 
 def require_fresh_route(
@@ -519,7 +568,7 @@ def require_fresh_route(
     model: str | None,
     *,
     now: datetime | None = None,
-    current_source_fingerprint: str | None = None,
+    source_evidence: SourceEvidence | None = None,
     runtime_status: dict | RuntimeEvidence | None = None,
     runtime_scope: dict | None = None,
 ) -> dict | None:
@@ -570,11 +619,14 @@ def require_fresh_route(
     try:
         _validate_route_freshness(
             row, harness, model, now=check_time,
-            current_source_fingerprint=current_source_fingerprint,
         )
-        if runtime_status is not None or runtime_scope is not None:
-            _require_controlled_runtime(
+        if (runtime_status is not None or runtime_scope is not None
+                or source_evidence is not None):
+            runtime = _require_controlled_runtime(
                 row, harness, model, runtime_status, runtime_scope
+            )
+            _require_controlled_source(
+                row, harness, model, runtime, source_evidence
             )
         latest = con.execute(
             "SELECT generation_id,completed_at FROM model_catalog_generations "
@@ -603,7 +655,11 @@ def require_fresh_route(
                  "remediation": "sc models refresh"},
             )
     except RouteResolutionError as exc:
-        if exc.code == "thinking_evidence_stale" and not row.get("stale"):
+        if (
+            exc.code == "thinking_evidence_stale"
+            and exc.details.get("persist_route_stale", True)
+            and not row.get("stale")
+        ):
             remediation = exc.details.get("remediation") or "sc models refresh"
             reason = f"{exc.code}: {exc.message}; remediation: {remediation}"
             updated = con.execute(
@@ -637,20 +693,20 @@ def resolve_persisted_v2(
     effort: str | None = None,
     *,
     now: datetime | None = None,
-    current_source_fingerprint: str | None = None,
+    source_evidence: SourceEvidence | None = None,
     runtime_status: dict | None = None,
     runtime_scope: dict | None = None,
 ) -> tuple[dict, str]:
     """Resolve through the shared durable freshness boundary."""
     fresh_row = require_fresh_route(
         con, row, harness, model, now=now,
-        current_source_fingerprint=current_source_fingerprint,
+        source_evidence=source_evidence,
         runtime_status=runtime_status,
         runtime_scope=runtime_scope,
     )
     return resolve_v2(
         fresh_row, harness, model, effort, now=now,
-        current_source_fingerprint=current_source_fingerprint,
+        source_evidence=source_evidence,
         runtime_status=runtime_status,
         runtime_scope=runtime_scope,
     )
@@ -663,7 +719,7 @@ def resolve_v2(
     effort: str | None = None,
     *,
     now: datetime | None = None,
-    current_source_fingerprint: str | None = None,
+    source_evidence: SourceEvidence | None = None,
     runtime_status: dict | None = None,
     runtime_scope: dict | None = None,
 ) -> tuple[dict, str]:
@@ -726,10 +782,12 @@ def resolve_v2(
     check_time = now or datetime.now(timezone.utc)
     _validate_route_freshness(
         row, harness, model, now=check_time,
-        current_source_fingerprint=current_source_fingerprint,
     )
-    _require_controlled_runtime(
+    runtime = _require_controlled_runtime(
         row, harness, model, runtime_status, runtime_scope
+    )
+    _require_controlled_source(
+        row, harness, model, runtime, source_evidence
     )
 
     supported, effort_metadata = _supported_efforts(row)

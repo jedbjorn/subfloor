@@ -65,6 +65,33 @@ def compatible_runtime(version: str = "2.22.0", *, harness: str = "vibe",
     }
 
 
+def controlled_bundle(
+    harness: str, selector: str, fingerprint: str | None, *,
+    status: dict | None = None,
+) -> dict:
+    versions = {
+        "claude": "2.1.222", "codex": "0.145.0",
+        "kimi": "0.33.0", "opencode": "1.18.9",
+    }
+    status = status or compatible_runtime(versions[harness], harness=harness)
+    scope = {
+        "runtime": status["runtime"],
+        "runtime_identity": status["runtime_identity"],
+    }
+    return {
+        "runtime_status": status,
+        "runtime_scope": scope,
+        "source_evidence": server.route_bindings.SourceEvidence(
+            harness=harness,
+            selector=selector,
+            runtime=scope["runtime"],
+            runtime_identity=scope["runtime_identity"],
+            harness_version=status["version"],
+            fingerprint=fingerprint,
+        ),
+    }
+
+
 def build_db() -> sqlite3.Connection:
     """Fresh in-memory DB: schema.sql + every migration, FK enforcement on."""
     con = sqlite3.connect(":memory:")
@@ -660,23 +687,15 @@ class FlavorDefaultsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.con = build_db()
         self.addCleanup(self.con.close)
-        fingerprint = mock.patch.object(
+        evidence = mock.patch.object(
             server.model_catalog,
-            "current_source_fingerprint",
-            return_value="f" * 64,
-        )
-        fingerprint.start()
-        self.addCleanup(fingerprint.stop)
-        runtime = mock.patch.object(
-            server.model_catalog,
-            "harness_runtime_status",
-            side_effect=lambda harness: compatible_runtime(
-                "2.1.222" if harness == "claude" else "0.145.0",
-                harness=harness,
+            "controlled_route_evidence",
+            side_effect=lambda harness, selector: controlled_bundle(
+                harness, selector, "f" * 64,
             ),
         )
-        runtime.start()
-        self.addCleanup(runtime.stop)
+        evidence.start()
+        self.addCleanup(evidence.stop)
 
     def _row(self, flavor, harness):
         return self.con.execute(
@@ -798,9 +817,10 @@ class FlavorDefaultsTest(unittest.TestCase):
     def test_fingerprint_drift_stales_route_and_refuses_selection(self) -> None:
         self._route("codex", "gpt-drift")
         with mock.patch.object(
-            server.model_catalog,
-            "current_source_fingerprint",
-            return_value="changed-fingerprint",
+            server.model_catalog, "controlled_route_evidence",
+            return_value=controlled_bundle(
+                "codex", "gpt-drift", "changed-fingerprint"
+            ),
         ):
             ok, err = server.set_flavor_default(
                 self.con,
@@ -1203,6 +1223,16 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
             return body
 
         output = io.StringIO()
+        missing_status = {
+            "harness": "codex",
+            **routes_cli.model_catalog.harness_versions.runtime_scope(),
+            "version": None,
+            "compatibility": None,
+            "minimum_version": "0.145.0",
+            "maximum_version_exclusive": "0.147.0",
+            "verified_version": "0.145.0",
+            "error": "HARNESS_UNAVAILABLE",
+        }
         with (
             mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
             mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
@@ -1211,19 +1241,11 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
                 routes_cli, "_open_db", side_effect=AssertionError("opened DB")
             ),
             mock.patch.object(
-                routes_cli.model_catalog, "harness_runtime_status",
-                return_value={
-                    "harness": "codex", **routes_cli.model_catalog.harness_versions.runtime_scope(),
-                    "version": None, "compatibility": None,
-                    "minimum_version": "0.145.0",
-                    "maximum_version_exclusive": "0.147.0",
-                    "verified_version": "0.145.0",
-                    "error": "HARNESS_UNAVAILABLE",
-                },
-            ),
-            mock.patch.object(
-                routes_cli.model_catalog, "current_source_fingerprint",
-                return_value="current-fingerprint",
+                routes_cli.model_catalog, "controlled_route_evidence",
+                return_value=controlled_bundle(
+                    "codex", "api-model", "current-fingerprint",
+                    status=missing_status,
+                ),
             ),
             contextlib.redirect_stdout(output),
         ):
@@ -1257,18 +1279,14 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         def publish_after_probe(*_args, **_kwargs):
             nonlocal successor
             successor = self.publish_successor()
-            return "current-fingerprint"
+            return controlled_bundle(
+                "codex", "api-model", "current-fingerprint"
+            )
 
         with (
             mock.patch.object(
-                server.model_catalog, "current_source_fingerprint",
+                server.model_catalog, "controlled_route_evidence",
                 side_effect=publish_after_probe,
-            ),
-            mock.patch.object(
-                server.model_catalog, "harness_runtime_status",
-                return_value=compatible_runtime(
-                    "0.145.0", harness="codex"
-                ),
             ),
         ):
             ok, err = server.set_flavor_default(con, {
@@ -1290,13 +1308,9 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
 
         with (
             mock.patch.object(
-                server.model_catalog, "current_source_fingerprint",
-                return_value=successor,
-            ),
-            mock.patch.object(
-                server.model_catalog, "harness_runtime_status",
-                return_value=compatible_runtime(
-                    "0.145.0", harness="codex"
+                server.model_catalog, "controlled_route_evidence",
+                return_value=controlled_bundle(
+                    "codex", "api-model", successor
                 ),
             ),
         ):

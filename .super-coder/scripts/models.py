@@ -84,7 +84,7 @@ def _resolution_error(exc: route_bindings.RouteResolutionError) -> dict:
 
 def resolve(con, harness: str, selector: str | None = None, *,
             shell: str = "<shell>", effort: str | None = None,
-            now=None, current_source_fingerprint: str | None = None,
+            now=None, source_evidence: route_bindings.SourceEvidence | None = None,
             runtime_status: dict | None = None,
             runtime_scope: dict | None = None) -> dict:
     try:
@@ -98,29 +98,27 @@ def resolve(con, harness: str, selector: str | None = None, *,
             runtime_status = model_catalog.harness_runtime_status(harness)
         return resolve_row(
             None, harness, selector, shell=shell, effort=effort, now=now,
-            current_source_fingerprint=current_source_fingerprint,
             runtime_status=runtime_status, runtime_scope=runtime_scope,
         )
     observed_row = _route(con, harness, selector)
     if runtime_scope is None:
         runtime_scope = model_catalog.harness_versions.runtime_scope()
-    if runtime_status is None:
-        runtime_status = model_catalog.harness_runtime_status(harness)
-    if current_source_fingerprint is None:
-        current_source_fingerprint = model_catalog.current_source_fingerprint(
-            harness, selector
-        ) or ""
+    if runtime_status is None or source_evidence is None:
+        evidence = model_catalog.controlled_route_evidence(harness, selector)
+        runtime_status = runtime_status or evidence["runtime_status"]
+        source_evidence = source_evidence or evidence["source_evidence"]
     with db_driver.write_transaction(con, "model_route.resolve"):
         return resolve_row(
             observed_row, harness, selector, shell=shell, effort=effort, now=now,
-            current_source_fingerprint=current_source_fingerprint, con=con,
+            source_evidence=source_evidence, con=con,
             runtime_status=runtime_status, runtime_scope=runtime_scope,
         )
 
 
 def resolve_row(row: dict | None, harness: str, selector: str | None, *,
                 shell: str = "<shell>", effort: str | None = None,
-                now=None, current_source_fingerprint: str | None = None,
+                now=None,
+                source_evidence: route_bindings.SourceEvidence | None = None,
                 con=None, runtime_status: dict | None = None,
                 runtime_scope: dict | None = None) -> dict:
     """Resolve inside ``con``'s caller-owned write, or purely when omitted."""
@@ -128,14 +126,14 @@ def resolve_row(row: dict | None, harness: str, selector: str | None, *,
         if con is not None:
             binding, binding_digest = route_bindings.resolve_persisted_v2(
                 con, row, harness, selector, effort, now=now,
-                current_source_fingerprint=current_source_fingerprint,
+                source_evidence=source_evidence,
                 runtime_status=runtime_status,
                 runtime_scope=runtime_scope,
             )
         else:
             binding, binding_digest = route_bindings.resolve_v2(
                 row, harness, selector, effort, now=now,
-                current_source_fingerprint=current_source_fingerprint,
+                source_evidence=source_evidence,
                 runtime_status=runtime_status,
                 runtime_scope=runtime_scope,
             )
@@ -260,15 +258,18 @@ def main(argv: list[str] | None = None) -> int:
         routes = projection.get("routes") or []
         route = routes[0] if routes else None
         runtime_scope = model_catalog.harness_versions.runtime_scope()
-        runtime_status = model_catalog.harness_runtime_status(harness)
-        fingerprint = None
+        runtime_status = None
+        source_evidence = None
         if selector is not None and harness != "vibe":
-            fingerprint = (
-                model_catalog.current_source_fingerprint(harness, selector) or ""
-            )
+            evidence = model_catalog.controlled_route_evidence(harness, selector)
+            runtime_scope = evidence["runtime_scope"]
+            runtime_status = evidence["runtime_status"]
+            source_evidence = evidence["source_evidence"]
+        else:
+            runtime_status = model_catalog.harness_runtime_status(harness)
         data = resolve_row(
             route, harness, selector, shell=shell,
-            effort=effort, current_source_fingerprint=fingerprint,
+            effort=effort, source_evidence=source_evidence,
             runtime_status=runtime_status,
             runtime_scope=runtime_scope,
         )

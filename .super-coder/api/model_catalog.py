@@ -947,15 +947,24 @@ def _with_live_opencode(payload: dict, provider_models) -> dict:
     return result
 
 
-def current_source_fingerprint(harness: str, selector: str, *, env=os.environ,
-                               run=subprocess.run,
-                               opencode_provider=opencode_connected_models,
-                               harness_probe=harness_versions.compatibility_status,
-                               ) -> str | None:
-    """Recompute one no-token local source fingerprint for drift detection."""
+def controlled_route_evidence(
+    harness: str,
+    selector: str,
+    *,
+    env=os.environ,
+    run=subprocess.run,
+    opencode_provider=opencode_connected_models,
+    harness_probe=harness_versions.compatibility_status,
+) -> dict:
+    """Probe one controlled route and bind its source to this runtime seat."""
     harness = (harness or "").strip().lower()
+    scope = harness_versions.runtime_scope()
     entries: list[dict]
+    status: dict = {}
+    fingerprint = None
     try:
+        statuses = harness_probe()
+        status = dict(statuses.get(harness) or {})
         if harness == "claude":
             entries = _from_claude_cli(run)
         elif harness == "codex":
@@ -964,35 +973,60 @@ def current_source_fingerprint(harness: str, selector: str, *, env=os.environ,
             entries = _from_kimi_config(env, run)
         elif harness == "opencode":
             if not shutil.which("opencode"):
-                return None
-            entries = [
-                _entry(
-                    model["id"], model.get("release_date") or "",
-                    model.get("name") or model["id"], model.get("family"),
-                    source="opencode-provider-api", availability="available",
-                    provider=model.get("provider"),
-                    provider_model=model.get("provider_model"),
-                    supported_efforts=model.get("supported_efforts") or [],
-                    default_effort=model.get("default_effort"),
-                    cli_version=model.get("cli_version"),
-                    selector_binding=model.get("selector_binding"),
-                    adapter_metadata=model.get("adapter_metadata"),
-                    native_variant_ids=model.get("native_variant_ids"),
-                )
-                for model in opencode_provider()
-            ]
+                entries = []
+            else:
+                entries = [
+                    _entry(
+                        model["id"], model.get("release_date") or "",
+                        model.get("name") or model["id"], model.get("family"),
+                        source="opencode-provider-api",
+                        availability="available",
+                        provider=model.get("provider"),
+                        provider_model=model.get("provider_model"),
+                        supported_efforts=model.get("supported_efforts") or [],
+                        default_effort=model.get("default_effort"),
+                        cli_version=model.get("cli_version"),
+                        selector_binding=model.get("selector_binding"),
+                        adapter_metadata=model.get("adapter_metadata"),
+                        native_variant_ids=model.get("native_variant_ids"),
+                    )
+                    for model in opencode_provider()
+                ]
         else:
-            return None
-        statuses = harness_probe()
+            entries = []
     except Exception:  # noqa: BLE001 (unreadable live evidence is stale)
-        return None
+        entries = []
     entry = next((item for item in entries if item["id"] == selector), None)
-    if entry is None:
-        return None
-    status = (statuses.get(harness) or {})
-    if not _compatible_route_status(harness, entry, status):
-        return None
-    return _entry_evidence(harness, entry, status)["source_fingerprint"]
+    if entry is not None and _compatible_route_status(harness, entry, status):
+        fingerprint = _entry_evidence(
+            harness, entry, status
+        )["source_fingerprint"]
+    source_evidence = route_bindings.SourceEvidence(
+        harness=harness,
+        selector=selector,
+        runtime=status.get("runtime"),
+        runtime_identity=status.get("runtime_identity"),
+        harness_version=status.get("version"),
+        fingerprint=fingerprint,
+    )
+    return {
+        "runtime_status": status,
+        "runtime_scope": scope,
+        "source_evidence": source_evidence,
+    }
+
+
+def current_source_fingerprint(harness: str, selector: str, *, env=os.environ,
+                               run=subprocess.run,
+                               opencode_provider=opencode_connected_models,
+                               harness_probe=harness_versions.compatibility_status,
+                               ) -> str | None:
+    """Compatibility helper for non-resolution drift displays."""
+    evidence = controlled_route_evidence(
+        harness, selector, env=env, run=run,
+        opencode_provider=opencode_provider, harness_probe=harness_probe,
+    )
+    return evidence["source_evidence"].fingerprint
 
 
 def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,

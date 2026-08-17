@@ -501,7 +501,9 @@ _ROUTE_NOT_OBSERVED = object()
 
 def _model_route_available_in_transaction(
     con, observed_route: dict | None, harness: str, selector: str,
-    fingerprint: str, runtime_status: dict | None, runtime_scope: dict | None,
+    source_evidence: route_bindings.SourceEvidence | None,
+    runtime_status: dict | None,
+    runtime_scope: dict | None,
 ) -> bool:
     if (
         observed_route is None
@@ -523,7 +525,7 @@ def _model_route_available_in_transaction(
     try:
         route_bindings.require_fresh_route(
             con, observed_route, harness, selector,
-            current_source_fingerprint=fingerprint,
+            source_evidence=source_evidence,
             runtime_status=runtime_status,
             runtime_scope=runtime_scope,
         )
@@ -534,7 +536,7 @@ def _model_route_available_in_transaction(
 
 def model_route_available(
     con, harness: str, selector: str, *,
-    current_source_fingerprint: str | None = None,
+    source_evidence: route_bindings.SourceEvidence | None = None,
     observed_route=_ROUTE_NOT_OBSERVED,
     runtime_status: dict | None = None,
     runtime_scope: dict | None = None,
@@ -550,30 +552,25 @@ def model_route_available(
             (harness, selector),
         ).fetchone()
         observed_route = dict(row) if row else None
-    if harness != "vibe" and current_source_fingerprint is None:
+    if harness != "vibe" and (
+            source_evidence is None or runtime_status is None
+            or runtime_scope is None):
         if con.in_transaction:
             raise RuntimeError(
-                "transactional route checks require a precomputed fingerprint"
+                "transactional route checks require precomputed route evidence"
             )
-        current_source_fingerprint = (
-            model_catalog.current_source_fingerprint(harness, selector) or ""
-        )
-    if harness != "vibe" and runtime_status is None:
-        if con.in_transaction:
-            raise RuntimeError(
-                "transactional route checks require precomputed runtime evidence"
-            )
-        runtime_scope = model_catalog.harness_versions.runtime_scope()
-        runtime_status = model_catalog.harness_runtime_status(harness)
-    fingerprint = current_source_fingerprint or ""
+        evidence = model_catalog.controlled_route_evidence(harness, selector)
+        source_evidence = evidence["source_evidence"]
+        runtime_scope = evidence["runtime_scope"]
+        runtime_status = evidence["runtime_status"]
     if con.in_transaction:
         return _model_route_available_in_transaction(
-            con, observed_route, harness, selector, fingerprint,
+            con, observed_route, harness, selector, source_evidence,
             runtime_status, runtime_scope,
         )
     with db_driver.write_transaction(con, "model_route.available"):
         return _model_route_available_in_transaction(
-            con, observed_route, harness, selector, fingerprint,
+            con, observed_route, harness, selector, source_evidence,
             runtime_status, runtime_scope,
         )
 
@@ -605,7 +602,7 @@ def set_flavor_default(con, body) -> tuple[bool, str | None]:
                 "invalid_model_route: model must be null for Harness default "
                 "or an exact non-empty available route")
         model = raw_model.strip() if isinstance(raw_model, str) else None
-    fingerprint = None
+    source_evidence = None
     runtime_status = None
     runtime_scope = None
     observed_route = None
@@ -616,15 +613,14 @@ def set_flavor_default(con, body) -> tuple[bool, str | None]:
         ).fetchone()
         observed_route = dict(row) if row else None
         if harness != "vibe":
-            runtime_scope = model_catalog.harness_versions.runtime_scope()
-            runtime_status = model_catalog.harness_runtime_status(harness)
-            fingerprint = (
-                model_catalog.current_source_fingerprint(harness, model) or ""
-            )
+            evidence = model_catalog.controlled_route_evidence(harness, model)
+            runtime_scope = evidence["runtime_scope"]
+            runtime_status = evidence["runtime_status"]
+            source_evidence = evidence["source_evidence"]
     with db_driver.write_transaction(con, "flavor_default.set"):
         if model is not None and not model_route_available(
                 con, harness, model,
-                current_source_fingerprint=fingerprint,
+                source_evidence=source_evidence,
                 observed_route=observed_route,
                 runtime_status=runtime_status,
                 runtime_scope=runtime_scope):

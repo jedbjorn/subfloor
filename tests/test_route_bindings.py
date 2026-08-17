@@ -45,6 +45,27 @@ def compatible_runtime(version: str = "2.22.0", *, harness: str | None = None,
     }
 
 
+def controlled_source(
+    fingerprint: str | None = "2" * 64,
+    *,
+    harness: str = "codex",
+    selector: str = "gpt-test",
+    version: str | None = None,
+    scope: dict | None = None,
+) -> route_bindings.SourceEvidence:
+    versions = {
+        "claude": "2.1.222", "codex": "0.145.0",
+        "kimi": "0.33.0", "opencode": "1.18.9",
+    }
+    scope = scope or route_bindings.harness_versions.runtime_scope()
+    return route_bindings.SourceEvidence(
+        harness=harness,
+        selector=selector,
+        runtime=scope["runtime"],
+        runtime_identity=scope["runtime_identity"],
+        harness_version=version or versions[harness],
+        fingerprint=fingerprint,
+    )
 def route_schema(path: str | Path = ":memory:") -> sqlite3.Connection:
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
@@ -127,12 +148,12 @@ class BindingIdentityTest(unittest.TestCase):
     def test_controlled_omitted_and_explicit_high_have_same_fixed_identity(self):
         implicit, implicit_digest = route_bindings.resolve_v2(
             self.controlled_row(), "Codex", "gpt-test", now=self.NOW,
-            current_source_fingerprint="2" * 64,
+            source_evidence=controlled_source(),
             runtime_status=compatible_runtime("0.145.0", harness="codex"),
         )
         explicit, explicit_digest = route_bindings.resolve_v2(
             self.controlled_row(), "codex", "gpt-test", " HIGH ", now=self.NOW,
-            current_source_fingerprint="2" * 64,
+            source_evidence=controlled_source(),
             runtime_status=compatible_runtime("0.145.0", harness="codex"),
         )
 
@@ -184,12 +205,16 @@ class BindingIdentityTest(unittest.TestCase):
     def test_opencode_ascii_lookup_accepts_case_without_aliasing_unicode(self):
         canonical, canonical_digest = route_bindings.resolve_v2(
             self.opencode_row(), "opencode", "provider/model", "k",
-            now=self.NOW, current_source_fingerprint="2" * 64,
+            now=self.NOW, source_evidence=controlled_source(
+                harness="opencode", selector="provider/model"
+            ),
             runtime_status=compatible_runtime("1.18.9", harness="opencode"),
         )
         mixed_case, mixed_case_digest = route_bindings.resolve_v2(
             self.opencode_row(), "opencode", "provider/model", " K ",
-            now=self.NOW, current_source_fingerprint="2" * 64,
+            now=self.NOW, source_evidence=controlled_source(
+                harness="opencode", selector="provider/model"
+            ),
             runtime_status=compatible_runtime("1.18.9", harness="opencode"),
         )
 
@@ -205,7 +230,9 @@ class BindingIdentityTest(unittest.TestCase):
                     route_bindings.resolve_v2(
                         self.opencode_row(), "opencode", "provider/model",
                         confusable, now=self.NOW,
-                        current_source_fingerprint="2" * 64,
+                        source_evidence=controlled_source(
+                            harness="opencode", selector="provider/model"
+                        ),
                         runtime_status=compatible_runtime(
                             "1.18.9", harness="opencode"
                         ),
@@ -237,7 +264,8 @@ class BindingIdentityTest(unittest.TestCase):
                 with self.assertRaises(route_bindings.RouteResolutionError) as raised:
                     route_bindings.resolve_v2(
                         self.controlled_row(**overrides), "codex", "gpt-test", effort,
-                        now=self.NOW, current_source_fingerprint=fingerprint,
+                        now=self.NOW,
+                        source_evidence=controlled_source(fingerprint),
                         runtime_status=compatible_runtime(
                             "0.145.0", harness="codex"
                         ),
@@ -255,7 +283,6 @@ class BindingIdentityTest(unittest.TestCase):
                 with self.assertRaises(route_bindings.RouteResolutionError) as raised:
                     route_bindings.resolve_v2(
                         row, harness, model, "high", now=self.NOW,
-                        current_source_fingerprint="2" * 64,
                     )
                 self.assertEqual(raised.exception.code, "thinking_evidence_missing")
                 self.assertIn("does not match", raised.exception.message)
@@ -272,11 +299,11 @@ class BindingIdentityTest(unittest.TestCase):
                 with self.assertRaises(route_bindings.RouteResolutionError) as raised:
                     route_bindings.resolve_v2(
                         self.controlled_row(**overrides), "codex", "gpt-test",
-                        now=self.NOW, current_source_fingerprint="2" * 64,
+                        now=self.NOW,
                     )
                 self.assertEqual(raised.exception.code, code)
 
-    def test_controlled_route_requires_current_source_fingerprint(self):
+    def test_controlled_route_requires_scoped_source_evidence(self):
         with self.assertRaises(route_bindings.RouteResolutionError) as raised:
             route_bindings.resolve_v2(
                 self.controlled_row(), "codex", "gpt-test", now=self.NOW
@@ -288,7 +315,7 @@ class BindingIdentityTest(unittest.TestCase):
         good = compatible_runtime("0.145.0", harness="codex", scope=scope)
         binding, digest = route_bindings.resolve_v2(
             self.controlled_row(), "codex", "gpt-test", now=self.NOW,
-            current_source_fingerprint="2" * 64,
+            source_evidence=controlled_source(scope=scope),
             runtime_status=good, runtime_scope=scope,
         )
         self.assertEqual(binding["harness"], "codex")
@@ -317,12 +344,52 @@ class BindingIdentityTest(unittest.TestCase):
                 ) as raised:
                     route_bindings.resolve_v2(
                         self.controlled_row(), "codex", "gpt-test",
-                        now=self.NOW, current_source_fingerprint="2" * 64,
+                        now=self.NOW,
+                        source_evidence=controlled_source(scope=scope),
                         runtime_status=status, runtime_scope=scope,
                     )
                 self.assertEqual(
                     raised.exception.code, "thinking_evidence_stale"
                 )
+
+    def test_controlled_source_proof_must_match_route_and_runtime(self):
+        scope = {"runtime": "sandbox", "runtime_identity": "sandbox:image-a"}
+        runtime = compatible_runtime(
+            "0.145.0", harness="codex", scope=scope
+        )
+        cases = {
+            "untyped-stored-fingerprint": {
+                "harness": "codex",
+                "selector": "gpt-test",
+                **scope,
+                "harness_version": "0.145.0",
+                "fingerprint": "2" * 64,
+            },
+            "other-harness": controlled_source(
+                harness="claude", selector="gpt-test", scope=scope
+            ),
+            "other-selector": controlled_source(
+                selector="other-model", scope=scope
+            ),
+            "other-seat": controlled_source(scope={
+                "runtime": "sandbox",
+                "runtime_identity": "sandbox:image-b",
+            }),
+            "other-version": controlled_source(
+                version="0.146.0", scope=scope
+            ),
+        }
+        for name, source in cases.items():
+            with self.subTest(name=name), self.assertRaises(
+                route_bindings.RouteResolutionError
+            ) as raised:
+                route_bindings.resolve_v2(
+                    self.controlled_row(), "codex", "gpt-test",
+                    now=self.NOW, source_evidence=source,
+                    runtime_status=runtime, runtime_scope=scope,
+                )
+            self.assertEqual(raised.exception.code, "thinking_evidence_stale")
+            self.assertFalse(raised.exception.details["persist_route_stale"])
 
     def test_legacy_gate_requires_a_proven_version_one_row(self):
         self.assertEqual(
@@ -635,7 +702,6 @@ class GenerationPersistenceTest(unittest.TestCase):
         with self.assertRaises(route_bindings.RouteResolutionError) as raised:
             route_bindings.resolve_v2(
                 row, "codex", "carried",
-                current_source_fingerprint=old_fingerprint,
             )
         self.assertEqual(raised.exception.code, "thinking_evidence_stale")
 
@@ -684,7 +750,9 @@ class GenerationPersistenceTest(unittest.TestCase):
 
                 got = routes_cli.resolve(
                     con, "Codex", name, now=datetime.now(timezone.utc),
-                    current_source_fingerprint=fingerprint,
+                    source_evidence=controlled_source(
+                        fingerprint, selector=name
+                    ),
                     runtime_status=compatible_runtime(
                         "0.145.0", harness="codex"
                     ),
@@ -704,13 +772,50 @@ class GenerationPersistenceTest(unittest.TestCase):
                 )
                 refused_again = routes_cli.resolve(
                     con, "codex", name,
-                    current_source_fingerprint=row["source_fingerprint"],
+                    source_evidence=controlled_source(
+                        row["source_fingerprint"], selector=name
+                    ),
                     runtime_status=compatible_runtime(
                         "0.145.0", harness="codex"
                     ),
                 )
                 self.assertFalse(refused_again["ok"])
                 self.assertEqual(refused_again["code"], "thinking_evidence_stale")
+
+    def test_wrong_seat_source_proof_does_not_stale_shared_route(self):
+        model_catalog.persist_routes(self.con, self.payload("seat-bound"))
+        row = dict(self.con.execute(
+            "SELECT * FROM model_routes WHERE selector='seat-bound'"
+        ).fetchone())
+        sandbox = {
+            "runtime": "sandbox", "runtime_identity": "sandbox:image-a",
+        }
+        runtime = compatible_runtime(
+            "0.145.0", harness="codex", scope=sandbox
+        )
+        wrong_source = controlled_source(
+            row["source_fingerprint"], selector="seat-bound",
+            scope={
+                "runtime": "sandbox",
+                "runtime_identity": "sandbox:image-b",
+            },
+        )
+
+        got = routes_cli.resolve(
+            self.con, "codex", "seat-bound",
+            source_evidence=wrong_source,
+            runtime_status=runtime, runtime_scope=sandbox,
+        )
+        stored = self.con.execute(
+            "SELECT stale,last_error FROM model_routes "
+            "WHERE selector='seat-bound'"
+        ).fetchone()
+
+        self.assertEqual(got["code"], "thinking_evidence_stale")
+        self.assertNotIn("binding", got)
+        self.assertNotIn("binding_digest", got)
+        self.assertNotIn("command", got)
+        self.assertEqual(tuple(stored), (0, None))
 
     def test_authoritative_resolution_stales_version_drift(self):
         payload = self.payload("version-drift")
@@ -726,7 +831,9 @@ class GenerationPersistenceTest(unittest.TestCase):
 
         got = routes_cli.resolve(
             self.con, "codex", "version-drift",
-            current_source_fingerprint=row["source_fingerprint"],
+            source_evidence=controlled_source(
+                row["source_fingerprint"], selector="version-drift"
+            ),
             runtime_status=compatible_runtime("0.145.0", harness="codex"),
         )
         stored = self.con.execute(
@@ -760,7 +867,9 @@ class GenerationPersistenceTest(unittest.TestCase):
 
         got = routes_cli.resolve(
             self.con, "codex", "superseded",
-            current_source_fingerprint=row["source_fingerprint"],
+            source_evidence=controlled_source(
+                row["source_fingerprint"], selector="superseded"
+            ),
             runtime_status=compatible_runtime("0.145.0", harness="codex"),
         )
         stored = self.con.execute(
@@ -790,11 +899,22 @@ class GenerationPersistenceTest(unittest.TestCase):
 
         def publish_successor(*_args, **_kwargs):
             model_catalog.persist_routes(refresher, second)
-            return observed["source_fingerprint"]
+            status = compatible_runtime("0.145.0", harness="codex")
+            return {
+                "runtime_status": status,
+                "runtime_scope": {
+                    "runtime": status["runtime"],
+                    "runtime_identity": status["runtime_identity"],
+                },
+                "source_evidence": controlled_source(
+                    observed["source_fingerprint"],
+                    selector="generation-race",
+                ),
+            }
 
         with mock.patch.object(
             routes_cli.model_catalog,
-            "current_source_fingerprint",
+            "controlled_route_evidence",
             side_effect=publish_successor,
         ) as probe:
             got = routes_cli.resolve(
@@ -809,7 +929,10 @@ class GenerationPersistenceTest(unittest.TestCase):
         ).fetchone())
         retried = routes_cli.resolve(
             resolver, "codex", "generation-race",
-            current_source_fingerprint=stored["source_fingerprint"],
+            source_evidence=controlled_source(
+                stored["source_fingerprint"], selector="generation-race",
+                version="0.146.0",
+            ),
             runtime_status=compatible_runtime("0.146.0", harness="codex"),
         )
         self.assertEqual(probe.call_count, 1)
@@ -855,7 +978,9 @@ class GenerationPersistenceTest(unittest.TestCase):
         ).fetchall()
         resolved = routes_cli.resolve(
             late, "codex", "ordered-success",
-            current_source_fingerprint=route["source_fingerprint"],
+            source_evidence=controlled_source(
+                route["source_fingerprint"], selector="ordered-success"
+            ),
             runtime_status=compatible_runtime("0.145.0", harness="codex"),
         )
         self.assertTrue(newest_payload["generation_published"])
@@ -902,7 +1027,9 @@ class GenerationPersistenceTest(unittest.TestCase):
         ).fetchall()
         resolved = routes_cli.resolve(
             late, "codex", "ordered-failure",
-            current_source_fingerprint=route["source_fingerprint"],
+            source_evidence=controlled_source(
+                route["source_fingerprint"], selector="ordered-failure"
+            ),
             runtime_status=compatible_runtime("0.145.0", harness="codex"),
         )
         self.assertTrue(newest_payload["generation_published"])
@@ -1201,7 +1328,12 @@ class GenerationPersistenceTest(unittest.TestCase):
         with self.assertRaises(route_bindings.RouteResolutionError) as raised:
             route_bindings.require_fresh_route(
                 self.con, row, "codex", "rollback-route",
-                current_source_fingerprint="wrong-fingerprint",
+                source_evidence=controlled_source(
+                    "wrong-fingerprint", selector="rollback-route"
+                ),
+                runtime_status=compatible_runtime(
+                    "0.145.0", harness="codex"
+                ),
             )
         staged = self.con.execute(
             "SELECT stale,last_error FROM model_routes "
@@ -1245,7 +1377,7 @@ class ParticipantRevisionTest(unittest.TestCase):
         binding, _ = route_bindings.resolve_v2(
             BindingIdentityTest.controlled_row(), "codex", "gpt-test", "high",
             now=BindingIdentityTest.NOW,
-            current_source_fingerprint="2" * 64,
+            source_evidence=controlled_source(),
             runtime_status=compatible_runtime("0.145.0", harness="codex"),
         )
         return binding
