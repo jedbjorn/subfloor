@@ -1061,15 +1061,6 @@ def verify_stored_v2_before_first_turn(
     validate_v2_binding(binding)
     harness = binding["harness"]
     model = binding["requested_model"]
-    if (
-        not _exact_nonblank(harness_version)
-        or _parsed_version(harness_version) != harness_version
-    ):
-        raise RouteResolutionError(
-            "route_evidence_stale",
-            "Stored Sprint route has no immutable harness-version evidence",
-            {"harness": harness, "model": model, "remediation": "pause and reroute"},
-        )
     if binding["control_state"] != "controlled":
         import model_catalog  # noqa: PLC0415
 
@@ -1080,7 +1071,14 @@ def verify_stored_v2_before_first_turn(
             harness_versions.runtime_scope(),
             error_code="route_evidence_stale",
         )
-        if source_fingerprint is not None or runtime.version != harness_version:
+        if source_fingerprint is not None or (
+            harness_version is not None
+            and (
+                not _exact_nonblank(harness_version)
+                or _parsed_version(harness_version) != harness_version
+                or runtime.version != harness_version
+            )
+        ):
             raise RouteResolutionError(
                 "route_evidence_stale",
                 "Stored Sprint route evidence changed before its first native turn",
@@ -1094,6 +1092,15 @@ def verify_stored_v2_before_first_turn(
             )
         return
 
+    if (
+        not _exact_nonblank(harness_version)
+        or _parsed_version(harness_version) != harness_version
+    ):
+        raise RouteResolutionError(
+            "route_evidence_stale",
+            "Stored Sprint route has no immutable harness-version evidence",
+            {"harness": harness, "model": model, "remediation": "pause and reroute"},
+        )
     if not _lower_hex(source_fingerprint, LOWER_HEX_64):
         raise RouteResolutionError(
             "route_evidence_stale",

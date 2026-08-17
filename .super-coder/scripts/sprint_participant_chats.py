@@ -512,21 +512,23 @@ def prepare_wake_conversation(
         route_revision = int(row["route_revision"])
         control_state = binding["control_state"]
         route_contract_version = 2
-        prior_turn = con.execute(
+        prior_native_turn = con.execute(
             "SELECT 1 FROM sprint_participant_conversations link "
             "JOIN conversations conversation "
             "ON conversation.conversation_id=link.conversation_id "
             "JOIN conversation_runs run "
             "ON run.conversation_id=conversation.conversation_id "
             "WHERE link.sprint_participant_id=? "
-            "AND conversation.creation_idempotency_key LIKE ? LIMIT 1",
+            "AND conversation.creation_idempotency_key LIKE ? "
+            "AND run.harness_session_after IS NOT NULL "
+            "AND run.runner_ref IS NOT NULL LIMIT 1",
             (
                 row["participant_id"],
                 f"generation:%:participant:{row['participant_id']}:"
                 f"route:{route_revision}:wake:%",
             ),
         ).fetchone()
-        if prior_turn is None:
+        if prior_native_turn is None:
             try:
                 route_bindings.verify_stored_v2_before_first_turn(
                     con,

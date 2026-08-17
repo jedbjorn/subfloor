@@ -29,6 +29,7 @@ sys.path[:0] = [
     str(ROOT / "tests"),
 ]
 
+import active_chat_registry
 import db_driver
 import mem
 import model_catalog
@@ -126,18 +127,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             seed.close()
         self.con = db_driver.connect(self.db_path)
         self.addCleanup(self.con.close)
-        self.con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
-        self.con.executemany(
-            "INSERT INTO shells "
-            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
-            "VALUES (?,?,?,?,?,1)",
-            (
-                (1, "Developer", "DEV1", "dev", "prompt"),
-                (2, "Reviewer", "REV1", "reviewer", "prompt"),
-                (3, "Planner", "PLN1", "planner", "prompt"),
-            ),
-        )
-        self.con.commit()
+        self._seed_identity(self.con)
         worktrees = self.root / "worktrees"
 
         def shell_work_dir(shortname: str, _flavor: str | None) -> Path:
@@ -152,6 +142,21 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
         )
         route_path_patch.start()
         self.addCleanup(route_path_patch.stop)
+
+    @staticmethod
+    def _seed_identity(con: sqlite3.Connection) -> None:
+        con.execute("INSERT INTO users (user_id,username) VALUES (1,'operator')")
+        con.executemany(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (?,?,?,?,?,1)",
+            (
+                (1, "Developer", "DEV1", "dev", "prompt"),
+                (2, "Reviewer", "REV1", "reviewer", "prompt"),
+                (3, "Planner", "PLN1", "planner", "prompt"),
+            ),
+        )
+        con.commit()
 
     @staticmethod
     def _runtime(harness: str) -> tuple[dict, dict]:
@@ -182,16 +187,19 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
         harness: str,
         model: str | None,
         effort: str | None,
+        con: sqlite3.Connection | None = None,
     ) -> int:
+        if con is None:
+            con = self.con
         feature_id = int(
-            self.con.execute(
+            con.execute(
                 "INSERT INTO roadmap (title,roadmap_status) "
                 "VALUES ('Bound dispatch proof','in_progress')"
             ).lastrowid
         )
         body = f"bound dispatch proof for {harness}"
         document_id = int(
-            self.con.execute(
+            con.execute(
                 "INSERT INTO documents (feature_id,kind,seq,title,body) "
                 "VALUES (?,'spec',1,'Bound dispatch proof',?)",
                 (feature_id, body),
@@ -199,7 +207,7 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
         )
         revision = hashlib.sha256(body.encode()).hexdigest()
         approval_id = int(
-            self.con.execute(
+            con.execute(
                 "INSERT INTO sprint_spec_approvals "
                 "(document_id,revision_sha256,reviewer_shell_id,verdict) "
                 "VALUES (?,?,2,'pass')",
@@ -207,20 +215,20 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             ).lastrowid
         )
         sprint_id = int(
-            self.con.execute(
+            con.execute(
                 "INSERT INTO sprints "
                 "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
                 "VALUES (?,3,1)",
                 (feature_id,),
             ).lastrowid
         )
-        self.con.execute(
+        con.execute(
             "INSERT INTO sprint_specs "
             "(sprint_id,document_id,bound_revision_sha256,approval_id,"
             "bound_revision_body) VALUES (?,?,?,?,?)",
             (sprint_id, document_id, revision, approval_id, body),
         )
-        self.con.executemany(
+        con.executemany(
             "INSERT INTO sprint_participants "
             "(sprint_id,shell_id,role,harness,model,effort) "
             "VALUES (?,?,?,?,?,?)",
@@ -230,14 +238,111 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
                 (sprint_id, 2, "reviewer", harness, model, effort),
             ),
         )
-        self.con.execute(
+        con.execute(
             "INSERT INTO sprint_work_units "
             "(sprint_id,assigned_shell_id,reviewer_shell_id,title,expected_output) "
             "VALUES (?,1,2,'Bound delivery','Dispatch the bound route')",
             (sprint_id,),
         )
-        self.con.commit()
+        con.commit()
         return sprint_id
+
+    def _historical_upgrade_database(
+        self,
+    ) -> tuple[Path, sqlite3.Connection]:
+        path = self.root / "historical-sprint-binding.db"
+        seed = sqlite3.connect(path)
+        try:
+            apply_schema(seed, through="0215_reseed_sprint_binding_guidance.sql")
+        finally:
+            seed.close()
+        con = db_driver.connect(path)
+        self.addCleanup(con.close)
+        self._seed_identity(con)
+        return path, con
+
+    @staticmethod
+    def _activate_historical_binding(
+        con: sqlite3.Connection,
+        sprint_id: int,
+        binding: dict,
+    ) -> tuple[int, int]:
+        participants = {
+            str(row["role"]): int(row["participant_id"])
+            for row in con.execute(
+                "SELECT participant_id,role FROM sprint_participants "
+                "WHERE sprint_id=?",
+                (sprint_id,),
+            )
+        }
+        participant_id = participants["developer"]
+        digest = route_bindings.digest_json(binding)
+        binding_id = int(
+            con.execute(
+                "INSERT INTO sprint_participant_route_bindings ("
+                "participant_id,route_revision,contract_version,control_state,"
+                "harness,requested_model,provider_model,requested_effort,"
+                "effective_effort,native_variant_id,transport,"
+                "catalogue_generation,evidence_digest,selector_binding,"
+                "adapter_metadata,binding_json,binding_digest) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    participant_id,
+                    1,
+                    binding["contract_version"],
+                    binding["control_state"],
+                    binding["harness"],
+                    binding["requested_model"],
+                    binding["provider_model"],
+                    binding["requested_effort"],
+                    binding["effective_effort"],
+                    binding["native_variant_id"],
+                    binding["transport"],
+                    binding["catalogue_generation"],
+                    binding["evidence_digest"],
+                    (
+                        route_bindings.canonical_json(binding["selector_binding"])
+                        if binding["selector_binding"] is not None
+                        else None
+                    ),
+                    route_bindings.canonical_json(binding["adapter_metadata"]),
+                    route_bindings.canonical_json(binding),
+                    digest,
+                ),
+            ).lastrowid
+        )
+        con.execute(
+            "UPDATE sprint_participants SET active_route_binding_id=? "
+            "WHERE participant_id=?",
+            (binding_id, participant_id),
+        )
+        con.execute(
+            "UPDATE sprints SET lifecycle='armed',armed_at=datetime('now'),"
+            "conformance_reviewer_shell_id=2,"
+            "conformance_owner_generation=1 "
+            "WHERE sprint_id=?",
+            (sprint_id,),
+        )
+        con.commit()
+        return participants["planner"], participant_id
+
+    @staticmethod
+    def _controlled_historical_binding() -> dict:
+        return {
+            "contract_version": 2,
+            "control_state": "controlled",
+            "harness": "codex",
+            "requested_model": "gpt-5.4",
+            "provider_model": "gpt-5.4",
+            "requested_effort": "high",
+            "effective_effort": "high",
+            "native_variant_id": None,
+            "transport": "codex-reasoning-config",
+            "catalogue_generation": "a" * 32,
+            "evidence_digest": "b" * 64,
+            "selector_binding": {"kind": "exact-model", "selector": "gpt-5.4"},
+            "adapter_metadata": {},
+        }
 
     @staticmethod
     def _variant_metadata(effort: str, verbosity: str) -> tuple[str, str]:
@@ -668,6 +773,267 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
                 "route_evidence_stale: Stored Sprint route evidence changed "
                 "before its first native turn",
             ),
+        )
+
+    def test_pre_native_failure_does_not_bypass_later_stale_check(self) -> None:
+        observation = self._seed_opencode_catalogue()
+        sprint_id = self._seed_sprint(
+            harness="opencode", model=self.SELECTOR, effort="high"
+        )
+        with mock.patch.object(
+            model_catalog, "controlled_route_evidence", return_value=observation
+        ):
+            first_wake_id = self._arm(sprint_id)
+            first_run = self._deliver_and_claim(first_wake_id)
+            broker = BrokerStore(self.db_path)
+            self.assertTrue(
+                broker.finish_run(
+                    first_run.run_id,
+                    "failed",
+                    event_type="run.failed",
+                    error_code="HARNESS_LAUNCH_FAILED",
+                    error_detail="launch preparation failed before native start",
+                )
+            )
+            with db_driver.write_transaction(
+                self.con, "test.close_pre_native_failure"
+            ):
+                closed = active_chat_registry.close_for_wake(
+                    self.con, first_run.shell_id
+                )
+            self.assertIsNotNone(closed)
+            self.assertEqual(closed.chat_id, first_run.conversation_id)
+
+            self._publish_successor_catalogue(retain_high=True)
+            observation["source_fingerprint"] = self.SUCCESSOR_FINGERPRINT
+            participants = {
+                str(row["role"]): int(row["participant_id"])
+                for row in self.con.execute(
+                    "SELECT participant_id,role FROM sprint_participants "
+                    "WHERE sprint_id=?",
+                    (sprint_id,),
+                )
+            }
+            receipt = sprint_message_delivery.SprintMessageStore(self.con).send(
+                sprint_id,
+                to_participant_id=participants["developer"],
+                from_participant_id=participants["planner"],
+                message_kind="notification",
+                body="Retry after a pre-native launch failure",
+                idempotency_key="pre-native-failure-followup",
+                declared_type="new",
+            )
+            before = tuple(
+                int(row[0])
+                for row in self.con.execute(
+                    "SELECT COUNT(*) FROM conversations UNION ALL "
+                    "SELECT COUNT(*) FROM conversation_messages UNION ALL "
+                    "SELECT COUNT(*) FROM conversation_outbox UNION ALL "
+                    "SELECT COUNT(*) FROM conversation_runs"
+                )
+            )
+            deliveries: list[tuple[str, str, str]] = []
+            outcome = sprint_message_delivery.SprintWakeDeliveryService(
+                self.con, force_new_quiet_seconds=0
+            ).deliver_once(
+                "pre-native-failure-stale-proof",
+                lambda conversation_id, prompt, key: deliveries.append(
+                    (conversation_id, prompt, key)
+                ),
+            )
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual(receipt.wake_id, outcome.wake_id)
+        self.assertEqual(("pending", 1), (outcome.state, outcome.attempt_number))
+        self.assertEqual(deliveries, [])
+        self.assertEqual(before, (1, 1, 1, 1))
+        self.assertEqual(
+            tuple(
+                int(row[0])
+                for row in self.con.execute(
+                    "SELECT COUNT(*) FROM conversations UNION ALL "
+                    "SELECT COUNT(*) FROM conversation_messages UNION ALL "
+                    "SELECT COUNT(*) FROM conversation_outbox UNION ALL "
+                    "SELECT COUNT(*) FROM conversation_runs"
+                )
+            ),
+            before,
+        )
+        self.assertEqual(
+            tuple(
+                self.con.execute(
+                    "SELECT state,attempt_count,last_error "
+                    "FROM sprint_wake_outbox WHERE wake_id=?",
+                    (receipt.wake_id,),
+                ).fetchone()
+            ),
+            (
+                "pending",
+                1,
+                "route_evidence_stale: Stored Sprint route evidence changed "
+                "before its first native turn",
+            ),
+        )
+
+    def test_historical_uncontrolled_binding_reaches_launch_after_upgrade(self) -> None:
+        db_path, con = self._historical_upgrade_database()
+        status, scope = self._runtime("kimi")
+        binding, _digest = route_bindings.resolve_v2(
+            None,
+            "kimi",
+            None,
+            None,
+            runtime_status=status,
+            runtime_scope=scope,
+        )
+        sprint_id = self._seed_sprint(
+            harness="kimi", model=None, effort=None, con=con
+        )
+        planner_id, developer_id = self._activate_historical_binding(
+            con, sprint_id, binding
+        )
+        con.executescript(
+            (ENGINE / "migrations" / "0216_sprint_binding_provenance.sql").read_text()
+        )
+        receipt = sprint_message_delivery.SprintMessageStore(con).send(
+            sprint_id,
+            to_participant_id=developer_id,
+            from_participant_id=planner_id,
+            message_kind="notification",
+            body="First wake after provenance upgrade",
+            idempotency_key="historical-uncontrolled-first-wake",
+            declared_type="force-new",
+        )
+        with mock.patch.object(
+            model_catalog, "harness_runtime_status", return_value=status
+        ) as runtime_probe:
+            outcome = sprint_message_delivery.SprintWakeDeliveryService(
+                con, force_new_quiet_seconds=0
+            ).deliver_once(
+                "historical-uncontrolled-upgrade",
+                lambda conversation_id, prompt, key: (
+                    sprint_runtime.enqueue_conversation_turn(
+                        db_path, conversation_id, prompt, key
+                    )
+                ),
+            )
+        self.assertIsNotNone(outcome)
+        self.assertEqual((receipt.wake_id, "delivered", 1), (
+            outcome.wake_id,
+            outcome.state,
+            outcome.attempt_number,
+        ))
+        runtime_probe.assert_called_once_with("kimi")
+        broker_run = BrokerStore(db_path).claim_next("historical-upgrade-broker")
+        self.assertIsNotNone(broker_run)
+        prepared: list[dict] = []
+
+        def prepare_launch(**kwargs):
+            prepared.append(kwargs)
+            return SimpleNamespace(
+                cwd=str(broker_run.worktree),
+                archive_id=43,
+                harness=kwargs["harness"],
+                model=kwargs["model"],
+                effort=kwargs["effort"],
+                env={},
+            )
+
+        context, archive_id = ConversationLaunchPreparer(
+            db_path,
+            prepare_launch=prepare_launch,
+            liveness=lambda: {"supported": True, "processes": []},
+        )(broker_run)
+        self.assertEqual((archive_id, len(prepared)), (43, 1))
+        self.assertEqual(
+            (context.model, context.effort, prepared[0]["route_binding"]),
+            (None, None, binding),
+        )
+        self.assertEqual(
+            tuple(
+                con.execute(
+                    "SELECT source_fingerprint,harness_version FROM "
+                    "sprint_participant_route_bindings WHERE participant_id=?",
+                    (developer_id,),
+                ).fetchone()
+            ),
+            (None, None),
+        )
+
+    def test_historical_controlled_binding_fails_closed_after_upgrade(self) -> None:
+        _db_path, con = self._historical_upgrade_database()
+        binding = self._controlled_historical_binding()
+        route_bindings.validate_v2_binding(binding)
+        sprint_id = self._seed_sprint(
+            harness="codex", model="gpt-5.4", effort="high", con=con
+        )
+        planner_id, developer_id = self._activate_historical_binding(
+            con, sprint_id, binding
+        )
+        con.executescript(
+            (ENGINE / "migrations" / "0216_sprint_binding_provenance.sql").read_text()
+        )
+        receipt = sprint_message_delivery.SprintMessageStore(con).send(
+            sprint_id,
+            to_participant_id=developer_id,
+            from_participant_id=planner_id,
+            message_kind="notification",
+            body="Controlled first wake after provenance upgrade",
+            idempotency_key="historical-controlled-first-wake",
+            declared_type="force-new",
+        )
+        deliveries: list[tuple[str, str, str]] = []
+        outcome = sprint_message_delivery.SprintWakeDeliveryService(
+            con, force_new_quiet_seconds=0
+        ).deliver_once(
+            "historical-controlled-upgrade",
+            lambda conversation_id, prompt, key: deliveries.append(
+                (conversation_id, prompt, key)
+            ),
+        )
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual((receipt.wake_id, "pending", 1), (
+            outcome.wake_id,
+            outcome.state,
+            outcome.attempt_number,
+        ))
+        self.assertEqual(deliveries, [])
+        self.assertEqual(
+            tuple(
+                con.execute(
+                    "SELECT source_fingerprint,harness_version FROM "
+                    "sprint_participant_route_bindings WHERE participant_id=?",
+                    (developer_id,),
+                ).fetchone()
+            ),
+            (None, None),
+        )
+        self.assertEqual(
+            tuple(
+                con.execute(
+                    "SELECT state,attempt_count,last_error "
+                    "FROM sprint_wake_outbox WHERE wake_id=?",
+                    (receipt.wake_id,),
+                ).fetchone()
+            ),
+            (
+                "pending",
+                1,
+                "route_evidence_stale: Stored Sprint route has no immutable "
+                "harness-version evidence",
+            ),
+        )
+        self.assertEqual(
+            tuple(
+                int(row[0])
+                for row in con.execute(
+                    "SELECT COUNT(*) FROM conversations UNION ALL "
+                    "SELECT COUNT(*) FROM conversation_messages UNION ALL "
+                    "SELECT COUNT(*) FROM conversation_runs"
+                )
+            ),
+            (0, 0, 0),
         )
 
 
