@@ -38,6 +38,7 @@ import sqlite3
 import subprocess
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -352,46 +353,48 @@ def _cache_matches_authority(cached: dict, con) -> bool:
     return generation is None or cached.get("catalogue_generation") == generation
 
 
-def _publish_cache(payload: dict, con=None) -> bool:
-    """Atomically replace the cache only when this payload is authoritative."""
+@contextmanager
+def _publication_lock():
+    """Serialize generation projection, cache replacement, and its receipt."""
     CACHE.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = CACHE.with_name(f"{CACHE.name}.lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def _publish_cache_locked(payload: dict, con=None) -> bool:
+    """Replace the cache while the caller owns the publication lock."""
     temporary = CACHE.with_name(
         f".{CACHE.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
-    lock_path = CACHE.with_name(f"{CACHE.name}.lock")
     serialized = json.dumps(payload, indent=1) + "\n"
     try:
         with temporary.open("x") as stream:
             stream.write(serialized)
             stream.flush()
             os.fsync(stream.fileno())
-        with lock_path.open("a+") as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            authoritative = _authoritative_generation(con)
-            if (
-                authoritative is not None
-                and payload.get("catalogue_generation") != authoritative
-            ):
-                return False
-            os.replace(temporary, CACHE)
-            authoritative = _authoritative_generation(con)
-            if (
-                authoritative is not None
-                and payload.get("catalogue_generation") != authoritative
-            ):
-                cached = _load_cache()
-                if cached and cached.get("catalogue_generation") == payload.get(
-                    "catalogue_generation"
-                ):
-                    CACHE.unlink(missing_ok=True)
-                return False
-            return True
+        authoritative = _authoritative_generation(con)
+        if (
+            authoritative is not None
+            and payload.get("catalogue_generation") != authoritative
+        ):
+            return False
+        os.replace(temporary, CACHE)
+        return True
     finally:
         temporary.unlink(missing_ok=True)
 
 
+def _publish_cache(payload: dict, con=None) -> bool:
+    """Atomically replace the cache only when this payload is authoritative."""
+    with _publication_lock():
+        return _publish_cache_locked(payload, con)
+
+
 def _finish_cache_publication(
-    candidate: dict, response: dict, con, opencode_provider
+    candidate: dict, response: dict, con, opencode_provider, *,
+    publication_locked: bool = False,
 ) -> dict:
     for field in (
         "catalogue_generation", "generation_state", "generation_published",
@@ -399,7 +402,8 @@ def _finish_cache_publication(
     ):
         if field in response:
             candidate[field] = response[field]
-    if _publish_cache(candidate, con):
+    publish = _publish_cache_locked if publication_locked else _publish_cache
+    if publish(candidate, con):
         return response
 
     if "generation_published" in response:
@@ -588,8 +592,12 @@ def _legacy_persist_routes(con, payload: dict) -> None:
     con.commit()
 
 
-def persist_routes(con, payload: dict) -> None:
+def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> None:
     """Append an attempt; only the newest completed attempt changes routes."""
+    if not publication_locked:
+        with _publication_lock():
+            persist_routes(con, payload, publication_locked=True)
+        return
     try:
         con.execute("SELECT 1 FROM model_catalog_generations LIMIT 1")
     except Exception:
@@ -867,9 +875,10 @@ def runtime_verification(con, *, env=os.environ,
     return report
 
 
-def _served(payload: dict, con=None, *, publish: bool = False) -> dict:
+def _served(payload: dict, con=None, *, publish: bool = False,
+            publication_locked: bool = False) -> dict:
     if con is not None and publish:
-        persist_routes(con, payload)
+        persist_routes(con, payload, publication_locked=publication_locked)
     return payload
 
 
@@ -972,11 +981,13 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     fresh cache → serve it; miss/stale/refresh → live sweep, cache the result;
     sweep failed → stale cache if any, else the static floor. Every response
     carries `stale` + `fetched_at` so the GUI can say how current it is."""
-    cached = _load_cache()
-    if (
-        cached and not refresh and _fresh(cached)
-        and _cache_matches_authority(cached, con)
-    ):
+    with _publication_lock():
+        cached = _load_cache()
+        serve_cached = bool(
+            cached and not refresh and _fresh(cached)
+            and _cache_matches_authority(cached, con)
+        )
+    if serve_cached:
         return _served(_with_live_opencode(
             {**cached, "stale": bool(
                 cached.get("stale") or cached.get("partial")
@@ -1005,7 +1016,6 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
                 response["verification"] = verification
             if not refresh:
                 return _served(response, con)
-            response = _served(response, con, publish=True)
             cached_failure = {
                 **cached,
                 "stale": True,
@@ -1015,6 +1025,15 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             }
             if "verification" in response:
                 cached_failure["verification"] = response["verification"]
+            if con is not None:
+                with _publication_lock():
+                    response = _served(
+                        response, con, publish=True, publication_locked=True
+                    )
+                    return _finish_cache_publication(
+                        cached_failure, response, con, opencode_provider,
+                        publication_locked=True,
+                    )
             return _finish_cache_publication(
                 cached_failure, response, con, opencode_provider
             )
@@ -1036,7 +1055,15 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             response["verification"] = verification
         if not refresh:
             return _served(response, con)
-        response = _served(response, con, publish=True)
+        if con is not None:
+            with _publication_lock():
+                response = _served(
+                    response, con, publish=True, publication_locked=True
+                )
+                return _finish_cache_publication(
+                    fallback, response, con, opencode_provider,
+                    publication_locked=True,
+                )
         return _finish_cache_publication(
             fallback, response, con, opencode_provider
         )
@@ -1060,18 +1087,30 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             "runtime": "sandbox" if env.get("SC_SANDBOX") else "host",
             "harnesses": harnesses,
         }
-        response = _served(response, con, publish=True)
+        with _publication_lock():
+            response = _served(
+                response, con, publish=True, publication_locked=True
+            )
 
-        def captured_probe():
-            if probe_error is not None:
-                raise RuntimeError(probe_error)
-            return harnesses
+            def captured_probe():
+                if probe_error is not None:
+                    raise RuntimeError(probe_error)
+                return harnesses
 
-        verification = runtime_verification(
-            con, env=env, harness_probe=captured_probe
-        )
-        fresh["verification"] = verification
-        response["verification"] = verification
+            verification = runtime_verification(
+                con, env=env, harness_probe=captured_probe
+            )
+            fresh["verification"] = verification
+            response["verification"] = verification
+            if response.get("partial"):
+                fresh["partial"] = True
+                fresh["errors"] = (
+                    response.get("errors") or fresh.get("errors") or []
+                )
+            return _finish_cache_publication(
+                fresh, response, con, opencode_provider,
+                publication_locked=True,
+            )
     else:
         response = _served(response, con)
     if response.get("partial"):

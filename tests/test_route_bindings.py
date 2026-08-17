@@ -6,6 +6,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -757,164 +758,109 @@ class GenerationPersistenceTest(unittest.TestCase):
         self.assertEqual((route["stale"], route["last_error"]), (0, None))
         self.assertTrue(resolved["ok"])
 
-    def test_two_catalog_refreshes_publish_one_cache_and_route_generation(self):
-        older_con, newer_con = self.shared_connections()
-        older = self.payload("older-route")
-        newer = self.payload("newer-route")
-        older.pop("verification")
-        newer.pop("verification")
+    def test_losing_catalog_attempts_keep_winner_cache_and_routes(self):
+        loser_con, winner_con = self.shared_connections()
+        winner = self.payload("winner-route")
+        loser = self.payload("loser-route")
+        winner.pop("verification")
+        loser.pop("verification")
         base = datetime.now(timezone.utc)
-        older["fetched_at"] = base.isoformat()
-        newer["fetched_at"] = (base + timedelta(seconds=1)).isoformat()
         statuses = {"codex": self.status()}
-        clock = mock.Mock()
-        clock.now.side_effect = [
-            base + timedelta(seconds=offset) for offset in range(7)
-        ]
-        clock.fromisoformat.side_effect = datetime.fromisoformat
-        interleaved = False
-        publications = []
-        newer_response = {}
-        real_publish = model_catalog._publish_cache
 
-        def publish_with_interleave(candidate, con=None):
-            nonlocal interleaved
-            selector = candidate["harnesses"]["codex"]["models"][0]["id"]
-            if con is older_con and not interleaved:
-                interleaved = True
-                newer_response.update(model_catalog.catalog(
-                    refresh=True, con=newer_con,
-                    opencode_provider=lambda: [],
-                    harness_probe=lambda: statuses,
-                ))
-            published = real_publish(candidate, con)
-            publications.append((selector, published))
-            return published
+        def clock(when):
+            value = mock.Mock()
+            value.now.return_value = when
+            value.fromisoformat.side_effect = datetime.fromisoformat
+            return value
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
             model_catalog, "CACHE", Path(tmp) / "model_catalog.json"
-        ), mock.patch.object(
-            model_catalog, "build", side_effect=[older, newer]
-        ) as build, mock.patch.object(
-            model_catalog, "datetime", clock
-        ), mock.patch.object(
-            model_catalog, "_publish_cache",
-            side_effect=publish_with_interleave,
         ):
-            outer_response = model_catalog.catalog(
-                refresh=True, con=older_con,
-                opencode_provider=lambda: [],
-                harness_probe=lambda: statuses,
-            )
+            with mock.patch.object(
+                model_catalog, "build", return_value=winner
+            ), mock.patch.object(
+                model_catalog, "datetime", clock(base + timedelta(minutes=1))
+            ):
+                winner_response = model_catalog.catalog(
+                    refresh=True, con=winner_con,
+                    opencode_provider=lambda: [],
+                    harness_probe=lambda: statuses,
+                )
+            with mock.patch.object(
+                model_catalog, "build", return_value=loser
+            ), mock.patch.object(
+                model_catalog, "datetime", clock(base)
+            ):
+                loser_response = model_catalog.catalog(
+                    refresh=True, con=loser_con,
+                    opencode_provider=lambda: [],
+                    harness_probe=lambda: statuses,
+                )
             cached = json.loads(model_catalog.CACHE.read_text())
-            ordinary = model_catalog.catalog(
-                con=older_con, opencode_provider=lambda: [],
-                harness_probe=lambda: (_ for _ in ()).throw(
-                    AssertionError("ordinary winner cache read reprobed")
-                ),
-            )
 
-        generations = older_con.execute(
+        generations = loser_con.execute(
             "SELECT generation_id,state FROM model_catalog_generations "
             "ORDER BY completed_at,generation_id"
         ).fetchall()
-        fresh_routes = older_con.execute(
+        fresh_routes = loser_con.execute(
             "SELECT selector,generation_id,stale,last_error FROM model_routes "
             "WHERE stale=0 ORDER BY selector"
         ).fetchall()
-        predecessor = older_con.execute(
-            "SELECT stale,last_error FROM model_routes "
-            "WHERE selector='older-route'"
+        loser_route = loser_con.execute(
+            "SELECT 1 FROM model_routes WHERE selector='loser-route'"
         ).fetchone()
-        winner_generation = newer_response["catalogue_generation"]
-        self.assertEqual(build.call_count, 2)
-        self.assertEqual(
-            publications,
-            [("newer-route", True), ("older-route", False)],
-        )
-        self.assertEqual(
-            outer_response["catalogue_generation"], winner_generation
-        )
-        self.assertEqual(
-            newer_response["catalogue_generation"], winner_generation
-        )
-        self.assertEqual(cached["catalogue_generation"], winner_generation)
-        self.assertEqual(ordinary["catalogue_generation"], winner_generation)
-        for payload in (outer_response, newer_response, cached, ordinary):
+        winner_generation = winner_response["catalogue_generation"]
+        for payload in (winner_response, loser_response, cached):
+            self.assertEqual(payload["catalogue_generation"], winner_generation)
             self.assertEqual(
                 payload["harnesses"]["codex"]["models"][0]["id"],
-                "newer-route",
+                "winner-route",
             )
             self.assertFalse(payload["stale"])
         self.assertEqual(len(generations), 2)
-        self.assertEqual(
-            {row["state"] for row in generations}, {"successful"}
-        )
         self.assertEqual(generations[-1]["generation_id"], winner_generation)
-        self.assertEqual(len(fresh_routes), 1)
         self.assertEqual(
-            tuple(fresh_routes[0]),
-            ("newer-route", winner_generation, 0, None),
+            [tuple(row) for row in fresh_routes],
+            [("winner-route", winner_generation, 0, None)],
         )
-        self.assertEqual(
-            tuple(predecessor),
-            (1, "not observed in latest generation"),
-        )
+        self.assertIsNone(loser_route)
 
-    def test_failed_catalog_loser_cannot_replace_successful_winner_cache(self):
+    def test_older_failed_catalog_keeps_successful_winner_cache(self):
         failed_con, winner_con = self.shared_connections()
         winner = self.payload("winner-route")
         winner.pop("verification")
         base = datetime.now(timezone.utc)
-        winner["fetched_at"] = (base + timedelta(seconds=1)).isoformat()
         statuses = {"codex": self.status()}
-        clock = mock.Mock()
-        clock.now.side_effect = [
-            base + timedelta(seconds=offset) for offset in range(7)
-        ]
-        clock.fromisoformat.side_effect = datetime.fromisoformat
-        interleaved = False
-        publications = []
-        winner_response = {}
-        real_publish = model_catalog._publish_cache
 
-        def publish_with_interleave(candidate, con=None):
-            nonlocal interleaved
-            state = candidate["generation_state"]
-            if con is failed_con and not interleaved:
-                interleaved = True
-                winner_response.update(model_catalog.catalog(
-                    refresh=True, con=winner_con,
-                    opencode_provider=lambda: [],
-                    harness_probe=lambda: statuses,
-                ))
-            published = real_publish(candidate, con)
-            publications.append((state, published))
-            return published
+        def clock(when):
+            value = mock.Mock()
+            value.now.return_value = when
+            value.fromisoformat.side_effect = datetime.fromisoformat
+            return value
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
             model_catalog, "CACHE", Path(tmp) / "model_catalog.json"
-        ), mock.patch.object(
-            model_catalog, "build",
-            side_effect=[RuntimeError("older refresh failed"), winner],
-        ) as build, mock.patch.object(
-            model_catalog, "datetime", clock
-        ), mock.patch.object(
-            model_catalog, "_publish_cache",
-            side_effect=publish_with_interleave,
         ):
-            outer_response = model_catalog.catalog(
-                refresh=True, con=failed_con,
-                opencode_provider=lambda: [],
-                harness_probe=lambda: statuses,
-            )
+            with mock.patch.object(
+                model_catalog, "build", return_value=winner
+            ), mock.patch.object(
+                model_catalog, "datetime", clock(base + timedelta(minutes=1))
+            ):
+                winner_response = model_catalog.catalog(
+                    refresh=True, con=winner_con,
+                    opencode_provider=lambda: [],
+                    harness_probe=lambda: statuses,
+                )
+            with mock.patch.object(
+                model_catalog, "build",
+                side_effect=RuntimeError("older refresh failed"),
+            ), mock.patch.object(model_catalog, "datetime", clock(base)):
+                failed_response = model_catalog.catalog(
+                    refresh=True, con=failed_con,
+                    opencode_provider=lambda: [],
+                    harness_probe=lambda: statuses,
+                )
             cached = json.loads(model_catalog.CACHE.read_text())
-            ordinary = model_catalog.catalog(
-                con=failed_con, opencode_provider=lambda: [],
-                harness_probe=lambda: (_ for _ in ()).throw(
-                    AssertionError("ordinary winner cache read reprobed")
-                ),
-            )
 
         generations = failed_con.execute(
             "SELECT generation_id,state,error_summary "
@@ -925,118 +871,154 @@ class GenerationPersistenceTest(unittest.TestCase):
             "WHERE stale=0 ORDER BY selector"
         ).fetchall()
         winner_generation = winner_response["catalogue_generation"]
-        self.assertEqual(build.call_count, 2)
-        self.assertEqual(
-            publications,
-            [("successful", True), ("failed", False)],
-        )
-        for payload in (outer_response, winner_response, cached, ordinary):
-            self.assertEqual(
-                payload["catalogue_generation"], winner_generation
-            )
+        for payload in (winner_response, failed_response, cached):
+            self.assertEqual(payload["catalogue_generation"], winner_generation)
             self.assertEqual(
                 payload["harnesses"]["codex"]["models"][0]["id"],
                 "winner-route",
             )
             self.assertFalse(payload["stale"])
-        self.assertEqual(len(generations), 2)
         self.assertEqual(
-            [row["state"] for row in generations],
-            ["failed", "successful"],
+            [row["state"] for row in generations], ["failed", "successful"]
         )
         self.assertEqual(
             json.loads(generations[0]["error_summary"])["error"],
             "older refresh failed",
         )
         self.assertEqual(
-            generations[1]["generation_id"], winner_generation
-        )
-        self.assertEqual(len(fresh_routes), 1)
-        self.assertEqual(
-            tuple(fresh_routes[0]),
-            ("winner-route", winner_generation, 0, None),
+            [tuple(row) for row in fresh_routes],
+            [("winner-route", winner_generation, 0, None)],
         )
 
-    def test_replace_seam_rejects_newer_success_or_failure_generation(self):
+    def test_publication_owner_excludes_commit_after_final_authority_read(self):
         cases = ("successful", "failed")
         for challenger_state in cases:
-            with self.subTest(challenger_state=challenger_state):
-                older_con, challenger_con = self.shared_connections()
-                older = self.payload("replace-older")
+            with self.subTest(challenger_state=challenger_state), \
+                    tempfile.TemporaryDirectory() as tmp:
+                db_path = Path(tmp) / "routes.db"
+                observer = route_schema(db_path)
+                self.addCleanup(observer.close)
+                older = self.payload("owner-older")
+                challenger = self.payload("owner-newer")
                 older.pop("verification")
-                later = datetime.now(timezone.utc) + timedelta(minutes=5)
-                if challenger_state == "successful":
-                    challenger = self.payload("replace-newer")
-                    challenger["refresh_started_at"] = later.isoformat()
-                    challenger["refresh_completed_at"] = (
-                        later + timedelta(seconds=1)
-                    ).isoformat()
-                else:
-                    challenger = {
-                        "v": model_catalog.PAYLOAD_VERSION,
-                        "fetched_at": later.isoformat(),
-                        "refresh_started_at": later.isoformat(),
-                        "refresh_completed_at": (
-                            later + timedelta(seconds=1)
-                        ).isoformat(),
-                        "stale": True,
-                        "partial": False,
-                        "error": "newer refresh failed",
-                        "harnesses": {},
-                        "verification": {
-                            "runtime": "host", "harnesses": {},
-                        },
-                    }
+                challenger.pop("verification")
                 statuses = {"codex": self.status()}
-                real_replace = model_catalog.os.replace
+                base = datetime.now(timezone.utc)
+                authority_read = threading.Event()
+                release_owner = threading.Event()
+                challenger_waiting = threading.Event()
+                responses = {}
+                failures = []
+                real_authority = model_catalog._authoritative_generation
+                real_flock = model_catalog.fcntl.flock
 
-                def commit_challenger_then_replace(source, destination):
-                    model_catalog.persist_routes(challenger_con, challenger)
-                    real_replace(source, destination)
+                clock = mock.Mock()
+                clock.now.side_effect = lambda *_args, **_kwargs: (
+                    base + timedelta(minutes=1)
+                    if threading.current_thread().name == "challenger"
+                    else base
+                )
+                clock.fromisoformat.side_effect = datetime.fromisoformat
 
-                with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+                def build_for_thread(*_args, **_kwargs):
+                    if threading.current_thread().name == "challenger":
+                        if challenger_state == "failed":
+                            raise RuntimeError("newer refresh failed")
+                        return challenger
+                    return older
+
+                def pause_owner_after_authority_read(con):
+                    authority = real_authority(con)
+                    if threading.current_thread().name == "owner":
+                        authority_read.set()
+                        if not release_owner.wait(5):
+                            raise AssertionError("owner publication was not resumed")
+                    return authority
+
+                def observe_challenger_lock(fd, operation):
+                    if threading.current_thread().name == "challenger":
+                        challenger_waiting.set()
+                    return real_flock(fd, operation)
+
+                def refresh(name):
+                    con = sqlite3.connect(db_path, timeout=5)
+                    con.row_factory = sqlite3.Row
+                    try:
+                        responses[name] = model_catalog.catalog(
+                            refresh=True, con=con,
+                            opencode_provider=lambda: [],
+                            harness_probe=lambda: statuses,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        failures.append(exc)
+                    finally:
+                        con.close()
+
+                with mock.patch.object(
                     model_catalog, "CACHE", Path(tmp) / "model_catalog.json"
                 ), mock.patch.object(
-                    model_catalog, "build", return_value=older
+                    model_catalog, "build", side_effect=build_for_thread
                 ), mock.patch.object(
-                    model_catalog.os, "replace",
-                    side_effect=commit_challenger_then_replace,
-                ) as replace:
-                    response = model_catalog.catalog(
-                        refresh=True, con=older_con,
-                        opencode_provider=lambda: [],
-                        harness_probe=lambda: statuses,
+                    model_catalog, "datetime", clock
+                ), mock.patch.object(
+                    model_catalog, "_authoritative_generation",
+                    side_effect=pause_owner_after_authority_read,
+                ), mock.patch.object(
+                    model_catalog.fcntl, "flock",
+                    side_effect=observe_challenger_lock,
+                ):
+                    owner_thread = threading.Thread(
+                        target=refresh, args=("owner",), name="owner"
                     )
-                    cache_exists = model_catalog.CACHE.exists()
+                    challenger_thread = threading.Thread(
+                        target=refresh, args=("challenger",), name="challenger"
+                    )
+                    owner_thread.start()
+                    try:
+                        self.assertTrue(authority_read.wait(5))
+                        challenger_thread.start()
+                        self.assertTrue(challenger_waiting.wait(5))
+                        generations_while_owned = observer.execute(
+                            "SELECT generation_id FROM model_catalog_generations"
+                        ).fetchall()
+                        self.assertEqual(len(generations_while_owned), 1)
+                        self.assertFalse(model_catalog.CACHE.exists())
+                        self.assertNotIn("challenger", responses)
+                    finally:
+                        release_owner.set()
+                        owner_thread.join(5)
+                        if challenger_thread.ident is not None:
+                            challenger_thread.join(5)
+                    self.assertFalse(owner_thread.is_alive())
+                    self.assertFalse(challenger_thread.is_alive())
+                    cached = json.loads(model_catalog.CACHE.read_text())
 
-                generations = older_con.execute(
+                self.assertEqual(failures, [])
+                generations = observer.execute(
                     "SELECT generation_id,state FROM model_catalog_generations "
                     "ORDER BY completed_at,generation_id"
                 ).fetchall()
-                fresh_routes = older_con.execute(
+                fresh_routes = observer.execute(
                     "SELECT selector,generation_id,stale,last_error "
                     "FROM model_routes WHERE stale=0 ORDER BY selector"
                 ).fetchall()
-                authority = generations[-1]
-                self.assertEqual(replace.call_count, 1)
-                self.assertFalse(response["generation_published"])
-                self.assertTrue(response["stale"])
-                self.assertEqual(
-                    response["error"],
-                    "Catalogue changed during refresh; retry",
-                )
-                self.assertFalse(cache_exists)
+                winner = responses["challenger"]
+                self.assertTrue(responses["owner"]["generation_published"])
+                self.assertTrue(winner["generation_published"])
                 self.assertEqual(len(generations), 2)
-                self.assertEqual(authority["state"], challenger_state)
                 self.assertEqual(
-                    authority["generation_id"],
-                    challenger["catalogue_generation"],
+                    generations[-1]["generation_id"],
+                    winner["catalogue_generation"],
                 )
+                self.assertEqual(
+                    cached["catalogue_generation"],
+                    winner["catalogue_generation"],
+                )
+                self.assertEqual(cached["generation_state"], challenger_state)
                 if challenger_state == "successful":
-                    self.assertEqual(len(fresh_routes), 1)
                     self.assertEqual(
-                        tuple(fresh_routes[0]),
-                        ("replace-newer", authority["generation_id"], 0, None),
+                        [tuple(row) for row in fresh_routes],
+                        [("owner-newer", winner["catalogue_generation"], 0, None)],
                     )
                 else:
                     self.assertEqual(fresh_routes, [])
