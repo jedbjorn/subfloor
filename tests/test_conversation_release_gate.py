@@ -276,9 +276,22 @@ class CrossHarnessReleaseGateTest(unittest.TestCase):
                         "native_variant_ids": {
                             "low": "low", "high": "high",
                         } if opencode else {},
+                        "adapter_metadata_by_effort": {
+                            effort: {
+                                "compatibility_manifest": "opencode-1.18.9-v1",
+                                "provider_family": "openai-ai-sdk",
+                                "variant_options": {"reasoningEffort": effort},
+                            }
+                            for effort in ("low", "high")
+                        } if opencode else {},
                     }),
                     json.dumps({
-                        "variant_options": {"reasoningEffort": "high"},
+                        "compatibility_manifest": "opencode-1.18.9-v1",
+                        "provider_family": "openai-ai-sdk",
+                        "variant_options_by_effort": {
+                            effort: {"reasoningEffort": effort}
+                            for effort in ("low", "high")
+                        },
                     }) if opencode else "{}",
                 ),
             )

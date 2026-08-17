@@ -13,7 +13,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
+sys.path.insert(0, str(ENGINE / "api"))
 
+import route_bindings  # noqa: E402
 import run as run_mod  # noqa: E402
 from conversation_broker import BrokerRun  # noqa: E402
 from conversation_launch import (  # noqa: E402
@@ -53,6 +55,75 @@ def make_run(
         runner_ref=None,
         state="leased",
     )
+
+
+def harness_default_binding(harness: str = "kimi") -> dict:
+    binding = {
+        "contract_version": 2,
+        "control_state": "harness-default",
+        "harness": harness,
+        "requested_model": None,
+        "provider_model": None,
+        "requested_effort": None,
+        "effective_effort": None,
+        "native_variant_id": None,
+        "transport": "native-default",
+        "catalogue_generation": None,
+        "evidence_digest": None,
+        "selector_binding": None,
+        "adapter_metadata": {},
+    }
+    route_bindings.validate_v2_binding(binding)
+    return binding
+
+
+def controlled_opencode_binding() -> dict:
+    binding = {
+        "contract_version": 2,
+        "control_state": "controlled",
+        "harness": "opencode",
+        "requested_model": "openai/gpt-test",
+        "provider_model": "openai/gpt-test",
+        "requested_effort": "high",
+        "effective_effort": "high",
+        "native_variant_id": "high",
+        "transport": "opencode-route-agent",
+        "catalogue_generation": "a" * 32,
+        "evidence_digest": "b" * 64,
+        "selector_binding": {"kind": "exact-model"},
+        "adapter_metadata": {"variant_options": {"reasoningEffort": "high"}},
+    }
+    route_bindings.validate_v2_binding(binding)
+    return binding
+
+
+def test_bound_headless_route_preserves_harness_default_nulls() -> None:
+    binding = harness_default_binding()
+    route = run_mod.resolve_bound_headless_route(
+        harness="kimi",
+        model=None,
+        effort=None,
+        binding=binding,
+        binding_digest=route_bindings.digest_json(binding),
+    )
+
+    assert route.harness == "kimi"
+    assert route.model is None
+    assert route.effort is None
+
+
+def test_bound_headless_route_uses_exact_controlled_native_variant() -> None:
+    binding = controlled_opencode_binding()
+    route = run_mod.resolve_bound_headless_route(
+        harness="opencode",
+        model="openai/gpt-test",
+        effort="high",
+        binding=binding,
+        binding_digest=route_bindings.digest_json(binding),
+    )
+
+    assert route.model == "openai/gpt-test"
+    assert route.effort == binding["native_variant_id"] == "high"
 
 
 @pytest.fixture

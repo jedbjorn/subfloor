@@ -7,10 +7,12 @@ import json
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,8 +23,10 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 
 import conversation_broker
 import conversation_events
+import conversation_launch
 import conversation_routes
 import sprint_participant_chats
+from conversation_adapters import NativeTurn, NormalizedEvent
 from segmented_response_traces import (
     HISTORICAL_SEGMENT_TRACES,
     PENDING_BOUNDARY_TRACE,
@@ -130,9 +134,23 @@ class ConversationApiCase(unittest.TestCase):
                     "digests": {"low": "d" * 64, "high": "e" * 64},
                     "native_variant_ids": {"low": "low", "high": "high"}
                     if opencode else {},
+                    "adapter_metadata_by_effort": {
+                        effort: {
+                            "compatibility_manifest": "opencode-1.18.9-v1",
+                            "provider_family": "openai-ai-sdk",
+                            "variant_options": {"reasoningEffort": effort},
+                        }
+                        for effort in ("low", "high")
+                    } if opencode else {},
                 }),
-                json.dumps({"variant_options": {"reasoningEffort": "high"}})
-                if opencode else "{}",
+                json.dumps({
+                    "compatibility_manifest": "opencode-1.18.9-v1",
+                    "provider_family": "openai-ai-sdk",
+                    "variant_options_by_effort": {
+                        effort: {"reasoningEffort": effort}
+                        for effort in ("low", "high")
+                    },
+                }) if opencode else "{}",
             ),
         )
 
@@ -1132,6 +1150,129 @@ class ConversationResourceTest(ConversationApiCase):
                 con.execute("SELECT COUNT(*) FROM conversations").fetchone()[0],
                 1,
             )
+
+    def test_harness_default_first_prompt_dispatches_without_route_defaults(
+        self,
+    ) -> None:
+        status, _, created = self.request(
+            "POST",
+            "/api/conversations",
+            body={"shell_id": 1, "harness": "kimi", "model": None},
+            key="kimi-native-default-dispatch",
+        )
+        self.assertEqual(status, 201, created)
+        conversation_id = created["conversation_id"]
+        status, _, accepted = self.request(
+            "POST",
+            f"/api/conversations/{conversation_id}/messages",
+            body={"text": "dispatch without defaults"},
+            key="kimi-native-default-message",
+        )
+        self.assertEqual(status, 202, accepted)
+        with self.connect() as con:
+            con.execute(
+                "INSERT INTO shell_memory_archives "
+                "(archive_id,shell_id,session_id,date) "
+                "VALUES (42,1,'native-default-session','2026-08-17')"
+            )
+
+        prepared_calls = []
+        dispatched_contexts = []
+
+        def prepare(**kwargs):
+            prepared_calls.append(kwargs)
+            binding = kwargs["route_binding"]
+            self.assertEqual(
+                kwargs["binding_digest"],
+                conversation_broker.route_transport.route_bindings.digest_json(
+                    binding
+                ),
+            )
+            self.assertEqual(binding["control_state"], "harness-default")
+            self.assertEqual(binding["transport"], "native-default")
+            self.assertIsNone(binding["requested_model"])
+            self.assertIsNone(binding["effective_effort"])
+            return SimpleNamespace(
+                cwd=str(self.root / ".sc-worktrees" / "dev"),
+                archive_id=42,
+                harness="kimi",
+                model=None,
+                effort=None,
+                env={"SC_HARNESS": "kimi"},
+            )
+
+        class DeterministicAdapter:
+            def start(adapter_self, context, message):
+                dispatched_contexts.append(context)
+                self.assertEqual(message, "dispatch without defaults")
+                return NativeTurn(
+                    harness="kimi",
+                    session_ref="native-default-session",
+                    run_ref="native-default-run",
+                    worktree=context.checked_worktree(),
+                )
+
+            def stream(adapter_self, _turn):
+                yield NormalizedEvent("run.completed", {"status": "completed"})
+
+            def close(adapter_self):
+                pass
+
+        preparer = conversation_launch.ConversationLaunchPreparer(
+            self.db_path,
+            prepare_launch=prepare,
+            liveness=lambda: {"supported": True, "processes": []},
+        )
+        broker = conversation_broker.ConversationBroker(
+            self.db_path,
+            adapter_factory=lambda _harness: DeterministicAdapter(),
+            launch_preparer=preparer,
+            owner="native-default-test-broker",
+            heartbeat_seconds=60,
+            recovery_seconds=60,
+        )
+        broker.start()
+        self.addCleanup(broker.join, 2)
+        self.addCleanup(broker.stop)
+        self.assertTrue(broker.wait_started())
+        broker.notify()
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with closing(self.connect()) as con:
+                row = con.execute(
+                    "SELECT state,error_code FROM conversation_runs "
+                    "WHERE conversation_id=?",
+                    (conversation_id,),
+                ).fetchone()
+            if row is not None and row["state"] == "succeeded":
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("Harness-default prompt did not dispatch successfully")
+
+        broker.stop()
+        broker.join(2)
+        self.assertFalse(broker.is_alive())
+        self.assertEqual(len(prepared_calls), 1)
+        self.assertEqual(len(dispatched_contexts), 1)
+        context = dispatched_contexts[0]
+        self.assertIsNone(context.model)
+        self.assertIsNone(context.effort)
+        self.assertEqual(context.route_binding["control_state"], "harness-default")
+        self.assertRegex(context.binding_digest, r"^[0-9a-f]{64}$")
+        with closing(self.connect()) as con:
+            run = con.execute(
+                "SELECT state,error_code,error_detail FROM conversation_runs "
+                "WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+            run_count = con.execute(
+                "SELECT COUNT(*) FROM conversation_runs WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()[0]
+        self.assertEqual(tuple(run), ("succeeded", None, None))
+        self.assertEqual(run_count, 1)
 
     def test_create_is_idempotent_and_never_exposes_native_identity(self) -> None:
         first = self.create(title="API")
