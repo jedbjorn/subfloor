@@ -81,14 +81,7 @@ def controlled_bundle(
     return {
         "runtime_status": status,
         "runtime_scope": scope,
-        "source_evidence": server.route_bindings.SourceEvidence(
-            harness=harness,
-            selector=selector,
-            runtime=scope["runtime"],
-            runtime_identity=scope["runtime_identity"],
-            harness_version=status["version"],
-            fingerprint=fingerprint,
-        ),
+        "source_fingerprint": fingerprint,
     }
 
 

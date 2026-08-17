@@ -951,12 +951,22 @@ def controlled_route_evidence(
     harness: str,
     selector: str,
     *,
-    env=os.environ,
-    run=subprocess.run,
-    opencode_provider=opencode_connected_models,
-    harness_probe=harness_versions.compatibility_status,
+    env=None,
+    run=None,
+    opencode_provider=None,
+    harness_probe=None,
 ) -> dict:
     """Probe one controlled route and bind its source to this runtime seat."""
+    env = os.environ if env is None else env
+    run = subprocess.run if run is None else run
+    opencode_provider = (
+        opencode_connected_models if opencode_provider is None
+        else opencode_provider
+    )
+    harness_probe = (
+        harness_versions.compatibility_status
+        if harness_probe is None else harness_probe
+    )
     harness = (harness or "").strip().lower()
     scope = harness_versions.runtime_scope()
     entries: list[dict]
@@ -1001,18 +1011,10 @@ def controlled_route_evidence(
         fingerprint = _entry_evidence(
             harness, entry, status
         )["source_fingerprint"]
-    source_evidence = route_bindings.SourceEvidence(
-        harness=harness,
-        selector=selector,
-        runtime=status.get("runtime"),
-        runtime_identity=status.get("runtime_identity"),
-        harness_version=status.get("version"),
-        fingerprint=fingerprint,
-    )
     return {
         "runtime_status": status,
         "runtime_scope": scope,
-        "source_evidence": source_evidence,
+        "source_fingerprint": fingerprint,
     }
 
 
@@ -1026,7 +1028,7 @@ def current_source_fingerprint(harness: str, selector: str, *, env=os.environ,
         harness, selector, env=env, run=run,
         opencode_provider=opencode_provider, harness_probe=harness_probe,
     )
-    return evidence["source_evidence"].fingerprint
+    return evidence["source_fingerprint"]
 
 
 def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,

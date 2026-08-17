@@ -116,14 +116,62 @@ def controlled_bundle(
     return {
         "runtime_status": status,
         "runtime_scope": scope,
-        "source_evidence": route_bindings.SourceEvidence(
-            harness=harness,
-            selector=selector,
-            runtime=scope["runtime"],
-            runtime_identity=scope["runtime_identity"],
-            harness_version=status["version"],
-            fingerprint=fingerprint,
+        "source_fingerprint": fingerprint,
+    }
+
+
+def controlled_proof(
+    harness: str, selector: str, status: dict, fingerprint: str | None
+):
+    with mock.patch.object(
+        mc, "controlled_route_evidence",
+        return_value=controlled_bundle(harness, selector, status, fingerprint),
+    ) as collector:
+        proof = route_bindings.probe_controlled_route(harness, selector)
+    collector.assert_called_once_with(harness, selector)
+    return proof
+
+
+def controlled_row(
+    harness: str, selector: str, status: dict, fingerprint: str
+) -> dict:
+    sources = {
+        "claude": ("claude-cli", "claude-portable-manifest"),
+        "codex": ("codex-cache", "codex-model-cache"),
+        "kimi": ("kimi-config", "kimi-alias-config"),
+        "opencode": (
+            "opencode-provider-api", "opencode-connected-variant"
         ),
+    }
+    source, evidence_kind = sources[harness]
+    metadata = {
+        "supported": ["high"],
+        "default": "high",
+        "digests": {"high": "4" * 64},
+        "native_variant_ids": (
+            {"high": "high"} if harness == "opencode" else {}
+        ),
+    }
+    return {
+        "harness": harness,
+        "selector": selector,
+        "provider_model": selector,
+        "source": source,
+        "availability": "available",
+        "headless_supported": 1,
+        "stale": 0,
+        "last_error": None,
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+        "generation_id": "1" * 32,
+        "evidence_kind": evidence_kind,
+        "source_fingerprint": fingerprint,
+        "cli_version": f"{harness} {status['version']}",
+        "harness_version": status["version"],
+        "harness_compatibility": status["compatibility"],
+        "supported_efforts": ["high"],
+        "effort_metadata": metadata,
+        "selector_binding": {"kind": "exact-model", "selector": selector},
+        "adapter_metadata": {},
     }
 
 
@@ -237,27 +285,57 @@ class ControlledRouteEvidenceTest(unittest.TestCase):
                     )
                 self.assertEqual(proof["runtime_status"], status)
                 self.assertEqual(proof["runtime_scope"], sandbox)
-                self.assertEqual(
-                    proof["source_evidence"].harness, harness
-                )
-                self.assertEqual(
-                    proof["source_evidence"].selector, selector
-                )
-                self.assertEqual(
-                    proof["source_evidence"].runtime, sandbox["runtime"]
-                )
-                self.assertEqual(
-                    proof["source_evidence"].runtime_identity,
-                    sandbox["runtime_identity"],
-                )
-                self.assertEqual(
-                    proof["source_evidence"].harness_version,
-                    versions[harness],
-                )
                 self.assertRegex(
-                    proof["source_evidence"].fingerprint,
+                    proof["source_fingerprint"],
                     r"^[0-9a-f]{64}$",
                 )
+
+                canonical_toml_available = mock.patch.object(
+                    mc.toml_compat, "AVAILABLE", True
+                ) if harness == "kimi" else contextlib.nullcontext()
+                canonical_toml_loads = mock.patch.object(
+                    mc.toml_compat, "loads", return_value={
+                        "models": {"configured-alias": {
+                            "provider": "moonshot",
+                            "model": "kimi-k2",
+                            "support_efforts": ["low", "high"],
+                            "default_effort": "high",
+                        }},
+                    }
+                ) if harness == "kimi" else contextlib.nullcontext()
+                with (
+                    self.subTest(harness=harness, state="canonical-resolver"),
+                    mock.patch.dict(mc.os.environ, envs[harness], clear=True),
+                    mock.patch.object(mc.subprocess, "run", side_effect=run),
+                    mock.patch.object(
+                        mc, "opencode_connected_models", return_value=connected
+                    ),
+                    mock.patch.object(
+                        mc.harness_versions, "compatibility_status",
+                        return_value={harness: status},
+                    ),
+                    mock.patch.object(
+                        mc.harness_versions, "runtime_scope",
+                        return_value=sandbox,
+                    ),
+                    mock.patch.object(
+                        mc.shutil, "which", return_value=f"/bin/{harness}"
+                    ),
+                    canonical_toml_available,
+                    canonical_toml_loads,
+                ):
+                    binding, digest = route_bindings.resolve_v2(
+                        controlled_row(
+                            harness, selector, status,
+                            proof["source_fingerprint"],
+                        ),
+                        harness,
+                        selector,
+                        "high",
+                    )
+                self.assertEqual(binding["requested_model"], selector)
+                self.assertEqual(binding["effective_effort"], "high")
+                self.assertRegex(digest, r"^[0-9a-f]{64}$")
 
                 missing_env = {
                     "codex": {"CODEX_HOME": str(root / "missing-codex")},
@@ -289,17 +367,7 @@ class ControlledRouteEvidenceTest(unittest.TestCase):
                         opencode_provider=missing_provider,
                         harness_probe=lambda: {harness: status},
                     )
-                self.assertEqual(
-                    missing["source_evidence"],
-                    route_bindings.SourceEvidence(
-                        harness=harness,
-                        selector=selector,
-                        runtime=sandbox["runtime"],
-                        runtime_identity=sandbox["runtime_identity"],
-                        harness_version=versions[harness],
-                        fingerprint=None,
-                    ),
-                )
+                self.assertIsNone(missing["source_fingerprint"])
 
 
 class BuildTest(NoCLI):
@@ -514,13 +582,17 @@ class RoutePersistenceTest(unittest.TestCase):
             "SELECT source_fingerprint FROM model_routes WHERE harness='codex' "
             "AND selector='gpt-5.6-sol'"
         ).fetchone()[0]
-        got = routes_cli.resolve(
-            self.con, "codex", "gpt-5.6-sol", shell="DEV3",
-            source_evidence=controlled_bundle(
-                "codex", "gpt-5.6-sol",
-                runtime_status("0.145.0", harness="codex"), fingerprint,
-            )["source_evidence"],
-            runtime_status=runtime_status("0.145.0", harness="codex"))
+        observation = controlled_bundle(
+            "codex", "gpt-5.6-sol",
+            runtime_status("0.145.0", harness="codex"), fingerprint,
+        )
+        with mock.patch.object(
+            mc, "controlled_route_evidence", return_value=observation
+        ) as collector:
+            got = routes_cli.resolve(
+                self.con, "codex", "gpt-5.6-sol", shell="DEV3"
+            )
+        collector.assert_called_once_with("codex", "gpt-5.6-sol")
         self.assertTrue(got["ok"])
         self.assertEqual(
             got["command"],
@@ -539,14 +611,17 @@ class RoutePersistenceTest(unittest.TestCase):
             "SELECT source_fingerprint FROM model_routes WHERE harness='kimi' "
             "AND selector='kimi-code/legacy'"
         ).fetchone()[0]
-        got = routes_cli.resolve(
-            self.con, "kimi", "kimi-code/legacy",
-            source_evidence=controlled_bundle(
-                "kimi", "kimi-code/legacy",
-                runtime_status("0.33.0", harness="kimi"), fingerprint,
-            )["source_evidence"],
-            runtime_status=runtime_status("0.33.0", harness="kimi"),
+        observation = controlled_bundle(
+            "kimi", "kimi-code/legacy",
+            runtime_status("0.33.0", harness="kimi"), fingerprint,
         )
+        with mock.patch.object(
+            mc, "controlled_route_evidence", return_value=observation
+        ) as collector:
+            got = routes_cli.resolve(
+                self.con, "kimi", "kimi-code/legacy"
+            )
+        collector.assert_called_once_with("kimi", "kimi-code/legacy")
         self.assertFalse(got["ok"])
         self.assertEqual(got["code"], "unsupported_thinking_level")
 

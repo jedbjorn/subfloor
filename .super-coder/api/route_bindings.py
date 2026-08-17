@@ -90,14 +90,44 @@ class RuntimeEvidence:
         })
 
 
-@dataclass(frozen=True)
-class SourceEvidence:
-    harness: str | None
-    selector: str | None
-    runtime: str | None
-    runtime_identity: str | None
-    harness_version: str | None
-    fingerprint: str | None
+_CONTROLLED_PROOF_ISSUER = object()
+
+
+class _ControlledRouteProof:
+    """Opaque result of one resolver-owned runtime and source observation."""
+
+    __slots__ = (
+        "_harness", "_selector", "_runtime_status", "_runtime",
+        "_runtime_identity", "_source_fingerprint", "_issuer",
+    )
+
+    def __init__(
+        self,
+        issuer,
+        *,
+        harness: str,
+        selector: str,
+        runtime_status: RuntimeEvidence,
+        runtime_scope: dict,
+        source_fingerprint: str | None,
+    ) -> None:
+        if issuer is not _CONTROLLED_PROOF_ISSUER:
+            raise TypeError(
+                "controlled route proofs are issued only by the canonical probe"
+            )
+        object.__setattr__(self, "_harness", harness)
+        object.__setattr__(self, "_selector", selector)
+        object.__setattr__(self, "_runtime_status", runtime_status)
+        object.__setattr__(self, "_runtime", runtime_scope.get("runtime"))
+        object.__setattr__(
+            self, "_runtime_identity", runtime_scope.get("runtime_identity")
+        )
+        object.__setattr__(self, "_source_fingerprint", source_fingerprint)
+        object.__setattr__(self, "_issuer", issuer)
+
+    def __setattr__(self, _name, _value) -> None:
+        raise AttributeError("controlled route proofs are immutable")
+
 
 def canonical_json(value: Any) -> str:
     return json.dumps(
@@ -349,6 +379,7 @@ def _require_runtime(
                 "expected_runtime": expected_runtime,
                 "expected_runtime_identity": expected_identity,
                 "runtime_error": status.error,
+                "persist_route_stale": error_code != "thinking_evidence_stale",
                 "remediation": "install or repair the compatible harness runtime",
             },
         )
@@ -370,6 +401,7 @@ def _require_runtime(
                 "version": version,
                 "compatibility": status.compatibility,
                 "runtime_error": "HARNESS_COMPATIBILITY_EVIDENCE_INVALID",
+                "persist_route_stale": error_code != "thinking_evidence_stale",
                 "remediation": "re-probe the harness in the execution runtime",
             },
         )
@@ -415,22 +447,80 @@ def _require_controlled_runtime(
     return status
 
 
+def probe_controlled_route(harness: str, model: str) -> _ControlledRouteProof:
+    """Collect one indivisible execution-seat proof for an exact route.
+
+    The public resolver accepts only this opaque result, never caller-authored
+    runtime labels or a source digest copied from durable catalogue state.
+    Importing lazily avoids the catalogue's binding-schema import cycle.
+    """
+    harness = normalize_harness(harness)
+    model = _normalize_model(model)
+    if model is None or harness == "vibe":
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            "Controlled route proof requires an exact controlled route",
+            {"harness": harness, "model": model},
+        )
+    import model_catalog  # noqa: PLC0415
+
+    observation = model_catalog.controlled_route_evidence(harness, model)
+    status = RuntimeEvidence.from_value(observation.get("runtime_status"))
+    scope = observation.get("runtime_scope")
+    if not isinstance(scope, dict):
+        scope = {}
+    return _ControlledRouteProof(
+        _CONTROLLED_PROOF_ISSUER,
+        harness=harness,
+        selector=model,
+        runtime_status=status,
+        runtime_scope=scope,
+        source_fingerprint=observation.get("source_fingerprint"),
+    )
+
+
+def _controlled_proof(
+    proof: _ControlledRouteProof | None,
+    harness: str,
+    model: str,
+    *,
+    collect: bool,
+) -> _ControlledRouteProof:
+    if proof is None and collect:
+        proof = probe_controlled_route(harness, model)
+    if (
+        not isinstance(proof, _ControlledRouteProof)
+        or proof._issuer is not _CONTROLLED_PROOF_ISSUER
+        or proof._harness != harness
+        or proof._selector != model
+    ):
+        raise RouteResolutionError(
+            "thinking_evidence_stale",
+            "Route proof was not collected by the canonical execution-seat probe",
+            {
+                "harness": harness,
+                "model": model,
+                "persist_route_stale": False,
+                "remediation": "re-probe the route in the execution runtime",
+            },
+        )
+    return proof
+
+
 def _require_controlled_source(
     row: dict,
     harness: str,
     model: str,
     runtime: RuntimeEvidence,
-    source_evidence: SourceEvidence | None,
+    proof: _ControlledRouteProof,
 ) -> None:
-    """Require source evidence captured in the same execution seat."""
-    source = source_evidence if isinstance(source_evidence, SourceEvidence) \
-        else SourceEvidence(None, None, None, None, None, None)
+    """Require the canonical probe's source to match its runtime and the row."""
     coherent = (
-        source.harness == harness
-        and source.selector == model
-        and source.runtime == runtime.runtime
-        and source.runtime_identity == runtime.runtime_identity
-        and source.harness_version == runtime.version
+        proof._harness == harness
+        and proof._selector == model
+        and proof._runtime_status.runtime == runtime.runtime
+        and proof._runtime_status.runtime_identity == runtime.runtime_identity
+        and proof._runtime_status.version == runtime.version
     )
     if not coherent:
         raise RouteResolutionError(
@@ -439,11 +529,11 @@ def _require_controlled_source(
             {
                 "harness": harness,
                 "model": model,
-                "evidence_harness": source.harness,
-                "evidence_model": source.selector,
-                "evidence_runtime": source.runtime,
-                "evidence_runtime_identity": source.runtime_identity,
-                "evidence_harness_version": source.harness_version,
+                "evidence_harness": proof._harness,
+                "evidence_model": proof._selector,
+                "evidence_runtime": proof._runtime_status.runtime,
+                "evidence_runtime_identity": proof._runtime_status.runtime_identity,
+                "evidence_harness_version": proof._runtime_status.version,
                 "runtime": runtime.runtime,
                 "runtime_identity": runtime.runtime_identity,
                 "runtime_harness_version": runtime.version,
@@ -459,7 +549,7 @@ def _require_controlled_source(
             {"harness": harness, "model": model,
              "remediation": "sc models refresh"},
         )
-    if source.fingerprint != stored_fingerprint:
+    if proof._source_fingerprint != stored_fingerprint:
         raise RouteResolutionError(
             "thinking_evidence_stale",
             "Installed route source changed after refresh",
@@ -568,9 +658,7 @@ def require_fresh_route(
     model: str | None,
     *,
     now: datetime | None = None,
-    source_evidence: SourceEvidence | None = None,
-    runtime_status: dict | RuntimeEvidence | None = None,
-    runtime_scope: dict | None = None,
+    route_proof: _ControlledRouteProof | None = None,
 ) -> dict | None:
     """Validate and stage one exact route's freshness in the caller's write."""
     harness = normalize_harness(harness)
@@ -620,14 +708,16 @@ def require_fresh_route(
         _validate_route_freshness(
             row, harness, model, now=check_time,
         )
-        if (runtime_status is not None or runtime_scope is not None
-                or source_evidence is not None):
-            runtime = _require_controlled_runtime(
-                row, harness, model, runtime_status, runtime_scope
-            )
-            _require_controlled_source(
-                row, harness, model, runtime, source_evidence
-            )
+        proof = _controlled_proof(
+            route_proof, harness, model, collect=False
+        )
+        runtime = _require_controlled_runtime(
+            row, harness, model,
+            proof._runtime_status,
+            {"runtime": proof._runtime,
+             "runtime_identity": proof._runtime_identity},
+        )
+        _require_controlled_source(row, harness, model, runtime, proof)
         latest = con.execute(
             "SELECT generation_id,completed_at FROM model_catalog_generations "
             "WHERE state='successful' "
@@ -693,20 +783,18 @@ def resolve_persisted_v2(
     effort: str | None = None,
     *,
     now: datetime | None = None,
-    source_evidence: SourceEvidence | None = None,
+    route_proof: _ControlledRouteProof | None = None,
     runtime_status: dict | None = None,
     runtime_scope: dict | None = None,
 ) -> tuple[dict, str]:
     """Resolve through the shared durable freshness boundary."""
     fresh_row = require_fresh_route(
         con, row, harness, model, now=now,
-        source_evidence=source_evidence,
-        runtime_status=runtime_status,
-        runtime_scope=runtime_scope,
+        route_proof=route_proof,
     )
     return resolve_v2(
         fresh_row, harness, model, effort, now=now,
-        source_evidence=source_evidence,
+        route_proof=route_proof,
         runtime_status=runtime_status,
         runtime_scope=runtime_scope,
     )
@@ -719,7 +807,7 @@ def resolve_v2(
     effort: str | None = None,
     *,
     now: datetime | None = None,
-    source_evidence: SourceEvidence | None = None,
+    route_proof: _ControlledRouteProof | None = None,
     runtime_status: dict | None = None,
     runtime_scope: dict | None = None,
 ) -> tuple[dict, str]:
@@ -783,12 +871,13 @@ def resolve_v2(
     _validate_route_freshness(
         row, harness, model, now=check_time,
     )
+    proof = _controlled_proof(route_proof, harness, model, collect=True)
     runtime = _require_controlled_runtime(
-        row, harness, model, runtime_status, runtime_scope
+        row, harness, model, proof._runtime_status,
+        {"runtime": proof._runtime,
+         "runtime_identity": proof._runtime_identity},
     )
-    _require_controlled_source(
-        row, harness, model, runtime, source_evidence
-    )
+    _require_controlled_source(row, harness, model, runtime, proof)
 
     supported, effort_metadata = _supported_efforts(row)
     if requested not in supported:

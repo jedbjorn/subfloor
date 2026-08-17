@@ -501,9 +501,7 @@ _ROUTE_NOT_OBSERVED = object()
 
 def _model_route_available_in_transaction(
     con, observed_route: dict | None, harness: str, selector: str,
-    source_evidence: route_bindings.SourceEvidence | None,
-    runtime_status: dict | None,
-    runtime_scope: dict | None,
+    route_proof,
 ) -> bool:
     if (
         observed_route is None
@@ -525,9 +523,7 @@ def _model_route_available_in_transaction(
     try:
         route_bindings.require_fresh_route(
             con, observed_route, harness, selector,
-            source_evidence=source_evidence,
-            runtime_status=runtime_status,
-            runtime_scope=runtime_scope,
+            route_proof=route_proof,
         )
     except route_bindings.RouteResolutionError:
         return False
@@ -536,10 +532,8 @@ def _model_route_available_in_transaction(
 
 def model_route_available(
     con, harness: str, selector: str, *,
-    source_evidence: route_bindings.SourceEvidence | None = None,
+    route_proof=None,
     observed_route=_ROUTE_NOT_OBSERVED,
-    runtime_status: dict | None = None,
-    runtime_scope: dict | None = None,
 ) -> bool:
     """True only for an exact route proved available by the local catalogue."""
     if observed_route is _ROUTE_NOT_OBSERVED:
@@ -552,26 +546,19 @@ def model_route_available(
             (harness, selector),
         ).fetchone()
         observed_route = dict(row) if row else None
-    if harness != "vibe" and (
-            source_evidence is None or runtime_status is None
-            or runtime_scope is None):
+    if harness != "vibe" and route_proof is None:
         if con.in_transaction:
             raise RuntimeError(
                 "transactional route checks require precomputed route evidence"
             )
-        evidence = model_catalog.controlled_route_evidence(harness, selector)
-        source_evidence = evidence["source_evidence"]
-        runtime_scope = evidence["runtime_scope"]
-        runtime_status = evidence["runtime_status"]
+        route_proof = route_bindings.probe_controlled_route(harness, selector)
     if con.in_transaction:
         return _model_route_available_in_transaction(
-            con, observed_route, harness, selector, source_evidence,
-            runtime_status, runtime_scope,
+            con, observed_route, harness, selector, route_proof,
         )
     with db_driver.write_transaction(con, "model_route.available"):
         return _model_route_available_in_transaction(
-            con, observed_route, harness, selector, source_evidence,
-            runtime_status, runtime_scope,
+            con, observed_route, harness, selector, route_proof,
         )
 
 
@@ -602,9 +589,7 @@ def set_flavor_default(con, body) -> tuple[bool, str | None]:
                 "invalid_model_route: model must be null for Harness default "
                 "or an exact non-empty available route")
         model = raw_model.strip() if isinstance(raw_model, str) else None
-    source_evidence = None
-    runtime_status = None
-    runtime_scope = None
+    route_proof = None
     observed_route = None
     if model is not None:
         row = con.execute(
@@ -613,17 +598,12 @@ def set_flavor_default(con, body) -> tuple[bool, str | None]:
         ).fetchone()
         observed_route = dict(row) if row else None
         if harness != "vibe":
-            evidence = model_catalog.controlled_route_evidence(harness, model)
-            runtime_scope = evidence["runtime_scope"]
-            runtime_status = evidence["runtime_status"]
-            source_evidence = evidence["source_evidence"]
+            route_proof = route_bindings.probe_controlled_route(harness, model)
     with db_driver.write_transaction(con, "flavor_default.set"):
         if model is not None and not model_route_available(
                 con, harness, model,
-                source_evidence=source_evidence,
-                observed_route=observed_route,
-                runtime_status=runtime_status,
-                runtime_scope=runtime_scope):
+                route_proof=route_proof,
+                observed_route=observed_route):
             return False, (
                 f"invalid_model_route: {model!r} is not an exact currently "
                 f"available route for {harness}; choose an available "
