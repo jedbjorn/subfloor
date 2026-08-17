@@ -87,14 +87,14 @@ def resolve(con, harness: str, selector: str | None = None, *,
             None, harness, selector, shell=shell, effort=effort, now=now,
             current_source_fingerprint=current_source_fingerprint,
         )
+    observed_row = _route(con, harness, selector)
     if current_source_fingerprint is None:
         current_source_fingerprint = model_catalog.current_source_fingerprint(
             harness, selector
         ) or ""
     with db_driver.write_transaction(con, "model_route.resolve"):
-        row = _route(con, harness, selector)
         return resolve_row(
-            row, harness, selector, shell=shell, effort=effort, now=now,
+            observed_row, harness, selector, shell=shell, effort=effort, now=now,
             current_source_fingerprint=current_source_fingerprint, con=con,
         )
 
@@ -232,12 +232,17 @@ def main(argv: list[str] | None = None) -> int:
             return _print_resolved(_resolution_error(exc), as_json)
         routes = _api_routes(harness=harness, selector=selector) \
             if selector is not None and harness != "vibe" else []
-        fingerprint = (routes[0].get("current_source_fingerprint") or "") \
-            if routes else None
-        data = resolve_row(
-            routes[0] if routes else None, harness, selector, shell=shell,
-            effort=effort, current_source_fingerprint=fingerprint,
-        )
+        route = routes[0] if routes else None
+        resolution_error = (route or {}).get("route_resolution_error")
+        if resolution_error:
+            data = {"ok": False, **resolution_error}
+        else:
+            fingerprint = (route.get("current_source_fingerprint") or "") \
+                if route else None
+            data = resolve_row(
+                route, harness, selector, shell=shell,
+                effort=effort, current_source_fingerprint=fingerprint,
+            )
         return _print_resolved(data, as_json)
 
     con = _open_db()

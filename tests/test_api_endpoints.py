@@ -22,6 +22,8 @@ Run:
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sqlite3
 import sys
@@ -37,6 +39,7 @@ MIGRATIONS = ENGINE / "migrations"
 
 sys.path.insert(0, str(ENGINE / "api"))
 import server  # noqa: E402  (server.py adds scripts/ to the path on import)
+import models as routes_cli  # noqa: E402
 
 
 def build_db() -> sqlite3.Connection:
@@ -915,11 +918,22 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         source.execute(
             "INSERT INTO model_routes (harness,selector,source,availability,"
             "headless_supported,high_effort_supported,supported_efforts,"
-            "cli_version,last_seen_at,generation_id,source_fingerprint,"
-            "harness_version,harness_compatibility) VALUES "
+            "provider_model,cli_version,last_seen_at,generation_id,"
+            "source_fingerprint,harness_version,harness_compatibility,"
+            "evidence_kind,evidence_digest,selector_binding,effort_metadata,"
+            "adapter_metadata) VALUES "
             "('codex','api-model','api-source-v1','available',1,1,'[\"high\"]',"
-            "'codex 1.5.0',datetime('now'),?,?, '1.5.0','verified')",
-            ("a" * 32, "current-fingerprint"),
+            "'api-provider-model','codex 1.5.0',datetime('now'),?,?,"
+            "'1.5.0','verified','codex-model-cache',?,?,?, '{}')",
+            (
+                "a" * 32, "current-fingerprint", "c" * 64,
+                '{"kind":"exact-model","selector":"api-model"}',
+                json.dumps({
+                    "supported": ["high"], "default": "high",
+                    "digests": {"high": "d" * 64},
+                    "native_variant_ids": {},
+                }, separators=(",", ":"), sort_keys=True),
+            ),
         )
         source.commit()
         target = sqlite3.connect(self.path)
@@ -933,20 +947,44 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         return con
 
     def request(self, path: str, token: str | None = "shell-token", *,
-                fingerprint: str = "current-fingerprint"):
+                fingerprint="current-fingerprint"):
         headers = "Host: 127.0.0.1"
         if token is not None:
             headers += f"\r\nAuthorization: Bearer {token}"
+        probe = {"side_effect": fingerprint} if callable(fingerprint) else {
+            "return_value": fingerprint
+        }
         with (
             mock.patch.object(server, "db", side_effect=self.connect),
             mock.patch.object(
                 server.model_catalog,
                 "current_source_fingerprint",
-                return_value=fingerprint,
+                **probe,
             ),
         ):
             status, _headers, body = server.dispatch_http("GET", path, headers, b"")
         return status, json.loads(body)
+
+    def publish_successor(self) -> str:
+        fingerprint = "successor-fingerprint"
+        completed = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+        with self.connect() as con:
+            con.execute(
+                "INSERT INTO model_catalog_generations (generation_id,"
+                "payload_version,contract_version,started_at,completed_at,state,"
+                "runtime,source_summary,harness_versions,source_fingerprints,"
+                "error_summary,payload_digest) VALUES (?,6,2,?,?,"
+                "'successful','host','[]','{}','{}',NULL,?)",
+                ("f" * 32, completed, completed, "e" * 64),
+            )
+            con.execute(
+                "UPDATE model_routes SET generation_id=?,source_fingerprint=?,"
+                "cli_version='codex 1.6.0',harness_version='1.6.0',"
+                "last_seen_at=?,stale=0,last_error=NULL "
+                "WHERE harness='codex' AND selector='api-model'",
+                ("f" * 32, fingerprint, completed),
+            )
+        return fingerprint
 
     def test_model_routes_require_shell_auth_and_apply_exact_filters(self) -> None:
         self.assertEqual(self.request("/_sc/model-routes", None)[0], 401)
@@ -1007,6 +1045,134 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
             "thinking_evidence_stale: Installed route source changed after "
             "refresh; remediation: sc models refresh",
         ))
+
+    def test_authenticated_route_read_retains_pre_probe_identity(self) -> None:
+        successor = None
+        first_body = None
+
+        def publish_after_probe(*_args, **_kwargs):
+            nonlocal successor
+            successor = self.publish_successor()
+            return "current-fingerprint"
+
+        def api(method, path):
+            nonlocal first_body
+            self.assertEqual(method, "GET")
+            self.assertEqual(
+                path, "/_sc/model-routes?harness=codex&selector=api-model"
+            )
+            status, first_body = self.request(path, fingerprint=publish_after_probe)
+            self.assertEqual(status, 200, first_body)
+            return first_body
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+            mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+            mock.patch.object(routes_cli.mem, "_api", side_effect=api),
+            mock.patch.object(
+                routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = routes_cli.main([
+                "resolve", "Codex", "api-model", "--json",
+            ])
+        result = json.loads(output.getvalue())
+        route = first_body["routes"][0]
+        with self.connect() as con:
+            stored = con.execute(
+                "SELECT generation_id,source_fingerprint,stale,last_error "
+                "FROM model_routes WHERE harness='codex' "
+                "AND selector='api-model'"
+            ).fetchone()
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(result["code"], "thinking_evidence_stale")
+        self.assertEqual(
+            result["error"], "Route evidence changed during resolution; retry"
+        )
+        self.assertEqual(route["generation_id"], "f" * 32)
+        self.assertEqual(route["source_fingerprint"], successor)
+        self.assertEqual(route["stale"], 0)
+        self.assertIsNone(route["last_error"])
+        self.assertEqual(route["route_resolution_error"], {
+            "code": "thinking_evidence_stale",
+            "error": "Route evidence changed during resolution; retry",
+            "details": {
+                "harness": "codex", "model": "api-model",
+                "remediation": "retry route resolution",
+            },
+        })
+        self.assertEqual(tuple(stored), ("f" * 32, successor, 0, None))
+
+        retry_status, retry_body = self.request(
+            "/_sc/model-routes?harness=codex&selector=api-model",
+            fingerprint=successor,
+        )
+        retry_route = retry_body["routes"][0]
+        resolved = routes_cli.resolve_row(
+            retry_route, "codex", "api-model",
+            current_source_fingerprint=successor,
+        )
+        self.assertEqual(retry_status, 200, retry_body)
+        self.assertNotIn("route_resolution_error", retry_route)
+        self.assertTrue(resolved["ok"])
+        self.assertEqual(
+            resolved["binding"]["catalogue_generation"], "f" * 32
+        )
+
+    def test_flavor_route_check_retains_pre_probe_identity(self) -> None:
+        con = self.connect()
+        self.addCleanup(con.close)
+        before = con.execute(
+            "SELECT model FROM flavor_defaults "
+            "WHERE flavor='planner' AND harness='codex'"
+        ).fetchone()[0]
+        successor = None
+
+        def publish_after_probe(*_args, **_kwargs):
+            nonlocal successor
+            successor = self.publish_successor()
+            return "current-fingerprint"
+
+        with mock.patch.object(
+            server.model_catalog,
+            "current_source_fingerprint",
+            side_effect=publish_after_probe,
+        ):
+            ok, err = server.set_flavor_default(con, {
+                "flavor": "planner", "harness": "codex", "model": "api-model",
+            })
+
+        stored = con.execute(
+            "SELECT generation_id,source_fingerprint,stale,last_error "
+            "FROM model_routes WHERE harness='codex' AND selector='api-model'"
+        ).fetchone()
+        unchanged = con.execute(
+            "SELECT model FROM flavor_defaults "
+            "WHERE flavor='planner' AND harness='codex'"
+        ).fetchone()[0]
+        self.assertFalse(ok)
+        self.assertIn("invalid_model_route", err)
+        self.assertEqual(tuple(stored), ("f" * 32, successor, 0, None))
+        self.assertEqual(unchanged, before)
+
+        with mock.patch.object(
+            server.model_catalog,
+            "current_source_fingerprint",
+            return_value=successor,
+        ):
+            retry_ok, retry_err = server.set_flavor_default(con, {
+                "flavor": "planner", "harness": "codex", "model": "api-model",
+            })
+        selected = con.execute(
+            "SELECT model FROM flavor_defaults "
+            "WHERE flavor='planner' AND harness='codex'"
+        ).fetchone()[0]
+        self.assertTrue(retry_ok, retry_err)
+        self.assertIsNone(retry_err)
+        self.assertEqual(selected, "api-model")
 
     def test_catalogue_filters_reject_unknown_or_repeated_input(self) -> None:
         self.assertEqual(

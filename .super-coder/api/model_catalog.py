@@ -503,7 +503,7 @@ def _legacy_persist_routes(con, payload: dict) -> None:
 
 
 def persist_routes(con, payload: dict) -> None:
-    """Publish one complete refresh generation or record one failed attempt."""
+    """Append an attempt; only the newest completed attempt changes routes."""
     try:
         con.execute("SELECT 1 FROM model_catalog_generations LIMIT 1")
     except Exception:
@@ -570,13 +570,18 @@ def persist_routes(con, payload: dict) -> None:
                 payload_digest,
             ),
         )
-        if failed:
+        authoritative = con.execute(
+            "SELECT generation_id FROM model_catalog_generations "
+            "ORDER BY completed_at DESC,generation_id DESC LIMIT 1"
+        ).fetchone()
+        publish_projection = authoritative[0] == generation_id
+        if publish_projection and failed:
             con.execute(
                 "UPDATE model_routes SET stale=1,last_error=?",
                 (payload.get("error") or "; ".join(payload.get("errors") or [])
                  or "partial model refresh",),
             )
-        else:
+        elif publish_projection:
             con.execute(
                 "UPDATE model_routes SET stale=1,last_error='not observed in latest generation'"
             )
@@ -639,6 +644,7 @@ def persist_routes(con, payload: dict) -> None:
                     )
     payload["catalogue_generation"] = generation_id
     payload["generation_state"] = state
+    payload["generation_published"] = publish_projection
 
 
 def _requires_high_effort(harness: str) -> bool:

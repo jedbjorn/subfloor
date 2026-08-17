@@ -18,11 +18,10 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 import model_catalog  # noqa: E402
 import route_bindings  # noqa: E402
 import models as routes_cli  # noqa: E402
-import db_driver  # noqa: E402
 
 
-def route_schema() -> sqlite3.Connection:
-    con = sqlite3.connect(":memory:")
+def route_schema(path: str | Path = ":memory:") -> sqlite3.Connection:
+    con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys=ON")
     con.executescript((
@@ -201,6 +200,18 @@ class GenerationPersistenceTest(unittest.TestCase):
         )
         self.headless.start()
         self.addCleanup(self.headless.stop)
+
+    def shared_connections(self) -> tuple[sqlite3.Connection, sqlite3.Connection]:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "routes.db"
+        first = route_schema(path)
+        second = sqlite3.connect(path)
+        second.row_factory = sqlite3.Row
+        second.execute("PRAGMA foreign_keys=ON")
+        self.addCleanup(first.close)
+        self.addCleanup(second.close)
+        return first, second
 
     @staticmethod
     def status(*, version="0.145.0", compatibility="verified", error=None) -> dict:
@@ -537,51 +548,149 @@ class GenerationPersistenceTest(unittest.TestCase):
             "successful generation; remediation: sc models refresh",
         ))
 
-    def test_obsolete_resolution_cannot_stale_successor_generation(self):
+    def test_direct_resolve_retains_pre_probe_generation_identity(self):
+        resolver, refresher = self.shared_connections()
         first = self.payload("generation-race")
-        model_catalog.persist_routes(self.con, first)
-        old = dict(self.con.execute(
+        first["fetched_at"] = "2026-08-17T00:00:00+00:00"
+        model_catalog.persist_routes(resolver, first)
+        observed = dict(resolver.execute(
             "SELECT * FROM model_routes WHERE selector='generation-race'"
         ).fetchone())
-        second = self.payload("generation-race")
-        second["fetched_at"] = (
-            datetime.now(timezone.utc) + timedelta(minutes=1)
-        ).isoformat()
-        model_catalog.persist_routes(self.con, second)
-        successor = dict(self.con.execute(
-            "SELECT * FROM model_routes WHERE selector='generation-race'"
-        ).fetchone())
-
-        with db_driver.write_transaction(self.con, "test.obsolete_resolution"):
-            with self.assertRaises(route_bindings.RouteResolutionError) as raised:
-                route_bindings.require_fresh_route(
-                    self.con, old, "codex", "generation-race",
-                    current_source_fingerprint=successor["source_fingerprint"],
-                )
-
-        stored = dict(self.con.execute(
-            "SELECT * FROM model_routes WHERE selector='generation-race'"
-        ).fetchone())
-        resolved = routes_cli.resolve(
-            self.con, "codex", "generation-race",
-            current_source_fingerprint=successor["source_fingerprint"],
+        second = self.payload(
+            "generation-race", cli_version="codex-cli 0.146.0",
+            status=self.status(version="0.146.0"),
         )
-        self.assertEqual(raised.exception.code, "thinking_evidence_stale")
+        second["fetched_at"] = "2026-08-17T00:01:00+00:00"
+
+        def publish_successor(*_args, **_kwargs):
+            model_catalog.persist_routes(refresher, second)
+            return observed["source_fingerprint"]
+
+        with mock.patch.object(
+            routes_cli.model_catalog,
+            "current_source_fingerprint",
+            side_effect=publish_successor,
+        ) as probe:
+            got = routes_cli.resolve(resolver, "codex", "generation-race")
+
+        stored = dict(resolver.execute(
+            "SELECT * FROM model_routes WHERE selector='generation-race'"
+        ).fetchone())
+        retried = routes_cli.resolve(
+            resolver, "codex", "generation-race",
+            current_source_fingerprint=stored["source_fingerprint"],
+        )
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(got["code"], "thinking_evidence_stale")
         self.assertEqual(
-            raised.exception.message,
+            got["error"],
             "Route evidence changed during resolution; retry",
         )
-        self.assertNotEqual(old["generation_id"], successor["generation_id"])
-        self.assertEqual(stored["generation_id"], successor["generation_id"])
-        self.assertEqual(stored["source_fingerprint"],
-                         successor["source_fingerprint"])
+        self.assertNotEqual(observed["generation_id"], stored["generation_id"])
+        self.assertNotEqual(observed["source_fingerprint"],
+                            stored["source_fingerprint"])
         self.assertEqual(stored["stale"], 0)
         self.assertIsNone(stored["last_error"])
-        self.assertTrue(resolved["ok"])
+        self.assertTrue(retried["ok"])
         self.assertEqual(
-            resolved["binding"]["catalogue_generation"],
-            successor["generation_id"],
+            retried["binding"]["catalogue_generation"],
+            stored["generation_id"],
         )
+
+    def test_late_success_records_attempt_without_replacing_newer_routes(self):
+        late, newer = self.shared_connections()
+        newest_payload = self.payload("ordered-success")
+        newest_payload["fetched_at"] = "2026-08-17T00:02:00+00:00"
+        newest_payload["harnesses"]["codex"]["models"][0][
+            "provider_model"
+        ] = "new-provider-model"
+        model_catalog.persist_routes(newer, newest_payload)
+        newest_generation = newest_payload["catalogue_generation"]
+        older_payload = self.payload("ordered-success")
+        older_payload["fetched_at"] = "2026-08-17T00:01:00+00:00"
+        older_payload["harnesses"]["codex"]["models"][0][
+            "provider_model"
+        ] = "old-provider-model"
+
+        model_catalog.persist_routes(late, older_payload)
+
+        route = dict(late.execute(
+            "SELECT * FROM model_routes WHERE selector='ordered-success'"
+        ).fetchone())
+        generations = late.execute(
+            "SELECT generation_id,state FROM model_catalog_generations "
+            "ORDER BY completed_at,generation_id"
+        ).fetchall()
+        resolved = routes_cli.resolve(
+            late, "codex", "ordered-success",
+            current_source_fingerprint=route["source_fingerprint"],
+        )
+        self.assertTrue(newest_payload["generation_published"])
+        self.assertFalse(older_payload["generation_published"])
+        self.assertEqual(len(generations), 2)
+        self.assertEqual(
+            {row["generation_id"]: row["state"] for row in generations},
+            {
+                older_payload["catalogue_generation"]: "successful",
+                newest_generation: "successful",
+            },
+        )
+        self.assertEqual(route["generation_id"], newest_generation)
+        self.assertEqual(route["provider_model"], "new-provider-model")
+        self.assertEqual((route["stale"], route["last_error"]), (0, None))
+        self.assertTrue(resolved["ok"])
+
+    def test_late_failure_records_attempt_without_staling_newer_routes(self):
+        late, newer = self.shared_connections()
+        newest_payload = self.payload("ordered-failure")
+        newest_payload["fetched_at"] = "2026-08-17T00:02:00+00:00"
+        model_catalog.persist_routes(newer, newest_payload)
+        newest_generation = newest_payload["catalogue_generation"]
+        older_failure = {
+            "v": model_catalog.PAYLOAD_VERSION,
+            "refresh_started_at": "2026-08-17T00:00:00+00:00",
+            "refresh_completed_at": "2026-08-17T00:01:00+00:00",
+            "fetched_at": "2026-08-17T00:01:00+00:00",
+            "stale": True,
+            "partial": False,
+            "error": "older refresh failed",
+            "harnesses": {},
+            "verification": {"runtime": "host", "harnesses": {}},
+        }
+
+        model_catalog.persist_routes(late, older_failure)
+
+        route = dict(late.execute(
+            "SELECT * FROM model_routes WHERE selector='ordered-failure'"
+        ).fetchone())
+        generations = late.execute(
+            "SELECT generation_id,state,error_summary "
+            "FROM model_catalog_generations ORDER BY completed_at,generation_id"
+        ).fetchall()
+        resolved = routes_cli.resolve(
+            late, "codex", "ordered-failure",
+            current_source_fingerprint=route["source_fingerprint"],
+        )
+        self.assertTrue(newest_payload["generation_published"])
+        self.assertFalse(older_failure["generation_published"])
+        self.assertEqual(len(generations), 2)
+        by_generation = {row["generation_id"]: row for row in generations}
+        self.assertEqual(
+            {key: row["state"] for key, row in by_generation.items()},
+            {
+                older_failure["catalogue_generation"]: "failed",
+                newest_generation: "successful",
+            },
+        )
+        self.assertEqual(
+            json.loads(by_generation[
+                older_failure["catalogue_generation"]
+            ]["error_summary"])["error"],
+            "older refresh failed",
+        )
+        self.assertEqual(route["generation_id"], newest_generation)
+        self.assertEqual((route["stale"], route["last_error"]), (0, None))
+        self.assertTrue(resolved["ok"])
 
     def test_freshness_failure_respects_outer_rollback(self):
         model_catalog.persist_routes(self.con, self.payload("rollback-route"))
