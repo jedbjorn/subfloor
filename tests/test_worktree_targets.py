@@ -42,7 +42,9 @@ from urllib.parse import urlparse
 REPO = Path(__file__).resolve().parents[1]
 ENGINE = REPO / ".super-coder"
 sys.path.insert(0, str(ENGINE / "scripts"))
+sys.path.insert(0, str(ENGINE / "api"))
 import migrate as migrate_mod  # noqa: E402
+import model_catalog  # noqa: E402
 
 # Copied engine minus caches and anything instance-owned: the fixture's live
 # state is the sentinel this module writes, never a real fork's.
@@ -84,8 +86,21 @@ class _CatalogApiHandler(BaseHTTPRequestHandler):
     route = {
         "harness": "codex", "selector": "wt-live-model", "source": "live-api",
         "availability": "available", "stale": 0, "headless_supported": 1,
-        "high_effort_supported": 1, "cli_version": "test",
+        "high_effort_supported": 1, "cli_version": "codex-cli 0.145.0",
+        "harness_version": "0.145.0", "harness_compatibility": "verified",
         "supported_efforts": '["high"]',
+        "last_seen_at": "2099-01-01T00:00:00+00:00",
+        "generation_id": "1" * 32,
+        "evidence_kind": "codex-model-cache",
+        "source_fingerprint": "3" * 64,
+        "effort_metadata": json.dumps({
+            "supported": ["high"], "default": "high",
+            "digests": {"high": "2" * 64}, "native_variant_ids": {},
+        }),
+        "selector_binding": json.dumps({
+            "kind": "exact-model", "selector": "wt-live-model",
+        }),
+        "adapter_metadata": "{}",
     }
     skill = {
         "skill_id": 999, "name": "wt-live-skill", "common": 0,
@@ -634,8 +649,48 @@ class LiveSurfacesStillResolveTest(WorktreeFixture):
 
         before = state_digest(self.main)
         self._make_live_engine_read_only()
+        runtime = Path(self._tmp) / "controlled-runtime"
+        runtime.mkdir(exist_ok=True)
+        binary = runtime / "codex"
+        binary.write_text("#!/bin/sh\nprintf 'codex-cli 0.145.0\\n'\n")
+        binary.chmod(0o755)
+        codex_home = runtime / "codex-home"
+        codex_home.mkdir(exist_ok=True)
+        codex_home.joinpath("models_cache.json").write_text(json.dumps({
+            "models": [{
+                "slug": "wt-live-model", "display_name": "Worktree Live",
+                "visibility": "list", "default_reasoning_level": "high",
+                "supported_reasoning_levels": [{"effort": "high"}],
+            }],
+        }))
+        status = {
+            "version": "0.145.0", "compatibility": "verified",
+            "minimum_version": "0.145.0",
+            "maximum_version_exclusive": "0.147.0",
+            "verified_version": "0.145.0", "error": None,
+        }
+        entry = model_catalog._entry(
+            "wt-live-model", name="Worktree Live", source="codex-cache",
+            availability="available", provider="openai",
+            supported_efforts=["high"], default_effort="high",
+            cli_version="codex-cli 0.145.0",
+        )
+        original_fingerprint = _CatalogApiHandler.route["source_fingerprint"]
+        _CatalogApiHandler.route["source_fingerprint"] = (
+            model_catalog._entry_evidence("codex", entry, status)[
+                "source_fingerprint"
+            ]
+        )
+        self.addCleanup(
+            _CatalogApiHandler.route.__setitem__,
+            "source_fingerprint", original_fingerprint,
+        )
         api, thread, base = start_catalog_api()
-        env = {"SC_API_TOKEN": "shell-token", "SC_API_BASE": base}
+        env = {
+            "SC_API_TOKEN": "shell-token", "SC_API_BASE": base,
+            "CODEX_HOME": str(codex_home),
+            "PATH": f"{runtime}:{os.environ.get('PATH', '')}",
+        }
         try:
             listed = run_sc(
                 self.wt, "models", "list", "codex", env_overrides=env

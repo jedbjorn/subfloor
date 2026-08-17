@@ -3,7 +3,7 @@
 
 The catalog is layered and best-effort: models.dev (keyless, all five
 harnesses) → provider APIs (only with env keys) → OpenCode's connected-provider
-projection → cache → static floor. Payload v5 retains family metadata
+    projection → cache → static floor. Payload v6 retains family metadata
 (newest-first; claude families with a CLI alias resolve `latest` to the
 alias), the flat `models` list for sub-version search, and fork-local harness
 and configured-route verification. These tests pin
@@ -17,12 +17,16 @@ Run:
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +34,7 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "api"))
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 import model_catalog as mc  # noqa: E402
 import models as routes_cli  # noqa: E402
+import route_bindings  # noqa: E402
 
 MODELS_DEV = {
     "anthropic": {"models": {
@@ -69,6 +74,95 @@ def ids(harness_block):
     return [e["id"] for e in harness_block["models"]]
 
 
+_AUTO_COMPATIBILITY = object()
+
+
+def runtime_status(version="2.22.0", compatibility=_AUTO_COMPATIBILITY,
+                   error=None, *, harness=None, scope=None):
+    harness = harness or (
+        "claude" if isinstance(version, str) and version.startswith("2.1.")
+        else "vibe"
+    )
+    ranges = {
+        "claude": ("2.1.220", "2.2.0", "2.1.222"),
+        "codex": ("0.145.0", "0.147.0", "0.145.0"),
+        "kimi": ("0.30.0", "0.34.0", "0.33.0"),
+        "opencode": ("1.18.9", "1.19.0", "1.18.9"),
+        "vibe": ("2.22.0", "2.23.0", "2.22.0"),
+    }
+    minimum, maximum, verified = ranges[harness]
+    if compatibility is _AUTO_COMPATIBILITY:
+        compatibility = "verified" if version == verified else "supported"
+    scope = scope or routes_cli.model_catalog.harness_versions.runtime_scope()
+    return {
+        "harness": harness,
+        **scope,
+        "version": version,
+        "compatibility": compatibility,
+        "minimum_version": minimum,
+        "maximum_version_exclusive": maximum,
+        "verified_version": verified,
+        "error": error,
+    }
+
+
+def controlled_bundle(
+    harness: str, selector: str, status: dict, fingerprint: str | None
+) -> dict:
+    scope = {
+        "runtime": status["runtime"],
+        "runtime_identity": status["runtime_identity"],
+    }
+    return {
+        "runtime_status": status,
+        "runtime_scope": scope,
+        "source_fingerprint": fingerprint,
+    }
+
+
+def controlled_row(
+    harness: str, selector: str, status: dict, fingerprint: str
+) -> dict:
+    sources = {
+        "claude": ("claude-cli", "claude-portable-manifest"),
+        "codex": ("codex-cache", "codex-model-cache"),
+        "kimi": ("kimi-config", "kimi-alias-config"),
+        "opencode": (
+            "opencode-provider-api", "opencode-connected-variant"
+        ),
+    }
+    source, evidence_kind = sources[harness]
+    metadata = {
+        "supported": ["high"],
+        "default": "high",
+        "digests": {"high": "4" * 64},
+        "native_variant_ids": (
+            {"high": "high"} if harness == "opencode" else {}
+        ),
+    }
+    return {
+        "harness": harness,
+        "selector": selector,
+        "provider_model": selector,
+        "source": source,
+        "availability": "available",
+        "headless_supported": 1,
+        "stale": 0,
+        "last_error": None,
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+        "generation_id": "1" * 32,
+        "evidence_kind": evidence_kind,
+        "source_fingerprint": fingerprint,
+        "cli_version": f"{harness} {status['version']}",
+        "harness_version": status["version"],
+        "harness_compatibility": status["compatibility"],
+        "supported_efforts": ["high"],
+        "effort_metadata": metadata,
+        "selector_binding": {"kind": "exact-model", "selector": selector},
+        "adapter_metadata": {},
+    }
+
+
 class NoCLI(unittest.TestCase):
     """Base: opencode binary absent unless a test opts in."""
 
@@ -78,7 +172,204 @@ class NoCLI(unittest.TestCase):
         self.addCleanup(p.stop)
 
 
+class ControlledRouteEvidenceTest(unittest.TestCase):
+    def test_each_collector_binds_source_to_exact_sandbox_route(self):
+        sandbox = {
+            "runtime": "sandbox",
+            "runtime_identity": "sandbox:collector-image",
+        }
+        versions = {
+            "claude": "2.1.222", "codex": "0.145.0",
+            "kimi": "0.33.0", "opencode": "1.18.9",
+        }
+        selectors = {
+            "claude": "opus", "codex": "cache-model",
+            "kimi": "configured-alias", "opencode": "provider/model",
+        }
+
+        def run(argv, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{argv[0]} {versions[argv[0]]}\n",
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex"
+            codex_home.mkdir()
+            (codex_home / "models_cache.json").write_text(json.dumps({
+                "models": [{
+                    "slug": "cache-model",
+                    "display_name": "Cache Model",
+                    "supported_reasoning_levels": [
+                        {"effort": "low"}, {"effort": "high"},
+                    ],
+                    "default_reasoning_level": "high",
+                }],
+            }))
+            kimi_home = root / "kimi"
+            kimi_home.mkdir()
+            (kimi_home / "config.toml").write_text(
+                "[models.configured-alias]\n"
+                'provider = "moonshot"\n'
+                'model = "kimi-k2"\n'
+                'support_efforts = ["low", "high"]\n'
+                'default_effort = "high"\n'
+            )
+            envs = {
+                "claude": {},
+                "codex": {"CODEX_HOME": str(codex_home)},
+                "kimi": {"KIMI_CODE_HOME": str(kimi_home)},
+                "opencode": {},
+            }
+            connected = [{
+                "id": "provider/model",
+                "provider": "provider",
+                "provider_model": "model",
+                "cli_version": "opencode 1.18.9",
+                "supported_efforts": ["high"],
+                "default_effort": "high",
+                "selector_binding": {
+                    "kind": "connected-model", "selector": "provider/model",
+                },
+                "adapter_metadata": {"provider_family": "openai"},
+                "native_variant_ids": {"high": "high"},
+            }]
+
+            for harness, selector in selectors.items():
+                status = runtime_status(
+                    versions[harness], harness=harness, scope=sandbox
+                )
+                toml_available = mock.patch.object(
+                    mc.toml_compat, "AVAILABLE", True
+                ) if harness == "kimi" else contextlib.nullcontext()
+                toml_loads = mock.patch.object(
+                    mc.toml_compat, "loads", return_value={
+                        "models": {"configured-alias": {
+                            "provider": "moonshot",
+                            "model": "kimi-k2",
+                            "support_efforts": ["low", "high"],
+                            "default_effort": "high",
+                        }},
+                    }
+                ) if harness == "kimi" else contextlib.nullcontext()
+                with (
+                    self.subTest(harness=harness, state="present"),
+                    mock.patch.object(
+                        mc.harness_versions, "runtime_scope",
+                        return_value=sandbox,
+                    ),
+                    mock.patch.object(
+                        mc.shutil, "which", return_value=f"/bin/{harness}"
+                    ),
+                    toml_available,
+                    toml_loads,
+                ):
+                    proof = mc.controlled_route_evidence(
+                        harness, selector, env=envs[harness], run=run,
+                        opencode_provider=lambda: connected,
+                        harness_probe=lambda: {harness: status},
+                    )
+                self.assertEqual(proof["runtime_status"], status)
+                self.assertEqual(proof["runtime_scope"], sandbox)
+                self.assertRegex(
+                    proof["source_fingerprint"],
+                    r"^[0-9a-f]{64}$",
+                )
+
+                canonical_toml_available = mock.patch.object(
+                    mc.toml_compat, "AVAILABLE", True
+                ) if harness == "kimi" else contextlib.nullcontext()
+                canonical_toml_loads = mock.patch.object(
+                    mc.toml_compat, "loads", return_value={
+                        "models": {"configured-alias": {
+                            "provider": "moonshot",
+                            "model": "kimi-k2",
+                            "support_efforts": ["low", "high"],
+                            "default_effort": "high",
+                        }},
+                    }
+                ) if harness == "kimi" else contextlib.nullcontext()
+                with (
+                    self.subTest(harness=harness, state="canonical-resolver"),
+                    mock.patch.dict(mc.os.environ, envs[harness], clear=True),
+                    mock.patch.object(mc.subprocess, "run", side_effect=run),
+                    mock.patch.object(
+                        mc, "opencode_connected_models", return_value=connected
+                    ),
+                    mock.patch.object(
+                        mc.harness_versions, "compatibility_status",
+                        return_value={harness: status},
+                    ),
+                    mock.patch.object(
+                        mc.harness_versions, "runtime_scope",
+                        return_value=sandbox,
+                    ),
+                    mock.patch.object(
+                        mc.shutil, "which", return_value=f"/bin/{harness}"
+                    ),
+                    canonical_toml_available,
+                    canonical_toml_loads,
+                ):
+                    binding, digest = route_bindings.resolve_v2(
+                        controlled_row(
+                            harness, selector, status,
+                            proof["source_fingerprint"],
+                        ),
+                        harness,
+                        selector,
+                        "high",
+                    )
+                self.assertEqual(binding["requested_model"], selector)
+                self.assertEqual(binding["effective_effort"], "high")
+                self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+                missing_env = {
+                    "codex": {"CODEX_HOME": str(root / "missing-codex")},
+                    "kimi": {"KIMI_CODE_HOME": str(root / "missing-kimi")},
+                }.get(harness, envs[harness])
+                missing_which = None if harness == "claude" else f"/bin/{harness}"
+                missing_provider = (lambda: []) if harness == "opencode" \
+                    else (lambda: connected)
+                toml_available = mock.patch.object(
+                    mc.toml_compat, "AVAILABLE", True
+                ) if harness == "kimi" else contextlib.nullcontext()
+                toml_loads = mock.patch.object(
+                    mc.toml_compat, "loads", return_value={}
+                ) if harness == "kimi" else contextlib.nullcontext()
+                with (
+                    self.subTest(harness=harness, state="missing"),
+                    mock.patch.object(
+                        mc.harness_versions, "runtime_scope",
+                        return_value=sandbox,
+                    ),
+                    mock.patch.object(
+                        mc.shutil, "which", return_value=missing_which
+                    ),
+                    toml_available,
+                    toml_loads,
+                ):
+                    missing = mc.controlled_route_evidence(
+                        harness, selector, env=missing_env, run=run,
+                        opencode_provider=missing_provider,
+                        harness_probe=lambda: {harness: status},
+                    )
+                self.assertIsNone(missing["source_fingerprint"])
+
+
 class BuildTest(NoCLI):
+    def test_single_harness_runtime_status_uses_version_bounded_probe(self):
+        expected = runtime_status()
+        with mock.patch.object(
+            mc.harness_versions, "compatibility_status",
+            return_value={"vibe": expected},
+        ) as probe:
+            got = mc.harness_runtime_status("vibe")
+
+        self.assertEqual(got, expected)
+        probe.assert_called_once_with(("vibe",))
+
     def test_harness_mapping_and_prefixing(self):
         got = mc.build(fetch=fetch_ok, env={}, run=None)
         self.assertEqual(got["v"], mc.PAYLOAD_VERSION)
@@ -213,9 +504,29 @@ class RoutePersistenceTest(unittest.TestCase):
         self.con.row_factory = sqlite3.Row
         migration = ROOT / ".super-coder" / "migrations" / "0075_model_routes.sql"
         self.con.executescript(migration.read_text())
+        self.con.executescript(
+            "CREATE TABLE sprints (sprint_id INTEGER PRIMARY KEY,lifecycle TEXT);"
+            "CREATE TABLE sprint_participants ("
+            "participant_id INTEGER PRIMARY KEY,sprint_id INTEGER);"
+        )
+        self.con.executescript((
+            ROOT / ".super-coder" / "migrations" /
+            "0212_route_binding_foundation.sql"
+        ).read_text())
 
     def tearDown(self):
         self.con.close()
+
+    @staticmethod
+    def verification(harness: str, version: str) -> dict:
+        return {"verification": {"runtime": "host", "harnesses": {
+            harness: {
+                "version": version, "compatibility": "verified",
+                "minimum_version": version,
+                "maximum_version_exclusive": "99.0.0",
+                "verified_version": version, "error": None,
+            }
+        }}}
 
     def test_persist_marks_exact_high_effort_route_runnable(self):
         payload = {
@@ -223,7 +534,9 @@ class RoutePersistenceTest(unittest.TestCase):
             "harnesses": {"kimi": {"models": [mc._entry(
                 "kimi-code/k3", source="kimi-config", availability="available",
                 provider="managed:kimi-code", provider_model="k3",
-                supported_efforts=["low", "high"])]}},
+                supported_efforts=["low", "high"],
+                cli_version="kimi 0.33.0")]}},
+            **self.verification("kimi", "0.33.0"),
         }
         mc.persist_routes(self.con, payload)
         row = self.con.execute(
@@ -235,7 +548,9 @@ class RoutePersistenceTest(unittest.TestCase):
         fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
                  "harnesses": {"claude": {"models": [mc._entry(
                      "fable", source="claude-cli", availability="available",
-                     supported_efforts=["high"])]}}}
+                     supported_efforts=["high"],
+                     cli_version="claude 2.1.222")]}},
+                 **self.verification("claude", "2.1.222")}
         mc.persist_routes(self.con, fresh)
         mc.persist_routes(self.con, {"fetched_at": None, "stale": True,
                                      "error": "network down", "harnesses": {}})
@@ -244,13 +559,28 @@ class RoutePersistenceTest(unittest.TestCase):
         self.assertEqual(tuple(row), (1, "network down"))
 
     def test_resolver_returns_exact_high_effort_sc_run_call(self):
-        fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
+        fresh = {"fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
                  "harnesses": {"codex": {"models": [mc._entry(
                      "gpt-5.6-sol", source="codex-cache",
-                     availability="available", supported_efforts=["high"])]}}}
+                     availability="available", supported_efforts=["high"],
+                     cli_version="codex-cli 0.145.0")]}},
+                 **self.verification("codex", "0.145.0")}
         mc.persist_routes(self.con, fresh)
-        got = routes_cli.resolve(
-            self.con, "codex", "gpt-5.6-sol", shell="DEV3")
+        fingerprint = self.con.execute(
+            "SELECT source_fingerprint FROM model_routes WHERE harness='codex' "
+            "AND selector='gpt-5.6-sol'"
+        ).fetchone()[0]
+        observation = controlled_bundle(
+            "codex", "gpt-5.6-sol",
+            runtime_status("0.145.0", harness="codex"), fingerprint,
+        )
+        with mock.patch.object(
+            mc, "controlled_route_evidence", return_value=observation
+        ) as collector:
+            got = routes_cli.resolve(
+                self.con, "codex", "gpt-5.6-sol", shell="DEV3"
+            )
+        collector.assert_called_once_with("codex", "gpt-5.6-sol")
         self.assertTrue(got["ok"])
         self.assertEqual(
             got["command"],
@@ -258,14 +588,30 @@ class RoutePersistenceTest(unittest.TestCase):
              "gpt-5.6-sol", "--effort", "high"])
 
     def test_resolver_rejects_unverified_high_effort(self):
-        fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
+        fresh = {"fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
                  "harnesses": {"kimi": {"models": [mc._entry(
                      "kimi-code/legacy", source="kimi-config",
-                     availability="available", supported_efforts=[])]}}}
+                     availability="available", supported_efforts=[],
+                     cli_version="kimi 0.33.0")]}},
+                 **self.verification("kimi", "0.33.0")}
         mc.persist_routes(self.con, fresh)
-        got = routes_cli.resolve(self.con, "kimi", "kimi-code/legacy")
+        fingerprint = self.con.execute(
+            "SELECT source_fingerprint FROM model_routes WHERE harness='kimi' "
+            "AND selector='kimi-code/legacy'"
+        ).fetchone()[0]
+        observation = controlled_bundle(
+            "kimi", "kimi-code/legacy",
+            runtime_status("0.33.0", harness="kimi"), fingerprint,
+        )
+        with mock.patch.object(
+            mc, "controlled_route_evidence", return_value=observation
+        ) as collector:
+            got = routes_cli.resolve(
+                self.con, "kimi", "kimi-code/legacy"
+            )
+        collector.assert_called_once_with("kimi", "kimi-code/legacy")
         self.assertFalse(got["ok"])
-        self.assertIn("high-effort", got["error"])
+        self.assertEqual(got["code"], "unsupported_thinking_level")
 
 
 class RuntimeVerificationTest(unittest.TestCase):
@@ -331,13 +677,16 @@ class RuntimeVerificationTest(unittest.TestCase):
             "harnesses": {
                 "codex": {"models": [mc._entry(
                     "gpt-ready", source="codex-cache",
-                    availability="available", supported_efforts=["high"]
+                    availability="available", supported_efforts=["high"],
+                    cli_version="codex-cli 2.0.0",
                 )]},
                 "opencode": {"models": [mc._entry(
                     "openai/local", source="opencode-provider-api",
-                    availability="available"
+                    availability="available", cli_version="opencode 1.6.0",
                 )]},
             },
+            "verification": {"runtime": "sandbox",
+                             "harnesses": self.harnesses()},
         })
 
         report = mc.runtime_verification(
@@ -349,9 +698,9 @@ class RuntimeVerificationTest(unittest.TestCase):
                          "newer-unverified")
         self.assertEqual(report["summary"], {
             "harnesses_checked": 4,
-            "harnesses_ready": 3,
+            "harnesses_ready": 2,
             "exact_routes": 4,
-            "exact_routes_runnable": 2,
+            "exact_routes_runnable": 1,
             "harness_defaults": 1,
         })
         by_key = {
@@ -360,11 +709,11 @@ class RuntimeVerificationTest(unittest.TestCase):
         }
         self.assertEqual(by_key[("dev", "codex")], {
             "flavor": "dev", "harness": "codex", "model": "gpt-ready",
-            "is_default": True, "state": "runnable", "runnable": True,
-            "reason": None,
+            "is_default": True, "state": "harness-error", "runnable": False,
+            "reason": "HARNESS_VERSION_UNVERIFIED",
         })
         self.assertEqual(by_key[("planner", "codex")]["state"],
-                         "route-missing")
+                         "harness-error")
         self.assertFalse(by_key[("planner", "codex")]["runnable"])
         self.assertEqual(by_key[("reviewer", "claude")]["state"],
                          "harness-default")
@@ -427,6 +776,10 @@ class RuntimeVerificationTest(unittest.TestCase):
             "WHERE harness='codex' AND selector='gpt-stale'"
         )
         statuses = self.harnesses()
+        statuses["codex"] = {
+            **statuses["claude"], "version": "1.6.0",
+            "compatibility": "supported",
+        }
         statuses["vibe"] = {
             "version": "vibe 1.0.0", "compatibility": None,
             "minimum_version": None, "maximum_version_exclusive": None,
@@ -508,7 +861,7 @@ class RuntimeVerificationTest(unittest.TestCase):
         self.assertEqual(got["sources"], ["static"])
         self.assertEqual(got["verification"]["summary"], {
             "harnesses_checked": 4,
-            "harnesses_ready": 3,
+            "harnesses_ready": 2,
             "exact_routes": 0,
             "exact_routes_runnable": 0,
             "harness_defaults": 0,
@@ -521,9 +874,124 @@ class RouteCliConnectionTest(unittest.TestCase):
     ROUTE = {
         "harness": "codex", "selector": "api-model", "source": "live-api",
         "availability": "available", "stale": 0, "headless_supported": 1,
-        "high_effort_supported": 1, "cli_version": "1",
+        "high_effort_supported": 1, "cli_version": "codex-cli 0.145.0",
+        "harness_version": "0.145.0", "harness_compatibility": "verified",
         "supported_efforts": '["high"]',
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+        "generation_id": "1" * 32,
+        "evidence_kind": "codex-model-cache",
+        "source_fingerprint": "3" * 64,
+        "effort_metadata": json.dumps({
+            "supported": ["high"], "default": "high",
+            "digests": {"high": "2" * 64}, "native_variant_ids": {},
+        }),
+        "selector_binding": '{"kind":"exact-model","selector":"api-model"}',
+        "adapter_metadata": "{}",
     }
+
+    @classmethod
+    def controlled_route(cls, harness: str) -> dict:
+        versions = {
+            "claude": "2.1.222", "codex": "0.145.0",
+            "kimi": "0.33.0", "opencode": "1.18.9",
+        }
+        evidence = {
+            "claude": "claude-portable-manifest",
+            "codex": "codex-model-cache",
+            "kimi": "kimi-alias-config",
+            "opencode": "opencode-connected-variant",
+        }
+        row = {
+            **cls.ROUTE,
+            "harness": harness,
+            "cli_version": f"{harness} {versions[harness]}",
+            "harness_version": versions[harness],
+            "evidence_kind": evidence[harness],
+        }
+        if harness == "opencode":
+            row["effort_metadata"] = json.dumps({
+                "supported": ["high"], "default": "high",
+                "digests": {"high": "2" * 64},
+                "native_variant_ids": {"high": "high"},
+            })
+        return row
+
+    def authenticated_controlled(self, harness: str, row: dict, *,
+                                 status: dict, fingerprint: str) -> tuple[int, dict]:
+        output = io.StringIO()
+        with (
+            mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+            mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+            mock.patch.object(
+                routes_cli.mem, "_api", return_value={"routes": [row]}
+            ),
+            mock.patch.object(
+                routes_cli.model_catalog, "controlled_route_evidence",
+                return_value=controlled_bundle(
+                    harness, "api-model", status, fingerprint
+                ),
+            ) as source_probe,
+            mock.patch.object(
+                routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = routes_cli.main([
+                "resolve", harness, "api-model", "--json",
+            ])
+        source_probe.assert_called_once_with(harness, "api-model")
+        return exit_code, json.loads(output.getvalue())
+
+    def test_authenticated_controlled_routes_use_execution_seat_proof(self):
+        sandbox = {
+            "runtime": "sandbox", "runtime_identity": "sandbox:test-image",
+        }
+        versions = {
+            "claude": "2.1.222", "codex": "0.145.0",
+            "kimi": "0.33.0", "opencode": "1.18.9",
+        }
+        for harness, version in versions.items():
+            row = self.controlled_route(harness)
+            good = runtime_status(
+                version, harness=harness, scope=sandbox
+            )
+            with self.subTest(harness=harness, case="matching-sandbox"):
+                exit_code, result = self.authenticated_controlled(
+                    harness, row, status=good, fingerprint="3" * 64,
+                )
+                self.assertEqual(exit_code, 0, result)
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["binding"]["harness"], harness)
+            with self.subTest(harness=harness, case="source-mismatch"):
+                exit_code, result = self.authenticated_controlled(
+                    harness, row, status=good, fingerprint="9" * 64,
+                )
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(result["code"], "thinking_evidence_stale")
+                self.assertNotIn("binding", result)
+                self.assertNotIn("binding_digest", result)
+                self.assertNotIn("command", result)
+
+        codex = self.controlled_route("codex")
+        cases = {
+            "container-missing": runtime_status(
+                None, compatibility=None, error="HARNESS_UNAVAILABLE",
+                harness="codex", scope=sandbox,
+            ),
+            "container-version-mismatch": runtime_status(
+                "0.146.0", harness="codex", scope=sandbox,
+            ),
+        }
+        for name, status in cases.items():
+            with self.subTest(case=name):
+                exit_code, result = self.authenticated_controlled(
+                    "codex", codex, status=status, fingerprint="3" * 64,
+                )
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(result["code"], "thinking_evidence_stale")
+                self.assertNotIn("binding", result)
+                self.assertNotIn("binding_digest", result)
+                self.assertNotIn("command", result)
 
     def test_list_and_resolve_use_shell_api_without_opening_database(self):
         with (
@@ -534,6 +1002,13 @@ class RouteCliConnectionTest(unittest.TestCase):
             ) as api,
             mock.patch.object(
                 routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+            ),
+            mock.patch.object(
+                routes_cli.model_catalog, "controlled_route_evidence",
+                return_value=controlled_bundle(
+                    "codex", "api-model",
+                    runtime_status("0.145.0", harness="codex"), "3" * 64,
+                ),
             ),
         ):
             self.assertEqual(routes_cli.main(["list", "codex"]), 0)
@@ -557,6 +1032,336 @@ class RouteCliConnectionTest(unittest.TestCase):
         ):
             self.assertEqual(routes_cli.main(["list"]), 0)
         opened.assert_called_once_with()
+
+    def test_resolve_rejects_an_explicitly_blank_shell(self):
+        for value in ("", "   "):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                SystemExit, "--shell requires a non-blank value"
+            ):
+                routes_cli._resolve_args([
+                    "resolve", "codex", "api-model", "--shell", value,
+                ])
+
+    def test_authenticated_resolve_normalizes_harness_before_lookup(self):
+        api = mock.Mock(return_value={"routes": [self.ROUTE]})
+
+        def resolve(harness: str) -> dict:
+            output = io.StringIO()
+            with (
+                mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+                mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+                mock.patch.object(routes_cli.mem, "_api", api),
+                mock.patch.object(
+                    routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+                ),
+                mock.patch.object(
+                    routes_cli.model_catalog, "controlled_route_evidence",
+                    return_value=controlled_bundle(
+                        "codex", "api-model",
+                        runtime_status("0.145.0", harness="codex"), "3" * 64,
+                    ),
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(routes_cli.main([
+                    "resolve", harness, "api-model", "--json",
+                ]), 0)
+            return json.loads(output.getvalue())
+
+        mixed = resolve("Codex")
+        lower = resolve("codex")
+
+        self.assertEqual(api.call_args_list, [
+            mock.call(
+                "GET", "/_sc/model-routes?harness=codex&selector=api-model"
+            ),
+            mock.call(
+                "GET", "/_sc/model-routes?harness=codex&selector=api-model"
+            ),
+        ])
+        self.assertEqual(mixed["binding"], lower["binding"])
+        self.assertEqual(mixed["binding_digest"], lower["binding_digest"])
+
+    def test_local_resolve_rejects_unknown_harness_and_accepts_mixed_case(self):
+        def resolve(harness: str) -> tuple[int, dict, mock.Mock]:
+            output = io.StringIO()
+            con = mock.Mock()
+            with (
+                mock.patch.object(routes_cli.mem, "SC_API_TOKEN", ""),
+                mock.patch.object(routes_cli, "_open_db", return_value=con),
+                contextlib.redirect_stdout(output),
+            ):
+                status = routes_cli.main(["resolve", harness, "--json"])
+            return status, json.loads(output.getvalue()), con
+
+        with mock.patch.object(
+            routes_cli.model_catalog, "harness_runtime_status",
+            return_value=runtime_status("2.1.223", harness="claude"),
+        ):
+            refused_status, refused, refused_con = resolve("not-a-harness")
+            accepted_status, accepted, accepted_con = resolve("ClAuDe")
+
+        self.assertEqual(refused_status, 2)
+        self.assertEqual(refused["code"], "unsupported_thinking_level")
+        self.assertEqual(refused["error"], "Harness is not supported")
+        self.assertNotIn("binding", refused)
+        self.assertNotIn("binding_digest", refused)
+        self.assertNotIn("command", refused)
+        refused_con.close.assert_called_once_with()
+        self.assertEqual(accepted_status, 0)
+        self.assertEqual(accepted["harness"], "claude")
+        self.assertEqual(accepted["binding"]["harness"], "claude")
+        self.assertEqual(
+            accepted["binding"]["control_state"], "harness-default"
+        )
+        self.assertEqual(
+            accepted["command"],
+            ["./sc", "run", "<shell>", "--harness", "claude"],
+        )
+        accepted_con.close.assert_called_once_with()
+
+    def test_local_uncontrolled_resolve_requires_compatible_runtime(self):
+        con = mock.Mock()
+        with mock.patch.object(
+            routes_cli.model_catalog, "harness_runtime_status",
+            return_value=runtime_status(
+                version=None, compatibility=None, error="HARNESS_UNAVAILABLE",
+                harness="claude",
+            ),
+        ):
+            unavailable_harness = routes_cli.resolve(con, "claude")
+        with mock.patch.object(
+            routes_cli.model_catalog, "harness_runtime_status",
+            return_value=runtime_status(
+                version="3.0.0", compatibility="newer-unverified"
+            ),
+        ):
+            incompatible_vibe = routes_cli.resolve(
+                con, "vibe", "devstral-latest"
+            )
+
+        for result in (unavailable_harness, incompatible_vibe):
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["code"], "thinking_evidence_missing")
+            self.assertNotIn("binding", result)
+            self.assertNotIn("binding_digest", result)
+            self.assertNotIn("command", result)
+        self.assertIn("no compatible installed runtime", unavailable_harness["error"])
+        self.assertIn("no compatible installed runtime", incompatible_vibe["error"])
+
+    def test_local_ready_uncontrolled_routes_keep_typed_null_identity(self):
+        con = mock.Mock()
+        with mock.patch.object(
+            routes_cli.model_catalog, "harness_runtime_status",
+            side_effect=lambda harness: runtime_status(
+                "2.1.223", harness="claude"
+            ) if harness == "claude" else runtime_status(harness="vibe"),
+        ):
+            default_first = routes_cli.resolve(con, "claude")
+            default_replay = routes_cli.resolve(con, "claude")
+            vibe_first = routes_cli.resolve(con, "vibe", "vibe-local")
+            vibe_replay = routes_cli.resolve(con, "vibe", "vibe-local")
+
+        for result, state in (
+            (default_first, "harness-default"),
+            (vibe_first, "native-uncontrolled"),
+        ):
+            binding = result["binding"]
+            self.assertTrue(result["ok"])
+            self.assertEqual(binding["control_state"], state)
+            self.assertIsNone(binding["requested_effort"])
+            self.assertIsNone(binding["effective_effort"])
+            self.assertIsNone(binding["catalogue_generation"])
+            self.assertIsNone(binding["evidence_digest"])
+            self.assertNotIn("--effort", result["command"])
+        self.assertEqual(
+            default_first["binding_digest"], default_replay["binding_digest"]
+        )
+        self.assertEqual(
+            vibe_first["binding_digest"], vibe_replay["binding_digest"]
+        )
+
+    def test_authenticated_uncontrolled_resolve_applies_runtime_compatibility(self):
+        cases = (
+            (
+                ["resolve", "claude", "--json"],
+                {"routes": [], "runtime_status": runtime_status(
+                    "2.1.223", harness="claude"
+                )},
+                runtime_status(
+                    version=None, compatibility=None,
+                    error="HARNESS_UNAVAILABLE",
+                    harness="claude",
+                ),
+                "/_sc/model-routes?harness=claude",
+            ),
+            (
+                ["resolve", "vibe", "devstral-latest", "--json"],
+                {"routes": [], "runtime_status": runtime_status()},
+                runtime_status(
+                    version="3.0.0", compatibility="newer-unverified"
+                ),
+                "/_sc/model-routes?harness=vibe&selector=devstral-latest",
+            ),
+        )
+        for argv, projection, local_status, path in cases:
+            with self.subTest(argv=argv):
+                output = io.StringIO()
+                api = mock.Mock(return_value=projection)
+                with (
+                    mock.patch.object(
+                        routes_cli.mem, "SC_API_TOKEN", "shell-token"
+                    ),
+                    mock.patch.object(
+                        routes_cli.mem, "SC_API_BASE", "http://engine"
+                    ),
+                    mock.patch.object(routes_cli.mem, "_api", api),
+                    mock.patch.object(
+                        routes_cli.model_catalog, "harness_runtime_status",
+                        return_value=local_status,
+                    ),
+                    mock.patch.object(
+                        routes_cli, "_open_db",
+                        side_effect=AssertionError("opened DB"),
+                    ),
+                    contextlib.redirect_stdout(output),
+                ):
+                    status = routes_cli.main(argv)
+                result = json.loads(output.getvalue())
+                self.assertEqual(status, 2)
+                self.assertEqual(result["code"], "thinking_evidence_missing")
+                self.assertNotIn("binding", result)
+                self.assertNotIn("binding_digest", result)
+                self.assertNotIn("command", result)
+                api.assert_called_once_with("GET", path)
+
+    def test_authenticated_ready_uncontrolled_binding_is_stable(self):
+        projections = {
+            "/_sc/model-routes?harness=claude": {
+                "routes": [],
+            },
+            "/_sc/model-routes?harness=vibe&selector=vibe-local": {
+                "routes": [],
+            },
+        }
+
+        def resolve(argv):
+            output = io.StringIO()
+            with (
+                mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+                mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+                mock.patch.object(
+                    routes_cli.mem, "_api",
+                    side_effect=lambda _method, path: projections[path],
+                ),
+                mock.patch.object(
+                    routes_cli.model_catalog, "harness_runtime_status",
+                    side_effect=lambda harness: runtime_status(
+                        "2.1.223", harness="claude"
+                    ) if harness == "claude" else runtime_status(harness="vibe"),
+                ),
+                mock.patch.object(
+                    routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(routes_cli.main(argv), 0)
+            return json.loads(output.getvalue())
+
+        for argv in (
+            ["resolve", "claude", "--json"],
+            ["resolve", "vibe", "vibe-local", "--json"],
+        ):
+            with self.subTest(argv=argv):
+                first = resolve(argv)
+                replay = resolve(argv)
+                self.assertEqual(first["binding_digest"], replay["binding_digest"])
+                self.assertIsNone(first["binding"]["requested_effort"])
+                self.assertIsNone(first["binding"]["effective_effort"])
+                self.assertIsNone(first["binding"]["catalogue_generation"])
+                self.assertIsNone(first["binding"]["evidence_digest"])
+                self.assertNotIn("--effort", first["command"])
+
+    def test_authenticated_resolution_uses_the_shell_execution_runtime(self):
+        host = {"runtime": "host", "runtime_identity": "host:api-host"}
+        sandbox = {
+            "runtime": "sandbox", "runtime_identity": "sandbox:shell-image",
+        }
+        host_ready = runtime_status(scope=host)
+        host_missing = runtime_status(
+            version=None, compatibility=None, error="HARNESS_UNAVAILABLE",
+            scope=host,
+        )
+        sandbox_ready = runtime_status(scope=sandbox)
+        sandbox_missing = runtime_status(
+            version=None, compatibility=None, error="HARNESS_UNAVAILABLE",
+            scope=sandbox,
+        )
+        sandbox_incompatible = runtime_status(
+            version="2.23.0", compatibility="newer-unverified", scope=sandbox,
+        )
+        cases = (
+            ("host-ready-container-missing", host_ready, sandbox_missing,
+             sandbox, False),
+            ("host-missing-container-ready", host_missing, sandbox_ready,
+             sandbox, True),
+            ("incompatible-image-version", host_ready, sandbox_incompatible,
+             sandbox, False),
+            ("matching-bare-metal", host_ready, host_ready, host, True),
+        )
+
+        for name, api_status, shell_status, shell_scope, accepted in cases:
+            with self.subTest(name=name):
+                output = io.StringIO()
+                api = mock.Mock(return_value={
+                    "routes": [],
+                    # A legacy/malicious server value must never be admission
+                    # evidence for the shell's execution runtime.
+                    "runtime_status": api_status,
+                })
+                local_probe = mock.Mock(return_value=shell_status)
+                with (
+                    mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+                    mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+                    mock.patch.object(routes_cli.mem, "_api", api),
+                    mock.patch.object(
+                        routes_cli.model_catalog, "harness_runtime_status",
+                        local_probe,
+                    ),
+                    mock.patch.object(
+                        routes_cli.model_catalog.harness_versions,
+                        "runtime_scope", return_value=shell_scope,
+                    ),
+                    mock.patch.object(
+                        routes_cli, "_open_db",
+                        side_effect=AssertionError("opened DB"),
+                    ),
+                    contextlib.redirect_stdout(output),
+                ):
+                    exit_code = routes_cli.main([
+                        "resolve", "vibe", "devstral-latest", "--json",
+                    ])
+                result = json.loads(output.getvalue())
+
+                self.assertEqual(exit_code, 0 if accepted else 2)
+                self.assertEqual(result["ok"], accepted)
+                if accepted:
+                    self.assertEqual(
+                        result["binding"]["control_state"],
+                        "native-uncontrolled",
+                    )
+                    self.assertIsNone(result["binding"]["requested_effort"])
+                    self.assertNotIn("--effort", result["command"])
+                else:
+                    self.assertEqual(result["code"], "thinking_evidence_missing")
+                    self.assertNotIn("binding", result)
+                    self.assertNotIn("binding_digest", result)
+                    self.assertNotIn("command", result)
+                local_probe.assert_called_once_with("vibe")
+                api.assert_called_once_with(
+                    "GET",
+                    "/_sc/model-routes?harness=vibe&selector=devstral-latest",
+                )
 
     def test_refresh_keeps_the_wal_enabled_write_lane(self):
         con = mock.Mock()

@@ -94,25 +94,28 @@ class ProbeResult:
     compatibility: str
 
 
-def checked_probe_result(
-    *,
-    harness: str,
-    manifest: Mapping[str, Any],
-    capabilities: AdapterCapabilities,
-    version: str,
-) -> ProbeResult:
-    conversation = manifest.get("conversation") or {}
-    minimum = conversation.get("minimum_cli_version")
-    maximum = conversation.get("maximum_cli_version_exclusive")
-    verified = conversation.get("verified_cli_version")
-    compatibility = {
+@dataclass(frozen=True)
+class VersionCompatibility:
+    version: str
+    minimum_version: str
+    maximum_version_exclusive: str
+    verified_version: str
+    compatibility: str
+
+
+def checked_version_compatibility(
+    *, harness: str, compatibility: Mapping[str, Any], version: str,
+) -> VersionCompatibility:
+    minimum = compatibility.get("minimum_cli_version")
+    maximum = compatibility.get("maximum_cli_version_exclusive")
+    verified = compatibility.get("verified_cli_version")
+    declared = {
         "minimum_cli_version": minimum,
         "maximum_cli_version_exclusive": maximum,
         "verified_cli_version": verified,
     }
     missing = [
-        key
-        for key, value in compatibility.items()
+        key for key, value in declared.items()
         if not isinstance(value, str) or not value
     ]
     if missing:
@@ -126,25 +129,42 @@ def checked_probe_result(
             "HARNESS_VERSION_UNSUPPORTED",
             f"{harness} {version} is older than required {minimum}",
         )
-    # The minimum is a capability floor: older releases are known not to
-    # satisfy this adapter contract.  The maximum is only the edge of the
-    # tested envelope.  Vendor releases newer than that envelope must stay
-    # visible without globally locking otherwise valid engine actions; actual
-    # protocol incompatibilities still fail at the operation that observes
-    # them.
+    # The minimum is a capability floor. The maximum is the edge of the tested
+    # envelope: newer releases remain visible as newer-unverified so each
+    # operation can apply its own fail-closed compatibility requirement.
     compatibility_status = (
         "newer-unverified"
         if version_tuple(version) >= version_tuple(maximum)
         else ("verified" if version == verified else "supported")
     )
-    return ProbeResult(
-        harness=harness,
+    return VersionCompatibility(
         version=version,
         minimum_version=minimum,
-        capabilities=capabilities,
         maximum_version_exclusive=maximum,
         verified_version=verified,
         compatibility=compatibility_status,
+    )
+
+
+def checked_probe_result(
+    *,
+    harness: str,
+    manifest: Mapping[str, Any],
+    capabilities: AdapterCapabilities,
+    version: str,
+) -> ProbeResult:
+    conversation = manifest.get("conversation") or {}
+    checked = checked_version_compatibility(
+        harness=harness, compatibility=conversation, version=version
+    )
+    return ProbeResult(
+        harness=harness,
+        version=checked.version,
+        minimum_version=checked.minimum_version,
+        capabilities=capabilities,
+        maximum_version_exclusive=checked.maximum_version_exclusive,
+        verified_version=checked.verified_version,
+        compatibility=checked.compatibility,
     )
 
 

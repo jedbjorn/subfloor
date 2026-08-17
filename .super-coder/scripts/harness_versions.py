@@ -21,12 +21,24 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 
 # Probe order = the order the harness picker lists them.
 HARNESSES = ("claude", "codex", "opencode", "vibe", "kimi")
 TIMEOUT = 8
+
+
+def runtime_scope(*, env=None, hostname: str | None = None) -> dict[str, str]:
+    """Identify the execution seat whose binaries this process can probe."""
+    env = os.environ if env is None else env
+    runtime = "sandbox" if env.get("SC_SANDBOX") else "host"
+    hostname = socket.gethostname() if hostname is None else hostname
+    return {
+        "runtime": runtime,
+        "runtime_identity": f"{runtime}:{hostname}",
+    }
 
 
 def probe(name: str) -> str | None:
@@ -48,32 +60,28 @@ def versions() -> dict[str, str | None]:
     return {name: probe(name) for name in HARNESSES}
 
 
-def compatibility_status() -> dict[str, dict[str, str | None]]:
+def compatibility_status(
+    harnesses: tuple[str, ...] | None = None,
+) -> dict[str, dict[str, str | None]]:
     """Report runtime binaries through the adapters' shared range contract."""
     from conversation_adapters import ADAPTER_TYPES, AdapterError
     from conversation_adapters.base import (
-        AdapterCapabilities,
-        checked_probe_result,
+        ADAPTERS,
+        checked_version_compatibility,
         load_manifest,
     )
 
+    harnesses = HARNESSES if harnesses is None else harnesses
+    scope = runtime_scope()
     found: dict[str, dict[str, str | None]] = {}
-    for name in HARNESSES:
+    for name in harnesses:
+        identity = {"harness": name, **scope}
         raw_version = probe(name)
         match = re.search(r"\d+\.\d+\.\d+", raw_version or "")
         version = match.group(0) if match else None
-        if name not in ADAPTER_TYPES:
-            found[name] = {
-                "version": raw_version,
-                "compatibility": None,
-                "minimum_version": None,
-                "maximum_version_exclusive": None,
-                "verified_version": None,
-                "error": None if raw_version else "HARNESS_UNAVAILABLE",
-            }
-            continue
         if version is None:
             found[name] = {
+                **identity,
                 "version": None,
                 "compatibility": None,
                 "minimum_version": None,
@@ -84,16 +92,24 @@ def compatibility_status() -> dict[str, dict[str, str | None]]:
             continue
         manifest = {}
         try:
-            manifest = load_manifest(name)
-            result = checked_probe_result(
+            if name in ADAPTER_TYPES:
+                manifest = load_manifest(name)
+                compatibility = manifest.get("conversation") or {}
+            else:
+                adapter = json.loads(
+                    (ADAPTERS / name / "adapter.json").read_text()
+                )
+                compatibility = adapter.get("runtime_compatibility") or {}
+                manifest = {"conversation": compatibility}
+            result = checked_version_compatibility(
                 harness=name,
-                manifest=manifest,
-                capabilities=AdapterCapabilities.from_manifest(manifest),
+                compatibility=compatibility,
                 version=version,
             )
-        except AdapterError as exc:
+        except (AdapterError, OSError, json.JSONDecodeError) as exc:
             conversation = manifest.get("conversation", {})
             found[name] = {
+                **identity,
                 "version": version,
                 "compatibility": None,
                 "minimum_version": conversation.get("minimum_cli_version"),
@@ -101,10 +117,12 @@ def compatibility_status() -> dict[str, dict[str, str | None]]:
                     "maximum_cli_version_exclusive"
                 ),
                 "verified_version": conversation.get("verified_cli_version"),
-                "error": exc.code,
+                "error": exc.code if isinstance(exc, AdapterError)
+                else "HARNESS_MANIFEST_INVALID",
             }
             continue
         found[name] = {
+            **identity,
             "version": result.version,
             "compatibility": result.compatibility,
             "minimum_version": result.minimum_version,
@@ -116,7 +134,7 @@ def compatibility_status() -> dict[str, dict[str, str | None]]:
 
 
 def main(argv: list[str]) -> int:
-    provenance = "sandbox" if os.environ.get("SC_SANDBOX") else "host"
+    provenance = runtime_scope()["runtime"]
     found = compatibility_status()
     if "--json" in argv:
         print(json.dumps({"runtime": provenance, "harnesses": found}, indent=2))

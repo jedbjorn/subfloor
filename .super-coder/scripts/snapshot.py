@@ -49,6 +49,11 @@ SPRINT_INSTANCE_TABLES = [
     "sprint_spec_approvals",
     "sprints",
     "sprint_specs",
+    # Bindings load before participants because the latter's active-pointer
+    # ownership trigger must be able to see the referenced immutable row.
+    # Snapshot load has foreign_keys disabled, so the binding's participant FK
+    # is reconciled when the complete snapshot is present.
+    "sprint_participant_route_bindings",
     "sprint_participants",
     "sprint_participant_conversations",
     "sprint_cleanup_targets",
