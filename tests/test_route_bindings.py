@@ -21,13 +21,23 @@ import route_bindings  # noqa: E402
 import models as routes_cli  # noqa: E402
 
 
-def compatible_runtime(version: str = "2.22.0") -> dict:
+def compatible_runtime(version: str = "2.22.0", *, harness: str | None = None,
+                       scope: dict | None = None) -> dict:
+    harness = harness or ("claude" if version.startswith("2.1.") else "vibe")
+    ranges = {
+        "claude": ("2.1.220", "2.2.0", "2.1.222"),
+        "vibe": ("2.22.0", "2.23.0", "2.22.0"),
+    }
+    minimum, maximum, verified = ranges[harness]
+    scope = scope or route_bindings.harness_versions.runtime_scope()
     return {
+        "harness": harness,
+        **scope,
         "version": version,
-        "compatibility": "verified",
-        "minimum_version": version,
-        "maximum_version_exclusive": "99.0.0",
-        "verified_version": version,
+        "compatibility": "verified" if version == verified else "supported",
+        "minimum_version": minimum,
+        "maximum_version_exclusive": maximum,
+        "verified_version": verified,
         "error": None,
     }
 
@@ -1288,6 +1298,81 @@ class ParticipantRevisionTest(unittest.TestCase):
                 (10, default_receipt["binding_id"]),
                 (11, vibe_receipt["binding_id"]),
             ],
+        )
+
+    def test_runtime_evidence_is_harness_range_and_execution_seat_scoped(self):
+        host_scope = {"runtime": "host", "runtime_identity": "host:seat-a"}
+        sandbox_scope = {
+            "runtime": "sandbox", "runtime_identity": "sandbox:seat-b",
+        }
+        good = compatible_runtime(scope=host_scope)
+        rejected = (
+            ("cross-harness", compatible_runtime(
+                "2.1.222", harness="claude", scope=host_scope
+            ), host_scope),
+            ("below-minimum-labelled-verified", {
+                **good, "version": "2.21.9", "compatibility": "verified",
+            }, host_scope),
+            ("maximum-labelled-supported", {
+                **good, "version": "2.23.0", "compatibility": "supported",
+            }, host_scope),
+            ("different-execution-seat", good, sandbox_scope),
+        )
+
+        for name, status, expected_scope in rejected:
+            with self.subTest(name=name):
+                binding = digest = None
+                with self.assertRaises(
+                    route_bindings.RouteResolutionError
+                ) as raised:
+                    binding, digest = route_bindings.resolve_v2(
+                        None, "vibe", "devstral-latest",
+                        runtime_status=status, runtime_scope=expected_scope,
+                    )
+                self.assertEqual(raised.exception.code, "thinking_evidence_missing")
+                self.assertIsNone(binding)
+                self.assertIsNone(digest)
+
+                with self.assertRaises(route_bindings.RouteResolutionError):
+                    self.store.bind(
+                        10, self.binding, self.digest, transition="arm",
+                        runtime_status=status, runtime_scope=expected_scope,
+                    )
+                self.assertEqual(
+                    self.con.execute(
+                        "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    self.con.execute(
+                        "SELECT COUNT(*) FROM sprint_participants "
+                        "WHERE active_route_binding_id IS NOT NULL"
+                    ).fetchone()[0],
+                    0,
+                )
+
+        binding, digest = route_bindings.resolve_v2(
+            None, "vibe", "devstral-latest",
+            runtime_status=good, runtime_scope=host_scope,
+        )
+        receipt = self.store.bind(
+            10, binding, digest, transition="arm",
+            runtime_status=good, runtime_scope=host_scope,
+        )
+        self.assertEqual(receipt["route_revision"], 1)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT binding_digest FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+            digest,
+        )
+        self.assertEqual(
+            self.con.execute(
+                "SELECT active_route_binding_id FROM sprint_participants "
+                "WHERE participant_id=10"
+            ).fetchone()[0],
+            receipt["binding_id"],
         )
 
     def test_store_cannot_bypass_uncontrolled_runtime_admission(self):

@@ -41,6 +41,8 @@ def test_runtime_binary_version_is_checked_against_adapter_range() -> None:
     ):
         assert harness_versions.compatibility_status() == {
             "claude": {
+                "harness": "claude",
+                **harness_versions.runtime_scope(),
                 "version": "2.1.222",
                 "compatibility": "verified",
                 "minimum_version": "2.1.220",
@@ -62,6 +64,8 @@ def test_newer_runtime_is_reported_without_becoming_an_error() -> None:
     ):
         assert harness_versions.compatibility_status() == {
             "codex": {
+                "harness": "codex",
+                **harness_versions.runtime_scope(),
                 "version": "0.147.0",
                 "compatibility": "newer-unverified",
                 "minimum_version": "0.145.0",
@@ -79,6 +83,8 @@ def test_missing_non_conversation_harness_is_reported_unavailable() -> None:
     ):
         assert harness_versions.compatibility_status() == {
             "vibe": {
+                "harness": "vibe",
+                **harness_versions.runtime_scope(),
                 "version": None,
                 "compatibility": None,
                 "minimum_version": None,
@@ -97,6 +103,8 @@ def test_vibe_runtime_uses_its_non_conversation_compatibility_manifest() -> None
 
     assert status == {
         "vibe": {
+            "harness": "vibe",
+            **harness_versions.runtime_scope(),
             "version": "2.22.0",
             "compatibility": "verified",
             "minimum_version": "2.22.0",

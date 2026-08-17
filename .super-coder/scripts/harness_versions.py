@@ -21,12 +21,24 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 
 # Probe order = the order the harness picker lists them.
 HARNESSES = ("claude", "codex", "opencode", "vibe", "kimi")
 TIMEOUT = 8
+
+
+def runtime_scope(*, env=None, hostname: str | None = None) -> dict[str, str]:
+    """Identify the execution seat whose binaries this process can probe."""
+    env = os.environ if env is None else env
+    runtime = "sandbox" if env.get("SC_SANDBOX") else "host"
+    hostname = socket.gethostname() if hostname is None else hostname
+    return {
+        "runtime": runtime,
+        "runtime_identity": f"{runtime}:{hostname}",
+    }
 
 
 def probe(name: str) -> str | None:
@@ -60,13 +72,16 @@ def compatibility_status(
     )
 
     harnesses = HARNESSES if harnesses is None else harnesses
+    scope = runtime_scope()
     found: dict[str, dict[str, str | None]] = {}
     for name in harnesses:
+        identity = {"harness": name, **scope}
         raw_version = probe(name)
         match = re.search(r"\d+\.\d+\.\d+", raw_version or "")
         version = match.group(0) if match else None
         if version is None:
             found[name] = {
+                **identity,
                 "version": None,
                 "compatibility": None,
                 "minimum_version": None,
@@ -94,6 +109,7 @@ def compatibility_status(
         except (AdapterError, OSError, json.JSONDecodeError) as exc:
             conversation = manifest.get("conversation", {})
             found[name] = {
+                **identity,
                 "version": version,
                 "compatibility": None,
                 "minimum_version": conversation.get("minimum_cli_version"),
@@ -106,6 +122,7 @@ def compatibility_status(
             }
             continue
         found[name] = {
+            **identity,
             "version": result.version,
             "compatibility": result.compatibility,
             "minimum_version": result.minimum_version,
@@ -117,7 +134,7 @@ def compatibility_status(
 
 
 def main(argv: list[str]) -> int:
-    provenance = "sandbox" if os.environ.get("SC_SANDBOX") else "host"
+    provenance = runtime_scope()["runtime"]
     found = compatibility_status()
     if "--json" in argv:
         print(json.dumps({"runtime": provenance, "harnesses": found}, indent=2))

@@ -42,13 +42,22 @@ import server  # noqa: E402  (server.py adds scripts/ to the path on import)
 import models as routes_cli  # noqa: E402
 
 
-def compatible_runtime(version: str = "2.22.0") -> dict:
+def compatible_runtime(version: str = "2.22.0", *, harness: str = "vibe",
+                       scope: dict | None = None) -> dict:
+    ranges = {
+        "claude": ("2.1.220", "2.2.0", "2.1.222"),
+        "vibe": ("2.22.0", "2.23.0", "2.22.0"),
+    }
+    minimum, maximum, verified = ranges[harness]
+    scope = scope or routes_cli.model_catalog.harness_versions.runtime_scope()
     return {
+        "harness": harness,
+        **scope,
         "version": version,
-        "compatibility": "verified",
-        "minimum_version": "2.0.0",
-        "maximum_version_exclusive": "3.0.0",
-        "verified_version": version,
+        "compatibility": "verified" if version == verified else "supported",
+        "minimum_version": minimum,
+        "maximum_version_exclusive": maximum,
+        "verified_version": verified,
         "error": None,
     }
 
@@ -1033,7 +1042,7 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         self.assertEqual(status, 200, current)
         self.assertEqual(current["routes"][0]["source"], "api-source-v2")
 
-    def test_uncontrolled_route_projection_reports_runtime_compatibility(self) -> None:
+    def test_route_projection_does_not_claim_api_host_runtime_evidence(self) -> None:
         status, unavailable = self.request(
             "/_sc/model-routes?harness=claude",
             runtime_status={
@@ -1043,11 +1052,8 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         )
 
         self.assertEqual(status, 200, unavailable)
-        self.assertEqual(unavailable["runtime_status"], {
-            "version": None, "compatibility": None,
-            "error": "HARNESS_UNAVAILABLE",
-        })
         self.assertEqual(unavailable["routes"], [])
+        self.assertNotIn("runtime_status", unavailable)
 
     def test_real_advisory_vibe_catalogue_resolves_locally_and_via_api(self) -> None:
         vibe_status = compatible_runtime()
@@ -1103,6 +1109,10 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
             mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
             mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
             mock.patch.object(routes_cli.mem, "_api", side_effect=api),
+            mock.patch.object(
+                routes_cli.model_catalog, "harness_runtime_status",
+                return_value=vibe_status,
+            ),
             mock.patch.object(
                 routes_cli, "_open_db", side_effect=AssertionError("opened DB")
             ),

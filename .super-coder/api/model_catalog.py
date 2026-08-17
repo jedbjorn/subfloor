@@ -461,8 +461,13 @@ def harness_runtime_status(harness: str) -> dict:
         )
     except Exception:  # noqa: BLE001
         return {
+            "harness": harness,
+            **harness_versions.runtime_scope(),
             "version": None,
             "compatibility": None,
+            "minimum_version": None,
+            "maximum_version_exclusive": None,
+            "verified_version": None,
             "error": "HARNESS_PROBE_FAILED",
         }
 

@@ -11,8 +11,11 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
+import harness_versions
+from conversation_adapters.base import AdapterError, checked_version_compatibility
 
 CONTRACT_VERSION = 2
 FRESH_HOURS = 24
@@ -53,6 +56,7 @@ LOWER_HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 ASCII_LOWER_TRANSLATION = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
 )
+ADAPTERS = Path(__file__).resolve().parents[1] / "adapters"
 
 
 @dataclass(frozen=True)
@@ -63,6 +67,27 @@ class RouteResolutionError(Exception):
 
     def __str__(self) -> str:
         return self.message
+
+
+@dataclass(frozen=True)
+class RuntimeEvidence:
+    harness: str | None
+    runtime: str | None
+    runtime_identity: str | None
+    version: str | None
+    compatibility: str | None
+    minimum_version: str | None
+    maximum_version_exclusive: str | None
+    verified_version: str | None
+    error: str | None
+
+    @classmethod
+    def from_value(cls, value: Any) -> RuntimeEvidence:
+        status = value if isinstance(value, dict) else {}
+        return cls(**{
+            field: status.get(field)
+            for field in cls.__dataclass_fields__
+        })
 
 
 def canonical_json(value: Any) -> str:
@@ -243,18 +268,61 @@ def _parsed_version(value: Any) -> str | None:
     return match.group(0) if match else None
 
 
+def _runtime_manifest_compatibility(harness: str, version: str):
+    try:
+        manifest = json.loads((ADAPTERS / harness / "adapter.json").read_text())
+        declared = (
+            manifest.get("runtime_compatibility")
+            if harness == "vibe"
+            else manifest.get("conversation")
+        ) or {}
+        return checked_version_compatibility(
+            harness=harness, compatibility=declared, version=version
+        )
+    except AdapterError as exc:
+        message = (
+            f"Harness '{harness}' has no valid compatibility manifest"
+            if exc.code == "HARNESS_MANIFEST_INVALID"
+            else f"Harness '{harness}' has no compatible installed runtime"
+        )
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            message,
+            {"harness": harness, "runtime_error": exc.code},
+        ) from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            f"Harness '{harness}' has no valid compatibility manifest",
+            {"harness": harness, "runtime_error": getattr(exc, "code", None)},
+        ) from exc
+
+
 def _require_uncontrolled_runtime(
-    harness: str, model: str | None, runtime_status: dict | None,
+    harness: str,
+    model: str | None,
+    runtime_status: dict | RuntimeEvidence | None,
+    runtime_scope: dict | None = None,
 ) -> None:
-    """Admit typed-uncontrolled identity only for a verified local adapter."""
-    status = runtime_status if isinstance(runtime_status, dict) else {}
-    version = status.get("version")
-    compatibility = status.get("compatibility")
-    error = status.get("error")
+    """Admit typed-uncontrolled identity only for the exact execution seat."""
+    status = runtime_status if isinstance(runtime_status, RuntimeEvidence) \
+        else RuntimeEvidence.from_value(runtime_status)
+    scope = runtime_scope if isinstance(runtime_scope, dict) \
+        else harness_versions.runtime_scope()
+    expected_runtime = scope.get("runtime")
+    expected_identity = scope.get("runtime_identity")
+    version = status.version
     if (
-        error
+        status.harness != harness
+        or status.runtime not in {"host", "sandbox"}
+        or status.runtime != expected_runtime
+        or not isinstance(status.runtime_identity, str)
+        or status.runtime_identity != expected_identity
+        or not status.runtime_identity.startswith(f"{status.runtime}:")
+        or not isinstance(expected_identity, str)
+        or not expected_identity.startswith(f"{expected_runtime}:")
+        or status.error is not None
         or _parsed_version(version) != version
-        or compatibility not in COMPATIBLE_HARNESS_STATES
     ):
         raise RouteResolutionError(
             "thinking_evidence_missing",
@@ -263,9 +331,35 @@ def _require_uncontrolled_runtime(
                 "harness": harness,
                 "model": model,
                 "version": version,
-                "compatibility": compatibility,
-                "runtime_error": error,
+                "compatibility": status.compatibility,
+                "evidence_harness": status.harness,
+                "evidence_runtime": status.runtime,
+                "evidence_runtime_identity": status.runtime_identity,
+                "expected_runtime": expected_runtime,
+                "expected_runtime_identity": expected_identity,
+                "runtime_error": status.error,
                 "remediation": "install or repair the compatible harness runtime",
+            },
+        )
+    checked = _runtime_manifest_compatibility(harness, version)
+    coherent = (
+        status.compatibility == checked.compatibility
+        and status.minimum_version == checked.minimum_version
+        and status.maximum_version_exclusive == checked.maximum_version_exclusive
+        and status.verified_version == checked.verified_version
+        and status.compatibility in COMPATIBLE_HARNESS_STATES
+    )
+    if not coherent:
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            f"Harness '{harness}' has no compatible installed runtime",
+            {
+                "harness": harness,
+                "model": model,
+                "version": version,
+                "compatibility": status.compatibility,
+                "runtime_error": "HARNESS_COMPATIBILITY_EVIDENCE_INVALID",
+                "remediation": "re-probe the harness in the execution runtime",
             },
         )
 
@@ -498,6 +592,7 @@ def resolve_persisted_v2(
     now: datetime | None = None,
     current_source_fingerprint: str | None = None,
     runtime_status: dict | None = None,
+    runtime_scope: dict | None = None,
 ) -> tuple[dict, str]:
     """Resolve through the shared durable freshness boundary."""
     fresh_row = require_fresh_route(
@@ -508,6 +603,7 @@ def resolve_persisted_v2(
         fresh_row, harness, model, effort, now=now,
         current_source_fingerprint=current_source_fingerprint,
         runtime_status=runtime_status,
+        runtime_scope=runtime_scope,
     )
 
 
@@ -520,13 +616,16 @@ def resolve_v2(
     now: datetime | None = None,
     current_source_fingerprint: str | None = None,
     runtime_status: dict | None = None,
+    runtime_scope: dict | None = None,
 ) -> tuple[dict, str]:
     """Resolve one v2 intent to a fixed-key immutable binding and digest."""
     harness = normalize_harness(harness)
     model = _normalize_model(model)
     if model is None or harness == "vibe":
         binding = _uncontrolled_binding(harness, model, effort)
-        _require_uncontrolled_runtime(harness, model, runtime_status)
+        _require_uncontrolled_runtime(
+            harness, model, runtime_status, runtime_scope
+        )
         validate_v2_binding(binding)
         return binding, digest_json(binding)
 
@@ -656,11 +755,13 @@ class ParticipantRouteBindingStore:
         self.con = con
 
     def bind(self, participant_id: int, binding: dict, binding_digest: str, *,
-             transition: str, runtime_status: dict | None = None) -> dict:
+             transition: str, runtime_status: dict | None = None,
+             runtime_scope: dict | None = None) -> dict:
         validate_v2_binding(binding)
         if binding["control_state"] != "controlled":
             _require_uncontrolled_runtime(
-                binding["harness"], binding["requested_model"], runtime_status
+                binding["harness"], binding["requested_model"], runtime_status,
+                runtime_scope,
             )
         if (not _lower_hex(binding_digest, LOWER_HEX_64)
                 or digest_json(binding) != binding_digest):

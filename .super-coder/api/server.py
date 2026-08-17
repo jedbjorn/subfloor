@@ -504,10 +504,7 @@ def get_model_routes(con, *, harness: str | None = None,
                     current["route_resolution_error"] = resolution_error
                 refreshed.append(current)
         routes = refreshed
-    result = {"routes": routes}
-    if harness is not None:
-        result["runtime_status"] = model_catalog.harness_runtime_status(harness)
-    return result
+    return {"routes": routes}
 
 
 def known_harnesses() -> list[str]:

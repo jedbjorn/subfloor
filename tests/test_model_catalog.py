@@ -72,13 +72,31 @@ def ids(harness_block):
     return [e["id"] for e in harness_block["models"]]
 
 
-def runtime_status(version="2.22.0", compatibility="verified", error=None):
+_AUTO_COMPATIBILITY = object()
+
+
+def runtime_status(version="2.22.0", compatibility=_AUTO_COMPATIBILITY,
+                   error=None, *, harness=None, scope=None):
+    harness = harness or (
+        "claude" if isinstance(version, str) and version.startswith("2.1.")
+        else "vibe"
+    )
+    ranges = {
+        "claude": ("2.1.220", "2.2.0", "2.1.222"),
+        "vibe": ("2.22.0", "2.23.0", "2.22.0"),
+    }
+    minimum, maximum, verified = ranges[harness]
+    if compatibility is _AUTO_COMPATIBILITY:
+        compatibility = "verified" if version == verified else "supported"
+    scope = scope or routes_cli.model_catalog.harness_versions.runtime_scope()
     return {
+        "harness": harness,
+        **scope,
         "version": version,
         "compatibility": compatibility,
-        "minimum_version": "2.0.0",
-        "maximum_version_exclusive": "3.0.0",
-        "verified_version": "2.22.0",
+        "minimum_version": minimum,
+        "maximum_version_exclusive": maximum,
+        "verified_version": verified,
         "error": error,
     }
 
@@ -698,7 +716,7 @@ class RouteCliConnectionTest(unittest.TestCase):
 
         with mock.patch.object(
             routes_cli.model_catalog, "harness_runtime_status",
-            return_value=runtime_status("2.1.223"),
+            return_value=runtime_status("2.1.223", harness="claude"),
         ):
             refused_status, refused, refused_con = resolve("not-a-harness")
             accepted_status, accepted, accepted_con = resolve("ClAuDe")
@@ -727,7 +745,8 @@ class RouteCliConnectionTest(unittest.TestCase):
         with mock.patch.object(
             routes_cli.model_catalog, "harness_runtime_status",
             return_value=runtime_status(
-                version=None, compatibility=None, error="HARNESS_UNAVAILABLE"
+                version=None, compatibility=None, error="HARNESS_UNAVAILABLE",
+                harness="claude",
             ),
         ):
             unavailable_harness = routes_cli.resolve(con, "claude")
@@ -754,7 +773,9 @@ class RouteCliConnectionTest(unittest.TestCase):
         con = mock.Mock()
         with mock.patch.object(
             routes_cli.model_catalog, "harness_runtime_status",
-            return_value=runtime_status(),
+            side_effect=lambda harness: runtime_status(
+                "2.1.223", harness="claude"
+            ) if harness == "claude" else runtime_status(harness="vibe"),
         ):
             default_first = routes_cli.resolve(con, "claude")
             default_replay = routes_cli.resolve(con, "claude")
@@ -785,20 +806,25 @@ class RouteCliConnectionTest(unittest.TestCase):
             (
                 ["resolve", "claude", "--json"],
                 {"routes": [], "runtime_status": runtime_status(
+                    "2.1.223", harness="claude"
+                )},
+                runtime_status(
                     version=None, compatibility=None,
                     error="HARNESS_UNAVAILABLE",
-                )},
+                    harness="claude",
+                ),
                 "/_sc/model-routes?harness=claude",
             ),
             (
                 ["resolve", "vibe", "devstral-latest", "--json"],
-                {"routes": [], "runtime_status": runtime_status(
-                    version="3.0.0", compatibility="newer-unverified",
-                )},
+                {"routes": [], "runtime_status": runtime_status()},
+                runtime_status(
+                    version="3.0.0", compatibility="newer-unverified"
+                ),
                 "/_sc/model-routes?harness=vibe&selector=devstral-latest",
             ),
         )
-        for argv, projection, path in cases:
+        for argv, projection, local_status, path in cases:
             with self.subTest(argv=argv):
                 output = io.StringIO()
                 api = mock.Mock(return_value=projection)
@@ -810,6 +836,10 @@ class RouteCliConnectionTest(unittest.TestCase):
                         routes_cli.mem, "SC_API_BASE", "http://engine"
                     ),
                     mock.patch.object(routes_cli.mem, "_api", api),
+                    mock.patch.object(
+                        routes_cli.model_catalog, "harness_runtime_status",
+                        return_value=local_status,
+                    ),
                     mock.patch.object(
                         routes_cli, "_open_db",
                         side_effect=AssertionError("opened DB"),
@@ -828,10 +858,10 @@ class RouteCliConnectionTest(unittest.TestCase):
     def test_authenticated_ready_uncontrolled_binding_is_stable(self):
         projections = {
             "/_sc/model-routes?harness=claude": {
-                "routes": [], "runtime_status": runtime_status("2.1.223"),
+                "routes": [],
             },
             "/_sc/model-routes?harness=vibe&selector=vibe-local": {
-                "routes": [], "runtime_status": runtime_status(),
+                "routes": [],
             },
         }
 
@@ -843,6 +873,12 @@ class RouteCliConnectionTest(unittest.TestCase):
                 mock.patch.object(
                     routes_cli.mem, "_api",
                     side_effect=lambda _method, path: projections[path],
+                ),
+                mock.patch.object(
+                    routes_cli.model_catalog, "harness_runtime_status",
+                    side_effect=lambda harness: runtime_status(
+                        "2.1.223", harness="claude"
+                    ) if harness == "claude" else runtime_status(harness="vibe"),
                 ),
                 mock.patch.object(
                     routes_cli, "_open_db", side_effect=AssertionError("opened DB")
@@ -865,6 +901,87 @@ class RouteCliConnectionTest(unittest.TestCase):
                 self.assertIsNone(first["binding"]["catalogue_generation"])
                 self.assertIsNone(first["binding"]["evidence_digest"])
                 self.assertNotIn("--effort", first["command"])
+
+    def test_authenticated_resolution_uses_the_shell_execution_runtime(self):
+        host = {"runtime": "host", "runtime_identity": "host:api-host"}
+        sandbox = {
+            "runtime": "sandbox", "runtime_identity": "sandbox:shell-image",
+        }
+        host_ready = runtime_status(scope=host)
+        host_missing = runtime_status(
+            version=None, compatibility=None, error="HARNESS_UNAVAILABLE",
+            scope=host,
+        )
+        sandbox_ready = runtime_status(scope=sandbox)
+        sandbox_missing = runtime_status(
+            version=None, compatibility=None, error="HARNESS_UNAVAILABLE",
+            scope=sandbox,
+        )
+        sandbox_incompatible = runtime_status(
+            version="2.23.0", compatibility="newer-unverified", scope=sandbox,
+        )
+        cases = (
+            ("host-ready-container-missing", host_ready, sandbox_missing,
+             sandbox, False),
+            ("host-missing-container-ready", host_missing, sandbox_ready,
+             sandbox, True),
+            ("incompatible-image-version", host_ready, sandbox_incompatible,
+             sandbox, False),
+            ("matching-bare-metal", host_ready, host_ready, host, True),
+        )
+
+        for name, api_status, shell_status, shell_scope, accepted in cases:
+            with self.subTest(name=name):
+                output = io.StringIO()
+                api = mock.Mock(return_value={
+                    "routes": [],
+                    # A legacy/malicious server value must never be admission
+                    # evidence for the shell's execution runtime.
+                    "runtime_status": api_status,
+                })
+                local_probe = mock.Mock(return_value=shell_status)
+                with (
+                    mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+                    mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+                    mock.patch.object(routes_cli.mem, "_api", api),
+                    mock.patch.object(
+                        routes_cli.model_catalog, "harness_runtime_status",
+                        local_probe,
+                    ),
+                    mock.patch.object(
+                        routes_cli.model_catalog.harness_versions,
+                        "runtime_scope", return_value=shell_scope,
+                    ),
+                    mock.patch.object(
+                        routes_cli, "_open_db",
+                        side_effect=AssertionError("opened DB"),
+                    ),
+                    contextlib.redirect_stdout(output),
+                ):
+                    exit_code = routes_cli.main([
+                        "resolve", "vibe", "devstral-latest", "--json",
+                    ])
+                result = json.loads(output.getvalue())
+
+                self.assertEqual(exit_code, 0 if accepted else 2)
+                self.assertEqual(result["ok"], accepted)
+                if accepted:
+                    self.assertEqual(
+                        result["binding"]["control_state"],
+                        "native-uncontrolled",
+                    )
+                    self.assertIsNone(result["binding"]["requested_effort"])
+                    self.assertNotIn("--effort", result["command"])
+                else:
+                    self.assertEqual(result["code"], "thinking_evidence_missing")
+                    self.assertNotIn("binding", result)
+                    self.assertNotIn("binding_digest", result)
+                    self.assertNotIn("command", result)
+                local_probe.assert_called_once_with("vibe")
+                api.assert_called_once_with(
+                    "GET",
+                    "/_sc/model-routes?harness=vibe&selector=devstral-latest",
+                )
 
     def test_refresh_keeps_the_wal_enabled_write_lane(self):
         con = mock.Mock()
