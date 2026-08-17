@@ -51,11 +51,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      # pytest is the runner; every other test import is stdlib or engine-local.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # pytest is the runner; test imports remain stdlib or engine-local.
       - name: Install pytest
         run: pip install pytest
+      - name: Install exact OpenCode compatibility binary
+        run: npm install --global opencode-ai@1.18.9
       - name: Run the suite
         run: pytest tests/ -q
+        env:
+          SC_REQUIRE_OPENCODE_CANARY: '1'
 
   # The end-to-end proof `./sc verify` runs: rebuild the DB from committed text
   # (schema + migrations + content.sql), flat-render, then a render-only boot —
