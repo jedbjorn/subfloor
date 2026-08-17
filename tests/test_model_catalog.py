@@ -72,6 +72,17 @@ def ids(harness_block):
     return [e["id"] for e in harness_block["models"]]
 
 
+def runtime_status(version="2.22.0", compatibility="verified", error=None):
+    return {
+        "version": version,
+        "compatibility": compatibility,
+        "minimum_version": "2.0.0",
+        "maximum_version_exclusive": "3.0.0",
+        "verified_version": "2.22.0",
+        "error": error,
+    }
+
+
 class NoCLI(unittest.TestCase):
     """Base: opencode binary absent unless a test opts in."""
 
@@ -82,6 +93,17 @@ class NoCLI(unittest.TestCase):
 
 
 class BuildTest(NoCLI):
+    def test_single_harness_runtime_status_uses_version_bounded_probe(self):
+        expected = runtime_status()
+        with mock.patch.object(
+            mc.harness_versions, "compatibility_status",
+            return_value={"vibe": expected},
+        ) as probe:
+            got = mc.harness_runtime_status("vibe")
+
+        self.assertEqual(got, expected)
+        probe.assert_called_once_with(("vibe",))
+
     def test_harness_mapping_and_prefixing(self):
         got = mc.build(fetch=fetch_ok, env={}, run=None)
         self.assertEqual(got["v"], mc.PAYLOAD_VERSION)
@@ -675,7 +697,8 @@ class RouteCliConnectionTest(unittest.TestCase):
             return status, json.loads(output.getvalue()), con
 
         with mock.patch.object(
-            routes_cli.model_catalog, "harness_launch_ready", return_value=True
+            routes_cli.model_catalog, "harness_runtime_status",
+            return_value=runtime_status("2.1.223"),
         ):
             refused_status, refused, refused_con = resolve("not-a-harness")
             accepted_status, accepted, accepted_con = resolve("ClAuDe")
@@ -699,49 +722,39 @@ class RouteCliConnectionTest(unittest.TestCase):
         )
         accepted_con.close.assert_called_once_with()
 
-    def test_local_uncontrolled_resolve_requires_launch_readiness(self):
+    def test_local_uncontrolled_resolve_requires_compatible_runtime(self):
         con = mock.Mock()
         with mock.patch.object(
-            routes_cli.model_catalog, "harness_launch_ready", return_value=False
+            routes_cli.model_catalog, "harness_runtime_status",
+            return_value=runtime_status(
+                version=None, compatibility=None, error="HARNESS_UNAVAILABLE"
+            ),
         ):
             unavailable_harness = routes_cli.resolve(con, "claude")
-        with (
-            mock.patch.object(
-                routes_cli.model_catalog, "harness_launch_ready",
-                return_value=True,
+        with mock.patch.object(
+            routes_cli.model_catalog, "harness_runtime_status",
+            return_value=runtime_status(
+                version="3.0.0", compatibility="newer-unverified"
             ),
-            mock.patch.object(routes_cli, "_route", return_value=None),
         ):
-            unavailable_vibe = routes_cli.resolve(
-                con, "vibe", "definitely-not-local"
+            incompatible_vibe = routes_cli.resolve(
+                con, "vibe", "devstral-latest"
             )
 
-        for result in (unavailable_harness, unavailable_vibe):
+        for result in (unavailable_harness, incompatible_vibe):
             self.assertFalse(result["ok"])
             self.assertEqual(result["code"], "thinking_evidence_missing")
             self.assertNotIn("binding", result)
             self.assertNotIn("binding_digest", result)
             self.assertNotIn("command", result)
-        self.assertIn("not available for launch", unavailable_harness["error"])
-        self.assertEqual(
-            unavailable_vibe["error"],
-            "Route 'vibe/definitely-not-local' is not currently available",
-        )
+        self.assertIn("no compatible installed runtime", unavailable_harness["error"])
+        self.assertIn("no compatible installed runtime", incompatible_vibe["error"])
 
     def test_local_ready_uncontrolled_routes_keep_typed_null_identity(self):
         con = mock.Mock()
-        vibe_row = {
-            "harness": "vibe", "selector": "vibe-local",
-            "source": "vibe-local", "availability": "available",
-            "stale": 0, "cli_version": "vibe 2.22.0",
-            "supported_efforts": "[]",
-        }
-        with (
-            mock.patch.object(
-                routes_cli.model_catalog, "harness_launch_ready",
-                return_value=True,
-            ),
-            mock.patch.object(routes_cli, "_route", return_value=vibe_row),
+        with mock.patch.object(
+            routes_cli.model_catalog, "harness_runtime_status",
+            return_value=runtime_status(),
         ):
             default_first = routes_cli.resolve(con, "claude")
             default_replay = routes_cli.resolve(con, "claude")
@@ -767,17 +780,22 @@ class RouteCliConnectionTest(unittest.TestCase):
             vibe_first["binding_digest"], vibe_replay["binding_digest"]
         )
 
-    def test_authenticated_uncontrolled_resolve_applies_server_readiness(self):
+    def test_authenticated_uncontrolled_resolve_applies_runtime_compatibility(self):
         cases = (
             (
                 ["resolve", "claude", "--json"],
-                {"routes": [], "harness_ready": False},
+                {"routes": [], "runtime_status": runtime_status(
+                    version=None, compatibility=None,
+                    error="HARNESS_UNAVAILABLE",
+                )},
                 "/_sc/model-routes?harness=claude",
             ),
             (
-                ["resolve", "vibe", "missing-vibe", "--json"],
-                {"routes": [], "harness_ready": True},
-                "/_sc/model-routes?harness=vibe&selector=missing-vibe",
+                ["resolve", "vibe", "devstral-latest", "--json"],
+                {"routes": [], "runtime_status": runtime_status(
+                    version="3.0.0", compatibility="newer-unverified",
+                )},
+                "/_sc/model-routes?harness=vibe&selector=devstral-latest",
             ),
         )
         for argv, projection, path in cases:
@@ -808,18 +826,12 @@ class RouteCliConnectionTest(unittest.TestCase):
                 api.assert_called_once_with("GET", path)
 
     def test_authenticated_ready_uncontrolled_binding_is_stable(self):
-        vibe_row = {
-            "harness": "vibe", "selector": "vibe-local",
-            "source": "vibe-local", "availability": "available",
-            "stale": 0, "cli_version": "vibe 2.22.0",
-            "supported_efforts": "[]", "current_source_fingerprint": None,
-        }
         projections = {
             "/_sc/model-routes?harness=claude": {
-                "routes": [], "harness_ready": True,
+                "routes": [], "runtime_status": runtime_status("2.1.223"),
             },
             "/_sc/model-routes?harness=vibe&selector=vibe-local": {
-                "routes": [vibe_row], "harness_ready": True,
+                "routes": [], "runtime_status": runtime_status(),
             },
         }
 

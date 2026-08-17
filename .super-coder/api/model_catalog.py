@@ -453,14 +453,18 @@ def _headless_supported(harness: str) -> bool:
     return bool((cfg.get("headless") or {}).get("launch"))
 
 
-def harness_launch_ready(harness: str) -> bool:
-    """Match the launcher's ordinary adapter + executable readiness rule."""
+def harness_runtime_status(harness: str) -> dict:
+    """Return exact version-bounded runtime evidence for one shipped harness."""
     try:
-        cfg = json.loads((ADAPTERS / harness / "adapter.json").read_text())
-        command = (cfg.get("launch") or [harness])[0]
+        return dict(
+            harness_versions.compatibility_status((harness,)).get(harness) or {}
+        )
     except Exception:  # noqa: BLE001
-        return False
-    return bool(shutil.which(command))
+        return {
+            "version": None,
+            "compatibility": None,
+            "error": "HARNESS_PROBE_FAILED",
+        }
 
 
 def _evidence_kind(harness: str, source: str) -> str | None:

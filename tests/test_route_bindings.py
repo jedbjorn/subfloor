@@ -21,6 +21,17 @@ import route_bindings  # noqa: E402
 import models as routes_cli  # noqa: E402
 
 
+def compatible_runtime(version: str = "2.22.0") -> dict:
+    return {
+        "version": version,
+        "compatibility": "verified",
+        "minimum_version": version,
+        "maximum_version_exclusive": "99.0.0",
+        "verified_version": version,
+        "error": None,
+    }
+
+
 def route_schema(path: str | Path = ":memory:") -> sqlite3.Connection:
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
@@ -117,14 +128,17 @@ class BindingIdentityTest(unittest.TestCase):
 
     def test_uncontrolled_bindings_encode_every_inapplicable_value_as_null(self):
         default, default_digest = route_bindings.resolve_v2(
-            None, "ClAuDe", None, None, now=self.NOW
+            None, "ClAuDe", None, None, now=self.NOW,
+            runtime_status=compatible_runtime("2.1.223"),
         )
         vibe, vibe_digest = route_bindings.resolve_v2(
-            None, "vibe", "devstral-latest", None, now=self.NOW
+            None, "vibe", "devstral-latest", None, now=self.NOW,
+            runtime_status=compatible_runtime(),
         )
         default_replay, replay_digest = route_bindings.resolve_v2(
             None, "claude", None, None,
             now=self.NOW + timedelta(days=90),
+            runtime_status=compatible_runtime("2.1.223"),
         )
 
         self.assertEqual(default, default_replay)
@@ -1140,7 +1154,8 @@ class ParticipantRevisionTest(unittest.TestCase):
         self.con.execute("INSERT INTO sprint_participants VALUES (11,1,NULL)")
         self.store = route_bindings.ParticipantRouteBindingStore(self.con)
         self.binding, self.digest = route_bindings.resolve_v2(
-            None, "vibe", "devstral-latest", None
+            None, "vibe", "devstral-latest", None,
+            runtime_status=compatible_runtime(),
         )
 
     @staticmethod
@@ -1187,14 +1202,132 @@ class ParticipantRevisionTest(unittest.TestCase):
         route_bindings.validate_v2_binding(decoded)
         return row, decoded
 
+    def test_uncontrolled_runtime_rejection_creates_no_binding_or_pointer(self):
+        rejected_statuses = (
+            None,
+            {
+                "version": None, "compatibility": None,
+                "error": "HARNESS_UNAVAILABLE",
+            },
+            {
+                "version": "not-a-version", "compatibility": "verified",
+                "error": None,
+            },
+            {
+                "version": "1.0.0", "compatibility": None,
+                "error": "HARNESS_VERSION_UNSUPPORTED",
+            },
+            {
+                "version": "99.0.0", "compatibility": "newer-unverified",
+                "error": None,
+            },
+        )
+        for harness, model in (("claude", None), ("vibe", "devstral-latest")):
+            for status in rejected_statuses:
+                with self.subTest(harness=harness, runtime_status=status):
+                    binding = digest = None
+                    with self.assertRaises(
+                        route_bindings.RouteResolutionError
+                    ) as raised:
+                        binding, digest = route_bindings.resolve_v2(
+                            None, harness, model, runtime_status=status
+                        )
+                    self.assertEqual(
+                        raised.exception.code, "thinking_evidence_missing"
+                    )
+                    self.assertIsNone(binding)
+                    self.assertIsNone(digest)
+                    stored = self.con.execute(
+                        "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+                    ).fetchone()[0]
+                    pointers = self.con.execute(
+                        "SELECT COUNT(*) FROM sprint_participants "
+                        "WHERE active_route_binding_id IS NOT NULL"
+                    ).fetchone()[0]
+                    self.assertEqual(stored, 0)
+                    self.assertEqual(pointers, 0)
+
+    def test_compatible_uncontrolled_bindings_persist_for_both_states(self):
+        default, default_digest = route_bindings.resolve_v2(
+            None, "claude", None,
+            runtime_status=compatible_runtime("2.1.223"),
+        )
+        vibe, vibe_digest = route_bindings.resolve_v2(
+            None, "vibe", "devstral-latest",
+            runtime_status=compatible_runtime(),
+        )
+
+        default_receipt = self.store.bind(
+            10, default, default_digest, transition="arm",
+            runtime_status=compatible_runtime("2.1.223"),
+        )
+        vibe_receipt = self.store.bind(
+            11, vibe, vibe_digest, transition="arm",
+            runtime_status=compatible_runtime(),
+        )
+        rows = self.con.execute(
+            "SELECT participant_id,control_state,requested_model,"
+            "requested_effort,catalogue_generation,evidence_digest "
+            "FROM sprint_participant_route_bindings ORDER BY participant_id"
+        ).fetchall()
+        pointers = self.con.execute(
+            "SELECT participant_id,active_route_binding_id "
+            "FROM sprint_participants ORDER BY participant_id"
+        ).fetchall()
+
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                (10, "harness-default", None, None, None, None),
+                (11, "native-uncontrolled", "devstral-latest", None, None, None),
+            ],
+        )
+        self.assertEqual(
+            [tuple(row) for row in pointers],
+            [
+                (10, default_receipt["binding_id"]),
+                (11, vibe_receipt["binding_id"]),
+            ],
+        )
+
+    def test_store_cannot_bypass_uncontrolled_runtime_admission(self):
+        incompatible = {
+            "version": "99.0.0", "compatibility": "newer-unverified",
+            "error": None,
+        }
+        for status in (None, incompatible):
+            with self.subTest(runtime_status=status):
+                with self.assertRaises(
+                    route_bindings.RouteResolutionError
+                ) as raised:
+                    self.store.bind(
+                        10, self.binding, self.digest, transition="arm",
+                        runtime_status=status,
+                    )
+                self.assertEqual(
+                    raised.exception.code, "thinking_evidence_missing"
+                )
+                self.assertEqual(
+                    self.con.execute(
+                        "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertIsNone(self.con.execute(
+                    "SELECT active_route_binding_id FROM sprint_participants "
+                    "WHERE participant_id=10"
+                ).fetchone()[0])
+
     @staticmethod
     def invalid_bindings() -> list[tuple[str, dict]]:
         controlled = ParticipantRevisionTest.controlled_binding()
         uncontrolled, _ = route_bindings.resolve_v2(
-            None, "vibe", "devstral-latest", None
+            None, "vibe", "devstral-latest", None,
+            runtime_status=compatible_runtime(),
         )
         harness_default, _ = route_bindings.resolve_v2(
-            None, "claude", None, None
+            None, "claude", None, None,
+            runtime_status=compatible_runtime("2.1.223"),
         )
         return [
             ("controlled-vibe", {**controlled, "harness": "vibe"}),
@@ -1225,13 +1358,18 @@ class ParticipantRevisionTest(unittest.TestCase):
         ]
 
     def test_arm_then_paused_reroute_appends_and_switches_only_owner(self):
-        first = self.store.bind(10, self.binding, self.digest, transition="arm")
+        first = self.store.bind(
+            10, self.binding, self.digest, transition="arm",
+            runtime_status=compatible_runtime(),
+        )
         self.con.execute("UPDATE sprints SET lifecycle='paused' WHERE sprint_id=1")
         rerouted, rerouted_digest = route_bindings.resolve_v2(
-            None, "vibe", "codestral-latest", None
+            None, "vibe", "codestral-latest", None,
+            runtime_status=compatible_runtime(),
         )
         second = self.store.bind(
-            10, rerouted, rerouted_digest, transition="reroute"
+            10, rerouted, rerouted_digest, transition="reroute",
+            runtime_status=compatible_runtime(),
         )
 
         rows = self.con.execute(
@@ -1286,7 +1424,8 @@ class ParticipantRevisionTest(unittest.TestCase):
 
     def test_typed_uncontrolled_binding_survives_store_json_round_trip(self):
         receipt = self.store.bind(
-            10, self.binding, self.digest, transition="arm"
+            10, self.binding, self.digest, transition="arm",
+            runtime_status=compatible_runtime(),
         )
 
         row, decoded = self.stored_binding(receipt["binding_id"])
@@ -1339,12 +1478,21 @@ class ParticipantRevisionTest(unittest.TestCase):
                 )
 
     def test_prepared_reroute_paused_arm_cross_owner_and_mutation_are_refused(self):
-        first = self.store.bind(10, self.binding, self.digest, transition="arm")
+        first = self.store.bind(
+            10, self.binding, self.digest, transition="arm",
+            runtime_status=compatible_runtime(),
+        )
         with self.assertRaisesRegex(ValueError, "paused Sprint"):
-            self.store.bind(11, self.binding, self.digest, transition="reroute")
+            self.store.bind(
+                11, self.binding, self.digest, transition="reroute",
+                runtime_status=compatible_runtime(),
+            )
         self.con.execute("UPDATE sprints SET lifecycle='paused' WHERE sprint_id=1")
         with self.assertRaisesRegex(ValueError, "unbound prepared"):
-            self.store.bind(11, self.binding, self.digest, transition="arm")
+            self.store.bind(
+                11, self.binding, self.digest, transition="arm",
+                runtime_status=compatible_runtime(),
+            )
         with self.assertRaises(sqlite3.IntegrityError):
             self.con.execute(
                 "UPDATE sprint_participants SET active_route_binding_id=? "

@@ -82,32 +82,6 @@ def _resolution_error(exc: route_bindings.RouteResolutionError) -> dict:
             "details": exc.details}
 
 
-def _uncontrolled_readiness_error(
-    row: dict | None, harness: str, selector: str | None, harness_ready: bool,
-) -> dict | None:
-    if selector is not None and harness != "vibe":
-        return None
-    if not harness_ready:
-        return _resolution_error(route_bindings.RouteResolutionError(
-            "thinking_evidence_missing",
-            f"Harness '{harness}' is not available for launch on this machine",
-            {"harness": harness, "model": selector,
-             "remediation": "install or repair the harness runtime"},
-        ))
-    if selector is not None and (
-        row is None
-        or row.get("availability") != "available"
-        or bool(row.get("stale"))
-    ):
-        return _resolution_error(route_bindings.RouteResolutionError(
-            "thinking_evidence_missing",
-            f"Route '{harness}/{selector}' is not currently available",
-            {"harness": harness, "model": selector,
-             "remediation": "sc models refresh"},
-        ))
-    return None
-
-
 def resolve(con, harness: str, selector: str | None = None, *,
             shell: str = "<shell>", effort: str | None = None,
             now=None, current_source_fingerprint: str | None = None) -> dict:
@@ -116,11 +90,10 @@ def resolve(con, harness: str, selector: str | None = None, *,
     except route_bindings.RouteResolutionError as exc:
         return _resolution_error(exc)
     if selector is None or harness == "vibe":
-        row = _route(con, harness, selector) if selector is not None else None
         return resolve_row(
-            row, harness, selector, shell=shell, effort=effort, now=now,
+            None, harness, selector, shell=shell, effort=effort, now=now,
             current_source_fingerprint=current_source_fingerprint,
-            harness_ready=model_catalog.harness_launch_ready(harness),
+            runtime_status=model_catalog.harness_runtime_status(harness),
         )
     observed_row = _route(con, harness, selector)
     if current_source_fingerprint is None:
@@ -137,23 +110,20 @@ def resolve(con, harness: str, selector: str | None = None, *,
 def resolve_row(row: dict | None, harness: str, selector: str | None, *,
                 shell: str = "<shell>", effort: str | None = None,
                 now=None, current_source_fingerprint: str | None = None,
-                con=None, harness_ready: bool = False) -> dict:
+                con=None, runtime_status: dict | None = None) -> dict:
     """Resolve inside ``con``'s caller-owned write, or purely when omitted."""
-    readiness_error = _uncontrolled_readiness_error(
-        row, harness, selector, harness_ready
-    )
-    if readiness_error is not None:
-        return readiness_error
     try:
         if con is not None:
             binding, binding_digest = route_bindings.resolve_persisted_v2(
                 con, row, harness, selector, effort, now=now,
                 current_source_fingerprint=current_source_fingerprint,
+                runtime_status=runtime_status,
             )
         else:
             binding, binding_digest = route_bindings.resolve_v2(
                 row, harness, selector, effort, now=now,
                 current_source_fingerprint=current_source_fingerprint,
+                runtime_status=runtime_status,
             )
     except route_bindings.RouteResolutionError as exc:
         return _resolution_error(exc)
@@ -284,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
             data = resolve_row(
                 route, harness, selector, shell=shell,
                 effort=effort, current_source_fingerprint=fingerprint,
-                harness_ready=bool(projection.get("harness_ready")),
+                runtime_status=projection.get("runtime_status"),
             )
         return _print_resolved(data, as_json)
 

@@ -42,6 +42,17 @@ import server  # noqa: E402  (server.py adds scripts/ to the path on import)
 import models as routes_cli  # noqa: E402
 
 
+def compatible_runtime(version: str = "2.22.0") -> dict:
+    return {
+        "version": version,
+        "compatibility": "verified",
+        "minimum_version": "2.0.0",
+        "maximum_version_exclusive": "3.0.0",
+        "verified_version": version,
+        "error": None,
+    }
+
+
 def build_db() -> sqlite3.Connection:
     """Fresh in-memory DB: schema.sql + every migration, FK enforcement on."""
     con = sqlite3.connect(":memory:")
@@ -947,7 +958,7 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         return con
 
     def request(self, path: str, token: str | None = "shell-token", *,
-                fingerprint="current-fingerprint", harness_ready=True):
+                fingerprint="current-fingerprint", runtime_status=None):
         headers = "Host: 127.0.0.1"
         if token is not None:
             headers += f"\r\nAuthorization: Bearer {token}"
@@ -963,8 +974,11 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
             ),
             mock.patch.object(
                 server.model_catalog,
-                "harness_launch_ready",
-                return_value=harness_ready,
+                "harness_runtime_status",
+                return_value=(
+                    compatible_runtime()
+                    if runtime_status is None else runtime_status
+                ),
             ),
         ):
             status, _headers, body = server.dispatch_http("GET", path, headers, b"")
@@ -1019,32 +1033,104 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         self.assertEqual(status, 200, current)
         self.assertEqual(current["routes"][0]["source"], "api-source-v2")
 
-    def test_uncontrolled_route_projection_reports_launch_readiness(self) -> None:
+    def test_uncontrolled_route_projection_reports_runtime_compatibility(self) -> None:
         status, unavailable = self.request(
-            "/_sc/model-routes?harness=claude", harness_ready=False
-        )
-        with self.connect() as con:
-            con.execute(
-                "INSERT INTO model_routes (harness,selector,source,availability,"
-                "headless_supported,high_effort_supported,supported_efforts,"
-                "provider_model,cli_version,last_seen_at,stale,adapter_metadata) "
-                "VALUES ('vibe','vibe-local','vibe-local','available',0,0,'[]',"
-                "'vibe-local','vibe 2.22.0',datetime('now'),0,'{}')"
-            )
-        vibe_status, vibe = self.request(
-            "/_sc/model-routes?harness=vibe&selector=vibe-local",
-            harness_ready=True,
+            "/_sc/model-routes?harness=claude",
+            runtime_status={
+                "version": None, "compatibility": None,
+                "error": "HARNESS_UNAVAILABLE",
+            },
         )
 
         self.assertEqual(status, 200, unavailable)
-        self.assertFalse(unavailable["harness_ready"])
+        self.assertEqual(unavailable["runtime_status"], {
+            "version": None, "compatibility": None,
+            "error": "HARNESS_UNAVAILABLE",
+        })
         self.assertEqual(unavailable["routes"], [])
-        self.assertEqual(vibe_status, 200, vibe)
-        self.assertTrue(vibe["harness_ready"])
-        self.assertEqual(len(vibe["routes"]), 1)
-        self.assertEqual(vibe["routes"][0]["selector"], "vibe-local")
-        self.assertIsNone(vibe["routes"][0]["current_source_fingerprint"])
-        self.assertNotIn("route_resolution_error", vibe["routes"][0])
+
+    def test_real_advisory_vibe_catalogue_resolves_locally_and_via_api(self) -> None:
+        vibe_status = compatible_runtime()
+        run = mock.Mock()
+        run.return_value.returncode = 1
+        run.return_value.stdout = ""
+        run.return_value.stderr = ""
+
+        def fetch(url, _headers=None):
+            if url == server.model_catalog.MODELS_DEV_URL:
+                return {"mistral": {"models": {
+                    "devstral-latest": {
+                        "name": "Devstral", "release_date": "2026-01-01",
+                    },
+                }}}
+            raise AssertionError(f"unexpected catalogue request: {url}")
+
+        con = self.connect()
+        self.addCleanup(con.close)
+        with mock.patch.object(
+            server.model_catalog, "CACHE",
+            Path(self.tmp.name) / "model_catalog.json",
+        ):
+            refreshed = server.model_catalog.catalog(
+                refresh=True, fetch=fetch, env={}, run=run, con=con,
+                opencode_provider=lambda: [],
+                harness_probe=lambda: {"vibe": vibe_status},
+            )
+            route = dict(con.execute(
+                "SELECT * FROM model_routes "
+                "WHERE harness='vibe' AND selector='devstral-latest'"
+            ).fetchone())
+            with mock.patch.object(
+                routes_cli.model_catalog, "harness_runtime_status",
+                return_value=vibe_status,
+            ):
+                local = routes_cli.resolve(con, "vibe", "devstral-latest")
+
+        def api(method, path):
+            self.assertEqual(method, "GET")
+            self.assertEqual(
+                path,
+                "/_sc/model-routes?harness=vibe&selector=devstral-latest",
+            )
+            api_status, body = self.request(
+                path, runtime_status=vibe_status
+            )
+            self.assertEqual(api_status, 200, body)
+            return body
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+            mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+            mock.patch.object(routes_cli.mem, "_api", side_effect=api),
+            mock.patch.object(
+                routes_cli, "_open_db", side_effect=AssertionError("opened DB")
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = routes_cli.main([
+                "resolve", "vibe", "devstral-latest", "--json",
+            ])
+        authenticated = json.loads(output.getvalue())
+
+        self.assertFalse(refreshed["stale"])
+        self.assertEqual(route["availability"], "advisory")
+        self.assertEqual(route["headless_supported"], 0)
+        self.assertIsNone(route["evidence_kind"])
+        self.assertIsNone(route["harness_version"])
+        self.assertIsNone(route["harness_compatibility"])
+        self.assertEqual(
+            route["generation_id"], refreshed["catalogue_generation"]
+        )
+        self.assertTrue(local["ok"])
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(authenticated["ok"])
+        self.assertEqual(local["binding"], authenticated["binding"])
+        self.assertEqual(local["binding_digest"], authenticated["binding_digest"])
+        self.assertIsNone(local["binding"]["requested_effort"])
+        self.assertIsNone(local["binding"]["catalogue_generation"])
+        self.assertNotIn("--effort", local["command"])
+        self.assertNotIn("--effort", authenticated["command"])
 
     def test_skill_catalogue_requires_auth_and_includes_grant_scopes(self) -> None:
         self.assertEqual(self.request("/_sc/skills", None)[0], 401)

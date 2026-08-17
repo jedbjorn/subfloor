@@ -243,6 +243,33 @@ def _parsed_version(value: Any) -> str | None:
     return match.group(0) if match else None
 
 
+def _require_uncontrolled_runtime(
+    harness: str, model: str | None, runtime_status: dict | None,
+) -> None:
+    """Admit typed-uncontrolled identity only for a verified local adapter."""
+    status = runtime_status if isinstance(runtime_status, dict) else {}
+    version = status.get("version")
+    compatibility = status.get("compatibility")
+    error = status.get("error")
+    if (
+        error
+        or _parsed_version(version) != version
+        or compatibility not in COMPATIBLE_HARNESS_STATES
+    ):
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            f"Harness '{harness}' has no compatible installed runtime",
+            {
+                "harness": harness,
+                "model": model,
+                "version": version,
+                "compatibility": compatibility,
+                "runtime_error": error,
+                "remediation": "install or repair the compatible harness runtime",
+            },
+        )
+
+
 def _uncontrolled_binding(harness: str, model: str | None, effort: str | None) -> dict:
     if effort is not None:
         raise RouteResolutionError(
@@ -470,6 +497,7 @@ def resolve_persisted_v2(
     *,
     now: datetime | None = None,
     current_source_fingerprint: str | None = None,
+    runtime_status: dict | None = None,
 ) -> tuple[dict, str]:
     """Resolve through the shared durable freshness boundary."""
     fresh_row = require_fresh_route(
@@ -479,6 +507,7 @@ def resolve_persisted_v2(
     return resolve_v2(
         fresh_row, harness, model, effort, now=now,
         current_source_fingerprint=current_source_fingerprint,
+        runtime_status=runtime_status,
     )
 
 
@@ -490,12 +519,14 @@ def resolve_v2(
     *,
     now: datetime | None = None,
     current_source_fingerprint: str | None = None,
+    runtime_status: dict | None = None,
 ) -> tuple[dict, str]:
     """Resolve one v2 intent to a fixed-key immutable binding and digest."""
     harness = normalize_harness(harness)
     model = _normalize_model(model)
     if model is None or harness == "vibe":
         binding = _uncontrolled_binding(harness, model, effort)
+        _require_uncontrolled_runtime(harness, model, runtime_status)
         validate_v2_binding(binding)
         return binding, digest_json(binding)
 
@@ -625,8 +656,12 @@ class ParticipantRouteBindingStore:
         self.con = con
 
     def bind(self, participant_id: int, binding: dict, binding_digest: str, *,
-             transition: str) -> dict:
+             transition: str, runtime_status: dict | None = None) -> dict:
         validate_v2_binding(binding)
+        if binding["control_state"] != "controlled":
+            _require_uncontrolled_runtime(
+                binding["harness"], binding["requested_model"], runtime_status
+            )
         if (not _lower_hex(binding_digest, LOWER_HEX_64)
                 or digest_json(binding) != binding_digest):
             raise ValueError("binding does not match the canonical v2 contract")

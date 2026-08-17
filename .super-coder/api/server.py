@@ -506,7 +506,7 @@ def get_model_routes(con, *, harness: str | None = None,
         routes = refreshed
     result = {"routes": routes}
     if harness is not None:
-        result["harness_ready"] = model_catalog.harness_launch_ready(harness)
+        result["runtime_status"] = model_catalog.harness_runtime_status(harness)
     return result
 
 

@@ -4,6 +4,11 @@
   "boot_artifact": "AGENTS.md",
   "emit": [],
   "env": {},
+  "runtime_compatibility": {
+    "minimum_cli_version": "2.22.0",
+    "maximum_cli_version_exclusive": "2.23.0",
+    "verified_cli_version": "2.22.0"
+  },
   "mcp": {
     "streamable_http": {
       "supported": false,

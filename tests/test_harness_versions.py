@@ -89,6 +89,25 @@ def test_missing_non_conversation_harness_is_reported_unavailable() -> None:
         }
 
 
+def test_vibe_runtime_uses_its_non_conversation_compatibility_manifest() -> None:
+    with mock.patch.object(
+        harness_versions, "probe", return_value="vibe 2.22.0"
+    ) as probe:
+        status = harness_versions.compatibility_status(("vibe",))
+
+    assert status == {
+        "vibe": {
+            "version": "2.22.0",
+            "compatibility": "verified",
+            "minimum_version": "2.22.0",
+            "maximum_version_exclusive": "2.23.0",
+            "verified_version": "2.22.0",
+            "error": None,
+        }
+    }
+    probe.assert_called_once_with("vibe")
+
+
 def test_text_status_couples_host_provenance_and_compatibility() -> None:
     output = io.StringIO()
     with (
