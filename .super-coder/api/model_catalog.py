@@ -29,10 +29,12 @@ availability, CLI version, and effort support.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import urllib.request
 import uuid
@@ -328,6 +330,79 @@ def _load_cache() -> dict | None:
     # A cache written by another payload version would hand the client a
     # shape it can't render — ignore it entirely.
     return cached if cached.get("v") == PAYLOAD_VERSION else None
+
+
+def _authoritative_generation(con) -> str | None:
+    if con is None:
+        return None
+    try:
+        row = con.execute(
+            "SELECT generation_id FROM model_catalog_generations "
+            "ORDER BY completed_at DESC,generation_id DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return None
+        raise
+    return row[0] if row is not None else None
+
+
+def _cache_matches_authority(cached: dict, con) -> bool:
+    generation = _authoritative_generation(con)
+    return generation is None or cached.get("catalogue_generation") == generation
+
+
+def _publish_cache(payload: dict, con=None) -> bool:
+    """Atomically replace the cache only when this payload is authoritative."""
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = CACHE.with_name(
+        f".{CACHE.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    lock_path = CACHE.with_name(f"{CACHE.name}.lock")
+    serialized = json.dumps(payload, indent=1) + "\n"
+    try:
+        with temporary.open("x") as stream:
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        with lock_path.open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            authoritative = _authoritative_generation(con)
+            if (
+                authoritative is not None
+                and payload.get("catalogue_generation") != authoritative
+            ):
+                return False
+            os.replace(temporary, CACHE)
+            return True
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _finish_cache_publication(
+    candidate: dict, response: dict, con, opencode_provider
+) -> dict:
+    for field in (
+        "catalogue_generation", "generation_state", "generation_published",
+        "refresh_started_at", "refresh_completed_at",
+    ):
+        if field in response:
+            candidate[field] = response[field]
+    if _publish_cache(candidate, con):
+        return response
+
+    if "generation_published" in response:
+        response["generation_published"] = False
+    winner = _load_cache()
+    if winner and _cache_matches_authority(winner, con):
+        return _served(_with_live_opencode(
+            {**winner, "stale": bool(
+                winner.get("stale") or winner.get("partial")
+            )},
+            opencode_provider,
+        ), con)
+    return {**response, "stale": True,
+            "error": "Catalogue changed during refresh; retry"}
 
 
 def _fresh(cached: dict) -> bool:
@@ -887,7 +962,10 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     sweep failed → stale cache if any, else the static floor. Every response
     carries `stale` + `fetched_at` so the GUI can say how current it is."""
     cached = _load_cache()
-    if cached and not refresh and _fresh(cached):
+    if (
+        cached and not refresh and _fresh(cached)
+        and _cache_matches_authority(cached, con)
+    ):
         return _served(_with_live_opencode(
             {**cached, "stale": bool(
                 cached.get("stale") or cached.get("partial")
@@ -914,21 +992,21 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
                     con, env=env, harness_probe=harness_probe
                 )
                 response["verification"] = verification
-            if refresh:
-                cached_failure = {
-                    **cached,
-                    "stale": True,
-                    "error": str(e),
-                    "refresh_started_at": refresh_started_at,
-                    "refresh_completed_at": refresh_completed_at,
-                }
-                if "verification" in response:
-                    cached_failure["verification"] = response["verification"]
-                CACHE.parent.mkdir(parents=True, exist_ok=True)
-                CACHE.write_text(json.dumps(
-                    cached_failure, indent=1
-                ) + "\n")
-            return _served(response, con, publish=refresh)
+            if not refresh:
+                return _served(response, con)
+            response = _served(response, con, publish=True)
+            cached_failure = {
+                **cached,
+                "stale": True,
+                "error": str(e),
+                "refresh_started_at": refresh_started_at,
+                "refresh_completed_at": refresh_completed_at,
+            }
+            if "verification" in response:
+                cached_failure["verification"] = response["verification"]
+            return _finish_cache_publication(
+                cached_failure, response, con, opencode_provider
+            )
         fallback = {
             "v": PAYLOAD_VERSION, "fetched_at": None,
             "sources": ["static"], "stale": True,
@@ -945,9 +1023,12 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             )
             fallback["verification"] = verification
             response["verification"] = verification
-            CACHE.parent.mkdir(parents=True, exist_ok=True)
-            CACHE.write_text(json.dumps(fallback, indent=1) + "\n")
-        return _served(response, con, publish=refresh)
+        if not refresh:
+            return _served(response, con)
+        response = _served(response, con, publish=True)
+        return _finish_cache_publication(
+            fallback, response, con, opencode_provider
+        )
     response = _with_live_opencode(
         {**fresh, "stale": bool(fresh.get("partial"))}, opencode_provider
     )
@@ -985,6 +1066,6 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     if response.get("partial"):
         fresh["partial"] = True
         fresh["errors"] = response.get("errors") or fresh.get("errors") or []
-    CACHE.parent.mkdir(parents=True, exist_ok=True)
-    CACHE.write_text(json.dumps(fresh, indent=1) + "\n")
-    return response
+    return _finish_cache_publication(
+        fresh, response, con, opencode_provider
+    )

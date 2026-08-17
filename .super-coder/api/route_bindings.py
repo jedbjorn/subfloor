@@ -49,6 +49,9 @@ TRANSPORTS = {
 
 LOWER_HEX_32 = re.compile(r"^[0-9a-f]{32}$")
 LOWER_HEX_64 = re.compile(r"^[0-9a-f]{64}$")
+ASCII_LOWER_TRANSLATION = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+)
 
 
 @dataclass(frozen=True)
@@ -139,6 +142,10 @@ def _exact_nonblank(value: Any) -> bool:
 
 def _lower_hex(value: Any, pattern: re.Pattern[str]) -> bool:
     return isinstance(value, str) and pattern.fullmatch(value) is not None
+
+
+def _ascii_lower(value: str) -> str:
+    return value.translate(ASCII_LOWER_TRANSLATION)
 
 
 def _binding_error(reason: str) -> RouteResolutionError:
@@ -483,7 +490,11 @@ def resolve_v2(
         validate_v2_binding(binding)
         return binding, digest_json(binding)
 
-    requested = "high" if effort is None else effort.strip().lower()
+    requested = "high" if effort is None else effort.strip()
+    if harness == "opencode":
+        requested = _ascii_lower(requested)
+    else:
+        requested = requested.lower()
     if not requested:
         raise RouteResolutionError(
             "unsupported_thinking_level",

@@ -74,6 +74,29 @@ class BindingIdentityTest(unittest.TestCase):
         }
         return {**base, **overrides}
 
+    @classmethod
+    def opencode_row(cls) -> dict:
+        return cls.controlled_row(
+            harness="opencode",
+            selector="provider/model",
+            provider_model="provider/model",
+            source="opencode-provider-api",
+            evidence_kind="opencode-connected-variant",
+            supported_efforts='["k"]',
+            effort_metadata=json.dumps({
+                "supported": ["k"],
+                "default": "k",
+                "digests": {"k": "5" * 64},
+                "native_variant_ids": {"k": "k"},
+            }),
+            selector_binding=json.dumps({
+                "kind": "exact-model", "selector": "provider/model",
+            }),
+            adapter_metadata=json.dumps({
+                "variant_options": {"reasoningEffort": "high"},
+            }),
+        )
+
     def test_controlled_omitted_and_explicit_high_have_same_fixed_identity(self):
         implicit, implicit_digest = route_bindings.resolve_v2(
             self.controlled_row(), "Codex", "gpt-test", now=self.NOW,
@@ -114,6 +137,37 @@ class BindingIdentityTest(unittest.TestCase):
             self.assertIsNone(binding["catalogue_generation"])
             self.assertIsNone(binding["evidence_digest"])
             self.assertEqual(binding["transport"], "native-default")
+
+    def test_opencode_ascii_lookup_accepts_case_without_aliasing_unicode(self):
+        canonical, canonical_digest = route_bindings.resolve_v2(
+            self.opencode_row(), "opencode", "provider/model", "k",
+            now=self.NOW, current_source_fingerprint="2" * 64,
+        )
+        mixed_case, mixed_case_digest = route_bindings.resolve_v2(
+            self.opencode_row(), "opencode", "provider/model", " K ",
+            now=self.NOW, current_source_fingerprint="2" * 64,
+        )
+
+        self.assertEqual(mixed_case, canonical)
+        self.assertEqual(mixed_case_digest, canonical_digest)
+        self.assertEqual(canonical["requested_effort"], "k")
+        self.assertEqual(canonical["native_variant_id"], "k")
+        for confusable in ("K", "Ｋ"):
+            with self.subTest(confusable=confusable):
+                with self.assertRaises(
+                    route_bindings.RouteResolutionError
+                ) as raised:
+                    route_bindings.resolve_v2(
+                        self.opencode_row(), "opencode", "provider/model",
+                        confusable, now=self.NOW,
+                        current_source_fingerprint="2" * 64,
+                    )
+                self.assertEqual(
+                    raised.exception.code, "unsupported_thinking_level"
+                )
+                self.assertEqual(
+                    raised.exception.details["requested_effort"], confusable
+                )
 
     def test_non_null_effort_is_refused_for_vibe_and_harness_default(self):
         for harness, model in (("vibe", "devstral-latest"), ("codex", None)):
@@ -691,6 +745,206 @@ class GenerationPersistenceTest(unittest.TestCase):
         self.assertEqual(route["generation_id"], newest_generation)
         self.assertEqual((route["stale"], route["last_error"]), (0, None))
         self.assertTrue(resolved["ok"])
+
+    def test_two_catalog_refreshes_publish_one_cache_and_route_generation(self):
+        older_con, newer_con = self.shared_connections()
+        older = self.payload("older-route")
+        newer = self.payload("newer-route")
+        older.pop("verification")
+        newer.pop("verification")
+        base = datetime.now(timezone.utc)
+        older["fetched_at"] = base.isoformat()
+        newer["fetched_at"] = (base + timedelta(seconds=1)).isoformat()
+        statuses = {"codex": self.status()}
+        clock = mock.Mock()
+        clock.now.side_effect = [
+            base + timedelta(seconds=offset) for offset in range(7)
+        ]
+        clock.fromisoformat.side_effect = datetime.fromisoformat
+        interleaved = False
+        publications = []
+        newer_response = {}
+        real_publish = model_catalog._publish_cache
+
+        def publish_with_interleave(candidate, con=None):
+            nonlocal interleaved
+            selector = candidate["harnesses"]["codex"]["models"][0]["id"]
+            if con is older_con and not interleaved:
+                interleaved = True
+                newer_response.update(model_catalog.catalog(
+                    refresh=True, con=newer_con,
+                    opencode_provider=lambda: [],
+                    harness_probe=lambda: statuses,
+                ))
+            published = real_publish(candidate, con)
+            publications.append((selector, published))
+            return published
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            model_catalog, "CACHE", Path(tmp) / "model_catalog.json"
+        ), mock.patch.object(
+            model_catalog, "build", side_effect=[older, newer]
+        ) as build, mock.patch.object(
+            model_catalog, "datetime", clock
+        ), mock.patch.object(
+            model_catalog, "_publish_cache",
+            side_effect=publish_with_interleave,
+        ):
+            outer_response = model_catalog.catalog(
+                refresh=True, con=older_con,
+                opencode_provider=lambda: [],
+                harness_probe=lambda: statuses,
+            )
+            cached = json.loads(model_catalog.CACHE.read_text())
+            ordinary = model_catalog.catalog(
+                con=older_con, opencode_provider=lambda: [],
+                harness_probe=lambda: (_ for _ in ()).throw(
+                    AssertionError("ordinary winner cache read reprobed")
+                ),
+            )
+
+        generations = older_con.execute(
+            "SELECT generation_id,state FROM model_catalog_generations "
+            "ORDER BY completed_at,generation_id"
+        ).fetchall()
+        fresh_routes = older_con.execute(
+            "SELECT selector,generation_id,stale,last_error FROM model_routes "
+            "WHERE stale=0 ORDER BY selector"
+        ).fetchall()
+        predecessor = older_con.execute(
+            "SELECT stale,last_error FROM model_routes "
+            "WHERE selector='older-route'"
+        ).fetchone()
+        winner_generation = newer_response["catalogue_generation"]
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(
+            publications,
+            [("newer-route", True), ("older-route", False)],
+        )
+        self.assertEqual(
+            outer_response["catalogue_generation"], winner_generation
+        )
+        self.assertEqual(
+            newer_response["catalogue_generation"], winner_generation
+        )
+        self.assertEqual(cached["catalogue_generation"], winner_generation)
+        self.assertEqual(ordinary["catalogue_generation"], winner_generation)
+        for payload in (outer_response, newer_response, cached, ordinary):
+            self.assertEqual(
+                payload["harnesses"]["codex"]["models"][0]["id"],
+                "newer-route",
+            )
+            self.assertFalse(payload["stale"])
+        self.assertEqual(len(generations), 2)
+        self.assertEqual(
+            {row["state"] for row in generations}, {"successful"}
+        )
+        self.assertEqual(generations[-1]["generation_id"], winner_generation)
+        self.assertEqual(len(fresh_routes), 1)
+        self.assertEqual(
+            tuple(fresh_routes[0]),
+            ("newer-route", winner_generation, 0, None),
+        )
+        self.assertEqual(
+            tuple(predecessor),
+            (1, "not observed in latest generation"),
+        )
+
+    def test_failed_catalog_loser_cannot_replace_successful_winner_cache(self):
+        failed_con, winner_con = self.shared_connections()
+        winner = self.payload("winner-route")
+        winner.pop("verification")
+        base = datetime.now(timezone.utc)
+        winner["fetched_at"] = (base + timedelta(seconds=1)).isoformat()
+        statuses = {"codex": self.status()}
+        clock = mock.Mock()
+        clock.now.side_effect = [
+            base + timedelta(seconds=offset) for offset in range(7)
+        ]
+        clock.fromisoformat.side_effect = datetime.fromisoformat
+        interleaved = False
+        publications = []
+        winner_response = {}
+        real_publish = model_catalog._publish_cache
+
+        def publish_with_interleave(candidate, con=None):
+            nonlocal interleaved
+            state = candidate["generation_state"]
+            if con is failed_con and not interleaved:
+                interleaved = True
+                winner_response.update(model_catalog.catalog(
+                    refresh=True, con=winner_con,
+                    opencode_provider=lambda: [],
+                    harness_probe=lambda: statuses,
+                ))
+            published = real_publish(candidate, con)
+            publications.append((state, published))
+            return published
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            model_catalog, "CACHE", Path(tmp) / "model_catalog.json"
+        ), mock.patch.object(
+            model_catalog, "build",
+            side_effect=[RuntimeError("older refresh failed"), winner],
+        ) as build, mock.patch.object(
+            model_catalog, "datetime", clock
+        ), mock.patch.object(
+            model_catalog, "_publish_cache",
+            side_effect=publish_with_interleave,
+        ):
+            outer_response = model_catalog.catalog(
+                refresh=True, con=failed_con,
+                opencode_provider=lambda: [],
+                harness_probe=lambda: statuses,
+            )
+            cached = json.loads(model_catalog.CACHE.read_text())
+            ordinary = model_catalog.catalog(
+                con=failed_con, opencode_provider=lambda: [],
+                harness_probe=lambda: (_ for _ in ()).throw(
+                    AssertionError("ordinary winner cache read reprobed")
+                ),
+            )
+
+        generations = failed_con.execute(
+            "SELECT generation_id,state,error_summary "
+            "FROM model_catalog_generations ORDER BY completed_at,generation_id"
+        ).fetchall()
+        fresh_routes = failed_con.execute(
+            "SELECT selector,generation_id,stale,last_error FROM model_routes "
+            "WHERE stale=0 ORDER BY selector"
+        ).fetchall()
+        winner_generation = winner_response["catalogue_generation"]
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(
+            publications,
+            [("successful", True), ("failed", False)],
+        )
+        for payload in (outer_response, winner_response, cached, ordinary):
+            self.assertEqual(
+                payload["catalogue_generation"], winner_generation
+            )
+            self.assertEqual(
+                payload["harnesses"]["codex"]["models"][0]["id"],
+                "winner-route",
+            )
+            self.assertFalse(payload["stale"])
+        self.assertEqual(len(generations), 2)
+        self.assertEqual(
+            [row["state"] for row in generations],
+            ["failed", "successful"],
+        )
+        self.assertEqual(
+            json.loads(generations[0]["error_summary"])["error"],
+            "older refresh failed",
+        )
+        self.assertEqual(
+            generations[1]["generation_id"], winner_generation
+        )
+        self.assertEqual(len(fresh_routes), 1)
+        self.assertEqual(
+            tuple(fresh_routes[0]),
+            ("winner-route", winner_generation, 0, None),
+        )
 
     def test_freshness_failure_respects_outer_rollback(self):
         model_catalog.persist_routes(self.con, self.payload("rollback-route"))
