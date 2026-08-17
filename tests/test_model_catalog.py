@@ -205,6 +205,19 @@ class ControlledRouteEvidenceTest(unittest.TestCase):
                 status = runtime_status(
                     versions[harness], harness=harness, scope=sandbox
                 )
+                toml_available = mock.patch.object(
+                    mc.toml_compat, "AVAILABLE", True
+                ) if harness == "kimi" else contextlib.nullcontext()
+                toml_loads = mock.patch.object(
+                    mc.toml_compat, "loads", return_value={
+                        "models": {"configured-alias": {
+                            "provider": "moonshot",
+                            "model": "kimi-k2",
+                            "support_efforts": ["low", "high"],
+                            "default_effort": "high",
+                        }},
+                    }
+                ) if harness == "kimi" else contextlib.nullcontext()
                 with (
                     self.subTest(harness=harness, state="present"),
                     mock.patch.object(
@@ -214,6 +227,8 @@ class ControlledRouteEvidenceTest(unittest.TestCase):
                     mock.patch.object(
                         mc.shutil, "which", return_value=f"/bin/{harness}"
                     ),
+                    toml_available,
+                    toml_loads,
                 ):
                     proof = mc.controlled_route_evidence(
                         harness, selector, env=envs[harness], run=run,
@@ -251,6 +266,12 @@ class ControlledRouteEvidenceTest(unittest.TestCase):
                 missing_which = None if harness == "claude" else f"/bin/{harness}"
                 missing_provider = (lambda: []) if harness == "opencode" \
                     else (lambda: connected)
+                toml_available = mock.patch.object(
+                    mc.toml_compat, "AVAILABLE", True
+                ) if harness == "kimi" else contextlib.nullcontext()
+                toml_loads = mock.patch.object(
+                    mc.toml_compat, "loads", return_value={}
+                ) if harness == "kimi" else contextlib.nullcontext()
                 with (
                     self.subTest(harness=harness, state="missing"),
                     mock.patch.object(
@@ -260,6 +281,8 @@ class ControlledRouteEvidenceTest(unittest.TestCase):
                     mock.patch.object(
                         mc.shutil, "which", return_value=missing_which
                     ),
+                    toml_available,
+                    toml_loads,
                 ):
                     missing = mc.controlled_route_evidence(
                         harness, selector, env=missing_env, run=run,
