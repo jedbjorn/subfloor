@@ -4265,12 +4265,16 @@ class SprintWorkUnitStore:
                         },
                         actor_kind="system",
                     )
-                self._queue_planner_merge_bypass(
-                    sprint_id,
-                    work_unit_id=int(unit["work_unit_id"]),
-                    transition_key=transition_key,
-                    before=str(unit["disposition"]),
-                )
+                    # The notice mirrors the event and is deduped on the same
+                    # condition: re-observing the merge after the unit's
+                    # disposition moved on (resume reconciliation) must not
+                    # rebuild the body under the same idempotency key.
+                    self._queue_planner_merge_bypass(
+                        sprint_id,
+                        work_unit_id=int(unit["work_unit_id"]),
+                        transition_key=transition_key,
+                        before=str(unit["disposition"]),
+                    )
                 continue
             changed = True
             self.con.execute(
