@@ -986,6 +986,102 @@ class SpecApprovalTest(SprintDomainCase):
 
 
 class LiveReplanningTest(SprintDomainCase):
+    def test_resume_skips_a_sparse_historical_assignment_generation(self) -> None:
+        sprint_id, work_unit_id = self.create_sprint()
+        self.store.arm(sprint_id, 3)
+        assignment = self.con.execute(
+            "SELECT message.message_id,wake.wake_id FROM wake_message message "
+            "JOIN sprint_wake_messages wake USING (message_id) "
+            "WHERE message.work_unit_id=? AND message.message_kind='work_assignment'",
+            (work_unit_id,),
+        ).fetchone()
+        self.con.execute(
+            "UPDATE wake_message SET delivered_at=datetime('now') WHERE message_id=?",
+            (assignment["message_id"],),
+        )
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET state='delivered',"
+            "delivered_at=datetime('now') WHERE wake_id=?",
+            (assignment["wake_id"],),
+        )
+        self.con.commit()
+        messages = sprint_message_delivery.SprintMessageStore(self.con)
+        messages.mark_read(
+            int(assignment["message_id"]),
+            1,
+            sprint_id=sprint_id,
+        )
+        self.store.pause(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="replace the released assignment",
+        )
+        units = sprint_domain.SprintWorkUnitStore(self.con)
+        self.assertTrue(
+            units.recall(
+                sprint_id,
+                work_unit_id,
+                3,
+                reason="reconcile a historical assignment generation",
+            )
+        )
+        sparse_key = f"sprint:{sprint_id}:work-unit:{work_unit_id}:assignment:2"
+        self.con.execute(
+            "UPDATE wake_message SET idempotency_key=? WHERE message_id=?",
+            (sparse_key, assignment["message_id"]),
+        )
+        self.con.commit()
+        self.assertTrue(
+            units.replan(
+                sprint_id,
+                work_unit_id,
+                3,
+                title="Corrective assignment",
+                expected_output="Dispatch from a fresh durable generation",
+            )
+        )
+
+        receipt = self.store.resume(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="the corrective assignment is ready",
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual(1, len(receipt.dispatched_wake_ids))
+        assignments = [
+            tuple(row)
+            for row in self.con.execute(
+                "SELECT body,idempotency_key,disposition FROM wake_message "
+                "WHERE work_unit_id=? AND message_kind='work_assignment' "
+                "ORDER BY message_id",
+                (work_unit_id,),
+            )
+        ]
+        self.assertEqual(
+            [
+                (
+                    "Foundation\n\nShip the durable foundation",
+                    sparse_key,
+                    "accepted",
+                ),
+                (
+                    "Corrective assignment\n\n"
+                    "Dispatch from a fresh durable generation",
+                    f"sprint:{sprint_id}:work-unit:{work_unit_id}:assignment:3",
+                    "pending",
+                ),
+            ],
+            assignments,
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM wake_message WHERE idempotency_key=?",
+                (f"sprint:{sprint_id}:work-unit:{work_unit_id}:assignment:1",),
+            ).fetchone()[0],
+        )
+
     def test_paused_recall_reassign_and_reroute_dispatches_fresh_generation(self) -> None:
         self.con.execute(
             "INSERT INTO shells "
