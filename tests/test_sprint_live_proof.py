@@ -439,11 +439,11 @@ class SprintBoundRouteDispatchProof(unittest.TestCase):
             "headless_supported,high_effort_supported,default_effort,"
             "supported_efforts,cli_version,last_seen_at,stale,generation_id,"
             "evidence_kind,evidence_digest,source_fingerprint,harness_version,"
-            "harness_compatibility,selector_binding,effort_metadata,"
+            "harness_compatibility,harness_support_state,selector_binding,effort_metadata,"
             "adapter_metadata) VALUES "
             "('opencode',?,'openai',?,'opencode-provider-api','available',1,1,"
             "'high','[\"high\"]','opencode 1.18.9',?,0,?,"
-            "'opencode-connected-variant',?,?,'1.18.9','verified',?,?,?)",
+            "'opencode-connected-variant',?,?,'1.18.9','verified','tested',?,?,?)",
             (
                 self.SELECTOR,
                 self.SELECTOR,

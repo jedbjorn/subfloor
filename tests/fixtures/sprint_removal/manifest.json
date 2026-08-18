@@ -113,7 +113,8 @@
     ".super-coder/migrations/0209_reseed_git_github_capabilities.sql",
     ".super-coder/migrations/0212_route_binding_foundation.sql",
     ".super-coder/migrations/0215_reseed_sprint_binding_guidance.sql",
-    ".super-coder/migrations/0216_sprint_binding_provenance.sql"
+    ".super-coder/migrations/0216_sprint_binding_provenance.sql",
+    ".super-coder/migrations/0218_sprint_binding_support_provenance.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,

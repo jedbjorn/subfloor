@@ -803,6 +803,8 @@ class SprintBoardProjection:
                 ),
                 "binding_digest": row["binding_digest"],
                 "catalogue_generation": row["catalogue_generation"],
+                "harness_version": row["harness_version"],
+                "harness_support_state": row["harness_support_state"],
                 "disposition": row["disposition"],
                 "current_conversation_id": row["current_conversation_id"],
             }
@@ -812,7 +814,8 @@ class SprintBoardProjection:
                 "p.active_route_binding_id,binding.control_state,"
                 "binding.effective_effort,binding.native_variant_id,"
                 "binding.route_revision,binding.binding_digest,"
-                "binding.catalogue_generation,"
+                "binding.catalogue_generation,binding.harness_version,"
+                "binding.harness_support_state,"
                 "active.chat_id AS current_conversation_id "
                 "FROM sprint_participants p "
                 "JOIN shells sh ON sh.shell_id=p.shell_id "

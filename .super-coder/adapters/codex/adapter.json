@@ -28,8 +28,8 @@
   "conversation": {
     "contract_version": 1,
     "minimum_cli_version": "0.145.0",
-    "maximum_cli_version_exclusive": "0.147.0",
-    "verified_cli_version": "0.145.0",
+    "maximum_cli_version_exclusive": "0.148.0",
+    "verified_cli_version": "0.147.0",
     "driver": "codex-app-server",
     "session_ref": { "source": "thread.start", "field": "thread.id" },
     "start": { "method": "thread/start" },

@@ -19,7 +19,9 @@ from conversation_adapters.base import AdapterError, checked_version_compatibili
 
 CONTRACT_VERSION = 2
 FRESH_HOURS = 24
-COMPATIBLE_HARNESS_STATES = frozenset({"verified", "supported"})
+HARNESS_SUPPORT_STATES = frozenset({"tested", "best-effort"})
+LEGACY_HARNESS_EVIDENCE_FORMAT = "legacy-semver"
+RAW_HARNESS_EVIDENCE_FORMAT = "raw-observed-v1"
 BINDING_KEYS = (
     "contract_version",
     "control_state",
@@ -75,6 +77,7 @@ class RuntimeEvidence:
     runtime: str | None
     runtime_identity: str | None
     version: str | None
+    observed_version: str | None
     compatibility: str | None
     minimum_version: str | None
     maximum_version_exclusive: str | None
@@ -84,8 +87,9 @@ class RuntimeEvidence:
     @classmethod
     def from_value(cls, value: Any) -> RuntimeEvidence:
         status = value if isinstance(value, dict) else {}
+        observed_version = status.get("observed_version", status.get("version"))
         return cls(**{
-            field: status.get(field)
+            field: observed_version if field == "observed_version" else status.get(field)
             for field in cls.__dataclass_fields__
         })
 
@@ -211,6 +215,37 @@ def _exact_nonblank(value: Any) -> bool:
     return isinstance(value, str) and bool(value) and value == value.strip()
 
 
+def _stored_support_state(row: dict) -> str | None:
+    """Read pre-0217 rows as their legacy verified support claim."""
+    state = row.get("harness_support_state")
+    if state in HARNESS_SUPPORT_STATES:
+        return state
+    return "tested" if row.get("harness_compatibility") in {
+        "verified", "supported"
+    } else None
+
+
+def _matches_captured_version(
+    captured: str | None,
+    runtime: RuntimeEvidence,
+    *,
+    evidence_format: str = RAW_HARNESS_EVIDENCE_FORMAT,
+) -> bool:
+    """Compare the exact new encoding, or the explicit legacy semver encoding."""
+    if evidence_format == LEGACY_HARNESS_EVIDENCE_FORMAT:
+        return captured == runtime.version
+    return captured == runtime.observed_version
+
+
+def _runtime_support_state(runtime: RuntimeEvidence) -> str | None:
+    if runtime.error or not _exact_nonblank(runtime.observed_version):
+        return None
+    return "tested" if (
+        runtime.version == runtime.verified_version
+        and runtime.compatibility == "verified"
+    ) else "best-effort"
+
+
 def _lower_hex(value: Any, pattern: re.Pattern[str]) -> bool:
     return isinstance(value, str) and pattern.fullmatch(value) is not None
 
@@ -302,11 +337,6 @@ def validate_v2_binding(binding: dict) -> None:
         )
 
 
-def _parsed_version(value: Any) -> str | None:
-    match = re.search(r"\d+\.\d+\.\d+", value) if isinstance(value, str) else None
-    return match.group(0) if match else None
-
-
 def _runtime_manifest_compatibility(harness: str, version: str):
     try:
         manifest = json.loads((ADAPTERS / harness / "adapter.json").read_text())
@@ -352,7 +382,7 @@ def _require_runtime(
         else harness_versions.runtime_scope()
     expected_runtime = scope.get("runtime")
     expected_identity = scope.get("runtime_identity")
-    version = status.version
+    observed_version = status.observed_version
     if (
         status.harness != harness
         or status.runtime not in {"host", "sandbox"}
@@ -363,7 +393,7 @@ def _require_runtime(
         or not isinstance(expected_identity, str)
         or not expected_identity.startswith(f"{expected_runtime}:")
         or status.error is not None
-        or _parsed_version(version) != version
+        or not _exact_nonblank(observed_version)
     ):
         raise RouteResolutionError(
             error_code,
@@ -371,7 +401,7 @@ def _require_runtime(
             {
                 "harness": harness,
                 "model": model,
-                "version": version,
+                "version": observed_version,
                 "compatibility": status.compatibility,
                 "evidence_harness": status.harness,
                 "evidence_runtime": status.runtime,
@@ -380,29 +410,7 @@ def _require_runtime(
                 "expected_runtime_identity": expected_identity,
                 "runtime_error": status.error,
                 "persist_route_stale": error_code != "thinking_evidence_stale",
-                "remediation": "install or repair the compatible harness runtime",
-            },
-        )
-    checked = _runtime_manifest_compatibility(harness, version)
-    coherent = (
-        status.compatibility == checked.compatibility
-        and status.minimum_version == checked.minimum_version
-        and status.maximum_version_exclusive == checked.maximum_version_exclusive
-        and status.verified_version == checked.verified_version
-        and status.compatibility in COMPATIBLE_HARNESS_STATES
-    )
-    if not coherent:
-        raise RouteResolutionError(
-            error_code,
-            f"Harness '{harness}' has no compatible installed runtime",
-            {
-                "harness": harness,
-                "model": model,
-                "version": version,
-                "compatibility": status.compatibility,
-                "runtime_error": "HARNESS_COMPATIBILITY_EVIDENCE_INVALID",
-                "persist_route_stale": error_code != "thinking_evidence_stale",
-                "remediation": "re-probe the harness in the execution runtime",
+                "remediation": "install or repair the harness runtime",
             },
         )
     return status
@@ -432,7 +440,7 @@ def _require_controlled_runtime(
         harness, model, runtime_status, runtime_scope,
         error_code=error_code,
     )
-    if status.version != row.get("harness_version"):
+    if not _matches_captured_version(row.get("harness_version"), status):
         raise RouteResolutionError(
             error_code,
             "Installed harness version changed after refresh",
@@ -440,7 +448,7 @@ def _require_controlled_runtime(
                 "harness": harness,
                 "model": model,
                 "harness_version": row.get("harness_version"),
-                "installed_version": status.version,
+                "installed_version": status.observed_version,
                 "runtime": status.runtime,
                 "runtime_identity": status.runtime_identity,
                 "remediation": "sc models refresh",
@@ -524,7 +532,7 @@ def _require_controlled_source(
         and proof._selector == model
         and proof._runtime_status.runtime == runtime.runtime
         and proof._runtime_status.runtime_identity == runtime.runtime_identity
-        and proof._runtime_status.version == runtime.version
+        and proof._runtime_status.observed_version == runtime.observed_version
     )
     if not coherent:
         raise RouteResolutionError(
@@ -537,10 +545,10 @@ def _require_controlled_source(
                 "evidence_model": proof._selector,
                 "evidence_runtime": proof._runtime_status.runtime,
                 "evidence_runtime_identity": proof._runtime_status.runtime_identity,
-                "evidence_harness_version": proof._runtime_status.version,
+                "evidence_harness_version": proof._runtime_status.observed_version,
                 "runtime": runtime.runtime,
                 "runtime_identity": runtime.runtime_identity,
-                "runtime_harness_version": runtime.version,
+                "runtime_harness_version": runtime.observed_version,
                 "persist_route_stale": False,
                 "remediation": "re-probe the route in the execution runtime",
             },
@@ -610,24 +618,24 @@ def _validate_route_freshness(
     *,
     now: datetime,
 ) -> None:
+    if row.get("stale"):
+        raise RouteResolutionError(
+            "thinking_evidence_stale",
+            row.get("last_error") or "Route evidence is stale",
+            {"harness": harness, "model": model, "remediation": "sc models refresh"},
+        )
     captured_version = row.get("harness_version")
-    compatibility = row.get("harness_compatibility")
-    if compatibility not in COMPATIBLE_HARNESS_STATES or not captured_version:
+    support_state = _stored_support_state(row)
+    if support_state not in HARNESS_SUPPORT_STATES or not _exact_nonblank(captured_version):
         raise RouteResolutionError(
             "thinking_evidence_missing",
-            f"Route {harness}/{model} has no version-verified adapter transport",
+            f"Route {harness}/{model} has no observed harness transport",
             {
                 "harness": harness,
                 "model": model,
                 "harness_version": captured_version,
-                "compatibility": compatibility,
+                "harness_support_state": support_state,
             },
-        )
-    if _parsed_version(row.get("cli_version")) != captured_version:
-        raise RouteResolutionError(
-            "thinking_evidence_stale",
-            "Installed harness version changed after refresh",
-            {"harness": harness, "model": model, "remediation": "sc models refresh"},
         )
     if row.get("availability") != "available" or not row.get("headless_supported"):
         raise RouteResolutionError(
@@ -639,12 +647,6 @@ def _validate_route_freshness(
         raise RouteResolutionError(
             "thinking_evidence_missing",
             "Route has no successful catalogue generation",
-            {"harness": harness, "model": model, "remediation": "sc models refresh"},
-        )
-    if row.get("stale"):
-        raise RouteResolutionError(
-            "thinking_evidence_stale",
-            row.get("last_error") or "Route evidence is stale",
             {"harness": harness, "model": model, "remediation": "sc models refresh"},
         )
     if _age_hours(row.get("last_seen_at"), now) > FRESH_HOURS:
@@ -1051,6 +1053,7 @@ def verify_stored_v2_before_first_turn(
     *,
     source_fingerprint: str | None,
     harness_version: str | None,
+    harness_evidence_format: str = RAW_HARNESS_EVIDENCE_FORMAT,
 ) -> None:
     """Refuse drift without replacing an immutable stored binding.
 
@@ -1075,8 +1078,10 @@ def verify_stored_v2_before_first_turn(
             harness_version is not None
             and (
                 not _exact_nonblank(harness_version)
-                or _parsed_version(harness_version) != harness_version
-                or runtime.version != harness_version
+                or not _matches_captured_version(
+                    harness_version, runtime,
+                    evidence_format=harness_evidence_format,
+                )
             )
         ):
             raise RouteResolutionError(
@@ -1086,7 +1091,7 @@ def verify_stored_v2_before_first_turn(
                     "harness": harness,
                     "model": model,
                     "captured_harness_version": harness_version,
-                    "installed_harness_version": runtime.version,
+                    "installed_harness_version": runtime.observed_version,
                     "remediation": "pause and reroute",
                 },
             )
@@ -1094,7 +1099,6 @@ def verify_stored_v2_before_first_turn(
 
     if (
         not _exact_nonblank(harness_version)
-        or _parsed_version(harness_version) != harness_version
     ):
         raise RouteResolutionError(
             "route_evidence_stale",
@@ -1116,7 +1120,10 @@ def verify_stored_v2_before_first_turn(
         error_code="route_evidence_stale",
     )
     if (
-        runtime.version != harness_version
+        not _matches_captured_version(
+            harness_version, runtime,
+            evidence_format=harness_evidence_format,
+        )
         or proof._source_fingerprint != source_fingerprint
     ):
         raise RouteResolutionError(
@@ -1126,7 +1133,7 @@ def verify_stored_v2_before_first_turn(
                 "harness": harness,
                 "model": model,
                 "captured_harness_version": harness_version,
-                "installed_harness_version": runtime.version,
+                "installed_harness_version": runtime.observed_version,
                 "remediation": "pause and reroute",
             },
         )
@@ -1142,7 +1149,8 @@ class ParticipantRouteBindingStore:
              transition: str, runtime_status: dict | None = None,
              runtime_scope: dict | None = None,
              source_fingerprint: str | None = None,
-             harness_version: str | None = None) -> dict:
+             harness_version: str | None = None,
+             harness_support_state: str | None = None) -> dict:
         validate_v2_binding(binding)
         if (not _lower_hex(binding_digest, LOWER_HEX_64)
                 or digest_json(binding) != binding_digest):
@@ -1151,10 +1159,11 @@ class ParticipantRouteBindingStore:
             if (
                 not _lower_hex(source_fingerprint, LOWER_HEX_64)
                 or not _exact_nonblank(harness_version)
-                or _parsed_version(harness_version) != harness_version
+                or harness_support_state not in HARNESS_SUPPORT_STATES
             ):
                 raise ValueError(
-                    "controlled Sprint bindings require immutable source provenance"
+                    "controlled Sprint bindings require immutable source provenance "
+                    "and support state"
                 )
         else:
             runtime = _require_runtime(
@@ -1165,7 +1174,12 @@ class ParticipantRouteBindingStore:
                 raise ValueError(
                     "uncontrolled Sprint bindings cannot store a source fingerprint"
                 )
-            harness_version = runtime.version
+            harness_version = runtime.observed_version
+            harness_support_state = _runtime_support_state(runtime)
+            if harness_support_state not in HARNESS_SUPPORT_STATES:
+                raise ValueError(
+                    "uncontrolled Sprint bindings require immutable support provenance"
+                )
         row = self.con.execute(
             "SELECT participant.active_route_binding_id,sprint.lifecycle "
             "FROM sprint_participants participant "
@@ -1198,15 +1212,17 @@ class ParticipantRouteBindingStore:
             "requested_model,provider_model,requested_effort,effective_effort,"
             "native_variant_id,transport,catalogue_generation,evidence_digest,"
             "selector_binding,adapter_metadata,binding_json,binding_digest,"
-            "source_fingerprint,harness_version"
-            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "source_fingerprint,harness_version,harness_evidence_format,"
+            "harness_support_state"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 participant_id, revision, *values[:11],
                 canonical_json(binding["selector_binding"])
                 if binding["selector_binding"] is not None else None,
                 canonical_json(binding["adapter_metadata"]),
                 canonical_json(binding), binding_digest,
-                source_fingerprint, harness_version,
+                source_fingerprint, harness_version, RAW_HARNESS_EVIDENCE_FORMAT,
+                harness_support_state,
             ),
         )
         binding_id = int(cursor.lastrowid)
@@ -1215,4 +1231,6 @@ class ParticipantRouteBindingStore:
             "WHERE participant_id=?", (binding_id, participant_id)
         )
         return {"binding_id": binding_id, "participant_id": participant_id,
-                "route_revision": revision, "binding_digest": binding_digest}
+                "route_revision": revision, "binding_digest": binding_digest,
+                "harness_version": harness_version,
+                "harness_support_state": harness_support_state}

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +24,8 @@ import sprint_domain
 import sprint_liveness
 import sprint_message_delivery as delivery
 import sprint_runtime
-from conversation_adapters import AdapterError
+from conversation_adapters import AdapterError, CodexAdapter, KimiAdapter
+from conversation_adapters import base as adapter_base
 from conversation_adapters.base import AdapterCapabilities, checked_probe_result
 from sprint_route_binding_support import candidate as route_candidate
 
@@ -273,7 +275,8 @@ class DispatchGateTest(SprintWorkDispatchCase):
             "SELECT participant.shell_id,binding.route_revision,"
             "binding.control_state,binding.requested_model,"
             "binding.requested_effort,binding.effective_effort,"
-            "binding.catalogue_generation,binding.evidence_digest "
+            "binding.catalogue_generation,binding.evidence_digest,"
+            "binding.harness_version,binding.harness_support_state "
             "FROM sprint_participants participant "
             "JOIN sprint_participant_route_bindings binding "
             "ON binding.binding_id=participant.active_route_binding_id "
@@ -287,16 +290,18 @@ class DispatchGateTest(SprintWorkDispatchCase):
         default = next(row for row in rows if int(row[0]) == 4)
         self.assertEqual(
             ("native-uncontrolled", "devstral", None, None, None, None),
-            tuple(vibe)[2:],
+            tuple(vibe)[2:8],
         )
         self.assertEqual(
             ("harness-default", None, None, None, None, None),
-            tuple(default)[2:],
+            tuple(default)[2:8],
         )
         controlled = [row for row in rows if row[2] == "controlled"]
         self.assertEqual(3, len(controlled))
         self.assertTrue(all(row[6] == "1" * 32 for row in controlled))
         self.assertTrue(all(row[7] == "2" * 64 for row in controlled))
+        self.assertTrue(all(row[9] in {"tested", "best-effort"} for row in rows))
+        self.assertTrue(all(row[9] == "tested" for row in controlled))
         self.assertEqual(
             generation,
             self.con.execute(
@@ -530,7 +535,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
         self.assertIsInstance(caught.exception, sprint_domain.SprintPreflightError)
         self.assert_arm_left_no_writes()
 
-    def test_arm_allows_newer_unverified_harness(self) -> None:
+    def test_arm_uses_bound_route_evidence_not_static_harness_probe(self) -> None:
         self.create_unit(developer=1)
         observed: list[tuple[str, str]] = []
         capabilities = AdapterCapabilities(
@@ -575,7 +580,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
             ).fetchone()[0],
         )
 
-    def test_arm_rejects_too_old_harness_before_any_write(self) -> None:
+    def test_arm_does_not_reapply_static_harness_version_admission(self) -> None:
         self.create_unit(developer=1)
 
         def too_old(harness: str):
@@ -584,16 +589,63 @@ class DispatchGateTest(SprintWorkDispatchCase):
                 f"{harness} 0.9.0 is older than required 1.0.0",
             )
 
-        with self.assertRaisesRegex(
-            sprint_domain.SprintInvariantError,
-            "HARNESS_VERSION_UNSUPPORTED",
-        ) as caught:
-            sprint_domain.SprintLifecycleStore(
-                self.con, probe_harness=too_old
-            ).arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
+        sprint_domain.SprintLifecycleStore(
+            self.con, probe_harness=too_old
+        ).arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
+        self.assertEqual(
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+            "armed",
+        )
 
-        self.assertIsInstance(caught.exception, sprint_domain.SprintPreflightError)
-        self.assert_arm_left_no_writes()
+    def test_non_semver_adapter_output_admits_arm_and_paused_reroute(self) -> None:
+        self.create_unit(developer=1)
+        adapters = {
+            "codex": CodexAdapter(rpc=mock.Mock()),
+            "kimi": KimiAdapter(),
+        }
+
+        def version_output(argv, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{argv[0]} dev-build\n",
+                stderr="",
+            )
+
+        with (
+            mock.patch.object(
+                sprint_domain,
+                "adapter_for",
+                side_effect=lambda harness: adapters[harness],
+            ),
+            mock.patch.object(adapter_base.subprocess, "run", side_effect=version_output),
+        ):
+            lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+            lifecycle.arm(self.sprint_id, 3, conformance_reviewer_shell_id=2)
+            lifecycle.pause(
+                self.sprint_id,
+                sprint_domain.LifecycleActor("planner", 3),
+                reason="verify non-semver reroute",
+            )
+            receipt = sprint_domain.SprintParticipantStore(self.con).reroute(
+                self.sprint_id,
+                3,
+                participant_shell_id=4,
+                harness="codex",
+                model="dev-build-route",
+                effort="high",
+            )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual(receipt.control_state, "controlled")
+        self.assertEqual(
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?", (self.sprint_id,)
+            ).fetchone()[0],
+            "paused",
+        )
 
     def test_arm_selection_race_returns_retryable_conflict_without_lifecycle_writes(
         self,

@@ -219,6 +219,7 @@ class ParticipantBindingCandidate:
     runtime_scope: dict | None
     source_fingerprint: str | None
     harness_version: str | None
+    harness_support_state: str | None
 
 
 @dataclass(frozen=True)
@@ -234,6 +235,8 @@ class ParticipantRerouteReceipt:
     control_state: str
     route_revision: int | None
     binding_digest: str | None
+    harness_version: str | None
+    harness_support_state: str | None
 
     def __bool__(self) -> bool:
         return self.changed
@@ -248,6 +251,7 @@ _ROUTE_EVIDENCE_FIELDS = (
     "source_fingerprint",
     "harness_version",
     "harness_compatibility",
+    "harness_support_state",
     "supported_efforts",
     "selector_binding",
     "effort_metadata",
@@ -287,6 +291,7 @@ def _participant_binding_candidate(
     runtime_scope = None
     evidence_snapshot = None
     source_fingerprint = None
+    harness_support_state = None
     if model is None or harness == "vibe":
         runtime_scope = model_catalog.harness_versions.runtime_scope()
         runtime_status = model_catalog.harness_runtime_status(harness)
@@ -298,7 +303,10 @@ def _participant_binding_candidate(
             runtime_status=runtime_status,
             runtime_scope=runtime_scope,
         )
-        harness_version = runtime_status.get("version")
+        harness_version = runtime_status.get(
+            "observed_version", runtime_status.get("version")
+        )
+        harness_support_state = model_catalog._support_state(runtime_status)
     else:
         evidence = con.execute(
             "SELECT * FROM model_routes WHERE harness=? AND selector=?",
@@ -316,6 +324,7 @@ def _participant_binding_candidate(
             evidence_snapshot = _route_evidence_snapshot(evidence_dict)
             source_fingerprint = evidence_dict.get("source_fingerprint")
             harness_version = evidence_dict.get("harness_version")
+            harness_support_state = evidence_dict.get("harness_support_state")
         else:
             harness_version = None
     return ParticipantBindingCandidate(
@@ -327,6 +336,7 @@ def _participant_binding_candidate(
         runtime_scope=runtime_scope,
         source_fingerprint=source_fingerprint,
         harness_version=harness_version,
+        harness_support_state=harness_support_state,
     )
 
 
@@ -682,14 +692,19 @@ class SprintLifecycleStore:
         for harness in dict.fromkeys(
             candidate.binding["harness"] for candidate in candidates
         ):
-            try:
-                self.probe_harness(harness)
-            except AdapterError as exc:
-                raise SprintPreflightError(str(exc)) from exc
+            self._probe_bound_harness(harness)
         return ArmBindingPreflight(
             intent_fingerprint=self._intent_fingerprint(participants),
             candidates=tuple(candidates),
         )
+
+    def _probe_bound_harness(self, harness: str) -> None:
+        """Keep executable probing, but do not turn static ranges into admission."""
+        try:
+            self.probe_harness(harness)
+        except AdapterError as exc:
+            if exc.code != "HARNESS_VERSION_UNSUPPORTED":
+                raise SprintPreflightError(str(exc)) from exc
 
     def _require_prior_cleanup_resolved(self, sprint_id: int) -> None:
         shell_ids = [
@@ -778,6 +793,7 @@ class SprintLifecycleStore:
                 runtime_scope=candidate.runtime_scope,
                 source_fingerprint=candidate.source_fingerprint,
                 harness_version=candidate.harness_version,
+                harness_support_state=candidate.harness_support_state,
             )
             receipt.update(
                 {
@@ -3385,6 +3401,13 @@ class SprintParticipantStore:
             lambda harness: adapter_for(harness).probe()
         )
 
+    def _probe_bound_harness(self, harness: str) -> None:
+        try:
+            self.probe_harness(harness)
+        except AdapterError as exc:
+            if exc.code != "HARNESS_VERSION_UNSUPPORTED":
+                raise SprintPreflightError(str(exc)) from exc
+
     def reroute(
         self,
         sprint_id: int,
@@ -3440,10 +3463,7 @@ class SprintParticipantStore:
             raise SprintPreflightError(
                 exc.message, code=exc.code, details=exc.details
             ) from exc
-        try:
-            self.probe_harness(candidate.binding["harness"])
-        except AdapterError as exc:
-            raise SprintPreflightError(str(exc)) from exc
+        self._probe_bound_harness(candidate.binding["harness"])
 
         before = self._projection(participant)
         after = {
@@ -3472,6 +3492,14 @@ class SprintParticipantStore:
                 ),
                 binding_digest=(
                     str(active["binding_digest"]) if active is not None else None
+                ),
+                harness_version=(
+                    str(active["harness_version"])
+                    if active is not None else candidate.harness_version
+                ),
+                harness_support_state=(
+                    str(active["harness_support_state"])
+                    if active is not None else candidate.harness_support_state
                 ),
             )
 
@@ -3523,6 +3551,7 @@ class SprintParticipantStore:
                     runtime_scope=candidate.runtime_scope,
                     source_fingerprint=candidate.source_fingerprint,
                     harness_version=candidate.harness_version,
+                    harness_support_state=candidate.harness_support_state,
                 )
             self.con.execute(
                 "UPDATE sprint_participants SET harness=?,model=?,effort=?,route=?,"
@@ -3562,6 +3591,10 @@ class SprintParticipantStore:
                                 "binding_digest": (
                                     candidate.binding_digest
                                     if binding_receipt is not None else None
+                                ),
+                                "harness_version": candidate.harness_version,
+                                "harness_support_state": (
+                                    candidate.harness_support_state
                                 ),
                             },
                         },
@@ -3604,6 +3637,8 @@ class SprintParticipantStore:
             binding_digest=(
                 candidate.binding_digest if binding_receipt is not None else None
             ),
+            harness_version=candidate.harness_version,
+            harness_support_state=candidate.harness_support_state,
         )
 
     def _participant(self, sprint_id: int, shell_id: int) -> sqlite3.Row:
@@ -3612,7 +3647,8 @@ class SprintParticipantStore:
             "participant.shell_id,participant.role,participant.harness,"
             "participant.model,participant.effort,participant.route,"
             "participant.active_route_binding_id,binding.control_state,"
-            "binding.route_revision,binding.binding_digest "
+            "binding.route_revision,binding.binding_digest,binding.harness_version,"
+            "binding.harness_support_state "
             "FROM sprint_participants participant "
             "LEFT JOIN sprint_participant_route_bindings binding "
             "ON binding.binding_id=participant.active_route_binding_id "

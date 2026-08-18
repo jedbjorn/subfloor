@@ -87,7 +87,9 @@ class _CatalogApiHandler(BaseHTTPRequestHandler):
         "harness": "codex", "selector": "wt-live-model", "source": "live-api",
         "availability": "available", "stale": 0, "headless_supported": 1,
         "high_effort_supported": 1, "cli_version": "codex-cli 0.145.0",
-        "harness_version": "0.145.0", "harness_compatibility": "verified",
+        "harness_version": "codex-cli 0.145.0",
+        "harness_compatibility": "supported",
+        "harness_support_state": "best-effort",
         "supported_efforts": '["high"]',
         "last_seen_at": "2099-01-01T00:00:00+00:00",
         "generation_id": "1" * 32,
@@ -664,10 +666,11 @@ class LiveSurfacesStillResolveTest(WorktreeFixture):
             }],
         }))
         status = {
-            "version": "0.145.0", "compatibility": "verified",
+            "version": "0.145.0", "observed_version": "codex-cli 0.145.0",
+            "compatibility": "supported",
             "minimum_version": "0.145.0",
-            "maximum_version_exclusive": "0.147.0",
-            "verified_version": "0.145.0", "error": None,
+            "maximum_version_exclusive": "0.148.0",
+            "verified_version": "0.147.0", "error": None,
         }
         entry = model_catalog._entry(
             "wt-live-model", name="Worktree Live", source="codex-cache",

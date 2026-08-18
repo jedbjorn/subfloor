@@ -28,6 +28,20 @@ import sys
 # Probe order = the order the harness picker lists them.
 HARNESSES = ("claude", "codex", "opencode", "vibe", "kimi")
 TIMEOUT = 8
+SEMVER_TOKEN = re.compile(
+    r"(?:^|(?<=\s))v?((\d+\.\d+\.\d+)(?:-[0-9A-Za-z.-]+)?"
+    r"(?:\+[0-9A-Za-z.-]+)?)(?=$|\s|\()"
+)
+# Only these complete observed outputs earned the maintained-version canary.
+# Parsing a matching semantic core is useful diagnostic evidence, but it must
+# not promote an arbitrary wrapper or custom build to the tested assurance.
+MAINTAINED_OBSERVED_VERSIONS = {
+    "claude": "2.1.223 (Claude Code)",
+    "codex": "codex-cli 0.147.0",
+    "opencode": "1.18.9",
+    "vibe": "vibe 2.22.0",
+    "kimi": "0.33.0",
+}
 
 
 def runtime_scope(*, env=None, hostname: str | None = None) -> dict[str, str]:
@@ -51,6 +65,8 @@ def probe(name: str) -> str | None:
         proc = subprocess.run([name, "--version"], capture_output=True, text=True,
                               timeout=TIMEOUT)
     except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
         return None
     out = (proc.stdout or proc.stderr or "").strip().splitlines()
     return out[0].strip() if out else None
@@ -77,12 +93,11 @@ def compatibility_status(
     for name in harnesses:
         identity = {"harness": name, **scope}
         raw_version = probe(name)
-        match = re.search(r"\d+\.\d+\.\d+", raw_version or "")
-        version = match.group(0) if match else None
-        if version is None:
+        if raw_version is None:
             found[name] = {
                 **identity,
                 "version": None,
+                "observed_version": None,
                 "compatibility": None,
                 "minimum_version": None,
                 "maximum_version_exclusive": None,
@@ -90,6 +105,8 @@ def compatibility_status(
                 "error": "HARNESS_UNAVAILABLE",
             }
             continue
+        match = SEMVER_TOKEN.search(raw_version)
+        version = match.group(1) if match else None
         manifest = {}
         try:
             if name in ADAPTER_TYPES:
@@ -101,16 +118,32 @@ def compatibility_status(
                 )
                 compatibility = adapter.get("runtime_compatibility") or {}
                 manifest = {"conversation": compatibility}
+            validation_version = (match.group(2) if match else None) or compatibility.get("verified_cli_version")
             result = checked_version_compatibility(
                 harness=name,
                 compatibility=compatibility,
-                version=version,
+                version=validation_version,
             )
         except (AdapterError, OSError, json.JSONDecodeError) as exc:
             conversation = manifest.get("conversation", {})
+            if isinstance(exc, AdapterError) and exc.code == "HARNESS_VERSION_UNSUPPORTED":
+                found[name] = {
+                    **identity,
+                    "version": version,
+                    "observed_version": raw_version,
+                    "compatibility": "older-unverified",
+                    "minimum_version": conversation.get("minimum_cli_version"),
+                    "maximum_version_exclusive": conversation.get(
+                        "maximum_cli_version_exclusive"
+                    ),
+                    "verified_version": conversation.get("verified_cli_version"),
+                    "error": None,
+                }
+                continue
             found[name] = {
                 **identity,
                 "version": version,
+                "observed_version": raw_version,
                 "compatibility": None,
                 "minimum_version": conversation.get("minimum_cli_version"),
                 "maximum_version_exclusive": conversation.get(
@@ -121,10 +154,31 @@ def compatibility_status(
                 else "HARNESS_MANIFEST_INVALID",
             }
             continue
+        if version is None:
+            found[name] = {
+                **identity,
+                "version": None,
+                "observed_version": raw_version,
+                "compatibility": "non-semver",
+                "minimum_version": result.minimum_version,
+                "maximum_version_exclusive": result.maximum_version_exclusive,
+                "verified_version": result.verified_version,
+                "error": None,
+            }
+            continue
+        compatibility_state = result.compatibility
+        if version != match.group(2) and compatibility_state == "verified":
+            compatibility_state = "prerelease-unverified"
+        elif (
+            compatibility_state == "verified"
+            and raw_version != MAINTAINED_OBSERVED_VERSIONS.get(name)
+        ):
+            compatibility_state = "custom-unverified"
         found[name] = {
             **identity,
-            "version": result.version,
-            "compatibility": result.compatibility,
+            "version": version,
+            "observed_version": raw_version,
+            "compatibility": compatibility_state,
             "minimum_version": result.minimum_version,
             "maximum_version_exclusive": result.maximum_version_exclusive,
             "verified_version": result.verified_version,
@@ -142,23 +196,22 @@ def main(argv: list[str]) -> int:
     print(f"  runtime:   {provenance}")
     for name, status in found.items():
         version = status["version"]
+        observed_version = status.get("observed_version") or version
         compatibility = status["compatibility"]
         if status["error"]:
-            detail = f"{version or '—'} · {status['error']}"
-        elif version and compatibility == "newer-unverified":
+            detail = f"{observed_version or '—'} · {status['error']}"
+        elif observed_version and compatibility == "verified":
             detail = (
-                f"{version} · {compatibility} · tested "
+                f"{observed_version} · {compatibility} · tested "
                 f"[{status['minimum_version']}, "
                 f"{status['maximum_version_exclusive']})"
             )
-        elif version and compatibility:
+        elif observed_version and compatibility:
             detail = (
-                f"{version} · {compatibility} · supported "
-                f"[{status['minimum_version']}, "
-                f"{status['maximum_version_exclusive']})"
+                f"{observed_version} · {compatibility} · best-effort"
             )
-        elif version:
-            detail = version
+        elif observed_version:
+            detail = observed_version
         else:
             detail = "— not installed"
         print(f"  {name:9} {detail}")

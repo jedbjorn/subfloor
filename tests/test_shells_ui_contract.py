@@ -44,7 +44,8 @@ def test_thinking_selector_state_matrix_is_route_aware():
     ]
     script = helper + r"""
 const catalog = {stale: false, harnesses: {codex: {models: [
-  {id: "gpt-high", availability: "available", supported_efforts: ["low", "high"]},
+  {id: "gpt-high", availability: "available", supported_efforts: ["low", "high"],
+   harness_support_state: "tested", harness_version: "codex-cli 0.147.0"},
   {id: "gpt-explicit", availability: "available", supported_efforts: ["low", "medium"]},
 ]}}};
 console.log(JSON.stringify({
@@ -59,6 +60,7 @@ console.log(JSON.stringify({
     result = run_js(script)
     assert result["controlled"]["selected"] == "low"
     assert result["defaulted"]["selected"] == "high"
+    assert "Support: tested (codex-cli 0.147.0)" in result["defaulted"]["guidance"]
     assert result["explicit"]["selected"] == ""
     assert result["explicit"]["disabled"] is False
     assert result["harnessDefault"]["label"] == "Harness default"
@@ -74,6 +76,7 @@ def test_default_models_saves_model_and_effort_atomically():
     assert 'model: row.model, effort' in DEFAULT_MODELS
     assert 'row.effort_state = "selection-required"' in DEFAULT_MODELS
     assert 'ariaLabel: `Thinking level for ${flavor} ${h}`' in DEFAULT_MODELS
+    assert "m.harness_support_state" in DEFAULT_MODELS
 
 
 def test_skills_is_nested_under_shells_instead_of_global_navigation():

@@ -78,7 +78,7 @@ CLAUDE_ALIASES = ["fable", "opus", "sonnet", "haiku"]
 # Bump when the response/cache shape changes — a cached payload from another
 # version is ignored (treated as no cache) instead of being served to a
 # client that expects the new shape.
-PAYLOAD_VERSION = 6
+PAYLOAD_VERSION = 7
 _GENERATION_TABLE_UNAVAILABLE = object()
 
 # provider APIs, keyed by harness: (env var, url, header builder). Responses
@@ -481,24 +481,51 @@ def _evidence_kind(harness: str, source: str) -> str | None:
     }.get((harness, source))
 
 
+_SEMVER_TOKEN = re.compile(
+    r"(?:(?:claude|codex(?:-cli)?|opencode|vibe|kimi) )?v?"
+    r"((\d+\.\d+\.\d+)(?:-[0-9A-Za-z.-]+)?"
+    r"(?:\+[0-9A-Za-z.-]+)?)"
+)
+
+
 def _parsed_version(value: object) -> str | None:
-    match = re.search(r"\d+\.\d+\.\d+", value) if isinstance(value, str) else None
-    return match.group(0) if match else None
+    """Return one complete SemVer token, never a same-core substring."""
+    match = _SEMVER_TOKEN.fullmatch(value.strip()) if isinstance(value, str) else None
+    return match.group(1) if match else None
+
+
+def _observed_version(status: dict) -> str | None:
+    value = status.get("observed_version", status.get("version"))
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _support_state(status: dict) -> str | None:
+    if status.get("error") or not _observed_version(status):
+        return None
+    return "tested" if (
+        status.get("version")
+        and status.get("version") == status.get("verified_version")
+        and status.get("compatibility") == "verified"
+    ) else "best-effort"
 
 
 def _compatible_route_status(harness: str, entry: dict,
                              status: dict) -> bool:
-    """Require one exact adapter-compatible binary for controlled evidence."""
+    """Require executable and exact source evidence, never a version range."""
     if _evidence_kind(harness, entry.get("source") or "unknown") is None:
         return True
     if not isinstance(status, dict):
         return False
     return bool(
         not status.get("error")
-        and status.get("compatibility")
-        in route_bindings.COMPATIBLE_HARNESS_STATES
-        and status.get("version")
-        and _parsed_version(entry.get("cli_version")) == status.get("version")
+        and _observed_version(status)
+        and (
+            entry.get("cli_version") == _observed_version(status)
+            or (
+                status.get("version")
+                and _parsed_version(entry.get("cli_version")) == status.get("version")
+            )
+        )
     )
 
 
@@ -556,8 +583,9 @@ def _entry_evidence(harness: str, entry: dict,
         "cli_version": entry.get("cli_version"),
         "selector_binding": selector_binding,
         "adapter_metadata": catalogue_adapter_metadata,
-        "harness_version": (status or {}).get("version"),
+        "harness_version": _observed_version(status or {}),
         "harness_compatibility": (status or {}).get("compatibility"),
+        "harness_support_state": _support_state(status or {}),
         "adapter_minimum_version": (status or {}).get("minimum_version"),
         "adapter_maximum_version_exclusive": (status or {}).get(
             "maximum_version_exclusive"
@@ -592,13 +620,27 @@ def _entry_evidence(harness: str, entry: dict,
             **base, "effort_metadata": effort_metadata
         }),
         "source_fingerprint": source_fingerprint,
-        "harness_version": (status or {}).get("version"),
+        "harness_version": _observed_version(status or {}),
         "harness_compatibility": (status or {}).get("compatibility"),
+        "harness_support_state": _support_state(status or {}),
         "selector_binding": selector_binding,
         "effort_metadata": effort_metadata,
         "adapter_metadata": entry.get("adapter_metadata") or {},
         "supported_efforts": efforts,
     }
+
+
+def _project_route_support(payload: dict, harnesses: dict[str, dict]) -> dict:
+    """Attach route-local support metadata without changing route admission."""
+    for harness, block in (payload.get("harnesses") or {}).items():
+        status = harnesses.get(harness) or {}
+        observed_version = _observed_version(status)
+        support_state = _support_state(status)
+        for entry in block.get("models") or []:
+            if _evidence_kind(harness, entry.get("source") or "unknown"):
+                entry["harness_version"] = observed_version
+                entry["harness_support_state"] = support_state
+    return payload
 
 
 def _legacy_persist_routes(con, payload: dict) -> None:
@@ -746,10 +788,10 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
                         "source,availability,headless_supported,high_effort_supported,"
                         "default_effort,supported_efforts,cli_version,last_seen_at,stale,"
                         "last_error,generation_id,evidence_kind,evidence_digest,"
-                        "source_fingerprint,harness_version,harness_compatibility,"
+                "source_fingerprint,harness_version,harness_compatibility,harness_support_state,"
                         "selector_binding,effort_metadata,"
                         "adapter_metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                        "?,?,?,?,?,?,?,?,?) ON CONFLICT(harness,selector) DO UPDATE SET "
+                "?,?,?,?,?,?,?,?,?,?) ON CONFLICT(harness,selector) DO UPDATE SET "
                         "provider=excluded.provider,provider_model=excluded.provider_model,"
                         "display_name=excluded.display_name,family=excluded.family,"
                         "source=excluded.source,availability=excluded.availability,"
@@ -764,6 +806,7 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
                         "source_fingerprint=excluded.source_fingerprint,"
                         "harness_version=excluded.harness_version,"
                         "harness_compatibility=excluded.harness_compatibility,"
+                        "harness_support_state=excluded.harness_support_state,"
                         "selector_binding=excluded.selector_binding,"
                         "effort_metadata=excluded.effort_metadata,"
                         "adapter_metadata=excluded.adapter_metadata",
@@ -778,7 +821,9 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
                             generation_id, evidence["evidence_kind"],
                             evidence["evidence_digest"], evidence["source_fingerprint"],
                             evidence["harness_version"],
-                            evidence["harness_compatibility"],
+                            evidence["harness_compatibility"] if evidence["harness_compatibility"]
+                            in {"verified", "supported"} else None,
+                            evidence["harness_support_state"],
                             route_bindings.canonical_json(evidence["selector_binding"]),
                             route_bindings.canonical_json(evidence["effort_metadata"]),
                             route_bindings.canonical_json(evidence["adapter_metadata"]),
@@ -810,14 +855,8 @@ def _default_route_verification(con, harnesses: dict[str, dict]) -> list[dict]:
         model = configured["model"]
         status = harnesses.get(harness) or {}
         harness_error = status.get("error")
-        if status.get("version") is None:
+        if not _observed_version(status):
             harness_error = harness_error or "HARNESS_UNAVAILABLE"
-        elif (
-            harness in route_bindings.CONTROLLED_EVIDENCE
-            and status.get("compatibility")
-            not in route_bindings.COMPATIBLE_HARNESS_STATES
-        ):
-            harness_error = "HARNESS_VERSION_UNVERIFIED"
 
         route = None
         if model is not None:
@@ -892,17 +931,15 @@ def runtime_verification(con, *, env=os.environ,
         report["error"] = str(exc)
         return report
 
+    harnesses = {
+        harness: {**status, "support_state": _support_state(status)}
+        for harness, status in harnesses.items()
+    }
     report["harnesses"] = harnesses
     report["summary"]["harnesses_checked"] = len(harnesses)
     report["summary"]["harnesses_ready"] = sum(
         1 for harness, status in harnesses.items()
-        if status.get("version") is not None
-        and not status.get("error")
-        and (
-            harness not in route_bindings.CONTROLLED_EVIDENCE
-            or status.get("compatibility")
-            in route_bindings.COMPATIBLE_HARNESS_STATES
-        )
+        if _observed_version(status) is not None and not status.get("error")
     )
     try:
         defaults = _default_route_verification(con, harnesses)
@@ -1191,6 +1228,8 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             "runtime": "sandbox" if env.get("SC_SANDBOX") else "host",
             "harnesses": harnesses,
         }
+        _project_route_support(response, harnesses)
+        _project_route_support(fresh, harnesses)
         with _publication_lock():
             response = _served(
                 response, con, publish=True, publication_locked=True

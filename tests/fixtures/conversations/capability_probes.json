@@ -24,7 +24,7 @@
       }
     },
     "claude": {
-      "verified_cli_version": "2.1.222",
+      "verified_cli_version": "2.1.223",
       "maximum_cli_version_exclusive": "2.2.0",
       "driver": "claude-print",
       "native_ref_shape": "uuid",
@@ -44,8 +44,8 @@
       }
     },
     "codex": {
-      "verified_cli_version": "0.145.0",
-      "maximum_cli_version_exclusive": "0.147.0",
+      "verified_cli_version": "0.147.0",
+      "maximum_cli_version_exclusive": "0.148.0",
       "driver": "codex-app-server",
       "native_ref_shape": "uuid",
       "observed_events": [

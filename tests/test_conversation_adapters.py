@@ -746,16 +746,22 @@ class ConversationAdapterTest(unittest.TestCase):
 
     def test_declared_compatibility_ranges_enforce_floor_and_flag_newer(self) -> None:
         cases = {
-            "claude": ("2.1.219", "2.1.220", "2.1.222", "2.2.0"),
-            "codex": ("0.144.999", "0.145.0", "0.146.1", "0.147.0"),
+            "claude": ("2.1.219", "2.1.220", "2.1.223", "2.2.0"),
+            "codex": ("0.144.999", "0.145.0", "0.147.0", "0.148.0"),
             "opencode": ("1.18.8", "1.18.9", "1.18.13", "1.19.0"),
             "kimi": ("0.29.999", "0.30.0", "0.33.0", "0.34.0"),
+        }
+        current_observed = {
+            "claude": "2.1.223 (Claude Code)",
+            "codex": "codex-cli 0.147.0",
+            "opencode": "1.18.13",
+            "kimi": "0.33.0",
         }
         for harness, (below, lower, current, upper) in cases.items():
             with self.subTest(harness=harness):
                 adapter, _native = self.build(harness)
                 lower_result = adapter._probe_result(lower)
-                current_result = adapter._probe_result(current)
+                current_result = adapter._probe_result(current_observed[harness])
                 self.assertEqual(lower_result.minimum_version, lower)
                 self.assertEqual(current_result.version, current)
                 self.assertEqual(
@@ -778,11 +784,37 @@ class ConversationAdapterTest(unittest.TestCase):
                 self.assertEqual(upper_result.compatibility, "newer-unverified")
                 self.assertEqual(upper_result.maximum_version_exclusive, upper)
 
+    def test_same_core_non_tokens_are_not_verified(self) -> None:
+        adapter, _native = self.build("codex")
+        for observed in (
+            "codex-cli 0.147.0dev", "codex-cli 0.147.0.1",
+            "codex-cli 0.147.0_dev", "codex-cli 0.147.0~dev",
+            "codex-cli 0.147.0/dev", "codex-cli 0.147.0:dev",
+        ):
+            with self.subTest(observed=observed):
+                result = adapter._probe_result(observed)
+                self.assertEqual(result.version, observed)
+                self.assertEqual(result.compatibility, "non-semver")
+                self.assertEqual(result.verified_version, "0.147.0")
+
+    def test_custom_current_core_is_not_verified(self) -> None:
+        adapter, _native = self.build("codex")
+        for observed in (
+            "codex-cli 0.147.0(dev)",
+            "codex-cli 0.147.0 custom-build",
+            "wrapper 0.147.0 (not-the-canary)",
+        ):
+            with self.subTest(observed=observed):
+                result = adapter._probe_result(observed)
+                self.assertEqual(result.version, observed)
+                self.assertEqual(result.compatibility, "custom-unverified")
+                self.assertEqual(result.verified_version, "0.147.0")
+
     def test_verified_probe_result_names_missing_manifest_keys(self) -> None:
         adapter, _native = self.build("claude")
-        result = adapter._probe_result("2.1.222")
+        result = adapter._probe_result("2.1.223 (Claude Code)")
         self.assertEqual(result.compatibility, "verified")
-        self.assertEqual(result.verified_version, "2.1.222")
+        self.assertEqual(result.verified_version, "2.1.223")
         self.assertEqual(result.maximum_version_exclusive, "2.2.0")
 
         manifest = json.loads(
@@ -824,6 +856,21 @@ class ConversationAdapterTest(unittest.TestCase):
             ),
         ):
             base_adapter.load_manifest("claude")
+
+    def test_successful_non_semver_probe_preserves_manifest_validation(self) -> None:
+        adapter, _native = self.build("codex")
+        with mock.patch.object(
+            base_adapter.subprocess,
+            "run",
+            return_value=mock.Mock(
+                returncode=0, stdout="codex dev-build\n", stderr=""
+            ),
+        ):
+            result = adapter.probe()
+
+        self.assertEqual(result.version, "codex dev-build")
+        self.assertEqual(result.compatibility, "non-semver")
+        self.assertEqual(result.verified_version, "0.147.0")
 
     def write_claude_session(
         self,

@@ -19,6 +19,8 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 import model_catalog  # noqa: E402
 import models as routes_cli  # noqa: E402
 import route_bindings  # noqa: E402
+import harness_versions  # noqa: E402
+import server as api_server  # noqa: E402
 
 
 def compatible_runtime(version: str = "2.22.0", *, harness: str | None = None,
@@ -114,6 +116,14 @@ def route_schema(path: str | Path = ":memory:") -> sqlite3.Connection:
         ROOT / ".super-coder" / "migrations" /
         "0216_sprint_binding_provenance.sql"
     ).read_text())
+    con.executescript((
+        ROOT / ".super-coder" / "migrations" /
+        "0217_harness_support_metadata.sql"
+    ).read_text())
+    con.executescript((
+        ROOT / ".super-coder" / "migrations" /
+        "0218_sprint_binding_support_provenance.sql"
+    ).read_text())
     return con
 
 
@@ -142,6 +152,27 @@ def resolve_controlled(
 class BindingIdentityTest(unittest.TestCase):
     NOW = datetime(2026, 8, 16, 20, 0, tzinfo=timezone.utc)
 
+    def test_uncontrolled_binding_requires_exact_raw_runtime_identity(self):
+        binding = route_bindings._uncontrolled_binding("vibe", "devstral", None)
+        scope = harness_versions.runtime_scope()
+        runtime = {
+            "harness": "vibe",
+            **scope,
+            "version": "2.22.0",
+            "observed_version": "vibe 2.22.0-dev",
+            "compatibility": "prerelease-unverified",
+            "error": None,
+        }
+        with mock.patch.object(model_catalog, "harness_runtime_status", return_value=runtime):
+            with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+                route_bindings.verify_stored_v2_before_first_turn(
+                    None,
+                    binding,
+                    source_fingerprint=None,
+                    harness_version="2.22.0",
+                )
+        self.assertEqual(raised.exception.code, "route_evidence_stale")
+
     @staticmethod
     def controlled_row(**overrides) -> dict:
         base = {
@@ -160,6 +191,7 @@ class BindingIdentityTest(unittest.TestCase):
             "cli_version": "codex-cli 0.145.0",
             "harness_version": "0.145.0",
             "harness_compatibility": "verified",
+            "harness_support_state": "tested",
             "supported_efforts": '["low","high"]',
             "effort_metadata": json.dumps({
                 "supported": ["low", "high"],
@@ -207,6 +239,7 @@ class BindingIdentityTest(unittest.TestCase):
                 },
             }),
         )
+
 
     def test_controlled_omitted_and_explicit_high_have_same_fixed_identity(self):
         implicit, implicit_digest = resolve_controlled_v2(
@@ -399,21 +432,17 @@ class BindingIdentityTest(unittest.TestCase):
                 self.assertEqual(raised.exception.code, "thinking_evidence_missing")
                 self.assertIn("does not match", raised.exception.message)
 
-    def test_controlled_route_requires_matching_compatible_harness_version(self):
-        cases = (
-            ({"harness_compatibility": None}, "thinking_evidence_missing"),
-            ({"harness_compatibility": "newer-unverified"},
-             "thinking_evidence_missing"),
-            ({"harness_version": "0.144.0"}, "thinking_evidence_stale"),
-        )
-        for overrides, code in cases:
-            with self.subTest(overrides=overrides):
-                with self.assertRaises(route_bindings.RouteResolutionError) as raised:
-                    route_bindings.resolve_v2(
-                        self.controlled_row(**overrides), "codex", "gpt-test",
-                        now=self.NOW,
-                    )
-                self.assertEqual(raised.exception.code, code)
+    def test_controlled_route_accepts_best_effort_version_metadata(self):
+        for compatibility in (None, "newer-unverified", "non-semver"):
+            with self.subTest(compatibility=compatibility):
+                binding, _ = resolve_controlled_v2(
+                    self.controlled_row(
+                        harness_compatibility=compatibility,
+                        harness_support_state="best-effort",
+                    ),
+                    "codex", "gpt-test", now=self.NOW,
+                )
+                self.assertEqual(binding["requested_effort"], "high")
 
     def test_controlled_route_requires_collected_source_evidence(self):
         observation = controlled_observation(None)
@@ -544,6 +573,273 @@ class BindingIdentityTest(unittest.TestCase):
             route_bindings.legacy_route(
                 row_contract_version=2, harness="vibe", model="old", effort=None
             )
+
+
+class LegacySprintBindingUpgradeTest(unittest.TestCase):
+    def setUp(self):
+        self.con = sqlite3.connect(":memory:")
+        self.con.row_factory = sqlite3.Row
+        self.con.execute("PRAGMA foreign_keys=ON")
+        self.con.executescript((
+            ROOT / ".super-coder" / "migrations" / "0075_model_routes.sql"
+        ).read_text())
+        self.con.executescript(
+            "CREATE TABLE sprints (sprint_id INTEGER PRIMARY KEY,lifecycle TEXT NOT NULL);"
+            "CREATE TABLE sprint_participants (participant_id INTEGER PRIMARY KEY,"
+            "sprint_id INTEGER NOT NULL REFERENCES sprints(sprint_id));"
+        )
+        for migration in (
+            "0212_route_binding_foundation.sql",
+            "0216_sprint_binding_provenance.sql",
+        ):
+            self.con.executescript((ROOT / ".super-coder" / "migrations" / migration).read_text())
+        self.con.execute("INSERT INTO sprints VALUES (1,'armed')")
+        self.con.executemany(
+            "INSERT INTO sprint_participants VALUES (?,1,NULL)", ((10,), (11,), (12,))
+        )
+        self.addCleanup(self.con.close)
+
+    def _insert_legacy(self, participant_id: int, binding: dict, *,
+                       source_fingerprint: str | None, harness_version: str) -> None:
+        values = [binding[key] for key in route_bindings.BINDING_KEYS]
+        self.con.execute(
+            "INSERT INTO sprint_participant_route_bindings ("
+            "participant_id,route_revision,contract_version,control_state,harness,"
+            "requested_model,provider_model,requested_effort,effective_effort,"
+            "native_variant_id,transport,catalogue_generation,evidence_digest,"
+            "selector_binding,adapter_metadata,binding_json,binding_digest,"
+            "source_fingerprint,harness_version"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                participant_id, 1, *values[:11],
+                route_bindings.canonical_json(binding["selector_binding"])
+                if binding["selector_binding"] is not None else None,
+                route_bindings.canonical_json(binding["adapter_metadata"]),
+                route_bindings.canonical_json(binding), route_bindings.digest_json(binding),
+                source_fingerprint, harness_version,
+            ),
+        )
+
+    def test_dirty_upgrade_preserves_legacy_semver_and_new_raw_rows_are_exact(self):
+        now = datetime.now(timezone.utc)
+        controlled, _ = resolve_controlled_v2(
+            BindingIdentityTest.controlled_row(last_seen_at=now.isoformat()),
+            "codex", "gpt-test", "high", now=now,
+            runtime_status=compatible_runtime("0.145.0", harness="codex"),
+        )
+        default, _ = route_bindings.resolve_v2(
+            None, "claude", None,
+            runtime_status=compatible_runtime("2.1.223", harness="claude"),
+        )
+        vibe, _ = route_bindings.resolve_v2(
+            None, "vibe", "devstral", None,
+            runtime_status=compatible_runtime("2.22.0", harness="vibe"),
+        )
+        captured = {
+            10: ("2" * 64, "0.147.0"),
+            11: (None, "2.1.223"),
+            12: (None, "2.22.0"),
+        }
+        for participant_id, binding in ((10, controlled), (11, default), (12, vibe)):
+            self._insert_legacy(participant_id, binding,
+                                source_fingerprint=captured[participant_id][0],
+                                harness_version=captured[participant_id][1])
+        before = [tuple(row) for row in self.con.execute(
+            "SELECT binding_json,binding_digest FROM sprint_participant_route_bindings "
+            "ORDER BY participant_id"
+        )]
+        for migration in (
+            "0217_harness_support_metadata.sql",
+            "0218_sprint_binding_support_provenance.sql",
+        ):
+            self.con.executescript((ROOT / ".super-coder" / "migrations" / migration).read_text())
+        upgraded = self.con.execute(
+            "SELECT participant_id,binding_json,binding_digest,harness_evidence_format "
+            "FROM sprint_participant_route_bindings ORDER BY participant_id"
+        ).fetchall()
+        self.assertEqual(before, [tuple(row)[1:3] for row in upgraded])
+        self.assertEqual(
+            [row["harness_evidence_format"] for row in upgraded],
+            ["legacy-semver", "legacy-semver", "legacy-semver"],
+        )
+
+        scope = harness_versions.runtime_scope()
+        codex = {**compatible_runtime("0.147.0", harness="codex", scope=scope),
+                 "observed_version": "codex-cli 0.147.0"}
+        claude = {**compatible_runtime("2.1.223", harness="claude", scope=scope),
+                  "observed_version": "2.1.223 (Claude Code)"}
+        vibe_status = {**compatible_runtime("2.22.0", harness="vibe", scope=scope),
+                       "observed_version": "vibe 2.22.0"}
+        with (
+            mock.patch.object(model_catalog, "controlled_route_evidence", return_value={
+                "runtime_status": codex, "runtime_scope": scope,
+                "source_fingerprint": "2" * 64,
+            }),
+            mock.patch.object(model_catalog, "harness_runtime_status", side_effect=lambda h: {
+                "claude": claude, "vibe": vibe_status,
+            }[h]),
+        ):
+            for row in upgraded:
+                participant_id = int(row["participant_id"])
+                route_bindings.verify_stored_v2_before_first_turn(
+                    self.con, json.loads(row["binding_json"]),
+                    source_fingerprint=captured[participant_id][0],
+                    harness_version=captured[participant_id][1],
+                    harness_evidence_format=row["harness_evidence_format"],
+                )
+            changed = {**codex, "version": "0.148.0",
+                       "observed_version": "codex-cli 0.148.0"}
+            with mock.patch.object(model_catalog, "controlled_route_evidence", return_value={
+                "runtime_status": changed, "runtime_scope": scope,
+                "source_fingerprint": "2" * 64,
+            }), self.assertRaises(route_bindings.RouteResolutionError) as raised:
+                route_bindings.verify_stored_v2_before_first_turn(
+                    self.con, controlled, source_fingerprint="2" * 64,
+                    harness_version="0.147.0",
+                    harness_evidence_format="legacy-semver",
+                )
+        self.assertEqual(raised.exception.code, "route_evidence_stale")
+
+        raw_binding = route_bindings._uncontrolled_binding("vibe", "devstral", None)
+        raw_runtime = {**compatible_runtime("2.22.0", harness="vibe", scope=scope),
+                       "version": None, "observed_version": "vibe dev-build",
+                       "compatibility": "non-semver"}
+        with mock.patch.object(model_catalog, "harness_runtime_status", return_value=raw_runtime):
+            route_bindings.verify_stored_v2_before_first_turn(
+                self.con, raw_binding, source_fingerprint=None,
+                harness_version="vibe dev-build",
+                harness_evidence_format="raw-observed-v1",
+            )
+        changed_raw_runtime = {**raw_runtime, "observed_version": "vibe dev-build-next"}
+        with mock.patch.object(
+            model_catalog, "harness_runtime_status", return_value=changed_raw_runtime
+        ):
+            with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+                route_bindings.verify_stored_v2_before_first_turn(
+                    self.con, raw_binding, source_fingerprint=None,
+                    harness_version="vibe dev-build",
+                    harness_evidence_format="raw-observed-v1",
+                )
+        self.assertEqual(raised.exception.code, "route_evidence_stale")
+
+    def test_dirty_v6_catalogue_requires_refresh_before_republication(self):
+        legacy_generation = "a" * 32
+        now = datetime.now(timezone.utc).isoformat()
+        self.con.executescript(
+            "CREATE TABLE flavor_defaults ("
+            "flavor TEXT NOT NULL,harness TEXT NOT NULL,model TEXT,"
+            "effort TEXT,is_default INTEGER NOT NULL DEFAULT 0,"
+            "PRIMARY KEY (flavor,harness));"
+        )
+        self.con.execute(
+            "INSERT INTO model_catalog_generations ("
+            "generation_id,payload_version,contract_version,started_at,completed_at,"
+            "state,runtime,source_summary,harness_versions,source_fingerprints,"
+            "error_summary,payload_digest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (legacy_generation, 6, 2, now, now, "successful", "host", "[]", "{}",
+             "{}", None, "1" * 64),
+        )
+        self.con.execute(
+            "INSERT INTO model_routes ("
+            "harness,selector,source,availability,headless_supported,"
+            "high_effort_supported,default_effort,supported_efforts,cli_version,"
+            "last_seen_at,stale,generation_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("codex", "legacy-codex", "codex-cache", "available", 1, 1,
+             "high", "[\"high\"]", "codex-cli 0.147.0", now, 0,
+             legacy_generation),
+        )
+        self.con.execute(
+            "INSERT INTO flavor_defaults (flavor,harness,model,effort,is_default) "
+            "VALUES ('legacy','codex','legacy-codex',NULL,1)"
+        )
+        self.con.commit()
+
+        for migration in (
+            "0217_harness_support_metadata.sql",
+            "0218_sprint_binding_support_provenance.sql",
+            "0219_harness_support_refresh_boundary.sql",
+        ):
+            self.con.executescript(
+                (ROOT / ".super-coder" / "migrations" / migration).read_text()
+            )
+
+        legacy_route = self.con.execute(
+            "SELECT stale,last_error,harness_support_state FROM model_routes "
+            "WHERE harness='codex' AND selector='legacy-codex'"
+        ).fetchone()
+        self.assertEqual(
+            tuple(legacy_route),
+            (1, "Catalogue refresh required after harness support evidence migration", None),
+        )
+        self.assertIsNone(self.con.execute(
+            "SELECT 1 FROM model_catalog_generations"
+        ).fetchone())
+
+        status = {
+            **GenerationPersistenceTest.status(
+                version="0.147.0", compatibility="verified"
+            ),
+            "observed_version": "codex-cli 0.147.0",
+            "verified_version": "0.147.0",
+            "maximum_version_exclusive": "0.148.0",
+        }
+        ordinary = GenerationPersistenceTest.payload(
+            "ordinary-codex", cli_version=status["observed_version"], status=status
+        )
+        refreshed_payload = GenerationPersistenceTest.payload(
+            "refreshed-codex", cli_version=status["observed_version"], status=status
+        )
+        legacy_cache = {
+            "v": 6,
+            "fetched_at": now,
+            "sources": ["codex-cache"],
+            "catalogue_generation": legacy_generation,
+            "harnesses": {"codex": {"models": [{"id": "legacy-codex"}]}},
+        }
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(model_catalog, "CACHE", Path(tmp) / "catalog.json"), \
+             mock.patch.object(
+                 model_catalog, "build", side_effect=[ordinary, refreshed_payload]
+             ) as build:
+            model_catalog.CACHE.write_text(json.dumps(legacy_cache))
+            required = model_catalog.catalog(
+                con=self.con, opencode_provider=lambda: []
+            )
+            defaults = api_server.get_flavor_defaults(self.con)["flavors"]["legacy"]
+            unresolved = routes_cli.resolve(self.con, "codex", "legacy-codex")
+            refreshed = model_catalog.catalog(
+                refresh=True, con=self.con, harness_probe=lambda: {"codex": status},
+                opencode_provider=lambda: [],
+            )
+            cached = json.loads(model_catalog.CACHE.read_text())
+
+        self.assertEqual(build.call_count, 2)
+        self.assertTrue(required["stale"])
+        self.assertEqual(
+            required["error"],
+            "Catalogue refresh required after runtime evidence rebuild",
+        )
+        self.assertEqual(defaults[0]["harness_support_state"], None)
+        self.assertEqual(defaults[0]["effective_effort"], None)
+        self.assertFalse(unresolved["ok"])
+        self.assertEqual(unresolved["code"], "thinking_evidence_stale")
+        self.assertFalse(refreshed["stale"])
+        self.assertEqual(
+            refreshed["harnesses"]["codex"]["models"][0]["harness_support_state"],
+            "tested",
+        )
+        self.assertEqual(cached["v"], 7)
+        current = self.con.execute(
+            "SELECT selector,stale,harness_version,harness_support_state FROM model_routes "
+            "WHERE harness='codex' ORDER BY selector"
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in current],
+            [
+                ("legacy-codex", 1, None, None),
+                ("refreshed-codex", 0, "codex-cli 0.147.0", "tested"),
+            ],
+        )
 
 
 class GenerationPersistenceTest(unittest.TestCase):
@@ -783,14 +1079,14 @@ class GenerationPersistenceTest(unittest.TestCase):
             ("explicit-route", generation["generation_id"], 0, None),
         )
 
-    def test_incompatible_harnesses_never_publish_controlled_routes(self):
+    def test_missing_harness_is_rejected_but_best_effort_versions_publish(self):
         cases = (
             ("missing", None, self.status(
                 version=None, compatibility=None, error="HARNESS_UNAVAILABLE"
             )),
             ("below", "codex-cli 0.144.0", self.status(
                 version="0.144.0", compatibility=None,
-                error="HARNESS_VERSION_UNSUPPORTED",
+                error=None,
             )),
             ("newer", "codex-cli 0.147.0", self.status(
                 version="0.147.0", compatibility="newer-unverified",
@@ -807,7 +1103,8 @@ class GenerationPersistenceTest(unittest.TestCase):
             "ORDER BY rowid"
         ).fetchall()
         routes = self.con.execute(
-            "SELECT harness,selector FROM model_routes ORDER BY selector"
+            "SELECT harness,selector,harness_support_state FROM model_routes "
+            "ORDER BY selector"
         ).fetchall()
         self.assertEqual([row["state"] for row in generations],
                          ["successful", "successful", "successful"])
@@ -816,15 +1113,191 @@ class GenerationPersistenceTest(unittest.TestCase):
              for row in generations],
             [None, "0.144.0", "0.147.0"],
         )
-        self.assertEqual(routes, [])
+        self.assertEqual(
+            [tuple(row) for row in routes],
+            [("codex", "below", "best-effort"),
+             ("codex", "newer", "best-effort")],
+        )
 
-    def test_incompatible_refresh_stales_prior_compatible_route(self):
+    def test_refresh_projects_tested_and_best_effort_route_support_to_clients(self):
+        tested = {
+            **self.status(version="0.145.0", compatibility="verified"),
+            "observed_version": "codex-cli 0.145.0",
+        }
+        best_effort = {
+            "harness": "kimi", "version": None,
+            "observed_version": "kimi dev-build",
+            "compatibility": "non-semver", "minimum_version": "0.30.0",
+            "maximum_version_exclusive": "0.34.0", "verified_version": "0.33.0",
+            "error": None,
+        }
+        payload = self.payload("tested-route", cli_version=tested["observed_version"],
+                               status=tested)
+        payload["harnesses"]["kimi"] = {"models": [model_catalog._entry(
+            "best-effort-route", source="kimi-config", availability="available",
+            provider="moonshot", provider_model="k3", supported_efforts=["high"],
+            default_effort="high", cli_version=best_effort["observed_version"],
+        )]}
+        statuses = {"codex": tested, "kimi": best_effort}
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(model_catalog, "CACHE", Path(tmp) / "catalog.json"), \
+             mock.patch.object(model_catalog, "build", return_value=payload):
+            refreshed = model_catalog.catalog(
+                refresh=True, con=self.con, harness_probe=lambda: statuses,
+            )
+            cached = json.loads(model_catalog.CACHE.read_text())
+        projected = {
+            (harness, entry["id"]): entry
+            for source in (refreshed, cached)
+            for harness, block in source["harnesses"].items()
+            for entry in block["models"]
+        }
+        self.assertEqual(
+            (projected[("codex", "tested-route")]["harness_support_state"],
+             projected[("codex", "tested-route")]["harness_version"]),
+            ("tested", "codex-cli 0.145.0"),
+        )
+        self.assertEqual(
+            (projected[("kimi", "best-effort-route")]["harness_support_state"],
+             projected[("kimi", "best-effort-route")]["harness_version"]),
+            ("best-effort", "kimi dev-build"),
+        )
+
+    def test_real_best_effort_probes_publish_and_resolve_every_route_shape(self):
+        cases = (
+            ("older", "codex-cli 0.144.0", "older-unverified"),
+            ("non-semver", "codex dev-build", "non-semver"),
+        )
+        for selector, raw_version, compatibility in cases:
+            with self.subTest(raw_version=raw_version):
+                with mock.patch.object(harness_versions, "probe", return_value=raw_version):
+                    status = harness_versions.compatibility_status(("codex",))["codex"]
+                self.assertEqual(status["compatibility"], compatibility)
+                self.assertIsNone(status["error"])
+
+                model_catalog.persist_routes(
+                    self.con,
+                    self.payload(selector, cli_version=raw_version, status=status),
+                )
+                row = dict(self.con.execute(
+                    "SELECT * FROM model_routes WHERE selector=?", (selector,)
+                ).fetchone())
+                self.assertEqual(row["harness_version"], raw_version)
+                self.assertEqual(row["harness_support_state"], "best-effort")
+
+                observation = {
+                    "runtime_status": status,
+                    "runtime_scope": harness_versions.runtime_scope(),
+                    "source_fingerprint": row["source_fingerprint"],
+                }
+                with mock.patch.object(
+                    model_catalog, "controlled_route_evidence", return_value=observation
+                ):
+                    controlled = routes_cli.resolve(self.con, "codex", selector)
+                self.assertTrue(controlled["ok"])
+                self.assertEqual(controlled["binding"]["requested_model"], selector)
+                self.assertEqual(controlled["harness_version"], raw_version)
+                self.assertEqual(controlled["harness_support_state"], "best-effort")
+
+                uncontrolled, _ = route_bindings.resolve_v2(
+                    None, "codex", None, runtime_status=status
+                )
+                self.assertEqual(uncontrolled["control_state"], "harness-default")
+
+    def test_mixed_harness_refresh_keeps_route_local_support_state(self):
+        scope = harness_versions.runtime_scope()
+        codex = {
+            **self.status(
+                version="0.147.0", compatibility="verified"
+            ),
+            "harness": "codex",
+            "observed_version": "codex-cli 0.147.0",
+            "maximum_version_exclusive": "0.148.0",
+            "verified_version": "0.147.0",
+            **scope,
+        }
+        kimi = {
+            "harness": "kimi",
+            "version": None,
+            "observed_version": "kimi dev-build",
+            "compatibility": "non-semver",
+            "minimum_version": "0.30.0",
+            "maximum_version_exclusive": "0.34.0",
+            "verified_version": "0.33.0",
+            "error": None,
+            **scope,
+        }
+        payload = self.payload(
+            "codex-tested", cli_version=codex["observed_version"], status=codex
+        )
+        payload["harnesses"]["kimi"] = {"models": [model_catalog._entry(
+            "kimi-best-effort", source="kimi-config", availability="available",
+            provider="moonshot", provider_model="k3", supported_efforts=["high"],
+            default_effort="high", cli_version=kimi["observed_version"],
+        )]}
+        payload["verification"]["harnesses"]["kimi"] = kimi
+        model_catalog.persist_routes(self.con, payload)
+
+        rows = {
+            (row["harness"], row["selector"]): dict(row)
+            for row in self.con.execute("SELECT * FROM model_routes")
+        }
+        self.assertEqual(rows[("codex", "codex-tested")]["harness_support_state"], "tested")
+        self.assertEqual(rows[("kimi", "kimi-best-effort")]["harness_support_state"], "best-effort")
+
+        for harness, selector, status in (
+            ("codex", "codex-tested", codex),
+            ("kimi", "kimi-best-effort", kimi),
+        ):
+            row = rows[(harness, selector)]
+            with mock.patch.object(
+                model_catalog,
+                "controlled_route_evidence",
+                return_value={
+                    "runtime_status": status,
+                    "runtime_scope": scope,
+                    "source_fingerprint": row["source_fingerprint"],
+                },
+            ):
+                resolved = routes_cli.resolve(self.con, harness, selector)
+            self.assertTrue(resolved["ok"])
+            self.assertEqual(resolved["binding"]["requested_model"], selector)
+
+        older_codex = {
+            **codex,
+            "version": "0.144.0",
+            "observed_version": "codex-cli 0.144.0",
+            "compatibility": "older-unverified",
+        }
+        unavailable_kimi = {**kimi, "observed_version": None, "error": "HARNESS_UNAVAILABLE"}
+        payload = self.payload(
+            "codex-older", cli_version=older_codex["observed_version"], status=older_codex
+        )
+        payload["harnesses"]["kimi"] = {"models": [model_catalog._entry(
+            "kimi-unavailable", source="kimi-config", availability="available",
+            supported_efforts=["high"], cli_version="kimi dev-build",
+        )]}
+        payload["verification"]["harnesses"]["kimi"] = unavailable_kimi
+        model_catalog.persist_routes(self.con, payload)
+        older_row = dict(self.con.execute(
+            "SELECT * FROM model_routes WHERE harness='codex' AND selector='codex-older'"
+        ).fetchone())
+        self.assertEqual(older_row["harness_support_state"], "best-effort")
+        with mock.patch.object(
+            model_catalog,
+            "controlled_route_evidence",
+            return_value={
+                "runtime_status": older_codex,
+                "runtime_scope": scope,
+                "source_fingerprint": older_row["source_fingerprint"],
+            },
+        ):
+            resolved = routes_cli.resolve(self.con, "codex", "codex-older")
+        self.assertTrue(resolved["ok"])
+
+    def test_best_effort_refresh_replaces_prior_route_without_staling(self):
         first = self.payload("carried")
         model_catalog.persist_routes(self.con, first)
-        old_fingerprint = self.con.execute(
-            "SELECT source_fingerprint FROM model_routes WHERE selector='carried'"
-        ).fetchone()[0]
-
         model_catalog.persist_routes(
             self.con,
             self.payload(
@@ -839,15 +1312,11 @@ class GenerationPersistenceTest(unittest.TestCase):
         row = dict(self.con.execute(
             "SELECT * FROM model_routes WHERE selector='carried'"
         ).fetchone())
-        self.assertEqual(row["stale"], 1)
-        self.assertIn("newer-unverified", row["last_error"])
-        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
-            route_bindings.resolve_v2(
-                row, "codex", "carried",
-            )
-        self.assertEqual(raised.exception.code, "thinking_evidence_stale")
+        self.assertEqual(row["stale"], 0)
+        self.assertIsNone(row["last_error"])
+        self.assertEqual(row["harness_support_state"], "best-effort")
 
-    def test_live_fingerprint_refuses_unverified_installed_version(self):
+    def test_live_fingerprint_accepts_best_effort_installed_version(self):
         entry = model_catalog._entry(
             "gpt-test", source="codex-cache", availability="available",
             supported_efforts=["high"], cli_version="codex-cli 0.147.0",
@@ -861,7 +1330,7 @@ class GenerationPersistenceTest(unittest.TestCase):
                     version="0.147.0", compatibility="newer-unverified"
                 )},
             )
-        self.assertIsNone(fingerprint)
+        self.assertRegex(fingerprint, r"^[0-9a-f]{64}$")
 
     def test_authoritative_resolution_durably_stales_drift_and_expiry(self):
         cases = (
@@ -948,7 +1417,7 @@ class GenerationPersistenceTest(unittest.TestCase):
         self.assertNotIn("command", got)
         self.assertEqual(tuple(stored), (0, None))
 
-    def test_authoritative_resolution_stales_version_drift(self):
+    def test_authoritative_resolution_accepts_changed_cli_text_when_proof_matches(self):
         payload = self.payload("version-drift")
         model_catalog.persist_routes(self.con, payload)
         self.con.execute(
@@ -964,17 +1433,7 @@ class GenerationPersistenceTest(unittest.TestCase):
             self.con, "codex", "version-drift",
             fingerprint=row["source_fingerprint"],
         )
-        stored = self.con.execute(
-            "SELECT stale,last_error FROM model_routes "
-            "WHERE selector='version-drift'"
-        ).fetchone()
-
-        self.assertEqual(got["code"], "thinking_evidence_stale")
-        self.assertEqual(tuple(stored), (
-            1,
-            "thinking_evidence_stale: Installed harness version changed after "
-            "refresh; remediation: sc models refresh",
-        ))
+        self.assertTrue(got["ok"])
 
     def test_authoritative_resolution_requires_latest_successful_generation(self):
         payload = self.payload("superseded")
@@ -1052,6 +1511,7 @@ class GenerationPersistenceTest(unittest.TestCase):
         retried = resolve_controlled(
             resolver, "codex", "generation-race",
             fingerprint=stored["source_fingerprint"], version="0.146.0",
+            now=datetime(2026, 8, 17, 0, 3, tzinfo=timezone.utc),
         )
         self.assertEqual(probe.call_count, 1)
         self.assertEqual(got["code"], "thinking_evidence_stale")
@@ -1097,6 +1557,7 @@ class GenerationPersistenceTest(unittest.TestCase):
         resolved = resolve_controlled(
             late, "codex", "ordered-success",
             fingerprint=route["source_fingerprint"],
+            now=datetime(2026, 8, 17, 0, 3, tzinfo=timezone.utc),
         )
         self.assertTrue(newest_payload["generation_published"])
         self.assertFalse(older_payload["generation_published"])
@@ -1143,6 +1604,7 @@ class GenerationPersistenceTest(unittest.TestCase):
         resolved = resolve_controlled(
             late, "codex", "ordered-failure",
             fingerprint=route["source_fingerprint"],
+            now=datetime(2026, 8, 17, 0, 3, tzinfo=timezone.utc),
         )
         self.assertTrue(newest_payload["generation_published"])
         self.assertFalse(older_failure["generation_published"])
@@ -1622,7 +2084,7 @@ class ParticipantRevisionTest(unittest.TestCase):
             ],
         )
 
-    def test_runtime_evidence_is_harness_range_and_execution_seat_scoped(self):
+    def test_runtime_evidence_is_execution_seat_scoped_not_range_gated(self):
         host_scope = {"runtime": "host", "runtime_identity": "host:seat-a"}
         sandbox_scope = {
             "runtime": "sandbox", "runtime_identity": "sandbox:seat-b",
@@ -1632,12 +2094,6 @@ class ParticipantRevisionTest(unittest.TestCase):
             ("cross-harness", compatible_runtime(
                 "2.1.222", harness="claude", scope=host_scope
             ), host_scope),
-            ("below-minimum-labelled-verified", {
-                **good, "version": "2.21.9", "compatibility": "verified",
-            }, host_scope),
-            ("maximum-labelled-supported", {
-                **good, "version": "2.23.0", "compatibility": "supported",
-            }, host_scope),
             ("different-execution-seat", good, sandbox_scope),
         )
 
@@ -1666,6 +2122,22 @@ class ParticipantRevisionTest(unittest.TestCase):
                     ).fetchone()[0],
                     0,
                 )
+
+        for name, status in (
+            ("older", {**good, "version": "2.21.9", "compatibility": "older"}),
+            ("newer", {**good, "version": "2.23.0", "compatibility": "newer-unverified"}),
+            ("non-semver", {
+                **good, "version": None, "observed_version": "vibe dev-build",
+                "compatibility": "non-semver",
+            }),
+        ):
+            with self.subTest(name=name):
+                binding, digest = route_bindings.resolve_v2(
+                    None, "vibe", "devstral-latest",
+                    runtime_status=status, runtime_scope=host_scope,
+                )
+                self.assertEqual(binding["control_state"], "native-uncontrolled")
+                self.assertRegex(digest, r"^[0-9a-f]{64}$")
                 self.assertEqual(
                     self.con.execute(
                         "SELECT COUNT(*) FROM sprint_participants "
@@ -1809,6 +2281,7 @@ class ParticipantRevisionTest(unittest.TestCase):
             transition="arm",
             source_fingerprint=self.CONTROLLED_SOURCE_FINGERPRINT,
             harness_version=self.CONTROLLED_HARNESS_VERSION,
+            harness_support_state="tested",
         )
 
         row, decoded = self.stored_binding(receipt["binding_id"])

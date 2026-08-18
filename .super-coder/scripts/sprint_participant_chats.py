@@ -427,9 +427,12 @@ def prepare_wake_conversation(
         )
     } if binding_schema else set()
     provenance_projection = (
-        "binding.source_fingerprint,binding.harness_version "
-        if {"source_fingerprint", "harness_version"} <= binding_columns
-        else "NULL AS source_fingerprint,NULL AS harness_version "
+        "binding.source_fingerprint,binding.harness_version,"
+        "binding.harness_evidence_format "
+        if {"source_fingerprint", "harness_version", "harness_evidence_format"}
+        <= binding_columns
+        else "NULL AS source_fingerprint,NULL AS harness_version,"
+        "NULL AS harness_evidence_format "
     )
     binding_projection = (
         "p.active_route_binding_id,binding.route_revision,binding.binding_json,"
@@ -437,7 +440,8 @@ def prepare_wake_conversation(
         if binding_schema
         else "NULL AS active_route_binding_id,NULL AS route_revision,"
         "NULL AS binding_json,NULL AS binding_digest,"
-        "NULL AS source_fingerprint,NULL AS harness_version "
+        "NULL AS source_fingerprint,NULL AS harness_version,"
+        "NULL AS harness_evidence_format "
     )
     binding_join = (
         "LEFT JOIN sprint_participant_route_bindings binding "
@@ -535,6 +539,10 @@ def prepare_wake_conversation(
                     binding,
                     source_fingerprint=row["source_fingerprint"],
                     harness_version=row["harness_version"],
+                    harness_evidence_format=(
+                        row["harness_evidence_format"]
+                        or route_bindings.LEGACY_HARNESS_EVIDENCE_FORMAT
+                    ),
                 )
             except route_bindings.RouteResolutionError as exc:
                 raise SprintConversationError(
