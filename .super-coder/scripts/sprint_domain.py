@@ -4558,16 +4558,21 @@ class SprintWorkUnitStore:
         unit: sqlite3.Row,
     ) -> int:
         unit_id = int(unit["work_unit_id"])
-        generation = int(
-            self.con.execute(
-                "SELECT COUNT(*) FROM wake_message "
-                "WHERE work_unit_id=? AND message_kind='work_assignment'",
-                (unit_id,),
-            ).fetchone()[0]
-        ) + 1
-        key = (
-            f"sprint:{sprint_id}:work-unit:{unit_id}:assignment:{generation}"
-        )
+        key_prefix = f"sprint:{sprint_id}:work-unit:{unit_id}:assignment:"
+        generation = 0
+        for row in self.con.execute(
+            "SELECT idempotency_key FROM wake_message "
+            "WHERE work_unit_id=? AND message_kind='work_assignment'",
+            (unit_id,),
+        ):
+            key = str(row["idempotency_key"])
+            if not key.startswith(key_prefix):
+                continue
+            suffix = key.removeprefix(key_prefix)
+            if suffix.isdigit():
+                generation = max(generation, int(suffix))
+        generation += 1
+        key = f"{key_prefix}{generation}"
         # Local import avoids a module cycle: the message store uses the domain
         # lifecycle for durable failure evidence.
         from sprint_message_delivery import SprintMessageStore
