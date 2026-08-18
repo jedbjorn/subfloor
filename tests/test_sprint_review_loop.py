@@ -1509,6 +1509,67 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             ),
         )
 
+    def test_grant_bypassed_resume_after_disposition_change_does_not_conflict(self):
+        handoff = self.request_review()
+        self.accept_review(handoff.message_id)
+        self.reader.current = pull_request(
+            state="MERGED", checks="SUCCESS", checks_failed=False
+        )
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(
+            "in_review",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+        notice = self.con.execute(
+            "SELECT body FROM wake_message "
+            "WHERE idempotency_key LIKE 'merge-grant-bypassed:%'"
+        ).fetchone()
+        self.assertIn("from in_review", notice["body"])
+
+        lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+        lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("participant", 1),
+            reason="reconcile the bypass",
+        )
+        # The Planner dispositions the bypassed unit for fixing before
+        # resuming; resume re-observes the same merged transition.
+        self.con.execute(
+            "UPDATE sprint_work_units SET disposition='fixing' "
+            "WHERE work_unit_id=?",
+            (self.unit_id,),
+        )
+        self.con.commit()
+
+        receipt = lifecycle.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+
+        self.assertTrue(receipt.changed)
+        self.assertEqual(
+            (1, 1),
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='merge.grant_bypassed'),"
+                    "(SELECT COUNT(*) FROM wake_message "
+                    "WHERE idempotency_key LIKE 'merge-grant-bypassed:%')"
+                ).fetchone()
+            ),
+        )
+        self.assertEqual(
+            "from in_review",
+            self.con.execute(
+                "SELECT substr(body,instr(body,'from '),14) FROM wake_message "
+                "WHERE idempotency_key LIKE 'merge-grant-bypassed:%'"
+            ).fetchone()[0],
+        )
+
     def test_grant_bypassed_merge_resolves_accepted_review_expectation(self):
         handoff = self.request_review()
         self.accept_review(handoff.message_id)
