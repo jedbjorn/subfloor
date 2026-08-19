@@ -22,14 +22,14 @@ class GitSyncPolicyTest(unittest.TestCase):
     def test_boot_grants_only_exact_shell_base_discard_authority(self):
         body = " ".join(BOOT.read_text().split())
         self.assertIn("treat `shell/<shortname>` as a disposable base", body.lower())
-        self.assertIn("do not ask whether to preserve them", body.lower())
+        self.assertIn("durable work lives in the engine db", body.lower())
         self.assertIn("`git status --short` is empty", body)
         self.assertIn("`HEAD` equals `origin/main`", body)
         self.assertIn(
-            "NEVER apply this discard/reset authority to a feature branch or open PR",
+            "NEVER to a feature branch or open PR",
             body,
         )
-        self.assertIn("Surface a target/identity mismatch", body)
+        self.assertIn("surface a target/identity mismatch", body)
 
     def test_git_skill_makes_the_base_reset_executable_and_bounded(self):
         body = " ".join(ASSET.read_text().split())

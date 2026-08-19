@@ -206,8 +206,8 @@ class AdminExecutionContextTest(unittest.TestCase):
         self.assertIn("inside the sandbox container", context)
         self.assertIn("0.0.0.0:$SC_DEV_PORT", context)
         self.assertIn("running `make dos-admin` from a host terminal", context)
-        self.assertNotIn("Host authority is available", context)
-        self.assertIn("surface this to FnB", api_guidance)
+        self.assertNotIn("Host authority covers", context)
+        self.assertIn("surface it to the FnB and stop", api_guidance)
         self.assertNotIn("host Admin boot remains valid", api_guidance)
 
     def test_host_admin_names_authority_role_boundary_and_offline_recovery(self):
@@ -217,12 +217,13 @@ class AdminExecutionContextTest(unittest.TestCase):
         self.assertIn("directly on the host", context)
         self.assertIn("bound to `127.0.0.1`", context)
         self.assertIn("engine update, rollback, migration", context)
-        self.assertIn("does not transfer product feature work", context)
+        self.assertIn("ownership stay with Dev and DevOps", context)
         self.assertIn("operator owns avoiding simultaneous use", context)
         self.assertNotIn("0.0.0.0:$SC_DEV_PORT", context)
         self.assertIn("host Admin boot remains valid", api_guidance)
-        self.assertIn("`sc mem` remains unavailable until the API returns", api_guidance)
-        self.assertNotIn("surface this to FnB", api_guidance)
+        self.assertIn("`sc mem` stays unavailable until the API returns", api_guidance)
+        self.assertIn("never falls back to raw writes", api_guidance)
+        self.assertNotIn("surface it to the FnB", api_guidance)
 
     def test_unknown_launch_mode_is_rejected_instead_of_misrendered(self):
         with self.assertRaisesRegex(ValueError, "unsupported launch mode: vm"):

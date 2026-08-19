@@ -3,8 +3,8 @@
 
 The contract: templates/boot.md carries exactly one `{{project_vs_engine}}`
 slot; compose substitutes the fork block by default and the source block when
-source_mode is set. A fork boot must keep the never-edit-engine rule and name
-its upstream; a source boot must say the opposite — you are upstream, the
+source_mode is set. A fork boot must pin the engine as a gitignored dependency
+authored upstream; a source boot must say the opposite — you are upstream, the
 engine is your work surface — and defuse the fork-language in engine skills.
 Losing the slot (a template edit) or a constant would silently drop the whole
 section from every boot doc; this pins both.
@@ -40,8 +40,9 @@ class ProjectVsEngineTest(unittest.TestCase):
 
     def test_fork_block_keeps_the_dependency_stance(self):
         fork = compose.PROJECT_VS_ENGINE_FORK
-        self.assertIn("do not treat it as the project or edit", fork)
-        self.assertIn("authored upstream in subfloor", fork)
+        flat = " ".join(fork.split())
+        self.assertIn("gitignored dependency", fork)
+        self.assertIn("authored upstream in subfloor", flat)
         self.assertIn("`./sc update`", fork)
         self.assertNotIn("you are upstream", fork)
 
@@ -51,7 +52,7 @@ class ProjectVsEngineTest(unittest.TestCase):
         self.assertIn("There is no upstream above you", source)
         self.assertIn("`./sc update`", source)  # the self-update loop
         self.assertIn("fork-language", source)  # the skills caveat
-        self.assertNotIn("do not treat it as the project", source)
+        self.assertNotIn("gitignored dependency", source)
 
     def test_substitution_resolves_per_mode(self):
         fork_render = self.template.replace(
