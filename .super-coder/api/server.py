@@ -695,7 +695,11 @@ def set_flavor_default(con, body) -> tuple[bool, dict | None]:
                     f"for {harness}; choose an available model or Harness "
                     "default")
             supported = _stored_supported_efforts(observed_route)
-            if not effort_supplied and effort not in supported:
+            if (
+                not effort_supplied
+                and effort not in supported
+                and effort != route_bindings.DEFAULT_EFFORT
+            ):
                 effort = "high" if "high" in supported else None
                 if effort is None:
                     return False, _flavor_default_error(
@@ -705,7 +709,9 @@ def set_flavor_default(con, body) -> tuple[bool, dict | None]:
                         {"harness": harness, "model": model,
                          "requested_effort": None,
                          "supported_efforts": supported,
-                         "remediation": "select a supported Thinking level"})
+                         "default_effort": route_bindings.DEFAULT_EFFORT,
+                         "remediation": "select a supported Thinking level or "
+                         "'default' (Model default)"})
             try:
                 route_proof = route_bindings._probe_controlled_route(
                     harness, model)
