@@ -1294,6 +1294,268 @@ class LiveReplanningTest(SprintDomainCase):
             units.recall(sprint_id, work_unit_id, 3, reason="unsafe rewind")
 
 
+class ResolveUnitTest(SprintDomainCase):
+    def _release_unit(self, sprint_id: int) -> int:
+        assignment_wake = self.store.arm(sprint_id, 3)[0]
+        assignment_message = int(
+            self.con.execute(
+                "SELECT message_id FROM sprint_wake_messages WHERE wake_id=?",
+                (assignment_wake,),
+            ).fetchone()[0]
+        )
+        self.con.execute(
+            "UPDATE wake_message SET delivered_at=datetime('now') "
+            "WHERE message_id=?",
+            (assignment_message,),
+        )
+        self.con.execute(
+            "UPDATE sprint_wake_outbox SET state='delivered',"
+            "delivered_at=datetime('now') WHERE wake_id=?",
+            (assignment_wake,),
+        )
+        self.con.commit()
+        sprint_message_delivery.SprintMessageStore(self.con).mark_read(
+            assignment_message, 1, sprint_id=sprint_id
+        )
+        return assignment_message
+
+    def _pause(self, sprint_id: int) -> None:
+        self.store.pause(
+            sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="Planner is restructuring the live plan",
+        )
+
+    def _bind_pr(self, sprint_id: int, work_unit_id: int) -> int:
+        owner = int(
+            self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=1",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        registered_pr_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_registered_prs "
+                "(sprint_id,owner_participant_id,repository,pr_number) "
+                "VALUES (?,?,'acme/repo',99)",
+                (sprint_id, owner),
+            ).lastrowid
+        )
+        self.con.execute(
+            "INSERT INTO sprint_pr_work_units "
+            "(sprint_id,registered_pr_id,work_unit_id) VALUES (?,?,?)",
+            (sprint_id, registered_pr_id, work_unit_id),
+        )
+        self.con.commit()
+        return registered_pr_id
+
+    def test_resolve_refuses_armed_non_planner_blank_and_bad_target(self) -> None:
+        sprint_id, work_unit_id = self.create_sprint()
+        units = sprint_domain.SprintWorkUnitStore(self.con)
+        with self.assertRaisesRegex(ValueError, "must be completed or cancelled"):
+            units.resolve(sprint_id, work_unit_id, 3, target="blocked", reason="x")
+        with self.assertRaisesRegex(ValueError, "resolution reason is required"):
+            units.resolve(sprint_id, work_unit_id, 3, target="completed", reason=" ")
+        self.store.arm(sprint_id, 3)
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "resolved only while the Sprint is paused",
+        ):
+            units.resolve(
+                sprint_id, work_unit_id, 3, target="completed", reason="too early"
+            )
+        self._pause(sprint_id)
+        with self.assertRaisesRegex(
+            sprint_domain.SprintAuthorityError, "only the originating Planner"
+        ):
+            units.resolve(
+                sprint_id, work_unit_id, 4, target="completed", reason="intruder"
+            )
+        self.assertEqual(
+            "ready",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (work_unit_id,),
+            ).fetchone()[0],
+        )
+
+    def test_resolve_completed_supersedes_pr_link_and_notifies(self) -> None:
+        sprint_id, work_unit_id = self.create_sprint()
+        assignment_message = self._release_unit(sprint_id)
+        registered_pr_id = self._bind_pr(sprint_id, work_unit_id)
+        self._pause(sprint_id)
+
+        units = sprint_domain.SprintWorkUnitStore(self.con)
+        changed = units.resolve(
+            sprint_id,
+            work_unit_id,
+            3,
+            target="completed",
+            reason="PR #99 merged while the Sprint was paused",
+        )
+
+        self.assertTrue(changed)
+        unit = self.con.execute(
+            "SELECT disposition,completion_result,completion_source,completed_at "
+            "FROM sprint_work_units WHERE work_unit_id=?",
+            (work_unit_id,),
+        ).fetchone()
+        self.assertEqual(
+            (
+                "completed",
+                "PR #99 merged while the Sprint was paused",
+                "planner_override",
+                unit["completed_at"],
+            ),
+            tuple(unit),
+        )
+        self.assertIsNotNone(unit["completed_at"])
+        link = self.con.execute(
+            "SELECT superseded_at FROM sprint_pr_work_units "
+            "WHERE registered_pr_id=? AND work_unit_id=?",
+            (registered_pr_id, work_unit_id),
+        ).fetchone()
+        self.assertIsNotNone(link["superseded_at"])
+        self.assertIsNotNone(
+            self.con.execute(
+                "SELECT 1 FROM sprint_registered_prs WHERE registered_pr_id=?",
+                (registered_pr_id,),
+            ).fetchone(),
+            "resolution retains the PR registration",
+        )
+        self.assertEqual(
+            "accepted",
+            self.con.execute(
+                "SELECT disposition FROM wake_message WHERE message_id=?",
+                (assignment_message,),
+            ).fetchone()[0],
+            "the accepted assignment is history, not rewritten",
+        )
+        event = json.loads(
+            self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='planner_override'",
+                (sprint_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(
+            {
+                "after": "completed",
+                "before": "active",
+                "pr_numbers": [99],
+                "reason": "PR #99 merged while the Sprint was paused",
+                "retired_message_ids": [assignment_message],
+                "work_unit_id": work_unit_id,
+            },
+            event,
+        )
+        notices = self.con.execute(
+            "SELECT to_participant_id,body FROM wake_message "
+            "WHERE idempotency_key LIKE 'planner-override:%' "
+            "ORDER BY to_participant_id",
+            (),
+        ).fetchall()
+        recipients = {
+            int(row["participant_id"])
+            for row in self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND role IN ('developer','reviewer')",
+                (sprint_id,),
+            )
+        }
+        self.assertEqual(recipients, {int(row[0]) for row in notices})
+        for notice in notices:
+            self.assertIn("from active to completed", notice["body"])
+            self.assertIn("PR #99 merged", notice["body"])
+
+    def test_resolve_cancelled_keeps_pr_and_leaves_completion_source(self) -> None:
+        sprint_id, work_unit_id = self.create_sprint()
+        self._release_unit(sprint_id)
+        registered_pr_id = self._bind_pr(sprint_id, work_unit_id)
+        self._pause(sprint_id)
+
+        changed = sprint_domain.SprintWorkUnitStore(self.con).resolve(
+            sprint_id,
+            work_unit_id,
+            3,
+            target="cancelled",
+            reason="lane abandoned; the registered PR keeps its history",
+        )
+
+        self.assertTrue(changed)
+        unit = self.con.execute(
+            "SELECT disposition,completion_source FROM sprint_work_units "
+            "WHERE work_unit_id=?",
+            (work_unit_id,),
+        ).fetchone()
+        self.assertEqual(("cancelled", None), tuple(unit))
+        self.assertIsNotNone(
+            self.con.execute(
+                "SELECT superseded_at FROM sprint_pr_work_units "
+                "WHERE registered_pr_id=?",
+                (registered_pr_id,),
+            ).fetchone()[0]
+        )
+
+    def test_resolve_replay_and_terminal_conflicts(self) -> None:
+        sprint_id, work_unit_id = self.create_sprint()
+        self._release_unit(sprint_id)
+        self._pause(sprint_id)
+        units = sprint_domain.SprintWorkUnitStore(self.con)
+        self.assertTrue(
+            units.resolve(
+                sprint_id, work_unit_id, 3, target="completed", reason="done"
+            )
+        )
+
+        self.assertFalse(
+            units.resolve(
+                sprint_id, work_unit_id, 3, target="completed", reason="done"
+            )
+        )
+        self.assertEqual(
+            (1, 2),
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='planner_override'),"
+                    "(SELECT COUNT(*) FROM wake_message "
+                    "WHERE idempotency_key LIKE 'planner-override:%')"
+                ).fetchone()
+            ),
+            "replay returns the prior result without new evidence",
+        )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintConflictError, "already completed"
+        ):
+            units.resolve(
+                sprint_id, work_unit_id, 3, target="completed", reason="different"
+            )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintConflictError, "already completed"
+        ):
+            units.resolve(sprint_id, work_unit_id, 3, target="cancelled", reason="done")
+
+    def test_resolve_conflicts_with_externally_completed_unit(self) -> None:
+        sprint_id, work_unit_id = self.create_sprint()
+        self.store.arm(sprint_id, 3)
+        self._pause(sprint_id)
+        units = sprint_domain.SprintWorkUnitStore(self.con)
+        units.recall(sprint_id, work_unit_id, 3, reason="return to plan")
+        self.assertTrue(
+            units.cancel(sprint_id, work_unit_id, 3, reason="scope dropped")
+        )
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintConflictError, "already cancelled"
+        ):
+            units.resolve(
+                sprint_id, work_unit_id, 3, target="cancelled", reason="scope dropped"
+            )
+
+
 class LifecycleTest(SprintDomainCase):
     def test_sprint_insert_must_start_prepared(self) -> None:
         sprint_id, _ = self.create_sprint()

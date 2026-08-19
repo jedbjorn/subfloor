@@ -159,6 +159,16 @@ _EVENT_FIELDS = {
         {"work_unit_id", "result", "output_kind", "source", "transition_key"}
     ),
     "work_unit.cancelled": frozenset({"work_unit_id", "reason"}),
+    "planner_override": frozenset(
+        {
+            "work_unit_id",
+            "before",
+            "after",
+            "reason",
+            "pr_numbers",
+            "retired_message_ids",
+        }
+    ),
     "participant.route_changed": frozenset(
         {"participant_id", "shell_id", "role", "before", "after"}
     ),

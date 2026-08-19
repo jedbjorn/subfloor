@@ -1485,6 +1485,11 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             (int(notice[0]), int(notice[1]), notice[3]),
         )
         self.assertIn("remains incomplete", notice["body"])
+        self.assertIn(
+            "sc sprint resolve-unit",
+            notice["body"],
+            "the bypass notice names the Planner remedy",
+        )
 
         lifecycle = sprint_domain.SprintLifecycleStore(self.con)
         lifecycle.pause(
@@ -1509,7 +1514,7 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             ),
         )
 
-    def test_grant_bypassed_resume_after_disposition_change_does_not_conflict(self):
+    def test_grant_bypassed_resume_after_planner_resolution_does_not_conflict(self):
         handoff = self.request_review()
         self.accept_review(handoff.message_id)
         self.reader.current = pull_request(
@@ -1528,6 +1533,7 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             "WHERE idempotency_key LIKE 'merge-grant-bypassed:%'"
         ).fetchone()
         self.assertIn("from in_review", notice["body"])
+        self.assertIn("resolve-unit", notice["body"])
 
         lifecycle = sprint_domain.SprintLifecycleStore(self.con)
         lifecycle.pause(
@@ -1535,14 +1541,27 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
             sprint_domain.LifecycleActor("participant", 1),
             reason="reconcile the bypass",
         )
-        # The Planner dispositions the bypassed unit for fixing before
-        # resuming; resume re-observes the same merged transition.
-        self.con.execute(
-            "UPDATE sprint_work_units SET disposition='fixing' "
-            "WHERE work_unit_id=?",
-            (self.unit_id,),
+        # The Planner resolves the bypassed unit as completed before resuming
+        # (the PR merged out-of-band); resume re-observes the same merged
+        # transition but the superseded link no longer drives the unit.
+        resolved = sprint_domain.SprintWorkUnitStore(self.con).resolve(
+            self.sprint_id,
+            self.unit_id,
+            3,
+            target="completed",
+            reason="PR merged while the Sprint was paused",
         )
-        self.con.commit()
+        self.assertTrue(resolved)
+        self.assertEqual(
+            ("completed", "planner_override"),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,completion_source FROM sprint_work_units "
+                    "WHERE work_unit_id=?",
+                    (self.unit_id,),
+                ).fetchone()
+            ),
+        )
 
         receipt = lifecycle.resume(
             self.sprint_id,
@@ -1569,6 +1588,237 @@ class MergeGateAndAdvanceTest(SprintReviewLoopCase):
                 "WHERE idempotency_key LIKE 'merge-grant-bypassed:%'"
             ).fetchone()[0],
         )
+
+    def test_merged_fixing_lane_stops_driving_after_planner_resolution(self):
+        # U80 replay: a fixing lane whose PR merged while the Sprint was
+        # paused resolves via resolve-unit; the watcher then leaves the
+        # terminal lane alone and the Sprint resumes cleanly.
+        handoff = self.request_review()
+        self.accept_review(handoff.message_id)
+        changed = self.loop.record_review(
+            self.sprint_id,
+            self.registered_pr_id,
+            2,
+            verdict="changes_requested",
+            body="Medium: keep the reviewed head intact.",
+            idempotency_key="u80-changes",
+        )
+        self.assertEqual("fixing", changed.disposition)
+
+        lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+        lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="reconcile a PR that merged out-of-band",
+        )
+        self.reader.current = pull_request(
+            state="MERGED", checks="SUCCESS", checks_failed=False
+        )
+        self.assertTrue(self.watcher.poll_once())
+        self.assertEqual(
+            "fixing",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+            "the merge observer leaves the lane for Planner disposition",
+        )
+        notice = self.con.execute(
+            "SELECT body FROM wake_message "
+            "WHERE idempotency_key LIKE 'merge-grant-bypassed:%'"
+        ).fetchone()
+        self.assertIn("resolve-unit", notice["body"])
+
+        resolved = sprint_domain.SprintWorkUnitStore(self.con).resolve(
+            self.sprint_id,
+            self.unit_id,
+            3,
+            target="completed",
+            reason="PR merged while the Sprint was paused",
+        )
+        self.assertTrue(resolved)
+        self.assertEqual(
+            ("completed", "planner_override"),
+            tuple(
+                self.con.execute(
+                    "SELECT disposition,completion_source FROM sprint_work_units "
+                    "WHERE work_unit_id=?",
+                    (self.unit_id,),
+                ).fetchone()
+            ),
+        )
+
+        # A fresh observation of the same merged PR no longer projects onto
+        # the resolved lane: no completion event, no second bypass notice.
+        self.reader.current = pull_request(
+            state="MERGED",
+            checks="SUCCESS",
+            checks_failed=False,
+            head_sha="d" * 40,
+        )
+        self.watcher.poll_once()
+        self.assertEqual(
+            (1, 1, 0),
+            tuple(
+                self.con.execute(
+                    "SELECT "
+                    "(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='merge.grant_bypassed'),"
+                    "(SELECT COUNT(*) FROM wake_message "
+                    "WHERE idempotency_key LIKE 'merge-grant-bypassed:%'),"
+                    "(SELECT COUNT(*) FROM sprint_events "
+                    "WHERE event_type='work_unit.completed')"
+                ).fetchone()
+            ),
+        )
+
+        receipt = lifecycle.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+        )
+        self.assertTrue(receipt.changed)
+        self.assertEqual(
+            "completed",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+
+    def test_reroute_reviewer_retires_pr_bound_review_expectation(self):
+        # Issue #1220 replay: rerouting a Reviewer off a PR-bound in_review
+        # lane retires the old review generation; resume queues a fresh
+        # review request on the replacement route at the same PR head.
+        handoff = self.request_review()
+        self.accept_review(handoff.message_id)
+        self.assertEqual(
+            "in_review",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+        )
+
+        lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+        lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="replace the review route",
+        )
+        prepared = sprint_domain.sprint_participant_chats.PreparedParticipantRoute(
+            participant_id=self.reviewer_id,
+            shell_id=2,
+            role="reviewer",
+            shortname="REV1",
+            harness="codex",
+            provider="openai",
+            model="replacement-model",
+            effort="medium",
+            worktree="/tmp/rev1",
+        )
+        with mock.patch.object(
+            sprint_domain.sprint_participant_chats,
+            "prepare_participant_route",
+            return_value=prepared,
+        ):
+            changed_route = sprint_domain.SprintParticipantStore(
+                self.con, probe_harness=lambda _harness: None
+            ).reroute(
+                self.sprint_id,
+                3,
+                participant_shell_id=2,
+                harness="codex",
+                model="replacement-model",
+                effort="medium",
+                route="codex/replacement-model",
+            )
+        self.assertTrue(changed_route)
+
+        retired = self.con.execute(
+            "SELECT disposition,decline_reason FROM wake_message "
+            "WHERE message_id=?",
+            (handoff.message_id,),
+        ).fetchone()
+        self.assertEqual("declined", retired["disposition"])
+        self.assertIn("reroute", retired["decline_reason"])
+        fresh = self.con.execute(
+            "SELECT message_id,disposition,to_participant_id FROM wake_message "
+            "WHERE work_unit_id=? AND message_kind='review_request' "
+            "AND idempotency_key LIKE '%:review-request:reroute:%'",
+            (self.unit_id,),
+        ).fetchone()
+        self.assertIsNotNone(fresh, "reroute queues a fresh review generation")
+        self.assertEqual(self.reviewer_id, int(fresh["to_participant_id"]))
+        self.assertEqual(
+            "in_review",
+            self.con.execute(
+                "SELECT disposition FROM sprint_work_units WHERE work_unit_id=?",
+                (self.unit_id,),
+            ).fetchone()[0],
+            "the lane itself is not rewritten",
+        )
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT superseded_at FROM sprint_pr_work_units "
+                "WHERE sprint_id=? AND work_unit_id=?",
+                (self.sprint_id, self.unit_id),
+            ).fetchone()[0],
+            "the PR link stays active",
+        )
+
+        receipt = lifecycle.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="route replaced",
+        )
+        self.assertTrue(receipt.changed)
+        fresh_wake = int(
+            self.con.execute(
+                "SELECT wake_id FROM sprint_wake_messages WHERE message_id=?",
+                (int(fresh["message_id"]),),
+            ).fetchone()[0]
+        )
+        # The reroute-queued request is durable delivery intent once armed:
+        # the wake delivery service can place it on the replacement route.
+        service = sprint_message_delivery.SprintWakeDeliveryService(self.con)
+        delivered: set[int] = set()
+        for attempt in range(4):
+            receipt_delivery = service.deliver_once(
+                f"rerouted-review-{attempt}",
+                lambda conversation, _prompt, _key: conversation,
+            )
+            if receipt_delivery is None:
+                break
+            delivered.add(int(receipt_delivery.wake_id))
+        self.assertIn(fresh_wake, delivered)
+
+    def test_reroute_developer_still_refuses_in_review_lane(self):
+        # The relaxation covers only the participant's own route
+        # expectations; an in_review lane still blocks the Developer's
+        # reroute because the open turn belongs to the Reviewer's seat.
+        handoff = self.request_review()
+        self.accept_review(handoff.message_id)
+        lifecycle = sprint_domain.SprintLifecycleStore(self.con)
+        lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="replace the dev route",
+        )
+        with self.assertRaisesRegex(
+            sprint_domain.SprintInvariantError,
+            "recall or finish that expectation first",
+        ):
+            sprint_domain.SprintParticipantStore(
+                self.con, probe_harness=lambda _harness: None
+            ).reroute(
+                self.sprint_id,
+                3,
+                participant_shell_id=1,
+                harness="codex",
+                model="replacement-model",
+                effort="medium",
+                route="codex/replacement-model",
+            )
 
     def test_grant_bypassed_merge_resolves_accepted_review_expectation(self):
         handoff = self.request_review()

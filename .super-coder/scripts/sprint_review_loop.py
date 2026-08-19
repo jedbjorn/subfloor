@@ -366,10 +366,15 @@ class SprintReviewLoopStore:
             int(unit[0])
             for unit in self.con.execute(
                 "SELECT work_unit_id FROM sprint_pr_work_units "
-                "WHERE registered_pr_id=? ORDER BY work_unit_id",
+                "WHERE registered_pr_id=? AND superseded_at IS NULL "
+                "ORDER BY work_unit_id",
                 (registered_pr_id,),
             )
         ]
+        if not unit_ids:
+            # Every link was superseded by a Planner override: the watcher no
+            # longer drives the lane, so the merge projects nothing.
+            return []
         return self.units.complete_from_merge_in_transaction(
             int(row["sprint_id"]),
             unit_ids,

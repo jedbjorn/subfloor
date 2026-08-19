@@ -1305,7 +1305,8 @@ class SprintPRWatcher:
             "SELECT l.work_unit_id,u.disposition "
             "FROM sprint_pr_work_units l JOIN sprint_work_units u "
             "ON u.sprint_id=l.sprint_id AND u.work_unit_id=l.work_unit_id "
-            "WHERE l.registered_pr_id=? ORDER BY l.work_unit_id",
+            "WHERE l.registered_pr_id=? AND l.superseded_at IS NULL "
+            "ORDER BY l.work_unit_id",
             (registered_pr_id,),
         ).fetchall() if registered_pr_id is not None else []
         work_unit_id = (

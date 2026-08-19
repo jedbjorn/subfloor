@@ -3072,6 +3072,18 @@ class Handler(BaseHTTPRequestHandler):
                     reason=body.get("reason") or "",
                 )
                 return self._send(200, {"changed": changed})
+            if path == "/_sc/sprint/resolve-unit":
+                planner_shell_id = self._sprint_planner_proxy(
+                    con, sprint_id, shell_id
+                )
+                changed = sprint_domain.SprintWorkUnitStore(con).resolve(
+                    sprint_id,
+                    self._sprint_integer(body, "work_unit_id"),
+                    planner_shell_id,
+                    target=self._sprint_optional_text(body, "target") or "",
+                    reason=self._sprint_optional_text(body, "reason") or "",
+                )
+                return self._send(200, {"changed": changed})
             if path == "/_sc/sprint/inbox-read":
                 message_id = self._sprint_integer(body, "message_id")
                 disposition = sprint_message_delivery.SprintMessageStore(

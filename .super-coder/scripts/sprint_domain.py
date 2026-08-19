@@ -263,6 +263,26 @@ _ROUTE_EVIDENCE_FIELDS = (
 )
 
 
+def _next_assignment_key(
+    con: sqlite3.Connection, sprint_id: int, work_unit_id: int
+) -> str:
+    """Next durable generation key for one lane's work-assignment message."""
+    key_prefix = f"sprint:{sprint_id}:work-unit:{work_unit_id}:assignment:"
+    generation = 0
+    for row in con.execute(
+        "SELECT idempotency_key FROM wake_message "
+        "WHERE work_unit_id=? AND message_kind='work_assignment'",
+        (work_unit_id,),
+    ):
+        key = str(row["idempotency_key"])
+        if not key.startswith(key_prefix):
+            continue
+        suffix = key.removeprefix(key_prefix)
+        if suffix.isdigit():
+            generation = max(generation, int(suffix))
+    return f"{key_prefix}{generation + 1}"
+
+
 def _route_evidence_snapshot(row: dict | sqlite3.Row) -> dict:
     return {field: row[field] for field in _ROUTE_EVIDENCE_FIELDS}
 
@@ -1844,7 +1864,8 @@ class SprintLifecycleStore:
                 int(item[0])
                 for item in self.con.execute(
                     "SELECT work_unit_id FROM sprint_pr_work_units "
-                    "WHERE registered_pr_id=? ORDER BY work_unit_id",
+                    "WHERE registered_pr_id=? AND superseded_at IS NULL "
+                    "ORDER BY work_unit_id",
                     (registered_pr_id,),
                 )
             )
@@ -3521,7 +3542,9 @@ class SprintParticipantStore:
                 raise SprintInvariantError(
                     "participant route changed during preflight; retry reroute"
                 )
-            self._require_idle_projection(current, lifecycle)
+            expectation_facts = self._require_idle_projection(
+                current, lifecycle, planner_shell_id=planner_shell_id
+            )
             if lifecycle == "paused":
                 expected = candidate.evidence_snapshot
                 if expected is not None:
@@ -3577,6 +3600,7 @@ class SprintParticipantStore:
                             "shell_id": participant_shell_id,
                             "role": str(current["role"]),
                             "before": before,
+                            "retired_expectations": expectation_facts,
                             "after": {
                                 **after,
                                 "binding_status": (
@@ -3673,32 +3697,49 @@ class SprintParticipantStore:
         self,
         participant: sqlite3.Row,
         lifecycle: str,
-    ) -> None:
+        *,
+        planner_shell_id: int,
+    ) -> list[dict]:
+        """Guard the route change and relax it for own-route expectations.
+
+        A paused Sprint no longer refuses reroute solely because the
+        participant owns released PR-bound units (spec #161): when every
+        blocking open expectation belongs to the participant's own route, the
+        reroute transaction retires it and queues a fresh one on the
+        replacement route (delivered at resume).  Expectations owned by
+        another seat — a released ``ready``/``in_review`` lane for a
+        Developer — still block, as do live wakes, runs, and chats.
+        """
         if lifecycle == "prepared":
-            return
+            return []
         sprint_id = int(participant["sprint_id"])
         shell_id = int(participant["shell_id"])
         if participant["role"] == "developer":
-            active = self.con.execute(
-                "SELECT work_unit_id,disposition FROM sprint_work_units "
+            rows = self.con.execute(
+                "SELECT work_unit_id,disposition,title,expected_output "
+                "FROM sprint_work_units "
                 "WHERE sprint_id=? AND assigned_shell_id=? AND disposition IN "
                 "('ready','active','in_review','fixing','merge_ready') "
-                "ORDER BY work_unit_id LIMIT 1",
+                "ORDER BY work_unit_id",
                 (sprint_id, shell_id),
-            ).fetchone()
+            ).fetchall()
+            relaxable = {"active", "fixing", "merge_ready"}
         else:
-            active = self.con.execute(
-                "SELECT work_unit_id,disposition FROM sprint_work_units "
+            rows = self.con.execute(
+                "SELECT work_unit_id,disposition,title,expected_output "
+                "FROM sprint_work_units "
                 "WHERE sprint_id=? AND reviewer_shell_id=? "
-                "AND disposition='in_review' ORDER BY work_unit_id LIMIT 1",
+                "AND disposition='in_review' ORDER BY work_unit_id",
                 (sprint_id, shell_id),
-            ).fetchone()
-        if active is not None:
-            raise SprintInvariantError(
-                f"participant route still owns released work unit "
-                f"{int(active['work_unit_id'])} ({active['disposition']}); "
-                "recall or finish that expectation first"
-            )
+            ).fetchall()
+            relaxable = {"in_review"}
+        for row in rows:
+            if str(row["disposition"]) not in relaxable:
+                raise SprintInvariantError(
+                    f"participant route still owns released work unit "
+                    f"{int(row['work_unit_id'])} ({row['disposition']}); "
+                    "recall or finish that expectation first"
+                )
         wake = self.con.execute(
             "SELECT wake_id,state FROM sprint_wake_outbox "
             "WHERE participant_id=? AND state IN ('pending','delivering') "
@@ -3730,6 +3771,170 @@ class SprintParticipantStore:
                 f"participant route still owns active chat {chat.chat_id}; "
                 "close and unregister it before reroute"
             )
+        if not rows:
+            return []
+        return self._retire_own_route_expectations(
+            participant,
+            rows,
+            planner_shell_id=planner_shell_id,
+        )
+
+    def _retire_own_route_expectations(
+        self,
+        participant: sqlite3.Row,
+        rows: list[sqlite3.Row],
+        *,
+        planner_shell_id: int,
+    ) -> list[dict]:
+        """Retire each own-route expectation and queue its replacement.
+
+        Units, dispositions, PR links, and review history are not rewritten;
+        the retired generation is declined/resolved, never erased.  Fresh
+        expectations are durable immediately but deliver only once the Sprint
+        is armed again (wake delivery gates on the armed lifecycle).
+        """
+        sprint_id = int(participant["sprint_id"])
+        participant_id = int(participant["participant_id"])
+        planner = self.con.execute(
+            "SELECT participant_id FROM sprint_participants "
+            "WHERE sprint_id=? AND role='planner'",
+            (sprint_id,),
+        ).fetchone()
+        if planner is None:
+            raise SprintInvariantError("Sprint has no Planner participant")
+        planner_participant_id = int(planner["participant_id"])
+
+        from sprint_liveness import SprintLivenessMonitor
+        from sprint_message_delivery import SprintMessageStore
+
+        messages = SprintMessageStore(self.con)
+        monitor = SprintLivenessMonitor(self.con)
+        facts: list[dict] = []
+        for row in rows:
+            unit_id = int(row["work_unit_id"])
+            disposition = str(row["disposition"])
+            if participant["role"] == "developer":
+                if disposition == "merge_ready":
+                    # The lane awaits the Developer's own merge authorization;
+                    # no message expectation is bound to the old route.
+                    facts.append(
+                        {"work_unit_id": unit_id, "disposition": disposition}
+                    )
+                    continue
+                retired = messages.retire_route_expectations_in_transaction(
+                    sprint_id,
+                    unit_id,
+                    retirement_reason=(
+                        "Rerouted by Planner: assignment moved to the "
+                        "replacement route"
+                    ),
+                    resolution="assignment retired by Planner reroute",
+                    kinds=("work_assignment",),
+                )
+                receipt = messages.send_in_transaction(
+                    sprint_id,
+                    from_participant_id=planner_participant_id,
+                    to_participant_id=participant_id,
+                    work_unit_id=unit_id,
+                    message_kind="work_assignment",
+                    body=f"{row['title']}\n\n{row['expected_output']}",
+                    actionable=True,
+                    declared_type="force-new",
+                    idempotency_key=_next_assignment_key(
+                        self.con, sprint_id, unit_id
+                    ),
+                )
+                facts.append(
+                    {
+                        "work_unit_id": unit_id,
+                        "disposition": disposition,
+                        "retired_message_ids": list(retired),
+                        "fresh_message_id": receipt.message_id,
+                    }
+                )
+                continue
+            request = self.con.execute(
+                "SELECT message_id,body,from_participant_id FROM wake_message "
+                "WHERE sprint_id=? AND work_unit_id=? AND to_participant_id=? "
+                "AND message_kind='review_request' "
+                "AND disposition IN ('pending','accepted') "
+                "ORDER BY message_id DESC LIMIT 1",
+                (sprint_id, unit_id, participant_id),
+            ).fetchone()
+            if request is None:
+                raise SprintInvariantError(
+                    f"participant route still owns released work unit "
+                    f"{unit_id} ({disposition}); recall or finish that "
+                    "expectation first"
+                )
+            request_id = int(request["message_id"])
+            evidence = self.con.execute(
+                "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                "AND event_type='review.requested' "
+                "AND json_extract(payload,'$.message_id')=? "
+                "ORDER BY event_id DESC LIMIT 1",
+                (sprint_id, request_id),
+            ).fetchone()
+            if evidence is None:
+                raise SprintInvariantError(
+                    "open review request has no head evidence"
+                )
+            requested = json.loads(evidence["payload"])
+            messages.supersede_actionable_in_transaction(
+                request_id,
+                "retired by Planner reroute; a fresh review request follows "
+                "on the replacement route",
+            )
+            monitor.resolve_in_transaction(
+                request_id,
+                "review request retired by Planner reroute",
+            )
+            receipt = messages.send_in_transaction(
+                sprint_id,
+                from_participant_id=int(request["from_participant_id"]),
+                to_participant_id=participant_id,
+                work_unit_id=unit_id,
+                message_kind="review_request",
+                body=str(request["body"]),
+                actionable=True,
+                declared_type="force-new",
+                idempotency_key=(
+                    f"sprint:{sprint_id}:work-unit:{unit_id}:"
+                    f"review-request:reroute:{request_id}"
+                ),
+            )
+            self.con.execute(
+                "INSERT INTO sprint_events "
+                "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+                "VALUES (?,'review.requested','planner',?,?)",
+                (
+                    sprint_id,
+                    planner_shell_id,
+                    json.dumps(
+                        {
+                            "head_sha": requested.get("head_sha"),
+                            "message_id": receipt.message_id,
+                            "registered_pr_id": requested.get(
+                                "registered_pr_id"
+                            ),
+                            "source": "planner.reroute",
+                            "retired_message_id": request_id,
+                            "transition_id": requested.get("transition_id"),
+                            "work_unit_id": unit_id,
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            facts.append(
+                {
+                    "work_unit_id": unit_id,
+                    "disposition": disposition,
+                    "retired_message_ids": [request_id],
+                    "fresh_message_id": receipt.message_id,
+                }
+            )
+        return facts
 
     @staticmethod
     def _projection(participant: sqlite3.Row) -> dict:
@@ -3985,6 +4190,7 @@ class SprintWorkUnitStore:
             registered = self.con.execute(
                 "SELECT registered_pr_id FROM sprint_pr_work_units "
                 "WHERE sprint_id=? AND work_unit_id=? "
+                "AND superseded_at IS NULL "
                 "ORDER BY registered_pr_id LIMIT 1",
                 (sprint_id, work_unit_id),
             ).fetchone()
@@ -4204,6 +4410,146 @@ class SprintWorkUnitStore:
             pause_receipt = self._queue_delivery_terminal(sprint_id)
         if pause_receipt is not None:
             self.lifecycle.signal_pause_receipt(pause_receipt)
+        return True
+
+    def resolve(
+        self,
+        sprint_id: int,
+        work_unit_id: int,
+        planner_shell_id: int,
+        *,
+        target: str,
+        reason: str,
+    ) -> bool:
+        """Force-move one non-terminal lane to a terminal Planner disposition.
+
+        Paused-only, Planner-only, reasoned, and audited: retires the lane's
+        open route expectations, supersedes its PR links (rows retained), and
+        wakes the assigned Developer and Reviewer.  PR-bound units are the
+        point of the verb; ``--to completed`` fabricates no merge observation.
+        """
+        if target not in {"completed", "cancelled"}:
+            raise ValueError("resolve-unit target must be completed or cancelled")
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("work-unit resolution reason is required")
+        if len(reason) > 8000:
+            raise ValueError(
+                f"work-unit resolution reason is {len(reason)} characters; "
+                "maximum is 8000"
+            )
+        with db_driver.write_transaction(self.con, "sprint.work_unit.resolve"):
+            lifecycle, planner_participant_id = self._require_planner(
+                sprint_id, planner_shell_id
+            )
+            if lifecycle != "paused":
+                raise SprintInvariantError(
+                    "work units may be resolved only while the Sprint is paused"
+                )
+            unit = self._unit(sprint_id, work_unit_id)
+            before = str(unit["disposition"])
+            if before in {"completed", "cancelled"}:
+                override = self.con.execute(
+                    "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='planner_override' "
+                    "AND json_extract(payload,'$.work_unit_id')=? "
+                    "ORDER BY event_id DESC LIMIT 1",
+                    (sprint_id, work_unit_id),
+                ).fetchone()
+                if override is not None:
+                    prior = json.loads(override["payload"])
+                    if (
+                        before == target
+                        and prior.get("after") == target
+                        and prior.get("reason") == reason
+                    ):
+                        return False
+                raise SprintConflictError(
+                    f"work unit {work_unit_id} is already {before}; "
+                    "resolve-unit does not move a terminal work unit",
+                    {
+                        "code": "work_unit_already_terminal",
+                        "work_unit_id": work_unit_id,
+                        "disposition": before,
+                    },
+                )
+            pr_numbers = [
+                int(row["pr_number"])
+                for row in self.con.execute(
+                    "SELECT pr.pr_number FROM sprint_pr_work_units link "
+                    "JOIN sprint_registered_prs pr "
+                    "ON pr.registered_pr_id=link.registered_pr_id "
+                    "WHERE link.sprint_id=? AND link.work_unit_id=? "
+                    "AND link.superseded_at IS NULL ORDER BY pr.pr_number",
+                    (sprint_id, work_unit_id),
+                )
+            ]
+            from sprint_message_delivery import SprintMessageStore
+
+            messages = SprintMessageStore(self.con)
+            retired_message_ids = messages.retire_route_expectations_in_transaction(
+                sprint_id,
+                work_unit_id,
+                retirement_reason=f"Resolved by Planner as {target}: {reason}",
+                resolution=f"work unit resolved by Planner as {target}: {reason}",
+            )
+            self.con.execute(
+                "UPDATE sprint_pr_work_units SET superseded_at=datetime('now') "
+                "WHERE sprint_id=? AND work_unit_id=? AND superseded_at IS NULL",
+                (sprint_id, work_unit_id),
+            )
+            self.con.execute(
+                "UPDATE sprint_work_units SET disposition=?,completion_result=?,"
+                "completed_at=datetime('now'),updated_at=datetime('now'),"
+                "completion_source=CASE WHEN ?='completed' "
+                "THEN 'planner_override' ELSE completion_source END "
+                "WHERE work_unit_id=?",
+                (target, reason, target, work_unit_id),
+            )
+            # The durable event lands before any wake: it, not the narration,
+            # is the delivery proof of the override.
+            self._event(
+                sprint_id,
+                "planner_override",
+                planner_shell_id,
+                {
+                    "work_unit_id": work_unit_id,
+                    "before": before,
+                    "after": target,
+                    "reason": reason,
+                    "pr_numbers": pr_numbers,
+                    "retired_message_ids": list(retired_message_ids),
+                },
+            )
+            recipients = self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id IN (?,?) "
+                "AND role IN ('developer','reviewer') ORDER BY participant_id",
+                (
+                    sprint_id,
+                    int(unit["assigned_shell_id"]),
+                    int(unit["reviewer_shell_id"]),
+                ),
+            ).fetchall()
+            reason_key = hashlib.sha256(reason.encode()).hexdigest()[:16]
+            for recipient in recipients:
+                messages.send_in_transaction(
+                    sprint_id,
+                    from_participant_id=planner_participant_id,
+                    to_participant_id=int(recipient["participant_id"]),
+                    work_unit_id=work_unit_id,
+                    message_kind="notification",
+                    body=(
+                        f"Planner resolved work unit {work_unit_id} from "
+                        f"{before} to {target}: {reason}"
+                    ),
+                    actionable=False,
+                    declared_type="re-enter",
+                    idempotency_key=(
+                        f"planner-override:{sprint_id}:{work_unit_id}:{target}:"
+                        f"{reason_key}:participant:{int(recipient['participant_id'])}"
+                    ),
+                )
         return True
 
     def complete_from_merge_in_transaction(
@@ -4501,7 +4847,10 @@ class SprintWorkUnitStore:
             body=(
                 f"Merged PR bypassed the Sprint merge grant for work unit "
                 f"{work_unit_id} from {before}; the unit remains incomplete "
-                "and requires Planner disposition."
+                "and requires Planner disposition: pause the Sprint and run "
+                f"`sc sprint resolve-unit --sprint {sprint_id} "
+                f"--work-unit {work_unit_id} --to completed|cancelled "
+                "--reason <text>`."
             ),
             actionable=False,
             declared_type="re-enter",
@@ -4562,21 +4911,7 @@ class SprintWorkUnitStore:
         unit: sqlite3.Row,
     ) -> int:
         unit_id = int(unit["work_unit_id"])
-        key_prefix = f"sprint:{sprint_id}:work-unit:{unit_id}:assignment:"
-        generation = 0
-        for row in self.con.execute(
-            "SELECT idempotency_key FROM wake_message "
-            "WHERE work_unit_id=? AND message_kind='work_assignment'",
-            (unit_id,),
-        ):
-            key = str(row["idempotency_key"])
-            if not key.startswith(key_prefix):
-                continue
-            suffix = key.removeprefix(key_prefix)
-            if suffix.isdigit():
-                generation = max(generation, int(suffix))
-        generation += 1
-        key = f"{key_prefix}{generation}"
+        key = _next_assignment_key(self.con, sprint_id, unit_id)
         # Local import avoids a module cycle: the message store uses the domain
         # lifecycle for durable failure evidence.
         from sprint_message_delivery import SprintMessageStore

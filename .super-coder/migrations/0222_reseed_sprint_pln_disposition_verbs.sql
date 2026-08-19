@@ -1,11 +1,17 @@
----
-name: sprint_pln
-description: Run an armed Sprints v2 collaboration loop as Planner — dispatch and restructure lanes, change participant routes, and execute Reviewer decisions through durable pause, resume, and close protocols.
-category: workflow
-common: false
----
+-- 0222 — reseed sprint_pln with the Planner unit disposition verbs (spec #161).
+-- Documents resolve-unit beside recall/replan and the reroute relaxation for
+-- own-route PR-bound expectations.  Full-body UPSERT converges existing
+-- installations to the asset content.
 
-# sprint_pln — govern the armed Sprint
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'sprint_pln',
+  'Run an armed Sprints v2 collaboration loop as Planner — dispatch and restructure lanes, change participant routes, and execute Reviewer decisions through durable pause, resume, and close protocols.',
+  'workflow',
+  NULL,
+  0,
+  '# sprint_pln — govern the armed Sprint
 
 Use as originating Planner after `sprint_prep` arms a Sprint. System records
 facts; Reviewer owns review/conformance judgment + reports; Planner owns plan
@@ -251,7 +257,7 @@ sc sprint resolve-unit --sprint <id> --work-unit <id> \
   --to completed|cancelled --reason <reason>
 ```
 
-Paused-only; retires the lane's open expectations, supersedes its PR links
+Paused-only; retires the lane''s open expectations, supersedes its PR links
 (registration kept for reconcile-pr), and wakes both seats. Recall+replan
 ships revised work; resolve only closes the lane.
 
@@ -265,8 +271,8 @@ sc sprint reroute-participant --sprint <id> --participant-shell <id> \
 ```
 
 Prepared Sprints may reroute directly. Paused reroute retires the
-participant's own released expectations and queues fresh ones on the
-replacement route at resume; another seat's open turn still blocks. Existing
+participant''s own released expectations and queues fresh ones on the
+replacement route at resume; another seat''s open turn still blocks. Existing
 chats/runs remain history; next Force-new delivery uses replacement. Reroute
 declared participants only. On decline, preserve reason and choose
 replacement from current capacity; ask Reviewer only if review/conformance
@@ -353,4 +359,12 @@ On an initial clean completion receipt, verify the named Sprint is terminal and
 record `cleanup_state=pending`; run no close command. Stop until the
 engine-authored cleanup success or failure receipt arrives. The Planner does
 not author a second report, accept an actionable handoff, poll cleanup, or ask
-another role to reset a worktree.
+another role to reset a worktree.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;
