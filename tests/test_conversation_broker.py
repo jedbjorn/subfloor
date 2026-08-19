@@ -31,6 +31,8 @@ from conversation_adapters import (  # noqa: E402
     OpenCodeAdapter,
     ReconcileResult,
 )
+from conversation_boot import BootDirective  # noqa: E402
+import conversation_boot  # noqa: E402
 from conversation_broker import (  # noqa: E402
     BrokerInvariantError,
     BrokerRun,
@@ -1739,6 +1741,577 @@ class ServiceContractTest(ConversationBrokerCase):
         self.assertEqual(adapter.started, 1)
         self.assertEqual(adapter.resumed, 0)
         self.assertTrue(broker.wait_idle())
+
+
+class BootSeamPreparer:
+    """The real conversation_boot seam as the broker's launch_preparer.
+
+    Exercises binding, validation, and byte restoration against the test DB
+    without dragging in the rest of run.prepare_launch; compose is a probe so
+    tests can count compositions and change the volatile shell state between
+    turns. ``last_content`` is the exact byte string this turn resolved and
+    materialized, for dispatch-edge assertions."""
+
+    def __init__(
+        self,
+        db_path: Path,
+        compose,
+        *,
+        archive_id: int,
+        write_failures: int = 0,
+    ) -> None:
+        self.db_path = db_path
+        self.compose = compose
+        self.archive_id = archive_id
+        self.write_failures = write_failures
+        self.compose_calls = 0
+        self.last_content: str | None = None
+
+    def __call__(self, broker_run: BrokerRun):
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        try:
+            directive = BootDirective(
+                conversation_id=broker_run.conversation_id,
+                phase="resume" if broker_run.session_before else "start",
+            )
+
+            def composing() -> str:
+                self.compose_calls += 1
+                return self.compose()
+
+            content = conversation_boot.resolve_boot(con, directive, composing)
+        finally:
+            con.close()
+        if self.write_failures:
+            self.write_failures -= 1
+            raise OSError("injected boot write failure")
+        conversation_boot.write_boot_files(Path(broker_run.worktree), content)
+        self.last_content = content
+        return broker_run.context(), self.archive_id
+
+
+class BootAssertingAdapter(FakeAdapter):
+    """At each native dispatch edge, both worktree boot files must already
+    hold the exact bytes this turn's preparation resolved."""
+
+    def __init__(self, preparer: BootSeamPreparer, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.preparer = preparer
+        self.messages: list[str] = []
+        self.resume_sessions: list[str] = []
+
+    def _assert_boot_owned(self, context: ConversationContext) -> None:
+        expected = self.preparer.last_content
+        if expected is None:
+            raise AssertionError("native dispatch before boot preparation")
+        for name in conversation_boot.BOOT_FILES:
+            actual = (context.worktree / name).read_bytes()
+            if actual != expected.encode("utf-8"):
+                raise AssertionError(f"{name} drifted from the bound snapshot")
+
+    def start(self, context: ConversationContext, message: str) -> NativeTurn:
+        self.messages.append(message)
+        self._assert_boot_owned(context)
+        return super().start(context, message)
+
+    def resume(
+        self,
+        session_ref: str,
+        context: ConversationContext,
+        message: str,
+    ) -> NativeTurn:
+        self.messages.append(message)
+        self.resume_sessions.append(session_ref)
+        self._assert_boot_owned(context)
+        return super().resume(session_ref, context, message)
+
+
+class BootSnapshotContractTest(ConversationBrokerCase):
+    """Spec #163 broker boundaries: bind before start, exact reuse on resume."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        con = self.connect()
+        self.archive_id = int(
+            con.execute(
+                "INSERT INTO shell_memory_archives "
+                "(shell_id,session_id,date,full_narrative) "
+                "VALUES (1,'9001','2026-08-19','boot snapshot tests')"
+            ).lastrowid
+        )
+        con.commit()
+        con.close()
+        self.boot_state = {"marker": "one"}
+
+    def compose(self) -> str:
+        return f"boot marker {self.boot_state['marker']}"
+
+    def stamp_ledger(self, applied_at: str = "2000-01-01 00:00:00") -> None:
+        """Mark the 0224 migration applied, so later conversations are new."""
+        con = self.connect()
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "  filename TEXT PRIMARY KEY,"
+            "  applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO schema_migrations (filename,applied_at) "
+            "VALUES ('0224_conversation_boot_snapshots.sql',?)",
+            (applied_at,),
+        )
+        con.commit()
+        con.close()
+
+    def snapshot_row(self, conversation_id: str):
+        con = self.connect()
+        row = con.execute(
+            "SELECT content,content_sha256,content_bytes,binding_origin "
+            "FROM conversation_boot_snapshots WHERE conversation_id=?",
+            (conversation_id,),
+        ).fetchone()
+        con.close()
+        return row
+
+    def requeue(self, conversation_id: str) -> int:
+        """Post the next message as the API would: conversation back to queued."""
+        con = self.connect()
+        con.execute(
+            "UPDATE conversations SET state='queued' WHERE conversation_id=?",
+            (conversation_id,),
+        )
+        con.commit()
+        con.close()
+        return self.add_message(conversation_id)
+
+    def add_message_body(self, conversation_id: str, body: str) -> int:
+        self.serial += 1
+        key = f"message-{self.serial}"
+        con = self.connect()
+        message_id = con.execute(
+            "INSERT INTO conversation_messages "
+            "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+            "idempotency_key,request_hash,state) "
+            "VALUES (?,'user','1','prompt',?,?,?,'queued')",
+            (conversation_id, body, key, f"hash-{key}"),
+        ).lastrowid
+        con.execute(
+            "INSERT INTO conversation_outbox (conversation_id,message_id) "
+            "VALUES (?,?)",
+            (conversation_id, message_id),
+        )
+        con.commit()
+        con.close()
+        return int(message_id)
+
+    def file_states(self) -> dict:
+        return {
+            name: (
+                (self.worktree / name).read_bytes(),
+                (self.worktree / name).stat().st_mtime_ns,
+            )
+            for name in conversation_boot.BOOT_FILES
+        }
+
+    def test_first_turn_binds_before_native_start(self) -> None:
+        self.stamp_ledger()
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        adapter = BootAssertingAdapter(preparer)
+        broker = self.start_broker(
+            lambda _harness: adapter, launch_preparer=preparer
+        )
+        conversation_id = self.add_conversation()
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            con = self.connect()
+            state = con.execute(
+                "SELECT state FROM conversation_runs WHERE trigger_message_id=?",
+                (message_id,),
+            ).fetchone()
+            con.close()
+            if state and state[0] == "succeeded":
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("first turn did not finish")
+
+        row = self.snapshot_row(conversation_id)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["content"], "boot marker one")
+        self.assertEqual(row["binding_origin"], "new_conversation")
+        self.assertEqual(adapter.messages, ["hello"])
+        self.assertEqual(preparer.compose_calls, 1)
+
+    def test_resume_reuses_bytes_and_never_rewrites_matching_files(self) -> None:
+        self.stamp_ledger()
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        adapter = BootAssertingAdapter(preparer)
+        broker = self.start_broker(
+            lambda _harness: adapter, launch_preparer=preparer
+        )
+        conversation_id = self.add_conversation()
+        first_message = self.add_message(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, first_message, "succeeded")
+        digest = self.snapshot_row(conversation_id)["content_sha256"]
+        files = self.file_states()
+
+        # Volatile boot inputs change; the conversation's bytes must not.
+        self.boot_state["marker"] = "two"
+        second_message = self.requeue(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, second_message, "succeeded")
+
+        self.assertEqual(adapter.started, 1)
+        self.assertEqual(adapter.resumed, 1)
+        self.assertEqual(adapter.messages, ["hello", "hello"])
+        self.assertEqual(preparer.compose_calls, 1)
+        self.assertEqual(
+            self.snapshot_row(conversation_id)["content_sha256"], digest
+        )
+        self.assertEqual(self.file_states(), files)
+
+    def test_resume_restores_files_replaced_by_another_chat(self) -> None:
+        self.stamp_ledger()
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        adapter = BootAssertingAdapter(preparer)
+        broker = self.start_broker(
+            lambda _harness: adapter, launch_preparer=preparer
+        )
+        conversation_id = self.add_conversation()
+        first_message = self.add_message(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, first_message, "succeeded")
+        digest = self.snapshot_row(conversation_id)["content_sha256"]
+
+        # A different chat (or any external lifecycle) replaced the shared
+        # worktree files; resume must restore the stored bytes before dispatch.
+        for name in conversation_boot.BOOT_FILES:
+            (self.worktree / name).write_text("another chat's boot")
+        second_message = self.requeue(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, second_message, "succeeded")
+
+        self.assertEqual(adapter.resumed, 1)
+        self.assertEqual(preparer.compose_calls, 1)
+        self.assertEqual(
+            self.snapshot_row(conversation_id)["content_sha256"], digest
+        )
+        for name in conversation_boot.BOOT_FILES:
+            self.assertEqual(
+                (self.worktree / name).read_bytes(),
+                b"boot marker one",
+            )
+
+    def test_boot_write_failure_keeps_snapshot_and_retry_does_not_recompose(
+        self,
+    ) -> None:
+        self.stamp_ledger()
+        preparer = BootSeamPreparer(
+            self.db_path,
+            self.compose,
+            archive_id=self.archive_id,
+            write_failures=1,
+        )
+        adapter = BootAssertingAdapter(preparer)
+        broker = self.start_broker(
+            lambda _harness: adapter, launch_preparer=preparer
+        )
+        conversation_id = self.add_conversation()
+        first_message = self.add_message(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, first_message, "failed")
+
+        # Committed before the failed write; no prompt ever reached a native
+        # session for the first message.
+        row = self.snapshot_row(conversation_id)
+        self.assertIsNotNone(row)
+        self.assertEqual(adapter.started, 0)
+        self.assertEqual(adapter.resumed, 0)
+
+        second_message = self.requeue(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, second_message, "succeeded")
+
+        self.assertEqual(preparer.compose_calls, 1)
+        self.assertEqual(
+            self.snapshot_row(conversation_id)["content_sha256"],
+            row["content_sha256"],
+        )
+        self.assertEqual(adapter.messages, ["hello"])
+
+    def test_unbound_legacy_conversation_adopts_once_on_first_resume(
+        self,
+    ) -> None:
+        # No schema_migrations ledger in this fixture: the conversation cannot
+        # be proven post-migration, so the legacy adoption rule applies.
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        adapter = BootAssertingAdapter(
+            preparer, native_session_ref="native-old"
+        )
+        broker = self.start_broker(
+            lambda _harness: adapter, launch_preparer=preparer
+        )
+        conversation_id = self.add_conversation(session_ref="native-old")
+        first_message = self.add_message(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, first_message, "succeeded")
+
+        row = self.snapshot_row(conversation_id)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["binding_origin"], "legacy_first_resume")
+        self.assertEqual(adapter.resumed, 1)
+        self.assertEqual(adapter.started, 0)
+
+        second_message = self.requeue(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, second_message, "succeeded")
+        self.assertEqual(preparer.compose_calls, 1)
+        self.assertEqual(
+            self.snapshot_row(conversation_id)["content_sha256"],
+            row["content_sha256"],
+        )
+        self.assertEqual(adapter.resumed, 2)
+
+    def test_unbound_post_migration_conversation_fails_closed(self) -> None:
+        self.stamp_ledger()
+
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        adapter = BootAssertingAdapter(preparer)
+        broker = self.start_broker(
+            lambda _harness: adapter, launch_preparer=preparer
+        )
+        conversation_id = self.add_conversation(session_ref="native-new")
+        message_id = self.add_message(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, message_id, "failed")
+
+        con = self.connect()
+        error = con.execute(
+            "SELECT error_code FROM conversation_runs "
+            "WHERE trigger_message_id=?",
+            (message_id,),
+        ).fetchone()[0]
+        con.close()
+        self.assertEqual(error, "BOOT_SNAPSHOT_MISSING")
+        self.assertIsNone(self.snapshot_row(conversation_id))
+        self.assertEqual(adapter.started, 0)
+        self.assertEqual(adapter.resumed, 0)
+        self.assertEqual(preparer.compose_calls, 0)
+
+    def wait_message_run(
+        self, conversation_id: str, message_id: int, state: str
+    ) -> None:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            con = self.connect()
+            row = con.execute(
+                "SELECT state FROM conversation_runs "
+                "WHERE conversation_id=? AND trigger_message_id=?",
+                (conversation_id, message_id),
+            ).fetchone()
+            con.close()
+            if row is not None and row[0] == state:
+                return
+            time.sleep(0.01)
+        self.fail(
+            f"message {message_id} run did not reach {state}"
+        )
+
+    def test_close_reopen_with_rotation_restores_original_snapshot(self) -> None:
+        self.stamp_ledger()
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        adapter = BootAssertingAdapter(
+            preparer, native_session_ref="native-A"
+        )
+        broker = self.start_broker(
+            lambda _harness: adapter, launch_preparer=preparer
+        )
+        chat_a = self.add_conversation()
+        first = self.add_message(chat_a)
+        broker.notify()
+        self.wait_message_run(chat_a, first, "succeeded")
+        digest_a = self.snapshot_row(chat_a)["content_sha256"]
+        self.assertEqual(
+            self.snapshot_row(chat_a)["content"], "boot marker one"
+        )
+
+        # Close A, then run a different chat B on the same shell: the shared
+        # worktree files move to B's freshly composed snapshot.
+        con = self.connect()
+        con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+            "WHERE conversation_id=?",
+            (chat_a,),
+        )
+        con.commit()
+        con.close()
+        self.boot_state["marker"] = "two"
+        chat_b = self.add_conversation()
+        second = self.add_message(chat_b)
+        broker.notify()
+        self.wait_message_run(chat_b, second, "succeeded")
+        digest_b = self.snapshot_row(chat_b)["content_sha256"]
+        self.assertNotEqual(digest_a, digest_b)
+        self.assertEqual(
+            self.snapshot_row(chat_b)["content"], "boot marker two"
+        )
+        for name in conversation_boot.BOOT_FILES:
+            self.assertEqual(
+                (self.worktree / name).read_bytes(), b"boot marker two"
+            )
+
+        # Reopen A (the API's closed->idle walk + active-chat rotation): the
+        # API auto-closes the idle open chat B first, then A's original
+        # snapshot is restored and the original native session resumes.
+        con = self.connect()
+        con.execute(
+            "UPDATE conversations SET state='closed',closed_at=datetime('now') "
+            "WHERE conversation_id=?",
+            (chat_b,),
+        )
+        con.execute(
+            "UPDATE conversations SET state='idle',closed_at=NULL "
+            "WHERE conversation_id=?",
+            (chat_a,),
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO active_shell_chats (shell_id,chat_id) "
+            "VALUES (1,?)",
+            (chat_a,),
+        )
+        con.commit()
+        con.close()
+        third = self.requeue(chat_a)
+        broker.notify()
+        self.wait_message_run(chat_a, third, "succeeded")
+
+        self.assertEqual(adapter.started, 2)  # A's first turn, B's first turn
+        self.assertEqual(adapter.resumed, 1)  # A's reopen resumes native-A
+        self.assertEqual(preparer.compose_calls, 2)  # one per conversation
+        self.assertEqual(
+            self.snapshot_row(chat_a)["content_sha256"], digest_a
+        )
+        for name in conversation_boot.BOOT_FILES:
+            self.assertEqual(
+                (self.worktree / name).read_bytes(), b"boot marker one"
+            )
+
+    def test_broker_restart_between_turns_reuses_the_snapshot(self) -> None:
+        self.stamp_ledger()
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        first_adapter = BootAssertingAdapter(preparer)
+        broker = self.start_broker(
+            lambda _harness: first_adapter, launch_preparer=preparer
+        )
+        conversation_id = self.add_conversation()
+        first = self.add_message(conversation_id)
+        broker.notify()
+        self.wait_message_run(conversation_id, first, "succeeded")
+        digest = self.snapshot_row(conversation_id)["content_sha256"]
+        broker.stop()
+        broker.join(2)
+        self.assertFalse(broker.is_alive())
+
+        # Engine restart: a fresh broker process resumes the same conversation.
+        second_adapter = BootAssertingAdapter(preparer)
+        restarted = self.start_broker(
+            lambda _harness: second_adapter, launch_preparer=preparer
+        )
+        second = self.requeue(conversation_id)
+        restarted.notify()
+        self.wait_message_run(conversation_id, second, "succeeded")
+
+        self.assertEqual(preparer.compose_calls, 1)
+        self.assertEqual(second_adapter.resumed, 1)
+        self.assertEqual(second_adapter.started, 0)
+        self.assertEqual(
+            self.snapshot_row(conversation_id)["content_sha256"], digest
+        )
+
+    def test_every_supported_harness_resumes_exact_session_and_prompt(self) -> None:
+        """Claude, Codex, Kimi, and OpenCode chats each bind one snapshot and
+        resume the persisted native session with only the next queued prompt."""
+        self.stamp_ledger()
+        preparer = BootSeamPreparer(
+            self.db_path, self.compose, archive_id=self.archive_id
+        )
+        adapters = {
+            harness: BootAssertingAdapter(
+                preparer,
+                harness=harness,
+                native_session_ref=f"native-{harness}",
+            )
+            for harness in ("claude", "codex", "kimi", "opencode")
+        }
+        broker = self.start_broker(
+            lambda harness: adapters[harness], launch_preparer=preparer
+        )
+        for harness, adapter in adapters.items():
+            with self.subTest(harness=harness):
+                conversation_id = self.add_conversation(harness=harness)
+                first = self.add_message_body(
+                    conversation_id, f"first {harness} prompt"
+                )
+                broker.notify()
+                self.wait_message_run(conversation_id, first, "succeeded")
+                digest = self.snapshot_row(conversation_id)["content_sha256"]
+
+                con = self.connect()
+                con.execute(
+                    "UPDATE conversations SET state='queued' "
+                    "WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                con.commit()
+                con.close()
+                second = self.add_message_body(
+                    conversation_id, f"second {harness} prompt"
+                )
+                broker.notify()
+                self.wait_message_run(conversation_id, second, "succeeded")
+
+                self.assertEqual(adapter.started, 1)
+                self.assertEqual(adapter.resumed, 1)
+                self.assertEqual(
+                    adapter.messages,
+                    [f"first {harness} prompt", f"second {harness} prompt"],
+                )
+                self.assertEqual(
+                    adapter.resume_sessions, [f"native-{harness}"]
+                )
+                self.assertEqual(
+                    self.snapshot_row(conversation_id)["content_sha256"],
+                    digest,
+                )
+                con = self.connect()
+                con.execute(
+                    "UPDATE conversations SET state='closed',"
+                    "closed_at=datetime('now') WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                con.commit()
+                con.close()
+
+        # Exactly one composition per conversation across all four harnesses.
+        self.assertEqual(preparer.compose_calls, 4)
 
 
 if __name__ == "__main__":

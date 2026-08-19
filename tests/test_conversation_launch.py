@@ -17,6 +17,7 @@ sys.path.insert(0, str(ENGINE / "api"))
 
 import route_bindings  # noqa: E402
 import run as run_mod  # noqa: E402
+from conversation_boot import BootDirective  # noqa: E402
 from conversation_broker import BrokerRun  # noqa: E402
 from conversation_launch import (  # noqa: E402
     ConversationLaunchError,
@@ -190,7 +191,33 @@ def test_preparer_returns_canonical_environment_and_archive(launch_case):
         "effort": "high",
         "headless_prompt": "Do the work",
         "current_leased_run_id": 7,
+        "boot": BootDirective(
+            conversation_id="cv_" + "a" * 32,
+            phase="start",
+        ),
     }]
+
+
+def test_preparer_marks_a_resume_turn_with_the_resume_phase(launch_case):
+    db_path, worktree = launch_case
+    called = []
+    preparer = ConversationLaunchPreparer(
+        db_path,
+        prepare_launch=lambda **kwargs: called.append(kwargs) or SimpleNamespace(
+            cwd=str(worktree),
+            archive_id=42,
+            harness="codex",
+            model="gpt-test",
+            effort="high",
+            env={},
+        ),
+        liveness=lambda: {"supported": True, "processes": []},
+    )
+    preparer(make_run(worktree, session_before="native-session-1"))
+    assert called[0]["boot"] == BootDirective(
+        conversation_id="cv_" + "a" * 32,
+        phase="resume",
+    )
 
 
 def test_preexisting_null_model_chat_refuses_turn_and_preserves_row(launch_case):

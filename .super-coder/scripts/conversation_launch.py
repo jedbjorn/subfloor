@@ -13,6 +13,7 @@ import route_transport
 import run as run_mod
 import shell_liveness
 from conversation_adapters import ConversationContext
+from conversation_boot import BootDirective, BootSnapshotError
 
 class ConversationLaunchError(RuntimeError):
     """Stable pre-dispatch refusal owned by browser conversation launching."""
@@ -28,8 +29,11 @@ class ConversationLaunchPreparer:
 
     ``run.prepare_launch`` is intentionally reused without executing its argv:
     native conversation adapters own dispatch and streaming, while the normal
-    CLI path remains the source of truth for shell identity, worktree, rendered
-    boot files, harness permissions, session archives, and injected environment.
+    CLI path remains the source of truth for shell identity, worktree,
+    harness permissions, session archives, and injected environment. The boot
+    document is the one exception (spec #163): the directive handed down names
+    the conversation and its start/resume phase, so the conversation's single
+    committed snapshot is bound or restored instead of freshly composed.
     """
 
     def __init__(
@@ -146,6 +150,17 @@ class ConversationLaunchPreparer:
                 "effort": broker_run.effort,
                 "headless_prompt": broker_run.body,
                 "current_leased_run_id": broker_run.run_id,
+                # Explicit conversation launch mode (spec #163): the broker's
+                # leased run knows whether this turn starts a new native
+                # session or resumes the persisted one; boot composition,
+                # binding, and byte restoration key off that, never off file
+                # existence.
+                "boot": BootDirective(
+                    conversation_id=broker_run.conversation_id,
+                    phase=(
+                        "resume" if broker_run.session_before else "start"
+                    ),
+                ),
             }
             if binding is not None:
                 launch_args["route_binding"] = binding
@@ -153,6 +168,10 @@ class ConversationLaunchPreparer:
             plan = self.prepare_launch(
                 **launch_args,
             )
+        except BootSnapshotError as exc:
+            # Snapshot integrity failures keep their stable code so the run
+            # record names the invariant that refused dispatch.
+            raise ConversationLaunchError(exc.code, exc.detail) from exc
         except (run_mod.LaunchError, SystemExit) as exc:
             raise ConversationLaunchError(
                 "CONVERSATION_LAUNCH_REFUSED",

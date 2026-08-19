@@ -55,6 +55,7 @@ from compose import compose_boot  # noqa: E402
 sys.path.insert(0, str(ENGINE / "scripts"))
 import artifact_policy  # noqa: E402
 import callable_floor  # noqa: E402
+import conversation_boot  # noqa: E402
 import db_driver  # noqa: E402
 import git_freshness  # noqa: E402
 import git_prune  # noqa: E402  — boot-time prune of provably-merged local branches
@@ -1185,7 +1186,9 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
                    headless_prompt: "str | None" = None,
                    current_leased_run_id: "int | None" = None,
                    route_binding: "dict | None" = None,
-                   binding_digest: "str | None" = None) -> LaunchPlan:
+                   binding_digest: "str | None" = None,
+                   boot: "conversation_boot.BootDirective | None" = None,
+                   ) -> LaunchPlan:
     """Prepare a launch exactly as main() would, without any TTY.
 
     A browser chat uses the normal harness, model, effort, permission,
@@ -1200,6 +1203,12 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     the gate — the caller refuses before this runs), the banner/spinner/
     boot summary, tab titles, and git_prune (a hygiene sweep for human
     boots; an engine-driven pane launch must never delete branches).
+
+    ``boot`` carries an explicit conversation launch mode (spec #163): with a
+    BootDirective the boot document is the conversation's one committed
+    snapshot (bound on start, reused or restored on resume) instead of a
+    fresh composition on every call; without it, behavior is unchanged —
+    compose fresh and write on every launch.
 
     Raises LaunchError on a refusal it owns; shared helpers that predate
     this seam (open_db, authenticate, ensure_worktree) still sys.exit, so
@@ -1343,23 +1352,34 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     floor_note = main_checkout_note(REPO_ROOT)
     work_repo_note = declared_work_repo_note(REPO_ROOT)
 
-    content = compose_boot(con, full, user, session_id, archive_id,
-                           work_dir=work_dir if work_dir != REPO_ROOT else None,
-                           sync_note=sync_note,
-                           floor_note=floor_note,
-                           work_repo_note=work_repo_note,
-                           source_mode=install.is_source_repo(),
-                           devkit_declared=(work_dir / ".subfloor" / "dev-kit.json").is_file(),
-                           devkit_repair=bool(os.environ.get("SC_DEVKIT_REPAIR")),
-                           api_key=full["api_key"],
-                           api_port=api_port,
-                           launch_mode=execution_mode())
+    content = conversation_boot.resolve_boot(
+        con,
+        boot,
+        compose=lambda: compose_boot(
+            con, full, user, session_id, archive_id,
+            work_dir=work_dir if work_dir != REPO_ROOT else None,
+            sync_note=sync_note,
+            floor_note=floor_note,
+            work_repo_note=work_repo_note,
+            source_mode=install.is_source_repo(),
+            devkit_declared=(work_dir / ".subfloor" / "dev-kit.json").is_file(),
+            devkit_repair=bool(os.environ.get("SC_DEVKIT_REPAIR")),
+            api_key=full["api_key"],
+            api_port=api_port,
+            launch_mode=execution_mode()),
+    )
     render_harness_skills(
         con, full["shell_id"], work_dir, adapter
     )
     con.close()
-    for name in ("CLAUDE.md", "AGENTS.md"):
-        atomic_write(work_dir / name, content)
+    if boot is None:
+        # Interactive/legacy launches: fresh boot doc on every launch.
+        for name in ("CLAUDE.md", "AGENTS.md"):
+            atomic_write(work_dir / name, content)
+    else:
+        # Conversation launches: exact committed bytes, untouched when the
+        # files already match, atomically restored when they do not.
+        conversation_boot.write_boot_files(work_dir, content)
 
     # Adapter seam: emitted config, plugin path resolution, always-on and
     # sandbox-only JSON merges — the same permission/config files a normal

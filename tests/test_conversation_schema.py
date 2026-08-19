@@ -2,6 +2,7 @@
 """Feature #24 conversation schema, transition, and rebuild contracts."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import sys
@@ -1148,6 +1149,7 @@ class SnapshotPolicyTest(ConversationDbCase):
         "conversations",
         "active_shell_chats",
         "conversation_git_targets",
+        "conversation_boot_snapshots",
         "conversation_messages",
         "conversation_runs",
         "conversation_events",
@@ -1237,6 +1239,175 @@ class SnapshotPolicyTest(ConversationDbCase):
             "PRAGMA foreign_key_check"
         ).fetchall(), [])
         target.close()
+
+
+class BootSnapshotSchemaCase(ConversationDbCase):
+    """Spec #163 conversation_boot_snapshots schema contract."""
+
+    MIGRATION = MIGRATIONS / "0224_conversation_boot_snapshots.sql"
+    DIGEST = hashlib.sha256(b"boot content").hexdigest()
+
+    def bind(self, conversation: str, **overrides) -> None:
+        row = {
+            "conversation_id": conversation,
+            "content": "boot content",
+            "content_sha256": self.DIGEST,
+            "content_bytes": len(b"boot content"),
+            "format_version": 1,
+            "binding_origin": "new_conversation",
+        }
+        row.update(overrides)
+        self.con.execute(
+            "INSERT INTO conversation_boot_snapshots "
+            "(conversation_id,content,content_sha256,content_bytes,"
+            "format_version,binding_origin) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                row["conversation_id"],
+                row["content"],
+                row["content_sha256"],
+                row["content_bytes"],
+                row["format_version"],
+                row["binding_origin"],
+            ),
+        )
+
+    def test_round_trip_and_bound_at_default(self) -> None:
+        conversation = self.add_conversation()
+        self.bind(conversation)
+        row = self.con.execute(
+            "SELECT content,content_sha256,content_bytes,format_version,"
+            "binding_origin,bound_at FROM conversation_boot_snapshots "
+            "WHERE conversation_id=?",
+            (conversation,),
+        ).fetchone()
+        self.assertEqual(
+            tuple(row)[:5],
+            ("boot content", self.DIGEST, 12, 1, "new_conversation"),
+        )
+        self.assertIsNotNone(row[5])
+
+    def test_one_snapshot_per_conversation(self) -> None:
+        conversation = self.add_conversation()
+        self.bind(conversation)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.bind(conversation, binding_origin="legacy_first_resume")
+
+    def test_digest_must_be_lowercase_hex_sha256(self) -> None:
+        conversation = self.add_conversation()
+        for bad in ("x" * 64, "A" + self.DIGEST[1:], self.DIGEST[:63]):
+            with self.subTest(digest=bad):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.bind(conversation, content_sha256=bad)
+
+    def test_content_is_bounded_and_non_empty(self) -> None:
+        conversation = self.add_conversation()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.bind(conversation, content="", content_bytes=0)
+        oversized = "a" * (1048576 + 1)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.bind(
+                conversation,
+                content=oversized,
+                content_bytes=len(oversized),
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.bind(conversation, content="ok", content_bytes=1048577)
+
+    def test_content_bytes_agrees_with_utf8_bytes(self) -> None:
+        conversation = self.add_conversation()
+        text = "boot ünïcode"  # 13 chars, 15 UTF-8 bytes
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.bind(conversation, content=text, content_bytes=len(text))
+        self.bind(
+            conversation,
+            content=text,
+            content_bytes=len(text.encode("utf-8")),
+        )
+
+    def test_format_version_and_origin_are_constrained(self) -> None:
+        conversation = self.add_conversation()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.bind(conversation, format_version=0)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.bind(conversation, binding_origin="fresh_render")
+
+    def test_snapshot_is_immutable(self) -> None:
+        conversation = self.add_conversation()
+        self.bind(conversation)
+        for column, value in (
+            ("content", "tampered"),
+            ("content_sha256", "f" * 64),
+            ("content_bytes", 99),
+            ("format_version", 2),
+            ("binding_origin", "legacy_first_resume"),
+            ("bound_at", "1999-01-01 00:00:00"),
+        ):
+            with self.subTest(column=column):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.con.execute(
+                        "UPDATE conversation_boot_snapshots "
+                        f"SET {column}=? WHERE conversation_id=?",
+                        (value, conversation),
+                    )
+
+    def test_snapshot_follows_conversation_delete_cascade(self) -> None:
+        conversation = self.add_conversation()
+        self.bind(conversation)
+        self.con.execute(
+            "DELETE FROM conversations WHERE conversation_id=?",
+            (conversation,),
+        )
+        self.assertIsNone(
+            self.con.execute(
+                "SELECT 1 FROM conversation_boot_snapshots "
+                "WHERE conversation_id=?",
+                (conversation,),
+            ).fetchone(),
+        )
+
+    def test_migration_leaves_legacy_conversations_unbound(self) -> None:
+        legacy = sqlite3.connect(":memory:")
+        legacy.row_factory = sqlite3.Row
+        apply_schema(legacy, through="0223_model_default_effort_binding.sql")
+        legacy.execute(
+            "INSERT INTO users (user_id, username) VALUES (1,'operator')"
+        )
+        legacy.execute(
+            "INSERT INTO shells "
+            "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+            "VALUES (1,'Dev','dev1','dev','prompt',1)"
+        )
+        legacy.execute(
+            "INSERT INTO conversations "
+            "(shell_id,owner_user_id,harness,worktree,state,"
+            "creation_idempotency_key,creation_request_hash) "
+            "VALUES (1,1,'codex','/tmp/worktree-1','idle','legacy','legacy-h')"
+        )
+        legacy.executescript(self.MIGRATION.read_text())
+        legacy.execute("PRAGMA foreign_keys=ON")
+        conversation = legacy.execute(
+            "SELECT conversation_id FROM conversations"
+        ).fetchone()[0]
+        self.assertIsNone(
+            legacy.execute(
+                "SELECT 1 FROM conversation_boot_snapshots "
+                "WHERE conversation_id=?",
+                (conversation,),
+            ).fetchone(),
+        )
+        self.assertEqual(
+            tuple(
+                legacy.execute(
+                    "SELECT state,harness FROM conversations"
+                ).fetchone()
+            ),
+            ("idle", "codex"),
+        )
+        self.assertEqual(
+            legacy.execute("PRAGMA foreign_key_check").fetchall(), []
+        )
+        legacy.close()
 
 
 if __name__ == "__main__":
