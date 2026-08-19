@@ -372,6 +372,27 @@ sc_devkit_help_form() {
   return 1
 }
 
+# Shared preflight for every host-side broker's `up`. The brokers write
+# pid/log/sock into $ENGINE/run — a bind-mounted dir that a sudo restart
+# (root-owned) or sandbox-side write (container-mapped uid) can leave
+# unreachable for the invoking user. That used to fail the log redirect and
+# pid write with "Permission denied" while `up` still printed "up"; restart
+# health then reported the cryptic "live broker has no recognized supervisor".
+# Clear the stale artifacts, prove run/ is writable, and fail fast with the
+# remediation instead of lying about the start.
+sc_broker_preflight() {  # $1 = label, $2 = pidfile, $3 = logfile, $4 = sock
+  if ! mkdir -p "$ENGINE/run" 2>/dev/null || [ ! -w "$ENGINE/run" ]; then
+    echo "✗ $1: $ENGINE/run is not writable by $(id -un) — stale from a sudo restart or a container-mapped write" >&2
+    echo "  fix: sudo chown -R $(id -u):$(id -g) '$ENGINE/run'" >&2
+    return 1
+  fi
+  if ! rm -f "$2" "$3" "$4" 2>/dev/null; then
+    echo "✗ $1: stale broker artifacts in $ENGINE/run are not removable by $(id -un) — stale from a sudo restart or a container-mapped write" >&2
+    echo "  fix: sudo rm -f '$2' '$3' '$4' && sudo chown -R $(id -u):$(id -g) '$ENGINE/run'" >&2
+    return 1
+  fi
+}
+
 # ── Windows VM broker (HOST-side; drives the test VM for sandboxed forks) ──────
 # A separate host process — the sandbox server can't hold the ssh key or reach
 # libvirt. It listens on a unix socket in the bind-mounted engine dir so
@@ -399,7 +420,7 @@ sc_vm_broker_up() {
     echo "→ vm-broker: no VM linked (instance.json has no \`vm\` block) — nothing to serve"; return 0
   fi
   if sc_vm_broker_alive; then echo "→ vm-broker already serving $("$PY" "$S/vm.py" sock)"; return 0; fi
-  mkdir -p "$ENGINE/run"
+  sc_broker_preflight vm-broker "$VM_BROKER_PID" "$ENGINE/run/vm-broker.log" "$("$PY" "$S/vm.py" sock)" || return 1
   nohup "$PY" "$ENGINE/api/vm_broker.py" >"$ENGINE/run/vm-broker.log" 2>&1 &
   echo $! > "$VM_BROKER_PID"
   echo "→ vm-broker up (pid $!) · socket $("$PY" "$S/vm.py" sock) · log $ENGINE/run/vm-broker.log"
@@ -477,7 +498,7 @@ sc_ts_broker_up() {
     echo "→ ts-broker: no tailnet linked (instance.json has no \`ts\` block) — nothing to serve"; return 0
   fi
   if sc_ts_broker_alive; then echo "→ ts-broker already serving $("$PY" "$S/ts.py" sock)"; return 0; fi
-  mkdir -p "$ENGINE/run"
+  sc_broker_preflight ts-broker "$TS_BROKER_PID" "$ENGINE/run/ts-broker.log" "$("$PY" "$S/ts.py" sock)" || return 1
   nohup "$PY" "$ENGINE/api/ts_broker.py" >"$ENGINE/run/ts-broker.log" 2>&1 &
   echo $! > "$TS_BROKER_PID"
   echo "→ ts-broker up (pid $!) · socket $("$PY" "$S/ts.py" sock) · log $ENGINE/run/ts-broker.log"
@@ -550,7 +571,7 @@ sc_pm2_broker_up() {
     echo "→ pm2-broker: no process stack linked (instance.json has no \`pm2\` block) — nothing to serve"; return 0
   fi
   if sc_pm2_broker_alive; then echo "→ pm2-broker already serving $("$PY" "$S/pm2.py" sock)"; return 0; fi
-  mkdir -p "$ENGINE/run"
+  sc_broker_preflight pm2-broker "$PM2_BROKER_PID" "$ENGINE/run/pm2-broker.log" "$("$PY" "$S/pm2.py" sock)" || return 1
   nohup "$PY" "$ENGINE/api/pm2_broker.py" >"$ENGINE/run/pm2-broker.log" 2>&1 &
   echo $! > "$PM2_BROKER_PID"
   echo "→ pm2-broker up (pid $!) · socket $("$PY" "$S/pm2.py" sock) · log $ENGINE/run/pm2-broker.log"
@@ -621,7 +642,7 @@ sc_db_broker_up() {
     echo "→ db-broker: no live DB linked (instance.json has no \`db\` block) — nothing to serve"; return 0
   fi
   if sc_db_broker_alive; then echo "→ db-broker already serving $("$PY" "$S/dbq.py" sock)"; return 0; fi
-  mkdir -p "$ENGINE/run"
+  sc_broker_preflight db-broker "$DB_BROKER_PID" "$ENGINE/run/db-broker.log" "$("$PY" "$S/dbq.py" sock)" || return 1
   nohup "$PY" "$ENGINE/api/db_broker.py" >"$ENGINE/run/db-broker.log" 2>&1 &
   echo $! > "$DB_BROKER_PID"
   echo "→ db-broker up (pid $!) · socket $("$PY" "$S/dbq.py" sock) · log $ENGINE/run/db-broker.log"
