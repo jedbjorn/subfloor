@@ -2,6 +2,7 @@
 """Managed OpenCode server lifecycle and connected-provider projection."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -17,7 +18,8 @@ from conversation_adapters import opencode  # noqa: E402
 
 
 class FakeProcess:
-    def __init__(self) -> None:
+    def __init__(self, pid: int = 4321) -> None:
+        self.pid = pid
         self.returncode = None
         self.terminated = False
         self.killed = False
@@ -48,6 +50,12 @@ class OpenCodeServerTest(unittest.TestCase):
         )
         self.log_patch.start()
         self.addCleanup(self.log_patch.stop)
+        self.state_path = Path(self.tmp.name) / "opencode-server.json"
+        self.state_patch = mock.patch.object(
+            opencode, "SERVER_STATE", self.state_path
+        )
+        self.state_patch.start()
+        self.addCleanup(self.state_patch.stop)
         opencode._SERVER_PROCESS = None
         opencode._SERVER_PASSWORD = None
         opencode._SERVER_LOG_HANDLE = None
@@ -101,6 +109,66 @@ class OpenCodeServerTest(unittest.TestCase):
         opencode.stop_server()
         self.assertTrue(process.terminated)
         self.assertFalse(process.killed)
+
+    def test_orphaned_managed_server_is_readopted_via_recorded_password(self):
+        self.state_path.write_text(
+            json.dumps({"pid": os.getpid(), "password": "orphan-secret"})
+        )
+        with mock.patch.object(
+            opencode,
+            "_server_healthy",
+            side_effect=lambda password: password == "orphan-secret",
+        ), mock.patch.object(opencode.subprocess, "Popen") as spawn, \
+                mock.patch.object(opencode, "_reap_orphan_server") as reap:
+            password = opencode.ensure_server()
+
+        self.assertEqual(password, "orphan-secret")
+        spawn.assert_not_called()
+        reap.assert_not_called()
+        self.assertTrue(self.state_path.exists())
+
+    def test_unreachable_orphan_is_reaped_then_respawned(self):
+        self.state_path.write_text(
+            json.dumps({"pid": 4322, "password": "stale-secret"})
+        )
+        process = FakeProcess(pid=9999)
+        checks = iter([False, False, False, True])
+        with mock.patch.dict(os.environ, {}, clear=False), \
+                mock.patch.object(
+                    opencode, "_server_healthy",
+                    side_effect=lambda _password: next(checks),
+                ), mock.patch.object(
+                    opencode, "_pid_is_opencode_serve", return_value=True
+                ) as identify, mock.patch.object(
+                    opencode, "_reap_orphan_server"
+                ) as reap, mock.patch.object(
+                    opencode.shutil, "which", return_value="/bin/opencode"
+                ), mock.patch.object(
+                    opencode.secrets, "token_urlsafe", return_value="fresh-secret"
+                ), mock.patch.object(
+                    opencode.subprocess, "Popen", return_value=process
+                ):
+            os.environ.pop("OPENCODE_SERVER_PASSWORD", None)
+            password = opencode.ensure_server(timeout=1)
+
+        self.assertEqual(password, "fresh-secret")
+        identify.assert_called_once_with(4322)
+        reap.assert_called_once_with(4322)
+        self.assertEqual(
+            json.loads(self.state_path.read_text()),
+            {"pid": 9999, "password": "fresh-secret"},
+        )
+
+    def test_stop_server_preserves_state_of_adopted_orphan(self):
+        self.state_path.write_text(
+            json.dumps({"pid": 4322, "password": "orphan-secret"})
+        )
+        opencode.stop_server()
+        self.assertTrue(self.state_path.exists())
+
+        opencode._SERVER_PROCESS = FakeProcess()
+        opencode.stop_server()
+        self.assertFalse(self.state_path.exists())
 
     def test_connected_models_excludes_disconnected_and_inactive_routes(self):
         got = opencode.connected_models(
@@ -180,6 +248,63 @@ class OpenCodeServerTest(unittest.TestCase):
             },
         )
         self.assertEqual(model["cli_version"], "1.18.9")
+
+    def test_connected_models_resolves_family_from_model_api_npm(self):
+        # opencode 1.18.x /provider projection carries the SDK package at
+        # model.api.npm; no provider carries a top-level npm (subfloor#1240).
+        got = opencode.connected_models({
+            "_sc_cli_version": "1.18.18",
+            "connected": ["halo"],
+            "all": [{
+                "id": "halo",
+                "models": {
+                    "qwen3.8-27b-q8-mtp2": {
+                        "name": "Qwen3.8 27B Q8 (MTP depth 2)",
+                        "api": {"npm": "@ai-sdk/openai-compatible"},
+                        "variants": {
+                            "none": {"reasoningEffort": "none"},
+                            "medium": {"reasoningEffort": "medium"},
+                        },
+                    }
+                },
+            }],
+        })
+
+        self.assertEqual(len(got), 1)
+        model = got[0]
+        self.assertEqual(model["supported_efforts"], ["none", "medium"])
+        self.assertEqual(
+            model["adapter_metadata"]["provider_family"], "openai-ai-sdk"
+        )
+        self.assertEqual(
+            model["adapter_metadata"]["variant_options_by_effort"],
+            {
+                "none": {"reasoningEffort": "none"},
+                "medium": {"reasoningEffort": "medium"},
+            },
+        )
+
+    def test_connected_models_model_api_npm_wins_over_provider_npm(self):
+        got = opencode.connected_models({
+            "connected": ["mixed"],
+            "all": [{
+                "id": "mixed",
+                "npm": "@ai-sdk/anthropic",
+                "models": {
+                    "openai-backed": {
+                        "api": {"npm": "@ai-sdk/openai-compatible"},
+                        "variants": {"low": {"reasoningEffort": "low"}},
+                    }
+                },
+            }],
+        })
+
+        self.assertEqual(len(got), 1)
+        model = got[0]
+        self.assertEqual(model["supported_efforts"], ["low"])
+        self.assertEqual(
+            model["adapter_metadata"]["provider_family"], "openai-ai-sdk"
+        )
 
     def test_variant_id_collision_rejects_every_member_before_value_admission(self):
         admitted = opencode.admitted_variants(
