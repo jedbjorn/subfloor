@@ -176,12 +176,17 @@ RUN echo "harness epoch: ${SC_HARNESS_EPOCH}" \
       | env KIMI_INSTALL_DIR=/usr/local KIMI_NO_MODIFY_PATH=1 bash
 
 # A user matching the host uid/gid so bind-mounted files aren't root-owned.
-# A host GID may already exist in the base image, so creating it unconditionally
-# can fail the build. Reuse an existing GID; only create when absent. The group's
-# *name* is irrelevant; only the numeric GID must match the host for bind-mounted
-# ownership to line up.
+# A host GID or UID may already exist in the base image — sudo builds pass
+# UID/GID 0, which the image's root already owns — so creating either
+# unconditionally can fail the build. Reuse existing IDs; only create when
+# absent. The *names* are irrelevant; only the numeric IDs must match the host
+# for bind-mounted ownership to line up. HOME is /home/${SC_USER} regardless
+# (see ENV below), so ensure that dir even when the user pre-existed (root's
+# real home is /root).
 RUN if ! getent group ${SC_GID} >/dev/null; then groupadd -g ${SC_GID} ${SC_USER}; fi \
- && useradd -m -u ${SC_UID} -g ${SC_GID} -s /bin/bash ${SC_USER}
+ && if ! getent passwd ${SC_UID} >/dev/null; then useradd -m -u ${SC_UID} -g ${SC_GID} -s /bin/bash ${SC_USER}; fi \
+ && mkdir -p /home/${SC_USER} \
+ && chown ${SC_UID}:${SC_GID} /home/${SC_USER}
 
 USER ${SC_USER}
 ENV HOME=/home/${SC_USER}
