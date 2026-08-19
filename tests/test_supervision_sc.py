@@ -615,6 +615,44 @@ class RestrictedLaunchTests(unittest.TestCase):
         self.assertIn("  vm-broker: failed (systemd restart)", result.stdout)
         self.assertIn("  postgres: skipped (unconfigured)", result.stdout)
 
+    def test_broker_up_clears_stale_run_artifacts_and_starts(self):
+        self.fx.env["SC_TEST_CONFIGURED"] = "ts"
+        run_dir = self.fx.engine / "run"
+        run_dir.mkdir()
+        # Stale leftovers from a dead broker; the socket path the engine
+        # resolves must point inside run/ so preflight clears it.
+        self.fx.env["SC_TEST_TS_SOCK"] = str(run_dir / "ts-broker.sock")
+        for name in ("ts-broker.pid", "ts-broker.log", "ts-broker.sock"):
+            (run_dir / name).write_text("stale\n")
+
+        result = self.fx.run("ts-broker-up")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("→ ts-broker up (pid ", result.stdout)
+        self.assertNotEqual((run_dir / "ts-broker.pid").read_text(), "stale\n")
+        self.assertFalse((run_dir / "ts-broker.sock").exists())
+
+    def test_broker_up_refuses_unwritable_run_dir_with_remediation(self):
+        self.fx.env["SC_TEST_CONFIGURED"] = "ts"
+        run_dir = self.fx.engine / "run"
+        run_dir.mkdir()
+        (run_dir / "ts-broker.log").write_text("stale\n")
+        # A sudo restart or container-mapped write leaves run/ unreachable for
+        # the invoking user; up must fail fast and say how to fix it instead
+        # of printing "up" for a broker that never started.
+        run_dir.chmod(0o555)
+        try:
+            result = self.fx.run("ts-broker-up")
+        finally:
+            # Restore writability before the fixture's rmtree cleanup runs.
+            run_dir.chmod(0o755)
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn("→ ts-broker up", result.stdout)
+        self.assertIn("✗ ts-broker:", result.stderr)
+        self.assertIn("sudo chown", result.stderr)
+        self.assertFalse((run_dir / "ts-broker.pid").exists())
+
     def test_restart_replaces_configured_postgres_identity(self):
         self.fx.configure_pg()
         initial = self.fx.run("pg-up")
