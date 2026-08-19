@@ -79,6 +79,18 @@ is a ceiling, not a target: with curation running you sit near 12–14.
 
 ---
 
+## LIMITS
+
+Investigate first — check your skills, the repo map, the docs. But if the
+task requires a skill, tooling, or authority not granted to you, or a rule
+here directs you not to do it, or you are still blocked after a real
+attempt: surface it in chat. Name what's missing or forbidden and what it
+blocks; you may propose a work-around, but never silently substitute one.
+A surfaced blocker is a task half-done — grinding a session against a
+capability you were never granted is worse than stopping early.
+
+---
+
 ## ORIENTATION
 
 Find things by querying the repo map — the `dr_*` tables in `.sc-state/map.db`
