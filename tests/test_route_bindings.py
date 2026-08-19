@@ -262,6 +262,58 @@ class BindingIdentityTest(unittest.TestCase):
         self.assertEqual(implicit["evidence_digest"], "4" * 64)
         self.assertEqual(implicit["control_state"], "controlled")
 
+    def test_controlled_omitted_effort_falls_back_to_model_default(self):
+        # Decision #223: omitted effort on a controlled exact route resolves
+        # high where advertised, else the reserved Model default — so a route
+        # without high still binds instead of raising unsupported_thinking_level.
+        runtime = compatible_runtime("0.145.0", harness="codex")
+        no_high = self.controlled_row(
+            supported_efforts='["low","medium"]',
+            effort_metadata=json.dumps({
+                "supported": ["low", "medium"],
+                "default": None,
+                "digests": {"low": "3" * 64, "medium": "6" * 64},
+                "native_variant_ids": {},
+            }),
+        )
+        binding, _ = resolve_controlled_v2(
+            no_high, "codex", "gpt-test", now=self.NOW,
+            runtime_status=runtime,
+        )
+        self.assertEqual(binding["requested_effort"], "default")
+        self.assertEqual(binding["effective_effort"], "default")
+        self.assertIsNone(binding["evidence_digest"])
+        self.assertIsNone(binding["native_variant_id"])
+
+        # A no-thinking route binds through the same chain with the same
+        # identity as an explicit Model default.
+        empty = self.controlled_row(
+            supported_efforts="[]",
+            effort_metadata=json.dumps({
+                "supported": [], "default": None,
+                "digests": {}, "native_variant_ids": {},
+            }),
+        )
+        omitted, omitted_digest = resolve_controlled_v2(
+            empty, "codex", "gpt-test", now=self.NOW,
+            runtime_status=runtime,
+        )
+        explicit, explicit_digest = resolve_controlled_v2(
+            empty, "codex", "gpt-test", "default", now=self.NOW,
+            runtime_status=runtime,
+        )
+        self.assertEqual(omitted["requested_effort"], "default")
+        self.assertEqual(omitted, explicit)
+        self.assertEqual(omitted_digest, explicit_digest)
+
+        # An explicitly stored unadvertised level still fails closed.
+        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+            resolve_controlled_v2(
+                empty, "codex", "gpt-test", "high", now=self.NOW,
+                runtime_status=runtime,
+            )
+        self.assertEqual(raised.exception.code, "unsupported_thinking_level")
+
     def test_model_default_bypasses_only_the_effort_value_gates(self):
         row = self.controlled_row(
             supported_efforts="[]",

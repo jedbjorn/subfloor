@@ -700,18 +700,10 @@ def set_flavor_default(con, body) -> tuple[bool, dict | None]:
                 and effort not in supported
                 and effort != route_bindings.DEFAULT_EFFORT
             ):
-                effort = "high" if "high" in supported else None
-                if effort is None:
-                    return False, _flavor_default_error(
-                        "unsupported_thinking_level",
-                        "Select an explicit supported Thinking level before "
-                        "saving this model",
-                        {"harness": harness, "model": model,
-                         "requested_effort": None,
-                         "supported_efforts": supported,
-                         "default_effort": route_bindings.DEFAULT_EFFORT,
-                         "remediation": "select a supported Thinking level or "
-                         "'default' (Model default)"})
+                # Decision #223: omitted/unselected effort is resolved by the
+                # bind-time chain in _resolve_v2 (high where advertised, else
+                # Model default) — no hard 422 for unadvertised omitted-high.
+                effort = None
             try:
                 route_proof = route_bindings._probe_controlled_route(
                     harness, model)
