@@ -435,8 +435,15 @@ function thinkingLevelState(harness, catalog, model, preferred = null) {
   ];
   const fresh = Boolean(
     route && route.availability === "available" && !catalog.stale);
+  // Decision #223: preselect the bind-time fallback chain — a stored effort
+  // (manual override) wins, then high where advertised, then the reserved
+  // Model default; no selection only when nothing is advertised.  Options
+  // stay listed whenever the route advertises any levels.
   const selected = supported.includes(preferred)
-    ? preferred : supported.includes("high") ? "high" : "";
+    ? preferred
+    : supported.includes("high")
+      ? "high"
+      : supported.includes("default") ? "default" : "";
   const support = route?.harness_support_state
     ? ` Support: ${route.harness_support_state}`
       + (route.harness_version ? ` (${route.harness_version}).` : ".")

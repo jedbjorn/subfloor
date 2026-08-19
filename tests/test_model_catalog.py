@@ -642,10 +642,11 @@ class RoutePersistenceTest(unittest.TestCase):
              "gpt-5.6-sol", "--effort", "high"])
 
     def test_empty_effort_list_alias_admits_only_model_default(self):
-        # Spec #160: an alias that declares no effort list persists
-        # supported_efforts=[]; the reserved 'default' still binds (no effort
-        # transport), while every named level — explicit or the omitted-effort
-        # 'high' rule — keeps failing membership.
+        # Spec #160 + decision #223: an alias that declares no effort list
+        # persists supported_efforts=[]; the reserved 'default' still binds
+        # (no effort transport), omitted effort falls back to it through the
+        # bind-time chain, and every explicit named level keeps failing
+        # membership.
         fresh = {"fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
                  "harnesses": {"kimi": {"models": [mc._entry(
                      "kimi-code/legacy", source="kimi-config",
@@ -687,11 +688,14 @@ class RoutePersistenceTest(unittest.TestCase):
              "kimi-code/legacy", "--effort", "default"])
         self.assertEqual(
             route_bindings.digest_json(binding), bound["binding_digest"])
-        for rejected in (named, omitted):
-            self.assertFalse(rejected["ok"])
-            self.assertEqual(rejected["code"], "unsupported_thinking_level")
-            self.assertEqual(
-                rejected["details"]["default_effort"], "default")
+        # Decision #223: the omitted effort resolves to the reserved Model
+        # default with the exact identity of an explicit 'default'.
+        self.assertTrue(omitted["ok"])
+        self.assertEqual(omitted["binding"], binding)
+        self.assertEqual(omitted["binding_digest"], bound["binding_digest"])
+        self.assertFalse(named["ok"])
+        self.assertEqual(named["code"], "unsupported_thinking_level")
+        self.assertEqual(named["details"]["default_effort"], "default")
         self.assertEqual(named["details"]["requested_effort"], "high")
 
     def test_default_binds_alongside_advertised_named_efforts(self):

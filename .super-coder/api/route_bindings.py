@@ -913,17 +913,22 @@ def _resolve_v2(
         validate_v2_binding(binding)
         return binding, digest_json(binding)
 
-    requested = "high" if effort is None else effort.strip()
-    if harness == "opencode":
-        requested = _ascii_lower(requested)
-    else:
-        requested = requested.lower()
-    if not requested:
-        raise RouteResolutionError(
-            "unsupported_thinking_level",
-            "Thinking level must be non-blank",
-            {"harness": harness, "model": model},
-        )
+    # Decision #223: an omitted effort is resolved against the route's
+    # advertised levels below (high where advertised, else Model default);
+    # only an explicitly supplied effort is normalized and validated here.
+    requested: str | None = None
+    if effort is not None:
+        requested = effort.strip()
+        if harness == "opencode":
+            requested = _ascii_lower(requested)
+        else:
+            requested = requested.lower()
+        if not requested:
+            raise RouteResolutionError(
+                "unsupported_thinking_level",
+                "Thinking level must be non-blank",
+                {"harness": harness, "model": model},
+            )
     if row is None:
         raise RouteResolutionError(
             "thinking_evidence_missing",
@@ -971,6 +976,12 @@ def _resolve_v2(
     _require_controlled_source(row, harness, model, runtime, proof)
 
     supported, effort_metadata = _supported_efforts(row)
+    if requested is None:
+        # Decision #223 bind-time fallback chain: omitted/unselected effort
+        # on a controlled exact route resolves high where advertised, else
+        # the reserved Model default (no effort transport) — every exact
+        # model stays bindable even with no thinking support.
+        requested = "high" if "high" in supported else DEFAULT_EFFORT
     if requested == DEFAULT_EFFORT:
         # Model default: the exact-model evidence, freshness, runtime, and
         # source gates above still apply; only the effort-value membership and

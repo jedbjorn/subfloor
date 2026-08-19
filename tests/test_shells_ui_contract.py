@@ -47,12 +47,14 @@ const catalog = {stale: false, harnesses: {codex: {models: [
   {id: "gpt-high", availability: "available", supported_efforts: ["low", "high"],
    harness_support_state: "tested", harness_version: "codex-cli 0.147.0"},
   {id: "gpt-explicit", availability: "available", supported_efforts: ["low", "medium"]},
+  {id: "gpt-plain", availability: "available", supported_efforts: []},
 ]}}};
 console.log(JSON.stringify({
   controlled: thinkingLevelState("codex", catalog, "gpt-high", "low"),
   defaulted: thinkingLevelState("codex", catalog, "gpt-high", null),
   explicit: thinkingLevelState("codex", catalog, "gpt-explicit", null),
   modelDefault: thinkingLevelState("codex", catalog, "gpt-explicit", "default"),
+  noThinking: thinkingLevelState("codex", catalog, "gpt-plain", null),
   harnessDefault: thinkingLevelState("codex", catalog, null, null),
   vibe: thinkingLevelState("vibe", catalog, "devstral", null),
   stale: thinkingLevelState("codex", {...catalog, stale: true}, "gpt-high", "high"),
@@ -63,9 +65,15 @@ console.log(JSON.stringify({
     assert result["controlled"]["supported"] == ["default", "low", "high"]
     assert result["defaulted"]["selected"] == "high"
     assert "Support: tested (codex-cli 0.147.0)" in result["defaulted"]["guidance"]
-    assert result["explicit"]["selected"] == ""
+    # Decision #223: with no stored preference the selector preselects the
+    # bind-time chain — high where advertised, else Model default.
+    assert result["explicit"]["selected"] == "default"
+    assert result["explicit"]["label"] == "Model default"
     assert result["explicit"]["disabled"] is False
     assert result["explicit"]["supported"] == ["default", "low", "medium"]
+    assert result["noThinking"]["selected"] == "default"
+    assert result["noThinking"]["disabled"] is False
+    assert result["noThinking"]["supported"] == ["default"]
     assert result["modelDefault"]["selected"] == "default"
     assert result["modelDefault"]["label"] == "Model default"
     assert "model-default" in result["modelDefault"]["guidance"]
