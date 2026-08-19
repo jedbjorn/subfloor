@@ -804,6 +804,37 @@ class FlavorDefaultsTest(unittest.TestCase):
         self.assertEqual(err["details"]["default_effort"], "default")
         self.assertEqual(self._row("planner", "codex")["effort"], "default")
 
+    def test_omitted_effort_resolves_by_fallback_chain(self) -> None:
+        # Decision #223: saving a model without an effort resolves high where
+        # advertised, else the reserved Model default — no more hard 422 on
+        # unadvertised omitted-high, so no-thinking models save and bind.
+        self._route("claude", "opus")
+        ok, err = server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "claude",
+                       "model": "opus"})
+        self.assertTrue(ok, err)
+        self.assertEqual(self._row("planner", "claude")["effort"], "high")
+
+        self._route("codex", "gpt-plain", efforts=())
+        ok, err = server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "codex",
+                       "model": "gpt-plain"})
+        self.assertTrue(ok, err)
+        row = self._row("planner", "codex")
+        self.assertEqual((row["model"], row["effort"]), ("gpt-plain", "default"))
+        projection = server.get_flavor_defaults(self.con)["flavors"]["planner"]
+        by_harness = {r["harness"]: r for r in projection}
+        self.assertEqual(by_harness["codex"]["effort_state"], "controlled")
+        self.assertEqual(by_harness["codex"]["effective_effort"], "default")
+
+        # A no-high route with named levels also resolves to Model default.
+        self._route("codex", "gpt-lowonly", efforts=("low",))
+        ok, err = server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "codex",
+                       "model": "gpt-lowonly"})
+        self.assertTrue(ok, err)
+        self.assertEqual(self._row("planner", "codex")["effort"], "default")
+
     def test_unsupported_effort_writes_nothing(self) -> None:
         before = tuple(self._row("planner", "claude"))
         self._route("claude", "opus-next")
