@@ -1,16 +1,21 @@
----
-name: curate
-description: The periodic L&S sweep. Run when the STATUS L&S line says "curation due" — resolve contradictions, merge entries stating one rule, recommend recurring processes upstream, move environment facts out, then stamp `sc mem curated`. Yours alone; never delegate it.
-category: substrate
-common: true
----
+-- 0220 — curate: name the recommendation route as the authorized exception
+-- to the FnB-first gate in `issue_reporting` (absorbed from the boot doc's
+-- CURATION section under the directive-compression dedupe).
 
-# curate — the L&S sweep
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'curate',
+  'The periodic L&S sweep. Run when the STATUS L&S line says "curation due" — resolve contradictions, merge entries stating one rule, recommend recurring processes upstream, move environment facts out, then stamp `sc mem curated`. Yours alone; never delegate it.',
+  'substrate',
+  NULL,
+  1,
+  '# curate — the L&S sweep
 
 Write-time triage (`--supersedes` / `--new`) catches contradiction and
 restatement pairwise, at the moment of writing. It **cannot** catch the
 emergent cluster: five entries can each be a valid distinct rule and only in
-aggregate be five instances of one principle. That is this pass's job, along
+aggregate be five instances of one principle. That is this pass''s job, along
 with recommendation, category drift, and size drift.
 
 **Yours alone.** Law 3 and Law 7 reserve curation to the shell. Never hand this
@@ -124,4 +129,12 @@ issues do not bypass the cap by deleting knowledge before its replacement ships.
 
 The trigger firing often does not mean the threshold is wrong; it means entries
 are being written faster than they are reconciled. Fix that at write time, with
-`--supersedes`.
+`--supersedes`.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;

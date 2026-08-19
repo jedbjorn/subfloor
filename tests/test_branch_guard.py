@@ -190,8 +190,8 @@ class OperatorDocumentationTest(unittest.TestCase):
 
     def test_launched_shell_boot_keeps_branch_only_guidance(self):
         body = (ROOT / ".super-coder" / "templates" / "boot.md").read_text()
-        self.assertIn("vibe included", body)
-        self.assertIn("Create a branch and retry", body)
+        self.assertIn("Branch before you build", body)
+        self.assertIn("pre-commit hook refuses the commit on every harness", body)
         self.assertNotIn("git commit --no-verify", body)
 
 
