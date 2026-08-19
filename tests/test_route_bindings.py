@@ -126,7 +126,7 @@ def route_schema(path: str | Path = ":memory:") -> sqlite3.Connection:
     ).read_text())
     con.executescript((
         ROOT / ".super-coder" / "migrations" /
-        "0220_model_default_effort_binding.sql"
+        "0223_model_default_effort_binding.sql"
     ).read_text())
     return con
 

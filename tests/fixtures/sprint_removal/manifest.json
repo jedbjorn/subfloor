@@ -115,7 +115,7 @@
     ".super-coder/migrations/0215_reseed_sprint_binding_guidance.sql",
     ".super-coder/migrations/0216_sprint_binding_provenance.sql",
     ".super-coder/migrations/0218_sprint_binding_support_provenance.sql",
-    ".super-coder/migrations/0220_model_default_effort_binding.sql"
+    ".super-coder/migrations/0223_model_default_effort_binding.sql"
   ],
   "baseline_migration_ledger": {
     "count": 142,
