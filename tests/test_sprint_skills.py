@@ -67,6 +67,9 @@ GITHUB_CAPABILITY_RESEED = (
 BINDING_GUIDANCE_RESEED = (
     ENGINE / "migrations" / "0215_reseed_sprint_binding_guidance.sql"
 )
+DISPOSITION_VERBS_RESEED = (
+    ENGINE / "migrations" / "0222_reseed_sprint_pln_disposition_verbs.sql"
+)
 
 
 class SprintSkillTest(unittest.TestCase):
@@ -187,6 +190,7 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(migration)
             con.executescript(INFORMATIONAL_RECEIPT_RESEED.read_text())
             con.executescript(BINDING_GUIDANCE_RESEED.read_text())
+            con.executescript(DISPOSITION_VERBS_RESEED.read_text())
 
             for name in sorted(CONFORMANCE_OWNER_SKILLS):
                 with self.subTest(name=name):
@@ -239,6 +243,7 @@ class SprintSkillTest(unittest.TestCase):
             migration = INFORMATIONAL_RECEIPT_RESEED.read_text()
             con.executescript(migration)
             con.executescript(migration)
+            con.executescript(DISPOSITION_VERBS_RESEED.read_text())
 
             for name in sorted(HANDOFF_ROLE_SKILLS):
                 with self.subTest(name=name):
@@ -872,6 +877,7 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(DISPOSABLE_SHELL_BASE_RESEED.read_text())
             con.executescript(GITHUB_CAPABILITY_RESEED.read_text())
             con.executescript(BINDING_GUIDANCE_RESEED.read_text())
+            con.executescript(DISPOSITION_VERBS_RESEED.read_text())
 
             self.assertIsNotNone(
                 con.execute(
@@ -1000,6 +1006,61 @@ class SprintSkillTest(unittest.TestCase):
             row = con.execute(
                 "SELECT description,category,command,common,content,is_deleted "
                 "FROM skills WHERE name='sprint_dev'"
+            ).fetchone()
+            self.assertEqual(
+                (
+                    parsed["description"],
+                    parsed["category"],
+                    parsed["command"],
+                    parsed["common"],
+                    parsed["content"],
+                    0,
+                ),
+                tuple(row),
+            )
+        finally:
+            con.close()
+
+    def test_disposition_verbs_reseed_matches_asset_and_replays_idempotently(self):
+        con = sqlite3.connect(":memory:")
+        try:
+            con.executescript((ENGINE / "schema.sql").read_text())
+            for migration in sorted((ENGINE / "migrations").glob("*.sql")):
+                if migration.name >= "0222_reseed_sprint_pln_disposition_verbs.sql":
+                    break
+                con.executescript(migration.read_text())
+            con.execute(
+                "UPDATE skills SET description='stale',category='stale',"
+                "command='stale',common=1,content='no disposition verbs',"
+                "is_deleted=1 WHERE name='sprint_pln'"
+            )
+
+            migration = (
+                ENGINE
+                / "migrations"
+                / "0222_reseed_sprint_pln_disposition_verbs.sql"
+            ).read_text()
+            con.executescript(migration)
+            con.executescript(migration)
+            self.assertIn(
+                "sc sprint resolve-unit",
+                con.execute(
+                    "SELECT content FROM skills WHERE name='sprint_pln'"
+                ).fetchone()[0],
+            )
+            for later_migration in sorted(
+                (ENGINE / "migrations").glob("*.sql")
+            ):
+                if (
+                    later_migration.name
+                    > "0222_reseed_sprint_pln_disposition_verbs.sql"
+                ):
+                    con.executescript(later_migration.read_text())
+
+            parsed = seed_skills.parse_skill(ASSETS / "sprint_pln" / "SKILL.md")
+            row = con.execute(
+                "SELECT description,category,command,common,content,is_deleted "
+                "FROM skills WHERE name='sprint_pln'"
             ).fetchone()
             self.assertEqual(
                 (
@@ -1370,6 +1431,7 @@ class SprintSkillTest(unittest.TestCase):
             "decline",
             "complete-unit",
             "cancel-unit",
+            "resolve-unit",
             "register-pr",
             "reconcile-pr",
             "pause",
