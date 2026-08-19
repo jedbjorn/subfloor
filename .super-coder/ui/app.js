@@ -427,7 +427,12 @@ function thinkingLevelState(harness, catalog, model, preferred = null) {
   };
   const route = (catalog.harnesses?.[harness]?.models || [])
     .find((candidate) => candidate.id === model);
-  const supported = [...new Set(route?.supported_efforts || [])];
+  // Spec #160: the reserved Model default is always offered for a controlled
+  // exact route, alongside its freshly proven named values.
+  const supported = [
+    "default",
+    ...(route?.supported_efforts || []).filter((effort) => effort !== "default"),
+  ];
   const fresh = Boolean(
     route && route.availability === "available" && !catalog.stale);
   const selected = supported.includes(preferred)
@@ -438,16 +443,22 @@ function thinkingLevelState(harness, catalog, model, preferred = null) {
     : "";
   if (!fresh) return {
     disabled: true, selected, supported,
-    label: selected || "Refresh required",
+    label: selected ? thinkingLevelLabel(selected) : "Refresh required",
     guidance: "Refresh & verify Default Models before saving this route.",
   };
   return {
     disabled: false, selected, supported,
-    label: selected || "Choose Thinking level",
-    guidance: selected
-      ? `Thinking level ${selected} is proven for ${model}.${support}`
-      : "Choose a supported Thinking level before saving.",
+    label: selected ? thinkingLevelLabel(selected) : "Choose Thinking level",
+    guidance: !selected
+      ? "Choose a supported Thinking level before saving."
+      : selected === "default"
+        ? `${model} runs at its own model-default thinking level.${support}`
+        : `Thinking level ${selected} is proven for ${model}.${support}`,
   };
+}
+
+function thinkingLevelLabel(effort) {
+  return effort === "default" ? "Model default" : effort;
 }
 
 function dmModelPicker(harness, cat, row, save, onRouteChanged = () => {}) {
@@ -707,7 +718,7 @@ async function renderDefaultModels(root, s, catalogOverride = null) {
           }));
           for (const effort of state.supported) thinking.append(el("option", {
             value: effort,
-            textContent: effort,
+            textContent: thinkingLevelLabel(effort),
             selected: effort === state.selected,
           }));
         }
@@ -3820,7 +3831,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
       }));
       for (const effort of state.supported) effortSelect.append(el("option", {
         value: effort,
-        textContent: effort,
+        textContent: thinkingLevelLabel(effort),
         selected: effort === state.selected,
       }));
     }

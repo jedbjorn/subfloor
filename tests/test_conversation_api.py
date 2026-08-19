@@ -1402,6 +1402,71 @@ class ConversationResourceTest(ConversationApiCase):
                 0,
             )
 
+    def test_model_default_binds_route_with_no_advertised_efforts(self) -> None:
+        # Spec #160: conversation create admits 'default' on a route whose
+        # supported_efforts list is empty, and persists the controlled
+        # binding with requested=effective='default' and no effort digest.
+        with self.connect() as con:
+            status = self.runtime_status("codex")
+            now = datetime.now(timezone.utc).isoformat()
+            con.execute(
+                "INSERT INTO model_routes ("
+                "harness,selector,provider_model,source,availability,"
+                "headless_supported,high_effort_supported,supported_efforts,"
+                "default_effort,cli_version,last_seen_at,stale,generation_id,"
+                "evidence_kind,evidence_digest,source_fingerprint,"
+                "harness_version,harness_compatibility,selector_binding,"
+                "effort_metadata,adapter_metadata) VALUES ("
+                "'codex','gpt-plain','gpt-plain','codex-cache','available',"
+                "1,0,'[]',NULL,?,?,0,?,"
+                "'codex-model-cache',?,?,?,'verified',?,?,?)",
+                (
+                    f"codex {status['version']}", now, "a" * 32,
+                    "e" * 64, "f" * 64, status["version"],
+                    json.dumps({"kind": "exact-model", "selector": "gpt-plain"}),
+                    json.dumps({
+                        "supported": [], "default": None,
+                        "digests": {}, "native_variant_ids": {},
+                    }),
+                    "{}",
+                ),
+            )
+        status, _, created = self.request(
+            "POST", "/api/conversations",
+            body={"shell_id": 1, "harness": "codex", "model": "gpt-plain",
+                  "effort": " DEFAULT "},
+            key="model-default",
+        )
+        self.assertEqual(status, 201, created)
+        self.assertEqual(created["route"]["effort"], "default")
+        self.assertEqual(created["route"]["control_state"], "controlled")
+        with self.connect() as con:
+            row = con.execute(
+                "SELECT route_binding FROM conversations "
+                "WHERE creation_idempotency_key='model-default'"
+            ).fetchone()
+        binding = json.loads(row["route_binding"])
+        conversation_routes.route_bindings.validate_v2_binding(binding)
+        self.assertEqual(binding["requested_effort"], "default")
+        self.assertEqual(binding["effective_effort"], "default")
+        self.assertIsNone(binding["evidence_digest"])
+        self.assertEqual(
+            conversation_routes.route_bindings.digest_json(binding),
+            created["route"]["binding_digest"],
+        )
+
+        status, _, error = self.request(
+            "POST", "/api/conversations",
+            body={"shell_id": 1, "harness": "codex", "model": "gpt-plain",
+                  "effort": "high"},
+            key="model-default-named",
+        )
+        self.assertEqual(status, 422, error)
+        self.assertEqual(
+            error["error"]["code"], "unsupported_thinking_level")
+        self.assertEqual(
+            error["error"]["details"]["default_effort"], "default")
+
     def test_legacy_creation_key_replays_without_v2_resolution(self) -> None:
         with self.connect() as con:
             con.execute(

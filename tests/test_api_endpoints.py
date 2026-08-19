@@ -696,9 +696,11 @@ class FlavorDefaultsTest(unittest.TestCase):
             "WHERE flavor=? AND harness=?", (flavor, harness)).fetchone()
 
     def _route(self, harness, selector, *, availability="available", stale=0,
-               seen_at=None):
+               seen_at=None, efforts=("low", "high")):
         seen_at = seen_at or datetime.now(timezone.utc).isoformat()
         if harness != "vibe":
+            supported = list(efforts)
+            digests = {"low": "d" * 64, "high": "e" * 64}
             version = "2.1.222" if harness == "claude" else "0.145.0"
             self.con.execute(
                 "INSERT OR IGNORE INTO model_catalog_generations ("
@@ -715,18 +717,21 @@ class FlavorDefaultsTest(unittest.TestCase):
                 "stale,generation_id,evidence_kind,evidence_digest,"
                 "source_fingerprint,harness_version,harness_compatibility,"
                 "selector_binding,effort_metadata,adapter_metadata,default_effort"
-                ") VALUES (?,?,?,?,1,1,'[\"low\",\"high\"]',?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ") VALUES (?,?,?,?,1,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     harness, selector, "test", availability,
+                    json.dumps(supported),
                     f"{harness} {version}", seen_at, stale, "a" * 32,
                     {"claude": "claude-portable-manifest",
                      "codex": "codex-model-cache"}[harness],
                     "e" * 64, "f" * 64, version, "verified",
                     json.dumps({"kind": "exact-model", "selector": selector}),
                     json.dumps({
-                        "supported": ["low", "high"],
-                        "default": "high",
-                        "digests": {"low": "d" * 64, "high": "e" * 64},
+                        "supported": supported,
+                        "default": "high" if "high" in supported else None,
+                        "digests": {
+                            effort: digests[effort] for effort in supported
+                        },
                         "native_variant_ids": {},
                     }),
                     "{}", "high",
@@ -766,6 +771,38 @@ class FlavorDefaultsTest(unittest.TestCase):
         self.assertTrue(ok, err)
         row = self._row("planner", "claude")
         self.assertEqual((row["model"], row["effort"]), ("opus-next", "low"))
+
+    def test_model_default_persists_for_empty_effort_list_route(self) -> None:
+        # Spec #160: 'default' is admitted and persisted even when the route
+        # advertises no named levels; re-saving without an effort keeps it,
+        # and a named level is still refused with 'default' in the details.
+        self._route("codex", "gpt-plain", efforts=())
+        ok, err = server.set_flavor_default(
+            self.con,
+            {"flavor": "planner", "harness": "codex",
+             "model": "gpt-plain", "effort": " DEFAULT "},
+        )
+        self.assertTrue(ok, err)
+        row = self._row("planner", "codex")
+        self.assertEqual((row["model"], row["effort"]), ("gpt-plain", "default"))
+        projection = server.get_flavor_defaults(self.con)["flavors"]["planner"]
+        by_harness = {r["harness"]: r for r in projection}
+        self.assertEqual(by_harness["codex"]["effort_state"], "controlled")
+        self.assertEqual(by_harness["codex"]["effective_effort"], "default")
+        ok, err = server.set_flavor_default(
+            self.con, {"flavor": "planner", "harness": "codex",
+                       "is_default": True})
+        self.assertTrue(ok, err)
+        self.assertEqual(self._row("planner", "codex")["effort"], "default")
+        ok, err = server.set_flavor_default(
+            self.con,
+            {"flavor": "planner", "harness": "codex",
+             "model": "gpt-plain", "effort": "high"},
+        )
+        self.assertFalse(ok)
+        self.assertEqual(err["code"], "unsupported_thinking_level")
+        self.assertEqual(err["details"]["default_effort"], "default")
+        self.assertEqual(self._row("planner", "codex")["effort"], "default")
 
     def test_unsupported_effort_writes_nothing(self) -> None:
         before = tuple(self._row("planner", "claude"))

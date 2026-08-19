@@ -124,6 +124,10 @@ def route_schema(path: str | Path = ":memory:") -> sqlite3.Connection:
         ROOT / ".super-coder" / "migrations" /
         "0218_sprint_binding_support_provenance.sql"
     ).read_text())
+    con.executescript((
+        ROOT / ".super-coder" / "migrations" /
+        "0223_model_default_effort_binding.sql"
+    ).read_text())
     return con
 
 
@@ -257,6 +261,76 @@ class BindingIdentityTest(unittest.TestCase):
         self.assertEqual(implicit["requested_effort"], "high")
         self.assertEqual(implicit["evidence_digest"], "4" * 64)
         self.assertEqual(implicit["control_state"], "controlled")
+
+    def test_model_default_bypasses_only_the_effort_value_gates(self):
+        row = self.controlled_row(
+            supported_efforts="[]",
+            effort_metadata=json.dumps({
+                "supported": [], "default": None,
+                "digests": {}, "native_variant_ids": {},
+            }),
+        )
+        runtime = compatible_runtime("0.145.0", harness="codex")
+        binding, digest = resolve_controlled_v2(
+            row, "codex", "gpt-test", " DeFaUlt ", now=self.NOW,
+            runtime_status=runtime,
+        )
+        self.assertEqual(binding["requested_effort"], "default")
+        self.assertEqual(binding["effective_effort"], "default")
+        self.assertIsNone(binding["evidence_digest"])
+        self.assertIsNone(binding["native_variant_id"])
+        named, named_digest = resolve_controlled_v2(
+            self.controlled_row(), "codex", "gpt-test", "high", now=self.NOW,
+            runtime_status=runtime,
+        )
+        self.assertNotEqual(digest, named_digest)
+
+        # Freshness, exact-model evidence, and transport gates are unchanged.
+        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+            resolve_controlled_v2(
+                {**row, "stale": 1, "last_error": "network down"},
+                "codex", "gpt-test", "default", now=self.NOW,
+                runtime_status=runtime,
+            )
+        self.assertEqual(raised.exception.code, "thinking_evidence_stale")
+        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+            resolve_controlled_v2(
+                row, "codex", "gpt-test", "high", now=self.NOW,
+                runtime_status=runtime,
+            )
+        self.assertEqual(raised.exception.code, "unsupported_thinking_level")
+        self.assertEqual(raised.exception.details["default_effort"], "default")
+        self.assertEqual(raised.exception.details["supported_efforts"], [])
+
+        # 'default' on an uncontrolled route stays rejected (decision #212).
+        with self.assertRaises(route_bindings.RouteResolutionError) as raised:
+            route_bindings.resolve_v2(
+                None, "codex", None, "default", now=self.NOW,
+                runtime_status=runtime,
+            )
+        self.assertEqual(raised.exception.code, "unsupported_thinking_level")
+
+        # The canonical shape is enforced both ways: no digest on a default
+        # binding, a digest on every named-effort binding.
+        forged = {**binding, "evidence_digest": "4" * 64}
+        with self.assertRaises(route_bindings.RouteResolutionError):
+            route_bindings.validate_v2_binding(forged)
+        forged_named = {**named, "evidence_digest": None}
+        with self.assertRaises(route_bindings.RouteResolutionError):
+            route_bindings.validate_v2_binding(forged_named)
+
+    def test_opencode_model_default_needs_no_variant_or_overlay(self):
+        row = self.opencode_row()
+        binding, _ = resolve_controlled_v2(
+            row, "opencode", "provider/model", "default", now=self.NOW,
+            runtime_status=compatible_runtime("1.18.9", harness="opencode"),
+        )
+        self.assertEqual(binding["requested_effort"], "default")
+        self.assertIsNone(binding["native_variant_id"])
+        self.assertIsNone(binding["evidence_digest"])
+        forged = {**binding, "native_variant_id": "default"}
+        with self.assertRaises(route_bindings.RouteResolutionError):
+            route_bindings.validate_v2_binding(forged)
 
     def test_opencode_binding_keeps_only_the_selected_admitted_overlay(self):
         row = self.opencode_row()

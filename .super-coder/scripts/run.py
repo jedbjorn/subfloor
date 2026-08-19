@@ -80,7 +80,8 @@ SESSION_OPEN_RETRY_DELAYS_S = (0.1, 0.3)
 
 def _headless_effort_args(hcfg: dict, effort: "str | None",
                           harness: str = "?") -> list[str]:
-    if not effort:
+    if not effort or effort == route_transport.route_bindings.DEFAULT_EFFORT:
+        # Model default: no effort transport — the harness default governs.
         return []
     ecfg = hcfg.get("effort") or {}
     if ecfg.get("flag"):
@@ -95,7 +96,9 @@ def _headless_effort_args(hcfg: dict, effort: "str | None",
 
 def headless_effort_env(adapter: dict, effort: "str | None") -> dict[str, str]:
     ecfg = ((adapter.get("headless") or {}).get("effort") or {})
-    return {ecfg["env"]: effort} if effort and ecfg.get("env") else {}
+    if not effort or effort == route_transport.route_bindings.DEFAULT_EFFORT:
+        return {}
+    return {ecfg["env"]: effort} if ecfg.get("env") else {}
 
 
 def default_headless_effort(adapter: dict) -> "str | None":

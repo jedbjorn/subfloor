@@ -1392,6 +1392,61 @@ class LifecycleTest(SprintDomainCase):
                 "'normal-2','hash')"
             )
 
+    def test_arm_persists_model_default_binding_with_stable_digest(self) -> None:
+        # Spec #160: a participant that selected 'default' arms into a
+        # controlled binding with requested=effective='default', no effort
+        # digest, and an identity stable across resolutions but distinct from
+        # the same route's named-effort binding.
+        sprint_id, _ = self.create_sprint()
+        self.con.execute(
+            "UPDATE sprint_participants SET harness='kimi',"
+            "model='kimi-code/legacy',effort='default' "
+            "WHERE sprint_id=? AND role='reviewer'",
+            (sprint_id,),
+        )
+        self.con.commit()
+
+        self.store.arm(sprint_id, 3)
+
+        row = self.con.execute(
+            "SELECT b.control_state,b.requested_effort,b.effective_effort,"
+            "b.evidence_digest,b.native_variant_id,b.binding_json,"
+            "b.binding_digest "
+            "FROM sprint_participant_route_bindings b "
+            "JOIN sprint_participants p ON p.participant_id=b.participant_id "
+            "WHERE p.sprint_id=? AND p.role='reviewer'",
+            (sprint_id,),
+        ).fetchone()
+        self.assertEqual(
+            ("controlled", "default", "default", None, None), tuple(row[:5])
+        )
+        decoded = json.loads(row["binding_json"])
+        sprint_domain.route_bindings.validate_v2_binding(decoded)
+        self.assertEqual(
+            sprint_domain.route_bindings.digest_json(decoded),
+            row["binding_digest"],
+        )
+
+        # Re-resolving the same intent reproduces the exact persisted digest;
+        # the same route at a named effort is a distinct identity.
+        participant = self.con.execute(
+            "SELECT participant_id,harness,model,effort "
+            "FROM sprint_participants WHERE sprint_id=? AND role='reviewer'",
+            (sprint_id,),
+        ).fetchone()
+        repeat = route_candidate(None, participant)
+        self.assertEqual(row["binding_digest"], repeat.binding_digest)
+        named = route_candidate(
+            None,
+            {
+                "participant_id": participant["participant_id"],
+                "harness": "kimi",
+                "model": "kimi-code/legacy",
+                "effort": "high",
+            },
+        )
+        self.assertNotEqual(row["binding_digest"], named.binding_digest)
+
     def test_arm_rolls_back_when_initial_release_fails(self) -> None:
         sprint_id, _ = self.create_sprint()
         self.con.execute(

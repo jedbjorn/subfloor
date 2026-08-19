@@ -54,6 +54,36 @@ def controlled(harness: str) -> tuple[dict, str]:
     return binding, digest
 
 
+def model_default(harness: str) -> tuple[dict, str]:
+    model = "openai/gpt-test" if harness == "opencode" else "model-test"
+    binding = {
+        "contract_version": 2,
+        "control_state": "controlled",
+        "harness": harness,
+        "requested_model": model,
+        "provider_model": "gpt-test" if harness == "opencode" else model,
+        "requested_effort": "default",
+        "effective_effort": "default",
+        "native_variant_id": None,
+        "transport": {
+            "claude": "claude-effort-argument",
+            "codex": "codex-reasoning-config",
+            "kimi": "kimi-effort-environment",
+            "opencode": "opencode-route-agent",
+        }[harness],
+        "catalogue_generation": "1" * 32,
+        "evidence_digest": None,
+        "selector_binding": {"kind": "exact-test-route"},
+        "adapter_metadata": {},
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            binding, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    return binding, digest
+
+
 def uncontrolled(state: str, harness: str, model: str | None) -> tuple[dict, str]:
     binding = {
         "contract_version": 2,
@@ -152,6 +182,56 @@ class RouteTransportTest(unittest.TestCase):
             "--model", "openai/gpt-test", "--agent", f"sc-route-{digest}",
         ))
         self.assertNotIn("--variant", projection.argument_tail)
+
+    def test_model_default_omits_every_effort_transport(self) -> None:
+        expected = {
+            "claude": ["claude", "--model", "model-test", "-p", "hello"],
+            "codex": ["codex", "exec", "-m", "model-test", "hello"],
+            "kimi": ["kimi", "-m", "model-test", "-p", "hello"],
+        }
+        for harness in ("claude", "codex", "kimi"):
+            with self.subTest(harness=harness):
+                binding, digest = model_default(harness)
+                projection = route_transport.project(
+                    binding, digest, expected_harness=harness,
+                    worktree=self.root, interface="headless",
+                )
+                self.assertEqual(projection.effort, "default")
+                self.assertEqual(projection.argument_tail, ())
+                self.assertEqual(projection.environment, ())
+                command = run.headless_command(
+                    run.load_adapter(harness),
+                    "hello",
+                    transport=projection,
+                )
+                self.assertEqual(command, expected[harness])
+                self.assertNotIn("KIMI_MODEL_THINKING_EFFORT", projection.env())
+
+    def test_opencode_model_default_has_agent_without_variant_overlay(self):
+        binding, digest = model_default("opencode")
+        projection = route_transport.project(
+            binding,
+            digest,
+            expected_harness="opencode",
+            worktree=self.root,
+            interface="headless",
+        )
+        command = run.headless_command(
+            run.load_adapter("opencode"), "hello", transport=projection
+        )
+        agent = f"sc-route-{digest}"
+
+        self.assertEqual(command, [
+            "opencode", "run", "--model", "openai/gpt-test",
+            "--agent", agent, "hello",
+        ])
+        self.assertNotIn("--variant", command)
+        self.assertIsNone(projection.native_variant_id)
+        configured = json.loads((self.root / "opencode.json").read_text())
+        self.assertEqual(
+            configured["agent"][agent],
+            {"mode": "primary", "model": "openai/gpt-test"},
+        )
 
     def test_vibe_and_harness_default_never_emit_effort_transport(self):
         routes = [

@@ -53,6 +53,11 @@ TRANSPORTS = {
     "opencode": "opencode-route-agent",
 }
 
+# Reserved canonical effort: bind the exact model with no effort transport and
+# let the harness or alias's own default govern thinking.  Admitted for every
+# controlled exact route regardless of its advertised supported_efforts.
+DEFAULT_EFFORT = "default"
+
 LOWER_HEX_32 = re.compile(r"^[0-9a-f]{32}$")
 LOWER_HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 ASCII_LOWER_TRANSLATION = str.maketrans(
@@ -299,13 +304,23 @@ def validate_v2_binding(binding: dict) -> None:
             raise _binding_error(
                 "catalogue_generation must be 32 lowercase hex characters"
             )
-        if not _lower_hex(binding["evidence_digest"], LOWER_HEX_64):
+        if requested_effort == DEFAULT_EFFORT:
+            if binding["evidence_digest"] is not None:
+                raise _binding_error(
+                    "model-default bindings carry no effort-value digest"
+                )
+        elif not _lower_hex(binding["evidence_digest"], LOWER_HEX_64):
             raise _binding_error("evidence_digest must be a SHA-256 hex digest")
         selector_binding = binding["selector_binding"]
         if not isinstance(selector_binding, dict) or not selector_binding:
             raise _binding_error("controlled selector_binding must be a non-empty object")
         native_variant = binding["native_variant_id"]
-        if harness == "opencode":
+        if requested_effort == DEFAULT_EFFORT:
+            if native_variant is not None:
+                raise _binding_error(
+                    "model-default bindings carry no native variant"
+                )
+        elif harness == "opencode":
             if native_variant != requested_effort:
                 raise _binding_error(
                     "OpenCode native variant must equal the canonical effort"
@@ -956,39 +971,52 @@ def _resolve_v2(
     _require_controlled_source(row, harness, model, runtime, proof)
 
     supported, effort_metadata = _supported_efforts(row)
-    if requested not in supported:
-        raise RouteResolutionError(
-            "unsupported_thinking_level",
-            f"Thinking level {requested!r} is unsupported for {harness}/{model}",
-            {
-                "harness": harness,
-                "model": model,
-                "requested_effort": requested,
-                "supported_efforts": supported,
-                "generation": generation,
-            },
-        )
-    effort_digests = effort_metadata.get("digests") or {}
-    evidence_digest = effort_digests.get(requested)
-    if not evidence_digest:
-        raise RouteResolutionError(
-            "thinking_evidence_missing",
-            "Selected thinking level has no route evidence digest",
-            {"harness": harness, "model": model, "requested_effort": requested},
-        )
-    native_variants = effort_metadata.get("native_variant_ids") or {}
-    native_variant = native_variants.get(requested) if harness == "opencode" else None
-    if harness == "opencode" and not native_variant:
-        raise RouteResolutionError(
-            "thinking_evidence_missing",
-            "OpenCode route has no admitted exact native variant",
-            {"harness": harness, "model": model, "requested_effort": requested},
-        )
+    if requested == DEFAULT_EFFORT:
+        # Model default: the exact-model evidence, freshness, runtime, and
+        # source gates above still apply; only the effort-value membership and
+        # digest gates are bypassed.  The binding carries no effort digest or
+        # native variant, and launch applies no effort transport.
+        evidence_digest = None
+        native_variant = None
+    else:
+        if requested not in supported:
+            raise RouteResolutionError(
+                "unsupported_thinking_level",
+                f"Thinking level {requested!r} is unsupported for {harness}/{model}",
+                {
+                    "harness": harness,
+                    "model": model,
+                    "requested_effort": requested,
+                    "supported_efforts": supported,
+                    "default_effort": DEFAULT_EFFORT,
+                    "generation": generation,
+                    "remediation": (
+                        "choose an advertised level or 'default' "
+                        "(Model default)"
+                    ),
+                },
+            )
+        effort_digests = effort_metadata.get("digests") or {}
+        evidence_digest = effort_digests.get(requested)
+        if not evidence_digest:
+            raise RouteResolutionError(
+                "thinking_evidence_missing",
+                "Selected thinking level has no route evidence digest",
+                {"harness": harness, "model": model, "requested_effort": requested},
+            )
+        native_variants = effort_metadata.get("native_variant_ids") or {}
+        native_variant = native_variants.get(requested) if harness == "opencode" else None
+        if harness == "opencode" and not native_variant:
+            raise RouteResolutionError(
+                "thinking_evidence_missing",
+                "OpenCode route has no admitted exact native variant",
+                {"harness": harness, "model": model, "requested_effort": requested},
+            )
 
     adapter_metadata = _json_object(
         row.get("adapter_metadata"), field="adapter_metadata"
     )
-    if harness == "opencode":
+    if harness == "opencode" and requested != DEFAULT_EFFORT:
         metadata_by_effort = effort_metadata.get("adapter_metadata_by_effort") or {}
         selected_metadata = metadata_by_effort.get(requested)
         if (
