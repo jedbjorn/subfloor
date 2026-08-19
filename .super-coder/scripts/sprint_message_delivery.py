@@ -523,37 +523,53 @@ class SprintMessageStore:
                 and message["message_kind"] == "work_assignment"
                 and message["work_unit_id"] is not None
             ):
-                changed = self.con.execute(
-                    "UPDATE sprint_work_units SET disposition='active',"
-                    "updated_at=datetime('now') WHERE sprint_id=? "
-                    "AND work_unit_id=? AND assigned_shell_id=? "
-                    "AND disposition='ready'",
+                # A rerouted lane keeps its released disposition (active or
+                # fixing); only a ready lane transitions on acceptance.
+                lane = self.con.execute(
+                    "SELECT disposition FROM sprint_work_units "
+                    "WHERE sprint_id=? AND work_unit_id=? AND assigned_shell_id=?",
                     (
                         message["sprint_id"],
                         message["work_unit_id"],
                         shell_id,
                     ),
-                ).rowcount
-                if changed != 1:
+                ).fetchone()
+                if lane is None or str(lane["disposition"]) not in {
+                    "ready",
+                    "active",
+                    "fixing",
+                }:
                     raise SprintInvariantError(
                         "work assignment no longer owns a ready editing lane"
                     )
-                self.con.execute(
-                    "INSERT INTO sprint_events "
-                    "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
-                    "VALUES (?,'work_unit.accepted','participant',?,?)",
-                    (
-                        message["sprint_id"],
-                        shell_id,
-                        json.dumps(
-                            {
-                                "message_id": message_id,
-                                "work_unit_id": int(message["work_unit_id"]),
-                            },
-                            sort_keys=True,
+                if str(lane["disposition"]) == "ready":
+                    self.con.execute(
+                        "UPDATE sprint_work_units SET disposition='active',"
+                        "updated_at=datetime('now') WHERE sprint_id=? "
+                        "AND work_unit_id=? AND assigned_shell_id=? "
+                        "AND disposition='ready'",
+                        (
+                            message["sprint_id"],
+                            message["work_unit_id"],
+                            shell_id,
                         ),
-                    ),
-                )
+                    )
+                    self.con.execute(
+                        "INSERT INTO sprint_events "
+                        "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+                        "VALUES (?,'work_unit.accepted','participant',?,?)",
+                        (
+                            message["sprint_id"],
+                            shell_id,
+                            json.dumps(
+                                {
+                                    "message_id": message_id,
+                                    "work_unit_id": int(message["work_unit_id"]),
+                                },
+                                sort_keys=True,
+                            ),
+                        ),
+                    )
             self._cancel_resolved_wakes(message_id)
             return disposition
 
