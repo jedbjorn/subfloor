@@ -904,6 +904,51 @@ class SprintMessageStore:
             )
         return message_ids
 
+    def retire_route_expectations_in_transaction(
+        self,
+        sprint_id: int,
+        work_unit_id: int,
+        *,
+        retirement_reason: str,
+        resolution: str,
+        kinds: tuple[str, ...] = ("work_assignment", "review_request"),
+    ) -> tuple[int, ...]:
+        """Retire one lane's open route expectations, preserving history.
+
+        Pending expectations are declined with the Planner's reason; accepted
+        ones keep their disposition (they are history) and only their liveness
+        expectation is resolved.  Wake delivery intent is cancelled either way.
+        """
+        if not self.con.in_transaction:
+            raise RuntimeError("expectation retirement requires an active transaction")
+        marks = ",".join("?" for _ in kinds)
+        rows = self.con.execute(
+            "SELECT message_id,disposition FROM wake_message "
+            "WHERE sprint_id=? AND work_unit_id=? "
+            f"AND message_kind IN ({marks}) "
+            "AND disposition IN ('pending','accepted') ORDER BY message_id",
+            (sprint_id, work_unit_id, *kinds),
+        ).fetchall()
+        message_ids = tuple(int(row["message_id"]) for row in rows)
+        if not rows:
+            return ()
+
+        from sprint_liveness import SprintLivenessMonitor
+
+        monitor = SprintLivenessMonitor(self.con)
+        for row in rows:
+            message_id = int(row["message_id"])
+            if row["disposition"] == "pending":
+                self.con.execute(
+                    "UPDATE wake_message SET disposition='declined',"
+                    "read_at=COALESCE(read_at,datetime('now')),decline_reason=? "
+                    "WHERE message_id=? AND disposition='pending'",
+                    (retirement_reason, message_id),
+                )
+                self._cancel_resolved_wakes(message_id)
+            monitor.resolve_in_transaction(message_id, resolution)
+        return message_ids
+
 
 class SprintWakeDeliveryService:
     """Lease wake intents and resolve their chat placement at delivery time."""

@@ -1844,7 +1844,8 @@ class SprintLifecycleStore:
                 int(item[0])
                 for item in self.con.execute(
                     "SELECT work_unit_id FROM sprint_pr_work_units "
-                    "WHERE registered_pr_id=? ORDER BY work_unit_id",
+                    "WHERE registered_pr_id=? AND superseded_at IS NULL "
+                    "ORDER BY work_unit_id",
                     (registered_pr_id,),
                 )
             )
@@ -3985,6 +3986,7 @@ class SprintWorkUnitStore:
             registered = self.con.execute(
                 "SELECT registered_pr_id FROM sprint_pr_work_units "
                 "WHERE sprint_id=? AND work_unit_id=? "
+                "AND superseded_at IS NULL "
                 "ORDER BY registered_pr_id LIMIT 1",
                 (sprint_id, work_unit_id),
             ).fetchone()
@@ -4204,6 +4206,146 @@ class SprintWorkUnitStore:
             pause_receipt = self._queue_delivery_terminal(sprint_id)
         if pause_receipt is not None:
             self.lifecycle.signal_pause_receipt(pause_receipt)
+        return True
+
+    def resolve(
+        self,
+        sprint_id: int,
+        work_unit_id: int,
+        planner_shell_id: int,
+        *,
+        target: str,
+        reason: str,
+    ) -> bool:
+        """Force-move one non-terminal lane to a terminal Planner disposition.
+
+        Paused-only, Planner-only, reasoned, and audited: retires the lane's
+        open route expectations, supersedes its PR links (rows retained), and
+        wakes the assigned Developer and Reviewer.  PR-bound units are the
+        point of the verb; ``--to completed`` fabricates no merge observation.
+        """
+        if target not in {"completed", "cancelled"}:
+            raise ValueError("resolve-unit target must be completed or cancelled")
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("work-unit resolution reason is required")
+        if len(reason) > 8000:
+            raise ValueError(
+                f"work-unit resolution reason is {len(reason)} characters; "
+                "maximum is 8000"
+            )
+        with db_driver.write_transaction(self.con, "sprint.work_unit.resolve"):
+            lifecycle, planner_participant_id = self._require_planner(
+                sprint_id, planner_shell_id
+            )
+            if lifecycle != "paused":
+                raise SprintInvariantError(
+                    "work units may be resolved only while the Sprint is paused"
+                )
+            unit = self._unit(sprint_id, work_unit_id)
+            before = str(unit["disposition"])
+            if before in {"completed", "cancelled"}:
+                override = self.con.execute(
+                    "SELECT payload FROM sprint_events WHERE sprint_id=? "
+                    "AND event_type='planner_override' "
+                    "AND json_extract(payload,'$.work_unit_id')=? "
+                    "ORDER BY event_id DESC LIMIT 1",
+                    (sprint_id, work_unit_id),
+                ).fetchone()
+                if override is not None:
+                    prior = json.loads(override["payload"])
+                    if (
+                        before == target
+                        and prior.get("after") == target
+                        and prior.get("reason") == reason
+                    ):
+                        return False
+                raise SprintConflictError(
+                    f"work unit {work_unit_id} is already {before}; "
+                    "resolve-unit does not move a terminal work unit",
+                    {
+                        "code": "work_unit_already_terminal",
+                        "work_unit_id": work_unit_id,
+                        "disposition": before,
+                    },
+                )
+            pr_numbers = [
+                int(row["pr_number"])
+                for row in self.con.execute(
+                    "SELECT pr.pr_number FROM sprint_pr_work_units link "
+                    "JOIN sprint_registered_prs pr "
+                    "ON pr.registered_pr_id=link.registered_pr_id "
+                    "WHERE link.sprint_id=? AND link.work_unit_id=? "
+                    "AND link.superseded_at IS NULL ORDER BY pr.pr_number",
+                    (sprint_id, work_unit_id),
+                )
+            ]
+            from sprint_message_delivery import SprintMessageStore
+
+            messages = SprintMessageStore(self.con)
+            retired_message_ids = messages.retire_route_expectations_in_transaction(
+                sprint_id,
+                work_unit_id,
+                retirement_reason=f"Resolved by Planner as {target}: {reason}",
+                resolution=f"work unit resolved by Planner as {target}: {reason}",
+            )
+            self.con.execute(
+                "UPDATE sprint_pr_work_units SET superseded_at=datetime('now') "
+                "WHERE sprint_id=? AND work_unit_id=? AND superseded_at IS NULL",
+                (sprint_id, work_unit_id),
+            )
+            self.con.execute(
+                "UPDATE sprint_work_units SET disposition=?,completion_result=?,"
+                "completed_at=datetime('now'),updated_at=datetime('now'),"
+                "completion_source=CASE WHEN ?='completed' "
+                "THEN 'planner_override' ELSE completion_source END "
+                "WHERE work_unit_id=?",
+                (target, reason, target, work_unit_id),
+            )
+            # The durable event lands before any wake: it, not the narration,
+            # is the delivery proof of the override.
+            self._event(
+                sprint_id,
+                "planner_override",
+                planner_shell_id,
+                {
+                    "work_unit_id": work_unit_id,
+                    "before": before,
+                    "after": target,
+                    "reason": reason,
+                    "pr_numbers": pr_numbers,
+                    "retired_message_ids": list(retired_message_ids),
+                },
+            )
+            recipients = self.con.execute(
+                "SELECT participant_id FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id IN (?,?) "
+                "AND role IN ('developer','reviewer') ORDER BY participant_id",
+                (
+                    sprint_id,
+                    int(unit["assigned_shell_id"]),
+                    int(unit["reviewer_shell_id"]),
+                ),
+            ).fetchall()
+            reason_key = hashlib.sha256(reason.encode()).hexdigest()[:16]
+            for recipient in recipients:
+                messages.send_in_transaction(
+                    sprint_id,
+                    from_participant_id=planner_participant_id,
+                    to_participant_id=int(recipient["participant_id"]),
+                    work_unit_id=work_unit_id,
+                    message_kind="notification",
+                    body=(
+                        f"Planner resolved work unit {work_unit_id} from "
+                        f"{before} to {target}: {reason}"
+                    ),
+                    actionable=False,
+                    declared_type="re-enter",
+                    idempotency_key=(
+                        f"planner-override:{sprint_id}:{work_unit_id}:{target}:"
+                        f"{reason_key}:participant:{int(recipient['participant_id'])}"
+                    ),
+                )
         return True
 
     def complete_from_merge_in_transaction(
@@ -4501,7 +4643,10 @@ class SprintWorkUnitStore:
             body=(
                 f"Merged PR bypassed the Sprint merge grant for work unit "
                 f"{work_unit_id} from {before}; the unit remains incomplete "
-                "and requires Planner disposition."
+                "and requires Planner disposition: pause the Sprint and run "
+                f"`sc sprint resolve-unit --sprint {sprint_id} "
+                f"--work-unit {work_unit_id} --to completed|cancelled "
+                "--reason <text>`."
             ),
             actionable=False,
             declared_type="re-enter",

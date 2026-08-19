@@ -246,6 +246,21 @@ def cmd_cancel_unit(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_resolve_unit(args: argparse.Namespace) -> int:
+    result = _post(
+        "/_sc/sprint/resolve-unit",
+        {
+            "sprint_id": args.sprint,
+            "work_unit_id": args.work_unit,
+            "target": args.to,
+            "reason": args.reason,
+        },
+        idempotent=True,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_arm(args: argparse.Namespace) -> int:
     result = _post(
         "/_sc/sprint/arm",
@@ -655,6 +670,19 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_unit.add_argument("--work-unit", type=int, required=True)
     cancel_unit.add_argument("--reason", required=True)
     cancel_unit.set_defaults(fn=cmd_cancel_unit)
+
+    resolve_unit = sub.add_parser(
+        "resolve-unit",
+        help="Planner force-moves one non-terminal lane to a terminal "
+        "disposition while the Sprint is paused",
+    )
+    resolve_unit.add_argument("--sprint", type=int, required=True)
+    resolve_unit.add_argument("--work-unit", type=int, required=True)
+    resolve_unit.add_argument(
+        "--to", choices=("completed", "cancelled"), required=True
+    )
+    resolve_unit.add_argument("--reason", required=True)
+    resolve_unit.set_defaults(fn=cmd_resolve_unit)
 
     register = sub.add_parser(
         "register-pr", help="Developer registers one PR to its owning work unit"
