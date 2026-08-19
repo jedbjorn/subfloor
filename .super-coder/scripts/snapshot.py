@@ -121,6 +121,9 @@ PER_INSTANCE_TABLES = [
     "conversations",
     "active_shell_chats",
     "conversation_git_targets",
+    # Immutable per-conversation boot snapshot: a child of conversations that
+    # must survive rebuild with it, or every chat would rebind as legacy.
+    "conversation_boot_snapshots",
     "conversation_messages",
     "conversation_runs",
     "conversation_events",
