@@ -65,6 +65,7 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
         harness_version = runtime_status["version"]
     else:
         selected = "high" if effort is None else str(effort).strip().lower()
+        model_default = selected == route_bindings.DEFAULT_EFFORT
         binding = {
             "contract_version": 2,
             "control_state": "controlled",
@@ -73,10 +74,14 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
             "provider_model": model,
             "requested_effort": selected,
             "effective_effort": selected,
-            "native_variant_id": selected if harness == "opencode" else None,
+            "native_variant_id": (
+                selected
+                if harness == "opencode" and not model_default
+                else None
+            ),
             "transport": route_bindings.TRANSPORTS[harness],
             "catalogue_generation": "1" * 32,
-            "evidence_digest": "2" * 64,
+            "evidence_digest": None if model_default else "2" * 64,
             "selector_binding": {"kind": "test", "selector": model},
             "adapter_metadata": {},
         }

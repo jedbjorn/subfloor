@@ -641,7 +641,11 @@ class RoutePersistenceTest(unittest.TestCase):
             ["./sc", "run", "DEV3", "--harness", "codex", "-m",
              "gpt-5.6-sol", "--effort", "high"])
 
-    def test_resolver_rejects_unverified_high_effort(self):
+    def test_empty_effort_list_alias_admits_only_model_default(self):
+        # Spec #160: an alias that declares no effort list persists
+        # supported_efforts=[]; the reserved 'default' still binds (no effort
+        # transport), while every named level — explicit or the omitted-effort
+        # 'high' rule — keeps failing membership.
         fresh = {"fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
                  "harnesses": {"kimi": {"models": [mc._entry(
                      "kimi-code/legacy", source="kimi-config",
@@ -659,13 +663,71 @@ class RoutePersistenceTest(unittest.TestCase):
         )
         with mock.patch.object(
             mc, "controlled_route_evidence", return_value=observation
-        ) as collector:
-            got = routes_cli.resolve(
+        ):
+            bound = routes_cli.resolve(
+                self.con, "kimi", "kimi-code/legacy", effort="default",
+                shell="DEV3",
+            )
+            named = routes_cli.resolve(
+                self.con, "kimi", "kimi-code/legacy", effort="high"
+            )
+            omitted = routes_cli.resolve(
                 self.con, "kimi", "kimi-code/legacy"
             )
-        collector.assert_called_once_with("kimi", "kimi-code/legacy")
-        self.assertFalse(got["ok"])
-        self.assertEqual(got["code"], "unsupported_thinking_level")
+        self.assertTrue(bound["ok"])
+        binding = bound["binding"]
+        self.assertEqual(binding["control_state"], "controlled")
+        self.assertEqual(binding["requested_effort"], "default")
+        self.assertEqual(binding["effective_effort"], "default")
+        self.assertIsNone(binding["evidence_digest"])
+        self.assertIsNone(binding["native_variant_id"])
+        self.assertEqual(
+            bound["command"],
+            ["./sc", "run", "DEV3", "--harness", "kimi", "-m",
+             "kimi-code/legacy", "--effort", "default"])
+        self.assertEqual(
+            route_bindings.digest_json(binding), bound["binding_digest"])
+        for rejected in (named, omitted):
+            self.assertFalse(rejected["ok"])
+            self.assertEqual(rejected["code"], "unsupported_thinking_level")
+            self.assertEqual(
+                rejected["details"]["default_effort"], "default")
+        self.assertEqual(named["details"]["requested_effort"], "high")
+
+    def test_default_binds_alongside_advertised_named_efforts(self):
+        fresh = {"fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
+                 "harnesses": {"codex": {"models": [mc._entry(
+                     "gpt-5.6-sol", source="codex-cache",
+                     availability="available", supported_efforts=["low", "high"],
+                     cli_version="codex-cli 0.145.0")]}},
+                 **self.verification("codex", "0.145.0")}
+        mc.persist_routes(self.con, fresh)
+        fingerprint = self.con.execute(
+            "SELECT source_fingerprint FROM model_routes WHERE harness='codex' "
+            "AND selector='gpt-5.6-sol'"
+        ).fetchone()[0]
+        observation = controlled_bundle(
+            "codex", "gpt-5.6-sol",
+            runtime_status("0.145.0", harness="codex"), fingerprint,
+        )
+        with mock.patch.object(
+            mc, "controlled_route_evidence", return_value=observation
+        ):
+            bound_default = routes_cli.resolve(
+                self.con, "codex", "gpt-5.6-sol", effort=" DEFAULT "
+            )
+            bound_named = routes_cli.resolve(
+                self.con, "codex", "gpt-5.6-sol", effort="high"
+            )
+        self.assertTrue(bound_default["ok"])
+        # Trimmed and case-folded like any other effort; the digest covers the
+        # literal 'default' and is distinct from the named-effort binding.
+        self.assertEqual(
+            bound_default["binding"]["requested_effort"], "default")
+        self.assertTrue(bound_named["ok"])
+        self.assertEqual(bound_named["binding"]["requested_effort"], "high")
+        self.assertNotEqual(
+            bound_default["binding_digest"], bound_named["binding_digest"])
 
 
 class RuntimeVerificationTest(unittest.TestCase):

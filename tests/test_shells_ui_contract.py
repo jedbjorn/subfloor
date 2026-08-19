@@ -52,6 +52,7 @@ console.log(JSON.stringify({
   controlled: thinkingLevelState("codex", catalog, "gpt-high", "low"),
   defaulted: thinkingLevelState("codex", catalog, "gpt-high", null),
   explicit: thinkingLevelState("codex", catalog, "gpt-explicit", null),
+  modelDefault: thinkingLevelState("codex", catalog, "gpt-explicit", "default"),
   harnessDefault: thinkingLevelState("codex", catalog, null, null),
   vibe: thinkingLevelState("vibe", catalog, "devstral", null),
   stale: thinkingLevelState("codex", {...catalog, stale: true}, "gpt-high", "high"),
@@ -59,12 +60,18 @@ console.log(JSON.stringify({
 """
     result = run_js(script)
     assert result["controlled"]["selected"] == "low"
+    assert result["controlled"]["supported"] == ["default", "low", "high"]
     assert result["defaulted"]["selected"] == "high"
     assert "Support: tested (codex-cli 0.147.0)" in result["defaulted"]["guidance"]
     assert result["explicit"]["selected"] == ""
     assert result["explicit"]["disabled"] is False
+    assert result["explicit"]["supported"] == ["default", "low", "medium"]
+    assert result["modelDefault"]["selected"] == "default"
+    assert result["modelDefault"]["label"] == "Model default"
+    assert "model-default" in result["modelDefault"]["guidance"]
     assert result["harnessDefault"]["label"] == "Harness default"
     assert result["harnessDefault"]["disabled"] is True
+    assert result["harnessDefault"]["supported"] == []
     assert result["vibe"]["label"] == "Thinking control unavailable"
     assert result["stale"]["disabled"] is True
     assert "Refresh & verify" in result["stale"]["guidance"]
