@@ -255,5 +255,22 @@ class DockerWrapperContractTest(unittest.TestCase):
         self.assertNotIn("via git toplevel or SC_ROOT", wrapper)
 
 
+class DockerSandboxUserContractTest(unittest.TestCase):
+    def test_host_id_collision_cannot_fail_image_build(self) -> None:
+        # sudo builds pass SC_UID/SC_GID 0, which the base image's root already
+        # owns; an unconditional groupadd/useradd exits the build (useradd: 9).
+        dockerfile = (ROOT / ".super-coder" / "Dockerfile").read_text()
+        start = dockerfile.index("RUN if ! getent group ${SC_GID}")
+        block = dockerfile[start : dockerfile.index("\n\n", start)]
+        self.assertIn(
+            "if ! getent group ${SC_GID} >/dev/null; then groupadd", block
+        )
+        self.assertIn(
+            "if ! getent passwd ${SC_UID} >/dev/null; then useradd", block
+        )
+        # HOME is /home/${SC_USER} even for a pre-existing user (root: /root).
+        self.assertIn("mkdir -p /home/${SC_USER}", block)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
