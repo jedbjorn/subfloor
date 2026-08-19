@@ -10,6 +10,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -44,6 +45,7 @@ from .base import (
 ENGINE = Path(__file__).resolve().parents[2]
 SERVER_ENDPOINT = "http://127.0.0.1:4096"
 SERVER_LOG = ENGINE / "logs" / "opencode-server.log"
+SERVER_STATE = ENGINE / "run" / "opencode-server.json"
 SHELL_RUNTIME_DIR = ENGINE / "run" / "opencode-shells"
 TURN_TIMEOUT_SECONDS = 5400.0
 _SERVER_LOCK = threading.RLock()
@@ -62,6 +64,77 @@ OPENAI_PROVIDER_PACKAGES = frozenset({
     "@ai-sdk/openai", "@ai-sdk/openai-compatible", "@ai-sdk/azure",
 })
 ANTHROPIC_PROVIDER_PACKAGES = frozenset({"@ai-sdk/anthropic"})
+
+
+def _read_server_state() -> dict[str, Any] | None:
+    """Return the recorded managed-server identity, if any is readable."""
+    try:
+        data = json.loads(SERVER_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("pid"), int)
+        or isinstance(data["pid"], bool)
+        or not isinstance(data.get("password"), str)
+    ):
+        return None
+    return data
+
+
+def _write_server_state(pid: int, password: str) -> None:
+    SERVER_STATE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(SERVER_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump({"pid": pid, "password": password}, handle)
+
+
+def _clear_server_state() -> None:
+    try:
+        SERVER_STATE.unlink()
+    except OSError:
+        pass
+
+
+def _pid_is_opencode_serve(pid: int) -> bool:
+    """Best-effort identity check so only an opencode serve is ever reaped."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        cmdline = raw.replace(b"\x00", " ").decode("utf-8", errors="replace")
+    except OSError:
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "args="],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if result.returncode != 0:
+            return False
+        cmdline = result.stdout
+    parts = cmdline.split()
+    return "serve" in parts and any(
+        os.path.basename(part) == "opencode" for part in parts
+    )
+
+
+def _reap_orphan_server(pid: int) -> None:
+    """Terminate a recorded orphan that fails every health check."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if not _pid_is_opencode_serve(pid):
+            return
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 def _server_healthy(password: str | None) -> bool:
@@ -91,14 +164,29 @@ def ensure_server(*, timeout: float = 10.0) -> str | None:
     global _SERVER_PROCESS, _SERVER_PASSWORD, _SERVER_LOG_HANDLE
     with _SERVER_LOCK:
         configured_password = os.environ.get("OPENCODE_SERVER_PASSWORD")
+        state = _read_server_state()
+        state_pid = state["pid"] if state else None
         candidate_passwords = []
-        for password in (_SERVER_PASSWORD, configured_password, None):
+        for password in (
+            _SERVER_PASSWORD,
+            state["password"] if state else None,
+            configured_password,
+            None,
+        ):
             if password not in candidate_passwords:
                 candidate_passwords.append(password)
         for password in candidate_passwords:
             if _server_healthy(password):
                 _SERVER_PASSWORD = password
                 return password
+
+        if state_pid is not None:
+            # A server this engine started outlived the process that spawned
+            # it (restart, crash) and answers none of our passwords. Reap the
+            # verified orphan so the managed spawn below can take the port.
+            _clear_server_state()
+            if _pid_is_opencode_serve(state_pid):
+                _reap_orphan_server(state_pid)
 
         if _SERVER_PROCESS is not None and _SERVER_PROCESS.poll() is None:
             raise AdapterError(
@@ -155,6 +243,7 @@ def ensure_server(*, timeout: float = 10.0) -> str | None:
                 break
             if _server_healthy(password):
                 _SERVER_PASSWORD = password
+                _write_server_state(_SERVER_PROCESS.pid, password)
                 return password
             time.sleep(0.05)
 
@@ -186,6 +275,10 @@ def stop_server() -> None:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=3)
+        if process is not None:
+            # Our own managed server is gone; drop its re-adoption record.
+            # An adopted orphan (never in _SERVER_PROCESS) keeps its record.
+            _clear_server_state()
         if _SERVER_LOG_HANDLE is not None:
             _SERVER_LOG_HANDLE.close()
             _SERVER_LOG_HANDLE = None
@@ -214,13 +307,23 @@ def _collision_identity(value: str) -> str:
     return unicodedata.normalize("NFKC", value.strip()).casefold()
 
 
-def _provider_family(provider: Mapping[str, Any]) -> str | None:
-    package = provider.get("npm")
+def _provider_family(package: Any) -> str | None:
+    if not isinstance(package, str):
+        return None
     if package in OPENAI_PROVIDER_PACKAGES:
         return "openai-ai-sdk"
     if package in ANTHROPIC_PROVIDER_PACKAGES:
         return "anthropic-ai-sdk"
     return None
+
+
+def _model_family(provider: Mapping[str, Any], model: Mapping[str, Any]) -> str | None:
+    # opencode's /provider projection carries the SDK package at
+    # model.api.npm; a top-level provider npm is legacy fallback.
+    api = model.get("api")
+    if isinstance(api, Mapping) and api.get("npm"):
+        return _provider_family(api.get("npm"))
+    return _provider_family(provider.get("npm"))
 
 
 def _contains_forbidden_key(value: Any) -> bool:
@@ -331,13 +434,13 @@ def connected_models(state: Mapping[str, Any] | None = None) -> list[dict[str, A
         if not isinstance(provider, dict) or provider.get("id") not in connected:
             continue
         provider_id = provider["id"]
-        provider_family = _provider_family(provider)
         for model_id, model in (provider.get("models") or {}).items():
             if not isinstance(model_id, str) or not isinstance(model, dict):
                 continue
             status = model.get("status")
             if status not in (None, "active"):
                 continue
+            provider_family = _model_family(provider, model)
             variants = admitted_variants(
                 model.get("variants"), provider_family=provider_family, model=model
             )
