@@ -279,6 +279,15 @@ def route_agent_name(binding_digest: str) -> str:
 
 def route_agent_projection(binding: Mapping[str, Any]) -> dict[str, Any]:
     model = binding.get("requested_model")
+    if not isinstance(model, str) or not model:
+        raise OpenCodeConfigError(
+            "HARNESS_CONFIG_INVALID",
+            "OpenCode binding has no exact admitted manifest variant overlay",
+        )
+    # Model default (spec #160): the agent pins only the exact model — no
+    # variant overlay, so the provider's own default governs thinking.
+    if binding.get("effective_effort") == "default":
+        return {"mode": "primary", "model": model}
     metadata = binding.get("adapter_metadata")
     options = metadata.get("variant_options") if isinstance(metadata, dict) else None
     manifest = (
@@ -287,9 +296,7 @@ def route_agent_projection(binding: Mapping[str, Any]) -> dict[str, Any]:
     family = metadata.get("provider_family") if isinstance(metadata, dict) else None
     canonical = canonical_variant_options(options, provider_family=family)
     if (
-        not isinstance(model, str)
-        or not model
-        or manifest != VARIANT_MANIFEST
+        manifest != VARIANT_MANIFEST
         or canonical is None
         or canonical != options
     ):

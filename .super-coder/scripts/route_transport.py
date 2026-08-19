@@ -63,23 +63,31 @@ def project(
         return TransportProjection(harness=harness, model=model, effort=None)
 
     effort = value["effective_effort"]
+    model_default = effort == route_bindings.DEFAULT_EFFORT
     if harness == "claude":
         return TransportProjection(
-            harness, model, effort, argument_tail=("--effort", effort)
+            harness, model, effort,
+            argument_tail=() if model_default else ("--effort", effort),
         )
     if harness == "codex":
         return TransportProjection(
             harness,
             model,
             effort,
-            argument_tail=("-c", f'model_reasoning_effort="{effort}"'),
+            argument_tail=(
+                () if model_default
+                else ("-c", f'model_reasoning_effort="{effort}"')
+            ),
         )
     if harness == "kimi":
         return TransportProjection(
             harness,
             model,
             effort,
-            environment=(("KIMI_MODEL_THINKING_EFFORT", effort),),
+            environment=(
+                () if model_default
+                else (("KIMI_MODEL_THINKING_EFFORT", effort),)
+            ),
         )
     if harness == "opencode":
         if worktree is None:
@@ -94,7 +102,8 @@ def project(
             arguments = ("--model", model, "--agent", agent)
         elif interface == "headless":
             arguments = (
-                "--agent", agent, "--variant", value["native_variant_id"]
+                ("--agent", agent) if model_default
+                else ("--agent", agent, "--variant", value["native_variant_id"])
             )
         else:
             arguments = ()
