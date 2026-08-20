@@ -11,6 +11,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -50,6 +51,7 @@ SHELL_RUNTIME_DIR = ENGINE / "run" / "opencode-shells"
 TURN_TIMEOUT_SECONDS = 5400.0
 _SERVER_LOCK = threading.RLock()
 _SERVER_PROCESS: subprocess.Popen | None = None
+_SERVER_ENDPOINT = SERVER_ENDPOINT
 _SERVER_PASSWORD: str | None = None
 _SERVER_LOG_HANDLE = None
 
@@ -82,11 +84,34 @@ def _read_server_state() -> dict[str, Any] | None:
     return data
 
 
-def _write_server_state(pid: int, password: str) -> None:
+def _server_endpoint(port: int) -> str:
+    return f"http://127.0.0.1:{port}"
+
+
+def _server_port(state: Mapping[str, Any]) -> int:
+    """Return a validated recorded port, accepting legacy fixed-port state."""
+    port = state.get("port", 4096)
+    if (
+        isinstance(port, bool)
+        or not isinstance(port, int)
+        or not 1 <= port <= 65535
+    ):
+        return 4096
+    return port
+
+
+def _available_loopback_port() -> int:
+    """Ask the kernel for a currently available private sidecar port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+def _write_server_state(pid: int, password: str, port: int) -> None:
     SERVER_STATE.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(SERVER_STATE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump({"pid": pid, "password": password}, handle)
+        json.dump({"pid": pid, "password": password, "port": port}, handle)
 
 
 def _clear_server_state() -> None:
@@ -137,10 +162,10 @@ def _reap_orphan_server(pid: int) -> None:
         pass
 
 
-def _server_healthy(password: str | None) -> bool:
+def _server_healthy(endpoint: str, password: str | None) -> bool:
     try:
         health = UrlHttpTransport(
-            SERVER_ENDPOINT,
+            endpoint,
             password=password,
             timeout=1.0,
         ).request("GET", "/global/health")
@@ -153,37 +178,44 @@ def _server_healthy(password: str | None) -> bool:
     )
 
 
-def ensure_server(*, timeout: float = 10.0) -> str | None:
-    """Return the credential for a healthy loopback ``opencode serve``.
+def ensure_server(*, timeout: float = 10.0) -> tuple[str, str | None]:
+    """Return the endpoint and credential for a healthy ``opencode serve``.
 
     Browser conversations are server-backed, so the engine owns the local
     sidecar lifecycle instead of requiring an operator to start it by hand.
     An already-running compatible server is reused. A server started here is
     loopback-only and protected with an in-memory Basic Auth password.
     """
-    global _SERVER_PROCESS, _SERVER_PASSWORD, _SERVER_LOG_HANDLE
+    global _SERVER_PROCESS, _SERVER_ENDPOINT, _SERVER_PASSWORD
+    global _SERVER_LOG_HANDLE
     with _SERVER_LOCK:
         configured_password = os.environ.get("OPENCODE_SERVER_PASSWORD")
         state = _read_server_state()
         state_pid = state["pid"] if state else None
-        candidate_passwords = []
-        for password in (
-            _SERVER_PASSWORD,
-            state["password"] if state else None,
-            configured_password,
-            None,
+        state_endpoint = (
+            _server_endpoint(_server_port(state)) if state else None
+        )
+        candidates = []
+        for endpoint, password in (
+            (_SERVER_ENDPOINT, _SERVER_PASSWORD),
+            (state_endpoint, state["password"] if state else None),
+            (SERVER_ENDPOINT, configured_password),
+            (SERVER_ENDPOINT, None),
         ):
-            if password not in candidate_passwords:
-                candidate_passwords.append(password)
-        for password in candidate_passwords:
-            if _server_healthy(password):
+            candidate = (endpoint, password)
+            if endpoint is not None and candidate not in candidates:
+                candidates.append(candidate)
+        for endpoint, password in candidates:
+            if _server_healthy(endpoint, password):
+                _SERVER_ENDPOINT = endpoint
                 _SERVER_PASSWORD = password
-                return password
+                return endpoint, password
 
         if state_pid is not None:
             # A server this engine started outlived the process that spawned
-            # it (restart, crash) and answers none of our passwords. Reap the
-            # verified orphan so the managed spawn below can take the port.
+            # it (restart, crash) and answers none of our passwords. Reap only
+            # the verified orphan before starting an independently addressed
+            # replacement.
             _clear_server_state()
             if _pid_is_opencode_serve(state_pid):
                 _reap_orphan_server(state_pid)
@@ -204,6 +236,8 @@ def ensure_server(*, timeout: float = 10.0) -> str | None:
             )
 
         password = configured_password or secrets.token_urlsafe(32)
+        port = _available_loopback_port()
+        endpoint = _server_endpoint(port)
         env = dict(os.environ)
         env["OPENCODE_SERVER_PASSWORD"] = password
         env.setdefault("OPENCODE_SERVER_USERNAME", "opencode")
@@ -218,7 +252,7 @@ def ensure_server(*, timeout: float = 10.0) -> str | None:
                     "--hostname",
                     "127.0.0.1",
                     "--port",
-                    "4096",
+                    str(port),
                     "--log-level",
                     "WARN",
                 ],
@@ -241,10 +275,11 @@ def ensure_server(*, timeout: float = 10.0) -> str | None:
         while time.monotonic() < deadline:
             if _SERVER_PROCESS.poll() is not None:
                 break
-            if _server_healthy(password):
+            if _server_healthy(endpoint, password):
+                _SERVER_ENDPOINT = endpoint
                 _SERVER_PASSWORD = password
-                _write_server_state(_SERVER_PROCESS.pid, password)
-                return password
+                _write_server_state(_SERVER_PROCESS.pid, password, port)
+                return endpoint, password
             time.sleep(0.05)
 
         exit_code = _SERVER_PROCESS.poll()
@@ -263,10 +298,12 @@ def ensure_server(*, timeout: float = 10.0) -> str | None:
 
 def stop_server() -> None:
     """Stop only the OpenCode server process this module started."""
-    global _SERVER_PROCESS, _SERVER_PASSWORD, _SERVER_LOG_HANDLE
+    global _SERVER_PROCESS, _SERVER_ENDPOINT, _SERVER_PASSWORD
+    global _SERVER_LOG_HANDLE
     with _SERVER_LOCK:
         process = _SERVER_PROCESS
         _SERVER_PROCESS = None
+        _SERVER_ENDPOINT = SERVER_ENDPOINT
         _SERVER_PASSWORD = None
         if process is not None and process.poll() is None:
             process.terminate()
@@ -286,9 +323,9 @@ def stop_server() -> None:
 
 def provider_state() -> dict[str, Any]:
     """Return OpenCode's authoritative provider/model connection projection."""
-    password = ensure_server()
+    endpoint, password = ensure_server()
     transport = UrlHttpTransport(
-        SERVER_ENDPOINT,
+        endpoint,
         password=password,
         timeout=10.0,
     )
@@ -500,7 +537,7 @@ class OpenCodeAdapter(ConversationAdapter):
     def __init__(
         self,
         *,
-        endpoint: str = SERVER_ENDPOINT,
+        endpoint: str | None = None,
         password: str | None = None,
         transport: HttpTransport | None = None,
         manifest: Mapping[str, Any] | None = None,
@@ -511,9 +548,13 @@ class OpenCodeAdapter(ConversationAdapter):
         if transport is not None:
             self.transport = transport
         else:
+            if endpoint is None:
+                endpoint, managed_password = ensure_server()
+                if password is None:
+                    password = managed_password
             self.transport = UrlHttpTransport(
                 endpoint,
-                password=password if password is not None else ensure_server(),
+                password=password,
                 timeout=TURN_TIMEOUT_SECONDS,
             )
 
