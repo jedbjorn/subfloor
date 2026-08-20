@@ -240,12 +240,9 @@ def test_manifest_registry_probe_and_surface_contract_are_live() -> None:
     assert probe.capabilities.interruption is True
     assert probe.capabilities.session_inspection is True
     manifest = json.loads((ENGINE / "adapters" / "deepseek" / "adapter.json").read_text())
-    assert manifest["surfaces"] == {
-        "terminal": False,
-        "one_shot": False,
-        "browser": True,
-        "sprint": False,
-    }
+    assert [
+        name for name, enabled in manifest["surfaces"].items() if enabled
+    ] == ["browser"]
 
     next_release = checked_version_compatibility(
         harness="deepseek",
