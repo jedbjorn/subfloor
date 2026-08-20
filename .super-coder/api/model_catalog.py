@@ -415,9 +415,7 @@ def _finish_cache_publication(
     winner = _load_cache()
     if winner and _cache_matches_authority(winner, con):
         return _served(_with_live_opencode(
-            {**winner, "stale": bool(
-                winner.get("stale") or winner.get("partial")
-            )},
+            {**winner, "stale": bool(winner.get("stale"))},
             opencode_provider,
         ), con)
     return {**response, "stale": True,
@@ -699,7 +697,10 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
     completed_at = payload.get("refresh_completed_at") or payload.get("fetched_at") \
         or datetime.now(timezone.utc).isoformat()
     generation_id = uuid.uuid4().hex
-    failed = bool(payload.get("stale") or payload.get("partial"))
+    # A best-effort source failure is partial, not stale. Publish the routes
+    # that were freshly observed and leave only the missing harness's prior
+    # routes stale. A genuinely stale/fallback payload still fails closed.
+    failed = bool(payload.get("stale"))
     state = "failed" if failed else "successful"
     verification = payload.get("verification") or {}
     harness_statuses = verification.get("harnesses") or {}
@@ -725,7 +726,7 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
     error_summary = {
         "error": payload.get("error"),
         "errors": payload.get("errors") or [],
-    } if failed else None
+    } if failed or payload.get("partial") else None
     payload_digest = route_bindings.digest_json({
         "v": payload.get("v", PAYLOAD_VERSION),
         "fetched_at": payload.get("fetched_at"),
@@ -770,6 +771,11 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
                 "UPDATE model_routes SET stale=1,last_error='not observed in latest generation'"
             )
             for harness, block in (payload.get("harnesses") or {}).items():
+                if block.get("error"):
+                    con.execute(
+                        "UPDATE model_routes SET last_error=? WHERE harness=?",
+                        (block["error"], harness),
+                    )
                 headless = int(_headless_supported(harness))
                 for entry in block.get("models") or []:
                     route_key = (harness, entry["id"])
@@ -1124,9 +1130,7 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
         )
     if serve_cached:
         return _served(_with_live_opencode(
-            {**cached, "stale": bool(
-                cached.get("stale") or cached.get("partial")
-            )},
+            {**cached, "stale": bool(cached.get("stale"))},
             opencode_provider), con)
     refresh_started_at = datetime.now(timezone.utc).isoformat()
     try:
@@ -1203,7 +1207,7 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             fallback, response, con, opencode_provider
         )
     response = _with_live_opencode(
-        {**fresh, "stale": bool(fresh.get("partial"))}, opencode_provider
+        {**fresh, "stale": False}, opencode_provider
     )
     response["refresh_started_at"] = refresh_started_at
     response["refresh_completed_at"] = datetime.now(timezone.utc).isoformat()

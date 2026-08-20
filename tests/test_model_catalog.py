@@ -612,6 +612,67 @@ class RoutePersistenceTest(unittest.TestCase):
             "SELECT stale, last_error FROM model_routes WHERE selector='fable'").fetchone()
         self.assertEqual(tuple(row), (1, "network down"))
 
+    def test_partial_opencode_failure_preserves_other_harness_routes(self):
+        claude = self.verification("claude", "2.1.222")
+        opencode = self.verification("opencode", "1.18.18")
+        statuses = {
+            "claude": claude["verification"]["harnesses"]["claude"],
+            "opencode": opencode["verification"]["harnesses"]["opencode"],
+        }
+        initial = {
+            "fetched_at": "2026-08-20T00:00:00+00:00",
+            "stale": False,
+            "harnesses": {
+                "claude": {"models": [mc._entry(
+                    "opus", source="claude-cli", availability="available",
+                    cli_version="claude 2.1.222",
+                )]},
+                "opencode": {"models": [mc._entry(
+                    "halo/qwen", source="opencode-provider-api",
+                    availability="available", cli_version="opencode 1.18.18",
+                )]},
+            },
+            "verification": {"runtime": "host", "harnesses": statuses},
+        }
+        mc.persist_routes(self.con, initial)
+
+        partial = {
+            **initial,
+            "fetched_at": "2026-08-20T00:01:00+00:00",
+            "partial": True,
+            "errors": ["opencode-provider-api: sidecar unavailable"],
+            "harnesses": {
+                "claude": initial["harnesses"]["claude"],
+                "opencode": {
+                    "models": [],
+                    "error": "HARNESS_UNAVAILABLE: sidecar unavailable",
+                },
+            },
+        }
+        mc.persist_routes(self.con, partial)
+
+        rows = self.con.execute(
+            "SELECT harness,selector,stale,last_error FROM model_routes "
+            "ORDER BY harness"
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                ("claude", "opus", 0, None),
+                ("opencode", "halo/qwen", 1,
+                 "HARNESS_UNAVAILABLE: sidecar unavailable"),
+            ],
+        )
+        generation = self.con.execute(
+            "SELECT state,error_summary FROM model_catalog_generations "
+            "ORDER BY completed_at DESC,generation_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(generation["state"], "successful")
+        self.assertEqual(
+            json.loads(generation["error_summary"])["errors"],
+            ["opencode-provider-api: sidecar unavailable"],
+        )
+
     def test_resolver_returns_exact_high_effort_sc_run_call(self):
         fresh = {"fetched_at": datetime.now(timezone.utc).isoformat(), "stale": False,
                  "harnesses": {"codex": {"models": [mc._entry(
@@ -1571,6 +1632,46 @@ class CatalogCacheTest(NoCLI):
         )
         self.assertFalse(second["stale"], "the base cache remains fresh")
         self.assertEqual(provider_models.call_count, 2)
+
+    def test_opencode_overlay_failure_does_not_make_fresh_catalog_stale(self):
+        with mock.patch.object(
+            mc.shutil, "which",
+            side_effect=lambda name: (
+                "/usr/bin/opencode" if name == "opencode" else None
+            ),
+        ):
+            got = mc.catalog(
+                fetch=fetch_ok,
+                env={},
+                run=None,
+                opencode_provider=mock.Mock(
+                    side_effect=RuntimeError("sidecar unavailable")
+                ),
+            )
+            cached = mc.catalog(
+                fetch=fetch_down,
+                env={},
+                run=None,
+                opencode_provider=mock.Mock(
+                    side_effect=RuntimeError("sidecar still unavailable")
+                ),
+            )
+
+        self.assertTrue(got["partial"])
+        self.assertFalse(got["stale"])
+        self.assertIn("claude-opus-4-8", ids(got["harnesses"]["claude"]))
+        self.assertEqual(got["harnesses"]["opencode"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["opencode"]["error"],
+            "sidecar unavailable",
+        )
+        self.assertTrue(cached["partial"])
+        self.assertFalse(cached["stale"])
+        self.assertIn("claude-opus-4-8", ids(cached["harnesses"]["claude"]))
+        self.assertEqual(
+            cached["harnesses"]["opencode"]["error"],
+            "sidecar still unavailable",
+        )
 
     def test_stale_cache_served_when_refresh_fails(self):
         mc.catalog(fetch=fetch_ok, env={}, run=None)

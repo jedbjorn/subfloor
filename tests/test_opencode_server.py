@@ -57,6 +57,7 @@ class OpenCodeServerTest(unittest.TestCase):
         self.state_patch.start()
         self.addCleanup(self.state_patch.stop)
         opencode._SERVER_PROCESS = None
+        opencode._SERVER_ENDPOINT = opencode.SERVER_ENDPOINT
         opencode._SERVER_PASSWORD = None
         opencode._SERVER_LOG_HANDLE = None
         self.addCleanup(opencode.stop_server)
@@ -65,27 +66,31 @@ class OpenCodeServerTest(unittest.TestCase):
         with mock.patch.object(
             opencode, "_server_healthy", return_value=True
         ), mock.patch.object(opencode.subprocess, "Popen") as spawn:
-            password = opencode.ensure_server()
+            endpoint, password = opencode.ensure_server()
+        self.assertEqual(endpoint, opencode.SERVER_ENDPOINT)
         self.assertIsNone(password)
         spawn.assert_not_called()
 
-    def test_managed_server_is_loopback_authenticated_and_stoppable(self):
+    def test_managed_server_uses_private_dynamic_loopback_port(self):
         process = FakeProcess()
         checks = iter([False, True])
         with mock.patch.dict(os.environ, {}, clear=False), \
                 mock.patch.object(
                     opencode, "_server_healthy",
-                    side_effect=lambda _password: next(checks),
+                    side_effect=lambda _endpoint, _password: next(checks),
                 ), mock.patch.object(
                     opencode.shutil, "which", return_value="/bin/opencode"
                 ), mock.patch.object(
                     opencode.secrets, "token_urlsafe", return_value="server-secret"
                 ), mock.patch.object(
+                    opencode, "_available_loopback_port", return_value=43210
+                ), mock.patch.object(
                     opencode.subprocess, "Popen", return_value=process
                 ) as spawn:
             os.environ.pop("OPENCODE_SERVER_PASSWORD", None)
-            password = opencode.ensure_server(timeout=1)
+            endpoint, password = opencode.ensure_server(timeout=1)
 
+        self.assertEqual(endpoint, "http://127.0.0.1:43210")
         self.assertEqual(password, "server-secret")
         argv = spawn.call_args.args[0]
         self.assertEqual(
@@ -96,7 +101,7 @@ class OpenCodeServerTest(unittest.TestCase):
                 "--hostname",
                 "127.0.0.1",
                 "--port",
-                "4096",
+                "43210",
                 "--log-level",
                 "WARN",
             ],
@@ -117,11 +122,15 @@ class OpenCodeServerTest(unittest.TestCase):
         with mock.patch.object(
             opencode,
             "_server_healthy",
-            side_effect=lambda password: password == "orphan-secret",
+            side_effect=lambda endpoint, password: (
+                endpoint == opencode.SERVER_ENDPOINT
+                and password == "orphan-secret"
+            ),
         ), mock.patch.object(opencode.subprocess, "Popen") as spawn, \
                 mock.patch.object(opencode, "_reap_orphan_server") as reap:
-            password = opencode.ensure_server()
+            endpoint, password = opencode.ensure_server()
 
+        self.assertEqual(endpoint, opencode.SERVER_ENDPOINT)
         self.assertEqual(password, "orphan-secret")
         spawn.assert_not_called()
         reap.assert_not_called()
@@ -136,7 +145,7 @@ class OpenCodeServerTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False), \
                 mock.patch.object(
                     opencode, "_server_healthy",
-                    side_effect=lambda _password: next(checks),
+                    side_effect=lambda _endpoint, _password: next(checks),
                 ), mock.patch.object(
                     opencode, "_pid_is_opencode_serve", return_value=True
                 ) as identify, mock.patch.object(
@@ -146,17 +155,20 @@ class OpenCodeServerTest(unittest.TestCase):
                 ), mock.patch.object(
                     opencode.secrets, "token_urlsafe", return_value="fresh-secret"
                 ), mock.patch.object(
+                    opencode, "_available_loopback_port", return_value=43211
+                ), mock.patch.object(
                     opencode.subprocess, "Popen", return_value=process
                 ):
             os.environ.pop("OPENCODE_SERVER_PASSWORD", None)
-            password = opencode.ensure_server(timeout=1)
+            endpoint, password = opencode.ensure_server(timeout=1)
 
+        self.assertEqual(endpoint, "http://127.0.0.1:43211")
         self.assertEqual(password, "fresh-secret")
         identify.assert_called_once_with(4322)
         reap.assert_called_once_with(4322)
         self.assertEqual(
             json.loads(self.state_path.read_text()),
-            {"pid": 9999, "password": "fresh-secret"},
+            {"pid": 9999, "password": "fresh-secret", "port": 43211},
         )
 
     def test_stop_server_preserves_state_of_adopted_orphan(self):
@@ -399,14 +411,15 @@ class OpenCodeServerTest(unittest.TestCase):
 
     def test_default_adapter_uses_managed_server_password(self):
         with mock.patch.object(
-            opencode, "ensure_server", return_value="managed-secret"
+            opencode, "ensure_server",
+            return_value=("http://127.0.0.1:43212", "managed-secret"),
         ) as ensure, mock.patch.object(
             opencode, "UrlHttpTransport"
         ) as transport:
             opencode.OpenCodeAdapter()
         ensure.assert_called_once_with()
         transport.assert_called_once_with(
-            opencode.SERVER_ENDPOINT,
+            "http://127.0.0.1:43212",
             password="managed-secret",
             timeout=opencode.TURN_TIMEOUT_SECONDS,
         )
