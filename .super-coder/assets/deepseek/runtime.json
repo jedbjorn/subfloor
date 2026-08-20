@@ -16,14 +16,14 @@
   },
   "patch": {
     "path": "assets/deepseek/deepseek-harness-bb4ca698-lifecycle.patch",
-    "sha256": "e04c04b4497535c7c7fcb28f6d9507542d7b0b72addb24373db0bedf8cfcd009",
+    "sha256": "93538c3ab1fbda75a898ae80b3ea907e3e9955f44fbdcae33a369db99054c558",
     "protocol": "super-coder-deepseek-lifecycle-v1",
     "upstream_issue_url": "https://github.com/deepseek-ai/deepseek-harness/issues/new",
     "upstream_contribution": "git apply assets/deepseek/deepseek-harness-bb4ca698-lifecycle.patch"
   },
   "build": {
     "path": "scripts/build_deepseek_carrier.py",
-    "sha256": "c15d53b4163de875a27d83d93b94c869ba94b4b3ad8d435412644ebdcf906686",
+    "sha256": "2a5dc5affc1dc3451cf47b2552cc0ed2def45fee4670772af3a335ad5a3452d2",
     "lock_sha256": "f517dc3978d57531cda747df62a2abdde1df5b9f25415fcf1fc5d51f8b7547ea",
     "node_version": "24.18.1",
     "pnpm_version": "11.7.0",

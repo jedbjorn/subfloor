@@ -38,7 +38,7 @@ index a7b22ddd8..bc9301ef8 100644
  } from './adapter.ts'
  import type { DeepSeekCatalogModel, DeepSeekConnectionOptions } from './adapter.ts'
 +import type { ProviderRequestOptions } from './serialize.ts'
- 
+
  export {
    DEFAULT_CONTEXT_WINDOW,
 @@ -35,7 +36,7 @@ export {
@@ -48,7 +48,7 @@ index a7b22ddd8..bc9301ef8 100644
 -export type { RequestDefaults } from './serialize.ts'
 +export type { ProviderRequestOptions, RequestDefaults } from './serialize.ts'
  export type * from './types.ts'
- 
+
  export const name = 'llm-deepseek'
 @@ -78,6 +79,10 @@ export interface Config {
    streamIdleTimeoutMs?: number
@@ -59,7 +59,7 @@ index a7b22ddd8..bc9301ef8 100644
 +  /** Final outbound effort patch supplied by a lifecycle owner. */
 +  providerRequestReasoningEffort?: 'omit' | 'low' | 'high' | 'max'
  }
- 
+
  const catalogModel: z<DeepSeekCatalogModel> = z.object({
 @@ -98,6 +103,8 @@ export const Config: z<Config> = z.object({
    models: z.array(catalogModel).default(DEFAULT_MODELS),
@@ -68,7 +68,7 @@ index a7b22ddd8..bc9301ef8 100644
 +  providerRequestThinking: z.union(['omit', 'enabled', 'disabled']),
 +  providerRequestReasoningEffort: z.union(['omit', 'low', 'high', 'max']),
  })
- 
+
  /** Public API default; the internal endpoint comes from $DEEPSEEK_BASE_URL. */
 @@ -180,6 +187,7 @@ export function resolveAdapterOptions(config: Config, environment?: LaunchEnviro
        `llm-deepseek: streamIdleTimeoutMs must be a positive finite number no greater than ${MAX_TIMER_DELAY_MS}`,
@@ -89,7 +89,7 @@ index a7b22ddd8..bc9301ef8 100644
 @@ -197,6 +206,16 @@ export function resolveAdapterOptions(config: Config, environment?: LaunchEnviro
    }
  }
- 
+
 +function resolveProviderRequestOptions(config: Config): ProviderRequestOptions | undefined {
 +  const thinking = config.providerRequestThinking
 +  const reasoningEffort = config.providerRequestReasoningEffort
@@ -110,7 +110,7 @@ index f51ef2303..b2f0ae3cd 100644
 @@ -17,6 +17,12 @@ export interface RequestDefaults {
    reasoningEffort?: 'off' | 'low' | 'high' | 'max' | undefined
  }
- 
+
 +/** Caller-resolved patch applied at the final outbound serialization seam. */
 +export interface ProviderRequestOptions {
 +  thinking: 'omit' | 'enabled' | 'disabled'
@@ -131,7 +131,7 @@ index f51ef2303..b2f0ae3cd 100644
 @@ -170,7 +177,7 @@ export function serializeRequest(
    // compaction calls continue to inherit the adapter's thinking defaults.
    const resolvedThinking = resolveThinking(options, defaults)
- 
+
 -  return {
 +  const request: WireRequest = {
      model: options.model,
@@ -171,13 +171,13 @@ index 714cfc5d2..cfe8d4ef7 100644
  import type { ContentBlock, GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
 -import { serializeMessages, serializeRequest } from '../src/serialize.ts'
 +import { applyProviderRequestOptions, serializeMessages, serializeRequest } from '../src/serialize.ts'
- 
+
  function request(overrides: Partial<GenerateOptions> = {}): GenerateOptions {
    return { provider: 'deepseek-official', model: 'deepseek-v4-flash', messages: [], ...overrides }
 @@ -256,6 +256,29 @@ describe('serializeRequest', () => {
      expect(wire.reasoning_effort).toBeUndefined()
    })
- 
+
 +  it('final provider patch removes materialized thinking defaults', () => {
 +    const wire = serializeRequest(
 +      request({ messages: history, reasoningEffort: ReasoningEffortId('high') }),
@@ -205,10 +205,10 @@ index 714cfc5d2..cfe8d4ef7 100644
      const wire = serializeRequest(request({ messages: history }), { thinking: 'enabled' })
      expect(wire.thinking).toEqual({ type: 'enabled' })
 diff --git a/packages/sdk/protocol/src/index.ts b/packages/sdk/protocol/src/index.ts
-index 5f0aaca21..7e247f0ad 100644
+index 5f0aaca21..9dd0beb38 100644
 --- a/packages/sdk/protocol/src/index.ts
 +++ b/packages/sdk/protocol/src/index.ts
-@@ -15,8 +15,13 @@ export type {
+@@ -15,8 +15,14 @@ export type {
    HarnessSdkRequestMap,
    InitializeParams,
    InitializeResult,
@@ -218,12 +218,13 @@ index 5f0aaca21..7e247f0ad 100644
    SessionEventNotification,
 +  SessionIdentityParams,
 +  SessionInspectionResult,
++  SessionReconcileParams,
 +  SessionReconcileResult,
    SessionStatusNotification,
    SessionPromptParams,
    SessionPromptResult,
 diff --git a/packages/sdk/protocol/src/types.ts b/packages/sdk/protocol/src/types.ts
-index 533b5f23c..14c712843 100644
+index 533b5f23c..309072b3f 100644
 --- a/packages/sdk/protocol/src/types.ts
 +++ b/packages/sdk/protocol/src/types.ts
 @@ -22,6 +22,20 @@ export interface InitializeParams {
@@ -245,15 +246,21 @@ index 533b5f23c..14c712843 100644
 +  /** Omit the wire field or force one exact DeepSeek reasoning level. */
 +  reasoningEffort: 'omit' | 'low' | 'high' | 'max'
  }
- 
+
  /** Wire-stable server identity returned by initialization. */
-@@ -44,6 +58,33 @@ export interface SessionPromptResult {
+@@ -44,6 +58,40 @@ export interface SessionPromptResult {
    messageId: string
  }
- 
+
 +/** Parameters shared by lifecycle operations that target one exact session. */
 +export interface SessionIdentityParams {
 +  sessionId: string
++}
++
++/** Exact persisted event boundary for one dispatched turn. */
++export interface SessionReconcileParams extends SessionIdentityParams {
++  /** First sequence number that can belong to the abandoned turn. */
++  fromEventSeq: number
 +}
 +
 +/** Native presence and live state without importing persistence layouts. */
@@ -276,37 +283,54 @@ index 533b5f23c..14c712843 100644
 +  sessionId: string
 +  accepted: boolean
 +  status: 'idle' | 'running'
++  outcome: 'not-running' | 'cancelled' | 'deadline-exceeded'
 +}
 +
  /** Deployment-mapped SDK outcome: `ok` for an accepted result, `error` otherwise. */
  export type SdkRunStatus = 'ok' | 'error'
- 
-@@ -101,5 +142,9 @@ export interface HarnessSdkNotificationMap {
+
+@@ -101,5 +149,9 @@ export interface HarnessSdkNotificationMap {
  export interface HarnessSdkRequestMap {
    'initialize': { params: InitializeParams; result: InitializeResult }
    'session/prompt': { params: SessionPromptParams; result: SessionPromptResult }
 +  'session/start': { params: SessionIdentityParams; result: SessionInspectionResult }
 +  'session/cancel': { params: SessionIdentityParams; result: SessionCancelResult }
 +  'session/inspect': { params: SessionIdentityParams; result: SessionInspectionResult }
-+  'session/reconcile': { params: SessionIdentityParams; result: SessionReconcileResult }
++  'session/reconcile': { params: SessionReconcileParams; result: SessionReconcileResult }
    'shutdown': { params: undefined; result: Record<string, never> }
  }
 diff --git a/packages/sdk/server/src/server.ts b/packages/sdk/server/src/server.ts
-index 195caa908..7089f5b64 100644
+index 195caa908..5c617dea3 100644
 --- a/packages/sdk/server/src/server.ts
 +++ b/packages/sdk/server/src/server.ts
-@@ -19,6 +19,10 @@ import type {
+@@ -19,6 +19,11 @@ import type {
    InitializeResult,
    JsonRpcTransportPeer,
    SessionEventNotification,
 +  SessionCancelResult,
 +  SessionIdentityParams,
 +  SessionInspectionResult,
++  SessionReconcileParams,
 +  SessionReconcileResult,
    SessionPromptParams,
    SessionPromptResult,
    SubagentFinishedNotification,
-@@ -119,7 +123,14 @@ export class HarnessSdkJsonRpcServer {
+@@ -29,6 +34,14 @@ interface SessionRecord {
+   handle: AgentHandle
+ }
+
++interface SessionSnapshot {
++  presence: SessionInspectionResult['presence']
++  status: SessionInspectionResult['status']
++  events: readonly { seq: number; type: string; data: unknown }[]
++}
++
++const NATIVE_CANCEL_TIMEOUT_MS = 5_000
++
+ /** Recover the delegating parent from the service-owned scoped carrier. */
+ function subagentParentOf(carrier: Scoped<SubagentRuntime>): Agent {
+   return carrierKeyOf(carrier) as Agent
+@@ -119,7 +132,14 @@ export class HarnessSdkJsonRpcServer {
      this.maxTokens = params.maxTokens
      if (!this.hasAdapterFor(this.provider)) {
        if (this.provider !== 'deepseek-official') throw new Error(`no adapter registered for provider "${this.provider}"`)
@@ -322,10 +346,10 @@ index 195caa908..7089f5b64 100644
      }
      return { serverInfo: { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' } }
    }
-@@ -142,6 +153,47 @@ export class HarnessSdkJsonRpcServer {
+@@ -142,6 +162,52 @@ export class HarnessSdkJsonRpcServer {
      return { messageId: message.id }
    }
- 
+
 +  /** Materialize or exactly resume one caller-supplied native identity. */
 +  async startSession(params: SessionIdentityParams): Promise<SessionInspectionResult> {
 +    await this.getOrCreateSession(params.sessionId)
@@ -336,31 +360,36 @@ index 195caa908..7089f5b64 100644
 +  async cancelSession(params: SessionIdentityParams): Promise<SessionCancelResult> {
 +    const record = this.sessions.get(params.sessionId)
 +    if (record === undefined || this.ctx.agents.get(SessionId(params.sessionId)) !== record.handle.agent) {
-+      return { sessionId: params.sessionId, accepted: false, status: 'idle' }
++      return { sessionId: params.sessionId, accepted: false, status: 'idle', outcome: 'not-running' }
 +    }
 +    const accepted = record.handle.agent.status === 'running'
-+    if (accepted) {
-+      record.handle.agent.cancel({ kind: 'user' })
-+      await record.handle.agent.whenIdle()
++    if (!accepted) {
++      return { sessionId: params.sessionId, accepted: false, status: 'idle', outcome: 'not-running' }
 +    }
-+    return { sessionId: params.sessionId, accepted, status: record.handle.agent.status }
++    record.handle.agent.cancel({ kind: 'user' })
++    const reachedIdle = await waitForIdle(record.handle.agent, NATIVE_CANCEL_TIMEOUT_MS)
++    const cancelled = reachedIdle && record.handle.agent.status === 'idle'
++    return {
++      sessionId: params.sessionId,
++      accepted: true,
++      status: record.handle.agent.status,
++      outcome: cancelled ? 'cancelled' : 'deadline-exceeded',
++    }
 +  }
 +
 +  /** Inspect live or persisted state through public services only. */
 +  async inspectSession(params: SessionIdentityParams): Promise<SessionInspectionResult> {
-+    const live = this.ctx.agents.get(SessionId(params.sessionId))
-+    if (live !== undefined) return inspection(params.sessionId, 'live', live.status, live.session.events)
-+    const persistence = this.ctx.get('sessionPersistence')
-+    if (persistence === undefined) return inspection(params.sessionId, 'absent', 'unknown', [])
-+    const exists = (await persistence.list()).some((candidate: { id: unknown }) => String(candidate.id) === params.sessionId)
-+    if (!exists) return inspection(params.sessionId, 'absent', 'unknown', [])
-+    const stored = await persistence.inspect(SessionId(params.sessionId))
-+    return inspection(params.sessionId, 'persisted', 'idle', stored.events)
++    const snapshot = await this.sessionSnapshot(params.sessionId)
++    return inspection(params.sessionId, snapshot)
 +  }
 +
 +  /** Classify an abandoned lease without inventing successful completion. */
-+  async reconcileSession(params: SessionIdentityParams): Promise<SessionReconcileResult> {
-+    const inspected = await this.inspectSession(params)
++  async reconcileSession(params: SessionReconcileParams): Promise<SessionReconcileResult> {
++    if (!Number.isSafeInteger(params.fromEventSeq) || params.fromEventSeq < 0) {
++      throw new TypeError('session/reconcile fromEventSeq must be a non-negative safe integer')
++    }
++    const snapshot = await this.sessionSnapshot(params.sessionId)
++    const inspected = inspection(params.sessionId, snapshot, params.fromEventSeq)
 +    const outcome = inspected.status === 'running'
 +      ? 'running'
 +      : reconcileOutcome(inspected.lastTurnReason, this.options)
@@ -370,7 +399,7 @@ index 195caa908..7089f5b64 100644
    /**
     * Dispose server-owned agents, adapter, and subscriptions to quiescence.
     * The surrounding context remains running.
-@@ -193,6 +245,14 @@ export class HarnessSdkJsonRpcServer {
+@@ -193,6 +259,14 @@ export class HarnessSdkJsonRpcServer {
          return this.initialize(params as unknown as InitializeParams)
        case 'session/prompt':
          return this.prompt(params as unknown as SessionPromptParams)
@@ -381,11 +410,11 @@ index 195caa908..7089f5b64 100644
 +      case 'session/inspect':
 +        return this.inspectSession(params as unknown as SessionIdentityParams)
 +      case 'session/reconcile':
-+        return this.reconcileSession(params as unknown as SessionIdentityParams)
++        return this.reconcileSession(params as unknown as SessionReconcileParams)
        case 'shutdown':
          return this.shutdown()
        default:
-@@ -220,15 +280,22 @@ export class HarnessSdkJsonRpcServer {
+@@ -220,21 +294,86 @@ export class HarnessSdkJsonRpcServer {
      // rows in the host plane, so this agent reads them from the global layer. A
      // deployment that configures a roster has to join one here first
      // (@deepseek-ai/dsh-agent-presets README, "Composing a child agent").
@@ -417,29 +446,57 @@ index 195caa908..7089f5b64 100644
      const rec: SessionRecord = { handle }
      this.sessions.set(sessionId, rec)
      return rec
-@@ -238,3 +305,35 @@ export class HarnessSdkJsonRpcServer {
+   }
+
++  private async sessionSnapshot(sessionId: string): Promise<SessionSnapshot> {
++    const live = this.ctx.agents.get(SessionId(sessionId))
++    if (live !== undefined) return { presence: 'live', status: live.status, events: live.session.events }
++    const persistence = this.ctx.get('sessionPersistence')
++    if (persistence === undefined) return { presence: 'absent', status: 'unknown', events: [] }
++    const exists = (await persistence.list()).some((candidate: { id: unknown }) => String(candidate.id) === sessionId)
++    if (!exists) return { presence: 'absent', status: 'unknown', events: [] }
++    const stored = await persistence.inspect(SessionId(sessionId))
++    return { presence: 'persisted', status: 'idle', events: stored.events }
++  }
++
+   private hasAdapterFor(provider: string): boolean {
      return this.ctx.get('llm')?.listProviders().some(entry => entry.id === provider) ?? false
    }
  }
 +
 +function inspection(
 +  sessionId: string,
-+  presence: SessionInspectionResult['presence'],
-+  status: SessionInspectionResult['status'],
-+  events: readonly { seq: number; type: string; data: unknown }[],
++  snapshot: SessionSnapshot,
++  fromEventSeq?: number,
 +): SessionInspectionResult {
-+  const lastTurn = events.findLast(event => event.type === 'turn/end')
++  const lastTurn = fromEventSeq === undefined
++    ? snapshot.events.findLast(event => event.type === 'turn/end')
++    : snapshot.events.find(event => event.type === 'turn/end' && event.seq >= fromEventSeq)
 +  const reason = lastTurn?.data !== null && typeof lastTurn?.data === 'object'
 +    ? (lastTurn.data as { reason?: { kind?: unknown } }).reason?.kind
 +    : undefined
-+  const lastEventSeq = events.at(-1)?.seq
++  const lastEventSeq = snapshot.events.at(-1)?.seq
 +  return {
 +    sessionId,
-+    presence,
-+    status,
-+    eventCount: events.length,
++    presence: snapshot.presence,
++    status: snapshot.status,
++    eventCount: snapshot.events.length,
 +    ...lastEventSeq === undefined ? {} : { lastEventSeq },
 +    ...typeof reason === 'string' ? { lastTurnReason: reason } : {},
++  }
++}
++
++async function waitForIdle(agent: Agent, timeoutMs: number): Promise<boolean> {
++  let timer: ReturnType<typeof setTimeout> | undefined
++  try {
++    return await Promise.race([
++      agent.whenIdle().then(() => true),
++      new Promise<boolean>(resolveTimeout => {
++        timer = setTimeout(() => resolveTimeout(false), timeoutMs)
++      }),
++    ])
++  } finally {
++    if (timer !== undefined) clearTimeout(timer)
 +  }
 +}
 +
@@ -454,7 +511,7 @@ index 195caa908..7089f5b64 100644
 +  return 'unknown'
 +}
 diff --git a/packages/sdk/server/tests/server.spec.ts b/packages/sdk/server/tests/server.spec.ts
-index 495f1d90f..98ec1da9f 100644
+index 495f1d90f..3ff1fefbc 100644
 --- a/packages/sdk/server/tests/server.spec.ts
 +++ b/packages/sdk/server/tests/server.spec.ts
 @@ -124,6 +124,7 @@ describe('HarnessSdkJsonRpcServer', () => {
@@ -464,10 +521,10 @@ index 495f1d90f..98ec1da9f 100644
 +        providerRequestOptions: { thinking: 'omit', reasoningEffort: 'omit' },
        }) as { serverInfo: { name: string } }
        expect(init.serverInfo.name).toBe('deepseek-harness-sdk-runtime')
- 
+
 @@ -134,11 +135,19 @@ describe('HarnessSdkJsonRpcServer', () => {
        expect((receipt as { messageId?: unknown }).messageId).toBeTypeOf('string')
- 
+
        await vi.waitFor(() => { expect(llmServer.requests).toHaveLength(1) })
 -      const body = llmServer.requests[0] as { model: string; messages: { role: string }[]; max_tokens?: number }
 +      const body = llmServer.requests[0] as {
@@ -486,10 +543,10 @@ index 495f1d90f..98ec1da9f 100644
        expect(llmServer.headers[0]?.authorization).toBe('Bearer test-key')
        expect(transport.notifications.some(n => n.method === 'session.event')).toBe(true)
        await vi.waitFor(() => {
-@@ -171,6 +180,86 @@ describe('HarnessSdkJsonRpcServer', () => {
+@@ -171,6 +180,237 @@ describe('HarnessSdkJsonRpcServer', () => {
      }
    })
- 
+
 +  it('resumes a persisted caller identity instead of creating a colliding session', async () => {
 +    const events = [{
 +      type: 'turn/end', seq: 7, time: 1,
@@ -556,24 +613,175 @@ index 495f1d90f..98ec1da9f 100644
 +    await server.startSession({ sessionId: 'owned' })
 +
 +    await expect(server.cancelSession({ sessionId: 'owned' })).resolves.toEqual({
-+      sessionId: 'owned', accepted: true, status: 'idle',
++      sessionId: 'owned', accepted: true, status: 'idle', outcome: 'cancelled',
 +    })
 +    expect(agent.cancel).toHaveBeenCalledWith({ kind: 'user' })
-+    await expect(server.reconcileSession({ sessionId: 'owned' })).resolves.toEqual({
++    await expect(server.reconcileSession({ sessionId: 'owned', fromEventSeq: 0 })).resolves.toEqual({
 +      sessionId: 'owned', presence: 'live', status: 'idle', eventCount: 1,
 +      lastEventSeq: 3, lastTurnReason: 'aborted', outcome: 'cancelled',
 +    })
 +    await expect(server.cancelSession({ sessionId: 'other' })).resolves.toEqual({
-+      sessionId: 'other', accepted: false, status: 'idle',
++      sessionId: 'other', accepted: false, status: 'idle', outcome: 'not-running',
 +    })
++    await expect(server.cancelSession({ sessionId: 'owned' })).resolves.toEqual({
++      sessionId: 'owned', accepted: false, status: 'idle', outcome: 'not-running',
++    })
++    expect(agent.cancel).toHaveBeenCalledTimes(1)
 +    expect((other as unknown as { cancel?: unknown }).cancel).toBeUndefined()
 +    await server.shutdown()
++  })
++
++  it('reports the exact live turn as running before native cancellation', async () => {
++    const events = [{
++      type: 'turn/end', seq: 3, time: 1,
++      data: { turn: 1, reason: { kind: 'completed' } },
++    }]
++    const agent = {
++      id: SessionId('running'), session: { events }, status: 'running',
++    } as unknown as Agent
++    const handle: AgentHandle = { agent, dispose: vi.fn(() => Promise.resolve()) }
++    const ctx = {
++      on: vi.fn(() => () => undefined),
++      agents: {
++        create: vi.fn(async () => handle),
++        get: (id: SessionId) => String(id) === 'running' ? agent : undefined,
++      },
++      get: () => undefined,
++    } as unknown as Context
++    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
++    await server.startSession({ sessionId: 'running' })
++
++    await expect(server.reconcileSession({ sessionId: 'running', fromEventSeq: 4 })).resolves.toEqual({
++      sessionId: 'running', presence: 'live', status: 'running', eventCount: 1,
++      lastEventSeq: 3, outcome: 'running',
++    })
++    await server.shutdown()
++  })
++
++  it('does not reuse an older terminal event for a newer incomplete turn', async () => {
++    const events = [
++      { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
++      { type: 'turn/end', seq: 1, time: 2, data: { turn: 1, reason: { kind: 'completed' } } },
++      { type: 'turn/start', seq: 2, time: 3, data: { turn: 2 } },
++      { type: 'step/start', seq: 3, time: 4, data: { turn: 2, step: 1 } },
++    ]
++    const persistence = {
++      list: vi.fn(async () => [{ id: SessionId('persisted'), cwd: '/work' }]),
++      inspect: vi.fn(async () => ({ meta: { id: SessionId('persisted') }, events })),
++    }
++    const ctx = {
++      on: vi.fn(() => () => undefined),
++      agents: { create: vi.fn(), get: () => undefined },
++      get: (name: string) => name === 'sessionPersistence' ? persistence : undefined,
++    } as unknown as Context
++    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
++
++    await expect(server.reconcileSession({ sessionId: 'persisted', fromEventSeq: 2 })).resolves.toEqual({
++      sessionId: 'persisted', presence: 'persisted', status: 'idle', eventCount: 4,
++      lastEventSeq: 3, outcome: 'unknown',
++    })
++    await server.shutdown()
++  })
++
++  it('rejects an invalid reconciliation boundary before reading persistence', async () => {
++    const persistence = {
++      list: vi.fn(async () => []),
++      inspect: vi.fn(),
++    }
++    const ctx = {
++      on: vi.fn(() => () => undefined),
++      agents: { create: vi.fn(), get: () => undefined },
++      get: (name: string) => name === 'sessionPersistence' ? persistence : undefined,
++    } as unknown as Context
++    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
++
++    await expect(server.reconcileSession({ sessionId: 'persisted', fromEventSeq: -1 }))
++      .rejects.toThrow('session/reconcile fromEventSeq must be a non-negative safe integer')
++    expect(persistence.list).not.toHaveBeenCalled()
++    expect(persistence.inspect).not.toHaveBeenCalled()
++    await server.shutdown()
++  })
++
++  it.each([
++    ['completed', 'succeeded'],
++    ['error', 'failed'],
++    ['aborted', 'cancelled'],
++  ] as const)('classifies a matching %s terminal as %s', async (reason, outcome) => {
++    const events = [
++      { type: 'turn/end', seq: 1, time: 1, data: { turn: 1, reason: { kind: 'completed' } } },
++      { type: 'turn/start', seq: 2, time: 2, data: { turn: 2 } },
++      { type: 'turn/end', seq: 3, time: 3, data: { turn: 2, reason: { kind: reason } } },
++    ]
++    const persistence = {
++      list: vi.fn(async () => [{ id: SessionId('persisted'), cwd: '/work' }]),
++      inspect: vi.fn(async () => ({ meta: { id: SessionId('persisted') }, events })),
++    }
++    const ctx = {
++      on: vi.fn(() => () => undefined),
++      agents: { create: vi.fn(), get: () => undefined },
++      get: (name: string) => name === 'sessionPersistence' ? persistence : undefined,
++    } as unknown as Context
++    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
++
++    await expect(server.reconcileSession({ sessionId: 'persisted', fromEventSeq: 2 })).resolves.toEqual({
++      sessionId: 'persisted', presence: 'persisted', status: 'idle', eventCount: 3,
++      lastEventSeq: 3, lastTurnReason: reason, outcome,
++    })
++    await server.shutdown()
++  })
++
++  it('bounds a non-cooperative native cancellation without touching another session', async () => {
++    vi.useFakeTimers()
++    let status: 'idle' | 'running' = 'running'
++    const cancel = vi.fn()
++    const agent = {
++      id: SessionId('stuck'), session: { events: [] },
++      get status() { return status },
++      cancel,
++      whenIdle: vi.fn(() => new Promise<void>(() => undefined)),
++    } as unknown as Agent
++    const otherCancel = vi.fn()
++    const other = {
++      id: SessionId('other'), session: { events: [] }, status: 'running', cancel: otherCancel,
++    } as unknown as Agent
++    const handle: AgentHandle = { agent, dispose: vi.fn(() => Promise.resolve()) }
++    const ctx = {
++      on: vi.fn(() => () => undefined),
++      agents: {
++        create: vi.fn(async () => handle),
++        get: (id: SessionId) => String(id) === 'stuck' ? agent : String(id) === 'other' ? other : undefined,
++      },
++      get: () => undefined,
++    } as unknown as Context
++    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
++    try {
++      await server.startSession({ sessionId: 'stuck' })
++      let settled = false
++      const pending = server.cancelSession({ sessionId: 'stuck' }).then(result => {
++        settled = true
++        return result
++      })
++
++      await vi.advanceTimersByTimeAsync(4_999)
++      expect(settled).toBe(false)
++      await vi.advanceTimersByTimeAsync(1)
++      await expect(pending).resolves.toEqual({
++        sessionId: 'stuck', accepted: true, status: 'running', outcome: 'deadline-exceeded',
++      })
++      expect(cancel).toHaveBeenCalledTimes(1)
++      expect(cancel).toHaveBeenCalledWith({ kind: 'user' })
++      expect(otherCancel).not.toHaveBeenCalled()
++      await server.shutdown()
++    } finally {
++      status = 'idle'
++      vi.useRealTimers()
++    }
 +  })
 +
    it('queues overlapping prompts for one session without blocking other sessions', async () => {
      const mainFollowup = vi.fn<Agent['followup']>()
      const mainAgent = ({
-@@ -910,7 +999,9 @@ describe('HarnessSdkJsonRpcServer', () => {
+@@ -910,7 +1150,9 @@ describe('HarnessSdkJsonRpcServer', () => {
      const ctx = {
        on: vi.fn(() => () => undefined),
        agents: { create, get: () => undefined },
@@ -617,7 +825,7 @@ index 8c098224f..1f4acb597 100644
 +    SessionInspection,
 +    SessionReconciliation,
 +)
- 
+
  __all__ = [
      "DeepSeekHarness",
 @@ -16,4 +25,7 @@ __all__ = [
@@ -629,12 +837,12 @@ index 8c098224f..1f4acb597 100644
 +    "SessionReconciliation",
  ]
 diff --git a/python/sdk/src/deepseek_harness/client.py b/python/sdk/src/deepseek_harness/client.py
-index 5442c7e14..21d3d97b1 100644
+index 5442c7e14..4482f625d 100644
 --- a/python/sdk/src/deepseek_harness/client.py
 +++ b/python/sdk/src/deepseek_harness/client.py
 @@ -15,7 +15,16 @@ from typing import Callable, TypeAlias, TypeVar
  from pydantic import BaseModel
- 
+
  from .errors import JsonRpcError, TransportClosedError
 -from .models import IncomingRequest, InitializeResponse, JsonObject, JsonValue, Notification
 +from .models import (
@@ -647,7 +855,7 @@ index 5442c7e14..21d3d97b1 100644
 +    SessionInspection,
 +    SessionReconciliation,
 +)
- 
+
  ModelT = TypeVar("ModelT", bound=BaseModel)
  NotificationFilter: TypeAlias = Callable[[Notification], bool]
 @@ -121,6 +130,7 @@ class HarnessClient:
@@ -658,7 +866,7 @@ index 5442c7e14..21d3d97b1 100644
      ) -> InitializeResponse:
          payload: JsonObject = {
              "cwd": str(Path(cwd).resolve()),
-@@ -129,12 +139,34 @@ class HarnessClient:
+@@ -129,12 +139,38 @@ class HarnessClient:
          }
          if max_tokens is not None:
              payload["maxTokens"] = max_tokens
@@ -669,7 +877,7 @@ index 5442c7e14..21d3d97b1 100644
          except BaseException:
              self.close()
              raise
- 
+
 +    def session_start(self, session_id: str) -> SessionInspection:
 +        return self.request(
 +            "session/start", {"sessionId": session_id}, response_model=SessionInspection
@@ -685,20 +893,24 @@ index 5442c7e14..21d3d97b1 100644
 +            "session/inspect", {"sessionId": session_id}, response_model=SessionInspection
 +        )
 +
-+    def session_reconcile(self, session_id: str) -> SessionReconciliation:
++    def session_reconcile(
++        self, session_id: str, *, from_event_seq: int
++    ) -> SessionReconciliation:
 +        return self.request(
-+            "session/reconcile", {"sessionId": session_id}, response_model=SessionReconciliation
++            "session/reconcile",
++            {"sessionId": session_id, "fromEventSeq": from_event_seq},
++            response_model=SessionReconciliation,
 +        )
 +
      def session_prompt(
          self,
          session_id: str,
 diff --git a/python/sdk/src/deepseek_harness/models.py b/python/sdk/src/deepseek_harness/models.py
-index f398bb422..47795199d 100644
+index f398bb422..5acbfca44 100644
 --- a/python/sdk/src/deepseek_harness/models.py
 +++ b/python/sdk/src/deepseek_harness/models.py
-@@ -30,3 +30,22 @@ class ServerInfo(BaseModel):
- 
+@@ -30,3 +30,23 @@ class ServerInfo(BaseModel):
+
  class InitializeResponse(BaseModel):
      serverInfo: ServerInfo | None = None
 +
@@ -720,11 +932,12 @@ index f398bb422..47795199d 100644
 +    sessionId: str
 +    accepted: bool
 +    status: str
++    outcome: str
 diff --git a/python/sdk/tests/test_client.py b/python/sdk/tests/test_client.py
-index 51c9dacb3..f6e233724 100644
+index 51c9dacb3..2fac916d8 100644
 --- a/python/sdk/tests/test_client.py
 +++ b/python/sdk/tests/test_client.py
-@@ -461,7 +461,16 @@ for line in sys.stdin:
+@@ -461,7 +461,17 @@ for line in sys.stdin:
      msg = json.loads(line)
      method = msg.get("method")
      if method == "initialize":
@@ -735,13 +948,14 @@ index 51c9dacb3..f6e233724 100644
 +    elif method == "session/inspect":
 +        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": "main", "presence": "live", "status": "running", "eventCount": 3}}), flush=True)
 +    elif method == "session/cancel":
-+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": "main", "accepted": True, "status": "idle"}}), flush=True)
++        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": "main", "accepted": True, "status": "idle", "outcome": "cancelled"}}), flush=True)
 +    elif method == "session/reconcile":
++        assert msg["params"]["fromEventSeq"] == 2
 +        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": "main", "presence": "live", "status": "idle", "eventCount": 4, "lastTurnReason": "aborted", "outcome": "cancelled"}}), flush=True)
      elif method == "session/prompt":
          params = msg.get("params") or {}
          print(json.dumps({"jsonrpc": "2.0", "method": "llm/request", "params": {"requestId": "req-1", "sessionId": params["sessionId"], "model": "dsagent", "messages": []}}), flush=True)
-@@ -475,9 +484,19 @@ for line in sys.stdin:
+@@ -475,9 +485,21 @@ for line in sys.stdin:
      with HarnessClient(
          HarnessConfig(launch_args_override=(sys.executable, str(script)))
      ) as client:
@@ -753,11 +967,13 @@ index 51c9dacb3..f6e233724 100644
 +            provider_request_options={"thinking": "omit", "reasoningEffort": "omit"},
 +        )
          assert init.serverInfo.name == "fake-dsh"
- 
+
 +        assert client.session_start("main").presence == "persisted"
 +        assert client.session_inspect("main").status == "running"
-+        assert client.session_cancel("main").accepted is True
-+        assert client.session_reconcile("main").outcome == "cancelled"
++        cancellation = client.session_cancel("main")
++        assert cancellation.accepted is True
++        assert cancellation.outcome == "cancelled"
++        assert client.session_reconcile("main", from_event_seq=2).outcome == "cancelled"
 +
          client.session_prompt("main", [{"type": "text", "text": "fix it"}])
          notification = client.next_notification()

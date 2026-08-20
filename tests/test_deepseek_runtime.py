@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 
 import deepseek_runtime  # noqa: E402
+import build_deepseek_carrier  # noqa: E402
 
 
 def load_tests(_loader, _standard_tests, _pattern):
@@ -267,6 +268,42 @@ def test_provider_request_patch_is_callable_exact_and_fail_closed() -> None:
         assert exc.code == "HARNESS_PROVIDER_OPTION_INVALID"
     else:
         raise AssertionError("unknown provider option was accepted")
+
+
+def test_carrier_build_normalizes_only_the_pkg_sea_temp_token() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        executable_path = Path(raw) / "carrier"
+        executable_path.write_bytes(
+            b"prefix/tmp/pkg-sea-Ab9Z0q/sea-main.js/suffix"
+        )
+
+        build_deepseek_carrier.normalize_sea_executable(executable_path)
+
+        assert executable_path.read_bytes() == (
+            b"prefix/tmp/pkg-sea-SC0000/sea-main.js/suffix"
+        )
+
+
+def test_carrier_build_rejects_missing_or_malformed_pkg_sea_temp_path() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        missing = root / "missing"
+        malformed = root / "malformed"
+        missing.write_bytes(b"no SEA marker")
+        malformed.write_bytes(b"/tmp/pkg-sea-ABC123/not-main.js")
+
+        for path, expected in (
+            (missing, "carrier executable does not contain a pkg SEA temp path"),
+            (malformed, "carrier executable has an unexpected pkg SEA temp path"),
+        ):
+            before = path.read_bytes()
+            try:
+                build_deepseek_carrier.normalize_sea_executable(path)
+            except RuntimeError as exc:
+                assert str(exc) == expected
+            else:
+                raise AssertionError(f"invalid SEA path was accepted: {path.name}")
+            assert path.read_bytes() == before
 
 
 def test_bare_metal_install_uses_a_separate_venv_and_writes_version_evidence() -> None:

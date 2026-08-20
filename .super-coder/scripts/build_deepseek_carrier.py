@@ -20,6 +20,9 @@ ENGINE = Path(__file__).resolve().parents[1]
 MANIFEST = ENGINE / "assets" / "deepseek" / "runtime.json"
 SOURCE_DATE_EPOCH = "1786963622"
 COMMAND_TIMEOUT = 2700
+SEA_TEMP_PREFIX = b"/tmp/pkg-sea-"
+SEA_TEMP_SUFFIX = b"/sea-main.js"
+SEA_CANONICAL_TOKEN = b"SC0000"
 
 
 def sha256(path: Path) -> str:
@@ -122,6 +125,24 @@ def patch_source(source: Path, manifest: Mapping[str, object]) -> None:
         raise RuntimeError("patched runtime does not declare the required carrier protocol")
 
 
+def normalize_sea_executable(path: Path) -> None:
+    """Remove pkg's sole random temp token from the otherwise stable SEA."""
+    payload = path.read_bytes()
+    marker_count = payload.count(SEA_TEMP_PREFIX)
+    if marker_count == 0:
+        raise RuntimeError("carrier executable does not contain a pkg SEA temp path")
+    if marker_count != 1:
+        raise RuntimeError("carrier executable contains multiple pkg SEA temp paths")
+    token_start = payload.index(SEA_TEMP_PREFIX) + len(SEA_TEMP_PREFIX)
+    token_end = token_start + len(SEA_CANONICAL_TOKEN)
+    token = payload[token_start:token_end]
+    if len(token) != len(SEA_CANONICAL_TOKEN) or not token.isalnum():
+        raise RuntimeError("carrier executable has an invalid pkg SEA temp token")
+    if payload[token_end:token_end + len(SEA_TEMP_SUFFIX)] != SEA_TEMP_SUFFIX:
+        raise RuntimeError("carrier executable has an unexpected pkg SEA temp path")
+    path.write_bytes(payload[:token_start] + SEA_CANONICAL_TOKEN + payload[token_end:])
+
+
 def platform_name() -> str:
     import platform
 
@@ -141,6 +162,7 @@ def build(source: Path, output: Path, manifest: Mapping[str, object]) -> dict[st
     environment = {
         **os.environ,
         "CI": "true",
+        "TMPDIR": "/tmp",
         "SOURCE_DATE_EPOCH": SOURCE_DATE_EPOCH,
         "PYTHONHASHSEED": "0",
     }
@@ -200,6 +222,7 @@ def build(source: Path, output: Path, manifest: Mapping[str, object]) -> dict[st
     )
     output.mkdir(parents=True, exist_ok=True)
     executable = source / "dist-exe" / f"dsh-jsonrpc-agent-pkg-{target}"
+    normalize_sea_executable(executable)
     for package in ("runtime", "sdk"):
         argv = [
             str(builder_python),
