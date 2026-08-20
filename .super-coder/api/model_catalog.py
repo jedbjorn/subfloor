@@ -289,11 +289,20 @@ def _deepseek_provider_metadata(model: str, proof: dict) -> dict:
             "thinking": {"type": "enabled"},
             "reasoning_effort": effort,
         }
+        expected_native = {
+            "event_type": "provider.request",
+            "provider": route_bindings.DEEPSEEK_PROVIDER_ROUTE,
+            "model": model,
+            "reasoning_effort": (
+                None if effort == route_bindings.DEFAULT_EFFORT else effort
+            ),
+            "purpose": "conversation",
+        }
         digest_payload = {
             key: item.get(key) if isinstance(item, dict) else None
             for key in (
                 "contract", "model", "effort", "provider_options",
-                "wire_options", "runtime_version", "source_commit",
+                "wire_options", "native_request", "runtime_version", "source_commit",
                 "patch_sha256",
             )
         }
@@ -304,6 +313,7 @@ def _deepseek_provider_metadata(model: str, proof: dict) -> dict:
             or item.get("effort") != effort
             or item.get("provider_options") != expected_options
             or item.get("wire_options") != expected_wire
+            or item.get("native_request") != expected_native
             or item.get("runtime_version") != expected_runtime
             or item.get("source_commit") != expected_source
             or item.get("patch_sha256") != expected_patch

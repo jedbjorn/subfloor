@@ -36,6 +36,41 @@ def completed(*, stdout: str = "", stderr: str = "", returncode: int = 0):
     return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
 
 
+def native_request_metadata(model: str, efforts) -> dict:
+    return {
+        effort: {
+            "event_type": "provider.request",
+            "provider": "deepseek-official",
+            "model": model,
+            "reasoning_effort": None if effort == "default" else effort,
+            "purpose": "conversation",
+        }
+        for effort in efforts
+    }
+
+
+def emit_provider_requests(argv, kwargs) -> dict:
+    options_by_effort = json.loads(argv[-1])
+    for options in options_by_effort.values():
+        body = {"model": argv[-2], "messages": [], "stream": True}
+        if options["thinking"] != "omit":
+            body["thinking"] = {"type": options["thinking"]}
+        if options["reasoningEffort"] != "omit":
+            body["reasoning_effort"] = options["reasoningEffort"]
+        request = urllib.request.Request(
+            kwargs["env"]["DEEPSEEK_BASE_URL"] + "/chat/completions",
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bearer {kwargs['env']['DEEPSEEK_API_KEY']}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            response.read()
+    return options_by_effort
+
+
 def executable(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("#!/bin/sh\nexit 0\n")
@@ -288,31 +323,18 @@ def test_provider_wire_evidence_captures_default_omission_and_named_mapping() ->
 
     def runner(argv, **kwargs):
         runner_calls.append((argv, kwargs))
-        options_by_effort = json.loads(argv[-1])
-        for options in options_by_effort.values():
-            body = {"model": argv[-2], "messages": [], "stream": True}
-            if options["thinking"] != "omit":
-                body["thinking"] = {"type": options["thinking"]}
-            if options["reasoningEffort"] != "omit":
-                body["reasoning_effort"] = options["reasoningEffort"]
-            request = urllib.request.Request(
-                kwargs["env"]["DEEPSEEK_BASE_URL"] + "/chat/completions",
-                data=json.dumps(body).encode(),
-                headers={
-                    "Authorization": f"Bearer {kwargs['env']['DEEPSEEK_API_KEY']}",
-                    "Content-Type": "application/json",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(request, timeout=5) as response:
-                response.read()
-        return completed()
+        options_by_effort = emit_provider_requests(argv, kwargs)
+        return completed(stdout=json.dumps(
+            native_request_metadata(argv[-2], options_by_effort)
+        ))
 
     evidence = deepseek_runtime.provider_wire_evidence(
         "deepseek-v4-pro",
         {
             "default": {"thinking": "omit", "reasoningEffort": "omit"},
+            "low": {"thinking": "enabled", "reasoningEffort": "low"},
             "high": {"thinking": "enabled", "reasoningEffort": "high"},
+            "max": {"thinking": "enabled", "reasoningEffort": "max"},
         },
         env={},
         runner=runner,
@@ -321,10 +343,25 @@ def test_provider_wire_evidence_captures_default_omission_and_named_mapping() ->
 
     assert evidence["contract"] == deepseek_runtime.PROVIDER_WIRE_CONTRACT
     assert evidence["proofs"]["default"]["wire_options"] == {}
-    assert evidence["proofs"]["high"]["wire_options"] == {
-        "thinking": {"type": "enabled"},
-        "reasoning_effort": "high",
+    assert evidence["proofs"]["default"]["native_request"] == {
+        "event_type": "provider.request",
+        "provider": "deepseek-official",
+        "model": "deepseek-v4-pro",
+        "reasoning_effort": None,
+        "purpose": "conversation",
     }
+    for effort in ("low", "high", "max"):
+        assert evidence["proofs"][effort]["wire_options"] == {
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": effort,
+        }
+        assert evidence["proofs"][effort]["native_request"] == {
+            "event_type": "provider.request",
+            "provider": "deepseek-official",
+            "model": "deepseek-v4-pro",
+            "reasoning_effort": effort,
+            "purpose": "conversation",
+        }
     assert len(evidence["proofs"]["default"]["digest"]) == 64
     assert len(runner_calls) == 1
     assert runner_calls[0][1]["timeout"] == 30
@@ -364,7 +401,9 @@ def test_provider_wire_evidence_rejects_materialized_default() -> None:
         )
         with urllib.request.urlopen(request, timeout=5) as response:
             response.read()
-        return completed()
+        return completed(stdout=json.dumps(
+            native_request_metadata(argv[-2], options_by_effort)
+        ))
 
     try:
         deepseek_runtime.provider_wire_evidence(
@@ -378,6 +417,73 @@ def test_provider_wire_evidence_rejects_materialized_default() -> None:
         assert exc.code == "HARNESS_PROVIDER_WIRE_MISMATCH"
     else:
         raise AssertionError("materialized default entered controlled evidence")
+
+
+def test_provider_wire_evidence_rejects_missing_native_request_metadata() -> None:
+    status = deepseek_runtime.RuntimeStatus(
+        available=True,
+        enabled=True,
+        error=None,
+        detail=None,
+        carrier_python="/carrier/bin/python",
+        python_version="3.14.7",
+        sdk_version="0.1.0rc7",
+        runtime_version="0.1.0rc7",
+        composition_sha256=deepseek_runtime.load_runtime_manifest()["composition"]["sha256"],
+    )
+
+    def runner(argv, **kwargs):
+        emit_provider_requests(argv, kwargs)
+        return completed(stdout="")
+
+    try:
+        deepseek_runtime.provider_wire_evidence(
+            "deepseek-v4-pro",
+            {"default": {"thinking": "omit", "reasoningEffort": "omit"}},
+            env={},
+            runner=runner,
+            status=status,
+        )
+    except deepseek_runtime.DeepSeekRuntimeError as exc:
+        assert exc.code == "HARNESS_PROVIDER_WIRE_INVALID"
+        assert exc.detail == "carrier returned no valid native request metadata"
+    else:
+        raise AssertionError("wire-only receipt entered controlled evidence")
+
+
+def test_provider_wire_evidence_rejects_mismatched_native_effort() -> None:
+    status = deepseek_runtime.RuntimeStatus(
+        available=True,
+        enabled=True,
+        error=None,
+        detail=None,
+        carrier_python="/carrier/bin/python",
+        python_version="3.14.7",
+        sdk_version="0.1.0rc7",
+        runtime_version="0.1.0rc7",
+        composition_sha256=deepseek_runtime.load_runtime_manifest()["composition"]["sha256"],
+    )
+
+    def runner(argv, **kwargs):
+        options_by_effort = emit_provider_requests(argv, kwargs)
+        metadata = native_request_metadata(argv[-2], options_by_effort)
+        metadata["low"]["reasoning_effort"] = "high"
+        return completed(stdout=json.dumps(metadata))
+
+    try:
+        deepseek_runtime.provider_wire_evidence(
+            "deepseek-v4-pro",
+            {"low": {"thinking": "enabled", "reasoningEffort": "low"},
+             "default": {"thinking": "omit", "reasoningEffort": "omit"}},
+            env={},
+            runner=runner,
+            status=status,
+        )
+    except deepseek_runtime.DeepSeekRuntimeError as exc:
+        assert exc.code == "HARNESS_PROVIDER_WIRE_MISMATCH"
+        assert exc.detail == "native request metadata does not match effort low"
+    else:
+        raise AssertionError("mismatched native effort entered controlled evidence")
 
 
 def test_carrier_build_normalizes_only_the_pkg_sea_temp_token() -> None:

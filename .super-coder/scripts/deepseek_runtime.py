@@ -53,8 +53,10 @@ from deepseek_harness import HarnessClient, HarnessConfig
 
 model = sys.argv[1]
 options_by_effort = json.loads(sys.argv[2])
+native_requests = {}
 for index, (effort, options) in enumerate(options_by_effort.items()):
     session_id = f"wire-proof-{index}-{effort}"
+    native_metadata = []
     config = HarnessConfig(
         cwd=os.environ["DSH_CWD"],
         env=dict(os.environ),
@@ -75,12 +77,32 @@ for index, (effort, options) in enumerate(options_by_effort.items()):
         )
         while True:
             notification = client.next_notification()
+            if notification.method == "provider.request":
+                payload = notification.payload
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("sessionId") == session_id
+                    and payload.get("purpose") == "conversation"
+                ):
+                    native_metadata.append({
+                        "event_type": "provider.request",
+                        "provider": payload.get("provider"),
+                        "model": payload.get("model"),
+                        "reasoning_effort": payload.get("reasoningEffort"),
+                        "purpose": payload.get("purpose"),
+                    })
             if (
                 notification.method == "session.status"
                 and notification.payload.get("sessionId") == session_id
                 and notification.payload.get("status") == "idle"
             ):
                 break
+    if len(native_metadata) != 1:
+        raise RuntimeError(
+            f"expected one native provider.request for {effort}, observed {len(native_metadata)}"
+        )
+    native_requests[effort] = native_metadata[0]
+print(json.dumps(native_requests, sort_keys=True, separators=(",", ":")))
 """.strip()
 
 
@@ -1124,6 +1146,21 @@ def provider_wire_evidence(
                         secrets=("wire-proof-sentinel",),
                     ),
                 )
+            try:
+                native_requests = json.loads(completed.stdout)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise DeepSeekRuntimeError(
+                    "HARNESS_PROVIDER_WIRE_INVALID",
+                    "carrier returned no valid native request metadata",
+                ) from exc
+            if (
+                not isinstance(native_requests, dict)
+                or set(native_requests) != set(requested)
+            ):
+                raise DeepSeekRuntimeError(
+                    "HARNESS_PROVIDER_WIRE_INVALID",
+                    "carrier native request metadata does not cover every effort",
+                )
             if capture_errors or len(captures) != len(requested):
                 raise DeepSeekRuntimeError(
                     "HARNESS_PROVIDER_WIRE_INVALID",
@@ -1166,12 +1203,28 @@ def provider_wire_evidence(
                         "HARNESS_PROVIDER_WIRE_MISMATCH",
                         f"outbound reasoning fields do not match effort {effort}",
                     )
+                native_request = native_requests[effort]
+                expected_native = {
+                    "event_type": "provider.request",
+                    "provider": "deepseek-official",
+                    "model": model,
+                    "reasoning_effort": (
+                        None if effort == "default" else effort
+                    ),
+                    "purpose": "conversation",
+                }
+                if native_request != expected_native:
+                    raise DeepSeekRuntimeError(
+                        "HARNESS_PROVIDER_WIRE_MISMATCH",
+                        f"native request metadata does not match effort {effort}",
+                    )
                 evidence = {
                     "contract": PROVIDER_WIRE_CONTRACT,
                     "model": model,
                     "effort": effort,
                     "provider_options": options,
                     "wire_options": observed_options,
+                    "native_request": native_request,
                     "runtime_version": observed_status.runtime_version,
                     "source_commit": manifest["source"]["commit"],
                     "patch_sha256": manifest["patch"]["sha256"],

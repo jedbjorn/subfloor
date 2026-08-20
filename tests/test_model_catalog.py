@@ -88,9 +88,16 @@ def deepseek_wire_proof(model, options_by_effort, env=None):
             "effort": effort,
             "provider_options": dict(options),
             "wire_options": wire,
+            "native_request": {
+                "event_type": "provider.request",
+                "provider": "deepseek-official",
+                "model": model,
+                "reasoning_effort": None if effort == "default" else effort,
+                "purpose": "conversation",
+            },
             "runtime_version": "0.1.0rc7",
             "source_commit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
-            "patch_sha256": "93538c3ab1fbda75a898ae80b3ea907e3e9955f44fbdcae33a369db99054c558",
+            "patch_sha256": "034245298c94964e67f6f756b6067926740def4cd98f68e4a4751d6f65d6d74b",
         }
         proofs[effort] = {
             **evidence,
@@ -699,6 +706,72 @@ class BuildTest(NoCLI):
 
         self.assertTrue(got["partial"])
         self.assertEqual(got["sources"], ["models.dev"])
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
+        )
+
+    def test_deepseek_wire_only_receipt_admits_no_route(self):
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": [{"id": "deepseek-v4-pro"}]}
+
+        def wire_only(model, options_by_effort, env=None):
+            proof = deepseek_wire_proof(model, options_by_effort, env)
+            for item in proof["proofs"].values():
+                item.pop("native_request")
+                item["digest"] = route_bindings.digest_json({
+                    key: item[key]
+                    for key in (
+                        "contract", "model", "effort", "provider_options",
+                        "wire_options", "runtime_version", "source_commit",
+                        "patch_sha256",
+                    )
+                })
+            return proof
+
+        got = mc.build(
+            fetch=fetch,
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            run=None,
+            deepseek_wire_probe=wire_only,
+        )
+
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
+        )
+
+    def test_deepseek_native_effort_mismatch_admits_no_route(self):
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": [{"id": "deepseek-v4-pro"}]}
+
+        def mismatched_native(model, options_by_effort, env=None):
+            proof = deepseek_wire_proof(model, options_by_effort, env)
+            item = proof["proofs"]["low"]
+            item["native_request"]["reasoning_effort"] = "high"
+            item["digest"] = route_bindings.digest_json({
+                key: item[key]
+                for key in (
+                    "contract", "model", "effort", "provider_options",
+                    "wire_options", "native_request", "runtime_version",
+                    "source_commit", "patch_sha256",
+                )
+            })
+            return proof
+
+        got = mc.build(
+            fetch=fetch,
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            run=None,
+            deepseek_wire_probe=mismatched_native,
+        )
+
         self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
         self.assertEqual(
             got["harnesses"]["deepseek"]["error"],
