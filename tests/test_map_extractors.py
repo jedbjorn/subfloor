@@ -167,7 +167,9 @@ class ExtractorDiscoveryTest(unittest.TestCase):
                 "    con.execute(\"INSERT INTO dr_route (path) VALUES ('/hit')\")\n"
                 "    return '1 route'\n")
             (ext / "broken.py").write_text(
-                "def extract(con, repo_root, cfg):\n    raise RuntimeError('boom')\n")
+                "def extract(con, repo_root, cfg):\n"
+                "    con.execute(\"INSERT INTO dr_route (path) VALUES ('/partial')\")\n"
+                "    raise RuntimeError('boom')\n")
             (ext / "_helper.py").write_text("# underscore = ignored\n")
             con = map_db()
             summaries = map_repo.run_extractors(con, root, {})
@@ -177,6 +179,12 @@ class ExtractorDiscoveryTest(unittest.TestCase):
             self.assertFalse(any("_helper" in s for s in summaries))
             self.assertEqual(
                 con.execute("SELECT path FROM dr_route").fetchone()["path"], "/hit")
+            self.assertEqual(
+                0,
+                con.execute(
+                    "SELECT COUNT(*) FROM dr_route WHERE path='/partial'"
+                ).fetchone()[0],
+            )
             con.close()
 
 

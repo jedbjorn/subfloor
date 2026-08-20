@@ -98,8 +98,9 @@ it's thrash.
 
 Find things by querying the repo map — the `dr_*` tables in `.sc-state/map.db`
 (SQLite), kept fresh by the cartographer shell. You read the map; the
-cartographer owns and heals it. Query it with `sc map-sql` — never look for
-`dr_*` in the memory DB. Table reference, query patterns, and the semantic
+cartographer owns and heals it. Inspect structure with `sc map-schema`; query
+data with `sc map-sql` — never look for `dr_*` in the memory DB. Table
+reference, query patterns, and the semantic
 layer (`dr_endpoint` / `dr_db_table` / `dr_route`): the `surface_catalogue`
 skill. Map first, grep second; lazy-load only what the map points at. Before
 writing SQL against your memory DB, check the `db_map` skill.

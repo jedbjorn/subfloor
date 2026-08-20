@@ -1,12 +1,17 @@
----
-name: cartographer
-description: Own the repo map — configure mapping to THIS repo, wire auto-remap, install semantic extractors, curate authored navigation, and finish through one truthful finalization gate. Cartographer-only.
-category: substrate
-command: sc map-setup
-common: false
----
+-- 0226 — reseed Cartographer workflow hardening.
+-- Full-body UPSERTs converge existing forks to guarded extractor install,
+-- supported schema inspection, root grouping, executable notice flags,
+-- and truthful non-owning map finalization.
 
-# cartographer — own the repo map
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'cartographer',
+  'Own the repo map — configure mapping to THIS repo, wire auto-remap, install semantic extractors, curate authored navigation, and finish through one truthful finalization gate. Cartographer-only.',
+  'substrate',
+  'sc map-setup',
+  0,
+  '# cartographer — own the repo map
 
 Working shells consume the `dr_*` catalogue and NEVER map. Own its config,
 automation, semantic extractors, sections, descriptions, shape notices, and
@@ -71,7 +76,7 @@ Automation remains healthy when:
 - `post-merge` / `post-checkout` / `post-rewrite` run `sc map` through
   `core.hooksPath`.
 - `sc rebuild` remaps after rebuilding the engine DB.
-- pm2's `sc-map-<repo>` one-shot cycles stopped -> online hourly while the
+- pm2''s `sc-map-<repo>` one-shot cycles stopped -> online hourly while the
   stack is up. A repo without pm2 relies on hooks + manual `sc map`.
 
 ## Authored navigation
@@ -85,20 +90,20 @@ group and never enter `dr_section`.
 ```sql
 -- Repository Root leaves; a non-empty result renders the synthetic group:
 SELECT path, desc, lines FROM dr_filepath
-WHERE instr(path, '/') = 0 ORDER BY path;
+WHERE instr(path, ''/'') = 0 ORDER BY path;
 
 -- Authored sections + live counts:
 SELECT s.name, s.path_prefix, s.description,
        (SELECT COUNT(*) FROM dr_filepath f
-        WHERE f.path LIKE s.path_prefix || '%') n
+        WHERE f.path LIKE s.path_prefix || ''%'') n
 FROM dr_section s ORDER BY s.sort_order, s.name;
 
 -- WORKLIST: only nested unmatched files are real section gaps:
 SELECT f.path FROM dr_filepath f
-WHERE instr(f.path, '/') > 0
+WHERE instr(f.path, ''/'') > 0
   AND NOT EXISTS (
     SELECT 1 FROM dr_section s
-    WHERE f.path LIKE s.path_prefix || '%'
+    WHERE f.path LIKE s.path_prefix || ''%''
   )
 ORDER BY f.path;
 
@@ -107,14 +112,14 @@ SELECT s.name, s.path_prefix, s.description
 FROM dr_section s
 WHERE NOT EXISTS (
   SELECT 1 FROM dr_filepath f
-  WHERE f.path LIKE s.path_prefix || '%'
+  WHERE f.path LIKE s.path_prefix || ''%''
 )
 ORDER BY s.name;
 ```
 
 Use `sc map-sql-rw` to `INSERT` / `UPDATE` / `DELETE` the exact rows identified
 by these queries. Pass = nested unmatched + stale-section worklists return no
-rows; root files remain queryable through `instr(path, '/') = 0`.
+rows; root files remain queryable through `instr(path, ''/'') = 0`.
 
 ### Descriptions
 
@@ -125,11 +130,11 @@ in the live DB but are not snapshot durability; refill after a fresh rebuild.
 ```sql
 WITH f AS (
   SELECT path, role, desc,
-         replace(path, rtrim(path, replace(path,'/','')), '') AS base
+         replace(path, rtrim(path, replace(path,''/'','''')), '''') AS base
   FROM dr_filepath
 ), g AS (
-  SELECT *, CASE WHEN instr(base,'.') > 0
-    THEN substr(base, 1, instr(base,'.')-1) ELSE base END AS stem
+  SELECT *, CASE WHEN instr(base,''.'') > 0
+    THEN substr(base, 1, instr(base,''.'')-1) ELSE base END AS stem
   FROM f
 )
 SELECT path, role, desc FROM g
@@ -146,18 +151,18 @@ spot checks per section describe behavior that the path alone cannot reveal.
 
 ### Product DB
 
-Tag the host application's schema/migrations as product DB, never engine
+Tag the host application''s schema/migrations as product DB, never engine
 memory. The live app `.db` is often ignored; tracked schema + migrations are
 the durable map anchors.
 
 ```sql
 UPDATE dr_filepath
-SET desc='Product DB schema — the APP database (NOT engine memory)'
-WHERE path='<app schema file>';
+SET desc=''Product DB schema — the APP database (NOT engine memory)''
+WHERE path=''<app schema file>'';
 
 UPDATE dr_filepath
-SET desc='Product DB migration — change the app schema here'
-WHERE path LIKE '<app migrations dir>/%';
+SET desc=''Product DB migration — change the app schema here''
+WHERE path LIKE ''<app migrations dir>/%'';
 ```
 
 Create an authored section when those files form a real area. Pass = working
@@ -205,7 +210,7 @@ flags: <numeric_id>=<SC-name>[, <numeric_id>=<SC-name>] | none
 curate; verify and close each flag; mark this notice read last.
 ```
 
-Name the durable ref + exact path region. Pair every flag's numeric DB ID with
+Name the durable ref + exact path region. Pair every flag''s numeric DB ID with
 its display name. Write `flags: none` when no flag exists. Pass = one notice
 carries every map-quality flag opened for that shape change.
 
@@ -229,4 +234,122 @@ status are local-only. Sections persist only after the GUI Snapshot action or
 Admin runs `sc snapshot`. NEVER run plain `sc snapshot` from Cartographer; it
 is refused. Pass = `sc map finalize` reports Authored sections `PASS` after
 Admin acts, without Cartographer mutating snapshot/Git/message/flag state on
-their behalf.
+their behalf.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'surface_catalogue',
+  'Read the host repo via the dr_* catalogue (files, languages, deps, env) BEFORE grepping or walking the tree. Query first, lazy-load the few files it points at. Use to orient in an unfamiliar repo fast.',
+  'substrate',
+  NULL,
+  1,
+  '# surface_catalogue — read the repo from the map, not by grepping
+
+super-coder lives inside a host repo. The `dr_*` tables = a scan of that repo
+— query them first to orient, not the tree. They live in the **map db**,
+`.sc-state/local/map/map.db` — a separate file from your memory db
+(`.super-coder/shell_db.db`). Inspect structure with `sc map-schema`; query
+data with `sc map-sql "…"`.
+
+NEVER map the repo yourself. The map stays fresh automatically (git hooks
+re-map on pull / branch-switch / rebase) and is owned by the **cartographer**
+shell. Empty / stale / wrong map -> flag the cartographer, don''t re-map.
+
+| Table | Holds |
+|---|---|
+| `dr_repo` | the repo: name, root, remote, vcs, default_branch, file_count, mapped_at |
+| `dr_section` | the navigational index: `name`, `path_prefix`, `description` — "UI here / API here / docs here". Rendered in the boot `## CONNECTIONS` block; start here. |
+| `dr_filepath` | one row per file: `path`, `ext`, `lang`, `role` (code/doc/config/test/asset/env), `bytes`, `lines`, `desc` (cartographer one-liner, NULL until curated) |
+| `dr_dependency` | deps from the manifests: `manager` (npm/pip/poetry/go/cargo), `name`, `version`, `kind`, `source_file` |
+| `dr_env` | env-var names found in `.env.*` example files: `name`, `source_file` |
+| `dr_endpoint` | HTTP routes: `method`, `path`, `handler` (file:line), `framework`, `source_file` |
+| `dr_db_table` / `dr_db_column` | the app DB schema: tables/views + their columns (`type`, `pk`, `not_null`) |
+| `dr_route` / `dr_component` | UI routes (`path`, `kind`) + components (`name`, `path`) |
+
+First five = mapped on EVERY repo. Last three = the semantic layer, populated
+only when the cartographer wired an extractor for this repo''s stack (see the
+`cartographer` skill). Empty `dr_endpoint` = no extractor wired, NOT "no
+endpoints" — check before relying on it; flag the cartographer if a dimension
+you need is missing.
+
+## Orient fast
+
+Boot `## CONNECTIONS` already shows the section index. Flow: pick a section
+there -> query that section''s leaves (file names + descriptions) -> read the
+one or two files you need. Section-first, one cheap query deep — never a full
+preload.
+
+Run `sc map-schema` before the first structural query; pass = it lists the
+expected `dr_*` object. Run `sc map-schema <dr_table>` before using unfamiliar
+columns; pass = ordinal/name/type/nullability/default/PK + indexes are explicit.
+Use `sc map-sql` only for data queries.
+
+```sql
+-- all of these run against the map db:  sc map-sql "<query>"
+-- the section index (same as boot CONNECTIONS) — where to start:
+SELECT name, path_prefix, description FROM dr_section ORDER BY sort_order, name;
+
+-- a chosen section''s leaves — the descriptions tell you which file to open:
+SELECT path, desc, lines FROM dr_filepath
+WHERE path LIKE ''shell_core/api/%'' ORDER BY path;
+
+-- the synthetic Repository Root group (not an authored dr_section row):
+SELECT path, desc, lines FROM dr_filepath
+WHERE instr(path, ''/'') = 0 ORDER BY path;
+
+-- what is this repo + how big:
+SELECT name, default_branch, file_count, mapped_at FROM dr_repo;
+
+-- language mix:
+SELECT lang, COUNT(*) n, SUM(lines) lines FROM dr_filepath
+WHERE lang IS NOT NULL GROUP BY lang ORDER BY n DESC;
+
+-- where the code lives (skip docs/config/assets):
+SELECT path, lang, lines FROM dr_filepath WHERE role=''code'' ORDER BY lines DESC;
+
+-- find files by area (the map is the index; grep only what it points at):
+SELECT path FROM dr_filepath WHERE path LIKE ''%auth%'';
+
+-- stack + config surface:
+SELECT manager, name, version FROM dr_dependency ORDER BY manager, name;
+SELECT name, source_file FROM dr_env ORDER BY name;
+
+-- semantic layer (only if an extractor is wired for this repo — see cartographer):
+SELECT method, path, handler FROM dr_endpoint ORDER BY path;            -- the API surface
+SELECT name, kind, source_file FROM dr_db_table ORDER BY name;          -- the app DB schema
+-- table_name is a string ref (cache; no FK): schema + migration files each
+-- contribute their own copy of a table''s columns — select source_file and
+-- read one source''s rows, or expect duplicates:
+SELECT source_file, name, type, pk, not_null FROM dr_db_column
+WHERE table_name=''users'' ORDER BY source_file;
+SELECT path, kind, file FROM dr_route ORDER BY path;                    -- UI routes
+```
+
+## Stance
+
+- **Map first, grep second.** Query `dr_filepath` for the handful of files
+  that matter, then read those — NEVER `grep -r` the whole tree.
+- **Lazy-load.** Pull a file''s contents only once the map points at it. Carry
+  the map, not the territory.
+- **Map looks wrong?** Empty, stale (repo changed since `mapped_at`),
+  mis-classified, a nested file under "other / unsectioned", or a `desc IS
+  NULL` where you needed one -> Cartographer worklist item. Root files belong
+  to `Repository Root`, not the unsectioned worklist. Flag the gap; don''t
+  author the map yourself.
+- **Semantic layer when wired.** Endpoints / DB schema / UI routes let you
+  jump straight to the API surface or schema; a dimension is empty -> fall
+  back to section + descriptions. Symbol-level semantics (functions/classes)
+  are a later pass.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;

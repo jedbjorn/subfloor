@@ -23,13 +23,17 @@ TEMPLATE_PATH = ENGINE / "templates" / "boot.md"
 # map that is *wrong* rather than newly-grown. Substituted into the
 # `{{map_discrepancy}}` slot in boot.md; stripped clean for the cartographer.
 MAP_DISCREPANCY_BLOCK = (
-    "**If the map is wrong, report it — you don't map.** A discrepancy is the "
-    "map being stale, missing a file, mis-sectioning an area, or contradicting "
-    "the repo. On finding one: (1) surface the gap to the FnB; (2) message the "
-    "cartographer naming what's off and where — `--message send cartographer "
-    "\"map gap: <what's off> — paths: <region/>. heal.\"`; (3) tell the FnB to "
-    "boot the cartographer shell. Then keep working from what the map *does* "
-    "show — healing is the cartographer's job."
+    "**If the map is wrong, report it — you don't map.** Surface the gap to "
+    "the FnB. Open any blocking map-quality flag first; retain its numeric ID "
+    "+ display name. Then send one `messaging` notice to `cartographer`:\n\n"
+    "```text\n"
+    "shape: <what is wrong> — paths: <region/>; ref: <feature/doc/PR>\n"
+    "flags: <numeric_id>=<SC-name>[, <numeric_id>=<SC-name>] | none\n"
+    "curate; verify and close each flag; mark this notice read last.\n"
+    "```\n\n"
+    "Use `flags: none` when no flag exists. Tell the FnB to boot the "
+    "Cartographer; pass = its scoped map checks pass + every named flag is "
+    "resolved + the notice is read. Keep working from what the map does show."
 )
 # PROJECT vs ENGINE renders by repo position (`{{project_vs_engine}}` slot).
 # A fork consumes the engine as a gitignored dependency; the SOURCE repo
@@ -280,20 +284,28 @@ def render_connections(con) -> str:
         lines.append(f"- Repo root: `{repo['root']}`{branch}{mapped}")
         lines.append(f"- Shared (scratch / handoff): `{repo['root']}/shared`")
 
+    root_count = con.execute(
+        "SELECT COUNT(*) FROM dr_filepath WHERE instr(path, '/') = 0"
+    ).fetchone()[0]
     sections = con.execute(
         "SELECT s.name, s.path_prefix, s.description, "
         "  (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || '%') AS n "
         "FROM dr_section s ORDER BY s.sort_order, s.name").fetchall()
-    if sections:
+    unsectioned = con.execute(
+        "SELECT COUNT(*) FROM dr_filepath f WHERE instr(f.path, '/') > 0 AND NOT EXISTS "
+        "(SELECT 1 FROM dr_section s WHERE f.path LIKE s.path_prefix || '%')"
+    ).fetchone()[0]
+    if root_count or sections or unsectioned:
         lines += ["", "**Sections** — `name · location · files · what's there`. Query a "
                   "section's leaves (file names + descriptions) on demand, never all at once:"]
+        if root_count:
+            lines.append(
+                f"- **Repository Root** · `./` · {root_count} files — "
+                "Top-level project entrypoints and metadata"
+            )
         for s in sections:
             desc = f" — {s['description']}" if s["description"] else ""
             lines.append(f"- **{s['name']}** · `{s['path_prefix']}` · {s['n']} files{desc}")
-        unsectioned = con.execute(
-            "SELECT COUNT(*) FROM dr_filepath f WHERE NOT EXISTS "
-            "(SELECT 1 FROM dr_section s WHERE f.path LIKE s.path_prefix || '%')"
-        ).fetchone()[0]
         if unsectioned:
             lines.append(f"- _other / unsectioned_ · {unsectioned} files — cartographer worklist")
 
@@ -514,10 +526,12 @@ def compose_boot(con: sqlite3.Connection, shell, user, session_id: str,
     if not bootstrapped:
         if flavor == "cartographer":
             prompt = (
-                "You own the repo map and haven't set it up yet. Run the "
-                "**cartographer** skill now — configure `map.config.json` for "
-                "this repo, wire the auto-remap git hooks (`./sc map-setup`), and "
-                "map. Do this before other work; the working shells rely on it.")
+                "You own the repo map and haven't completed setup. Run the "
+                "**cartographer** skill now: inspect with `sc map-schema`, "
+                "configure the local map, wire hooks with `sc map-setup`, install "
+                "worktree-authored extractors through `sc map-extractor install`, "
+                "and act on every `sc map finalize` row. Pass = finalization exits "
+                "0 before you mark yourself oriented.")
         else:
             prompt = (
                 "You have not oriented in this repo yet. Run the **bootstrap** "

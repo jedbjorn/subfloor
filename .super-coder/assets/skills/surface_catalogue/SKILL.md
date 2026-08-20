@@ -9,8 +9,9 @@ common: true
 
 super-coder lives inside a host repo. The `dr_*` tables = a scan of that repo
 — query them first to orient, not the tree. They live in the **map db**,
-`.sc-state/map.db` — a separate file from your memory db
-(`.super-coder/shell_db.db`). Query it via `sc map-sql "…"`.
+`.sc-state/local/map/map.db` — a separate file from your memory db
+(`.super-coder/shell_db.db`). Inspect structure with `sc map-schema`; query
+data with `sc map-sql "…"`.
 
 NEVER map the repo yourself. The map stays fresh automatically (git hooks
 re-map on pull / branch-switch / rebase) and is owned by the **cartographer**
@@ -40,6 +41,11 @@ there -> query that section's leaves (file names + descriptions) -> read the
 one or two files you need. Section-first, one cheap query deep — never a full
 preload.
 
+Run `sc map-schema` before the first structural query; pass = it lists the
+expected `dr_*` object. Run `sc map-schema <dr_table>` before using unfamiliar
+columns; pass = ordinal/name/type/nullability/default/PK + indexes are explicit.
+Use `sc map-sql` only for data queries.
+
 ```sql
 -- all of these run against the map db:  sc map-sql "<query>"
 -- the section index (same as boot CONNECTIONS) — where to start:
@@ -48,6 +54,10 @@ SELECT name, path_prefix, description FROM dr_section ORDER BY sort_order, name;
 -- a chosen section's leaves — the descriptions tell you which file to open:
 SELECT path, desc, lines FROM dr_filepath
 WHERE path LIKE 'shell_core/api/%' ORDER BY path;
+
+-- the synthetic Repository Root group (not an authored dr_section row):
+SELECT path, desc, lines FROM dr_filepath
+WHERE instr(path, '/') = 0 ORDER BY path;
 
 -- what is this repo + how big:
 SELECT name, default_branch, file_count, mapped_at FROM dr_repo;
@@ -84,9 +94,10 @@ SELECT path, kind, file FROM dr_route ORDER BY path;                    -- UI ro
 - **Lazy-load.** Pull a file's contents only once the map points at it. Carry
   the map, not the territory.
 - **Map looks wrong?** Empty, stale (repo changed since `mapped_at`),
-  mis-classified, a file under "other / unsectioned", or a `desc IS NULL`
-  where you needed one -> cartographer worklist item. Flag it; don't author
-  the map yourself.
+  mis-classified, a nested file under "other / unsectioned", or a `desc IS
+  NULL` where you needed one -> Cartographer worklist item. Root files belong
+  to `Repository Root`, not the unsectioned worklist. Flag the gap; don't
+  author the map yourself.
 - **Semantic layer when wired.** Endpoints / DB schema / UI routes let you
   jump straight to the API surface or schema; a dimension is empty -> fall
   back to section + descriptions. Symbol-level semantics (functions/classes)

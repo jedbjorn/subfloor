@@ -83,6 +83,18 @@ def map_config_path() -> Path:
     return LOCAL_DIR / "map" / "config.json"
 
 
+def map_extractor_receipts_dir() -> Path:
+    return LOCAL_DIR / "map" / "extractor-receipts"
+
+
+def map_extractor_install_lock_path() -> Path:
+    return LOCAL_DIR / "map" / ".extractor-install.lock"
+
+
+def map_extractor_status_path() -> Path:
+    return LOCAL_DIR / "map" / "extractor-status.json"
+
+
 def retired_skills_path() -> Path:
     return LOCAL_DIR / "skills_retired.json"
 

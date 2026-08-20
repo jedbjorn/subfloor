@@ -169,11 +169,12 @@ procedure solo; at most spawn one adversarial skeptic against your own diff
    add`/`stash`/`checkout`/`commit`. Read *Worktree reality* below before
    reaching for isolation — it has real costs. Reviewer/checker agents are
    read-only; no isolation needed.
-4. **Agent claims are inputs, not results.** Re-run the real check yourself
-   — `sc test`, lint, the spec''s done-condition — before marking anything
-   done. "Agent says tests pass" is not verification. Diffs: pull them
-   yourself (`git -C <worktree> diff`); NEVER adjudicate pasted diffs or
-   pasted test output — pastes are lossy and unverifiable.
+4. **Agent claims are inputs, not results.** Follow the boot `TESTING POSTURE`:
+   re-run smallest affected targets, lint, and the spec''s done-condition
+   yourself; never use bare `sc test` merely to duplicate configured CI.
+   "Agent says tests pass" is not verification. Pull diffs yourself
+   (`git -C <worktree> diff`); NEVER adjudicate pasted diffs/output — pastes
+   are lossy.
 
 ---
 
@@ -266,7 +267,7 @@ After the task plan exists (base skill, Steps 1–3, unchanged):
    (`sc mem task start`) -> spawn one implementer per task (isolation per
    contract rule 3) -> pull each returned diff yourself and apply it to your
    tree -> spawn checker agent(s) prompted to **refute** it -> adjudicate +
-   run the real tests on the merged state -> `sc mem task done` -> update
+   run the affected tests on the merged state -> `sc mem task done` -> update
    current_state -> next wave.
 3. One wave live at a time.
 
@@ -663,299 +664,234 @@ ON CONFLICT(name) DO UPDATE SET
 
 INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
   'cartographer',
-  'Own the repo map — configure mapping to THIS repo, wire the auto-remap git hooks, heal both on drift. Cartographer-only; no working shell maps. Run on first boot + whenever the map looks wrong.',
+  'Own the repo map — configure mapping to THIS repo, wire auto-remap, install semantic extractors, curate authored navigation, and finish through one truthful finalization gate. Cartographer-only.',
   'substrate',
   'sc map-setup',
   0,
-  '# cartographer — own the repo map so no other shell has to
+  '# cartographer — own the repo map
 
-Working shells consume the `dr_*` catalogue (`surface_catalogue`) and never
-map. You alone do three things: **configure** how this repo is mapped, **wire**
-the automation that keeps it fresh, **heal** both on drift.
+Working shells consume the `dr_*` catalogue and NEVER map. Own its config,
+automation, semantic extractors, sections, descriptions, shape notices, and
+completion evidence.
 
-Map db = `.sc-state/local/map/map.db`, separate from the engine memory db
-(`shell_db.db`) so an engine schema change never touches the map. Reads: `sc
-map-sql "…"`. Authoring writes (UPDATE/INSERT/DELETE on `dr_*`): `sc
-map-sql-rw "…"` — `sc map-sql` refuses writes. Authored sections serialize to
-`.sc-state/local/map/content.sql` on snapshot (admin/GUI step — see Standing jobs)
-and reload on a fresh map db.
+Map data = `.sc-state/local/map/map.db`, separate from engine memory. Use:
 
-`<self>` = your `shell_id` (ACTIVE SESSION block).
+- `sc map-schema [dr_table]` for structure. Pass = the expected `dr_*` object
+  + columns are listed; never guess schema or inspect raw SQLite.
+- `sc map-sql "…"` for read-only data queries.
+- `sc map-sql-rw "…"` only for the authored `dr_section` / `dr_filepath.desc`
+  writes named below.
+- `sc map` to refresh derived rows.
+- `sc map finalize` to prove completion. Exit `0` = every required row is
+  `PASS` / `N/A`; exit `2` names pending owner actions; exit `1` names a failed
+  check.
 
-## Freshness machinery — what you own
+## First boot / heal
 
-- **Git hooks** `post-merge` / `post-checkout` / `post-rewrite` re-run `sc map`
-  on every pull / branch-switch / rebase. Tracked in `.super-coder/hooks/`,
-  fired via `core.hooksPath` — per-clone, unset until `sc map-setup` wires it.
-- **`sc rebuild`** re-maps (map = derived cache) -> a fresh rebuild never
-  leaves an empty map.
-- **Hourly cron** — pm2 runs `sc-map-<repo>` on `cron_restart`
-  (`.super-coder/ecosystem.config.cjs`) while the stack is up (`sc up`);
-  catches uncommitted local restructuring the git hooks can''t see. Verify:
-  `pm2 list | grep sc-map` — state cycling stopped→online per tick = the
-  one-shot pattern, not a crash. A fork without pm2 has no cron; the hooks
-  still cover it, and manual `sc map` always works.
-- **You** — per-repo config + hook wiring + extractors + repair of all three.
+Run this sequence on first boot, after a shape notice, or when the map drifts:
 
-## First boot — configure mapping for THIS repo
+1. `sc map-schema` then `sc map-schema dr_repo`. Pass = map structure is
+   inspectable through the supported surface.
+2. Inspect live data:
 
-1. **Inspect.** Read the current map + tree:
    ```sql
-   SELECT name, default_branch, file_count, mapped_at FROM dr_repo;
-   SELECT lang, COUNT(*) n FROM dr_filepath WHERE lang IS NOT NULL GROUP BY lang ORDER BY n DESC;
+   SELECT name, root, default_branch, file_count, mapped_at FROM dr_repo;
+   SELECT lang, COUNT(*) n FROM dr_filepath
+   WHERE lang IS NOT NULL GROUP BY lang ORDER BY n DESC;
    SELECT role, COUNT(*) n FROM dr_filepath GROUP BY role ORDER BY n DESC;
    ```
-   Eyeball the top-level dirs -> anything mis-classified, or a
-   generated/vendored dir being indexed?
 
-2. **Author the active map config at the canonical live root** —
-   `$SC_ROOT/.sc-state/local/map/config.json`. The mapper
-   deliberately reads the shared live checkout, not your shell worktree. It is
-   per-instance and survives `sc update`. All keys optional; each merges over
-   `map_repo.py` defaults:
+3. Tune `$SC_ROOT/.sc-state/local/map/config.json` only where defaults are
+   wrong. Config is per-clone runtime state and never a commit. All keys are
+   optional; skip sets extend defaults and cannot re-include engine-owned
+   paths:
+
    ```json
    {
-     "skip_dirs":  ["generated", "fixtures"],
+     "skip_dirs": ["generated", "fixtures"],
      "skip_files": ["LICENSE"],
      "role_overrides": [
-       { "prefix": "cmd/",      "role": "code" },
-       { "glob":   "*.proto",   "role": "code" },
-       { "prefix": "docs/adr/", "role": "doc"  }
+       {"prefix": "cmd/", "role": "code"},
+       {"glob": "*.proto", "role": "code"},
+       {"prefix": "docs/adr/", "role": "doc"}
      ]
    }
    ```
-   - `skip_dirs` / `skip_files` — ADDED to the defaults; never shrink them.
-   - `role_overrides` — applied after default role inference, first match
-     wins. `prefix` matches the repo-relative path; `glob` matches the filename.
-   Add only what the defaults get wrong — empty/absent config is fine for a
-   plain repo.
 
-3. **Wire + map:** `sc map-setup` -> `core.hooksPath` points at
-   `.super-coder/hooks/`, hooks executable, initial map run.
+4. Run `sc map-setup`. Pass = `git config --get core.hooksPath` prints
+   `.super-coder/hooks`, the declared hooks are executable, and `dr_repo`
+   carries a current `mapped_at` + correct file count.
+5. Curate sections + descriptions + semantic rows with the worklists below.
+6. Resolve every notice-linked flag, then mark the notice read last.
+7. Run `sc map finalize`. Complete Cartographer-owned actions; hand each
+   Admin-owned snapshot/review action to Admin. Pass = a rerun exits `0`.
+8. On first boot only, run `sc mem state "…"` then `sc mem oriented` after the
+   finalizer is green.
 
-4. **Verify the wiring, not just the files:**
-   ```sh
-   git config --get core.hooksPath      # → .super-coder/hooks
-   ls -l .super-coder/hooks             # all three, executable
-   ```
-   ```sql
-   SELECT file_count, mapped_at FROM dr_repo;   -- non-zero, just now
-   ```
-   Spot-check overrides took:
-   `SELECT path, role FROM dr_filepath WHERE path LIKE ''cmd/%'';`
+Automation remains healthy when:
 
-5. **Describe — NULLs and filler** — run the description worklist (Standing
-   jobs § 2); leave only when it returns zero rows, NULLs and filler both.
+- `post-merge` / `post-checkout` / `post-rewrite` run `sc map` through
+  `core.hooksPath`.
+- `sc rebuild` remaps after rebuilding the engine DB.
+- pm2''s `sc-map-<repo>` one-shot cycles stopped -> online hourly while the
+  stack is up. A repo without pm2 relies on hooks + manual `sc map`.
 
-6. **Persist locally.** Hook wiring and map config are per-clone runtime state,
-   never a commit. Then `sc mem state "…"` -> `sc mem oriented` (sets
-   `bootstrapped=1` — the write is live in the shared DB; it does NOT snapshot).
+## Authored navigation
 
-## Heal — run whenever the map looks wrong
+### Sections
 
-Triggers: repo restructured / new language or dir / files mis-roled / map
-stale or empty on a clone whose hooks never got wired.
-
-1. Re-inspect (step 1) — what changed?
-2. Edit the active canonical-root config from step 2 to match.
-3. `sc map-setup` (idempotent) — re-wires hooks + re-maps.
-4. Verify (step 4). Vanished paths are auto-pruned from `dr_filepath` by the
-   remap.
-5. **Stale sections** — `dr_section` is authored, never auto-pruned. After any
-   migration/restructure run the stale-section worklist (Standing jobs § 1);
-   DELETE or repath every row it returns.
-6. **Describe — NULLs and filler** (Standing jobs § 2) -> worklist empty
-   before you leave.
-7. Persist by mode as in first-boot step 6.
-
-## Standing jobs — sections, descriptions, product DB
-
-Both authored layers survive the remap (`dr_section` is never touched by the
-mapper; `dr_filepath.desc` is preserved by its UPSERT); neither blocks the
-auto-remap hook. Boot `## CONNECTIONS` renders the section index;
-descriptions are the leaves a shell queries once narrowed to a section.
-
-**1. Sections (`dr_section`)** — curate the navigational index. Seeded one
-section per top-level dir on first map; make it *good*: rename to what shells
-call the area, split coarse dirs into real areas, merge noise, write the
-one-line `description`.
+`dr_section` is authored + snapshot-backed. Curate useful path prefixes; never
+insert an empty prefix. Root files belong to the synthetic `Repository Root`
+group and never enter `dr_section`.
 
 ```sql
--- the current index + live file counts:
+-- Repository Root leaves; a non-empty result renders the synthetic group:
+SELECT path, desc, lines FROM dr_filepath
+WHERE instr(path, ''/'') = 0 ORDER BY path;
+
+-- Authored sections + live counts:
 SELECT s.name, s.path_prefix, s.description,
-       (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || ''%'') n
+       (SELECT COUNT(*) FROM dr_filepath f
+        WHERE f.path LIKE s.path_prefix || ''%'') n
 FROM dr_section s ORDER BY s.sort_order, s.name;
 
--- split / rename / describe (authored — survives the remap, snapshotted):
-UPDATE dr_section SET name=''API'', path_prefix=''shell_core/api/'', description=''FastAPI routers'' WHERE name=''shell_core'';
-INSERT INTO dr_section (name, path_prefix, description, sort_order)
-VALUES (''UI'', ''shell_core/ui/'', ''SvelteKit substrate UI'', 5);
+-- WORKLIST: only nested unmatched files are real section gaps:
+SELECT f.path FROM dr_filepath f
+WHERE instr(f.path, ''/'') > 0
+  AND NOT EXISTS (
+    SELECT 1 FROM dr_section s
+    WHERE f.path LIKE s.path_prefix || ''%''
+  )
+ORDER BY f.path;
 
--- WORKLIST — keep the catch-all empty. Files under no section = a new area to
--- section (they render under "other / unsectioned" in CONNECTIONS until you do):
-SELECT path FROM dr_filepath f WHERE NOT EXISTS
-  (SELECT 1 FROM dr_section s WHERE f.path LIKE s.path_prefix || ''%'')
-ORDER BY path;
-
--- STALE SECTIONS (run after any migration or restructure — dr_filepath pruning
--- is automatic; dr_section is authored and never auto-pruned):
+-- STALE authored sections after a rename/removal:
 SELECT s.name, s.path_prefix, s.description
 FROM dr_section s
-WHERE (SELECT COUNT(*) FROM dr_filepath f WHERE f.path LIKE s.path_prefix || ''%'') = 0
+WHERE NOT EXISTS (
+  SELECT 1 FROM dr_filepath f
+  WHERE f.path LIKE s.path_prefix || ''%''
+)
 ORDER BY s.name;
--- For each row: DELETE (area gone) or UPDATE path_prefix (area renamed).
 ```
 
-**2. Descriptions (`dr_filepath.desc`)** — per-file one-liners, ≤100 chars,
-**adequate, not merely present**. A desc must say something the path does not:
-what the file *does* or *holds*, never its kind restated from the name —
-"Engine database migration: 0042_x.sql" is filler (non-NULL, zero information
-beyond the path), and a NULL-only worklist is blind to it: one mapped repo
-carried 263 such placeholders, invisible for months because every row was
-non-NULL. Derive each one-liner from the file''s own docstring / frontmatter /
-header comment; hand-write the few with nothing extractable. Run the worklist
-every session; every run ends with zero rows — NULLs *and* filler — not
-optional. Queried by working shells within a chosen section
-(`surface_catalogue`), never bulk-loaded at boot.
+Use `sc map-sql-rw` to `INSERT` / `UPDATE` / `DELETE` the exact rows identified
+by these queries. Pass = nested unmatched + stale-section worklists return no
+rows; root files remain queryable through `instr(path, ''/'') = 0`.
+
+### Descriptions
+
+Set `dr_filepath.desc` to an adequate one-line description (<=100 chars): say
+what the file does/holds, not its kind or filename. Descriptions survive remap
+in the live DB but are not snapshot durability; refill after a fresh rebuild.
 
 ```sql
--- WORKLIST — undescribed OR filler, most-load-bearing first. The filler clause
--- is a heuristic (desc ENDS with the filename or its stem — the "<kind
--- restated>: <name>" shape); judge each hit — and treat a desc you could have
--- written from the path alone as filler even if the query missed it:
-WITH f AS (SELECT path, role, desc,
-                  replace(path, rtrim(path, replace(path,''/'','''')), '''') AS base
-           FROM dr_filepath),
-     g AS (SELECT *, CASE WHEN instr(base,''.'') > 0
-                          THEN substr(base, 1, instr(base,''.'')-1)
-                          ELSE base END AS stem FROM f)
+WITH f AS (
+  SELECT path, role, desc,
+         replace(path, rtrim(path, replace(path,''/'','''')), '''') AS base
+  FROM dr_filepath
+), g AS (
+  SELECT *, CASE WHEN instr(base,''.'') > 0
+    THEN substr(base, 1, instr(base,''.'')-1) ELSE base END AS stem
+  FROM f
+)
 SELECT path, role, desc FROM g
 WHERE desc IS NULL
-   OR (length(stem) >= 5 AND (lower(substr(desc, -length(base))) = lower(base)
-                           OR lower(substr(desc, -length(stem))) = lower(stem)))
+   OR (length(stem) >= 5 AND (
+       lower(substr(desc, -length(base))) = lower(base)
+       OR lower(substr(desc, -length(stem))) = lower(stem)
+   ))
 ORDER BY (desc IS NULL) DESC, role, path;
-
--- describe (≤100 chars; preserved across the next auto-remap):
-UPDATE dr_filepath SET desc=''Boot composer — assembles CLAUDE.md from DB state'' WHERE path=''.super-coder/render/compose.py'';
 ```
 
-Before leaving the job, spot-read a few descs per section against the files
-themselves; any desc derivable from the path alone goes back on the list.
-(Deliberate uniform tags — e.g. Standing job 3''s product-DB tagging — pass the
-bar: they state tenancy the path doesn''t.)
+Update only rows verified against the file. Pass = the worklist is empty +
+spot checks per section describe behavior that the path alone cannot reveal.
 
-**3. Product DB** — the app''s own database, separate from engine memory
-(`.super-coder/shell_db.db`); working shells change them in completely
-different ways (boot `## DATABASES`), and the map you author is the only
-per-fork signal of where the app DB lives. The live `.db` is usually
-gitignored (absent from the map); schema + migrations are tracked = the
-durable anchor. Tag them plainly as the product/app DB so no shell mistakes
-them for engine memory; give them a section if they form an area.
+### Product DB
+
+Tag the host application''s schema/migrations as product DB, never engine
+memory. The live app `.db` is often ignored; tracked schema + migrations are
+the durable map anchors.
 
 ```sql
--- tag the product DB''s definition (the engine-vs-app split made visible):
-UPDATE dr_filepath SET desc=''Product DB schema — the APP database (NOT engine memory)'' WHERE path=''<app schema file>'';
-UPDATE dr_filepath SET desc=''Product DB migration — change the app schema here'' WHERE path LIKE ''<app migrations dir>/%'';
--- optional: a section if the product DB is its own area
-INSERT INTO dr_section (name, path_prefix, description, sort_order)
-VALUES (''App DB'', ''<db dir>/'', ''Product runtime database — schema + migrations (NOT the engine memory DB)'', 7);
+UPDATE dr_filepath
+SET desc=''Product DB schema — the APP database (NOT engine memory)''
+WHERE path=''<app schema file>'';
+
+UPDATE dr_filepath
+SET desc=''Product DB migration — change the app schema here''
+WHERE path LIKE ''<app migrations dir>/%'';
 ```
 
-Fork ships no database of its own -> skip.
+Create an authored section when those files form a real area. Pass = working
+shells can identify the app DB definition without confusing it with
+`.super-coder/shell_db.db`. No product DB -> `N/A`.
 
-After a curation pass your writes are already live in the shared map db —
-done. NEVER run a plain `sc snapshot` from a shell — it is refused by design;
-persistence = the GUI Snapshot button or an admin''s `SC_ADMIN=1 sc
-snapshot`. Don''t chase it. (Sections are snapshotted; descriptions ride the
-live DB + survive remap — refill from the worklist if a rebuild drops them.)
+## Semantic extractors
 
-## Extending the map — semantic extractors
+Extractors implement `extract(con, repo_root, cfg) -> str` and own only their
+semantic `dr_*` rows. They DELETE + repopulate their own derived tables, guard
+unparseable files, report best-effort omissions, and never claim exhaustive
+coverage.
 
-The engine maps the generic 80% (files, languages, roles, deps, env).
-Semantic dimensions — HTTP endpoints (`dr_endpoint`), app DB schema
-(`dr_db_table`/`dr_db_column`), UI routes/components
-(`dr_route`/`dr_component`) — vary by stack: you extract them via drop-in
-Python modules in `.sc-state/map_extractors/*.py`, discovered + run by
-`sc map` after the core pass. Fork-owned (outside the gitignored engine dir ->
-`sc update` never clobbers them); table *columns* are standardized in the
-engine (`map_schema.sql`) so working-shell queries have a stable shape
-everywhere.
+Adopt an extractor:
 
-Adopt one per stack:
+1. Inspect stack dependencies/file mix with `sc map-sql`.
+2. Read the closest reference under
+   `$SC_ENGINE_DIR/templates/map_extractors/`. Author/adapt
+   `$SC_SHELL_WORKTREE/.sc-state/map_extractors/<name>.py` in your worktree.
+3. Run `sc map-extractor install
+   "$SC_SHELL_WORKTREE/.sc-state/map_extractors/<name>.py"`. Pass = output
+   prints the installed canonical path + SHA-256 matching the authored bytes.
+4. NEVER `cp`, `mv`, redirect, or use a file-edit tool into
+   `$SC_ROOT/.sc-state/map_extractors/`. The guarded installer is the only
+   supported cross-worktree write.
+5. Run `sc map`, inspect structure with `sc map-schema <dr_table>`, then query
+   rows with `sc map-sql`. Pass = expected semantic rows exist + the map log
+   has no extractor failure.
+6. Commit + push the authored worktree source. Hand Admin the source path for
+   review/merge when finalization names that action. Generated map DB, status,
+   receipts, and snapshots stay local-only.
 
-1. **Detect the stack:** `SELECT manager, name FROM dr_dependency;`
-   (fastapi? flask? svelte? next?) + the file mix
-   (`SELECT lang, COUNT(*) FROM dr_filepath GROUP BY lang`).
-2. **Copy the matching reference** from the engine''s
-   `.super-coder/templates/map_extractors/` into
-   `$SC_ROOT/.sc-state/map_extractors/`:
-   - `fastapi_endpoints.py` — decorator routes (`@app.get(...)`, Flask `@app.route`) → `dr_endpoint`
-   - `sqlite_schema.py` — SQL `CREATE TABLE/VIEW` → `dr_db_table`/`dr_db_column`
-   - `sveltekit_routes.py` — filesystem routes + `*.svelte` → `dr_route`/`dr_component`
-   Adapt the `framework` label + file filter to this repo. Uncovered stack
-   (Django URLs, Express, Spring, Rails) -> copy the closest as a skeleton,
-   rewrite the match — target the dominant pattern, not 100%.
-3. **Run + verify:** `sc map` -> table populated, rows look right
-   (`SELECT method, path FROM dr_endpoint LIMIT 10;`).
-4. **Hand off authored extractor code** to admin via the `messaging` skill,
-   naming each changed `.sc-state/map_extractors/` path and the verification
-   result. Extractor code is deliberate source; generated map DB/content stays
-   local.
+An extractor failure rolls its plug-in writes back while preserving the core
+map. Pass = `sc map finalize` reports no failed module and every installed
+extractor has matching receipt/source/Admin evidence.
 
-**Contract** (full version: `templates/map_extractors/README.md`): each module
-defines `extract(con, repo_root, cfg) -> str`. `con` = the live map db with
-`dr_filepath` already populated — query it for inputs. DELETE + repopulate
-only your own `dr_*` table(s); return a one-line summary for the map log.
-NEVER assume a file parses — guard yourself even though `map_repo` guards each
-extractor. Static extraction is best-effort: log what you skip (dynamic
-routes, computed paths); never claim full coverage.
+## Shape notices
 
-## Shape-change notices — the curation trigger
+Sender = the dev/coder shell on merge, not Planner. Open blocking map-quality flags before sending
+one notice to the `cartographer` role alias:
 
-The hooks keep the mechanical catalogue fresh, but a newly-landed file arrives
-`desc IS NULL` and unsectioned. Working shells message you on shape change so
-curation is a timely push, not a next-boot pull — the only inbox traffic you
-act on as cartographer.
-
-**Notice contract** (one source of truth — the relay skills point here).
-Sender = the **dev/coder** shell on merge (feature landed, doc written); NOT
-the planner — specs render into a known area and need no curation. Sent via
-the `messaging` skill to `cartographer` — a role alias the API resolves to
-this fork''s cartographer shell whatever its actual shortname:
-
-```
---message send cartographer "shape: <what landed> — paths: <region/>; <ref>. curate."
+```text
+shape: <what landed> — paths: <region/>; ref: <feature/doc/PR>
+flags: <numeric_id>=<SC-name>[, <numeric_id>=<SC-name>] | none
+curate; verify and close each flag; mark this notice read last.
 ```
 
-Body names **what** changed + **where** (the path region) so your pass is
-scoped, not a full re-survey. A `documents`/feature ref is optional.
+Name the durable ref + exact path region. Pair every flag''s numeric DB ID with
+its display name. Write `flags: none` when no flag exists. Pass = one notice
+carries every map-quality flag opened for that shape change.
 
-**On a notice** — check inbox -> run the worklists scoped to the named
-region -> mark read:
+On receipt:
 
-```sql
--- 1. the new files this notice is about (scope by the region it named):
-SELECT path, role FROM dr_filepath
-WHERE desc IS NULL AND path LIKE ''region/%'' ORDER BY role, path;
--- 2. describe them (≤100 chars) — UPDATE dr_filepath SET desc=… per the worklist above.
--- 3. do they form / join a section? curate dr_section if the region is a new area.
-```
+1. Parse all three lines. Missing/malformed `flags`, missing flag, or ID/name mismatch -> surface
+   the exact defect + leave the notice unread.
+2. Run the nested-section + stale-section + description + semantic worklists
+   scoped to the named region. Pass = every scoped result is clean.
+3. For each pair, run `sc mem get flags <numeric_id>` and confirm the display
+   name. An already-resolved row passes only when its notes name the verified
+   map result. Otherwise run `sc mem flag close <numeric_id> --notes "<what
+   was verified>"`; pass = the exact row is resolved with adequate notes.
+4. Run `--message mark-read <message_id>` last. Pass = scoped worklists + every
+   named flag passed before the notice became read. Send no closure reply.
 
-Then `--message mark-read <id>` (`messaging` skill). The mechanical remap
-already ran via the hook; your job on the notice = the authored layer only —
-describe the new leaves, section a new area. `desc IS NULL` already narrows to
-exactly the uncurated tail.
+## Persistence boundary
 
-## Stance
-
-- The map is infrastructure, not a chore for every shell. A working shell
-  hunting the tree for something the map should know = heal the map; do not
-  teach that shell to map.
-- Config is the lever: tune `map.config.json`; touch `map_repo.py` only when
-  the mechanism itself (a parser, a role kind) is wrong.
-- Verify the automation, not just the file: a written hook that
-  `core.hooksPath` doesn''t point at does nothing -> check the wiring after
-  every setup.',
+Map config, live descriptions, derived rows, install receipts, and generated
+status are local-only. Sections persist only after the GUI Snapshot action or
+Admin runs `sc snapshot`. NEVER run plain `sc snapshot` from Cartographer; it
+is refused. Pass = `sc map finalize` reports Authored sections `PASS` after
+Admin acts, without Cartographer mutating snapshot/Git/message/flag state on
+their behalf.',
   0
 )
 ON CONFLICT(name) DO UPDATE SET
@@ -1117,8 +1053,10 @@ rule, ≤500 chars, hard-enforced.
 ## Pass 3 — Recommend
 
 A cluster of three or more that keeps **recurring across sessions** is a
-candidate reusable process. Curation never creates or promotes a skill
-directly. Deduplicate against all upstream issues first:
+candidate reusable process. This recommendation route is the authorized
+exception to the "enhancement ideas go to the FnB first" gate in
+`issue_reporting`. Curation never creates or promotes a skill directly.
+Deduplicate against all upstream issues first:
 
 ```bash
 gh issue list --repo jedbjorn/subfloor --state all --search "skills: recommend <topic>"
@@ -2119,17 +2057,32 @@ One repo at its root -> plain `git` (cwd = repo root) is safe.
 
 Project = this repo minus `.super-coder/`. Engine = `.super-coder/` — gitignored, materialized by `sc update`, authored upstream in super-coder. NEVER commit or edit anything under `.super-coder/`.
 
+## GitHub capability boundary
+
+`sc launch` and `sc restart` re-resolve Git transport and GitHub API
+capabilities from the host on every invocation, including `--no-build` forms.
+`build`, `enter`, and an already running sandbox do not refresh auth. Pass = the
+lifecycle summary says `ready` for the operation you need; `unavailable` and
+`unverified` are NEVER readiness claims.
+
+Preserve the configured `origin` transport. For SSH, fix the host agent and
+load an authorized GitHub identity; NEVER copy or mount private keys. For
+HTTPS/API, fix a scoped host `SC_GH_TOKEN` or the host `gh` OAuth login. Then
+run `sc launch` or `sc restart`; the running sandbox remains unchanged
+until that refresh. NEVER rewrite the remote or start an interactive login
+inside the sandbox to work around a missing capability.
+
 ## Sync before you start — hard pre-code gate
 
 Run the gate every session + before each new unit of work. `shell/<shortname>` = a moving base pinned to `origin/main`, not a content branch — cut feature branches from it. A stale base -> you read code that no longer exists + your PRs conflict on arrival.
 
 The launcher auto-syncs at boot when provably nothing can be lost (on base branch + clean tree + no local-only commits). Read the `sync:` line in ACTIVE SESSION: auto-synced + nothing done since -> current, carry on. Says **NOT auto-synced** / you''re mid-session about to start new work -> run:
 
-1. `git fetch origin main && git rev-list --count HEAD..origin/main` -> 0 = carry on.
-2. Behind -> take stock BEFORE touching anything: `git status` (uncommitted) + `git rev-list origin/main..HEAD` (unmerged commits) + `git branch --no-merged origin/main` (unlanded branches).
-3. Anything local -> surface to the FnB first: list the commits/files, ask land / stash / discard. No sync without their call (soft gate).
-4. Clean (or FnB said go) -> `git checkout shell/<shortname> && git reset --hard origin/main`. NEVER `git pull`/merge on the base — merge bubbles accumulate + your squash-merged work replays as conflicts.
-5. Reset only the base, never a feature branch. Stale feature branch -> `git rebase origin/main`.
+1. `git fetch origin main && git rev-list --count HEAD..origin/main` -> record remote freshness; continue through the branch/target gate even when the count is 0.
+2. Compare `git rev-parse --show-toplevel` + `git branch --show-current` with ACTIVE SESSION before any destructive command. A mismatch -> stop + surface it.
+3. Exact `shell/<shortname>` base -> discard local-only commits, tracked changes, and non-ignored untracked files without asking: `git reset --hard origin/main && git clean -fd`. Durable work belongs in the engine DB or a pushed remote branch with a PR. Pass = `git status --short` is empty + `git rev-parse HEAD` equals `git rev-parse origin/main`.
+4. NEVER reset or clean a feature branch / open PR. Clean stale feature branch -> `git rebase origin/main`. Dirty or unpushed feature work -> list it + ask the FnB to land / stash / discard.
+5. NEVER `git pull`/merge on the base — merge bubbles accumulate + squash-merged work replays as conflicts.
 
 ## Branch -> commit -> push -> PR -> stop
 
@@ -3583,10 +3536,11 @@ sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"
 sc mem state "[<feature>] — last: <last_done>. next: <next_up>."
 ```
 
-The final Verification task runs focused/full gates, every In Scope
-done-condition, and the Anticipated User Activity contract. Unexpected reach,
-weakened hardening, or crossed tenancy is a failure. A large spec may stop
-after a verified task slice; leave later tasks pending and state the next one.
+The final Verification task follows the boot `TESTING POSTURE`; require focused
+local proof + green configured CI, every In Scope done-condition, and the
+Anticipated User Activity contract. Unexpected reach, weakened hardening, or
+crossed tenancy fails. A large spec may stop after a verified task slice; leave
+later tasks pending and state the next one.
 
 ## 5. Ship and hand docs to Planner
 
@@ -3798,6 +3752,15 @@ reason when unable to accept. After handling an informational message, run
 `accept`; it marks the message read and does not change Sprint or work-unit
 state.
 
+An unusable success receipt from idempotent bookkeeping does not stall the
+Sprint. Retry the exact command once, then use its normal read surface once to
+prove the exact postcondition. For informational `accept`, prior inbox presence
++ absence of that exact message id proves the read landed. Continue under that
+proof + name the receipt defect in the next normal handoff. NEVER use this
+recovery to infer assignment ownership, review outcome, merge authorization,
+lifecycle/work-unit transition, governing revision, PR head/green state, or
+cleanup authority. An unproved postcondition stops.
+
 Assignments and review requests use Force-new delivery; verdicts and PR-event
 wakes use Re-enter. Delivery waits for a natural boundary; the runtime owns
 bundling, rotation, and recovery. Stop after a successful typed handoff.
@@ -3861,11 +3824,12 @@ in the relay.
 
 ## Build and verify
 
-Sync the assigned repository, branch, implement the smallest complete change,
-and exercise the unit''s independent gate + realistic failures. Keep external
-calls outside DB transactions; preserve durable identities and append-only
-evidence. Record CI failures, infrastructure anomalies, retries, review
-friction, and known departures for closeout.
+Sync + branch; implement the smallest complete change. Per boot `TESTING
+POSTURE`, run the smallest affected gate + failures; configured CI green =
+full-suite proof, red -> diagnose/fix/push/rerun. Keep external calls outside
+DB transactions; preserve durable identities and append-only evidence. Record
+CI failures, infrastructure anomalies, retries, review friction, and
+departures for closeout.
 
 Immediately before `complete-unit`, `register-pr`, or `request-review`, re-run
 `sc sprint inbox --sprint <id>` once and act on new messages. After the typed
@@ -4048,6 +4012,15 @@ Accept/decline only actionable items. After acting on an informational message,
 run `accept`; it marks the message read and does not change Sprint or work-unit
 state.
 
+An unusable success receipt from idempotent bookkeeping does not stall the
+Sprint. Retry the exact command once, then use its normal read surface once to
+prove the exact postcondition. For informational `accept`, prior inbox presence
++ absence of that exact message id proves the read landed. Continue under that
+proof + name the receipt defect in the next normal handoff. NEVER use this
+recovery to infer assignment ownership, review outcome, merge authorization,
+lifecycle/work-unit transition, governing revision, PR head/green state, or
+cleanup authority. An unproved postcondition stops.
+
 - Keep dependencies as hard sequence; restructure current projection under
   Planner authority, record why, and never rewrite completed history.
 - Developers own PR green/review/correction/merge. Reviewers own verdicts and
@@ -4226,6 +4199,19 @@ reconciliation. Resume creates fresh assignment generation. One spec task may
 govern repeated verification/replacement lanes; each lane lists it once. Do not
 duplicate the spec task.
 
+Close a released lane terminal when its work finished out-of-band (a PR that
+merged while paused) or its lane is abandoned — the PR-bound case recall
+refuses:
+
+```text
+sc sprint resolve-unit --sprint <id> --work-unit <id> \
+  --to completed|cancelled --reason <reason>
+```
+
+Paused-only; retires the lane''s open expectations, supersedes its PR links
+(registration kept for reconcile-pr), and wakes both seats. Recall+replan
+ships revised work; resolve only closes the lane.
+
 To change future assignment/review model, pause armed Sprint, clear released
 expectation, then validate + replace route:
 
@@ -4235,11 +4221,13 @@ sc sprint reroute-participant --sprint <id> --participant-shell <id> \
   [--route <display-route>]
 ```
 
-Prepared Sprints may reroute directly. Armed Developer route rejects released
-lane; Reviewer route rejects in-review lane. Existing chats/runs remain history;
-next Force-new delivery uses replacement. Reroute declared participants only.
-On decline, preserve reason and choose replacement from current capacity; ask
-Reviewer only if review/conformance judgment changes.
+Prepared Sprints may reroute directly. Paused reroute retires the
+participant''s own released expectations and queues fresh ones on the
+replacement route at resume; another seat''s open turn still blocks. Existing
+chats/runs remain history; next Force-new delivery uses replacement. Reroute
+declared participants only. On decline, preserve reason and choose
+replacement from current capacity; ask Reviewer only if review/conformance
+judgment changes.
 
 ### Re-enter after conformance
 
@@ -4356,16 +4344,24 @@ Produce one editable prepared Sprint with:
 - work units made from existing spec tasks, each with one Developer and one
   assigned Reviewer;
 - dependency edges and planned waves;
-- one validated harness/model/effective effort selection per participant;
+- one harness/model/Thinking level (`effort`) intent per participant;
 - a committed Sprint merge grant; and
 - a capacity plan sized to justified parallel work and review demand, with the
   local/GitHub capacity to execute it.
 
-The arming transaction validates every recorded selection (explicit null
-model/effort means the route default), records the armed transition, publishes
-the initial assignment messages, and declares a New wake to the overseeing
-Planner. Defaults satisfy the gate, but dispatch never precedes that validation.
-Participant chats are created or re-entered later by wake delivery.
+Prepared routes are intent-only: declaration and prepared reroute write no
+binding, catalogue generation, or digest. Preview every participant with
+`sc models resolve <harness> [<model>] [--effort <level>]`; omit `--effort` for
+Vibe and Harness default. Pass = each controlled preview names the requested
+Thinking level and each uncontrolled preview returns explicit `effort: null`.
+Defaults satisfy the gate only as prepared intent; arm must still resolve and
+bind them.
+
+Arm resolves every intent against one fresh catalogue generation, creates
+immutable route revision 1 for every participant, records the armed transition,
+publishes the initial assignments, and declares a New Planner wake in one
+transaction. Any mismatch rolls back every binding, wake, and lifecycle write.
+Participant chats later consume only the active stored binding.
 
 ## Eligibility pass
 
@@ -4450,8 +4446,11 @@ Record the capacity rationale: chosen participants, parallel lanes, expected
 review overlap, retained reserve, and why another shell would or would not
 shorten the critical path.
 
-For every participant, record role, route, model, and effective effort. Never
-pretend a native session can resume across harnesses.
+For every participant, record role, route, nullable model, and Thinking level
+(`effort`). Controlled exact routes default omitted effort to `high` only when
+the preview proves support. Set both model and effort to JSON null for Harness
+default. Vibe requires effort null and reports **Thinking control unavailable**.
+Never pretend a native session can resume across harnesses.
 
 Declare the prepared envelope from a JSON array of participant objects, binding
 each current governing document directly. The server reads and hashes the body
@@ -4474,8 +4473,10 @@ must also retain a specific review row as evidence, but its verdict and reviewed
 revision do not affect eligibility and direct `--spec` is canonical.
 
 The participant file contains `shell_id`, `role`, and `harness`, with optional
-`model`, `effort`, and `route`. FnB may add `--planner-shell <id>` when declaring
-for the originating Planner. Keep the Sprint prepared while shaping the plan.
+nullable `model`, Thinking level (`effort`), and `route`. FnB may add
+`--planner-shell <id>` when declaring for the originating Planner. Keep the
+Sprint prepared while shaping the plan. Prepared reroute returns
+`binding_status=unbound-intent`; it must not create route history.
 
 ## Final arming check
 
@@ -4509,8 +4510,9 @@ no partial Sprint.
 sc sprint arm --sprint <id> --conformance-reviewer-shell <shell-id>
 ```
 
-Require the receipt to identify the selected owner. After `arm` succeeds,
-participant pickup belongs to native delivery. The armed
+Require the receipt to identify the selected owner and one revision-1 binding
+for every participant. After `arm` succeeds, participant pickup belongs to
+native delivery. The armed
 runtime dispatches ready work and wake recovery reconciles unread pickup; the
 preparing Planner does not manually boot participants or create a second wake
 path. Initial assignments use Force-new delivery; a live turn reaches its
@@ -4580,6 +4582,15 @@ sc sprint decline --sprint <id> --message <message-id> --reason <reason>
 Decline actionable work only with a concrete reason. After handling an
 informational message, run `accept`; it marks the message read and does not
 change Sprint or work-unit state.
+
+An unusable success receipt from idempotent bookkeeping does not stall the
+Sprint. Retry the exact command once, then use its normal read surface once to
+prove the exact postcondition. For informational `accept`, prior inbox presence
++ absence of that exact message id proves the read landed. Continue under that
+proof + name the receipt defect in the next normal handoff. NEVER use this
+recovery to infer assignment ownership, review outcome, merge authorization,
+lifecycle/work-unit transition, governing revision, PR head/green state, or
+cleanup authority. An unproved postcondition stops.
 
 Review requests use Force-new delivery. Verdicts and Planner decisions use
 Re-enter. Delivery waits for a natural boundary; the runtime owns bundling,
@@ -4837,8 +4848,9 @@ INSERT INTO skills (name, description, category, command, common, content, is_de
 
 super-coder lives inside a host repo. The `dr_*` tables = a scan of that repo
 — query them first to orient, not the tree. They live in the **map db**,
-`.sc-state/map.db` — a separate file from your memory db
-(`.super-coder/shell_db.db`). Query it via `sc map-sql "…"`.
+`.sc-state/local/map/map.db` — a separate file from your memory db
+(`.super-coder/shell_db.db`). Inspect structure with `sc map-schema`; query
+data with `sc map-sql "…"`.
 
 NEVER map the repo yourself. The map stays fresh automatically (git hooks
 re-map on pull / branch-switch / rebase) and is owned by the **cartographer**
@@ -4868,6 +4880,11 @@ there -> query that section''s leaves (file names + descriptions) -> read the
 one or two files you need. Section-first, one cheap query deep — never a full
 preload.
 
+Run `sc map-schema` before the first structural query; pass = it lists the
+expected `dr_*` object. Run `sc map-schema <dr_table>` before using unfamiliar
+columns; pass = ordinal/name/type/nullability/default/PK + indexes are explicit.
+Use `sc map-sql` only for data queries.
+
 ```sql
 -- all of these run against the map db:  sc map-sql "<query>"
 -- the section index (same as boot CONNECTIONS) — where to start:
@@ -4876,6 +4893,10 @@ SELECT name, path_prefix, description FROM dr_section ORDER BY sort_order, name;
 -- a chosen section''s leaves — the descriptions tell you which file to open:
 SELECT path, desc, lines FROM dr_filepath
 WHERE path LIKE ''shell_core/api/%'' ORDER BY path;
+
+-- the synthetic Repository Root group (not an authored dr_section row):
+SELECT path, desc, lines FROM dr_filepath
+WHERE instr(path, ''/'') = 0 ORDER BY path;
 
 -- what is this repo + how big:
 SELECT name, default_branch, file_count, mapped_at FROM dr_repo;
@@ -4912,9 +4933,10 @@ SELECT path, kind, file FROM dr_route ORDER BY path;                    -- UI ro
 - **Lazy-load.** Pull a file''s contents only once the map points at it. Carry
   the map, not the territory.
 - **Map looks wrong?** Empty, stale (repo changed since `mapped_at`),
-  mis-classified, a file under "other / unsectioned", or a `desc IS NULL`
-  where you needed one -> cartographer worklist item. Flag it; don''t author
-  the map yourself.
+  mis-classified, a nested file under "other / unsectioned", or a `desc IS
+  NULL` where you needed one -> Cartographer worklist item. Root files belong
+  to `Repository Root`, not the unsectioned worklist. Flag the gap; don''t
+  author the map yourself.
 - **Semantic layer when wired.** Endpoints / DB schema / UI routes let you
   jump straight to the API surface or schema; a dimension is empty -> fall
   back to section + descriptions. Symbol-level semantics (functions/classes)
