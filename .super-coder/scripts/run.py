@@ -1136,6 +1136,7 @@ class LaunchPlan(NamedTuple):
     model: "str | None"
     effort: "str | None"
     cli_version: "str | None"
+    boot_content: str
 
 
 def cleanup_before_launch(
@@ -1493,7 +1494,8 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     return LaunchPlan(argv=argv, env=env, cwd=str(work_dir),
                       session_id=session_id, archive_id=archive_id,
                       harness=harness, model=session_model,
-                      effort=session_effort, cli_version=_cli_version(argv[0]))
+                      effort=session_effort, cli_version=_cli_version(argv[0]),
+                      boot_content=content)
 
 
 # ── Main ────────────────────────────────────────────────────────────────────

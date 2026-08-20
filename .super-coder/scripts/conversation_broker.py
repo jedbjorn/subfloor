@@ -105,6 +105,7 @@ class BrokerRun:
             title=self.title,
             route_binding=self.route_binding,
             binding_digest=self.binding_digest,
+            conversation_id=self.conversation_id,
         )
 
 

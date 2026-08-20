@@ -139,6 +139,8 @@ class ConversationLayout:
     session_root: Path
     diagnostics: Path
     process_identity: Path
+    adapter_identity: Path
+    adapter_lock: Path
 
 
 def _sha256(path: Path) -> str:
@@ -919,6 +921,8 @@ def conversation_layout(
         session_root=root / "sessions",
         diagnostics=root / "diagnostics",
         process_identity=root / "process.json",
+        adapter_identity=root / "adapter.json",
+        adapter_lock=root / "adapter.lock",
     )
 
 

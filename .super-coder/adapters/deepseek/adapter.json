@@ -4,7 +4,59 @@
   "surfaces": {
     "terminal": false,
     "one_shot": false,
-    "browser": false,
+    "browser": true,
     "sprint": false
-  }
+  },
+  "boot_artifact": "AGENTS.md",
+  "emit": [],
+  "skill_dirs": [".agents/skills"],
+  "env": {},
+  "mcp": {
+    "streamable_http": {
+      "supported": false,
+      "reason": "the fixed DeepSeek Cordis composition has no arbitrary MCP injection surface"
+    }
+  },
+  "conversation": {
+    "contract_version": 1,
+    "minimum_cli_version": "0.1.0rc7",
+    "maximum_cli_version_exclusive": "0.1.0rc8",
+    "verified_cli_version": "0.1.0rc7",
+    "driver": "deepseek-isolated-sdk-carrier",
+    "session_ref": { "source": "session/start", "field": "sessionId" },
+    "start": { "method": "session/start" },
+    "resume": { "method": "session/start", "session_field": "sessionId" },
+    "stream": { "transport": "isolated-jsonl-rpc-notifications" },
+    "interrupt": { "method": "session/cancel" },
+    "inspect": { "method": "session/inspect" },
+    "reconcile": { "method": "session/reconcile" },
+    "permission_policy": "fixed-unattended-composition",
+    "execution_permissions": {
+      "requirement": "worktree-command-access",
+      "unrestricted_mechanism": "fixed-local-bash-and-filesystem",
+      "sandbox_flag_required": false
+    },
+    "normalized_events": [
+      "session.started",
+      "run.started",
+      "assistant.delta",
+      "tool.started",
+      "tool.completed",
+      "permission.requested",
+      "input.requested",
+      "usage",
+      "run.completed",
+      "run.failed",
+      "run.interrupted"
+    ],
+    "capabilities": {
+      "exact_session_resume": true,
+      "structured_streaming": true,
+      "interruption": true,
+      "interactive_permission_response": false,
+      "server_backed": true,
+      "session_inspection": true
+    }
+  },
+  "sandbox": {}
 }

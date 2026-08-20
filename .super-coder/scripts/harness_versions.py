@@ -26,7 +26,7 @@ import subprocess
 import sys
 
 # Probe order = the order the harness picker lists them.
-HARNESSES = ("claude", "codex", "opencode", "vibe", "kimi")
+HARNESSES = ("claude", "codex", "opencode", "vibe", "kimi", "deepseek")
 TIMEOUT = 8
 SEMVER_TOKEN = re.compile(
     r"(?:^|(?<=\s))v?((\d+\.\d+\.\d+)(?:-[0-9A-Za-z.-]+)?"
@@ -41,6 +41,7 @@ MAINTAINED_OBSERVED_VERSIONS = {
     "opencode": "1.18.9",
     "vibe": "vibe 2.22.0",
     "kimi": "0.33.0",
+    "deepseek": "0.1.0rc7",
 }
 
 
@@ -59,6 +60,11 @@ def probe(name: str) -> str | None:
     """First line of `<harness> --version`, or None when absent/unusable.
     Absent, hung, and crashed all collapse to None on purpose: the caller is a
     status line, and every one of those means "cannot tell you a version"."""
+    if name == "deepseek":
+        import deepseek_runtime
+
+        status = deepseek_runtime.runtime_status()
+        return status.runtime_version if status.available else None
     if not shutil.which(name):
         return None
     try:
@@ -92,6 +98,44 @@ def compatibility_status(
     found: dict[str, dict[str, str | None]] = {}
     for name in harnesses:
         identity = {"harness": name, **scope}
+        if name == "deepseek":
+            import deepseek_runtime
+
+            try:
+                status = deepseek_runtime.runtime_status()
+                manifest = load_manifest(name)
+            except (deepseek_runtime.DeepSeekRuntimeError, AdapterError, OSError) as exc:
+                found[name] = {
+                    **identity,
+                    "version": None,
+                    "observed_version": None,
+                    "compatibility": None,
+                    "minimum_version": None,
+                    "maximum_version_exclusive": None,
+                    "verified_version": None,
+                    "error": getattr(exc, "code", "HARNESS_MANIFEST_INVALID"),
+                }
+                continue
+            conversation = manifest["conversation"]
+            found[name] = {
+                **identity,
+                "version": status.runtime_version,
+                "observed_version": status.runtime_version,
+                "compatibility": (
+                    "verified"
+                    if status.available
+                    and status.runtime_version
+                    == conversation["verified_cli_version"]
+                    else None
+                ),
+                "minimum_version": conversation["minimum_cli_version"],
+                "maximum_version_exclusive": conversation[
+                    "maximum_cli_version_exclusive"
+                ],
+                "verified_version": conversation["verified_cli_version"],
+                "error": None if status.available else status.error,
+            }
+            continue
         raw_version = probe(name)
         if raw_version is None:
             found[name] = {
