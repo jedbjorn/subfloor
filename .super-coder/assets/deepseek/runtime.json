@@ -1,27 +1,47 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "python_minimum": "3.10",
+  "carrier": {
+    "protocol": "super-coder-deepseek-lifecycle-v1",
+    "acquisition": "verified-source-build"
+  },
   "source": {
     "repository": "https://github.com/deepseek-ai/deepseek-harness",
     "commit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
-    "license": "MIT"
+    "archive_url": "https://github.com/deepseek-ai/deepseek-harness/archive/bb4ca698d63714e753f5621b07400e6ebb0b5d97.tar.gz",
+    "archive_sha256": "d5a78fb623d1c14846812e8e18042134a1127ab86dea259f79c2c8358e8481bc",
+    "license": "MIT",
+    "license_path": "assets/deepseek/LICENSE.deepseek-harness",
+    "license_sha256": "ebb4f09972aee8608be255debaf78451a68e95c290f55c240dec2ecfa16ea6be"
+  },
+  "patch": {
+    "path": "assets/deepseek/deepseek-harness-bb4ca698-lifecycle.patch",
+    "sha256": "93538c3ab1fbda75a898ae80b3ea907e3e9955f44fbdcae33a369db99054c558",
+    "protocol": "super-coder-deepseek-lifecycle-v1",
+    "upstream_issue_url": "https://github.com/deepseek-ai/deepseek-harness/issues/new",
+    "upstream_contribution": "git apply assets/deepseek/deepseek-harness-bb4ca698-lifecycle.patch"
+  },
+  "build": {
+    "path": "scripts/build_deepseek_carrier.py",
+    "sha256": "2a5dc5affc1dc3451cf47b2552cc0ed2def45fee4670772af3a335ad5a3452d2",
+    "lock_sha256": "f517dc3978d57531cda747df62a2abdde1df5b9f25415fcf1fc5d51f8b7547ea",
+    "node_version": "24.18.1",
+    "pnpm_version": "11.7.0",
+    "uv_version": "0.11.23",
+    "source_date_epoch": 1786963622,
+    "artifact_evidence": "deepseek-carrier-artifacts.json"
   },
   "sdk": {
     "distribution": "deepseek-harness-sdk",
-    "version": "0.1.0rc7",
-    "wheel_sha256": "5327d60659d8802442d2c589c89c3528cf18eb07b5d698059c833eb6b853b7d4"
+    "version": "0.1.0rc7"
   },
   "runtime": {
     "distribution": "deepseek-harness-runtime-bin",
     "version": "0.1.0rc7",
-    "wheel_sha256": {
-      "macos-arm64": "39ae51dec905c496ede69250d51b02a424a6c96829feb2ad7e01b3cec97a3255",
-      "linux-arm64": "de4e2571d3cd1c521ee22c754460dd251b45bd91a033876f554d0eab9b2843a1",
-      "linux-x64": "bf26f76a8cab7bedcce3a060b81d19ec1cabd8bd261c40b47381d630742797a7"
-    }
+    "platforms": ["macos-arm64", "linux-arm64", "linux-x64"]
   },
   "composition": {
     "path": "assets/deepseek/cordis.yml",
-    "sha256": "176f00285a2bf8f7b01b69136b250183122d6a01a06d93c3f4dac056b3a0460c"
+    "sha256": "9f29580d44ff78363f32585e926f384038de1f7f51dafde473375d69e73e69de"
   }
 }

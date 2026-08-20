@@ -1,0 +1,992 @@
+diff --git a/packages/llm/llm-deepseek/src/adapter.ts b/packages/llm/llm-deepseek/src/adapter.ts
+index bc30d46c3..d1fc82833 100644
+--- a/packages/llm/llm-deepseek/src/adapter.ts
++++ b/packages/llm/llm-deepseek/src/adapter.ts
+@@ -21,7 +21,7 @@ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
+ import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
+ import type { AnonymousUserId } from '@deepseek-ai/dsh-anonymous-user-id'
+ import { serializeRequest } from './serialize.ts'
+-import type { RequestDefaults } from './serialize.ts'
++import type { ProviderRequestOptions, RequestDefaults } from './serialize.ts'
+ import { parseSse } from './sse.ts'
+ import { translate } from './translate.ts'
+ import type { WireError } from './types.ts'
+@@ -58,6 +58,8 @@ export interface DeepSeekConnectionOptions {
+   apiKeyEnv: CredentialRef
+   /** Request defaults applied to every call (thinking mode, effort). */
+   defaults: RequestDefaults
++  /** Optional final outbound patch already resolved by the owning caller. */
++  providerRequestOptions?: ProviderRequestOptions
+   /** Default per-request output cap; explicit request values win. */
+   maxTokens: number
+   /** Positive context capacity used when the selected model has no exact value. */
+@@ -280,7 +282,7 @@ export class DeepSeekAdapter extends LlmAdapter {
+     userId: AnonymousUserId,
+     onComment: () => void,
+   ): AsyncIterable<StreamChunk> {
+-    const body = serializeRequest(options, connection.defaults)
++    const body = serializeRequest(options, connection.defaults, connection.providerRequestOptions)
+     // Prepared outside the try so the TRANSPORT label below covers exactly the
+     // transport boundary, never a serialization failure.
+     const payload = JSON.stringify(body)
+diff --git a/packages/llm/llm-deepseek/src/index.ts b/packages/llm/llm-deepseek/src/index.ts
+index a7b22ddd8..bc9301ef8 100644
+--- a/packages/llm/llm-deepseek/src/index.ts
++++ b/packages/llm/llm-deepseek/src/index.ts
+@@ -27,6 +27,7 @@ import {
+   DeepSeekAdapter,
+ } from './adapter.ts'
+ import type { DeepSeekCatalogModel, DeepSeekConnectionOptions } from './adapter.ts'
++import type { ProviderRequestOptions } from './serialize.ts'
+
+ export {
+   DEFAULT_CONTEXT_WINDOW,
+@@ -35,7 +36,7 @@ export {
+   DeepSeekAdapter,
+ } from './adapter.ts'
+ export type { DeepSeekAdapterOptions, DeepSeekCatalogModel, DeepSeekConnectionOptions } from './adapter.ts'
+-export type { RequestDefaults } from './serialize.ts'
++export type { ProviderRequestOptions, RequestDefaults } from './serialize.ts'
+ export type * from './types.ts'
+
+ export const name = 'llm-deepseek'
+@@ -78,6 +79,10 @@ export interface Config {
+   streamIdleTimeoutMs?: number
+   /** Provider-owned model-request retry policy; omission uses normal defaults. */
+   retryPolicy?: RetryPolicyConfig
++  /** Final outbound thinking patch supplied by a lifecycle owner. */
++  providerRequestThinking?: 'omit' | 'enabled' | 'disabled'
++  /** Final outbound effort patch supplied by a lifecycle owner. */
++  providerRequestReasoningEffort?: 'omit' | 'low' | 'high' | 'max'
+ }
+
+ const catalogModel: z<DeepSeekCatalogModel> = z.object({
+@@ -98,6 +103,8 @@ export const Config: z<Config> = z.object({
+   models: z.array(catalogModel).default(DEFAULT_MODELS),
+   streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
+   retryPolicy: RetryPolicySchema,
++  providerRequestThinking: z.union(['omit', 'enabled', 'disabled']),
++  providerRequestReasoningEffort: z.union(['omit', 'low', 'high', 'max']),
+ })
+
+ /** Public API default; the internal endpoint comes from $DEEPSEEK_BASE_URL. */
+@@ -180,6 +187,7 @@ export function resolveAdapterOptions(config: Config, environment?: LaunchEnviro
+       `llm-deepseek: streamIdleTimeoutMs must be a positive finite number no greater than ${MAX_TIMER_DELAY_MS}`,
+     )
+   }
++  const providerRequestOptions = resolveProviderRequestOptions(config)
+   return {
+     apiKeyEnv: credentialRef(config.apiKeyEnv ?? DEFAULT_API_KEY_ENV),
+     baseURL: config.baseURL
+@@ -189,6 +197,7 @@ export function resolveAdapterOptions(config: Config, environment?: LaunchEnviro
+       thinking: config.thinking,
+       reasoningEffort: config.reasoningEffort,
+     },
++    ...providerRequestOptions === undefined ? {} : { providerRequestOptions },
+     maxTokens: config.maxTokens ?? DEFAULT_MAX_TOKENS,
+     defaultContextWindow: config.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
+     models: resolveModels(config.models),
+@@ -197,6 +206,16 @@ export function resolveAdapterOptions(config: Config, environment?: LaunchEnviro
+   }
+ }
+
++function resolveProviderRequestOptions(config: Config): ProviderRequestOptions | undefined {
++  const thinking = config.providerRequestThinking
++  const reasoningEffort = config.providerRequestReasoningEffort
++  if (thinking === undefined && reasoningEffort === undefined) return undefined
++  if (thinking === undefined || reasoningEffort === undefined) {
++    throw new Error('llm-deepseek: provider request patch requires both fields')
++  }
++  return { thinking, reasoningEffort }
++}
++
+ export function apply(ctx: Context, config: Config): void {
+   let current: () => Config = () => config
+   let lastRaw: Config | undefined
+diff --git a/packages/llm/llm-deepseek/src/serialize.ts b/packages/llm/llm-deepseek/src/serialize.ts
+index f51ef2303..b2f0ae3cd 100644
+--- a/packages/llm/llm-deepseek/src/serialize.ts
++++ b/packages/llm/llm-deepseek/src/serialize.ts
+@@ -17,6 +17,12 @@ export interface RequestDefaults {
+   reasoningEffort?: 'off' | 'low' | 'high' | 'max' | undefined
+ }
+
++/** Caller-resolved patch applied at the final outbound serialization seam. */
++export interface ProviderRequestOptions {
++  thinking: 'omit' | 'enabled' | 'disabled'
++  reasoningEffort: 'omit' | 'low' | 'high' | 'max'
++}
++
+ interface ResolvedThinking {
+   thinking?: 'enabled' | 'disabled'
+   reasoningEffort?: 'low' | 'high' | 'max'
+@@ -151,6 +157,7 @@ export function serializeMessages(messages: Message[]): WireMessage[] {
+ export function serializeRequest(
+   options: GenerateOptions,
+   defaults: RequestDefaults = {},
++  providerRequestOptions?: ProviderRequestOptions,
+ ): WireRequest {
+   const messages: WireMessage[] = []
+   if (options.system !== undefined) {
+@@ -170,7 +177,7 @@ export function serializeRequest(
+   // compaction calls continue to inherit the adapter's thinking defaults.
+   const resolvedThinking = resolveThinking(options, defaults)
+
+-  return {
++  const request: WireRequest = {
+     model: options.model,
+     messages,
+     stream: true,
+@@ -184,4 +191,23 @@ export function serializeRequest(
+     ...options.maxTokens === undefined ? {} : { max_tokens: options.maxTokens },
+     ...options.stop !== undefined ? { stop: options.stop } : {},
+   }
++  return providerRequestOptions === undefined
++    ? request
++    : applyProviderRequestOptions(request, providerRequestOptions)
++}
++
++/**
++ * Apply one immutable caller-owned patch after every adapter/model default.
++ * This function deliberately performs no effort-policy resolution.
++ */
++export function applyProviderRequestOptions(
++  request: WireRequest,
++  options: ProviderRequestOptions,
++): WireRequest {
++  const patched = { ...request }
++  delete patched.thinking
++  delete patched.reasoning_effort
++  if (options.thinking !== 'omit') patched.thinking = { type: options.thinking }
++  if (options.reasoningEffort !== 'omit') patched.reasoning_effort = options.reasoningEffort
++  return patched
+ }
+diff --git a/packages/llm/llm-deepseek/tests/serialize.spec.ts b/packages/llm/llm-deepseek/tests/serialize.spec.ts
+index 714cfc5d2..cfe8d4ef7 100644
+--- a/packages/llm/llm-deepseek/tests/serialize.spec.ts
++++ b/packages/llm/llm-deepseek/tests/serialize.spec.ts
+@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
+ import { AttachmentId } from '@deepseek-ai/dsh-attachment'
+ import { createUserMessage, CallId, ReasoningEffortId, createMessage } from '@deepseek-ai/dsh-llm'
+ import type { ContentBlock, GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
+-import { serializeMessages, serializeRequest } from '../src/serialize.ts'
++import { applyProviderRequestOptions, serializeMessages, serializeRequest } from '../src/serialize.ts'
+
+ function request(overrides: Partial<GenerateOptions> = {}): GenerateOptions {
+   return { provider: 'deepseek-official', model: 'deepseek-v4-flash', messages: [], ...overrides }
+@@ -256,6 +256,29 @@ describe('serializeRequest', () => {
+     expect(wire.reasoning_effort).toBeUndefined()
+   })
+
++  it('final provider patch removes materialized thinking defaults', () => {
++    const wire = serializeRequest(
++      request({ messages: history, reasoningEffort: ReasoningEffortId('high') }),
++      { thinking: 'enabled', reasoningEffort: 'high' },
++      { thinking: 'omit', reasoningEffort: 'omit' },
++    )
++    expect(wire.thinking).toBeUndefined()
++    expect(wire.reasoning_effort).toBeUndefined()
++  })
++
++  it('callable provider patch replaces both outbound fields exactly', () => {
++    const source = serializeRequest(request({ messages: history }), {
++      thinking: 'disabled', reasoningEffort: 'off',
++    })
++    const wire = applyProviderRequestOptions(source, {
++      thinking: 'enabled', reasoningEffort: 'low',
++    })
++    expect(wire.thinking).toEqual({ type: 'enabled' })
++    expect(wire.reasoning_effort).toBe('low')
++    expect(source.thinking).toEqual({ type: 'disabled' })
++    expect(source.reasoning_effort).toBeUndefined()
++  })
++
+   it('preserves an explicit enabled default without inventing a wire effort', () => {
+     const wire = serializeRequest(request({ messages: history }), { thinking: 'enabled' })
+     expect(wire.thinking).toEqual({ type: 'enabled' })
+diff --git a/packages/sdk/protocol/src/index.ts b/packages/sdk/protocol/src/index.ts
+index 5f0aaca21..9dd0beb38 100644
+--- a/packages/sdk/protocol/src/index.ts
++++ b/packages/sdk/protocol/src/index.ts
+@@ -15,8 +15,14 @@ export type {
+   HarnessSdkRequestMap,
+   InitializeParams,
+   InitializeResult,
++  ProviderRequestOptions,
+   SdkRunStatus,
++  SessionCancelResult,
+   SessionEventNotification,
++  SessionIdentityParams,
++  SessionInspectionResult,
++  SessionReconcileParams,
++  SessionReconcileResult,
+   SessionStatusNotification,
+   SessionPromptParams,
+   SessionPromptResult,
+diff --git a/packages/sdk/protocol/src/types.ts b/packages/sdk/protocol/src/types.ts
+index 533b5f23c..309072b3f 100644
+--- a/packages/sdk/protocol/src/types.ts
++++ b/packages/sdk/protocol/src/types.ts
+@@ -22,6 +22,20 @@ export interface InitializeParams {
+   model: string
+   /** Optional positive output-token cap inherited by SDK-created agents and their in-process descendants. */
+   maxTokens?: number
++  /**
++   * Caller-resolved outbound DeepSeek request options. Both fields are
++   * explicit so a reserved default can remove adapter/model defaults without
++   * the runtime re-resolving policy.
++   */
++  providerRequestOptions?: ProviderRequestOptions
++}
++
++/** Exact outbound option patch applied after ordinary request resolution. */
++export interface ProviderRequestOptions {
++  /** Omit the wire field or force the exact DeepSeek thinking toggle. */
++  thinking: 'omit' | 'enabled' | 'disabled'
++  /** Omit the wire field or force one exact DeepSeek reasoning level. */
++  reasoningEffort: 'omit' | 'low' | 'high' | 'max'
+ }
+
+ /** Wire-stable server identity returned by initialization. */
+@@ -44,6 +58,40 @@ export interface SessionPromptResult {
+   messageId: string
+ }
+
++/** Parameters shared by lifecycle operations that target one exact session. */
++export interface SessionIdentityParams {
++  sessionId: string
++}
++
++/** Exact persisted event boundary for one dispatched turn. */
++export interface SessionReconcileParams extends SessionIdentityParams {
++  /** First sequence number that can belong to the abandoned turn. */
++  fromEventSeq: number
++}
++
++/** Native presence and live state without importing persistence layouts. */
++export interface SessionInspectionResult {
++  sessionId: string
++  presence: 'absent' | 'persisted' | 'live'
++  status: 'idle' | 'running' | 'unknown'
++  eventCount: number
++  lastEventSeq?: number
++  lastTurnReason?: string
++}
++
++/** Truthful recovery classification for an abandoned super-coder lease. */
++export interface SessionReconcileResult extends SessionInspectionResult {
++  outcome: 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown'
++}
++
++/** Result of an active-turn cancellation request. */
++export interface SessionCancelResult {
++  sessionId: string
++  accepted: boolean
++  status: 'idle' | 'running'
++  outcome: 'not-running' | 'cancelled' | 'deadline-exceeded'
++}
++
+ /** Deployment-mapped SDK outcome: `ok` for an accepted result, `error` otherwise. */
+ export type SdkRunStatus = 'ok' | 'error'
+
+@@ -101,5 +149,9 @@ export interface HarnessSdkNotificationMap {
+ export interface HarnessSdkRequestMap {
+   'initialize': { params: InitializeParams; result: InitializeResult }
+   'session/prompt': { params: SessionPromptParams; result: SessionPromptResult }
++  'session/start': { params: SessionIdentityParams; result: SessionInspectionResult }
++  'session/cancel': { params: SessionIdentityParams; result: SessionCancelResult }
++  'session/inspect': { params: SessionIdentityParams; result: SessionInspectionResult }
++  'session/reconcile': { params: SessionReconcileParams; result: SessionReconcileResult }
+   'shutdown': { params: undefined; result: Record<string, never> }
+ }
+diff --git a/packages/sdk/server/src/server.ts b/packages/sdk/server/src/server.ts
+index 195caa908..5c617dea3 100644
+--- a/packages/sdk/server/src/server.ts
++++ b/packages/sdk/server/src/server.ts
+@@ -19,6 +19,11 @@ import type {
+   InitializeResult,
+   JsonRpcTransportPeer,
+   SessionEventNotification,
++  SessionCancelResult,
++  SessionIdentityParams,
++  SessionInspectionResult,
++  SessionReconcileParams,
++  SessionReconcileResult,
+   SessionPromptParams,
+   SessionPromptResult,
+   SubagentFinishedNotification,
+@@ -29,6 +34,14 @@ interface SessionRecord {
+   handle: AgentHandle
+ }
+
++interface SessionSnapshot {
++  presence: SessionInspectionResult['presence']
++  status: SessionInspectionResult['status']
++  events: readonly { seq: number; type: string; data: unknown }[]
++}
++
++const NATIVE_CANCEL_TIMEOUT_MS = 5_000
++
+ /** Recover the delegating parent from the service-owned scoped carrier. */
+ function subagentParentOf(carrier: Scoped<SubagentRuntime>): Agent {
+   return carrierKeyOf(carrier) as Agent
+@@ -119,7 +132,14 @@ export class HarnessSdkJsonRpcServer {
+     this.maxTokens = params.maxTokens
+     if (!this.hasAdapterFor(this.provider)) {
+       if (this.provider !== 'deepseek-official') throw new Error(`no adapter registered for provider "${this.provider}"`)
+-      this.llmFiber = await this.ctx.plugin(LlmDeepSeek, {})
++      this.llmFiber = await this.ctx.plugin(LlmDeepSeek, {
++        ...params.providerRequestOptions === undefined
++          ? {}
++          : {
++            providerRequestThinking: params.providerRequestOptions.thinking,
++            providerRequestReasoningEffort: params.providerRequestOptions.reasoningEffort,
++          },
++      })
+     }
+     return { serverInfo: { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' } }
+   }
+@@ -142,6 +162,52 @@ export class HarnessSdkJsonRpcServer {
+     return { messageId: message.id }
+   }
+
++  /** Materialize or exactly resume one caller-supplied native identity. */
++  async startSession(params: SessionIdentityParams): Promise<SessionInspectionResult> {
++    await this.getOrCreateSession(params.sessionId)
++    return this.inspectSession(params)
++  }
++
++  /** Cancel only the active turn for one live SDK-owned identity. */
++  async cancelSession(params: SessionIdentityParams): Promise<SessionCancelResult> {
++    const record = this.sessions.get(params.sessionId)
++    if (record === undefined || this.ctx.agents.get(SessionId(params.sessionId)) !== record.handle.agent) {
++      return { sessionId: params.sessionId, accepted: false, status: 'idle', outcome: 'not-running' }
++    }
++    const accepted = record.handle.agent.status === 'running'
++    if (!accepted) {
++      return { sessionId: params.sessionId, accepted: false, status: 'idle', outcome: 'not-running' }
++    }
++    record.handle.agent.cancel({ kind: 'user' })
++    const reachedIdle = await waitForIdle(record.handle.agent, NATIVE_CANCEL_TIMEOUT_MS)
++    const cancelled = reachedIdle && record.handle.agent.status === 'idle'
++    return {
++      sessionId: params.sessionId,
++      accepted: true,
++      status: record.handle.agent.status,
++      outcome: cancelled ? 'cancelled' : 'deadline-exceeded',
++    }
++  }
++
++  /** Inspect live or persisted state through public services only. */
++  async inspectSession(params: SessionIdentityParams): Promise<SessionInspectionResult> {
++    const snapshot = await this.sessionSnapshot(params.sessionId)
++    return inspection(params.sessionId, snapshot)
++  }
++
++  /** Classify an abandoned lease without inventing successful completion. */
++  async reconcileSession(params: SessionReconcileParams): Promise<SessionReconcileResult> {
++    if (!Number.isSafeInteger(params.fromEventSeq) || params.fromEventSeq < 0) {
++      throw new TypeError('session/reconcile fromEventSeq must be a non-negative safe integer')
++    }
++    const snapshot = await this.sessionSnapshot(params.sessionId)
++    const inspected = inspection(params.sessionId, snapshot, params.fromEventSeq)
++    const outcome = inspected.status === 'running'
++      ? 'running'
++      : reconcileOutcome(inspected.lastTurnReason, this.options)
++    return { ...inspected, outcome }
++  }
++
+   /**
+    * Dispose server-owned agents, adapter, and subscriptions to quiescence.
+    * The surrounding context remains running.
+@@ -193,6 +259,14 @@ export class HarnessSdkJsonRpcServer {
+         return this.initialize(params as unknown as InitializeParams)
+       case 'session/prompt':
+         return this.prompt(params as unknown as SessionPromptParams)
++      case 'session/start':
++        return this.startSession(params as unknown as SessionIdentityParams)
++      case 'session/cancel':
++        return this.cancelSession(params as unknown as SessionIdentityParams)
++      case 'session/inspect':
++        return this.inspectSession(params as unknown as SessionIdentityParams)
++      case 'session/reconcile':
++        return this.reconcileSession(params as unknown as SessionReconcileParams)
+       case 'shutdown':
+         return this.shutdown()
+       default:
+@@ -220,21 +294,86 @@ export class HarnessSdkJsonRpcServer {
+     // rows in the host plane, so this agent reads them from the global layer. A
+     // deployment that configures a roster has to join one here first
+     // (@deepseek-ai/dsh-agent-presets README, "Composing a child agent").
+-    const handle = await this.ctx.agents.create({
+-      sessionId: SessionId(sessionId),
+-      meta: { cwd: this.cwd },
+-      agentOptions: {
+-        provider: this.provider,
+-        model: this.model,
+-        ...this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens },
+-      },
+-    })
++    const identity = SessionId(sessionId)
++    const persistence = this.ctx.get('sessionPersistence')
++    const persisted = persistence !== undefined
++      && (await persistence.list()).some((candidate: { id: unknown }) => candidate.id === identity)
++    const agentOptions = {
++      provider: this.provider,
++      model: this.model,
++      ...this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens },
++    }
++    const handle = persisted
++      ? await this.ctx.agents.resume({ resumeSessionId: identity, agentOptions })
++      : await this.ctx.agents.create({
++        sessionId: identity,
++        meta: { cwd: this.cwd },
++        agentOptions,
++      })
+     const rec: SessionRecord = { handle }
+     this.sessions.set(sessionId, rec)
+     return rec
+   }
+
++  private async sessionSnapshot(sessionId: string): Promise<SessionSnapshot> {
++    const live = this.ctx.agents.get(SessionId(sessionId))
++    if (live !== undefined) return { presence: 'live', status: live.status, events: live.session.events }
++    const persistence = this.ctx.get('sessionPersistence')
++    if (persistence === undefined) return { presence: 'absent', status: 'unknown', events: [] }
++    const exists = (await persistence.list()).some((candidate: { id: unknown }) => String(candidate.id) === sessionId)
++    if (!exists) return { presence: 'absent', status: 'unknown', events: [] }
++    const stored = await persistence.inspect(SessionId(sessionId))
++    return { presence: 'persisted', status: 'idle', events: stored.events }
++  }
++
+   private hasAdapterFor(provider: string): boolean {
+     return this.ctx.get('llm')?.listProviders().some(entry => entry.id === provider) ?? false
+   }
+ }
++
++function inspection(
++  sessionId: string,
++  snapshot: SessionSnapshot,
++  fromEventSeq?: number,
++): SessionInspectionResult {
++  const lastTurn = fromEventSeq === undefined
++    ? snapshot.events.findLast(event => event.type === 'turn/end')
++    : snapshot.events.find(event => event.type === 'turn/end' && event.seq >= fromEventSeq)
++  const reason = lastTurn?.data !== null && typeof lastTurn?.data === 'object'
++    ? (lastTurn.data as { reason?: { kind?: unknown } }).reason?.kind
++    : undefined
++  const lastEventSeq = snapshot.events.at(-1)?.seq
++  return {
++    sessionId,
++    presence: snapshot.presence,
++    status: snapshot.status,
++    eventCount: snapshot.events.length,
++    ...lastEventSeq === undefined ? {} : { lastEventSeq },
++    ...typeof reason === 'string' ? { lastTurnReason: reason } : {},
++  }
++}
++
++async function waitForIdle(agent: Agent, timeoutMs: number): Promise<boolean> {
++  let timer: ReturnType<typeof setTimeout> | undefined
++  try {
++    return await Promise.race([
++      agent.whenIdle().then(() => true),
++      new Promise<boolean>(resolveTimeout => {
++        timer = setTimeout(() => resolveTimeout(false), timeoutMs)
++      }),
++    ])
++  } finally {
++    if (timer !== undefined) clearTimeout(timer)
++  }
++}
++
++function reconcileOutcome(
++  reason: string | undefined,
++  options: HarnessSdkJsonRpcServerOptions,
++): SessionReconcileResult['outcome'] {
++  if (reason === 'completed') return 'succeeded'
++  if (reason === 'max-tokens') return options.maxTokensAsSuccess === true ? 'succeeded' : 'failed'
++  if (reason === 'aborted') return 'cancelled'
++  if (reason === 'blocked' || reason === 'error') return 'failed'
++  return 'unknown'
++}
+diff --git a/packages/sdk/server/tests/server.spec.ts b/packages/sdk/server/tests/server.spec.ts
+index 495f1d90f..3ff1fefbc 100644
+--- a/packages/sdk/server/tests/server.spec.ts
++++ b/packages/sdk/server/tests/server.spec.ts
+@@ -124,6 +124,7 @@ describe('HarnessSdkJsonRpcServer', () => {
+         provider: 'deepseek-official',
+         model: 'dsagent-model',
+         maxTokens: 321,
++        providerRequestOptions: { thinking: 'omit', reasoningEffort: 'omit' },
+       }) as { serverInfo: { name: string } }
+       expect(init.serverInfo.name).toBe('deepseek-harness-sdk-runtime')
+
+@@ -134,11 +135,19 @@ describe('HarnessSdkJsonRpcServer', () => {
+       expect((receipt as { messageId?: unknown }).messageId).toBeTypeOf('string')
+
+       await vi.waitFor(() => { expect(llmServer.requests).toHaveLength(1) })
+-      const body = llmServer.requests[0] as { model: string; messages: { role: string }[]; max_tokens?: number }
++      const body = llmServer.requests[0] as {
++        model: string
++        messages: { role: string }[]
++        max_tokens?: number
++        thinking?: unknown
++        reasoning_effort?: unknown
++      }
+       expect(body.model).toBe('dsagent-model')
+       expect(body.max_tokens).toBe(321)
+       expect(body.messages[0]?.role).toBe('system')
+       expect(body.messages.at(-1)?.role).toBe('user')
++      expect(body.thinking).toBeUndefined()
++      expect(body.reasoning_effort).toBeUndefined()
+       expect(llmServer.headers[0]?.authorization).toBe('Bearer test-key')
+       expect(transport.notifications.some(n => n.method === 'session.event')).toBe(true)
+       await vi.waitFor(() => {
+@@ -171,6 +180,237 @@ describe('HarnessSdkJsonRpcServer', () => {
+     }
+   })
+
++  it('resumes a persisted caller identity instead of creating a colliding session', async () => {
++    const events = [{
++      type: 'turn/end', seq: 7, time: 1,
++      data: { turn: 1, reason: { kind: 'completed' } },
++    }]
++    const session = { events } as unknown as Agent['session']
++    const agent = {
++      id: SessionId('stable'), session, status: 'idle',
++    } as Agent
++    const handle: AgentHandle = { agent, dispose: vi.fn(() => Promise.resolve()) }
++    const live = new Map<string, Agent>()
++    const resume = vi.fn(async () => {
++      live.set('stable', agent)
++      return handle
++    })
++    const create = vi.fn(() => Promise.reject(new Error('must not create a persisted identity')))
++    const persistence = {
++      list: vi.fn(async () => [{ id: SessionId('stable'), cwd: '/work' }]),
++      inspect: vi.fn(async () => ({ meta: { id: SessionId('stable') }, events })),
++    }
++    const ctx = {
++      on: vi.fn(() => () => undefined),
++      agents: { create, resume, get: (id: SessionId) => live.get(String(id)) },
++      get: (name: string) => name === 'sessionPersistence' ? persistence : undefined,
++    } as unknown as Context
++    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
++
++    await expect(server.startSession({ sessionId: 'stable' })).resolves.toEqual({
++      sessionId: 'stable', presence: 'live', status: 'idle', eventCount: 1,
++      lastEventSeq: 7, lastTurnReason: 'completed',
++    })
++    expect(resume).toHaveBeenCalledWith({
++      resumeSessionId: SessionId('stable'),
++      agentOptions: { provider: 'deepseek-official', model: 'deepseek-official' },
++    })
++    expect(create).not.toHaveBeenCalled()
++    await server.shutdown()
++  })
++
++  it('inspects, cancels, and reconciles only the exact live session', async () => {
++    const events = [{
++      type: 'turn/end', seq: 3, time: 1,
++      data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } },
++    }]
++    let status: 'idle' | 'running' = 'running'
++    const agent = {
++      id: SessionId('owned'),
++      session: { events },
++      get status() { return status },
++      cancel: vi.fn(() => { status = 'idle' }),
++      whenIdle: vi.fn(() => Promise.resolve()),
++    } as unknown as Agent
++    const other = { id: SessionId('other'), status: 'running' } as Agent
++    const handle: AgentHandle = { agent, dispose: vi.fn(() => Promise.resolve()) }
++    const ctx = {
++      on: vi.fn(() => () => undefined),
++      agents: {
++        create: vi.fn(async () => handle),
++        get: (id: SessionId) => String(id) === 'owned' ? agent : String(id) === 'other' ? other : undefined,
++      },
++      get: () => undefined,
++    } as unknown as Context
++    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
++    await server.startSession({ sessionId: 'owned' })
++
++    await expect(server.cancelSession({ sessionId: 'owned' })).resolves.toEqual({
++      sessionId: 'owned', accepted: true, status: 'idle', outcome: 'cancelled',
++    })
++    expect(agent.cancel).toHaveBeenCalledWith({ kind: 'user' })
++    await expect(server.reconcileSession({ sessionId: 'owned', fromEventSeq: 0 })).resolves.toEqual({
++      sessionId: 'owned', presence: 'live', status: 'idle', eventCount: 1,
++      lastEventSeq: 3, lastTurnReason: 'aborted', outcome: 'cancelled',
++    })
++    await expect(server.cancelSession({ sessionId: 'other' })).resolves.toEqual({
++      sessionId: 'other', accepted: false, status: 'idle', outcome: 'not-running',
++    })
++    await expect(server.cancelSession({ sessionId: 'owned' })).resolves.toEqual({
++      sessionId: 'owned', accepted: false, status: 'idle', outcome: 'not-running',
++    })
++    expect(agent.cancel).toHaveBeenCalledTimes(1)
++    expect((other as unknown as { cancel?: unknown }).cancel).toBeUndefined()
++    await server.shutdown()
++  })
++
++  it('reports the exact live turn as running before native cancellation', async () => {
++    const events = [{
++      type: 'turn/end', seq: 3, time: 1,
++      data: { turn: 1, reason: { kind: 'completed' } },
++    }]
++    const agent = {
++      id: SessionId('running'), session: { events }, status: 'running',
++    } as unknown as Agent
++    const handle: AgentHandle = { agent, dispose: vi.fn(() => Promise.resolve()) }
++    const ctx = {
++      on: vi.fn(() => () => undefined),
++      agents: {
++        create: vi.fn(async () => handle),
++        get: (id: SessionId) => String(id) === 'running' ? agent : undefined,
++      },
++      get: () => undefined,
++    } as unknown as Context
++    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
++    await server.startSession({ sessionId: 'running' })
++
++    await expect(server.reconcileSession({ sessionId: 'running', fromEventSeq: 4 })).resolves.toEqual({
++      sessionId: 'running', presence: 'live', status: 'running', eventCount: 1,
++      lastEventSeq: 3, outcome: 'running',
++    })
++    await server.shutdown()
++  })
++
++  it('does not reuse an older terminal event for a newer incomplete turn', async () => {
++    const events = [
++      { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
++      { type: 'turn/end', seq: 1, time: 2, data: { turn: 1, reason: { kind: 'completed' } } },
++      { type: 'turn/start', seq: 2, time: 3, data: { turn: 2 } },
++      { type: 'step/start', seq: 3, time: 4, data: { turn: 2, step: 1 } },
++    ]
++    const persistence = {
++      list: vi.fn(async () => [{ id: SessionId('persisted'), cwd: '/work' }]),
++      inspect: vi.fn(async () => ({ meta: { id: SessionId('persisted') }, events })),
++    }
++    const ctx = {
++      on: vi.fn(() => () => undefined),
++      agents: { create: vi.fn(), get: () => undefined },
++      get: (name: string) => name === 'sessionPersistence' ? persistence : undefined,
++    } as unknown as Context
++    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
++
++    await expect(server.reconcileSession({ sessionId: 'persisted', fromEventSeq: 2 })).resolves.toEqual({
++      sessionId: 'persisted', presence: 'persisted', status: 'idle', eventCount: 4,
++      lastEventSeq: 3, outcome: 'unknown',
++    })
++    await server.shutdown()
++  })
++
++  it('rejects an invalid reconciliation boundary before reading persistence', async () => {
++    const persistence = {
++      list: vi.fn(async () => []),
++      inspect: vi.fn(),
++    }
++    const ctx = {
++      on: vi.fn(() => () => undefined),
++      agents: { create: vi.fn(), get: () => undefined },
++      get: (name: string) => name === 'sessionPersistence' ? persistence : undefined,
++    } as unknown as Context
++    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
++
++    await expect(server.reconcileSession({ sessionId: 'persisted', fromEventSeq: -1 }))
++      .rejects.toThrow('session/reconcile fromEventSeq must be a non-negative safe integer')
++    expect(persistence.list).not.toHaveBeenCalled()
++    expect(persistence.inspect).not.toHaveBeenCalled()
++    await server.shutdown()
++  })
++
++  it.each([
++    ['completed', 'succeeded'],
++    ['error', 'failed'],
++    ['aborted', 'cancelled'],
++  ] as const)('classifies a matching %s terminal as %s', async (reason, outcome) => {
++    const events = [
++      { type: 'turn/end', seq: 1, time: 1, data: { turn: 1, reason: { kind: 'completed' } } },
++      { type: 'turn/start', seq: 2, time: 2, data: { turn: 2 } },
++      { type: 'turn/end', seq: 3, time: 3, data: { turn: 2, reason: { kind: reason } } },
++    ]
++    const persistence = {
++      list: vi.fn(async () => [{ id: SessionId('persisted'), cwd: '/work' }]),
++      inspect: vi.fn(async () => ({ meta: { id: SessionId('persisted') }, events })),
++    }
++    const ctx = {
++      on: vi.fn(() => () => undefined),
++      agents: { create: vi.fn(), get: () => undefined },
++      get: (name: string) => name === 'sessionPersistence' ? persistence : undefined,
++    } as unknown as Context
++    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
++
++    await expect(server.reconcileSession({ sessionId: 'persisted', fromEventSeq: 2 })).resolves.toEqual({
++      sessionId: 'persisted', presence: 'persisted', status: 'idle', eventCount: 3,
++      lastEventSeq: 3, lastTurnReason: reason, outcome,
++    })
++    await server.shutdown()
++  })
++
++  it('bounds a non-cooperative native cancellation without touching another session', async () => {
++    vi.useFakeTimers()
++    let status: 'idle' | 'running' = 'running'
++    const cancel = vi.fn()
++    const agent = {
++      id: SessionId('stuck'), session: { events: [] },
++      get status() { return status },
++      cancel,
++      whenIdle: vi.fn(() => new Promise<void>(() => undefined)),
++    } as unknown as Agent
++    const otherCancel = vi.fn()
++    const other = {
++      id: SessionId('other'), session: { events: [] }, status: 'running', cancel: otherCancel,
++    } as unknown as Agent
++    const handle: AgentHandle = { agent, dispose: vi.fn(() => Promise.resolve()) }
++    const ctx = {
++      on: vi.fn(() => () => undefined),
++      agents: {
++        create: vi.fn(async () => handle),
++        get: (id: SessionId) => String(id) === 'stuck' ? agent : String(id) === 'other' ? other : undefined,
++      },
++      get: () => undefined,
++    } as unknown as Context
++    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
++    try {
++      await server.startSession({ sessionId: 'stuck' })
++      let settled = false
++      const pending = server.cancelSession({ sessionId: 'stuck' }).then(result => {
++        settled = true
++        return result
++      })
++
++      await vi.advanceTimersByTimeAsync(4_999)
++      expect(settled).toBe(false)
++      await vi.advanceTimersByTimeAsync(1)
++      await expect(pending).resolves.toEqual({
++        sessionId: 'stuck', accepted: true, status: 'running', outcome: 'deadline-exceeded',
++      })
++      expect(cancel).toHaveBeenCalledTimes(1)
++      expect(cancel).toHaveBeenCalledWith({ kind: 'user' })
++      expect(otherCancel).not.toHaveBeenCalled()
++      await server.shutdown()
++    } finally {
++      status = 'idle'
++      vi.useRealTimers()
++    }
++  })
++
+   it('queues overlapping prompts for one session without blocking other sessions', async () => {
+     const mainFollowup = vi.fn<Agent['followup']>()
+     const mainAgent = ({
+@@ -910,7 +1150,9 @@ describe('HarnessSdkJsonRpcServer', () => {
+     const ctx = {
+       on: vi.fn(() => () => undefined),
+       agents: { create, get: () => undefined },
+-      get: () => ({ listProviders: () => [{ id: 'mock', name: 'Mock' }] }),
++      get: (name: string) => name === 'llm'
++        ? { listProviders: () => [{ id: 'mock', name: 'Mock' }] }
++        : undefined,
+     } as unknown as Context
+     const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport()) as unknown as {
+       initialize(params: { cwd: string; provider: string; model: string; maxTokens?: number }): Promise<unknown>
+diff --git a/python/sdk-runtime/src/deepseek_harness_runtime/deepseek-harness-runtime.json b/python/sdk-runtime/src/deepseek_harness_runtime/deepseek-harness-runtime.json
+index e4d02d8a3..5ff8a564c 100644
+--- a/python/sdk-runtime/src/deepseek_harness_runtime/deepseek-harness-runtime.json
++++ b/python/sdk-runtime/src/deepseek_harness_runtime/deepseek-harness-runtime.json
+@@ -1 +1,8 @@
+-{"name":"deepseek-harness-runtime-bin","version":"0.0.0-dev"}
++{
++  "name": "deepseek-harness-runtime-bin",
++  "version": "0.0.0-dev",
++  "carrier": {
++    "protocol": "super-coder-deepseek-lifecycle-v1",
++    "sourceCommit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97"
++  }
++}
+diff --git a/python/sdk/src/deepseek_harness/__init__.py b/python/sdk/src/deepseek_harness/__init__.py
+index 8c098224f..1f4acb597 100644
+--- a/python/sdk/src/deepseek_harness/__init__.py
++++ b/python/sdk/src/deepseek_harness/__init__.py
+@@ -1,7 +1,16 @@
+ from .api import DeepSeekHarness, DeepSeekHarnessConfig, RunResult, Session
+ from .client import HarnessClient, HarnessConfig
+ from .errors import SdkProtocolError
+-from .models import IncomingRequest, InitializeResponse, JsonObject, Notification, ServerInfo
++from .models import (
++    IncomingRequest,
++    InitializeResponse,
++    JsonObject,
++    Notification,
++    ServerInfo,
++    SessionCancellation,
++    SessionInspection,
++    SessionReconciliation,
++)
+
+ __all__ = [
+     "DeepSeekHarness",
+@@ -16,4 +25,7 @@ __all__ = [
+     "JsonObject",
+     "Notification",
+     "ServerInfo",
++    "SessionCancellation",
++    "SessionInspection",
++    "SessionReconciliation",
+ ]
+diff --git a/python/sdk/src/deepseek_harness/client.py b/python/sdk/src/deepseek_harness/client.py
+index 5442c7e14..4482f625d 100644
+--- a/python/sdk/src/deepseek_harness/client.py
++++ b/python/sdk/src/deepseek_harness/client.py
+@@ -15,7 +15,16 @@ from typing import Callable, TypeAlias, TypeVar
+ from pydantic import BaseModel
+
+ from .errors import JsonRpcError, TransportClosedError
+-from .models import IncomingRequest, InitializeResponse, JsonObject, JsonValue, Notification
++from .models import (
++    IncomingRequest,
++    InitializeResponse,
++    JsonObject,
++    JsonValue,
++    Notification,
++    SessionCancellation,
++    SessionInspection,
++    SessionReconciliation,
++)
+
+ ModelT = TypeVar("ModelT", bound=BaseModel)
+ NotificationFilter: TypeAlias = Callable[[Notification], bool]
+@@ -121,6 +130,7 @@ class HarnessClient:
+         provider: str,
+         model: str,
+         max_tokens: int | None = None,
++        provider_request_options: JsonObject | None = None,
+     ) -> InitializeResponse:
+         payload: JsonObject = {
+             "cwd": str(Path(cwd).resolve()),
+@@ -129,12 +139,38 @@ class HarnessClient:
+         }
+         if max_tokens is not None:
+             payload["maxTokens"] = max_tokens
++        if provider_request_options is not None:
++            payload["providerRequestOptions"] = provider_request_options
+         try:
+             return self.request("initialize", payload, response_model=InitializeResponse)
+         except BaseException:
+             self.close()
+             raise
+
++    def session_start(self, session_id: str) -> SessionInspection:
++        return self.request(
++            "session/start", {"sessionId": session_id}, response_model=SessionInspection
++        )
++
++    def session_cancel(self, session_id: str) -> SessionCancellation:
++        return self.request(
++            "session/cancel", {"sessionId": session_id}, response_model=SessionCancellation
++        )
++
++    def session_inspect(self, session_id: str) -> SessionInspection:
++        return self.request(
++            "session/inspect", {"sessionId": session_id}, response_model=SessionInspection
++        )
++
++    def session_reconcile(
++        self, session_id: str, *, from_event_seq: int
++    ) -> SessionReconciliation:
++        return self.request(
++            "session/reconcile",
++            {"sessionId": session_id, "fromEventSeq": from_event_seq},
++            response_model=SessionReconciliation,
++        )
++
+     def session_prompt(
+         self,
+         session_id: str,
+diff --git a/python/sdk/src/deepseek_harness/models.py b/python/sdk/src/deepseek_harness/models.py
+index f398bb422..5acbfca44 100644
+--- a/python/sdk/src/deepseek_harness/models.py
++++ b/python/sdk/src/deepseek_harness/models.py
+@@ -30,3 +30,23 @@ class ServerInfo(BaseModel):
+
+ class InitializeResponse(BaseModel):
+     serverInfo: ServerInfo | None = None
++
++
++class SessionInspection(BaseModel):
++    sessionId: str
++    presence: str
++    status: str
++    eventCount: int
++    lastEventSeq: int | None = None
++    lastTurnReason: str | None = None
++
++
++class SessionReconciliation(SessionInspection):
++    outcome: str
++
++
++class SessionCancellation(BaseModel):
++    sessionId: str
++    accepted: bool
++    status: str
++    outcome: str
+diff --git a/python/sdk/tests/test_client.py b/python/sdk/tests/test_client.py
+index 51c9dacb3..2fac916d8 100644
+--- a/python/sdk/tests/test_client.py
++++ b/python/sdk/tests/test_client.py
+@@ -461,7 +461,17 @@ for line in sys.stdin:
+     msg = json.loads(line)
+     method = msg.get("method")
+     if method == "initialize":
++        assert msg["params"]["providerRequestOptions"] == {"thinking": "omit", "reasoningEffort": "omit"}
+         print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"serverInfo": {"name": "fake-dsh"}}}), flush=True)
++    elif method == "session/start":
++        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": "main", "presence": "persisted", "status": "idle", "eventCount": 2}}), flush=True)
++    elif method == "session/inspect":
++        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": "main", "presence": "live", "status": "running", "eventCount": 3}}), flush=True)
++    elif method == "session/cancel":
++        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": "main", "accepted": True, "status": "idle", "outcome": "cancelled"}}), flush=True)
++    elif method == "session/reconcile":
++        assert msg["params"]["fromEventSeq"] == 2
++        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": "main", "presence": "live", "status": "idle", "eventCount": 4, "lastTurnReason": "aborted", "outcome": "cancelled"}}), flush=True)
+     elif method == "session/prompt":
+         params = msg.get("params") or {}
+         print(json.dumps({"jsonrpc": "2.0", "method": "llm/request", "params": {"requestId": "req-1", "sessionId": params["sessionId"], "model": "dsagent", "messages": []}}), flush=True)
+@@ -475,9 +485,21 @@ for line in sys.stdin:
+     with HarnessClient(
+         HarnessConfig(launch_args_override=(sys.executable, str(script)))
+     ) as client:
+-        init = client.initialize(provider="deepseek-official", cwd="/workspace", model="dsagent")
++        init = client.initialize(
++            provider="deepseek-official",
++            cwd="/workspace",
++            model="dsagent",
++            provider_request_options={"thinking": "omit", "reasoningEffort": "omit"},
++        )
+         assert init.serverInfo.name == "fake-dsh"
+
++        assert client.session_start("main").presence == "persisted"
++        assert client.session_inspect("main").status == "running"
++        cancellation = client.session_cancel("main")
++        assert cancellation.accepted is True
++        assert cancellation.outcome == "cancelled"
++        assert client.session_reconcile("main", from_event_seq=2).outcome == "cancelled"
++
+         client.session_prompt("main", [{"type": "text", "text": "fix it"}])
+         notification = client.next_notification()
+         assert notification.method == "llm/request"
+diff --git a/scripts/build-exe-for-python-sdk.ts b/scripts/build-exe-for-python-sdk.ts
+index 801a004fd..694122b8b 100644
+--- a/scripts/build-exe-for-python-sdk.ts
++++ b/scripts/build-exe-for-python-sdk.ts
+@@ -386,6 +386,7 @@ class SingleExeBuild {
+     if (!this.cli.dryRun) await mkdir(this.outDir, { recursive: true })
+     await this.run(`pkg ${target.spec}`, pnpmBin(), [
+       'dlx',
++      '--allow-build=esbuild',
+       PKG_SPEC,
+       this.staging,
+       '--sea',
