@@ -98,6 +98,38 @@ def controlled_opencode_binding() -> dict:
     return binding
 
 
+def unsupported_deepseek_binding() -> dict:
+    return {
+        "contract_version": 2,
+        "control_state": "controlled",
+        "harness": "deepseek",
+        "requested_model": "deepseek-v4-pro",
+        "provider_model": "deepseek-v4-pro",
+        "requested_effort": "medium",
+        "effective_effort": "medium",
+        "native_variant_id": None,
+        "transport": "deepseek-provider-options-v1",
+        "catalogue_generation": "a" * 32,
+        "evidence_digest": "b" * 64,
+        "selector_binding": {
+            "kind": "authenticated-provider-model",
+            "selector": "deepseek-v4-pro",
+        },
+        "adapter_metadata": {
+            "provider_route": "deepseek-official",
+            "transport_contract": "deepseek-provider-options-v1",
+            "wire_evidence_digest": "c" * 64,
+            "provider_options": {
+                "omit": [],
+                "set": {
+                    "thinking": {"type": "enabled"},
+                    "reasoning_effort": "medium",
+                },
+            },
+        },
+    }
+
+
 def test_bound_headless_route_preserves_harness_default_nulls() -> None:
     binding = harness_default_binding()
     route = run_mod.resolve_bound_headless_route(
@@ -125,6 +157,24 @@ def test_bound_headless_route_uses_exact_controlled_native_variant() -> None:
 
     assert route.model == "openai/gpt-test"
     assert route.effort == binding["native_variant_id"] == "high"
+
+
+def test_bound_headless_route_rejects_unsupported_deepseek_effort() -> None:
+    binding = unsupported_deepseek_binding()
+
+    with pytest.raises(route_bindings.RouteResolutionError) as refused:
+        run_mod.resolve_bound_headless_route(
+            harness="deepseek",
+            model="deepseek-v4-pro",
+            effort="medium",
+            binding=binding,
+            binding_digest=route_bindings.digest_json(binding),
+        )
+
+    assert refused.value.code == "thinking_evidence_missing"
+    assert refused.value.details == {
+        "reason": "DeepSeek effort is outside the carrier contract"
+    }
 
 
 @pytest.fixture

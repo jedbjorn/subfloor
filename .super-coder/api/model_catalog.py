@@ -10,10 +10,12 @@ of this is load-bearing — a source that fails just thins the suggestions:
      newest-first sorting.
   2. Provider list-models APIs — only when the matching env key is present.
      Harness logins are OAuth, not API keys, so these are usually absent.
-  3. OpenCode's loopback `/provider` projection — only providers OpenCode
+  3. DeepSeek's authenticated list-models API — exact ids only, paired with
+     the pinned runtime's documented provider-option contract.
+  4. OpenCode's loopback `/provider` projection — only providers OpenCode
      reports as connected, with exactly the models each connected provider
      exposes. This live overlay is refreshed on every served catalog.
-  4. A static floor (the ids the engine ships in flavor_defaults) when every
+  5. A static floor (the ids the engine ships in flavor_defaults) when every
      live source fails and no cache exists.
 
 Fetched server-side (no CORS), cached under the gitignored .super-coder/logs/
@@ -36,6 +38,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import urllib.parse
 import urllib.request
 import uuid
 from contextlib import contextmanager
@@ -54,6 +57,7 @@ CACHE = ENGINE / "logs" / "model_catalog.json"
 ADAPTERS = ENGINE / "adapters"
 TTL_HOURS = 24
 TIMEOUT = 8
+MAX_HTTP_JSON_BYTES = 4 * 1024 * 1024
 MODELS_DEV_URL = "https://models.dev/api.json"
 
 # harness -> models.dev provider key. kimi maps to "kimi-for-coding" (the
@@ -92,6 +96,29 @@ PROVIDER_APIS = {
              lambda k: {"Authorization": f"Bearer {k}"}),
 }
 
+DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
+DEEPSEEK_BASE_URL_ENV = "DEEPSEEK_BASE_URL"
+DEEPSEEK_PUBLIC_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_SOURCE = "deepseek-provider-api"
+DEEPSEEK_DISCOVERY_ERROR = "authenticated DeepSeek model discovery failed"
+DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED = (
+    "DeepSeek provider-option mapper has no outbound wire proof"
+)
+DEEPSEEK_DISCOVERY_LIMIT_ERROR = (
+    "authenticated DeepSeek model response exceeds safety limits"
+)
+DEEPSEEK_NAMED_EFFORTS = ("low", "high", "max")
+DEEPSEEK_MAX_MODELS = 8
+DEEPSEEK_MODEL_ID_MAX_CHARS = 256
+
+
+class _DeepSeekWireProofError(RuntimeError):
+    pass
+
+
+class _ModelCatalogueLimitError(ValueError):
+    pass
+
 # The ids the engine ships in flavor_defaults — surfaced only when every live
 # source fails AND no cache exists, so the datalist is never empty.
 STATIC_FLOOR = {
@@ -108,7 +135,12 @@ def _http_json(url: str, headers: dict | None = None) -> dict:
     hdrs = {"User-Agent": "super-coder-model-catalog/1.0", **(headers or {})}
     req = urllib.request.Request(url, headers=hdrs)
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-        return json.loads(r.read().decode())
+        body = r.read(MAX_HTTP_JSON_BYTES + 1)
+    if len(body) > MAX_HTTP_JSON_BYTES:
+        raise _ModelCatalogueLimitError(
+            "model catalogue response exceeds safety limits"
+        )
+    return json.loads(body.decode())
 
 
 def _entry(mid: str, release_date: str = "", name: str = "",
@@ -189,6 +221,205 @@ def _from_provider_apis(fetch, env) -> dict[str, list[dict]]:
                 _entry(i, source=f"{HARNESS_PROVIDER[harness]}-api",
                        provider=HARNESS_PROVIDER[harness]) for i in ids]
     return out
+
+
+def _deepseek_models_url(env) -> str:
+    base = (env.get(DEEPSEEK_BASE_URL_ENV) or DEEPSEEK_PUBLIC_BASE_URL).strip()
+    parsed = urllib.parse.urlsplit(base)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("DeepSeek base URL must be credential-free HTTP(S)")
+    return base.rstrip("/") + "/models"
+
+
+def _deepseek_carrier_options() -> dict[str, dict[str, str]]:
+    return {
+        route_bindings.DEFAULT_EFFORT: {
+            "thinking": "omit", "reasoningEffort": "omit",
+        },
+        **{
+            effort: {"thinking": "enabled", "reasoningEffort": effort}
+            for effort in DEEPSEEK_NAMED_EFFORTS
+        },
+    }
+
+
+def _deepseek_provider_metadata(model: str, proof: dict) -> dict:
+    import deepseek_runtime  # noqa: PLC0415
+
+    manifest = deepseek_runtime.load_runtime_manifest()
+    expected_runtime = (manifest.get("runtime") or {}).get("version")
+    expected_source = (manifest.get("source") or {}).get("commit")
+    expected_patch = (manifest.get("patch") or {}).get("sha256")
+    if (
+        not isinstance(proof, dict)
+        or proof.get("contract") != deepseek_runtime.PROVIDER_WIRE_CONTRACT
+        or proof.get("model") != model
+        or not isinstance(proof.get("proofs"), dict)
+    ):
+        raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
+    carrier_options = _deepseek_carrier_options()
+    wire_proofs = proof["proofs"]
+    mappings = {
+        route_bindings.DEFAULT_EFFORT: {
+            "omit": list(route_bindings.DEEPSEEK_OVERRIDE_FIELDS),
+            "set": {},
+        },
+        **{
+            effort: {
+                "omit": [],
+                "set": {
+                    "thinking": {"type": "enabled"},
+                    "reasoning_effort": effort,
+                },
+            }
+            for effort in DEEPSEEK_NAMED_EFFORTS
+        },
+    }
+    digests = {}
+    for effort, expected_options in carrier_options.items():
+        item = wire_proofs.get(effort)
+        expected_wire = {} if effort == route_bindings.DEFAULT_EFFORT else {
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": effort,
+        }
+        expected_native = {
+            "event_type": "provider.request",
+            "provider": route_bindings.DEEPSEEK_PROVIDER_ROUTE,
+            "model": model,
+            "reasoning_effort": (
+                None if effort == route_bindings.DEFAULT_EFFORT else effort
+            ),
+            "purpose": "conversation",
+        }
+        digest_payload = {
+            key: item.get(key) if isinstance(item, dict) else None
+            for key in (
+                "contract", "model", "effort", "provider_options",
+                "wire_options", "native_request", "runtime_version", "source_commit",
+                "patch_sha256",
+            )
+        }
+        if (
+            not isinstance(item, dict)
+            or item.get("contract") != deepseek_runtime.PROVIDER_WIRE_CONTRACT
+            or item.get("model") != model
+            or item.get("effort") != effort
+            or item.get("provider_options") != expected_options
+            or item.get("wire_options") != expected_wire
+            or item.get("native_request") != expected_native
+            or item.get("runtime_version") != expected_runtime
+            or item.get("source_commit") != expected_source
+            or item.get("patch_sha256") != expected_patch
+            or not isinstance(item.get("digest"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["digest"]) is None
+            or item["digest"] != route_bindings.digest_json(digest_payload)
+        ):
+            raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
+        digests[effort] = item["digest"]
+    return {
+        "provider_route": route_bindings.DEEPSEEK_PROVIDER_ROUTE,
+        "transport_contract": route_bindings.DEEPSEEK_TRANSPORT_CONTRACT,
+        "provider_options_by_effort": mappings,
+        "wire_contract": deepseek_runtime.PROVIDER_WIRE_CONTRACT,
+        "wire_evidence_by_effort": digests,
+    }
+
+
+def _deepseek_manifest_identity() -> tuple[str, str]:
+    import deepseek_runtime  # noqa: PLC0415
+
+    manifest = deepseek_runtime.load_runtime_manifest()
+    sdk = manifest.get("sdk") or {}
+    runtime = manifest.get("runtime") or {}
+    if sdk.get("version") != runtime.get("version"):
+        raise ValueError("DeepSeek SDK/runtime versions are not aligned")
+    version = sdk.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("DeepSeek runtime has no exact version")
+    commit = (manifest.get("source") or {}).get("commit")
+    if (
+        not isinstance(commit, str)
+        or not re.fullmatch(r"[0-9a-f]{40}", commit)
+    ):
+        raise ValueError("DeepSeek runtime has no exact upstream commit")
+    return version, commit
+
+
+def _from_deepseek_api(fetch, env, wire_probe=None, *, selector=None) -> list[dict]:
+    """Read exact models only through the configured authenticated endpoint."""
+    key = env.get(DEEPSEEK_API_KEY_ENV)
+    if not isinstance(key, str) or not key.strip():
+        return []
+    url = _deepseek_models_url(env)
+    payload = fetch(url, {"Authorization": f"Bearer {key}"})
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("DeepSeek model response has no data list")
+    if len(rows) > DEEPSEEK_MAX_MODELS:
+        raise _ModelCatalogueLimitError(DEEPSEEK_DISCOVERY_LIMIT_ERROR)
+    version, source_commit = _deepseek_manifest_identity()
+    if wire_probe is None:
+        import deepseek_runtime  # noqa: PLC0415
+
+        wire_probe = deepseek_runtime.provider_wire_evidence
+    entries = []
+    seen = set()
+    exact_models = []
+    for row in rows:
+        model = row.get("id") if isinstance(row, dict) else None
+        if (
+            not isinstance(model, str)
+            or not model
+            or model != model.strip()
+            or model in seen
+        ):
+            continue
+        if len(model) > DEEPSEEK_MODEL_ID_MAX_CHARS:
+            raise _ModelCatalogueLimitError(DEEPSEEK_DISCOVERY_LIMIT_ERROR)
+        seen.add(model)
+        exact_models.append(model)
+        if selector is not None and model != selector:
+            continue
+        try:
+            proof = wire_probe(model, _deepseek_carrier_options(), env=env)
+            metadata = _deepseek_provider_metadata(model, proof)
+        except Exception:  # noqa: BLE001 (proof diagnostics stay local/redacted)
+            continue
+        entries.append(_entry(
+            model,
+            name=(row.get("name") if isinstance(row, dict) else None) or model,
+            source=DEEPSEEK_SOURCE,
+            availability="available",
+            provider=route_bindings.DEEPSEEK_PROVIDER_ROUTE,
+            provider_model=model,
+            supported_efforts=list(DEEPSEEK_NAMED_EFFORTS),
+            default_effort="high",
+            cli_version=version,
+            selector_binding={
+                "kind": "authenticated-provider-model",
+                "selector": model,
+                "provider_route": route_bindings.DEEPSEEK_PROVIDER_ROUTE,
+                "models_url": url,
+                "runtime_source_commit": source_commit,
+                "provider_wire_contract": metadata["wire_contract"],
+                "provider_wire_digests": metadata["wire_evidence_by_effort"],
+            },
+            adapter_metadata=metadata,
+        ))
+    if exact_models and not entries:
+        if selector is not None and selector not in exact_models:
+            raise ValueError("DeepSeek authenticated endpoint omitted exact model")
+        raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
+    if not entries:
+        raise ValueError("DeepSeek authenticated endpoint returned no exact models")
+    return entries
 
 
 def _cli_version(binary: str, run) -> str | None:
@@ -288,10 +519,12 @@ def _prefer(preferred: list[dict], advisory: list[dict]) -> list[dict]:
     return _merge(preferred, advisory)
 
 
-def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
+def build(fetch=_http_json, env=os.environ, run=subprocess.run,
+          deepseek_wire_probe=None) -> dict:
     """One live sweep across all sources. Raises only if EVERY source fails —
     partial results (e.g. models.dev down but a keyed API up) still count."""
     harnesses: dict[str, list[dict]] = {}
+    harness_errors: dict[str, str] = {}
     sources: list[str] = []
     errors: list[str] = []
     try:
@@ -302,6 +535,30 @@ def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
     for harness, extra in _from_provider_apis(fetch, env).items():
         harnesses[harness] = _merge(harnesses.get(harness, []), extra)
         sources.append(f"{HARNESS_PROVIDER[harness]}-api")
+    if env.get(DEEPSEEK_API_KEY_ENV):
+        try:
+            deepseek = _from_deepseek_api(
+                fetch, env, wire_probe=deepseek_wire_probe
+            )
+        except _ModelCatalogueLimitError:
+            deepseek = []
+            errors.append(
+                f"{DEEPSEEK_SOURCE}: {DEEPSEEK_DISCOVERY_LIMIT_ERROR}"
+            )
+            harness_errors["deepseek"] = DEEPSEEK_DISCOVERY_LIMIT_ERROR
+        except _DeepSeekWireProofError:
+            deepseek = []
+            errors.append(
+                f"{DEEPSEEK_SOURCE}: {DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED}"
+            )
+            harness_errors["deepseek"] = DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED
+        except Exception:  # noqa: BLE001 (secret-bearing discovery is redacted)
+            deepseek = []
+            errors.append(f"{DEEPSEEK_SOURCE}: {DEEPSEEK_DISCOVERY_ERROR}")
+            harness_errors["deepseek"] = DEEPSEEK_DISCOVERY_ERROR
+        harnesses["deepseek"] = deepseek
+        if deepseek:
+            sources.append(DEEPSEEK_SOURCE)
     local = {
         "claude": _from_claude_cli(run),
         "codex": _from_codex_cache(env, run),
@@ -320,7 +577,9 @@ def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
             "partial": bool(errors),
             **({"errors": errors} if errors else {}),
             "harnesses": {h: {"families": _families(h, entries),
-                              "models": entries}
+                              "models": entries,
+                              **({"error": harness_errors[h]}
+                                 if h in harness_errors else {})}
                           for h, entries in harnesses.items()}}
 
 
@@ -453,6 +712,38 @@ def _headless_supported(harness: str) -> bool:
 
 def harness_runtime_status(harness: str) -> dict:
     """Return exact version-bounded runtime evidence for one shipped harness."""
+    if harness == "deepseek":
+        try:
+            import deepseek_runtime  # noqa: PLC0415
+
+            status = deepseek_runtime.runtime_status()
+            manifest = deepseek_runtime.load_runtime_manifest()
+            verified = str((manifest.get("sdk") or {}).get("version") or "") or None
+            scope = harness_versions.runtime_scope()
+            version = status.sdk_version or status.runtime_version
+            return {
+                "harness": harness,
+                **scope,
+                "version": version,
+                "observed_version": version,
+                "compatibility": "verified" if status.available else None,
+                "minimum_version": None,
+                "maximum_version_exclusive": None,
+                "verified_version": verified,
+                "error": status.error,
+            }
+        except Exception:  # noqa: BLE001
+            return {
+                "harness": harness,
+                **harness_versions.runtime_scope(),
+                "version": None,
+                "observed_version": None,
+                "compatibility": None,
+                "minimum_version": None,
+                "maximum_version_exclusive": None,
+                "verified_version": None,
+                "error": "HARNESS_PROBE_FAILED",
+            }
     try:
         return dict(
             harness_versions.compatibility_status((harness,)).get(harness) or {}
@@ -474,6 +765,7 @@ def _evidence_kind(harness: str, source: str) -> str | None:
     return {
         ("claude", "claude-cli"): "claude-portable-manifest",
         ("codex", "codex-cache"): "codex-model-cache",
+        ("deepseek", DEEPSEEK_SOURCE): "deepseek-authenticated-models",
         ("kimi", "kimi-config"): "kimi-alias-config",
         ("opencode", "opencode-provider-api"): "opencode-connected-variant",
     }.get((harness, source))
@@ -562,6 +854,21 @@ def _entry_evidence(harness: str, entry: dict,
     )
 
     def binding_adapter_metadata(effort: str) -> dict:
+        if harness == "deepseek":
+            mappings = catalogue_adapter_metadata.get(
+                "provider_options_by_effort"
+            ) or {}
+            wire_digests = catalogue_adapter_metadata.get(
+                "wire_evidence_by_effort"
+            ) or {}
+            return {
+                "provider_route": catalogue_adapter_metadata.get("provider_route"),
+                "transport_contract": catalogue_adapter_metadata.get(
+                    "transport_contract"
+                ),
+                "provider_options": mappings.get(effort),
+                "wire_evidence_digest": wire_digests.get(effort),
+            }
         if harness != "opencode" or not variants_by_effort:
             return catalogue_adapter_metadata
         return {
@@ -596,6 +903,10 @@ def _entry_evidence(harness: str, entry: dict,
         "default_effort": entry.get("default_effort"),
         "native_variant_ids": entry.get("native_variant_ids") or {},
     })
+    metadata_efforts = [
+        *([route_bindings.DEFAULT_EFFORT] if harness == "deepseek" else []),
+        *efforts,
+    ]
     effort_metadata = {
         "supported": efforts,
         "default": entry.get("default_effort"),
@@ -609,7 +920,7 @@ def _entry_evidence(harness: str, entry: dict,
         },
         "native_variant_ids": entry.get("native_variant_ids") or {},
         "adapter_metadata_by_effort": {
-            effort: binding_adapter_metadata(effort) for effort in efforts
+            effort: binding_adapter_metadata(effort) for effort in metadata_efforts
         },
     }
     return {
@@ -710,7 +1021,10 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
     for harness, block in (payload.get("harnesses") or {}).items():
         for entry in block.get("models") or []:
             status = harness_statuses.get(harness) or {}
-            if not _compatible_route_status(harness, entry, status):
+            if (
+                (harness == "deepseek" and entry.get("availability") != "available")
+                or not _compatible_route_status(harness, entry, status)
+            ):
                 rejected_routes[(harness, entry["id"])] = _compatibility_error(
                     harness, entry, status
                 )
@@ -1021,6 +1335,13 @@ def _with_live_opencode(payload: dict, provider_models) -> dict:
     return result
 
 
+def _runtime_statuses(harness_probe, *, include_deepseek: bool) -> dict:
+    statuses = dict(harness_probe())
+    if include_deepseek and "deepseek" not in statuses:
+        statuses["deepseek"] = harness_runtime_status("deepseek")
+    return statuses
+
+
 def controlled_route_evidence(
     harness: str,
     selector: str,
@@ -1029,6 +1350,8 @@ def controlled_route_evidence(
     run=None,
     opencode_provider=None,
     harness_probe=None,
+    deepseek_fetch=None,
+    deepseek_wire_probe=None,
 ) -> dict:
     """Probe one controlled route and bind its source to this runtime seat."""
     env = os.environ if env is None else env
@@ -1041,13 +1364,16 @@ def controlled_route_evidence(
         harness_versions.compatibility_status
         if harness_probe is None else harness_probe
     )
+    deepseek_fetch = _http_json if deepseek_fetch is None else deepseek_fetch
     harness = (harness or "").strip().lower()
     scope = harness_versions.runtime_scope()
     entries: list[dict]
     status: dict = {}
     fingerprint = None
     try:
-        statuses = harness_probe()
+        statuses = _runtime_statuses(
+            harness_probe, include_deepseek=harness == "deepseek"
+        )
         status = dict(statuses.get(harness) or {})
         if harness == "claude":
             entries = _from_claude_cli(run)
@@ -1076,12 +1402,23 @@ def controlled_route_evidence(
                     )
                     for model in opencode_provider()
                 ]
+        elif harness == "deepseek":
+            entries = _from_deepseek_api(
+                deepseek_fetch,
+                env,
+                wire_probe=deepseek_wire_probe,
+                selector=selector,
+            )
         else:
             entries = []
     except Exception:  # noqa: BLE001 (unreadable live evidence is stale)
         entries = []
     entry = next((item for item in entries if item["id"] == selector), None)
-    if entry is not None and _compatible_route_status(harness, entry, status):
+    if (
+        entry is not None
+        and entry.get("availability") == "available"
+        and _compatible_route_status(harness, entry, status)
+    ):
         fingerprint = _entry_evidence(
             harness, entry, status
         )["source_fingerprint"]
@@ -1108,7 +1445,8 @@ def current_source_fingerprint(harness: str, selector: str, *, env=os.environ,
 def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             run=subprocess.run, con=None,
             opencode_provider=opencode_connected_models,
-            harness_probe=harness_versions.compatibility_status) -> dict:
+            harness_probe=harness_versions.compatibility_status,
+            deepseek_wire_probe=None) -> dict:
     """The cached-with-fallbacks entry point the API serves.
 
     fresh cache → serve it; miss/stale/refresh → live sweep, cache the result;
@@ -1134,7 +1472,9 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             opencode_provider), con)
     refresh_started_at = datetime.now(timezone.utc).isoformat()
     try:
-        fresh = build(fetch, env, run)
+        fresh = build(
+            fetch, env, run, deepseek_wire_probe=deepseek_wire_probe
+        )
     except Exception as e:  # noqa: BLE001
         refresh_completed_at = datetime.now(timezone.utc).isoformat()
         if cached:
@@ -1220,7 +1560,10 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     if refresh and con is not None:
         probe_error = None
         try:
-            harnesses = harness_probe()
+            harnesses = _runtime_statuses(
+                harness_probe,
+                include_deepseek="deepseek" in (response.get("harnesses") or {}),
+            )
         except Exception as exc:  # noqa: BLE001
             harnesses = {}
             probe_error = str(exc)

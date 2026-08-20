@@ -41,6 +41,7 @@ BINDING_KEYS = (
 CONTROLLED_EVIDENCE = {
     "claude": {"claude-portable-manifest"},
     "codex": {"codex-model-cache"},
+    "deepseek": {"deepseek-authenticated-models"},
     "kimi": {"kimi-alias-config"},
     "opencode": {"opencode-connected-variant"},
 }
@@ -49,9 +50,15 @@ SUPPORTED_HARNESSES = frozenset((*CONTROLLED_EVIDENCE, "vibe"))
 TRANSPORTS = {
     "claude": "claude-effort-argument",
     "codex": "codex-reasoning-config",
+    "deepseek": "deepseek-provider-options-v1",
     "kimi": "kimi-effort-environment",
     "opencode": "opencode-route-agent",
 }
+
+DEEPSEEK_PROVIDER_ROUTE = "deepseek-official"
+DEEPSEEK_TRANSPORT_CONTRACT = TRANSPORTS["deepseek"]
+DEEPSEEK_OVERRIDE_FIELDS = ("thinking", "reasoning_effort")
+DEEPSEEK_EFFORTS = frozenset({"default", "low", "high", "max"})
 
 # Reserved canonical effort: bind the exact model with no effort transport and
 # let the harness or alias's own default govern thinking.  Admitted for every
@@ -267,6 +274,48 @@ def _binding_error(reason: str) -> RouteResolutionError:
     )
 
 
+def _validate_deepseek_metadata(binding: dict) -> None:
+    """Pin the evidence-selected provider request expectation in the binding."""
+    metadata = binding["adapter_metadata"]
+    if set(metadata) != {
+        "provider_route", "transport_contract", "provider_options",
+        "wire_evidence_digest",
+    }:
+        raise _binding_error("DeepSeek metadata must contain the fixed bridge keys")
+    if metadata["provider_route"] != DEEPSEEK_PROVIDER_ROUTE:
+        raise _binding_error("DeepSeek provider route is not canonical")
+    if metadata["transport_contract"] != DEEPSEEK_TRANSPORT_CONTRACT:
+        raise _binding_error("DeepSeek transport contract is not canonical")
+    options = metadata["provider_options"]
+    if not _lower_hex(metadata["wire_evidence_digest"], LOWER_HEX_64):
+        raise _binding_error("DeepSeek provider wire evidence must be a SHA-256 digest")
+    if not isinstance(options, dict) or set(options) != {"omit", "set"}:
+        raise _binding_error("DeepSeek provider options must contain omit and set")
+    omitted = options["omit"]
+    selected = options["set"]
+    if not isinstance(omitted, list) or not isinstance(selected, dict):
+        raise _binding_error("DeepSeek provider option values have invalid types")
+
+    effort = binding["requested_effort"]
+    if effort not in DEEPSEEK_EFFORTS:
+        raise _binding_error("DeepSeek effort is outside the carrier contract")
+    if effort == DEFAULT_EFFORT:
+        if omitted != list(DEEPSEEK_OVERRIDE_FIELDS) or selected != {}:
+            raise _binding_error(
+                "DeepSeek model default must omit every reasoning override"
+            )
+        return
+    if omitted != [] or set(selected) != set(DEEPSEEK_OVERRIDE_FIELDS):
+        raise _binding_error("DeepSeek named effort must set the exact override pair")
+    if selected["thinking"] != {"type": "enabled"}:
+        raise _binding_error("DeepSeek named effort must explicitly enable thinking")
+    wire_effort = selected["reasoning_effort"]
+    if wire_effort != effort:
+        raise _binding_error(
+            "DeepSeek wire effort must equal the immutable requested effort"
+        )
+
+
 def validate_v2_binding(binding: dict) -> None:
     """Enforce the one semantic state contract accepted by every v2 consumer."""
     if not isinstance(binding, dict) or set(binding) != set(BINDING_KEYS):
@@ -327,6 +376,8 @@ def validate_v2_binding(binding: dict) -> None:
                 )
         elif native_variant is not None:
             raise _binding_error("native variants are exclusive to OpenCode")
+        if harness == "deepseek":
+            _validate_deepseek_metadata(binding)
         return
 
     if state not in {"harness-default", "native-uncontrolled"}:
@@ -586,6 +637,13 @@ def _require_controlled_source(
 
 
 def _uncontrolled_binding(harness: str, model: str | None, effort: str | None) -> dict:
+    if harness == "deepseek":
+        raise RouteResolutionError(
+            "thinking_evidence_missing",
+            "DeepSeek requires an authenticated exact model route",
+            {"harness": harness, "model": model,
+             "remediation": "sc models refresh"},
+        )
     if effort is not None:
         raise RouteResolutionError(
             "unsupported_thinking_level",
@@ -652,7 +710,10 @@ def _validate_route_freshness(
                 "harness_support_state": support_state,
             },
         )
-    if row.get("availability") != "available" or not row.get("headless_supported"):
+    if (
+        row.get("availability") != "available"
+        or (harness != "deepseek" and not row.get("headless_supported"))
+    ):
         raise RouteResolutionError(
             "thinking_evidence_missing",
             f"Route {harness}/{model} is not locally callable",
@@ -1027,6 +1088,20 @@ def _resolve_v2(
     adapter_metadata = _json_object(
         row.get("adapter_metadata"), field="adapter_metadata"
     )
+    if harness == "deepseek":
+        metadata_by_effort = effort_metadata.get("adapter_metadata_by_effort") or {}
+        selected_metadata = metadata_by_effort.get(requested)
+        if not isinstance(selected_metadata, dict):
+            raise RouteResolutionError(
+                "thinking_evidence_missing",
+                "DeepSeek route has no admitted provider-option mapping",
+                {
+                    "harness": harness,
+                    "model": model,
+                    "requested_effort": requested,
+                },
+            )
+        adapter_metadata = selected_metadata
     if harness == "opencode" and requested != DEFAULT_EFFORT:
         metadata_by_effort = effort_metadata.get("adapter_metadata_by_effort") or {}
         selected_metadata = metadata_by_effort.get(requested)

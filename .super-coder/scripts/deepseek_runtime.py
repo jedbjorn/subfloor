@@ -15,8 +15,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -27,6 +29,7 @@ MANIFEST_PATH = ASSET_ROOT / "runtime.json"
 RUN_ROOT = ENGINE / "run" / "deepseek"
 MINIMUM_PYTHON = (3, 10)
 PROBE_TIMEOUT = 10
+PROVIDER_WIRE_PROBE_TIMEOUT = 30
 INSTALL_TIMEOUT = 3600
 MAX_DIAGNOSTIC_CHARS = 4096
 SENSITIVE_ENV = re.compile(r"(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.I)
@@ -38,6 +41,69 @@ SECRET_TEXT = (
 LIFECYCLE_METHODS = frozenset(
     {"session/start", "session/cancel", "session/inspect", "session/reconcile", "shutdown"}
 )
+PROVIDER_WIRE_CONTRACT = "deepseek-provider-options-wire-v1"
+
+
+_PROVIDER_WIRE_PROBE = r"""
+import json
+import os
+import sys
+
+from deepseek_harness import HarnessClient, HarnessConfig
+
+model = sys.argv[1]
+options_by_effort = json.loads(sys.argv[2])
+native_requests = {}
+for index, (effort, options) in enumerate(options_by_effort.items()):
+    session_id = f"wire-proof-{index}-{effort}"
+    native_metadata = []
+    config = HarnessConfig(
+        cwd=os.environ["DSH_CWD"],
+        env=dict(os.environ),
+        request_timeout_seconds=6,
+        shutdown_timeout_seconds=1,
+    )
+    with HarnessClient(config) as client:
+        client.initialize(
+            cwd=os.environ["DSH_CWD"],
+            provider="deepseek-official",
+            model=model,
+            max_tokens=8,
+            provider_request_options=options,
+        )
+        client.session_prompt(
+            session_id,
+            [{"type": "text", "text": "Reply with OK."}],
+        )
+        while True:
+            notification = client.next_notification()
+            if notification.method == "provider.request":
+                payload = notification.payload
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("sessionId") == session_id
+                    and payload.get("purpose") == "conversation"
+                ):
+                    native_metadata.append({
+                        "event_type": "provider.request",
+                        "provider": payload.get("provider"),
+                        "model": payload.get("model"),
+                        "reasoning_effort": payload.get("reasoningEffort"),
+                        "purpose": payload.get("purpose"),
+                    })
+            if (
+                notification.method == "session.status"
+                and notification.payload.get("sessionId") == session_id
+                and notification.payload.get("status") == "idle"
+            ):
+                break
+    if len(native_metadata) != 1:
+        raise RuntimeError(
+            f"expected one native provider.request for {effort}, observed {len(native_metadata)}"
+        )
+    native_requests[effort] = native_metadata[0]
+print(json.dumps(native_requests, sort_keys=True, separators=(",", ":")))
+""".strip()
 
 
 class DeepSeekRuntimeError(RuntimeError):
@@ -925,6 +991,258 @@ def provider_request_options(
         )
     load_runtime_manifest()
     return {"thinking": thinking, "reasoningEffort": reasoning_effort}
+
+
+def _wire_digest(value: Mapping[str, object]) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def provider_wire_evidence(
+    model: str,
+    options_by_effort: Mapping[str, Mapping[str, str]],
+    *,
+    env: Mapping[str, str] | None = None,
+    engine: Path = ENGINE,
+    runner=subprocess.run,
+    status: RuntimeStatus | None = None,
+) -> dict[str, object]:
+    """Capture the pinned carrier's final outbound reasoning fields.
+
+    The carrier talks only to an engine-owned loopback SSE endpoint. The
+    authenticated provider model lookup remains a separate catalogue step;
+    this probe proves that the exact pinned serializer turns each immutable
+    option pair into the expected provider request bytes.
+    """
+    if not isinstance(model, str) or not model or model != model.strip():
+        raise DeepSeekRuntimeError(
+            "HARNESS_PROVIDER_MODEL_INVALID", "provider model must be exact"
+        )
+    env = os.environ if env is None else env
+    observed_status = status or runtime_status(
+        env=env, engine=engine, runner=runner
+    )
+    if not observed_status.available or not observed_status.carrier_python:
+        raise DeepSeekRuntimeError(
+            observed_status.error or "HARNESS_RUNTIME_MISSING",
+            observed_status.detail or "isolated DeepSeek carrier is unavailable",
+        )
+
+    requested: dict[str, dict[str, str]] = {}
+    for effort, raw in options_by_effort.items():
+        if (
+            not isinstance(effort, str)
+            or not effort
+            or effort != effort.strip().lower()
+            or not isinstance(raw, Mapping)
+        ):
+            raise DeepSeekRuntimeError(
+                "HARNESS_PROVIDER_OPTION_INVALID",
+                "provider wire efforts must be canonical mappings",
+            )
+        try:
+            requested[effort] = provider_request_options(
+                thinking=str(raw["thinking"]),
+                reasoning_effort=str(raw["reasoningEffort"]),
+            )
+        except KeyError as exc:
+            raise DeepSeekRuntimeError(
+                "HARNESS_PROVIDER_OPTION_INVALID",
+                "provider wire mapping requires thinking and reasoningEffort",
+            ) from exc
+        if set(raw) != {"thinking", "reasoningEffort"}:
+            raise DeepSeekRuntimeError(
+                "HARNESS_PROVIDER_OPTION_INVALID",
+                "provider wire mapping contains unexpected fields",
+            )
+    if "default" not in requested:
+        raise DeepSeekRuntimeError(
+            "HARNESS_PROVIDER_OPTION_INVALID", "reserved default proof is required"
+        )
+
+    captures: list[dict[str, object]] = []
+    capture_errors: list[str] = []
+
+    class CaptureHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 (stdlib handler API)
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+                if length <= 0 or length > 1024 * 1024:
+                    raise ValueError("provider request body size is invalid")
+                payload = json.loads(self.rfile.read(length).decode())
+                if not isinstance(payload, dict):
+                    raise ValueError("provider request body is not an object")
+                captures.append({
+                    "authorization": self.headers.get("Authorization"),
+                    "payload": payload,
+                })
+            except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                capture_errors.append(str(exc))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(
+                b'data: {"choices":[{"delta":{"role":"assistant",'
+                b'"content":null,"reasoning_content":""}}]}\n\n'
+                b'data: {"choices":[{"delta":{"content":"OK"}}]}\n\n'
+                b'data: {"choices":[{"delta":{"content":""},'
+                b'"finish_reason":"stop"}],"usage":{"prompt_tokens":1,'
+                b'"completion_tokens":1}}\n\n'
+                b'data: [DONE]\n\n'
+            )
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), CaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = server.server_address
+    base_url = f"http://127.0.0.1:{address[1]}"
+    manifest = load_runtime_manifest()
+    proofs: dict[str, dict[str, object]] = {}
+    try:
+        with tempfile.TemporaryDirectory(prefix="sc-deepseek-wire-") as raw:
+            root = Path(raw)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            layout = conversation_layout("provider-wire-proof", state_root=root / "state")
+            child_env = launch_environment(
+                layout,
+                worktree=workspace,
+                system_prompt="Provider wire contract probe.",
+                api_key="wire-proof-sentinel",
+                base_url=base_url,
+                base_env=env,
+            )
+            try:
+                completed = runner(
+                    [
+                        observed_status.carrier_python,
+                        "-I",
+                        "-c",
+                        _PROVIDER_WIRE_PROBE,
+                        model,
+                        json.dumps(requested, separators=(",", ":")),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=PROVIDER_WIRE_PROBE_TIMEOUT,
+                    check=False,
+                    env=child_env,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise DeepSeekRuntimeError(
+                    "HARNESS_PROVIDER_WIRE_UNAVAILABLE",
+                    sanitize_diagnostic(str(exc)),
+                ) from exc
+            if completed.returncode != 0:
+                raise DeepSeekRuntimeError(
+                    "HARNESS_PROVIDER_WIRE_UNAVAILABLE",
+                    sanitize_diagnostic(
+                        completed.stderr or completed.stdout or "wire probe failed",
+                        secrets=("wire-proof-sentinel",),
+                    ),
+                )
+            try:
+                native_requests = json.loads(completed.stdout)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise DeepSeekRuntimeError(
+                    "HARNESS_PROVIDER_WIRE_INVALID",
+                    "carrier returned no valid native request metadata",
+                ) from exc
+            if (
+                not isinstance(native_requests, dict)
+                or set(native_requests) != set(requested)
+            ):
+                raise DeepSeekRuntimeError(
+                    "HARNESS_PROVIDER_WIRE_INVALID",
+                    "carrier native request metadata does not cover every effort",
+                )
+            if capture_errors or len(captures) != len(requested):
+                raise DeepSeekRuntimeError(
+                    "HARNESS_PROVIDER_WIRE_INVALID",
+                    capture_errors[-1] if capture_errors else (
+                        f"expected {len(requested)} provider requests, "
+                        f"observed {len(captures)}"
+                    ),
+                )
+            for (effort, options), capture in zip(
+                requested.items(), captures
+            ):
+                if capture["authorization"] != "Bearer wire-proof-sentinel":
+                    raise DeepSeekRuntimeError(
+                        "HARNESS_PROVIDER_WIRE_INVALID",
+                        "provider request did not cross the authenticated transport",
+                    )
+                payload = capture["payload"]
+                assert isinstance(payload, dict)
+                if payload.get("model") != model:
+                    raise DeepSeekRuntimeError(
+                        "HARNESS_PROVIDER_WIRE_MISMATCH",
+                        "provider request changed the exact model",
+                    )
+                observed_options = {
+                    key: payload[key]
+                    for key in ("thinking", "reasoning_effort")
+                    if key in payload
+                }
+                expected_options: dict[str, object] = {}
+                if options["thinking"] != "omit":
+                    expected_options["thinking"] = {
+                        "type": options["thinking"]
+                    }
+                if options["reasoningEffort"] != "omit":
+                    expected_options["reasoning_effort"] = options[
+                        "reasoningEffort"
+                    ]
+                if observed_options != expected_options:
+                    raise DeepSeekRuntimeError(
+                        "HARNESS_PROVIDER_WIRE_MISMATCH",
+                        f"outbound reasoning fields do not match effort {effort}",
+                    )
+                native_request = native_requests[effort]
+                expected_native = {
+                    "event_type": "provider.request",
+                    "provider": "deepseek-official",
+                    "model": model,
+                    "reasoning_effort": (
+                        None if effort == "default" else effort
+                    ),
+                    "purpose": "conversation",
+                }
+                if native_request != expected_native:
+                    raise DeepSeekRuntimeError(
+                        "HARNESS_PROVIDER_WIRE_MISMATCH",
+                        f"native request metadata does not match effort {effort}",
+                    )
+                evidence = {
+                    "contract": PROVIDER_WIRE_CONTRACT,
+                    "model": model,
+                    "effort": effort,
+                    "provider_options": options,
+                    "wire_options": observed_options,
+                    "native_request": native_request,
+                    "runtime_version": observed_status.runtime_version,
+                    "source_commit": manifest["source"]["commit"],
+                    "patch_sha256": manifest["patch"]["sha256"],
+                }
+                proofs[effort] = {
+                    **evidence,
+                    "digest": _wire_digest(evidence),
+                }
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+    return {
+        "contract": PROVIDER_WIRE_CONTRACT,
+        "model": model,
+        "proofs": proofs,
+    }
 
 
 def redacted_environment(env: Mapping[str, str]) -> dict[str, str]:

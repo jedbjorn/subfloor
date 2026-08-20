@@ -74,6 +74,42 @@ def ids(harness_block):
     return [e["id"] for e in harness_block["models"]]
 
 
+def deepseek_wire_proof(model, options_by_effort, env=None):
+    del env
+    proofs = {}
+    for effort, options in options_by_effort.items():
+        wire = {} if effort == "default" else {
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": effort,
+        }
+        evidence = {
+            "contract": "deepseek-provider-options-wire-v1",
+            "model": model,
+            "effort": effort,
+            "provider_options": dict(options),
+            "wire_options": wire,
+            "native_request": {
+                "event_type": "provider.request",
+                "provider": "deepseek-official",
+                "model": model,
+                "reasoning_effort": None if effort == "default" else effort,
+                "purpose": "conversation",
+            },
+            "runtime_version": "0.1.0rc7",
+            "source_commit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
+            "patch_sha256": "034245298c94964e67f6f756b6067926740def4cd98f68e4a4751d6f65d6d74b",
+        }
+        proofs[effort] = {
+            **evidence,
+            "digest": route_bindings.digest_json(evidence),
+        }
+    return {
+        "contract": "deepseek-provider-options-wire-v1",
+        "model": model,
+        "proofs": proofs,
+    }
+
+
 _AUTO_COMPATIBILITY = object()
 
 
@@ -86,6 +122,7 @@ def runtime_status(version="2.22.0", compatibility=_AUTO_COMPATIBILITY,
     ranges = {
         "claude": ("2.1.220", "2.2.0", "2.1.222"),
         "codex": ("0.145.0", "0.147.0", "0.145.0"),
+        "deepseek": (None, None, "0.1.0rc7"),
         "kimi": ("0.30.0", "0.34.0", "0.33.0"),
         "opencode": ("1.18.9", "1.19.0", "1.18.9"),
         "vibe": ("2.22.0", "2.23.0", "2.22.0"),
@@ -425,6 +462,388 @@ class BuildTest(NoCLI):
                          "keyed-API ids append deduped, models.dev order kept")
         self.assertIn("openai-api", got["sources"])
 
+    def test_deepseek_catalogue_uses_only_authenticated_exact_models(self):
+        calls = []
+
+        def fetch(url, headers=None):
+            calls.append((url, headers))
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            if url == "https://gateway.example/deepseek/v1/models":
+                return {"data": [
+                    {"id": "deepseek-v4-pro"},
+                    {"id": " deepseek-invalid"},
+                    {"id": "deepseek-v4-flash", "name": "V4 Flash"},
+                    {"id": "deepseek-v4-pro"},
+                    {},
+                ]}
+            raise AssertionError(url)
+
+        got = mc.build(fetch=fetch, env={
+            "DEEPSEEK_API_KEY": "secret-key",
+            "DEEPSEEK_BASE_URL": "https://gateway.example/deepseek/v1",
+        }, run=None, deepseek_wire_probe=deepseek_wire_proof)
+
+        block = got["harnesses"]["deepseek"]
+        self.assertEqual(ids(block), ["deepseek-v4-pro", "deepseek-v4-flash"])
+        self.assertEqual(got["sources"], ["models.dev", mc.DEEPSEEK_SOURCE])
+        self.assertFalse(got["partial"])
+        self.assertEqual(calls[-1], (
+            "https://gateway.example/deepseek/v1/models",
+            {"Authorization": "Bearer secret-key"},
+        ))
+        route = block["models"][0]
+        self.assertEqual(route["availability"], "available")
+        self.assertNotIn("error", block)
+        self.assertEqual(route["provider"], "deepseek-official")
+        self.assertEqual(route["provider_model"], "deepseek-v4-pro")
+        self.assertEqual(route["supported_efforts"], ["low", "high", "max"])
+        self.assertEqual(route["default_effort"], "high")
+        self.assertEqual(route["selector_binding"], {
+            "kind": "authenticated-provider-model",
+            "selector": "deepseek-v4-pro",
+            "provider_route": "deepseek-official",
+            "models_url": "https://gateway.example/deepseek/v1/models",
+            "runtime_source_commit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
+            "provider_wire_contract": "deepseek-provider-options-wire-v1",
+            "provider_wire_digests": {
+                effort: deepseek_wire_proof(
+                    "deepseek-v4-pro", mc._deepseek_carrier_options()
+                )["proofs"][effort]["digest"]
+                for effort in ("default", "low", "high", "max")
+            },
+        })
+        mappings = route["adapter_metadata"]["provider_options_by_effort"]
+        self.assertEqual(mappings["default"], {
+            "omit": ["thinking", "reasoning_effort"], "set": {},
+        })
+        self.assertEqual(mappings["high"], {
+            "omit": [],
+            "set": {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "high",
+            },
+        })
+
+    def test_http_json_rejects_body_larger_than_four_mebibytes(self):
+        reads = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, amount):
+                reads.append(amount)
+                return b"x" * (4 * 1024 * 1024 + 1)
+
+        with mock.patch.object(
+            mc.urllib.request, "urlopen", return_value=Response()
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "model catalogue response exceeds safety limits"
+            ):
+                mc._http_json("https://provider.example/models")
+
+        self.assertEqual(reads, [4 * 1024 * 1024 + 1])
+
+    def test_deepseek_oversized_http_response_has_stable_fail_closed_result(self):
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _amount):
+                return self.body
+
+        def open_request(request, timeout=None):
+            self.assertEqual(timeout, mc.TIMEOUT)
+            if request.full_url == mc.MODELS_DEV_URL:
+                return Response(json.dumps(MODELS_DEV).encode())
+            self.assertEqual(request.full_url, "https://api.deepseek.com/models")
+            return Response(b"x" * (4 * 1024 * 1024 + 1))
+
+        with mock.patch.object(mc.urllib.request, "urlopen", side_effect=open_request):
+            got = mc.build(
+                env={"DEEPSEEK_API_KEY": "secret-key"},
+                run=None,
+                deepseek_wire_probe=deepseek_wire_proof,
+            )
+
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            "authenticated DeepSeek model response exceeds safety limits",
+        )
+        self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
+
+    def test_deepseek_catalogue_caps_models_and_wire_probe_work(self):
+        proof_calls = []
+
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": [{"id": f"deepseek-exact-{index}"}
+                             for index in range(8)]}
+
+        def prove(model, options_by_effort, env=None):
+            proof_calls.append(model)
+            return deepseek_wire_proof(model, options_by_effort, env)
+
+        got = mc.build(
+            fetch=fetch,
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            run=None,
+            deepseek_wire_probe=prove,
+        )
+
+        self.assertEqual(
+            ids(got["harnesses"]["deepseek"]),
+            [f"deepseek-exact-{index}" for index in range(8)],
+        )
+        self.assertEqual(
+            proof_calls,
+            [f"deepseek-exact-{index}" for index in range(8)],
+        )
+
+    def test_deepseek_catalogue_fails_closed_before_probe_above_model_cap(self):
+        proof_calls = []
+
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": [{"id": f"deepseek-exact-{index}"}
+                             for index in range(9)]}
+
+        got = mc.build(
+            fetch=fetch,
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            run=None,
+            deepseek_wire_probe=lambda model, options_by_effort, env=None: (
+                proof_calls.append(model)
+            ),
+        )
+
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            "authenticated DeepSeek model response exceeds safety limits",
+        )
+        self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
+        self.assertEqual(proof_calls, [])
+
+    def test_deepseek_catalogue_fails_closed_before_probe_on_oversized_id(self):
+        proof_calls = []
+
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": [{"id": "d" * 257}]}
+
+        got = mc.build(
+            fetch=fetch,
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            run=None,
+            deepseek_wire_probe=lambda model, options_by_effort, env=None: (
+                proof_calls.append(model)
+            ),
+        )
+
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            "authenticated DeepSeek model response exceeds safety limits",
+        )
+        self.assertEqual(proof_calls, [])
+
+    def test_deepseek_discovery_failure_is_redacted_and_fails_closed(self):
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            raise OSError("Authorization: Bearer secret-key")
+
+        got = mc.build(
+            fetch=fetch, env={"DEEPSEEK_API_KEY": "secret-key"}, run=None
+        )
+
+        self.assertTrue(got["partial"])
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            mc.DEEPSEEK_DISCOVERY_ERROR,
+        )
+        serialized = json.dumps(got)
+        self.assertNotIn("secret-key", serialized)
+        self.assertNotIn("Bearer", serialized)
+
+    def test_deepseek_tampered_wire_receipt_admits_no_route(self):
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            self.assertEqual(
+                headers, {"Authorization": "Bearer secret-key"}
+            )
+            return {"data": [{"id": "deepseek-v4-pro"}]}
+
+        def tampered_wire(model, options_by_effort, env=None):
+            proof = deepseek_wire_proof(model, options_by_effort, env)
+            proof["proofs"]["default"]["digest"] = "0" * 64
+            return proof
+
+        got = mc.build(
+            fetch=fetch,
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            run=None,
+            deepseek_wire_probe=tampered_wire,
+        )
+
+        self.assertTrue(got["partial"])
+        self.assertEqual(got["sources"], ["models.dev"])
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
+        )
+
+    def test_deepseek_wire_only_receipt_admits_no_route(self):
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": [{"id": "deepseek-v4-pro"}]}
+
+        def wire_only(model, options_by_effort, env=None):
+            proof = deepseek_wire_proof(model, options_by_effort, env)
+            for item in proof["proofs"].values():
+                item.pop("native_request")
+                item["digest"] = route_bindings.digest_json({
+                    key: item[key]
+                    for key in (
+                        "contract", "model", "effort", "provider_options",
+                        "wire_options", "runtime_version", "source_commit",
+                        "patch_sha256",
+                    )
+                })
+            return proof
+
+        got = mc.build(
+            fetch=fetch,
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            run=None,
+            deepseek_wire_probe=wire_only,
+        )
+
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
+        )
+
+    def test_deepseek_native_effort_mismatch_admits_no_route(self):
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": [{"id": "deepseek-v4-pro"}]}
+
+        def mismatched_native(model, options_by_effort, env=None):
+            proof = deepseek_wire_proof(model, options_by_effort, env)
+            item = proof["proofs"]["low"]
+            item["native_request"]["reasoning_effort"] = "high"
+            item["digest"] = route_bindings.digest_json({
+                key: item[key]
+                for key in (
+                    "contract", "model", "effort", "provider_options",
+                    "wire_options", "native_request", "runtime_version",
+                    "source_commit", "patch_sha256",
+                )
+            })
+            return proof
+
+        got = mc.build(
+            fetch=fetch,
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            run=None,
+            deepseek_wire_probe=mismatched_native,
+        )
+
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
+        )
+
+    def test_deepseek_controlled_probe_reauthenticates_exact_source(self):
+        scope = mc.harness_versions.runtime_scope()
+        status = runtime_status(
+            "0.1.0rc7", harness="deepseek", scope=scope
+        )
+        calls = []
+
+        def fetch(url, headers=None):
+            calls.append((url, headers))
+            return {"data": [{"id": "deepseek-v4-pro"}]}
+
+        proof = mc.controlled_route_evidence(
+            "deepseek",
+            "deepseek-v4-pro",
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            harness_probe=lambda: {"deepseek": status},
+            deepseek_fetch=fetch,
+            deepseek_wire_probe=deepseek_wire_proof,
+        )
+
+        self.assertEqual(proof["runtime_status"], status)
+        self.assertEqual(proof["runtime_scope"], scope)
+        self.assertRegex(proof["source_fingerprint"], r"^[0-9a-f]{64}$")
+        self.assertEqual(calls, [(
+            "https://api.deepseek.com/models",
+            {"Authorization": "Bearer secret-key"},
+        )])
+
+        missing = mc.controlled_route_evidence(
+            "deepseek",
+            "deepseek-v4-pro",
+            env={},
+            harness_probe=lambda: {"deepseek": status},
+            deepseek_fetch=fetch,
+        )
+        self.assertIsNone(missing["source_fingerprint"])
+        self.assertEqual(len(calls), 1)
+
+    def test_deepseek_controlled_probe_serializes_only_selected_model(self):
+        scope = mc.harness_versions.runtime_scope()
+        status = runtime_status(
+            "0.1.0rc7", harness="deepseek", scope=scope
+        )
+        proof_calls = []
+
+        def fetch(_url, headers=None):
+            self.assertEqual(headers, {"Authorization": "Bearer secret-key"})
+            return {"data": [{"id": f"deepseek-exact-{index}"}
+                             for index in range(8)]}
+
+        def prove(model, options_by_effort, env=None):
+            proof_calls.append(model)
+            return deepseek_wire_proof(model, options_by_effort, env)
+
+        proof = mc.controlled_route_evidence(
+            "deepseek",
+            "deepseek-exact-7",
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            harness_probe=lambda: {"deepseek": status},
+            deepseek_fetch=fetch,
+            deepseek_wire_probe=prove,
+        )
+
+        self.assertRegex(proof["source_fingerprint"], r"^[0-9a-f]{64}$")
+        self.assertEqual(proof_calls, ["deepseek-exact-7"])
+
     def test_bad_provider_key_never_fails_the_sweep(self):
         def fetch(url, headers=None):
             if url == mc.MODELS_DEV_URL:
@@ -597,6 +1016,45 @@ class RoutePersistenceTest(unittest.TestCase):
             "SELECT selector, availability, headless_supported, "
             "high_effort_supported, stale FROM model_routes").fetchone()
         self.assertEqual(tuple(row), ("kimi-code/k3", "available", 1, 1, 0))
+
+    def test_authenticated_deepseek_ids_stay_unbindable_before_wire_proof(self):
+        def fetch(url, _headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": [{"id": "deepseek-v4-pro"}]}
+
+        def unavailable_wire(*_args, **_kwargs):
+            raise RuntimeError("carrier unavailable")
+
+        payload = mc.build(
+            fetch=fetch,
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            run=None,
+            deepseek_wire_probe=unavailable_wire,
+        )
+        payload.update(self.verification("deepseek", "0.1.0rc7"))
+        self.assertEqual(payload["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            payload["harnesses"]["deepseek"]["error"],
+            mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
+        )
+
+        mc.persist_routes(self.con, payload)
+
+        row = self.con.execute(
+            "SELECT availability,source_fingerprint,stale FROM model_routes "
+            "WHERE harness='deepseek' AND selector='deepseek-v4-pro'"
+        ).fetchone()
+        self.assertIsNone(row)
+        refused = routes_cli.resolve(
+            self.con,
+            "deepseek",
+            "deepseek-v4-pro",
+            effort="default",
+        )
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["code"], "thinking_evidence_missing")
+        self.assertIsNone(refused.get("binding"))
 
     def test_failed_refresh_keeps_route_and_marks_it_stale(self):
         fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
