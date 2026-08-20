@@ -26,6 +26,7 @@ RESEEDED_SKILLS = set(SKILLS) | {"db_map"}
 AUTHORITY_SPLIT_SKILLS = {"sprint_pln", "sprint_rev"}
 V21_ROLE_SKILLS = set(SKILLS)
 HANDOFF_ROLE_SKILLS = {"sprint_dev", "sprint_rev", "sprint_pln"}
+FOCUSED_DEV_VERIFICATION_SKILLS = {"agents", "spec", "sprint_dev"}
 CLOSEOUT_ROLE_SKILLS = {"sprint_close", "sprint_dev", "sprint_pln", "sprint_rev"}
 FORCE_NEW_ROLE_SKILLS = {"sprint_dev", "sprint_pln", "sprint_rev"}
 POLISHED_SPRINT_SKILLS = set(SKILLS) - {"sprint_prep"}
@@ -139,7 +140,7 @@ class SprintSkillTest(unittest.TestCase):
             con.executescript(migration)
 
             for name in CONTEXT_EFFICIENT_SKILLS:
-                if name in HANDOFF_ROLE_SKILLS:
+                if name in HANDOFF_ROLE_SKILLS | FOCUSED_DEV_VERIFICATION_SKILLS:
                     continue  # Later reseeds deliberately supersede role bodies.
                 parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
                 actual = con.execute(
@@ -247,6 +248,8 @@ class SprintSkillTest(unittest.TestCase):
 
             for name in sorted(HANDOFF_ROLE_SKILLS):
                 with self.subTest(name=name):
+                    if name in FOCUSED_DEV_VERIFICATION_SKILLS:
+                        continue  # Migration 0225 deliberately supersedes this body.
                     parsed = seed_skills.parse_skill(ASSETS / name / "SKILL.md")
                     row = con.execute(
                         "SELECT description,category,command,common,content,is_deleted "
