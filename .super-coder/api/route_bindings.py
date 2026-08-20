@@ -58,6 +58,7 @@ TRANSPORTS = {
 DEEPSEEK_PROVIDER_ROUTE = "deepseek-official"
 DEEPSEEK_TRANSPORT_CONTRACT = TRANSPORTS["deepseek"]
 DEEPSEEK_OVERRIDE_FIELDS = ("thinking", "reasoning_effort")
+DEEPSEEK_EFFORTS = frozenset({"default", "low", "high", "max"})
 
 # Reserved canonical effort: bind the exact model with no effort transport and
 # let the harness or alias's own default govern thinking.  Admitted for every
@@ -296,6 +297,8 @@ def _validate_deepseek_metadata(binding: dict) -> None:
         raise _binding_error("DeepSeek provider option values have invalid types")
 
     effort = binding["requested_effort"]
+    if effort not in DEEPSEEK_EFFORTS:
+        raise _binding_error("DeepSeek effort is outside the carrier contract")
     if effort == DEFAULT_EFFORT:
         if omitted != list(DEEPSEEK_OVERRIDE_FIELDS) or selected != {}:
             raise _binding_error(

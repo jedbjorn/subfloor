@@ -52,34 +52,35 @@ import sys
 from deepseek_harness import HarnessClient, HarnessConfig
 
 model = sys.argv[1]
-options = json.loads(sys.argv[2])
-session_id = sys.argv[3]
-config = HarnessConfig(
-    cwd=os.environ["DSH_CWD"],
-    env=dict(os.environ),
-    request_timeout_seconds=15,
-    shutdown_timeout_seconds=1,
-)
-with HarnessClient(config) as client:
-    client.initialize(
+options_by_effort = json.loads(sys.argv[2])
+for index, (effort, options) in enumerate(options_by_effort.items()):
+    session_id = f"wire-proof-{index}-{effort}"
+    config = HarnessConfig(
         cwd=os.environ["DSH_CWD"],
-        provider="deepseek-official",
-        model=model,
-        max_tokens=8,
-        provider_request_options=options,
+        env=dict(os.environ),
+        request_timeout_seconds=6,
+        shutdown_timeout_seconds=1,
     )
-    client.session_prompt(
-        session_id,
-        [{"type": "text", "text": "Reply with OK."}],
-    )
-    while True:
-        notification = client.next_notification()
-        if (
-            notification.method == "session.status"
-            and notification.payload.get("sessionId") == session_id
-            and notification.payload.get("status") == "idle"
-        ):
-            break
+    with HarnessClient(config) as client:
+        client.initialize(
+            cwd=os.environ["DSH_CWD"],
+            provider="deepseek-official",
+            model=model,
+            max_tokens=8,
+            provider_request_options=options,
+        )
+        client.session_prompt(
+            session_id,
+            [{"type": "text", "text": "Reply with OK."}],
+        )
+        while True:
+            notification = client.next_notification()
+            if (
+                notification.method == "session.status"
+                and notification.payload.get("sessionId") == session_id
+                and notification.payload.get("status") == "idle"
+            ):
+                break
 """.strip()
 
 
@@ -1094,48 +1095,46 @@ def provider_wire_evidence(
                 base_url=base_url,
                 base_env=env,
             )
-            for index, (effort, options) in enumerate(requested.items()):
-                before = len(captures)
-                session_id = f"wire-proof-{index}-{effort}"
-                try:
-                    completed = runner(
-                        [
-                            observed_status.carrier_python,
-                            "-I",
-                            "-c",
-                            _PROVIDER_WIRE_PROBE,
-                            model,
-                            json.dumps(options, separators=(",", ":")),
-                            session_id,
-                        ],
-                        capture_output=True,
-                        text=True,
-                        timeout=PROVIDER_WIRE_PROBE_TIMEOUT,
-                        check=False,
-                        env=child_env,
-                    )
-                except (OSError, subprocess.SubprocessError) as exc:
-                    raise DeepSeekRuntimeError(
-                        "HARNESS_PROVIDER_WIRE_UNAVAILABLE",
-                        sanitize_diagnostic(str(exc)),
-                    ) from exc
-                if completed.returncode != 0:
-                    raise DeepSeekRuntimeError(
-                        "HARNESS_PROVIDER_WIRE_UNAVAILABLE",
-                        sanitize_diagnostic(
-                            completed.stderr or completed.stdout or "wire probe failed",
-                            secrets=("wire-proof-sentinel",),
-                        ),
-                    )
-                fresh = captures[before:]
-                if capture_errors or len(fresh) != 1:
-                    raise DeepSeekRuntimeError(
-                        "HARNESS_PROVIDER_WIRE_INVALID",
-                        capture_errors[-1] if capture_errors else (
-                            f"expected one provider request, observed {len(fresh)}"
-                        ),
-                    )
-                capture = fresh[0]
+            try:
+                completed = runner(
+                    [
+                        observed_status.carrier_python,
+                        "-I",
+                        "-c",
+                        _PROVIDER_WIRE_PROBE,
+                        model,
+                        json.dumps(requested, separators=(",", ":")),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=PROVIDER_WIRE_PROBE_TIMEOUT,
+                    check=False,
+                    env=child_env,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise DeepSeekRuntimeError(
+                    "HARNESS_PROVIDER_WIRE_UNAVAILABLE",
+                    sanitize_diagnostic(str(exc)),
+                ) from exc
+            if completed.returncode != 0:
+                raise DeepSeekRuntimeError(
+                    "HARNESS_PROVIDER_WIRE_UNAVAILABLE",
+                    sanitize_diagnostic(
+                        completed.stderr or completed.stdout or "wire probe failed",
+                        secrets=("wire-proof-sentinel",),
+                    ),
+                )
+            if capture_errors or len(captures) != len(requested):
+                raise DeepSeekRuntimeError(
+                    "HARNESS_PROVIDER_WIRE_INVALID",
+                    capture_errors[-1] if capture_errors else (
+                        f"expected {len(requested)} provider requests, "
+                        f"observed {len(captures)}"
+                    ),
+                )
+            for (effort, options), capture in zip(
+                requested.items(), captures
+            ):
                 if capture["authorization"] != "Bearer wire-proof-sentinel":
                     raise DeepSeekRuntimeError(
                         "HARNESS_PROVIDER_WIRE_INVALID",

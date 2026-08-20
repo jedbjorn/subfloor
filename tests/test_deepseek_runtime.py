@@ -284,24 +284,28 @@ def test_provider_wire_evidence_captures_default_omission_and_named_mapping() ->
         composition_sha256=deepseek_runtime.load_runtime_manifest()["composition"]["sha256"],
     )
 
+    runner_calls = []
+
     def runner(argv, **kwargs):
-        options = json.loads(argv[-2])
-        body = {"model": argv[-3], "messages": [], "stream": True}
-        if options["thinking"] != "omit":
-            body["thinking"] = {"type": options["thinking"]}
-        if options["reasoningEffort"] != "omit":
-            body["reasoning_effort"] = options["reasoningEffort"]
-        request = urllib.request.Request(
-            kwargs["env"]["DEEPSEEK_BASE_URL"] + "/chat/completions",
-            data=json.dumps(body).encode(),
-            headers={
-                "Authorization": f"Bearer {kwargs['env']['DEEPSEEK_API_KEY']}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=5) as response:
-            response.read()
+        runner_calls.append((argv, kwargs))
+        options_by_effort = json.loads(argv[-1])
+        for options in options_by_effort.values():
+            body = {"model": argv[-2], "messages": [], "stream": True}
+            if options["thinking"] != "omit":
+                body["thinking"] = {"type": options["thinking"]}
+            if options["reasoningEffort"] != "omit":
+                body["reasoning_effort"] = options["reasoningEffort"]
+            request = urllib.request.Request(
+                kwargs["env"]["DEEPSEEK_BASE_URL"] + "/chat/completions",
+                data=json.dumps(body).encode(),
+                headers={
+                    "Authorization": f"Bearer {kwargs['env']['DEEPSEEK_API_KEY']}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                response.read()
         return completed()
 
     evidence = deepseek_runtime.provider_wire_evidence(
@@ -322,6 +326,8 @@ def test_provider_wire_evidence_captures_default_omission_and_named_mapping() ->
         "reasoning_effort": "high",
     }
     assert len(evidence["proofs"]["default"]["digest"]) == 64
+    assert len(runner_calls) == 1
+    assert runner_calls[0][1]["timeout"] == 30
 
 
 def test_provider_wire_evidence_rejects_materialized_default() -> None:
@@ -338,8 +344,10 @@ def test_provider_wire_evidence_rejects_materialized_default() -> None:
     )
 
     def runner(argv, **kwargs):
+        options_by_effort = json.loads(argv[-1])
+        assert list(options_by_effort) == ["default"]
         body = {
-            "model": argv[-3],
+            "model": argv[-2],
             "messages": [],
             "stream": True,
             "thinking": {"type": "enabled"},

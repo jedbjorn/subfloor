@@ -518,6 +518,144 @@ class BuildTest(NoCLI):
             },
         })
 
+    def test_http_json_rejects_body_larger_than_four_mebibytes(self):
+        reads = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, amount):
+                reads.append(amount)
+                return b"x" * (4 * 1024 * 1024 + 1)
+
+        with mock.patch.object(
+            mc.urllib.request, "urlopen", return_value=Response()
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "model catalogue response exceeds safety limits"
+            ):
+                mc._http_json("https://provider.example/models")
+
+        self.assertEqual(reads, [4 * 1024 * 1024 + 1])
+
+    def test_deepseek_oversized_http_response_has_stable_fail_closed_result(self):
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _amount):
+                return self.body
+
+        def open_request(request, timeout=None):
+            self.assertEqual(timeout, mc.TIMEOUT)
+            if request.full_url == mc.MODELS_DEV_URL:
+                return Response(json.dumps(MODELS_DEV).encode())
+            self.assertEqual(request.full_url, "https://api.deepseek.com/models")
+            return Response(b"x" * (4 * 1024 * 1024 + 1))
+
+        with mock.patch.object(mc.urllib.request, "urlopen", side_effect=open_request):
+            got = mc.build(
+                env={"DEEPSEEK_API_KEY": "secret-key"},
+                run=None,
+                deepseek_wire_probe=deepseek_wire_proof,
+            )
+
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            "authenticated DeepSeek model response exceeds safety limits",
+        )
+        self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
+
+    def test_deepseek_catalogue_caps_models_and_wire_probe_work(self):
+        proof_calls = []
+
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": [{"id": f"deepseek-exact-{index}"}
+                             for index in range(8)]}
+
+        def prove(model, options_by_effort, env=None):
+            proof_calls.append(model)
+            return deepseek_wire_proof(model, options_by_effort, env)
+
+        got = mc.build(
+            fetch=fetch,
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            run=None,
+            deepseek_wire_probe=prove,
+        )
+
+        self.assertEqual(
+            ids(got["harnesses"]["deepseek"]),
+            [f"deepseek-exact-{index}" for index in range(8)],
+        )
+        self.assertEqual(
+            proof_calls,
+            [f"deepseek-exact-{index}" for index in range(8)],
+        )
+
+    def test_deepseek_catalogue_fails_closed_before_probe_above_model_cap(self):
+        proof_calls = []
+
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": [{"id": f"deepseek-exact-{index}"}
+                             for index in range(9)]}
+
+        got = mc.build(
+            fetch=fetch,
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            run=None,
+            deepseek_wire_probe=lambda model, options_by_effort, env=None: (
+                proof_calls.append(model)
+            ),
+        )
+
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            "authenticated DeepSeek model response exceeds safety limits",
+        )
+        self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
+        self.assertEqual(proof_calls, [])
+
+    def test_deepseek_catalogue_fails_closed_before_probe_on_oversized_id(self):
+        proof_calls = []
+
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": [{"id": "d" * 257}]}
+
+        got = mc.build(
+            fetch=fetch,
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            run=None,
+            deepseek_wire_probe=lambda model, options_by_effort, env=None: (
+                proof_calls.append(model)
+            ),
+        )
+
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            "authenticated DeepSeek model response exceeds safety limits",
+        )
+        self.assertEqual(proof_calls, [])
+
     def test_deepseek_discovery_failure_is_redacted_and_fails_closed(self):
         def fetch(url, headers=None):
             if url == mc.MODELS_DEV_URL:
@@ -604,6 +742,34 @@ class BuildTest(NoCLI):
         )
         self.assertIsNone(missing["source_fingerprint"])
         self.assertEqual(len(calls), 1)
+
+    def test_deepseek_controlled_probe_serializes_only_selected_model(self):
+        scope = mc.harness_versions.runtime_scope()
+        status = runtime_status(
+            "0.1.0rc7", harness="deepseek", scope=scope
+        )
+        proof_calls = []
+
+        def fetch(_url, headers=None):
+            self.assertEqual(headers, {"Authorization": "Bearer secret-key"})
+            return {"data": [{"id": f"deepseek-exact-{index}"}
+                             for index in range(8)]}
+
+        def prove(model, options_by_effort, env=None):
+            proof_calls.append(model)
+            return deepseek_wire_proof(model, options_by_effort, env)
+
+        proof = mc.controlled_route_evidence(
+            "deepseek",
+            "deepseek-exact-7",
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            harness_probe=lambda: {"deepseek": status},
+            deepseek_fetch=fetch,
+            deepseek_wire_probe=prove,
+        )
+
+        self.assertRegex(proof["source_fingerprint"], r"^[0-9a-f]{64}$")
+        self.assertEqual(proof_calls, ["deepseek-exact-7"])
 
     def test_bad_provider_key_never_fails_the_sweep(self):
         def fetch(url, headers=None):

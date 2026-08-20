@@ -575,6 +575,28 @@ class BindingIdentityTest(unittest.TestCase):
         with self.assertRaises(route_bindings.RouteResolutionError):
             route_bindings.validate_v2_binding(changed_effort)
 
+        unsupported_effort = {
+            **named,
+            "requested_effort": "medium",
+            "effective_effort": "medium",
+            "adapter_metadata": {
+                **named["adapter_metadata"],
+                "provider_options": {
+                    "omit": [],
+                    "set": {
+                        "thinking": {"type": "enabled"},
+                        "reasoning_effort": "medium",
+                    },
+                },
+            },
+        }
+        with self.assertRaises(route_bindings.RouteResolutionError) as invalid:
+            route_bindings.validate_v2_binding(unsupported_effort)
+        self.assertEqual(
+            invalid.exception.details,
+            {"reason": "DeepSeek effort is outside the carrier contract"},
+        )
+
         with self.assertRaises(route_bindings.RouteResolutionError) as refused:
             resolve_controlled_v2(
                 self.deepseek_row(),
@@ -888,6 +910,51 @@ class LegacySprintBindingUpgradeTest(unittest.TestCase):
                 route_bindings.canonical_json(binding), route_bindings.digest_json(binding),
                 source_fingerprint, harness_version,
             ),
+        )
+
+    def test_deepseek_migration_keeps_one_advancing_sequence_row(self):
+        binding = ParticipantRevisionTest.controlled_binding()
+        self._insert_legacy(
+            10,
+            binding,
+            source_fingerprint="2" * 64,
+            harness_version="0.145.0",
+        )
+        for migration in (
+            "0217_harness_support_metadata.sql",
+            "0218_sprint_binding_support_provenance.sql",
+            "0223_model_default_effort_binding.sql",
+            "0227_deepseek_controlled_route_binding.sql",
+        ):
+            self.con.executescript(
+                (ROOT / ".super-coder" / "migrations" / migration).read_text()
+            )
+
+        self.assertEqual(
+            [tuple(row) for row in self.con.execute(
+                "SELECT name,seq FROM sqlite_sequence "
+                "WHERE name='sprint_participant_route_bindings'"
+            )],
+            [("sprint_participant_route_bindings", 1)],
+        )
+
+        self.con.execute("UPDATE sprints SET lifecycle='prepared' WHERE sprint_id=1")
+        receipt = route_bindings.ParticipantRouteBindingStore(self.con).bind(
+            11,
+            binding,
+            route_bindings.digest_json(binding),
+            transition="arm",
+            source_fingerprint="2" * 64,
+            harness_version="0.145.0",
+            harness_support_state="tested",
+        )
+        self.assertEqual(receipt["binding_id"], 2)
+        self.assertEqual(
+            [tuple(row) for row in self.con.execute(
+                "SELECT name,seq FROM sqlite_sequence "
+                "WHERE name='sprint_participant_route_bindings'"
+            )],
+            [("sprint_participant_route_bindings", 2)],
         )
 
     def test_dirty_upgrade_preserves_legacy_semver_and_new_raw_rows_are_exact(self):
@@ -2622,6 +2689,81 @@ class ParticipantRevisionTest(unittest.TestCase):
             ).fetchone()[0],
             receipt["binding_id"],
         )
+        self.assertEqual(
+            [tuple(row) for row in self.con.execute(
+                "SELECT name,seq FROM sqlite_sequence "
+                "WHERE name='sprint_participant_route_bindings'"
+            )],
+            [("sprint_participant_route_bindings", receipt["binding_id"])],
+        )
+
+        sibling = self.store.bind(
+            11,
+            binding,
+            digest,
+            transition="arm",
+            source_fingerprint=self.CONTROLLED_SOURCE_FINGERPRINT,
+            harness_version="0.1.0rc7",
+            harness_support_state="tested",
+        )
+        self.assertGreater(sibling["binding_id"], receipt["binding_id"])
+        self.assertEqual(
+            [tuple(row) for row in self.con.execute(
+                "SELECT name,seq FROM sqlite_sequence "
+                "WHERE name='sprint_participant_route_bindings'"
+            )],
+            [("sprint_participant_route_bindings", sibling["binding_id"])],
+        )
+
+    def test_deepseek_unsupported_effort_cannot_enter_migrated_store(self):
+        binding, _ = resolve_controlled_v2(
+            BindingIdentityTest.deepseek_row(),
+            "deepseek",
+            "deepseek-v4-pro",
+            "high",
+            now=BindingIdentityTest.NOW,
+            runtime_status=compatible_runtime("0.1.0rc7", harness="deepseek"),
+        )
+        binding = {
+            **binding,
+            "requested_effort": "medium",
+            "effective_effort": "medium",
+            "adapter_metadata": {
+                **binding["adapter_metadata"],
+                "provider_options": {
+                    "omit": [],
+                    "set": {
+                        "thinking": {"type": "enabled"},
+                        "reasoning_effort": "medium",
+                    },
+                },
+            },
+        }
+        digest = route_bindings.digest_json(binding)
+
+        with self.assertRaises(route_bindings.RouteResolutionError):
+            self.store.bind(
+                10,
+                binding,
+                digest,
+                transition="arm",
+                source_fingerprint=self.CONTROLLED_SOURCE_FINGERPRINT,
+                harness_version="0.1.0rc7",
+                harness_support_state="tested",
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.insert_raw(binding, digest)
+
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertIsNone(self.con.execute(
+            "SELECT active_route_binding_id FROM sprint_participants "
+            "WHERE participant_id=10"
+        ).fetchone()[0])
 
     def test_deepseek_refuses_harness_default_without_writing(self):
         with self.assertRaises(route_bindings.RouteResolutionError) as refused:

@@ -79,6 +79,8 @@ CREATE TABLE _sprint_participant_route_bindings_deepseek (
        AND requested_effort IS NOT NULL
        AND trim(requested_effort)<>''
        AND requested_effort=lower(trim(requested_effort))
+       AND (harness<>'deepseek'
+         OR requested_effort IN ('default','low','high','max'))
        AND effective_effort IS NOT NULL
        AND effective_effort=requested_effort
        AND transport=CASE harness
@@ -188,10 +190,6 @@ FROM sprint_participant_route_bindings;
 DROP TABLE sprint_participant_route_bindings;
 ALTER TABLE _sprint_participant_route_bindings_deepseek
 RENAME TO sprint_participant_route_bindings;
-
-INSERT INTO sqlite_sequence (name, seq)
-SELECT 'sprint_participant_route_bindings', COALESCE(MAX(binding_id), 0)
-FROM sprint_participant_route_bindings;
 
 CREATE INDEX idx_sprint_participant_route_bindings_participant
     ON sprint_participant_route_bindings(participant_id, route_revision DESC);

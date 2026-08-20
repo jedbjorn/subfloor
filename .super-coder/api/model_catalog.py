@@ -57,6 +57,7 @@ CACHE = ENGINE / "logs" / "model_catalog.json"
 ADAPTERS = ENGINE / "adapters"
 TTL_HOURS = 24
 TIMEOUT = 8
+MAX_HTTP_JSON_BYTES = 4 * 1024 * 1024
 MODELS_DEV_URL = "https://models.dev/api.json"
 
 # harness -> models.dev provider key. kimi maps to "kimi-for-coding" (the
@@ -103,10 +104,19 @@ DEEPSEEK_DISCOVERY_ERROR = "authenticated DeepSeek model discovery failed"
 DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED = (
     "DeepSeek provider-option mapper has no outbound wire proof"
 )
+DEEPSEEK_DISCOVERY_LIMIT_ERROR = (
+    "authenticated DeepSeek model response exceeds safety limits"
+)
 DEEPSEEK_NAMED_EFFORTS = ("low", "high", "max")
+DEEPSEEK_MAX_MODELS = 8
+DEEPSEEK_MODEL_ID_MAX_CHARS = 256
 
 
 class _DeepSeekWireProofError(RuntimeError):
+    pass
+
+
+class _ModelCatalogueLimitError(ValueError):
     pass
 
 # The ids the engine ships in flavor_defaults — surfaced only when every live
@@ -125,7 +135,12 @@ def _http_json(url: str, headers: dict | None = None) -> dict:
     hdrs = {"User-Agent": "super-coder-model-catalog/1.0", **(headers or {})}
     req = urllib.request.Request(url, headers=hdrs)
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-        return json.loads(r.read().decode())
+        body = r.read(MAX_HTTP_JSON_BYTES + 1)
+    if len(body) > MAX_HTTP_JSON_BYTES:
+        raise _ModelCatalogueLimitError(
+            "model catalogue response exceeds safety limits"
+        )
+    return json.loads(body.decode())
 
 
 def _entry(mid: str, release_date: str = "", name: str = "",
@@ -327,7 +342,7 @@ def _deepseek_manifest_identity() -> tuple[str, str]:
     return version, commit
 
 
-def _from_deepseek_api(fetch, env, wire_probe=None) -> list[dict]:
+def _from_deepseek_api(fetch, env, wire_probe=None, *, selector=None) -> list[dict]:
     """Read exact models only through the configured authenticated endpoint."""
     key = env.get(DEEPSEEK_API_KEY_ENV)
     if not isinstance(key, str) or not key.strip():
@@ -337,6 +352,8 @@ def _from_deepseek_api(fetch, env, wire_probe=None) -> list[dict]:
     rows = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
         raise ValueError("DeepSeek model response has no data list")
+    if len(rows) > DEEPSEEK_MAX_MODELS:
+        raise _ModelCatalogueLimitError(DEEPSEEK_DISCOVERY_LIMIT_ERROR)
     version, source_commit = _deepseek_manifest_identity()
     if wire_probe is None:
         import deepseek_runtime  # noqa: PLC0415
@@ -354,8 +371,12 @@ def _from_deepseek_api(fetch, env, wire_probe=None) -> list[dict]:
             or model in seen
         ):
             continue
+        if len(model) > DEEPSEEK_MODEL_ID_MAX_CHARS:
+            raise _ModelCatalogueLimitError(DEEPSEEK_DISCOVERY_LIMIT_ERROR)
         seen.add(model)
         exact_models.append(model)
+        if selector is not None and model != selector:
+            continue
         try:
             proof = wire_probe(model, _deepseek_carrier_options(), env=env)
             metadata = _deepseek_provider_metadata(model, proof)
@@ -383,6 +404,8 @@ def _from_deepseek_api(fetch, env, wire_probe=None) -> list[dict]:
             adapter_metadata=metadata,
         ))
     if exact_models and not entries:
+        if selector is not None and selector not in exact_models:
+            raise ValueError("DeepSeek authenticated endpoint omitted exact model")
         raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
     if not entries:
         raise ValueError("DeepSeek authenticated endpoint returned no exact models")
@@ -507,6 +530,12 @@ def build(fetch=_http_json, env=os.environ, run=subprocess.run,
             deepseek = _from_deepseek_api(
                 fetch, env, wire_probe=deepseek_wire_probe
             )
+        except _ModelCatalogueLimitError:
+            deepseek = []
+            errors.append(
+                f"{DEEPSEEK_SOURCE}: {DEEPSEEK_DISCOVERY_LIMIT_ERROR}"
+            )
+            harness_errors["deepseek"] = DEEPSEEK_DISCOVERY_LIMIT_ERROR
         except _DeepSeekWireProofError:
             deepseek = []
             errors.append(
@@ -1365,7 +1394,10 @@ def controlled_route_evidence(
                 ]
         elif harness == "deepseek":
             entries = _from_deepseek_api(
-                deepseek_fetch, env, wire_probe=deepseek_wire_probe
+                deepseek_fetch,
+                env,
+                wire_probe=deepseek_wire_probe,
+                selector=selector,
             )
         else:
             entries = []
