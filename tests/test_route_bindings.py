@@ -29,6 +29,7 @@ def compatible_runtime(version: str = "2.22.0", *, harness: str | None = None,
     ranges = {
         "claude": ("2.1.220", "2.2.0", "2.1.222"),
         "codex": ("0.145.0", "0.147.0", "0.145.0"),
+        "deepseek": (None, None, "0.1.0rc7"),
         "kimi": ("0.30.0", "0.34.0", "0.33.0"),
         "opencode": ("1.18.9", "1.19.0", "1.18.9"),
         "vibe": ("2.22.0", "2.23.0", "2.22.0"),
@@ -56,7 +57,7 @@ def controlled_observation(
 ) -> dict:
     versions = {
         "claude": "2.1.222", "codex": "0.145.0",
-        "kimi": "0.33.0", "opencode": "1.18.9",
+        "deepseek": "0.1.0rc7", "kimi": "0.33.0", "opencode": "1.18.9",
     }
     scope = scope or route_bindings.harness_versions.runtime_scope()
     status = compatible_runtime(
@@ -127,6 +128,10 @@ def route_schema(path: str | Path = ":memory:") -> sqlite3.Connection:
     con.executescript((
         ROOT / ".super-coder" / "migrations" /
         "0223_model_default_effort_binding.sql"
+    ).read_text())
+    con.executescript((
+        ROOT / ".super-coder" / "migrations" /
+        "0227_deepseek_controlled_route_binding.sql"
     ).read_text())
     return con
 
@@ -240,6 +245,62 @@ class BindingIdentityTest(unittest.TestCase):
                 "provider_family": "openai-ai-sdk",
                 "variant_options_by_effort": {
                     "k": {"reasoningEffort": "high"},
+                },
+            }),
+        )
+
+    @classmethod
+    def deepseek_row(cls) -> dict:
+        selected = {
+            "default": {
+                "provider_route": "deepseek-official",
+                "transport_contract": "deepseek-provider-options-v1",
+                "provider_options": {
+                    "omit": ["thinking", "reasoning_effort"], "set": {},
+                },
+            },
+            "high": {
+                "provider_route": "deepseek-official",
+                "transport_contract": "deepseek-provider-options-v1",
+                "provider_options": {
+                    "omit": [],
+                    "set": {
+                        "thinking": {"type": "enabled"},
+                        "reasoning_effort": "high",
+                    },
+                },
+            },
+        }
+        return cls.controlled_row(
+            harness="deepseek",
+            selector="deepseek-v4-pro",
+            provider_model="deepseek-v4-pro",
+            source="deepseek-provider-api",
+            evidence_kind="deepseek-authenticated-models",
+            availability="available",
+            headless_supported=0,
+            cli_version="0.1.0rc7",
+            harness_version="0.1.0rc7",
+            supported_efforts='["high"]',
+            effort_metadata=json.dumps({
+                "supported": ["high"],
+                "default": "high",
+                "digests": {"high": "4" * 64},
+                "native_variant_ids": {},
+                "adapter_metadata_by_effort": selected,
+            }),
+            selector_binding=json.dumps({
+                "kind": "authenticated-provider-model",
+                "selector": "deepseek-v4-pro",
+                "provider_route": "deepseek-official",
+                "models_url": "https://api.deepseek.com/models",
+                "runtime_source_commit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
+            }),
+            adapter_metadata=json.dumps({
+                "provider_route": "deepseek-official",
+                "transport_contract": "deepseek-provider-options-v1",
+                "provider_options_by_effort": {
+                    key: value["provider_options"] for key, value in selected.items()
                 },
             }),
         )
@@ -441,6 +502,80 @@ class BindingIdentityTest(unittest.TestCase):
             )
 
         self.assertEqual(refused.exception.code, "thinking_evidence_missing")
+
+    def test_deepseek_binding_pins_default_omission_and_named_wire_mapping(self):
+        runtime = compatible_runtime("0.1.0rc7", harness="deepseek")
+        default, default_digest = resolve_controlled_v2(
+            self.deepseek_row(),
+            "deepseek",
+            "deepseek-v4-pro",
+            "default",
+            now=self.NOW,
+            runtime_status=runtime,
+        )
+        named, named_digest = resolve_controlled_v2(
+            self.deepseek_row(),
+            "deepseek",
+            "deepseek-v4-pro",
+            "high",
+            now=self.NOW,
+            runtime_status=runtime,
+        )
+
+        self.assertEqual(default["transport"], "deepseek-provider-options-v1")
+        self.assertEqual(default["adapter_metadata"], {
+            "provider_route": "deepseek-official",
+            "transport_contract": "deepseek-provider-options-v1",
+            "provider_options": {
+                "omit": ["thinking", "reasoning_effort"], "set": {},
+            },
+        })
+        self.assertEqual(named["adapter_metadata"], {
+            "provider_route": "deepseek-official",
+            "transport_contract": "deepseek-provider-options-v1",
+            "provider_options": {
+                "omit": [],
+                "set": {
+                    "thinking": {"type": "enabled"},
+                    "reasoning_effort": "high",
+                },
+            },
+        })
+        self.assertNotEqual(default_digest, named_digest)
+
+        forged = {
+            **default,
+            "adapter_metadata": named["adapter_metadata"],
+        }
+        with self.assertRaises(route_bindings.RouteResolutionError):
+            route_bindings.validate_v2_binding(forged)
+
+        changed_effort = {
+            **named,
+            "adapter_metadata": {
+                **named["adapter_metadata"],
+                "provider_options": {
+                    **named["adapter_metadata"]["provider_options"],
+                    "set": {
+                        **named["adapter_metadata"]["provider_options"]["set"],
+                        "reasoning_effort": "low",
+                    },
+                },
+            },
+        }
+        with self.assertRaises(route_bindings.RouteResolutionError):
+            route_bindings.validate_v2_binding(changed_effort)
+
+        with self.assertRaises(route_bindings.RouteResolutionError) as refused:
+            resolve_controlled_v2(
+                self.deepseek_row(),
+                "deepseek",
+                "deepseek-v4-pro",
+                "medium",
+                now=self.NOW,
+                runtime_status=runtime,
+            )
+        self.assertEqual(refused.exception.code, "unsupported_thinking_level")
 
     def test_uncontrolled_bindings_encode_every_inapplicable_value_as_null(self):
         default, default_digest = route_bindings.resolve_v2(
@@ -2440,6 +2575,66 @@ class ParticipantRevisionTest(unittest.TestCase):
         self.assertIsNone(self.con.execute(
             "SELECT active_route_binding_id FROM sprint_participants "
             "WHERE participant_id=11"
+        ).fetchone()[0])
+
+    def test_deepseek_controlled_binding_survives_migrated_store_round_trip(self):
+        binding, digest = resolve_controlled_v2(
+            BindingIdentityTest.deepseek_row(),
+            "deepseek",
+            "deepseek-v4-pro",
+            "default",
+            now=BindingIdentityTest.NOW,
+            runtime_status=compatible_runtime("0.1.0rc7", harness="deepseek"),
+        )
+
+        receipt = self.store.bind(
+            10,
+            binding,
+            digest,
+            transition="arm",
+            source_fingerprint=self.CONTROLLED_SOURCE_FINGERPRINT,
+            harness_version="0.1.0rc7",
+            harness_support_state="tested",
+        )
+
+        row, decoded = self.stored_binding(receipt["binding_id"])
+        self.assertEqual(
+            (row["control_state"], row["harness"], row["binding_digest"]),
+            ("controlled", "deepseek", digest),
+        )
+        self.assertEqual(decoded, binding)
+        self.assertEqual(decoded["adapter_metadata"]["provider_options"], {
+            "omit": ["thinking", "reasoning_effort"], "set": {},
+        })
+        self.assertEqual(
+            self.con.execute(
+                "SELECT active_route_binding_id FROM sprint_participants "
+                "WHERE participant_id=10"
+            ).fetchone()[0],
+            receipt["binding_id"],
+        )
+
+    def test_deepseek_refuses_harness_default_without_writing(self):
+        with self.assertRaises(route_bindings.RouteResolutionError) as refused:
+            route_bindings.resolve_v2(
+                None,
+                "deepseek",
+                None,
+                runtime_status=compatible_runtime(
+                    "0.1.0rc7", harness="deepseek"
+                ),
+            )
+
+        self.assertEqual(refused.exception.code, "thinking_evidence_missing")
+        self.assertEqual(
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertIsNone(self.con.execute(
+            "SELECT active_route_binding_id FROM sprint_participants "
+            "WHERE participant_id=10"
         ).fetchone()[0])
 
     def test_typed_uncontrolled_binding_survives_store_json_round_trip(self):
