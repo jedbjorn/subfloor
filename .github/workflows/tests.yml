@@ -34,6 +34,7 @@ jobs:
         run: >-
           python -m unittest -v
           tests.test_host_runtime_contract
+          tests.test_deepseek_runtime
           tests.test_install_fresh_fork
           tests.test_install_phases
           tests.test_model_catalog

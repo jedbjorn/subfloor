@@ -72,6 +72,22 @@ LABEL sc.github_host_trust_sha256="${SC_GITHUB_HOST_TRUST_SHA256}"
 # .venv.
 RUN pip install --no-cache-dir "websockets==16.1.1"
 
+# DeepSeek Harness has a Python 3.10+ floor. Keep its official same-version
+# SDK/runtime pair in a dedicated carrier instead of adding either distribution
+# to the engine interpreter. The engine's bare-metal Python 3.9 floor therefore
+# remains unchanged; this image's Python 3.12 supplies the optional carrier.
+# Updating the pin invalidates this layer without coupling it to the rolling CLI
+# harness epoch below. scripts/deepseek_runtime.py verifies the same pair and
+# the platform-wheel hashes recorded in assets/deepseek/runtime.json.
+ARG SC_DEEPSEEK_SDK_VERSION=0.1.0rc7
+ENV SC_DEEPSEEK_CARRIER_PYTHON=/opt/super-coder/deepseek-runtime/bin/python
+RUN python -m venv /opt/super-coder/deepseek-runtime \
+ && /opt/super-coder/deepseek-runtime/bin/python -m pip install \
+      --disable-pip-version-check --no-cache-dir \
+      "deepseek-harness-sdk==${SC_DEEPSEEK_SDK_VERSION}" \
+ && /opt/super-coder/deepseek-runtime/bin/python -I -c \
+      "import importlib.metadata as m,sys; expected='${SC_DEEPSEEK_SDK_VERSION}'; assert sys.prefix != sys.base_prefix; assert m.version('deepseek-harness-sdk') == expected; assert m.version('deepseek-harness-runtime-bin') == expected"
+
 # GitHub CLI (gh) — shells open their own feature PRs from the sandbox.
 # Not in Debian's default repos, so add the official gh apt source. Auth is NOT
 # baked: the token arrives at runtime via GH_TOKEN (`./sc launch` forwards the
