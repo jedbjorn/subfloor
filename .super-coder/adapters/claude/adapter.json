@@ -1,6 +1,12 @@
 {
   "harness": "claude",
   "launch": ["claude"],
+  "surfaces": {
+    "terminal": true,
+    "one_shot": true,
+    "browser": true,
+    "sprint": true
+  },
   "boot_artifact": "CLAUDE.md",
   "global_pointer": ".claude/CLAUDE.md",
   "emit": [],

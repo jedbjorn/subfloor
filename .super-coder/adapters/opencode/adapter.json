@@ -1,6 +1,12 @@
 {
   "harness": "opencode",
   "launch": ["opencode"],
+  "surfaces": {
+    "terminal": true,
+    "one_shot": true,
+    "browser": true,
+    "sprint": true
+  },
   "boot_artifact": "AGENTS.md",
   "global_pointer": ".config/opencode/AGENTS.md",
   "emit": ["opencode.json"],

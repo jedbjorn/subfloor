@@ -66,6 +66,7 @@ import conversation_launch  # noqa: E402  (canonical shell launch preparation)
 import conversation_reaper  # noqa: E402  (Feature #31 orphan process ladder)
 import db_driver  # noqa: E402
 import git_hygiene  # noqa: E402  (live repo dirty/stale/clean snapshot)
+import harness_surfaces  # noqa: E402  (authoritative per-harness surfaces)
 import mem_credentials  # noqa: E402  (runtime Admin credential provisioning, spec #30 req 11)
 import runtime_flags  # noqa: E402  (system-managed non-blocking runtime advisories)
 import sprint_close  # noqa: E402  (Sprints v2 conformance + report evidence)
@@ -471,11 +472,38 @@ def get_model_routes(con, *, harness: str | None = None,
 
 
 def known_harnesses() -> list[str]:
-    """The harness set = the shipped adapters (claude/codex/kimi/opencode/vibe)."""
-    d = ENGINE / "adapters"
-    if d.exists():
-        return sorted(p.name for p in d.iterdir() if p.is_dir())
-    return ["claude", "codex", "kimi", "opencode", "vibe"]
+    """Compatibility string roster for terminal/default-model callers."""
+    return harness_surfaces.known_terminal_harnesses()
+
+
+def _historical_harnesses(con) -> set[str]:
+    """Names retained in durable rows, including removed/unknown harnesses."""
+    found: set[str] = set()
+    tables = {
+        row[0]
+        for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    for table in (
+        "conversations",
+        "sprint_participants",
+        "flavor_defaults",
+        "model_routes",
+    ):
+        if table not in tables:
+            continue
+        columns = {
+            row[1] for row in con.execute(f'PRAGMA table_info("{table}")')
+        }
+        if "harness" not in columns:
+            continue
+        found.update(
+            row[0]
+            for row in con.execute(
+                f"SELECT DISTINCT lower(trim(harness)) FROM {table} "
+                "WHERE harness IS NOT NULL AND trim(harness)<>''"
+            )
+        )
+    return found
 
 
 def get_flavor_defaults(con) -> dict:
@@ -541,7 +569,11 @@ def get_flavor_defaults(con) -> dict:
         })
     for t in shell_factory.flavors():
         flavors.setdefault(t.get("flavor"), [])
-    return {"flavors": flavors, "harnesses": known_harnesses()}
+    return {
+        "flavors": flavors,
+        "harnesses": known_harnesses(),
+        "harness_status": harness_surfaces.project(_historical_harnesses(con)),
+    }
 
 
 def _model_route_available_in_transaction(

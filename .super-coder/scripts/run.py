@@ -248,6 +248,15 @@ def load_adapter(harness: str) -> dict:
             "emit": [], "env": {}}
 
 
+def require_harness_surface(adapter: dict, surface: str) -> None:
+    """Reject a manifest's explicit unsupported surface before launch setup."""
+    declared = adapter.get("surfaces")
+    if isinstance(declared, dict) and declared.get(surface) is False:
+        harness = adapter.get("harness", "unknown")
+        label = surface.replace("_", "-")
+        raise ValueError(f"harness '{harness}' does not support {label}")
+
+
 def linked_vm_configured() -> bool:
     """Match ``sc_vm_broker_configured``: a truthy persisted vm block."""
     return bool(ports_mod.resolve(persist=False).get("vm"))
@@ -653,6 +662,9 @@ def detect_harnesses() -> list[str]:
         try:
             adapter = json.loads(cfg.read_text())
         except (json.JSONDecodeError, OSError):
+            continue
+        surfaces = adapter.get("surfaces") or {}
+        if surfaces.get("terminal") is not True:
             continue
         cmd = (adapter.get("launch") or [d.name])[0]
         if shutil.which(cmd):
@@ -1711,6 +1723,12 @@ def main() -> None:
     flavor_model = fdef["models"].get(harness) if fdef else None
     flavor_effort = (fdef.get("efforts") or {}).get(harness) if fdef else None
     adapter = load_adapter(harness)
+    try:
+        require_harness_surface(adapter, "one_shot" if headless else "terminal")
+    except ValueError as exc:
+        con.close()
+        prefix = "sc run" if headless else "session launch"
+        sys.exit(f"{prefix}: {exc}")
     if host_admin:
         try:
             require_host_harness(adapter, harness)

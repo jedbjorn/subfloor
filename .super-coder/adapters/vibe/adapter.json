@@ -1,6 +1,12 @@
 {
   "harness": "vibe",
   "launch": ["vibe", "--trust"],
+  "surfaces": {
+    "terminal": true,
+    "one_shot": false,
+    "browser": false,
+    "sprint": false
+  },
   "boot_artifact": "AGENTS.md",
   "emit": [],
   "env": {},

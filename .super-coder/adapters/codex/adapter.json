@@ -1,6 +1,12 @@
 {
   "harness": "codex",
   "launch": ["codex", "--dangerously-bypass-hook-trust"],
+  "surfaces": {
+    "terminal": true,
+    "one_shot": true,
+    "browser": true,
+    "sprint": true
+  },
   "boot_artifact": "AGENTS.md",
   "global_pointer": ".codex/AGENTS.md",
   "emit": [".codex/hooks.json"],

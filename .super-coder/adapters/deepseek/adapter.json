@@ -1,0 +1,10 @@
+{
+  "harness": "deepseek",
+  "runtime": { "command": "deepseek-harness" },
+  "surfaces": {
+    "terminal": false,
+    "one_shot": false,
+    "browser": false,
+    "sprint": false
+  }
+}

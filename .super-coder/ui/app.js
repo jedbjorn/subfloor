@@ -2724,7 +2724,12 @@ async function renderAnalytics(root) {
 // A browser conversation owns the shell's single session slot until ended. It
 // uses the normal CLI preparation path server-side, but deliberately has no
 // terminal, tmux controls, or live hand-off between browser and CLI.
-const CHAT_HARNESSES = ["opencode", "claude", "codex", "kimi"];
+const LEGACY_CHAT_HARNESSES = ["opencode", "claude", "codex", "kimi"];
+const CHAT_HARNESSES_FROM_SERVER = (defaults) => defaults.harness_status
+  ? Object.entries(defaults.harness_status)
+    .filter(([, status]) => status.surfaces?.browser)
+    .map(([harness]) => harness)
+  : LEGACY_CHAT_HARNESSES;
 const CHAT_FLAVOR_ORDER = [
   "cartographer", "admin", "planner", "dev", "reviewer", "devops",
 ];
@@ -3793,7 +3798,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
   const rows = defaults.flavors?.[shell.flavor] || [];
   const byHarness = Object.fromEntries(rows.map((row) => [row.harness, row]));
   const defaultHarness = rows.find((row) => row.is_default)?.harness;
-  const availableHarnesses = CHAT_HARNESSES;
+  const availableHarnesses = CHAT_HARNESSES_FROM_SERVER(defaults);
   let harness = availableHarnesses.includes(defaultHarness)
     ? defaultHarness : availableHarnesses[0];
   const form = el("form", { className: "chat-new-form" });
