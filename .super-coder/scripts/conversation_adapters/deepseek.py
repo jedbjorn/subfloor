@@ -14,7 +14,7 @@ import subprocess
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol
+from typing import Any, Callable, Iterator, Mapping, Protocol
 
 import deepseek_runtime
 import route_transport
@@ -42,7 +42,10 @@ SESSION_REF = re.compile(r"^deepseek-[0-9a-f]{32}$")
 RUN_REF_PREFIX = "deepseek-run-v1:"
 MAX_NATIVE_BYTES = 8192
 MAX_UNKNOWN_EVENTS = 8
+DEFAULT_STREAM_INACTIVITY_SECONDS = 30.0
+DEFAULT_SILENT_PROBE_LIMIT = 2
 SENSITIVE_KEY = re.compile(r"(?:key|token|secret|password|credential|authorization)", re.I)
+_CARRIER_STREAM_END = object()
 
 
 class DeepSeekTransport(Protocol):
@@ -50,7 +53,7 @@ class DeepSeekTransport(Protocol):
 
     def request(self, method: str, params: Mapping[str, Any]) -> Any: ...
 
-    def notifications(self) -> Iterable[Mapping[str, Any]]: ...
+    def poll_notification(self, timeout: float) -> Mapping[str, Any] | None: ...
 
     def close(self) -> None: ...
 
@@ -136,7 +139,7 @@ class DeepSeekCarrierProcess:
     def _read_loop(self) -> None:
         stdout = self.process.stdout
         if stdout is None:
-            self._notifications.put(None)
+            self._notifications.put(_CARRIER_STREAM_END)
             return
         for line in stdout:
             try:
@@ -168,7 +171,7 @@ class DeepSeekCarrierProcess:
             waiters = list(self._pending.values())
         for waiter in waiters:
             waiter.put(error)
-        self._notifications.put(None)
+        self._notifications.put(_CARRIER_STREAM_END)
 
     def request(self, method: str, params: Mapping[str, Any]) -> Any:
         with self._pending_lock:
@@ -203,15 +206,26 @@ class DeepSeekCarrierProcess:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
 
-    def notifications(self) -> Iterator[Mapping[str, Any]]:
-        while True:
-            message = self._notifications.get()
-            if message is None:
-                return
-            if isinstance(message, AdapterError):
-                raise message
-            if isinstance(message, dict):
-                yield message
+    def poll_notification(self, timeout: float) -> Mapping[str, Any] | None:
+        try:
+            message = self._notifications.get(timeout=timeout)
+        except queue.Empty:
+            if self.process.poll() is not None:
+                raise AdapterError(
+                    "HARNESS_UNAVAILABLE",
+                    "DeepSeek carrier exited without closing its event stream",
+                    retryable=True,
+                )
+            return None
+        if message is _CARRIER_STREAM_END:
+            raise AdapterError(
+                "HARNESS_UNAVAILABLE",
+                "DeepSeek carrier stream closed",
+                retryable=True,
+            )
+        if isinstance(message, AdapterError):
+            raise message
+        return message if isinstance(message, dict) else None
 
     def close(self) -> None:
         if self.process.poll() is not None:
@@ -328,6 +342,8 @@ class DeepSeekAdapter(ConversationAdapter):
         state_root: Path | None = None,
         start_ticks: Callable[..., int] = deepseek_runtime.process_start_ticks,
         record_identity: Callable[..., Mapping[str, Any]] = deepseek_runtime.record_process_identity,
+        stream_inactivity_seconds: float = DEFAULT_STREAM_INACTIVITY_SECONDS,
+        silent_probe_limit: int = DEFAULT_SILENT_PROBE_LIMIT,
     ) -> None:
         super().__init__(manifest or load_manifest(self.harness))
         self.runtime_probe = runtime_probe
@@ -335,6 +351,12 @@ class DeepSeekAdapter(ConversationAdapter):
         self.state_root = state_root
         self.start_ticks = start_ticks
         self.record_identity = record_identity
+        if stream_inactivity_seconds <= 0:
+            raise ValueError("stream_inactivity_seconds must be positive")
+        if silent_probe_limit <= 0:
+            raise ValueError("silent_probe_limit must be positive")
+        self.stream_inactivity_seconds = stream_inactivity_seconds
+        self.silent_probe_limit = silent_probe_limit
         self._transport_instance: DeepSeekTransport | None = None
         self._lease: _ConversationProcessLease | None = None
         self._transport_identity: tuple[str, str, str | None] | None = None
@@ -740,13 +762,13 @@ class DeepSeekAdapter(ConversationAdapter):
                 "HARNESS_SESSION_IDENTITY_EXISTS",
                 "DeepSeek conversation root already owns a native identity",
             )
-        inspected = transport.request("session/start", {"sessionId": session_ref})
-        actual = inspected.get("sessionId") if isinstance(inspected, dict) else None
-        ensure_exact_session(session_ref, actual)
         if not resumed:
             self._write_identity(layout, self._identity_value(context, session_ref))
         else:
             self._validate_identity(layout, context, session_ref)
+        inspected = transport.request("session/start", {"sessionId": session_ref})
+        actual = inspected.get("sessionId") if isinstance(inspected, dict) else None
+        ensure_exact_session(session_ref, actual)
         last_seq = inspected.get("lastEventSeq") if isinstance(inspected, dict) else None
         if last_seq is not None and (
             not isinstance(last_seq, int) or isinstance(last_seq, bool) or last_seq < 0
@@ -756,21 +778,12 @@ class DeepSeekAdapter(ConversationAdapter):
                 "DeepSeek session/start returned an invalid event boundary",
             )
         boundary = 0 if last_seq is None else last_seq + 1
-        prompted = transport.request(
-            "session/prompt", {"sessionId": session_ref, "message": message}
-        )
-        message_id = prompted.get("messageId") if isinstance(prompted, dict) else None
-        if not isinstance(message_id, str) or not message_id:
-            raise AdapterError(
-                "HARNESS_PROTOCOL_ERROR",
-                "DeepSeek session/prompt returned no message identity",
-            )
         process = getattr(transport, "process", None)
         pid = getattr(process, "pid", None)
-        return NativeTurn(
+        turn = NativeTurn(
             harness=self.harness,
             session_ref=session_ref,
-            run_ref=_run_ref(message_id, boundary),
+            run_ref=_run_ref(f"dispatch-uncertain-{uuid.uuid4().hex}", boundary),
             worktree=context.checked_worktree(),
             process_ref=str(pid) if isinstance(pid, int) and pid > 0 else None,
             metadata={
@@ -784,25 +797,45 @@ class DeepSeekAdapter(ConversationAdapter):
                 "boot_sha256": self._identity_value(context, session_ref)["boot_sha256"],
             },
         )
+        try:
+            prompted = transport.request(
+                "session/prompt", {"sessionId": session_ref, "message": message}
+            )
+        except AdapterError as exc:
+            turn.metadata["dispatch_error"] = {
+                "code": exc.code,
+                "detail": deepseek_runtime.sanitize_diagnostic(exc.detail),
+            }
+            return turn
+        message_id = prompted.get("messageId") if isinstance(prompted, dict) else None
+        if not isinstance(message_id, str) or not message_id:
+            turn.metadata["dispatch_error"] = {
+                "code": "HARNESS_PROTOCOL_ERROR",
+                "detail": "DeepSeek session/prompt returned no message identity",
+            }
+            return turn
+        turn.run_ref = _run_ref(message_id, boundary)
+        return turn
 
     def start(self, context: ConversationContext, message: str) -> NativeTurn:
         message = ensure_nonempty_message(message)
         layout = deepseek_runtime.conversation_layout(
             self._conversation_id(context), state_root=self.state_root
         )
-        if self._read_identity(layout) is not None:
-            raise AdapterError(
-                "HARNESS_SESSION_IDENTITY_EXISTS",
-                "DeepSeek conversation root already owns a native identity",
-            )
+        stored = self._read_identity(layout)
+        session_ref = (
+            self._session_ref(stored.get("session_ref"))
+            if stored is not None
+            else f"deepseek-{uuid.uuid4().hex}"
+        )
         transport, layout = self._transport(context, dispatch=True)
         return self._start_turn(
             transport,
             layout,
-            f"deepseek-{uuid.uuid4().hex}",
+            session_ref,
             context,
             message,
-            resumed=False,
+            resumed=stored is not None,
         )
 
     def resume(
@@ -1056,6 +1089,115 @@ class DeepSeekAdapter(ConversationAdapter):
             native_type,
         )
 
+    def _dispatch_failure_terminal(
+        self,
+        turn: NativeTurn,
+        failure: Mapping[str, Any],
+    ) -> NormalizedEvent | None:
+        try:
+            cancellation = self.interrupt(turn)
+        except AdapterError:
+            return None
+        if not cancellation.acknowledged:
+            return None
+        return self._terminal(
+            turn,
+            "run.failed",
+            {
+                "status": "failed",
+                "error": failure.get("code") or "HARNESS_DISPATCH_UNCERTAIN",
+                "detail": failure.get("detail") or "DeepSeek prompt dispatch failed",
+                "native_cancelled": True,
+            },
+            "session/prompt",
+        )
+
+    def _silent_stream_terminal(
+        self,
+        turn: NativeTurn,
+        probe_count: int,
+    ) -> NormalizedEvent | None:
+        transport = self._transport_instance
+        if transport is None:
+            raise AdapterError(
+                "HARNESS_UNAVAILABLE",
+                "DeepSeek carrier is not connected",
+                retryable=True,
+            )
+        try:
+            inspected = transport.request(
+                "session/inspect", {"sessionId": turn.session_ref}
+            )
+            actual = inspected.get("sessionId") if isinstance(inspected, dict) else None
+            ensure_exact_session(turn.session_ref, actual)
+            state = inspected.get("status") if isinstance(inspected, dict) else None
+            result = transport.request(
+                "session/reconcile",
+                {
+                    "sessionId": turn.session_ref,
+                    "fromEventSeq": int(turn.metadata.get("from_event_seq", 0)),
+                },
+            )
+            actual = result.get("sessionId") if isinstance(result, dict) else None
+            ensure_exact_session(turn.session_ref, actual)
+            outcome = result.get("outcome") if isinstance(result, dict) else None
+        except AdapterError:
+            self.close()
+            raise
+        if outcome == "succeeded":
+            return self._terminal(
+                turn,
+                "run.completed",
+                {"status": "completed", "reconciled_after_silence": True},
+                "session/reconcile",
+            )
+        if outcome == "failed":
+            return self._terminal(
+                turn,
+                "run.failed",
+                {
+                    "status": "failed",
+                    "error": "HARNESS_NATIVE_RUN_FAILED",
+                    "reconciled_after_silence": True,
+                },
+                "session/reconcile",
+            )
+        if outcome == "cancelled":
+            return self._terminal(
+                turn,
+                "run.interrupted",
+                {"status": "cancelled", "reconciled_after_silence": True},
+                "session/reconcile",
+                "native",
+            )
+        if outcome == "running" and probe_count < self.silent_probe_limit:
+            turn.metadata["silent_probe_state"] = state
+            return None
+        try:
+            cancellation = self.interrupt(turn)
+        except AdapterError:
+            cancellation = InterruptResult(False, "native cancellation failed")
+        if cancellation.acknowledged:
+            terminal = self._terminal(
+                turn,
+                "run.failed",
+                {
+                    "status": "failed",
+                    "error": "HARNESS_STREAM_INACTIVE",
+                    "detail": "DeepSeek carrier stayed silent through bounded liveness probes",
+                    "native_cancelled": True,
+                    "last_inspected_state": state,
+                },
+                "session/reconcile",
+            )
+            self.close()
+            return terminal
+        self.close()
+        raise AdapterError(
+            "HARNESS_STREAM_INACTIVE",
+            "DeepSeek carrier stayed silent and its native outcome is unknown",
+        )
+
     def stream(self, turn: NativeTurn) -> Iterator[NormalizedEvent]:
         if self._transport_instance is None:
             raise AdapterError(
@@ -1073,7 +1215,24 @@ class DeepSeekAdapter(ConversationAdapter):
             },
             "session/start",
         )
-        for raw in self._transport_instance.notifications():
+        dispatch_error = turn.metadata.get("dispatch_error")
+        if isinstance(dispatch_error, Mapping):
+            terminal = self._dispatch_failure_terminal(turn, dispatch_error)
+            if terminal is not None:
+                yield terminal
+            return
+        silent_probes = 0
+        transport = self._transport_instance
+        while True:
+            raw = transport.poll_notification(self.stream_inactivity_seconds)
+            if raw is None:
+                silent_probes += 1
+                terminal = self._silent_stream_terminal(turn, silent_probes)
+                if terminal is not None:
+                    yield terminal
+                    return
+                continue
+            silent_probes = 0
             method = raw.get("method")
             params = raw.get("params")
             if not isinstance(method, str) or not isinstance(params, dict):

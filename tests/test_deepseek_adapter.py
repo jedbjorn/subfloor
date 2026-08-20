@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping
+from unittest import mock
 
 import pytest
 
@@ -17,6 +18,7 @@ sys.path.insert(0, str(ENGINE / "api"))
 
 import deepseek_runtime  # noqa: E402
 import route_bindings  # noqa: E402
+from conversation_broker import BrokerRun, ConversationBroker  # noqa: E402
 from conversation_adapters import ADAPTER_TYPES, adapter_for  # noqa: E402
 from conversation_adapters.base import (  # noqa: E402
     AdapterError,
@@ -129,6 +131,11 @@ class FakeTransport:
         notifications: list[Mapping[str, Any]] | None = None,
         reconcile_outcome: str = "succeeded",
         pid: int = 54321,
+        prompt_error: AdapterError | None = None,
+        prompt_result: Mapping[str, Any] | None = None,
+        silent: bool = False,
+        inspect_status: str = "idle",
+        cancel_accepted: bool = True,
     ) -> None:
         self.argv = argv
         self.cwd = cwd
@@ -136,8 +143,18 @@ class FakeTransport:
         self.process = SimpleNamespace(pid=pid)
         self.items = list(notifications or [])
         self.reconcile_outcome = reconcile_outcome
+        self.prompt_error = prompt_error
+        self.prompt_result = prompt_result
+        self.silent = silent
+        self.inspect_status = inspect_status
+        self.cancel_accepted = cancel_accepted
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.closed = False
+        skill_root = self.cwd / ".agents" / "skills"
+        self.runtime_skills = {
+            str(path.relative_to(skill_root)): path.read_text()
+            for path in sorted(skill_root.glob("*/SKILL.md"))
+        }
 
     def request(self, method: str, params: Mapping[str, Any]) -> Any:
         self.requests.append((method, dict(params)))
@@ -151,19 +168,25 @@ class FakeTransport:
                 "lastEventSeq": 4,
             }
         if method == "session/prompt":
-            return {"messageId": "native-message-7"}
+            if self.prompt_error is not None:
+                raise self.prompt_error
+            return dict(
+                self.prompt_result
+                if self.prompt_result is not None
+                else {"messageId": "native-message-7"}
+            )
         if method == "session/cancel":
             return {
                 "sessionId": session_id,
-                "accepted": True,
-                "status": "idle",
-                "outcome": "cancelled",
+                "accepted": self.cancel_accepted,
+                "status": "idle" if self.cancel_accepted else "running",
+                "outcome": "cancelled" if self.cancel_accepted else "running",
             }
         if method == "session/inspect":
             return {
                 "sessionId": session_id,
                 "presence": "persisted",
-                "status": "idle",
+                "status": self.inspect_status,
                 "eventCount": 12,
                 "lastEventSeq": 11,
             }
@@ -180,8 +203,16 @@ class FakeTransport:
             return {}
         raise AssertionError(f"unexpected fake method {method}")
 
-    def notifications(self):
-        yield from self.items
+    def poll_notification(self, _timeout: float):
+        if self.items:
+            return self.items.pop(0)
+        if self.silent:
+            return None
+        raise AdapterError(
+            "HARNESS_UNAVAILABLE",
+            "fake carrier stream closed",
+            retryable=True,
+        )
 
     def close(self) -> None:
         self.closed = True
@@ -198,12 +229,17 @@ class Factory:
         return transport
 
 
-def make_adapter(state_root: Path, factory: Factory) -> DeepSeekAdapter:
+def make_adapter(
+    state_root: Path,
+    factory: Factory,
+    **adapter_options: Any,
+) -> DeepSeekAdapter:
     adapter = DeepSeekAdapter(
         runtime_probe=lambda **_: runtime_status(),
         transport_factory=factory,
         state_root=state_root,
         start_ticks=lambda _pid: 77,
+        **adapter_options,
     )
     CREATED_ADAPTERS.append(adapter)
     return adapter
@@ -464,22 +500,255 @@ def test_same_conversation_cannot_spawn_two_carriers(tmp_path: Path) -> None:
     first.close()
 
 
+@pytest.mark.parametrize(
+    ("transport_options", "expected_code"),
+    [
+        (
+            {
+                "prompt_error": AdapterError(
+                    "HARNESS_TIMEOUT", "native prompt response timed out"
+                )
+            },
+            "HARNESS_TIMEOUT",
+        ),
+        (
+            {
+                "prompt_error": AdapterError(
+                    "HARNESS_PROTOCOL_ERROR", "native prompt was rejected"
+                )
+            },
+            "HARNESS_PROTOCOL_ERROR",
+        ),
+        ({"prompt_result": {}}, "HARNESS_PROTOCOL_ERROR"),
+    ],
+)
+def test_prompt_failure_returns_recoverable_identity_and_exact_resume(
+    tmp_path: Path,
+    transport_options: Mapping[str, Any],
+    expected_code: str,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    state = tmp_path / "state"
+    first_factory = Factory(**dict(transport_options))
+    first = make_adapter(state, first_factory)
+    current = context(worktree)
+
+    uncertain = first.start(current, "first")
+    layout = deepseek_runtime.conversation_layout(
+        current.conversation_id, state_root=state
+    )
+    events = list(first.stream(uncertain))
+
+    assert uncertain.session_ref.startswith("deepseek-")
+    assert uncertain.run_ref.startswith("deepseek-run-v1:")
+    assert uncertain.metadata["dispatch_error"]["code"] == expected_code
+    assert json.loads(layout.adapter_identity.read_text())["session_ref"] == (
+        uncertain.session_ref
+    )
+    assert [event.type for event in events] == ["session.started", "run.failed"]
+    assert events[-1].payload["error"] == expected_code
+    assert events[-1].payload["native_cancelled"] is True
+    assert first_factory.instances[0].requests[-1] == (
+        "session/cancel",
+        {"sessionId": uncertain.session_ref},
+    )
+
+    first.close()
+    layout.process_identity.unlink()
+    recovery_factory = Factory(pid=54322)
+    recovery = make_adapter(state, recovery_factory)
+    resumed = recovery.start(current, "retry")
+
+    assert resumed.session_ref == uncertain.session_ref
+    assert resumed.metadata["resumed"] is True
+    assert recovery_factory.instances[0].requests[:2] == [
+        ("session/start", {"sessionId": uncertain.session_ref}),
+        ("session/prompt", {"sessionId": uncertain.session_ref, "message": "retry"}),
+    ]
+
+
+def test_broker_captures_prompt_failure_identity_before_terminal(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    factory = Factory(
+        prompt_error=AdapterError(
+            "HARNESS_TIMEOUT", "native prompt response timed out"
+        )
+    )
+    adapter = make_adapter(tmp_path / "state", factory)
+    current = context(worktree)
+    store = mock.Mock()
+    store.append_events.side_effect = lambda _run_id, events: list(
+        range(1, len(events) + 1)
+    )
+    store.finish_run.return_value = True
+    broker = ConversationBroker(
+        tmp_path / "unused.db",
+        store=store,
+        adapter_factory=lambda _harness: adapter,
+        launch_preparer=lambda _run: (current, 17),
+    )
+    run = BrokerRun(
+        run_id=7,
+        conversation_id=current.conversation_id or "",
+        message_id=11,
+        shell_id=1,
+        harness="deepseek",
+        provider=current.provider,
+        model=current.model,
+        effort=current.effort,
+        worktree=worktree,
+        title=None,
+        body="first",
+        session_before=None,
+        session_after=None,
+        runner_ref=None,
+        state="leased",
+        route_contract_version=2,
+        route_binding=current.route_binding,
+        binding_digest=current.binding_digest,
+    )
+    active = SimpleNamespace(
+        run=run,
+        adapter=None,
+        turn=None,
+        interrupt_requested=False,
+        interrupt_sent=False,
+    )
+
+    broker._execute(active)
+
+    captured = store.mark_native_started.call_args.args[2]
+    assert captured.session_ref.startswith("deepseek-")
+    assert captured.run_ref.startswith("deepseek-run-v1:")
+    assert captured.metadata["dispatch_error"]["code"] == "HARNESS_TIMEOUT"
+    terminal_call = store.finish_run.call_args
+    assert terminal_call.args[:2] == (7, "failed")
+    assert terminal_call.kwargs["error_code"] == "HARNESS_TIMEOUT"
+
+
+def test_uncancelled_prompt_failure_reconciles_exactly_after_close(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    state = tmp_path / "state"
+    first_factory = Factory(
+        prompt_error=AdapterError(
+            "HARNESS_TIMEOUT", "native prompt response timed out"
+        ),
+        cancel_accepted=False,
+    )
+    first = make_adapter(state, first_factory)
+    current = context(worktree)
+    uncertain = first.start(current, "first")
+
+    assert [event.type for event in first.stream(uncertain)] == [
+        "session.started"
+    ]
+    first.close()
+    layout = deepseek_runtime.conversation_layout(
+        current.conversation_id, state_root=state
+    )
+    layout.process_identity.unlink()
+    recovery_factory = Factory(reconcile_outcome="unknown", pid=54322)
+    recovery = make_adapter(state, recovery_factory)
+
+    result = recovery.reconcile(uncertain, current)
+
+    assert result.outcome == "unknown"
+    assert result.proven is False
+    assert recovery_factory.instances[0].requests[-1] == (
+        "session/reconcile",
+        {"sessionId": uncertain.session_ref, "fromEventSeq": 5},
+    )
+
+
+def test_silent_live_carrier_is_bounded_reconciled_and_scoped(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    state = tmp_path / "state"
+    factory = Factory(
+        silent=True,
+        inspect_status="running",
+        reconcile_outcome="running",
+    )
+    adapter = make_adapter(
+        state,
+        factory,
+        stream_inactivity_seconds=0.001,
+        silent_probe_limit=2,
+    )
+    current = context(worktree)
+    turn = adapter.start(current, "long work")
+
+    events = list(adapter.stream(turn))
+
+    assert [event.type for event in events] == ["session.started", "run.failed"]
+    assert events[-1].payload == {
+        "status": "failed",
+        "error": "HARNESS_STREAM_INACTIVE",
+        "detail": "DeepSeek carrier stayed silent through bounded liveness probes",
+        "native_cancelled": True,
+        "last_inspected_state": "running",
+        "session_ref": turn.session_ref,
+        "run_ref": turn.run_ref,
+    }
+    assert factory.instances[0].requests[-5:] == [
+        ("session/inspect", {"sessionId": turn.session_ref}),
+        (
+            "session/reconcile",
+            {"sessionId": turn.session_ref, "fromEventSeq": 5},
+        ),
+        ("session/inspect", {"sessionId": turn.session_ref}),
+        (
+            "session/reconcile",
+            {"sessionId": turn.session_ref, "fromEventSeq": 5},
+        ),
+        ("session/cancel", {"sessionId": turn.session_ref}),
+    ]
+    assert factory.instances[0].closed is True
+
+    layout = deepseek_runtime.conversation_layout(
+        current.conversation_id, state_root=state
+    )
+    layout.process_identity.unlink()
+    recovery_factory = Factory(pid=54322)
+    recovery = make_adapter(state, recovery_factory)
+    resumed = recovery.resume(turn.session_ref, current, "after silence")
+    assert resumed.session_ref == turn.session_ref
+
+
 def test_exact_resume_refreshes_turn_environment_without_changing_boot_or_identity(tmp_path: Path) -> None:
     worktree = tmp_path / "worktree"
-    skill = worktree / ".agents" / "skills" / "demo" / "SKILL.md"
-    skill.parent.mkdir(parents=True)
-    skill.write_text("version one")
+    skill_root = worktree / ".agents" / "skills"
+    changed = skill_root / "changed" / "SKILL.md"
+    sibling = skill_root / "current" / "SKILL.md"
+    revoked = skill_root / "revoked" / "SKILL.md"
+    for path, body in (
+        (changed, "version one"),
+        (sibling, "sibling current"),
+        (revoked, "must disappear"),
+    ):
+        path.parent.mkdir(parents=True)
+        path.write_text(body)
     state = tmp_path / "state"
     first_factory = Factory()
     first = make_adapter(state, first_factory)
-    initial = context(worktree, env={"GRANTED_TOOL": "old", "TURN_MARKER": "one"})
+    initial = context(worktree, env={"TURN_MARKER": "one"})
     first_turn = first.start(initial, "first")
     layout = deepseek_runtime.conversation_layout(initial.conversation_id, state_root=state)
     stored_before = json.loads(layout.adapter_identity.read_text())
     first.close()
     layout.process_identity.unlink()
 
-    skill.write_text("version two")
+    assert first_factory.instances[0].runtime_skills == {
+        "changed/SKILL.md": "version one",
+        "current/SKILL.md": "sibling current",
+        "revoked/SKILL.md": "must disappear",
+    }
+
+    changed.write_text("version two")
+    revoked.unlink()
     second_factory = Factory(pid=54322)
     second = make_adapter(state, second_factory)
     refreshed = context(worktree, env={"TURN_MARKER": "two"})
@@ -491,8 +760,10 @@ def test_exact_resume_refreshes_turn_environment_without_changing_boot_or_identi
     assert stored_after == stored_before
     assert stored_after["boot_sha256"] == hashlib_sha256("immutable boot bytes")
     assert second_factory.instances[0].env["TURN_MARKER"] == "two"
-    assert "GRANTED_TOOL" not in second_factory.instances[0].env
-    assert skill.read_text() == "version two"
+    assert second_factory.instances[0].runtime_skills == {
+        "changed/SKILL.md": "version two",
+        "current/SKILL.md": "sibling current",
+    }
     second.close()
 
 
