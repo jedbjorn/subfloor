@@ -278,6 +278,7 @@ def _validate_deepseek_metadata(binding: dict) -> None:
     metadata = binding["adapter_metadata"]
     if set(metadata) != {
         "provider_route", "transport_contract", "provider_options",
+        "wire_evidence_digest",
     }:
         raise _binding_error("DeepSeek metadata must contain the fixed bridge keys")
     if metadata["provider_route"] != DEEPSEEK_PROVIDER_ROUTE:
@@ -285,6 +286,8 @@ def _validate_deepseek_metadata(binding: dict) -> None:
     if metadata["transport_contract"] != DEEPSEEK_TRANSPORT_CONTRACT:
         raise _binding_error("DeepSeek transport contract is not canonical")
     options = metadata["provider_options"]
+    if not _lower_hex(metadata["wire_evidence_digest"], LOWER_HEX_64):
+        raise _binding_error("DeepSeek provider wire evidence must be a SHA-256 digest")
     if not isinstance(options, dict) or set(options) != {"omit", "set"}:
         raise _binding_error("DeepSeek provider options must contain omit and set")
     omitted = options["omit"]

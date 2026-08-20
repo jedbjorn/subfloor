@@ -255,6 +255,7 @@ class BindingIdentityTest(unittest.TestCase):
             "default": {
                 "provider_route": "deepseek-official",
                 "transport_contract": "deepseek-provider-options-v1",
+                "wire_evidence_digest": "5" * 64,
                 "provider_options": {
                     "omit": ["thinking", "reasoning_effort"], "set": {},
                 },
@@ -262,6 +263,7 @@ class BindingIdentityTest(unittest.TestCase):
             "high": {
                 "provider_route": "deepseek-official",
                 "transport_contract": "deepseek-provider-options-v1",
+                "wire_evidence_digest": "6" * 64,
                 "provider_options": {
                     "omit": [],
                     "set": {
@@ -301,6 +303,11 @@ class BindingIdentityTest(unittest.TestCase):
                 "transport_contract": "deepseek-provider-options-v1",
                 "provider_options_by_effort": {
                     key: value["provider_options"] for key, value in selected.items()
+                },
+                "wire_contract": "deepseek-provider-options-wire-v1",
+                "wire_evidence_by_effort": {
+                    "default": "5" * 64,
+                    "high": "6" * 64,
                 },
             }),
         )
@@ -526,6 +533,7 @@ class BindingIdentityTest(unittest.TestCase):
         self.assertEqual(default["adapter_metadata"], {
             "provider_route": "deepseek-official",
             "transport_contract": "deepseek-provider-options-v1",
+            "wire_evidence_digest": "5" * 64,
             "provider_options": {
                 "omit": ["thinking", "reasoning_effort"], "set": {},
             },
@@ -533,6 +541,7 @@ class BindingIdentityTest(unittest.TestCase):
         self.assertEqual(named["adapter_metadata"], {
             "provider_route": "deepseek-official",
             "transport_contract": "deepseek-provider-options-v1",
+            "wire_evidence_digest": "6" * 64,
             "provider_options": {
                 "omit": [],
                 "set": {

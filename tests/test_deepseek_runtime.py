@@ -9,6 +9,7 @@ import stat
 import sys
 import tempfile
 import unittest
+import urllib.request
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -268,6 +269,107 @@ def test_provider_request_patch_is_callable_exact_and_fail_closed() -> None:
         assert exc.code == "HARNESS_PROVIDER_OPTION_INVALID"
     else:
         raise AssertionError("unknown provider option was accepted")
+
+
+def test_provider_wire_evidence_captures_default_omission_and_named_mapping() -> None:
+    status = deepseek_runtime.RuntimeStatus(
+        available=True,
+        enabled=True,
+        error=None,
+        detail=None,
+        carrier_python="/carrier/bin/python",
+        python_version="3.14.7",
+        sdk_version="0.1.0rc7",
+        runtime_version="0.1.0rc7",
+        composition_sha256=deepseek_runtime.load_runtime_manifest()["composition"]["sha256"],
+    )
+
+    def runner(argv, **kwargs):
+        options = json.loads(argv[-2])
+        body = {"model": argv[-3], "messages": [], "stream": True}
+        if options["thinking"] != "omit":
+            body["thinking"] = {"type": options["thinking"]}
+        if options["reasoningEffort"] != "omit":
+            body["reasoning_effort"] = options["reasoningEffort"]
+        request = urllib.request.Request(
+            kwargs["env"]["DEEPSEEK_BASE_URL"] + "/chat/completions",
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bearer {kwargs['env']['DEEPSEEK_API_KEY']}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            response.read()
+        return completed()
+
+    evidence = deepseek_runtime.provider_wire_evidence(
+        "deepseek-v4-pro",
+        {
+            "default": {"thinking": "omit", "reasoningEffort": "omit"},
+            "high": {"thinking": "enabled", "reasoningEffort": "high"},
+        },
+        env={},
+        runner=runner,
+        status=status,
+    )
+
+    assert evidence["contract"] == deepseek_runtime.PROVIDER_WIRE_CONTRACT
+    assert evidence["proofs"]["default"]["wire_options"] == {}
+    assert evidence["proofs"]["high"]["wire_options"] == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "high",
+    }
+    assert len(evidence["proofs"]["default"]["digest"]) == 64
+
+
+def test_provider_wire_evidence_rejects_materialized_default() -> None:
+    status = deepseek_runtime.RuntimeStatus(
+        available=True,
+        enabled=True,
+        error=None,
+        detail=None,
+        carrier_python="/carrier/bin/python",
+        python_version="3.14.7",
+        sdk_version="0.1.0rc7",
+        runtime_version="0.1.0rc7",
+        composition_sha256=deepseek_runtime.load_runtime_manifest()["composition"]["sha256"],
+    )
+
+    def runner(argv, **kwargs):
+        body = {
+            "model": argv[-3],
+            "messages": [],
+            "stream": True,
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "high",
+        }
+        request = urllib.request.Request(
+            kwargs["env"]["DEEPSEEK_BASE_URL"] + "/chat/completions",
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": f"Bearer {kwargs['env']['DEEPSEEK_API_KEY']}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            response.read()
+        return completed()
+
+    try:
+        deepseek_runtime.provider_wire_evidence(
+            "deepseek-v4-pro",
+            {"default": {"thinking": "omit", "reasoningEffort": "omit"}},
+            env={},
+            runner=runner,
+            status=status,
+        )
+    except deepseek_runtime.DeepSeekRuntimeError as exc:
+        assert exc.code == "HARNESS_PROVIDER_WIRE_MISMATCH"
+    else:
+        raise AssertionError("materialized default entered controlled evidence")
 
 
 def test_carrier_build_normalizes_only_the_pkg_sea_temp_token() -> None:

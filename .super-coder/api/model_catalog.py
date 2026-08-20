@@ -105,6 +105,10 @@ DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED = (
 )
 DEEPSEEK_NAMED_EFFORTS = ("low", "high", "max")
 
+
+class _DeepSeekWireProofError(RuntimeError):
+    pass
+
 # The ids the engine ships in flavor_defaults — surfaced only when every live
 # source fails AND no cache exists, so the datalist is never empty.
 STATIC_FLOOR = {
@@ -219,7 +223,34 @@ def _deepseek_models_url(env) -> str:
     return base.rstrip("/") + "/models"
 
 
-def _deepseek_provider_metadata() -> dict:
+def _deepseek_carrier_options() -> dict[str, dict[str, str]]:
+    return {
+        route_bindings.DEFAULT_EFFORT: {
+            "thinking": "omit", "reasoningEffort": "omit",
+        },
+        **{
+            effort: {"thinking": "enabled", "reasoningEffort": effort}
+            for effort in DEEPSEEK_NAMED_EFFORTS
+        },
+    }
+
+
+def _deepseek_provider_metadata(model: str, proof: dict) -> dict:
+    import deepseek_runtime  # noqa: PLC0415
+
+    manifest = deepseek_runtime.load_runtime_manifest()
+    expected_runtime = (manifest.get("runtime") or {}).get("version")
+    expected_source = (manifest.get("source") or {}).get("commit")
+    expected_patch = (manifest.get("patch") or {}).get("sha256")
+    if (
+        not isinstance(proof, dict)
+        or proof.get("contract") != deepseek_runtime.PROVIDER_WIRE_CONTRACT
+        or proof.get("model") != model
+        or not isinstance(proof.get("proofs"), dict)
+    ):
+        raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
+    carrier_options = _deepseek_carrier_options()
+    wire_proofs = proof["proofs"]
     mappings = {
         route_bindings.DEFAULT_EFFORT: {
             "omit": list(route_bindings.DEEPSEEK_OVERRIDE_FIELDS),
@@ -236,10 +267,43 @@ def _deepseek_provider_metadata() -> dict:
             for effort in DEEPSEEK_NAMED_EFFORTS
         },
     }
+    digests = {}
+    for effort, expected_options in carrier_options.items():
+        item = wire_proofs.get(effort)
+        expected_wire = {} if effort == route_bindings.DEFAULT_EFFORT else {
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": effort,
+        }
+        digest_payload = {
+            key: item.get(key) if isinstance(item, dict) else None
+            for key in (
+                "contract", "model", "effort", "provider_options",
+                "wire_options", "runtime_version", "source_commit",
+                "patch_sha256",
+            )
+        }
+        if (
+            not isinstance(item, dict)
+            or item.get("contract") != deepseek_runtime.PROVIDER_WIRE_CONTRACT
+            or item.get("model") != model
+            or item.get("effort") != effort
+            or item.get("provider_options") != expected_options
+            or item.get("wire_options") != expected_wire
+            or item.get("runtime_version") != expected_runtime
+            or item.get("source_commit") != expected_source
+            or item.get("patch_sha256") != expected_patch
+            or not isinstance(item.get("digest"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["digest"]) is None
+            or item["digest"] != route_bindings.digest_json(digest_payload)
+        ):
+            raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
+        digests[effort] = item["digest"]
     return {
         "provider_route": route_bindings.DEEPSEEK_PROVIDER_ROUTE,
         "transport_contract": route_bindings.DEEPSEEK_TRANSPORT_CONTRACT,
         "provider_options_by_effort": mappings,
+        "wire_contract": deepseek_runtime.PROVIDER_WIRE_CONTRACT,
+        "wire_evidence_by_effort": digests,
     }
 
 
@@ -263,7 +327,7 @@ def _deepseek_manifest_identity() -> tuple[str, str]:
     return version, commit
 
 
-def _from_deepseek_api(fetch, env) -> list[dict]:
+def _from_deepseek_api(fetch, env, wire_probe=None) -> list[dict]:
     """Read exact models only through the configured authenticated endpoint."""
     key = env.get(DEEPSEEK_API_KEY_ENV)
     if not isinstance(key, str) or not key.strip():
@@ -274,9 +338,13 @@ def _from_deepseek_api(fetch, env) -> list[dict]:
     if not isinstance(rows, list):
         raise ValueError("DeepSeek model response has no data list")
     version, source_commit = _deepseek_manifest_identity()
-    metadata = _deepseek_provider_metadata()
+    if wire_probe is None:
+        import deepseek_runtime  # noqa: PLC0415
+
+        wire_probe = deepseek_runtime.provider_wire_evidence
     entries = []
     seen = set()
+    exact_models = []
     for row in rows:
         model = row.get("id") if isinstance(row, dict) else None
         if (
@@ -287,14 +355,17 @@ def _from_deepseek_api(fetch, env) -> list[dict]:
         ):
             continue
         seen.add(model)
+        exact_models.append(model)
+        try:
+            proof = wire_probe(model, _deepseek_carrier_options(), env=env)
+            metadata = _deepseek_provider_metadata(model, proof)
+        except Exception:  # noqa: BLE001 (proof diagnostics stay local/redacted)
+            continue
         entries.append(_entry(
             model,
             name=(row.get("name") if isinstance(row, dict) else None) or model,
             source=DEEPSEEK_SOURCE,
-            # Authenticated discovery proves the exact provider id, not the
-            # provider-option mapper.  U78 promotes this only after U77's
-            # bridge seam captures default/named outbound request bytes.
-            availability="advisory",
+            availability="available",
             provider=route_bindings.DEEPSEEK_PROVIDER_ROUTE,
             provider_model=model,
             supported_efforts=list(DEEPSEEK_NAMED_EFFORTS),
@@ -306,9 +377,13 @@ def _from_deepseek_api(fetch, env) -> list[dict]:
                 "provider_route": route_bindings.DEEPSEEK_PROVIDER_ROUTE,
                 "models_url": url,
                 "runtime_source_commit": source_commit,
+                "provider_wire_contract": metadata["wire_contract"],
+                "provider_wire_digests": metadata["wire_evidence_by_effort"],
             },
             adapter_metadata=metadata,
         ))
+    if exact_models and not entries:
+        raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
     if not entries:
         raise ValueError("DeepSeek authenticated endpoint returned no exact models")
     return entries
@@ -411,7 +486,8 @@ def _prefer(preferred: list[dict], advisory: list[dict]) -> list[dict]:
     return _merge(preferred, advisory)
 
 
-def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
+def build(fetch=_http_json, env=os.environ, run=subprocess.run,
+          deepseek_wire_probe=None) -> dict:
     """One live sweep across all sources. Raises only if EVERY source fails —
     partial results (e.g. models.dev down but a keyed API up) still count."""
     harnesses: dict[str, list[dict]] = {}
@@ -428,15 +504,20 @@ def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
         sources.append(f"{HARNESS_PROVIDER[harness]}-api")
     if env.get(DEEPSEEK_API_KEY_ENV):
         try:
-            deepseek = _from_deepseek_api(fetch, env)
+            deepseek = _from_deepseek_api(
+                fetch, env, wire_probe=deepseek_wire_probe
+            )
+        except _DeepSeekWireProofError:
+            deepseek = []
+            errors.append(
+                f"{DEEPSEEK_SOURCE}: {DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED}"
+            )
+            harness_errors["deepseek"] = DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED
         except Exception:  # noqa: BLE001 (secret-bearing discovery is redacted)
             deepseek = []
             errors.append(f"{DEEPSEEK_SOURCE}: {DEEPSEEK_DISCOVERY_ERROR}")
-        harnesses["deepseek"] = deepseek
-        if deepseek:
-            harness_errors["deepseek"] = DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED
-        if not deepseek:
             harness_errors["deepseek"] = DEEPSEEK_DISCOVERY_ERROR
+        harnesses["deepseek"] = deepseek
         if deepseek:
             sources.append(DEEPSEEK_SOURCE)
     local = {
@@ -738,12 +819,16 @@ def _entry_evidence(harness: str, entry: dict,
             mappings = catalogue_adapter_metadata.get(
                 "provider_options_by_effort"
             ) or {}
+            wire_digests = catalogue_adapter_metadata.get(
+                "wire_evidence_by_effort"
+            ) or {}
             return {
                 "provider_route": catalogue_adapter_metadata.get("provider_route"),
                 "transport_contract": catalogue_adapter_metadata.get(
                     "transport_contract"
                 ),
                 "provider_options": mappings.get(effort),
+                "wire_evidence_digest": wire_digests.get(effort),
             }
         if harness != "opencode" or not variants_by_effort:
             return catalogue_adapter_metadata
@@ -1227,6 +1312,7 @@ def controlled_route_evidence(
     opencode_provider=None,
     harness_probe=None,
     deepseek_fetch=None,
+    deepseek_wire_probe=None,
 ) -> dict:
     """Probe one controlled route and bind its source to this runtime seat."""
     env = os.environ if env is None else env
@@ -1278,7 +1364,9 @@ def controlled_route_evidence(
                     for model in opencode_provider()
                 ]
         elif harness == "deepseek":
-            entries = _from_deepseek_api(deepseek_fetch, env)
+            entries = _from_deepseek_api(
+                deepseek_fetch, env, wire_probe=deepseek_wire_probe
+            )
         else:
             entries = []
     except Exception:  # noqa: BLE001 (unreadable live evidence is stale)
@@ -1315,7 +1403,8 @@ def current_source_fingerprint(harness: str, selector: str, *, env=os.environ,
 def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             run=subprocess.run, con=None,
             opencode_provider=opencode_connected_models,
-            harness_probe=harness_versions.compatibility_status) -> dict:
+            harness_probe=harness_versions.compatibility_status,
+            deepseek_wire_probe=None) -> dict:
     """The cached-with-fallbacks entry point the API serves.
 
     fresh cache → serve it; miss/stale/refresh → live sweep, cache the result;
@@ -1341,7 +1430,9 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             opencode_provider), con)
     refresh_started_at = datetime.now(timezone.utc).isoformat()
     try:
-        fresh = build(fetch, env, run)
+        fresh = build(
+            fetch, env, run, deepseek_wire_probe=deepseek_wire_probe
+        )
     except Exception as e:  # noqa: BLE001
         refresh_completed_at = datetime.now(timezone.utc).isoformat()
         if cached:
