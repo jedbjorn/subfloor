@@ -99,10 +99,11 @@ sc mem task cancel <task_id> --notes "moved to F<id> as task #<n>"
 sc mem state "[<feature>] — last: <last_done>. next: <next_up>."
 ```
 
-The final Verification task runs focused/full gates, every In Scope
-done-condition, and the Anticipated User Activity contract. Unexpected reach,
-weakened hardening, or crossed tenancy is a failure. A large spec may stop
-after a verified task slice; leave later tasks pending and state the next one.
+The final Verification task follows the boot `TESTING POSTURE`; require focused
+local proof + green configured CI, every In Scope done-condition, and the
+Anticipated User Activity contract. Unexpected reach, weakened hardening, or
+crossed tenancy fails. A large spec may stop after a verified task slice; leave
+later tasks pending and state the next one.
 
 ## 5. Ship and hand docs to Planner
 

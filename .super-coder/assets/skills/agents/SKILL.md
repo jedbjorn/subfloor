@@ -59,11 +59,12 @@ procedure solo; at most spawn one adversarial skeptic against your own diff
    add`/`stash`/`checkout`/`commit`. Read *Worktree reality* below before
    reaching for isolation — it has real costs. Reviewer/checker agents are
    read-only; no isolation needed.
-4. **Agent claims are inputs, not results.** Re-run the real check yourself
-   — `sc test`, lint, the spec's done-condition — before marking anything
-   done. "Agent says tests pass" is not verification. Diffs: pull them
-   yourself (`git -C <worktree> diff`); NEVER adjudicate pasted diffs or
-   pasted test output — pastes are lossy and unverifiable.
+4. **Agent claims are inputs, not results.** Follow the boot `TESTING POSTURE`:
+   re-run smallest affected targets, lint, and the spec's done-condition
+   yourself; never use bare `sc test` merely to duplicate configured CI.
+   "Agent says tests pass" is not verification. Pull diffs yourself
+   (`git -C <worktree> diff`); NEVER adjudicate pasted diffs/output — pastes
+   are lossy.
 
 ---
 
@@ -156,7 +157,7 @@ After the task plan exists (base skill, Steps 1–3, unchanged):
    (`sc mem task start`) -> spawn one implementer per task (isolation per
    contract rule 3) -> pull each returned diff yourself and apply it to your
    tree -> spawn checker agent(s) prompted to **refute** it -> adjudicate +
-   run the real tests on the merged state -> `sc mem task done` -> update
+   run the affected tests on the merged state -> `sc mem task done` -> update
    current_state -> next wave.
 3. One wave live at a time.
 

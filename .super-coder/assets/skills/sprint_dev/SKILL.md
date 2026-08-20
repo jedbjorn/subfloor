@@ -106,11 +106,12 @@ in the relay.
 
 ## Build and verify
 
-Sync the assigned repository, branch, implement the smallest complete change,
-and exercise the unit's independent gate + realistic failures. Keep external
-calls outside DB transactions; preserve durable identities and append-only
-evidence. Record CI failures, infrastructure anomalies, retries, review
-friction, and known departures for closeout.
+Sync + branch; implement the smallest complete change. Per boot `TESTING
+POSTURE`, run the smallest affected gate + failures; configured CI green =
+full-suite proof, red -> diagnose/fix/push/rerun. Keep external calls outside
+DB transactions; preserve durable identities and append-only evidence. Record
+CI failures, infrastructure anomalies, retries, review friction, and
+departures for closeout.
 
 Immediately before `complete-unit`, `register-pr`, or `request-review`, re-run
 `sc sprint inbox --sprint <id>` once and act on new messages. After the typed
