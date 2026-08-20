@@ -46,6 +46,7 @@ class SupervisionFixture:
             "cli_entry.py",
             "docker_cache.py",
             "engine_manifest.py",
+            "engine_paths.py",
             "global_pointer.py",
             "install.py",
             "devkit.py",

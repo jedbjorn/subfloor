@@ -207,6 +207,7 @@ class ScFixture:
         for script in (
             "dispatch.sh",
             "install.py",
+            "engine_paths.py",
             "callable_floor.py",
             "engine_manifest.py",
             "global_pointer.py",

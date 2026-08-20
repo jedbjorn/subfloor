@@ -955,7 +955,7 @@ esac
 # migrate) probes first because it executes host Python. Container entry
 # deliberately remains a Docker handoff rather than a host-runtime gate.
 case "$cmd" in
-  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|map-sql|map-sql-rw|render|render-check|map|map-setup|analytics|models|seed-skills|skill|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health)
+  install|ensure-harness|doctor|update|update-harnesses|harness-status|docker-cache-gc|rollback|feature|artifact-mode|eject|remove|init|rebuild|migrate|migration|snapshot|mem|pr|token|persist|job|visual-qa|map-sql|map-sql-rw|map-schema|map-extractor|render|render-check|map|map-setup|analytics|models|seed-skills|skill|ports|url|preview|serve|vm|vm-broker|vm-bake|vm-broker-up|vm-broker-down|vm-broker-sock|vm-mcp-relay|vm-broker-install|vm-broker-uninstall|ts-broker|ts-broker-up|ts-broker-down|ts-broker-sock|ts-broker-install|ts-broker-uninstall|pm2-broker|pm2-broker-up|pm2-broker-down|pm2-broker-sock|pm2-broker-install|pm2-broker-uninstall|db-broker|db-broker-up|db-broker-down|db-broker-sock|db-broker-install|db-broker-uninstall|db-init|pg-init|pg-up|pg-down|admin|boot|boot-*|run|deps|test|lint|typecheck|launch|down|restart|build|verify|health)
     case "$cmd" in
       deps|test|lint|typecheck)
         sc_devkit_help_form "$@" || sc_python_probe ;;
@@ -1057,6 +1057,8 @@ case "$cmd" in
   map-sql)      exec sqlite3 -readonly "$(sc_mapdb)" "$@" ;;
   sql-rw)       exec sqlite3 "$DB" "$@" ;;
   map-sql-rw)   exec sqlite3 "$(sc_mapdb)" "$@" ;;
+  map-schema)   exec "$PY" "$S/map_schema_cli.py" "$@" ;;
+  map-extractor) exec "$PY" "$S/map_extractor_install.py" "$@" ;;
   render)       if [ "$LINKED" -eq 1 ]; then
                   sc_refuse_linked render \
                     "$DB -> $("$PY" "$S/artifact_policy.py" path renders)"
@@ -1076,9 +1078,11 @@ case "$cmd" in
                 fi
                 exec "$PY" "$CALLER_ENGINE/scripts/render_check.py" ;;
   map)          case "${1:-}" in
-                  -h|--help) echo "usage: ./sc map — rescan the host repo into the configured dr_* catalogue; takes no arguments"
+                  -h|--help) echo "usage: ./sc map [finalize [--json]] — refresh the dr_* catalogue or report Cartographer completion"
                              exit 0 ;;
-                  ?*)        echo "sc map: unknown argument '$1' (takes none; -h for usage)" >&2
+                  finalize)  shift
+                             exec "$PY" "$S/map_finalize.py" "$@" ;;
+                  ?*)        echo "sc map: unknown argument '$1' (-h for usage)" >&2
                              exit 2 ;;
                 esac
                 exec "$PY" "$S/map_repo.py" ;;
@@ -1520,6 +1524,7 @@ super-coder — forkable shell substrate
   ./sc visual-qa <mode>    viewport screenshot QA: ci boots/captures · run captures a local app · init scaffolds config
   sc sql "<query>"         read-only passthrough to the engine DB (schema/skills/flags) — absolute path, cwd-independent (no `cd` to root)
   sc map-sql "<query>"     read-only passthrough to the repo-map DB (dr_* catalogue) — absolute path, cwd-independent
+  sc map-schema [dr_table] list live dr_* objects or stable column/index metadata — read-only, no arbitrary SQL
   sc sql-rw · sc map-sql-rw
                            read-WRITE passthroughs — bypass the API's triggers/caps; `sc mem` is the write path.
                              Only for procedures with no API surface (map authoring) where a skill names it
@@ -1533,6 +1538,10 @@ super-coder — forkable shell substrate
                              (incremental + idempotent; --harness <name> · --quiet · --full re-parses everything).
                              Also runs at boot and behind the GUI Analytics tab
   ./sc map                 scan the host repo into the dr_* catalogue (re-runnable)
+  ./sc map finalize [--json]
+                           refresh + report live/snapshot/install/source/Admin/notice/flag evidence; never owns those actions
+  ./sc map-extractor install <worktree-file>
+                           validate + atomically install one Cartographer-authored extractor and write its SHA-256 receipt
   ./sc map-setup           wire the auto-remap git hooks (core.hooksPath) + map — the cartographer's one-shot
   ./sc seed-skills         upsert assets/skills/ into the live DB (+ regenerate the seed migration — source repo only)
   ./sc init                seed a fresh fork's first user + shell (run once after install)

@@ -24,10 +24,12 @@ import json
 import re
 import sqlite3
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import artifact_policy  # noqa: E402
+from engine_paths import is_generated_install_path  # noqa: E402
 import map_db  # noqa: E402 — sibling module in scripts/ (on sys.path for script + importers)
 import toml_compat  # noqa: E402
 
@@ -57,11 +59,20 @@ CONFIG_PATH_LEGACY = ENGINE / "map.config.json"
 SKIP_DIRS = {".git", ".sc-worktrees", "node_modules", ".super-coder", ".sc-state",
              ".venv", "venv",
              "__pycache__", ".svelte-kit", "dist", "build", ".next", "target",
-             "vendor", ".claude", ".idea", ".vscode", "coverage", ".pytest_cache",
-             # super-coder's own render output — mirrors the DB, not host source.
-             "specs_sc", "docs_sc", "skills_sc"}
-SKIP_FILES = {"roadmap_sc.md", "CLAUDE.md", "AGENTS.md", "opencode.json"}
+             "vendor", ".idea", ".vscode", "coverage", ".pytest_cache"}
+SKIP_FILES: set[str] = set()
 MAX_FILES = 20000  # backstop for huge trees; logs if hit
+
+
+@dataclass(frozen=True)
+class MapRefreshResult:
+    files: int
+    dependencies: int
+    env_vars: int
+    truncated: bool
+    extractor_summaries: tuple[str, ...]
+    map_root: Path
+    mapped_at: str
 
 LANG = {
     ".py": "Python", ".js": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript",
@@ -85,8 +96,11 @@ def path_is_skipped(
     skip_files: set[str],
 ) -> bool:
     """One testable exclusion predicate for the derived repo catalogue."""
-    return any(part in skip_dirs for part in rel_parts) or (
-        bool(rel_parts) and rel_parts[-1] in skip_files
+    relative = PurePosixPath(*rel_parts)
+    return (
+        is_generated_install_path(relative)
+        or any(part in skip_dirs for part in rel_parts)
+        or (bool(rel_parts) and rel_parts[-1] in skip_files)
     )
 
 
@@ -252,7 +266,8 @@ def seed_sections(con: sqlite3.Connection) -> None:
     is empty, so the cartographer's curated sections (and any loaded from the
     snapshot on rebuild) are never overwritten. Each top-level dir becomes one
     section (`name=dir`, `path_prefix=dir/`, description NULL-until-curated).
-    Root-level files match no prefix and surface under the render-time catch-all.
+    Root-level files match no prefix and surface in the synthetic Repository Root
+    group at render time.
     The cartographer renames / merges / splits / describes from here."""
     if con.execute("SELECT COUNT(*) FROM dr_section").fetchone()[0]:
         return
@@ -285,9 +300,11 @@ def run_extractors(con: sqlite3.Connection, repo_root: Path, cfg: dict) -> list[
     if not ext_dir.is_dir():
         return []
     summaries: list[str] = []
-    for path in sorted(ext_dir.glob("*.py")):
+    for index, path in enumerate(sorted(ext_dir.glob("*.py"))):
         if path.name.startswith("_"):
             continue
+        savepoint = f"extractor_{index}"
+        con.execute(f"SAVEPOINT {savepoint}")
         try:
             spec = importlib.util.spec_from_file_location(f"map_ext_{path.stem}", path)
             mod = importlib.util.module_from_spec(spec)
@@ -295,16 +312,21 @@ def run_extractors(con: sqlite3.Connection, repo_root: Path, cfg: dict) -> list[
             fn = getattr(mod, "extract", None)
             if fn is None:
                 summaries.append(f"{path.stem}: no extract() — skipped")
+                con.execute(f"ROLLBACK TO {savepoint}")
+                con.execute(f"RELEASE {savepoint}")
                 continue
             result = fn(con, repo_root, cfg) or "ok"
-            con.commit()
+            con.execute(f"RELEASE {savepoint}")
             summaries.append(f"{path.stem}: {result}")
         except Exception as e:  # noqa: BLE001 — an extractor must never fail the map
+            con.execute(f"ROLLBACK TO {savepoint}")
+            con.execute(f"RELEASE {savepoint}")
             summaries.append(f"{path.stem}: FAILED ({e})")
+    con.commit()
     return summaries
 
 
-def main() -> int:
+def refresh() -> MapRefreshResult:
     # The map lives in its OWN db (.sc-state/map.db), not shell_db.db. connect()
     # creates + schema-applies a fresh one and seeds its authored layer (sections
     # from map_content.sql, or the pre-split engine DB on first run post-split).
@@ -375,24 +397,59 @@ def main() -> int:
         con.execute("DROP TABLE _seen")
         seed_sections(con)
 
+        mapped_at = datetime.now().isoformat(timespec="seconds")
         con.execute(
             "INSERT INTO dr_repo (repo_id, name, root, remote, vcs, default_branch, "
             "file_count, mapped_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
             (MAP_ROOT.name, str(MAP_ROOT), git("remote", "get-url", "origin"),
              "git" if (MAP_ROOT / ".git").exists() else None,
              git("rev-parse", "--abbrev-ref", "HEAD"), files,
-             datetime.now().isoformat(timespec="seconds")))
+             mapped_at))
         con.commit()
         # Fork-owned semantic extractors (endpoints / db schema / routes), if any.
         ext_summaries = run_extractors(con, MAP_ROOT, cfg)
-        msg = f"map_repo: {files} files, {deps} deps, {envs} env vars → dr_* ({MAP_ROOT.name})"
-        if truncated:
-            msg += f"  ⚠ stopped at MAX_FILES={MAX_FILES}"
-        print(msg)
-        for s in ext_summaries:
-            print(f"map_repo: extractor {s}")
+        status = {
+            "mapped_at": mapped_at,
+            "outcomes": [
+                {
+                    "module": summary.split(":", 1)[0],
+                    "status": (
+                        "FAIL" if "FAILED" in summary or "no extract()" in summary
+                        else "PASS"
+                    ),
+                    "summary": summary,
+                }
+                for summary in ext_summaries
+            ],
+        }
+        artifact_policy.atomic_write_text(
+            artifact_policy.map_extractor_status_path(),
+            json.dumps(status, indent=2, sort_keys=True) + "\n",
+        )
+        return MapRefreshResult(
+            files=files,
+            dependencies=deps,
+            env_vars=envs,
+            truncated=truncated,
+            extractor_summaries=tuple(ext_summaries),
+            map_root=MAP_ROOT,
+            mapped_at=mapped_at,
+        )
     finally:
         con.close()
+
+
+def main() -> int:
+    result = refresh()
+    msg = (
+        f"map_repo: {result.files} files, {result.dependencies} deps, "
+        f"{result.env_vars} env vars → dr_* ({result.map_root.name})"
+    )
+    if result.truncated:
+        msg += f"  ⚠ stopped at MAX_FILES={MAX_FILES}"
+    print(msg)
+    for summary in result.extractor_summaries:
+        print(f"map_repo: extractor {summary}")
     return 0
 
 

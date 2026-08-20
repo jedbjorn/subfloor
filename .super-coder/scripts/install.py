@@ -75,6 +75,7 @@ if __name__ == "__main__":
 sys.path.insert(0, str(ENGINE / "scripts"))
 import callable_floor  # noqa: E402
 import engine_manifest  # noqa: E402
+from engine_paths import GENERATED_INSTALL_PATHS  # noqa: E402
 import global_pointer  # noqa: E402
 import ports as ports_mod  # noqa: E402
 
@@ -199,26 +200,6 @@ VISUAL_QA_TEMPLATE_TARGETS = {
     "subfloor-visual-qa.yml": Path(".github/workflows/subfloor-visual-qa.yml"),
     "visual-qa.example.json": Path(".sc-state/visual-qa.example.json"),
 }
-
-# Repo-local surfaces emitted or wholly owned by an installed engine.  Teardown
-# imports this inventory so install and remove cannot quietly disagree about
-# which generated paths belong to subfloor.  Mixed host files (Makefile,
-# .gitignore, shared/) are handled surgically instead.
-GENERATED_INSTALL_PATHS = (
-    Path("CLAUDE.md"),
-    Path("AGENTS.md"),
-    Path("opencode.json"),
-    Path(".claude/settings.local.json"),
-    Path(".codex/hooks.json"),
-    Path(".claude/skills"),
-    Path(".agents/skills"),
-    Path(".opencode/skills"),
-    Path("roadmap_sc.md"),
-    Path("docs_sc"),
-    Path("specs_sc"),
-    Path("skills_sc"),
-)
-
 
 def origin_basename() -> str | None:
     p = sh("git", "-C", str(REPO_ROOT), "remote", "get-url", "origin")
