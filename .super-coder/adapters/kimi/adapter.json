@@ -1,6 +1,12 @@
 {
   "harness": "kimi",
   "launch": ["kimi"],
+  "surfaces": {
+    "terminal": true,
+    "one_shot": true,
+    "browser": true,
+    "sprint": true
+  },
   "comm_aliases": ["kimi-code"],
   "boot_artifact": "AGENTS.md",
   "emit": [],

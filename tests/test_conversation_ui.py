@@ -266,11 +266,11 @@ def test_sprint_conversations_are_not_closed_by_normal_chat_controls():
 def test_start_chat_has_default_and_configured_paths_without_terminal_controls():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
-    assert (
-        'const CHAT_HARNESSES = ["opencode", "claude", "codex", "kimi"]'
-        in interface
-    )
-    assert "const availableHarnesses = CHAT_HARNESSES;" in interface
+    assert "const CHAT_HARNESSES_FROM_SERVER = (defaults)" in interface
+    assert "defaults.harness_status" in interface
+    assert "status.surfaces?.browser" in interface
+    assert ': LEGACY_CHAT_HARNESSES;' in interface
+    assert "const availableHarnesses = CHAT_HARNESSES_FROM_SERVER(defaults);" in interface
     assert 'shell.flavor === "conductor"' not in interface
     assert 'const CHAT_CONFIGURE_ROUTE = "configure"' in interface
     assert 'textContent: "＋ Chat"' in interface

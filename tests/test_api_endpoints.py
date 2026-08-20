@@ -750,8 +750,47 @@ class FlavorDefaultsTest(unittest.TestCase):
         got = server.get_flavor_defaults(self.con)
         self.assertIn("planner", got["flavors"])
         self.assertIn("admin", got["flavors"], "template flavors appear even unseeded")
-        for h in ("claude", "codex", "opencode", "vibe"):
-            self.assertIn(h, got["harnesses"])
+        self.assertEqual(
+            got["harnesses"], ["claude", "codex", "kimi", "opencode", "vibe"]
+        )
+        self.assertIn("deepseek", got["harness_status"])
+        self.assertNotIn("deepseek", got["harnesses"])
+        self.assertEqual(got["harness_status"]["deepseek"]["surfaces"], {
+            "terminal": False,
+            "one_shot": False,
+            "browser": False,
+            "sprint": False,
+        })
+
+    def test_historical_unknown_harness_stays_projected_without_launch_access(self) -> None:
+        self.con.execute(
+            "INSERT INTO users (user_id,username) VALUES (910,'historical-owner')"
+        )
+        self.con.execute(
+            "INSERT INTO shells (shell_id,display_name,system_prompt,user_id) "
+            "VALUES (910,'Historical','prompt',910)"
+        )
+        self.con.execute(
+            "INSERT INTO conversations ("
+            "conversation_id,shell_id,owner_user_id,harness,worktree,"
+            "creation_idempotency_key,creation_request_hash"
+            ") VALUES ('cv_removed',?,?,'removed-harness','/tmp/removed',"
+            "'removed-create','removed-hash')",
+            (910, 910),
+        )
+        self.con.commit()
+
+        got = server.get_flavor_defaults(self.con)
+
+        self.assertEqual(
+            got["harness_status"]["removed-harness"]["unavailable_reason"],
+            "HARNESS_NOT_SHIPPED",
+        )
+        self.assertEqual(
+            got["harness_status"]["removed-harness"]["surfaces"],
+            {"terminal": False, "one_shot": False, "browser": False, "sprint": False},
+        )
+        self.assertNotIn("removed-harness", got["harnesses"])
 
     def test_set_model(self) -> None:
         self._route("claude", "opus")
