@@ -56,33 +56,61 @@ def carrier_evidence(
             "base_prefix": "/usr" if isolated else str(python.parent.parent),
             "sdk": sdk,
             "runtime": runtime,
+            "carrier": {
+                "protocol": "super-coder-deepseek-lifecycle-v1",
+                "sourceCommit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
+            },
         }
     )
 
 
-def test_runtime_manifest_pins_official_pair_and_all_published_artifacts() -> None:
+def write_artifact_evidence(directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest = deepseek_runtime.load_runtime_manifest()
+    records = []
+    for filename, payload in (
+        ("deepseek_harness_runtime_bin-0.1.0rc7-py3-none-test.whl", b"runtime"),
+        ("deepseek_harness_sdk-0.1.0rc7-py3-none-any.whl", b"sdk"),
+    ):
+        path = directory / filename
+        path.write_bytes(payload)
+        records.append(
+            {"filename": filename, "sha256": deepseek_runtime._sha256(path), "size": len(payload)}
+        )
+    (directory / "deepseek-carrier-artifacts.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "platform": deepseek_runtime.carrier_runtime_platform(),
+                "source_commit": manifest["source"]["commit"],
+                "source_archive_sha256": manifest["source"]["archive_sha256"],
+                "patch_sha256": manifest["patch"]["sha256"],
+                "build_recipe_sha256": manifest["build"]["sha256"],
+                "build_tools": {
+                    "node": manifest["build"]["node_version"],
+                    "pnpm": manifest["build"]["pnpm_version"],
+                    "uv": manifest["build"]["uv_version"],
+                    "source_date_epoch": manifest["build"]["source_date_epoch"],
+                },
+                "artifacts": records,
+            }
+        )
+    )
+
+
+def test_runtime_manifest_pins_source_patch_recipe_and_supported_platforms() -> None:
     manifest = deepseek_runtime.load_runtime_manifest()
 
     assert manifest["python_minimum"] == "3.10"
-    assert manifest["source"] == {
-        "repository": "https://github.com/deepseek-ai/deepseek-harness",
-        "commit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
-        "license": "MIT",
+    assert manifest["carrier"] == {
+        "protocol": "super-coder-deepseek-lifecycle-v1",
+        "acquisition": "verified-source-build",
     }
-    assert manifest["sdk"] == {
-        "distribution": "deepseek-harness-sdk",
-        "version": "0.1.0rc7",
-        "wheel_sha256": "5327d60659d8802442d2c589c89c3528cf18eb07b5d698059c833eb6b853b7d4",
-    }
-    assert manifest["runtime"] == {
-        "distribution": "deepseek-harness-runtime-bin",
-        "version": "0.1.0rc7",
-        "wheel_sha256": {
-            "macos-arm64": "39ae51dec905c496ede69250d51b02a424a6c96829feb2ad7e01b3cec97a3255",
-            "linux-arm64": "de4e2571d3cd1c521ee22c754460dd251b45bd91a033876f554d0eab9b2843a1",
-            "linux-x64": "bf26f76a8cab7bedcce3a060b81d19ec1cabd8bd261c40b47381d630742797a7",
-        },
-    }
+    assert manifest["source"]["commit"] == "bb4ca698d63714e753f5621b07400e6ebb0b5d97"
+    assert manifest["source"]["archive_sha256"] == "d5a78fb623d1c14846812e8e18042134a1127ab86dea259f79c2c8358e8481bc"
+    assert manifest["patch"]["upstream_issue_url"] == "https://github.com/deepseek-ai/deepseek-harness/issues/new"
+    assert manifest["build"]["pnpm_version"] == "11.7.0"
+    assert manifest["runtime"]["platforms"] == ["macos-arm64", "linux-arm64", "linux-x64"]
 
 
 def test_composition_is_exact_and_contains_only_the_reviewed_plugin_allowlist() -> None:
@@ -96,7 +124,6 @@ def test_composition_is_exact_and_contains_only_the_reviewed_plugin_allowlist() 
 
     assert names == (
         "@deepseek-ai/dsh-sdk-jsonrpc-server",
-        "@deepseek-ai/dsh-llm-deepseek",
         "@deepseek-ai/dsh-subprocess-local",
         "@deepseek-ai/dsh-bash-local",
         "@deepseek-ai/dsh-fs-local",
@@ -120,7 +147,7 @@ def test_composition_digest_drift_fails_closed() -> None:
             deepseek_runtime.load_runtime_manifest()
         except deepseek_runtime.DeepSeekRuntimeError as exc:
             assert exc.code == "HARNESS_COMPOSITION_DRIFT"
-            assert "176f00285a2bf8f7b01b69136b250183122d6a01a06d93c3f4dac056b3a0460c" in exc.detail
+            assert "9f29580d44ff78363f32585e926f384038de1f7f51dafde473375d69e73e69de" in exc.detail
         else:
             raise AssertionError("composition drift was accepted")
 
@@ -185,11 +212,61 @@ def test_exact_isolated_pair_reports_available_and_mismatch_does_not() -> None:
             "python_version": "3.14.7",
             "sdk_version": "0.1.0rc7",
             "runtime_version": "0.1.0rc7",
-            "composition_sha256": "176f00285a2bf8f7b01b69136b250183122d6a01a06d93c3f4dac056b3a0460c",
+            "composition_sha256": "9f29580d44ff78363f32585e926f384038de1f7f51dafde473375d69e73e69de",
         }
         assert bad.available is False
         assert bad.error == "HARNESS_RUNTIME_VERSION_MISMATCH"
         assert "0.1.0rc7/0.1.0rc7" in bad.detail
+
+
+def test_stock_runtime_identity_is_rejected_even_when_versions_match() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        python = executable(Path(raw) / "venv" / "bin" / "python")
+        evidence = json.loads(carrier_evidence(python))
+        evidence["carrier"] = None
+
+        status = deepseek_runtime.probe_carrier(
+            python, runner=mock.Mock(return_value=completed(stdout=json.dumps(evidence)))
+        )
+
+        assert status.available is False
+        assert status.error == "HARNESS_RUNTIME_ARTIFACT_DRIFT"
+
+
+def test_built_artifact_digest_drift_fails_before_install() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        directory = Path(raw)
+        write_artifact_evidence(directory)
+        next(directory.glob("deepseek_harness_sdk-*.whl")).write_bytes(b"changed")
+
+        try:
+            deepseek_runtime._load_built_artifacts(
+                directory, manifest=deepseek_runtime.load_runtime_manifest()
+            )
+        except deepseek_runtime.DeepSeekRuntimeError as exc:
+            assert exc.code == "HARNESS_RUNTIME_ARTIFACT_DRIFT"
+        else:
+            raise AssertionError("changed built artifact was accepted")
+
+
+def test_provider_request_patch_is_callable_exact_and_fail_closed() -> None:
+    assert deepseek_runtime.provider_request_options(
+        thinking="omit", reasoning_effort="omit"
+    ) == {"thinking": "omit", "reasoningEffort": "omit"}
+    assert deepseek_runtime.provider_request_options(
+        thinking="enabled", reasoning_effort="max"
+    ) == {"thinking": "enabled", "reasoningEffort": "max"}
+    assert deepseek_runtime.LIFECYCLE_METHODS == {
+        "session/start", "session/cancel", "session/inspect", "session/reconcile", "shutdown"
+    }
+    try:
+        deepseek_runtime.provider_request_options(
+            thinking="default", reasoning_effort="high"
+        )
+    except deepseek_runtime.DeepSeekRuntimeError as exc:
+        assert exc.code == "HARNESS_PROVIDER_OPTION_INVALID"
+    else:
+        raise AssertionError("unknown provider option was accepted")
 
 
 def test_bare_metal_install_uses_a_separate_venv_and_writes_version_evidence() -> None:
@@ -205,6 +282,9 @@ def test_bare_metal_install_uses_a_separate_venv_and_writes_version_evidence() -
                 return completed(stdout="[3, 14, 7]\n")
             if argv[1:3] == ["-m", "venv"]:
                 executable(Path(argv[3]) / "bin" / "python")
+                return completed()
+            if len(argv) > 1 and Path(argv[1]).name == "build_deepseek_carrier.py":
+                write_artifact_evidence(Path(argv[argv.index("--output-dir") + 1]))
                 return completed()
             if argv[1:4] == ["-m", "pip", "install"]:
                 return completed()
@@ -225,14 +305,16 @@ def test_bare_metal_install_uses_a_separate_venv_and_writes_version_evidence() -
         assert status.available is True
         assert status.carrier_python == str(expected_python)
         assert expected_python != bootstrap
-        assert calls[2][1:4] == ["-m", "pip", "install"]
-        assert calls[2][-1] == "deepseek-harness-sdk==0.1.0rc7"
+        assert Path(calls[2][1]).name == "build_deepseek_carrier.py"
+        assert calls[3][-1] == "pydantic>=2.12,<3"
+        assert calls[4][5:7] == ["--no-index", "--no-deps"]
         evidence = json.loads(
             (expected_python.parent.parent / "install-evidence.json").read_text()
         )
         assert evidence["sdk_version"] == "0.1.0rc7"
         assert evidence["runtime_version"] == "0.1.0rc7"
         assert evidence["source"]["commit"] == "bb4ca698d63714e753f5621b07400e6ebb0b5d97"
+        assert evidence["built_artifacts"]["patch_sha256"] == deepseek_runtime.load_runtime_manifest()["patch"]["sha256"]
         assert stat.S_IMODE(
             (expected_python.parent.parent / "install-evidence.json").stat().st_mode
         ) == 0o600
@@ -283,7 +365,7 @@ def test_unsupported_container_architecture_degrades_without_partial_carrier() -
         assert not target.exists()
         assert json.loads(marker.read_text()) == {
             "architecture": "s390x",
-            "detail": "official DeepSeek runtime has no Linux wheel for s390x",
+            "detail": "pinned DeepSeek carrier has no build target for s390x",
             "error": "HARNESS_RUNTIME_INCOMPATIBLE",
             "sdk_version": "0.1.0rc7",
         }
@@ -363,6 +445,10 @@ def test_dockerfile_delegates_container_acquisition_to_tested_optional_helper() 
     assert (
         "COPY .super-coder/scripts/deepseek_runtime.py "
         "/opt/super-coder/deepseek-bootstrap/scripts/deepseek_runtime.py"
+    ) in dockerfile
+    assert (
+        "COPY .super-coder/scripts/build_deepseek_carrier.py "
+        "/opt/super-coder/deepseek-bootstrap/scripts/build_deepseek_carrier.py"
     ) in dockerfile
     assert (
         "--install-container-carrier /opt/super-coder/deepseek-runtime "
