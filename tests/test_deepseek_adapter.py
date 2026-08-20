@@ -150,11 +150,6 @@ class FakeTransport:
         self.cancel_accepted = cancel_accepted
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.closed = False
-        skill_root = self.cwd / ".agents" / "skills"
-        self.runtime_skills = {
-            str(path.relative_to(skill_root)): path.read_text()
-            for path in sorted(skill_root.glob("*/SKILL.md"))
-        }
 
     def request(self, method: str, params: Mapping[str, Any]) -> Any:
         self.requests.append((method, dict(params)))
@@ -718,19 +713,10 @@ def test_silent_live_carrier_is_bounded_reconciled_and_scoped(tmp_path: Path) ->
     assert resumed.session_ref == turn.session_ref
 
 
-def test_exact_resume_refreshes_turn_environment_without_changing_boot_or_identity(tmp_path: Path) -> None:
+def test_exact_resume_refreshes_skill_root_without_changing_boot_or_identity(tmp_path: Path) -> None:
     worktree = tmp_path / "worktree"
     skill_root = worktree / ".agents" / "skills"
-    changed = skill_root / "changed" / "SKILL.md"
-    sibling = skill_root / "current" / "SKILL.md"
-    revoked = skill_root / "revoked" / "SKILL.md"
-    for path, body in (
-        (changed, "version one"),
-        (sibling, "sibling current"),
-        (revoked, "must disappear"),
-    ):
-        path.parent.mkdir(parents=True)
-        path.write_text(body)
+    skill_root.mkdir(parents=True)
     state = tmp_path / "state"
     first_factory = Factory()
     first = make_adapter(state, first_factory)
@@ -741,14 +727,8 @@ def test_exact_resume_refreshes_turn_environment_without_changing_boot_or_identi
     first.close()
     layout.process_identity.unlink()
 
-    assert first_factory.instances[0].runtime_skills == {
-        "changed/SKILL.md": "version one",
-        "current/SKILL.md": "sibling current",
-        "revoked/SKILL.md": "must disappear",
-    }
+    assert first_factory.instances[0].env["DSH_SKILL_ROOT"] == str(skill_root)
 
-    changed.write_text("version two")
-    revoked.unlink()
     second_factory = Factory(pid=54322)
     second = make_adapter(state, second_factory)
     refreshed = context(worktree, env={"TURN_MARKER": "two"})
@@ -760,10 +740,7 @@ def test_exact_resume_refreshes_turn_environment_without_changing_boot_or_identi
     assert stored_after == stored_before
     assert stored_after["boot_sha256"] == hashlib_sha256("immutable boot bytes")
     assert second_factory.instances[0].env["TURN_MARKER"] == "two"
-    assert second_factory.instances[0].runtime_skills == {
-        "changed/SKILL.md": "version two",
-        "current/SKILL.md": "sibling current",
-    }
+    assert second_factory.instances[0].env["DSH_SKILL_ROOT"] == str(skill_root)
     second.close()
 
 

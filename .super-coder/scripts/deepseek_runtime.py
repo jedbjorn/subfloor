@@ -970,6 +970,7 @@ def launch_environment(
             "DSH_SESSION_ROOT": str(layout.session_root),
             "DSH_CORDIS_CONFIG": str(ENGINE / "assets" / "deepseek" / "cordis.yml"),
             "DSH_CWD": str(worktree.resolve()),
+            "DSH_SKILL_ROOT": str(worktree.resolve() / ".agents" / "skills"),
             "DSH_SYSTEM_PROMPT": system_prompt,
             "DEEPSEEK_API_KEY": api_key,
             "PYTHONNOUSERSITE": "1",

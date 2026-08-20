@@ -177,6 +177,10 @@ def build(source: Path, output: Path, manifest: Mapping[str, object]) -> dict[st
         "pnpm",
     ]
     checked_run([*pnpm, "install", "--frozen-lockfile"], cwd=source, env=environment)
+    # These pinned native suites prove the production skill provider/tool seam:
+    # current discovery, catalog addition/removal, exact-session resume, and
+    # latest-body loading. The composition digest separately binds this stack
+    # to the engine-rendered grant root.
     checked_run(
         [
             *pnpm,
@@ -185,6 +189,8 @@ def build(source: Path, output: Path, manifest: Mapping[str, object]) -> dict[st
             "run",
             "packages/sdk/server/tests/server.spec.ts",
             "packages/llm/llm-deepseek/tests/serialize.spec.ts",
+            "packages/skill/skill-filesystem/tests/skill-filesystem.spec.ts",
+            "packages/skill/tool-skill/tests/tool-skill.spec.ts",
         ],
         cwd=source,
         env=environment,

@@ -178,13 +178,33 @@ def test_composition_is_exact_and_contains_only_the_reviewed_plugin_allowlist() 
     )
 
 
+def test_composition_enables_native_skills_only_from_the_rendered_grant_root() -> None:
+    manifest = deepseek_runtime.load_runtime_manifest()
+    composition = ROOT / ".super-coder" / manifest["composition"]["path"]
+    body = composition.read_text()
+
+    assert "skills:\n      enabled: true" in body
+    assert "includeDefaultRoots: false" in body
+    assert "- !!js process.env.DSH_SKILL_ROOT" in body
+    assert "watch: false" in body
+    assert "DSH_AGENTS_HOME" not in body
+    assert "DSH_BUNDLED_SKILL_DIR" not in body
+
+
+def test_verified_carrier_build_exercises_native_skill_refresh_and_resume() -> None:
+    recipe = (ROOT / ".super-coder" / "scripts" / "build_deepseek_carrier.py").read_text()
+
+    assert "packages/skill/skill-filesystem/tests/skill-filesystem.spec.ts" in recipe
+    assert "packages/skill/tool-skill/tests/tool-skill.spec.ts" in recipe
+
+
 def test_composition_digest_drift_fails_closed() -> None:
     with mock.patch.object(deepseek_runtime, "_sha256", return_value="0" * 64):
         try:
             deepseek_runtime.load_runtime_manifest()
         except deepseek_runtime.DeepSeekRuntimeError as exc:
             assert exc.code == "HARNESS_COMPOSITION_DRIFT"
-            assert "9f29580d44ff78363f32585e926f384038de1f7f51dafde473375d69e73e69de" in exc.detail
+            assert "8c1e4a0988c2a00c457ba7d2b0fbf80dc02d5b0fd29a8e8f92567f09ef70f3c1" in exc.detail
         else:
             raise AssertionError("composition drift was accepted")
 
@@ -249,7 +269,7 @@ def test_exact_isolated_pair_reports_available_and_mismatch_does_not() -> None:
             "python_version": "3.14.7",
             "sdk_version": "0.1.0rc7",
             "runtime_version": "0.1.0rc7",
-            "composition_sha256": "9f29580d44ff78363f32585e926f384038de1f7f51dafde473375d69e73e69de",
+            "composition_sha256": "8c1e4a0988c2a00c457ba7d2b0fbf80dc02d5b0fd29a8e8f92567f09ef70f3c1",
         }
         assert bad.available is False
         assert bad.error == "HARNESS_RUNTIME_VERSION_MISMATCH"
@@ -750,6 +770,7 @@ def test_launch_environment_replaces_personal_state_and_redacts_credentials() ->
                 "PATH": "/usr/bin",
                 "DSH_HOME": "/home/operator/.dsh",
                 "DSH_SESSION_ROOT": "/tmp/shared",
+                "DSH_SKILL_ROOT": "/home/operator/.agents/skills",
                 "DSH_PROFILE": "mutable-personal-profile",
                 "DEEPSEEK_API_KEY": "old-secret",
             },
@@ -760,6 +781,7 @@ def test_launch_environment_replaces_personal_state_and_redacts_credentials() ->
         assert child["DSH_HOME"] == str(layout.home)
         assert child["DSH_SESSION_ROOT"] == str(layout.session_root)
         assert child["DSH_CWD"] == str(worktree)
+        assert child["DSH_SKILL_ROOT"] == str(worktree / ".agents" / "skills")
         assert child["DSH_SYSTEM_PROMPT"] == "immutable boot bytes"
         assert child["DEEPSEEK_API_KEY"] == "sk-private-credential"
         assert child["DEEPSEEK_BASE_URL"] == "https://api.deepseek.example/v1"

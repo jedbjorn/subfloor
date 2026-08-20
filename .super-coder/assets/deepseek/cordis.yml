@@ -36,7 +36,12 @@
     persona: !!js process.env.DSH_SYSTEM_PROMPT
     workspaceContext: false
     skills:
-      enabled: false
+      enabled: true
+      filesystem:
+        includeDefaultRoots: false
+        customSkillDirs:
+          - !!js process.env.DSH_SKILL_ROOT
+        watch: false
     toolBash:
       enableRunInBackground: false
     toolJobs: false

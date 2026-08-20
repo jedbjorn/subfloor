@@ -23,7 +23,7 @@
   },
   "build": {
     "path": "scripts/build_deepseek_carrier.py",
-    "sha256": "2a5dc5affc1dc3451cf47b2552cc0ed2def45fee4670772af3a335ad5a3452d2",
+    "sha256": "2b7c3ede160f48a6a7dfe06897f6fcea5e10cfdb9825e559d70186be8e4b2301",
     "lock_sha256": "f517dc3978d57531cda747df62a2abdde1df5b9f25415fcf1fc5d51f8b7547ea",
     "node_version": "24.18.1",
     "pnpm_version": "11.7.0",
@@ -42,6 +42,6 @@
   },
   "composition": {
     "path": "assets/deepseek/cordis.yml",
-    "sha256": "9f29580d44ff78363f32585e926f384038de1f7f51dafde473375d69e73e69de"
+    "sha256": "8c1e4a0988c2a00c457ba7d2b0fbf80dc02d5b0fd29a8e8f92567f09ef70f3c1"
   }
 }
