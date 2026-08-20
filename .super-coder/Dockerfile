@@ -72,6 +72,21 @@ LABEL sc.github_host_trust_sha256="${SC_GITHUB_HOST_TRUST_SHA256}"
 # .venv.
 RUN pip install --no-cache-dir "websockets==16.1.1"
 
+# DeepSeek Harness has a Python 3.10+ floor. Keep its official same-version
+# SDK/runtime pair in a dedicated carrier instead of adding either distribution
+# to the engine interpreter. The engine's bare-metal Python 3.9 floor therefore
+# remains unchanged; this image's Python 3.12 supplies the optional carrier.
+# The copied bootstrap is the same code the negative platform tests exercise.
+# It records published wheel hashes as provenance, verifies the installed pair's
+# exact versions, and degrades unsupported architecture/interpreter targets to a
+# stable marker without creating a partial carrier or failing the global image.
+ENV SC_DEEPSEEK_CARRIER_PYTHON=/opt/super-coder/deepseek-runtime/bin/python
+COPY .super-coder/scripts/deepseek_runtime.py /opt/super-coder/deepseek-bootstrap/scripts/deepseek_runtime.py
+COPY .super-coder/assets/deepseek /opt/super-coder/deepseek-bootstrap/assets/deepseek
+RUN python /opt/super-coder/deepseek-bootstrap/scripts/deepseek_runtime.py \
+      --install-container-carrier /opt/super-coder/deepseek-runtime "$(uname -m)" \
+      --json
+
 # GitHub CLI (gh) — shells open their own feature PRs from the sandbox.
 # Not in Debian's default repos, so add the official gh apt source. Auth is NOT
 # baked: the token arrives at runtime via GH_TOKEN (`./sc launch` forwards the

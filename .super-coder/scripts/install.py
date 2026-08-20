@@ -499,6 +499,40 @@ def ensure_harnesses() -> dict[str, str]:
     return status
 
 
+def deepseek_runtime_status(*, install: bool) -> dict[str, object]:
+    """Project the optional isolated carrier without gating core installation."""
+    try:
+        import deepseek_runtime
+
+        status = (
+            deepseek_runtime.ensure_carrier()
+            if install
+            else deepseek_runtime.runtime_status()
+        )
+        observed = status.sdk_version or "—"
+        if status.available:
+            print(
+                f"  ✓ {'deepseek':9} SDK/runtime {observed} in isolated "
+                f"Python {status.python_version} carrier"
+            )
+        else:
+            print(
+                f"  ⚠ {'deepseek':9} unavailable · {status.error}: "
+                f"{status.detail}"
+            )
+        return status.as_dict()
+    except Exception as exc:
+        # DeepSeek is an optional browser/Sprint capability. A broken or absent
+        # carrier must not narrow the engine's Python floor or abort core setup.
+        print(f"  ⚠ {'deepseek':9} unavailable · HARNESS_RUNTIME_INVALID: {exc}")
+        return {
+            "available": False,
+            "enabled": True,
+            "error": "HARNESS_RUNTIME_INVALID",
+            "detail": str(exc),
+        }
+
+
 # ── Docker preflight (the default run mode is a sandbox container) ────────────
 # Advisory only: real docker setup needs root + a re-login, so install GUIDES with
 # the right commands for the state it finds, never mutates. Mirrors the git/curl
@@ -880,6 +914,8 @@ def main(argv: list[str]) -> int:
     if "--update-harnesses" in argv:
         step("Updating harness CLIs to latest (claude + opencode + codex + vibe + kimi)")
         update_harnesses()
+        step("Ensuring isolated DeepSeek runtime")
+        deepseek_runtime_status(install=True)
         return 0
 
     # Standalone: just ensure the harness CLIs and exit (for an already-installed
@@ -887,6 +923,8 @@ def main(argv: list[str]) -> int:
     if "--ensure-harness" in argv:
         step("Ensuring harness CLIs (claude + opencode + codex + vibe + kimi)")
         ensure_harnesses()
+        step("Ensuring isolated DeepSeek runtime")
+        deepseek_runtime_status(install=True)
         return 0
 
     # Standalone preflight (re-run after configuring docker / logging in) —
@@ -946,6 +984,8 @@ def main(argv: list[str]) -> int:
         global_pointer.write_global_pointers()
     else:
         ensure_harnesses()
+    step("DeepSeek isolated runtime")
+    deepseek_runtime_status(install=not skip_harness)
     harness = detect_harness() or "claude"  # claude preferred; both should be present
     print(f"  → default harness for instance.json: {harness}")
 
