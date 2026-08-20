@@ -344,6 +344,12 @@ def runtime_status(
             detail=exc.detail,
             manifest=manifest,
         )
+    if not python.is_file():
+        marker = container_incompatibility_marker(python)
+        if marker.is_file():
+            return read_container_incompatibility(
+                marker, python=python, manifest=manifest
+            )
     return probe_carrier(python, runner=runner, manifest=manifest)
 
 
@@ -398,6 +404,83 @@ def discover_bootstrap_python(
     return None, detail
 
 
+def container_runtime_platform(architecture: str) -> str | None:
+    """Map a Linux machine architecture to an rc7 runtime wheel family."""
+    normalized = architecture.strip().lower()
+    return {
+        "amd64": "linux-x64",
+        "x86_64": "linux-x64",
+        "arm64": "linux-arm64",
+        "aarch64": "linux-arm64",
+    }.get(normalized)
+
+
+def container_incompatibility_marker(python: Path) -> Path:
+    return python.parent.parent.with_suffix(".unavailable.json")
+
+
+def _write_container_incompatibility(
+    marker: Path,
+    *,
+    architecture: str,
+    detail: str,
+    manifest: Mapping[str, object],
+) -> None:
+    sdk = manifest["sdk"]
+    assert isinstance(sdk, dict)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
+    payload = {
+        "error": "HARNESS_RUNTIME_INCOMPATIBLE",
+        "detail": detail,
+        "architecture": architecture,
+        "sdk_version": sdk["version"],
+    }
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        with os.fdopen(descriptor, "w") as target:
+            json.dump(payload, target, separators=(",", ":"), sort_keys=True)
+            target.write("\n")
+        os.replace(temporary, marker)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def read_container_incompatibility(
+    marker: Path,
+    *,
+    python: Path,
+    manifest: Mapping[str, object] | None = None,
+) -> RuntimeStatus:
+    manifest = load_runtime_manifest() if manifest is None else manifest
+    try:
+        evidence = json.loads(marker.read_text())
+        if evidence["error"] != "HARNESS_RUNTIME_INCOMPATIBLE":
+            raise ValueError("unexpected container incompatibility code")
+        detail = str(evidence["detail"])
+        architecture = str(evidence["architecture"])
+        sdk = manifest["sdk"]
+        assert isinstance(sdk, dict)
+        if evidence["sdk_version"] != sdk["version"]:
+            raise ValueError("container marker version does not match runtime manifest")
+    except (AssertionError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return _status(
+            available=False,
+            error="HARNESS_RUNTIME_EVIDENCE_INVALID",
+            detail=sanitize_diagnostic(f"invalid container marker {marker}: {exc}"),
+            python=python,
+            manifest=manifest,
+        )
+    return _status(
+        available=False,
+        error="HARNESS_RUNTIME_INCOMPATIBLE",
+        detail=f"{detail} (architecture: {architecture})",
+        python=python,
+        manifest=manifest,
+    )
+
+
 def _write_install_evidence(
     root: Path,
     *,
@@ -414,28 +497,24 @@ def _write_install_evidence(
         "runtime_version": status.runtime_version,
         "composition_sha256": status.composition_sha256,
         "source": manifest["source"],
-        "sdk": manifest["sdk"],
-        "runtime": manifest["runtime"],
+        "declared_sdk_artifact": manifest["sdk"],
+        "declared_runtime_artifacts": manifest["runtime"],
     }
     target = root / "install-evidence.json"
     target.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
     target.chmod(0o600)
 
 
-def ensure_carrier(
+def _install_carrier_at(
+    target_python: Path,
     *,
-    env: Mapping[str, str] | None = None,
-    engine: Path = ENGINE,
+    bootstrap: Path,
     runner=subprocess.run,
+    manifest: Mapping[str, object] | None = None,
 ) -> RuntimeStatus:
-    """Best-effort bare-metal install; never makes core installation fail."""
-    env = os.environ if env is None else env
-    current = runtime_status(env=env, engine=engine, runner=runner)
-    if not current.enabled or current.available:
-        return current
-    if env.get("SC_DEEPSEEK_CARRIER_PYTHON", "").strip():
-        return current
-    target_python = carrier_python(env=env, engine=engine)
+    manifest = load_runtime_manifest() if manifest is None else manifest
+    sdk = manifest["sdk"]
+    assert isinstance(sdk, dict)
     target_root = target_python.parent.parent
     if target_root.exists():
         return _status(
@@ -443,18 +522,8 @@ def ensure_carrier(
             error="HARNESS_RUNTIME_PARTIAL",
             detail=f"refusing to replace partial carrier: {target_root}",
             python=target_python,
+            manifest=manifest,
         )
-    bootstrap, observed = discover_bootstrap_python(env=env, runner=runner)
-    if bootstrap is None:
-        return _status(
-            available=False,
-            error="HARNESS_RUNTIME_INCOMPATIBLE",
-            detail=observed,
-            python=target_python,
-        )
-    manifest = load_runtime_manifest()
-    sdk = manifest["sdk"]
-    assert isinstance(sdk, dict)
     target_root.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{sdk['version']}-", dir=target_root.parent))
     try:
@@ -513,6 +582,84 @@ def ensure_carrier(
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
+
+
+def prepare_container_carrier(
+    target_root: Path,
+    *,
+    architecture: str,
+    bootstrap_python: Path = Path(sys.executable),
+    runner=subprocess.run,
+) -> RuntimeStatus:
+    """Install on supported Linux images; mark optional incompatibility otherwise."""
+    manifest = load_runtime_manifest()
+    target_python = target_root / "bin" / "python"
+    marker = container_incompatibility_marker(target_python)
+    platform = container_runtime_platform(architecture)
+    if platform is None:
+        detail = f"official DeepSeek runtime has no Linux wheel for {architecture or 'unknown'}"
+        _write_container_incompatibility(
+            marker,
+            architecture=architecture or "unknown",
+            detail=detail,
+            manifest=manifest,
+        )
+        return read_container_incompatibility(
+            marker, python=target_python, manifest=manifest
+        )
+    bootstrap, observed = discover_bootstrap_python(
+        env={"SC_DEEPSEEK_BOOTSTRAP_PYTHON": str(bootstrap_python)},
+        runner=runner,
+    )
+    if bootstrap is None:
+        detail = f"container has no Python 3.10+ carrier interpreter: {observed}"
+        _write_container_incompatibility(
+            marker,
+            architecture=architecture,
+            detail=detail,
+            manifest=manifest,
+        )
+        return read_container_incompatibility(
+            marker, python=target_python, manifest=manifest
+        )
+    status = _install_carrier_at(
+        target_python,
+        bootstrap=bootstrap,
+        runner=runner,
+        manifest=manifest,
+    )
+    if status.available and marker.exists():
+        marker.unlink()
+    return status
+
+
+def ensure_carrier(
+    *,
+    env: Mapping[str, str] | None = None,
+    engine: Path = ENGINE,
+    runner=subprocess.run,
+) -> RuntimeStatus:
+    """Best-effort bare-metal install; never makes core installation fail."""
+    env = os.environ if env is None else env
+    current = runtime_status(env=env, engine=engine, runner=runner)
+    if not current.enabled or current.available:
+        return current
+    if env.get("SC_DEEPSEEK_CARRIER_PYTHON", "").strip():
+        return current
+    target_python = carrier_python(env=env, engine=engine)
+    bootstrap, observed = discover_bootstrap_python(env=env, runner=runner)
+    if bootstrap is None:
+        return _status(
+            available=False,
+            error="HARNESS_RUNTIME_INCOMPATIBLE",
+            detail=observed,
+            python=target_python,
+        )
+    return _install_carrier_at(
+        target_python,
+        bootstrap=bootstrap,
+        runner=runner,
+    )
 
 
 def conversation_layout(
@@ -648,14 +795,35 @@ def record_process_identity(
 
 
 def main(argv: Sequence[str]) -> int:
-    status = ensure_carrier() if "--ensure" in argv else runtime_status()
+    container_install = "--install-container-carrier" in argv
+    if container_install:
+        index = argv.index("--install-container-carrier")
+        try:
+            target_root = Path(argv[index + 1])
+            architecture = argv[index + 2]
+        except IndexError:
+            raise SystemExit(
+                "deepseek-runtime: --install-container-carrier requires "
+                "<absolute-target-root> <architecture>"
+            )
+        if not target_root.is_absolute():
+            raise SystemExit(
+                "deepseek-runtime: container carrier target must be absolute"
+            )
+        status = prepare_container_carrier(
+            target_root, architecture=architecture
+        )
+    else:
+        status = ensure_carrier() if "--ensure" in argv else runtime_status()
     if "--json" in argv:
         print(json.dumps(status.as_dict(), indent=2, sort_keys=True))
     else:
         observed = status.sdk_version or "—"
         detail = "available" if status.available else status.error
         print(f"deepseek {observed} · {detail}")
-    return 0
+    if not container_install:
+        return 0
+    return 0 if status.available or status.error == "HARNESS_RUNTIME_INCOMPATIBLE" else 1
 
 
 if __name__ == "__main__":

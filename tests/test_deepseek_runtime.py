@@ -2,12 +2,14 @@
 """Isolated DeepSeek SDK/runtime carrier contracts."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import stat
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -253,6 +255,120 @@ def test_absent_compatible_bootstrap_does_not_create_a_partial_carrier() -> None
         assert status.error == "HARNESS_RUNTIME_INCOMPATIBLE"
         assert not engine.exists()
         assert runner.call_count == 1
+
+
+def test_unsupported_container_architecture_degrades_without_partial_carrier() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        target = Path(raw) / "deepseek-runtime"
+        runner = mock.Mock(
+            side_effect=AssertionError("unsupported architecture must not install")
+        )
+
+        status = deepseek_runtime.prepare_container_carrier(
+            target,
+            architecture="s390x",
+            runner=runner,
+        )
+        projected = deepseek_runtime.runtime_status(
+            env={
+                "SC_DEEPSEEK_CARRIER_PYTHON": str(target / "bin" / "python")
+            },
+            runner=runner,
+        )
+
+        marker = target.with_suffix(".unavailable.json")
+        assert status.available is False
+        assert status.error == "HARNESS_RUNTIME_INCOMPATIBLE"
+        assert status.carrier_python == str(target / "bin" / "python")
+        assert not target.exists()
+        assert json.loads(marker.read_text()) == {
+            "architecture": "s390x",
+            "detail": "official DeepSeek runtime has no Linux wheel for s390x",
+            "error": "HARNESS_RUNTIME_INCOMPATIBLE",
+            "sdk_version": "0.1.0rc7",
+        }
+        assert projected.error == "HARNESS_RUNTIME_INCOMPATIBLE"
+        assert "architecture: s390x" in projected.detail
+        runner.assert_not_called()
+
+
+def test_unsupported_container_cli_exits_successfully_for_global_image_build() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        target = Path(raw) / "deepseek-runtime"
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            returncode = deepseek_runtime.main(
+                [
+                    "--install-container-carrier",
+                    str(target),
+                    "s390x",
+                    "--json",
+                ]
+            )
+
+        payload = json.loads(output.getvalue())
+        assert returncode == 0
+        assert payload["available"] is False
+        assert payload["error"] == "HARNESS_RUNTIME_INCOMPATIBLE"
+        assert not target.exists()
+        assert target.with_suffix(".unavailable.json").is_file()
+
+
+def test_python39_container_degrades_on_supported_architecture_without_install() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        target = root / "deepseek-runtime"
+        bootstrap = executable(root / "python3.9")
+        runner = mock.Mock(return_value=completed(stdout="[3, 9, 19]\n"))
+
+        status = deepseek_runtime.prepare_container_carrier(
+            target,
+            architecture="x86_64",
+            bootstrap_python=bootstrap,
+            runner=runner,
+        )
+
+        assert status.available is False
+        assert status.error == "HARNESS_RUNTIME_INCOMPATIBLE"
+        assert "no Python 3.10+ carrier interpreter" in status.detail
+        assert not target.exists()
+        assert target.with_suffix(".unavailable.json").is_file()
+        assert runner.call_count == 1
+        assert runner.call_args.args[0] == [
+            str(bootstrap.resolve()),
+            "-I",
+            "-c",
+            deepseek_runtime._PYTHON_VERSION_PROBE,
+        ]
+
+
+def test_container_platform_map_matches_every_published_linux_wheel_family() -> None:
+    assert {
+        architecture: deepseek_runtime.container_runtime_platform(architecture)
+        for architecture in ("amd64", "x86_64", "arm64", "aarch64", "s390x")
+    } == {
+        "amd64": "linux-x64",
+        "x86_64": "linux-x64",
+        "arm64": "linux-arm64",
+        "aarch64": "linux-arm64",
+        "s390x": None,
+    }
+
+
+def test_dockerfile_delegates_container_acquisition_to_tested_optional_helper() -> None:
+    dockerfile = (ROOT / ".super-coder" / "Dockerfile").read_text()
+    folded = dockerfile.replace("\\\n", " ")
+
+    assert (
+        "COPY .super-coder/scripts/deepseek_runtime.py "
+        "/opt/super-coder/deepseek-bootstrap/scripts/deepseek_runtime.py"
+    ) in dockerfile
+    assert (
+        "--install-container-carrier /opt/super-coder/deepseek-runtime "
+        '"$(uname -m)"'
+    ) in folded
+    assert "RUN python -m venv /opt/super-coder/deepseek-runtime" not in folded
 
 
 def test_conversations_receive_distinct_private_roots_and_process_evidence() -> None:
