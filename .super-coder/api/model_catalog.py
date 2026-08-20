@@ -100,6 +100,9 @@ DEEPSEEK_BASE_URL_ENV = "DEEPSEEK_BASE_URL"
 DEEPSEEK_PUBLIC_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_SOURCE = "deepseek-provider-api"
 DEEPSEEK_DISCOVERY_ERROR = "authenticated DeepSeek model discovery failed"
+DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED = (
+    "DeepSeek provider-option mapper has no outbound wire proof"
+)
 DEEPSEEK_NAMED_EFFORTS = ("low", "high", "max")
 
 # The ids the engine ships in flavor_defaults — surfaced only when every live
@@ -288,7 +291,10 @@ def _from_deepseek_api(fetch, env) -> list[dict]:
             model,
             name=(row.get("name") if isinstance(row, dict) else None) or model,
             source=DEEPSEEK_SOURCE,
-            availability="available",
+            # Authenticated discovery proves the exact provider id, not the
+            # provider-option mapper.  U78 promotes this only after U77's
+            # bridge seam captures default/named outbound request bytes.
+            availability="advisory",
             provider=route_bindings.DEEPSEEK_PROVIDER_ROUTE,
             provider_model=model,
             supported_efforts=list(DEEPSEEK_NAMED_EFFORTS),
@@ -427,6 +433,8 @@ def build(fetch=_http_json, env=os.environ, run=subprocess.run) -> dict:
             deepseek = []
             errors.append(f"{DEEPSEEK_SOURCE}: {DEEPSEEK_DISCOVERY_ERROR}")
         harnesses["deepseek"] = deepseek
+        if deepseek:
+            harness_errors["deepseek"] = DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED
         if not deepseek:
             harness_errors["deepseek"] = DEEPSEEK_DISCOVERY_ERROR
         if deepseek:
@@ -889,7 +897,10 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
     for harness, block in (payload.get("harnesses") or {}).items():
         for entry in block.get("models") or []:
             status = harness_statuses.get(harness) or {}
-            if not _compatible_route_status(harness, entry, status):
+            if (
+                (harness == "deepseek" and entry.get("availability") != "available")
+                or not _compatible_route_status(harness, entry, status)
+            ):
                 rejected_routes[(harness, entry["id"])] = _compatibility_error(
                     harness, entry, status
                 )
@@ -1273,7 +1284,11 @@ def controlled_route_evidence(
     except Exception:  # noqa: BLE001 (unreadable live evidence is stale)
         entries = []
     entry = next((item for item in entries if item["id"] == selector), None)
-    if entry is not None and _compatible_route_status(harness, entry, status):
+    if (
+        entry is not None
+        and entry.get("availability") == "available"
+        and _compatible_route_status(harness, entry, status)
+    ):
         fingerprint = _entry_evidence(
             harness, entry, status
         )["source_fingerprint"]

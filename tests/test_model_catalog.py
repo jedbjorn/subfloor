@@ -457,7 +457,8 @@ class BuildTest(NoCLI):
             {"Authorization": "Bearer secret-key"},
         ))
         route = block["models"][0]
-        self.assertEqual(route["availability"], "available")
+        self.assertEqual(route["availability"], "advisory")
+        self.assertEqual(block["error"], mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
         self.assertEqual(route["provider"], "deepseek-official")
         self.assertEqual(route["provider_model"], "deepseek-v4-pro")
         self.assertEqual(route["supported_efforts"], ["low", "high", "max"])
@@ -522,7 +523,7 @@ class BuildTest(NoCLI):
 
         self.assertEqual(proof["runtime_status"], status)
         self.assertEqual(proof["runtime_scope"], scope)
-        self.assertRegex(proof["source_fingerprint"], r"^[0-9a-f]{64}$")
+        self.assertIsNone(proof["source_fingerprint"])
         self.assertEqual(calls, [(
             "https://api.deepseek.com/models",
             {"Authorization": "Bearer secret-key"},
@@ -710,6 +711,38 @@ class RoutePersistenceTest(unittest.TestCase):
             "SELECT selector, availability, headless_supported, "
             "high_effort_supported, stale FROM model_routes").fetchone()
         self.assertEqual(tuple(row), ("kimi-code/k3", "available", 1, 1, 0))
+
+    def test_authenticated_deepseek_ids_stay_unbindable_before_wire_proof(self):
+        entries = mc._from_deepseek_api(
+            lambda _url, _headers: {"data": [{"id": "deepseek-v4-pro"}]},
+            {"DEEPSEEK_API_KEY": "secret-key"},
+        )
+        payload = {
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "stale": False,
+            "harnesses": {"deepseek": {
+                "models": entries,
+                "error": mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
+            }},
+            **self.verification("deepseek", "0.1.0rc7"),
+        }
+
+        mc.persist_routes(self.con, payload)
+
+        row = self.con.execute(
+            "SELECT availability,source_fingerprint,stale FROM model_routes "
+            "WHERE harness='deepseek' AND selector='deepseek-v4-pro'"
+        ).fetchone()
+        self.assertIsNone(row)
+        refused = routes_cli.resolve(
+            self.con,
+            "deepseek",
+            "deepseek-v4-pro",
+            effort="default",
+        )
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["code"], "thinking_evidence_missing")
+        self.assertIsNone(refused.get("binding"))
 
     def test_failed_refresh_keeps_route_and_marks_it_stale(self):
         fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
