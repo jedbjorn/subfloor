@@ -1,5 +1,11 @@
 {
   "allowed_reference_files": [
+    ".super-coder/adapters/claude/adapter.json",
+    ".super-coder/adapters/codex/adapter.json",
+    ".super-coder/adapters/deepseek/adapter.json",
+    ".super-coder/adapters/kimi/adapter.json",
+    ".super-coder/adapters/opencode/adapter.json",
+    ".super-coder/adapters/vibe/adapter.json",
     ".super-coder/assets/skill_tombstones.json",
     ".super-coder/migrations/0146_sprint_v2_domain.sql",
     ".super-coder/migrations/0147_sprint_participant_conversations.sql",
@@ -33,6 +39,7 @@
     ".super-coder/scripts/sprint_pr_watcher.py",
     ".super-coder/scripts/sprint_recovery.py",
     ".super-coder/scripts/sprint_review_loop.py",
+    ".super-coder/scripts/harness_surfaces.py",
     ".super-coder/api/route_bindings.py",
     ".super-coder/migrations/0144_remove_sprint_v1.sql",
     "tests/fixtures/sprint_removal/build_pre_removal_fixture.py",
@@ -55,6 +62,7 @@
     "tests/test_sprint_cleanup.py",
     "tests/test_sprint_cli.py",
     "tests/test_sprint_skills.py",
+    "tests/test_harness_surfaces.py",
     "tests/test_focused_dev_verification.py",
     "tests/test_sprint_snapshot_rebuild.py",
     "tests/test_route_bindings.py",

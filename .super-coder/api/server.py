@@ -491,6 +491,11 @@ def _historical_harnesses(con) -> set[str]:
     ):
         if table not in tables:
             continue
+        columns = {
+            row[1] for row in con.execute(f'PRAGMA table_info("{table}")')
+        }
+        if "harness" not in columns:
+            continue
         found.update(
             row[0]
             for row in con.execute(
