@@ -1763,9 +1763,9 @@ class GenerationPersistenceTest(unittest.TestCase):
             ),
             (
                 "age-expired",
-                (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(),
+                (datetime.now(timezone.utc) - timedelta(days=7, hours=1)).isoformat(),
                 None,
-                "Route evidence is older than 24 hours",
+                "Route evidence is older than 7 days",
             ),
         )
         for name, fetched_at, supplied_fingerprint, message in cases:
@@ -1803,6 +1803,30 @@ class GenerationPersistenceTest(unittest.TestCase):
                 )
                 self.assertFalse(refused_again["ok"])
                 self.assertEqual(refused_again["code"], "thinking_evidence_stale")
+
+    def test_authoritative_resolution_accepts_evidence_older_than_one_day(self):
+        now = datetime.now(timezone.utc)
+        payload = self.payload("age-within-seven-days")
+        payload["fetched_at"] = (now - timedelta(hours=25)).isoformat()
+        model_catalog.persist_routes(self.con, payload)
+        row = dict(self.con.execute(
+            "SELECT * FROM model_routes WHERE selector='age-within-seven-days'"
+        ).fetchone())
+
+        got = resolve_controlled(
+            self.con,
+            "codex",
+            "age-within-seven-days",
+            fingerprint=row["source_fingerprint"],
+            now=now,
+        )
+
+        self.assertTrue(got["ok"])
+        stored = self.con.execute(
+            "SELECT stale,last_error FROM model_routes "
+            "WHERE selector='age-within-seven-days'"
+        ).fetchone()
+        self.assertEqual(tuple(stored), (0, None))
 
     def test_wrong_seat_source_proof_does_not_stale_shared_route(self):
         model_catalog.persist_routes(self.con, self.payload("seat-bound"))

@@ -19,7 +19,7 @@ import harness_versions
 from conversation_adapters.base import AdapterError, checked_version_compatibility
 
 CONTRACT_VERSION = 2
-FRESH_HOURS = 24
+FRESH_HOURS = 7 * 24
 HARNESS_SUPPORT_STATES = frozenset({"tested", "best-effort"})
 LEGACY_HARNESS_EVIDENCE_FORMAT = "legacy-semver"
 RAW_HARNESS_EVIDENCE_FORMAT = "raw-observed-v1"
@@ -781,7 +781,7 @@ def _validate_route_freshness(
     if _age_hours(row.get("last_seen_at"), now) > FRESH_HOURS:
         raise RouteResolutionError(
             "thinking_evidence_stale",
-            "Route evidence is older than 24 hours",
+            "Route evidence is older than 7 days",
             {"harness": harness, "model": model, "remediation": "sc models refresh"},
         )
 
@@ -875,7 +875,7 @@ def _require_fresh_route(
         if _age_hours(latest["completed_at"], check_time) > FRESH_HOURS:
             raise RouteResolutionError(
                 "thinking_evidence_stale",
-                "Latest successful catalogue generation is older than 24 hours",
+                "Latest successful catalogue generation is older than 7 days",
                 {"harness": harness, "model": model,
                  "remediation": "sc models refresh"},
             )
