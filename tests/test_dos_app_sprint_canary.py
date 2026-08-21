@@ -985,6 +985,68 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         self.assertNotIn("model", projected)
         self.assertEqual("gpt-test", projected["route"]["model"])
 
+    def test_launch_refreshes_routes_before_reading_provider_credential(self) -> None:
+        backend = canary.HostBackend(
+            canary.Deadline(100, 50), sleep=lambda _: None
+        )
+        config = dataclasses.replace(
+            self.config,
+            profile=canary.DEEPSEEK_SPRINT_PROFILE,
+            credential_file=self.root / "authorized-provider.key",
+        )
+        events: list[str] = []
+        run_envs: dict[str, dict[str, str]] = {}
+
+        def fake_run(argv, *, cwd=None, env=None, check=True, label):
+            events.append(label)
+            run_envs[label] = dict(env or {})
+            if label == "inspect launched harness versions":
+                return canary.CommandResult(
+                    "codex codex-cli-test\ndeepseek deepseek-test\n", "", 0
+                )
+            return canary.CommandResult("", "", 0)
+
+        def fake_read(_path):
+            events.append("read provider credential")
+            return "provider-canary-secret-value"
+
+        backend._run = fake_run  # type: ignore[method-assign]
+        backend._read_provider_key = fake_read  # type: ignore[method-assign]
+        health = mock.Mock()
+        health.request.return_value = {"status": "ok"}
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "unrelated-secret",
+                "ANTHROPIC_API_KEY": "unrelated-secret",
+            },
+        ), mock.patch.object(canary, "JsonHttp", return_value=health):
+            versions = backend.launch(config, self.facts, canary.ResourceLedger())
+
+        self.assertEqual(
+            [
+                "refresh isolated model routes",
+                "read provider credential",
+                "launch isolated runtime",
+                "inspect launched harness versions",
+            ],
+            events,
+        )
+        refresh_env = run_envs["refresh isolated model routes"]
+        self.assertTrue(
+            canary.PROVIDER_CREDENTIAL_ENV.isdisjoint(refresh_env)
+        )
+        launch_env = run_envs["launch isolated runtime"]
+        self.assertEqual(
+            {"OLLAMA_API_KEY"},
+            canary.PROVIDER_CREDENTIAL_ENV.intersection(launch_env),
+        )
+        self.assertEqual(
+            {"codex": "codex-cli-test", "deepseek": "deepseek-test"},
+            versions,
+        )
+
     def test_live_materialization_uses_exact_sha_refspec_and_verifies_pin(self) -> None:
         clock = FakeClock()
         deadline = canary.Deadline(100, 50, clock=clock)

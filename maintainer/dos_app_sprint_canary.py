@@ -1020,6 +1020,13 @@ class HostBackend:
         self, config: CanaryConfig, facts: Preflight, ledger: ResourceLedger
     ) -> dict[str, str]:
         self._release_ports()
+        env = self._runtime_env(facts)
+        self._run(
+            [str(facts.workspace / "sc"), "models", "refresh"],
+            cwd=facts.workspace,
+            env=env,
+            label="refresh isolated model routes",
+        )
         if config.profile == DEEPSEEK_SPRINT_PROFILE:
             self._provider_key = self._read_provider_key(config.credential_file)
         env = self._runtime_env(facts)
