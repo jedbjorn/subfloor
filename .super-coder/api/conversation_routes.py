@@ -2043,6 +2043,7 @@ def _transcript_projection(
         segments_by_run: dict[int, dict[int, list[dict]]] = {}
         context_tokens_by_run: dict[int, dict[int, int]] = {}
         latest_assistant_anchor_by_run: dict[int, int] = {}
+        latest_assistant_segment_by_run: dict[int, tuple[int, int, str]] = {}
         evidence_count_by_run: dict[int, int] = {}
         activities = []
         boundary_types = {
@@ -2067,8 +2068,30 @@ def _transcript_projection(
                 evidence_count_by_run[int(run_id)] = (
                     evidence_count_by_run.get(int(run_id), 0) + 1
                 )
+            if run_id is not None and event["event_type"] in boundary_types:
+                latest_assistant_segment_by_run.pop(int(run_id), None)
             if event["event_type"] == "assistant.delta" and run_id is not None:
-                anchor = event["segment_anchor_sequence"]
+                run_id = int(run_id)
+                native_anchor = event["segment_anchor_sequence"]
+                segment = event["payload"].get("segment")
+                if segment not in {"answer", "reasoning"}:
+                    segment = "answer"
+                previous = latest_assistant_segment_by_run.get(run_id)
+                if previous is not None and previous[0] == native_anchor:
+                    anchor = (
+                        previous[1]
+                        if previous[2] == segment
+                        else event["sequence"]
+                    )
+                else:
+                    anchor = native_anchor
+                event["segment_anchor_sequence"] = anchor
+                event["assistant_segment"] = segment
+                latest_assistant_segment_by_run[run_id] = (
+                    native_anchor,
+                    anchor,
+                    segment,
+                )
                 segments_by_run.setdefault(int(run_id), {}).setdefault(
                     anchor,
                     [],
@@ -2146,6 +2169,7 @@ def _transcript_projection(
                             delta["payload"]["text"] for delta in deltas
                         ),
                         "outcome": run["state"],
+                        "segment": deltas[0]["assistant_segment"],
                         "segment_anchor_sequence": anchor,
                         "first_sequence": deltas[0]["sequence"],
                         "last_sequence": deltas[-1]["sequence"],
@@ -2259,10 +2283,15 @@ def _transcript_projection(
         }
         if include_active_run and int(active_run_id) in run_by_id:
             active_run = run_by_id[int(active_run_id)]
+            active_segment = latest_assistant_segment_by_run.get(
+                int(active_run_id)
+            )
             projection["assistant_cursor"] = {
                 "run_id": int(active_run_id),
                 "segment_anchor_sequence": int(
-                    active_run["latest_boundary_sequence"]
+                    active_segment[1]
+                    if active_segment is not None
+                    else active_run["latest_boundary_sequence"]
                 ),
             }
         if warnings:

@@ -468,6 +468,10 @@ body.interface-view main {
 }
 .chat-bubble.chat-user { align-self: flex-end; background: #202936; border-color: #2c3b50; }
 .chat-bubble.chat-assistant { align-self: flex-start; }
+.chat-bubble.chat-assistant.chat-reasoning {
+  background: color-mix(in srgb, var(--panel) 88%, var(--accent));
+  border-style: dashed; color: var(--dim);
+}
 .chat-bubble.chat-activity {
   align-self: flex-start; background: transparent; border-style: dashed;
   color: var(--dim); font-size: .78rem; padding: .4rem .65rem;
@@ -491,6 +495,9 @@ body.interface-view main {
 .chat-context-tokens {
   color: var(--dim); font-size: .64rem; margin-top: .35rem; text-align: right;
   font-variant-numeric: tabular-nums;
+}
+.chat-harness-unavailable {
+  color: var(--warn); font-size: .72rem; grid-column: 1 / -1;
 }
 .chat-retry {
   margin-top: .4rem; background: transparent; color: var(--accent);

@@ -72,6 +72,7 @@ class ConversationApiCase(unittest.TestCase):
         versions = {
             "claude": ("2.1.222", "2.1.220", "2.2.0"),
             "codex": ("0.145.0", "0.145.0", "0.147.0"),
+            "deepseek": ("0.1.0rc7", "0.1.0rc7", "0.1.0rc8"),
             "kimi": ("0.33.0", "0.30.0", "0.34.0"),
             "opencode": ("1.18.9", "1.18.9", "1.19.0"),
         }
@@ -596,6 +597,30 @@ class ConversationApiCase(unittest.TestCase):
 
 
 class ConversationResourceTest(ConversationApiCase):
+    def test_deepseek_new_chat_requires_an_exact_route_without_writing(self) -> None:
+        status, _, error = self.request(
+            "POST",
+            "/api/conversations",
+            body={"shell_id": 1, "harness": "deepseek", "model": None},
+            key="deepseek-without-route",
+        )
+
+        self.assertEqual(status, 422, error)
+        self.assertEqual(error["error"], {
+            "code": "thinking_evidence_missing",
+            "message": "DeepSeek requires an authenticated exact model route",
+            "details": {
+                "harness": "deepseek",
+                "model": None,
+                "remediation": "sc models refresh",
+            },
+        })
+        with closing(self.connect()) as con:
+            count = con.execute(
+                "SELECT COUNT(*) FROM conversations WHERE harness='deepseek'"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
     def test_write_contention_returns_a_retryable_service_error(self) -> None:
         with mock.patch.object(
             conversation_routes.db_driver,
@@ -2623,6 +2648,80 @@ class ConversationPerformanceFixtureTest(ConversationApiCase):
         self.assertEqual(assistant["kind"], "assistant")
         self.assertEqual(assistant["text"], "answer")
         self.assertEqual(assistant["context_tokens"], 12345)
+
+    def test_reasoning_and_answer_deltas_remain_distinct_ordered_segments(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=702,
+                state="closed",
+            )
+            _message_id, run_id, _through = self.seed_segmented_trace(
+                con,
+                conversation_id=conversation_id,
+                events=(
+                    ("assistant.delta", {"text": "answer one", "segment": "answer"}),
+                    ("assistant.delta", {"text": "reason ", "segment": "reasoning"}),
+                    ("assistant.delta", {"text": "continued", "segment": "reasoning"}),
+                    ("assistant.delta", {"text": "answer two", "segment": "answer"}),
+                ),
+            )
+            con.commit()
+
+        status, _, transcript = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/transcript",
+        )
+
+        self.assertEqual(status, 200, transcript)
+        assistants = [
+            item for item in transcript["items"] if item["kind"] == "assistant"
+        ]
+        self.assertEqual(
+            [
+                (
+                    item["item_id"],
+                    item["segment"],
+                    item["text"],
+                    item["first_sequence"],
+                    item["last_sequence"],
+                )
+                for item in assistants
+            ],
+            [
+                (f"run:{run_id}:assistant:0", "answer", "answer one", 3, 3),
+                (f"run:{run_id}:assistant:4", "reasoning", "reason continued", 4, 5),
+                (f"run:{run_id}:assistant:6", "answer", "answer two", 6, 6),
+            ],
+        )
+        self.assertNotIn("reasoning", assistants[0]["text"])
+
+    def test_unknown_assistant_segment_fails_closed_to_answer_rendering(self) -> None:
+        with closing(self.connect()) as con:
+            conversation_id = self.seed_conversation(
+                con,
+                number=703,
+                state="closed",
+            )
+            self.seed_segmented_trace(
+                con,
+                conversation_id=conversation_id,
+                events=(("assistant.delta", {"text": "visible", "segment": "future"}),),
+            )
+            con.commit()
+
+        status, _, transcript = self.request(
+            "GET",
+            f"/api/conversations/{conversation_id}/transcript",
+        )
+
+        self.assertEqual(status, 200, transcript)
+        assistants = [
+            item for item in transcript["items"] if item["kind"] == "assistant"
+        ]
+        self.assertEqual(len(assistants), 1)
+        self.assertEqual(assistants[0]["segment"], "answer")
+        self.assertEqual(assistants[0]["text"], "visible")
 
     def test_segmented_plain_prose_keeps_one_stable_anchor_zero_item(self) -> None:
         self.assert_historical_segment_trace("plain_prose")
