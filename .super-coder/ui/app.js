@@ -2829,6 +2829,17 @@ function chatHarnessUnavailableReason(status) {
 
 const chatRequiresExactRoute = (harness) => harness === "deepseek";
 
+function chatExactRouteUnavailableReason(conversation, catalog) {
+  const route = conversation?.route || {};
+  if (!chatRequiresExactRoute(route.harness)) return null;
+  const exact = (catalog?.harnesses?.[route.harness]?.models || [])
+    .find((candidate) => candidate.id === route.model);
+  if (!route.model || catalog?.stale || !exact || exact.stale
+      || exact.availability !== "available")
+    return "HARNESS_ROUTE_UNAVAILABLE";
+  return null;
+}
+
 function chatStartedLabel(conversation) {
   if (!conversation.created_at) return "Start time unavailable";
   const raw = String(conversation.created_at);
@@ -4317,7 +4328,7 @@ function chatFlushTranscript(
 
 async function chatRenderOpen(
   host, initialConversation, initialSnapshot, harnessStatus = null,
-  onWakeDelivered = null,
+  modelCatalog = null, onWakeDelivered = null,
 ) {
   const generation = chatRenderGeneration;
   let conversation = initialConversation;
@@ -4602,7 +4613,8 @@ async function chatRenderOpen(
     // owned only for that window. Reopen is scope-blocked server-side forever.
     const sprintManaged = Boolean(conversation.sprint_managed);
     const reopenable = closed && !sprintScoped;
-    const unavailableReason = chatHarnessUnavailableReason(harnessStatus);
+    const unavailableReason = chatHarnessUnavailableReason(harnessStatus)
+      || chatExactRouteUnavailableReason(conversation, modelCatalog);
     unavailable.hidden = !unavailableReason;
     unavailable.textContent = unavailableReason
       ? `${unavailableReason} — history remains readable.` : "";
@@ -5497,9 +5509,10 @@ async function renderInterface(root) {
     pane.replaceChildren(
       el("div", { className: "chat-loading" }, "Loading transcript…"));
     try {
-      const [snapshot, defaults] = await Promise.all([
+      const [snapshot, defaults, catalog] = await Promise.all([
         chatApi(`/conversations/${selectedId}/transcript`),
         chatLoadHarnessDefaults().catch(() => null),
+        api("/models").catch(() => null),
       ]);
       if (generation !== chatRenderGeneration) return;
       await chatRenderOpen(
@@ -5507,6 +5520,7 @@ async function renderInterface(root) {
         conversation,
         snapshot,
         defaults?.harness_status?.[conversation.route?.harness] || null,
+        catalog,
         refreshWakeIndicators,
       );
     } catch (error) {

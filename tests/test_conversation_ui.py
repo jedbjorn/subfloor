@@ -379,6 +379,7 @@ def test_historical_unavailable_harness_keeps_reads_and_controls_but_not_compose
         interface.index("async function renderInterface")
     ]
     assert "chatLoadHarnessDefaults().catch(() => null)" in interface
+    assert 'api("/models").catch(() => null)' in interface
     assert "history remains readable" in open_chat
     assert "composer.disabled = Boolean(unavailableReason)" in open_chat
     assert "send.disabled = Boolean(unavailableReason)" in open_chat
@@ -387,6 +388,54 @@ def test_historical_unavailable_harness_keeps_reads_and_controls_but_not_compose
     assert 'textContent: "Analytics"' in open_chat
     assert "chatReviewWorkspace(reviewHost, conversation)" in open_chat
     assert ".chat-harness-unavailable" in STYLE
+
+
+def test_historical_deepseek_route_availability_is_exact_and_fail_closed():
+    helpers = APP[
+        APP.index("function chatHarnessUnavailableReason"):
+        APP.index("function chatStartedLabel")
+    ]
+    script = helpers + r"""
+const conversation = {
+  route: {harness: "deepseek", model: "deepseek-bound"},
+};
+const available = (models, stale = false) =>
+  chatExactRouteUnavailableReason(conversation, {
+    stale, harnesses: {deepseek: {models}},
+  });
+console.log(JSON.stringify({
+  zeroRoutes: available([]),
+  otherRouteOnly: available([
+    {id: "deepseek-other", availability: "available"},
+  ]),
+  boundUnavailable: available([
+    {id: "deepseek-bound", availability: "unauthenticated"},
+    {id: "deepseek-other", availability: "available"},
+  ]),
+  boundStale: available([
+    {id: "deepseek-bound", availability: "available", stale: true},
+  ]),
+  staleCatalog: available([
+    {id: "deepseek-bound", availability: "available"},
+  ], true),
+  exactAvailable: available([
+    {id: "deepseek-bound", availability: "available"},
+  ]),
+  otherHarness: chatExactRouteUnavailableReason({
+    route: {harness: "codex", model: "gpt-test"},
+  }, {stale: true, harnesses: {}}),
+}));
+"""
+
+    assert run_js(script) == {
+        "zeroRoutes": "HARNESS_ROUTE_UNAVAILABLE",
+        "otherRouteOnly": "HARNESS_ROUTE_UNAVAILABLE",
+        "boundUnavailable": "HARNESS_ROUTE_UNAVAILABLE",
+        "boundStale": "HARNESS_ROUTE_UNAVAILABLE",
+        "staleCatalog": "HARNESS_ROUTE_UNAVAILABLE",
+        "exactAvailable": None,
+        "otherHarness": None,
+    }
 
 
 def test_transcript_streams_normalized_events_and_reconnects_natively():
@@ -935,8 +984,10 @@ def test_interface_arrival_defers_configuration_and_phases_history_requests():
                     APP.index("// ── Tabs + boot")]
     loader = APP[APP.index("function chatLoadHarnessDefaults"):
                      APP.index("function chatStopStream")]
+    open_chat = interface[interface.index("const loadTranscript = async"):
+                          interface.index("await loadTranscript()")]
 
-    assert 'api("/models")' not in interface
+    assert 'api("/models").catch(() => null)' in open_chat
     assert 'api("/flavor-defaults")' not in interface
     assert 'api("/flavor-defaults")' in loader
     assert 'api("/models")' in loader

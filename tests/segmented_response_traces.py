@@ -106,11 +106,11 @@ LIVE_SEGMENT_EVENTS = (
 )
 
 
-def version_two_snapshot() -> dict:
+def version_three_snapshot() -> dict:
     """Return a fresh snapshot paused after an initial assistant segment."""
     return {
         "conversation_id": "cv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "projection_version": 2,
+        "projection_version": 3,
         "through_sequence": 5,
         "assistant_cursor": {
             "run_id": 77,
@@ -145,6 +145,7 @@ def version_two_snapshot() -> dict:
                 "created_at": "2026-07-30 20:00:02",
                 "text": "before tool",
                 "outcome": None,
+                "segment": "answer",
                 "segment_anchor_sequence": 0,
                 "first_sequence": 3,
                 "last_sequence": 3,
