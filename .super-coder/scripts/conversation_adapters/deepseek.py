@@ -45,6 +45,27 @@ MAX_UNKNOWN_EVENTS = 8
 DEFAULT_STREAM_INACTIVITY_SECONDS = 30.0
 DEFAULT_SILENT_PROBE_LIMIT = 2
 SENSITIVE_KEY = re.compile(r"(?:key|token|secret|password|credential|authorization)", re.I)
+NATIVE_ERROR_CODES = frozenset(
+    {
+        "ABORTED",
+        "AUTH",
+        "CONTEXT_WINDOW_EXCEEDED",
+        "EMPTY_RESPONSE",
+        "INVALID_CREDENTIAL",
+        "INVALID_REQUEST",
+        "MALFORMED_RESPONSE",
+        "MISSING_CREDENTIAL",
+        "PI_AI_ERROR",
+        "QUOTA",
+        "RATE_LIMIT",
+        "SERVER",
+        "STREAM_CLOSED",
+        "TIMEOUT",
+        "TRANSPORT",
+        "UNSUPPORTED_CONTENT",
+    }
+)
+NATIVE_HTTP_ERROR_CODE = re.compile(r"^HTTP_[1-5][0-9]{2}$")
 _CARRIER_STREAM_END = object()
 
 
@@ -328,6 +349,16 @@ def _bounded_native(value: Any) -> Any:
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "original_bytes": len(encoded),
     }
+
+
+def _native_failure_code(reason: Any) -> str:
+    error = reason.get("error") if isinstance(reason, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    if isinstance(code, str) and (
+        code in NATIVE_ERROR_CODES or NATIVE_HTTP_ERROR_CODE.fullmatch(code)
+    ):
+        return f"HARNESS_NATIVE_RUN_{code}"
+    return "HARNESS_NATIVE_RUN_FAILED"
 
 
 class DeepSeekAdapter(ConversationAdapter):
@@ -1103,7 +1134,7 @@ class DeepSeekAdapter(ConversationAdapter):
                     "run.failed",
                     {
                         "status": "failed",
-                        "error": "HARNESS_NATIVE_RUN_FAILED",
+                        "error": _native_failure_code(reason),
                         "reason": kind or "unknown",
                         "native": native,
                     },

@@ -626,6 +626,51 @@ def test_approval_event_fails_only_the_owned_run_and_releases_no_other_transport
     adapter_b.close()
 
 
+@pytest.mark.parametrize(
+    ("native_code", "expected_code"),
+    [
+        ("INVALID_CREDENTIAL", "HARNESS_NATIVE_RUN_INVALID_CREDENTIAL"),
+        ("HTTP_503", "HARNESS_NATIVE_RUN_HTTP_503"),
+        ("invalid credential token=must-not-survive", "HARNESS_NATIVE_RUN_FAILED"),
+        ("PLAUSIBLE_BUT_UNKNOWN", "HARNESS_NATIVE_RUN_FAILED"),
+        (None, "HARNESS_NATIVE_RUN_FAILED"),
+    ],
+)
+def test_turn_failure_projects_only_a_strict_native_error_code(
+    tmp_path: Path,
+    native_code: str | None,
+    expected_code: str,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    factory = Factory()
+    adapter = make_adapter(tmp_path / "state", factory)
+    try:
+        turn = adapter.start(context(worktree), "Do it")
+        reason: dict[str, Any] = {
+            "kind": "error",
+            "error": {"message": "opaque provider detail"},
+        }
+        if native_code is not None:
+            reason["error"]["code"] = native_code
+        factory.instances[0].items = [
+            native_notification(
+                turn.session_ref,
+                "turn/end",
+                5,
+                {"turn": 1, "reason": reason},
+            )
+        ]
+
+        events = list(adapter.stream(turn))
+
+        assert [event.type for event in events] == ["session.started", "run.failed"]
+        assert events[-1].payload["error"] == expected_code
+        assert "must-not-survive" not in events[-1].payload["error"]
+    finally:
+        adapter.close()
+
+
 def test_same_conversation_cannot_spawn_two_carriers(tmp_path: Path) -> None:
     worktree = tmp_path / "worktree"
     worktree.mkdir()

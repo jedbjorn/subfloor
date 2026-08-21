@@ -1195,6 +1195,36 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         self.assertNotIn(raw_detail, encoded)
         self.assertNotIn("opaque-provider-secret", encoded)
 
+    def test_participant_failure_classifies_a_stable_native_error_code(self) -> None:
+        backend = canary.HostBackend(
+            canary.Deadline(100, 50), sleep=lambda _: None
+        )
+        backend._run = mock.Mock(
+            return_value=canary.CommandResult(
+                json.dumps(
+                    [
+                        {
+                            "state": "failed",
+                            "error_code": "HARNESS_NATIVE_RUN_INVALID_CREDENTIAL",
+                            "error_detail": "HARNESS_NATIVE_RUN_FAILED",
+                        }
+                    ]
+                ),
+                "",
+                0,
+            )
+        )
+
+        evidence = backend._conversation_failure_evidence(
+            self.facts, "cv_" + "1" * 32
+        )
+
+        self.assertEqual(
+            "HARNESS_NATIVE_RUN_INVALID_CREDENTIAL", evidence["error_code"]
+        )
+        self.assertEqual("credential_rejected", evidence["category"])
+        self.assertEqual(64, len(evidence["detail_sha256"]))
+
     def test_live_materialization_uses_exact_sha_refspec_and_verifies_pin(self) -> None:
         clock = FakeClock()
         deadline = canary.Deadline(100, 50, clock=clock)

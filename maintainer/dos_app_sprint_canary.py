@@ -1221,12 +1221,45 @@ class HostBackend:
             return {"diagnostic": "absent"}
         row = rows[0]
         detail = str(row.get("error_detail") or "")
-        lowered = detail.lower()
+        error_code = str(row.get("error_code") or "")
+        lowered = f"{error_code} {detail}".lower()
         categories = (
-            ("credential_rejected", ("unauthorized", "invalid api key", "http 401")),
-            ("rate_limited", ("rate limit", "http 429", "too many requests")),
+            (
+                "credential_rejected",
+                (
+                    "unauthorized",
+                    "invalid api key",
+                    "invalid_credential",
+                    "missing_credential",
+                    "native_run_auth",
+                    "http 401",
+                ),
+            ),
+            (
+                "quota_exhausted",
+                ("native_run_quota", "insufficient_quota", "quota exhausted"),
+            ),
+            (
+                "rate_limited",
+                (
+                    "rate limit",
+                    "rate_limit",
+                    "http 429",
+                    "http_429",
+                    "too many requests",
+                ),
+            ),
             ("timeout", ("timeout", "timed out", "deadline")),
-            ("connectivity", ("connection", "dns", "network", "unreachable")),
+            (
+                "connectivity",
+                (
+                    "connection",
+                    "dns",
+                    "network",
+                    "native_run_transport",
+                    "unreachable",
+                ),
+            ),
             ("protocol", ("protocol", "schema", "invalid json", "malformed")),
             ("process_exit", ("exit code", "process exited", "signal")),
         )
@@ -1240,7 +1273,7 @@ class HostBackend:
         )
         return {
             "run_state": row.get("state"),
-            "error_code": row.get("error_code"),
+            "error_code": error_code or None,
             "category": category,
             "detail_bytes": len(detail.encode()),
             "detail_sha256": hashlib.sha256(detail.encode()).hexdigest(),
