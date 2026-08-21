@@ -43,6 +43,32 @@ SHA = "a" * 40
 BASE_SHA = "b" * 40
 
 
+def route_admission_payload(
+    *, category: str | None = None, **updates
+) -> dict[str, object]:
+    admitted = category is None
+    payload: dict[str, object] = {
+        "contract_version": 1,
+        "requested_provider": "ollama-cloud",
+        "requested_model": "deepseek-v4-pro:0813",
+        "admitted": admitted,
+        "error_code": (
+            None
+            if admitted
+            else canary.ROUTE_ADMISSION_ERROR_CODES[category]
+        ),
+        "category": category,
+        "required_surface": "sprint",
+        "required_capability": "reviewer-shell-tool-execution",
+        "freshness": "fresh",
+        "authentication": "verified",
+        "tool_capability": "supported" if admitted else "unknown",
+        "exit_class": "success" if admitted else "route-rejected",
+    }
+    payload.update(updates)
+    return payload
+
+
 class FakeClock:
     def __init__(self) -> None:
         self.now = 100.0
@@ -111,11 +137,24 @@ class FakeBackend:
         config: canary.CanaryConfig,
         facts: canary.Preflight,
         ledger: canary.ResourceLedger,
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         self.calls.append("launch")
         if self.fail_at == "launch":
             raise canary.CanaryError("LAUNCH_TEST", "launch failed")
-        return {"codex": "0.146.1", "kimi": "0.33.0"}
+        if self.fail_at == "route_admission":
+            raise canary.CanaryError(
+                "CANARY_ROUTE_NOT_ADMITTED",
+                "exact route rejected",
+                details={
+                    "route_admission": canary._route_admission_fallback(
+                        "route-rejected"
+                    )
+                },
+            )
+        return {
+            "versions": {"codex": "0.146.1", "kimi": "0.33.0"},
+            "route_admission": None,
+        }
 
     def orchestrate(
         self,
@@ -745,6 +784,97 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             [item for item in backend.calls if item.startswith("stage:")],
         )
 
+    def test_route_rejection_precedes_sprint_conversation_and_generation(self) -> None:
+        backend = FakeBackend(self.facts, fail_at="route_admission")
+        controller, _ = self.controller(backend)
+
+        with self.assertRaises(canary.CanaryError) as raised:
+            controller.run()
+
+        self.assertEqual("CANARY_ROUTE_NOT_ADMITTED", raised.exception.code)
+        self.assertEqual(
+            ["preflight", f"materialize:{SHA}", "launch", "cleanup"],
+            backend.calls,
+        )
+        payload = self.receipt()
+        self.assertEqual("route_admission", payload["failure"]["primary"]["stage"])
+        self.assertEqual({}, payload["sprint"])
+        self.assertEqual({}, payload["pull_request"])
+        self.assertTrue(payload["cleanup"]["complete"])
+
+    def test_route_admission_validator_accepts_every_bounded_rejection(self) -> None:
+        for category in sorted(canary.ROUTE_ADMISSION_CATEGORIES):
+            with self.subTest(category=category):
+                payload = route_admission_payload(category=category)
+                result = canary._validated_route_admission(
+                    canary.CommandResult(json.dumps(payload), "ignored raw", 2)
+                )
+                self.assertEqual(category, result["category"])
+                self.assertFalse(result["admitted"])
+
+    def test_route_admission_validator_distinguishes_tool_support_states(self) -> None:
+        unsupported = route_admission_payload(
+            category="tool-capability-unsupported",
+            tool_capability="unsupported",
+        )
+        unproven = route_admission_payload(
+            category="tool-capability-unproven",
+            authentication="unproven",
+            tool_capability="unproven",
+        )
+
+        self.assertEqual(
+            "unsupported",
+            canary._validated_route_admission(
+                canary.CommandResult(json.dumps(unsupported), "", 2)
+            )["tool_capability"],
+        )
+        self.assertEqual(
+            "unproven",
+            canary._validated_route_admission(
+                canary.CommandResult(json.dumps(unproven), "", 2)
+            )["tool_capability"],
+        )
+
+    def test_route_admission_validator_fails_closed_without_raw_output(self) -> None:
+        cases = {
+            "malformed": canary.CommandResult("not-json-private-body", "raw", 2),
+            "unknown-key": canary.CommandResult(
+                json.dumps({**route_admission_payload(), "raw": "private"}), "", 0
+            ),
+            "identity": canary.CommandResult(
+                json.dumps(route_admission_payload(requested_model="nearby")), "", 0
+            ),
+            "stale-success": canary.CommandResult(
+                json.dumps(route_admission_payload(freshness="stale")), "", 0
+            ),
+            "unknown-category": canary.CommandResult(
+                json.dumps(
+                    {
+                        **route_admission_payload(category="unknown"),
+                        "error_code": "ROUTE_ADMISSION_NOT_ALLOWLISTED",
+                        "category": "not-allowlisted",
+                    }
+                ),
+                "",
+                2,
+            ),
+            "exit-mismatch": canary.CommandResult(
+                json.dumps(route_admission_payload()), "", 7
+            ),
+        }
+        for label, result in cases.items():
+            with self.subTest(label=label), self.assertRaises(
+                canary.CanaryError
+            ) as raised:
+                canary._validated_route_admission(result)
+            serialized = json.dumps(raised.exception.details)
+            self.assertNotIn(result.stdout, serialized)
+            self.assertEqual(
+                set(canary.ROUTE_ADMISSION_KEYS),
+                set(raised.exception.details["route_admission"]),
+            )
+
     def test_force_new_probe_requires_absence_and_both_direct_rejections(self) -> None:
         proof = {
             "sprint_id": 12,
@@ -1253,15 +1383,19 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         events: list[str] = []
         run_envs: dict[str, dict[str, str]] = {}
         run_argv: dict[str, tuple[str, ...]] = {}
+        run_checks: dict[str, bool] = {}
 
         def fake_run(argv, *, cwd=None, env=None, check=True, label):
             events.append(label)
             run_envs[label] = dict(env or {})
             run_argv[label] = tuple(argv)
-            if label.startswith("resolve exact-image") or label.startswith(
-                "resolve admitted"
-            ):
+            run_checks[label] = check
+            if label.startswith("resolve exact-image"):
                 return canary.CommandResult('{"ok": true}', "", 0)
+            if label.startswith("resolve admitted"):
+                return canary.CommandResult(
+                    json.dumps(route_admission_payload()), "", 0
+                )
             if label == "verify non-secret route probe stopped":
                 return canary.CommandResult("", "not found", 1)
             if label == "inspect launched harness versions":
@@ -1286,7 +1420,9 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                 "ANTHROPIC_API_KEY": "unrelated-secret",
             },
         ), mock.patch.object(canary, "JsonHttp", return_value=health):
-            versions = backend.launch(config, self.facts, canary.ResourceLedger())
+            launch_result = backend.launch(
+                config, self.facts, canary.ResourceLedger()
+            )
 
         self.assertEqual(
             [
@@ -1316,9 +1452,15 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             "provider-canary-secret-value",
             run_argv["refresh admitted deepseek route"],
         )
+        self.assertIn(
+            "--sprint-admission-json",
+            run_argv["resolve admitted deepseek route"],
+        )
+        self.assertFalse(run_checks["refresh admitted deepseek route"])
+        self.assertFalse(run_checks["resolve admitted deepseek route"])
         self.assertEqual(
             {"codex": "codex-cli-test", "deepseek": "deepseek-test"},
-            versions,
+            launch_result["versions"],
         )
 
     def test_dispatch_forwards_ollama_value_without_putting_it_in_argv(self) -> None:

@@ -190,6 +190,50 @@ PARTICIPANT_UPSTREAM_CODES = frozenset(
     }
 )
 PARTICIPANT_HTTP_CODE = re.compile(r"^HTTP_[1-5][0-9]{2}$")
+ROUTE_ADMISSION_KEYS = (
+    "contract_version",
+    "requested_provider",
+    "requested_model",
+    "admitted",
+    "error_code",
+    "category",
+    "required_surface",
+    "required_capability",
+    "freshness",
+    "authentication",
+    "tool_capability",
+    "exit_class",
+)
+ROUTE_ADMISSION_CATEGORIES = frozenset(
+    {
+        "harness-unavailable",
+        "runtime-unavailable",
+        "credential-or-authentication",
+        "catalogue-unavailable",
+        "catalogue-stale",
+        "exact-model-absent",
+        "exact-model-unavailable",
+        "tool-capability-unsupported",
+        "tool-capability-unproven",
+        "route-evidence-invalid",
+        "provider-option-drift",
+        "unknown",
+    }
+)
+ROUTE_ADMISSION_ERROR_CODES = {
+    category: "ROUTE_ADMISSION_" + category.replace("-", "_").upper()
+    for category in ROUTE_ADMISSION_CATEGORIES
+}
+ROUTE_ADMISSION_FRESHNESS = frozenset({"fresh", "stale", "missing", "unknown"})
+ROUTE_ADMISSION_AUTHENTICATION = frozenset(
+    {"verified", "failed", "unproven", "unknown"}
+)
+ROUTE_ADMISSION_TOOL_CAPABILITY = frozenset(
+    {"supported", "unsupported", "unproven", "unknown"}
+)
+ROUTE_ADMISSION_EXIT_CLASSES = frozenset(
+    {"success", "route-rejected", "malformed-response", "identity-mismatch", "command-failed"}
+)
 
 
 class CanaryError(RuntimeError):
@@ -284,7 +328,7 @@ class Backend(Protocol):
 
     def launch(
         self, config: CanaryConfig, facts: Preflight, ledger: ResourceLedger
-    ) -> dict[str, str]: ...
+    ) -> dict[str, Any]: ...
 
     def orchestrate(
         self,
@@ -565,6 +609,90 @@ def _json_output(result: CommandResult, *, label: str) -> Any:
         raise CanaryError(
             "CANARY_COMMAND_INVALID", f"{label} returned invalid JSON"
         ) from exc
+
+
+def _route_admission_fallback(exit_class: str) -> dict[str, Any]:
+    provider, model = DEEPSEEK_MODEL.split("/", 1)
+    return {
+        "contract_version": 1,
+        "requested_provider": provider,
+        "requested_model": model,
+        "admitted": False,
+        "error_code": ROUTE_ADMISSION_ERROR_CODES["unknown"],
+        "category": "unknown",
+        "required_surface": "sprint",
+        "required_capability": "reviewer-shell-tool-execution",
+        "freshness": "unknown",
+        "authentication": "unknown",
+        "tool_capability": "unknown",
+        "exit_class": exit_class,
+    }
+
+
+def _validated_route_admission(result: CommandResult) -> dict[str, Any]:
+    """Consume only the fixed admission contract; never project raw output."""
+    try:
+        payload = json.loads(result.stdout or "null")
+    except json.JSONDecodeError:
+        payload = None
+    if not isinstance(payload, dict) or tuple(payload) != ROUTE_ADMISSION_KEYS:
+        raise CanaryError(
+            "CANARY_ROUTE_ADMISSION_INVALID",
+            "exact-route admission returned a malformed bounded contract",
+            details={"route_admission": _route_admission_fallback("malformed-response")},
+        )
+
+    provider, model = DEEPSEEK_MODEL.split("/", 1)
+    identity_matches = (
+        payload.get("requested_provider") == provider
+        and payload.get("requested_model") == model
+        and payload.get("required_surface") == "sprint"
+        and payload.get("required_capability")
+        == "reviewer-shell-tool-execution"
+    )
+    if not identity_matches:
+        raise CanaryError(
+            "CANARY_ROUTE_ADMISSION_INVALID",
+            "exact-route admission identity did not match the canary",
+            details={"route_admission": _route_admission_fallback("identity-mismatch")},
+        )
+
+    admitted = payload.get("admitted")
+    category = payload.get("category")
+    error_code = payload.get("error_code")
+    bounded = (
+        payload.get("contract_version") == 1
+        and type(admitted) is bool
+        and payload.get("freshness") in ROUTE_ADMISSION_FRESHNESS
+        and payload.get("authentication") in ROUTE_ADMISSION_AUTHENTICATION
+        and payload.get("tool_capability") in ROUTE_ADMISSION_TOOL_CAPABILITY
+        and payload.get("exit_class") in ROUTE_ADMISSION_EXIT_CLASSES
+    )
+    if admitted:
+        bounded = bounded and (
+            result.returncode == 0
+            and category is None
+            and error_code is None
+            and payload.get("freshness") == "fresh"
+            and payload.get("authentication") == "verified"
+            and payload.get("tool_capability") == "supported"
+            and payload.get("exit_class") == "success"
+        )
+    else:
+        bounded = bounded and (
+            result.returncode == 2
+            and category in ROUTE_ADMISSION_CATEGORIES
+            and error_code == ROUTE_ADMISSION_ERROR_CODES.get(category)
+            and payload.get("exit_class") == "route-rejected"
+        )
+    if not bounded:
+        exit_class = "command-failed" if result.returncode not in {0, 2} else "malformed-response"
+        raise CanaryError(
+            "CANARY_ROUTE_ADMISSION_INVALID",
+            "exact-route admission violated its bounded contract",
+            details={"route_admission": _route_admission_fallback(exit_class)},
+        )
+    return {key: payload[key] for key in ROUTE_ADMISSION_KEYS}
 
 
 def _nonempty_file(path: Path) -> bool:
@@ -1258,7 +1386,7 @@ class HostBackend:
 
     def launch(
         self, config: CanaryConfig, facts: Preflight, ledger: ResourceLedger
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         self._release_ports()
 
         def start_runtime(env: Mapping[str, str], *, label: str) -> None:
@@ -1335,9 +1463,10 @@ class HostBackend:
         if config.profile == DEEPSEEK_SPRINT_PROFILE:
             self._run(
                 ["docker", "exec", facts.container, "./sc", "models", "refresh"],
+                check=False,
                 label="refresh admitted deepseek route",
             )
-            deepseek_resolution = _json_output(
+            route_admission = _validated_route_admission(
                 self._run(
                     [
                         "docker",
@@ -1348,21 +1477,20 @@ class HostBackend:
                         "resolve",
                         "deepseek",
                         DEEPSEEK_MODEL,
-                        "--json",
+                        "--sprint-admission-json",
                     ],
+                    check=False,
                     label="resolve admitted deepseek route",
-                ),
-                label="resolve admitted deepseek route",
-            )
-            if (
-                not isinstance(deepseek_resolution, dict)
-                or deepseek_resolution.get("ok") is not True
-            ):
-                raise CanaryError(
-                    "CANARY_ROUTE_NOT_CANONICAL",
-                    "admitted DeepSeek route did not resolve",
-                    details={"harness": "deepseek", "selector": DEEPSEEK_MODEL},
                 )
+            )
+            if not route_admission["admitted"]:
+                raise CanaryError(
+                    "CANARY_ROUTE_NOT_ADMITTED",
+                    "exact DeepSeek Sprint route was not admitted",
+                    details={"route_admission": route_admission},
+                )
+        else:
+            route_admission = None
         status = self._run(
             [str(facts.workspace / "sc"), "harness-status"],
             cwd=facts.workspace,
@@ -1386,7 +1514,7 @@ class HostBackend:
                 "CANARY_RUNTIME_PROVENANCE_MISSING",
                 "launched runtime did not report every profile harness version",
             )
-        return versions
+        return {"versions": versions, "route_admission": route_admission}
 
     def _wait_idle(
         self,
@@ -3842,8 +3970,16 @@ class CanaryController:
             )
             self.receipt.write()
 
+            self._stage("route_admission")
+            launch_result = self.backend.launch(
+                self.config, self.facts, self.ledger
+            )
+            versions = launch_result["versions"]
+            route_admission = launch_result.get("route_admission")
+            if route_admission is not None:
+                self.receipt.data["routes"]["admission"] = route_admission
+
             self._stage("launch")
-            versions = self.backend.launch(self.config, self.facts, self.ledger)
             self.receipt.data["runtime"] = {
                 "namespace": self.facts.network,
                 "container": self.facts.container,
@@ -3859,7 +3995,10 @@ class CanaryController:
                 self._stage,
                 self._checkpoint,
             )
-            self.receipt.data["routes"] = outcome["routes"]
+            self.receipt.data["routes"] = {
+                **self.receipt.data["routes"],
+                **outcome["routes"],
+            }
             self.receipt.data["sprint"] = outcome["sprint"]
             self.receipt.data["pull_request"] = outcome["pull_request"]
             self.receipt.event("sprint.completed", **outcome["sprint"])

@@ -652,6 +652,21 @@ class BuildTest(NoCLI):
         )])
         self.assertNotIn("ollama-secret", json.dumps(evidence))
 
+    def test_ollama_tool_capability_distinguishes_explicit_unsupported(self):
+        adapter = deepseek_runtime.provider_adapter("ollama-cloud")
+        with self.assertRaises(mc._DeepSeekToolCapabilityError) as raised:
+            mc._deepseek_tool_capability(
+                "ollama-cloud",
+                "deepseek-v4-pro:0813",
+                adapter,
+                "ollama-secret",
+                post=lambda *_args: {"capabilities": ["completion"]},
+            )
+
+        self.assertEqual(
+            mc.DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED, str(raised.exception)
+        )
+
     def test_ollama_route_fails_closed_when_exact_model_tools_are_unproven(self):
         wire_probe = mock.Mock(
             side_effect=AssertionError("capability failure must precede wire proof")
@@ -698,10 +713,30 @@ class BuildTest(NoCLI):
         self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
         self.assertEqual(
             got["harnesses"]["deepseek"]["error"],
-            mc.DEEPSEEK_DISCOVERY_EVIDENCE_INVALID,
+            mc.DEEPSEEK_EXACT_MODEL_ABSENT,
         )
         self.assertNotIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
         probe.assert_not_called()
+
+    def test_authenticated_provider_rejection_has_one_redacted_auth_category(self):
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            raise mc.urllib.error.HTTPError(url, 401, "raw detail", {}, None)
+
+        got = mc.build(
+            fetch=fetch,
+            env={"OLLAMA_API_KEY": "ollama-secret"},
+            run=None,
+        )
+
+        self.assertEqual(
+            mc.DEEPSEEK_AUTHENTICATION_ERROR,
+            got["harnesses"]["deepseek"]["error"],
+        )
+        serialized = json.dumps(got)
+        self.assertNotIn("raw detail", serialized)
+        self.assertNotIn("ollama-secret", serialized)
 
     def test_one_provider_failure_does_not_suppress_the_other_provider(self):
         def fetch(url, headers=None):
@@ -2377,6 +2412,188 @@ class RouteCliConnectionTest(unittest.TestCase):
         ):
             self.assertEqual(routes_cli.main(["refresh"]), 0)
         opened.assert_called_once_with()
+
+
+class SprintAdmissionProjectionTest(unittest.TestCase):
+    SELECTOR = "ollama-cloud/deepseek-v4-pro:0813"
+
+    @classmethod
+    def route(cls, **updates) -> dict:
+        value = {
+            "harness": "deepseek",
+            "selector": cls.SELECTOR,
+            "availability": "available",
+            "stale": 0,
+            "last_error": None,
+            "selector_binding": json.dumps({
+                "tool_capability_verified": True,
+            }),
+        }
+        value.update(updates)
+        return value
+
+    @classmethod
+    def resolved(cls, **binding_updates) -> dict:
+        binding = {
+            "harness": "deepseek",
+            "requested_model": cls.SELECTOR,
+            "provider_model": "deepseek-v4-pro:0813",
+            "selector_binding": {"tool_capability_verified": True},
+            "adapter_metadata": {"provider_route": "ollama-cloud"},
+        }
+        binding.update(binding_updates)
+        return {"ok": True, "binding": binding}
+
+    def test_admitted_result_has_only_the_bounded_exact_contract(self):
+        result = routes_cli.sprint_admission_result(
+            self.resolved(), self.route(), "deepseek", self.SELECTOR
+        )
+
+        self.assertEqual(tuple(result), routes_cli.SPRINT_ADMISSION_KEYS)
+        self.assertEqual(result, {
+            "contract_version": 1,
+            "requested_provider": "ollama-cloud",
+            "requested_model": "deepseek-v4-pro:0813",
+            "admitted": True,
+            "error_code": None,
+            "category": None,
+            "required_surface": "sprint",
+            "required_capability": "reviewer-shell-tool-execution",
+            "freshness": "fresh",
+            "authentication": "verified",
+            "tool_capability": "supported",
+            "exit_class": "success",
+        })
+
+    def test_every_rejection_category_maps_to_one_stable_bounded_code(self):
+        cases = {
+            "harness-unavailable": ({"code": "harness_unavailable"}, self.route()),
+            "runtime-unavailable": ({"code": "runtime_unavailable"}, self.route()),
+            "credential-or-authentication": (
+                {"code": "credential_or_authentication"}, self.route()
+            ),
+            "catalogue-unavailable": (
+                {"code": "catalogue_unavailable"}, self.route()
+            ),
+            "catalogue-stale": (
+                {"code": "thinking_evidence_stale"}, self.route(stale=1)
+            ),
+            "exact-model-absent": ({"code": "exact_model_absent"}, None),
+            "exact-model-unavailable": (
+                {"code": "exact_model_unavailable"},
+                self.route(availability="unavailable"),
+            ),
+            "tool-capability-unsupported": (
+                {"code": "tool_capability_unsupported"}, self.route()
+            ),
+            "tool-capability-unproven": (
+                {"code": "tool_capability_unproven"}, self.route()
+            ),
+            "route-evidence-invalid": (
+                {"code": "route_evidence_invalid"}, self.route()
+            ),
+            "provider-option-drift": (
+                {"code": "provider_option_drift"}, self.route()
+            ),
+            "unknown": ({"code": "unexpected_internal_code"}, self.route()),
+        }
+        for category, (failure, route) in cases.items():
+            with self.subTest(category=category):
+                result = routes_cli.sprint_admission_result(
+                    {"ok": False, **failure}, route, "deepseek", self.SELECTOR
+                )
+                self.assertEqual(tuple(result), routes_cli.SPRINT_ADMISSION_KEYS)
+                self.assertFalse(result["admitted"])
+                self.assertEqual(category, result["category"])
+                self.assertEqual(
+                    routes_cli.SPRINT_ADMISSION_ERROR_CODES[category],
+                    result["error_code"],
+                )
+                self.assertEqual("route-rejected", result["exit_class"])
+
+    def test_tool_unsupported_and_unproven_use_authenticated_metadata(self):
+        unsupported = routes_cli.sprint_admission_result(
+            {"ok": False, "code": "thinking_evidence_stale"},
+            self.route(
+                stale=1,
+                last_error=mc.DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED,
+            ),
+            "deepseek",
+            self.SELECTOR,
+        )
+        unproven = routes_cli.sprint_admission_result(
+            {"ok": False, "code": "thinking_evidence_stale"},
+            self.route(
+                stale=1,
+                last_error=mc.DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED,
+            ),
+            "deepseek",
+            self.SELECTOR,
+        )
+
+        self.assertEqual("tool-capability-unsupported", unsupported["category"])
+        self.assertEqual("unsupported", unsupported["tool_capability"])
+        self.assertEqual("verified", unsupported["authentication"])
+        self.assertEqual("tool-capability-unproven", unproven["category"])
+        self.assertEqual("unproven", unproven["tool_capability"])
+        self.assertEqual("unproven", unproven["authentication"])
+
+    def test_success_with_exact_identity_or_tool_drift_fails_closed(self):
+        mismatched = routes_cli.sprint_admission_result(
+            self.resolved(provider_model="nearby-model"),
+            self.route(),
+            "deepseek",
+            self.SELECTOR,
+        )
+        unproven = routes_cli.sprint_admission_result(
+            self.resolved(),
+            self.route(selector_binding=json.dumps({})),
+            "deepseek",
+            self.SELECTOR,
+        )
+
+        self.assertFalse(mismatched["admitted"])
+        self.assertEqual("route-evidence-invalid", mismatched["category"])
+        self.assertFalse(unproven["admitted"])
+        self.assertEqual("tool-capability-unproven", unproven["category"])
+
+    def test_sprint_admission_cli_emits_no_raw_resolution_diagnostics(self):
+        projection = {"routes": [self.route(
+            stale=1,
+            last_error=mc.DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED,
+        )]}
+        output = io.StringIO()
+        with (
+            mock.patch.object(routes_cli.mem, "SC_API_TOKEN", "shell-token"),
+            mock.patch.object(routes_cli.mem, "SC_API_BASE", "http://engine"),
+            mock.patch.object(routes_cli.mem, "_api", return_value=projection),
+            mock.patch.object(
+                routes_cli.model_catalog,
+                "controlled_route_evidence",
+                return_value=controlled_bundle(
+                    "deepseek",
+                    self.SELECTOR,
+                    runtime_status(harness="deepseek"),
+                    None,
+                ),
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = routes_cli.main([
+                "resolve",
+                "deepseek",
+                self.SELECTOR,
+                "--sprint-admission-json",
+            ])
+        payload = json.loads(output.getvalue())
+
+        self.assertEqual(2, exit_code)
+        self.assertEqual(tuple(payload), routes_cli.SPRINT_ADMISSION_KEYS)
+        self.assertEqual("tool-capability-unsupported", payload["category"])
+        serialized = output.getvalue()
+        self.assertNotIn('"error":', serialized.lower())
+        self.assertNotIn('"details":', serialized.lower())
+        self.assertNotIn(mc.DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED, serialized)
 
 
 class CatalogCacheTest(NoCLI):

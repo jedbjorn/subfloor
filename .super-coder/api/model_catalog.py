@@ -38,6 +38,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -99,6 +100,8 @@ PROVIDER_APIS = {
 DEEPSEEK_SOURCE = "deepseek-provider-api"
 OLLAMA_CLOUD_SOURCE = "ollama-cloud-provider-api"
 DEEPSEEK_DISCOVERY_ERROR = "authenticated DeepSeek model discovery failed"
+DEEPSEEK_AUTHENTICATION_ERROR = "authenticated DeepSeek credential was rejected"
+DEEPSEEK_EXACT_MODEL_ABSENT = "authenticated DeepSeek exact model is absent"
 DEEPSEEK_DISCOVERY_EVIDENCE_INVALID = (
     "authenticated DeepSeek model evidence is malformed or duplicated"
 )
@@ -109,6 +112,9 @@ DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED = (
 DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED = (
     "authenticated DeepSeek model has no governed tool-capability proof"
 )
+DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED = (
+    "authenticated DeepSeek model explicitly lacks required tool capability"
+)
 DEEPSEEK_DISCOVERY_LIMIT_ERROR = (
     "authenticated DeepSeek model response exceeds safety limits"
 )
@@ -116,6 +122,10 @@ DEEPSEEK_MODEL_ID_MAX_CHARS = 256
 
 
 class _DeepSeekWireProofError(RuntimeError):
+    pass
+
+
+class _DeepSeekExactModelAbsentError(RuntimeError):
     pass
 
 
@@ -304,9 +314,10 @@ def _deepseek_tool_capability(
         not isinstance(capabilities, list)
         or len(capabilities) > 32
         or any(not isinstance(item, str) for item in capabilities)
-        or "tools" not in capabilities
     ):
         raise _DeepSeekToolCapabilityError(DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED)
+    if "tools" not in capabilities:
+        raise _DeepSeekToolCapabilityError(DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED)
     return {"required": True, "tools": True}
 
 
@@ -540,9 +551,7 @@ def _from_deepseek_provider(
     if configured:
         configured_set = set(configured)
         if not configured_set.issubset(seen):
-            raise _DeepSeekDiscoveryEvidenceError(
-                DEEPSEEK_DISCOVERY_EVIDENCE_INVALID
-            )
+            raise _DeepSeekExactModelAbsentError(DEEPSEEK_EXACT_MODEL_ABSENT)
         exact_rows = [
             (row, model) for row, model in exact_rows if model in configured_set
         ]
@@ -786,11 +795,28 @@ def build(
         except _DeepSeekDiscoveryEvidenceError:
             provider_errors.append((source, DEEPSEEK_DISCOVERY_EVIDENCE_INVALID))
             continue
-        except _DeepSeekToolCapabilityError:
-            provider_errors.append((source, DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED))
+        except _DeepSeekExactModelAbsentError:
+            provider_errors.append((source, DEEPSEEK_EXACT_MODEL_ABSENT))
+            continue
+        except _DeepSeekToolCapabilityError as exc:
+            stable_error = str(exc)
+            if stable_error not in {
+                DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED,
+                DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED,
+            }:
+                stable_error = DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED
+            provider_errors.append((source, stable_error))
             continue
         except _DeepSeekWireProofError:
             provider_errors.append((source, DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED))
+            continue
+        except urllib.error.HTTPError as exc:
+            stable_error = (
+                DEEPSEEK_AUTHENTICATION_ERROR
+                if exc.code in {401, 403}
+                else DEEPSEEK_DISCOVERY_ERROR
+            )
+            provider_errors.append((source, stable_error))
             continue
         except Exception:  # noqa: BLE001 (secret-bearing discovery is redacted)
             provider_errors.append((source, DEEPSEEK_DISCOVERY_ERROR))
