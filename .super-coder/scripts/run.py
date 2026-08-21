@@ -988,14 +988,19 @@ def _is_unused(narrative: str) -> bool:
 
 
 def session_provider(harness: str, model: "str | None") -> "str | None":
-    """Boot-time provider for the archive row. opencode model ids are
-    provider-prefixed ("ollama-cloud/<model>") — the prefix wins; otherwise the
-    harness's home provider (claude→anthropic, codex→openai, vibe→mistral).
+    """Boot-time provider for the archive row. opencode and deepseek model ids
+    may be provider-prefixed ("ollama-cloud/<model>") — the prefix wins;
+    otherwise use the harness's home provider (claude→anthropic, codex→openai,
+    vibe→mistral, deepseek→deepseek-official).
     model_catalog maps kimi→"kimi-for-coding" for the model datalist, but its
     wire.jsonl reports provider="kimi" natively — pin that value here (ahead of
     the map lookup) so boot-row and sweep-row providers agree."""
-    if harness in model_catalog.PREFIXED_HARNESSES and model and "/" in model:
+    if (
+        harness in model_catalog.PREFIXED_HARNESSES or harness == "deepseek"
+    ) and model and "/" in model:
         return model.split("/", 1)[0]
+    if harness == "deepseek":
+        return "deepseek-official"
     if harness == "kimi":
         return "kimi"
     return model_catalog.HARNESS_PROVIDER.get(harness)
