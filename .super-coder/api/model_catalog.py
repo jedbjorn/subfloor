@@ -405,7 +405,7 @@ def _deepseek_provider_metadata(
             purpose: {
                 "wire_options": expected_wire,
                 "shell_tool": (
-                    [deepseek_runtime.PROVIDER_WIRE_SHELL_TOOL]
+                    [deepseek_runtime.provider_wire_shell_tool(provider)]
                     if purpose == "conversation"
                     else None
                 ),

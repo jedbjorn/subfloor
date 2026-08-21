@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -336,6 +337,14 @@ def provider_adapter(provider: str) -> dict[str, object]:
             f'provider route "{provider}" is not in the reviewed allowlist',
         )
     return selected
+
+
+def provider_wire_shell_tool(provider: str) -> dict[str, object]:
+    """Return the exact final tool declaration for one governed serializer."""
+    tool = json.loads(json.dumps(PROVIDER_WIRE_SHELL_TOOL))
+    if provider_adapter(provider)["wire_mode"] == "pi-ai-provider-default":
+        tool["function"]["strict"] = False
+    return tool
 
 
 def provider_composition(provider: str) -> dict[str, str]:
@@ -1159,6 +1168,16 @@ def prepare_container_carrier(
         runner=runner,
         manifest=manifest,
     )
+    if status.available:
+        for path in (target_root, *target_root.rglob("*")):
+            if path.is_symlink():
+                continue
+            mode = path.stat().st_mode
+            if path.is_dir():
+                path.chmod(0o555)
+            elif stat.S_ISREG(mode):
+                path.chmod(0o555 if mode & 0o111 else 0o444)
+        status = probe_carrier(target_python, runner=runner, manifest=manifest)
     if status.available and marker.exists():
         marker.unlink()
     return status
@@ -1566,7 +1585,7 @@ def provider_wire_evidence(
                             f"{effort} purpose {purpose}",
                         )
                     expected_tools = (
-                        [PROVIDER_WIRE_SHELL_TOOL]
+                        [provider_wire_shell_tool(provider)]
                         if purpose == "conversation"
                         else None
                     )

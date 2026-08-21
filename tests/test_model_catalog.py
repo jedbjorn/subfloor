@@ -111,7 +111,7 @@ def deepseek_wire_proof(provider, model, options_by_effort, env=None):
                 purpose: {
                     "wire_options": wire,
                     "shell_tool": (
-                        [deepseek_runtime.PROVIDER_WIRE_SHELL_TOOL]
+                        [deepseek_runtime.provider_wire_shell_tool(provider)]
                         if purpose == "conversation"
                         else None
                     ),

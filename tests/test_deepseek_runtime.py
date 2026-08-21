@@ -63,7 +63,9 @@ def emit_provider_requests(argv, kwargs) -> dict:
         for purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES:
             body = {"model": argv[-2], "messages": [], "stream": True}
             if purpose == "conversation":
-                body["tools"] = [deepseek_runtime.PROVIDER_WIRE_SHELL_TOOL]
+                body["tools"] = [
+                    deepseek_runtime.provider_wire_shell_tool("deepseek-official")
+                ]
             if options["thinking"] != "omit":
                 body["thinking"] = {"type": options["thinking"]}
             if options["reasoningEffort"] != "omit":
@@ -287,6 +289,17 @@ def test_ollama_composition_drift_fails_only_when_that_route_is_selected() -> No
             raise AssertionError("changed Ollama composition was accepted")
 
 
+def test_provider_wire_tool_matches_each_final_serializer_contract() -> None:
+    official = deepseek_runtime.provider_wire_shell_tool("deepseek-official")
+    ollama = deepseek_runtime.provider_wire_shell_tool("ollama-cloud")
+
+    assert "strict" not in official["function"]
+    assert ollama["function"]["strict"] is False
+    assert {
+        key: value for key, value in ollama["function"].items() if key != "strict"
+    } == official["function"]
+
+
 def test_missing_carrier_is_a_deepseek_only_unavailable_status() -> None:
     with tempfile.TemporaryDirectory() as raw:
         engine = Path(raw) / "engine"
@@ -479,7 +492,7 @@ def test_provider_wire_evidence_captures_default_omission_and_named_mapping() ->
         assert purpose_proof["wire_options"] == {}
         assert purpose_proof["native_request"]["purpose"] == purpose
         assert purpose_proof["shell_tool"] == (
-            [deepseek_runtime.PROVIDER_WIRE_SHELL_TOOL]
+            [deepseek_runtime.provider_wire_shell_tool("deepseek-official")]
             if purpose == "conversation"
             else None
         )
@@ -801,6 +814,42 @@ def test_unsupported_container_architecture_degrades_without_partial_carrier() -
         assert projected.error == "HARNESS_RUNTIME_INCOMPATIBLE"
         assert "architecture: s390x" in projected.detail
         runner.assert_not_called()
+
+
+def test_supported_container_carrier_is_root_owned_read_only_runtime_input() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        target = root / "deepseek-runtime"
+        bootstrap = executable(root / "python3.14")
+
+        def runner(argv, **_kwargs):
+            if argv[-1] == deepseek_runtime._PYTHON_VERSION_PROBE:
+                return completed(stdout="[3, 14, 7]\n")
+            if argv[1:3] == ["-m", "venv"]:
+                executable(Path(argv[3]) / "bin" / "python")
+                return completed()
+            if len(argv) > 1 and Path(argv[1]).name == "build_deepseek_carrier.py":
+                write_artifact_evidence(Path(argv[argv.index("--output-dir") + 1]))
+                return completed()
+            if argv[1:4] == ["-m", "pip", "install"]:
+                return completed()
+            if argv[-1] == deepseek_runtime._CARRIER_PROBE:
+                return completed(stdout=carrier_evidence(Path(argv[0])))
+            raise AssertionError(f"unexpected command: {argv}")
+
+        status = deepseek_runtime.prepare_container_carrier(
+            target,
+            architecture="x86_64",
+            bootstrap_python=bootstrap,
+            runner=runner,
+        )
+
+        assert status.available is True
+        assert stat.S_IMODE(target.stat().st_mode) == 0o555
+        assert stat.S_IMODE((target / "install-evidence.json").stat().st_mode) == 0o444
+        for path in target.rglob("*"):
+            if not path.is_symlink():
+                assert stat.S_IMODE(path.stat().st_mode) & 0o222 == 0
 
 
 def test_unsupported_container_cli_exits_successfully_for_global_image_build() -> None:
