@@ -1202,6 +1202,10 @@ case "$cmd" in
     # key + .env there; the mount below carries them in like every other harness).
     mistral_env=""
     [ -n "${MISTRAL_API_KEY:-}" ] && mistral_env="-e MISTRAL_API_KEY=${MISTRAL_API_KEY}"
+    # DeepSeek production canaries pass only the variable NAME to Docker. The
+    # value stays in Docker's inherited environment and never enters argv.
+    ollama_env=""
+    [ -n "${OLLAMA_API_KEY:-}" ] && ollama_env="-e OLLAMA_API_KEY"
     # Forward DATABASE_URL into the sandbox when a pg sidecar is configured, so
     # the fork's APP can connect to it. Default tracks the sidecar's container
     # name + baked sc/sc/sc creds (one source of truth); SC_DATABASE_URL overrides
@@ -1268,7 +1272,7 @@ case "$cmd" in
         SC_GITHUB_AUTH_ARGS \
         -e HOME="$HOME" -e SC_BIND=0.0.0.0 -e SC_PYTHON=python3 -e PYTHONUNBUFFERED=1 \
         -e SC_SANDBOX=1 -e SC_DEV_PORT="$dp" \
-        $mistral_env $pg_env \
+        $mistral_env $ollama_env $pg_env \
         -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" \
         -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
         -w "$here" \

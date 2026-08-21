@@ -743,10 +743,23 @@ class HostBackend:
                 details={"remaining": remaining, "required": MIN_GITHUB_REMAINING},
             )
         self._run(["docker", "info"], label="Docker capacity preflight")
-        self._run(
-            ["docker", "image", "inspect", "super-coder-sandbox"],
+        image = self._run(
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                '{{ index .Config.Labels "sc.engine_ref" }}',
+                "super-coder-sandbox",
+            ],
             label="sandbox image preflight",
-        )
+        ).stdout.strip()
+        if image != candidate:
+            raise CanaryError(
+                "CANARY_EXACT_REF_MISMATCH",
+                "sandbox image label does not match the candidate",
+                details={"expected": candidate, "actual": image or None},
+            )
         codex_auth = Path.home() / ".codex" / "auth.json"
         kimi_auth = Path.home() / ".kimi-code" / "credentials" / "kimi-code.json"
         if not _nonempty_file(codex_auth) or (
@@ -1020,32 +1033,79 @@ class HostBackend:
         self, config: CanaryConfig, facts: Preflight, ledger: ResourceLedger
     ) -> dict[str, str]:
         self._release_ports()
-        env = self._runtime_env(facts)
+
+        def start_runtime(env: Mapping[str, str], *, label: str) -> None:
+            self._run(
+                [str(facts.workspace / "sc"), "launch", "--no-build"],
+                cwd=facts.workspace,
+                env=env,
+                label=label,
+            )
+            api = JsonHttp(f"http://127.0.0.1:{facts.api_port}", self.deadline)
+            while True:
+                try:
+                    health = api.request("GET", "/api/health")
+                    if health:
+                        return
+                except CanaryError:
+                    pass
+                self.deadline.remaining()
+                self.sleep(min(config.poll_interval_s, self.deadline.remaining()))
+
+        nonsecret_env = self._runtime_env(facts)
+        start_runtime(nonsecret_env, label="launch non-secret route probe")
         self._run(
-            [str(facts.workspace / "sc"), "models", "refresh"],
-            cwd=facts.workspace,
-            env=env,
-            label="refresh isolated model routes",
+            ["docker", "exec", facts.container, "./sc", "models", "refresh"],
+            label="refresh exact-image model routes",
         )
+        for harness, selector in (
+            ("codex", "gpt-5.6-terra"),
+            ("deepseek", DEEPSEEK_MODEL),
+        ):
+            resolution = _json_output(
+                self._run(
+                    [
+                        "docker",
+                        "exec",
+                        facts.container,
+                        "./sc",
+                        "models",
+                        "resolve",
+                        harness,
+                        selector,
+                        "--json",
+                    ],
+                    label=f"resolve exact-image {harness} route",
+                ),
+                label=f"resolve exact-image {harness} route",
+            )
+            if not isinstance(resolution, dict) or resolution.get("ok") is not True:
+                raise CanaryError(
+                    "CANARY_ROUTE_NOT_CANONICAL",
+                    f"exact-image {harness} route did not resolve",
+                    details={"harness": harness, "selector": selector},
+                )
+        self._run(
+            [str(facts.workspace / "sc"), "down"],
+            cwd=facts.workspace,
+            env=nonsecret_env,
+            label="stop non-secret route probe",
+        )
+        stopped = self._run(
+            ["docker", "container", "inspect", facts.container],
+            check=False,
+            label="verify non-secret route probe stopped",
+        )
+        if stopped.returncode == 0:
+            raise CanaryError(
+                "CANARY_CLEANUP_FAILED",
+                "non-secret route probe container remained after stop",
+            )
+
         if config.profile == DEEPSEEK_SPRINT_PROFILE:
             self._provider_key = self._read_provider_key(config.credential_file)
         env = self._runtime_env(facts)
-        self._run(
-            [str(facts.workspace / "sc"), "launch", "--no-build"],
-            cwd=facts.workspace,
-            env=env,
-            label="launch isolated runtime",
-        )
-        api = JsonHttp(f"http://127.0.0.1:{facts.api_port}", self.deadline)
-        while True:
-            try:
-                health = api.request("GET", "/api/health")
-                if health:
-                    break
-            except CanaryError:
-                pass
-            self.deadline.remaining()
-            self.sleep(min(config.poll_interval_s, self.deadline.remaining()))
+        start_runtime(env, label="launch isolated runtime")
         status = self._run(
             [str(facts.workspace / "sc"), "harness-status"],
             cwd=facts.workspace,

@@ -1000,6 +1000,10 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         def fake_run(argv, *, cwd=None, env=None, check=True, label):
             events.append(label)
             run_envs[label] = dict(env or {})
+            if label.startswith("resolve exact-image"):
+                return canary.CommandResult('{"ok": true}', "", 0)
+            if label == "verify non-secret route probe stopped":
+                return canary.CommandResult("", "not found", 1)
             if label == "inspect launched harness versions":
                 return canary.CommandResult(
                     "codex codex-cli-test\ndeepseek deepseek-test\n", "", 0
@@ -1026,14 +1030,19 @@ class DosAppSprintCanaryTest(unittest.TestCase):
 
         self.assertEqual(
             [
-                "refresh isolated model routes",
+                "launch non-secret route probe",
+                "refresh exact-image model routes",
+                "resolve exact-image codex route",
+                "resolve exact-image deepseek route",
+                "stop non-secret route probe",
+                "verify non-secret route probe stopped",
                 "read provider credential",
                 "launch isolated runtime",
                 "inspect launched harness versions",
             ],
             events,
         )
-        refresh_env = run_envs["refresh isolated model routes"]
+        refresh_env = run_envs["launch non-secret route probe"]
         self.assertTrue(
             canary.PROVIDER_CREDENTIAL_ENV.isdisjoint(refresh_env)
         )
@@ -1046,6 +1055,47 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             {"codex": "codex-cli-test", "deepseek": "deepseek-test"},
             versions,
         )
+
+    def test_dispatch_forwards_ollama_value_without_putting_it_in_argv(self) -> None:
+        dispatcher = (
+            ROOT / ".super-coder" / "scripts" / "dispatch.sh"
+        ).read_text()
+
+        self.assertIn(
+            'ollama_env="-e OLLAMA_API_KEY"', dispatcher
+        )
+        self.assertIn("$mistral_env $ollama_env $pg_env", dispatcher)
+        self.assertNotIn(
+            'ollama_env="-e OLLAMA_API_KEY=${OLLAMA_API_KEY}"', dispatcher
+        )
+
+    def test_route_probe_failure_prevents_provider_credential_read(self) -> None:
+        backend = canary.HostBackend(
+            canary.Deadline(100, 50), sleep=lambda _: None
+        )
+        config = dataclasses.replace(
+            self.config,
+            profile=canary.DEEPSEEK_SPRINT_PROFILE,
+            credential_file=self.root / "authorized-provider.key",
+        )
+
+        def fake_run(argv, *, cwd=None, env=None, check=True, label):
+            if label == "refresh exact-image model routes":
+                raise canary.CanaryError(
+                    "CANARY_COMMAND_FAILED", "route refresh failed"
+                )
+            return canary.CommandResult("", "", 0)
+
+        backend._run = fake_run  # type: ignore[method-assign]
+        backend._read_provider_key = mock.Mock()  # type: ignore[method-assign]
+        health = mock.Mock()
+        health.request.return_value = {"status": "ok"}
+
+        with mock.patch.object(canary, "JsonHttp", return_value=health), \
+                self.assertRaisesRegex(canary.CanaryError, "route refresh failed"):
+            backend.launch(config, self.facts, canary.ResourceLedger())
+
+        backend._read_provider_key.assert_not_called()
 
     def test_live_materialization_uses_exact_sha_refspec_and_verifies_pin(self) -> None:
         clock = FakeClock()
