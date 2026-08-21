@@ -996,11 +996,15 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         )
         events: list[str] = []
         run_envs: dict[str, dict[str, str]] = {}
+        run_argv: dict[str, tuple[str, ...]] = {}
 
         def fake_run(argv, *, cwd=None, env=None, check=True, label):
             events.append(label)
             run_envs[label] = dict(env or {})
-            if label.startswith("resolve exact-image"):
+            run_argv[label] = tuple(argv)
+            if label.startswith("resolve exact-image") or label.startswith(
+                "resolve admitted"
+            ):
                 return canary.CommandResult('{"ok": true}', "", 0)
             if label == "verify non-secret route probe stopped":
                 return canary.CommandResult("", "not found", 1)
@@ -1033,11 +1037,12 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                 "launch non-secret route probe",
                 "refresh exact-image model routes",
                 "resolve exact-image codex route",
-                "resolve exact-image deepseek route",
                 "stop non-secret route probe",
                 "verify non-secret route probe stopped",
                 "read provider credential",
                 "launch isolated runtime",
+                "refresh admitted deepseek route",
+                "resolve admitted deepseek route",
                 "inspect launched harness versions",
             ],
             events,
@@ -1050,6 +1055,10 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         self.assertEqual(
             {"OLLAMA_API_KEY"},
             canary.PROVIDER_CREDENTIAL_ENV.intersection(launch_env),
+        )
+        self.assertNotIn(
+            "provider-canary-secret-value",
+            run_argv["refresh admitted deepseek route"],
         )
         self.assertEqual(
             {"codex": "codex-cli-test", "deepseek": "deepseek-test"},

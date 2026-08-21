@@ -1058,33 +1058,32 @@ class HostBackend:
             ["docker", "exec", facts.container, "./sc", "models", "refresh"],
             label="refresh exact-image model routes",
         )
-        for harness, selector in (
-            ("codex", "gpt-5.6-terra"),
-            ("deepseek", DEEPSEEK_MODEL),
+        codex_resolution = _json_output(
+            self._run(
+                [
+                    "docker",
+                    "exec",
+                    facts.container,
+                    "./sc",
+                    "models",
+                    "resolve",
+                    "codex",
+                    "gpt-5.6-terra",
+                    "--json",
+                ],
+                label="resolve exact-image codex route",
+            ),
+            label="resolve exact-image codex route",
+        )
+        if (
+            not isinstance(codex_resolution, dict)
+            or codex_resolution.get("ok") is not True
         ):
-            resolution = _json_output(
-                self._run(
-                    [
-                        "docker",
-                        "exec",
-                        facts.container,
-                        "./sc",
-                        "models",
-                        "resolve",
-                        harness,
-                        selector,
-                        "--json",
-                    ],
-                    label=f"resolve exact-image {harness} route",
-                ),
-                label=f"resolve exact-image {harness} route",
+            raise CanaryError(
+                "CANARY_ROUTE_NOT_CANONICAL",
+                "exact-image codex route did not resolve",
+                details={"harness": "codex", "selector": "gpt-5.6-terra"},
             )
-            if not isinstance(resolution, dict) or resolution.get("ok") is not True:
-                raise CanaryError(
-                    "CANARY_ROUTE_NOT_CANONICAL",
-                    f"exact-image {harness} route did not resolve",
-                    details={"harness": harness, "selector": selector},
-                )
         self._run(
             [str(facts.workspace / "sc"), "down"],
             cwd=facts.workspace,
@@ -1106,6 +1105,37 @@ class HostBackend:
             self._provider_key = self._read_provider_key(config.credential_file)
         env = self._runtime_env(facts)
         start_runtime(env, label="launch isolated runtime")
+        if config.profile == DEEPSEEK_SPRINT_PROFILE:
+            self._run(
+                ["docker", "exec", facts.container, "./sc", "models", "refresh"],
+                label="refresh admitted deepseek route",
+            )
+            deepseek_resolution = _json_output(
+                self._run(
+                    [
+                        "docker",
+                        "exec",
+                        facts.container,
+                        "./sc",
+                        "models",
+                        "resolve",
+                        "deepseek",
+                        DEEPSEEK_MODEL,
+                        "--json",
+                    ],
+                    label="resolve admitted deepseek route",
+                ),
+                label="resolve admitted deepseek route",
+            )
+            if (
+                not isinstance(deepseek_resolution, dict)
+                or deepseek_resolution.get("ok") is not True
+            ):
+                raise CanaryError(
+                    "CANARY_ROUTE_NOT_CANONICAL",
+                    "admitted DeepSeek route did not resolve",
+                    details={"harness": "deepseek", "selector": DEEPSEEK_MODEL},
+                )
         status = self._run(
             [str(facts.workspace / "sc"), "harness-status"],
             cwd=facts.workspace,
