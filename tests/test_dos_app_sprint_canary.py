@@ -1225,6 +1225,19 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         self.assertEqual("credential_rejected", evidence["category"])
         self.assertEqual(64, len(evidence["detail_sha256"]))
 
+    def test_qaqc_prompt_loads_the_predeclaration_reviewer_skill(self) -> None:
+        prompt = canary.HostBackend._qaqc_reviewer_prompt(117)
+
+        self.assertIn("Load sprint_rev", prompt)
+        self.assertIn("pre-declaration QA/QC path", prompt)
+        self.assertIn("there is no Sprint id or Sprint inbox yet", prompt)
+        self.assertIn(
+            "sc sprint record-qaqc --document 117 --verdict pass", prompt
+        )
+        self.assertIn("retry the exact command", prompt)
+        self.assertIn("stop only after confirmation", prompt)
+        self.assertNotIn("sc sprint inbox --sprint", prompt)
+
     def test_live_materialization_uses_exact_sha_refspec_and_verifies_pin(self) -> None:
         clock = FakeClock()
         deadline = canary.Deadline(100, 50, clock=clock)

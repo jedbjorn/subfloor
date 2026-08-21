@@ -1320,6 +1320,19 @@ class HostBackend:
             raise CanaryError("CANARY_QAQC_FAILED", "reviewer did not record approval")
         return int(rows[0]["approval_id"])
 
+    @staticmethod
+    def _qaqc_reviewer_prompt(document_id: int) -> str:
+        return (
+            "Load sprint_rev and use its explicit pre-declaration QA/QC path; "
+            "there is no Sprint id or Sprint inbox yet. "
+            f"Review spec document #{document_id} as the canary QA/QC Reviewer. "
+            "Confirm it is limited to a deterministic file, an ephemeral-base PR, real "
+            "Sprint lifecycle actions, and no change to main. If sound, run exactly "
+            f"sc sprint record-qaqc --document {document_id} --verdict pass. "
+            "Verify that command confirms the durable approval, retry the exact command "
+            "if the write is failed or ambiguous, and stop only after confirmation."
+        )
+
     def _create_conversation(
         self,
         api: JsonHttp,
@@ -2575,13 +2588,7 @@ raise TimeoutError("controller did not close the Force-new barrier")
         self._message(
             api,
             reviewer_id,
-            (
-                f"Review spec document #{document_id} as the canary QA/QC Reviewer. "
-                "Confirm it is limited to a deterministic file, an ephemeral-base PR, real "
-                "Sprint lifecycle actions, and no change to main. If sound, run "
-                f"sc sprint record-qaqc --document {document_id} --verdict pass. "
-                "Confirm the durable approval and stop."
-            ),
+            self._qaqc_reviewer_prompt(document_id),
             f"{config.run_id}:reviewer:qaqc",
         )
         self._wait_idle(api, reviewer_id, config, facts)
