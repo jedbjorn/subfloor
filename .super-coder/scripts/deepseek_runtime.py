@@ -524,6 +524,39 @@ def sanitize_diagnostic(
     return bounded
 
 
+def failed_command_diagnostic(
+    completed: subprocess.CompletedProcess[str],
+    *,
+    secrets: Sequence[str] = (),
+    limit: int = MAX_DIAGNOSTIC_CHARS,
+) -> str:
+    """Retain a failed command's bounded beginning and terminal cause."""
+    prefix = f"exit code {completed.returncode}"
+    streams = tuple(
+        value.strip()
+        for value in (completed.stdout, completed.stderr)
+        if isinstance(value, str) and value.strip()
+    )
+    if not streams:
+        return prefix
+    payload = sanitize_diagnostic(
+        "\n".join(streams),
+        secrets=secrets,
+        limit=sum(len(value) for value in streams) + len(streams),
+    )
+    separator = ": "
+    available = max(0, limit - len(prefix) - len(separator))
+    if len(payload) <= available:
+        return prefix + separator + payload
+    marker = "\n…[truncated middle]…\n"
+    if available <= len(marker):
+        return (prefix + separator + marker[:available])[:limit]
+    retained = available - len(marker)
+    head = retained // 3
+    tail = retained - head
+    return prefix + separator + payload[:head] + marker + payload[-tail:]
+
+
 def probe_carrier(
     python: Path,
     *,
@@ -974,7 +1007,7 @@ def _install_carrier_at(
                 check=False,
             )
             if completed.returncode != 0:
-                detail = sanitize_diagnostic(completed.stderr or completed.stdout or "install failed")
+                detail = failed_command_diagnostic(completed)
                 return _status(
                     available=False,
                     error="HARNESS_RUNTIME_INSTALL_FAILED",
@@ -1014,7 +1047,7 @@ def _install_carrier_at(
                 check=False,
             )
             if completed.returncode != 0:
-                detail = sanitize_diagnostic(completed.stderr or completed.stdout or "install failed")
+                detail = failed_command_diagnostic(completed)
                 return _status(
                     available=False,
                     error="HARNESS_RUNTIME_INSTALL_FAILED",

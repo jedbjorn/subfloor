@@ -1106,6 +1106,31 @@ def test_diagnostics_redact_known_and_explicit_secrets_before_bounding() -> None
     assert diagnostic.count("[REDACTED]") == 3
 
 
+def test_failed_command_diagnostic_retains_redacted_terminal_cause() -> None:
+    secret = "private-token-value"
+    completed_process = subprocess.CompletedProcess(
+        ["builder"],
+        -9,
+        stdout="carrier build started\n" + "ordinary output " * 200,
+        stderr=(
+            f"Authorization: Bearer {secret}\n"
+            + "warning output " * 300
+            + "\nterminal failure cause"
+        ),
+    )
+
+    diagnostic = deepseek_runtime.failed_command_diagnostic(
+        completed_process, secrets=(secret,), limit=256
+    )
+
+    assert len(diagnostic) == 256
+    assert diagnostic.startswith("exit code -9: carrier build started")
+    assert "…[truncated middle]…" in diagnostic
+    assert diagnostic.endswith("terminal failure cause")
+    assert secret not in diagnostic
+    assert "Authorization: Bearer" not in diagnostic
+
+
 def test_carrier_worker_redacts_ollama_credential_from_errors() -> None:
     worker_path = ROOT / ".super-coder" / "scripts" / "deepseek_carrier_worker.py"
     spec = importlib.util.spec_from_file_location("deepseek_carrier_worker_test", worker_path)
