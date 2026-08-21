@@ -1,4 +1,12 @@
-# The sandbox image COPYs nothing from the build context (the repo is bind-
-# mounted at runtime, not baked). So send the daemon an empty context — keeps
-# builds fast and avoids tar'ing .git / the .db / node_modules.
+# The sandbox image receives only the immutable DeepSeek carrier inputs copied
+# by .super-coder/Dockerfile. Keep the root context default-deny: parent
+# exceptions permit traversal only, while the two scripts and governed asset
+# tree below are the complete copyable surface.
 *
+!.super-coder
+!.super-coder/scripts
+!.super-coder/scripts/deepseek_runtime.py
+!.super-coder/scripts/build_deepseek_carrier.py
+!.super-coder/assets
+!.super-coder/assets/deepseek
+!.super-coder/assets/deepseek/**
