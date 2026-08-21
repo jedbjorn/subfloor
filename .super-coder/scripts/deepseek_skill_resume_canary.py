@@ -178,7 +178,9 @@ class _MockProvider:
         self.thread.join(timeout=2)
 
 
-def _binding() -> tuple[dict[str, Any], str]:
+def _binding(provider_url: str) -> tuple[dict[str, Any], str]:
+    manifest = deepseek_runtime.load_runtime_manifest()
+    provider = deepseek_runtime.provider_adapter("deepseek-official")
     binding = {
         "contract_version": 2,
         "control_state": "controlled",
@@ -197,8 +199,18 @@ def _binding() -> tuple[dict[str, Any], str]:
         },
         "adapter_metadata": {
             "provider_route": "deepseek-official",
+            "provider_adapter_id": provider["adapter_id"],
+            "provider_adapter_digest": route_bindings.digest_json(provider),
+            "provider_registry_sha256": manifest["provider_adapters"]["sha256"],
+            "credential_kind": provider["credential_kind"],
+            "endpoint_identity": provider_url,
+            "discovery_evidence_digest": "b" * 64,
             "transport_contract": "deepseek-provider-options-v1",
             "wire_evidence_digest": "c" * 64,
+            "runtime_version": manifest["runtime"]["version"],
+            "source_commit": manifest["source"]["commit"],
+            "patch_sha256": manifest["patch"]["sha256"],
+            "composition_sha256": manifest["composition"]["sha256"],
             "provider_options": {
                 "omit": ["thinking", "reasoning_effort"],
                 "set": {},
@@ -210,7 +222,7 @@ def _binding() -> tuple[dict[str, Any], str]:
 
 
 def _context(worktree: Path, provider_url: str) -> ConversationContext:
-    binding, digest = _binding()
+    binding, digest = _binding(provider_url)
     return ConversationContext(
         worktree=worktree,
         provider="deepseek-official",

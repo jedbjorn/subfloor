@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import importlib.util
 import json
 import os
 import stat
@@ -39,11 +40,14 @@ def completed(*, stdout: str = "", stderr: str = "", returncode: int = 0):
 def native_request_metadata(model: str, efforts) -> dict:
     return {
         effort: {
-            "event_type": "provider.request",
-            "provider": "deepseek-official",
-            "model": model,
-            "reasoning_effort": None if effort == "default" else effort,
-            "purpose": "conversation",
+            purpose: {
+                "event_type": "provider.request",
+                "provider": "deepseek-official",
+                "model": model,
+                "reasoning_effort": None if effort == "default" else effort,
+                "purpose": purpose,
+            }
+            for purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES
         }
         for effort in efforts
     }
@@ -52,22 +56,23 @@ def native_request_metadata(model: str, efforts) -> dict:
 def emit_provider_requests(argv, kwargs) -> dict:
     options_by_effort = json.loads(argv[-1])
     for options in options_by_effort.values():
-        body = {"model": argv[-2], "messages": [], "stream": True}
-        if options["thinking"] != "omit":
-            body["thinking"] = {"type": options["thinking"]}
-        if options["reasoningEffort"] != "omit":
-            body["reasoning_effort"] = options["reasoningEffort"]
-        request = urllib.request.Request(
-            kwargs["env"]["DEEPSEEK_BASE_URL"] + "/chat/completions",
-            data=json.dumps(body).encode(),
-            headers={
-                "Authorization": f"Bearer {kwargs['env']['DEEPSEEK_API_KEY']}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=5) as response:
-            response.read()
+        for _purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES:
+            body = {"model": argv[-2], "messages": [], "stream": True}
+            if options["thinking"] != "omit":
+                body["thinking"] = {"type": options["thinking"]}
+            if options["reasoningEffort"] != "omit":
+                body["reasoning_effort"] = options["reasoningEffort"]
+            request = urllib.request.Request(
+                kwargs["env"]["DEEPSEEK_BASE_URL"] + "/chat/completions",
+                data=json.dumps(body).encode(),
+                headers={
+                    "Authorization": f"Bearer {kwargs['env']['DEEPSEEK_API_KEY']}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                response.read()
     return options_by_effort
 
 
@@ -159,7 +164,7 @@ def test_runtime_manifest_pins_source_patch_recipe_and_supported_platforms() -> 
         "protocol": "super-coder-deepseek-lifecycle-v1",
         "acquisition": "verified-source-build",
         "worker_path": "scripts/deepseek_carrier_worker.py",
-        "worker_sha256": "da6b9803a2429ce926b97cff162f9aa387daa7570778c8dc53b97c7bfe685b89",
+        "worker_sha256": "c75ad8ff34dd659a5d2d1c4727f619c599a0c18924269be82a1b5ca605d39c34",
     }
     assert manifest["source"]["commit"] == "bb4ca698d63714e753f5621b07400e6ebb0b5d97"
     assert manifest["source"]["archive_sha256"] == "d5a78fb623d1c14846812e8e18042134a1127ab86dea259f79c2c8358e8481bc"
@@ -188,12 +193,42 @@ def test_composition_is_exact_and_contains_only_the_reviewed_plugin_allowlist() 
         "@deepseek-ai/dsh-session-persistence-jsonl",
         "@deepseek-ai/dsh-session-checkpoint-policy",
         "@deepseek-ai/dsh-token-meter",
+        "@deepseek-ai/dsh-llm-deepseek",
     )
     assert not any(
         forbidden in name
         for name in names
         for forbidden in ("approval", "question", "plugin", "web", "terminal")
     )
+
+
+def test_provider_compositions_activate_only_the_selected_adapter() -> None:
+    expected = {
+        "deepseek-official": (
+            "@deepseek-ai/dsh-llm-deepseek",
+            "@deepseek-ai/dsh-llm-pi-ai",
+        ),
+        "ollama-cloud": (
+            "@deepseek-ai/dsh-llm-pi-ai",
+            "@deepseek-ai/dsh-llm-deepseek",
+        ),
+    }
+
+    for provider, (selected, excluded) in expected.items():
+        composition = deepseek_runtime.provider_composition(provider)
+        path = Path(composition["path"])
+        body = path.read_text()
+        names = tuple(
+            line.split("name:", 1)[1].strip().strip("'")
+            for line in body.splitlines()
+            if line.strip().startswith("name:")
+        )
+        adapter = deepseek_runtime.provider_adapter(provider)
+
+        assert composition["sha256"] == adapter["composition_sha256"]
+        assert deepseek_runtime._sha256(path) == composition["sha256"]
+        assert names.count(selected) == 1
+        assert excluded not in names
 
 
 def test_composition_enables_native_skills_only_from_the_rendered_grant_root() -> None:
@@ -210,14 +245,40 @@ def test_composition_enables_native_skills_only_from_the_rendered_grant_root() -
 
 
 def test_composition_digest_drift_fails_closed() -> None:
-    with mock.patch.object(deepseek_runtime, "_sha256", return_value="0" * 64):
+    manifest = deepseek_runtime.load_runtime_manifest()
+    composition = ROOT / ".super-coder" / manifest["composition"]["path"]
+    real_sha256 = deepseek_runtime._sha256
+
+    def changed_digest(path: Path) -> str:
+        return "0" * 64 if path == composition else real_sha256(path)
+
+    with mock.patch.object(deepseek_runtime, "_sha256", side_effect=changed_digest):
         try:
             deepseek_runtime.load_runtime_manifest()
         except deepseek_runtime.DeepSeekRuntimeError as exc:
             assert exc.code == "HARNESS_COMPOSITION_DRIFT"
-            assert "8c1e4a0988c2a00c457ba7d2b0fbf80dc02d5b0fd29a8e8f92567f09ef70f3c1" in exc.detail
+            assert manifest["composition"]["sha256"] in exc.detail
         else:
             raise AssertionError("composition drift was accepted")
+
+
+def test_ollama_composition_drift_fails_only_when_that_route_is_selected() -> None:
+    official = deepseek_runtime.provider_composition("deepseek-official")
+    ollama = deepseek_runtime.provider_composition("ollama-cloud")
+    real_sha256 = deepseek_runtime._sha256
+
+    def changed_digest(path: Path) -> str:
+        return "0" * 64 if path == Path(ollama["path"]) else real_sha256(path)
+
+    with mock.patch.object(deepseek_runtime, "_sha256", side_effect=changed_digest):
+        assert deepseek_runtime.provider_composition("deepseek-official") == official
+        try:
+            deepseek_runtime.provider_composition("ollama-cloud")
+        except deepseek_runtime.DeepSeekRuntimeError as exc:
+            assert exc.code == "HARNESS_COMPOSITION_DRIFT"
+            assert ollama["sha256"] in exc.detail
+        else:
+            raise AssertionError("changed Ollama composition was accepted")
 
 
 def test_missing_carrier_is_a_deepseek_only_unavailable_status() -> None:
@@ -280,7 +341,7 @@ def test_exact_isolated_pair_reports_available_and_mismatch_does_not() -> None:
             "python_version": "3.14.7",
             "sdk_version": "0.1.0rc7",
             "runtime_version": "0.1.0rc7",
-            "composition_sha256": "8c1e4a0988c2a00c457ba7d2b0fbf80dc02d5b0fd29a8e8f92567f09ef70f3c1",
+            "composition_sha256": deepseek_runtime.load_runtime_manifest()["composition"]["sha256"],
         }
         assert bad.available is False
         assert bad.error == "HARNESS_RUNTIME_VERSION_MISMATCH"
@@ -380,6 +441,7 @@ def test_provider_wire_evidence_captures_default_omission_and_named_mapping() ->
         ))
 
     evidence = deepseek_runtime.provider_wire_evidence(
+        "deepseek-official",
         "deepseek-v4-pro",
         {
             "default": {"thinking": "omit", "reasoningEffort": "omit"},
@@ -401,6 +463,13 @@ def test_provider_wire_evidence_captures_default_omission_and_named_mapping() ->
         "reasoning_effort": None,
         "purpose": "conversation",
     }
+    assert set(evidence["proofs"]["default"]["purpose_proofs"]) == set(
+        deepseek_runtime.PROVIDER_WIRE_PURPOSES
+    )
+    for purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES:
+        purpose_proof = evidence["proofs"]["default"]["purpose_proofs"][purpose]
+        assert purpose_proof["wire_options"] == {}
+        assert purpose_proof["native_request"]["purpose"] == purpose
     for effort in ("low", "high", "max"):
         assert evidence["proofs"][effort]["wire_options"] == {
             "thinking": {"type": "enabled"},
@@ -441,23 +510,25 @@ def test_provider_wire_evidence_rejects_materialized_default() -> None:
             "thinking": {"type": "enabled"},
             "reasoning_effort": "high",
         }
-        request = urllib.request.Request(
-            kwargs["env"]["DEEPSEEK_BASE_URL"] + "/chat/completions",
-            data=json.dumps(body).encode(),
-            headers={
-                "Authorization": f"Bearer {kwargs['env']['DEEPSEEK_API_KEY']}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=5) as response:
-            response.read()
+        for _purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES:
+            request = urllib.request.Request(
+                kwargs["env"]["DEEPSEEK_BASE_URL"] + "/chat/completions",
+                data=json.dumps(body).encode(),
+                headers={
+                    "Authorization": f"Bearer {kwargs['env']['DEEPSEEK_API_KEY']}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                response.read()
         return completed(stdout=json.dumps(
             native_request_metadata(argv[-2], options_by_effort)
         ))
 
     try:
         deepseek_runtime.provider_wire_evidence(
+            "deepseek-official",
             "deepseek-v4-pro",
             {"default": {"thinking": "omit", "reasoningEffort": "omit"}},
             env={},
@@ -489,6 +560,7 @@ def test_provider_wire_evidence_rejects_missing_native_request_metadata() -> Non
 
     try:
         deepseek_runtime.provider_wire_evidence(
+            "deepseek-official",
             "deepseek-v4-pro",
             {"default": {"thinking": "omit", "reasoningEffort": "omit"}},
             env={},
@@ -500,6 +572,41 @@ def test_provider_wire_evidence_rejects_missing_native_request_metadata() -> Non
         assert exc.detail == "carrier returned no valid native request metadata"
     else:
         raise AssertionError("wire-only receipt entered controlled evidence")
+
+
+def test_provider_wire_evidence_rejects_missing_egress_purpose() -> None:
+    status = deepseek_runtime.RuntimeStatus(
+        available=True,
+        enabled=True,
+        error=None,
+        detail=None,
+        carrier_python="/carrier/bin/python",
+        python_version="3.14.7",
+        sdk_version="0.1.0rc7",
+        runtime_version="0.1.0rc7",
+        composition_sha256=deepseek_runtime.load_runtime_manifest()["composition"]["sha256"],
+    )
+
+    def runner(argv, **kwargs):
+        options_by_effort = emit_provider_requests(argv, kwargs)
+        metadata = native_request_metadata(argv[-2], options_by_effort)
+        del metadata["default"]["session-title"]
+        return completed(stdout=json.dumps(metadata))
+
+    try:
+        deepseek_runtime.provider_wire_evidence(
+            "deepseek-official",
+            "deepseek-v4-pro",
+            {"default": {"thinking": "omit", "reasoningEffort": "omit"}},
+            env={},
+            runner=runner,
+            status=status,
+        )
+    except deepseek_runtime.DeepSeekRuntimeError as exc:
+        assert exc.code == "HARNESS_PROVIDER_WIRE_INVALID"
+        assert exc.detail == "native request purposes are incomplete for effort default"
+    else:
+        raise AssertionError("incomplete purpose proof entered controlled evidence")
 
 
 def test_provider_wire_evidence_rejects_mismatched_native_effort() -> None:
@@ -518,11 +625,12 @@ def test_provider_wire_evidence_rejects_mismatched_native_effort() -> None:
     def runner(argv, **kwargs):
         options_by_effort = emit_provider_requests(argv, kwargs)
         metadata = native_request_metadata(argv[-2], options_by_effort)
-        metadata["low"]["reasoning_effort"] = "high"
+        metadata["low"]["conversation"]["reasoning_effort"] = "high"
         return completed(stdout=json.dumps(metadata))
 
     try:
         deepseek_runtime.provider_wire_evidence(
+            "deepseek-official",
             "deepseek-v4-pro",
             {"low": {"thinking": "enabled", "reasoningEffort": "low"},
              "default": {"thinking": "omit", "reasoningEffort": "omit"}},
@@ -532,7 +640,9 @@ def test_provider_wire_evidence_rejects_mismatched_native_effort() -> None:
         )
     except deepseek_runtime.DeepSeekRuntimeError as exc:
         assert exc.code == "HARNESS_PROVIDER_WIRE_MISMATCH"
-        assert exc.detail == "native request metadata does not match effort low"
+        assert exc.detail == (
+            "native request metadata does not match effort low purpose conversation"
+        )
     else:
         raise AssertionError("mismatched native effort entered controlled evidence")
 
@@ -804,6 +914,11 @@ def test_launch_environment_replaces_personal_state_and_redacts_credentials() ->
                 "DSH_SKILL_ROOT": "/home/operator/.agents/skills",
                 "DSH_PROFILE": "mutable-personal-profile",
                 "DEEPSEEK_API_KEY": "old-secret",
+                "ANTHROPIC_API_KEY": "ambient-anthropic-secret",
+                "KIMI_API_KEY": "ambient-kimi-secret",
+                "MISTRAL_API_KEY": "ambient-mistral-secret",
+                "OLLAMA_API_KEY": "ambient-ollama-secret",
+                "OPENAI_API_KEY": "ambient-openai-secret",
             },
         )
         redacted = deepseek_runtime.redacted_environment(child)
@@ -816,11 +931,89 @@ def test_launch_environment_replaces_personal_state_and_redacts_credentials() ->
         assert child["DSH_SYSTEM_PROMPT"] == "immutable boot bytes"
         assert child["DEEPSEEK_API_KEY"] == "sk-private-credential"
         assert child["DEEPSEEK_BASE_URL"] == "https://api.deepseek.example/v1"
+        assert child["DSH_CORDIS_CONFIG"].endswith("/assets/deepseek/cordis.yml")
         assert "DSH_PROFILE" not in child
         assert "/home/operator/.dsh" not in child.values()
         assert "old-secret" not in child.values()
+        assert {
+            name
+            for name in child
+            if name in {
+                "ANTHROPIC_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "KIMI_API_KEY",
+                "MISTRAL_API_KEY",
+                "OLLAMA_API_KEY",
+                "OPENAI_API_KEY",
+            }
+        } == {"DEEPSEEK_API_KEY"}
+        for leaked in (
+            "ambient-anthropic-secret",
+            "ambient-kimi-secret",
+            "ambient-mistral-secret",
+            "ambient-ollama-secret",
+            "ambient-openai-secret",
+        ):
+            assert leaked not in child.values()
         assert redacted["DEEPSEEK_API_KEY"] == "[REDACTED]"
         assert "sk-private-credential" not in json.dumps(redacted)
+
+
+def test_ollama_launch_projects_only_its_fixed_provider_credential() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        worktree = root / "worktree"
+        worktree.mkdir()
+        layout = deepseek_runtime.conversation_layout(42, state_root=root / "state")
+
+        child = deepseek_runtime.launch_environment(
+            layout,
+            worktree=worktree,
+            system_prompt="immutable boot bytes",
+            provider="ollama-cloud",
+            api_key="ollama-private-credential",
+            base_env={
+                "PATH": "/usr/bin",
+                "ANTHROPIC_API_KEY": "ambient-anthropic-secret",
+                "DEEPSEEK_API_KEY": "ambient-deepseek-secret",
+                "DEEPSEEK_BASE_URL": "https://attacker.example/v1",
+                "KIMI_API_KEY": "ambient-kimi-secret",
+                "MISTRAL_API_KEY": "ambient-mistral-secret",
+                "OLLAMA_API_KEY": "old-ollama-secret",
+                "OPENAI_API_KEY": "ambient-openai-secret",
+                "SC_DEEPSEEK_PROVIDER": "deepseek-official",
+            },
+        )
+
+        assert child["OLLAMA_API_KEY"] == "ollama-private-credential"
+        assert child["SC_DEEPSEEK_PROVIDER_BASE_URL"] == "https://ollama.com/v1"
+        assert child["DSH_CORDIS_CONFIG"].endswith(
+            "/assets/deepseek/cordis-ollama-cloud.yml"
+        )
+        assert "DEEPSEEK_API_KEY" not in child
+        assert "DEEPSEEK_BASE_URL" not in child
+        assert "SC_DEEPSEEK_PROVIDER" not in child
+        assert {
+            name
+            for name in child
+            if name in {
+                "ANTHROPIC_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "KIMI_API_KEY",
+                "MISTRAL_API_KEY",
+                "OLLAMA_API_KEY",
+                "OPENAI_API_KEY",
+            }
+        } == {"OLLAMA_API_KEY"}
+        for leaked in (
+            "ambient-anthropic-secret",
+            "ambient-deepseek-secret",
+            "ambient-kimi-secret",
+            "ambient-mistral-secret",
+            "ambient-openai-secret",
+            "old-ollama-secret",
+        ):
+            assert leaked not in child.values()
 
 
 def test_disable_is_non_destructive_and_short_circuits_runtime_probe() -> None:
@@ -864,6 +1057,22 @@ def test_diagnostics_redact_known_and_explicit_secrets_before_bounding() -> None
     assert "bearer-secret" not in diagnostic
     assert secret not in diagnostic
     assert diagnostic.count("[REDACTED]") == 3
+
+
+def test_carrier_worker_redacts_ollama_credential_from_errors() -> None:
+    worker_path = ROOT / ".super-coder" / "scripts" / "deepseek_carrier_worker.py"
+    spec = importlib.util.spec_from_file_location("deepseek_carrier_worker_test", worker_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    stub = SimpleNamespace(HarnessClient=object, HarnessConfig=object)
+    with mock.patch.dict(sys.modules, {"deepseek_harness": stub}):
+        spec.loader.exec_module(module)
+
+    secret = "ollama-private-credential-value"
+    detail = module._detail(ValueError(f"OLLAMA_API_KEY={secret}"))
+
+    assert secret not in detail
+    assert detail == "OLLAMA_API_KEY=[REDACTED]"
 
 
 def test_linux_process_identity_reads_start_ticks_after_a_spaced_comm() -> None:

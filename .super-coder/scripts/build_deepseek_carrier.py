@@ -35,8 +35,8 @@ def sha256(path: Path) -> str:
 
 def load_manifest() -> dict[str, object]:
     payload = json.loads(MANIFEST.read_text())
-    if payload.get("schema_version") != 2:
-        raise RuntimeError("carrier build requires DeepSeek runtime manifest schema 2")
+    if payload.get("schema_version") != 3:
+        raise RuntimeError("carrier build requires DeepSeek runtime manifest schema 3")
     return payload
 
 
@@ -211,6 +211,8 @@ def build(source: Path, output: Path, manifest: Mapping[str, object]) -> dict[st
             "run",
             "packages/sdk/server/tests/server.spec.ts",
             "packages/llm/llm-deepseek/tests/serialize.spec.ts",
+            "packages/llm/llm-pi-ai/tests/adapter.spec.ts",
+            "packages/llm/llm-pi-ai/tests/config.spec.ts",
             "packages/skill/skill-filesystem/tests/skill-filesystem.spec.ts",
             "packages/skill/tool-skill/tests/tool-skill.spec.ts",
         ],

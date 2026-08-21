@@ -1,11 +1,11 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "python_minimum": "3.10",
   "carrier": {
     "protocol": "super-coder-deepseek-lifecycle-v1",
     "acquisition": "verified-source-build",
     "worker_path": "scripts/deepseek_carrier_worker.py",
-    "worker_sha256": "da6b9803a2429ce926b97cff162f9aa387daa7570778c8dc53b97c7bfe685b89"
+    "worker_sha256": "c75ad8ff34dd659a5d2d1c4727f619c599a0c18924269be82a1b5ca605d39c34"
   },
   "source": {
     "repository": "https://github.com/deepseek-ai/deepseek-harness",
@@ -18,14 +18,14 @@
   },
   "patch": {
     "path": "assets/deepseek/deepseek-harness-bb4ca698-lifecycle.patch",
-    "sha256": "034245298c94964e67f6f756b6067926740def4cd98f68e4a4751d6f65d6d74b",
+    "sha256": "ad5a7d5f8ac54a7a00521d15a097ec510962fb00fa69019b3f69514eacde078f",
     "protocol": "super-coder-deepseek-lifecycle-v1",
     "upstream_issue_url": "https://github.com/deepseek-ai/deepseek-harness/issues/new",
     "upstream_contribution": "git apply assets/deepseek/deepseek-harness-bb4ca698-lifecycle.patch"
   },
   "build": {
     "path": "scripts/build_deepseek_carrier.py",
-    "sha256": "107a7af5370d0707de155949f2850b9ee391c295ae0f6b37f282d72c4035accb",
+    "sha256": "21ece73a4cdb59673e987e33809aab9f3e0013c6930b050e571b0d49fdd1f396",
     "lock_sha256": "f517dc3978d57531cda747df62a2abdde1df5b9f25415fcf1fc5d51f8b7547ea",
     "node_version": "24.18.1",
     "pnpm_version": "11.7.0",
@@ -33,7 +33,7 @@
     "source_date_epoch": 1786963622,
     "artifact_evidence": "deepseek-carrier-artifacts.json",
     "canary_path": "scripts/deepseek_skill_resume_canary.py",
-    "canary_sha256": "1962ca50a8c8ca67a54fac57f72d1114c5174ed289ded7a67301393e06c004ac",
+    "canary_sha256": "ffc7efd08c6ea4735b135a6eeedc7fd4959d722313d909a5e476c9a4baf08f0c",
     "canary_contract": "deepseek-production-skill-resume-v1"
   },
   "sdk": {
@@ -47,6 +47,10 @@
   },
   "composition": {
     "path": "assets/deepseek/cordis.yml",
-    "sha256": "8c1e4a0988c2a00c457ba7d2b0fbf80dc02d5b0fd29a8e8f92567f09ef70f3c1"
+    "sha256": "10ff54722966868f86fb6cfdbd07dc8d3c899c98b3296613290ec30d82c04a8c"
+  },
+  "provider_adapters": {
+    "path": "assets/deepseek/provider-adapters.json",
+    "sha256": "2e12e44fcd0329a343722d05cc9dd7591e79a730fdc6c81d06be685bb675d029"
   }
 }

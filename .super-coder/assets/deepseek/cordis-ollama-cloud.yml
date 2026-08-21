@@ -1,9 +1,10 @@
-# super-coder-owned unattended DeepSeek composition.
+# super-coder-owned unattended DeepSeek composition for Ollama Cloud.
 #
 # The Python carrier pins the plugin closure. This file pins which of those
-# plugins may run for a browser conversation. stdout remains JSON-RPC-only;
-# there is deliberately no terminal UI, approval service, user-question tool,
-# plugin manager, mutable profile include, or home-level patch layer.
+# plugins may run for an Ollama Cloud browser conversation. stdout remains
+# JSON-RPC-only; there is deliberately no DeepSeek-official adapter, terminal
+# UI, approval service, user-question tool, plugin manager, mutable profile
+# include, or home-level patch layer.
 
 - id: sdk-jsonrpc-server
   name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
@@ -58,8 +59,17 @@
 - id: token-meter
   name: '@deepseek-ai/dsh-token-meter'
 
-- id: provider-deepseek-official
-  name: '@deepseek-ai/dsh-llm-deepseek'
+- id: provider-ollama-cloud
+  name: '@deepseek-ai/dsh-llm-pi-ai'
   config:
-    providerRequestThinking: !!js process.env.SC_DEEPSEEK_PROVIDER_THINKING
-    providerRequestReasoningEffort: !!js process.env.SC_DEEPSEEK_PROVIDER_REASONING_EFFORT
+    providers:
+      ollama-cloud:
+        apiKeyEnv: OLLAMA_API_KEY
+        displayName: Ollama Cloud
+        api: openai-completions
+        baseURL: !!js process.env.SC_DEEPSEEK_PROVIDER_BASE_URL
+        models:
+          - id: !!js process.env.SC_DEEPSEEK_MODEL
+        retryPolicy:
+          mode: normal
+          maxRetries: 0

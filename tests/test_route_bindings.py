@@ -251,9 +251,22 @@ class BindingIdentityTest(unittest.TestCase):
 
     @classmethod
     def deepseek_row(cls) -> dict:
+        identity = {
+            "provider_adapter_id": "deepseek-native-v1",
+            "provider_adapter_digest": "1" * 64,
+            "provider_registry_sha256": "2" * 64,
+            "credential_kind": "deepseek-api-key",
+            "endpoint_identity": "https://api.deepseek.com",
+            "discovery_evidence_digest": "3" * 64,
+            "runtime_version": "0.1.0rc7",
+            "source_commit": "b" * 40,
+            "patch_sha256": "7" * 64,
+            "composition_sha256": "8" * 64,
+        }
         selected = {
             "default": {
                 "provider_route": "deepseek-official",
+                **identity,
                 "transport_contract": "deepseek-provider-options-v1",
                 "wire_evidence_digest": "5" * 64,
                 "provider_options": {
@@ -262,6 +275,7 @@ class BindingIdentityTest(unittest.TestCase):
             },
             "high": {
                 "provider_route": "deepseek-official",
+                **identity,
                 "transport_contract": "deepseek-provider-options-v1",
                 "wire_evidence_digest": "6" * 64,
                 "provider_options": {
@@ -532,16 +546,36 @@ class BindingIdentityTest(unittest.TestCase):
         self.assertEqual(default["transport"], "deepseek-provider-options-v1")
         self.assertEqual(default["adapter_metadata"], {
             "provider_route": "deepseek-official",
+            "provider_adapter_id": "deepseek-native-v1",
+            "provider_adapter_digest": "1" * 64,
+            "provider_registry_sha256": "2" * 64,
+            "credential_kind": "deepseek-api-key",
+            "endpoint_identity": "https://api.deepseek.com",
+            "discovery_evidence_digest": "3" * 64,
             "transport_contract": "deepseek-provider-options-v1",
             "wire_evidence_digest": "5" * 64,
+            "runtime_version": "0.1.0rc7",
+            "source_commit": "b" * 40,
+            "patch_sha256": "7" * 64,
+            "composition_sha256": "8" * 64,
             "provider_options": {
                 "omit": ["thinking", "reasoning_effort"], "set": {},
             },
         })
         self.assertEqual(named["adapter_metadata"], {
             "provider_route": "deepseek-official",
+            "provider_adapter_id": "deepseek-native-v1",
+            "provider_adapter_digest": "1" * 64,
+            "provider_registry_sha256": "2" * 64,
+            "credential_kind": "deepseek-api-key",
+            "endpoint_identity": "https://api.deepseek.com",
+            "discovery_evidence_digest": "3" * 64,
             "transport_contract": "deepseek-provider-options-v1",
             "wire_evidence_digest": "6" * 64,
+            "runtime_version": "0.1.0rc7",
+            "source_commit": "b" * 40,
+            "patch_sha256": "7" * 64,
+            "composition_sha256": "8" * 64,
             "provider_options": {
                 "omit": [],
                 "set": {
@@ -607,6 +641,56 @@ class BindingIdentityTest(unittest.TestCase):
                 runtime_status=runtime,
             )
         self.assertEqual(refused.exception.code, "unsupported_thinking_level")
+
+    def test_ollama_binding_pins_provider_model_credential_and_endpoint(self):
+        binding = {
+            "contract_version": 2,
+            "control_state": "controlled",
+            "harness": "deepseek",
+            "requested_model": "ollama-cloud/deepseek-v4-pro",
+            "provider_model": "deepseek-v4-pro",
+            "requested_effort": "default",
+            "effective_effort": "default",
+            "native_variant_id": None,
+            "transport": "deepseek-provider-options-v1",
+            "catalogue_generation": "a" * 32,
+            "evidence_digest": None,
+            "selector_binding": {
+                "kind": "authenticated-provider-model",
+                "selector": "ollama-cloud/deepseek-v4-pro",
+            },
+            "adapter_metadata": {
+                "provider_route": "ollama-cloud",
+                "provider_adapter_id": "dsh-llm-pi-ai@0.1.0-rc.7/ollama-cloud",
+                "provider_adapter_digest": "1" * 64,
+                "provider_registry_sha256": "2" * 64,
+                "credential_kind": "ollama-api-key",
+                "endpoint_identity": "https://ollama.com/v1",
+                "discovery_evidence_digest": "3" * 64,
+                "transport_contract": "deepseek-provider-options-v1",
+                "provider_options": {
+                    "omit": ["thinking", "reasoning_effort"], "set": {},
+                },
+                "wire_evidence_digest": "4" * 64,
+                "runtime_version": "0.1.0rc7",
+                "source_commit": "b" * 40,
+                "patch_sha256": "5" * 64,
+                "composition_sha256": "6" * 64,
+            },
+        }
+
+        route_bindings.validate_v2_binding(binding)
+        for field, value in (
+            ("credential_kind", "deepseek-api-key"),
+            ("endpoint_identity", "https://token@ollama.com/v1"),
+            ("endpoint_identity", "https://"),
+            ("provider_adapter_digest", "0" * 63),
+        ):
+            forged = json.loads(json.dumps(binding))
+            forged["adapter_metadata"][field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(route_bindings.RouteResolutionError):
+                    route_bindings.validate_v2_binding(forged)
 
     def test_uncontrolled_bindings_encode_every_inapplicable_value_as_null(self):
         default, default_digest = route_bindings.resolve_v2(
@@ -1165,7 +1249,7 @@ class LegacySprintBindingUpgradeTest(unittest.TestCase):
             refreshed["harnesses"]["codex"]["models"][0]["harness_support_state"],
             "tested",
         )
-        self.assertEqual(cached["v"], 7)
+        self.assertEqual(cached["v"], 8)
         current = self.con.execute(
             "SELECT selector,stale,harness_version,harness_support_state FROM model_routes "
             "WHERE harness='codex' ORDER BY selector"

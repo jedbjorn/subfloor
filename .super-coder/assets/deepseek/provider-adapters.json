@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "providers": {
+    "deepseek-official": {
+      "adapter_id": "dsh-llm-deepseek@0.1.0-rc.7",
+      "plugin": "@deepseek-ai/dsh-llm-deepseek",
+      "plugin_version": "0.1.0-rc.7",
+      "adapter_kind": "native-deepseek",
+      "composition_path": "assets/deepseek/cordis.yml",
+      "composition_sha256": "10ff54722966868f86fb6cfdbd07dc8d3c899c98b3296613290ec30d82c04a8c",
+      "credential_kind": "deepseek-api-key",
+      "credential_source_env": "DEEPSEEK_API_KEY",
+      "credential_child_env": "DEEPSEEK_API_KEY",
+      "endpoint_default": "https://api.deepseek.com",
+      "endpoint_env": "DEEPSEEK_BASE_URL",
+      "discovery_path": "/models",
+      "discovery_shape": "openai-model-list-v1",
+      "selector_prefix": false,
+      "max_models": 8,
+      "model_selectors": [],
+      "wire_proof_budget": 8,
+      "named_efforts": ["low", "high", "max"],
+      "wire_mode": "deepseek-request-patch"
+    },
+    "ollama-cloud": {
+      "adapter_id": "dsh-llm-pi-ai@0.1.0-rc.7/ollama-cloud",
+      "plugin": "@deepseek-ai/dsh-llm-pi-ai",
+      "plugin_version": "0.1.0-rc.7",
+      "adapter_kind": "llm-pi-ai",
+      "composition_path": "assets/deepseek/cordis-ollama-cloud.yml",
+      "composition_sha256": "7bec59aa0af713e94513cc0a39ddcf9b3699d0c4132612d09d0c98dfbc108dbd",
+      "dependency": {
+        "distribution": "@earendil-works/pi-ai",
+        "version": "0.82.1",
+        "integrity": "sha512-3WFYRhEp3lQB3444EhPMBcM7zSaEUE3eJgHOR7s4081NLqbw/FsWilIKWXSua0Gv3sRr7m9xMidR3pPDE7jI/A=="
+      },
+      "credential_kind": "ollama-api-key",
+      "credential_source_env": "OLLAMA_API_KEY",
+      "credential_child_env": "OLLAMA_API_KEY",
+      "endpoint_default": "https://ollama.com/v1",
+      "endpoint_env": null,
+      "discovery_path": "/models",
+      "discovery_shape": "openai-model-list-v1",
+      "selector_prefix": true,
+      "max_models": 64,
+      "model_selectors": ["deepseek-v4-pro:0813"],
+      "wire_proof_budget": 4,
+      "named_efforts": [],
+      "wire_mode": "pi-ai-provider-default"
+    }
+  }
+}
