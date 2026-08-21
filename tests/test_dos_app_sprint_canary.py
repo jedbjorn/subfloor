@@ -950,6 +950,23 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             ):
                 canary._validated_deepseek_candidates(invalid)
 
+    def test_deepseek_candidate_projection_excludes_failed_live_reviewer_route(
+        self,
+    ) -> None:
+        result = canary.CommandResult(
+            "deepseek/ollama-cloud/deepseek-v4-flash:0731\tavailable\t"
+            "ollama-cloud-provider-api\n"
+            "deepseek/ollama-cloud/other:cloud\tavailable\t"
+            "ollama-cloud-provider-api\n",
+            "",
+            0,
+        )
+
+        self.assertEqual(
+            ["ollama-cloud/other:cloud"],
+            canary._validated_deepseek_candidates(result),
+        )
+
     def test_restart_probe_requires_the_exact_bounded_contract(self) -> None:
         payload = restart_probe()
         result = canary._validated_restart_probe(

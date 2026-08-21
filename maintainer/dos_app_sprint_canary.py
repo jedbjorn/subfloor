@@ -71,6 +71,9 @@ DEEPSEEK_CANDIDATE_PREFERENCES = (
     "ollama-cloud/glm-5.2:cloud",
     "ollama-cloud/minimax-m3:cloud",
 )
+DEEPSEEK_CANDIDATE_REJECTIONS = frozenset(
+    {"ollama-cloud/deepseek-v4-flash:0731"}
+)
 DEEPSEEK_CANDIDATE_LIMIT = 4
 DEEPSEEK_CANDIDATE_OUTPUT_BYTES = 16 * 1024
 RESTART_REHEARSAL_MODEL = "ollama-cloud/sc-loopback-restart:fixture"
@@ -876,6 +879,8 @@ def _validated_deepseek_candidates(result: CommandResult) -> list[str]:
                 "CANARY_ROUTE_CANDIDATES_INVALID",
                 "DeepSeek candidate identity was not exact and bounded",
             )
+        if selector in DEEPSEEK_CANDIDATE_REJECTIONS:
+            continue
         candidates.append(selector)
     if len(candidates) != len(set(candidates)) or not candidates:
         raise CanaryError(
