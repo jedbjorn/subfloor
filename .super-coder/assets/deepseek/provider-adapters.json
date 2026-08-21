@@ -43,7 +43,7 @@
       "discovery_shape": "openai-model-list-v1",
       "selector_prefix": true,
       "max_models": 64,
-      "model_selectors": ["deepseek-v4-pro:0813"],
+      "model_selectors": [],
       "wire_proof_budget": 4,
       "named_efforts": [],
       "wire_mode": "pi-ai-provider-default"

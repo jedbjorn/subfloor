@@ -468,7 +468,12 @@ def get_model_routes(con, *, harness: str | None = None,
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY harness, availability='available' DESC, selector"
-    return {"routes": rows(con.execute(sql, tuple(params)))}
+    result = {"routes": rows(con.execute(sql, tuple(params)))}
+    if harness is not None:
+        harness_error = model_catalog.latest_harness_error(con, harness)
+        if harness_error is not None:
+            result["harness_error"] = harness_error
+    return result
 
 
 def known_harnesses() -> list[str]:
@@ -713,6 +718,8 @@ def set_flavor_default(con, body) -> tuple[bool, dict | None]:
     observed_route = None
     route_proof = None
     if model is not None:
+        if harness == "deepseek" and (model_supplied or effort_supplied):
+            model_catalog.ensure_deepseek_route(con, model)
         row = con.execute(
             "SELECT * FROM model_routes WHERE harness=? AND selector=?",
             (harness, model),

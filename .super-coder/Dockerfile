@@ -112,7 +112,7 @@ ENV SC_DEEPSEEK_CARRIER_PYTHON=/opt/super-coder/deepseek-runtime/bin/python
 COPY .super-coder/scripts/deepseek_runtime.py /opt/super-coder/deepseek-bootstrap/scripts/deepseek_runtime.py
 COPY .super-coder/scripts/build_deepseek_carrier.py /opt/super-coder/deepseek-bootstrap/scripts/build_deepseek_carrier.py
 COPY .super-coder/scripts/deepseek_carrier_worker.py /opt/super-coder/deepseek-bootstrap/scripts/deepseek_carrier_worker.py
-COPY .super-coder/scripts/deepseek_skill_resume_canary.py /opt/super-coder/deepseek-bootstrap/scripts/deepseek_skill_resume_canary.py
+COPY .super-coder/scripts/deepseek_inference_canary.py /opt/super-coder/deepseek-bootstrap/scripts/deepseek_inference_canary.py
 COPY .super-coder/scripts/cli_entry.py /opt/super-coder/deepseek-bootstrap/scripts/cli_entry.py
 COPY .super-coder/assets/deepseek /opt/super-coder/deepseek-bootstrap/assets/deepseek
 RUN python /opt/super-coder/deepseek-bootstrap/scripts/deepseek_runtime.py \

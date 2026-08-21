@@ -374,10 +374,10 @@ def load_runtime_manifest(path: Path = MANIFEST_PATH) -> dict[str, object]:
             raise ValueError("patch and carrier protocol identities differ")
         if runtime["platforms"] != ["macos-arm64", "linux-arm64", "linux-x64"]:
             raise ValueError("runtime platform contract drifted")
-        if build["canary_path"] != "scripts/deepseek_skill_resume_canary.py":
-            raise ValueError("unexpected production skill canary path")
-        if build["canary_contract"] != "deepseek-production-skill-resume-v1":
-            raise ValueError("unexpected production skill canary contract")
+        if build["canary_path"] != "scripts/deepseek_inference_canary.py":
+            raise ValueError("unexpected production inference canary path")
+        if build["canary_contract"] != "deepseek-production-ordinary-inference-v1":
+            raise ValueError("unexpected production inference canary contract")
         if not isinstance(composition, dict):
             raise ValueError("composition evidence must be an object")
         if not isinstance(provider_adapters, dict):
@@ -408,7 +408,7 @@ def load_runtime_manifest(path: Path = MANIFEST_PATH) -> dict[str, object]:
                     "path": build["canary_path"],
                     "sha256": build["canary_sha256"],
                 },
-                "scripts/deepseek_skill_resume_canary.py",
+                "scripts/deepseek_inference_canary.py",
                 "HARNESS_RUNTIME_ARTIFACT_DRIFT",
             ),
         ):
@@ -522,6 +522,39 @@ def sanitize_diagnostic(
     if len(bounded) > limit:
         return bounded[: max(0, limit - 14)] + "…[truncated]"
     return bounded
+
+
+def failed_command_diagnostic(
+    completed: subprocess.CompletedProcess[str],
+    *,
+    secrets: Sequence[str] = (),
+    limit: int = MAX_DIAGNOSTIC_CHARS,
+) -> str:
+    """Retain a failed command's bounded beginning and terminal cause."""
+    prefix = f"exit code {completed.returncode}"
+    streams = tuple(
+        value.strip()
+        for value in (completed.stdout, completed.stderr)
+        if isinstance(value, str) and value.strip()
+    )
+    if not streams:
+        return prefix
+    payload = sanitize_diagnostic(
+        "\n".join(streams),
+        secrets=secrets,
+        limit=sum(len(value) for value in streams) + len(streams),
+    )
+    separator = ": "
+    available = max(0, limit - len(prefix) - len(separator))
+    if len(payload) <= available:
+        return prefix + separator + payload
+    marker = "\n…[truncated middle]…\n"
+    if available <= len(marker):
+        return (prefix + separator + marker[:available])[:limit]
+    retained = available - len(marker)
+    head = retained // 3
+    tail = retained - head
+    return prefix + separator + payload[:head] + marker + payload[-tail:]
 
 
 def probe_carrier(
@@ -889,19 +922,15 @@ def _load_built_artifacts(
             "contract": build["canary_contract"],
             "source_commit": source["commit"],
             "composition_sha256": manifest["composition"]["sha256"],
-            "initial_catalog": ["changed", "current", "revoked"],
-            "resumed_catalog": ["changed", "current", "new"],
-            "changed_body_refreshed": True,
-            "new_grant_loadable": True,
-            "revoked_grant_absent": True,
-            "boot_digest_preserved": True,
-            "native_session_preserved": True,
-            "fresh_carrier_process": True,
-            "initial_terminal": "run.completed",
-            "resumed_terminal": "run.completed",
+            "provider": "deepseek-official",
+            "model": "deepseek-ordinary-inference-canary",
+            "provider_request_count": 1,
+            "reserved_default_omitted": True,
+            "assistant_response_nonempty": True,
+            "terminal": "run.completed",
         }
         if evidence["canary"] != expected_canary:
-            raise ValueError("artifact production skill-resume canary drifted")
+            raise ValueError("artifact production inference canary drifted")
         records = evidence["artifacts"]
         if not isinstance(records, list) or len(records) != 2:
             raise ValueError("artifact evidence must contain exactly two wheels")
@@ -974,7 +1003,7 @@ def _install_carrier_at(
                 check=False,
             )
             if completed.returncode != 0:
-                detail = sanitize_diagnostic(completed.stderr or completed.stdout or "install failed")
+                detail = failed_command_diagnostic(completed)
                 return _status(
                     available=False,
                     error="HARNESS_RUNTIME_INSTALL_FAILED",
@@ -1014,7 +1043,7 @@ def _install_carrier_at(
                 check=False,
             )
             if completed.returncode != 0:
-                detail = sanitize_diagnostic(completed.stderr or completed.stdout or "install failed")
+                detail = failed_command_diagnostic(completed)
                 return _status(
                     available=False,
                     error="HARNESS_RUNTIME_INSTALL_FAILED",

@@ -138,19 +138,15 @@ def write_artifact_evidence(directory: Path) -> None:
                 },
                 "canary": {
                     "schema_version": 1,
-                    "contract": "deepseek-production-skill-resume-v1",
+                    "contract": "deepseek-production-ordinary-inference-v1",
                     "source_commit": manifest["source"]["commit"],
                     "composition_sha256": manifest["composition"]["sha256"],
-                    "initial_catalog": ["changed", "current", "revoked"],
-                    "resumed_catalog": ["changed", "current", "new"],
-                    "changed_body_refreshed": True,
-                    "new_grant_loadable": True,
-                    "revoked_grant_absent": True,
-                    "boot_digest_preserved": True,
-                    "native_session_preserved": True,
-                    "fresh_carrier_process": True,
-                    "initial_terminal": "run.completed",
-                    "resumed_terminal": "run.completed",
+                    "provider": "deepseek-official",
+                    "model": "deepseek-ordinary-inference-canary",
+                    "provider_request_count": 1,
+                    "reserved_default_omitted": True,
+                    "assistant_response_nonempty": True,
+                    "terminal": "run.completed",
                 },
                 "artifacts": records,
             }
@@ -380,7 +376,7 @@ def test_built_artifact_digest_drift_fails_before_install() -> None:
             raise AssertionError("changed built artifact was accepted")
 
 
-def test_built_artifact_without_production_skill_canary_is_rejected() -> None:
+def test_built_artifact_without_production_inference_canary_is_rejected() -> None:
     with tempfile.TemporaryDirectory() as raw:
         directory = Path(raw)
         write_artifact_evidence(directory)
@@ -397,7 +393,7 @@ def test_built_artifact_without_production_skill_canary_is_rejected() -> None:
             assert exc.code == "HARNESS_RUNTIME_ARTIFACT_DRIFT"
             assert "canary" in exc.detail
         else:
-            raise AssertionError("artifact without production skill canary was accepted")
+            raise AssertionError("artifact without production inference canary was accepted")
 
 
 def test_provider_request_patch_is_callable_exact_and_fail_closed() -> None:
@@ -1104,6 +1100,31 @@ def test_diagnostics_redact_known_and_explicit_secrets_before_bounding() -> None
     assert "bearer-secret" not in diagnostic
     assert secret not in diagnostic
     assert diagnostic.count("[REDACTED]") == 3
+
+
+def test_failed_command_diagnostic_retains_redacted_terminal_cause() -> None:
+    secret = "private-token-value"
+    completed_process = subprocess.CompletedProcess(
+        ["builder"],
+        -9,
+        stdout="carrier build started\n" + "ordinary output " * 200,
+        stderr=(
+            f"Authorization: Bearer {secret}\n"
+            + "warning output " * 300
+            + "\nterminal failure cause"
+        ),
+    )
+
+    diagnostic = deepseek_runtime.failed_command_diagnostic(
+        completed_process, secrets=(secret,), limit=256
+    )
+
+    assert len(diagnostic) == 256
+    assert diagnostic.startswith("exit code -9: carrier build started")
+    assert "…[truncated middle]…" in diagnostic
+    assert diagnostic.endswith("terminal failure cause")
+    assert secret not in diagnostic
+    assert "Authorization: Bearer" not in diagnostic
 
 
 def test_carrier_worker_redacts_ollama_credential_from_errors() -> None:

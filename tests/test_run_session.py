@@ -68,6 +68,7 @@ class FlavorRouteDefaultsTest(unittest.TestCase):
             "CREATE TABLE flavor_defaults ("
             "flavor TEXT,harness TEXT,model TEXT,effort TEXT,is_default INTEGER)"
         )
+
         con.executemany(
             "INSERT INTO flavor_defaults VALUES (?,?,?,?,?)",
             [
@@ -82,6 +83,18 @@ class FlavorRouteDefaultsTest(unittest.TestCase):
                 "models": {"codex": "gpt-test", "kimi": None},
                 "efforts": {"codex": "low", "kimi": None},
             }},
+        )
+
+    def test_deepseek_provider_tracks_the_bound_provider_route(self) -> None:
+        self.assertEqual(
+            "ollama-cloud",
+            run.session_provider(
+                "deepseek", "ollama-cloud/deepseek-v4-pro:0813"
+            ),
+        )
+        self.assertEqual(
+            "deepseek-official",
+            run.session_provider("deepseek", "deepseek-v4-pro"),
         )
 
 

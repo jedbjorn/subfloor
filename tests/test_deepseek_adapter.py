@@ -293,6 +293,30 @@ def native_notification(
     }
 
 
+def provider_notification(
+    session_ref: str,
+    *,
+    provider: str = "ollama-cloud",
+    model: str = "deepseek-v4-pro:0813",
+    default_omitted: bool = True,
+    purpose: str = "conversation",
+) -> dict[str, Any]:
+    return {
+        "method": "native/notification",
+        "params": {
+            "method": "provider.request",
+            "payload": {
+                "sessionId": session_ref,
+                "provider": provider,
+                "model": model,
+                "reasoningEffort": None,
+                "reservedDefaultOmitted": default_omitted,
+                "purpose": purpose,
+            },
+        },
+    }
+
+
 def test_manifest_registry_probe_and_surface_contract_are_live() -> None:
     adapter = DeepSeekAdapter(runtime_probe=lambda **_: runtime_status())
     probe = adapter.probe()
@@ -624,6 +648,119 @@ def test_approval_event_fails_only_the_owned_run_and_releases_no_other_transport
     assert turn_b.session_ref != turn_a.session_ref
     adapter_a.close()
     adapter_b.close()
+
+
+@pytest.mark.parametrize(
+    ("native_code", "native_message", "expected_code"),
+    [
+        (
+            "INVALID_CREDENTIAL",
+            "opaque provider detail",
+            "HARNESS_NATIVE_RUN_INVALID_CREDENTIAL",
+        ),
+        ("HTTP_503", "opaque provider detail", "HARNESS_NATIVE_RUN_HTTP_503"),
+        (
+            "PI_AI_ERROR",
+            "request failed with 404 status code (no body)",
+            "HARNESS_NATIVE_RUN_HTTP_404",
+        ),
+        (
+            "PI_AI_ERROR",
+            "opaque provider detail token=404-must-not-survive",
+            "HARNESS_NATIVE_RUN_PI_AI_ERROR",
+        ),
+        (
+            "PLAUSIBLE_BUT_UNKNOWN",
+            "opaque provider detail",
+            "HARNESS_NATIVE_RUN_FAILED",
+        ),
+        (None, "opaque provider detail", "HARNESS_NATIVE_RUN_FAILED"),
+    ],
+)
+def test_turn_failure_projects_only_a_strict_native_error_code(
+    tmp_path: Path,
+    native_code: str | None,
+    native_message: str,
+    expected_code: str,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    factory = Factory()
+    adapter = make_adapter(tmp_path / "state", factory)
+    try:
+        turn = adapter.start(context(worktree), "Do it")
+        reason: dict[str, Any] = {
+            "kind": "error",
+            "error": {"message": native_message},
+        }
+        if native_code is not None:
+            reason["error"]["code"] = native_code
+        factory.instances[0].items = [
+            native_notification(
+                turn.session_ref,
+                "turn/end",
+                5,
+                {"turn": 1, "reason": reason},
+            )
+        ]
+
+        events = list(adapter.stream(turn))
+
+        assert [event.type for event in events] == ["session.started", "run.failed"]
+        assert events[-1].payload["error"] == expected_code
+        assert native_message not in events[-1].payload["detail"]
+    finally:
+        adapter.close()
+
+
+def test_provider_failure_retains_exact_route_and_default_omission_only(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    factory = Factory()
+    adapter = make_adapter(tmp_path / "state", factory)
+    try:
+        turn = adapter.start(context(worktree, provider="ollama-cloud"), "Do it")
+        factory.instances[0].items = [
+            provider_notification(turn.session_ref),
+            native_notification(
+                turn.session_ref,
+                "turn/end",
+                5,
+                {
+                    "turn": 1,
+                    "reason": {
+                        "kind": "error",
+                        "error": {
+                            "code": "AUTH",
+                            "status": 401,
+                            "message": "credential must-not-survive",
+                        },
+                    },
+                },
+            ),
+        ]
+
+        events = list(adapter.stream(turn))
+        evidence = json.loads(events[-1].payload["detail"])
+
+        assert evidence == {
+            "schema_version": 1,
+            "source": "provider",
+            "phase": "provider-response",
+            "category": "authentication",
+            "upstream_code": "AUTH",
+            "http_status": 401,
+            "provider_request_observed": True,
+            "provider_exact": True,
+            "model_exact": True,
+            "reserved_default_omitted": True,
+            "purpose": "conversation",
+        }
+        assert "must-not-survive" not in events[-1].payload["detail"]
+    finally:
+        adapter.close()
 
 
 def test_same_conversation_cannot_spawn_two_carriers(tmp_path: Path) -> None:

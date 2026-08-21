@@ -45,6 +45,59 @@ MAX_UNKNOWN_EVENTS = 8
 DEFAULT_STREAM_INACTIVITY_SECONDS = 30.0
 DEFAULT_SILENT_PROBE_LIMIT = 2
 SENSITIVE_KEY = re.compile(r"(?:key|token|secret|password|credential|authorization)", re.I)
+NATIVE_ERROR_CODES = frozenset(
+    {
+        "ABORTED",
+        "AUTH",
+        "CONTEXT_WINDOW_EXCEEDED",
+        "EMPTY_RESPONSE",
+        "INVALID_CREDENTIAL",
+        "INVALID_REQUEST",
+        "MALFORMED_RESPONSE",
+        "MISSING_CREDENTIAL",
+        "PI_AI_ERROR",
+        "QUOTA",
+        "RATE_LIMIT",
+        "SERVER",
+        "STREAM_CLOSED",
+        "TIMEOUT",
+        "TRANSPORT",
+        "UNSUPPORTED_CONTENT",
+    }
+)
+NATIVE_HTTP_ERROR_CODE = re.compile(r"^HTTP_[1-5][0-9]{2}$")
+NATIVE_HTTP_STATUS = re.compile(
+    r"(?:\bHTTP(?:\s+status)?[\s:_-]*([1-5][0-9]{2})\b|"
+    r"\b([1-5][0-9]{2})\s+status\s+code\b)",
+    re.I,
+)
+
+
+FAILURE_SOURCES = frozenset(
+    {"provider", "carrier", "protocol", "engine"}
+)
+FAILURE_PHASES = frozenset(
+    {
+        "initialize",
+        "request-serialize",
+        "provider-request",
+        "provider-response",
+        "terminal",
+    }
+)
+FAILURE_CATEGORIES = frozenset(
+    {
+        "authentication",
+        "quota-or-rate-limit",
+        "provider-unavailable",
+        "protocol-contract",
+        "carrier-contract",
+        "unknown",
+    }
+)
+FAILURE_PURPOSES = frozenset(
+    {"conversation", "compaction", "session-title", "unknown"}
+)
 _CARRIER_STREAM_END = object()
 
 
@@ -328,6 +381,100 @@ def _bounded_native(value: Any) -> Any:
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "original_bytes": len(encoded),
     }
+
+
+def _native_failure_code(reason: Any) -> str:
+    error = reason.get("error") if isinstance(reason, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    if isinstance(code, str) and (
+        code in NATIVE_ERROR_CODES or NATIVE_HTTP_ERROR_CODE.fullmatch(code)
+    ):
+        if code == "PI_AI_ERROR":
+            message = error.get("message")
+            match = (
+                NATIVE_HTTP_STATUS.search(message)
+                if isinstance(message, str)
+                else None
+            )
+            if match is not None:
+                return f"HARNESS_NATIVE_RUN_HTTP_{match.group(1) or match.group(2)}"
+        return f"HARNESS_NATIVE_RUN_{code}"
+    return "HARNESS_NATIVE_RUN_FAILED"
+
+
+def _native_http_status(error: Mapping[str, Any]) -> int | None:
+    status = error.get("status")
+    if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+        return status
+    code = error.get("code")
+    if isinstance(code, str) and NATIVE_HTTP_ERROR_CODE.fullmatch(code):
+        return int(code.removeprefix("HTTP_"))
+    message = error.get("message")
+    match = NATIVE_HTTP_STATUS.search(message) if isinstance(message, str) else None
+    return int(match.group(1) or match.group(2)) if match is not None else None
+
+
+def _native_failure_evidence(
+    reason: Any, request: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Project native failure data into one fixed, non-secret diagnostic shape."""
+    error = reason.get("error") if isinstance(reason, dict) else None
+    error = error if isinstance(error, dict) else {}
+    raw_code = error.get("code")
+    upstream_code = (
+        raw_code
+        if isinstance(raw_code, str)
+        and (raw_code in NATIVE_ERROR_CODES or NATIVE_HTTP_ERROR_CODE.fullmatch(raw_code))
+        else None
+    )
+    status = _native_http_status(error)
+    message = error.get("message")
+    lowered = message.lower() if isinstance(message, str) else ""
+    if (
+        upstream_code in {"AUTH", "INVALID_CREDENTIAL", "MISSING_CREDENTIAL"}
+        or status in {401, 403}
+    ):
+        category = "authentication"
+        phase = "provider-response"
+    elif upstream_code in {"QUOTA", "RATE_LIMIT"} or status == 429:
+        category = "quota-or-rate-limit"
+        phase = "provider-response"
+    elif upstream_code in {"SERVER", "TIMEOUT", "TRANSPORT", "STREAM_CLOSED"} or (
+        status is not None and status >= 500
+    ):
+        category = "provider-unavailable"
+        phase = "provider-response"
+    elif upstream_code in {"INVALID_REQUEST", "MALFORMED_RESPONSE", "UNSUPPORTED_CONTENT"} or (
+        status is not None and 400 <= status < 500
+    ):
+        category = "protocol-contract"
+        phase = "provider-response"
+    else:
+        category = "unknown"
+        phase = "terminal"
+    observed = isinstance(request, Mapping)
+    purpose = request.get("purpose") if observed else None
+    if purpose not in FAILURE_PURPOSES:
+        purpose = "unknown"
+    evidence = {
+        "schema_version": 1,
+        "source": "provider" if observed else "carrier",
+        "phase": phase,
+        "category": category,
+        "upstream_code": upstream_code,
+        "http_status": status,
+        "provider_request_observed": observed,
+        "provider_exact": bool(request.get("provider_exact")) if observed else False,
+        "model_exact": bool(request.get("model_exact")) if observed else False,
+        "reserved_default_omitted": (
+            bool(request.get("reserved_default_omitted")) if observed else False
+        ),
+        "purpose": purpose,
+    }
+    assert evidence["source"] in FAILURE_SOURCES
+    assert evidence["phase"] in FAILURE_PHASES
+    assert evidence["category"] in FAILURE_CATEGORIES
+    return evidence
 
 
 class DeepSeekAdapter(ConversationAdapter):
@@ -843,6 +990,8 @@ class DeepSeekAdapter(ConversationAdapter):
                 "layout_key": layout.conversation_key,
                 "binding_digest": context.binding_digest,
                 "boot_sha256": self._identity_value(context, session_ref)["boot_sha256"],
+                "expected_provider": context.provider,
+                "expected_model": context.route_binding.get("provider_model"),
             },
         )
         try:
@@ -1098,14 +1247,22 @@ class DeepSeekAdapter(ConversationAdapter):
                     "native",
                 )
             else:
+                evidence = _native_failure_evidence(
+                    reason,
+                    turn.metadata.get("provider_request_evidence"),
+                )
                 terminal = self._terminal(
                     turn,
                     "run.failed",
                     {
                         "status": "failed",
-                        "error": "HARNESS_NATIVE_RUN_FAILED",
+                        "error": _native_failure_code(reason),
                         "reason": kind or "unknown",
-                        "native": native,
+                        "detail": json.dumps(
+                            evidence,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
                     },
                     native_type,
                 )
@@ -1330,6 +1487,22 @@ class DeepSeekAdapter(ConversationAdapter):
             if not isinstance(native_method, str) or not isinstance(payload, dict):
                 continue
             if not self._matches_session(turn.session_ref, payload):
+                continue
+            if native_method == "provider.request":
+                purpose = payload.get("purpose")
+                turn.metadata["provider_request_evidence"] = {
+                    "provider_exact": payload.get("provider")
+                    == turn.metadata.get("expected_provider"),
+                    "model_exact": payload.get("model")
+                    == turn.metadata.get("expected_model"),
+                    "reserved_default_omitted": payload.get(
+                        "reservedDefaultOmitted"
+                    )
+                    is True,
+                    "purpose": (
+                        purpose if purpose in FAILURE_PURPOSES else "unknown"
+                    ),
+                }
                 continue
             if native_method != "session.event":
                 continue

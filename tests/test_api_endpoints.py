@@ -1267,6 +1267,44 @@ class AuthenticatedCliCatalogueRouteTest(unittest.TestCase):
         self.assertEqual(unavailable["routes"], [])
         self.assertNotIn("runtime_status", unavailable)
 
+    def test_route_projection_carries_latest_bounded_harness_failure(self) -> None:
+        completed = "2026-08-21T00:02:00+00:00"
+        con = self.connect()
+        con.execute(
+            "INSERT INTO model_catalog_generations (generation_id,"
+            "payload_version,contract_version,started_at,completed_at,state,"
+            "runtime,source_summary,harness_versions,source_fingerprints,"
+            "error_summary,payload_digest) VALUES (?,8,2,?,?,"
+            "'successful','sandbox','[]','{}','{}',?,?)",
+            (
+                "d" * 32,
+                completed,
+                completed,
+                json.dumps({
+                    "error": None,
+                    "errors": [],
+                    "harness_errors": {
+                        "deepseek": "authenticated DeepSeek exact model is absent"
+                    },
+                }),
+                "c" * 64,
+            ),
+        )
+        con.commit()
+        con.close()
+
+        status, body = self.request(
+            "/_sc/model-routes?harness=deepseek&selector="
+            "ollama-cloud%2Fdeepseek-v4-pro%3A0813"
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual([], body["routes"])
+        self.assertEqual(
+            "authenticated DeepSeek exact model is absent",
+            body["harness_error"],
+        )
+
     def test_real_advisory_vibe_catalogue_resolves_locally_and_via_api(self) -> None:
         vibe_status = compatible_runtime()
         run = mock.Mock()

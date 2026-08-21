@@ -187,6 +187,87 @@ def test_bound_headless_route_rejects_unsupported_deepseek_effort() -> None:
     }
 
 
+def test_native_deepseek_conversation_does_not_enable_cli_headless() -> None:
+    adapter = run_mod.load_adapter("deepseek")
+
+    assert run_mod.headless_command(adapter, "prompt") is None
+    assert run_mod.headless_command(
+        adapter, "prompt", conversation_owned=True
+    ) == []
+    assert adapter["surfaces"]["one_shot"] is False
+
+
+def test_native_deepseek_launch_plan_does_not_probe_an_empty_cli(
+    launch_case, monkeypatch
+) -> None:
+    db_path, worktree = launch_case
+
+    def connect():
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        return con
+
+    def reject_cli_probe(_binary: str) -> str:
+        raise AssertionError("native browser dispatch must not probe a CLI")
+
+    monkeypatch.setenv("RENDER_ONLY", "1")
+    monkeypatch.setattr(run_mod, "open_db", connect)
+    monkeypatch.setattr(
+        run_mod,
+        "authenticate",
+        lambda _con, interactive: {"user_id": 1, "username": "operator"},
+    )
+    monkeypatch.setattr(run_mod, "flavor_defaults", lambda _con: {})
+    monkeypatch.setattr(run_mod, "ensure_harness_path", lambda: None)
+    monkeypatch.setattr(
+        run_mod,
+        "resolve_headless_route",
+        lambda **_: SimpleNamespace(
+            model="ollama-cloud/deepseek-v4-pro:0813", effort="high"
+        ),
+    )
+    monkeypatch.setattr(run_mod, "cleanup_before_launch", lambda *_a, **_k: None)
+    monkeypatch.setattr(run_mod, "open_session", lambda *_a, **_k: ("0001", 42))
+    monkeypatch.setattr(run_mod.ports_mod, "resolve", lambda: {})
+    monkeypatch.setattr(run_mod, "shell_work_dir", lambda *_: worktree)
+    monkeypatch.setattr(run_mod, "ensure_worktree", lambda *_: None)
+    monkeypatch.setattr(run_mod, "sync_worktree", lambda *_: None)
+    monkeypatch.setattr(run_mod, "link_worktree_map", lambda *_: None)
+    monkeypatch.setattr(run_mod, "main_checkout_note", lambda *_: None)
+    monkeypatch.setattr(run_mod, "declared_work_repo_note", lambda *_: None)
+    monkeypatch.setattr(
+        run_mod.conversation_boot, "resolve_boot", lambda *_a, **_k: "boot bytes"
+    )
+    monkeypatch.setattr(run_mod.conversation_boot, "write_boot_files", lambda *_: None)
+    monkeypatch.setattr(run_mod, "render_harness_skills", lambda *_: None)
+    monkeypatch.setattr(run_mod, "emit_adapter", lambda *_: None)
+    monkeypatch.setattr(run_mod, "resolve_opencode_plugins", lambda *_: None)
+    monkeypatch.setattr(run_mod, "apply_merge_json", lambda *_: None)
+    monkeypatch.setattr(run_mod, "apply_managed_mcp", lambda *_: None)
+    monkeypatch.setattr(run_mod, "apply_sandbox", lambda *_: None)
+    monkeypatch.setattr(run_mod, "_cli_version", reject_cli_probe)
+
+    plan = run_mod.prepare_launch(
+        shell_id=1,
+        harness="deepseek",
+        model="ollama-cloud/deepseek-v4-pro:0813",
+        effort="high",
+        headless_prompt="Do the work",
+        conversation_owned=True,
+        current_leased_run_id=7,
+        boot=BootDirective(
+            conversation_id="cv_" + "a" * 32,
+            phase="start",
+        ),
+    )
+
+    assert plan.argv == []
+    assert plan.cli_version is None
+    assert plan.harness == "deepseek"
+    assert plan.model == "ollama-cloud/deepseek-v4-pro:0813"
+    assert plan.effort == "high"
+
+
 @pytest.fixture
 def launch_case():
     with tempfile.TemporaryDirectory() as tmp:
@@ -253,6 +334,7 @@ def test_preparer_returns_canonical_environment_and_archive(launch_case):
         "model": "gpt-test",
         "effort": "high",
         "headless_prompt": "Do the work",
+        "conversation_owned": True,
         "current_leased_run_id": 7,
         "boot": BootDirective(
             conversation_id="cv_" + "a" * 32,

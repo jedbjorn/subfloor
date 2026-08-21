@@ -57,6 +57,11 @@ DEFAULT_BUSY_RETRY_ATTEMPTS = 6
 _STREAM_END = object()
 
 
+def unexpected_error_code(exc: Exception) -> str:
+    """Classify an internal exception without persisting its message."""
+    return f"BROKER_RUN_{type(exc).__name__.upper()}"[:255]
+
+
 class BrokerError(RuntimeError):
     """Stable broker failure for the API boundary."""
 
@@ -1485,6 +1490,7 @@ class ConversationBroker(threading.Thread):
             )
         outcome = terminal_outcome(event.type)
         error = event.payload.get("error")
+        detail = event.payload.get("detail")
         exit_code = event.payload.get("exit_code")
         persisted, _result = self._retry_busy(
             partial(
@@ -1506,7 +1512,11 @@ class ConversationBroker(threading.Thread):
                     ),
                 },
                 error_code=str(error)[:255] if error else None,
-                error_detail=str(error) if error else None,
+                error_detail=(
+                    str(detail)[:16384]
+                    if detail is not None
+                    else str(error) if error else None
+                ),
                 exit_code=exit_code if isinstance(exit_code, int) else None,
             ),
             wait=True,
@@ -1520,7 +1530,7 @@ class ConversationBroker(threading.Thread):
         *,
         proven: bool,
     ) -> None:
-        code = getattr(exc, "code", "BROKER_RUN_ERROR")
+        code = getattr(exc, "code", unexpected_error_code(exc))
         detail = getattr(exc, "detail", str(exc))
         outcome = "failed" if proven else "unknown"
         self._retry_busy(

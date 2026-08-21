@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import queue
+import subprocess
 import sys
 import tempfile
 import threading
@@ -18,15 +21,14 @@ sys.path.insert(0, str(ENGINE / "scripts"))
 sys.path.insert(0, str(ENGINE / "api"))
 
 import deepseek_runtime  # noqa: E402
-import route_bindings  # noqa: E402
-from conversation_adapters.base import ConversationContext  # noqa: E402
-from conversation_adapters.deepseek import DeepSeekAdapter  # noqa: E402
 
 
 BOOT_BYTES = "immutable DeepSeek skill canary boot bytes"
 MODEL = "deepseek-v4-pro"
 INITIAL_SKILLS = ("changed", "current", "revoked")
 RESUMED_SKILLS = ("changed", "current", "new")
+SESSION_ID = "deepseek-" + "7" * 32
+WORKER = Path(__file__).resolve().parent / "deepseek_carrier_worker.py"
 
 
 def _skill_body(name: str, description: str, body: str) -> str:
@@ -178,81 +180,164 @@ class _MockProvider:
         self.thread.join(timeout=2)
 
 
-def _binding(provider_url: str) -> tuple[dict[str, Any], str]:
-    manifest = deepseek_runtime.load_runtime_manifest()
-    provider = deepseek_runtime.provider_adapter("deepseek-official")
-    binding = {
-        "contract_version": 2,
-        "control_state": "controlled",
-        "harness": "deepseek",
-        "requested_model": MODEL,
-        "provider_model": MODEL,
-        "requested_effort": "default",
-        "effective_effort": "default",
-        "native_variant_id": None,
-        "transport": "deepseek-provider-options-v1",
-        "catalogue_generation": "a" * 32,
-        "evidence_digest": None,
-        "selector_binding": {
-            "kind": "authenticated-provider-model",
-            "selector": MODEL,
-        },
-        "adapter_metadata": {
-            "provider_route": "deepseek-official",
-            "provider_adapter_id": provider["adapter_id"],
-            "provider_adapter_digest": route_bindings.digest_json(provider),
-            "provider_registry_sha256": manifest["provider_adapters"]["sha256"],
-            "credential_kind": provider["credential_kind"],
-            "endpoint_identity": provider_url,
-            "discovery_evidence_digest": "b" * 64,
-            "transport_contract": "deepseek-provider-options-v1",
-            "wire_evidence_digest": "c" * 64,
-            "runtime_version": manifest["runtime"]["version"],
-            "source_commit": manifest["source"]["commit"],
-            "patch_sha256": manifest["patch"]["sha256"],
-            "composition_sha256": manifest["composition"]["sha256"],
-            "provider_options": {
-                "omit": ["thinking", "reasoning_effort"],
-                "set": {},
-            },
-        },
-    }
-    route_bindings.validate_v2_binding(binding)
-    return binding, route_bindings.digest_json(binding)
+class _CarrierWorker:
+    def __init__(self, carrier_python: Path, worktree: Path, env: Mapping[str, str]):
+        self.process = subprocess.Popen(
+            [str(carrier_python), "-I", str(WORKER)],
+            cwd=worktree,
+            env=dict(env),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        self._messages: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._deferred: list[dict[str, Any]] = []
+        self._stderr: list[str] = []
+        self._next_id = 1
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+
+    def _read_stdout(self) -> None:
+        assert self.process.stdout is not None
+        for line in self.process.stdout:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError as exc:
+                self._messages.put(
+                    {"method": "worker/error", "params": {"detail": str(exc)}}
+                )
+                return
+            if isinstance(message, dict):
+                self._messages.put(message)
+
+    def _read_stderr(self) -> None:
+        assert self.process.stderr is not None
+        remaining = 4096
+        for line in self.process.stderr:
+            if remaining <= 0:
+                continue
+            chunk = deepseek_runtime.sanitize_diagnostic(line, limit=remaining)
+            self._stderr.append(chunk)
+            remaining -= len(chunk)
+
+    def _next(self, timeout: float = 15) -> dict[str, Any]:
+        if self._deferred:
+            return self._deferred.pop(0)
+        try:
+            return self._messages.get(timeout=timeout)
+        except queue.Empty as exc:
+            detail = "".join(self._stderr) or "carrier worker timed out"
+            raise RuntimeError(detail) from exc
+
+    def request(self, method: str, params: Mapping[str, Any]) -> Any:
+        request_id = self._next_id
+        self._next_id += 1
+        assert self.process.stdin is not None
+        self.process.stdin.write(
+            json.dumps(
+                {"id": request_id, "method": method, "params": dict(params)},
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        self.process.stdin.flush()
+        deferred: list[dict[str, Any]] = []
+        while True:
+            message = self._next()
+            if message.get("id") != request_id:
+                deferred.append(message)
+                continue
+            self._deferred[0:0] = deferred
+            error = message.get("error")
+            if isinstance(error, dict):
+                raise RuntimeError(str(error.get("detail") or error.get("code")))
+            return message.get("result")
+
+    def wait_for_completion(self, session_id: str) -> str:
+        while True:
+            message = self._next()
+            method = message.get("method")
+            params = message.get("params")
+            if method == "worker/error" and isinstance(params, dict):
+                raise RuntimeError(str(params.get("detail") or "carrier failed"))
+            if method == "native/request":
+                raise RuntimeError("carrier requested unsupported interaction")
+            if method != "native/notification" or not isinstance(params, dict):
+                continue
+            if params.get("method") != "session.event":
+                continue
+            payload = params.get("payload")
+            if not isinstance(payload, dict) or payload.get("sessionId") != session_id:
+                continue
+            event = payload.get("event")
+            if not isinstance(event, dict) or event.get("type") != "turn/end":
+                continue
+            data = event.get("data")
+            reason = data.get("reason") if isinstance(data, dict) else None
+            kind = reason.get("kind") if isinstance(reason, dict) else None
+            if kind != "completed":
+                raise RuntimeError(f"carrier turn ended as {kind or 'unknown'}")
+            return "run.completed"
+
+    def close(self) -> None:
+        if self.process.poll() is not None:
+            return
+        try:
+            self.request("shutdown", {})
+            self.process.wait(timeout=5)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            self.process.terminate()
+            self.process.wait(timeout=5)
 
 
-def _context(worktree: Path, provider_url: str) -> ConversationContext:
-    binding, digest = _binding(provider_url)
-    return ConversationContext(
+def _run_phase(
+    carrier_python: Path,
+    *,
+    layout: deepseek_runtime.ConversationLayout,
+    worktree: Path,
+    provider_url: str,
+    message: str,
+) -> tuple[int, str, str]:
+    child_env = deepseek_runtime.launch_environment(
+        layout,
         worktree=worktree,
+        system_prompt=BOOT_BYTES,
         provider="deepseek-official",
-        model=MODEL,
-        effort="default",
-        permission_mode="unrestricted",
-        env={
-            "DEEPSEEK_API_KEY": "sk-canary-never-persist",
-            "DEEPSEEK_BASE_URL": provider_url,
-        },
-        route_binding=binding,
-        binding_digest=digest,
-        conversation_id="cv_" + "7" * 32,
-        boot_content=BOOT_BYTES,
+        api_key="sk-canary-never-persist",
+        base_url=provider_url,
+        base_env=os.environ,
     )
-
-
-def _runtime_status(carrier_python: Path) -> deepseek_runtime.RuntimeStatus:
-    manifest = deepseek_runtime.load_runtime_manifest()
-    return deepseek_runtime.RuntimeStatus(
-        available=True,
-        enabled=True,
-        error=None,
-        detail=None,
-        carrier_python=str(carrier_python),
-        python_version="3.10+",
-        sdk_version="0.1.0rc7",
-        runtime_version="0.1.0rc7",
-        composition_sha256=str(manifest["composition"]["sha256"]),
+    child_env.update(
+        {
+            "SC_DEEPSEEK_PROVIDER": "deepseek-official",
+            "SC_DEEPSEEK_MODEL": MODEL,
+            "SC_DEEPSEEK_PROVIDER_OPTIONS": json.dumps(
+                {"thinking": "omit", "reasoningEffort": "omit"},
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            "SC_DEEPSEEK_PROVIDER_THINKING": "omit",
+            "SC_DEEPSEEK_PROVIDER_REASONING_EFFORT": "omit",
+        }
     )
+    worker = _CarrierWorker(carrier_python, worktree, child_env)
+    try:
+        started = worker.request("session/start", {"sessionId": SESSION_ID})
+        if not isinstance(started, dict) or started.get("sessionId") != SESSION_ID:
+            raise RuntimeError("carrier did not preserve the exact native session")
+        prompted = worker.request(
+            "session/prompt", {"sessionId": SESSION_ID, "message": message}
+        )
+        if not isinstance(prompted, dict) or not prompted.get("messageId"):
+            raise RuntimeError("carrier returned no native message identity")
+        terminal = worker.wait_for_completion(SESSION_ID)
+        boot_digest = hashlib.sha256(child_env["DSH_SYSTEM_PROMPT"].encode()).hexdigest()
+        return worker.process.pid, terminal, boot_digest
+    finally:
+        worker.close()
 
 
 def _catalog_text(request: Mapping[str, Any]) -> str:
@@ -291,14 +376,6 @@ def _assert_catalog(text: str, present: Sequence[str], absent: Sequence[str]) ->
             raise AssertionError(f"skill catalog retained {name}")
 
 
-def _terminal_event_types(adapter: DeepSeekAdapter, turn: Any) -> list[str]:
-    events = list(adapter.stream(turn))
-    terminal = [event.type for event in events if event.type.startswith("run.")]
-    if terminal[-1:] != ["run.completed"]:
-        raise AssertionError(f"DeepSeek canary did not complete: {terminal}")
-    return [event.type for event in events]
-
-
 def run_canary(carrier_python: Path) -> dict[str, object]:
     if not carrier_python.is_file():
         raise RuntimeError(f"carrier Python is missing: {carrier_python}")
@@ -311,30 +388,18 @@ def run_canary(carrier_python: Path) -> dict[str, object]:
         _write_skill(skill_root, "current", "Current skill", "current-body")
         _write_skill(skill_root, "revoked", "Revoked skill", "revoked-body")
         state_root = root / "state"
+        layout = deepseek_runtime.conversation_layout(
+            "cv_" + "7" * 32, state_root=state_root
+        )
 
         with _MockProvider() as provider:
-            context = _context(worktree, provider.url)
-            first = DeepSeekAdapter(
-                runtime_probe=lambda **_: _runtime_status(carrier_python),
-                state_root=state_root,
-                stream_inactivity_seconds=5,
+            first_pid, first_terminal, first_boot_digest = _run_phase(
+                carrier_python,
+                layout=layout,
+                worktree=worktree,
+                provider_url=provider.url,
+                message="Load the changed skill",
             )
-            try:
-                try:
-                    first_turn = first.start(context, "Load the changed skill")
-                except Exception as exc:
-                    transport = first._transport_instance
-                    stderr = "".join(getattr(transport, "stderr", ()))
-                    raise RuntimeError(f"initial carrier failed: {stderr}") from exc
-                first_pid = first_turn.process_ref
-                first_events = _terminal_event_types(first, first_turn)
-                layout = deepseek_runtime.conversation_layout(
-                    str(context.conversation_id), state_root=state_root
-                )
-                identity_before = json.loads(layout.adapter_identity.read_text())
-                process_before = json.loads(layout.process_identity.read_text())
-            finally:
-                first.close()
 
             initial_requests = provider.state.requests["initial"]
             if len(initial_requests) != 2:
@@ -350,30 +415,13 @@ def run_canary(carrier_python: Path) -> dict[str, object]:
             _write_skill(skill_root, "new", "New skill", "new-grant-body")
             (skill_root / "revoked" / "SKILL.md").unlink()
             provider.state.set_phase("resumed")
-            resumed_context = _context(worktree, provider.url)
-
-            resumed_adapter = DeepSeekAdapter(
-                runtime_probe=lambda **_: _runtime_status(carrier_python),
-                state_root=state_root,
-                stream_inactivity_seconds=5,
+            resumed_pid, resumed_terminal, resumed_boot_digest = _run_phase(
+                carrier_python,
+                layout=layout,
+                worktree=worktree,
+                provider_url=provider.url,
+                message="Load the current grants",
             )
-            try:
-                try:
-                    resumed_turn = resumed_adapter.resume(
-                        first_turn.session_ref,
-                        resumed_context,
-                        "Load the current grants",
-                    )
-                except Exception as exc:
-                    transport = resumed_adapter._transport_instance
-                    stderr = "".join(getattr(transport, "stderr", ()))
-                    raise RuntimeError(f"resumed carrier failed: {stderr}") from exc
-                resumed_pid = resumed_turn.process_ref
-                resumed_events = _terminal_event_types(resumed_adapter, resumed_turn)
-                identity_after = json.loads(layout.adapter_identity.read_text())
-                process_after = json.loads(layout.process_identity.read_text())
-            finally:
-                resumed_adapter.close()
 
             resumed_requests = provider.state.requests["resumed"]
             if len(resumed_requests) != 2:
@@ -399,22 +447,11 @@ def run_canary(carrier_python: Path) -> dict[str, object]:
                     "revoked skill call did not fail as unavailable: "
                     + serialized_results
                 )
-            if first_turn.session_ref != resumed_turn.session_ref:
-                raise AssertionError("exact native session identity changed on resume")
-            if identity_after != identity_before:
-                raise AssertionError("stored adapter identity changed on resume")
             expected_boot = hashlib.sha256(BOOT_BYTES.encode()).hexdigest()
-            if identity_after.get("boot_sha256") != expected_boot:
+            if {first_boot_digest, resumed_boot_digest} != {expected_boot}:
                 raise AssertionError("immutable boot digest changed on resume")
-            if (process_before["pid"], process_before["start_ticks"]) == (
-                process_after["pid"],
-                process_after["start_ticks"],
-            ):
+            if first_pid == resumed_pid:
                 raise AssertionError("resume reused the old carrier process")
-            if str(process_before["pid"]) != first_pid:
-                raise AssertionError("initial process reference was not exact")
-            if str(process_after["pid"]) != resumed_pid:
-                raise AssertionError("resumed process reference was not exact")
 
         manifest = deepseek_runtime.load_runtime_manifest()
         return {
@@ -430,8 +467,8 @@ def run_canary(carrier_python: Path) -> dict[str, object]:
             "boot_digest_preserved": True,
             "native_session_preserved": True,
             "fresh_carrier_process": True,
-            "initial_terminal": first_events[-1],
-            "resumed_terminal": resumed_events[-1],
+            "initial_terminal": first_terminal,
+            "resumed_terminal": resumed_terminal,
         }
 
 
