@@ -1239,12 +1239,19 @@ class HostBackend:
         *,
         shell_id: int,
         harness: str,
+        model: str | None = None,
+        effort: str | None = None,
         key: str,
     ) -> dict[str, Any]:
+        body: dict[str, Any] = {"shell_id": shell_id, "harness": harness}
+        if model is not None:
+            body["model"] = model
+        if effort is not None:
+            body["effort"] = effort
         conversation = api.request(
             "POST",
             "/api/conversations",
-            body={"shell_id": shell_id, "harness": harness},
+            body=body,
             key=key,
         )
         projected_route = conversation.get("route") or {}
@@ -2468,6 +2475,8 @@ raise TimeoutError("controller did not close the Force-new barrier")
             api,
             shell_id=shells["REV1"],
             harness=reviewer_harness,
+            model=DEEPSEEK_MODEL if deepseek_profile else None,
+            effort="default" if deepseek_profile else None,
             key=f"{config.run_id}:reviewer:create",
         )
         reviewer_id = str(reviewer["conversation_id"])

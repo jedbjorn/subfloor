@@ -964,7 +964,11 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         backend = canary.HostBackend(deadline)
 
         class FakeApi:
+            def __init__(self) -> None:
+                self.body = None
+
             def request(self, method, path, *, body=None, key=None):
+                self.body = body
                 return {
                     "conversation_id": "cv-nested",
                     "route": {
@@ -975,8 +979,9 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                     },
                 }
 
+        api = FakeApi()
         projected = backend._create_conversation(
-            cast(canary.JsonHttp, FakeApi()),
+            cast(canary.JsonHttp, api),
             shell_id=1,
             harness="codex",
             key="nested-route",
@@ -984,6 +989,44 @@ class DosAppSprintCanaryTest(unittest.TestCase):
 
         self.assertNotIn("model", projected)
         self.assertEqual("gpt-test", projected["route"]["model"])
+        self.assertEqual({"shell_id": 1, "harness": "codex"}, api.body)
+
+    def test_deepseek_conversation_binds_the_admitted_exact_route(self) -> None:
+        backend = canary.HostBackend(canary.Deadline(100, 50))
+
+        class FakeApi:
+            def request(self, method, path, *, body=None, key=None):
+                self.body = body
+                return {
+                    "conversation_id": "cv-deepseek",
+                    "route": {
+                        "harness": "deepseek",
+                        "provider": "ollama-cloud",
+                        "model": canary.DEEPSEEK_MODEL,
+                        "effort": "default",
+                    },
+                }
+
+        api = FakeApi()
+        projected = backend._create_conversation(
+            cast(canary.JsonHttp, api),
+            shell_id=2,
+            harness="deepseek",
+            model=canary.DEEPSEEK_MODEL,
+            effort="default",
+            key="deepseek-route",
+        )
+
+        self.assertEqual(
+            {
+                "shell_id": 2,
+                "harness": "deepseek",
+                "model": canary.DEEPSEEK_MODEL,
+                "effort": "default",
+            },
+            api.body,
+        )
+        self.assertEqual(canary.DEEPSEEK_MODEL, projected["route"]["model"])
 
     def test_launch_refreshes_routes_before_reading_provider_credential(self) -> None:
         backend = canary.HostBackend(
