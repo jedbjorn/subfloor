@@ -1025,7 +1025,7 @@ class FlavorDefaultsTest(unittest.TestCase):
         self.assertNotEqual(self._row("planner", "codex")["model"], "gpt-drift")
 
     def test_age_expiry_stales_route_and_refuses_selection(self) -> None:
-        old = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        old = (datetime.now(timezone.utc) - timedelta(days=7, hours=1)).isoformat()
         self._route("claude", "old-opus", seen_at=old)
 
         ok, err = server.set_flavor_default(
@@ -1042,7 +1042,7 @@ class FlavorDefaultsTest(unittest.TestCase):
         self.assertEqual(route["stale"], 1)
         self.assertEqual(
             route["last_error"],
-            "thinking_evidence_stale: Route evidence is older than 24 hours; "
+            "thinking_evidence_stale: Route evidence is older than 7 days; "
             "remediation: sc models refresh",
         )
         self.assertFalse(server.model_route_available(
