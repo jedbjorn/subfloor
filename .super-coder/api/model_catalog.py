@@ -1318,9 +1318,15 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
             source_fingerprints[f"{harness}/{entry['id']}"] = evidence[
                 "source_fingerprint"
             ]
+    harness_errors = {
+        harness: block["error"]
+        for harness, block in (payload.get("harnesses") or {}).items()
+        if isinstance(block, dict) and isinstance(block.get("error"), str)
+    }
     error_summary = {
         "error": payload.get("error"),
         "errors": payload.get("errors") or [],
+        "harness_errors": harness_errors,
     } if failed or payload.get("partial") else None
     payload_digest = route_bindings.digest_json({
         "v": payload.get("v", PAYLOAD_VERSION),
@@ -1433,6 +1439,26 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
     payload["catalogue_generation"] = generation_id
     payload["generation_state"] = state
     payload["generation_published"] = publish_projection
+
+
+def latest_harness_error(con, harness: str) -> str | None:
+    """Return only the latest generation's stable harness-level failure."""
+    try:
+        row = con.execute(
+            "SELECT error_summary FROM model_catalog_generations "
+            "ORDER BY completed_at DESC,generation_id DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or row[0] is None:
+        return None
+    try:
+        summary = json.loads(row[0])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    errors = summary.get("harness_errors") if isinstance(summary, dict) else None
+    value = errors.get(harness) if isinstance(errors, dict) else None
+    return value if isinstance(value, str) and len(value) <= 256 else None
 
 
 def _requires_high_effort(harness: str) -> bool:

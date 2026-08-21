@@ -1396,6 +1396,29 @@ class RoutePersistenceTest(unittest.TestCase):
             "high_effort_supported, stale FROM model_routes").fetchone()
         self.assertEqual(tuple(row), ("kimi-code/k3", "available", 1, 1, 0))
 
+    def test_latest_generation_retains_bounded_harness_failure_without_route(self):
+        payload = {
+            "fetched_at": "2026-08-21T00:00:00+00:00",
+            "stale": False,
+            "partial": True,
+            "errors": ["redacted provider failure"],
+            "harnesses": {
+                "deepseek": {
+                    "models": [],
+                    "error": mc.DEEPSEEK_AUTHENTICATION_ERROR,
+                }
+            },
+            **self.verification("deepseek", "0.1.0rc7"),
+        }
+
+        mc.persist_routes(self.con, payload)
+
+        self.assertEqual(
+            mc.DEEPSEEK_AUTHENTICATION_ERROR,
+            mc.latest_harness_error(self.con, "deepseek"),
+        )
+        self.assertIsNone(mc.latest_harness_error(self.con, "codex"))
+
     def test_authenticated_deepseek_ids_stay_unbindable_before_wire_proof(self):
         def fetch(url, _headers=None):
             if url == mc.MODELS_DEV_URL:
@@ -2556,6 +2579,27 @@ class SprintAdmissionProjectionTest(unittest.TestCase):
         self.assertEqual("route-evidence-invalid", mismatched["category"])
         self.assertFalse(unproven["admitted"])
         self.assertEqual("tool-capability-unproven", unproven["category"])
+
+    def test_missing_route_uses_authenticated_harness_failure_category(self):
+        authentication = routes_cli.sprint_admission_result(
+            {"ok": False, "code": "model_not_found"},
+            None,
+            "deepseek",
+            self.SELECTOR,
+            mc.DEEPSEEK_AUTHENTICATION_ERROR,
+        )
+        absent = routes_cli.sprint_admission_result(
+            {"ok": False, "code": "model_not_found"},
+            None,
+            "deepseek",
+            self.SELECTOR,
+            mc.DEEPSEEK_EXACT_MODEL_ABSENT,
+        )
+
+        self.assertEqual("credential-or-authentication", authentication["category"])
+        self.assertEqual("failed", authentication["authentication"])
+        self.assertEqual("exact-model-absent", absent["category"])
+        self.assertEqual("verified", absent["authentication"])
 
     def test_sprint_admission_cli_emits_no_raw_resolution_diagnostics(self):
         projection = {"routes": [self.route(

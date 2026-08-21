@@ -148,7 +148,9 @@ def _sprint_admission_identity(selector: str | None) -> tuple[str, str]:
     return provider, model
 
 
-def _sprint_admission_category(data: dict, route: dict | None) -> str:
+def _sprint_admission_category(
+    data: dict, route: dict | None, harness_error: str | None
+) -> str:
     code = data.get("code") if isinstance(data.get("code"), str) else None
     if code in SPRINT_ADMISSION_CODE_CATEGORIES:
         return SPRINT_ADMISSION_CODE_CATEGORIES[code]
@@ -162,9 +164,7 @@ def _sprint_admission_category(data: dict, route: dict | None) -> str:
         "HARNESS_RUNTIME_UNAVAILABLE",
     }:
         return "runtime-unavailable"
-    if route is None:
-        return "exact-model-absent"
-    last_error = route.get("last_error")
+    last_error = harness_error or (route or {}).get("last_error")
     if last_error == model_catalog.DEEPSEEK_AUTHENTICATION_ERROR:
         return "credential-or-authentication"
     if last_error == model_catalog.DEEPSEEK_EXACT_MODEL_ABSENT:
@@ -187,6 +187,8 @@ def _sprint_admission_category(data: dict, route: dict | None) -> str:
         model_catalog.DEEPSEEK_DISCOVERY_LIMIT_ERROR,
     }:
         return "catalogue-unavailable"
+    if route is None:
+        return "exact-model-absent"
     if route.get("stale") or code in {
         "thinking_evidence_stale", "thinking_evidence_changed"
     }:
@@ -205,6 +207,7 @@ def sprint_admission_result(
     route: dict | None,
     harness: str,
     selector: str | None,
+    harness_error: str | None = None,
 ) -> dict:
     """Project one bounded Sprint/tool admission result without raw diagnostics."""
     provider, model = _sprint_admission_identity(selector)
@@ -242,7 +245,7 @@ def sprint_admission_result(
     elif data.get("ok") is True and not tools_supported:
         category = "tool-capability-unproven"
     else:
-        category = _sprint_admission_category(data, route)
+        category = _sprint_admission_category(data, route, harness_error)
     if category not in SPRINT_ADMISSION_CATEGORIES and category is not None:
         category = "unknown"
     freshness = (
@@ -263,9 +266,17 @@ def sprint_admission_result(
         if category == "tool-capability-unproven"
         else "unknown"
     )
+    authenticated_evidence = harness_error in {
+        model_catalog.DEEPSEEK_EXACT_MODEL_ABSENT,
+        model_catalog.DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED,
+        model_catalog.DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED,
+        model_catalog.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
+        model_catalog.DEEPSEEK_DISCOVERY_EVIDENCE_INVALID,
+    }
     authentication = (
         "verified"
-        if admitted or category == "tool-capability-unsupported"
+        if admitted or authenticated_evidence
+        or category == "tool-capability-unsupported"
         else "failed"
         if category == "credential-or-authentication"
         else "unproven"
@@ -495,7 +506,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         if sprint_json:
             return _print_sprint_admission(
-                sprint_admission_result(data, route, harness, selector)
+                sprint_admission_result(
+                    data,
+                    route,
+                    harness,
+                    selector,
+                    projection.get("harness_error"),
+                )
             )
         return _print_resolved(data, as_json)
 
@@ -518,7 +535,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         if sprint_json:
             return _print_sprint_admission(
-                sprint_admission_result(data, route, harness, selector)
+                sprint_admission_result(
+                    data,
+                    route,
+                    harness,
+                    selector,
+                    model_catalog.latest_harness_error(con, harness),
+                )
             )
         return _print_resolved(data, as_json)
     finally:
