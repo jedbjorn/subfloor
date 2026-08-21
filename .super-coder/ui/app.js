@@ -2829,6 +2829,13 @@ function chatHarnessUnavailableReason(status) {
 
 const chatRequiresExactRoute = (harness) => harness === "deepseek";
 
+function chatOpenHarnessUnavailableReason(conversation, status) {
+  const harness = conversation?.route?.harness;
+  if (!status && chatRequiresExactRoute(harness))
+    return "HARNESS_UNAVAILABLE";
+  return chatHarnessUnavailableReason(status);
+}
+
 function chatExactRouteUnavailableReason(conversation, catalog) {
   const route = conversation?.route || {};
   if (!chatRequiresExactRoute(route.harness)) return null;
@@ -4613,7 +4620,9 @@ async function chatRenderOpen(
     // owned only for that window. Reopen is scope-blocked server-side forever.
     const sprintManaged = Boolean(conversation.sprint_managed);
     const reopenable = closed && !sprintScoped;
-    const unavailableReason = chatHarnessUnavailableReason(harnessStatus)
+    const unavailableReason = chatOpenHarnessUnavailableReason(
+      conversation, harnessStatus,
+    )
       || chatExactRouteUnavailableReason(conversation, modelCatalog);
     unavailable.hidden = !unavailableReason;
     unavailable.textContent = unavailableReason
@@ -5511,7 +5520,7 @@ async function renderInterface(root) {
     try {
       const [snapshot, defaults, catalog] = await Promise.all([
         chatApi(`/conversations/${selectedId}/transcript`),
-        chatLoadHarnessDefaults().catch(() => null),
+        api("/flavor-defaults").catch(() => null),
         api("/models").catch(() => null),
       ]);
       if (generation !== chatRenderGeneration) return;

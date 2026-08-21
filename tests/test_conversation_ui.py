@@ -378,7 +378,7 @@ def test_historical_unavailable_harness_keeps_reads_and_controls_but_not_compose
         interface.index("async function chatRenderOpen"):
         interface.index("async function renderInterface")
     ]
-    assert "chatLoadHarnessDefaults().catch(() => null)" in interface
+    assert 'api("/flavor-defaults").catch(() => null)' in interface
     assert 'api("/models").catch(() => null)' in interface
     assert "history remains readable" in open_chat
     assert "composer.disabled = Boolean(unavailableReason)" in open_chat
@@ -421,9 +421,17 @@ console.log(JSON.stringify({
   exactAvailable: available([
     {id: "deepseek-bound", availability: "available"},
   ]),
+  missingStatus: chatOpenHarnessUnavailableReason(conversation, null),
+  disabledHarness: chatOpenHarnessUnavailableReason(conversation, {
+    installed: true, enabled: false, healthy: false,
+    surfaces: {browser: true}, unavailable_reason: "HARNESS_DISABLED",
+  }),
   otherHarness: chatExactRouteUnavailableReason({
     route: {harness: "codex", model: "gpt-test"},
   }, {stale: true, harnesses: {}}),
+  otherHarnessMissingStatus: chatOpenHarnessUnavailableReason({
+    route: {harness: "codex", model: "gpt-test"},
+  }, null),
 }));
 """
 
@@ -434,7 +442,10 @@ console.log(JSON.stringify({
         "boundStale": "HARNESS_ROUTE_UNAVAILABLE",
         "staleCatalog": "HARNESS_ROUTE_UNAVAILABLE",
         "exactAvailable": None,
+        "missingStatus": "HARNESS_UNAVAILABLE",
+        "disabledHarness": "HARNESS_DISABLED",
         "otherHarness": None,
+        "otherHarnessMissingStatus": None,
     }
 
 
@@ -988,7 +999,7 @@ def test_interface_arrival_defers_configuration_and_phases_history_requests():
                           interface.index("await loadTranscript()")]
 
     assert 'api("/models").catch(() => null)' in open_chat
-    assert 'api("/flavor-defaults")' not in interface
+    assert 'api("/flavor-defaults").catch(() => null)' in open_chat
     assert 'api("/flavor-defaults")' in loader
     assert 'api("/models")' in loader
     assert "if (chatConfiguration) return Promise.resolve(chatConfiguration)" in loader

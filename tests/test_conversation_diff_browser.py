@@ -287,16 +287,61 @@ def observation_page(*, fresh: bool = True, fingerprint: str = "a" * 64) -> dict
 
 
 @pytest.mark.parametrize(
-    "catalog_models",
+    "case",
     [
-        [],
-        [{"id": "deepseek-other", "availability": "available"}],
+        {
+            "models": [],
+            "reason": "HARNESS_ROUTE_UNAVAILABLE",
+        },
+        {
+            "models": [{"id": "deepseek-other", "availability": "available"}],
+            "reason": "HARNESS_ROUTE_UNAVAILABLE",
+        },
+        {
+            "models": [{"id": "deepseek-bound", "availability": "available"}],
+            "status": {
+                "installed": True,
+                "enabled": False,
+                "healthy": False,
+                "surfaces": {"browser": True},
+                "unavailable_reason": "HARNESS_DISABLED",
+            },
+            "reason": "HARNESS_DISABLED",
+        },
+        {
+            "models": [{"id": "deepseek-bound", "availability": "available"}],
+            "status": {
+                "installed": False,
+                "enabled": True,
+                "healthy": False,
+                "surfaces": {"browser": True},
+                "unavailable_reason": "HARNESS_NOT_INSTALLED",
+            },
+            "reason": "HARNESS_NOT_INSTALLED",
+        },
+        {
+            "models": [{"id": "deepseek-bound", "availability": "available"}],
+            "status_failure": True,
+            "reason": "HARNESS_UNAVAILABLE",
+        },
+        {
+            "models": [{"id": "deepseek-bound", "availability": "available"}],
+            "transition": True,
+            "reason": "HARNESS_DISABLED",
+        },
     ],
-    ids=["zero-routes", "different-route-available"],
+    ids=[
+        "zero-routes",
+        "different-route-available",
+        "disabled",
+        "uninstalled",
+        "status-read-failure",
+        "healthy-to-disabled-transition",
+    ],
 )
-def test_historical_deepseek_exact_route_unavailable_disables_only_composer(
+def test_historical_deepseek_unavailability_disables_only_composer(
     static_ui,
-    catalog_models,
+    case,
 ):
     requests: list[tuple[str, str]] = []
     browser_errors: list[str] = []
@@ -313,6 +358,17 @@ def test_historical_deepseek_exact_route_unavailable_disables_only_composer(
         },
     }
     snapshot = version_three_snapshot()
+    healthy_status = {
+        "installed": True,
+        "enabled": True,
+        "healthy": True,
+        "surfaces": {"browser": True},
+        "unavailable_reason": None,
+    }
+    status_state = {
+        "value": case.get("status", healthy_status),
+        "failure": case.get("status_failure", False),
+    }
 
     def fulfill(route, payload, *, status=200):
         route.fulfill(
@@ -339,22 +395,20 @@ def test_historical_deepseek_exact_route_unavailable_disables_only_composer(
                 }],
             })
         if parsed.path == "/api/flavor-defaults":
+            if status_state["failure"]:
+                return fulfill(
+                    route,
+                    {"error": {"code": "STATUS_READ_FAILED"}},
+                    status=503,
+                )
             return fulfill(route, {
                 "flavors": {},
-                "harness_status": {
-                    "deepseek": {
-                        "installed": True,
-                        "enabled": True,
-                        "healthy": True,
-                        "surfaces": {"browser": True},
-                        "unavailable_reason": None,
-                    },
-                },
+                "harness_status": {"deepseek": status_state["value"]},
             })
         if parsed.path == "/api/models":
             return fulfill(route, {
                 "stale": False,
-                "harnesses": {"deepseek": {"models": catalog_models}},
+                "harnesses": {"deepseek": {"models": case["models"]}},
             })
         if parsed.path == "/api/conversations":
             if query.get("starred") == ["true"]:
@@ -370,8 +424,10 @@ def test_historical_deepseek_exact_route_unavailable_disables_only_composer(
             status=404,
         )
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+    with (
+        sync_playwright() as playwright,
+        closing(playwright.chromium.launch(headless=True)) as browser,
+    ):
         page = browser.new_page(viewport={"width": 1280, "height": 800})
         page.add_init_script(
             """
@@ -400,16 +456,41 @@ def test_historical_deepseek_exact_route_unavailable_disables_only_composer(
             "browser_errors": browser_errors,
             "page": page.locator("body").inner_text(),
         }, indent=2)
+        if case.get("transition"):
+            assert composer.is_enabled()
+            assert page.get_by_role("button", name="Send").is_enabled()
+            before_status_reads = sum(
+                request == ("GET", "/api/flavor-defaults")
+                for request in requests
+            )
+            status_state["value"] = {
+                "installed": True,
+                "enabled": False,
+                "healthy": False,
+                "surfaces": {"browser": True},
+                "unavailable_reason": "HARNESS_DISABLED",
+            }
+            page.evaluate(
+                "() => renderInterface(document.querySelector('#view-interface'))"
+            )
+            composer = page.locator(".chat-composer-input")
+            composer.wait_for()
+            assert sum(
+                request == ("GET", "/api/flavor-defaults")
+                for request in requests
+            ) == before_status_reads + 1
         assert page.get_by_text("use a tool", exact=True).is_visible()
         assert page.locator(".chat-harness-unavailable").text_content() == (
-            "HARNESS_ROUTE_UNAVAILABLE — history remains readable."
+            f"{case['reason']} — history remains readable."
         )
         assert composer.is_disabled()
         assert composer.get_attribute("placeholder") == (
-            "This harness is unavailable — HARNESS_ROUTE_UNAVAILABLE."
+            f"This harness is unavailable — {case['reason']}."
         )
         assert page.get_by_role("button", name="Send").is_disabled()
         assert page.locator(".chat-stop").is_enabled()
+        assert page.locator(".chat-title-button").is_enabled()
+        assert page.locator(".chat-history-star").is_enabled()
         assert page.locator(".chat-actions").get_by_role(
             "button", name="Close"
         ).is_enabled()
@@ -430,7 +511,6 @@ def test_historical_deepseek_exact_route_unavailable_disables_only_composer(
         )
         assert not [request for request in requests if request[0] == "POST"]
         assert browser_errors == []
-        browser.close()
 
 
 def test_diff_workspace_preserves_live_chat_and_uses_get_only(
