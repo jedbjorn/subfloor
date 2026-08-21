@@ -1,12 +1,16 @@
----
-name: messaging
-description: Shell-to-shell messaging — ordinary `sc mem message` inbox mail by default, with wake delivery only when explicitly instructed. Use to send, check, verify, or mark ordinary messages and to follow a named wake-producing workflow.
-category: substrate
-command: sc mem message
-common: true
----
+-- 0229 — teach the messaging skill ordinary-default vs explicit-wake delivery.
+-- The source asset changes in the same release. This forward reseed updates
+-- installed forks while preserving the skill id and all grants.
 
-# messaging — ordinary inbox + explicit wakes
+BEGIN;
+
+INSERT INTO skills (name, description, category, command, common, content, is_deleted) VALUES (
+  'messaging',
+  'Shell-to-shell messaging — ordinary `sc mem message` inbox mail by default, with wake delivery only when explicitly instructed. Use to send, check, verify, or mark ordinary messages and to follow a named wake-producing workflow.',
+  'substrate',
+  'sc mem message',
+  1,
+  '# messaging — ordinary inbox + explicit wakes
 
 Choose delivery before sending:
 
@@ -61,10 +65,10 @@ sc mem message send <to-shortname> "<body>" [--kind shell|task|result]
 - Examples: `sc mem message send cartographer "map is stale — re-run sc map"`
   · `sc mem message send plan1 "feature 12 task 3 complete (PR #41)" --kind result`
 - `cartographer` is a **role alias**: when no shell has that literal
-  shortname, it resolves to the fork's cartographer shell whatever its
+  shortname, it resolves to the fork''s cartographer shell whatever its
   shortname (e.g. `CART1`). Address the map-keeper as `cartographer` — no
   shortname lookup needed. An exact shortname match always wins.
-- Unknown / deleted recipient -> `mem: recipient shortname '<x>' unknown`;
+- Unknown / deleted recipient -> `mem: recipient shortname ''<x>'' unknown`;
   empty body -> `mem: body is empty`. Surface either to the operator plainly.
 - Sends are idempotent under load: each invocation carries a dedupe key, so
   a timed-out send retries itself and can never write a duplicate. Do NOT
@@ -88,11 +92,11 @@ sc mem message mark-read <message_id>
 ```
 
 Pass the `message_id` that `check` surfaced. Only messages addressed to you
-clear — another shell's message = no-op; re-marking a read message = no-op.
+clear — another shell''s message = no-op; re-marking a read message = no-op.
 
 ## Wake messages — active chat delivery
 
-A wake message creates durable delivery intent for the recipient's active
+A wake message creates durable delivery intent for the recipient''s active
 chat. Pending wakes coalesce per receiver; one wake turn drains every
 undelivered wake message for that shell. A wake does not enter the normal
 `sc mem message` inbox or `sent` view.
@@ -101,7 +105,7 @@ Use only the wake type selected by the instruction/workflow:
 
 | Recipient state | Delivery result |
 |---|---|
-| Verified live turn | Re-enter at the turn's natural boundary. |
+| Verified live turn | Re-enter at the turn''s natural boundary. |
 | Idle registered chat | Any coalesced New rotates; all Re-enter resumes. |
 | No registered chat | Create a chat and deliver as New. |
 
@@ -117,4 +121,12 @@ duplicate.
   item before continuing.
 - No threading: a reply = a new `send`; include `Re: <topic>` in the body if
   it matters.
-- `mark-read` only after you have actually acted on the message.
+- `mark-read` only after you have actually acted on the message.',
+  0
+)
+ON CONFLICT(name) DO UPDATE SET
+  description=excluded.description, category=excluded.category,
+  command=excluded.command, common=excluded.common,
+  content=excluded.content, is_deleted=0;
+
+COMMIT;
