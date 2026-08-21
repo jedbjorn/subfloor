@@ -2275,6 +2275,52 @@ class DeepSeekExactRestartHelperTest(unittest.TestCase):
             self.assertEqual(
                 str(root / ".sc-worktrees" / "rev1"), row["worktree"]
             )
+            with contextlib.closing(sqlite3.connect(database)) as con:
+                con.execute(
+                    "INSERT INTO conversation_messages "
+                    "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                    "idempotency_key,request_hash,state,completed_at) "
+                    "VALUES (?,'user','owner','prompt','bounded',"
+                    "'cleanup-proof','proof','completed',datetime('now'))",
+                    (prepared["conversation_id"],),
+                )
+                con.commit()
+            state_root = root / "state"
+            real_layout = restart_rehearsal.deepseek_runtime.conversation_layout
+            layout = real_layout(str(prepared["conversation_id"]), state_root=state_root)
+            restart_rehearsal.deepseek_runtime.provision_conversation(layout)
+            with mock.patch.object(
+                restart_rehearsal, "DB_PATH", database
+            ), mock.patch.object(
+                restart_rehearsal.deepseek_runtime,
+                "conversation_layout",
+                side_effect=lambda conversation_id: real_layout(
+                    conversation_id, state_root=state_root
+                ),
+            ):
+                cleanup = restart_rehearsal._cleanup(
+                    str(prepared["conversation_id"])
+                )
+            self.assertEqual(
+                {"ok": True, "conversation_removed": True, "root_removed": True},
+                cleanup,
+            )
+            with contextlib.closing(sqlite3.connect(database)) as con:
+                self.assertEqual(
+                    0,
+                    con.execute(
+                        "SELECT COUNT(*) FROM conversations WHERE conversation_id=?",
+                        (prepared["conversation_id"],),
+                    ).fetchone()[0],
+                )
+                self.assertEqual(
+                    0,
+                    con.execute(
+                        "SELECT COUNT(*) FROM conversation_messages "
+                        "WHERE conversation_id=?",
+                        (prepared["conversation_id"],),
+                    ).fetchone()[0],
+                )
 
 
 class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):

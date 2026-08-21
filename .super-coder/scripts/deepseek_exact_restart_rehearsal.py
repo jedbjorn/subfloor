@@ -325,6 +325,26 @@ def _cleanup(conversation_id: str) -> dict[str, Any]:
                 "DELETE FROM active_shell_chats WHERE chat_id=?", (conversation_id,)
             )
             con.execute(
+                "DELETE FROM conversation_events WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            con.execute(
+                "DELETE FROM conversation_outbox WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            con.execute(
+                "DELETE FROM conversation_runs WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            con.execute(
+                "DELETE FROM conversation_messages WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            con.execute(
+                "DELETE FROM conversation_git_targets WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            con.execute(
                 "DELETE FROM conversations WHERE conversation_id=?", (conversation_id,)
             )
     finally:
