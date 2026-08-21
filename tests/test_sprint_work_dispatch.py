@@ -224,6 +224,48 @@ class DispatchGateTest(SprintWorkDispatchCase):
             ),
         )
 
+    def reroute_state(self, shell_id: int) -> dict[str, object]:
+        participant = tuple(
+            self.con.execute(
+                "SELECT participant_id,harness,model,effort,route,"
+                "active_route_binding_id,updated_at FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=?",
+                (self.sprint_id, shell_id),
+            ).fetchone()
+        )
+        return {
+            "participant": participant,
+            "bindings": [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT binding_id,harness,requested_model,requested_effort,"
+                    "route_revision,binding_digest FROM "
+                    "sprint_participant_route_bindings WHERE participant_id=? "
+                    "ORDER BY binding_id",
+                    (participant[0],),
+                )
+            ],
+            "route_events": [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT event_id,event_type,payload FROM sprint_events "
+                    "WHERE sprint_id=? AND event_type IN "
+                    "('participant.route_changed','participant.route_revised') "
+                    "ORDER BY event_id",
+                    (self.sprint_id,),
+                )
+            ],
+            "wakes": [
+                tuple(row)
+                for row in self.con.execute(
+                    "SELECT message_id,receiver_shell_id,message_kind,disposition,"
+                    "read_at,delivered_at,work_unit_id FROM wake_message "
+                    "WHERE sprint_id=? ORDER BY message_id",
+                    (self.sprint_id,),
+                )
+            ],
+        }
+
     def test_arm_probes_each_distinct_harness_once_outside_write_transaction(self) -> None:
         self.create_unit(developer=1)
         observed: list[tuple[str, bool]] = []
@@ -294,6 +336,101 @@ class DispatchGateTest(SprintWorkDispatchCase):
             0,
             self.con.execute(
                 "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+        )
+
+    def test_prepared_reroute_rejects_deepseek_without_mutating_route_state(
+        self,
+    ) -> None:
+        self.create_unit(developer=1)
+        before = self.reroute_state(4)
+        self.assertEqual(("codex", None, None, None, None), before["participant"][1:6])
+        self.assertEqual([], before["bindings"])
+        self.assertEqual([], before["route_events"])
+        self.assertEqual([], before["wakes"])
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintPreflightError,
+            "harness 'deepseek' has no Sprint conversation surface",
+        ):
+            sprint_domain.SprintParticipantStore(
+                self.con, probe_harness=lambda _harness: None
+            ).reroute(
+                self.sprint_id,
+                3,
+                participant_shell_id=4,
+                harness="deepseek",
+                model="deepseek-v4-pro",
+                effort="default",
+                route="DeepSeek V4 Pro",
+            )
+
+        self.assertEqual(before, self.reroute_state(4))
+
+    def test_paused_reroute_rejects_deepseek_and_resume_keeps_original_route(
+        self,
+    ) -> None:
+        self.create_unit(developer=1)
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+        self.lifecycle.pause(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="verify unsupported reroute rejection",
+        )
+        before = self.reroute_state(4)
+        participant_before = before["participant"]
+        self.assertEqual(("codex", None, None, None), participant_before[1:5])
+        self.assertEqual(1, len(before["bindings"]))
+        self.assertEqual(
+            ("codex", None, None, 1), before["bindings"][0][1:5]
+        )
+        self.assertEqual([], before["route_events"])
+        self.assertEqual(2, len(before["wakes"]))
+
+        with self.assertRaisesRegex(
+            sprint_domain.SprintPreflightError,
+            "harness 'deepseek' has no Sprint conversation surface",
+        ):
+            sprint_domain.SprintParticipantStore(
+                self.con, probe_harness=lambda _harness: None
+            ).reroute(
+                self.sprint_id,
+                3,
+                participant_shell_id=4,
+                harness="deepseek",
+                model="deepseek-v4-pro",
+                effort="default",
+                route="DeepSeek V4 Pro",
+            )
+
+        self.assertEqual(before, self.reroute_state(4))
+        self.lifecycle.resume(
+            self.sprint_id,
+            sprint_domain.LifecycleActor("planner", 3),
+            reason="unsupported reroute left original route intact",
+        )
+        resumed = self.con.execute(
+            "SELECT participant.harness,binding.harness,binding.requested_model,"
+            "binding.route_revision,binding.binding_id "
+            "FROM sprint_participants participant "
+            "JOIN sprint_participant_route_bindings binding "
+            "ON binding.binding_id=participant.active_route_binding_id "
+            "WHERE participant.sprint_id=? AND participant.shell_id=4",
+            (self.sprint_id,),
+        ).fetchone()
+        self.assertEqual(
+            ("codex", "codex", None, 1, participant_before[5]), tuple(resumed)
+        )
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings "
+                "WHERE participant_id=(SELECT participant_id FROM "
+                "sprint_participants WHERE sprint_id=? AND shell_id=4) "
+                "AND harness='deepseek'",
+                (self.sprint_id,),
             ).fetchone()[0],
         )
 
