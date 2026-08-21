@@ -403,7 +403,9 @@ class DeepSeekAdapter(ConversationAdapter):
         return value
 
     @staticmethod
-    def _route(context: ConversationContext) -> tuple[str, str, dict[str, str]]:
+    def _route(
+        context: ConversationContext,
+    ) -> tuple[str, str, dict[str, str], str, str]:
         try:
             projection = route_transport.context_projection(context, "deepseek")
         except route_transport.route_bindings.RouteResolutionError as exc:
@@ -426,14 +428,51 @@ class DeepSeekAdapter(ConversationAdapter):
                 "HARNESS_ROUTE_INVALID", "DeepSeek adapter metadata is missing"
             )
         provider = metadata.get("provider_route")
-        if provider != "deepseek-official":
+        if provider not in route_transport.route_bindings.DEEPSEEK_PROVIDER_ROUTES:
             raise AdapterError(
-                "HARNESS_ROUTE_INVALID", "DeepSeek provider route is not exact"
+                "HARNESS_ROUTE_INVALID", "DeepSeek provider route is not reviewed"
             )
         if context.provider is not None and context.provider != provider:
             raise AdapterError(
                 "HARNESS_ROUTE_MISMATCH",
                 "stored provider disagrees with the immutable DeepSeek route",
+            )
+        try:
+            manifest = deepseek_runtime.load_runtime_manifest()
+            adapter = deepseek_runtime.provider_adapter(provider)
+        except deepseek_runtime.DeepSeekRuntimeError as exc:
+            raise AdapterError(exc.code, exc.detail) from exc
+        evidence = {
+            "provider_adapter_id": adapter["adapter_id"],
+            "provider_adapter_digest": route_transport.route_bindings.digest_json(adapter),
+            "provider_registry_sha256": manifest["provider_adapters"]["sha256"],
+            "credential_kind": adapter["credential_kind"],
+            "runtime_version": manifest["runtime"]["version"],
+            "source_commit": manifest["source"]["commit"],
+            "patch_sha256": manifest["patch"]["sha256"],
+            "composition_sha256": manifest["composition"]["sha256"],
+        }
+        for field, expected in evidence.items():
+            if metadata.get(field) != expected:
+                raise AdapterError(
+                    "HARNESS_PROVIDER_ADAPTER_DRIFT",
+                    f"DeepSeek immutable {field} changed after route binding",
+                )
+        endpoint = metadata.get("endpoint_identity")
+        if not isinstance(endpoint, str) or not endpoint:
+            raise AdapterError(
+                "HARNESS_PROVIDER_CONFIG_INVALID",
+                "DeepSeek route has no exact credential-free endpoint identity",
+            )
+        if adapter["endpoint_env"] is None and endpoint != adapter["endpoint_default"]:
+            raise AdapterError(
+                "HARNESS_PROVIDER_CONFIG_INVALID",
+                "DeepSeek provider endpoint changed after route binding",
+            )
+        provider_model = binding.get("provider_model")
+        if not isinstance(provider_model, str) or not provider_model:
+            raise AdapterError(
+                "HARNESS_ROUTE_INVALID", "DeepSeek provider model is missing"
             )
         raw = metadata.get("provider_options")
         if not isinstance(raw, Mapping):
@@ -471,7 +510,13 @@ class DeepSeekAdapter(ConversationAdapter):
             )
         except deepseek_runtime.DeepSeekRuntimeError as exc:
             raise AdapterError(exc.code, exc.detail) from exc
-        return provider, projection.model, options
+        return (
+            provider,
+            provider_model,
+            options,
+            str(adapter["credential_source_env"]),
+            endpoint,
+        )
 
     @staticmethod
     def _conversation_id(context: ConversationContext) -> str:
@@ -531,7 +576,7 @@ class DeepSeekAdapter(ConversationAdapter):
         dispatch: bool,
     ) -> tuple[DeepSeekTransport, deepseek_runtime.ConversationLayout]:
         conversation_id = self._conversation_id(context)
-        provider, model, options = self._route(context)
+        provider, model, options, credential_env, endpoint = self._route(context)
         identity = (conversation_id, model, context.binding_digest)
         if self._transport_instance is not None:
             if self._transport_identity != identity:
@@ -567,14 +612,15 @@ class DeepSeekAdapter(ConversationAdapter):
             if not boot_content:
                 boot_content = "super-coder bounded native-session recovery inspection"
             base_env = dict(context.env)
-            api_key = base_env.get("DEEPSEEK_API_KEY", "")
+            api_key = base_env.get(credential_env, "")
             try:
                 child_env = deepseek_runtime.launch_environment(
                     layout,
                     worktree=context.checked_worktree(),
                     system_prompt=boot_content,
+                    provider=provider,
                     api_key=api_key,
-                    base_url=base_env.get("DEEPSEEK_BASE_URL"),
+                    base_url=endpoint,
                     base_env=base_env,
                 )
             except deepseek_runtime.DeepSeekRuntimeError as exc:
@@ -586,6 +632,8 @@ class DeepSeekAdapter(ConversationAdapter):
                     "SC_DEEPSEEK_PROVIDER_OPTIONS": json.dumps(
                         options, separators=(",", ":"), sort_keys=True
                     ),
+                    "SC_DEEPSEEK_PROVIDER_THINKING": options["thinking"],
+                    "SC_DEEPSEEK_PROVIDER_REASONING_EFFORT": options["reasoningEffort"],
                 }
             )
             argv = [status.carrier_python, "-I", str(WORKER)]

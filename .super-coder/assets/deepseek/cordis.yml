@@ -57,3 +57,24 @@
 
 - id: token-meter
   name: '@deepseek-ai/dsh-token-meter'
+
+- id: provider-deepseek-official
+  name: '@deepseek-ai/dsh-llm-deepseek'
+  config:
+    providerRequestThinking: !!js process.env.SC_DEEPSEEK_PROVIDER_THINKING
+    providerRequestReasoningEffort: !!js process.env.SC_DEEPSEEK_PROVIDER_REASONING_EFFORT
+
+- id: provider-ollama-cloud
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      ollama-cloud:
+        apiKeyEnv: OLLAMA_API_KEY
+        displayName: Ollama Cloud
+        api: openai-completions
+        baseURL: !!js process.env.SC_DEEPSEEK_PROVIDER_BASE_URL
+        models:
+          - id: !!js process.env.SC_DEEPSEEK_MODEL
+        retryPolicy:
+          mode: normal
+          maxRetries: 0

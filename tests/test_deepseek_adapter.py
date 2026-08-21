@@ -54,7 +54,21 @@ def runtime_status(*, available: bool = True) -> deepseek_runtime.RuntimeStatus:
     )
 
 
-def deepseek_binding(*, effort: str = "default") -> tuple[dict[str, Any], str]:
+def deepseek_binding(
+    *, effort: str = "default", provider_route: str = "deepseek-official"
+) -> tuple[dict[str, Any], str]:
+    manifest = deepseek_runtime.load_runtime_manifest()
+    provider = deepseek_runtime.provider_adapter(provider_route)
+    selector = (
+        "deepseek-v4-pro"
+        if provider_route == "deepseek-official"
+        else f"{provider_route}/deepseek-v4-pro"
+    )
+    endpoint = (
+        "https://gateway.example/v1"
+        if provider_route == "deepseek-official"
+        else provider["endpoint_default"]
+    )
     if effort == "default":
         options = {"omit": ["thinking", "reasoning_effort"], "set": {}}
         evidence = None
@@ -71,7 +85,7 @@ def deepseek_binding(*, effort: str = "default") -> tuple[dict[str, Any], str]:
         "contract_version": 2,
         "control_state": "controlled",
         "harness": "deepseek",
-        "requested_model": "deepseek-v4-pro",
+        "requested_model": selector,
         "provider_model": "deepseek-v4-pro",
         "requested_effort": effort,
         "effective_effort": effort,
@@ -81,12 +95,22 @@ def deepseek_binding(*, effort: str = "default") -> tuple[dict[str, Any], str]:
         "evidence_digest": evidence,
         "selector_binding": {
             "kind": "authenticated-provider-model",
-            "selector": "deepseek-v4-pro",
+            "selector": selector,
         },
         "adapter_metadata": {
-            "provider_route": "deepseek-official",
+            "provider_route": provider_route,
+            "provider_adapter_id": provider["adapter_id"],
+            "provider_adapter_digest": route_bindings.digest_json(provider),
+            "provider_registry_sha256": manifest["provider_adapters"]["sha256"],
+            "credential_kind": provider["credential_kind"],
+            "endpoint_identity": endpoint,
+            "discovery_evidence_digest": "b" * 64,
             "transport_contract": "deepseek-provider-options-v1",
             "wire_evidence_digest": "c" * 64,
+            "runtime_version": manifest["runtime"]["version"],
+            "source_commit": manifest["source"]["commit"],
+            "patch_sha256": manifest["patch"]["sha256"],
+            "composition_sha256": manifest["composition"]["sha256"],
             "provider_options": options,
         },
     }
@@ -101,17 +125,23 @@ def context(
     boot: str | None = "immutable boot bytes",
     env: Mapping[str, str] | None = None,
     effort: str = "default",
+    provider: str = "deepseek-official",
 ) -> ConversationContext:
-    binding, digest = deepseek_binding(effort=effort)
+    binding, digest = deepseek_binding(effort=effort, provider_route=provider)
+    credential = (
+        {"DEEPSEEK_API_KEY": "sk-test-secret-value",
+         "DEEPSEEK_BASE_URL": "https://gateway.example/v1"}
+        if provider == "deepseek-official"
+        else {"OLLAMA_API_KEY": "ollama-test-secret-value"}
+    )
     return ConversationContext(
         worktree=worktree,
-        provider="deepseek-official",
-        model="deepseek-v4-pro",
+        provider=provider,
+        model=binding["requested_model"],
         effort=effort,
         permission_mode="unrestricted",
         env={
-            "DEEPSEEK_API_KEY": "sk-test-secret-value",
-            "DEEPSEEK_BASE_URL": "https://gateway.example/v1",
+            **credential,
             **dict(env or {}),
         },
         route_binding=binding,
@@ -333,6 +363,30 @@ def test_start_binds_exact_route_boot_and_isolated_process_identity(tmp_path: Pa
     assert os.stat(layout.adapter_identity).st_mode & 0o777 == 0o600
     adapter.close()
     assert transport.closed is True
+
+
+def test_ollama_start_uses_raw_provider_model_and_only_ollama_credential(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    factory = Factory()
+    adapter = make_adapter(tmp_path / "state", factory)
+
+    adapter.start(
+        context(
+            worktree,
+            provider="ollama-cloud",
+            env={"DEEPSEEK_API_KEY": "ambient-deepseek-secret"},
+        ),
+        "Do the work",
+    )
+    transport = factory.instances[0]
+
+    assert transport.env["SC_DEEPSEEK_PROVIDER"] == "ollama-cloud"
+    assert transport.env["SC_DEEPSEEK_MODEL"] == "deepseek-v4-pro"
+    assert transport.env["OLLAMA_API_KEY"] == "ollama-test-secret-value"
+    assert "DEEPSEEK_API_KEY" not in transport.env
+    assert "DEEPSEEK_BASE_URL" not in transport.env
+    assert "ambient-deepseek-secret" not in transport.env.values()
 
 
 def hashlib_sha256(value: str) -> str:

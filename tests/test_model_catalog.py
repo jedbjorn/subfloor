@@ -3,7 +3,7 @@
 
 The catalog is layered and best-effort: models.dev (keyless, all five
 harnesses) → provider APIs (only with env keys) → OpenCode's connected-provider
-    projection → cache → static floor. Payload v7 retains family metadata
+    projection → cache → static floor. Payload v8 retains family metadata
 (newest-first; claude families with a CLI alias resolve `latest` to the
 alias), the flat `models` list for sub-version search, and fork-local harness
 and configured-route verification. These tests pin
@@ -35,6 +35,7 @@ sys.path.insert(0, str(ROOT / ".super-coder" / "scripts"))
 import model_catalog as mc  # noqa: E402
 import models as routes_cli  # noqa: E402
 import route_bindings  # noqa: E402
+import deepseek_runtime  # noqa: E402
 
 MODELS_DEV = {
     "anthropic": {"models": {
@@ -74,37 +75,50 @@ def ids(harness_block):
     return [e["id"] for e in harness_block["models"]]
 
 
-def deepseek_wire_proof(model, options_by_effort, env=None):
+def deepseek_wire_proof(provider, model, options_by_effort, env=None):
     del env
+    manifest = deepseek_runtime.load_runtime_manifest()
+    registry = deepseek_runtime.load_provider_adapter_registry(
+        expected_sha256=manifest["provider_adapters"]["sha256"]
+    )
+    adapter = registry["providers"][provider]
+    adapter_digest = route_bindings.digest_json(adapter)
     proofs = {}
     for effort, options in options_by_effort.items():
-        wire = {} if effort == "default" else {
-            "thinking": {"type": "enabled"},
-            "reasoning_effort": effort,
-        }
+        wire = {}
+        if effort != "default":
+            if adapter["wire_mode"] == "deepseek-request-patch":
+                wire["thinking"] = {"type": "enabled"}
+            wire["reasoning_effort"] = effort
         evidence = {
-            "contract": "deepseek-provider-options-wire-v1",
+            "contract": deepseek_runtime.PROVIDER_WIRE_CONTRACT,
+            "provider": provider,
             "model": model,
             "effort": effort,
             "provider_options": dict(options),
             "wire_options": wire,
             "native_request": {
                 "event_type": "provider.request",
-                "provider": "deepseek-official",
+                "provider": provider,
                 "model": model,
                 "reasoning_effort": None if effort == "default" else effort,
                 "purpose": "conversation",
             },
             "runtime_version": "0.1.0rc7",
             "source_commit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
-            "patch_sha256": "034245298c94964e67f6f756b6067926740def4cd98f68e4a4751d6f65d6d74b",
+            "patch_sha256": manifest["patch"]["sha256"],
+            "composition_sha256": manifest["composition"]["sha256"],
+            "provider_registry_sha256": manifest["provider_adapters"]["sha256"],
+            "provider_adapter_id": adapter["adapter_id"],
+            "provider_adapter_digest": adapter_digest,
         }
         proofs[effort] = {
             **evidence,
             "digest": route_bindings.digest_json(evidence),
         }
     return {
-        "contract": "deepseek-provider-options-wire-v1",
+        "contract": deepseek_runtime.PROVIDER_WIRE_CONTRACT,
+        "provider": provider,
         "model": model,
         "proofs": proofs,
     }
@@ -499,16 +513,32 @@ class BuildTest(NoCLI):
         self.assertEqual(route["provider_model"], "deepseek-v4-pro")
         self.assertEqual(route["supported_efforts"], ["low", "high", "max"])
         self.assertEqual(route["default_effort"], "high")
+        manifest = deepseek_runtime.load_runtime_manifest()
+        provider = deepseek_runtime.provider_adapter("deepseek-official")
+        discovery_digest = route_bindings.digest_json({
+            "provider": "deepseek-official",
+            "endpoint_identity": "https://gateway.example/deepseek/v1",
+            "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
+            "provider_registry_sha256": manifest["provider_adapters"]["sha256"],
+        })
         self.assertEqual(route["selector_binding"], {
             "kind": "authenticated-provider-model",
             "selector": "deepseek-v4-pro",
+            "provider_model": "deepseek-v4-pro",
             "provider_route": "deepseek-official",
+            "provider_adapter_id": provider["adapter_id"],
+            "provider_adapter_digest": route_bindings.digest_json(provider),
+            "provider_registry_sha256": manifest["provider_adapters"]["sha256"],
+            "credential_kind": "deepseek-api-key",
+            "endpoint_identity": "https://gateway.example/deepseek/v1",
+            "discovery_evidence_digest": discovery_digest,
             "models_url": "https://gateway.example/deepseek/v1/models",
             "runtime_source_commit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
-            "provider_wire_contract": "deepseek-provider-options-wire-v1",
+            "provider_wire_contract": deepseek_runtime.PROVIDER_WIRE_CONTRACT,
             "provider_wire_digests": {
                 effort: deepseek_wire_proof(
-                    "deepseek-v4-pro", mc._deepseek_carrier_options()
+                    "deepseek-official", "deepseek-v4-pro",
+                    mc._deepseek_carrier_options()
                 )["proofs"][effort]["digest"]
                 for effort in ("default", "low", "high", "max")
             },
@@ -524,6 +554,72 @@ class BuildTest(NoCLI):
                 "reasoning_effort": "high",
             },
         })
+
+    def test_ollama_route_uses_only_ollama_credential_and_exact_prefix(self):
+        calls = []
+
+        def fetch(url, headers=None):
+            calls.append((url, headers))
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            if url == "https://ollama.com/v1/models":
+                return {"data": [{"id": "deepseek-v4-pro"}]}
+            raise AssertionError(url)
+
+        got = mc.build(
+            fetch=fetch,
+            env={"OLLAMA_API_KEY": "ollama-secret"},
+            run=None,
+            deepseek_wire_probe=deepseek_wire_proof,
+        )
+
+        route = got["harnesses"]["deepseek"]["models"][0]
+        self.assertEqual(route["id"], "ollama-cloud/deepseek-v4-pro")
+        self.assertEqual(route["provider"], "ollama-cloud")
+        self.assertEqual(route["provider_model"], "deepseek-v4-pro")
+        self.assertEqual(route["supported_efforts"], [])
+        self.assertIsNone(route["default_effort"])
+        self.assertEqual(route["adapter_metadata"]["credential_kind"], "ollama-api-key")
+        self.assertEqual(
+            route["adapter_metadata"]["provider_options_by_effort"],
+            {"default": {"omit": ["thinking", "reasoning_effort"], "set": {}}},
+        )
+        self.assertEqual(calls[-1], (
+            "https://ollama.com/v1/models",
+            {"Authorization": "Bearer ollama-secret"},
+        ))
+        self.assertIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
+        self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
+        serialized = json.dumps(got)
+        self.assertNotIn("ollama-secret", serialized)
+        self.assertNotIn("OLLAMA_API_KEY", serialized)
+
+    def test_one_provider_failure_does_not_suppress_the_other_provider(self):
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            if url == "https://api.deepseek.com/models":
+                raise OSError("deepseek unavailable")
+            if url == "https://ollama.com/v1/models":
+                return {"data": [{"id": "deepseek-v4-pro"}]}
+            raise AssertionError(url)
+
+        got = mc.build(
+            fetch=fetch,
+            env={
+                "DEEPSEEK_API_KEY": "deepseek-secret",
+                "OLLAMA_API_KEY": "ollama-secret",
+            },
+            run=None,
+            deepseek_wire_probe=deepseek_wire_proof,
+        )
+
+        self.assertEqual(
+            ids(got["harnesses"]["deepseek"]),
+            ["ollama-cloud/deepseek-v4-pro"],
+        )
+        self.assertIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
+        self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
 
     def test_http_json_rejects_body_larger_than_four_mebibytes(self):
         reads = []
@@ -593,9 +689,9 @@ class BuildTest(NoCLI):
             return {"data": [{"id": f"deepseek-exact-{index}"}
                              for index in range(8)]}
 
-        def prove(model, options_by_effort, env=None):
+        def prove(provider, model, options_by_effort, env=None):
             proof_calls.append(model)
-            return deepseek_wire_proof(model, options_by_effort, env)
+            return deepseek_wire_proof(provider, model, options_by_effort, env)
 
         got = mc.build(
             fetch=fetch,
@@ -626,7 +722,7 @@ class BuildTest(NoCLI):
             fetch=fetch,
             env={"DEEPSEEK_API_KEY": "secret-key"},
             run=None,
-            deepseek_wire_probe=lambda model, options_by_effort, env=None: (
+            deepseek_wire_probe=lambda provider, model, options_by_effort, env=None: (
                 proof_calls.append(model)
             ),
         )
@@ -651,7 +747,7 @@ class BuildTest(NoCLI):
             fetch=fetch,
             env={"DEEPSEEK_API_KEY": "secret-key"},
             run=None,
-            deepseek_wire_probe=lambda model, options_by_effort, env=None: (
+            deepseek_wire_probe=lambda provider, model, options_by_effort, env=None: (
                 proof_calls.append(model)
             ),
         )
@@ -692,8 +788,8 @@ class BuildTest(NoCLI):
             )
             return {"data": [{"id": "deepseek-v4-pro"}]}
 
-        def tampered_wire(model, options_by_effort, env=None):
-            proof = deepseek_wire_proof(model, options_by_effort, env)
+        def tampered_wire(provider, model, options_by_effort, env=None):
+            proof = deepseek_wire_proof(provider, model, options_by_effort, env)
             proof["proofs"]["default"]["digest"] = "0" * 64
             return proof
 
@@ -718,8 +814,8 @@ class BuildTest(NoCLI):
                 return MODELS_DEV
             return {"data": [{"id": "deepseek-v4-pro"}]}
 
-        def wire_only(model, options_by_effort, env=None):
-            proof = deepseek_wire_proof(model, options_by_effort, env)
+        def wire_only(provider, model, options_by_effort, env=None):
+            proof = deepseek_wire_proof(provider, model, options_by_effort, env)
             for item in proof["proofs"].values():
                 item.pop("native_request")
                 item["digest"] = route_bindings.digest_json({
@@ -751,8 +847,8 @@ class BuildTest(NoCLI):
                 return MODELS_DEV
             return {"data": [{"id": "deepseek-v4-pro"}]}
 
-        def mismatched_native(model, options_by_effort, env=None):
-            proof = deepseek_wire_proof(model, options_by_effort, env)
+        def mismatched_native(provider, model, options_by_effort, env=None):
+            proof = deepseek_wire_proof(provider, model, options_by_effort, env)
             item = proof["proofs"]["low"]
             item["native_request"]["reasoning_effort"] = "high"
             item["digest"] = route_bindings.digest_json({
@@ -828,9 +924,9 @@ class BuildTest(NoCLI):
             return {"data": [{"id": f"deepseek-exact-{index}"}
                              for index in range(8)]}
 
-        def prove(model, options_by_effort, env=None):
+        def prove(provider, model, options_by_effort, env=None):
             proof_calls.append(model)
-            return deepseek_wire_proof(model, options_by_effort, env)
+            return deepseek_wire_proof(provider, model, options_by_effort, env)
 
         proof = mc.controlled_route_evidence(
             "deepseek",

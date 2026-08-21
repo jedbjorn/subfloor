@@ -188,6 +188,8 @@ def test_composition_is_exact_and_contains_only_the_reviewed_plugin_allowlist() 
         "@deepseek-ai/dsh-session-persistence-jsonl",
         "@deepseek-ai/dsh-session-checkpoint-policy",
         "@deepseek-ai/dsh-token-meter",
+        "@deepseek-ai/dsh-llm-deepseek",
+        "@deepseek-ai/dsh-llm-pi-ai",
     )
     assert not any(
         forbidden in name
@@ -210,12 +212,19 @@ def test_composition_enables_native_skills_only_from_the_rendered_grant_root() -
 
 
 def test_composition_digest_drift_fails_closed() -> None:
-    with mock.patch.object(deepseek_runtime, "_sha256", return_value="0" * 64):
+    manifest = deepseek_runtime.load_runtime_manifest()
+    composition = ROOT / ".super-coder" / manifest["composition"]["path"]
+    real_sha256 = deepseek_runtime._sha256
+
+    def changed_digest(path: Path) -> str:
+        return "0" * 64 if path == composition else real_sha256(path)
+
+    with mock.patch.object(deepseek_runtime, "_sha256", side_effect=changed_digest):
         try:
             deepseek_runtime.load_runtime_manifest()
         except deepseek_runtime.DeepSeekRuntimeError as exc:
             assert exc.code == "HARNESS_COMPOSITION_DRIFT"
-            assert "8c1e4a0988c2a00c457ba7d2b0fbf80dc02d5b0fd29a8e8f92567f09ef70f3c1" in exc.detail
+            assert manifest["composition"]["sha256"] in exc.detail
         else:
             raise AssertionError("composition drift was accepted")
 
@@ -280,7 +289,7 @@ def test_exact_isolated_pair_reports_available_and_mismatch_does_not() -> None:
             "python_version": "3.14.7",
             "sdk_version": "0.1.0rc7",
             "runtime_version": "0.1.0rc7",
-            "composition_sha256": "8c1e4a0988c2a00c457ba7d2b0fbf80dc02d5b0fd29a8e8f92567f09ef70f3c1",
+            "composition_sha256": deepseek_runtime.load_runtime_manifest()["composition"]["sha256"],
         }
         assert bad.available is False
         assert bad.error == "HARNESS_RUNTIME_VERSION_MISMATCH"
@@ -380,6 +389,7 @@ def test_provider_wire_evidence_captures_default_omission_and_named_mapping() ->
         ))
 
     evidence = deepseek_runtime.provider_wire_evidence(
+        "deepseek-official",
         "deepseek-v4-pro",
         {
             "default": {"thinking": "omit", "reasoningEffort": "omit"},
@@ -458,6 +468,7 @@ def test_provider_wire_evidence_rejects_materialized_default() -> None:
 
     try:
         deepseek_runtime.provider_wire_evidence(
+            "deepseek-official",
             "deepseek-v4-pro",
             {"default": {"thinking": "omit", "reasoningEffort": "omit"}},
             env={},
@@ -489,6 +500,7 @@ def test_provider_wire_evidence_rejects_missing_native_request_metadata() -> Non
 
     try:
         deepseek_runtime.provider_wire_evidence(
+            "deepseek-official",
             "deepseek-v4-pro",
             {"default": {"thinking": "omit", "reasoningEffort": "omit"}},
             env={},
@@ -523,6 +535,7 @@ def test_provider_wire_evidence_rejects_mismatched_native_effort() -> None:
 
     try:
         deepseek_runtime.provider_wire_evidence(
+            "deepseek-official",
             "deepseek-v4-pro",
             {"low": {"thinking": "enabled", "reasoningEffort": "low"},
              "default": {"thinking": "omit", "reasoningEffort": "omit"}},
@@ -821,6 +834,37 @@ def test_launch_environment_replaces_personal_state_and_redacts_credentials() ->
         assert "old-secret" not in child.values()
         assert redacted["DEEPSEEK_API_KEY"] == "[REDACTED]"
         assert "sk-private-credential" not in json.dumps(redacted)
+
+
+def test_ollama_launch_projects_only_its_fixed_provider_credential() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        worktree = root / "worktree"
+        worktree.mkdir()
+        layout = deepseek_runtime.conversation_layout(42, state_root=root / "state")
+
+        child = deepseek_runtime.launch_environment(
+            layout,
+            worktree=worktree,
+            system_prompt="immutable boot bytes",
+            provider="ollama-cloud",
+            api_key="ollama-private-credential",
+            base_env={
+                "PATH": "/usr/bin",
+                "DEEPSEEK_API_KEY": "ambient-deepseek-secret",
+                "DEEPSEEK_BASE_URL": "https://attacker.example/v1",
+                "OLLAMA_API_KEY": "old-ollama-secret",
+                "SC_DEEPSEEK_PROVIDER": "deepseek-official",
+            },
+        )
+
+        assert child["OLLAMA_API_KEY"] == "ollama-private-credential"
+        assert child["SC_DEEPSEEK_PROVIDER_BASE_URL"] == "https://ollama.com/v1"
+        assert "DEEPSEEK_API_KEY" not in child
+        assert "DEEPSEEK_BASE_URL" not in child
+        assert "SC_DEEPSEEK_PROVIDER" not in child
+        assert "ambient-deepseek-secret" not in child.values()
+        assert "old-ollama-secret" not in child.values()
 
 
 def test_disable_is_non_destructive_and_short_circuits_runtime_probe() -> None:

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.parse
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +27,7 @@ from typing import Mapping, Sequence
 ENGINE = Path(__file__).resolve().parents[1]
 ASSET_ROOT = ENGINE / "assets" / "deepseek"
 MANIFEST_PATH = ASSET_ROOT / "runtime.json"
+PROVIDER_ADAPTERS_PATH = ASSET_ROOT / "provider-adapters.json"
 RUN_ROOT = ENGINE / "run" / "deepseek"
 MINIMUM_PYTHON = (3, 10)
 PROBE_TIMEOUT = 10
@@ -34,14 +36,14 @@ INSTALL_TIMEOUT = 3600
 MAX_DIAGNOSTIC_CHARS = 4096
 SENSITIVE_ENV = re.compile(r"(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.I)
 SECRET_TEXT = (
-    re.compile(r"(?i)(DEEPSEEK_API_KEY\s*[=:]\s*)[^\s,;]+"),
+    re.compile(r"(?i)((?:DEEPSEEK|OLLAMA)_API_KEY\s*[=:]\s*)[^\s,;]+"),
     re.compile(r"(?i)(Authorization\s*:\s*Bearer\s+)[^\s,;]+"),
     re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9._-]{8,}"),
 )
 LIFECYCLE_METHODS = frozenset(
     {"session/start", "session/cancel", "session/inspect", "session/reconcile", "shutdown"}
 )
-PROVIDER_WIRE_CONTRACT = "deepseek-provider-options-wire-v1"
+PROVIDER_WIRE_CONTRACT = "deepseek-provider-options-wire-v2"
 
 
 _PROVIDER_WIRE_PROBE = r"""
@@ -51,12 +53,15 @@ import sys
 
 from deepseek_harness import HarnessClient, HarnessConfig
 
-model = sys.argv[1]
-options_by_effort = json.loads(sys.argv[2])
+provider = sys.argv[1]
+model = sys.argv[2]
+options_by_effort = json.loads(sys.argv[3])
 native_requests = {}
 for index, (effort, options) in enumerate(options_by_effort.items()):
     session_id = f"wire-proof-{index}-{effort}"
     native_metadata = []
+    os.environ["SC_DEEPSEEK_PROVIDER_THINKING"] = options["thinking"]
+    os.environ["SC_DEEPSEEK_PROVIDER_REASONING_EFFORT"] = options["reasoningEffort"]
     config = HarnessConfig(
         cwd=os.environ["DSH_CWD"],
         env=dict(os.environ),
@@ -66,7 +71,7 @@ for index, (effort, options) in enumerate(options_by_effort.items()):
     with HarnessClient(config) as client:
         client.initialize(
             cwd=os.environ["DSH_CWD"],
-            provider="deepseek-official",
+            provider=provider,
             model=model,
             max_tokens=8,
             provider_request_options=options,
@@ -143,6 +148,117 @@ class ConversationLayout:
     adapter_lock: Path
 
 
+def _credential_free_url(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{field} must be an exact non-blank URL")
+    parsed = urllib.parse.urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"{field} must be credential-free HTTP(S)")
+    return value.rstrip("/")
+
+
+def load_provider_adapter_registry(
+    path: Path = PROVIDER_ADAPTERS_PATH,
+    *,
+    expected_sha256: str | None = None,
+) -> dict[str, object]:
+    """Load the fixed provider-adapter allowlist and validate its identity."""
+    try:
+        if expected_sha256 is not None and _sha256(path) != expected_sha256:
+            raise DeepSeekRuntimeError(
+                "HARNESS_PROVIDER_ADAPTER_DRIFT",
+                f"{path.relative_to(ENGINE)} digest does not match the runtime manifest",
+            )
+        raw = json.loads(path.read_text())
+        if raw.get("schema_version") != 1:
+            raise ValueError("unsupported provider adapter registry schema")
+        providers = raw.get("providers")
+        if not isinstance(providers, dict) or set(providers) != {
+            "deepseek-official", "ollama-cloud",
+        }:
+            raise ValueError("provider adapter registry must contain the fixed reviewed routes")
+        credential_names: set[str] = set()
+        for provider, entry in providers.items():
+            if not isinstance(entry, dict):
+                raise ValueError(f"provider adapter {provider} must be an object")
+            required = {
+                "adapter_id", "plugin", "plugin_version", "adapter_kind",
+                "credential_kind", "credential_source_env", "credential_child_env",
+                "endpoint_default", "endpoint_env", "discovery_path",
+                "discovery_shape", "selector_prefix", "max_models",
+                "named_efforts", "wire_mode",
+            }
+            if not required.issubset(entry):
+                raise ValueError(f"provider adapter {provider} is incomplete")
+            for field in (
+                "adapter_id", "plugin", "plugin_version", "adapter_kind",
+                "credential_kind", "credential_source_env", "credential_child_env",
+                "discovery_path", "discovery_shape", "wire_mode",
+            ):
+                if not isinstance(entry[field], str) or not entry[field]:
+                    raise ValueError(f"provider adapter {provider} has invalid {field}")
+            _credential_free_url(
+                entry["endpoint_default"], field=f"{provider}.endpoint_default"
+            )
+            endpoint_env = entry["endpoint_env"]
+            if endpoint_env is not None and (
+                not isinstance(endpoint_env, str) or not endpoint_env
+            ):
+                raise ValueError(f"provider adapter {provider} has invalid endpoint_env")
+            if not isinstance(entry["selector_prefix"], bool):
+                raise ValueError(f"provider adapter {provider} has invalid selector_prefix")
+            if (
+                not isinstance(entry["max_models"], int)
+                or isinstance(entry["max_models"], bool)
+                or not 1 <= entry["max_models"] <= 64
+            ):
+                raise ValueError(f"provider adapter {provider} has invalid max_models")
+            efforts = entry["named_efforts"]
+            if (
+                not isinstance(efforts, list)
+                or len(efforts) != len(set(efforts))
+                or any(item not in {"low", "high", "max"} for item in efforts)
+            ):
+                raise ValueError(f"provider adapter {provider} has invalid named_efforts")
+            credential_names.add(str(entry["credential_source_env"]))
+            credential_names.add(str(entry["credential_child_env"]))
+        if len(credential_names) != 2:
+            raise ValueError("provider credentials must remain provider-specific")
+    except DeepSeekRuntimeError:
+        raise
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise DeepSeekRuntimeError(
+            "HARNESS_PROVIDER_ADAPTER_INVALID", str(exc)
+        ) from exc
+    return raw
+
+
+def provider_adapter(provider: str) -> dict[str, object]:
+    """Return one digest-bound reviewed provider adapter, never a fallback."""
+    manifest = load_runtime_manifest()
+    evidence = manifest["provider_adapters"]
+    assert isinstance(evidence, dict)
+    registry = load_provider_adapter_registry(
+        expected_sha256=str(evidence["sha256"])
+    )
+    providers = registry["providers"]
+    assert isinstance(providers, dict)
+    selected = providers.get(provider)
+    if not isinstance(selected, dict):
+        raise DeepSeekRuntimeError(
+            "HARNESS_PROVIDER_ADAPTER_UNAVAILABLE",
+            f'provider route "{provider}" is not in the reviewed allowlist',
+        )
+    return selected
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -160,7 +276,7 @@ def load_runtime_manifest(path: Path = MANIFEST_PATH) -> dict[str, object]:
             "HARNESS_RUNTIME_MANIFEST_INVALID", f"cannot read {path}: {exc}"
         ) from exc
     try:
-        if raw["schema_version"] != 2:
+        if raw["schema_version"] != 3:
             raise ValueError("unsupported schema_version")
         if raw["python_minimum"] != "3.10":
             raise ValueError("python_minimum must preserve the 3.10 carrier floor")
@@ -171,6 +287,7 @@ def load_runtime_manifest(path: Path = MANIFEST_PATH) -> dict[str, object]:
         patch = raw["patch"]
         build = raw["build"]
         composition = raw["composition"]
+        provider_adapters = raw["provider_adapters"]
         if not isinstance(sdk, dict) or not isinstance(runtime, dict):
             raise ValueError("sdk/runtime evidence must be objects")
         if sdk["distribution"] != "deepseek-harness-sdk":
@@ -199,6 +316,14 @@ def load_runtime_manifest(path: Path = MANIFEST_PATH) -> dict[str, object]:
             raise ValueError("unexpected production skill canary contract")
         if not isinstance(composition, dict):
             raise ValueError("composition evidence must be an object")
+        if not isinstance(provider_adapters, dict):
+            raise ValueError("provider adapter evidence must be an object")
+        if provider_adapters.get("path") != "assets/deepseek/provider-adapters.json":
+            raise ValueError("provider adapter registry escaped the engine-owned asset")
+        load_provider_adapter_registry(
+            ENGINE / str(provider_adapters["path"]),
+            expected_sha256=str(provider_adapters["sha256"]),
+        )
         if composition["path"] != "assets/deepseek/cordis.yml":
             raise ValueError("composition path escaped the engine-owned asset")
         for evidence, expected_path, code in (
@@ -977,14 +1102,17 @@ def launch_environment(
     *,
     worktree: Path,
     system_prompt: str,
+    provider: str = "deepseek-official",
     api_key: str,
     base_url: str | None = None,
     base_env: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Build the explicit child environment without touching personal DSH state."""
     if not api_key.strip():
+        adapter = provider_adapter(provider)
         raise DeepSeekRuntimeError(
-            "HARNESS_CREDENTIAL_MISSING", "DEEPSEEK_API_KEY is required"
+            "HARNESS_CREDENTIAL_MISSING",
+            f"{adapter['credential_source_env']} is required for {provider}",
         )
     if not system_prompt:
         raise DeepSeekRuntimeError(
@@ -994,15 +1122,47 @@ def launch_environment(
         raise DeepSeekRuntimeError(
             "HARNESS_WORKTREE_MISMATCH", f"worktree is unavailable: {worktree}"
         )
-    if base_url is not None and not base_url.startswith(("https://", "http://")):
-        raise DeepSeekRuntimeError(
-            "HARNESS_PROVIDER_CONFIG_INVALID", "DeepSeek base URL must be HTTP(S)"
+    adapter = provider_adapter(provider)
+    endpoint_env = adapter["endpoint_env"]
+    if base_url is not None and endpoint_env is None:
+        expected = str(adapter["endpoint_default"])
+        if base_url.rstrip("/") != expected:
+            raise DeepSeekRuntimeError(
+                "HARNESS_PROVIDER_CONFIG_INVALID",
+                f"{provider} endpoint is fixed at {expected}",
+            )
+    try:
+        endpoint = _credential_free_url(
+            base_url or adapter["endpoint_default"], field=f"{provider} endpoint"
         )
-    load_runtime_manifest()
+    except ValueError as exc:
+        raise DeepSeekRuntimeError(
+            "HARNESS_PROVIDER_CONFIG_INVALID", str(exc)
+        ) from exc
     provision_conversation(layout)
     child = dict(os.environ if base_env is None else base_env)
+    manifest = load_runtime_manifest()
+    adapter_evidence = manifest["provider_adapters"]
+    assert isinstance(adapter_evidence, dict)
+    registry = load_provider_adapter_registry(
+        expected_sha256=str(adapter_evidence["sha256"])
+    )
+    providers = registry["providers"]
+    assert isinstance(providers, dict)
+    provider_variables = {
+        str(entry[field])
+        for entry in providers.values()
+        if isinstance(entry, dict)
+        for field in ("credential_source_env", "credential_child_env", "endpoint_env")
+        if entry.get(field)
+    }
     for name in tuple(child):
-        if name.startswith("DSH_") or name in {"DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"}:
+        if (
+            name.startswith("DSH_")
+            or name == "SC_DEEPSEEK_PROVIDER"
+            or name.startswith("SC_DEEPSEEK_PROVIDER_")
+            or name in provider_variables
+        ):
             child.pop(name, None)
     child.update(
         {
@@ -1012,12 +1172,13 @@ def launch_environment(
             "DSH_CWD": str(worktree.resolve()),
             "DSH_SKILL_ROOT": str(worktree.resolve() / ".agents" / "skills"),
             "DSH_SYSTEM_PROMPT": system_prompt,
-            "DEEPSEEK_API_KEY": api_key,
+            str(adapter["credential_child_env"]): api_key,
+            "SC_DEEPSEEK_PROVIDER_BASE_URL": endpoint,
             "PYTHONNOUSERSITE": "1",
         }
     )
-    if base_url:
-        child["DEEPSEEK_BASE_URL"] = base_url
+    if endpoint_env:
+        child[str(endpoint_env)] = endpoint
     return child
 
 
@@ -1046,6 +1207,7 @@ def _wire_digest(value: Mapping[str, object]) -> str:
 
 
 def provider_wire_evidence(
+    provider: str,
     model: str,
     options_by_effort: Mapping[str, Mapping[str, str]],
     *,
@@ -1054,13 +1216,14 @@ def provider_wire_evidence(
     runner=subprocess.run,
     status: RuntimeStatus | None = None,
 ) -> dict[str, object]:
-    """Capture the pinned carrier's final outbound reasoning fields.
+    """Capture one reviewed provider adapter's final outbound reasoning fields.
 
     The carrier talks only to an engine-owned loopback SSE endpoint. The
     authenticated provider model lookup remains a separate catalogue step;
     this probe proves that the exact pinned serializer turns each immutable
     option pair into the expected provider request bytes.
     """
+    adapter = provider_adapter(provider)
     if not isinstance(model, str) or not model or model != model.strip():
         raise DeepSeekRuntimeError(
             "HARNESS_PROVIDER_MODEL_INVALID", "provider model must be exact"
@@ -1158,10 +1321,20 @@ def provider_wire_evidence(
                 layout,
                 worktree=workspace,
                 system_prompt="Provider wire contract probe.",
+                provider=provider,
                 api_key="wire-proof-sentinel",
-                base_url=base_url,
+                base_url=(
+                    base_url if adapter["endpoint_env"] is not None else None
+                ),
                 base_env=env,
             )
+            child_env.update({
+                "SC_DEEPSEEK_PROVIDER": provider,
+                "SC_DEEPSEEK_MODEL": model,
+                "SC_DEEPSEEK_PROVIDER_BASE_URL": base_url,
+                "SC_DEEPSEEK_PROVIDER_THINKING": "omit",
+                "SC_DEEPSEEK_PROVIDER_REASONING_EFFORT": "omit",
+            })
             try:
                 completed = runner(
                     [
@@ -1169,6 +1342,7 @@ def provider_wire_evidence(
                         "-I",
                         "-c",
                         _PROVIDER_WIRE_PROBE,
+                        provider,
                         model,
                         json.dumps(requested, separators=(",", ":")),
                     ],
@@ -1235,10 +1409,11 @@ def provider_wire_evidence(
                     if key in payload
                 }
                 expected_options: dict[str, object] = {}
-                if options["thinking"] != "omit":
-                    expected_options["thinking"] = {
-                        "type": options["thinking"]
-                    }
+                if (
+                    adapter["wire_mode"] == "deepseek-request-patch"
+                    and options["thinking"] != "omit"
+                ):
+                    expected_options["thinking"] = {"type": options["thinking"]}
                 if options["reasoningEffort"] != "omit":
                     expected_options["reasoning_effort"] = options[
                         "reasoningEffort"
@@ -1251,7 +1426,7 @@ def provider_wire_evidence(
                 native_request = native_requests[effort]
                 expected_native = {
                     "event_type": "provider.request",
-                    "provider": "deepseek-official",
+                    "provider": provider,
                     "model": model,
                     "reasoning_effort": (
                         None if effort == "default" else effort
@@ -1265,6 +1440,7 @@ def provider_wire_evidence(
                     )
                 evidence = {
                     "contract": PROVIDER_WIRE_CONTRACT,
+                    "provider": provider,
                     "model": model,
                     "effort": effort,
                     "provider_options": options,
@@ -1273,6 +1449,10 @@ def provider_wire_evidence(
                     "runtime_version": observed_status.runtime_version,
                     "source_commit": manifest["source"]["commit"],
                     "patch_sha256": manifest["patch"]["sha256"],
+                    "composition_sha256": manifest["composition"]["sha256"],
+                    "provider_registry_sha256": manifest["provider_adapters"]["sha256"],
+                    "provider_adapter_id": adapter["adapter_id"],
+                    "provider_adapter_digest": _wire_digest(adapter),
                 }
                 proofs[effort] = {
                     **evidence,
@@ -1285,6 +1465,7 @@ def provider_wire_evidence(
 
     return {
         "contract": PROVIDER_WIRE_CONTRACT,
+        "provider": provider,
         "model": model,
         "proofs": proofs,
     }

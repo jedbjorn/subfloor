@@ -117,8 +117,18 @@ def unsupported_deepseek_binding() -> dict:
         },
         "adapter_metadata": {
             "provider_route": "deepseek-official",
+            "provider_adapter_id": "deepseek-native-v1",
+            "provider_adapter_digest": "1" * 64,
+            "provider_registry_sha256": "2" * 64,
+            "credential_kind": "deepseek-api-key",
+            "endpoint_identity": "https://api.deepseek.com",
+            "discovery_evidence_digest": "3" * 64,
             "transport_contract": "deepseek-provider-options-v1",
             "wire_evidence_digest": "c" * 64,
+            "runtime_version": "0.1.0rc7",
+            "source_commit": "b" * 40,
+            "patch_sha256": "4" * 64,
+            "composition_sha256": "5" * 64,
             "provider_options": {
                 "omit": [],
                 "set": {
