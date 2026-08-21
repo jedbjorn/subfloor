@@ -122,6 +122,73 @@ QAQC_EXIT_CLASSES = frozenset(
 QAQC_POSTCONDITIONS = frozenset(
     {"approved", "absent", "reviewer_mismatch", "revision_mismatch", "verdict_mismatch", "ambiguous"}
 )
+PARTICIPANT_FAILURE_KEYS = frozenset(
+    {
+        "schema_version",
+        "source",
+        "phase",
+        "category",
+        "upstream_code",
+        "http_status",
+        "provider_request_observed",
+        "provider_exact",
+        "model_exact",
+        "reserved_default_omitted",
+        "shell_tool_declared",
+        "purpose",
+    }
+)
+PARTICIPANT_FAILURE_SOURCES = frozenset(
+    {"provider", "carrier", "protocol", "tool-dispatch", "engine"}
+)
+PARTICIPANT_FAILURE_PHASES = frozenset(
+    {
+        "initialize",
+        "request-serialize",
+        "provider-request",
+        "provider-response",
+        "tool-call-decode",
+        "tool-dispatch",
+        "terminal",
+    }
+)
+PARTICIPANT_FAILURE_CATEGORIES = frozenset(
+    {
+        "model-tools-unsupported",
+        "tool-schema-rejected",
+        "tool-call-malformed",
+        "authentication",
+        "quota-or-rate-limit",
+        "provider-unavailable",
+        "protocol-contract",
+        "carrier-contract",
+        "unknown",
+    }
+)
+PARTICIPANT_FAILURE_PURPOSES = frozenset(
+    {"conversation", "compaction", "session-title", "unknown"}
+)
+PARTICIPANT_UPSTREAM_CODES = frozenset(
+    {
+        "ABORTED",
+        "AUTH",
+        "CONTEXT_WINDOW_EXCEEDED",
+        "EMPTY_RESPONSE",
+        "INVALID_CREDENTIAL",
+        "INVALID_REQUEST",
+        "MALFORMED_RESPONSE",
+        "MISSING_CREDENTIAL",
+        "PI_AI_ERROR",
+        "QUOTA",
+        "RATE_LIMIT",
+        "SERVER",
+        "STREAM_CLOSED",
+        "TIMEOUT",
+        "TRANSPORT",
+        "UNSUPPORTED_CONTENT",
+    }
+)
+PARTICIPANT_HTTP_CODE = re.compile(r"^HTTP_[1-5][0-9]{2}$")
 
 
 class CanaryError(RuntimeError):
@@ -1239,63 +1306,61 @@ class HostBackend:
         if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
             return {"diagnostic": "absent"}
         row = rows[0]
-        detail = str(row.get("error_detail") or "")
         error_code = str(row.get("error_code") or "")
-        lowered = f"{error_code} {detail}".lower()
-        categories = (
-            (
-                "credential_rejected",
-                (
-                    "unauthorized",
-                    "invalid api key",
-                    "invalid_credential",
-                    "missing_credential",
-                    "native_run_auth",
-                    "http 401",
-                ),
-            ),
-            (
-                "quota_exhausted",
-                ("native_run_quota", "insufficient_quota", "quota exhausted"),
-            ),
-            (
-                "rate_limited",
-                (
-                    "rate limit",
-                    "rate_limit",
-                    "http 429",
-                    "http_429",
-                    "too many requests",
-                ),
-            ),
-            ("timeout", ("timeout", "timed out", "deadline")),
-            (
-                "connectivity",
-                (
-                    "connection",
-                    "dns",
-                    "network",
-                    "native_run_transport",
-                    "unreachable",
-                ),
-            ),
-            ("protocol", ("protocol", "schema", "invalid json", "malformed")),
-            ("process_exit", ("exit code", "process exited", "signal")),
+        try:
+            evidence = json.loads(str(row.get("error_detail") or ""))
+        except json.JSONDecodeError:
+            return {
+                "run_state": row.get("state"),
+                "error_code": error_code or None,
+                "diagnostic": "structured_evidence_invalid",
+            }
+        valid = (
+            isinstance(evidence, dict)
+            and set(evidence) == PARTICIPANT_FAILURE_KEYS
+            and evidence.get("schema_version") == 1
+            and evidence.get("source") in PARTICIPANT_FAILURE_SOURCES
+            and evidence.get("phase") in PARTICIPANT_FAILURE_PHASES
+            and evidence.get("category") in PARTICIPANT_FAILURE_CATEGORIES
+            and evidence.get("purpose") in PARTICIPANT_FAILURE_PURPOSES
+            and (
+                evidence.get("upstream_code") is None
+                or evidence.get("upstream_code") in PARTICIPANT_UPSTREAM_CODES
+                or (
+                    isinstance(evidence.get("upstream_code"), str)
+                    and PARTICIPANT_HTTP_CODE.fullmatch(
+                        evidence["upstream_code"]
+                    )
+                    is not None
+                )
+            )
+            and (
+                evidence.get("http_status") is None
+                or isinstance(evidence.get("http_status"), int)
+                and not isinstance(evidence.get("http_status"), bool)
+                and 100 <= evidence["http_status"] <= 599
+            )
+            and all(
+                isinstance(evidence.get(key), bool)
+                for key in (
+                    "provider_request_observed",
+                    "provider_exact",
+                    "model_exact",
+                    "reserved_default_omitted",
+                    "shell_tool_declared",
+                )
+            )
         )
-        category = next(
-            (
-                name
-                for name, markers in categories
-                if any(marker in lowered for marker in markers)
-            ),
-            "unclassified",
-        )
+        if not valid:
+            return {
+                "run_state": row.get("state"),
+                "error_code": error_code or None,
+                "diagnostic": "structured_evidence_mismatch",
+            }
         return {
             "run_state": row.get("state"),
             "error_code": error_code or None,
-            "category": category,
-            "detail_bytes": len(detail.encode()),
-            "detail_sha256": hashlib.sha256(detail.encode()).hexdigest(),
+            **evidence,
         }
 
     @staticmethod

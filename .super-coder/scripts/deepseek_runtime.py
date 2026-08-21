@@ -52,7 +52,23 @@ SECRET_TEXT = (
 LIFECYCLE_METHODS = frozenset(
     {"session/start", "session/cancel", "session/inspect", "session/reconcile", "shutdown"}
 )
-PROVIDER_WIRE_CONTRACT = "deepseek-provider-options-wire-v3"
+PROVIDER_WIRE_CONTRACT = "deepseek-provider-options-wire-v4"
+PROVIDER_WIRE_SHELL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "bash",
+        "description": "Execute one bounded shell command.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["command", "description"],
+            "properties": {
+                "command": {"type": "string"},
+                "description": {"type": "string"},
+            },
+        },
+    },
+}
 
 
 _PROVIDER_WIRE_PROBE = r"""
@@ -107,6 +123,10 @@ for index, (effort, options) in enumerate(options_by_effort.items()):
                         "provider": payload.get("provider"),
                         "model": payload.get("model"),
                         "reasoning_effort": payload.get("reasoningEffort"),
+                        "reserved_default_omitted": payload.get(
+                            "reservedDefaultOmitted"
+                        ),
+                        "shell_tool_declared": payload.get("shellToolDeclared"),
                         "purpose": payload.get("purpose"),
                     })
 
@@ -244,6 +264,15 @@ def load_provider_adapter_registry(
                 raise ValueError(f"provider adapter {provider} has invalid endpoint_env")
             if not isinstance(entry["selector_prefix"], bool):
                 raise ValueError(f"provider adapter {provider} has invalid selector_prefix")
+            if provider == "ollama-cloud":
+                if entry.get("capability_shape") != "ollama-show-model-v1":
+                    raise ValueError("ollama-cloud capability shape is not reviewed")
+                _credential_free_url(
+                    entry.get("capability_url"),
+                    field="ollama-cloud.capability_url",
+                )
+                if entry.get("required_capabilities") != ["tools"]:
+                    raise ValueError("ollama-cloud must prove exact tool capability")
             if (
                 not isinstance(entry["max_models"], int)
                 or isinstance(entry["max_models"], bool)
@@ -1536,6 +1565,17 @@ def provider_wire_evidence(
                             f"outbound reasoning fields do not match effort "
                             f"{effort} purpose {purpose}",
                         )
+                    expected_tools = (
+                        [PROVIDER_WIRE_SHELL_TOOL]
+                        if purpose == "conversation"
+                        else None
+                    )
+                    if payload.get("tools") != expected_tools:
+                        raise DeepSeekRuntimeError(
+                            "HARNESS_PROVIDER_WIRE_MISMATCH",
+                            f"outbound shell tool declaration does not match "
+                            f"purpose {purpose}",
+                        )
                     native_request = native_by_purpose[purpose]
                     expected_native = {
                         "event_type": "provider.request",
@@ -1544,6 +1584,8 @@ def provider_wire_evidence(
                         "reasoning_effort": (
                             None if effort == "default" else effort
                         ),
+                        "reserved_default_omitted": effort == "default",
+                        "shell_tool_declared": purpose == "conversation",
                         "purpose": purpose,
                     }
                     if native_request != expected_native:
@@ -1554,6 +1596,7 @@ def provider_wire_evidence(
                         )
                     purpose_proofs[purpose] = {
                         "wire_options": observed_options,
+                        "shell_tool": expected_tools,
                         "native_request": native_request,
                     }
                 conversation = purpose_proofs["conversation"]

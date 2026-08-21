@@ -95,6 +95,8 @@ def deepseek_wire_proof(provider, model, options_by_effort, env=None):
             "provider": provider,
             "model": model,
             "reasoning_effort": None if effort == "default" else effort,
+            "reserved_default_omitted": effort == "default",
+            "shell_tool_declared": True,
             "purpose": "conversation",
         }
         evidence = {
@@ -108,7 +110,16 @@ def deepseek_wire_proof(provider, model, options_by_effort, env=None):
             "purpose_proofs": {
                 purpose: {
                     "wire_options": wire,
-                    "native_request": {**native_request, "purpose": purpose},
+                    "shell_tool": (
+                        [deepseek_runtime.PROVIDER_WIRE_SHELL_TOOL]
+                        if purpose == "conversation"
+                        else None
+                    ),
+                    "native_request": {
+                        **native_request,
+                        "shell_tool_declared": purpose == "conversation",
+                        "purpose": purpose,
+                    },
                 }
                 for purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES
             },
@@ -129,6 +140,14 @@ def deepseek_wire_proof(provider, model, options_by_effort, env=None):
         "provider": provider,
         "model": model,
         "proofs": proofs,
+    }
+
+
+def deepseek_tool_capability(provider, model, adapter, key):
+    del provider, model, key
+    return {
+        "required": bool(adapter.get("required_capabilities")),
+        "tools": True,
     }
 
 
@@ -579,6 +598,7 @@ class BuildTest(NoCLI):
             env={"OLLAMA_API_KEY": "ollama-secret"},
             run=None,
             deepseek_wire_probe=deepseek_wire_proof,
+            deepseek_capability_probe=deepseek_tool_capability,
         )
 
         route = got["harnesses"]["deepseek"]["models"][0]
@@ -588,6 +608,8 @@ class BuildTest(NoCLI):
         self.assertEqual(route["supported_efforts"], [])
         self.assertIsNone(route["default_effort"])
         self.assertEqual(route["adapter_metadata"]["credential_kind"], "ollama-api-key")
+        self.assertIs(route["selector_binding"]["tool_capability_verified"], True)
+        self.assertIs(route["adapter_metadata"]["tool_capability_verified"], True)
         self.assertEqual(
             route["adapter_metadata"]["provider_options_by_effort"],
             {"default": {"omit": ["thinking", "reasoning_effort"], "set": {}}},
@@ -605,6 +627,57 @@ class BuildTest(NoCLI):
         serialized = json.dumps(got)
         self.assertNotIn("ollama-secret", serialized)
         self.assertNotIn("OLLAMA_API_KEY", serialized)
+
+    def test_ollama_tool_capability_uses_exact_non_generative_model_metadata(self):
+        adapter = deepseek_runtime.provider_adapter("ollama-cloud")
+        calls = []
+
+        def post(url, payload, headers=None):
+            calls.append((url, payload, headers))
+            return {"capabilities": ["completion", "tools", "thinking"]}
+
+        evidence = mc._deepseek_tool_capability(
+            "ollama-cloud",
+            "deepseek-v4-pro:0813",
+            adapter,
+            "ollama-secret",
+            post=post,
+        )
+
+        self.assertEqual(evidence, {"required": True, "tools": True})
+        self.assertEqual(calls, [(
+            "https://ollama.com/api/show",
+            {"model": "deepseek-v4-pro:0813"},
+            {"Authorization": "Bearer ollama-secret"},
+        )])
+        self.assertNotIn("ollama-secret", json.dumps(evidence))
+
+    def test_ollama_route_fails_closed_when_exact_model_tools_are_unproven(self):
+        wire_probe = mock.Mock(
+            side_effect=AssertionError("capability failure must precede wire proof")
+        )
+
+        got = mc.build(
+            fetch=lambda url, _headers=None: (
+                MODELS_DEV
+                if url == mc.MODELS_DEV_URL
+                else {"data": [{"id": "deepseek-v4-pro:0813"}]}
+            ),
+            env={"OLLAMA_API_KEY": "ollama-secret"},
+            run=None,
+            deepseek_wire_probe=wire_probe,
+            deepseek_capability_probe=lambda *_args: {
+                "required": True,
+                "tools": False,
+            },
+        )
+
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            mc.DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED,
+        )
+        wire_probe.assert_not_called()
 
     def test_ollama_public_library_tag_cannot_substitute_for_authenticated_route(self):
         probe = mock.Mock(
@@ -648,6 +721,7 @@ class BuildTest(NoCLI):
             },
             run=None,
             deepseek_wire_probe=deepseek_wire_proof,
+            deepseek_capability_probe=deepseek_tool_capability,
         )
 
         self.assertEqual(
@@ -767,6 +841,7 @@ class BuildTest(NoCLI):
             env={"OLLAMA_API_KEY": "ollama-secret"},
             run=None,
             deepseek_wire_probe=unavailable_probe,
+            deepseek_capability_probe=deepseek_tool_capability,
         )
 
         self.assertEqual(proof_calls, [("ollama-cloud", configured)])

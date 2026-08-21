@@ -302,7 +302,7 @@ index 5f0aaca..a172c61 100644
    SessionPromptParams,
    SessionPromptResult,
 diff --git a/packages/sdk/protocol/src/types.ts b/packages/sdk/protocol/src/types.ts
-index 533b5f2..5736b80 100644
+index 533b5f2..72fe167 100644
 --- a/packages/sdk/protocol/src/types.ts
 +++ b/packages/sdk/protocol/src/types.ts
 @@ -22,6 +22,33 @@ export interface InitializeParams {
@@ -380,7 +380,7 @@ index 533b5f2..5736b80 100644
  /** Deployment-mapped SDK outcome: `ok` for an accepted result, `error` otherwise. */
  export type SdkRunStatus = 'ok' | 'error'
 
-@@ -55,6 +116,20 @@ export interface SessionEventNotification {
+@@ -55,6 +116,24 @@ export interface SessionEventNotification {
    event: SessionEvent
  }
 
@@ -394,6 +394,10 @@ index 533b5f2..5736b80 100644
 +  model: string
 +  /** Resolved native effort, or null when native configuration omits it. */
 +  reasoningEffort: string | null
++  /** True only when the reserved default omitted provider-owned overrides. */
++  reservedDefaultOmitted: boolean
++  /** True only when the final harness request declares the production bash tool. */
++  shellToolDeclared: boolean
 +  /** Explicit request purpose; ordinary agent-loop turns are `conversation`. */
 +  purpose: ProviderRequestPurpose
 +}
@@ -401,7 +405,7 @@ index 533b5f2..5736b80 100644
  /** Whole-agent lifecycle state for one session. */
  export interface SessionStatusNotification {
    /** Session whose live agent changed status. */
-@@ -91,6 +166,7 @@ export interface SubagentFinishedNotification {
+@@ -91,6 +170,7 @@ export interface SubagentFinishedNotification {
 
  /** Server-to-client notifications by JSON-RPC method name. */
  export interface HarnessSdkNotificationMap {
@@ -409,7 +413,7 @@ index 533b5f2..5736b80 100644
    'session.event': SessionEventNotification
    'session.status': SessionStatusNotification
    'subagent.started': SubagentStartedNotification
-@@ -100,6 +176,11 @@ export interface HarnessSdkNotificationMap {
+@@ -100,6 +180,11 @@ export interface HarnessSdkNotificationMap {
  /** Client-to-server request methods with their param and result shapes. */
  export interface HarnessSdkRequestMap {
    'initialize': { params: InitializeParams; result: InitializeResult }
@@ -422,7 +426,7 @@ index 533b5f2..5736b80 100644
    'shutdown': { params: undefined; result: Record<string, never> }
  }
 diff --git a/packages/sdk/server/src/server.ts b/packages/sdk/server/src/server.ts
-index 195caa9..1eba4d6 100644
+index 195caa9..5c7f0bf 100644
 --- a/packages/sdk/server/src/server.ts
 +++ b/packages/sdk/server/src/server.ts
 @@ -8,7 +8,7 @@
@@ -474,7 +478,7 @@ index 195caa9..1eba4d6 100644
    private llmFiber: { dispose(): Promise<void> } | undefined
    private readonly sessions = new Map<string, SessionRecord>()
    private readonly sessionCreations = new Map<string, Promise<SessionRecord>>()
-@@ -72,6 +90,17 @@ export class HarnessSdkJsonRpcServer {
+@@ -72,6 +90,19 @@ export class HarnessSdkJsonRpcServer {
        const payload: SessionEventNotification = { sessionId: String(session.id), event }
        this.transport.notify('session.event', payload)
      }))
@@ -484,6 +488,8 @@ index 195caa9..1eba4d6 100644
 +        provider: request.provider,
 +        model: request.model,
 +        reasoningEffort: request.reasoningEffort ?? null,
++        reservedDefaultOmitted: request.reasoningEffort === undefined,
++        shellToolDeclared: request.tools?.some(tool => tool.name === 'bash') === true,
 +        purpose: request.purpose ?? 'conversation',
 +      }
 +      this.transport.notify('provider.request', payload)
@@ -492,7 +498,7 @@ index 195caa9..1eba4d6 100644
      this.disposers.push(ctx.on('agent/status', ({ agent, status }) => {
        this.transport.notify('session.status', { sessionId: String(agent.session.id), status })
      }))
-@@ -117,9 +146,19 @@ export class HarnessSdkJsonRpcServer {
+@@ -117,9 +148,19 @@ export class HarnessSdkJsonRpcServer {
      this.provider = params.provider
      this.model = params.model
      this.maxTokens = params.maxTokens
@@ -513,7 +519,7 @@ index 195caa9..1eba4d6 100644
      }
      return { serverInfo: { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' } }
    }
-@@ -142,6 +181,82 @@ export class HarnessSdkJsonRpcServer {
+@@ -142,6 +183,99 @@ export class HarnessSdkJsonRpcServer {
      return { messageId: message.id }
    }
 
@@ -534,6 +540,23 @@ index 195caa9..1eba4d6 100644
 +      provider: this.provider,
 +      model: this.model,
 +      messages: [message],
++      ...purpose === 'conversation'
++        ? {
++          tools: [{
++            name: 'bash',
++            description: 'Execute one bounded shell command.',
++            parameters: {
++              type: 'object',
++              additionalProperties: false,
++              required: ['command', 'description'],
++              properties: {
++                command: { type: 'string' },
++                description: { type: 'string' },
++              },
++            },
++          }],
++        }
++        : {},
 +      sessionId: SessionId(params.sessionId),
 +      maxTokens: 8,
 +      ...this.reasoningEffort === undefined
@@ -596,7 +619,7 @@ index 195caa9..1eba4d6 100644
    /**
     * Dispose server-owned agents, adapter, and subscriptions to quiescence.
     * The surrounding context remains running.
-@@ -191,8 +306,18 @@ export class HarnessSdkJsonRpcServer {
+@@ -191,8 +325,18 @@ export class HarnessSdkJsonRpcServer {
      switch (method) {
        case 'initialize':
          return this.initialize(params as unknown as InitializeParams)
@@ -615,7 +638,7 @@ index 195caa9..1eba4d6 100644
        case 'shutdown':
          return this.shutdown()
        default:
-@@ -220,21 +345,89 @@ export class HarnessSdkJsonRpcServer {
+@@ -220,21 +364,89 @@ export class HarnessSdkJsonRpcServer {
      // rows in the host plane, so this agent reads them from the global layer. A
      // deployment that configures a roster has to join one here first
      // (@deepseek-ai/dsh-agent-presets README, "Composing a child agent").
@@ -715,7 +738,7 @@ index 195caa9..1eba4d6 100644
 +  return 'unknown'
 +}
 diff --git a/packages/sdk/server/tests/server.spec.ts b/packages/sdk/server/tests/server.spec.ts
-index 495f1d9..732d6f3 100644
+index 495f1d9..5581913 100644
 --- a/packages/sdk/server/tests/server.spec.ts
 +++ b/packages/sdk/server/tests/server.spec.ts
 @@ -124,6 +124,7 @@ describe('HarnessSdkJsonRpcServer', () => {
@@ -726,7 +749,7 @@ index 495f1d9..732d6f3 100644
        }) as { serverInfo: { name: string } }
        expect(init.serverInfo.name).toBe('deepseek-harness-sdk-runtime')
 
-@@ -134,13 +135,55 @@ describe('HarnessSdkJsonRpcServer', () => {
+@@ -134,13 +135,57 @@ describe('HarnessSdkJsonRpcServer', () => {
        expect((receipt as { messageId?: unknown }).messageId).toBeTypeOf('string')
 
        await vi.waitFor(() => { expect(llmServer.requests).toHaveLength(1) })
@@ -778,13 +801,15 @@ index 495f1d9..732d6f3 100644
 +          provider: 'deepseek-official',
 +          model: 'dsagent-model',
 +          reasoningEffort: null,
++          reservedDefaultOmitted: true,
++          shellToolDeclared: true,
 +          purpose: 'conversation',
 +        },
 +      })
        await vi.waitFor(() => {
          expect(transport.notifications.findLast(n => n.method === 'session.status')).toEqual({
            method: 'session.status',
-@@ -171,6 +214,355 @@ describe('HarnessSdkJsonRpcServer', () => {
+@@ -171,6 +216,379 @@ describe('HarnessSdkJsonRpcServer', () => {
      }
    })
 
@@ -843,6 +868,8 @@ index 495f1d9..732d6f3 100644
 +          provider: 'deepseek-official',
 +          model: 'dsagent-model',
 +          reasoningEffort: 'low',
++          reservedDefaultOmitted: false,
++          shellToolDeclared: true,
 +          purpose: 'conversation',
 +        },
 +      })
@@ -878,14 +905,34 @@ index 495f1d9..732d6f3 100644
 +      }
 +
 +      expect(llmServer.requests).toHaveLength(purposes.length)
-+      for (const body of llmServer.requests as {
++      for (const [index, body] of (llmServer.requests as {
 +        model: string
 +        thinking?: unknown
 +        reasoning_effort?: unknown
-+      }[]) {
++        tools?: unknown[]
++      }[]).entries()) {
 +        expect(body.model).toBe('dsagent-model')
 +        expect(body.thinking).toBeUndefined()
 +        expect(body.reasoning_effort).toBeUndefined()
++        if (index === 0) {
++          expect(body.tools).toEqual([{
++            type: 'function',
++            function: {
++              name: 'bash',
++              description: 'Execute one bounded shell command.',
++              parameters: {
++                type: 'object', additionalProperties: false,
++                required: ['command', 'description'],
++                properties: {
++                  command: { type: 'string' },
++                  description: { type: 'string' },
++                },
++              },
++            },
++          }])
++        } else {
++          expect(body.tools).toBeUndefined()
++        }
 +      }
 +      expect(transport.notifications.filter(n => n.method === 'provider.request')).toEqual(
 +        purposes.map(purpose => ({
@@ -895,6 +942,8 @@ index 495f1d9..732d6f3 100644
 +            provider: 'deepseek-official',
 +            model: 'dsagent-model',
 +            reasoningEffort: null,
++            reservedDefaultOmitted: true,
++            shellToolDeclared: purpose === 'conversation',
 +            purpose,
 +          },
 +        })),
@@ -1140,7 +1189,7 @@ index 495f1d9..732d6f3 100644
    it('queues overlapping prompts for one session without blocking other sessions', async () => {
      const mainFollowup = vi.fn<Agent['followup']>()
      const mainAgent = ({
-@@ -910,20 +1302,36 @@ describe('HarnessSdkJsonRpcServer', () => {
+@@ -910,20 +1328,36 @@ describe('HarnessSdkJsonRpcServer', () => {
      const ctx = {
        on: vi.fn(() => () => undefined),
        agents: { create, get: () => undefined },
@@ -1181,7 +1230,7 @@ index 495f1d9..732d6f3 100644
      }))
      await server.shutdown()
    })
-@@ -963,6 +1371,6 @@ describe('HarnessSdkJsonRpcServer', () => {
+@@ -963,6 +1397,6 @@ describe('HarnessSdkJsonRpcServer', () => {
      const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
 
      await expect(server.shutdown()).rejects.toBe(listenerFailure)

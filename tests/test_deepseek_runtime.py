@@ -47,6 +47,8 @@ def native_request_metadata(model: str, efforts) -> dict:
                 "provider": "deepseek-official",
                 "model": model,
                 "reasoning_effort": None if effort == "default" else effort,
+                "reserved_default_omitted": effort == "default",
+                "shell_tool_declared": purpose == "conversation",
                 "purpose": purpose,
             }
             for purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES
@@ -58,8 +60,10 @@ def native_request_metadata(model: str, efforts) -> dict:
 def emit_provider_requests(argv, kwargs) -> dict:
     options_by_effort = json.loads(argv[-1])
     for options in options_by_effort.values():
-        for _purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES:
+        for purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES:
             body = {"model": argv[-2], "messages": [], "stream": True}
+            if purpose == "conversation":
+                body["tools"] = [deepseek_runtime.PROVIDER_WIRE_SHELL_TOOL]
             if options["thinking"] != "omit":
                 body["thinking"] = {"type": options["thinking"]}
             if options["reasoningEffort"] != "omit":
@@ -463,6 +467,8 @@ def test_provider_wire_evidence_captures_default_omission_and_named_mapping() ->
         "provider": "deepseek-official",
         "model": "deepseek-v4-pro",
         "reasoning_effort": None,
+        "reserved_default_omitted": True,
+        "shell_tool_declared": True,
         "purpose": "conversation",
     }
     assert set(evidence["proofs"]["default"]["purpose_proofs"]) == set(
@@ -472,6 +478,11 @@ def test_provider_wire_evidence_captures_default_omission_and_named_mapping() ->
         purpose_proof = evidence["proofs"]["default"]["purpose_proofs"][purpose]
         assert purpose_proof["wire_options"] == {}
         assert purpose_proof["native_request"]["purpose"] == purpose
+        assert purpose_proof["shell_tool"] == (
+            [deepseek_runtime.PROVIDER_WIRE_SHELL_TOOL]
+            if purpose == "conversation"
+            else None
+        )
     for effort in ("low", "high", "max"):
         assert evidence["proofs"][effort]["wire_options"] == {
             "thinking": {"type": "enabled"},
@@ -482,6 +493,8 @@ def test_provider_wire_evidence_captures_default_omission_and_named_mapping() ->
             "provider": "deepseek-official",
             "model": "deepseek-v4-pro",
             "reasoning_effort": effort,
+            "reserved_default_omitted": False,
+            "shell_tool_declared": True,
             "purpose": "conversation",
         }
     assert len(evidence["proofs"]["default"]["digest"]) == 64

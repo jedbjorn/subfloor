@@ -1490,6 +1490,7 @@ class ConversationBroker(threading.Thread):
             )
         outcome = terminal_outcome(event.type)
         error = event.payload.get("error")
+        detail = event.payload.get("detail")
         exit_code = event.payload.get("exit_code")
         persisted, _result = self._retry_busy(
             partial(
@@ -1511,7 +1512,11 @@ class ConversationBroker(threading.Thread):
                     ),
                 },
                 error_code=str(error)[:255] if error else None,
-                error_detail=str(error) if error else None,
+                error_detail=(
+                    str(detail)[:16384]
+                    if detail is not None
+                    else str(error) if error else None
+                ),
                 exit_code=exit_code if isinstance(exit_code, int) else None,
             ),
             wait=True,

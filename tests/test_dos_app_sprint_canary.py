@@ -1178,7 +1178,24 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             def request(self, method, path, *, body=None, key=None):
                 return {"state": "error"}
 
-        raw_detail = "provider timed out token=opaque-provider-secret"
+        raw_detail = json.dumps(
+            {
+                "schema_version": 1,
+                "source": "provider",
+                "phase": "provider-response",
+                "category": "provider-unavailable",
+                "upstream_code": "TIMEOUT",
+                "http_status": None,
+                "provider_request_observed": True,
+                "provider_exact": True,
+                "model_exact": True,
+                "reserved_default_omitted": True,
+                "shell_tool_declared": True,
+                "purpose": "conversation",
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
         backend._run = mock.Mock(
             return_value=canary.CommandResult(
                 json.dumps(
@@ -1207,12 +1224,12 @@ class DosAppSprintCanaryTest(unittest.TestCase):
 
         failure = raised.exception.details["failure"]
         self.assertEqual("HARNESS_RUNTIME_FAILED", failure["error_code"])
-        self.assertEqual("timeout", failure["category"])
-        self.assertEqual(len(raw_detail.encode()), failure["detail_bytes"])
-        self.assertEqual(64, len(failure["detail_sha256"]))
+        self.assertEqual("provider-unavailable", failure["category"])
+        self.assertEqual("provider", failure["source"])
+        self.assertTrue(failure["shell_tool_declared"])
         encoded = json.dumps(raised.exception.details)
-        self.assertNotIn(raw_detail, encoded)
-        self.assertNotIn("opaque-provider-secret", encoded)
+        self.assertNotIn("error_detail", encoded)
+        self.assertNotIn("detail_sha256", encoded)
 
     def test_participant_failure_classifies_a_stable_native_error_code(self) -> None:
         backend = canary.HostBackend(
@@ -1225,7 +1242,22 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                         {
                             "state": "failed",
                             "error_code": "HARNESS_NATIVE_RUN_INVALID_CREDENTIAL",
-                            "error_detail": "HARNESS_NATIVE_RUN_FAILED",
+                        "error_detail": json.dumps(
+                            {
+                                "schema_version": 1,
+                                "source": "provider",
+                                "phase": "provider-response",
+                                "category": "authentication",
+                                "upstream_code": "INVALID_CREDENTIAL",
+                                "http_status": 401,
+                                "provider_request_observed": True,
+                                "provider_exact": True,
+                                "model_exact": True,
+                                "reserved_default_omitted": True,
+                                "shell_tool_declared": True,
+                                "purpose": "conversation",
+                            }
+                        ),
                         }
                     ]
                 ),
@@ -1241,8 +1273,43 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         self.assertEqual(
             "HARNESS_NATIVE_RUN_INVALID_CREDENTIAL", evidence["error_code"]
         )
-        self.assertEqual("credential_rejected", evidence["category"])
-        self.assertEqual(64, len(evidence["detail_sha256"]))
+        self.assertEqual("authentication", evidence["category"])
+        self.assertEqual(401, evidence["http_status"])
+
+    def test_participant_failure_rejects_unstructured_or_extra_evidence(self) -> None:
+        backend = canary.HostBackend(
+            canary.Deadline(100, 50), sleep=lambda _: None
+        )
+        for detail, diagnostic in (
+            ("provider raw body", "structured_evidence_invalid"),
+            (
+                json.dumps({
+                    "schema_version": 1,
+                    "source": "provider",
+                    "phase": "provider-response",
+                    "category": "unknown",
+                    "secret": "must-not-survive",
+                }),
+                "structured_evidence_mismatch",
+            ),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                backend._run = mock.Mock(
+                    return_value=canary.CommandResult(
+                        json.dumps([{
+                            "state": "failed",
+                            "error_code": "HARNESS_NATIVE_RUN_FAILED",
+                            "error_detail": detail,
+                        }]),
+                        "",
+                        0,
+                    )
+                )
+                evidence = backend._conversation_failure_evidence(
+                    self.facts, "cv_" + "1" * 32
+                )
+                self.assertEqual(diagnostic, evidence["diagnostic"])
+                self.assertNotIn("secret", json.dumps(evidence))
 
     def test_qaqc_prompt_loads_the_predeclaration_reviewer_skill(self) -> None:
         prompt = canary.HostBackend._qaqc_reviewer_prompt(117)

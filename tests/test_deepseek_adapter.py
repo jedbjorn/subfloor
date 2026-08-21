@@ -26,7 +26,10 @@ from conversation_adapters.base import (  # noqa: E402
     NativeTurn,
     checked_version_compatibility,
 )
-from conversation_adapters.deepseek import DeepSeekAdapter  # noqa: E402
+from conversation_adapters.deepseek import (  # noqa: E402
+    FAILURE_CATEGORIES,
+    DeepSeekAdapter,
+)
 
 CREATED_ADAPTERS: list[DeepSeekAdapter] = []
 
@@ -288,6 +291,32 @@ def native_notification(
             "payload": {
                 "sessionId": session_ref,
                 "event": {"type": event_type, "seq": seq, "time": seq, "data": dict(data)},
+            },
+        },
+    }
+
+
+def provider_notification(
+    session_ref: str,
+    *,
+    provider: str = "ollama-cloud",
+    model: str = "deepseek-v4-pro:0813",
+    default_omitted: bool = True,
+    shell_tool: bool = True,
+    purpose: str = "conversation",
+) -> dict[str, Any]:
+    return {
+        "method": "native/notification",
+        "params": {
+            "method": "provider.request",
+            "payload": {
+                "sessionId": session_ref,
+                "provider": provider,
+                "model": model,
+                "reasoningEffort": None,
+                "reservedDefaultOmitted": default_omitted,
+                "shellToolDeclared": shell_tool,
+                "purpose": purpose,
             },
         },
     }
@@ -690,6 +719,86 @@ def test_turn_failure_projects_only_a_strict_native_error_code(
         assert [event.type for event in events] == ["session.started", "run.failed"]
         assert events[-1].payload["error"] == expected_code
         assert "must-not-survive" not in events[-1].payload["error"]
+        evidence = json.loads(events[-1].payload["detail"])
+        assert evidence["category"] in FAILURE_CATEGORIES
+        assert evidence["provider_request_observed"] is False
+        assert native_message not in events[-1].payload["detail"]
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    ("native_code", "native_message", "status", "category", "phase"),
+    [
+        (
+            "PI_AI_ERROR", "tools are not supported by this model", 400,
+            "model-tools-unsupported", "provider-response",
+        ),
+        (
+            "INVALID_REQUEST", "tool schema rejected", 400,
+            "tool-schema-rejected", "provider-response",
+        ),
+        (
+            "MALFORMED_RESPONSE", "malformed tool call", None,
+            "tool-call-malformed", "tool-call-decode",
+        ),
+        ("AUTH", "opaque", 401, "authentication", "provider-response"),
+        ("RATE_LIMIT", "opaque", 429, "quota-or-rate-limit", "provider-response"),
+        ("SERVER", "opaque", 503, "provider-unavailable", "provider-response"),
+    ],
+)
+def test_provider_failure_retains_only_fixed_action_evidence(
+    tmp_path: Path,
+    native_code: str,
+    native_message: str,
+    status: int | None,
+    category: str,
+    phase: str,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    factory = Factory()
+    adapter = make_adapter(tmp_path / "state", factory)
+    try:
+        turn = adapter.start(
+            context(worktree, provider="ollama-cloud"),
+            "Do it",
+        )
+        error = {"code": native_code, "message": native_message}
+        if status is not None:
+            error["status"] = status
+        factory.instances[0].items = [
+            provider_notification(turn.session_ref),
+            native_notification(
+                turn.session_ref,
+                "turn/end",
+                5,
+                {"turn": 1, "reason": {"kind": "error", "error": error}},
+            ),
+        ]
+
+        events = list(adapter.stream(turn))
+
+        evidence = json.loads(events[-1].payload["detail"])
+        assert set(evidence) == {
+            "schema_version", "source", "phase", "category", "upstream_code",
+            "http_status", "provider_request_observed", "provider_exact",
+            "model_exact", "reserved_default_omitted", "shell_tool_declared",
+            "purpose",
+        }
+        assert evidence == {
+            **evidence,
+            "source": "provider",
+            "phase": phase,
+            "category": category,
+            "provider_request_observed": True,
+            "provider_exact": True,
+            "model_exact": True,
+            "reserved_default_omitted": True,
+            "shell_tool_declared": True,
+            "purpose": "conversation",
+        }
+        assert native_message not in events[-1].payload["detail"]
     finally:
         adapter.close()
 
@@ -844,6 +953,7 @@ def test_broker_captures_prompt_failure_identity_before_terminal(tmp_path: Path)
     terminal_call = store.finish_run.call_args
     assert terminal_call.args[:2] == (7, "failed")
     assert terminal_call.kwargs["error_code"] == "HARNESS_TIMEOUT"
+    assert terminal_call.kwargs["error_detail"] == "native prompt response timed out"
 
 
 def test_uncancelled_prompt_failure_reconciles_exactly_after_close(tmp_path: Path) -> None:
