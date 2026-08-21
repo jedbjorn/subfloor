@@ -799,13 +799,16 @@ class SprintCloseStore:
                 raise SprintAuthorityError(
                     "only the owning Planner or FnB may record the final report"
                 )
-            try:
-                self._require_reviewer(sprint_id, caller_shell_id)
-            except SprintAuthorityError:
+            reviewer = self.con.execute(
+                "SELECT 1 FROM sprint_participants "
+                "WHERE sprint_id=? AND shell_id=? AND role='reviewer'",
+                (sprint_id, caller_shell_id),
+            ).fetchone()
+            if reviewer is None:
                 raise SprintAuthorityError(
                     "only the owning Planner, FnB, or a participating Reviewer "
                     "may compile"
-                ) from None
+                )
         return row
 
     def _require_participant_or_admin(

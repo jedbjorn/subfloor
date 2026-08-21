@@ -36,6 +36,7 @@ TOKENS = {
     "admin": "admin-token",
     "developer": "dev-token",
     "reviewer": "review-token",
+    "reviewer3": "reviewer3-token",
     "planner": "planner-token",
 }
 
@@ -2490,6 +2491,85 @@ class SprintCliApiTest(unittest.TestCase):
                 con.execute(
                     "SELECT lifecycle,(SELECT COUNT(*) FROM sprint_registered_prs) "
                     "FROM sprints WHERE sprint_id=?",
+                    (sprint_id,),
+                ).fetchone(),
+            )
+        finally:
+            con.close()
+
+    def test_compile_report_allows_non_owner_reviewer_participant(self):
+        self.use_isolated_db()
+        feature_id, approval_id, task_id = self.seed_declaration("report-reader")
+        participants = self.write(
+            json.dumps(
+                [
+                    {"shell_id": 3, "role": "planner", "harness": "codex"},
+                    {"shell_id": 1, "role": "developer", "harness": "codex"},
+                    {"shell_id": 2, "role": "reviewer", "harness": "kimi"},
+                    {"shell_id": 7, "role": "reviewer", "harness": "codex"},
+                ]
+            )
+        )
+        sprint_id = self.run_cli(
+            TOKENS["planner"],
+            "declare",
+            "--feature",
+            str(feature_id),
+            "--spec-approval",
+            str(approval_id),
+            "--participants-file",
+            participants,
+            "--merge-grant",
+        )["sprint_id"]
+        self.run_cli(
+            TOKENS["planner"],
+            "plan-unit",
+            "--sprint",
+            str(sprint_id),
+            "--developer-shell",
+            "1",
+            "--reviewer-shell",
+            "2",
+            "--title",
+            "Report authority",
+            "--expected-output-file",
+            self.write("Keep Reviewer evidence readable."),
+            "--task",
+            str(task_id),
+        )
+        self.run_cli(
+            TOKENS["planner"],
+            "arm",
+            "--sprint",
+            str(sprint_id),
+            "--conformance-reviewer-shell",
+            "2",
+        )
+
+        report = self.run_cli(
+            TOKENS["reviewer3"],
+            "compile-report",
+            "--sprint",
+            str(sprint_id),
+            "--limit",
+            "50",
+        )
+
+        self.assertEqual(sprint_id, report["scope"]["sprint_id"])
+        self.assertEqual(1, report["planned_vs_actual"]["total"])
+        self.assertEqual(
+            "Report authority",
+            report["planned_vs_actual"]["items"][0]["title"],
+        )
+        con = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(
+                ("armed", 0),
+                con.execute(
+                    "SELECT sprint.lifecycle,"
+                    "(SELECT COUNT(*) FROM sprint_reports report "
+                    " WHERE report.sprint_id=sprint.sprint_id) "
+                    "FROM sprints sprint WHERE sprint.sprint_id=?",
                     (sprint_id,),
                 ).fetchone(),
             )
