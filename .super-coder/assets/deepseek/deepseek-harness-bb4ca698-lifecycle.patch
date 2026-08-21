@@ -422,7 +422,7 @@ index 533b5f2..5736b80 100644
    'shutdown': { params: undefined; result: Record<string, never> }
  }
 diff --git a/packages/sdk/server/src/server.ts b/packages/sdk/server/src/server.ts
-index 195caa9..550f956 100644
+index 195caa9..1eba4d6 100644
 --- a/packages/sdk/server/src/server.ts
 +++ b/packages/sdk/server/src/server.ts
 @@ -8,7 +8,7 @@
@@ -513,7 +513,7 @@ index 195caa9..550f956 100644
      }
      return { serverInfo: { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' } }
    }
-@@ -142,6 +181,80 @@ export class HarnessSdkJsonRpcServer {
+@@ -142,6 +181,82 @@ export class HarnessSdkJsonRpcServer {
      return { messageId: message.id }
    }
 
@@ -541,7 +541,9 @@ index 195caa9..550f956 100644
 +        : { reasoningEffort: ReasoningEffortId(this.reasoningEffort) },
 +      ...purpose === 'conversation' ? {} : { purpose },
 +    }
-+    for await (const _chunk of this.ctx.llm.stream(request)) { /* drain */ }
++    const llm = this.ctx.get('llm')
++    if (llm === undefined) throw new Error('provider wire probing requires the LLM service')
++    for await (const _chunk of llm.stream(request)) { /* drain */ }
 +    return { purpose }
 +  }
 +
@@ -594,7 +596,7 @@ index 195caa9..550f956 100644
    /**
     * Dispose server-owned agents, adapter, and subscriptions to quiescence.
     * The surrounding context remains running.
-@@ -191,8 +304,18 @@ export class HarnessSdkJsonRpcServer {
+@@ -191,8 +306,18 @@ export class HarnessSdkJsonRpcServer {
      switch (method) {
        case 'initialize':
          return this.initialize(params as unknown as InitializeParams)
@@ -613,7 +615,7 @@ index 195caa9..550f956 100644
        case 'shutdown':
          return this.shutdown()
        default:
-@@ -220,21 +343,89 @@ export class HarnessSdkJsonRpcServer {
+@@ -220,21 +345,89 @@ export class HarnessSdkJsonRpcServer {
      // rows in the host plane, so this agent reads them from the global layer. A
      // deployment that configures a roster has to join one here first
      // (@deepseek-ai/dsh-agent-presets README, "Composing a child agent").
