@@ -31,7 +31,7 @@ DEVKIT_RESEED = (
     ROOT
     / ".super-coder"
     / "migrations"
-    / "0211_reseed_native_package_dev_kit.sql"
+    / "0228_reseed_python_test_tooling.sql"
 )
 
 
