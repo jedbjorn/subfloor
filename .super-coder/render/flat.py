@@ -89,6 +89,17 @@ def _document_target(root: Path, rel: str, kind: str) -> Path:
     return root / path
 
 
+def document_rel_path(row) -> str:
+    """Resolve one document row to its managed repo-relative render path."""
+    if row["render_path"]:
+        return row["render_path"]
+    base = "specs_sc" if row["kind"] == "spec" else "docs_sc"
+    slug = row["title"] or f"{row['kind']}-{row['feature_id']}-{row['seq']}"
+    slug = slug.lower().replace(" ", "-").replace("—", "-")
+    slug = "".join(c for c in slug if c.isalnum() or c in "-_")
+    return f"{base}/{slug}.md"
+
+
 # ── Flat visibility render ────────────────────────────────────────────────────
 
 def _render_documents(con, written, skipped, root: Path) -> None:
@@ -106,13 +117,7 @@ def _render_documents(con, written, skipped, root: Path) -> None:
     for r in rows:
         if not r["body"]:
             continue
-        rel = r["render_path"]
-        if not rel:
-            base = "specs_sc" if r["kind"] == "spec" else "docs_sc"
-            slug = (r["title"] or f"{r['kind']}-{r['feature_id']}-{r['seq']}")
-            slug = slug.lower().replace(" ", "-").replace("—", "-")
-            slug = "".join(c for c in slug if c.isalnum() or c in "-_")
-            rel = f"{base}/{slug}.md"
+        rel = document_rel_path(r)
         # Per-document metadata into the rendered frontmatter — where the
         # feature sits in the plan + whether this spec is frozen.
         extra = [
