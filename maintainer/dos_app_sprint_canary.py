@@ -66,7 +66,14 @@ PICKUP_INJECTION_PAUSE_REASON = "wake_pickup_evidence_invalid"
 STANDARD_PROFILE = "standard"
 DEEPSEEK_SPRINT_PROFILE = "deepseek-sprint"
 PROFILES = {STANDARD_PROFILE, DEEPSEEK_SPRINT_PROFILE}
-DEEPSEEK_MODEL = "ollama-cloud/deepseek-v4-pro:0813"
+DEEPSEEK_PROVIDER = "ollama-cloud"
+DEEPSEEK_CANDIDATE_PREFERENCES = (
+    "ollama-cloud/glm-5.2:cloud",
+    "ollama-cloud/minimax-m3:cloud",
+)
+DEEPSEEK_CANDIDATE_LIMIT = 4
+DEEPSEEK_CANDIDATE_OUTPUT_BYTES = 16 * 1024
+RESTART_REHEARSAL_MODEL = "ollama-cloud/sc-loopback-restart:fixture"
 PROVIDER_CREDENTIAL_ENV = {
     "ANTHROPIC_API_KEY",
     "DEEPSEEK_API_KEY",
@@ -731,8 +738,10 @@ def _json_output(result: CommandResult, *, label: str) -> Any:
         ) from exc
 
 
-def _route_admission_fallback(exit_class: str) -> dict[str, Any]:
-    provider, model = DEEPSEEK_MODEL.split("/", 1)
+def _route_admission_fallback(
+    expected_model: str, exit_class: str
+) -> dict[str, Any]:
+    provider, model = expected_model.split("/", 1)
     return {
         "contract_version": 1,
         "requested_provider": provider,
@@ -749,7 +758,9 @@ def _route_admission_fallback(exit_class: str) -> dict[str, Any]:
     }
 
 
-def _validated_route_admission(result: CommandResult) -> dict[str, Any]:
+def _validated_route_admission(
+    result: CommandResult, expected_model: str
+) -> dict[str, Any]:
     """Consume only the fixed admission contract; never project raw output."""
     try:
         payload = json.loads(result.stdout or "null")
@@ -759,10 +770,14 @@ def _validated_route_admission(result: CommandResult) -> dict[str, Any]:
         raise CanaryError(
             "CANARY_ROUTE_ADMISSION_INVALID",
             "exact-route admission returned a malformed bounded contract",
-            details={"route_admission": _route_admission_fallback("malformed-response")},
+            details={
+                "route_admission": _route_admission_fallback(
+                    expected_model, "malformed-response"
+                )
+            },
         )
 
-    provider, model = DEEPSEEK_MODEL.split("/", 1)
+    provider, model = expected_model.split("/", 1)
     identity_matches = (
         payload.get("requested_provider") == provider
         and payload.get("requested_model") == model
@@ -774,7 +789,11 @@ def _validated_route_admission(result: CommandResult) -> dict[str, Any]:
         raise CanaryError(
             "CANARY_ROUTE_ADMISSION_INVALID",
             "exact-route admission identity did not match the canary",
-            details={"route_admission": _route_admission_fallback("identity-mismatch")},
+            details={
+                "route_admission": _route_admission_fallback(
+                    expected_model, "identity-mismatch"
+                )
+            },
         )
 
     admitted = payload.get("admitted")
@@ -810,9 +829,75 @@ def _validated_route_admission(result: CommandResult) -> dict[str, Any]:
         raise CanaryError(
             "CANARY_ROUTE_ADMISSION_INVALID",
             "exact-route admission violated its bounded contract",
-            details={"route_admission": _route_admission_fallback(exit_class)},
+            details={
+                "route_admission": _route_admission_fallback(
+                    expected_model, exit_class
+                )
+            },
         )
     return {key: payload[key] for key in ROUTE_ADMISSION_KEYS}
+
+
+def _validated_deepseek_candidates(result: CommandResult) -> list[str]:
+    """Accept only bounded, exact, authenticated Ollama route projections."""
+    if result.returncode != 0 or len(result.stdout.encode()) > DEEPSEEK_CANDIDATE_OUTPUT_BYTES:
+        raise CanaryError(
+            "CANARY_ROUTE_CANDIDATES_INVALID",
+            "bounded DeepSeek candidate projection failed",
+        )
+    lines = [line for line in result.stdout.splitlines() if line]
+    if len(lines) > 32:
+        raise CanaryError(
+            "CANARY_ROUTE_CANDIDATES_INVALID",
+            "DeepSeek candidate projection exceeded its row limit",
+        )
+    candidates: list[str] = []
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) not in {3, 4} or not fields[0].startswith("deepseek/"):
+            raise CanaryError(
+                "CANARY_ROUTE_CANDIDATES_INVALID",
+                "DeepSeek candidate projection was malformed",
+            )
+        selector = fields[0].removeprefix("deepseek/")
+        if not selector.startswith(f"{DEEPSEEK_PROVIDER}/"):
+            continue
+        if fields[1] != "available" or fields[2] != "ollama-cloud-provider-api":
+            continue
+        provider, model = selector.split("/", 1)
+        if (
+            provider != DEEPSEEK_PROVIDER
+            or not model
+            or model != model.strip()
+            or len(model) > 256
+            or any(char.isspace() or ord(char) < 32 for char in model)
+        ):
+            raise CanaryError(
+                "CANARY_ROUTE_CANDIDATES_INVALID",
+                "DeepSeek candidate identity was not exact and bounded",
+            )
+        candidates.append(selector)
+    if len(candidates) != len(set(candidates)) or not candidates:
+        raise CanaryError(
+            "CANARY_ROUTE_CANDIDATES_INVALID",
+            "DeepSeek candidate projection was empty or duplicated",
+        )
+    if len(candidates) > DEEPSEEK_CANDIDATE_LIMIT:
+        raise CanaryError(
+            "CANARY_ROUTE_CANDIDATES_INVALID",
+            "DeepSeek candidate projection exceeded its proof budget",
+        )
+    preference = {
+        selector: index
+        for index, selector in enumerate(DEEPSEEK_CANDIDATE_PREFERENCES)
+    }
+    return sorted(
+        candidates,
+        key=lambda selector: (
+            preference.get(selector, len(preference)),
+            selector,
+        ),
+    )
 
 
 def _restart_command_category(result: CommandResult) -> str | None:
@@ -832,7 +917,9 @@ def _restart_command_category(result: CommandResult) -> str | None:
     return "unknown"
 
 
-def _validated_restart_probe(result: CommandResult) -> dict[str, Any]:
+def _validated_restart_probe(
+    result: CommandResult, expected_model: str
+) -> dict[str, Any]:
     try:
         payload = json.loads(result.stdout or "null")
     except json.JSONDecodeError:
@@ -846,8 +933,8 @@ def _validated_restart_probe(result: CommandResult) -> dict[str, Any]:
         and HEX_SHA.fullmatch(payload["candidate_sha"]) is not None
         and isinstance(payload.get("conversation_id"), str)
         and CONVERSATION_ID_RE.fullmatch(payload["conversation_id"]) is not None
-        and payload.get("provider") == "ollama-cloud"
-        and payload.get("model") == DEEPSEEK_MODEL
+        and payload.get("provider") == DEEPSEEK_PROVIDER
+        and payload.get("model") == expected_model
         and isinstance(payload.get("runtime_version"), str)
         and bool(payload["runtime_version"])
         and isinstance(payload.get("source_commit"), str)
@@ -920,6 +1007,7 @@ def _restart_result(
     *,
     command_exit_class: str,
     command_exit_status: int,
+    expected_model: str,
     category: str | None = None,
 ) -> dict[str, Any]:
     same_runtime = all(
@@ -1014,10 +1102,12 @@ def _restart_result(
         "broker_state": after.get("run_state"),
         "lease_clear": after.get("lease_clear"),
     }
-    return _validated_restart_result(result)
+    return _validated_restart_result(result, expected_model)
 
 
-def _validated_restart_result(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _validated_restart_result(
+    payload: Mapping[str, Any], expected_model: str
+) -> dict[str, Any]:
     category = payload.get("category")
     native_session_id = payload.get("native_session_id")
     valid = (
@@ -1038,8 +1128,8 @@ def _validated_restart_result(payload: Mapping[str, Any]) -> dict[str, Any]:
             )
             or (native_session_id is None and category == "session-reference-missing")
         )
-        and payload.get("provider") == "ollama-cloud"
-        and payload.get("model") == DEEPSEEK_MODEL
+        and payload.get("provider") == DEEPSEEK_PROVIDER
+        and payload.get("model") == expected_model
         and isinstance(payload.get("runtime_version"), str)
         and 1 <= len(payload["runtime_version"]) <= 64
         and isinstance(payload.get("source_commit"), str)
@@ -1287,6 +1377,15 @@ class HostBackend:
         self.sleep = sleep
         self._port_sockets: list[socket.socket] = []
         self._provider_key: str | None = None
+        self._deepseek_model: str | None = None
+
+    def _selected_deepseek_model(self) -> str:
+        if self._deepseek_model is None:
+            raise CanaryError(
+                "CANARY_ROUTE_NOT_ADMITTED",
+                "no exact DeepSeek Sprint route was selected",
+            )
+        return self._deepseek_model
 
     @staticmethod
     def _validate_credential_file(path: Path | None) -> Path:
@@ -1940,7 +2039,7 @@ class HostBackend:
                 check=False,
                 label="refresh admitted deepseek route",
             )
-            route_admission = _validated_route_admission(
+            candidates = _validated_deepseek_candidates(
                 self._run(
                     [
                         "docker",
@@ -1948,21 +2047,44 @@ class HostBackend:
                         facts.container,
                         "./sc",
                         "models",
-                        "resolve",
+                        "list",
                         "deepseek",
-                        DEEPSEEK_MODEL,
-                        "--sprint-admission-json",
                     ],
                     check=False,
-                    label="resolve admitted deepseek route",
+                    label="list bounded deepseek candidates",
                 )
             )
-            if not route_admission["admitted"]:
+            route_admission = None
+            selected_model = None
+            for candidate in candidates:
+                admission = _validated_route_admission(
+                    self._run(
+                        [
+                            "docker",
+                            "exec",
+                            facts.container,
+                            "./sc",
+                            "models",
+                            "resolve",
+                            "deepseek",
+                            candidate,
+                            "--sprint-admission-json",
+                        ],
+                        check=False,
+                        label="resolve bounded deepseek candidate",
+                    ),
+                    candidate,
+                )
+                if admission["admitted"]:
+                    route_admission = admission
+                    selected_model = candidate
+                    break
+            if route_admission is None or selected_model is None:
                 raise CanaryError(
                     "CANARY_ROUTE_NOT_ADMITTED",
-                    "exact DeepSeek Sprint route was not admitted",
-                    details={"route_admission": route_admission},
+                    "no bounded exact DeepSeek Sprint candidate was admitted",
                 )
+            self._deepseek_model = selected_model
         else:
             route_admission = None
         status = self._run(
@@ -2063,12 +2185,14 @@ class HostBackend:
         conversation_id: str,
         *,
         native: bool,
+        expected_model: str,
     ) -> dict[str, Any]:
         args = ["probe", "--conversation", conversation_id]
         if native:
             args.append("--native")
         return _validated_restart_probe(
-            self._restart_helper(facts, *args, label="read bounded restart evidence")
+            self._restart_helper(facts, *args, label="read bounded restart evidence"),
+            expected_model,
         )
 
     def _wait_health(self, api: JsonHttp, config: CanaryConfig) -> None:
@@ -2151,8 +2275,8 @@ class HostBackend:
             != {"ok", "candidate_sha", "conversation_id", "provider", "model", "binding_digest"}
             or payload.get("ok") is not True
             or payload.get("candidate_sha") != facts.candidate_sha
-            or payload.get("provider") != "ollama-cloud"
-            or payload.get("model") != DEEPSEEK_MODEL
+            or payload.get("provider") != DEEPSEEK_PROVIDER
+            or payload.get("model") != RESTART_REHEARSAL_MODEL
             or not isinstance(conversation_id, str)
             or CONVERSATION_ID_RE.fullmatch(conversation_id) is None
         ):
@@ -2169,7 +2293,12 @@ class HostBackend:
                 f"{config.run_id}:restart-rehearsal:before",
             )
             self._wait_idle(api, conversation_id, config, facts)
-            before = self._restart_probe(facts, conversation_id, native=False)
+            before = self._restart_probe(
+                facts,
+                conversation_id,
+                native=False,
+                expected_model=RESTART_REHEARSAL_MODEL,
+            )
             self._run_exact_restart(facts, env)
             self._wait_health(api, config)
             self._start_restart_provider(facts)
@@ -2180,12 +2309,18 @@ class HostBackend:
                 f"{config.run_id}:restart-rehearsal:after",
             )
             self._wait_idle(api, conversation_id, config, facts)
-            after = self._restart_probe(facts, conversation_id, native=True)
+            after = self._restart_probe(
+                facts,
+                conversation_id,
+                native=True,
+                expected_model=RESTART_REHEARSAL_MODEL,
+            )
             result = _restart_result(
                 before,
                 after,
                 command_exit_class="success",
                 command_exit_status=0,
+                expected_model=RESTART_REHEARSAL_MODEL,
             )
             if not _restart_passed(result):
                 raise CanaryError(
@@ -3067,14 +3202,21 @@ class HostBackend:
         config: CanaryConfig,
         facts: Preflight,
         conversation_id: str,
+        expected_model: str,
     ) -> dict[str, Any]:
-        before = self._restart_probe(facts, conversation_id, native=False)
+        before = self._restart_probe(
+            facts,
+            conversation_id,
+            native=False,
+            expected_model=expected_model,
+        )
         if before["native_session_id"] is None:
             result = _restart_result(
                 before,
                 before,
                 command_exit_class="failure",
                 command_exit_status=1,
+                expected_model=expected_model,
                 category="session-reference-missing",
             )
             raise CanaryError(
@@ -3097,7 +3239,12 @@ class HostBackend:
                 f"{config.run_id}:deepseek:restart-resume",
             )
             self._wait_idle(api, conversation_id, config, facts)
-            after = self._restart_probe(facts, conversation_id, native=True)
+            after = self._restart_probe(
+                facts,
+                conversation_id,
+                native=True,
+                expected_model=expected_model,
+            )
         except CanaryError as exc:
             if exc.code == "CANARY_RESTART_RECOVERY_FAILED":
                 raise
@@ -3106,6 +3253,7 @@ class HostBackend:
                 before,
                 command_exit_class="success",
                 command_exit_status=0,
+                expected_model=expected_model,
                 category="native-resume-rejected",
             )
             raise CanaryError(
@@ -3118,6 +3266,7 @@ class HostBackend:
             after,
             command_exit_class="success",
             command_exit_status=0,
+            expected_model=expected_model,
         )
         if not _restart_passed(result):
             raise CanaryError(
@@ -3132,6 +3281,7 @@ class HostBackend:
         facts: Preflight,
         sprint_id: int,
         board: Mapping[str, Any],
+        expected_model: str,
     ) -> dict[str, Any]:
         evidence: dict[str, Any] = {}
         for role, skill_key in (("developer", "has_sprint_dev"), ("reviewer", "has_sprint_rev")):
@@ -3146,7 +3296,7 @@ class HostBackend:
             if (
                 not isinstance(participant, dict)
                 or participant.get("harness") != "deepseek"
-                or participant.get("model") != DEEPSEEK_MODEL
+                or participant.get("model") != expected_model
                 or participant.get("effort") != "default"
                 or not isinstance(participant.get("current_conversation_id"), str)
             ):
@@ -4163,6 +4313,9 @@ raise TimeoutError("controller did not close the Force-new barrier")
         deterministic_path = f"canary/{config.run_id}.txt"
         deterministic_content = f"subfloor sprint canary {facts.candidate_sha}"
         deepseek_profile = config.profile == DEEPSEEK_SPRINT_PROFILE
+        deepseek_model = (
+            self._selected_deepseek_model() if deepseek_profile else ""
+        )
 
         stage("planner_prepare")
         planner = self._create_conversation(
@@ -4227,14 +4380,14 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 "shell_id": shells["DEV1"],
                 "role": "developer",
                 "harness": developer_harness,
-                "model": DEEPSEEK_MODEL if deepseek_profile else None,
+                "model": deepseek_model if deepseek_profile else None,
                 "effort": "default" if deepseek_profile else None,
             },
             {
                 "shell_id": shells["REV1"],
                 "role": "reviewer",
                 "harness": reviewer_harness,
-                "model": DEEPSEEK_MODEL if deepseek_profile else None,
+                "model": deepseek_model if deepseek_profile else None,
                 "effort": "default" if deepseek_profile else None,
             },
         ]
@@ -4281,7 +4434,7 @@ raise TimeoutError("controller did not close the Force-new barrier")
             api,
             shell_id=shells["REV1"],
             harness=reviewer_harness,
-            model=DEEPSEEK_MODEL if deepseek_profile else None,
+            model=deepseek_model if deepseek_profile else None,
             effort="default" if deepseek_profile else None,
             key=f"{config.run_id}:reviewer:create",
         )
@@ -4320,8 +4473,8 @@ raise TimeoutError("controller did not close the Force-new barrier")
         restart_recovery = None
         if deepseek_profile:
             if (
-                reviewer_route["model"] != DEEPSEEK_MODEL
-                or reviewer_route["provider"] != "ollama-cloud"
+                reviewer_route["model"] != deepseek_model
+                or reviewer_route["provider"] != DEEPSEEK_PROVIDER
                 or reviewer_route["effort"] != "default"
             ):
                 raise CanaryError(
@@ -4331,7 +4484,7 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 )
             stage("deepseek_exact_session_restart")
             restart_recovery = self._restart_exact_session(
-                api, config, facts, reviewer_id
+                api, config, facts, reviewer_id, deepseek_model
             )
 
         stage("force_new_barrier")
@@ -4551,7 +4704,12 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 "CANARY_REENTRY_FAILED", "Planner Re-enter first run did not complete"
             )
         participant_evidence = (
-            self._deepseek_participant_evidence(facts, sprint_id, final_board)
+            self._deepseek_participant_evidence(
+                facts,
+                sprint_id,
+                final_board,
+                deepseek_model,
+            )
             if deepseek_profile
             else None
         )

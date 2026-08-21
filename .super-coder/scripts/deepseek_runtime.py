@@ -231,7 +231,7 @@ def load_provider_adapter_registry(
                 "credential_kind", "credential_source_env", "credential_child_env",
                 "endpoint_default", "endpoint_env", "discovery_path",
                 "discovery_shape", "selector_prefix", "max_models", "model_selectors",
-                "wire_proof_budget",
+                "candidate_preferences", "wire_proof_budget",
                 "named_efforts", "wire_mode",
             }
             if not required.issubset(entry):
@@ -292,12 +292,28 @@ def load_provider_adapter_registry(
                 )
             ):
                 raise ValueError(f"provider adapter {provider} has invalid model_selectors")
+            preferences = entry["candidate_preferences"]
+            if (
+                not isinstance(preferences, list)
+                or len(preferences) != len(set(preferences))
+                or any(
+                    not isinstance(item, str)
+                    or not item
+                    or item != item.strip()
+                    for item in preferences
+                )
+                or (selectors and preferences)
+            ):
+                raise ValueError(
+                    f"provider adapter {provider} has invalid candidate_preferences"
+                )
             proof_budget = entry["wire_proof_budget"]
             if (
                 not isinstance(proof_budget, int)
                 or isinstance(proof_budget, bool)
                 or not 1 <= proof_budget <= entry["max_models"]
                 or len(selectors) > proof_budget
+                or len(preferences) > proof_budget
             ):
                 raise ValueError(f"provider adapter {provider} has invalid wire_proof_budget")
             efforts = entry["named_efforts"]

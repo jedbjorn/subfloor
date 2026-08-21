@@ -44,9 +44,9 @@ from conversation_adapters.deepseek import (  # noqa: E402
 CONVERSATION_ID = re.compile(r"^cv_[0-9a-f]{32}$")
 HEX_SHA = re.compile(r"^[0-9a-f]{40}$")
 REHEARSAL_KEY = "deepseek-exact-restart-rehearsal-v1"
-SELECTOR = "ollama-cloud/deepseek-v4-pro:0813"
+SELECTOR = "ollama-cloud/sc-loopback-restart:fixture"
 PROVIDER = "ollama-cloud"
-PROVIDER_MODEL = "deepseek-v4-pro:0813"
+PROVIDER_MODEL = "sc-loopback-restart:fixture"
 FAILURE_CATEGORIES = {
     "broker-state-or-lease",
     "old-process-still-live",

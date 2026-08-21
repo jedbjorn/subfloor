@@ -239,6 +239,38 @@ def test_provider_compositions_activate_only_the_selected_adapter() -> None:
         assert excluded not in names
 
 
+def test_provider_registry_bounds_exact_candidate_preferences() -> None:
+    registry = deepseek_runtime.load_provider_adapter_registry()
+    providers = registry["providers"]
+    assert providers["deepseek-official"]["candidate_preferences"] == []
+    assert providers["ollama-cloud"]["candidate_preferences"] == [
+        "glm-5.2:cloud",
+        "minimax-m3:cloud",
+    ]
+    assert providers["ollama-cloud"]["model_selectors"] == []
+    assert providers["ollama-cloud"]["wire_proof_budget"] == 4
+
+    for preferences, selectors in (
+        (["duplicate", "duplicate"], []),
+        (["candidate"], ["fixed"]),
+        ([f"candidate-{index}" for index in range(5)], []),
+    ):
+        mutated = json.loads(
+            (ROOT / ".super-coder/assets/deepseek/provider-adapters.json").read_text()
+        )
+        mutated["providers"]["ollama-cloud"]["candidate_preferences"] = preferences
+        mutated["providers"]["ollama-cloud"]["model_selectors"] = selectors
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "provider-adapters.json"
+            path.write_text(json.dumps(mutated))
+            try:
+                deepseek_runtime.load_provider_adapter_registry(path)
+            except deepseek_runtime.DeepSeekRuntimeError as exc:
+                assert exc.code == "HARNESS_PROVIDER_ADAPTER_INVALID"
+            else:
+                raise AssertionError("invalid candidate preferences were accepted")
+
+
 def test_composition_enables_native_skills_only_from_the_rendered_grant_root() -> None:
     manifest = deepseek_runtime.load_runtime_manifest()
     composition = ROOT / ".super-coder" / manifest["composition"]["path"]

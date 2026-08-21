@@ -42,6 +42,7 @@ from maintainer import dos_app_sprint_canary as canary
 
 SHA = "a" * 40
 BASE_SHA = "b" * 40
+TEST_DEEPSEEK_MODEL = "ollama-cloud/glm-5.2:cloud"
 
 
 def route_admission_payload(
@@ -51,7 +52,7 @@ def route_admission_payload(
     payload: dict[str, object] = {
         "contract_version": 1,
         "requested_provider": "ollama-cloud",
-        "requested_model": "deepseek-v4-pro:0813",
+        "requested_model": "glm-5.2:cloud",
         "admitted": admitted,
         "error_code": (
             None
@@ -77,7 +78,7 @@ def restart_probe(**updates) -> dict[str, object]:
         "conversation_id": "cv_" + "1" * 32,
         "native_session_id": "deepseek-" + "3" * 32,
         "provider": "ollama-cloud",
-        "model": canary.DEEPSEEK_MODEL,
+        "model": TEST_DEEPSEEK_MODEL,
         "runtime_version": "1.0.0",
         "source_commit": "c" * 40,
         "patch_sha256": "d" * 64,
@@ -183,7 +184,7 @@ class FakeBackend:
                 "exact route rejected",
                 details={
                     "route_admission": canary._route_admission_fallback(
-                        "route-rejected"
+                        TEST_DEEPSEEK_MODEL, "route-rejected"
                     )
                 },
             )
@@ -843,7 +844,8 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             with self.subTest(category=category):
                 payload = route_admission_payload(category=category)
                 result = canary._validated_route_admission(
-                    canary.CommandResult(json.dumps(payload), "ignored raw", 2)
+                    canary.CommandResult(json.dumps(payload), "ignored raw", 2),
+                    TEST_DEEPSEEK_MODEL,
                 )
                 self.assertEqual(category, result["category"])
                 self.assertFalse(result["admitted"])
@@ -862,13 +864,15 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         self.assertEqual(
             "unsupported",
             canary._validated_route_admission(
-                canary.CommandResult(json.dumps(unsupported), "", 2)
+                canary.CommandResult(json.dumps(unsupported), "", 2),
+                TEST_DEEPSEEK_MODEL,
             )["tool_capability"],
         )
         self.assertEqual(
             "unproven",
             canary._validated_route_admission(
-                canary.CommandResult(json.dumps(unproven), "", 2)
+                canary.CommandResult(json.dumps(unproven), "", 2),
+                TEST_DEEPSEEK_MODEL,
             )["tool_capability"],
         )
 
@@ -903,7 +907,7 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             with self.subTest(label=label), self.assertRaises(
                 canary.CanaryError
             ) as raised:
-                canary._validated_route_admission(result)
+                canary._validated_route_admission(result, TEST_DEEPSEEK_MODEL)
             serialized = json.dumps(raised.exception.details)
             self.assertNotIn(result.stdout, serialized)
             self.assertEqual(
@@ -911,10 +915,46 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                 set(raised.exception.details["route_admission"]),
             )
 
+    def test_deepseek_candidate_projection_is_exact_bounded_and_deterministic(self) -> None:
+        result = canary.CommandResult(
+            "deepseek/ollama-cloud/other:cloud\tavailable\t"
+            "ollama-cloud-provider-api\n"
+            "deepseek/ollama-cloud/minimax-m3:cloud\tavailable\t"
+            "ollama-cloud-provider-api\n"
+            "deepseek/ollama-cloud/glm-5.2:cloud\tavailable\t"
+            "ollama-cloud-provider-api\n",
+            "",
+            0,
+        )
+
+        self.assertEqual(
+            canary._validated_deepseek_candidates(result),
+            [
+                "ollama-cloud/glm-5.2:cloud",
+                "ollama-cloud/minimax-m3:cloud",
+                "ollama-cloud/other:cloud",
+            ],
+        )
+        for invalid in (
+            canary.CommandResult(result.stdout + result.stdout, "", 0),
+            canary.CommandResult(
+                "deepseek/ollama-cloud/glm-5.2:cloud\tstale\t"
+                "ollama-cloud-provider-api\n",
+                "",
+                0,
+            ),
+            canary.CommandResult("private raw provider output", "", 0),
+        ):
+            with self.subTest(output=invalid.stdout), self.assertRaises(
+                canary.CanaryError
+            ):
+                canary._validated_deepseek_candidates(invalid)
+
     def test_restart_probe_requires_the_exact_bounded_contract(self) -> None:
         payload = restart_probe()
         result = canary._validated_restart_probe(
-            canary.CommandResult(json.dumps(payload), "", 0)
+            canary.CommandResult(json.dumps(payload), "", 0),
+            TEST_DEEPSEEK_MODEL,
         )
         self.assertEqual(set(canary.RESTART_PROBE_KEYS), set(result))
 
@@ -926,7 +966,8 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(canary.CanaryError) as raised:
                     canary._validated_restart_probe(
-                        canary.CommandResult(json.dumps(invalid), "", 0)
+                        canary.CommandResult(json.dumps(invalid), "", 0),
+                        TEST_DEEPSEEK_MODEL,
                     )
                 self.assertEqual(
                     {"restart": {"schema_version": 1, "category": "unknown"}},
@@ -944,6 +985,7 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             after,
             command_exit_class="success",
             command_exit_status=0,
+            expected_model=TEST_DEEPSEEK_MODEL,
         )
         self.assertTrue(canary._restart_passed(success))
         self.assertIsNone(success["category"])
@@ -971,6 +1013,7 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                     {**after, **updates},
                     command_exit_class="success",
                     command_exit_status=0,
+                    expected_model=TEST_DEEPSEEK_MODEL,
                 )
                 self.assertEqual(category, classified["category"])
                 self.assertFalse(canary._restart_passed(classified))
@@ -987,6 +1030,7 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                     after,
                     command_exit_class="failure",
                     command_exit_status=1,
+                    expected_model=TEST_DEEPSEEK_MODEL,
                     category=category,
                 )
                 self.assertEqual(category, classified["category"])
@@ -1486,7 +1530,7 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                     "route": {
                         "harness": "deepseek",
                         "provider": "ollama-cloud",
-                        "model": canary.DEEPSEEK_MODEL,
+                        "model": TEST_DEEPSEEK_MODEL,
                         "effort": "default",
                     },
                 }
@@ -1496,7 +1540,7 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             cast(canary.JsonHttp, api),
             shell_id=2,
             harness="deepseek",
-            model=canary.DEEPSEEK_MODEL,
+            model=TEST_DEEPSEEK_MODEL,
             effort="default",
             key="deepseek-route",
         )
@@ -1505,12 +1549,12 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             {
                 "shell_id": 2,
                 "harness": "deepseek",
-                "model": canary.DEEPSEEK_MODEL,
+                "model": TEST_DEEPSEEK_MODEL,
                 "effort": "default",
             },
             api.body,
         )
-        self.assertEqual(canary.DEEPSEEK_MODEL, projected["route"]["model"])
+        self.assertEqual(TEST_DEEPSEEK_MODEL, projected["route"]["model"])
 
     def test_launch_refreshes_routes_before_reading_provider_credential(self) -> None:
         backend = canary.HostBackend(
@@ -1533,7 +1577,16 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             run_checks[label] = check
             if label.startswith("resolve exact-image"):
                 return canary.CommandResult('{"ok": true}', "", 0)
-            if label.startswith("resolve admitted"):
+            if label == "list bounded deepseek candidates":
+                return canary.CommandResult(
+                    "deepseek/ollama-cloud/glm-5.2:cloud\tavailable\t"
+                    "ollama-cloud-provider-api\n"
+                    "deepseek/ollama-cloud/minimax-m3:cloud\tavailable\t"
+                    "ollama-cloud-provider-api\n",
+                    "",
+                    0,
+                )
+            if label == "resolve bounded deepseek candidate":
                 return canary.CommandResult(
                     json.dumps(route_admission_payload()), "", 0
                 )
@@ -1555,10 +1608,15 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         backend._run = fake_run  # type: ignore[method-assign]
         backend._read_provider_key = fake_read  # type: ignore[method-assign]
         rehearsal = canary._restart_result(
-            restart_probe(),
-            restart_probe(process_pid=200, process_start_ticks=2000),
+            restart_probe(model=canary.RESTART_REHEARSAL_MODEL),
+            restart_probe(
+                model=canary.RESTART_REHEARSAL_MODEL,
+                process_pid=200,
+                process_start_ticks=2000,
+            ),
             command_exit_class="success",
             command_exit_status=0,
+            expected_model=canary.RESTART_REHEARSAL_MODEL,
         )
         backend._credential_free_restart_rehearsal = mock.Mock(  # type: ignore[method-assign]
             return_value=rehearsal
@@ -1590,7 +1648,8 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                 "read provider credential",
                 "launch isolated runtime",
                 "refresh admitted deepseek route",
-                "resolve admitted deepseek route",
+                "list bounded deepseek candidates",
+                "resolve bounded deepseek candidate",
                 "inspect launched harness versions",
             ],
             events,
@@ -1610,10 +1669,12 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         )
         self.assertIn(
             "--sprint-admission-json",
-            run_argv["resolve admitted deepseek route"],
+            run_argv["resolve bounded deepseek candidate"],
         )
         self.assertFalse(run_checks["refresh admitted deepseek route"])
-        self.assertFalse(run_checks["resolve admitted deepseek route"])
+        self.assertFalse(run_checks["list bounded deepseek candidates"])
+        self.assertFalse(run_checks["resolve bounded deepseek candidate"])
+        self.assertEqual(TEST_DEEPSEEK_MODEL, backend._deepseek_model)
         self.assertEqual(rehearsal, launch_result["restart_rehearsal"])
         self.assertEqual(
             {"codex": "codex-cli-test", "deepseek": "deepseek-test"},
@@ -2154,14 +2215,14 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                 {
                     "role": "developer",
                     "harness": "deepseek",
-                    "model": canary.DEEPSEEK_MODEL,
+                    "model": TEST_DEEPSEEK_MODEL,
                     "effort": "default",
                     "current_conversation_id": "cv_" + "1" * 32,
                 },
                 {
                     "role": "reviewer",
                     "harness": "deepseek",
-                    "model": canary.DEEPSEEK_MODEL,
+                    "model": TEST_DEEPSEEK_MODEL,
                     "effort": "default",
                     "current_conversation_id": "cv_" + "2" * 32,
                 },
@@ -2185,14 +2246,16 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             return_value=canary.CommandResult('[{"handoffs":1}]', "", 0)
         )
 
-        evidence = backend._deepseek_participant_evidence(self.facts, 9, board)
+        evidence = backend._deepseek_participant_evidence(
+            self.facts, 9, board, TEST_DEEPSEEK_MODEL
+        )
 
         self.assertEqual(1, evidence["developer_handoffs"])
         self.assertTrue(evidence["developer"]["role_skill_loaded"])
         self.assertTrue(evidence["reviewer"]["role_skill_loaded"])
         self.assertEqual(3, evidence["developer"]["tool_completed"])
         self.assertEqual(
-            canary.DEEPSEEK_MODEL, evidence["reviewer"]["route"]["model"]
+            TEST_DEEPSEEK_MODEL, evidence["reviewer"]["route"]["model"]
         )
 
         missing_tools = conversation(self.facts, "cv_" + "1" * 32)
@@ -2201,7 +2264,9 @@ class DosAppSprintCanaryTest(unittest.TestCase):
             side_effect=[missing_tools, conversation(self.facts, "cv_" + "2" * 32)]
         )
         with self.assertRaisesRegex(canary.CanaryError, "completed-tool evidence"):
-            backend._deepseek_participant_evidence(self.facts, 9, board)
+            backend._deepseek_participant_evidence(
+                self.facts, 9, board, TEST_DEEPSEEK_MODEL
+            )
 
     def test_maintainer_command_is_not_distributed_or_added_as_sc_verb(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -2256,7 +2321,7 @@ class DeepSeekExactRestartHelperTest(unittest.TestCase):
 
             self.assertEqual(SHA, prepared["candidate_sha"])
             self.assertEqual("ollama-cloud", prepared["provider"])
-            self.assertEqual(canary.DEEPSEEK_MODEL, prepared["model"])
+            self.assertEqual(canary.RESTART_REHEARSAL_MODEL, prepared["model"])
             self.assertRegex(str(prepared["conversation_id"]), r"^cv_[0-9a-f]{32}$")
             with contextlib.closing(sqlite3.connect(database)) as con:
                 con.row_factory = sqlite3.Row
@@ -2444,7 +2509,7 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
                         2,
                         "reviewer",
                         "deepseek",
-                        canary.DEEPSEEK_MODEL,
+                        TEST_DEEPSEEK_MODEL,
                         "default",
                     ),
                     (
@@ -2452,7 +2517,7 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
                         3,
                         "developer",
                         "deepseek",
-                        canary.DEEPSEEK_MODEL,
+                        TEST_DEEPSEEK_MODEL,
                         "default",
                     ),
                 ),
@@ -2478,7 +2543,7 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
                 "VALUES (?,2,1,'deepseek','ollama-cloud',?,'default',?,'running',?,?)",
                 (
                     self.conversation_id,
-                    canary.DEEPSEEK_MODEL,
+                    TEST_DEEPSEEK_MODEL,
                     str(self.reviewer_worktree),
                     "qaqc-rehearsal",
                     "r" * 64,

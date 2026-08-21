@@ -51,6 +51,6 @@
   },
   "provider_adapters": {
     "path": "assets/deepseek/provider-adapters.json",
-    "sha256": "58fe570fce8b6235f412600ea0824ea96be0b2d46186e4845da03547af948480"
+    "sha256": "6e98eb91185b662bc35f80ad0704d347b09b8dbd5adf4f344010a28072a7d114"
   }
 }

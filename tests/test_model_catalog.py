@@ -588,8 +588,8 @@ class BuildTest(NoCLI):
                 return MODELS_DEV
             if url == "https://ollama.com/v1/models":
                 return {"data": [
-                    {"id": "deepseek-v4-pro:0813"},
-                    {"id": "deepseek-v4-pro:0813-cloud"},
+                    {"id": "minimax-m3:cloud"},
+                    {"id": "glm-5.2:cloud"},
                 ]}
             raise AssertionError(url)
 
@@ -602,9 +602,9 @@ class BuildTest(NoCLI):
         )
 
         route = got["harnesses"]["deepseek"]["models"][0]
-        self.assertEqual(route["id"], "ollama-cloud/deepseek-v4-pro:0813")
+        self.assertEqual(route["id"], "ollama-cloud/glm-5.2:cloud")
         self.assertEqual(route["provider"], "ollama-cloud")
-        self.assertEqual(route["provider_model"], "deepseek-v4-pro:0813")
+        self.assertEqual(route["provider_model"], "glm-5.2:cloud")
         self.assertEqual(route["supported_efforts"], [])
         self.assertIsNone(route["default_effort"])
         self.assertEqual(route["adapter_metadata"]["credential_kind"], "ollama-api-key")
@@ -620,9 +620,9 @@ class BuildTest(NoCLI):
         ))
         self.assertIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
         self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
-        self.assertNotIn(
-            "ollama-cloud/deepseek-v4-pro:0813-cloud",
+        self.assertEqual(
             ids(got["harnesses"]["deepseek"]),
+            ["ollama-cloud/glm-5.2:cloud", "ollama-cloud/minimax-m3:cloud"],
         )
         serialized = json.dumps(got)
         self.assertNotIn("ollama-secret", serialized)
@@ -651,6 +651,56 @@ class BuildTest(NoCLI):
             {"Authorization": "Bearer ollama-secret"},
         )])
         self.assertNotIn("ollama-secret", json.dumps(evidence))
+
+    def test_ollama_dynamic_candidates_skip_only_the_failed_exact_route(self):
+        capability_calls = []
+        wire_calls = []
+
+        def capability(provider, model, _adapter, _key):
+            capability_calls.append((provider, model))
+            if model == "glm-5.2:cloud":
+                raise mc._DeepSeekToolCapabilityError(
+                    mc.DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED
+                )
+            return {"required": True, "tools": True}
+
+        def prove(provider, model, options_by_effort, env=None):
+            wire_calls.append((provider, model))
+            return deepseek_wire_proof(provider, model, options_by_effort, env)
+
+        routes = mc._from_deepseek_provider(
+            "ollama-cloud",
+            lambda _url, _headers=None: {
+                "data": [
+                    {"id": "unrelated:cloud"},
+                    {"id": "minimax-m3:cloud"},
+                    {"id": "glm-5.2:cloud"},
+                ]
+            },
+            {"OLLAMA_API_KEY": "ollama-secret"},
+            wire_probe=prove,
+            capability_probe=capability,
+        )
+
+        self.assertEqual(
+            capability_calls,
+            [
+                ("ollama-cloud", "glm-5.2:cloud"),
+                ("ollama-cloud", "minimax-m3:cloud"),
+                ("ollama-cloud", "unrelated:cloud"),
+            ],
+        )
+        self.assertEqual(
+            wire_calls,
+            [
+                ("ollama-cloud", "minimax-m3:cloud"),
+                ("ollama-cloud", "unrelated:cloud"),
+            ],
+        )
+        self.assertEqual(
+            [route["id"] for route in routes],
+            ["ollama-cloud/minimax-m3:cloud", "ollama-cloud/unrelated:cloud"],
+        )
 
     def test_ollama_tool_capability_distinguishes_explicit_unsupported(self):
         adapter = deepseek_runtime.provider_adapter("ollama-cloud")
@@ -694,28 +744,24 @@ class BuildTest(NoCLI):
         )
         wire_probe.assert_not_called()
 
-    def test_ollama_public_library_tag_cannot_substitute_for_authenticated_route(self):
+    def test_requested_exact_ollama_route_cannot_substitute_nearby_tag(self):
         probe = mock.Mock(
             side_effect=AssertionError("missing exact inference id must not probe")
         )
 
-        got = mc.build(
-            fetch=lambda url, _headers=None: (
-                MODELS_DEV
-                if url == mc.MODELS_DEV_URL
-                else {"data": [{"id": "deepseek-v4-pro:0813-cloud"}]}
-            ),
-            env={"OLLAMA_API_KEY": "ollama-secret"},
-            run=None,
-            deepseek_wire_probe=probe,
-        )
-
-        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
-        self.assertEqual(
-            got["harnesses"]["deepseek"]["error"],
+        with self.assertRaisesRegex(
+            mc._DeepSeekExactModelAbsentError,
             mc.DEEPSEEK_EXACT_MODEL_ABSENT,
-        )
-        self.assertNotIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
+        ):
+            mc._from_deepseek_provider(
+                "ollama-cloud",
+                lambda _url, _headers=None: {
+                    "data": [{"id": "glm-5.2:cloud-latest"}]
+                },
+                {"OLLAMA_API_KEY": "ollama-secret"},
+                wire_probe=probe,
+                selector="ollama-cloud/glm-5.2:cloud",
+            )
         probe.assert_not_called()
 
     def test_authenticated_provider_rejection_has_one_redacted_auth_category(self):
@@ -854,7 +900,7 @@ class BuildTest(NoCLI):
             [f"deepseek-exact-{index}" for index in range(8)],
         )
 
-    def test_ollama_max_catalogue_proves_only_configured_exact_selectors(self):
+    def test_ollama_max_catalogue_proves_only_bounded_exact_candidates(self):
         proof_calls = []
         configured = "deepseek-v4-pro:0813"
         rows = [{"id": configured}] + [
@@ -879,7 +925,12 @@ class BuildTest(NoCLI):
             deepseek_capability_probe=deepseek_tool_capability,
         )
 
-        self.assertEqual(proof_calls, [("ollama-cloud", configured)])
+        self.assertEqual(proof_calls, [
+            ("ollama-cloud", configured),
+            ("ollama-cloud", "other-model-0"),
+            ("ollama-cloud", "other-model-1"),
+            ("ollama-cloud", "other-model-10"),
+        ])
         self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
         self.assertEqual(
             got["harnesses"]["deepseek"]["error"],

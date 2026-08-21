@@ -548,19 +548,46 @@ def _from_deepseek_provider(
         "provider_registry_sha256": registry_digest,
     })
     configured = adapter["model_selectors"]
-    if configured:
+    preferences = adapter["candidate_preferences"]
+    dynamic_candidates = False
+    if selector is not None:
+        exact_rows = [
+            (row, model)
+            for row, model in exact_rows
+            if (
+                f"{provider}/{model}" if adapter["selector_prefix"] else model
+            ) == selector
+        ]
+        if not exact_rows:
+            raise _DeepSeekExactModelAbsentError(DEEPSEEK_EXACT_MODEL_ABSENT)
+    elif configured:
         configured_set = set(configured)
         if not configured_set.issubset(seen):
             raise _DeepSeekExactModelAbsentError(DEEPSEEK_EXACT_MODEL_ABSENT)
         exact_rows = [
             (row, model) for row, model in exact_rows if model in configured_set
         ]
+    elif preferences:
+        by_model = {model: row for row, model in exact_rows}
+        preferred = [
+            (by_model[model], model) for model in preferences if model in by_model
+        ]
+        preferred_ids = {model for _row, model in preferred}
+        remaining = sorted(
+            (
+                (row, model)
+                for row, model in exact_rows
+                if model not in preferred_ids
+            ),
+            key=lambda item: item[1],
+        )
+        exact_rows = (preferred + remaining)[: adapter["wire_proof_budget"]]
+        dynamic_candidates = True
     if len(exact_rows) > adapter["wire_proof_budget"]:
         raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
+    capability_failures = []
     for row, model in exact_rows:
         route_selector = f"{provider}/{model}" if adapter["selector_prefix"] else model
-        if selector is not None and route_selector != selector:
-            continue
         try:
             capability_evidence = capability_probe(provider, model, adapter, key)
             expected_capability = {
@@ -571,12 +598,18 @@ def _from_deepseek_provider(
                 raise _DeepSeekToolCapabilityError(
                     DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED
                 )
-        except _DeepSeekToolCapabilityError:
-            raise
+        except _DeepSeekToolCapabilityError as exc:
+            if not dynamic_candidates:
+                raise
+            capability_failures.append(str(exc))
+            continue
         except Exception as exc:
-            raise _DeepSeekToolCapabilityError(
-                DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED
-            ) from exc
+            if not dynamic_candidates:
+                raise _DeepSeekToolCapabilityError(
+                    DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED
+                ) from exc
+            capability_failures.append(DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED)
+            continue
         try:
             proof = wire_probe(
                 provider, model, _deepseek_carrier_options(provider), env=env
@@ -633,6 +666,16 @@ def _from_deepseek_provider(
         }
         if selector is not None and selector not in selectors:
             raise ValueError("DeepSeek authenticated endpoint omitted exact model")
+        if capability_failures:
+            failure = (
+                DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED
+                if all(
+                    item == DEEPSEEK_PROVIDER_TOOLS_UNSUPPORTED
+                    for item in capability_failures
+                )
+                else DEEPSEEK_PROVIDER_TOOLS_UNVERIFIED
+            )
+            raise _DeepSeekToolCapabilityError(failure)
         raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
     if not entries:
         raise ValueError("DeepSeek authenticated endpoint returned no exact models")
