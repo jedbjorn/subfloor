@@ -1194,6 +1194,17 @@ def _cli_version(binary: str) -> "str | None":
     return lines[0].strip() if lines else None
 
 
+def _shell_path(work_dir: Path, inherited: str) -> str:
+    """Put this shell's existing project environment ahead of baseline tools."""
+    entries = [str(REPO_ROOT)]
+    project_bin = work_dir / ".venv" / "bin"
+    if project_bin.is_dir():
+        entries.append(str(project_bin))
+    if inherited:
+        entries.append(inherited)
+    return os.pathsep.join(entries)
+
+
 def prepare_launch(*, shell_id: int, harness: "str | None" = None,
                    model: "str | None" = None, effort: "str | None" = None,
                    headless_prompt: "str | None" = None,
@@ -1489,7 +1500,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     env["SC_HARNESS"] = harness
     env["SC_SHELL_WORKTREE"] = str(work_dir)
     env["SC_ROOT"] = str(REPO_ROOT)
-    env["PATH"] = os.pathsep.join([str(REPO_ROOT), env.get("PATH", "")])
+    env["PATH"] = _shell_path(work_dir, env.get("PATH", ""))
 
     return LaunchPlan(argv=argv, env=env, cwd=str(work_dir),
                       session_id=session_id, archive_id=archive_id,
@@ -2060,7 +2071,7 @@ def main() -> None:
     # vigilance. Works in both the docker sandbox and the no-docker host path since
     # run.py is the single exec chokepoint for every harness.
     env["SC_ROOT"] = str(REPO_ROOT)
-    env["PATH"] = os.pathsep.join([str(REPO_ROOT), env.get("PATH", "")])
+    env["PATH"] = _shell_path(work_dir, env.get("PATH", ""))
     # Operator-declared shared dirs that all shells may write into without
     # branch-guard warnings — host-level handoff/screenshot folders. Set
     # SC_SHARED_DIRS (space-separated absolute paths) in the launch environment;

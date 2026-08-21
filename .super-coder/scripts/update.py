@@ -1367,6 +1367,9 @@ def main(argv: list[str]) -> int:
         print("    git pull --ff-only       # brings the repin onto local main")
     print("  A bad update? `./sc rollback` restores the DB + engine together.")
     print("  Restart your session to boot onto the new floor.")
+    if epoch:
+        print("  Image-owned tool changes activate through a normal `./sc restart`;")
+        print("  `restart --no-build` deliberately retains the selected image.")
     return 0
 
 

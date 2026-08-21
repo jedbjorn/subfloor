@@ -72,6 +72,15 @@ LABEL sc.github_host_trust_sha256="${SC_GITHUB_HOST_TRUST_SHA256}"
 # .venv.
 RUN pip install --no-cache-dir "websockets==16.1.1"
 
+# Python project tooling — generic sandbox mechanisms, not fork dependency
+# policy. A fork's declared dev-kit hook and project environment still own its
+# exact test stack. Pin both tools so rebuilding after an engine update restores
+# a deterministic baseline instead of inheriting whatever the host happens to
+# provide.
+RUN pip install --no-cache-dir "uv==0.11.26" "pytest==9.1.1" \
+ && uv --version \
+ && python -m pytest --version
+
 # GitHub CLI (gh) — shells open their own feature PRs from the sandbox.
 # Not in Debian's default repos, so add the official gh apt source. Auth is NOT
 # baked: the token arrives at runtime via GH_TOKEN (`./sc launch` forwards the
