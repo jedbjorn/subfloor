@@ -38,6 +38,7 @@ from conversation_broker import (  # noqa: E402
     BrokerRun,
     BrokerStore,
     ConversationBroker,
+    unexpected_error_code,
 )
 
 
@@ -46,6 +47,15 @@ def apply_schema(con: sqlite3.Connection) -> None:
     for migration in sorted((ENGINE / "migrations").glob("*.sql")):
         con.executescript(migration.read_text())
     con.execute("PRAGMA foreign_keys=ON")
+
+
+def test_unexpected_error_code_retains_only_exception_class() -> None:
+    secret = "opaque-provider-secret"
+
+    code = unexpected_error_code(KeyError(secret))
+
+    assert code == "BROKER_RUN_KEYERROR"
+    assert secret not in code
 
 
 class FakeAdapter:
