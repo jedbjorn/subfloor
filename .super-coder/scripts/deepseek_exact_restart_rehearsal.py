@@ -319,7 +319,7 @@ def _cleanup(conversation_id: str) -> dict[str, Any]:
             (conversation_id,),
         ).fetchone()
         if row is None:
-            return {"ok": True, "conversation_removed": True, "root_removed": True}
+            return {"ok": True, "conversation_retired": True, "root_removed": True}
         if row["creation_idempotency_key"] != REHEARSAL_KEY:
             raise ValueError("conversation is not rehearsal-owned")
         latest = con.execute(
@@ -338,40 +338,9 @@ def _cleanup(conversation_id: str) -> dict[str, Any]:
                     "DELETE FROM active_shell_chats WHERE chat_id=?", (conversation_id,)
                 )
                 con.execute(
-                    "DELETE FROM sprint_wake_attempts WHERE target_conversation_id=?",
-                    (conversation_id,),
-                )
-                con.execute(
-                    "DELETE FROM sprint_participant_conversations "
-                    "WHERE conversation_id=?",
-                    (conversation_id,),
-                )
-                con.execute(
-                    "DELETE FROM conversation_events WHERE conversation_id=?",
-                    (conversation_id,),
-                )
-                con.execute(
-                    "DELETE FROM conversation_outbox WHERE conversation_id=?",
-                    (conversation_id,),
-                )
-                con.execute(
-                    "DELETE FROM conversation_runs WHERE conversation_id=?",
-                    (conversation_id,),
-                )
-                con.execute(
-                    "DELETE FROM conversation_messages WHERE conversation_id=?",
-                    (conversation_id,),
-                )
-                con.execute(
-                    "DELETE FROM conversation_git_targets WHERE conversation_id=?",
-                    (conversation_id,),
-                )
-                con.execute(
-                    "DELETE FROM conversation_boot_snapshots WHERE conversation_id=?",
-                    (conversation_id,),
-                )
-                con.execute(
-                    "DELETE FROM conversations WHERE conversation_id=?",
+                    "UPDATE conversations SET state='closed',"
+                    "closed_at=COALESCE(closed_at,datetime('now')),version=version+1 "
+                    "WHERE conversation_id=? AND state<>'closed'",
                     (conversation_id,),
                 )
         except sqlite3.Error as exc:
@@ -386,7 +355,7 @@ def _cleanup(conversation_id: str) -> dict[str, Any]:
         raise RehearsalFailure("persisted-root-mismatch") from exc
     return {
         "ok": True,
-        "conversation_removed": True,
+        "conversation_retired": True,
         "root_removed": not layout.root.exists(),
     }
 

@@ -2207,7 +2207,7 @@ class HostBackend:
             except json.JSONDecodeError:
                 cleanup_payload = None
             if cleaned.returncode != 0 or cleanup_payload != {
-                "conversation_removed": True,
+                "conversation_retired": True,
                 "ok": True,
                 "root_removed": True,
             }:

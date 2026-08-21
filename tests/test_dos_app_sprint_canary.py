@@ -2284,6 +2284,12 @@ class DeepSeekExactRestartHelperTest(unittest.TestCase):
                     "'cleanup-proof','proof','completed',datetime('now'))",
                     (prepared["conversation_id"],),
                 )
+                con.execute(
+                    "INSERT INTO conversation_events "
+                    "(conversation_id,sequence,event_type,payload) "
+                    "VALUES (?,1,'run.completed','{}')",
+                    (prepared["conversation_id"],),
+                )
                 con.commit()
             state_root = root / "state"
             real_layout = restart_rehearsal.deepseek_runtime.conversation_layout
@@ -2302,22 +2308,44 @@ class DeepSeekExactRestartHelperTest(unittest.TestCase):
                     str(prepared["conversation_id"])
                 )
             self.assertEqual(
-                {"ok": True, "conversation_removed": True, "root_removed": True},
+                {"ok": True, "conversation_retired": True, "root_removed": True},
                 cleanup,
             )
             with contextlib.closing(sqlite3.connect(database)) as con:
                 self.assertEqual(
-                    0,
+                    1,
                     con.execute(
                         "SELECT COUNT(*) FROM conversations WHERE conversation_id=?",
                         (prepared["conversation_id"],),
                     ).fetchone()[0],
                 )
                 self.assertEqual(
-                    0,
+                    1,
+                    con.execute(
+                        "SELECT COUNT(*) FROM conversation_events "
+                        "WHERE conversation_id=?",
+                        (prepared["conversation_id"],),
+                    ).fetchone()[0],
+                )
+                self.assertEqual(
+                    1,
                     con.execute(
                         "SELECT COUNT(*) FROM conversation_messages "
                         "WHERE conversation_id=?",
+                        (prepared["conversation_id"],),
+                    ).fetchone()[0],
+                )
+                self.assertEqual(
+                    "closed",
+                    con.execute(
+                        "SELECT state FROM conversations WHERE conversation_id=?",
+                        (prepared["conversation_id"],),
+                    ).fetchone()[0],
+                )
+                self.assertEqual(
+                    0,
+                    con.execute(
+                        "SELECT COUNT(*) FROM active_shell_chats WHERE chat_id=?",
                         (prepared["conversation_id"],),
                     ).fetchone()[0],
                 )
