@@ -25,7 +25,7 @@ from deepseek_harness import HarnessClient, HarnessConfig
 MAX_LINE_BYTES = 1024 * 1024
 MAX_DETAIL_CHARS = 4096
 SECRET_TEXT = (
-    re.compile(r"(?i)(DEEPSEEK_API_KEY\s*[=:]\s*)[^\s,;]+"),
+    re.compile(r"(?i)((?:DEEPSEEK|OLLAMA)_API_KEY\s*[=:]\s*)[^\s,;]+"),
     re.compile(r"(?i)(Authorization\s*:\s*Bearer\s+)[^\s,;]+"),
     re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9._-]{8,}"),
 )

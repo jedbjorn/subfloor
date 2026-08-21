@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import importlib.util
 import json
 import os
 import stat
@@ -159,7 +160,7 @@ def test_runtime_manifest_pins_source_patch_recipe_and_supported_platforms() -> 
         "protocol": "super-coder-deepseek-lifecycle-v1",
         "acquisition": "verified-source-build",
         "worker_path": "scripts/deepseek_carrier_worker.py",
-        "worker_sha256": "da6b9803a2429ce926b97cff162f9aa387daa7570778c8dc53b97c7bfe685b89",
+        "worker_sha256": "c75ad8ff34dd659a5d2d1c4727f619c599a0c18924269be82a1b5ca605d39c34",
     }
     assert manifest["source"]["commit"] == "bb4ca698d63714e753f5621b07400e6ebb0b5d97"
     assert manifest["source"]["archive_sha256"] == "d5a78fb623d1c14846812e8e18042134a1127ab86dea259f79c2c8358e8481bc"
@@ -908,6 +909,22 @@ def test_diagnostics_redact_known_and_explicit_secrets_before_bounding() -> None
     assert "bearer-secret" not in diagnostic
     assert secret not in diagnostic
     assert diagnostic.count("[REDACTED]") == 3
+
+
+def test_carrier_worker_redacts_ollama_credential_from_errors() -> None:
+    worker_path = ROOT / ".super-coder" / "scripts" / "deepseek_carrier_worker.py"
+    spec = importlib.util.spec_from_file_location("deepseek_carrier_worker_test", worker_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    stub = SimpleNamespace(HarnessClient=object, HarnessConfig=object)
+    with mock.patch.dict(sys.modules, {"deepseek_harness": stub}):
+        spec.loader.exec_module(module)
+
+    secret = "ollama-private-credential-value"
+    detail = module._detail(ValueError(f"OLLAMA_API_KEY={secret}"))
+
+    assert secret not in detail
+    assert detail == "OLLAMA_API_KEY=[REDACTED]"
 
 
 def test_linux_process_identity_reads_start_ticks_after_a_spaced_comm() -> None:
