@@ -450,7 +450,7 @@ class DeepSeekAdapter(ConversationAdapter):
             "runtime_version": manifest["runtime"]["version"],
             "source_commit": manifest["source"]["commit"],
             "patch_sha256": manifest["patch"]["sha256"],
-            "composition_sha256": manifest["composition"]["sha256"],
+            "composition_sha256": adapter["composition_sha256"],
         }
         for field, expected in evidence.items():
             if metadata.get(field) != expected:

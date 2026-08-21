@@ -107,7 +107,7 @@ def deepseek_wire_proof(provider, model, options_by_effort, env=None):
             "runtime_version": "0.1.0rc7",
             "source_commit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
             "patch_sha256": manifest["patch"]["sha256"],
-            "composition_sha256": manifest["composition"]["sha256"],
+            "composition_sha256": adapter["composition_sha256"],
             "provider_registry_sha256": manifest["provider_adapters"]["sha256"],
             "provider_adapter_id": adapter["adapter_id"],
             "provider_adapter_digest": adapter_digest,
@@ -486,10 +486,7 @@ class BuildTest(NoCLI):
             if url == "https://gateway.example/deepseek/v1/models":
                 return {"data": [
                     {"id": "deepseek-v4-pro"},
-                    {"id": " deepseek-invalid"},
                     {"id": "deepseek-v4-flash", "name": "V4 Flash"},
-                    {"id": "deepseek-v4-pro"},
-                    {},
                 ]}
             raise AssertionError(url)
 
@@ -563,7 +560,7 @@ class BuildTest(NoCLI):
             if url == mc.MODELS_DEV_URL:
                 return MODELS_DEV
             if url == "https://ollama.com/v1/models":
-                return {"data": [{"id": "deepseek-v4-pro"}]}
+                return {"data": [{"id": "deepseek-v4-pro:0813"}]}
             raise AssertionError(url)
 
         got = mc.build(
@@ -574,9 +571,9 @@ class BuildTest(NoCLI):
         )
 
         route = got["harnesses"]["deepseek"]["models"][0]
-        self.assertEqual(route["id"], "ollama-cloud/deepseek-v4-pro")
+        self.assertEqual(route["id"], "ollama-cloud/deepseek-v4-pro:0813")
         self.assertEqual(route["provider"], "ollama-cloud")
-        self.assertEqual(route["provider_model"], "deepseek-v4-pro")
+        self.assertEqual(route["provider_model"], "deepseek-v4-pro:0813")
         self.assertEqual(route["supported_efforts"], [])
         self.assertIsNone(route["default_effort"])
         self.assertEqual(route["adapter_metadata"]["credential_kind"], "ollama-api-key")
@@ -601,7 +598,7 @@ class BuildTest(NoCLI):
             if url == "https://api.deepseek.com/models":
                 raise OSError("deepseek unavailable")
             if url == "https://ollama.com/v1/models":
-                return {"data": [{"id": "deepseek-v4-pro"}]}
+                return {"data": [{"id": "deepseek-v4-pro:0813"}]}
             raise AssertionError(url)
 
         got = mc.build(
@@ -616,7 +613,7 @@ class BuildTest(NoCLI):
 
         self.assertEqual(
             ids(got["harnesses"]["deepseek"]),
-            ["ollama-cloud/deepseek-v4-pro"],
+            ["ollama-cloud/deepseek-v4-pro:0813"],
         )
         self.assertIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
         self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
@@ -708,6 +705,115 @@ class BuildTest(NoCLI):
             proof_calls,
             [f"deepseek-exact-{index}" for index in range(8)],
         )
+
+    def test_ollama_max_catalogue_proves_only_configured_exact_selectors(self):
+        proof_calls = []
+        configured = "deepseek-v4-pro:0813"
+        rows = [{"id": configured}] + [
+            {"id": f"other-model-{index}"} for index in range(63)
+        ]
+
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            self.assertEqual(url, "https://ollama.com/v1/models")
+            return {"data": rows}
+
+        def unavailable_probe(provider, model, options_by_effort, env=None):
+            proof_calls.append((provider, model))
+            raise TimeoutError("bounded carrier proof timed out")
+
+        got = mc.build(
+            fetch=fetch,
+            env={"OLLAMA_API_KEY": "ollama-secret"},
+            run=None,
+            deepseek_wire_probe=unavailable_probe,
+        )
+
+        self.assertEqual(proof_calls, [("ollama-cloud", configured)])
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
+        )
+
+    def test_authenticated_provider_rejects_entire_malformed_generation_before_probe(self):
+        configured = "deepseek-v4-pro:0813"
+        invalid_rows = (
+            [{"id": configured}, {"id": configured}],
+            [{"id": configured}, {"id": ""}],
+            [{"id": configured}, {"id": " bad "}],
+            [{"id": configured}, {"id": 7}],
+            [{"id": configured}, {}],
+            [{"id": configured}, "not-an-object"],
+        )
+
+        for rows in invalid_rows:
+            probe = mock.Mock(side_effect=AssertionError("invalid rows must not probe"))
+            with self.subTest(rows=rows):
+                with self.assertRaisesRegex(
+                    mc._DeepSeekDiscoveryEvidenceError,
+                    mc.DEEPSEEK_DISCOVERY_EVIDENCE_INVALID,
+                ):
+                    mc._from_deepseek_provider(
+                        "ollama-cloud",
+                        lambda _url, _headers: {"data": rows},
+                        {"OLLAMA_API_KEY": "ollama-secret"},
+                        wire_probe=probe,
+                    )
+                probe.assert_not_called()
+
+    def test_invalid_authenticated_generation_is_route_local(self):
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {
+                "data": [
+                    {"id": "deepseek-v4-pro:0813"},
+                    {"id": "deepseek-v4-pro:0813"},
+                ]
+            }
+
+        probe = mock.Mock(side_effect=AssertionError("invalid rows must not probe"))
+        got = mc.build(
+            fetch=fetch,
+            env={"OLLAMA_API_KEY": "ollama-secret"},
+            run=None,
+            deepseek_wire_probe=probe,
+        )
+
+        self.assertEqual(ids(got["harnesses"]["claude"]), [
+            "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7",
+        ])
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            mc.DEEPSEEK_DISCOVERY_EVIDENCE_INVALID,
+        )
+        probe.assert_not_called()
+
+    def test_registry_failure_is_deepseek_only_on_a_cold_successful_build(self):
+        failures = (
+            FileNotFoundError("provider registry missing"),
+            deepseek_runtime.DeepSeekRuntimeError(
+                "HARNESS_PROVIDER_ADAPTER_DRIFT", "provider registry digest drifted"
+            ),
+        )
+
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), mock.patch.object(
+                mc, "_deepseek_provider_registry", side_effect=failure
+            ):
+                got = mc.build(fetch=lambda _url, _headers=None: MODELS_DEV, env={}, run=None)
+
+            self.assertEqual(ids(got["harnesses"]["codex"]), ["gpt-5.5"])
+            self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+            self.assertEqual(
+                got["harnesses"]["deepseek"]["error"],
+                mc.DEEPSEEK_PROVIDER_REGISTRY_INVALID,
+            )
+            self.assertEqual(got["sources"], ["models.dev"])
+            self.assertTrue(got["partial"])
 
     def test_deepseek_catalogue_fails_closed_before_probe_above_model_cap(self):
         proof_calls = []

@@ -99,6 +99,10 @@ PROVIDER_APIS = {
 DEEPSEEK_SOURCE = "deepseek-provider-api"
 OLLAMA_CLOUD_SOURCE = "ollama-cloud-provider-api"
 DEEPSEEK_DISCOVERY_ERROR = "authenticated DeepSeek model discovery failed"
+DEEPSEEK_DISCOVERY_EVIDENCE_INVALID = (
+    "authenticated DeepSeek model evidence is malformed or duplicated"
+)
+DEEPSEEK_PROVIDER_REGISTRY_INVALID = "DeepSeek provider registry is unavailable"
 DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED = (
     "DeepSeek provider-option mapper has no outbound wire proof"
 )
@@ -113,6 +117,10 @@ class _DeepSeekWireProofError(RuntimeError):
 
 
 class _ModelCatalogueLimitError(ValueError):
+    pass
+
+
+class _DeepSeekDiscoveryEvidenceError(ValueError):
     pass
 
 # The ids the engine ships in flavor_defaults — surfaced only when every live
@@ -281,7 +289,7 @@ def _deepseek_provider_metadata(
     expected_runtime = (manifest.get("runtime") or {}).get("version")
     expected_source = (manifest.get("source") or {}).get("commit")
     expected_patch = (manifest.get("patch") or {}).get("sha256")
-    expected_composition = (manifest.get("composition") or {}).get("sha256")
+    expected_composition = adapter.get("composition_sha256")
     adapter_digest = route_bindings.digest_json(adapter)
     if (
         not isinstance(proof, dict)
@@ -424,14 +432,19 @@ def _from_deepseek_provider(
     seen = set()
     exact_rows = []
     for row in rows:
-        model = row.get("id") if isinstance(row, dict) else None
-        if (
-            not isinstance(model, str)
-            or not model
-            or model != model.strip()
-            or model in seen
-        ):
-            continue
+        if not isinstance(row, dict):
+            raise _DeepSeekDiscoveryEvidenceError(
+                DEEPSEEK_DISCOVERY_EVIDENCE_INVALID
+            )
+        model = row.get("id")
+        if not isinstance(model, str) or not model or model != model.strip():
+            raise _DeepSeekDiscoveryEvidenceError(
+                DEEPSEEK_DISCOVERY_EVIDENCE_INVALID
+            )
+        if model in seen:
+            raise _DeepSeekDiscoveryEvidenceError(
+                DEEPSEEK_DISCOVERY_EVIDENCE_INVALID
+            )
         if len(model) > DEEPSEEK_MODEL_ID_MAX_CHARS:
             raise _ModelCatalogueLimitError(DEEPSEEK_DISCOVERY_LIMIT_ERROR)
         seen.add(model)
@@ -442,6 +455,18 @@ def _from_deepseek_provider(
         "models": sorted(model for _row, model in exact_rows),
         "provider_registry_sha256": registry_digest,
     })
+    configured = adapter["model_selectors"]
+    if configured:
+        configured_set = set(configured)
+        if not configured_set.issubset(seen):
+            raise _DeepSeekDiscoveryEvidenceError(
+                DEEPSEEK_DISCOVERY_EVIDENCE_INVALID
+            )
+        exact_rows = [
+            (row, model) for row, model in exact_rows if model in configured_set
+        ]
+    if len(exact_rows) > adapter["wire_proof_budget"]:
+        raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
     for row, model in exact_rows:
         route_selector = f"{provider}/{model}" if adapter["selector_prefix"] else model
         if selector is not None and route_selector != selector:
@@ -616,10 +641,18 @@ def build(fetch=_http_json, env=os.environ, run=subprocess.run,
     for harness, extra in _from_provider_apis(fetch, env).items():
         harnesses[harness] = _merge(harnesses.get(harness, []), extra)
         sources.append(f"{HARNESS_PROVIDER[harness]}-api")
-    _manifest, deepseek_providers, _registry_digest = _deepseek_provider_registry()
     deepseek = []
     attempted_providers = []
     provider_errors = []
+    try:
+        _manifest, deepseek_providers, _registry_digest = _deepseek_provider_registry()
+    except Exception:  # noqa: BLE001 (DeepSeek failure remains route-local)
+        deepseek_providers = {}
+        harnesses.setdefault("deepseek", [])
+        harness_errors["deepseek"] = DEEPSEEK_PROVIDER_REGISTRY_INVALID
+        errors.append(
+            f"deepseek-provider-registry: {DEEPSEEK_PROVIDER_REGISTRY_INVALID}"
+        )
     for provider, adapter in deepseek_providers.items():
         if not env.get(adapter["credential_source_env"]):
             continue
@@ -631,6 +664,9 @@ def build(fetch=_http_json, env=os.environ, run=subprocess.run,
             )
         except _ModelCatalogueLimitError:
             provider_errors.append((source, DEEPSEEK_DISCOVERY_LIMIT_ERROR))
+            continue
+        except _DeepSeekDiscoveryEvidenceError:
+            provider_errors.append((source, DEEPSEEK_DISCOVERY_EVIDENCE_INVALID))
             continue
         except _DeepSeekWireProofError:
             provider_errors.append((source, DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED))

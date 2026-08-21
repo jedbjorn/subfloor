@@ -190,9 +190,11 @@ def load_provider_adapter_registry(
                 raise ValueError(f"provider adapter {provider} must be an object")
             required = {
                 "adapter_id", "plugin", "plugin_version", "adapter_kind",
+                "composition_path", "composition_sha256",
                 "credential_kind", "credential_source_env", "credential_child_env",
                 "endpoint_default", "endpoint_env", "discovery_path",
-                "discovery_shape", "selector_prefix", "max_models",
+                "discovery_shape", "selector_prefix", "max_models", "model_selectors",
+                "wire_proof_budget",
                 "named_efforts", "wire_mode",
             }
             if not required.issubset(entry):
@@ -200,10 +202,22 @@ def load_provider_adapter_registry(
             for field in (
                 "adapter_id", "plugin", "plugin_version", "adapter_kind",
                 "credential_kind", "credential_source_env", "credential_child_env",
-                "discovery_path", "discovery_shape", "wire_mode",
+                "composition_path", "discovery_path", "discovery_shape", "wire_mode",
             ):
                 if not isinstance(entry[field], str) or not entry[field]:
                     raise ValueError(f"provider adapter {provider} has invalid {field}")
+            expected_composition = {
+                "deepseek-official": "assets/deepseek/cordis.yml",
+                "ollama-cloud": "assets/deepseek/cordis-ollama-cloud.yml",
+            }[provider]
+            if entry["composition_path"] != expected_composition:
+                raise ValueError(
+                    f"provider adapter {provider} escaped its fixed composition"
+                )
+            if re.fullmatch(r"[0-9a-f]{64}", str(entry["composition_sha256"])) is None:
+                raise ValueError(
+                    f"provider adapter {provider} has invalid composition_sha256"
+                )
             _credential_free_url(
                 entry["endpoint_default"], field=f"{provider}.endpoint_default"
             )
@@ -220,6 +234,26 @@ def load_provider_adapter_registry(
                 or not 1 <= entry["max_models"] <= 64
             ):
                 raise ValueError(f"provider adapter {provider} has invalid max_models")
+            selectors = entry["model_selectors"]
+            if (
+                not isinstance(selectors, list)
+                or len(selectors) != len(set(selectors))
+                or any(
+                    not isinstance(item, str)
+                    or not item
+                    or item != item.strip()
+                    for item in selectors
+                )
+            ):
+                raise ValueError(f"provider adapter {provider} has invalid model_selectors")
+            proof_budget = entry["wire_proof_budget"]
+            if (
+                not isinstance(proof_budget, int)
+                or isinstance(proof_budget, bool)
+                or not 1 <= proof_budget <= entry["max_models"]
+                or len(selectors) > proof_budget
+            ):
+                raise ValueError(f"provider adapter {provider} has invalid wire_proof_budget")
             efforts = entry["named_efforts"]
             if (
                 not isinstance(efforts, list)
@@ -257,6 +291,20 @@ def provider_adapter(provider: str) -> dict[str, object]:
             f'provider route "{provider}" is not in the reviewed allowlist',
         )
     return selected
+
+
+def provider_composition(provider: str) -> dict[str, str]:
+    """Return the one exact digest-bound composition selected by the route."""
+    adapter = provider_adapter(provider)
+    path = ENGINE / str(adapter["composition_path"])
+    expected = str(adapter["composition_sha256"])
+    observed = _sha256(path)
+    if observed != expected:
+        raise DeepSeekRuntimeError(
+            "HARNESS_COMPOSITION_DRIFT",
+            f"{path.relative_to(ENGINE)} digest {observed} != {expected}",
+        )
+    return {"path": str(path), "sha256": expected}
 
 
 def _sha256(path: Path) -> str:
@@ -1123,6 +1171,7 @@ def launch_environment(
             "HARNESS_WORKTREE_MISMATCH", f"worktree is unavailable: {worktree}"
         )
     adapter = provider_adapter(provider)
+    composition = provider_composition(provider)
     endpoint_env = adapter["endpoint_env"]
     if base_url is not None and endpoint_env is None:
         expected = str(adapter["endpoint_default"])
@@ -1168,7 +1217,7 @@ def launch_environment(
         {
             "DSH_HOME": str(layout.home),
             "DSH_SESSION_ROOT": str(layout.session_root),
-            "DSH_CORDIS_CONFIG": str(ENGINE / "assets" / "deepseek" / "cordis.yml"),
+            "DSH_CORDIS_CONFIG": composition["path"],
             "DSH_CWD": str(worktree.resolve()),
             "DSH_SKILL_ROOT": str(worktree.resolve() / ".agents" / "skills"),
             "DSH_SYSTEM_PROMPT": system_prompt,
@@ -1449,7 +1498,7 @@ def provider_wire_evidence(
                     "runtime_version": observed_status.runtime_version,
                     "source_commit": manifest["source"]["commit"],
                     "patch_sha256": manifest["patch"]["sha256"],
-                    "composition_sha256": manifest["composition"]["sha256"],
+                    "composition_sha256": adapter["composition_sha256"],
                     "provider_registry_sha256": manifest["provider_adapters"]["sha256"],
                     "provider_adapter_id": adapter["adapter_id"],
                     "provider_adapter_digest": _wire_digest(adapter),

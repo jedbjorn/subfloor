@@ -190,13 +190,41 @@ def test_composition_is_exact_and_contains_only_the_reviewed_plugin_allowlist() 
         "@deepseek-ai/dsh-session-checkpoint-policy",
         "@deepseek-ai/dsh-token-meter",
         "@deepseek-ai/dsh-llm-deepseek",
-        "@deepseek-ai/dsh-llm-pi-ai",
     )
     assert not any(
         forbidden in name
         for name in names
         for forbidden in ("approval", "question", "plugin", "web", "terminal")
     )
+
+
+def test_provider_compositions_activate_only_the_selected_adapter() -> None:
+    expected = {
+        "deepseek-official": (
+            "@deepseek-ai/dsh-llm-deepseek",
+            "@deepseek-ai/dsh-llm-pi-ai",
+        ),
+        "ollama-cloud": (
+            "@deepseek-ai/dsh-llm-pi-ai",
+            "@deepseek-ai/dsh-llm-deepseek",
+        ),
+    }
+
+    for provider, (selected, excluded) in expected.items():
+        composition = deepseek_runtime.provider_composition(provider)
+        path = Path(composition["path"])
+        body = path.read_text()
+        names = tuple(
+            line.split("name:", 1)[1].strip().strip("'")
+            for line in body.splitlines()
+            if line.strip().startswith("name:")
+        )
+        adapter = deepseek_runtime.provider_adapter(provider)
+
+        assert composition["sha256"] == adapter["composition_sha256"]
+        assert deepseek_runtime._sha256(path) == composition["sha256"]
+        assert names.count(selected) == 1
+        assert excluded not in names
 
 
 def test_composition_enables_native_skills_only_from_the_rendered_grant_root() -> None:
@@ -228,6 +256,25 @@ def test_composition_digest_drift_fails_closed() -> None:
             assert manifest["composition"]["sha256"] in exc.detail
         else:
             raise AssertionError("composition drift was accepted")
+
+
+def test_ollama_composition_drift_fails_only_when_that_route_is_selected() -> None:
+    official = deepseek_runtime.provider_composition("deepseek-official")
+    ollama = deepseek_runtime.provider_composition("ollama-cloud")
+    real_sha256 = deepseek_runtime._sha256
+
+    def changed_digest(path: Path) -> str:
+        return "0" * 64 if path == Path(ollama["path"]) else real_sha256(path)
+
+    with mock.patch.object(deepseek_runtime, "_sha256", side_effect=changed_digest):
+        assert deepseek_runtime.provider_composition("deepseek-official") == official
+        try:
+            deepseek_runtime.provider_composition("ollama-cloud")
+        except deepseek_runtime.DeepSeekRuntimeError as exc:
+            assert exc.code == "HARNESS_COMPOSITION_DRIFT"
+            assert ollama["sha256"] in exc.detail
+        else:
+            raise AssertionError("changed Ollama composition was accepted")
 
 
 def test_missing_carrier_is_a_deepseek_only_unavailable_status() -> None:
@@ -830,6 +877,7 @@ def test_launch_environment_replaces_personal_state_and_redacts_credentials() ->
         assert child["DSH_SYSTEM_PROMPT"] == "immutable boot bytes"
         assert child["DEEPSEEK_API_KEY"] == "sk-private-credential"
         assert child["DEEPSEEK_BASE_URL"] == "https://api.deepseek.example/v1"
+        assert child["DSH_CORDIS_CONFIG"].endswith("/assets/deepseek/cordis.yml")
         assert "DSH_PROFILE" not in child
         assert "/home/operator/.dsh" not in child.values()
         assert "old-secret" not in child.values()
@@ -861,6 +909,9 @@ def test_ollama_launch_projects_only_its_fixed_provider_credential() -> None:
 
         assert child["OLLAMA_API_KEY"] == "ollama-private-credential"
         assert child["SC_DEEPSEEK_PROVIDER_BASE_URL"] == "https://ollama.com/v1"
+        assert child["DSH_CORDIS_CONFIG"].endswith(
+            "/assets/deepseek/cordis-ollama-cloud.yml"
+        )
         assert "DEEPSEEK_API_KEY" not in child
         assert "DEEPSEEK_BASE_URL" not in child
         assert "SC_DEEPSEEK_PROVIDER" not in child

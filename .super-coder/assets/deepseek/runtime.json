@@ -47,10 +47,10 @@
   },
   "composition": {
     "path": "assets/deepseek/cordis.yml",
-    "sha256": "fc487ba0ec76cd939c9ff55123548813633652ae985aa7b9a9a14c081f81ab17"
+    "sha256": "10ff54722966868f86fb6cfdbd07dc8d3c899c98b3296613290ec30d82c04a8c"
   },
   "provider_adapters": {
     "path": "assets/deepseek/provider-adapters.json",
-    "sha256": "6e96615367f20efd37713834cc6519d2fc3ef5026704fbf7d07213fc6b740060"
+    "sha256": "2e12e44fcd0329a343722d05cc9dd7591e79a730fdc6c81d06be685bb675d029"
   }
 }

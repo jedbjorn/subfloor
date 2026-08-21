@@ -59,10 +59,15 @@ def deepseek_binding(
 ) -> tuple[dict[str, Any], str]:
     manifest = deepseek_runtime.load_runtime_manifest()
     provider = deepseek_runtime.provider_adapter(provider_route)
-    selector = (
+    provider_model = (
         "deepseek-v4-pro"
         if provider_route == "deepseek-official"
-        else f"{provider_route}/deepseek-v4-pro"
+        else "deepseek-v4-pro:0813"
+    )
+    selector = (
+        provider_model
+        if provider_route == "deepseek-official"
+        else f"{provider_route}/{provider_model}"
     )
     endpoint = (
         "https://gateway.example/v1"
@@ -86,7 +91,7 @@ def deepseek_binding(
         "control_state": "controlled",
         "harness": "deepseek",
         "requested_model": selector,
-        "provider_model": "deepseek-v4-pro",
+        "provider_model": provider_model,
         "requested_effort": effort,
         "effective_effort": effort,
         "native_variant_id": None,
@@ -110,7 +115,7 @@ def deepseek_binding(
             "runtime_version": manifest["runtime"]["version"],
             "source_commit": manifest["source"]["commit"],
             "patch_sha256": manifest["patch"]["sha256"],
-            "composition_sha256": manifest["composition"]["sha256"],
+            "composition_sha256": provider["composition_sha256"],
             "provider_options": options,
         },
     }
@@ -382,11 +387,54 @@ def test_ollama_start_uses_raw_provider_model_and_only_ollama_credential(tmp_pat
     transport = factory.instances[0]
 
     assert transport.env["SC_DEEPSEEK_PROVIDER"] == "ollama-cloud"
-    assert transport.env["SC_DEEPSEEK_MODEL"] == "deepseek-v4-pro"
+    assert transport.env["SC_DEEPSEEK_MODEL"] == "deepseek-v4-pro:0813"
     assert transport.env["OLLAMA_API_KEY"] == "ollama-test-secret-value"
     assert "DEEPSEEK_API_KEY" not in transport.env
     assert "DEEPSEEK_BASE_URL" not in transport.env
     assert "ambient-deepseek-secret" not in transport.env.values()
+
+
+@pytest.mark.parametrize(
+    ("provider", "selected", "excluded"),
+    (
+        (
+            "deepseek-official",
+            "@deepseek-ai/dsh-llm-deepseek",
+            "@deepseek-ai/dsh-llm-pi-ai",
+        ),
+        (
+            "ollama-cloud",
+            "@deepseek-ai/dsh-llm-pi-ai",
+            "@deepseek-ai/dsh-llm-deepseek",
+        ),
+    ),
+)
+def test_exact_resume_preserves_selected_provider_composition(
+    tmp_path: Path, provider: str, selected: str, excluded: str
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    state = tmp_path / "state"
+    first_factory = Factory()
+    first = make_adapter(state, first_factory)
+    current = context(worktree, provider=provider)
+    turn = first.start(current, "first")
+    layout = deepseek_runtime.conversation_layout(current.conversation_id, state_root=state)
+    first.close()
+    layout.process_identity.unlink()
+
+    second_factory = Factory(pid=54322)
+    second = make_adapter(state, second_factory)
+    resumed = second.resume(turn.session_ref, current, "second")
+    first_config = first_factory.instances[0].env["DSH_CORDIS_CONFIG"]
+    second_config = second_factory.instances[0].env["DSH_CORDIS_CONFIG"]
+    body = Path(second_config).read_text()
+
+    assert resumed.session_ref == turn.session_ref
+    assert first_config == second_config
+    assert selected in body
+    assert excluded not in body
+    second.close()
 
 
 def hashlib_sha256(value: str) -> str:
