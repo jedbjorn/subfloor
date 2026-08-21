@@ -33,6 +33,7 @@ sys.path[:0] = [
 import mem
 import server
 import sprint_cli
+import deepseek_exact_restart_rehearsal as restart_rehearsal
 from conversation_adapters import NativeTurn
 from conversation_adapters.deepseek import DeepSeekAdapter
 from test_sprint_v2_domain import apply_schema
@@ -64,6 +65,41 @@ def route_admission_payload(
         "authentication": "verified",
         "tool_capability": "supported" if admitted else "unknown",
         "exit_class": "success" if admitted else "route-rejected",
+    }
+    payload.update(updates)
+    return payload
+
+
+def restart_probe(**updates) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "ok": True,
+        "candidate_sha": SHA,
+        "conversation_id": "cv_" + "1" * 32,
+        "native_session_id": "deepseek-" + "3" * 32,
+        "provider": "ollama-cloud",
+        "model": canary.DEEPSEEK_MODEL,
+        "runtime_version": "1.0.0",
+        "source_commit": "c" * 40,
+        "patch_sha256": "d" * 64,
+        "composition_sha256": "e" * 64,
+        "binding_digest": "f" * 64,
+        "boot_sha256": "1" * 64,
+        "persisted_root_id": "2" * 32,
+        "persisted_root_device": 10,
+        "persisted_root_inode": 20,
+        "persisted_root_present": True,
+        "persisted_root_private": True,
+        "run_id": 10,
+        "run_state": "succeeded",
+        "process_pid": 100,
+        "process_start_ticks": 1000,
+        "process_live": False,
+        "lease_clear": True,
+        "inspect_session_exact": True,
+        "inspect_presence": True,
+        "inspect_state": "idle",
+        "reconcile_outcome": "matched",
+        "reconcile_proven": True,
     }
     payload.update(updates)
     return payload
@@ -875,6 +911,111 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                 set(raised.exception.details["route_admission"]),
             )
 
+    def test_restart_probe_requires_the_exact_bounded_contract(self) -> None:
+        payload = restart_probe()
+        result = canary._validated_restart_probe(
+            canary.CommandResult(json.dumps(payload), "", 0)
+        )
+        self.assertEqual(set(canary.RESTART_PROBE_KEYS), set(result))
+
+        for invalid in (
+            {**payload, "raw": "private provider body"},
+            {**payload, "model": "nearby-model"},
+            {**payload, "candidate_sha": "branch-name"},
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(canary.CanaryError) as raised:
+                    canary._validated_restart_probe(
+                        canary.CommandResult(json.dumps(invalid), "", 0)
+                    )
+                self.assertEqual(
+                    {"restart": {"schema_version": 1, "category": "unknown"}},
+                    raised.exception.details,
+                )
+                self.assertNotIn(
+                    "private provider body", json.dumps(raised.exception.details)
+                )
+
+    def test_restart_result_classifies_every_failure_without_raw_evidence(self) -> None:
+        before = restart_probe()
+        after = restart_probe(process_pid=200, process_start_ticks=2000)
+        success = canary._restart_result(
+            before,
+            after,
+            command_exit_class="success",
+            command_exit_status=0,
+        )
+        self.assertTrue(canary._restart_passed(success))
+        self.assertIsNone(success["category"])
+        self.assertEqual(set(canary.RESTART_RESULT_KEYS), set(success))
+
+        mutations = {
+            "session-reference-missing": {"native_session_id": None},
+            "session-reference-mismatch": {"native_session_id": "deepseek-" + "4" * 32},
+            "persisted-root-missing": {"persisted_root_present": False},
+            "persisted-root-mismatch": {"persisted_root_id": "3" * 32},
+            "boot-or-runtime-drift": {"runtime_version": "2.0.0"},
+            "route-drift": {"binding_digest": "4" * 64},
+            "old-process-still-live": {},
+            "process-collision": {"process_pid": 100, "process_start_ticks": 1000},
+            "broker-state-or-lease": {"run_state": "failed"},
+            "native-resume-rejected": {"reconcile_proven": False},
+        }
+        for category, updates in mutations.items():
+            with self.subTest(category=category):
+                prior = dict(before)
+                if category == "old-process-still-live":
+                    prior["process_live"] = True
+                classified = canary._restart_result(
+                    prior,
+                    {**after, **updates},
+                    command_exit_class="success",
+                    command_exit_status=0,
+                )
+                self.assertEqual(category, classified["category"])
+                self.assertFalse(canary._restart_passed(classified))
+
+        for category in (
+            "command-contract",
+            "api-or-auth-target",
+            "restart-timeout",
+            "unknown",
+        ):
+            with self.subTest(category=category):
+                classified = canary._restart_result(
+                    before,
+                    after,
+                    command_exit_class="failure",
+                    command_exit_status=1,
+                    category=category,
+                )
+                self.assertEqual(category, classified["category"])
+        serialized = json.dumps(success)
+        for prohibited in ("stdout", "stderr", "argv", "OLLAMA_API_KEY", "prompt"):
+            self.assertNotIn(prohibited, serialized)
+
+    def test_restart_command_contract_is_bounded_and_noninteractive(self) -> None:
+        self.assertEqual(
+            "command-contract",
+            canary._restart_command_category(
+                canary.CommandResult("", "restart aborted: confirmation required", 1)
+            ),
+        )
+        backend = canary.HostBackend(canary.Deadline(100, 50))
+        captured: dict[str, object] = {}
+
+        def fake_run(argv, *, cwd=None, env=None, check=True, label):
+            captured.update(argv=tuple(argv), check=check, label=label)
+            return canary.CommandResult("", "", 0)
+
+        backend._run = fake_run  # type: ignore[method-assign]
+        backend._run_exact_restart(self.facts, {})
+        self.assertEqual(
+            (str(self.facts.workspace / "sc"), "restart", "--yes", "--no-build"),
+            captured["argv"],
+        )
+        self.assertFalse(captured["check"])
+
     def test_force_new_probe_requires_absence_and_both_direct_rejections(self) -> None:
         proof = {
             "sprint_id": 12,
@@ -1396,7 +1537,10 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                 return canary.CommandResult(
                     json.dumps(route_admission_payload()), "", 0
                 )
-            if label == "verify non-secret route probe stopped":
+            if label in {
+                "verify non-secret route probe stopped",
+                "verify exact-session rehearsal stopped",
+            }:
                 return canary.CommandResult("", "not found", 1)
             if label == "inspect launched harness versions":
                 return canary.CommandResult(
@@ -1410,6 +1554,15 @@ class DosAppSprintCanaryTest(unittest.TestCase):
 
         backend._run = fake_run  # type: ignore[method-assign]
         backend._read_provider_key = fake_read  # type: ignore[method-assign]
+        rehearsal = canary._restart_result(
+            restart_probe(),
+            restart_probe(process_pid=200, process_start_ticks=2000),
+            command_exit_class="success",
+            command_exit_status=0,
+        )
+        backend._credential_free_restart_rehearsal = mock.Mock(  # type: ignore[method-assign]
+            return_value=rehearsal
+        )
         health = mock.Mock()
         health.request.return_value = {"status": "ok"}
 
@@ -1431,6 +1584,9 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                 "resolve exact-image codex route",
                 "stop non-secret route probe",
                 "verify non-secret route probe stopped",
+                "launch credential-free exact-session rehearsal",
+                "stop credential-free exact-session rehearsal",
+                "verify exact-session rehearsal stopped",
                 "read provider credential",
                 "launch isolated runtime",
                 "refresh admitted deepseek route",
@@ -1458,6 +1614,7 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         )
         self.assertFalse(run_checks["refresh admitted deepseek route"])
         self.assertFalse(run_checks["resolve admitted deepseek route"])
+        self.assertEqual(rehearsal, launch_result["restart_rehearsal"])
         self.assertEqual(
             {"codex": "codex-cli-test", "deepseek": "deepseek-test"},
             launch_result["versions"],
@@ -2071,6 +2228,53 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         )
         self.assertNotIn("dos-app-sprint-canary)", dispatcher)
         self.assertTrue((root / "maintainer" / "dos_app_sprint_canary.py").is_file())
+
+
+class DeepSeekExactRestartHelperTest(unittest.TestCase):
+    def test_prepare_uses_installed_state_and_exact_controlled_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / "shell.db"
+            (root / ".sc-state").mkdir()
+            (root / ".sc-state" / "engine.ref").write_text(SHA + "\n")
+            with contextlib.closing(sqlite3.connect(database)) as con:
+                apply_schema(con)
+                con.execute("INSERT INTO users (user_id,username) VALUES (1,'owner')")
+                con.execute(
+                    "INSERT INTO shells "
+                    "(shell_id,display_name,shortname,flavor,system_prompt,user_id) "
+                    "VALUES (2,'Reviewer','REV1','reviewer','reviewer',1)"
+                )
+                con.commit()
+
+            with mock.patch.object(restart_rehearsal, "DB_PATH", database), mock.patch.object(
+                restart_rehearsal, "REPO_ROOT", root
+            ):
+                prepared = restart_rehearsal._prepare(
+                    "REV1", "http://127.0.0.1:18991/v1"
+                )
+
+            self.assertEqual(SHA, prepared["candidate_sha"])
+            self.assertEqual("ollama-cloud", prepared["provider"])
+            self.assertEqual(canary.DEEPSEEK_MODEL, prepared["model"])
+            self.assertRegex(str(prepared["conversation_id"]), r"^cv_[0-9a-f]{32}$")
+            with contextlib.closing(sqlite3.connect(database)) as con:
+                con.row_factory = sqlite3.Row
+                row = con.execute(
+                    "SELECT provider,model,worktree,route_binding "
+                    "FROM conversations WHERE conversation_id=?",
+                    (prepared["conversation_id"],),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            binding = json.loads(row["route_binding"])
+            self.assertEqual("deepseek", binding["harness"])
+            self.assertEqual(
+                "http://127.0.0.1:18991/v1",
+                binding["adapter_metadata"]["endpoint_identity"],
+            )
+            self.assertEqual(
+                str(root / ".sc-worktrees" / "rev1"), row["worktree"]
+            )
 
 
 class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):

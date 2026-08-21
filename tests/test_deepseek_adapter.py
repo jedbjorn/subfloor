@@ -18,6 +18,7 @@ sys.path.insert(0, str(ENGINE / "api"))
 
 import deepseek_runtime  # noqa: E402
 import route_bindings  # noqa: E402
+from conversation_adapters import deepseek as deepseek_adapter  # noqa: E402
 from conversation_broker import BrokerRun, ConversationBroker  # noqa: E402
 from conversation_adapters import ADAPTER_TYPES, adapter_for  # noqa: E402
 from conversation_adapters.base import (  # noqa: E402
@@ -345,6 +346,63 @@ def test_manifest_registry_probe_and_surface_contract_are_live() -> None:
         version="0.1.0rc8",
     )
     assert next_release.compatibility == "newer-unverified"
+
+
+def test_exact_restart_rehearsal_is_the_only_ollama_loopback_route(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    current = context(worktree, provider="ollama-cloud")
+    binding = json.loads(json.dumps(current.route_binding))
+    metadata = binding["adapter_metadata"]
+    metadata["endpoint_identity"] = deepseek_adapter.EXACT_RESTART_REHEARSAL_ENDPOINT
+    metadata["discovery_evidence_digest"] = (
+        deepseek_adapter.EXACT_RESTART_REHEARSAL_DISCOVERY
+    )
+    metadata["wire_evidence_digest"] = deepseek_adapter.EXACT_RESTART_REHEARSAL_WIRE
+    route_bindings.validate_v2_binding(binding)
+    rehearsal = ConversationContext(
+        worktree=current.worktree,
+        provider=current.provider,
+        model=current.model,
+        effort=current.effort,
+        permission_mode=current.permission_mode,
+        env=current.env,
+        route_binding=binding,
+        binding_digest=route_bindings.digest_json(binding),
+        conversation_id=current.conversation_id,
+        boot_content=current.boot_content,
+    )
+
+    provider, model, _options, _credential, endpoint = DeepSeekAdapter._route(
+        rehearsal
+    )
+    assert provider == "ollama-cloud"
+    assert model == "deepseek-v4-pro:0813"
+    assert endpoint == deepseek_adapter.EXACT_RESTART_REHEARSAL_ENDPOINT
+
+    for field, value in (
+        ("endpoint_identity", "http://127.0.0.1:18992/v1"),
+        ("discovery_evidence_digest", "0" * 64),
+        ("wire_evidence_digest", "0" * 64),
+    ):
+        rejected = json.loads(json.dumps(binding))
+        rejected["adapter_metadata"][field] = value
+        invalid = ConversationContext(
+            worktree=rehearsal.worktree,
+            provider=rehearsal.provider,
+            model=rehearsal.model,
+            effort=rehearsal.effort,
+            permission_mode=rehearsal.permission_mode,
+            env=rehearsal.env,
+            route_binding=rejected,
+            binding_digest=route_bindings.digest_json(rejected),
+            conversation_id=rehearsal.conversation_id,
+            boot_content=rehearsal.boot_content,
+        )
+        with pytest.raises(AdapterError, match="endpoint changed"):
+            DeepSeekAdapter._route(invalid)
 
 
 def test_start_binds_exact_route_boot_and_isolated_process_identity(tmp_path: Path) -> None:

@@ -44,6 +44,13 @@ MAX_NATIVE_BYTES = 8192
 MAX_UNKNOWN_EVENTS = 8
 DEFAULT_STREAM_INACTIVITY_SECONDS = 30.0
 DEFAULT_SILENT_PROBE_LIMIT = 2
+EXACT_RESTART_REHEARSAL_ENDPOINT = "http://127.0.0.1:18991/v1"
+EXACT_RESTART_REHEARSAL_DISCOVERY = (
+    "21f1ab18fa6541f0c2898b20519147a81dcc9c63fefe49001f993b912c94baed"
+)
+EXACT_RESTART_REHEARSAL_WIRE = (
+    "cae8a9431092040c06f1d9d1efa37a847f1c85adea92aa3cf16df91dcff095c9"
+)
 SENSITIVE_KEY = re.compile(r"(?:key|token|secret|password|credential|authorization)", re.I)
 NATIVE_ERROR_CODES = frozenset(
     {
@@ -71,6 +78,18 @@ NATIVE_HTTP_STATUS = re.compile(
     r"\b([1-5][0-9]{2})\s+status\s+code\b)",
     re.I,
 )
+
+
+def _is_exact_restart_rehearsal(binding: Mapping[str, Any]) -> bool:
+    metadata = binding.get("adapter_metadata")
+    return (
+        isinstance(metadata, Mapping)
+        and metadata.get("provider_route") == "ollama-cloud"
+        and metadata.get("endpoint_identity") == EXACT_RESTART_REHEARSAL_ENDPOINT
+        and metadata.get("discovery_evidence_digest")
+        == EXACT_RESTART_REHEARSAL_DISCOVERY
+        and metadata.get("wire_evidence_digest") == EXACT_RESTART_REHEARSAL_WIRE
+    )
 FAILURE_SOURCES = frozenset(
     {"provider", "carrier", "protocol", "tool-dispatch", "engine"}
 )
@@ -628,7 +647,11 @@ class DeepSeekAdapter(ConversationAdapter):
                 "HARNESS_PROVIDER_CONFIG_INVALID",
                 "DeepSeek route has no exact credential-free endpoint identity",
             )
-        if adapter["endpoint_env"] is None and endpoint != adapter["endpoint_default"]:
+        if (
+            adapter["endpoint_env"] is None
+            and endpoint != adapter["endpoint_default"]
+            and not _is_exact_restart_rehearsal(binding)
+        ):
             raise AdapterError(
                 "HARNESS_PROVIDER_CONFIG_INVALID",
                 "DeepSeek provider endpoint changed after route binding",
@@ -778,13 +801,14 @@ class DeepSeekAdapter(ConversationAdapter):
             base_env = dict(context.env)
             api_key = base_env.get(credential_env, "")
             try:
+                rehearsal = _is_exact_restart_rehearsal(context.route_binding)
                 child_env = deepseek_runtime.launch_environment(
                     layout,
                     worktree=context.checked_worktree(),
                     system_prompt=boot_content,
                     provider=provider,
                     api_key=api_key,
-                    base_url=endpoint,
+                    base_url=None if rehearsal else endpoint,
                     base_env=base_env,
                 )
             except deepseek_runtime.DeepSeekRuntimeError as exc:
@@ -800,6 +824,8 @@ class DeepSeekAdapter(ConversationAdapter):
                     "SC_DEEPSEEK_PROVIDER_REASONING_EFFORT": options["reasoningEffort"],
                 }
             )
+            if rehearsal:
+                child_env["SC_DEEPSEEK_PROVIDER_BASE_URL"] = endpoint
             argv = [status.carrier_python, "-I", str(WORKER)]
             transport = self.transport_factory(
                 argv=argv,

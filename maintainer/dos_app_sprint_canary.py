@@ -79,6 +79,7 @@ HEX_SHA = re.compile(r"^[0-9a-f]{40}$")
 RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{5,47}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 CONVERSATION_ID_RE = re.compile(r"^cv_[0-9a-f]{32}$")
+DEEPSEEK_SESSION_ID_RE = re.compile(r"^deepseek-[0-9a-f]{32}$")
 SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+"),
     re.compile(r"(?i)((?:api[_-]?key|token|secret|password)\s*[=:]\s*)[^\s,;]+"),
@@ -255,6 +256,103 @@ ROUTE_ADMISSION_TOOL_CAPABILITY = frozenset(
 )
 ROUTE_ADMISSION_EXIT_CLASSES = frozenset(
     {"success", "route-rejected", "malformed-response", "identity-mismatch", "command-failed"}
+)
+RESTART_REHEARSAL_PORT = 18991
+RESTART_REHEARSAL_HELPER = (
+    ".super-coder/scripts/deepseek_exact_restart_rehearsal.py"
+)
+RESTART_CATEGORIES = frozenset(
+    {
+        "command-contract",
+        "api-or-auth-target",
+        "session-reference-missing",
+        "session-reference-mismatch",
+        "persisted-root-missing",
+        "persisted-root-mismatch",
+        "boot-or-runtime-drift",
+        "route-drift",
+        "old-process-still-live",
+        "process-collision",
+        "broker-state-or-lease",
+        "native-resume-rejected",
+        "restart-timeout",
+        "unknown",
+    }
+)
+RESTART_PROBE_KEYS = frozenset(
+    {
+        "ok",
+        "candidate_sha",
+        "conversation_id",
+        "native_session_id",
+        "provider",
+        "model",
+        "runtime_version",
+        "source_commit",
+        "patch_sha256",
+        "composition_sha256",
+        "binding_digest",
+        "boot_sha256",
+        "persisted_root_id",
+        "persisted_root_device",
+        "persisted_root_inode",
+        "persisted_root_present",
+        "persisted_root_private",
+        "run_id",
+        "run_state",
+        "process_pid",
+        "process_start_ticks",
+        "process_live",
+        "lease_clear",
+        "inspect_session_exact",
+        "inspect_presence",
+        "inspect_state",
+        "reconcile_outcome",
+        "reconcile_proven",
+    }
+)
+RESTART_RESULT_KEYS = frozenset(
+    {
+        "schema_version",
+        "category",
+        "command_exit_class",
+        "command_exit_status",
+        "candidate_sha",
+        "conversation_id",
+        "native_session_id",
+        "provider",
+        "model",
+        "runtime_version",
+        "source_commit",
+        "patch_sha256",
+        "composition_sha256",
+        "binding_digest",
+        "boot_sha256",
+        "persisted_root_id",
+        "persisted_root_device",
+        "persisted_root_inode",
+        "persisted_root_private",
+        "old_process_pid",
+        "old_process_start_ticks",
+        "old_process_live",
+        "resumed_process_pid",
+        "resumed_process_start_ticks",
+        "resumed_process_distinct",
+        "same_candidate",
+        "same_runtime",
+        "same_boot",
+        "same_route",
+        "same_conversation",
+        "same_native_session",
+        "same_persisted_root",
+        "inspect_session_exact",
+        "inspect_presence",
+        "inspect_state",
+        "reconcile_outcome",
+        "reconcile_proven",
+        "broker_state",
+        "lease_clear",
+    }
 )
 
 
@@ -715,6 +813,327 @@ def _validated_route_admission(result: CommandResult) -> dict[str, Any]:
             details={"route_admission": _route_admission_fallback(exit_class)},
         )
     return {key: payload[key] for key in ROUTE_ADMISSION_KEYS}
+
+
+def _restart_command_category(result: CommandResult) -> str | None:
+    """Classify restart failures ephemerally without retaining command output."""
+    if result.returncode == 0:
+        return None
+    detail = f"{result.stdout}\n{result.stderr}".lower()
+    if any(token in detail for token in ("restart aborted", "unknown argument", "usage:")):
+        return "command-contract"
+    if any(
+        token in detail
+        for token in ("unauthorized", "forbidden", "authentication", "api target")
+    ):
+        return "api-or-auth-target"
+    if any(token in detail for token in ("broker", "lease", "engine unhealthy")):
+        return "broker-state-or-lease"
+    return "unknown"
+
+
+def _validated_restart_probe(result: CommandResult) -> dict[str, Any]:
+    try:
+        payload = json.loads(result.stdout or "null")
+    except json.JSONDecodeError:
+        payload = None
+    valid = (
+        result.returncode == 0
+        and isinstance(payload, dict)
+        and set(payload) == RESTART_PROBE_KEYS
+        and payload.get("ok") is True
+        and isinstance(payload.get("candidate_sha"), str)
+        and HEX_SHA.fullmatch(payload["candidate_sha"]) is not None
+        and isinstance(payload.get("conversation_id"), str)
+        and CONVERSATION_ID_RE.fullmatch(payload["conversation_id"]) is not None
+        and payload.get("provider") == "ollama-cloud"
+        and payload.get("model") == DEEPSEEK_MODEL
+        and isinstance(payload.get("runtime_version"), str)
+        and bool(payload["runtime_version"])
+        and isinstance(payload.get("source_commit"), str)
+        and HEX_SHA.fullmatch(payload["source_commit"]) is not None
+        and all(
+            isinstance(payload.get(key), str)
+            and re.fullmatch(r"[0-9a-f]{64}", payload[key]) is not None
+            for key in (
+                "patch_sha256",
+                "composition_sha256",
+                "binding_digest",
+                "boot_sha256",
+            )
+        )
+        and isinstance(payload.get("persisted_root_id"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", payload["persisted_root_id"]) is not None
+        and all(
+            payload.get(key) is None
+            or (
+                isinstance(payload.get(key), int)
+                and not isinstance(payload.get(key), bool)
+                and payload[key] > 0
+            )
+            for key in ("persisted_root_device", "persisted_root_inode")
+        )
+        and all(
+            type(payload.get(key)) is bool
+            for key in (
+                "persisted_root_present",
+                "persisted_root_private",
+                "process_live",
+                "lease_clear",
+            )
+        )
+        and all(
+            payload.get(key) is None or type(payload.get(key)) is bool
+            for key in ("inspect_session_exact", "inspect_presence", "reconcile_proven")
+        )
+        and all(
+            isinstance(payload.get(key), int)
+            and not isinstance(payload.get(key), bool)
+            and payload[key] > 0
+            for key in ("run_id", "process_pid", "process_start_ticks")
+        )
+        and isinstance(payload.get("native_session_id"), str)
+        and DEEPSEEK_SESSION_ID_RE.fullmatch(payload["native_session_id"]) is not None
+        and payload.get("run_state") in {"succeeded", "failed", "cancelled"}
+        and all(
+            payload.get(key) is None
+            or (
+                isinstance(payload.get(key), str)
+                and 1 <= len(payload[key]) <= 64
+                and re.fullmatch(r"[a-z0-9._-]+", payload[key]) is not None
+            )
+            for key in ("inspect_state", "reconcile_outcome")
+        )
+    )
+    if not valid:
+        raise CanaryError(
+            "CANARY_RESTART_RECOVERY_FAILED",
+            "exact-session probe violated its bounded contract",
+            details={"restart": {"schema_version": 1, "category": "unknown"}},
+        )
+    return {key: payload[key] for key in RESTART_PROBE_KEYS}
+
+
+def _restart_result(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    *,
+    command_exit_class: str,
+    command_exit_status: int,
+    category: str | None = None,
+) -> dict[str, Any]:
+    same_runtime = all(
+        before.get(key) == after.get(key)
+        for key in ("runtime_version", "source_commit", "patch_sha256", "composition_sha256")
+    )
+    same_route = all(
+        before.get(key) == after.get(key)
+        for key in ("provider", "model", "binding_digest")
+    )
+    distinct_process = (
+        isinstance(before.get("process_pid"), int)
+        and isinstance(before.get("process_start_ticks"), int)
+        and isinstance(after.get("process_pid"), int)
+        and isinstance(after.get("process_start_ticks"), int)
+        and (before["process_pid"], before["process_start_ticks"])
+        != (after["process_pid"], after["process_start_ticks"])
+    )
+    checks = {
+        "same_candidate": before.get("candidate_sha") == after.get("candidate_sha"),
+        "same_runtime": same_runtime,
+        "same_boot": before.get("boot_sha256") == after.get("boot_sha256"),
+        "same_route": same_route,
+        "same_conversation": before.get("conversation_id") == after.get("conversation_id"),
+        "same_native_session": before.get("native_session_id") == after.get("native_session_id"),
+        "same_persisted_root": all(
+            before.get(key) == after.get(key)
+            for key in (
+                "persisted_root_id",
+                "persisted_root_device",
+                "persisted_root_inode",
+            )
+        ),
+    }
+    if category is None:
+        if not before.get("native_session_id") or not after.get("native_session_id"):
+            category = "session-reference-missing"
+        elif not checks["same_native_session"]:
+            category = "session-reference-mismatch"
+        elif not before.get("persisted_root_present") or not after.get("persisted_root_present"):
+            category = "persisted-root-missing"
+        elif not checks["same_persisted_root"]:
+            category = "persisted-root-mismatch"
+        elif not checks["same_candidate"] or not same_runtime or not checks["same_boot"]:
+            category = "boot-or-runtime-drift"
+        elif not same_route or not checks["same_conversation"]:
+            category = "route-drift"
+        elif before.get("process_live") is True:
+            category = "old-process-still-live"
+        elif not distinct_process:
+            category = "process-collision"
+        elif after.get("run_state") != "succeeded" or after.get("lease_clear") is not True:
+            category = "broker-state-or-lease"
+        elif (
+            after.get("inspect_session_exact") is not True
+            or after.get("inspect_presence") is not True
+            or after.get("reconcile_proven") is not True
+        ):
+            category = "native-resume-rejected"
+    result = {
+        "schema_version": 1,
+        "category": category,
+        "command_exit_class": command_exit_class,
+        "command_exit_status": command_exit_status,
+        "candidate_sha": after.get("candidate_sha") or before.get("candidate_sha"),
+        "conversation_id": after.get("conversation_id") or before.get("conversation_id"),
+        "native_session_id": after.get("native_session_id") or before.get("native_session_id"),
+        "provider": after.get("provider") or before.get("provider"),
+        "model": after.get("model") or before.get("model"),
+        "runtime_version": after.get("runtime_version") or before.get("runtime_version"),
+        "source_commit": after.get("source_commit") or before.get("source_commit"),
+        "patch_sha256": after.get("patch_sha256") or before.get("patch_sha256"),
+        "composition_sha256": after.get("composition_sha256") or before.get("composition_sha256"),
+        "binding_digest": after.get("binding_digest") or before.get("binding_digest"),
+        "boot_sha256": after.get("boot_sha256") or before.get("boot_sha256"),
+        "persisted_root_id": after.get("persisted_root_id") or before.get("persisted_root_id"),
+        "persisted_root_device": after.get("persisted_root_device"),
+        "persisted_root_inode": after.get("persisted_root_inode"),
+        "persisted_root_private": after.get("persisted_root_private") is True,
+        "old_process_pid": before.get("process_pid"),
+        "old_process_start_ticks": before.get("process_start_ticks"),
+        "old_process_live": before.get("process_live") is True,
+        "resumed_process_pid": after.get("process_pid"),
+        "resumed_process_start_ticks": after.get("process_start_ticks"),
+        "resumed_process_distinct": distinct_process,
+        **checks,
+        "inspect_session_exact": after.get("inspect_session_exact"),
+        "inspect_presence": after.get("inspect_presence"),
+        "inspect_state": after.get("inspect_state"),
+        "reconcile_outcome": after.get("reconcile_outcome"),
+        "reconcile_proven": after.get("reconcile_proven"),
+        "broker_state": after.get("run_state"),
+        "lease_clear": after.get("lease_clear"),
+    }
+    return _validated_restart_result(result)
+
+
+def _validated_restart_result(payload: Mapping[str, Any]) -> dict[str, Any]:
+    category = payload.get("category")
+    native_session_id = payload.get("native_session_id")
+    valid = (
+        set(payload) == RESTART_RESULT_KEYS
+        and payload.get("schema_version") == 1
+        and (category is None or category in RESTART_CATEGORIES)
+        and payload.get("command_exit_class") in {"success", "failure", "timeout"}
+        and isinstance(payload.get("command_exit_status"), int)
+        and not isinstance(payload.get("command_exit_status"), bool)
+        and isinstance(payload.get("candidate_sha"), str)
+        and HEX_SHA.fullmatch(payload["candidate_sha"]) is not None
+        and isinstance(payload.get("conversation_id"), str)
+        and CONVERSATION_ID_RE.fullmatch(payload["conversation_id"]) is not None
+        and (
+            (
+                isinstance(native_session_id, str)
+                and DEEPSEEK_SESSION_ID_RE.fullmatch(native_session_id) is not None
+            )
+            or (native_session_id is None and category == "session-reference-missing")
+        )
+        and payload.get("provider") == "ollama-cloud"
+        and payload.get("model") == DEEPSEEK_MODEL
+        and isinstance(payload.get("runtime_version"), str)
+        and 1 <= len(payload["runtime_version"]) <= 64
+        and isinstance(payload.get("source_commit"), str)
+        and HEX_SHA.fullmatch(payload["source_commit"]) is not None
+        and all(
+            isinstance(payload.get(key), str)
+            and re.fullmatch(r"[0-9a-f]{64}", payload[key]) is not None
+            for key in (
+                "patch_sha256",
+                "composition_sha256",
+                "binding_digest",
+                "boot_sha256",
+            )
+        )
+        and isinstance(payload.get("persisted_root_id"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", payload["persisted_root_id"]) is not None
+        and all(
+            (
+                isinstance(payload.get(key), int)
+                and not isinstance(payload.get(key), bool)
+                and payload[key] > 0
+            )
+            or (payload.get(key) is None and category == "persisted-root-missing")
+            for key in ("persisted_root_device", "persisted_root_inode")
+        )
+        and all(
+            payload.get(key) is None
+            or (
+                isinstance(payload.get(key), int)
+                and not isinstance(payload.get(key), bool)
+                and payload[key] > 0
+            )
+            for key in (
+                "old_process_pid",
+                "old_process_start_ticks",
+                "resumed_process_pid",
+                "resumed_process_start_ticks",
+            )
+        )
+        and payload.get("broker_state") in {"succeeded", "failed", "cancelled"}
+        and all(
+            payload.get(key) is None
+            or (
+                isinstance(payload.get(key), str)
+                and 1 <= len(payload[key]) <= 64
+                and re.fullmatch(r"[a-z0-9._-]+", payload[key]) is not None
+            )
+            for key in ("inspect_state", "reconcile_outcome")
+        )
+        and all(
+            payload.get(key) is None or type(payload.get(key)) is bool
+            for key in ("inspect_session_exact", "inspect_presence", "reconcile_proven")
+        )
+        and all(type(payload.get(key)) is bool for key in (
+            "persisted_root_private", "old_process_live", "resumed_process_distinct",
+            "same_candidate", "same_runtime", "same_boot", "same_route",
+            "same_conversation", "same_native_session", "same_persisted_root",
+        ))
+    )
+    if not valid:
+        raise CanaryError(
+            "CANARY_RESTART_RECOVERY_FAILED",
+            "restart evidence violated its bounded contract",
+            details={"restart": {"schema_version": 1, "category": "unknown"}},
+        )
+    return {key: payload[key] for key in RESTART_RESULT_KEYS}
+
+
+def _restart_passed(payload: Mapping[str, Any]) -> bool:
+    return (
+        payload.get("category") is None
+        and payload.get("command_exit_class") == "success"
+        and payload.get("command_exit_status") == 0
+        and all(
+            payload.get(key) is True
+            for key in (
+                "persisted_root_private",
+                "resumed_process_distinct",
+                "same_candidate",
+                "same_runtime",
+                "same_boot",
+                "same_route",
+                "same_conversation",
+                "same_native_session",
+                "same_persisted_root",
+                "inspect_session_exact",
+                "inspect_presence",
+                "reconcile_proven",
+                "lease_clear",
+            )
+        )
+        and payload.get("old_process_live") is False
+        and payload.get("broker_state") == "succeeded"
+    )
 
 
 def _nonempty_file(path: Path) -> bool:
@@ -1479,7 +1898,40 @@ class HostBackend:
             )
 
         if config.profile == DEEPSEEK_SPRINT_PROFILE:
+            self._provider_key = "sc-loopback-restart-rehearsal-only"
+            rehearsal_env = self._runtime_env(facts)
+            try:
+                start_runtime(
+                    rehearsal_env,
+                    label="launch credential-free exact-session rehearsal",
+                )
+                restart_rehearsal = self._credential_free_restart_rehearsal(
+                    JsonHttp(f"http://127.0.0.1:{facts.api_port}", self.deadline),
+                    config,
+                    facts,
+                    rehearsal_env,
+                )
+                self._run(
+                    [str(facts.workspace / "sc"), "down"],
+                    cwd=facts.workspace,
+                    env=rehearsal_env,
+                    label="stop credential-free exact-session rehearsal",
+                )
+                stopped = self._run(
+                    ["docker", "container", "inspect", facts.container],
+                    check=False,
+                    label="verify exact-session rehearsal stopped",
+                )
+                if stopped.returncode == 0:
+                    raise CanaryError(
+                        "CANARY_CLEANUP_FAILED",
+                        "exact-session rehearsal container remained after stop",
+                    )
+            finally:
+                self._provider_key = None
             self._provider_key = self._read_provider_key(config.credential_file)
+        else:
+            restart_rehearsal = None
         env = self._runtime_env(facts)
         start_runtime(env, label="launch isolated runtime")
         if config.profile == DEEPSEEK_SPRINT_PROFILE:
@@ -1536,7 +1988,233 @@ class HostBackend:
                 "CANARY_RUNTIME_PROVENANCE_MISSING",
                 "launched runtime did not report every profile harness version",
             )
-        return {"versions": versions, "route_admission": route_admission}
+        return {
+            "versions": versions,
+            "route_admission": route_admission,
+            "restart_rehearsal": restart_rehearsal,
+        }
+
+    def _restart_helper(
+        self,
+        facts: Preflight,
+        *args: str,
+        label: str,
+    ) -> CommandResult:
+        return self._run(
+            [
+                "docker",
+                "exec",
+                facts.container,
+                "python3",
+                RESTART_REHEARSAL_HELPER,
+                *args,
+            ],
+            check=False,
+            label=label,
+        )
+
+    def _start_restart_provider(self, facts: Preflight) -> None:
+        launched = self._run(
+            [
+                "docker",
+                "exec",
+                "--detach",
+                facts.container,
+                "python3",
+                RESTART_REHEARSAL_HELPER,
+                "provider",
+                "--port",
+                str(RESTART_REHEARSAL_PORT),
+            ],
+            check=False,
+            label="start credential-free loopback provider",
+        )
+        if launched.returncode != 0:
+            raise CanaryError(
+                "CANARY_RESTART_RECOVERY_FAILED",
+                "credential-free loopback provider did not start",
+                details={"restart": {"schema_version": 1, "category": "unknown"}},
+            )
+        for _attempt in range(30):
+            probe = self._restart_helper(
+                facts,
+                "provider-probe",
+                "--port",
+                str(RESTART_REHEARSAL_PORT),
+                label="probe credential-free loopback provider",
+            )
+            try:
+                payload = json.loads(probe.stdout or "null")
+            except json.JSONDecodeError:
+                payload = None
+            if probe.returncode == 0 and payload == {"ok": True}:
+                return
+            self.deadline.remaining()
+            self.sleep(min(0.1, self.deadline.remaining()))
+        raise CanaryError(
+            "CANARY_RESTART_RECOVERY_FAILED",
+            "credential-free loopback provider did not become ready",
+            details={"restart": {"schema_version": 1, "category": "unknown"}},
+        )
+
+    def _restart_probe(
+        self,
+        facts: Preflight,
+        conversation_id: str,
+        *,
+        native: bool,
+    ) -> dict[str, Any]:
+        args = ["probe", "--conversation", conversation_id]
+        if native:
+            args.append("--native")
+        return _validated_restart_probe(
+            self._restart_helper(facts, *args, label="read bounded restart evidence")
+        )
+
+    def _wait_health(self, api: JsonHttp, config: CanaryConfig) -> None:
+        while True:
+            try:
+                if api.request("GET", "/api/health"):
+                    return
+            except CanaryError:
+                pass
+            try:
+                self.deadline.remaining()
+            except CanaryError as exc:
+                raise CanaryError(
+                    "CANARY_RESTART_RECOVERY_FAILED",
+                    "restarted runtime did not become healthy before its deadline",
+                    details={
+                        "restart": {
+                            "schema_version": 1,
+                            "category": "restart-timeout",
+                        }
+                    },
+                ) from exc
+            self.sleep(min(config.poll_interval_s, self.deadline.remaining()))
+
+    def _run_exact_restart(
+        self,
+        facts: Preflight,
+        env: Mapping[str, str],
+    ) -> None:
+        try:
+            result = self._run(
+                [str(facts.workspace / "sc"), "restart", "--yes", "--no-build"],
+                cwd=facts.workspace,
+                env=env,
+                check=False,
+                label="restart exact DeepSeek canary runtime",
+            )
+        except CanaryError as exc:
+            if exc.code != "CANARY_COMMAND_TIMEOUT":
+                raise
+            raise CanaryError(
+                "CANARY_RESTART_RECOVERY_FAILED",
+                "exact-session restart exceeded its deadline",
+                details={"restart": {"schema_version": 1, "category": "restart-timeout"}},
+            ) from exc
+        category = _restart_command_category(result)
+        if category is not None:
+            raise CanaryError(
+                "CANARY_RESTART_RECOVERY_FAILED",
+                "exact-session restart command was rejected",
+                details={"restart": {"schema_version": 1, "category": category}},
+            )
+
+    def _credential_free_restart_rehearsal(
+        self,
+        api: JsonHttp,
+        config: CanaryConfig,
+        facts: Preflight,
+        env: Mapping[str, str],
+    ) -> dict[str, Any]:
+        self._start_restart_provider(facts)
+        prepared = self._restart_helper(
+            facts,
+            "prepare",
+            "--shortname",
+            "REV1",
+            "--endpoint",
+            f"http://127.0.0.1:{RESTART_REHEARSAL_PORT}/v1",
+            label="prepare credential-free exact-session rehearsal",
+        )
+        try:
+            payload = json.loads(prepared.stdout or "null")
+        except json.JSONDecodeError:
+            payload = None
+        conversation_id = payload.get("conversation_id") if isinstance(payload, dict) else None
+        if (
+            prepared.returncode != 0
+            or not isinstance(payload, dict)
+            or set(payload)
+            != {"ok", "candidate_sha", "conversation_id", "provider", "model", "binding_digest"}
+            or payload.get("ok") is not True
+            or payload.get("candidate_sha") != facts.candidate_sha
+            or payload.get("provider") != "ollama-cloud"
+            or payload.get("model") != DEEPSEEK_MODEL
+            or not isinstance(conversation_id, str)
+            or CONVERSATION_ID_RE.fullmatch(conversation_id) is None
+        ):
+            raise CanaryError(
+                "CANARY_RESTART_RECOVERY_FAILED",
+                "credential-free restart fixture violated its bounded contract",
+                details={"restart": {"schema_version": 1, "category": "unknown"}},
+            )
+        try:
+            self._message(
+                api,
+                conversation_id,
+                "Reply with only restart-rehearsal-before.",
+                f"{config.run_id}:restart-rehearsal:before",
+            )
+            self._wait_idle(api, conversation_id, config, facts)
+            before = self._restart_probe(facts, conversation_id, native=False)
+            self._run_exact_restart(facts, env)
+            self._wait_health(api, config)
+            self._start_restart_provider(facts)
+            self._message(
+                api,
+                conversation_id,
+                "Resume this exact native session; reply with only restart-rehearsal-after.",
+                f"{config.run_id}:restart-rehearsal:after",
+            )
+            self._wait_idle(api, conversation_id, config, facts)
+            after = self._restart_probe(facts, conversation_id, native=True)
+            result = _restart_result(
+                before,
+                after,
+                command_exit_class="success",
+                command_exit_status=0,
+            )
+            if not _restart_passed(result):
+                raise CanaryError(
+                    "CANARY_RESTART_RECOVERY_FAILED",
+                    "credential-free exact-session rehearsal did not preserve identity",
+                    details={"restart": result},
+                )
+            return result
+        finally:
+            cleaned = self._restart_helper(
+                facts,
+                "cleanup",
+                "--conversation",
+                conversation_id,
+                label="clean credential-free exact-session rehearsal",
+            )
+            try:
+                cleanup_payload = json.loads(cleaned.stdout or "null")
+            except json.JSONDecodeError:
+                cleanup_payload = None
+            if cleaned.returncode != 0 or cleanup_payload != {
+                "conversation_removed": True,
+                "ok": True,
+                "root_removed": True,
+            }:
+                raise CanaryError(
+                    "CANARY_CLEANUP_FAILED",
+                    "credential-free exact-session rehearsal cleanup was incomplete",
+                )
 
     def _wait_idle(
         self,
@@ -2372,55 +3050,64 @@ class HostBackend:
         facts: Preflight,
         conversation_id: str,
     ) -> dict[str, Any]:
-        before = self._conversation_evidence(facts, conversation_id)
-        if before["harness"] != "deepseek" or before["session_sha256"] is None:
+        before = self._restart_probe(facts, conversation_id, native=False)
+        if before["native_session_id"] is None:
+            result = _restart_result(
+                before,
+                before,
+                command_exit_class="failure",
+                command_exit_status=1,
+                category="session-reference-missing",
+            )
             raise CanaryError(
                 "CANARY_RESTART_RECOVERY_FAILED",
                 "DeepSeek session evidence is absent before restart",
+                details={"restart": result},
             )
-        self._run(
-            [str(facts.workspace / "sc"), "restart", "--no-build"],
-            cwd=facts.workspace,
-            env=self._runtime_env(facts),
-            label="restart exact DeepSeek canary runtime",
-        )
-        while True:
-            try:
-                if api.request("GET", "/api/health"):
-                    break
-            except CanaryError:
-                pass
-            self.deadline.remaining()
-            self.sleep(min(config.poll_interval_s, self.deadline.remaining()))
-        self._message(
-            api,
-            conversation_id,
-            (
-                "Resume this exact conversation after the engine restart. Use Bash once "
-                "to run `pwd`, then reply with only `exact-session-recovered`. Pass when "
-                "the tool completes and this turn becomes idle; do not change files."
-            ),
-            f"{config.run_id}:deepseek:restart-resume",
-        )
-        self._wait_idle(api, conversation_id, config, facts)
-        after = self._conversation_evidence(facts, conversation_id)
-        if (
-            after["session_sha256"] != before["session_sha256"]
-            or after["boot_sha256"] != before["boot_sha256"]
-            or after["tool_completed"] <= before["tool_completed"]
-        ):
+        self._run_exact_restart(facts, self._runtime_env(facts))
+        self._wait_health(api, config)
+        try:
+            self._message(
+                api,
+                conversation_id,
+                (
+                    "Resume this exact conversation after the engine restart. Use Bash "
+                    "once to run `pwd`, then reply with only exact-session-recovered. "
+                    "Pass when the tool completes and this turn becomes idle; do not "
+                    "change files."
+                ),
+                f"{config.run_id}:deepseek:restart-resume",
+            )
+            self._wait_idle(api, conversation_id, config, facts)
+            after = self._restart_probe(facts, conversation_id, native=True)
+        except CanaryError as exc:
+            if exc.code == "CANARY_RESTART_RECOVERY_FAILED":
+                raise
+            result = _restart_result(
+                before,
+                before,
+                command_exit_class="success",
+                command_exit_status=0,
+                category="native-resume-rejected",
+            )
             raise CanaryError(
                 "CANARY_RESTART_RECOVERY_FAILED",
-                "restart did not preserve exact session/boot identity with a completed tool",
+                "native exact-session resume did not complete",
+                details={"restart": result},
+            ) from exc
+        result = _restart_result(
+            before,
+            after,
+            command_exit_class="success",
+            command_exit_status=0,
+        )
+        if not _restart_passed(result):
+            raise CanaryError(
+                "CANARY_RESTART_RECOVERY_FAILED",
+                "restart did not preserve the exact native session",
+                details={"restart": result},
             )
-        return {
-            "conversation_id": conversation_id,
-            "session_sha256": after["session_sha256"],
-            "boot_sha256": after["boot_sha256"],
-            "tool_completed_before": before["tool_completed"],
-            "tool_completed_after": after["tool_completed"],
-            "exact_session_preserved": True,
-        }
+        return result
 
     def _deepseek_participant_evidence(
         self,
@@ -4158,6 +4845,7 @@ class CanaryController:
             )
             versions = launch_result["versions"]
             route_admission = launch_result.get("route_admission")
+            restart_rehearsal = launch_result.get("restart_rehearsal")
             if route_admission is not None:
                 self.receipt.data["routes"]["admission"] = route_admission
 
@@ -4167,6 +4855,8 @@ class CanaryController:
                 "container": self.facts.container,
                 "harness_versions": versions,
             }
+            if restart_rehearsal is not None:
+                self.receipt.data["runtime"]["restart_rehearsal"] = restart_rehearsal
             self.receipt.event("runtime.launched", harnesses=sorted(versions))
             self.receipt.write()
 
