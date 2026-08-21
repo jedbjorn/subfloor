@@ -18,7 +18,7 @@
   },
   "patch": {
     "path": "assets/deepseek/deepseek-harness-bb4ca698-lifecycle.patch",
-    "sha256": "09f2a49e1567aa20b07b01b69a575a059bcf769e7157e7393d266497cf2c2ad5",
+    "sha256": "1916758816c4fc1cac5b1c4d6e90f5b2cb0826fb7271a08ca10539fb9ab5012d",
     "protocol": "super-coder-deepseek-lifecycle-v1",
     "upstream_issue_url": "https://github.com/deepseek-ai/deepseek-harness/issues/new",
     "upstream_contribution": "git apply assets/deepseek/deepseek-harness-bb4ca698-lifecycle.patch"

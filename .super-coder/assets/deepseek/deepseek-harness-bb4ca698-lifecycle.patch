@@ -802,7 +802,7 @@ index 495f1d9..5581913 100644
 +          model: 'dsagent-model',
 +          reasoningEffort: null,
 +          reservedDefaultOmitted: true,
-+          shellToolDeclared: true,
++          shellToolDeclared: false,
 +          purpose: 'conversation',
 +        },
 +      })
@@ -869,7 +869,7 @@ index 495f1d9..5581913 100644
 +          model: 'dsagent-model',
 +          reasoningEffort: 'low',
 +          reservedDefaultOmitted: false,
-+          shellToolDeclared: true,
++          shellToolDeclared: false,
 +          purpose: 'conversation',
 +        },
 +      })
