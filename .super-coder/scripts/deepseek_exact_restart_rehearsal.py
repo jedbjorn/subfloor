@@ -47,6 +47,18 @@ REHEARSAL_KEY = "deepseek-exact-restart-rehearsal-v1"
 SELECTOR = "ollama-cloud/deepseek-v4-pro:0813"
 PROVIDER = "ollama-cloud"
 PROVIDER_MODEL = "deepseek-v4-pro:0813"
+FAILURE_CATEGORIES = {
+    "broker-state-or-lease",
+    "old-process-still-live",
+    "persisted-root-mismatch",
+    "unknown",
+}
+
+
+class RehearsalFailure(RuntimeError):
+    def __init__(self, category: str) -> None:
+        super().__init__(category)
+        self.category = category
 
 
 def _candidate() -> str:
@@ -319,39 +331,59 @@ def _cleanup(conversation_id: str) -> dict[str, Any]:
             latest["state"] in {"leased", "starting", "running"}
             or _process_live(latest["process_pid"], latest["process_start_ticks"])
         ):
-            raise ValueError("rehearsal conversation still has a live run")
-        with db_driver.write_transaction(con, "deepseek.restart_rehearsal.cleanup"):
-            con.execute(
-                "DELETE FROM active_shell_chats WHERE chat_id=?", (conversation_id,)
-            )
-            con.execute(
-                "DELETE FROM conversation_events WHERE conversation_id=?",
-                (conversation_id,),
-            )
-            con.execute(
-                "DELETE FROM conversation_outbox WHERE conversation_id=?",
-                (conversation_id,),
-            )
-            con.execute(
-                "DELETE FROM conversation_runs WHERE conversation_id=?",
-                (conversation_id,),
-            )
-            con.execute(
-                "DELETE FROM conversation_messages WHERE conversation_id=?",
-                (conversation_id,),
-            )
-            con.execute(
-                "DELETE FROM conversation_git_targets WHERE conversation_id=?",
-                (conversation_id,),
-            )
-            con.execute(
-                "DELETE FROM conversations WHERE conversation_id=?", (conversation_id,)
-            )
+            raise RehearsalFailure("old-process-still-live")
+        try:
+            with db_driver.write_transaction(con, "deepseek.restart_rehearsal.cleanup"):
+                con.execute(
+                    "DELETE FROM active_shell_chats WHERE chat_id=?", (conversation_id,)
+                )
+                con.execute(
+                    "DELETE FROM sprint_wake_attempts WHERE target_conversation_id=?",
+                    (conversation_id,),
+                )
+                con.execute(
+                    "DELETE FROM sprint_participant_conversations "
+                    "WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                con.execute(
+                    "DELETE FROM conversation_events WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                con.execute(
+                    "DELETE FROM conversation_outbox WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                con.execute(
+                    "DELETE FROM conversation_runs WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                con.execute(
+                    "DELETE FROM conversation_messages WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                con.execute(
+                    "DELETE FROM conversation_git_targets WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                con.execute(
+                    "DELETE FROM conversation_boot_snapshots WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                con.execute(
+                    "DELETE FROM conversations WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+        except sqlite3.Error as exc:
+            raise RehearsalFailure("broker-state-or-lease") from exc
     finally:
         con.close()
     layout = deepseek_runtime.conversation_layout(conversation_id)
-    if layout.root.exists():
-        shutil.rmtree(layout.root)
+    try:
+        if layout.root.exists():
+            shutil.rmtree(layout.root)
+    except OSError as exc:
+        raise RehearsalFailure("persisted-root-mismatch") from exc
     return {
         "ok": True,
         "conversation_removed": True,
@@ -425,6 +457,9 @@ def _probe_provider(port: int) -> dict[str, Any]:
 
 
 def _failure_category(exc: BaseException) -> str:
+    category = getattr(exc, "category", None)
+    if category in FAILURE_CATEGORIES:
+        return str(category)
     code = str(getattr(exc, "code", ""))
     if code in {"HARNESS_SESSION_LOST", "HARNESS_SESSION_IDENTITY_INVALID"}:
         return "session-reference-missing"

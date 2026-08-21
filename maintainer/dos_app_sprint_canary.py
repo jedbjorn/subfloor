@@ -2211,6 +2211,24 @@ class HostBackend:
                 "ok": True,
                 "root_removed": True,
             }:
+                category = (
+                    cleanup_payload.get("category")
+                    if isinstance(cleanup_payload, dict)
+                    and set(cleanup_payload) == {"ok", "category"}
+                    and cleanup_payload.get("ok") is False
+                    else None
+                )
+                if category in RESTART_CATEGORIES:
+                    raise CanaryError(
+                        "CANARY_RESTART_RECOVERY_FAILED",
+                        "credential-free exact-session rehearsal cleanup was rejected",
+                        details={
+                            "restart": {
+                                "schema_version": 1,
+                                "category": category,
+                            }
+                        },
+                    )
                 raise CanaryError(
                     "CANARY_CLEANUP_FAILED",
                     "credential-free exact-session rehearsal cleanup was incomplete",
