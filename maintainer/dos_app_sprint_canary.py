@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -103,6 +104,24 @@ SENSITIVE_KEYS = {
     "token",
     "transcript",
 }
+QAQC_EVIDENCE_KEYS = frozenset(
+    {"boot", "terminal", "record_qaqc", "postcondition"}
+)
+QAQC_BOOT_KEYS = frozenset(
+    {"role", "skill", "shell_tool", "candidate", "predeclaration"}
+)
+QAQC_COMMAND_KEYS = frozenset(
+    {"observed", "invocation_count", "exit_class", "receipt", "identity"}
+)
+QAQC_TERMINAL_CLASSES = frozenset(
+    {"succeeded", "failed", "cancelled", "unknown", "missing", "ambiguous"}
+)
+QAQC_EXIT_CLASSES = frozenset(
+    {"success", "failure", "missing_completion", "not_invoked", "ambiguous"}
+)
+QAQC_POSTCONDITIONS = frozenset(
+    {"approved", "absent", "reviewer_mismatch", "revision_mismatch", "verdict_mismatch", "ambiguous"}
+)
 
 
 class CanaryError(RuntimeError):
@@ -1321,6 +1340,407 @@ class HostBackend:
         return int(rows[0]["approval_id"])
 
     @staticmethod
+    def _qaqc_invocation(arguments: Any, document_id: int) -> bool:
+        if isinstance(arguments, str):
+            try:
+                decoded = json.loads(arguments)
+            except json.JSONDecodeError:
+                decoded = {"cmd": arguments}
+        elif isinstance(arguments, dict):
+            decoded = arguments
+        else:
+            return False
+        command = decoded.get("cmd") or decoded.get("command")
+        if not isinstance(command, str):
+            return False
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            return False
+        return argv in (
+            [
+                "./sc",
+                "sprint",
+                "record-qaqc",
+                "--document",
+                str(document_id),
+                "--verdict",
+                "pass",
+            ],
+            [
+                "sc",
+                "sprint",
+                "record-qaqc",
+                "--document",
+                str(document_id),
+                "--verdict",
+                "pass",
+            ],
+        )
+
+    @staticmethod
+    def _qaqc_receipt_values(value: Any) -> list[dict[str, Any]]:
+        receipts: list[dict[str, Any]] = []
+
+        def visit(item: Any, depth: int = 0) -> None:
+            if depth > 8:
+                return
+            if isinstance(item, dict):
+                if {
+                    "approval_id",
+                    "revision_sha256",
+                    "verdict",
+                    "created",
+                }.issubset(item):
+                    receipts.append(item)
+                for child in item.values():
+                    visit(child, depth + 1)
+                return
+            if isinstance(item, list):
+                for child in item[:128]:
+                    visit(child, depth + 1)
+                return
+            if not isinstance(item, str) or len(item.encode()) > 65536:
+                return
+            try:
+                decoded = json.loads(item)
+            except json.JSONDecodeError:
+                return
+            if decoded != item:
+                visit(decoded, depth + 1)
+
+        visit(value)
+        return receipts
+
+    @staticmethod
+    def _validate_qaqc_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+        if set(evidence) != QAQC_EVIDENCE_KEYS:
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "QA/QC evidence escaped its fixed top-level allowlist",
+            )
+        boot = evidence.get("boot")
+        command = evidence.get("record_qaqc")
+        if not isinstance(boot, dict) or set(boot) != QAQC_BOOT_KEYS:
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "QA/QC boot evidence escaped its fixed allowlist",
+            )
+        if not isinstance(command, dict) or set(command) != QAQC_COMMAND_KEYS:
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "QA/QC command evidence escaped its fixed allowlist",
+            )
+        if evidence.get("terminal") not in QAQC_TERMINAL_CLASSES:
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "QA/QC terminal evidence is not a bounded category",
+            )
+        if command.get("exit_class") not in QAQC_EXIT_CLASSES:
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "QA/QC command exit evidence is not a bounded category",
+            )
+        if evidence.get("postcondition") not in QAQC_POSTCONDITIONS:
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "QA/QC postcondition evidence is not a bounded category",
+            )
+        if any(value not in {"resolved", "missing", "mismatch"} for value in boot.values()):
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "QA/QC boot evidence is not a bounded category",
+            )
+        if not isinstance(command.get("observed"), bool):
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "QA/QC observation evidence is not boolean",
+            )
+        count = command.get("invocation_count")
+        if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= 64:
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "QA/QC invocation count is outside its bound",
+            )
+        if not isinstance(command.get("receipt"), bool):
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "QA/QC receipt evidence is not boolean",
+            )
+        if command.get("identity") not in {"matched", "mismatch", "absent"}:
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "QA/QC receipt identity is not a bounded category",
+            )
+        return evidence
+
+    @staticmethod
+    def _qaqc_evidence_passed(evidence: Mapping[str, Any]) -> bool:
+        boot = evidence.get("boot")
+        command = evidence.get("record_qaqc")
+        return (
+            isinstance(boot, dict)
+            and set(boot) == QAQC_BOOT_KEYS
+            and all(value == "resolved" for value in boot.values())
+            and evidence.get("terminal") == "succeeded"
+            and isinstance(command, dict)
+            and command.get("observed") is True
+            and command.get("exit_class") == "success"
+            and command.get("receipt") is True
+            and command.get("identity") == "matched"
+            and evidence.get("postcondition") == "approved"
+        )
+
+    def _qaqc_action_evidence(
+        self,
+        facts: Preflight,
+        reviewer_id: str,
+        *,
+        reviewer_shell_id: int,
+        document_id: int,
+    ) -> tuple[int | None, dict[str, Any]]:
+        if not CONVERSATION_ID_RE.fullmatch(reviewer_id):
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "Reviewer conversation identity is invalid",
+            )
+        conversation_query = (
+            "SELECT c.harness,c.state,c.shell_id,c.worktree,s.flavor,s.shortname,"
+            "boot.content_sha256,boot.content_bytes,"
+            "instr(boot.content,'sprint_rev')>0 has_sprint_rev,"
+            "(SELECT r.state FROM conversation_runs r "
+            " WHERE r.conversation_id=c.conversation_id "
+            " ORDER BY r.run_id DESC LIMIT 1) terminal_state "
+            "FROM conversations c JOIN shells s ON s.shell_id=c.shell_id "
+            "LEFT JOIN conversation_boot_snapshots boot "
+            "ON boot.conversation_id=c.conversation_id "
+            f"WHERE c.conversation_id='{reviewer_id}';"
+        )
+        conversation_rows = _json_output(
+            self._run(
+                [
+                    "docker",
+                    "exec",
+                    facts.container,
+                    "./sc",
+                    "sql",
+                    "-json",
+                    conversation_query,
+                ],
+                label="read bounded QA/QC boot evidence",
+            ),
+            label="read bounded QA/QC boot evidence",
+        )
+        row = conversation_rows[0] if len(conversation_rows) == 1 else None
+        if not isinstance(row, dict):
+            row = {}
+
+        terminal = str(row.get("terminal_state") or "missing")
+        if len(conversation_rows) != 1:
+            terminal = "ambiguous"
+        elif terminal not in QAQC_TERMINAL_CLASSES:
+            terminal = "unknown"
+
+        skill_source = facts.workspace / ".super-coder" / "assets" / "skills" / "sprint_rev" / "SKILL.md"
+        composition = facts.workspace / ".super-coder" / "assets" / "deepseek" / "cordis-ollama-cloud.yml"
+        engine_ref = facts.workspace / ".sc-state" / "engine.ref"
+        try:
+            skill_body = skill_source.read_text()
+        except (OSError, UnicodeError):
+            skill_body = ""
+        try:
+            composition_body = composition.read_text()
+        except (OSError, UnicodeError):
+            composition_body = ""
+        try:
+            installed_ref = engine_ref.read_text().strip()
+        except (OSError, UnicodeError):
+            installed_ref = ""
+        boot = {
+            "role": (
+                "resolved"
+                if row.get("shell_id") == reviewer_shell_id
+                and row.get("flavor") == "reviewer"
+                and str(row.get("shortname") or "").upper() == "REV1"
+                else "mismatch"
+            ),
+            "skill": (
+                "resolved"
+                if bool(row.get("has_sprint_rev"))
+                and isinstance(row.get("content_sha256"), str)
+                and len(str(row["content_sha256"])) == 64
+                else "missing"
+            ),
+            "shell_tool": (
+                "resolved"
+                if row.get("harness") == "deepseek"
+                and "- id: bash" in composition_body
+                and "@deepseek-ai/dsh-bash-local" in composition_body
+                else "missing"
+            ),
+            "candidate": (
+                "resolved"
+                if installed_ref == facts.candidate_sha
+                and row.get("worktree") == str(facts.workspace)
+                else "mismatch"
+            ),
+            "predeclaration": (
+                "resolved"
+                if "pre-declaration QAQC" in skill_body
+                and "sc sprint record-qaqc" in skill_body
+                else "missing"
+            ),
+        }
+
+        event_query = (
+            "SELECT event_type,payload FROM conversation_events "
+            f"WHERE conversation_id='{reviewer_id}' "
+            "AND event_type IN ('tool.started','tool.completed') "
+            "AND run_id=(SELECT run_id FROM conversation_runs "
+            f"WHERE conversation_id='{reviewer_id}' "
+            "ORDER BY run_id DESC LIMIT 1) "
+            "ORDER BY sequence;"
+        )
+        event_rows = _json_output(
+            self._run(
+                [
+                    "docker",
+                    "exec",
+                    facts.container,
+                    "./sc",
+                    "sql",
+                    "-json",
+                    event_query,
+                ],
+                label="inspect bounded QA/QC action events",
+            ),
+            label="inspect bounded QA/QC action events",
+        )
+        started: list[tuple[str, dict[str, Any]]] = []
+        completed: dict[str, list[dict[str, Any]]] = {}
+        for event in event_rows if isinstance(event_rows, list) else []:
+            if not isinstance(event, dict):
+                continue
+            try:
+                payload = json.loads(str(event.get("payload") or "{}"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            tool_ref = payload.get("tool_ref")
+            if not isinstance(tool_ref, str) or not tool_ref:
+                continue
+            if (
+                event.get("event_type") == "tool.started"
+                and str(payload.get("name") or "").lower() in {"bash", "shell"}
+                and self._qaqc_invocation(payload.get("arguments"), document_id)
+            ):
+                started.append((tool_ref, payload))
+            elif event.get("event_type") == "tool.completed":
+                completed.setdefault(tool_ref, []).append(payload)
+
+        approval_query = (
+            "SELECT a.approval_id,a.document_id,a.revision_sha256,"
+            "a.reviewer_shell_id,a.verdict,d.body FROM documents d "
+            "LEFT JOIN sprint_spec_approvals a ON a.document_id=d.document_id "
+            f"WHERE d.document_id={document_id} ORDER BY a.approval_id;"
+        )
+        approval_rows = _json_output(
+            self._run(
+                [
+                    "docker",
+                    "exec",
+                    facts.container,
+                    "./sc",
+                    "sql",
+                    "-json",
+                    approval_query,
+                ],
+                label="read bounded QA/QC durable postcondition",
+            ),
+            label="read bounded QA/QC durable postcondition",
+        )
+        document_rows = [row for row in approval_rows if isinstance(row, dict)]
+        document_body = document_rows[0].get("body") if document_rows else None
+        revision = (
+            hashlib.sha256(document_body.encode()).hexdigest()
+            if isinstance(document_body, str)
+            else None
+        )
+        approvals = [row for row in document_rows if isinstance(row.get("approval_id"), int)]
+        exact = [
+            row
+            for row in approvals
+            if row.get("reviewer_shell_id") == reviewer_shell_id
+            and row.get("revision_sha256") == revision
+            and row.get("verdict") == "pass"
+        ]
+        if len(exact) == 1:
+            postcondition = "approved"
+            approval_id = int(exact[0]["approval_id"])
+        elif len(exact) > 1:
+            postcondition = "ambiguous"
+            approval_id = None
+        elif any(row.get("reviewer_shell_id") != reviewer_shell_id for row in approvals):
+            postcondition = "reviewer_mismatch"
+            approval_id = None
+        elif any(row.get("revision_sha256") != revision for row in approvals):
+            postcondition = "revision_mismatch"
+            approval_id = None
+        elif any(row.get("verdict") != "pass" for row in approvals):
+            postcondition = "verdict_mismatch"
+            approval_id = None
+        else:
+            postcondition = "absent"
+            approval_id = None
+
+        completions = [item for tool_ref, _payload in started for item in completed.get(tool_ref, [])]
+        statuses = {str(item.get("status") or "") for item in completions}
+        if not started:
+            exit_class = "not_invoked"
+        elif any(len(completed.get(tool_ref, [])) != 1 for tool_ref, _payload in started):
+            exit_class = "missing_completion" if not completions else "ambiguous"
+        elif statuses == {"completed"}:
+            exit_class = "success"
+        elif statuses == {"failed"}:
+            exit_class = "failure"
+        else:
+            exit_class = "ambiguous"
+
+        returned_receipts = [
+            receipt
+            for completion in completions
+            for receipt in self._qaqc_receipt_values(completion)
+        ]
+        matched_receipts = [
+            receipt
+            for receipt in returned_receipts
+            if approval_id is not None
+            and receipt.get("approval_id") == approval_id
+            and receipt.get("revision_sha256") == revision
+            and receipt.get("verdict") == "pass"
+            and isinstance(receipt.get("created"), bool)
+        ]
+        identity = (
+            "matched"
+            if len(matched_receipts) == 1
+            else "mismatch" if returned_receipts else "absent"
+        )
+        evidence = {
+            "boot": boot,
+            "terminal": terminal,
+            "record_qaqc": {
+                "observed": bool(started),
+                "invocation_count": min(len(started), 64),
+                "exit_class": exit_class,
+                "receipt": bool(returned_receipts),
+                "identity": identity,
+            },
+            "postcondition": postcondition,
+        }
+        return approval_id, self._validate_qaqc_evidence(evidence)
+
+    @staticmethod
     def _qaqc_reviewer_prompt(document_id: int) -> str:
         return (
             "Load sprint_rev and use its explicit pre-declaration QA/QC path; "
@@ -1328,7 +1748,7 @@ class HostBackend:
             f"Review spec document #{document_id} as the canary QA/QC Reviewer. "
             "Confirm it is limited to a deterministic file, an ephemeral-base PR, real "
             "Sprint lifecycle actions, and no change to main. If sound, run exactly "
-            f"sc sprint record-qaqc --document {document_id} --verdict pass. "
+            f"./sc sprint record-qaqc --document {document_id} --verdict pass. "
             "Verify that command confirms the durable approval, retry the exact command "
             "if the write is failed or ambiguous, and stop only after confirmation."
         )
@@ -2592,7 +3012,22 @@ raise TimeoutError("controller did not close the Force-new barrier")
             f"{config.run_id}:reviewer:qaqc",
         )
         self._wait_idle(api, reviewer_id, config, facts)
-        approval_id = self._approval(facts, document_id)
+        if deepseek_profile:
+            approval_id, qaqc_evidence = self._qaqc_action_evidence(
+                facts,
+                reviewer_id,
+                reviewer_shell_id=shells["REV1"],
+                document_id=document_id,
+            )
+            if approval_id is None or not self._qaqc_evidence_passed(qaqc_evidence):
+                raise CanaryError(
+                    "CANARY_QAQC_FAILED",
+                    "reviewer did not record exact approval",
+                    details={"qaqc_action": qaqc_evidence},
+                )
+        else:
+            approval_id = self._approval(facts, document_id)
+            qaqc_evidence = None
 
         restart_recovery = None
         if deepseek_profile:
@@ -2890,6 +3325,7 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 **gate_evidence,
                 "exact_session_restart": restart_recovery,
                 "participant_evidence": participant_evidence,
+                "qaqc_action": qaqc_evidence,
             },
             "routes": {
                 "planner_initial": planner_route,

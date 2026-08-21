@@ -3,20 +3,39 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
+import hashlib
+import io
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+ENGINE = ROOT / ".super-coder"
+sys.path[:0] = [
+    str(ROOT),
+    str(ROOT / "tests"),
+    str(ENGINE / "api"),
+    str(ENGINE / "scripts"),
+]
+
+import mem
+import server
+import sprint_cli
+from conversation_adapters import NativeTurn
+from conversation_adapters.deepseek import DeepSeekAdapter
+from test_sprint_v2_domain import apply_schema
 
 from maintainer import dos_app_sprint_canary as canary
 
@@ -1232,7 +1251,7 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         self.assertIn("pre-declaration QA/QC path", prompt)
         self.assertIn("there is no Sprint id or Sprint inbox yet", prompt)
         self.assertIn(
-            "sc sprint record-qaqc --document 117 --verdict pass", prompt
+            "./sc sprint record-qaqc --document 117 --verdict pass", prompt
         )
         self.assertIn("retry the exact command", prompt)
         self.assertIn("stop only after confirmation", prompt)
@@ -1649,6 +1668,365 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         )
         self.assertNotIn("dos-app-sprint-canary)", dispatcher)
         self.assertTrue((root / "maintainer" / "dos_app_sprint_canary.py").is_file())
+
+
+class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
+    """Secret-free rehearsal of the production Reviewer action boundary."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.workspace = self.root / "disposable"
+        self.workspace.mkdir()
+        (self.workspace / ".sc-state").mkdir()
+        skill_target = (
+            self.workspace
+            / ".super-coder"
+            / "assets"
+            / "skills"
+            / "sprint_rev"
+        )
+        skill_target.mkdir(parents=True)
+        shutil.copy2(
+            ENGINE / "assets" / "skills" / "sprint_rev" / "SKILL.md",
+            skill_target / "SKILL.md",
+        )
+        composition_target = (
+            self.workspace / ".super-coder" / "assets" / "deepseek"
+        )
+        composition_target.mkdir(parents=True)
+        shutil.copy2(
+            ENGINE / "assets" / "deepseek" / "cordis-ollama-cloud.yml",
+            composition_target / "cordis-ollama-cloud.yml",
+        )
+        self.candidate_sha = "c" * 40
+        (self.workspace / ".sc-state" / "engine.ref").write_text(
+            self.candidate_sha + "\n"
+        )
+        (self.workspace / "sc").write_text("#!/bin/sh\nexit 0\n")
+        (self.workspace / "sc").chmod(0o755)
+
+        self.db = self.root / "shell.db"
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            apply_schema(con)
+            con.execute("INSERT INTO users (user_id,username) VALUES (1,'owner')")
+            con.executemany(
+                "INSERT INTO shells "
+                "(shell_id,display_name,shortname,flavor,system_prompt,user_id,api_key) "
+                "VALUES (?,?,?,?,?,1,?)",
+                (
+                    (1, "Planner", "PLN1", "planner", "planner", "planner-token"),
+                    (2, "Reviewer", "REV1", "reviewer", "reviewer", "review-token"),
+                    (3, "Developer", "DEV1", "dev", "developer", "dev-token"),
+                ),
+            )
+            feature_id = int(
+                con.execute(
+                    "INSERT INTO roadmap (title,roadmap_status) "
+                    "VALUES ('Disposable QAQC rehearsal','in_progress')"
+                ).lastrowid
+            )
+            self.spec_body = "# Disposable spec\n\nCreate one deterministic file.\n"
+            self.document_id = int(
+                con.execute(
+                    "INSERT INTO documents (feature_id,kind,seq,title,body) "
+                    "VALUES (?,'spec',1,'Disposable spec',?)",
+                    (feature_id, self.spec_body),
+                ).lastrowid
+            )
+            self.conversation_id = "cv_" + "d" * 32
+            con.execute(
+                "INSERT INTO conversations "
+                "(conversation_id,shell_id,owner_user_id,harness,provider,model,"
+                "effort,worktree,state,creation_idempotency_key,creation_request_hash) "
+                "VALUES (?,2,1,'deepseek','ollama-cloud',?,'default',?,'idle',?,?)",
+                (
+                    self.conversation_id,
+                    canary.DEEPSEEK_MODEL,
+                    str(self.workspace),
+                    "qaqc-rehearsal",
+                    "r" * 64,
+                ),
+            )
+            boot = (
+                "# Reviewer\n\nRole: Reviewer\n\n"
+                + (ENGINE / "assets" / "skills" / "sprint_rev" / "SKILL.md").read_text()
+            )
+            con.execute(
+                "INSERT INTO conversation_boot_snapshots "
+                "(conversation_id,content,content_sha256,content_bytes,"
+                "format_version,binding_origin) VALUES (?,?,?,?,1,'new_conversation')",
+                (
+                    self.conversation_id,
+                    boot,
+                    hashlib.sha256(boot.encode()).hexdigest(),
+                    len(boot.encode()),
+                ),
+            )
+            message_id = int(
+                con.execute(
+                    "INSERT INTO conversation_messages "
+                    "(conversation_id,sender_kind,sender_ref,message_kind,body,"
+                    "idempotency_key,request_hash,state,completed_at) "
+                    "VALUES (?,'user','owner','prompt','bounded rehearsal',"
+                    "'prompt-1','m', 'completed',datetime('now'))",
+                    (self.conversation_id,),
+                ).lastrowid
+            )
+            self.run_id = int(
+                con.execute(
+                    "INSERT INTO conversation_runs "
+                    "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
+                    "lease_expires_at,started_at,ended_at,exit_code) "
+                    "VALUES (?,2,?,'succeeded','rehearsal',datetime('now'),"
+                    "datetime('now'),datetime('now'),0)",
+                    (self.conversation_id, message_id),
+                ).lastrowid
+            )
+            con.commit()
+
+        self.original_server_db = server.DB_PATH
+        server.DB_PATH = self.db
+        self.addCleanup(setattr, server, "DB_PATH", self.original_server_db)
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        self.addCleanup(self.httpd.server_close)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.httpd.shutdown)
+        self.original_api_base = mem.SC_API_BASE
+        self.original_api_token = mem.SC_API_TOKEN
+        mem.SC_API_BASE = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        mem.SC_API_TOKEN = "review-token"
+        self.addCleanup(setattr, mem, "SC_API_BASE", self.original_api_base)
+        self.addCleanup(setattr, mem, "SC_API_TOKEN", self.original_api_token)
+
+    def _normalize_action(
+        self, command: str, receipt: str, *, failed: bool = False
+    ) -> tuple[dict, dict]:
+        adapter = DeepSeekAdapter()
+        turn = NativeTurn(
+            harness="deepseek",
+            session_ref="deepseek-" + "e" * 32,
+            run_ref="rehearsal-run",
+            worktree=self.workspace,
+            metadata={"from_event_seq": 0, "seen_event_seq": set()},
+        )
+        started = adapter._session_event(
+            turn,
+            {
+                "type": "tool/call",
+                "seq": 1,
+                "data": {
+                    "callId": "qaqc-call",
+                    "name": "bash",
+                    "arguments": json.dumps({"cmd": command}),
+                },
+            },
+        )[0]
+        completed = adapter._session_event(
+            turn,
+            {
+                "type": "tool/result",
+                "seq": 2,
+                "data": {
+                    "message": {
+                        "toolCallId": "qaqc-call",
+                        "content": [{"type": "text", "text": receipt}],
+                        "isError": failed,
+                    }
+                },
+            },
+        )[0]
+        self.assertEqual("tool.started", started.type)
+        self.assertEqual("tool.completed", completed.type)
+        return dict(started.payload), dict(completed.payload)
+
+    def _insert_action(self, started: dict, completed: dict) -> None:
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            con.executemany(
+                "INSERT INTO conversation_events "
+                "(conversation_id,sequence,event_type,payload,run_id) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    (
+                        self.conversation_id,
+                        1,
+                        "tool.started",
+                        json.dumps(started),
+                        self.run_id,
+                    ),
+                    (
+                        self.conversation_id,
+                        2,
+                        "tool.completed",
+                        json.dumps(completed),
+                        self.run_id,
+                    ),
+                ),
+            )
+            con.commit()
+
+    def _classify(self) -> tuple[int | None, dict]:
+        backend = canary.HostBackend(canary.Deadline(100, 50))
+
+        def sqlite_run(argv, *, cwd=None, env=None, check=True, label):
+            self.assertEqual("-json", argv[-2])
+            with contextlib.closing(sqlite3.connect(self.db)) as con:
+                con.row_factory = sqlite3.Row
+                rows = [dict(row) for row in con.execute(argv[-1]).fetchall()]
+            return canary.CommandResult(json.dumps(rows), "", 0)
+
+        backend._run = sqlite_run  # type: ignore[method-assign]
+        facts = canary.Preflight(
+            candidate_sha=self.candidate_sha,
+            base_sha="b" * 40,
+            repository="acme/dos-app",
+            remote_url="https://github.com/acme/dos-app.git",
+            workspace=self.workspace,
+            base_branch="canary/base",
+            head_branch="canary/head",
+            container="rehearsal-container",
+            network="rehearsal-network",
+            api_port=1,
+            dev_port=2,
+            github_remaining=5000,
+        )
+        return backend._qaqc_action_evidence(
+            facts,
+            self.conversation_id,
+            reviewer_shell_id=2,
+            document_id=self.document_id,
+        )
+
+    def _record_approval(self) -> dict:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(
+                0,
+                sprint_cli.main(
+                    [
+                        "record-qaqc",
+                        "--document",
+                        str(self.document_id),
+                        "--verdict",
+                        "pass",
+                    ]
+                ),
+            )
+        return json.loads(output.getvalue())
+
+    def test_real_cli_api_and_deepseek_action_events_produce_exact_evidence(self) -> None:
+        command = (
+            f"./sc sprint record-qaqc --document {self.document_id} "
+            "--verdict pass"
+        )
+        self.assertIsNone(shutil.which("sc", path="/usr/local/bin:/usr/bin:/bin"))
+        self.assertTrue((self.workspace / "sc").is_file())
+
+        receipt = self._record_approval()
+        self.assertTrue(receipt["created"])
+        self.assertEqual("pass", receipt["verdict"])
+        self.assertEqual(
+            hashlib.sha256(self.spec_body.encode()).hexdigest(),
+            receipt["revision_sha256"],
+        )
+
+        started, completed = self._normalize_action(command, json.dumps(receipt))
+        self._insert_action(started, completed)
+        approval_id, evidence = self._classify()
+
+        self.assertEqual(receipt["approval_id"], approval_id)
+        self.assertEqual(
+            {
+                "boot": {
+                    "role": "resolved",
+                    "skill": "resolved",
+                    "shell_tool": "resolved",
+                    "candidate": "resolved",
+                    "predeclaration": "resolved",
+                },
+                "terminal": "succeeded",
+                "record_qaqc": {
+                    "observed": True,
+                    "invocation_count": 1,
+                    "exit_class": "success",
+                    "receipt": True,
+                    "identity": "matched",
+                },
+                "postcondition": "approved",
+            },
+            evidence,
+        )
+        self.assertTrue(canary.HostBackend._qaqc_evidence_passed(evidence))
+        encoded = json.dumps(evidence)
+        self.assertNotIn(command, encoded)
+        self.assertNotIn(receipt["revision_sha256"], encoded)
+
+    def test_missing_invocation_and_absent_approval_are_bounded(self) -> None:
+        approval_id, evidence = self._classify()
+
+        self.assertIsNone(approval_id)
+        self.assertEqual("not_invoked", evidence["record_qaqc"]["exit_class"])
+        self.assertFalse(evidence["record_qaqc"]["observed"])
+        self.assertEqual(0, evidence["record_qaqc"]["invocation_count"])
+        self.assertEqual("absent", evidence["postcondition"])
+        self.assertFalse(canary.HostBackend._qaqc_evidence_passed(evidence))
+
+    def test_rejected_command_is_distinct_from_missing_invocation(self) -> None:
+        command = (
+            f"./sc sprint record-qaqc --document {self.document_id} "
+            "--verdict pass"
+        )
+        started, completed = self._normalize_action(
+            command, "bounded rejection", failed=True
+        )
+        self._insert_action(started, completed)
+
+        approval_id, evidence = self._classify()
+
+        self.assertIsNone(approval_id)
+        self.assertTrue(evidence["record_qaqc"]["observed"])
+        self.assertEqual("failure", evidence["record_qaqc"]["exit_class"])
+        self.assertFalse(evidence["record_qaqc"]["receipt"])
+        self.assertEqual("absent", evidence["postcondition"])
+        self.assertFalse(canary.HostBackend._qaqc_evidence_passed(evidence))
+
+    def test_missing_command_receipt_is_distinct_from_green_postcondition(self) -> None:
+        receipt = self._record_approval()
+        command = (
+            f"./sc sprint record-qaqc --document {self.document_id} "
+            "--verdict pass"
+        )
+        started, completed = self._normalize_action(command, "receipt omitted")
+        self._insert_action(started, completed)
+
+        approval_id, evidence = self._classify()
+
+        self.assertEqual(receipt["approval_id"], approval_id)
+        self.assertEqual("success", evidence["record_qaqc"]["exit_class"])
+        self.assertFalse(evidence["record_qaqc"]["receipt"])
+        self.assertEqual("absent", evidence["record_qaqc"]["identity"])
+        self.assertEqual("approved", evidence["postcondition"])
+        self.assertFalse(canary.HostBackend._qaqc_evidence_passed(evidence))
+
+    def test_wrong_command_receipt_identity_is_bounded(self) -> None:
+        receipt = self._record_approval()
+        command = (
+            f"./sc sprint record-qaqc --document {self.document_id} "
+            "--verdict pass"
+        )
+        wrong = {**receipt, "approval_id": receipt["approval_id"] + 100}
+        started, completed = self._normalize_action(command, json.dumps(wrong))
+        self._insert_action(started, completed)
+
+        approval_id, evidence = self._classify()
+
+        self.assertEqual(receipt["approval_id"], approval_id)
+        self.assertTrue(evidence["record_qaqc"]["receipt"])
+        self.assertEqual("mismatch", evidence["record_qaqc"]["identity"])
+        self.assertEqual("approved", evidence["postcondition"])
+        self.assertFalse(canary.HostBackend._qaqc_evidence_passed(evidence))
 
 
 if __name__ == "__main__":
