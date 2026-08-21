@@ -772,13 +772,49 @@ class BuildTest(NoCLI):
                 ("ollama-cloud", configured),
                 ("ollama-cloud", "other-model-0"),
                 ("ollama-cloud", "other-model-1"),
-                ("ollama-cloud", "other-model-2"),
+                ("ollama-cloud", "other-model-10"),
             ],
         )
         self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
         self.assertEqual(
             got["harnesses"]["deepseek"]["error"],
             mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
+        )
+
+    def test_ollama_explicit_model_outside_background_sample_is_proved(self):
+        rows = [
+            {"id": model}
+            for model in ("model-a", "model-b", "model-c", "model-d", "wanted-model")
+        ]
+        proof_calls = []
+
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": rows}
+
+        def prove(provider, model, options_by_effort, env=None):
+            proof_calls.append((provider, model))
+            return deepseek_wire_proof(provider, model, options_by_effort, env)
+
+        got = mc.build(
+            fetch=fetch,
+            env={"OLLAMA_API_KEY": "ollama-secret"},
+            run=None,
+            deepseek_wire_probe=prove,
+            deepseek_selector="ollama-cloud/wanted-model",
+        )
+
+        self.assertEqual(
+            ids(got["harnesses"]["deepseek"]),
+            ["ollama-cloud/wanted-model"],
+        )
+        self.assertEqual(proof_calls, [("ollama-cloud", "wanted-model")])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["authenticated_routes"][0][
+                "selectors"
+            ],
+            [f"ollama-cloud/{row['id']}" for row in rows],
         )
 
     def test_authenticated_provider_rejects_entire_malformed_generation_before_probe(self):
@@ -1329,6 +1365,55 @@ class RoutePersistenceTest(unittest.TestCase):
         self.assertFalse(refused["ok"])
         self.assertEqual(refused["code"], "thinking_evidence_missing")
         self.assertIsNone(refused.get("binding"))
+
+    def test_reordered_catalogue_keeps_explicit_authenticated_route_current(self):
+        rows = [
+            {"id": model}
+            for model in ("model-a", "model-b", "model-c", "model-d", "wanted-model")
+        ]
+
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": rows}
+
+        arguments = {
+            "fetch": fetch,
+            "env": {"OLLAMA_API_KEY": "ollama-secret"},
+            "run": None,
+            "deepseek_wire_probe": deepseek_wire_proof,
+        }
+        status = self.verification("deepseek", "0.1.0rc7")[
+            "verification"
+        ]["harnesses"]["deepseek"]
+        with tempfile.TemporaryDirectory() as raw, mock.patch.object(
+            mc, "CACHE", Path(raw) / "model-catalog.json"
+        ):
+            admitted = mc.ensure_deepseek_route(
+                self.con,
+                "ollama-cloud/wanted-model",
+                **arguments,
+                opencode_provider=lambda: [],
+                harness_probe=lambda: {"deepseek": status},
+            )
+        self.assertIsNotNone(admitted)
+        self.assertEqual(admitted["provider_model"], "wanted-model")
+
+        rows.reverse()
+        background = mc.build(**arguments)
+        background.update(self.verification("deepseek", "0.1.0rc7"))
+        mc.persist_routes(self.con, background)
+
+        route = self.con.execute(
+            "SELECT stale,last_error,generation_id FROM model_routes "
+            "WHERE harness='deepseek' AND selector='ollama-cloud/wanted-model'"
+        ).fetchone()
+        generation = self.con.execute(
+            "SELECT generation_id FROM model_catalog_generations "
+            "ORDER BY completed_at DESC,generation_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(tuple(route)[:2], (0, None))
+        self.assertEqual(route["generation_id"], generation["generation_id"])
 
     def test_failed_refresh_keeps_route_and_marks_it_stale(self):
         fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,

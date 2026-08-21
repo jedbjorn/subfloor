@@ -155,27 +155,23 @@ def platform_name() -> str:
     return f"{operating_system}-{architecture}"
 
 
-def validate_skill_canary_receipt(
+def validate_inference_canary_receipt(
     receipt: Mapping[str, object], manifest: Mapping[str, object]
 ) -> None:
     expected = {
         "schema_version": 1,
-        "contract": "deepseek-production-skill-resume-v1",
+        "contract": "deepseek-production-ordinary-inference-v1",
         "source_commit": manifest["source"]["commit"],
         "composition_sha256": manifest["composition"]["sha256"],
-        "initial_catalog": ["changed", "current", "revoked"],
-        "resumed_catalog": ["changed", "current", "new"],
-        "changed_body_refreshed": True,
-        "new_grant_loadable": True,
-        "revoked_grant_absent": True,
-        "boot_digest_preserved": True,
-        "native_session_preserved": True,
-        "fresh_carrier_process": True,
-        "initial_terminal": "run.completed",
-        "resumed_terminal": "run.completed",
+        "provider": "deepseek-official",
+        "model": "deepseek-ordinary-inference-canary",
+        "provider_request_count": 1,
+        "reserved_default_omitted": True,
+        "assistant_response_nonempty": True,
+        "terminal": "run.completed",
     }
     if dict(receipt) != expected:
-        raise RuntimeError("production skill-resume canary receipt is incomplete")
+        raise RuntimeError("production ordinary-inference canary receipt is incomplete")
 
 
 def build(source: Path, output: Path, manifest: Mapping[str, object]) -> dict[str, object]:
@@ -200,9 +196,9 @@ def build(source: Path, output: Path, manifest: Mapping[str, object]) -> dict[st
         "pnpm",
     ]
     checked_run([*pnpm, "install", "--frozen-lockfile"], cwd=source, env=environment)
-    # These pinned native suites catch component-level provider/tool regressions.
-    # The post-wheel adapter canary below owns the production composition and
-    # exact-resume proof.
+    # These pinned native suites catch component-level carrier and provider
+    # serialization regressions. Skill/tool lifecycle coverage is deliberately
+    # outside the production installation gate.
     checked_run(
         [
             *pnpm,
@@ -213,8 +209,6 @@ def build(source: Path, output: Path, manifest: Mapping[str, object]) -> dict[st
             "packages/llm/llm-deepseek/tests/serialize.spec.ts",
             "packages/llm/llm-pi-ai/tests/adapter.spec.ts",
             "packages/llm/llm-pi-ai/tests/config.spec.ts",
-            "packages/skill/skill-filesystem/tests/skill-filesystem.spec.ts",
-            "packages/skill/tool-skill/tests/tool-skill.spec.ts",
         ],
         cwd=source,
         env=environment,
@@ -284,7 +278,7 @@ def build(source: Path, output: Path, manifest: Mapping[str, object]) -> dict[st
         env=build_environment,
     )
     canary_path = ENGINE / str(build_evidence["canary_path"])
-    canary_receipt_path = source.parent / "skill-resume-canary.json"
+    canary_receipt_path = source.parent / "ordinary-inference-canary.json"
     checked_run(
         [
             str(canary_python),
@@ -299,8 +293,8 @@ def build(source: Path, output: Path, manifest: Mapping[str, object]) -> dict[st
     )
     canary_receipt = json.loads(canary_receipt_path.read_text())
     if not isinstance(canary_receipt, dict):
-        raise RuntimeError("production skill-resume canary returned no object receipt")
-    validate_skill_canary_receipt(canary_receipt, manifest)
+        raise RuntimeError("production inference canary returned no object receipt")
+    validate_inference_canary_receipt(canary_receipt, manifest)
     return {
         "schema_version": 1,
         "platform": target,

@@ -25,16 +25,16 @@
   },
   "build": {
     "path": "scripts/build_deepseek_carrier.py",
-    "sha256": "21ece73a4cdb59673e987e33809aab9f3e0013c6930b050e571b0d49fdd1f396",
+    "sha256": "cf23af255aa3c913bde14c1067fc6ceb9bf9fa329d98d32abaed2c8a9837035a",
     "lock_sha256": "f517dc3978d57531cda747df62a2abdde1df5b9f25415fcf1fc5d51f8b7547ea",
     "node_version": "24.18.1",
     "pnpm_version": "11.7.0",
     "uv_version": "0.11.23",
     "source_date_epoch": 1786963622,
     "artifact_evidence": "deepseek-carrier-artifacts.json",
-    "canary_path": "scripts/deepseek_skill_resume_canary.py",
-    "canary_sha256": "1d0b3640d9579f42e9d0afa386e1f97c8360c6a372ea138534a343c292ddfba1",
-    "canary_contract": "deepseek-production-skill-resume-v1"
+    "canary_path": "scripts/deepseek_inference_canary.py",
+    "canary_sha256": "1e08f846ecd960b212296e279b72508470365f7da0395b57bf2fb65c0d17e2e7",
+    "canary_contract": "deepseek-production-ordinary-inference-v1"
   },
   "sdk": {
     "distribution": "deepseek-harness-sdk",

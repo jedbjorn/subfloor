@@ -718,6 +718,8 @@ def set_flavor_default(con, body) -> tuple[bool, dict | None]:
     observed_route = None
     route_proof = None
     if model is not None:
+        if harness == "deepseek" and (model_supplied or effort_supplied):
+            model_catalog.ensure_deepseek_route(con, model)
         row = con.execute(
             "SELECT * FROM model_routes WHERE harness=? AND selector=?",
             (harness, model),

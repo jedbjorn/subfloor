@@ -138,19 +138,15 @@ def write_artifact_evidence(directory: Path) -> None:
                 },
                 "canary": {
                     "schema_version": 1,
-                    "contract": "deepseek-production-skill-resume-v1",
+                    "contract": "deepseek-production-ordinary-inference-v1",
                     "source_commit": manifest["source"]["commit"],
                     "composition_sha256": manifest["composition"]["sha256"],
-                    "initial_catalog": ["changed", "current", "revoked"],
-                    "resumed_catalog": ["changed", "current", "new"],
-                    "changed_body_refreshed": True,
-                    "new_grant_loadable": True,
-                    "revoked_grant_absent": True,
-                    "boot_digest_preserved": True,
-                    "native_session_preserved": True,
-                    "fresh_carrier_process": True,
-                    "initial_terminal": "run.completed",
-                    "resumed_terminal": "run.completed",
+                    "provider": "deepseek-official",
+                    "model": "deepseek-ordinary-inference-canary",
+                    "provider_request_count": 1,
+                    "reserved_default_omitted": True,
+                    "assistant_response_nonempty": True,
+                    "terminal": "run.completed",
                 },
                 "artifacts": records,
             }
@@ -380,7 +376,7 @@ def test_built_artifact_digest_drift_fails_before_install() -> None:
             raise AssertionError("changed built artifact was accepted")
 
 
-def test_built_artifact_without_production_skill_canary_is_rejected() -> None:
+def test_built_artifact_without_production_inference_canary_is_rejected() -> None:
     with tempfile.TemporaryDirectory() as raw:
         directory = Path(raw)
         write_artifact_evidence(directory)
@@ -397,7 +393,7 @@ def test_built_artifact_without_production_skill_canary_is_rejected() -> None:
             assert exc.code == "HARNESS_RUNTIME_ARTIFACT_DRIFT"
             assert "canary" in exc.detail
         else:
-            raise AssertionError("artifact without production skill canary was accepted")
+            raise AssertionError("artifact without production inference canary was accepted")
 
 
 def test_provider_request_patch_is_callable_exact_and_fail_closed() -> None:

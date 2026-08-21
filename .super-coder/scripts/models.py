@@ -99,6 +99,8 @@ def resolve(con, harness: str, selector: str | None = None, *,
             None, harness, selector, shell=shell, effort=effort, now=now,
             runtime_status=runtime_status, runtime_scope=runtime_scope,
         )
+    if harness == "deepseek":
+        model_catalog.ensure_deepseek_route(con, selector)
     observed_row = _route(con, harness, selector)
     return resolve_row(
         observed_row, harness, selector, shell=shell, effort=effort, now=now,

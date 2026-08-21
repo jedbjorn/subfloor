@@ -432,6 +432,7 @@ def _from_deepseek_provider(
     wire_probe=None,
     *,
     selector=None,
+    discovery_out=None,
 ) -> list[dict]:
     """Read exact models through one reviewed provider-specific credential."""
     _manifest, providers, registry_digest = _deepseek_provider_registry()
@@ -480,6 +481,15 @@ def _from_deepseek_provider(
         "models": sorted(model for _row, model in exact_rows),
         "provider_registry_sha256": registry_digest,
     })
+    if discovery_out is not None:
+        discovery_out.update({
+            "provider": provider,
+            "selectors": [
+                f"{provider}/{model}" if adapter["selector_prefix"] else model
+                for _row, model in exact_rows
+            ],
+            "discovery_evidence_digest": discovery_evidence_digest,
+        })
     configured = adapter["model_selectors"]
     if selector is not None:
         exact_rows = [
@@ -499,7 +509,10 @@ def _from_deepseek_provider(
             (row, model) for row, model in exact_rows if model in configured_set
         ]
     else:
-        exact_rows = exact_rows[: adapter["wire_proof_budget"]]
+        if len(exact_rows) > adapter["wire_proof_budget"]:
+            exact_rows = sorted(exact_rows, key=lambda item: item[1])[
+                : adapter["wire_proof_budget"]
+            ]
     if len(exact_rows) > adapter["wire_proof_budget"]:
         raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
     for row, model in exact_rows:
@@ -663,6 +676,7 @@ def build(
     env=os.environ,
     run=subprocess.run,
     deepseek_wire_probe=None,
+    deepseek_selector=None,
 ) -> dict:
     """One live sweep across all sources. Raises only if EVERY source fails —
     partial results (e.g. models.dev down but a keyed API up) still count."""
@@ -679,6 +693,7 @@ def build(
         harnesses[harness] = _merge(harnesses.get(harness, []), extra)
         sources.append(f"{HARNESS_PROVIDER[harness]}-api")
     deepseek = []
+    authenticated_deepseek_routes = []
     attempted_providers = []
     provider_errors = []
     try:
@@ -695,12 +710,30 @@ def build(
             continue
         attempted_providers.append(provider)
         source = DEEPSEEK_SOURCE if provider == "deepseek-official" else OLLAMA_CLOUD_SOURCE
+        selected_for_provider = (
+            deepseek_selector
+            if (
+                (
+                    provider == "ollama-cloud"
+                    and str(deepseek_selector).startswith("ollama-cloud/")
+                )
+                or (
+                    provider == "deepseek-official"
+                    and deepseek_selector is not None
+                    and not str(deepseek_selector).startswith("ollama-cloud/")
+                )
+            )
+            else None
+        )
+        discovery = {}
         try:
             observed = _from_deepseek_provider(
                 provider,
                 fetch,
                 env,
                 wire_probe=deepseek_wire_probe,
+                selector=selected_for_provider,
+                discovery_out=discovery,
             )
         except _ModelCatalogueLimitError:
             provider_errors.append((source, DEEPSEEK_DISCOVERY_LIMIT_ERROR))
@@ -726,6 +759,7 @@ def build(
             provider_errors.append((source, DEEPSEEK_DISCOVERY_ERROR))
             continue
         deepseek = _merge(deepseek, observed)
+        authenticated_deepseek_routes.append(discovery)
         if observed:
             sources.append(source)
     if attempted_providers:
@@ -745,7 +779,7 @@ def build(
         sources.append(entries[0]["source"])
     if not sources:
         raise RuntimeError("; ".join(errors) or "no catalog sources available")
-    return {"v": PAYLOAD_VERSION,
+    result = {"v": PAYLOAD_VERSION,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "sources": sources,
             "partial": bool(errors),
@@ -755,6 +789,11 @@ def build(
                               **({"error": harness_errors[h]}
                                  if h in harness_errors else {})}
                           for h, entries in harnesses.items()}}
+    if "deepseek" in result["harnesses"]:
+        result["harnesses"]["deepseek"][
+            "authenticated_routes"
+        ] = authenticated_deepseek_routes
+    return result
 
 
 def _load_cache() -> dict | None:
@@ -1201,6 +1240,36 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
     verification = payload.get("verification") or {}
     harness_statuses = verification.get("harnesses") or {}
     source_fingerprints: dict[str, str] = {}
+    carried_deepseek_routes: dict[str, str] = {}
+    deepseek_block = (payload.get("harnesses") or {}).get("deepseek") or {}
+    authenticated_routes = {
+        item.get("provider"): item
+        for item in deepseek_block.get("authenticated_routes") or []
+        if isinstance(item, dict)
+    }
+    if authenticated_routes and not failed:
+        for row in con.execute(
+            "SELECT selector,provider,selector_binding,source_fingerprint "
+            "FROM model_routes WHERE harness='deepseek' AND stale=0"
+        ).fetchall():
+            route = dict(row)
+            authenticated = authenticated_routes.get(route["provider"])
+            try:
+                binding = json.loads(route["selector_binding"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(authenticated, dict)
+                and route["selector"] in (authenticated.get("selectors") or [])
+                and binding.get("discovery_evidence_digest")
+                == authenticated.get("discovery_evidence_digest")
+            ):
+                carried_deepseek_routes[route["selector"]] = route[
+                    "source_fingerprint"
+                ]
+                source_fingerprints[
+                    f"deepseek/{route['selector']}"
+                ] = route["source_fingerprint"]
     evidence_by_route: dict[tuple[str, str], dict] = {}
     rejected_routes: dict[tuple[str, str], str] = {}
     for harness, block in (payload.get("harnesses") or {}).items():
@@ -1340,6 +1409,14 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
                             route_bindings.canonical_json(evidence["adapter_metadata"]),
                         ),
                     )
+                if harness == "deepseek":
+                    for selector in carried_deepseek_routes:
+                        con.execute(
+                            "UPDATE model_routes SET stale=0,last_error=NULL,"
+                            "last_seen_at=?,generation_id=? "
+                            "WHERE harness='deepseek' AND selector=?",
+                            (completed_at, generation_id, selector),
+                        )
     payload["catalogue_generation"] = generation_id
     payload["generation_state"] = state
     payload["generation_published"] = publish_projection
@@ -1659,11 +1736,50 @@ def current_source_fingerprint(harness: str, selector: str, *, env=os.environ,
     return evidence["source_fingerprint"]
 
 
+def ensure_deepseek_route(
+    con,
+    selector: str,
+    *,
+    fetch=_http_json,
+    env=os.environ,
+    run=subprocess.run,
+    opencode_provider=opencode_connected_models,
+    harness_probe=harness_versions.compatibility_status,
+    deepseek_wire_probe=None,
+) -> dict | None:
+    """Publish one explicitly selected authenticated route outside the sample."""
+    row = con.execute(
+        "SELECT * FROM model_routes WHERE harness='deepseek' AND selector=?",
+        (selector,),
+    ).fetchone()
+    if row is not None and not row["stale"]:
+        return dict(row)
+    try:
+        catalog(
+            refresh=True,
+            fetch=fetch,
+            env=env,
+            run=run,
+            con=con,
+            opencode_provider=opencode_provider,
+            harness_probe=harness_probe,
+            deepseek_wire_probe=deepseek_wire_probe,
+            deepseek_selector=selector,
+        )
+    except Exception:  # noqa: BLE001 (provider diagnostics remain redacted)
+        return None
+    row = con.execute(
+        "SELECT * FROM model_routes WHERE harness='deepseek' AND selector=?",
+        (selector,),
+    ).fetchone()
+    return dict(row) if row is not None and not row["stale"] else None
+
+
 def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
             run=subprocess.run, con=None,
             opencode_provider=opencode_connected_models,
             harness_probe=harness_versions.compatibility_status,
-            deepseek_wire_probe=None) -> dict:
+            deepseek_wire_probe=None, deepseek_selector=None) -> dict:
     """The cached-with-fallbacks entry point the API serves.
 
     fresh cache → serve it; miss/stale/refresh → live sweep, cache the result;
@@ -1690,7 +1806,8 @@ def catalog(refresh: bool = False, fetch=_http_json, env=os.environ,
     refresh_started_at = datetime.now(timezone.utc).isoformat()
     try:
         fresh = build(
-            fetch, env, run, deepseek_wire_probe=deepseek_wire_probe
+            fetch, env, run, deepseek_wire_probe=deepseek_wire_probe,
+            deepseek_selector=deepseek_selector,
         )
     except Exception as e:  # noqa: BLE001
         refresh_completed_at = datetime.now(timezone.utc).isoformat()

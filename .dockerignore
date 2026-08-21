@@ -9,7 +9,7 @@
 !.super-coder/scripts/build_deepseek_carrier.py
 !.super-coder/scripts/cli_entry.py
 !.super-coder/scripts/deepseek_carrier_worker.py
-!.super-coder/scripts/deepseek_skill_resume_canary.py
+!.super-coder/scripts/deepseek_inference_canary.py
 !.super-coder/assets
 !.super-coder/assets/deepseek
 !.super-coder/assets/deepseek/**

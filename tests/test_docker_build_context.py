@@ -19,7 +19,7 @@ REQUIRED_SCRIPTS = {
     ".super-coder/scripts/cli_entry.py",
     ".super-coder/scripts/deepseek_carrier_worker.py",
     ".super-coder/scripts/deepseek_runtime.py",
-    ".super-coder/scripts/deepseek_skill_resume_canary.py",
+    ".super-coder/scripts/deepseek_inference_canary.py",
 }
 BOOTSTRAP_ENTRYPOINTS = {
     ".super-coder/scripts/cli_entry.py",
@@ -33,7 +33,7 @@ EXPECTED_RULES = [
     "!.super-coder/scripts/build_deepseek_carrier.py",
     "!.super-coder/scripts/cli_entry.py",
     "!.super-coder/scripts/deepseek_carrier_worker.py",
-    "!.super-coder/scripts/deepseek_skill_resume_canary.py",
+    "!.super-coder/scripts/deepseek_inference_canary.py",
     "!.super-coder/assets",
     f"!{DEEPSEEK_ASSETS}",
     f"!{DEEPSEEK_ASSETS}/**",
@@ -200,7 +200,7 @@ from pathlib import Path
 scripts = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(scripts))
 import deepseek_runtime
-import deepseek_skill_resume_canary
+import deepseek_inference_canary
 
 manifest = deepseek_runtime.load_runtime_manifest()
 print(json.dumps({
@@ -209,8 +209,8 @@ print(json.dumps({
     "runtime_module": str(
         Path(deepseek_runtime.__file__).resolve().relative_to(scripts)
     ),
-    "skill_canary": str(
-        Path(deepseek_skill_resume_canary.__file__).resolve().relative_to(scripts)
+    "inference_canary": str(
+        Path(deepseek_inference_canary.__file__).resolve().relative_to(scripts)
     ),
     "worker": manifest["carrier"]["worker_path"],
 }, sort_keys=True))
@@ -228,8 +228,8 @@ print(json.dumps({
     assert result.stderr == ""
     assert json.loads(result.stdout) == {
         "build": "scripts/build_deepseek_carrier.py",
-        "canary": "scripts/deepseek_skill_resume_canary.py",
+        "canary": "scripts/deepseek_inference_canary.py",
         "runtime_module": "deepseek_runtime.py",
-        "skill_canary": "deepseek_skill_resume_canary.py",
+        "inference_canary": "deepseek_inference_canary.py",
         "worker": "scripts/deepseek_carrier_worker.py",
     }
