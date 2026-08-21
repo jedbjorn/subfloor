@@ -205,10 +205,11 @@ def _validate_extension_dockerfile(path: Path) -> None:
         )
     if not from_positions:
         raise SandboxImageError("sandbox.dockerfile: must contain a FROM instruction")
-    final_index, final_from = from_positions[-1]
-    if min(arg_positions) > final_index:
+    _, final_from = from_positions[-1]
+    first_from_index = from_positions[0][0]
+    if min(arg_positions) > first_from_index:
         raise SandboxImageError(
-            "sandbox.dockerfile: ARG SC_BASE_IMAGE must precede the final FROM"
+            "sandbox.dockerfile: ARG SC_BASE_IMAGE must be global (before the first FROM)"
         )
     if not re.fullmatch(
         r"FROM\s+(?:--platform=\S+\s+)?\$\{SC_BASE_IMAGE\}(?:\s+AS\s+\S+)?",
@@ -763,16 +764,18 @@ def _run_archive_build(command: Sequence[str], archive: bytes, *, runner: Runner
         )
 
 
-def _apt_dockerfile(packages: Sequence[AptPackage]) -> str:
+def _apt_dockerfile(packages: Sequence[AptPackage], user: str) -> str:
     install = ["apt-get", "install", "-y", "--no-install-recommends"]
     install.extend(package.atom for package in packages)
     return "\n".join(
         (
             "ARG SC_BASE_IMAGE",
             "FROM ${SC_BASE_IMAGE}",
+            "USER root",
             'RUN ["apt-get", "update"]',
             "RUN " + json.dumps(install, separators=(",", ":")),
             'RUN ["sh", "-c", "rm -rf /var/lib/apt/lists/*"]',
+            f"USER {user}",
             "",
         )
     )
@@ -780,7 +783,6 @@ def _apt_dockerfile(packages: Sequence[AptPackage]) -> str:
 
 def _build_package_layer(
     plan: ImagePlan,
-    base_id: str,
     labels: dict[str, str],
     *,
     runner: Runner,
@@ -794,7 +796,7 @@ def _build_package_layer(
             "-f",
             "-",
             "--build-arg",
-            f"SC_BASE_IMAGE={base_id}",
+            f"SC_BASE_IMAGE={plan.base_tag}",
             *_label_arguments(labels),
             empty_context,
         ]
@@ -804,7 +806,7 @@ def _build_package_layer(
                 check=False,
                 text=True,
                 capture_output=True,
-                input=_apt_dockerfile(plan.packages),
+                input=_apt_dockerfile(plan.packages, plan.user),
             )
         except OSError as exc:
             raise SandboxPrerequisiteError(f"cannot run docker: {exc}") from exc
@@ -818,7 +820,6 @@ def _build_package_layer(
 
 def _build_package_runtime(
     plan: ImagePlan,
-    package_id: str,
     labels: dict[str, str],
     *,
     runner: Runner,
@@ -833,7 +834,7 @@ def _build_package_runtime(
             "-f",
             "-",
             "--build-arg",
-            f"SC_BASE_IMAGE={package_id}",
+            f"SC_BASE_IMAGE={plan.package_layer_tag}",
             *_label_arguments(labels),
             empty_context,
         ]
@@ -1350,9 +1351,7 @@ def build_images(
                 package_layer_id="self",
                 context_digest="none",
             )
-            package_id = _build_package_layer(
-                plan, base_id, package_labels, runner=runner
-            )
+            package_id = _build_package_layer(plan, package_labels, runner=runner)
             final_tag, final_id = plan.package_layer_tag, package_id
         if plan.extends_base:
             context_digest, archive, dockerfile_relative = _tracked_context(
@@ -1374,7 +1373,7 @@ def build_images(
                 "-f",
                 dockerfile_relative,
                 "--build-arg",
-                f"SC_BASE_IMAGE={final_id}",
+                f"SC_BASE_IMAGE={final_tag}",
                 *_label_arguments(extension_labels),
                 "-",
             ]
@@ -1391,9 +1390,7 @@ def build_images(
                 context_digest="none",
             )
             final_tag = plan.package_tag
-            final_id = _build_package_runtime(
-                plan, package_id, runtime_labels, runner=runner
-            )
+            final_id = _build_package_runtime(plan, runtime_labels, runner=runner)
         if plan.has_package_contract:
             proof, proof_digest, proof_command = _prove_packages(
                 final_id, plan.packages, runner=runner

@@ -346,6 +346,21 @@ class SandboxImagePlanTest(unittest.TestCase):
                 with self.assertRaisesRegex(SandboxImageError, "SC_BASE_IMAGE"):
                     fixture.plan()
 
+    def test_extension_base_arg_must_be_global_before_first_stage(self):
+        fixture = ImageFixture(self.base, "stage-local-arg")
+        dockerfile = fixture.context / "Fork.Dockerfile"
+        dockerfile.write_text(
+            "FROM busybox AS source\n"
+            "ARG SC_BASE_IMAGE\n"
+            "FROM ${SC_BASE_IMAGE}\n"
+        )
+
+        with self.assertRaisesRegex(
+            SandboxImageError,
+            r"ARG SC_BASE_IMAGE must be global \(before the first FROM\)",
+        ):
+            fixture.plan()
+
     def test_missing_docker_is_a_host_prerequisite_error_not_invalid_state(self):
         fixture = ImageFixture(self.base, "missing-docker")
         completed = subprocess.run(
@@ -397,7 +412,7 @@ class SandboxImagePlanTest(unittest.TestCase):
         self.assertNotIn("state: invalid", completed.stderr)
         self.assertNotIn("--no-build cannot reuse", completed.stderr)
 
-    def test_build_uses_immutable_base_id_exact_context_and_required_labels(self):
+    def test_build_uses_local_base_tag_exact_context_and_required_labels(self):
         fixture = ImageFixture(self.base, "fork")
         plan = fixture.plan()
         docker = FakeDocker()
@@ -424,7 +439,8 @@ class SandboxImagePlanTest(unittest.TestCase):
         self.assertIn("SC_PARENT_IMAGE=python:3.12-slim", base)
         self.assertNotIn("SC_PARENT_IMAGE=sha256:" + "a" * 64, base)
         self.assertIn("sc.parent_id=sha256:" + "a" * 64, base)
-        self.assertIn("SC_BASE_IMAGE=sha256:" + "b" * 64, extension)
+        self.assertIn(f"SC_BASE_IMAGE={plan.base_tag}", extension)
+        self.assertNotIn("SC_BASE_IMAGE=sha256:" + "b" * 64, extension)
         for key, value in plan.runtime_labels.items():
             self.assertIn(f"{key}={value}", extension)
         self.assertEqual(
@@ -473,20 +489,24 @@ class SandboxImagePlanTest(unittest.TestCase):
         package_build = next(
             command for command in docker.builds() if "-package-layer-" in command[command.index("-t") + 1]
         )
-        self.assertIn("SC_BASE_IMAGE=sha256:" + "b" * 64, package_build)
+        self.assertIn(f"SC_BASE_IMAGE={plan.base_tag}", package_build)
+        self.assertNotIn("SC_BASE_IMAGE=sha256:" + "b" * 64, package_build)
         dockerfile = docker.inputs[docker.commands.index(package_build)]
         self.assertEqual(
             dockerfile,
             "ARG SC_BASE_IMAGE\n"
             "FROM ${SC_BASE_IMAGE}\n"
+            "USER root\n"
             'RUN ["apt-get", "update"]\n'
             'RUN ["apt-get","install","-y","--no-install-recommends","curl","jq=1.6-2.1"]\n'
-            'RUN ["sh", "-c", "rm -rf /var/lib/apt/lists/*"]\n',
+            'RUN ["sh", "-c", "rm -rf /var/lib/apt/lists/*"]\n'
+            "USER tester\n",
         )
         runtime_build = next(
             command for command in docker.builds() if "-packages-" in command[command.index("-t") + 1]
         )
-        self.assertIn("SC_BASE_IMAGE=sha256:" + "k" * 64, runtime_build)
+        self.assertIn(f"SC_BASE_IMAGE={plan.package_layer_tag}", runtime_build)
+        self.assertNotIn("SC_BASE_IMAGE=sha256:" + "k" * 64, runtime_build)
         self.assertIn("sc.package_layer_id=sha256:" + "k" * 64, runtime_build)
         proof_command = next(
             command
@@ -507,6 +527,22 @@ class SandboxImagePlanTest(unittest.TestCase):
         self.assertEqual(receipt["format_version"], 2)
         self.assertTrue(receipt["source_tracked_clean"])
         self.assertEqual(preflight_image(plan, runner=docker), plan.package_tag)
+
+    def test_extension_build_uses_local_package_layer_tag(self):
+        fixture = ImageFixture(self.base, "package-extension", packages=["curl"])
+        plan = fixture.plan()
+        docker = FakeDocker()
+
+        self.assertEqual(build_images(plan, runner=docker), plan.runtime_tag)
+
+        extension_build = next(
+            command
+            for command in docker.builds()
+            if command[command.index("-t") + 1] == plan.runtime_tag
+        )
+        self.assertIn(f"SC_BASE_IMAGE={plan.package_layer_tag}", extension_build)
+        self.assertNotIn("SC_BASE_IMAGE=sha256:" + "k" * 64, extension_build)
+        self.assertIn("sc.package_layer_id=sha256:" + "k" * 64, extension_build)
 
     def test_pinned_version_mismatch_falls_back_to_fresh_engine_baseline(self):
         fixture = ImageFixture(
