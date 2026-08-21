@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import fnmatch
+import json
+import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path, PurePosixPath
 
 
@@ -12,6 +16,7 @@ DOCKERIGNORE = ROOT / ".dockerignore"
 DEEPSEEK_ASSETS = ".super-coder/assets/deepseek"
 REQUIRED_SCRIPTS = {
     ".super-coder/scripts/build_deepseek_carrier.py",
+    ".super-coder/scripts/cli_entry.py",
     ".super-coder/scripts/deepseek_runtime.py",
 }
 EXPECTED_RULES = [
@@ -20,6 +25,7 @@ EXPECTED_RULES = [
     "!.super-coder/scripts",
     "!.super-coder/scripts/deepseek_runtime.py",
     "!.super-coder/scripts/build_deepseek_carrier.py",
+    "!.super-coder/scripts/cli_entry.py",
     "!.super-coder/assets",
     f"!{DEEPSEEK_ASSETS}",
     f"!{DEEPSEEK_ASSETS}/**",
@@ -98,3 +104,57 @@ def test_sandbox_context_rejects_mutable_and_secret_bearing_neighbors() -> None:
     }
 
     assert {path for path in prohibited if _is_copyable(path, rules)} == set()
+
+
+def test_isolated_bootstrap_resolves_cli_entry(tmp_path: Path) -> None:
+    bootstrap = tmp_path / "deepseek-bootstrap"
+    scripts = bootstrap / "scripts"
+    scripts.mkdir(parents=True)
+    for source in sorted(REQUIRED_SCRIPTS):
+        shutil.copy2(ROOT / source, scripts / Path(source).name)
+    shutil.copytree(ROOT / DEEPSEEK_ASSETS, bootstrap / "assets" / "deepseek")
+
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    probe = """
+import ast
+import json
+import sys
+from pathlib import Path
+
+scripts = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(scripts))
+import cli_entry
+import deepseek_runtime
+
+tree = ast.parse(Path(deepseek_runtime.__file__).read_text())
+imports_cli_entry = any(
+    isinstance(node, ast.ImportFrom)
+    and node.module == "cli_entry"
+    and [(alias.name, alias.asname) for alias in node.names] == [("run_cli", None)]
+    for node in ast.walk(tree)
+)
+if not imports_cli_entry:
+    raise SystemExit("deepseek_runtime production CLI edge is missing")
+print(json.dumps({
+    "cli_entry": str(Path(cli_entry.__file__).resolve().relative_to(scripts)),
+    "deepseek_runtime": str(
+        Path(deepseek_runtime.__file__).resolve().relative_to(scripts)
+    ),
+}, sort_keys=True))
+"""
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", probe, str(scripts)],
+        cwd=tmp_path,
+        env={**environment, "PYTHONNOUSERSITE": "1"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert json.loads(result.stdout) == {
+        "cli_entry": "cli_entry.py",
+        "deepseek_runtime": "deepseek_runtime.py",
+    }
