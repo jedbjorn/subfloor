@@ -1378,14 +1378,16 @@ class HostBackend:
         self._port_sockets: list[socket.socket] = []
         self._provider_key: str | None = None
         self._deepseek_model: str | None = None
+        self._deepseek_admission: dict[str, Any] | None = None
+        self._deepseek_candidates: list[tuple[str, dict[str, Any]]] = []
 
-    def _selected_deepseek_model(self) -> str:
-        if self._deepseek_model is None:
+    def _candidate_deepseek_routes(self) -> list[tuple[str, dict[str, Any]]]:
+        if not self._deepseek_candidates:
             raise CanaryError(
                 "CANARY_ROUTE_NOT_ADMITTED",
-                "no exact DeepSeek Sprint route was selected",
+                "no bounded exact DeepSeek Sprint candidate passed route admission",
             )
-        return self._deepseek_model
+        return list(self._deepseek_candidates)
 
     @staticmethod
     def _validate_credential_file(path: Path | None) -> Path:
@@ -2054,8 +2056,7 @@ class HostBackend:
                     label="list bounded deepseek candidates",
                 )
             )
-            route_admission = None
-            selected_model = None
+            admitted_candidates: list[tuple[str, dict[str, Any]]] = []
             for candidate in candidates:
                 admission = _validated_route_admission(
                     self._run(
@@ -2076,15 +2077,14 @@ class HostBackend:
                     candidate,
                 )
                 if admission["admitted"]:
-                    route_admission = admission
-                    selected_model = candidate
-                    break
-            if route_admission is None or selected_model is None:
+                    admitted_candidates.append((candidate, admission))
+            if not admitted_candidates:
                 raise CanaryError(
                     "CANARY_ROUTE_NOT_ADMITTED",
                     "no bounded exact DeepSeek Sprint candidate was admitted",
                 )
-            self._deepseek_model = selected_model
+            self._deepseek_candidates = admitted_candidates
+            route_admission = None
         else:
             route_admission = None
         status = self._run(
@@ -2706,7 +2706,7 @@ class HostBackend:
         facts: Preflight,
         reviewer_id: str,
         *,
-        sprint_id: int,
+        sprint_id: int | None,
         reviewer_shell_id: int,
         document_id: int,
     ) -> tuple[int | None, dict[str, Any]]:
@@ -2917,108 +2917,112 @@ class HostBackend:
             postcondition = "absent"
             approval_id = None
 
-        binding_query = (
-            "SELECT sprint.conversation_generation,participant.participant_id "
-            "FROM sprints sprint JOIN sprint_participants participant "
-            "ON participant.sprint_id=sprint.sprint_id "
-            f"WHERE sprint.sprint_id={sprint_id} "
-            f"AND participant.shell_id={reviewer_shell_id} "
-            "AND participant.role='reviewer';"
-        )
-        binding_rows = _json_output(
-            self._run(
-                [
-                    "docker",
-                    "exec",
-                    facts.container,
-                    "./sc",
-                    "sql",
-                    "-json",
-                    binding_query,
-                ],
+        receipt_count = 0
+        action_identity = "absent"
+        if sprint_id is not None:
+            binding_query = (
+                "SELECT sprint.conversation_generation,participant.participant_id "
+                "FROM sprints sprint JOIN sprint_participants participant "
+                "ON participant.sprint_id=sprint.sprint_id "
+                f"WHERE sprint.sprint_id={sprint_id} "
+                f"AND participant.shell_id={reviewer_shell_id} "
+                "AND participant.role='reviewer';"
+            )
+            binding_rows = _json_output(
+                self._run(
+                    [
+                        "docker",
+                        "exec",
+                        facts.container,
+                        "./sc",
+                        "sql",
+                        "-json",
+                        binding_query,
+                    ],
+                    label="read bounded QA/QC participant binding",
+                ),
                 label="read bounded QA/QC participant binding",
-            ),
-            label="read bounded QA/QC participant binding",
-        )
-        binding = binding_rows[0] if len(binding_rows) == 1 else {}
-        events_page = api.request(
-            "GET", f"/api/sprints/{sprint_id}/events?limit=100"
-        )
-        receipt_events = [
-            item
-            for item in events_page.get("items") or []
-            if isinstance(item, dict) and item.get("type") == "qaqc.action_recorded"
-        ]
-        receipt_count = min(len(receipt_events), 64)
-        if not receipt_events:
-            action_identity = "absent"
-        elif len(receipt_events) != 1:
-            action_identity = "duplicate"
-        else:
-            event = receipt_events[0]
-            details = event.get("details")
-            actor = event.get("actor")
-            required_receipt_keys = {
-                "action_kind",
-                "sprint_id",
-                "participant_id",
-                "reviewer_shell_id",
-                "role",
-                "assignment_generation",
-                "conversation_id",
-                "session_id",
-                "run_id",
-                "candidate_sha",
-                "document_id",
-                "revision_sha256",
-                "review_phase",
-                "approval_id",
-                "approval_created",
-            }
-            if (
-                not isinstance(details, dict)
-                or set(details) != required_receipt_keys
-                or not isinstance(actor, dict)
-                or details.get("action_kind") != "record-qaqc"
-            ):
-                action_identity = "malformed"
-            elif details.get("sprint_id") != sprint_id:
-                action_identity = "sprint_mismatch"
-            elif details.get("participant_id") != binding.get("participant_id"):
-                action_identity = "participant_mismatch"
-            elif (
-                details.get("reviewer_shell_id") != reviewer_shell_id
-                or actor.get("shell_id") != reviewer_shell_id
-                or actor.get("kind") != "participant"
-            ):
-                action_identity = "shell_mismatch"
-            elif details.get("role") != "reviewer":
-                action_identity = "role_mismatch"
-            elif details.get("assignment_generation") != binding.get(
-                "conversation_generation"
-            ):
-                action_identity = "generation_mismatch"
-            elif details.get("conversation_id") != reviewer_id:
-                action_identity = "conversation_mismatch"
-            elif details.get("session_id") != row.get("terminal_session_id"):
-                action_identity = "session_mismatch"
-            elif details.get("run_id") != row.get("terminal_run_id"):
-                action_identity = "run_mismatch"
-            elif details.get("candidate_sha") != facts.candidate_sha:
-                action_identity = "candidate_mismatch"
-            elif (
-                details.get("document_id") != document_id
-                or details.get("revision_sha256") != revision
-            ):
-                action_identity = "spec_mismatch"
-            elif details.get("review_phase") != "pre-arm-qaqc":
-                action_identity = "phase_mismatch"
-            elif approval_id is None or details.get("approval_id") != approval_id:
-                action_identity = "approval_mismatch"
-            elif details.get("approval_created") is not True:
-                action_identity = "row_mismatch"
+            )
+            binding = binding_rows[0] if len(binding_rows) == 1 else {}
+            events_page = api.request(
+                "GET", f"/api/sprints/{sprint_id}/events?limit=100"
+            )
+            receipt_events = [
+                item
+                for item in events_page.get("items") or []
+                if isinstance(item, dict)
+                and item.get("type") == "qaqc.action_recorded"
+            ]
+            receipt_count = min(len(receipt_events), 64)
+            if not receipt_events:
+                action_identity = "absent"
+            elif len(receipt_events) != 1:
+                action_identity = "duplicate"
             else:
-                action_identity = "matched"
+                event = receipt_events[0]
+                details = event.get("details")
+                actor = event.get("actor")
+                required_receipt_keys = {
+                    "action_kind",
+                    "sprint_id",
+                    "participant_id",
+                    "reviewer_shell_id",
+                    "role",
+                    "assignment_generation",
+                    "conversation_id",
+                    "session_id",
+                    "run_id",
+                    "candidate_sha",
+                    "document_id",
+                    "revision_sha256",
+                    "review_phase",
+                    "approval_id",
+                    "approval_created",
+                }
+                if (
+                    not isinstance(details, dict)
+                    or set(details) != required_receipt_keys
+                    or not isinstance(actor, dict)
+                    or details.get("action_kind") != "record-qaqc"
+                ):
+                    action_identity = "malformed"
+                elif details.get("sprint_id") != sprint_id:
+                    action_identity = "sprint_mismatch"
+                elif details.get("participant_id") != binding.get("participant_id"):
+                    action_identity = "participant_mismatch"
+                elif (
+                    details.get("reviewer_shell_id") != reviewer_shell_id
+                    or actor.get("shell_id") != reviewer_shell_id
+                    or actor.get("kind") != "participant"
+                ):
+                    action_identity = "shell_mismatch"
+                elif details.get("role") != "reviewer":
+                    action_identity = "role_mismatch"
+                elif details.get("assignment_generation") != binding.get(
+                    "conversation_generation"
+                ):
+                    action_identity = "generation_mismatch"
+                elif details.get("conversation_id") != reviewer_id:
+                    action_identity = "conversation_mismatch"
+                elif details.get("session_id") != row.get("terminal_session_id"):
+                    action_identity = "session_mismatch"
+                elif details.get("run_id") != row.get("terminal_run_id"):
+                    action_identity = "run_mismatch"
+                elif details.get("candidate_sha") != facts.candidate_sha:
+                    action_identity = "candidate_mismatch"
+                elif (
+                    details.get("document_id") != document_id
+                    or details.get("revision_sha256") != revision
+                ):
+                    action_identity = "spec_mismatch"
+                elif details.get("review_phase") != "pre-arm-qaqc":
+                    action_identity = "phase_mismatch"
+                elif approval_id is None or details.get("approval_id") != approval_id:
+                    action_identity = "approval_mismatch"
+                elif details.get("approval_created") is not True:
+                    action_identity = "row_mismatch"
+                else:
+                    action_identity = "matched"
 
         receipt_matches_by_ref: dict[str, list[dict[str, Any]]] = {}
         for tool_ref, _payload in tool_started:
@@ -3072,6 +3076,14 @@ class HostBackend:
             if len(matched_receipts) == 1
             else "mismatch" if returned_receipts else "absent"
         )
+        if sprint_id is None:
+            receipt_count = min(len(matched_receipts), 64)
+            action_identity = (
+                "matched"
+                if len(matched_receipts) == 1 and approval_id is not None
+                else "duplicate" if len(matched_receipts) > 1
+                else "absent"
+            )
         evidence = {
             "boot": boot,
             "terminal": terminal,
@@ -4313,9 +4325,13 @@ raise TimeoutError("controller did not close the Force-new barrier")
         deterministic_path = f"canary/{config.run_id}.txt"
         deterministic_content = f"subfloor sprint canary {facts.candidate_sha}"
         deepseek_profile = config.profile == DEEPSEEK_SPRINT_PROFILE
-        deepseek_model = (
-            self._selected_deepseek_model() if deepseek_profile else ""
+        candidate_routes = (
+            self._candidate_deepseek_routes() if deepseek_profile else []
         )
+        qualification_titles = [
+            f"Reviewer route qualification {config.run_id} {index}"
+            for index, _route in enumerate(candidate_routes, start=1)
+        ]
 
         stage("planner_prepare")
         planner = self._create_conversation(
@@ -4337,6 +4353,15 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 "You are the Planner for an unattended source-maintainer canary. "
                 f"Create one in_progress roadmap feature titled exactly {feature_title!r}, "
                 f"one unfrozen spec titled exactly {spec_title!r}, and one pending task. "
+                + (
+                    "Also create one unfrozen, task-free QA/QC qualification spec for "
+                    "each exact title in this JSON array; keep every qualification body "
+                    "limited to the same deterministic-file and ephemeral-PR safety "
+                    f"contract: {json.dumps(qualification_titles, separators=(',', ':'))}. "
+                    if deepseek_profile
+                    else ""
+                )
+                +
                 "The spec must require DEV1 to create exactly one deterministic file and a "
                 "real GitHub PR against the named ephemeral base, with REV1 reviewing through "
                 f"{'DeepSeek Harness' if deepseek_profile else 'Kimi'}. "
@@ -4367,8 +4392,98 @@ raise TimeoutError("controller did not close the Force-new barrier")
         document_id = int(documents[0]["document_id"])
         task_id = int(tasks[0]["task_id"])
 
+        qualification_documents: dict[str, int] = {}
+        if deepseek_profile:
+            feature_documents = list(feature.get("documents") or [])
+            for title in qualification_titles:
+                matches = [
+                    item
+                    for item in feature_documents
+                    if item.get("kind") == "spec" and item.get("title") == title
+                ]
+                if len(matches) != 1:
+                    raise CanaryError(
+                        "CANARY_PLAN_FAILED",
+                        "Planner did not create every isolated route qualification spec",
+                    )
+                qualification_documents[title] = int(matches[0]["document_id"])
+
         reviewer_harness = "deepseek" if deepseek_profile else "kimi"
         developer_harness = "deepseek" if deepseek_profile else "codex"
+        deepseek_model = ""
+        selected_qualification: dict[str, Any] | None = None
+        reviewer: dict[str, Any] | None = None
+        reviewer_id = ""
+        reviewer_route: dict[str, Any] = {}
+        if deepseek_profile:
+            stage("deepseek_candidate_qualification")
+            for index, (candidate, admission) in enumerate(
+                candidate_routes, start=1
+            ):
+                candidate_reviewer = self._create_conversation(
+                    api,
+                    shell_id=shells["REV1"],
+                    harness="deepseek",
+                    model=candidate,
+                    effort="default",
+                    key=f"{config.run_id}:reviewer:qualify:{index}:create",
+                )
+                candidate_id = str(candidate_reviewer["conversation_id"])
+                candidate_projection = candidate_reviewer.get("route") or {}
+                candidate_route = {
+                    key: candidate_projection.get(key)
+                    for key in ("harness", "provider", "model", "effort")
+                }
+                qualification_id = qualification_documents[
+                    qualification_titles[index - 1]
+                ]
+                candidate_evidence: dict[str, Any] | None = None
+                try:
+                    self._message(
+                        api,
+                        candidate_id,
+                        self._qaqc_reviewer_prompt(qualification_id),
+                        f"{config.run_id}:reviewer:qualify:{index}:qaqc",
+                    )
+                    self._wait_idle(api, candidate_id, config, facts)
+                    approval_id, candidate_evidence = self._qaqc_action_evidence(
+                        api,
+                        facts,
+                        candidate_id,
+                        sprint_id=None,
+                        reviewer_shell_id=shells["REV1"],
+                        document_id=qualification_id,
+                    )
+                except CanaryError as exc:
+                    if exc.code != "CANARY_PARTICIPANT_FAILED":
+                        raise
+                    approval_id = None
+                if (
+                    approval_id is not None
+                    and candidate_evidence is not None
+                    and self._qaqc_evidence_passed(candidate_evidence)
+                ):
+                    self._deepseek_model = candidate
+                    self._deepseek_admission = admission
+                    deepseek_model = candidate
+                    selected_qualification = candidate_evidence
+                    reviewer = candidate_reviewer
+                    reviewer_id = candidate_id
+                    reviewer_route = candidate_route
+                    break
+                latest = api.request("GET", f"/api/conversations/{candidate_id}")
+                if latest.get("state") != "closed":
+                    api.request(
+                        "PATCH",
+                        f"/api/conversations/{candidate_id}",
+                        body={"version": latest["version"], "state": "closed"},
+                    )
+            if not deepseek_model:
+                raise CanaryError(
+                    "CANARY_ROUTE_NOT_ADMITTED",
+                    "no bounded exact model passed the live Reviewer tool proof",
+                )
+
         participants = [
             {
                 "shell_id": shells["PLN1"],
@@ -4435,20 +4550,24 @@ raise TimeoutError("controller did not close the Force-new barrier")
             )
 
         stage("deepseek_qaqc" if deepseek_profile else "kimi_qaqc")
-        reviewer = self._create_conversation(
-            api,
-            shell_id=shells["REV1"],
-            harness=reviewer_harness,
-            model=deepseek_model if deepseek_profile else None,
-            effort="default" if deepseek_profile else None,
-            key=f"{config.run_id}:reviewer:create",
-        )
-        reviewer_id = str(reviewer["conversation_id"])
-        reviewer_projection = reviewer.get("route") or {}
-        reviewer_route = {
-            key: reviewer_projection.get(key)
-            for key in ("harness", "provider", "model", "effort")
-        }
+        if not deepseek_profile:
+            reviewer = self._create_conversation(
+                api,
+                shell_id=shells["REV1"],
+                harness=reviewer_harness,
+                key=f"{config.run_id}:reviewer:create",
+            )
+            reviewer_id = str(reviewer["conversation_id"])
+            reviewer_projection = reviewer.get("route") or {}
+            reviewer_route = {
+                key: reviewer_projection.get(key)
+                for key in ("harness", "provider", "model", "effort")
+            }
+        if reviewer is None or not reviewer_id:
+            raise CanaryError(
+                "CANARY_ROUTE_NOT_ADMITTED",
+                "no qualified Reviewer conversation was retained",
+            )
         self._message(
             api,
             reviewer_id,
@@ -4737,6 +4856,17 @@ raise TimeoutError("controller did not close the Force-new barrier")
                 "qaqc_action": qaqc_evidence,
             },
             "routes": {
+                **(
+                    {
+                        "admission": self._deepseek_admission,
+                        "qualification": {
+                            "model": deepseek_model,
+                            "qaqc_action": selected_qualification,
+                        },
+                    }
+                    if deepseek_profile
+                    else {}
+                ),
                 "planner_initial": planner_route,
                 "planner_reentry": reentry_route,
                 "reviewer_qaqc": reviewer_route,

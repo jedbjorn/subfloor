@@ -1587,8 +1587,13 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                     0,
                 )
             if label == "resolve bounded deepseek candidate":
+                requested = str(argv[-2]).split("/", 1)[-1]
                 return canary.CommandResult(
-                    json.dumps(route_admission_payload()), "", 0
+                    json.dumps(
+                        route_admission_payload(requested_model=requested)
+                    ),
+                    "",
+                    0,
                 )
             if label in {
                 "verify non-secret route probe stopped",
@@ -1650,6 +1655,7 @@ class DosAppSprintCanaryTest(unittest.TestCase):
                 "refresh admitted deepseek route",
                 "list bounded deepseek candidates",
                 "resolve bounded deepseek candidate",
+                "resolve bounded deepseek candidate",
                 "inspect launched harness versions",
             ],
             events,
@@ -1674,7 +1680,14 @@ class DosAppSprintCanaryTest(unittest.TestCase):
         self.assertFalse(run_checks["refresh admitted deepseek route"])
         self.assertFalse(run_checks["list bounded deepseek candidates"])
         self.assertFalse(run_checks["resolve bounded deepseek candidate"])
-        self.assertEqual(TEST_DEEPSEEK_MODEL, backend._deepseek_model)
+        self.assertIsNone(backend._deepseek_model)
+        self.assertEqual(
+            [
+                "ollama-cloud/glm-5.2:cloud",
+                "ollama-cloud/minimax-m3:cloud",
+            ],
+            [model for model, _admission in backend._deepseek_candidates],
+        )
         self.assertEqual(rehearsal, launch_result["restart_rehearsal"])
         self.assertEqual(
             {"codex": "codex-cli-test", "deepseek": "deepseek-test"},
@@ -2706,7 +2719,9 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
             )
             con.commit()
 
-    def _classify(self, event_transform=None) -> tuple[int | None, dict]:
+    def _classify(
+        self, event_transform=None, *, sprint_id: int | None = -1
+    ) -> tuple[int | None, dict]:
         backend = canary.HostBackend(canary.Deadline(100, 50))
 
         def sqlite_run(argv, *, cwd=None, env=None, check=True, label):
@@ -2746,7 +2761,7 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
             api,
             facts,
             self.conversation_id,
-            sprint_id=self.sprint_id,
+            sprint_id=self.sprint_id if sprint_id == -1 else sprint_id,
             reviewer_shell_id=2,
             document_id=self.document_id,
         )
@@ -2868,6 +2883,13 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
             evidence,
         )
         self.assertTrue(canary.HostBackend._qaqc_evidence_passed(evidence))
+        qualification_approval, qualification_evidence = self._classify(
+            sprint_id=None
+        )
+        self.assertEqual(receipt["approval_id"], qualification_approval)
+        self.assertTrue(
+            canary.HostBackend._qaqc_evidence_passed(qualification_evidence)
+        )
         encoded = json.dumps(evidence)
         self.assertNotIn(command, encoded)
         self.assertNotIn(receipt["revision_sha256"], encoded)
