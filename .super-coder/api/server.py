@@ -43,6 +43,19 @@ REPO_ROOT = ENGINE.parent
 DB_PATH = ENGINE / "shell_db.db"
 UI_DIR = ENGINE / "ui"
 
+
+def _qaqc_candidate_sha() -> str | None:
+    """Return the installed immutable engine candidate, never caller input."""
+    try:
+        value = (REPO_ROOT / ".sc-state" / "engine.ref").read_text().strip()
+    except (OSError, UnicodeError):
+        return None
+    if len(value) not in {40, 64}:
+        return None
+    if any(char not in "0123456789abcdef" for char in value):
+        return None
+    return value
+
 # Rolling webapp event log — visibility into what the API actually did, since a
 # publish/snapshot that "looked done" gave no trace to inspect after the fact.
 # ONE file, last LOG_MAX_EVENTS end-to-end events, JSON-per-line so it's both
@@ -2884,12 +2897,14 @@ class Handler(BaseHTTPRequestHandler):
                         if body.get("findings_document_id") is not None
                         else None
                     ),
+                    candidate_sha=_qaqc_candidate_sha(),
                 )
                 return self._send(201 if receipt.created else 200, {
                     "approval_id": receipt.approval_id,
                     "revision_sha256": receipt.revision_sha256,
                     "verdict": receipt.verdict,
                     "created": receipt.created,
+                    "action_receipt": receipt.action_receipt,
                 })
             if path == "/_sc/sprint/declare":
                 sprint_id = self._declare_sprint(con, shell_id, body)

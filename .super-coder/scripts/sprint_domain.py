@@ -188,6 +188,40 @@ class SpecApprovalReceipt:
     revision_sha256: str
     verdict: str
     created: bool
+    action_receipt: dict[str, object] | None = None
+
+
+@dataclass(frozen=True)
+class _QaqcActionContext:
+    sprint_id: int
+    participant_id: int
+    reviewer_shell_id: int
+    assignment_generation: str
+    conversation_id: str
+    session_id: str
+    run_id: int
+    candidate_sha: str
+    document_id: int
+    revision_sha256: str
+
+    def payload(self, approval_id: int) -> dict[str, object]:
+        return {
+            "action_kind": "record-qaqc",
+            "sprint_id": self.sprint_id,
+            "participant_id": self.participant_id,
+            "reviewer_shell_id": self.reviewer_shell_id,
+            "role": "reviewer",
+            "assignment_generation": self.assignment_generation,
+            "conversation_id": self.conversation_id,
+            "session_id": self.session_id,
+            "run_id": self.run_id,
+            "candidate_sha": self.candidate_sha,
+            "document_id": self.document_id,
+            "revision_sha256": self.revision_sha256,
+            "review_phase": "pre-arm-qaqc",
+            "approval_id": approval_id,
+            "approval_created": True,
+        }
 
 
 @dataclass(frozen=True)
@@ -382,6 +416,7 @@ class SprintSpecApprovalStore:
         *,
         verdict: str,
         findings_document_id: int | None = None,
+        candidate_sha: str | None = None,
     ) -> SpecApprovalReceipt:
         if verdict not in {"pass", "fail"}:
             raise ValueError("QAQC verdict must be pass or fail")
@@ -415,6 +450,12 @@ class SprintSpecApprovalStore:
                         "QAQC findings must belong to the reviewed spec feature"
                     )
             revision = hashlib.sha256(document["body"].encode()).hexdigest()
+            action_context = self._action_context(
+                document_id,
+                reviewer_shell_id,
+                revision,
+                candidate_sha=candidate_sha,
+            )
             existing = self.con.execute(
                 "SELECT approval_id,verdict,findings_document_id "
                 "FROM sprint_spec_approvals WHERE document_id=? "
@@ -429,8 +470,18 @@ class SprintSpecApprovalStore:
                     raise SprintInvariantError(
                         "QAQC approval already exists with different evidence"
                     )
+                approval_id = int(existing["approval_id"])
+                action_receipt = (
+                    self._existing_action_receipt(approval_id, action_context)
+                    if action_context is not None
+                    else None
+                )
                 return SpecApprovalReceipt(
-                    int(existing["approval_id"]), revision, verdict, False
+                    approval_id,
+                    revision,
+                    verdict,
+                    False,
+                    action_receipt,
                 )
             approval_id = int(
                 self.con.execute(
@@ -446,7 +497,150 @@ class SprintSpecApprovalStore:
                     ),
                 ).lastrowid
             )
-        return SpecApprovalReceipt(approval_id, revision, verdict, True)
+            action_receipt = (
+                self._create_action_receipt(approval_id, action_context)
+                if action_context is not None
+                else None
+            )
+        return SpecApprovalReceipt(
+            approval_id,
+            revision,
+            verdict,
+            True,
+            action_receipt,
+        )
+
+    def _action_context(
+        self,
+        document_id: int,
+        reviewer_shell_id: int,
+        revision_sha256: str,
+        *,
+        candidate_sha: str | None,
+    ) -> _QaqcActionContext | None:
+        if candidate_sha is None or len(candidate_sha) not in {40, 64}:
+            return None
+        if any(char not in "0123456789abcdef" for char in candidate_sha):
+            return None
+        bindings = self.con.execute(
+            "SELECT sprint.sprint_id,sprint.conversation_generation,"
+            "participant.participant_id FROM sprints sprint "
+            "JOIN sprint_specs spec ON spec.sprint_id=sprint.sprint_id "
+            "JOIN sprint_participants participant "
+            "ON participant.sprint_id=sprint.sprint_id "
+            "WHERE sprint.lifecycle='prepared' AND spec.document_id=? "
+            "AND spec.bound_revision_sha256=? AND participant.shell_id=? "
+            "AND participant.role='reviewer' ORDER BY sprint.sprint_id",
+            (document_id, revision_sha256, reviewer_shell_id),
+        ).fetchall()
+        if len(bindings) != 1:
+            return None
+        active = self.con.execute(
+            "SELECT conversation.conversation_id,run.run_id,archive.session_id "
+            "FROM active_shell_chats chat "
+            "JOIN conversations conversation "
+            "ON conversation.conversation_id=chat.chat_id "
+            "JOIN shells shell ON shell.shell_id=chat.shell_id "
+            "JOIN conversation_runs run ON run.run_id=("
+            "SELECT MAX(candidate.run_id) FROM conversation_runs candidate "
+            "WHERE candidate.conversation_id=conversation.conversation_id) "
+            "JOIN shell_memory_archives archive ON archive.archive_id=run.archive_id "
+            "AND archive.shell_id=chat.shell_id "
+            "WHERE chat.shell_id=? AND conversation.shell_id=? "
+            "AND conversation.state='running' AND run.state='running' "
+            "AND run.shell_id=? AND shell.active_archive_id=run.archive_id",
+            (reviewer_shell_id, reviewer_shell_id, reviewer_shell_id),
+        ).fetchall()
+        if len(active) != 1:
+            return None
+        binding = bindings[0]
+        run = active[0]
+        generation = str(binding["conversation_generation"] or "")
+        if len(generation) != 32 or any(
+            char not in "0123456789abcdef" for char in generation
+        ):
+            return None
+        return _QaqcActionContext(
+            sprint_id=int(binding["sprint_id"]),
+            participant_id=int(binding["participant_id"]),
+            reviewer_shell_id=reviewer_shell_id,
+            assignment_generation=generation,
+            conversation_id=str(run["conversation_id"]),
+            session_id=str(run["session_id"]),
+            run_id=int(run["run_id"]),
+            candidate_sha=candidate_sha,
+            document_id=document_id,
+            revision_sha256=revision_sha256,
+        )
+
+    @staticmethod
+    def _action_receipt_projection(
+        row: sqlite3.Row, payload: dict[str, object]
+    ) -> dict[str, object]:
+        return {
+            "action_receipt_id": int(row["event_id"]),
+            "sprint_id": int(row["sprint_id"]),
+            **payload,
+            "created_at": str(row["created_at"]),
+        }
+
+    def _create_action_receipt(
+        self,
+        approval_id: int,
+        context: _QaqcActionContext,
+    ) -> dict[str, object]:
+        payload = context.payload(approval_id)
+        event_id = int(
+            self.con.execute(
+                "INSERT INTO sprint_events "
+                "(sprint_id,event_type,actor_kind,actor_shell_id,payload) "
+                "VALUES (?,'qaqc.action_recorded','participant',?,?)",
+                (
+                    context.sprint_id,
+                    context.reviewer_shell_id,
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                ),
+            ).lastrowid
+        )
+        row = self.con.execute(
+            "SELECT event_id,sprint_id,created_at FROM sprint_events "
+            "WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            raise SprintInvariantError("QAQC action receipt was not durable")
+        return self._action_receipt_projection(row, payload)
+
+    def _existing_action_receipt(
+        self,
+        approval_id: int,
+        context: _QaqcActionContext,
+    ) -> dict[str, object] | None:
+        rows = self.con.execute(
+            "SELECT event_id,sprint_id,actor_shell_id,payload,created_at "
+            "FROM sprint_events WHERE event_type='qaqc.action_recorded' "
+            "AND CAST(json_extract(payload,'$.approval_id') AS INTEGER)=? "
+            "ORDER BY event_id",
+            (approval_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise SprintInvariantError("QAQC approval has conflicting action receipts")
+        row = rows[0]
+        try:
+            payload = json.loads(str(row["payload"]))
+        except json.JSONDecodeError as exc:
+            raise SprintInvariantError("QAQC action receipt is malformed") from exc
+        expected = context.payload(approval_id)
+        if (
+            not isinstance(payload, dict)
+            or payload != expected
+            or int(row["sprint_id"]) != context.sprint_id
+            or int(row["actor_shell_id"]) != context.reviewer_shell_id
+        ):
+            raise SprintInvariantError("QAQC action receipt context does not match")
+        return self._action_receipt_projection(row, expected)
 
     def for_document(self, document_id: int) -> list[dict]:
         return [

@@ -106,13 +106,35 @@ SENSITIVE_KEYS = {
     "transcript",
 }
 QAQC_EVIDENCE_KEYS = frozenset(
-    {"boot", "terminal", "record_qaqc", "postcondition"}
+    {"boot", "terminal", "record_qaqc", "action_receipt", "postcondition"}
 )
 QAQC_BOOT_KEYS = frozenset(
     {"role", "skill", "shell_tool", "candidate", "predeclaration"}
 )
 QAQC_COMMAND_KEYS = frozenset(
     {"observed", "invocation_count", "exit_class", "receipt", "identity"}
+)
+QAQC_ACTION_RECEIPT_KEYS = frozenset({"count", "identity"})
+QAQC_ACTION_RECEIPT_IDENTITIES = frozenset(
+    {
+        "matched",
+        "absent",
+        "duplicate",
+        "sprint_mismatch",
+        "participant_mismatch",
+        "shell_mismatch",
+        "role_mismatch",
+        "generation_mismatch",
+        "conversation_mismatch",
+        "session_mismatch",
+        "run_mismatch",
+        "candidate_mismatch",
+        "spec_mismatch",
+        "phase_mismatch",
+        "approval_mismatch",
+        "row_mismatch",
+        "malformed",
+    }
 )
 QAQC_TERMINAL_CLASSES = frozenset(
     {"succeeded", "failed", "cancelled", "unknown", "missing", "ambiguous"}
@@ -1755,6 +1777,7 @@ class HostBackend:
             )
         boot = evidence.get("boot")
         command = evidence.get("record_qaqc")
+        action_receipt = evidence.get("action_receipt")
         if not isinstance(boot, dict) or set(boot) != QAQC_BOOT_KEYS:
             raise CanaryError(
                 "CANARY_QAQC_EVIDENCE_INVALID",
@@ -1764,6 +1787,14 @@ class HostBackend:
             raise CanaryError(
                 "CANARY_QAQC_EVIDENCE_INVALID",
                 "QA/QC command evidence escaped its fixed allowlist",
+            )
+        if (
+            not isinstance(action_receipt, dict)
+            or set(action_receipt) != QAQC_ACTION_RECEIPT_KEYS
+        ):
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "QA/QC action receipt evidence escaped its fixed allowlist",
             )
         if evidence.get("terminal") not in QAQC_TERMINAL_CLASSES:
             raise CanaryError(
@@ -1806,30 +1837,45 @@ class HostBackend:
                 "CANARY_QAQC_EVIDENCE_INVALID",
                 "QA/QC receipt identity is not a bounded category",
             )
+        receipt_count = action_receipt.get("count")
+        if (
+            not isinstance(receipt_count, int)
+            or isinstance(receipt_count, bool)
+            or not 0 <= receipt_count <= 64
+        ):
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "QA/QC action receipt count is outside its bound",
+            )
+        if action_receipt.get("identity") not in QAQC_ACTION_RECEIPT_IDENTITIES:
+            raise CanaryError(
+                "CANARY_QAQC_EVIDENCE_INVALID",
+                "QA/QC action receipt identity is not a bounded category",
+            )
         return evidence
 
     @staticmethod
     def _qaqc_evidence_passed(evidence: Mapping[str, Any]) -> bool:
         boot = evidence.get("boot")
-        command = evidence.get("record_qaqc")
+        action_receipt = evidence.get("action_receipt")
         return (
             isinstance(boot, dict)
             and set(boot) == QAQC_BOOT_KEYS
             and all(value == "resolved" for value in boot.values())
             and evidence.get("terminal") == "succeeded"
-            and isinstance(command, dict)
-            and command.get("observed") is True
-            and command.get("exit_class") == "success"
-            and command.get("receipt") is True
-            and command.get("identity") == "matched"
+            and isinstance(action_receipt, dict)
+            and action_receipt.get("count") == 1
+            and action_receipt.get("identity") == "matched"
             and evidence.get("postcondition") == "approved"
         )
 
     def _qaqc_action_evidence(
         self,
+        api: JsonHttp,
         facts: Preflight,
         reviewer_id: str,
         *,
+        sprint_id: int,
         reviewer_shell_id: int,
         document_id: int,
     ) -> tuple[int | None, dict[str, Any]]:
@@ -1844,7 +1890,14 @@ class HostBackend:
             "instr(boot.content,'sprint_rev')>0 has_sprint_rev,"
             "(SELECT r.state FROM conversation_runs r "
             " WHERE r.conversation_id=c.conversation_id "
-            " ORDER BY r.run_id DESC LIMIT 1) terminal_state "
+            " ORDER BY r.run_id DESC LIMIT 1) terminal_state,"
+            "(SELECT r.run_id FROM conversation_runs r "
+            " WHERE r.conversation_id=c.conversation_id "
+            " ORDER BY r.run_id DESC LIMIT 1) terminal_run_id,"
+            "(SELECT archive.session_id FROM conversation_runs r "
+            " JOIN shell_memory_archives archive ON archive.archive_id=r.archive_id "
+            " WHERE r.conversation_id=c.conversation_id "
+            " ORDER BY r.run_id DESC LIMIT 1) terminal_session_id "
             "FROM conversations c JOIN shells s ON s.shell_id=c.shell_id "
             "LEFT JOIN conversation_boot_snapshots boot "
             "ON boot.conversation_id=c.conversation_id "
@@ -2033,6 +2086,109 @@ class HostBackend:
             postcondition = "absent"
             approval_id = None
 
+        binding_query = (
+            "SELECT sprint.conversation_generation,participant.participant_id "
+            "FROM sprints sprint JOIN sprint_participants participant "
+            "ON participant.sprint_id=sprint.sprint_id "
+            f"WHERE sprint.sprint_id={sprint_id} "
+            f"AND participant.shell_id={reviewer_shell_id} "
+            "AND participant.role='reviewer';"
+        )
+        binding_rows = _json_output(
+            self._run(
+                [
+                    "docker",
+                    "exec",
+                    facts.container,
+                    "./sc",
+                    "sql",
+                    "-json",
+                    binding_query,
+                ],
+                label="read bounded QA/QC participant binding",
+            ),
+            label="read bounded QA/QC participant binding",
+        )
+        binding = binding_rows[0] if len(binding_rows) == 1 else {}
+        events_page = api.request(
+            "GET", f"/api/sprints/{sprint_id}/events?limit=100"
+        )
+        receipt_events = [
+            item
+            for item in events_page.get("items") or []
+            if isinstance(item, dict) and item.get("type") == "qaqc.action_recorded"
+        ]
+        receipt_count = min(len(receipt_events), 64)
+        if not receipt_events:
+            action_identity = "absent"
+        elif len(receipt_events) != 1:
+            action_identity = "duplicate"
+        else:
+            event = receipt_events[0]
+            details = event.get("details")
+            actor = event.get("actor")
+            required_receipt_keys = {
+                "action_kind",
+                "sprint_id",
+                "participant_id",
+                "reviewer_shell_id",
+                "role",
+                "assignment_generation",
+                "conversation_id",
+                "session_id",
+                "run_id",
+                "candidate_sha",
+                "document_id",
+                "revision_sha256",
+                "review_phase",
+                "approval_id",
+                "approval_created",
+            }
+            if (
+                not isinstance(details, dict)
+                or set(details) != required_receipt_keys
+                or not isinstance(actor, dict)
+                or details.get("action_kind") != "record-qaqc"
+            ):
+                action_identity = "malformed"
+            elif details.get("sprint_id") != sprint_id:
+                action_identity = "sprint_mismatch"
+            elif details.get("participant_id") != binding.get("participant_id"):
+                action_identity = "participant_mismatch"
+            elif (
+                details.get("reviewer_shell_id") != reviewer_shell_id
+                or actor.get("shell_id") != reviewer_shell_id
+                or actor.get("kind") != "participant"
+            ):
+                action_identity = "shell_mismatch"
+            elif details.get("role") != "reviewer":
+                action_identity = "role_mismatch"
+            elif details.get("assignment_generation") != binding.get(
+                "conversation_generation"
+            ):
+                action_identity = "generation_mismatch"
+            elif details.get("conversation_id") != reviewer_id:
+                action_identity = "conversation_mismatch"
+            elif details.get("session_id") != row.get("terminal_session_id"):
+                action_identity = "session_mismatch"
+            elif details.get("run_id") != row.get("terminal_run_id"):
+                action_identity = "run_mismatch"
+            elif details.get("candidate_sha") != facts.candidate_sha:
+                action_identity = "candidate_mismatch"
+            elif (
+                details.get("document_id") != document_id
+                or details.get("revision_sha256") != revision
+            ):
+                action_identity = "spec_mismatch"
+            elif details.get("review_phase") != "pre-arm-qaqc":
+                action_identity = "phase_mismatch"
+            elif approval_id is None or details.get("approval_id") != approval_id:
+                action_identity = "approval_mismatch"
+            elif details.get("approval_created") is not True:
+                action_identity = "row_mismatch"
+            else:
+                action_identity = "matched"
+
         receipt_matches_by_ref: dict[str, list[dict[str, Any]]] = {}
         for tool_ref, _payload in tool_started:
             receipts = [
@@ -2094,6 +2250,10 @@ class HostBackend:
                 "exit_class": exit_class,
                 "receipt": bool(returned_receipts),
                 "identity": identity,
+            },
+            "action_receipt": {
+                "count": receipt_count,
+                "identity": action_identity,
             },
             "postcondition": postcondition,
         }
@@ -3348,8 +3508,70 @@ raise TimeoutError("controller did not close the Force-new barrier")
         document_id = int(documents[0]["document_id"])
         task_id = int(tasks[0]["task_id"])
 
-        stage("deepseek_qaqc" if deepseek_profile else "kimi_qaqc")
         reviewer_harness = "deepseek" if deepseek_profile else "kimi"
+        developer_harness = "deepseek" if deepseek_profile else "codex"
+        participants = [
+            {
+                "shell_id": shells["PLN1"],
+                "role": "planner",
+                "harness": "codex",
+                "model": None,
+                "effort": None,
+            },
+            {
+                "shell_id": shells["DEV1"],
+                "role": "developer",
+                "harness": developer_harness,
+                "model": DEEPSEEK_MODEL if deepseek_profile else None,
+                "effort": "default" if deepseek_profile else None,
+            },
+            {
+                "shell_id": shells["REV1"],
+                "role": "reviewer",
+                "harness": reviewer_harness,
+                "model": DEEPSEEK_MODEL if deepseek_profile else None,
+                "effort": "default" if deepseek_profile else None,
+            },
+        ]
+        stage("declare_prepared")
+        self._message(
+            api,
+            planner_id,
+            (
+                f"Declare one merge-granted prepared Sprint for feature #{feature_id} "
+                f"using spec document #{document_id} directly, with no QA/QC approval id, "
+                "and the participant JSON below. Plan exactly one code unit assigning "
+                f"task #{task_id} to DEV1 with REV1. Expected output: create "
+                f"{deterministic_path!r} containing exactly {deterministic_content!r} plus "
+                f"a newline; use head branch {facts.head_branch!r}, created from "
+                f"origin/{facts.base_branch}; open the PR in {facts.repository!r} against "
+                f"base {facts.base_branch!r}; never target main. Do not arm or dispatch the "
+                "Sprint. Confirm every durable write and stop with the Sprint prepared. "
+                "Participants JSON: "
+                + json.dumps(participants, separators=(",", ":"))
+            ),
+            f"{config.run_id}:planner:declare-prepared",
+        )
+        self._wait_idle(api, planner_id, config, facts)
+        sprint_list = api.request("GET", "/api/sprints?limit=100")
+        matches = [
+            row
+            for row in sprint_list.get("items") or []
+            if (row.get("feature") or {}).get("feature_id") == feature_id
+            or row.get("feature_id") == feature_id
+        ]
+        if len(matches) != 1:
+            raise CanaryError(
+                "CANARY_DECLARATION_FAILED", "Planner did not declare one Sprint"
+            )
+        sprint_id = int(matches[0]["sprint_id"])
+        prepared_board = api.request("GET", f"/api/sprints/{sprint_id}")
+        if (prepared_board.get("sprint") or {}).get("lifecycle") != "prepared":
+            raise CanaryError(
+                "CANARY_DECLARATION_FAILED", "canary Sprint is not prepared"
+            )
+
+        stage("deepseek_qaqc" if deepseek_profile else "kimi_qaqc")
         reviewer = self._create_conversation(
             api,
             shell_id=shells["REV1"],
@@ -3373,8 +3595,10 @@ raise TimeoutError("controller did not close the Force-new barrier")
         self._wait_idle(api, reviewer_id, config, facts)
         if deepseek_profile:
             approval_id, qaqc_evidence = self._qaqc_action_evidence(
+                api,
                 facts,
                 reviewer_id,
+                sprint_id=sprint_id,
                 reviewer_shell_id=shells["REV1"],
                 document_id=document_id,
             )
@@ -3413,63 +3637,21 @@ raise TimeoutError("controller did not close the Force-new barrier")
         )
 
         stage("declare_and_arm")
-        developer_harness = "deepseek" if deepseek_profile else "codex"
-        developer_route = reviewer_route if deepseek_profile else planner_route
-        participants = [
-            {
-                "shell_id": shells["PLN1"],
-                "role": "planner",
-                "harness": "codex",
-                "model": None,
-                "effort": None,
-            },
-            {
-                "shell_id": shells["DEV1"],
-                "role": "developer",
-                "harness": developer_harness,
-                "model": developer_route["model"],
-                "effort": developer_route["effort"],
-            },
-            {
-                "shell_id": shells["REV1"],
-                "role": "reviewer",
-                "harness": reviewer_harness,
-                "model": reviewer_route["model"],
-                "effort": reviewer_route["effort"],
-            },
-        ]
         self._message(
             api,
             planner_id,
             (
-                f"QA/QC approval #{approval_id} now covers document #{document_id}. "
-                "Declare one merge-granted Sprint using the participant JSON below, plan one "
-                f"code unit assigning task #{task_id} to DEV1 with REV1, then arm and dispatch. "
-                f"Expected output: create {deterministic_path!r} containing exactly "
-                f"{deterministic_content!r} plus a newline; use head branch "
-                f"{facts.head_branch!r}, created from origin/{facts.base_branch}; "
-                f"open the PR in {facts.repository!r} against base "
-                f"{facts.base_branch!r}; never target main. The lane must register the PR, "
+                f"QA/QC approval #{approval_id} and its engine action receipt now correlate "
+                f"to prepared Sprint #{sprint_id} and document #{document_id}. Arm and "
+                "dispatch that existing Sprint without declaring or planning another one. "
+                "The lane must register the PR, "
                 f"reach green, request real Force-new {reviewer_harness} review, authorize and merge only "
                 "through Sprint gates, and report the merge to you. After dispatch, handle "
-                "your own informational Sprint inbox items and stop. Participants JSON: "
-                + json.dumps(participants, separators=(",", ":"))
+                "your own informational Sprint inbox items and stop."
             ),
             f"{config.run_id}:planner:arm",
         )
         self._wait_idle(api, planner_id, config, facts)
-        sprint_list = api.request("GET", "/api/sprints?limit=100")
-        matches = [
-            row
-            for row in sprint_list.get("items") or []
-            if (row.get("feature") or {}).get("feature_id") == feature_id
-            or row.get("feature_id") == feature_id
-        ]
-        if len(matches) != 1:
-            raise CanaryError(
-                "CANARY_DECLARATION_FAILED", "Planner did not declare one Sprint"
-            )
-        sprint_id = int(matches[0]["sprint_id"])
         board = api.request("GET", f"/api/sprints/{sprint_id}")
         if (board.get("sprint") or {}).get("lifecycle") != "armed":
             raise CanaryError("CANARY_ARM_FAILED", "canary Sprint is not armed")

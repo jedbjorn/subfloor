@@ -2140,12 +2140,64 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
                     (feature_id, self.spec_body),
                 ).lastrowid
             )
+            revision = hashlib.sha256(self.spec_body.encode()).hexdigest()
+            self.sprint_id = int(
+                con.execute(
+                    "INSERT INTO sprints "
+                    "(feature_id,originating_planner_shell_id,merge_grant_enabled) "
+                    "VALUES (?,1,1)",
+                    (feature_id,),
+                ).lastrowid
+            )
+            con.execute(
+                "INSERT INTO sprint_specs "
+                "(sprint_id,document_id,bound_revision_sha256,approval_id,"
+                "bound_revision_body) VALUES (?,?,?,NULL,?)",
+                (self.sprint_id, self.document_id, revision, self.spec_body),
+            )
+            con.executemany(
+                "INSERT INTO sprint_participants "
+                "(sprint_id,shell_id,role,harness,model,effort) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    (self.sprint_id, 1, "planner", "codex", None, None),
+                    (
+                        self.sprint_id,
+                        2,
+                        "reviewer",
+                        "deepseek",
+                        canary.DEEPSEEK_MODEL,
+                        "default",
+                    ),
+                    (
+                        self.sprint_id,
+                        3,
+                        "developer",
+                        "deepseek",
+                        canary.DEEPSEEK_MODEL,
+                        "default",
+                    ),
+                ),
+            )
+            self.reviewer_participant_id = int(
+                con.execute(
+                    "SELECT participant_id FROM sprint_participants "
+                    "WHERE sprint_id=? AND shell_id=2",
+                    (self.sprint_id,),
+                ).fetchone()[0]
+            )
+            self.assignment_generation = str(
+                con.execute(
+                    "SELECT conversation_generation FROM sprints WHERE sprint_id=?",
+                    (self.sprint_id,),
+                ).fetchone()[0]
+            )
             self.conversation_id = "cv_" + "d" * 32
             con.execute(
                 "INSERT INTO conversations "
                 "(conversation_id,shell_id,owner_user_id,harness,provider,model,"
                 "effort,worktree,state,creation_idempotency_key,creation_request_hash) "
-                "VALUES (?,2,1,'deepseek','ollama-cloud',?,'default',?,'idle',?,?)",
+                "VALUES (?,2,1,'deepseek','ollama-cloud',?,'default',?,'running',?,?)",
                 (
                     self.conversation_id,
                     canary.DEEPSEEK_MODEL,
@@ -2173,27 +2225,45 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
                 con.execute(
                     "INSERT INTO conversation_messages "
                     "(conversation_id,sender_kind,sender_ref,message_kind,body,"
-                    "idempotency_key,request_hash,state,completed_at) "
+                    "idempotency_key,request_hash,state) "
                     "VALUES (?,'user','owner','prompt','bounded rehearsal',"
-                    "'prompt-1','m', 'completed',datetime('now'))",
+                    "'prompt-1','m','running')",
                     (self.conversation_id,),
                 ).lastrowid
+            )
+            self.archive_id = int(
+                con.execute(
+                    "INSERT INTO shell_memory_archives "
+                    "(shell_id,session_id,date,full_narrative) "
+                    "VALUES (2,'0042',date('now'),'bounded rehearsal')"
+                ).lastrowid
+            )
+            con.execute(
+                "UPDATE shells SET active_archive_id=? WHERE shell_id=2",
+                (self.archive_id,),
             )
             self.run_id = int(
                 con.execute(
                     "INSERT INTO conversation_runs "
                     "(conversation_id,shell_id,trigger_message_id,state,lease_owner,"
-                    "lease_expires_at,started_at,ended_at,exit_code) "
-                    "VALUES (?,2,?,'succeeded','rehearsal',datetime('now'),"
-                    "datetime('now'),datetime('now'),0)",
-                    (self.conversation_id, message_id),
+                    "lease_expires_at,started_at,archive_id) "
+                    "VALUES (?,2,?,'running','rehearsal',datetime('now','+5 minutes'),"
+                    "datetime('now'),?)",
+                    (self.conversation_id, message_id, self.archive_id),
                 ).lastrowid
+            )
+            con.execute(
+                "INSERT INTO active_shell_chats (shell_id,chat_id) VALUES (2,?)",
+                (self.conversation_id,),
             )
             con.commit()
 
         self.original_server_db = server.DB_PATH
         server.DB_PATH = self.db
         self.addCleanup(setattr, server, "DB_PATH", self.original_server_db)
+        self.original_server_repo = server.REPO_ROOT
+        server.REPO_ROOT = self.workspace
+        self.addCleanup(setattr, server, "REPO_ROOT", self.original_server_repo)
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         self.addCleanup(self.httpd.server_close)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -2272,7 +2342,7 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
             )
             con.commit()
 
-    def _classify(self) -> tuple[int | None, dict]:
+    def _classify(self, event_transform=None) -> tuple[int | None, dict]:
         backend = canary.HostBackend(canary.Deadline(100, 50))
 
         def sqlite_run(argv, *, cwd=None, env=None, check=True, label):
@@ -2297,9 +2367,22 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
             dev_port=2,
             github_remaining=5000,
         )
+        real_api = canary.JsonHttp(mem.SC_API_BASE, canary.Deadline(100, 50))
+        if event_transform is None:
+            api = real_api
+        else:
+            api = mock.Mock()
+
+            def request(method, path, body=None):
+                result = real_api.request(method, path, body=body)
+                return event_transform(result) if "/events?" in path else result
+
+            api.request.side_effect = request
         return backend._qaqc_action_evidence(
+            api,
             facts,
             self.conversation_id,
+            sprint_id=self.sprint_id,
             reviewer_shell_id=2,
             document_id=self.document_id,
         )
@@ -2321,6 +2404,41 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
             )
         return json.loads(output.getvalue())
 
+    def _finish_run(self) -> None:
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            con.execute(
+                "UPDATE conversation_runs SET state='succeeded',ended_at=datetime('now'),"
+                "exit_code=0 WHERE run_id=?",
+                (self.run_id,),
+            )
+            con.execute(
+                "UPDATE conversation_messages SET state='completed',"
+                "completed_at=datetime('now') WHERE conversation_id=?",
+                (self.conversation_id,),
+            )
+            con.execute(
+                "UPDATE conversations SET state='idle' WHERE conversation_id=?",
+                (self.conversation_id,),
+            )
+            con.commit()
+
+    def _seed_approval_without_action_receipt(self, *, reviewer_shell_id: int = 2) -> int:
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            approval_id = int(
+                con.execute(
+                    "INSERT INTO sprint_spec_approvals "
+                    "(document_id,revision_sha256,reviewer_shell_id,verdict) "
+                    "VALUES (?,?,?,'pass')",
+                    (
+                        self.document_id,
+                        hashlib.sha256(self.spec_body.encode()).hexdigest(),
+                        reviewer_shell_id,
+                    ),
+                ).lastrowid
+            )
+            con.commit()
+        return approval_id
+
     def test_real_cli_api_and_deepseek_action_events_produce_exact_evidence(self) -> None:
         command = (
             f"bash -lc './sc sprint record-qaqc --document {self.document_id} "
@@ -2336,9 +2454,30 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
             hashlib.sha256(self.spec_body.encode()).hexdigest(),
             receipt["revision_sha256"],
         )
+        action_receipt = receipt["action_receipt"]
+        self.assertEqual("record-qaqc", action_receipt["action_kind"])
+        self.assertEqual(self.sprint_id, action_receipt["sprint_id"])
+        self.assertEqual(
+            self.reviewer_participant_id, action_receipt["participant_id"]
+        )
+        self.assertEqual(self.assignment_generation, action_receipt["assignment_generation"])
+        self.assertEqual(self.conversation_id, action_receipt["conversation_id"])
+        self.assertEqual("0042", action_receipt["session_id"])
+        self.assertEqual(self.run_id, action_receipt["run_id"])
+        self.assertEqual(self.candidate_sha, action_receipt["candidate_sha"])
+        self.assertEqual("pre-arm-qaqc", action_receipt["review_phase"])
+        self.assertEqual(receipt["approval_id"], action_receipt["approval_id"])
+        self.assertTrue(action_receipt["approval_created"])
+        replay = self._record_approval()
+        self.assertFalse(replay["created"])
+        self.assertEqual(
+            action_receipt["action_receipt_id"],
+            replay["action_receipt"]["action_receipt_id"],
+        )
 
         started, completed = self._normalize_action(command, json.dumps(receipt))
         self._insert_action(started, completed)
+        self._finish_run()
         approval_id, evidence = self._classify()
 
         self.assertEqual(receipt["approval_id"], approval_id)
@@ -2359,6 +2498,7 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
                     "receipt": True,
                     "identity": "matched",
                 },
+                "action_receipt": {"count": 1, "identity": "matched"},
                 "postcondition": "approved",
             },
             evidence,
@@ -2367,6 +2507,67 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
         encoded = json.dumps(evidence)
         self.assertNotIn(command, encoded)
         self.assertNotIn(receipt["revision_sha256"], encoded)
+
+    def test_engine_action_receipt_mismatch_categories_are_bounded(self) -> None:
+        self._record_approval()
+        self._finish_run()
+
+        def transformed(*, field=None, value=None, drop=False, duplicate=False):
+            def apply(page):
+                projected = json.loads(json.dumps(page))
+                if drop:
+                    projected["items"] = []
+                    return projected
+                receipt_event = next(
+                    item
+                    for item in projected["items"]
+                    if item.get("type") == "qaqc.action_recorded"
+                )
+                if field == "actor_shell_id":
+                    receipt_event["actor"]["shell_id"] = value
+                elif field == "malformed":
+                    receipt_event["details"].pop("run_id")
+                elif field is not None:
+                    receipt_event["details"][field] = value
+                if duplicate:
+                    projected["items"].append(json.loads(json.dumps(receipt_event)))
+                return projected
+
+            return apply
+
+        cases = (
+            ("absent", transformed(drop=True)),
+            ("duplicate", transformed(duplicate=True)),
+            ("sprint_mismatch", transformed(field="sprint_id", value=self.sprint_id + 1)),
+            ("participant_mismatch", transformed(field="participant_id", value=999)),
+            ("shell_mismatch", transformed(field="actor_shell_id", value=999)),
+            ("role_mismatch", transformed(field="role", value="developer")),
+            ("generation_mismatch", transformed(field="assignment_generation", value="f" * 32)),
+            ("conversation_mismatch", transformed(field="conversation_id", value="cv_" + "e" * 32)),
+            ("session_mismatch", transformed(field="session_id", value="9999")),
+            ("run_mismatch", transformed(field="run_id", value=self.run_id + 1)),
+            ("candidate_mismatch", transformed(field="candidate_sha", value="d" * 40)),
+            ("spec_mismatch", transformed(field="document_id", value=self.document_id + 1)),
+            ("phase_mismatch", transformed(field="review_phase", value="other")),
+            ("approval_mismatch", transformed(field="approval_id", value=999)),
+            ("row_mismatch", transformed(field="approval_created", value=False)),
+            ("malformed", transformed(field="malformed")),
+        )
+        for expected, transform in cases:
+            with self.subTest(expected=expected):
+                _approval_id, evidence = self._classify(transform)
+                self.assertEqual(expected, evidence["action_receipt"]["identity"])
+                self.assertFalse(canary.HostBackend._qaqc_evidence_passed(evidence))
+
+    def test_absent_active_run_creates_approval_without_provenance_receipt(self) -> None:
+        with contextlib.closing(sqlite3.connect(self.db)) as con:
+            con.execute("DELETE FROM active_shell_chats WHERE shell_id=2")
+            con.commit()
+
+        receipt = self._record_approval()
+
+        self.assertTrue(receipt["created"])
+        self.assertIsNone(receipt["action_receipt"])
 
     def test_missing_invocation_and_absent_approval_are_bounded(self) -> None:
         approval_id, evidence = self._classify()
@@ -2397,7 +2598,29 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
         self.assertEqual("absent", evidence["postcondition"])
         self.assertFalse(canary.HostBackend._qaqc_evidence_passed(evidence))
 
-    def test_missing_command_receipt_is_distinct_from_green_postcondition(self) -> None:
+    def test_approval_row_without_engine_action_receipt_fails_closed(self) -> None:
+        approval_id = self._seed_approval_without_action_receipt()
+        self._finish_run()
+
+        observed_approval_id, evidence = self._classify()
+
+        self.assertEqual(approval_id, observed_approval_id)
+        self.assertEqual({"count": 0, "identity": "absent"}, evidence["action_receipt"])
+        self.assertEqual("approved", evidence["postcondition"])
+        self.assertFalse(canary.HostBackend._qaqc_evidence_passed(evidence))
+
+    def test_approval_row_written_by_another_actor_fails_closed(self) -> None:
+        self._seed_approval_without_action_receipt(reviewer_shell_id=1)
+        self._finish_run()
+
+        approval_id, evidence = self._classify()
+
+        self.assertIsNone(approval_id)
+        self.assertEqual("reviewer_mismatch", evidence["postcondition"])
+        self.assertEqual({"count": 0, "identity": "absent"}, evidence["action_receipt"])
+        self.assertFalse(canary.HostBackend._qaqc_evidence_passed(evidence))
+
+    def test_native_receipt_omission_is_diagnostic_when_engine_receipt_matches(self) -> None:
         receipt = self._record_approval()
         command = (
             f"./sc sprint record-qaqc --document {self.document_id} "
@@ -2405,6 +2628,7 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
         )
         started, completed = self._normalize_action(command, "receipt omitted")
         self._insert_action(started, completed)
+        self._finish_run()
 
         approval_id, evidence = self._classify()
 
@@ -2412,10 +2636,11 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
         self.assertEqual("success", evidence["record_qaqc"]["exit_class"])
         self.assertFalse(evidence["record_qaqc"]["receipt"])
         self.assertEqual("absent", evidence["record_qaqc"]["identity"])
+        self.assertEqual({"count": 1, "identity": "matched"}, evidence["action_receipt"])
         self.assertEqual("approved", evidence["postcondition"])
-        self.assertFalse(canary.HostBackend._qaqc_evidence_passed(evidence))
+        self.assertTrue(canary.HostBackend._qaqc_evidence_passed(evidence))
 
-    def test_wrong_command_receipt_identity_is_bounded(self) -> None:
+    def test_wrong_native_receipt_identity_does_not_override_engine_receipt(self) -> None:
         receipt = self._record_approval()
         command = (
             f"./sc sprint record-qaqc --document {self.document_id} "
@@ -2424,14 +2649,16 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
         wrong = {**receipt, "approval_id": receipt["approval_id"] + 100}
         started, completed = self._normalize_action(command, json.dumps(wrong))
         self._insert_action(started, completed)
+        self._finish_run()
 
         approval_id, evidence = self._classify()
 
         self.assertEqual(receipt["approval_id"], approval_id)
         self.assertTrue(evidence["record_qaqc"]["receipt"])
         self.assertEqual("mismatch", evidence["record_qaqc"]["identity"])
+        self.assertEqual({"count": 1, "identity": "matched"}, evidence["action_receipt"])
         self.assertEqual("approved", evidence["postcondition"])
-        self.assertFalse(canary.HostBackend._qaqc_evidence_passed(evidence))
+        self.assertTrue(canary.HostBackend._qaqc_evidence_passed(evidence))
 
 
 if __name__ == "__main__":
