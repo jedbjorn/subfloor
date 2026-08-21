@@ -85,6 +85,47 @@ class FlavorRouteDefaultsTest(unittest.TestCase):
         )
 
 
+class ShellPathTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "repo"
+        self.worktree = self.root / ".sc-worktrees" / "dev1"
+        self.worktree.mkdir(parents=True)
+        self.root_patch = mock.patch.object(run, "REPO_ROOT", self.root)
+        self.root_patch.start()
+        self.addCleanup(self.root_patch.stop)
+
+    def test_existing_project_environment_precedes_inherited_tools(self) -> None:
+        project_bin = self.worktree / ".venv" / "bin"
+        project_bin.mkdir(parents=True)
+
+        path = run._shell_path(self.worktree, "/usr/local/bin:/usr/bin")
+
+        self.assertEqual(
+            path,
+            f"{self.root}:{project_bin}:/usr/local/bin:/usr/bin",
+        )
+
+    def test_absent_or_non_directory_environment_is_not_injected(self) -> None:
+        self.assertEqual(
+            run._shell_path(self.worktree, "/usr/bin"),
+            f"{self.root}:/usr/bin",
+        )
+        project_bin = self.worktree / ".venv" / "bin"
+        project_bin.parent.mkdir(parents=True)
+        project_bin.write_text("not a directory")
+        self.assertEqual(
+            run._shell_path(self.worktree, "/usr/bin"),
+            f"{self.root}:/usr/bin",
+        )
+
+    def test_interactive_and_prepared_launches_share_the_path_builder(self) -> None:
+        source = (SCRIPTS / "run.py").read_text()
+        assignment = 'env["PATH"] = _shell_path(work_dir, env.get("PATH", ""))'
+        self.assertEqual(source.count(assignment), 2)
+
+
 class _FailAfterArchive:
     """Connection proxy that injects a lock after the archive INSERT."""
 
