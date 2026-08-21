@@ -1679,6 +1679,8 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.workspace = self.root / "disposable"
         self.workspace.mkdir()
+        self.reviewer_worktree = self.workspace / ".sc-worktrees" / "rev1"
+        self.reviewer_worktree.mkdir(parents=True)
         (self.workspace / ".sc-state").mkdir()
         skill_target = (
             self.workspace
@@ -1744,7 +1746,7 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
                 (
                     self.conversation_id,
                     canary.DEEPSEEK_MODEL,
-                    str(self.workspace),
+                    str(self.reviewer_worktree),
                     "qaqc-rehearsal",
                     "r" * 64,
                 ),
@@ -1809,7 +1811,7 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
             harness="deepseek",
             session_ref="deepseek-" + "e" * 32,
             run_ref="rehearsal-run",
-            worktree=self.workspace,
+            worktree=self.reviewer_worktree,
             metadata={"from_event_seq": 0, "seen_event_seq": set()},
         )
         started = adapter._session_event(
@@ -1918,8 +1920,8 @@ class DeepSeekQaqcActionRehearsalTest(unittest.TestCase):
 
     def test_real_cli_api_and_deepseek_action_events_produce_exact_evidence(self) -> None:
         command = (
-            f"./sc sprint record-qaqc --document {self.document_id} "
-            "--verdict pass"
+            f"bash -lc './sc sprint record-qaqc --document {self.document_id} "
+            "--verdict pass'"
         )
         self.assertIsNone(shutil.which("sc", path="/usr/local/bin:/usr/bin:/bin"))
         self.assertTrue((self.workspace / "sc").is_file())

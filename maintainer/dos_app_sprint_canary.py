@@ -1556,6 +1556,15 @@ class HostBackend:
             installed_ref = engine_ref.read_text().strip()
         except (OSError, UnicodeError):
             installed_ref = ""
+        worktree = row.get("worktree")
+        candidate_worktree = False
+        if isinstance(worktree, str):
+            try:
+                Path(worktree).resolve().relative_to(facts.workspace.resolve())
+            except (OSError, ValueError):
+                pass
+            else:
+                candidate_worktree = True
         boot = {
             "role": (
                 "resolved"
@@ -1581,7 +1590,7 @@ class HostBackend:
             "candidate": (
                 "resolved"
                 if installed_ref == facts.candidate_sha
-                and row.get("worktree") == str(facts.workspace)
+                and candidate_worktree
                 else "mismatch"
             ),
             "predeclaration": (
@@ -1616,7 +1625,7 @@ class HostBackend:
             ),
             label="inspect bounded QA/QC action events",
         )
-        started: list[tuple[str, dict[str, Any]]] = []
+        tool_started: list[tuple[str, dict[str, Any]]] = []
         completed: dict[str, list[dict[str, Any]]] = {}
         for event in event_rows if isinstance(event_rows, list) else []:
             if not isinstance(event, dict):
@@ -1630,12 +1639,8 @@ class HostBackend:
             tool_ref = payload.get("tool_ref")
             if not isinstance(tool_ref, str) or not tool_ref:
                 continue
-            if (
-                event.get("event_type") == "tool.started"
-                and str(payload.get("name") or "").lower() in {"bash", "shell"}
-                and self._qaqc_invocation(payload.get("arguments"), document_id)
-            ):
-                started.append((tool_ref, payload))
+            if event.get("event_type") == "tool.started":
+                tool_started.append((tool_ref, payload))
             elif event.get("event_type") == "tool.completed":
                 completed.setdefault(tool_ref, []).append(payload)
 
@@ -1694,7 +1699,31 @@ class HostBackend:
             postcondition = "absent"
             approval_id = None
 
-        completions = [item for tool_ref, _payload in started for item in completed.get(tool_ref, [])]
+        receipt_matches_by_ref: dict[str, list[dict[str, Any]]] = {}
+        for tool_ref, _payload in tool_started:
+            receipts = [
+                receipt
+                for completion in completed.get(tool_ref, [])
+                for receipt in self._qaqc_receipt_values(completion)
+                if approval_id is not None
+                and receipt.get("approval_id") == approval_id
+                and receipt.get("revision_sha256") == revision
+                and receipt.get("verdict") == "pass"
+                and isinstance(receipt.get("created"), bool)
+            ]
+            if receipts:
+                receipt_matches_by_ref[tool_ref] = receipts
+        started = [
+            (tool_ref, payload)
+            for tool_ref, payload in tool_started
+            if self._qaqc_invocation(payload.get("arguments"), document_id)
+            or tool_ref in receipt_matches_by_ref
+        ]
+        completions = [
+            item
+            for tool_ref, _payload in started
+            for item in completed.get(tool_ref, [])
+        ]
         statuses = {str(item.get("status") or "") for item in completions}
         if not started:
             exit_class = "not_invoked"
@@ -1714,12 +1743,8 @@ class HostBackend:
         ]
         matched_receipts = [
             receipt
-            for receipt in returned_receipts
-            if approval_id is not None
-            and receipt.get("approval_id") == approval_id
-            and receipt.get("revision_sha256") == revision
-            and receipt.get("verdict") == "pass"
-            and isinstance(receipt.get("created"), bool)
+            for tool_ref, _payload in started
+            for receipt in receipt_matches_by_ref.get(tool_ref, [])
         ]
         identity = (
             "matched"
