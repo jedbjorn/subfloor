@@ -1166,6 +1166,7 @@ class HostBackend:
         api: JsonHttp,
         conversation_id: str,
         config: CanaryConfig,
+        facts: Preflight,
     ) -> dict[str, Any]:
         while True:
             conversation = api.request("GET", f"/api/conversations/{conversation_id}")
@@ -1187,10 +1188,63 @@ class HostBackend:
                     details={
                         "conversation_id": conversation_id,
                         "state": conversation.get("state"),
+                        "failure": self._conversation_failure_evidence(
+                            facts, conversation_id
+                        ),
                     },
                 )
             self.deadline.remaining()
             self.sleep(min(config.poll_interval_s, self.deadline.remaining()))
+
+    def _conversation_failure_evidence(
+        self, facts: Preflight, conversation_id: str
+    ) -> dict[str, Any]:
+        if not CONVERSATION_ID_RE.fullmatch(conversation_id):
+            return {"diagnostic": "invalid_conversation_id"}
+        query = (
+            "SELECT state,error_code,error_detail FROM conversation_runs "
+            f"WHERE conversation_id='{conversation_id}' "
+            "ORDER BY run_id DESC LIMIT 1;"
+        )
+        result = self._run(
+            ["docker", "exec", facts.container, "./sc", "sql", "-json", query],
+            check=False,
+            label="read bounded participant failure",
+        )
+        if result.returncode != 0:
+            return {"diagnostic": "unavailable"}
+        try:
+            rows = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            return {"diagnostic": "invalid"}
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            return {"diagnostic": "absent"}
+        row = rows[0]
+        detail = str(row.get("error_detail") or "")
+        lowered = detail.lower()
+        categories = (
+            ("credential_rejected", ("unauthorized", "invalid api key", "http 401")),
+            ("rate_limited", ("rate limit", "http 429", "too many requests")),
+            ("timeout", ("timeout", "timed out", "deadline")),
+            ("connectivity", ("connection", "dns", "network", "unreachable")),
+            ("protocol", ("protocol", "schema", "invalid json", "malformed")),
+            ("process_exit", ("exit code", "process exited", "signal")),
+        )
+        category = next(
+            (
+                name
+                for name, markers in categories
+                if any(marker in lowered for marker in markers)
+            ),
+            "unclassified",
+        )
+        return {
+            "run_state": row.get("state"),
+            "error_code": row.get("error_code"),
+            "category": category,
+            "detail_bytes": len(detail.encode()),
+            "detail_sha256": hashlib.sha256(detail.encode()).hexdigest(),
+        }
 
     @staticmethod
     def _shells(payload: dict[str, Any]) -> dict[str, int]:
@@ -1363,7 +1417,7 @@ class HostBackend:
             ),
             f"{config.run_id}:deepseek:restart-resume",
         )
-        self._wait_idle(api, conversation_id, config)
+        self._wait_idle(api, conversation_id, config, facts)
         after = self._conversation_evidence(facts, conversation_id)
         if (
             after["session_sha256"] != before["session_sha256"]
@@ -2448,7 +2502,7 @@ raise TimeoutError("controller did not close the Force-new barrier")
             ),
             f"{config.run_id}:planner:prepare",
         )
-        self._wait_idle(api, planner_id, config)
+        self._wait_idle(api, planner_id, config, facts)
         feature = self._feature(api.request("GET", "/api/roadmap"), feature_title)
         if feature is None:
             raise CanaryError(
@@ -2497,7 +2551,7 @@ raise TimeoutError("controller did not close the Force-new barrier")
             ),
             f"{config.run_id}:reviewer:qaqc",
         )
-        self._wait_idle(api, reviewer_id, config)
+        self._wait_idle(api, reviewer_id, config, facts)
         approval_id = self._approval(facts, document_id)
 
         restart_recovery = None
@@ -2569,7 +2623,7 @@ raise TimeoutError("controller did not close the Force-new barrier")
             ),
             f"{config.run_id}:planner:arm",
         )
-        self._wait_idle(api, planner_id, config)
+        self._wait_idle(api, planner_id, config, facts)
         sprint_list = api.request("GET", "/api/sprints?limit=100")
         matches = [
             row

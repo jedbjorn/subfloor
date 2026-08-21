@@ -1149,6 +1149,52 @@ class DosAppSprintCanaryTest(unittest.TestCase):
 
         backend._read_provider_key.assert_not_called()
 
+    def test_participant_failure_retains_only_bounded_error_evidence(self) -> None:
+        backend = canary.HostBackend(
+            canary.Deadline(100, 50), sleep=lambda _: None
+        )
+        conversation_id = "cv_" + "1" * 32
+
+        class ErrorApi:
+            def request(self, method, path, *, body=None, key=None):
+                return {"state": "error"}
+
+        raw_detail = "provider timed out token=opaque-provider-secret"
+        backend._run = mock.Mock(
+            return_value=canary.CommandResult(
+                json.dumps(
+                    [
+                        {
+                            "state": "failed",
+                            "error_code": "HARNESS_RUNTIME_FAILED",
+                            "error_detail": raw_detail,
+                        }
+                    ]
+                ),
+                "",
+                0,
+            )
+        )
+
+        with self.assertRaisesRegex(
+            canary.CanaryError, "terminalized before completing"
+        ) as raised:
+            backend._wait_idle(
+                cast(canary.JsonHttp, ErrorApi()),
+                conversation_id,
+                self.config,
+                self.facts,
+            )
+
+        failure = raised.exception.details["failure"]
+        self.assertEqual("HARNESS_RUNTIME_FAILED", failure["error_code"])
+        self.assertEqual("timeout", failure["category"])
+        self.assertEqual(len(raw_detail.encode()), failure["detail_bytes"])
+        self.assertEqual(64, len(failure["detail_sha256"]))
+        encoded = json.dumps(raised.exception.details)
+        self.assertNotIn(raw_detail, encoded)
+        self.assertNotIn("opaque-provider-secret", encoded)
+
     def test_live_materialization_uses_exact_sha_refspec_and_verifies_pin(self) -> None:
         clock = FakeClock()
         deadline = canary.Deadline(100, 50, clock=clock)
