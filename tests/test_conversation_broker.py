@@ -332,18 +332,24 @@ class ConversationBrokerCase(unittest.TestCase):
         state: str = "queued",
         session_ref: str | None = None,
         harness: str = "codex",
+        provider: str | None = None,
+        model: str | None = None,
+        title: str | None = None,
     ) -> str:
         self.serial += 1
         key = f"conversation-{self.serial}"
         con = self.connect()
         con.execute(
             "INSERT INTO conversations "
-            "(shell_id,owner_user_id,harness,worktree,state,"
+            "(shell_id,owner_user_id,harness,provider,model,title,worktree,state,"
             "harness_session_ref,creation_idempotency_key,"
-            "creation_request_hash) VALUES (?,1,?,?,?,?,?,?)",
+            "creation_request_hash) VALUES (?,1,?,?,?,?,?,?,?,?,?)",
             (
                 shell_id,
                 harness,
+                provider,
+                model,
+                title,
                 str(self.worktree),
                 state,
                 session_ref,
@@ -784,6 +790,106 @@ class StoreContractTest(ConversationBrokerCase):
             ],
         )
         self.assertEqual(json.loads(rows[-1]["payload"])["text"], "two")
+
+    def test_deepseek_browser_usage_accumulates_into_existing_analytics(self) -> None:
+        conversation_id = self.add_conversation(
+            harness="deepseek",
+            provider="deepseek-official",
+            model="deepseek-v4-pro",
+            title="Browser route",
+        )
+        self.add_message(conversation_id)
+        store = BrokerStore(self.db_path)
+        run = store.claim_next("broker")
+        store.mark_starting(run.run_id, "broker")
+        store.mark_native_started(
+            run.run_id,
+            "broker",
+            NativeTurn(
+                "deepseek",
+                "deepseek-session-1",
+                "deepseek-run-1",
+                self.worktree,
+            ),
+        )
+
+        store.append_events(
+            run.run_id,
+            [
+                NormalizedEvent(
+                    "usage",
+                    {"tokens": {
+                        "input_tokens": 8,
+                        "output_tokens": 3,
+                        "reasoning_tokens": 1,
+                    }},
+                ),
+                NormalizedEvent(
+                    "usage",
+                    {"tokens": {
+                        "input_tokens": 2,
+                        "output_tokens": 1,
+                        "cache_read_tokens": 5,
+                    }},
+                ),
+                NormalizedEvent(
+                    "usage",
+                    {"tokens": {"input_tokens": -1, "output_tokens": True}},
+                ),
+            ],
+        )
+
+        with self.connect() as con:
+            rows = con.execute(
+                "SELECT shell_id,harness,harness_session_ref,provider,model,title,"
+                "input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,"
+                "reasoning_tokens,status,parser_version FROM session_token_usage"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            tuple(rows[0]),
+            (
+                1,
+                "deepseek",
+                "deepseek-session-1",
+                "deepseek-official",
+                "deepseek-v4-pro",
+                "Browser route",
+                10,
+                4,
+                5,
+                None,
+                1,
+                "ok",
+                "browser-events-v1",
+            ),
+        )
+
+    def test_non_deepseek_usage_does_not_create_browser_analytics_rows(self) -> None:
+        conversation_id = self.add_conversation(harness="codex")
+        self.add_message(conversation_id)
+        store = BrokerStore(self.db_path)
+        run = store.claim_next("broker")
+        store.mark_starting(run.run_id, "broker")
+        store.mark_native_started(
+            run.run_id,
+            "broker",
+            NativeTurn("codex", "codex-session", "codex-run", self.worktree),
+        )
+
+        store.append_event(
+            run.run_id,
+            NormalizedEvent(
+                "usage",
+                {"tokens": {"input_tokens": 8, "output_tokens": 3}},
+            ),
+        )
+
+        with self.connect() as con:
+            count = con.execute(
+                "SELECT COUNT(*) FROM session_token_usage"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
 
     def test_terminal_observation_is_post_commit_and_cannot_fail_run(self) -> None:
         conversation_id = self.add_conversation()

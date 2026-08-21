@@ -287,7 +287,8 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
     assert 'ariaLabel: "Thinking level"' in interface
     assert 'el("label", { className: "k" }, "Thinking level")' in interface
     assert "thinkingLevelState(harness, catalog, model, preferred)" in interface
-    assert "submit.disabled = Boolean(model && (state.disabled || !state.selected))" in interface
+    assert "unavailable || exactRouteMissing" in interface
+    assert "model && (state.disabled || !state.selected)" in interface
     assert "Refresh & verify Default Models before saving this route." in APP
     assert '"Start chat"' in interface
     assert "harness: harnessSelect.value" in interface
@@ -297,6 +298,155 @@ def test_start_chat_has_default_and_configured_paths_without_terminal_controls()
     assert "xterm" not in interface.lower()
     assert "tmux" not in interface.lower()
     assert "attach" not in interface.lower()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+def test_deepseek_config_requires_an_available_exact_server_route():
+    availability = APP[
+        APP.index("function chatHarnessUnavailableReason"):
+        APP.index("function chatStartedLabel")
+    ]
+    models = APP[
+        APP.index("function chatModelOptions"):
+        APP.index("function chatCreateConversation")
+    ]
+    script = r"""
+const CHAT_HARNESS_DEFAULT_VALUE = "__sc_harness_default__";
+function el(_tag, attrs = {}) { return {...attrs}; }
+function select() {
+  return {
+    children: [],
+    replaceChildren() { this.children = []; },
+    append(value) { this.children.push(value); },
+    get options() { return this.children; },
+  };
+}
+""" + availability + models + r"""
+const catalog = {harnesses: {
+  deepseek: {models: [
+    {id: "deepseek-v4-pro", availability: "available"},
+    {id: "stale", availability: "unavailable"},
+  ]},
+  codex: {models: [{id: "gpt-test", availability: "available"}]},
+}};
+const deepseek = select();
+chatModelOptions(deepseek, catalog, "deepseek", null);
+const codex = select();
+chatModelOptions(codex, catalog, "codex", "gpt-test");
+console.log(JSON.stringify({
+  deepseek: deepseek.children,
+  codex: codex.children,
+  disabled: chatHarnessUnavailableReason({
+    installed: true, enabled: false, healthy: false,
+    surfaces: {browser: true}, unavailable_reason: "HARNESS_DISABLED",
+  }),
+  healthy: chatHarnessUnavailableReason({
+    installed: true, enabled: true, healthy: true,
+    surfaces: {browser: true}, unavailable_reason: null,
+  }),
+}));
+"""
+
+    result = run_js(script)
+    assert result == {
+        "deepseek": [
+            {
+                "value": "",
+                "textContent": "Choose an exact model",
+                "disabled": True,
+                "selected": True,
+            },
+            {"value": "deepseek-v4-pro", "textContent": "deepseek-v4-pro"},
+        ],
+        "codex": [
+            {"value": "", "textContent": "Use shell default — gpt-test"},
+            {
+                "value": "__sc_harness_default__",
+                "textContent": "Use harness default",
+            },
+            {"value": "gpt-test", "textContent": "gpt-test"},
+        ],
+        "disabled": "HARNESS_DISABLED",
+        "healthy": None,
+    }
+
+
+def test_historical_unavailable_harness_keeps_reads_and_controls_but_not_composer():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    open_chat = interface[
+        interface.index("async function chatRenderOpen"):
+        interface.index("async function renderInterface")
+    ]
+    assert 'api("/flavor-defaults").catch(() => null)' in interface
+    assert 'api("/models").catch(() => null)' in interface
+    assert "history remains readable" in open_chat
+    assert "composer.disabled = Boolean(unavailableReason)" in open_chat
+    assert "send.disabled = Boolean(unavailableReason)" in open_chat
+    assert "stop.disabled = conversation.state !== \"running\"" in open_chat
+    assert "close.disabled = sprintManaged || closed || closing" in open_chat
+    assert 'textContent: "Analytics"' in open_chat
+    assert "chatReviewWorkspace(reviewHost, conversation)" in open_chat
+    assert ".chat-harness-unavailable" in STYLE
+
+
+def test_historical_deepseek_route_availability_is_exact_and_fail_closed():
+    helpers = APP[
+        APP.index("function chatHarnessUnavailableReason"):
+        APP.index("function chatStartedLabel")
+    ]
+    script = helpers + r"""
+const conversation = {
+  route: {harness: "deepseek", model: "deepseek-bound"},
+};
+const available = (models, stale = false) =>
+  chatExactRouteUnavailableReason(conversation, {
+    stale, harnesses: {deepseek: {models}},
+  });
+console.log(JSON.stringify({
+  zeroRoutes: available([]),
+  otherRouteOnly: available([
+    {id: "deepseek-other", availability: "available"},
+  ]),
+  boundUnavailable: available([
+    {id: "deepseek-bound", availability: "unauthenticated"},
+    {id: "deepseek-other", availability: "available"},
+  ]),
+  boundStale: available([
+    {id: "deepseek-bound", availability: "available", stale: true},
+  ]),
+  staleCatalog: available([
+    {id: "deepseek-bound", availability: "available"},
+  ], true),
+  exactAvailable: available([
+    {id: "deepseek-bound", availability: "available"},
+  ]),
+  missingStatus: chatOpenHarnessUnavailableReason(conversation, null),
+  disabledHarness: chatOpenHarnessUnavailableReason(conversation, {
+    installed: true, enabled: false, healthy: false,
+    surfaces: {browser: true}, unavailable_reason: "HARNESS_DISABLED",
+  }),
+  otherHarness: chatExactRouteUnavailableReason({
+    route: {harness: "codex", model: "gpt-test"},
+  }, {stale: true, harnesses: {}}),
+  otherHarnessMissingStatus: chatOpenHarnessUnavailableReason({
+    route: {harness: "codex", model: "gpt-test"},
+  }, null),
+}));
+"""
+
+    assert run_js(script) == {
+        "zeroRoutes": "HARNESS_ROUTE_UNAVAILABLE",
+        "otherRouteOnly": "HARNESS_ROUTE_UNAVAILABLE",
+        "boundUnavailable": "HARNESS_ROUTE_UNAVAILABLE",
+        "boundStale": "HARNESS_ROUTE_UNAVAILABLE",
+        "staleCatalog": "HARNESS_ROUTE_UNAVAILABLE",
+        "exactAvailable": None,
+        "missingStatus": "HARNESS_UNAVAILABLE",
+        "disabledHarness": "HARNESS_DISABLED",
+        "otherHarness": None,
+        "otherHarnessMissingStatus": None,
+    }
 
 
 def test_transcript_streams_normalized_events_and_reconnects_natively():
@@ -310,6 +460,25 @@ def test_transcript_streams_normalized_events_and_reconnects_natively():
     assert "source.onerror" in interface
     assert "reconnecting" in interface
     assert "mdBlock(body)" in interface
+
+
+def test_reasoning_streams_as_distinct_assistant_segments_without_approval_ui():
+    interface = APP[APP.index("const CHAT_HARNESSES"):
+                    APP.index("// ── Tabs + boot")]
+    reducer = interface[
+        interface.index("const reduceEvent = (event) =>"):
+        interface.index("chatOpenStream(", interface.index(
+            "const reduceEvent = (event) =>"))
+    ]
+    assert 'event.payload?.segment === "reasoning"' in reducer
+    assert "previousSegment !== segment" in reducer
+    assert "anchor = sequence" in reducer
+    assert "assistantSegments.delete(event.run_id)" in reducer
+    assert 'bubble.classList.add("chat-reasoning")' in interface
+    assert 'segment === "reasoning" ? "Reasoning"' in interface
+    assert ".chat-bubble.chat-assistant.chat-reasoning" in STYLE
+    assert "approval control" not in interface.lower()
+    assert "approval button" not in interface.lower()
 
 
 def test_transcript_installs_snapshot_then_coalesces_keyed_live_updates():
@@ -582,8 +751,9 @@ def test_closed_chat_composer_offers_reopen():
     interface = APP[APP.index("const CHAT_HARNESSES"):
                     APP.index("// ── Tabs + boot")]
     assert "const reopenable = closed && !sprintScoped" in interface
-    assert "composer.disabled = closing || (closed && !reopenable)" in interface
-    assert "send.disabled = closing || (closed && !reopenable)" in interface
+    assert "composer.disabled = Boolean(unavailableReason)" in interface
+    assert "|| closing || (closed && !reopenable)" in interface
+    assert "send.disabled = Boolean(unavailableReason)" in interface
     assert (
         "This conversation is closed — send a message to reopen it."
         in interface
@@ -824,15 +994,19 @@ def test_interface_arrival_defers_configuration_and_phases_history_requests():
     interface = APP[APP.index("async function renderInterface"):
                     APP.index("// ── Tabs + boot")]
     loader = APP[APP.index("function chatLoadConfiguration"):
-                 APP.index("function chatStopStream")]
+                     APP.index("function chatStopStream")]
+    open_chat = interface[interface.index("const loadTranscript = async"):
+                          interface.index("await loadTranscript()")]
 
-    assert 'api("/models")' not in interface
-    assert 'api("/flavor-defaults")' not in interface
+    assert 'api("/models").catch(() => null)' in open_chat
+    assert 'api("/flavor-defaults").catch(() => null)' in open_chat
     assert 'api("/flavor-defaults")' in loader
     assert 'api("/models")' in loader
-    assert "if (chatConfiguration) return Promise.resolve(chatConfiguration)" in loader
     assert "if (chatConfigurationPromise) return chatConfigurationPromise" in loader
     assert "chatConfigurationPromise = null" in loader
+    assert "request.then(clear, clear)" in loader
+    assert "let chatConfiguration =" not in APP
+    assert "let chatHarnessDefaults" not in APP
     assert 'chatApi("/conversations?open=true&limit=100")' in interface
     assert "starred=false&limit=20" in interface
     assert "starred=true&limit=100" in interface

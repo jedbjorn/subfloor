@@ -2748,23 +2748,19 @@ let chatRenderGeneration = 0;
 let chatPendingSend = null;
 let chatModeController = null;
 let chatReviewCleanup = null;
-let chatConfiguration = null;
 let chatConfigurationPromise = null;
 
 function chatLoadConfiguration() {
-  if (chatConfiguration) return Promise.resolve(chatConfiguration);
   if (chatConfigurationPromise) return chatConfigurationPromise;
   const request = Promise.all([
     api("/flavor-defaults"),
     api("/models"),
-  ]).then(([defaults, catalog]) => {
-    chatConfiguration = { defaults, catalog };
-    return chatConfiguration;
-  });
+  ]).then(([defaults, catalog]) => ({ defaults, catalog }));
   chatConfigurationPromise = request;
-  request.catch(() => {
+  const clear = () => {
     if (chatConfigurationPromise === request) chatConfigurationPromise = null;
-  });
+  };
+  request.then(clear, clear);
   return request;
 }
 
@@ -2799,6 +2795,35 @@ function chatModelLabel(conversation) {
   if (route.control_state === "harness-default") return "harness default";
   const model = route.model || "harness default";
   return route.effort ? `${model} · ${route.effort}` : model;
+}
+
+function chatHarnessUnavailableReason(status) {
+  if (!status) return null;
+  if (!status.surfaces?.browser)
+    return status.unavailable_reason || "HARNESS_CONVERSATION_UNSUPPORTED";
+  if (!status.installed || !status.enabled || !status.healthy)
+    return status.unavailable_reason || "HARNESS_UNAVAILABLE";
+  return null;
+}
+
+const chatRequiresExactRoute = (harness) => harness === "deepseek";
+
+function chatOpenHarnessUnavailableReason(conversation, status) {
+  const harness = conversation?.route?.harness;
+  if (!status && chatRequiresExactRoute(harness))
+    return "HARNESS_UNAVAILABLE";
+  return chatHarnessUnavailableReason(status);
+}
+
+function chatExactRouteUnavailableReason(conversation, catalog) {
+  const route = conversation?.route || {};
+  if (!chatRequiresExactRoute(route.harness)) return null;
+  const exact = (catalog?.harnesses?.[route.harness]?.models || [])
+    .find((candidate) => candidate.id === route.model);
+  if (!route.model || catalog?.stale || !exact || exact.stale
+      || exact.availability !== "available")
+    return "HARNESS_ROUTE_UNAVAILABLE";
+  return null;
 }
 
 function chatStartedLabel(conversation) {
@@ -3050,11 +3075,15 @@ function chatUpdateContextTokens(node, value) {
 
 function chatBubble(
   kind, body, meta = "", conversation = null, createdAt = "", contextTokens = null,
+  segment = "answer",
 ) {
   const bubble = el("article", { className: `chat-bubble chat-${kind}` });
+  if (kind === "assistant" && segment === "reasoning")
+    bubble.classList.add("chat-reasoning");
   const header = el("div", { className: "chat-bubble-head" },
     el("div", { className: "chat-who" },
       kind === "user" ? "You"
+        : kind === "assistant" && segment === "reasoning" ? "Reasoning"
         : kind === "assistant" ? chatShellLabel(conversation)
         : "Activity"));
   const time = chatMessageTimeLabel(createdAt);
@@ -3122,13 +3151,22 @@ function chatModelOptions(select, catalog, harness, defaultModel) {
   select.replaceChildren();
   const models = catalog.harnesses?.[harness]?.models || [];
   const available = models.filter((model) => model.availability === "available");
-  select.append(el("option", {
-    value: "",
-    textContent: defaultModel
-      ? `Use shell default — ${defaultModel}`
-      : "Use harness default",
-  }));
+  const exactRequired = chatRequiresExactRoute(harness);
   if (defaultModel) select.append(el("option", {
+    value: "",
+    textContent: `Use shell default — ${defaultModel}`,
+  }));
+  else if (exactRequired) select.append(el("option", {
+    value: "",
+    textContent: "Choose an exact model",
+    disabled: true,
+    selected: true,
+  }));
+  else select.append(el("option", {
+    value: "",
+    textContent: "Use harness default",
+  }));
+  if (defaultModel && !exactRequired) select.append(el("option", {
     value: CHAT_HARNESS_DEFAULT_VALUE,
     textContent: "Use harness default",
   }));
@@ -3799,15 +3837,22 @@ async function chatRenderNew(host, shell, defaults, catalog) {
   const byHarness = Object.fromEntries(rows.map((row) => [row.harness, row]));
   const defaultHarness = rows.find((row) => row.is_default)?.harness;
   const availableHarnesses = CHAT_HARNESSES_FROM_SERVER(defaults);
-  let harness = availableHarnesses.includes(defaultHarness)
-    ? defaultHarness : availableHarnesses[0];
+  const healthyHarnesses = availableHarnesses.filter(
+    (value) => !chatHarnessUnavailableReason(defaults.harness_status?.[value]),
+  );
+  let harness = healthyHarnesses.includes(defaultHarness)
+    ? defaultHarness : healthyHarnesses[0] || availableHarnesses[0];
   const form = el("form", { className: "chat-new-form" });
   const harnessSelect = el("select");
   for (const value of availableHarnesses) {
+    const reason = chatHarnessUnavailableReason(defaults.harness_status?.[value]);
     harnessSelect.append(el("option", {
       value,
       selected: value === harness,
-      textContent: value + (value === defaultHarness ? " — shell default" : ""),
+      disabled: Boolean(reason),
+      textContent: value
+        + (value === defaultHarness ? " — shell default" : "")
+        + (reason ? ` — ${reason}` : ""),
     }));
   }
   const modelSelect = el("select");
@@ -3825,6 +3870,9 @@ async function chatRenderNew(host, shell, defaults, catalog) {
   const routeNote = el("div", { className: "chat-route-note" });
   const paintEfforts = () => {
     const row = byHarness[harness] || {};
+    const unavailable = chatHarnessUnavailableReason(
+      defaults.harness_status?.[harness],
+    );
     const harnessDefault = modelSelect.value === CHAT_HARNESS_DEFAULT_VALUE;
     const model = harnessDefault ? null : modelSelect.value || row.model || null;
     const preferred = modelSelect.value && !harnessDefault
@@ -3849,10 +3897,17 @@ async function chatRenderNew(host, shell, defaults, catalog) {
     }
     effortSelect.disabled = state.disabled;
     effortSelect.title = state.guidance;
-    submit.disabled = Boolean(model && (state.disabled || !state.selected));
+    const exactRouteMissing = chatRequiresExactRoute(harness) && !model;
+    submit.disabled = Boolean(
+      unavailable || exactRouteMissing
+        || model && (state.disabled || !state.selected),
+    );
     const transport = harness === "opencode"
       ? " OpenCode models come only from connected providers." : "";
-    routeNote.textContent = state.guidance + transport;
+    routeNote.textContent = unavailable
+      || (exactRouteMissing
+        ? "DeepSeek requires an authenticated exact model route."
+        : state.guidance + transport);
   };
   const paintModels = () => {
     harness = harnessSelect.value;
@@ -3877,6 +3932,7 @@ async function chatRenderNew(host, shell, defaults, catalog) {
   );
   form.onsubmit = async (event) => {
     event.preventDefault();
+    if (submit.disabled) return;
     submit.disabled = true;
     submit.textContent = "Starting…";
     const body = {
@@ -3910,6 +3966,8 @@ function chatTranscriptPageItems(snapshot) {
       if (item.run_id == null || !Number.isInteger(anchor) || anchor < 0
           || item.item_id !== `run:${item.run_id}:assistant:${anchor}`)
         throw new Error("Transcript contains an invalid assistant segment.");
+      if (item.segment != null && !["answer", "reasoning"].includes(item.segment))
+        throw new Error("Transcript contains an unknown assistant segment.");
     }
     items.set(item.item_id, { ...item });
   }
@@ -3933,11 +3991,18 @@ function chatCreateTranscriptState(snapshot) {
         > Number(cursor.segment_anchor_sequence)))
     throw new Error("Transcript assistant cursor moved backward.");
   const assistantAnchors = new Map();
+  const assistantSegments = new Map();
   if (cursor) {
     assistantAnchors.set(
       cursor.run_id,
       Number(cursor.segment_anchor_sequence),
     );
+    const cursorItem = [...items.values()].find((item) =>
+      item.kind === "assistant" && item.run_id === cursor.run_id
+        && Number(item.segment_anchor_sequence)
+          === Number(cursor.segment_anchor_sequence));
+    if (["answer", "reasoning"].includes(cursorItem?.segment))
+      assistantSegments.set(cursor.run_id, cursorItem.segment);
   }
   const order = [...items.keys()].sort((left, right) => {
     const a = items.get(left);
@@ -3952,6 +4017,7 @@ function chatCreateTranscriptState(snapshot) {
     lastSequence: Number(snapshot.through_sequence || 0),
     items,
     assistantAnchors,
+    assistantSegments,
     order,
     pages: [{ itemIds: [...order] }],
     nodes: new Map(),
@@ -4049,6 +4115,7 @@ function chatTranscriptItemNode(item, conversation, retry) {
     conversation,
     item.created_at,
     item.context_tokens,
+    item.segment,
   );
   if (item.kind === "user" && item.state === "failed") {
     const button = el("button", {
@@ -4247,7 +4314,8 @@ function chatFlushTranscript(
 }
 
 async function chatRenderOpen(
-  host, initialConversation, initialSnapshot, onWakeDelivered = null,
+  host, initialConversation, initialSnapshot, harnessStatus = null,
+  modelCatalog = null, onWakeDelivered = null,
 ) {
   const generation = chatRenderGeneration;
   let conversation = initialConversation;
@@ -4345,8 +4413,13 @@ async function chatRenderOpen(
     hidden: true,
   });
   const pending = el("div", { className: "chat-pending", hidden: true });
+  const unavailable = el("div", {
+    className: "chat-harness-unavailable",
+    hidden: true,
+  });
   const composerRow = el("div", { className: "chat-composer" },
-    composer, el("div", { className: "chat-compose-actions" }, pending, send, stop));
+    unavailable, composer,
+    el("div", { className: "chat-compose-actions" }, pending, send, stop));
   const reviewWorkspace = chatReviewWorkspace(reviewHost, conversation);
   const updateStreamStatus = () => {
     const connected = streamStatus === "connected";
@@ -4527,8 +4600,17 @@ async function chatRenderOpen(
     // owned only for that window. Reopen is scope-blocked server-side forever.
     const sprintManaged = Boolean(conversation.sprint_managed);
     const reopenable = closed && !sprintScoped;
-    composer.disabled = closing || (closed && !reopenable);
-    send.disabled = closing || (closed && !reopenable);
+    const unavailableReason = chatOpenHarnessUnavailableReason(
+      conversation, harnessStatus,
+    )
+      || chatExactRouteUnavailableReason(conversation, modelCatalog);
+    unavailable.hidden = !unavailableReason;
+    unavailable.textContent = unavailableReason
+      ? `${unavailableReason} — history remains readable.` : "";
+    composer.disabled = Boolean(unavailableReason)
+      || closing || (closed && !reopenable);
+    send.disabled = Boolean(unavailableReason)
+      || closing || (closed && !reopenable);
     stop.disabled = conversation.state !== "running" || closing || Boolean(stopRequest);
     stop.textContent = stopRequest ? "Stopping…" : "Stop";
     headerStop.disabled = stop.disabled;
@@ -4537,7 +4619,9 @@ async function chatRenderOpen(
     close.hidden = sprintManaged;
     close.disabled = sprintManaged || closed || closing;
     close.textContent = closing ? "Closing…" : "Close";
-    composer.placeholder = closed
+    composer.placeholder = unavailableReason
+      ? `This harness is unavailable — ${unavailableReason}.`
+      : closed
       ? (reopenable
         ? "This conversation is closed — send a message to reopen it."
         : "This conversation is closed.")
@@ -4643,12 +4727,7 @@ async function chatRenderOpen(
       pending.hidden = false;
       pending.textContent = `${error.code} — retry keeps this exact send`;
       toast(`${error.code}: ${error.message}`);
-    } finally {
-      send.disabled = (conversation.state === "closed"
-        && conversation.scope !== "normal")
-        || (conversation.state !== "closed"
-          && Boolean(conversation.close_requested_at));
-    }
+    } finally { paint(); }
   }
   send.onclick = submit;
   stop.onclick = async () => {
@@ -4725,6 +4804,7 @@ async function chatRenderOpen(
         return;
       }
       transcriptState.assistantAnchors.set(event.run_id, sequence);
+      transcriptState.assistantSegments.delete(event.run_id);
     }
 
     if (type === "message.accepted") {
@@ -4751,7 +4831,15 @@ async function chatRenderOpen(
         reconcileTranscript();
         return;
       }
-      const anchor = transcriptState.assistantAnchors.get(runId) || 0;
+      const segment = event.payload?.segment === "reasoning"
+        ? "reasoning" : "answer";
+      let anchor = transcriptState.assistantAnchors.get(runId) || 0;
+      const previousSegment = transcriptState.assistantSegments.get(runId);
+      if (previousSegment && previousSegment !== segment) {
+        anchor = sequence;
+        transcriptState.assistantAnchors.set(runId, anchor);
+      }
+      transcriptState.assistantSegments.set(runId, segment);
       const itemId = `run:${runId}:assistant:${anchor}`;
       let assistant = transcriptState.items.get(itemId);
       if (assistant && (assistant.message_id !== event.message_id
@@ -4770,6 +4858,7 @@ async function chatRenderOpen(
           created_at: event.created_at,
           text: "",
           outcome: null,
+          segment,
           segment_anchor_sequence: anchor,
           first_sequence: sequence,
           last_sequence: sequence,
@@ -4834,6 +4923,8 @@ async function chatRenderOpen(
       conversation.active_run_id = event.run_id;
       if (event.run_id != null)
         transcriptState.assistantAnchors.set(event.run_id, 0);
+      if (event.run_id != null)
+        transcriptState.assistantSegments.delete(event.run_id);
       if (onWakeDelivered) onWakeDelivered(conversation.shell.shell_id);
     }
     if (type === "conversation.updated" || type === "conversation.renamed")
@@ -4858,6 +4949,8 @@ async function chatRenderOpen(
       conversation.active_run_id = null;
       if (event.run_id != null)
         transcriptState.assistantAnchors.delete(event.run_id);
+      if (event.run_id != null)
+        transcriptState.assistantSegments.delete(event.run_id);
     }
 
     if (type === "assistant.delta") {
@@ -5405,13 +5498,18 @@ async function renderInterface(root) {
     pane.replaceChildren(
       el("div", { className: "chat-loading" }, "Loading transcript…"));
     try {
-      const snapshot = await chatApi(
-        `/conversations/${selectedId}/transcript`);
+      const [snapshot, defaults, catalog] = await Promise.all([
+        chatApi(`/conversations/${selectedId}/transcript`),
+        api("/flavor-defaults").catch(() => null),
+        api("/models").catch(() => null),
+      ]);
       if (generation !== chatRenderGeneration) return;
       await chatRenderOpen(
         pane,
         conversation,
         snapshot,
+        defaults?.harness_status?.[conversation.route?.harness] || null,
+        catalog,
         refreshWakeIndicators,
       );
     } catch (error) {
