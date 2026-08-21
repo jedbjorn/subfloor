@@ -313,33 +313,81 @@ class DispatchGateTest(SprintWorkDispatchCase):
             ).fetchone()[0],
         )
 
-    def test_arm_keeps_deepseek_closed_until_manifest_promotion(self) -> None:
-        self.create_unit(developer=1)
+    def test_arm_admits_deepseek_ollama_route_and_force_new_wake(self) -> None:
+        unit_id = self.create_unit(developer=1)
         self.con.execute(
             "UPDATE sprint_participants SET harness='deepseek',"
-            "model='deepseek-v4-pro',effort='default' "
+            "model='ollama-cloud/deepseek-v4-pro:0813',effort='default' "
             "WHERE sprint_id=? AND shell_id=1",
             (self.sprint_id,),
         )
         self.con.commit()
 
-        with self.assertRaisesRegex(
-            sprint_domain.SprintPreflightError,
-            "harness 'deepseek' has no Sprint conversation surface",
-        ):
-            self.lifecycle.arm(
-                self.sprint_id, 3, conformance_reviewer_shell_id=2
-            )
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
 
-        self.assert_arm_left_no_writes()
+        binding = self.con.execute(
+            "SELECT binding.harness,binding.control_state,"
+            "binding.requested_model,binding.provider_model,"
+            "binding.effective_effort,binding.transport,"
+            "binding.adapter_metadata FROM sprint_participants participant "
+            "JOIN sprint_participant_route_bindings binding "
+            "ON binding.binding_id=participant.active_route_binding_id "
+            "WHERE participant.sprint_id=? AND participant.shell_id=1",
+            (self.sprint_id,),
+        ).fetchone()
+        assignment = self.con.execute(
+            "SELECT work_unit_id,to_participant_id,declared_type,disposition "
+            "FROM wake_message WHERE work_unit_id=? "
+            "AND message_kind='work_assignment'",
+            (unit_id,),
+        ).fetchone()
+        developer_participant = self.con.execute(
+            "SELECT participant_id FROM sprint_participants "
+            "WHERE sprint_id=? AND shell_id=1",
+            (self.sprint_id,),
+        ).fetchone()[0]
+
         self.assertEqual(
-            0,
+            (
+                "deepseek",
+                "controlled",
+                "ollama-cloud/deepseek-v4-pro:0813",
+                "deepseek-v4-pro:0813",
+                "default",
+                "deepseek-provider-options-v1",
+            ),
+            tuple(binding)[:6],
+        )
+        metadata = json.loads(binding[6])
+        self.assertEqual(metadata["provider_route"], "ollama-cloud")
+        self.assertEqual(metadata["credential_kind"], "ollama-api-key")
+        self.assertEqual(metadata["endpoint_identity"], "https://ollama.com/v1")
+        self.assertEqual(
+            metadata["provider_adapter_id"],
+            "dsh-llm-pi-ai@0.1.0-rc.7/ollama-cloud",
+        )
+        self.assertEqual(
+            metadata["provider_options"],
+            {
+                "omit": ["thinking", "reasoning_effort"],
+                "set": {},
+            },
+        )
+        self.assertEqual(
+            (unit_id, developer_participant, "force-new", "pending"),
+            tuple(assignment),
+        )
+        self.assertEqual(
+            "armed",
             self.con.execute(
-                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
             ).fetchone()[0],
         )
 
-    def test_prepared_reroute_rejects_deepseek_without_mutating_route_state(
+    def test_prepared_reroute_admits_deepseek_as_unbound_intent(
         self,
     ) -> None:
         self.create_unit(developer=1)
@@ -349,25 +397,43 @@ class DispatchGateTest(SprintWorkDispatchCase):
         self.assertEqual([], before["route_events"])
         self.assertEqual([], before["wakes"])
 
-        with self.assertRaisesRegex(
-            sprint_domain.SprintPreflightError,
-            "harness 'deepseek' has no Sprint conversation surface",
-        ):
-            sprint_domain.SprintParticipantStore(
-                self.con, probe_harness=lambda _harness: None
-            ).reroute(
-                self.sprint_id,
-                3,
-                participant_shell_id=4,
-                harness="deepseek",
-                model="deepseek-v4-pro",
-                effort="default",
-                route="DeepSeek V4 Pro",
-            )
+        receipt = sprint_domain.SprintParticipantStore(
+            self.con, probe_harness=lambda _harness: None
+        ).reroute(
+            self.sprint_id,
+            3,
+            participant_shell_id=4,
+            harness="deepseek",
+            model="ollama-cloud/deepseek-v4-pro:0813",
+            effort="default",
+            route="Ollama Cloud DeepSeek V4 Pro 0813",
+        )
 
-        self.assertEqual(before, self.reroute_state(4))
+        after = self.reroute_state(4)
+        self.assertTrue(receipt.changed)
+        self.assertEqual("unbound-intent", receipt.binding_status)
+        self.assertEqual("controlled", receipt.control_state)
+        self.assertIsNone(receipt.route_revision)
+        self.assertEqual(
+            (
+                "deepseek",
+                "ollama-cloud/deepseek-v4-pro:0813",
+                "default",
+                "Ollama Cloud DeepSeek V4 Pro 0813",
+                None,
+            ),
+            after["participant"][1:6],
+        )
+        self.assertEqual([], after["bindings"])
+        self.assertEqual(1, len(after["route_events"]))
+        self.assertEqual("participant.route_changed", after["route_events"][0][1])
+        event = json.loads(after["route_events"][0][2])
+        self.assertEqual(event["before"]["harness"], "codex")
+        self.assertEqual(event["after"]["harness"], "deepseek")
+        self.assertEqual(event["after"]["binding_status"], "unbound-intent")
+        self.assertEqual([], after["wakes"])
 
-    def test_paused_reroute_rejects_deepseek_and_resume_keeps_original_route(
+    def test_paused_reroute_binds_deepseek_and_resume_keeps_new_route(
         self,
     ) -> None:
         self.create_unit(developer=1)
@@ -377,7 +443,7 @@ class DispatchGateTest(SprintWorkDispatchCase):
         self.lifecycle.pause(
             self.sprint_id,
             sprint_domain.LifecycleActor("planner", 3),
-            reason="verify unsupported reroute rejection",
+            reason="verify provider-neutral DeepSeek reroute",
         )
         before = self.reroute_state(4)
         participant_before = before["participant"]
@@ -389,27 +455,51 @@ class DispatchGateTest(SprintWorkDispatchCase):
         self.assertEqual([], before["route_events"])
         self.assertEqual(2, len(before["wakes"]))
 
-        with self.assertRaisesRegex(
-            sprint_domain.SprintPreflightError,
-            "harness 'deepseek' has no Sprint conversation surface",
-        ):
-            sprint_domain.SprintParticipantStore(
-                self.con, probe_harness=lambda _harness: None
-            ).reroute(
-                self.sprint_id,
-                3,
-                participant_shell_id=4,
-                harness="deepseek",
-                model="deepseek-v4-pro",
-                effort="default",
-                route="DeepSeek V4 Pro",
-            )
+        receipt = sprint_domain.SprintParticipantStore(
+            self.con, probe_harness=lambda _harness: None
+        ).reroute(
+            self.sprint_id,
+            3,
+            participant_shell_id=4,
+            harness="deepseek",
+            model="ollama-cloud/deepseek-v4-pro:0813",
+            effort="default",
+            route="Ollama Cloud DeepSeek V4 Pro 0813",
+        )
 
-        self.assertEqual(before, self.reroute_state(4))
+        rerouted = self.reroute_state(4)
+        self.assertTrue(receipt.changed)
+        self.assertEqual("bound", receipt.binding_status)
+        self.assertEqual("controlled", receipt.control_state)
+        self.assertEqual(2, receipt.route_revision)
+        self.assertEqual(
+            (
+                "deepseek",
+                "ollama-cloud/deepseek-v4-pro:0813",
+                "default",
+                "Ollama Cloud DeepSeek V4 Pro 0813",
+            ),
+            rerouted["participant"][1:5],
+        )
+        self.assertEqual(2, len(rerouted["bindings"]))
+        self.assertEqual(
+            (
+                "deepseek",
+                "ollama-cloud/deepseek-v4-pro:0813",
+                "default",
+                2,
+            ),
+            rerouted["bindings"][1][1:5],
+        )
+        self.assertEqual(
+            ["participant.route_changed", "participant.route_revised"],
+            [event[1] for event in rerouted["route_events"]],
+        )
+        self.assertEqual(before["wakes"], rerouted["wakes"])
         self.lifecycle.resume(
             self.sprint_id,
             sprint_domain.LifecycleActor("planner", 3),
-            reason="unsupported reroute left original route intact",
+            reason="provider-neutral DeepSeek reroute is bound",
         )
         resumed = self.con.execute(
             "SELECT participant.harness,binding.harness,binding.requested_model,"
@@ -421,10 +511,17 @@ class DispatchGateTest(SprintWorkDispatchCase):
             (self.sprint_id,),
         ).fetchone()
         self.assertEqual(
-            ("codex", "codex", None, 1, participant_before[5]), tuple(resumed)
+            (
+                "deepseek",
+                "deepseek",
+                "ollama-cloud/deepseek-v4-pro:0813",
+                2,
+                rerouted["participant"][5],
+            ),
+            tuple(resumed),
         )
         self.assertEqual(
-            0,
+            1,
             self.con.execute(
                 "SELECT COUNT(*) FROM sprint_participant_route_bindings "
                 "WHERE participant_id=(SELECT participant_id FROM "

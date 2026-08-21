@@ -22,24 +22,28 @@ from conversation_broker import BrokerRun
 from conversation_launch import ConversationLaunchPreparer
 
 
-def test_sprint_surface_gate_keeps_deepseek_closed_until_promoted() -> None:
-    with pytest.raises(
+def test_sprint_surface_gate_admits_deepseek_and_rejects_browser_only() -> None:
+    admitted = sprint_participant_chats.require_sprint_harness("deepseek")
+
+    assert admitted["harness"] == "deepseek"
+    assert admitted["surfaces"] == {
+        "terminal": False,
+        "one_shot": False,
+        "browser": True,
+        "sprint": True,
+    }
+
+    browser_only = dict(admitted)
+    browser_only["surfaces"] = {**admitted["surfaces"], "sprint": False}
+    with mock.patch.object(
+        sprint_participant_chats.run_mod,
+        "load_adapter",
+        return_value=browser_only,
+    ), pytest.raises(
         sprint_participant_chats.SprintConversationError,
         match="harness 'deepseek' has no Sprint conversation surface",
     ):
         sprint_participant_chats.require_sprint_harness("deepseek")
-
-    promoted = sprint_participant_chats.run_mod.load_adapter("deepseek")
-    promoted["surfaces"] = {**promoted["surfaces"], "sprint": True}
-    with mock.patch.object(
-        sprint_participant_chats.run_mod,
-        "load_adapter",
-        return_value=promoted,
-    ):
-        admitted = sprint_participant_chats.require_sprint_harness("deepseek")
-
-    assert admitted["harness"] == "deepseek"
-    assert admitted["surfaces"]["sprint"] is True
 
 
 @contextmanager

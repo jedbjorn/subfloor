@@ -52,7 +52,7 @@ class HarnessSurfaceProjectionTest(unittest.TestCase):
                 "terminal": False,
                 "one_shot": False,
                 "browser": True,
-                "sprint": False,
+                "sprint": True,
             },
             "unavailable_reason": None,
         })

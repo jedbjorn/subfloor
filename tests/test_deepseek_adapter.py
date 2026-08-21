@@ -308,7 +308,7 @@ def test_manifest_registry_probe_and_surface_contract_are_live() -> None:
     manifest = json.loads((ENGINE / "adapters" / "deepseek" / "adapter.json").read_text())
     assert [
         name for name, enabled in manifest["surfaces"].items() if enabled
-    ] == ["browser"]
+    ] == ["browser", "sprint"]
 
     next_release = checked_version_compatibility(
         harness="deepseek",

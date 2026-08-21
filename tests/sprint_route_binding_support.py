@@ -72,7 +72,11 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
             "control_state": "controlled",
             "harness": harness,
             "requested_model": model,
-            "provider_model": model,
+            "provider_model": (
+                model.split("/", 1)[1]
+                if harness == "deepseek" and "/" in model
+                else model
+            ),
             "requested_effort": selected,
             "effective_effort": selected,
             "native_variant_id": (
@@ -86,9 +90,21 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
             "selector_binding": {"kind": "test", "selector": model},
             "adapter_metadata": (
                 {
-                    "provider_route": "deepseek-official",
+                    "provider_route": "ollama-cloud",
+                    "provider_adapter_id": (
+                        "dsh-llm-pi-ai@0.1.0-rc.7/ollama-cloud"
+                    ),
+                    "provider_adapter_digest": "4" * 64,
+                    "provider_registry_sha256": "5" * 64,
+                    "credential_kind": "ollama-api-key",
+                    "endpoint_identity": "https://ollama.com/v1",
+                    "discovery_evidence_digest": "6" * 64,
                     "transport_contract": "deepseek-provider-options-v1",
-                    "wire_evidence_digest": "4" * 64,
+                    "wire_evidence_digest": "7" * 64,
+                    "runtime_version": "0.1.0rc7",
+                    "source_commit": "8" * 40,
+                    "patch_sha256": "9" * 64,
+                    "composition_sha256": "a" * 64,
                     "provider_options": {
                         "omit": ["thinking", "reasoning_effort"],
                         "set": {},
