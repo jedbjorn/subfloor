@@ -155,6 +155,29 @@ def platform_name() -> str:
     return f"{operating_system}-{architecture}"
 
 
+def validate_skill_canary_receipt(
+    receipt: Mapping[str, object], manifest: Mapping[str, object]
+) -> None:
+    expected = {
+        "schema_version": 1,
+        "contract": "deepseek-production-skill-resume-v1",
+        "source_commit": manifest["source"]["commit"],
+        "composition_sha256": manifest["composition"]["sha256"],
+        "initial_catalog": ["changed", "current", "revoked"],
+        "resumed_catalog": ["changed", "current", "new"],
+        "changed_body_refreshed": True,
+        "new_grant_loadable": True,
+        "revoked_grant_absent": True,
+        "boot_digest_preserved": True,
+        "native_session_preserved": True,
+        "fresh_carrier_process": True,
+        "initial_terminal": "run.completed",
+        "resumed_terminal": "run.completed",
+    }
+    if dict(receipt) != expected:
+        raise RuntimeError("production skill-resume canary receipt is incomplete")
+
+
 def build(source: Path, output: Path, manifest: Mapping[str, object]) -> dict[str, object]:
     build_evidence = manifest["build"]
     assert isinstance(build_evidence, dict)
@@ -177,10 +200,9 @@ def build(source: Path, output: Path, manifest: Mapping[str, object]) -> dict[st
         "pnpm",
     ]
     checked_run([*pnpm, "install", "--frozen-lockfile"], cwd=source, env=environment)
-    # These pinned native suites prove the production skill provider/tool seam:
-    # current discovery, catalog addition/removal, exact-session resume, and
-    # latest-body loading. The composition digest separately binds this stack
-    # to the engine-rendered grant root.
+    # These pinned native suites catch component-level provider/tool regressions.
+    # The post-wheel adapter canary below owns the production composition and
+    # exact-resume proof.
     checked_run(
         [
             *pnpm,
@@ -244,6 +266,39 @@ def build(source: Path, output: Path, manifest: Mapping[str, object]) -> dict[st
     wheels = sorted(output.glob("*.whl"))
     if len(wheels) != 2:
         raise RuntimeError(f"expected SDK and runtime wheels; found {[path.name for path in wheels]}")
+    canary_venv = source.parent / "python-canary"
+    checked_run([sys.executable, "-m", "venv", str(canary_venv)], cwd=source, env=environment)
+    canary_python = canary_venv / "bin" / "python"
+    checked_run(
+        [
+            str(build_venv / "bin" / "uv"),
+            "pip",
+            "install",
+            "--python",
+            str(canary_python),
+            *(str(path) for path in wheels),
+        ],
+        cwd=source,
+        env=build_environment,
+    )
+    canary_path = ENGINE / str(build_evidence["canary_path"])
+    canary_receipt_path = source.parent / "skill-resume-canary.json"
+    checked_run(
+        [
+            str(canary_python),
+            str(canary_path),
+            "--carrier-python",
+            str(canary_python),
+            "--receipt",
+            str(canary_receipt_path),
+        ],
+        cwd=ENGINE.parent,
+        env=environment,
+    )
+    canary_receipt = json.loads(canary_receipt_path.read_text())
+    if not isinstance(canary_receipt, dict):
+        raise RuntimeError("production skill-resume canary returned no object receipt")
+    validate_skill_canary_receipt(canary_receipt, manifest)
     return {
         "schema_version": 1,
         "platform": target,
@@ -257,6 +312,7 @@ def build(source: Path, output: Path, manifest: Mapping[str, object]) -> dict[st
             "uv": build_evidence["uv_version"],
             "source_date_epoch": build_evidence["source_date_epoch"],
         },
+        "canary": canary_receipt,
         "artifacts": [
             {"filename": path.name, "sha256": sha256(path), "size": path.stat().st_size}
             for path in wheels

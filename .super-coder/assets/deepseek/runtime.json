@@ -3,7 +3,9 @@
   "python_minimum": "3.10",
   "carrier": {
     "protocol": "super-coder-deepseek-lifecycle-v1",
-    "acquisition": "verified-source-build"
+    "acquisition": "verified-source-build",
+    "worker_path": "scripts/deepseek_carrier_worker.py",
+    "worker_sha256": "da6b9803a2429ce926b97cff162f9aa387daa7570778c8dc53b97c7bfe685b89"
   },
   "source": {
     "repository": "https://github.com/deepseek-ai/deepseek-harness",
@@ -23,13 +25,16 @@
   },
   "build": {
     "path": "scripts/build_deepseek_carrier.py",
-    "sha256": "2b7c3ede160f48a6a7dfe06897f6fcea5e10cfdb9825e559d70186be8e4b2301",
+    "sha256": "107a7af5370d0707de155949f2850b9ee391c295ae0f6b37f282d72c4035accb",
     "lock_sha256": "f517dc3978d57531cda747df62a2abdde1df5b9f25415fcf1fc5d51f8b7547ea",
     "node_version": "24.18.1",
     "pnpm_version": "11.7.0",
     "uv_version": "0.11.23",
     "source_date_epoch": 1786963622,
-    "artifact_evidence": "deepseek-carrier-artifacts.json"
+    "artifact_evidence": "deepseek-carrier-artifacts.json",
+    "canary_path": "scripts/deepseek_skill_resume_canary.py",
+    "canary_sha256": "1962ca50a8c8ca67a54fac57f72d1114c5174ed289ded7a67301393e06c004ac",
+    "canary_contract": "deepseek-production-skill-resume-v1"
   },
   "sdk": {
     "distribution": "deepseek-harness-sdk",

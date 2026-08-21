@@ -12,7 +12,13 @@ import os
 import re
 import sys
 import threading
+from pathlib import Path
 from typing import Any, Mapping
+
+# ``python -I worker.py`` deliberately removes the script directory from the
+# import path. Restore only this engine-owned directory so the standard
+# entrypoint wrapper remains available without exposing ambient Python paths.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from deepseek_harness import HarnessClient, HarnessConfig
 
