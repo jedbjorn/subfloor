@@ -627,18 +627,41 @@ def test_approval_event_fails_only_the_owned_run_and_releases_no_other_transport
 
 
 @pytest.mark.parametrize(
-    ("native_code", "expected_code"),
+    ("native_code", "native_message", "expected_code"),
     [
-        ("INVALID_CREDENTIAL", "HARNESS_NATIVE_RUN_INVALID_CREDENTIAL"),
-        ("HTTP_503", "HARNESS_NATIVE_RUN_HTTP_503"),
-        ("invalid credential token=must-not-survive", "HARNESS_NATIVE_RUN_FAILED"),
-        ("PLAUSIBLE_BUT_UNKNOWN", "HARNESS_NATIVE_RUN_FAILED"),
-        (None, "HARNESS_NATIVE_RUN_FAILED"),
+        (
+            "INVALID_CREDENTIAL",
+            "opaque provider detail",
+            "HARNESS_NATIVE_RUN_INVALID_CREDENTIAL",
+        ),
+        ("HTTP_503", "opaque provider detail", "HARNESS_NATIVE_RUN_HTTP_503"),
+        (
+            "PI_AI_ERROR",
+            "request failed with 404 status code (no body)",
+            "HARNESS_NATIVE_RUN_HTTP_404",
+        ),
+        (
+            "PI_AI_ERROR",
+            "opaque provider detail token=404-must-not-survive",
+            "HARNESS_NATIVE_RUN_PI_AI_ERROR",
+        ),
+        (
+            "invalid credential token=must-not-survive",
+            "opaque provider detail",
+            "HARNESS_NATIVE_RUN_FAILED",
+        ),
+        (
+            "PLAUSIBLE_BUT_UNKNOWN",
+            "opaque provider detail",
+            "HARNESS_NATIVE_RUN_FAILED",
+        ),
+        (None, "opaque provider detail", "HARNESS_NATIVE_RUN_FAILED"),
     ],
 )
 def test_turn_failure_projects_only_a_strict_native_error_code(
     tmp_path: Path,
     native_code: str | None,
+    native_message: str,
     expected_code: str,
 ) -> None:
     worktree = tmp_path / "worktree"
@@ -649,7 +672,7 @@ def test_turn_failure_projects_only_a_strict_native_error_code(
         turn = adapter.start(context(worktree), "Do it")
         reason: dict[str, Any] = {
             "kind": "error",
-            "error": {"message": "opaque provider detail"},
+            "error": {"message": native_message},
         }
         if native_code is not None:
             reason["error"]["code"] = native_code

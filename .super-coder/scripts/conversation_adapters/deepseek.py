@@ -66,6 +66,11 @@ NATIVE_ERROR_CODES = frozenset(
     }
 )
 NATIVE_HTTP_ERROR_CODE = re.compile(r"^HTTP_[1-5][0-9]{2}$")
+NATIVE_HTTP_STATUS = re.compile(
+    r"(?:\bHTTP(?:\s+status)?[\s:_-]*([1-5][0-9]{2})\b|"
+    r"\b([1-5][0-9]{2})\s+status\s+code\b)",
+    re.I,
+)
 _CARRIER_STREAM_END = object()
 
 
@@ -357,6 +362,15 @@ def _native_failure_code(reason: Any) -> str:
     if isinstance(code, str) and (
         code in NATIVE_ERROR_CODES or NATIVE_HTTP_ERROR_CODE.fullmatch(code)
     ):
+        if code == "PI_AI_ERROR":
+            message = error.get("message")
+            match = (
+                NATIVE_HTTP_STATUS.search(message)
+                if isinstance(message, str)
+                else None
+            )
+            if match is not None:
+                return f"HARNESS_NATIVE_RUN_HTTP_{match.group(1) or match.group(2)}"
         return f"HARNESS_NATIVE_RUN_{code}"
     return "HARNESS_NATIVE_RUN_FAILED"
 
