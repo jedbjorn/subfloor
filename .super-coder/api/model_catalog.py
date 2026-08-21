@@ -489,6 +489,8 @@ def _from_deepseek_provider(
                 for _row, model in exact_rows
             ],
             "discovery_evidence_digest": discovery_evidence_digest,
+            "attempted_selectors": [],
+            "proved_selectors": [],
         })
     configured = adapter["model_selectors"]
     if selector is not None:
@@ -515,6 +517,11 @@ def _from_deepseek_provider(
             ]
     if len(exact_rows) > adapter["wire_proof_budget"]:
         raise _DeepSeekWireProofError(DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED)
+    if discovery_out is not None:
+        discovery_out["attempted_selectors"] = [
+            f"{provider}/{model}" if adapter["selector_prefix"] else model
+            for _row, model in exact_rows
+        ]
     for row, model in exact_rows:
         route_selector = f"{provider}/{model}" if adapter["selector_prefix"] else model
         try:
@@ -554,6 +561,8 @@ def _from_deepseek_provider(
             },
             adapter_metadata=metadata,
         ))
+        if discovery_out is not None:
+            discovery_out["proved_selectors"].append(route_selector)
     if exact_rows and not entries:
         selectors = {
             f"{provider}/{item}" if adapter["selector_prefix"] else item
@@ -1247,6 +1256,17 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
         for item in deepseek_block.get("authenticated_routes") or []
         if isinstance(item, dict)
     }
+    attempted_deepseek_routes = {
+        selector
+        for item in authenticated_routes.values()
+        for selector in (item.get("attempted_selectors") or [])
+    }
+    proved_deepseek_routes = {
+        selector
+        for item in authenticated_routes.values()
+        for selector in (item.get("proved_selectors") or [])
+    }
+    failed_deepseek_routes = attempted_deepseek_routes - proved_deepseek_routes
     if authenticated_routes and not failed:
         for row in con.execute(
             "SELECT selector,provider,selector_binding,source_fingerprint "
@@ -1261,6 +1281,7 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
             if (
                 isinstance(authenticated, dict)
                 and route["selector"] in (authenticated.get("selectors") or [])
+                and route["selector"] not in attempted_deepseek_routes
                 and binding.get("discovery_evidence_digest")
                 == authenticated.get("discovery_evidence_digest")
             ):
@@ -1416,6 +1437,12 @@ def persist_routes(con, payload: dict, *, publication_locked: bool = False) -> N
                             "last_seen_at=?,generation_id=? "
                             "WHERE harness='deepseek' AND selector=?",
                             (completed_at, generation_id, selector),
+                        )
+                    for selector in failed_deepseek_routes:
+                        con.execute(
+                            "UPDATE model_routes SET stale=1,last_error=? "
+                            "WHERE harness='deepseek' AND selector=?",
+                            (DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED, selector),
                         )
     payload["catalogue_generation"] = generation_id
     payload["generation_state"] = state

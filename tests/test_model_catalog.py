@@ -1415,6 +1415,72 @@ class RoutePersistenceTest(unittest.TestCase):
         self.assertEqual(tuple(route)[:2], (0, None))
         self.assertEqual(route["generation_id"], generation["generation_id"])
 
+    def test_attempted_failed_deepseek_route_is_not_carried_current(self):
+        rows = [
+            {"id": model}
+            for model in ("model-a", "model-b", "model-c", "model-d", "wanted-model")
+        ]
+
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": rows}
+
+        environment = {"OLLAMA_API_KEY": "ollama-secret"}
+        admitted = mc.build(
+            fetch=fetch,
+            env=environment,
+            run=None,
+            deepseek_wire_probe=deepseek_wire_proof,
+            deepseek_selector="ollama-cloud/model-a",
+        )
+        admitted.update(self.verification("deepseek", "0.1.0rc7"))
+        mc.persist_routes(self.con, admitted)
+
+        proof_calls = []
+
+        def selective_failure(provider, model, options_by_effort, env=None):
+            proof_calls.append(model)
+            if model == "model-a":
+                raise RuntimeError("exact route wire proof failed")
+            return deepseek_wire_proof(provider, model, options_by_effort, env)
+
+        refreshed = mc.build(
+            fetch=fetch,
+            env=environment,
+            run=None,
+            deepseek_wire_probe=selective_failure,
+        )
+        refreshed.update(self.verification("deepseek", "0.1.0rc7"))
+        mc.persist_routes(self.con, refreshed)
+
+        current_generation = self.con.execute(
+            "SELECT generation_id FROM model_catalog_generations "
+            "ORDER BY completed_at DESC,generation_id DESC LIMIT 1"
+        ).fetchone()["generation_id"]
+        routes = self.con.execute(
+            "SELECT selector,stale,last_error,generation_id FROM model_routes "
+            "WHERE harness='deepseek' ORDER BY selector"
+        ).fetchall()
+        self.assertEqual(proof_calls, ["model-a", "model-b", "model-c", "model-d"])
+        self.assertEqual(
+            [tuple(route) for route in routes],
+            [
+                (
+                    "ollama-cloud/model-a",
+                    1,
+                    "DeepSeek provider-option mapper has no outbound wire proof",
+                    admitted["catalogue_generation"],
+                ),
+                ("ollama-cloud/model-b", 0, None, current_generation),
+                ("ollama-cloud/model-c", 0, None, current_generation),
+                ("ollama-cloud/model-d", 0, None, current_generation),
+            ],
+        )
+        self.assertFalse(any(
+            route["selector"].endswith("wanted-model") for route in routes
+        ))
+
     def test_failed_refresh_keeps_route_and_marks_it_stale(self):
         fresh = {"fetched_at": "2026-07-21T00:00:00+00:00", "stale": False,
                  "harnesses": {"claude": {"models": [mc._entry(
