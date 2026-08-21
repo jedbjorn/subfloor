@@ -149,6 +149,7 @@ class ConversationLaunchPreparer:
                 "model": broker_run.model,
                 "effort": broker_run.effort,
                 "headless_prompt": broker_run.body,
+                "conversation_owned": True,
                 "current_leased_run_id": broker_run.run_id,
                 # Explicit conversation launch mode (spec #163): the broker's
                 # leased run knows whether this turn starts a new native

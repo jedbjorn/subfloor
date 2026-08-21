@@ -187,6 +187,16 @@ def test_bound_headless_route_rejects_unsupported_deepseek_effort() -> None:
     }
 
 
+def test_native_deepseek_conversation_does_not_enable_cli_headless() -> None:
+    adapter = run_mod.load_adapter("deepseek")
+
+    assert run_mod.headless_command(adapter, "prompt") is None
+    assert run_mod.headless_command(
+        adapter, "prompt", conversation_owned=True
+    ) == []
+    assert adapter["surfaces"]["one_shot"] is False
+
+
 @pytest.fixture
 def launch_case():
     with tempfile.TemporaryDirectory() as tmp:
@@ -253,6 +263,7 @@ def test_preparer_returns_canonical_environment_and_archive(launch_case):
         "model": "gpt-test",
         "effort": "high",
         "headless_prompt": "Do the work",
+        "conversation_owned": True,
         "current_leased_run_id": 7,
         "boot": BootDirective(
             conversation_id="cv_" + "a" * 32,

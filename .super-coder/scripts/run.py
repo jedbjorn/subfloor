@@ -204,6 +204,7 @@ def headless_command(
     sandbox_flags: "list[str] | None" = None,
     effort: "str | None" = None,
     transport: "route_transport.TransportProjection | None" = None,
+    conversation_owned: bool = False,
 ) -> "list[str] | None":
     """The non-interactive exec argv from the adapter's `headless` block —
     launch prefix + model flag + sandbox flags + the prompt as the final
@@ -211,6 +212,12 @@ def headless_command(
     which takes no model from the launch seam — see the spec's non-goals)."""
     hcfg = adapter.get("headless")
     if not hcfg or not hcfg.get("launch"):
+        if (
+            conversation_owned
+            and (adapter.get("surfaces") or {}).get("browser") is True
+            and (adapter.get("conversation") or {}).get("driver")
+        ):
+            return []
         return None
     if transport is not None:
         if transport.harness != adapter.get("harness"):
@@ -1213,6 +1220,7 @@ def _shell_path(work_dir: Path, inherited: str) -> str:
 def prepare_launch(*, shell_id: int, harness: "str | None" = None,
                    model: "str | None" = None, effort: "str | None" = None,
                    headless_prompt: "str | None" = None,
+                   conversation_owned: bool = False,
                    current_leased_run_id: "int | None" = None,
                    route_binding: "dict | None" = None,
                    binding_digest: "str | None" = None,
@@ -1232,6 +1240,10 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
     the gate — the caller refuses before this runs), the banner/spinner/
     boot summary, tab titles, and git_prune (a hygiene sweep for human
     boots; an engine-driven pane launch must never delete branches).
+
+    ``conversation_owned`` lets a declared native browser adapter reuse this
+    preparation path without inventing a CLI one-shot command; the conversation
+    adapter owns dispatch and the returned argv is deliberately empty.
 
     ``boot`` carries an explicit conversation launch mode (spec #163): with a
     BootDirective the boot document is the conversation's one committed
@@ -1478,6 +1490,7 @@ def prepare_launch(*, shell_id: int, harness: "str | None" = None,
         argv = headless_command(
             adapter, headless_prompt, session_model,
             sandbox_flags, session_effort, transport=route_projection,
+            conversation_owned=conversation_owned,
         )
         if argv is None:
             raise LaunchError(f"harness '{harness}' has no headless adapter")
