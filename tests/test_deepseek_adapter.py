@@ -62,7 +62,7 @@ def deepseek_binding(
     provider_model = (
         "deepseek-v4-pro"
         if provider_route == "deepseek-official"
-        else "deepseek-v4-pro:0813-cloud"
+        else "deepseek-v4-pro:0813"
     )
     selector = (
         provider_model
@@ -421,7 +421,7 @@ def test_ollama_start_uses_raw_provider_model_and_only_ollama_credential(tmp_pat
     transport = factory.instances[0]
 
     assert transport.env["SC_DEEPSEEK_PROVIDER"] == "ollama-cloud"
-    assert transport.env["SC_DEEPSEEK_MODEL"] == "deepseek-v4-pro:0813-cloud"
+    assert transport.env["SC_DEEPSEEK_MODEL"] == "deepseek-v4-pro:0813"
     assert transport.env["OLLAMA_API_KEY"] == "ollama-test-secret-value"
     assert "DEEPSEEK_API_KEY" not in transport.env
     assert "DEEPSEEK_BASE_URL" not in transport.env

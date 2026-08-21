@@ -560,7 +560,10 @@ class BuildTest(NoCLI):
             if url == mc.MODELS_DEV_URL:
                 return MODELS_DEV
             if url == "https://ollama.com/v1/models":
-                return {"data": [{"id": "deepseek-v4-pro:0813-cloud"}]}
+                return {"data": [
+                    {"id": "deepseek-v4-pro:0813"},
+                    {"id": "deepseek-v4-pro:0813-cloud"},
+                ]}
             raise AssertionError(url)
 
         got = mc.build(
@@ -571,9 +574,9 @@ class BuildTest(NoCLI):
         )
 
         route = got["harnesses"]["deepseek"]["models"][0]
-        self.assertEqual(route["id"], "ollama-cloud/deepseek-v4-pro:0813-cloud")
+        self.assertEqual(route["id"], "ollama-cloud/deepseek-v4-pro:0813")
         self.assertEqual(route["provider"], "ollama-cloud")
-        self.assertEqual(route["provider_model"], "deepseek-v4-pro:0813-cloud")
+        self.assertEqual(route["provider_model"], "deepseek-v4-pro:0813")
         self.assertEqual(route["supported_efforts"], [])
         self.assertIsNone(route["default_effort"])
         self.assertEqual(route["adapter_metadata"]["credential_kind"], "ollama-api-key")
@@ -587,9 +590,37 @@ class BuildTest(NoCLI):
         ))
         self.assertIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
         self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
+        self.assertNotIn(
+            "ollama-cloud/deepseek-v4-pro:0813-cloud",
+            ids(got["harnesses"]["deepseek"]),
+        )
         serialized = json.dumps(got)
         self.assertNotIn("ollama-secret", serialized)
         self.assertNotIn("OLLAMA_API_KEY", serialized)
+
+    def test_ollama_public_library_tag_cannot_substitute_for_authenticated_route(self):
+        probe = mock.Mock(
+            side_effect=AssertionError("missing exact inference id must not probe")
+        )
+
+        got = mc.build(
+            fetch=lambda url, _headers=None: (
+                MODELS_DEV
+                if url == mc.MODELS_DEV_URL
+                else {"data": [{"id": "deepseek-v4-pro:0813-cloud"}]}
+            ),
+            env={"OLLAMA_API_KEY": "ollama-secret"},
+            run=None,
+            deepseek_wire_probe=probe,
+        )
+
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            mc.DEEPSEEK_DISCOVERY_EVIDENCE_INVALID,
+        )
+        self.assertNotIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
+        probe.assert_not_called()
 
     def test_one_provider_failure_does_not_suppress_the_other_provider(self):
         def fetch(url, headers=None):
@@ -598,7 +629,7 @@ class BuildTest(NoCLI):
             if url == "https://api.deepseek.com/models":
                 raise OSError("deepseek unavailable")
             if url == "https://ollama.com/v1/models":
-                return {"data": [{"id": "deepseek-v4-pro:0813-cloud"}]}
+                return {"data": [{"id": "deepseek-v4-pro:0813"}]}
             raise AssertionError(url)
 
         got = mc.build(
@@ -613,7 +644,7 @@ class BuildTest(NoCLI):
 
         self.assertEqual(
             ids(got["harnesses"]["deepseek"]),
-            ["ollama-cloud/deepseek-v4-pro:0813-cloud"],
+            ["ollama-cloud/deepseek-v4-pro:0813"],
         )
         self.assertIn(mc.OLLAMA_CLOUD_SOURCE, got["sources"])
         self.assertNotIn(mc.DEEPSEEK_SOURCE, got["sources"])
@@ -708,7 +739,7 @@ class BuildTest(NoCLI):
 
     def test_ollama_max_catalogue_proves_only_configured_exact_selectors(self):
         proof_calls = []
-        configured = "deepseek-v4-pro:0813-cloud"
+        configured = "deepseek-v4-pro:0813"
         rows = [{"id": configured}] + [
             {"id": f"other-model-{index}"} for index in range(63)
         ]
@@ -738,7 +769,7 @@ class BuildTest(NoCLI):
         )
 
     def test_authenticated_provider_rejects_entire_malformed_generation_before_probe(self):
-        configured = "deepseek-v4-pro:0813-cloud"
+        configured = "deepseek-v4-pro:0813"
         invalid_rows = (
             [{"id": configured}, {"id": configured}],
             [{"id": configured}, {"id": ""}],
@@ -769,8 +800,8 @@ class BuildTest(NoCLI):
                 return MODELS_DEV
             return {
                 "data": [
-                    {"id": "deepseek-v4-pro:0813-cloud"},
-                    {"id": "deepseek-v4-pro:0813-cloud"},
+                    {"id": "deepseek-v4-pro:0813"},
+                    {"id": "deepseek-v4-pro:0813"},
                 ]
             }
 
