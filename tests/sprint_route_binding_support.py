@@ -25,6 +25,7 @@ def _runtime(harness: str) -> tuple[dict, dict]:
         {
             "claude": "2.1.223",
             "codex": "0.146.0",
+            "deepseek": "0.1.0rc7",
             "kimi": "0.33.0",
             "opencode": "1.18.9",
             "vibe": "2.22.0",
@@ -83,7 +84,18 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
             "catalogue_generation": "1" * 32,
             "evidence_digest": None if model_default else "2" * 64,
             "selector_binding": {"kind": "test", "selector": model},
-            "adapter_metadata": {},
+            "adapter_metadata": (
+                {
+                    "provider_route": "deepseek-official",
+                    "transport_contract": "deepseek-provider-options-v1",
+                    "wire_evidence_digest": "4" * 64,
+                    "provider_options": {
+                        "omit": ["thinking", "reasoning_effort"],
+                        "set": {},
+                    },
+                }
+                if harness == "deepseek" else {}
+            ),
         }
         route_bindings.validate_v2_binding(binding)
         digest = route_bindings.digest_json(binding)
@@ -91,6 +103,7 @@ def candidate(_con, participant) -> sprint_domain.ParticipantBindingCandidate:
         harness_version = {
             "claude": "2.1.223",
             "codex": "0.146.0",
+            "deepseek": "0.1.0rc7",
             "kimi": "0.33.0",
             "opencode": "1.18.9",
         }[harness]

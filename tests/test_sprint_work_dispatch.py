@@ -238,6 +238,109 @@ class DispatchGateTest(SprintWorkDispatchCase):
 
         self.assertEqual([("codex", False), ("kimi", False)], observed)
 
+    def test_arm_rejects_browser_only_harness_before_any_sprint_write(self) -> None:
+        self.create_unit(developer=1)
+        load_adapter = sprint_domain.sprint_participant_chats.run_mod.load_adapter
+
+        def browser_only(harness: str) -> dict:
+            adapter = load_adapter(harness)
+            if harness != "codex":
+                return adapter
+            return {
+                **adapter,
+                "surfaces": {**adapter["surfaces"], "sprint": False},
+            }
+
+        with mock.patch.object(
+            sprint_domain.sprint_participant_chats.run_mod,
+            "load_adapter",
+            side_effect=browser_only,
+        ), self.assertRaisesRegex(
+            sprint_domain.SprintPreflightError,
+            "harness 'codex' has no Sprint conversation surface",
+        ):
+            self.lifecycle.arm(
+                self.sprint_id, 3, conformance_reviewer_shell_id=2
+            )
+
+        self.assert_arm_left_no_writes()
+        self.assertEqual(
+            0,
+            self.con.execute(
+                "SELECT COUNT(*) FROM sprint_participant_route_bindings"
+            ).fetchone()[0],
+        )
+
+    def test_arm_admits_deepseek_through_existing_binding_and_wake_state(self) -> None:
+        unit_id = self.create_unit(developer=1)
+        self.con.execute(
+            "UPDATE sprint_participants SET harness='deepseek',"
+            "model='deepseek-v4-pro',effort='default' "
+            "WHERE sprint_id=? AND shell_id=1",
+            (self.sprint_id,),
+        )
+        self.con.commit()
+
+        self.lifecycle.arm(
+            self.sprint_id, 3, conformance_reviewer_shell_id=2
+        )
+
+        binding = self.con.execute(
+            "SELECT binding.harness,binding.control_state,"
+            "binding.requested_model,binding.effective_effort,"
+            "binding.transport,binding.adapter_metadata "
+            "FROM sprint_participants participant "
+            "JOIN sprint_participant_route_bindings binding "
+            "ON binding.binding_id=participant.active_route_binding_id "
+            "WHERE participant.sprint_id=? AND participant.shell_id=1",
+            (self.sprint_id,),
+        ).fetchone()
+        assignment = self.con.execute(
+            "SELECT work_unit_id,to_participant_id,declared_type,disposition "
+            "FROM wake_message WHERE work_unit_id=? "
+            "AND message_kind='work_assignment'",
+            (unit_id,),
+        ).fetchone()
+        developer_participant = self.con.execute(
+            "SELECT participant_id FROM sprint_participants "
+            "WHERE sprint_id=? AND shell_id=1",
+            (self.sprint_id,),
+        ).fetchone()[0]
+
+        self.assertEqual(
+            (
+                "deepseek",
+                "controlled",
+                "deepseek-v4-pro",
+                "default",
+                "deepseek-provider-options-v1",
+            ),
+            tuple(binding)[:5],
+        )
+        self.assertEqual(
+            {
+                "provider_route": "deepseek-official",
+                "transport_contract": "deepseek-provider-options-v1",
+                "wire_evidence_digest": "4" * 64,
+                "provider_options": {
+                    "omit": ["thinking", "reasoning_effort"],
+                    "set": {},
+                },
+            },
+            json.loads(binding[5]),
+        )
+        self.assertEqual(
+            (unit_id, developer_participant, "force-new", "pending"),
+            tuple(assignment),
+        )
+        self.assertEqual(
+            "armed",
+            self.con.execute(
+                "SELECT lifecycle FROM sprints WHERE sprint_id=?",
+                (self.sprint_id,),
+            ).fetchone()[0],
+        )
+
     def test_arm_binds_every_participant_once_and_preserves_generation(self) -> None:
         self.create_unit(developer=1)
         self.con.execute(

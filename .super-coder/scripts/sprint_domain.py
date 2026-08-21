@@ -720,6 +720,11 @@ class SprintLifecycleStore:
 
     def _probe_bound_harness(self, harness: str) -> None:
         """Keep executable probing, but do not turn static ranges into admission."""
+        if sprint_participant_chats.run_mod.load_adapter(harness).get("conversation"):
+            try:
+                sprint_participant_chats.require_sprint_harness(harness)
+            except sprint_participant_chats.SprintConversationError as exc:
+                raise SprintPreflightError(str(exc)) from exc
         try:
             self.probe_harness(harness)
         except AdapterError as exc:
