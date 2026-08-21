@@ -32,6 +32,7 @@ RUN_ROOT = ENGINE / "run" / "deepseek"
 MINIMUM_PYTHON = (3, 10)
 PROBE_TIMEOUT = 10
 PROVIDER_WIRE_PROBE_TIMEOUT = 30
+PROVIDER_WIRE_PURPOSES = ("conversation", "compaction", "session-title")
 INSTALL_TIMEOUT = 3600
 MAX_DIAGNOSTIC_CHARS = 4096
 SENSITIVE_ENV = re.compile(r"(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.I)
@@ -51,7 +52,7 @@ SECRET_TEXT = (
 LIFECYCLE_METHODS = frozenset(
     {"session/start", "session/cancel", "session/inspect", "session/reconcile", "shutdown"}
 )
-PROVIDER_WIRE_CONTRACT = "deepseek-provider-options-wire-v2"
+PROVIDER_WIRE_CONTRACT = "deepseek-provider-options-wire-v3"
 
 
 _PROVIDER_WIRE_PROBE = r"""
@@ -60,14 +61,18 @@ import os
 import sys
 
 from deepseek_harness import HarnessClient, HarnessConfig
+from pydantic import BaseModel
+
+
+class ProviderProbeResult(BaseModel):
+    purpose: str
 
 provider = sys.argv[1]
 model = sys.argv[2]
 options_by_effort = json.loads(sys.argv[3])
 native_requests = {}
 for index, (effort, options) in enumerate(options_by_effort.items()):
-    session_id = f"wire-proof-{index}-{effort}"
-    native_metadata = []
+    native_by_purpose = {}
     os.environ["SC_DEEPSEEK_PROVIDER_THINKING"] = options["thinking"]
     os.environ["SC_DEEPSEEK_PROVIDER_REASONING_EFFORT"] = options["reasoningEffort"]
     config = HarnessConfig(
@@ -84,18 +89,18 @@ for index, (effort, options) in enumerate(options_by_effort.items()):
             max_tokens=8,
             provider_request_options=options,
         )
-        client.session_prompt(
-            session_id,
-            [{"type": "text", "text": "Reply with OK."}],
-        )
-        while True:
-            notification = client.next_notification()
-            if notification.method == "provider.request":
+        for purpose in ("conversation", "compaction", "session-title"):
+            session_id = f"wire-proof-{index}-{effort}-{purpose}"
+            native_metadata = []
+
+            def observe(notification):
+                if notification.method != "provider.request":
+                    return
                 payload = notification.payload
                 if (
                     isinstance(payload, dict)
                     and payload.get("sessionId") == session_id
-                    and payload.get("purpose") == "conversation"
+                    and payload.get("purpose") == purpose
                 ):
                     native_metadata.append({
                         "event_type": "provider.request",
@@ -104,17 +109,20 @@ for index, (effort, options) in enumerate(options_by_effort.items()):
                         "reasoning_effort": payload.get("reasoningEffort"),
                         "purpose": payload.get("purpose"),
                     })
-            if (
-                notification.method == "session.status"
-                and notification.payload.get("sessionId") == session_id
-                and notification.payload.get("status") == "idle"
-            ):
-                break
-    if len(native_metadata) != 1:
-        raise RuntimeError(
-            f"expected one native provider.request for {effort}, observed {len(native_metadata)}"
-        )
-    native_requests[effort] = native_metadata[0]
+
+            result = client.request(
+                "provider/probe",
+                {"sessionId": session_id, "purpose": purpose},
+                response_model=ProviderProbeResult,
+                on_notification=observe,
+            )
+            if result.purpose != purpose or len(native_metadata) != 1:
+                raise RuntimeError(
+                    f"expected one native provider.request for {effort}/{purpose}, "
+                    f"observed {len(native_metadata)}"
+                )
+            native_by_purpose[purpose] = native_metadata[0]
+    native_requests[effort] = native_by_purpose
 print(json.dumps(native_requests, sort_keys=True, separators=(",", ":")))
 """.strip()
 
@@ -1391,6 +1399,7 @@ def provider_wire_evidence(
                 "SC_DEEPSEEK_PROVIDER_BASE_URL": base_url,
                 "SC_DEEPSEEK_PROVIDER_THINKING": "omit",
                 "SC_DEEPSEEK_PROVIDER_REASONING_EFFORT": "omit",
+                "SC_DEEPSEEK_PROVIDER_WIRE_PROBE": "1",
             })
             try:
                 completed = runner(
@@ -1437,34 +1446,26 @@ def provider_wire_evidence(
                     "HARNESS_PROVIDER_WIRE_INVALID",
                     "carrier native request metadata does not cover every effort",
                 )
-            if capture_errors or len(captures) != len(requested):
+            expected_capture_count = len(requested) * len(PROVIDER_WIRE_PURPOSES)
+            if capture_errors or len(captures) != expected_capture_count:
                 raise DeepSeekRuntimeError(
                     "HARNESS_PROVIDER_WIRE_INVALID",
                     capture_errors[-1] if capture_errors else (
-                        f"expected {len(requested)} provider requests, "
+                        f"expected {expected_capture_count} provider requests, "
                         f"observed {len(captures)}"
                     ),
                 )
-            for (effort, options), capture in zip(
-                requested.items(), captures
-            ):
-                if capture["authorization"] != "Bearer wire-proof-sentinel":
+            capture_index = 0
+            for effort, options in requested.items():
+                native_by_purpose = native_requests[effort]
+                if (
+                    not isinstance(native_by_purpose, dict)
+                    or set(native_by_purpose) != set(PROVIDER_WIRE_PURPOSES)
+                ):
                     raise DeepSeekRuntimeError(
                         "HARNESS_PROVIDER_WIRE_INVALID",
-                        "provider request did not cross the authenticated transport",
+                        f"native request purposes are incomplete for effort {effort}",
                     )
-                payload = capture["payload"]
-                assert isinstance(payload, dict)
-                if payload.get("model") != model:
-                    raise DeepSeekRuntimeError(
-                        "HARNESS_PROVIDER_WIRE_MISMATCH",
-                        "provider request changed the exact model",
-                    )
-                observed_options = {
-                    key: payload[key]
-                    for key in ("thinking", "reasoning_effort")
-                    if key in payload
-                }
                 expected_options: dict[str, object] = {}
                 if (
                     adapter["wire_mode"] == "deepseek-request-patch"
@@ -1475,34 +1476,63 @@ def provider_wire_evidence(
                     expected_options["reasoning_effort"] = options[
                         "reasoningEffort"
                     ]
-                if observed_options != expected_options:
-                    raise DeepSeekRuntimeError(
-                        "HARNESS_PROVIDER_WIRE_MISMATCH",
-                        f"outbound reasoning fields do not match effort {effort}",
-                    )
-                native_request = native_requests[effort]
-                expected_native = {
-                    "event_type": "provider.request",
-                    "provider": provider,
-                    "model": model,
-                    "reasoning_effort": (
-                        None if effort == "default" else effort
-                    ),
-                    "purpose": "conversation",
-                }
-                if native_request != expected_native:
-                    raise DeepSeekRuntimeError(
-                        "HARNESS_PROVIDER_WIRE_MISMATCH",
-                        f"native request metadata does not match effort {effort}",
-                    )
+                purpose_proofs: dict[str, dict[str, object]] = {}
+                for purpose in PROVIDER_WIRE_PURPOSES:
+                    capture = captures[capture_index]
+                    capture_index += 1
+                    if capture["authorization"] != "Bearer wire-proof-sentinel":
+                        raise DeepSeekRuntimeError(
+                            "HARNESS_PROVIDER_WIRE_INVALID",
+                            "provider request did not cross the authenticated transport",
+                        )
+                    payload = capture["payload"]
+                    assert isinstance(payload, dict)
+                    if payload.get("model") != model:
+                        raise DeepSeekRuntimeError(
+                            "HARNESS_PROVIDER_WIRE_MISMATCH",
+                            "provider request changed the exact model",
+                        )
+                    observed_options = {
+                        key: payload[key]
+                        for key in ("thinking", "reasoning_effort")
+                        if key in payload
+                    }
+                    if observed_options != expected_options:
+                        raise DeepSeekRuntimeError(
+                            "HARNESS_PROVIDER_WIRE_MISMATCH",
+                            f"outbound reasoning fields do not match effort "
+                            f"{effort} purpose {purpose}",
+                        )
+                    native_request = native_by_purpose[purpose]
+                    expected_native = {
+                        "event_type": "provider.request",
+                        "provider": provider,
+                        "model": model,
+                        "reasoning_effort": (
+                            None if effort == "default" else effort
+                        ),
+                        "purpose": purpose,
+                    }
+                    if native_request != expected_native:
+                        raise DeepSeekRuntimeError(
+                            "HARNESS_PROVIDER_WIRE_MISMATCH",
+                            f"native request metadata does not match effort "
+                            f"{effort} purpose {purpose}",
+                        )
+                    purpose_proofs[purpose] = {
+                        "wire_options": observed_options,
+                        "native_request": native_request,
+                    }
+                conversation = purpose_proofs["conversation"]
                 evidence = {
                     "contract": PROVIDER_WIRE_CONTRACT,
                     "provider": provider,
                     "model": model,
                     "effort": effort,
                     "provider_options": options,
-                    "wire_options": observed_options,
-                    "native_request": native_request,
+                    "wire_options": conversation["wire_options"],
+                    "native_request": conversation["native_request"],
+                    "purpose_proofs": purpose_proofs,
                     "runtime_version": observed_status.runtime_version,
                     "source_commit": manifest["source"]["commit"],
                     "patch_sha256": manifest["patch"]["sha256"],

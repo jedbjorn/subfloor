@@ -90,6 +90,13 @@ def deepseek_wire_proof(provider, model, options_by_effort, env=None):
             if adapter["wire_mode"] == "deepseek-request-patch":
                 wire["thinking"] = {"type": "enabled"}
             wire["reasoning_effort"] = effort
+        native_request = {
+            "event_type": "provider.request",
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": None if effort == "default" else effort,
+            "purpose": "conversation",
+        }
         evidence = {
             "contract": deepseek_runtime.PROVIDER_WIRE_CONTRACT,
             "provider": provider,
@@ -97,12 +104,13 @@ def deepseek_wire_proof(provider, model, options_by_effort, env=None):
             "effort": effort,
             "provider_options": dict(options),
             "wire_options": wire,
-            "native_request": {
-                "event_type": "provider.request",
-                "provider": provider,
-                "model": model,
-                "reasoning_effort": None if effort == "default" else effort,
-                "purpose": "conversation",
+            "native_request": native_request,
+            "purpose_proofs": {
+                purpose: {
+                    "wire_options": wire,
+                    "native_request": {**native_request, "purpose": purpose},
+                }
+                for purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES
             },
             "runtime_version": "0.1.0rc7",
             "source_commit": "bb4ca698d63714e753f5621b07400e6ebb0b5d97",
@@ -1003,6 +1011,34 @@ class BuildTest(NoCLI):
             env={"DEEPSEEK_API_KEY": "secret-key"},
             run=None,
             deepseek_wire_probe=mismatched_native,
+        )
+
+        self.assertEqual(got["harnesses"]["deepseek"]["models"], [])
+        self.assertEqual(
+            got["harnesses"]["deepseek"]["error"],
+            mc.DEEPSEEK_PROVIDER_OPTIONS_UNVERIFIED,
+        )
+
+    def test_deepseek_missing_session_title_proof_admits_no_route(self):
+        def fetch(url, headers=None):
+            if url == mc.MODELS_DEV_URL:
+                return MODELS_DEV
+            return {"data": [{"id": "deepseek-v4-pro"}]}
+
+        def missing_purpose(provider, model, options_by_effort, env=None):
+            proof = deepseek_wire_proof(provider, model, options_by_effort, env)
+            item = proof["proofs"]["default"]
+            del item["purpose_proofs"]["session-title"]
+            item["digest"] = route_bindings.digest_json({
+                key: value for key, value in item.items() if key != "digest"
+            })
+            return proof
+
+        got = mc.build(
+            fetch=fetch,
+            env={"DEEPSEEK_API_KEY": "secret-key"},
+            run=None,
+            deepseek_wire_probe=missing_purpose,
         )
 
         self.assertEqual(got["harnesses"]["deepseek"]["models"], [])

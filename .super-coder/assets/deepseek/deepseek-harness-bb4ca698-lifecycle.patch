@@ -1,5 +1,5 @@
 diff --git a/packages/llm/llm-deepseek/src/adapter.ts b/packages/llm/llm-deepseek/src/adapter.ts
-index bc30d46c3..3facabafc 100644
+index bc30d46..3facaba 100644
 --- a/packages/llm/llm-deepseek/src/adapter.ts
 +++ b/packages/llm/llm-deepseek/src/adapter.ts
 @@ -21,7 +21,7 @@ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
@@ -68,7 +68,7 @@ index bc30d46c3..3facabafc 100644
      // transport boundary, never a serialization failure.
      const payload = JSON.stringify(body)
 diff --git a/packages/llm/llm-deepseek/src/index.ts b/packages/llm/llm-deepseek/src/index.ts
-index a7b22ddd8..bc9301ef8 100644
+index a7b22dd..bc9301e 100644
 --- a/packages/llm/llm-deepseek/src/index.ts
 +++ b/packages/llm/llm-deepseek/src/index.ts
 @@ -27,6 +27,7 @@ import {
@@ -142,7 +142,7 @@ index a7b22ddd8..bc9301ef8 100644
    let current: () => Config = () => config
    let lastRaw: Config | undefined
 diff --git a/packages/llm/llm-deepseek/src/serialize.ts b/packages/llm/llm-deepseek/src/serialize.ts
-index f51ef2303..cdbf65872 100644
+index f51ef23..b2f0ae3 100644
 --- a/packages/llm/llm-deepseek/src/serialize.ts
 +++ b/packages/llm/llm-deepseek/src/serialize.ts
 @@ -17,6 +17,12 @@ export interface RequestDefaults {
@@ -179,7 +179,7 @@ index f51ef2303..cdbf65872 100644
      ...options.maxTokens === undefined ? {} : { max_tokens: options.maxTokens },
      ...options.stop !== undefined ? { stop: options.stop } : {},
    }
-+  return providerRequestOptions === undefined || options.purpose === 'session-title'
++  return providerRequestOptions === undefined
 +    ? request
 +    : applyProviderRequestOptions(request, providerRequestOptions)
 +}
@@ -200,7 +200,7 @@ index f51ef2303..cdbf65872 100644
 +  return patched
  }
 diff --git a/packages/llm/llm-deepseek/tests/serialize.spec.ts b/packages/llm/llm-deepseek/tests/serialize.spec.ts
-index 714cfc5d2..09814a30f 100644
+index 714cfc5..40293b8 100644
 --- a/packages/llm/llm-deepseek/tests/serialize.spec.ts
 +++ b/packages/llm/llm-deepseek/tests/serialize.spec.ts
 @@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
@@ -212,7 +212,7 @@ index 714cfc5d2..09814a30f 100644
 
  function request(overrides: Partial<GenerateOptions> = {}): GenerateOptions {
    return { provider: 'deepseek-official', model: 'deepseek-v4-flash', messages: [], ...overrides }
-@@ -256,6 +256,46 @@ describe('serializeRequest', () => {
+@@ -256,6 +256,65 @@ describe('serializeRequest', () => {
      expect(wire.reasoning_effort).toBeUndefined()
    })
 
@@ -227,20 +227,39 @@ index 714cfc5d2..09814a30f 100644
 +  })
 +
 +  it.each([
-+    { thinking: 'omit', reasoningEffort: 'omit' },
-+    { thinking: 'enabled', reasoningEffort: 'low' },
-+  ] as const)('keeps session-title thinking disabled ahead of the $reasoningEffort route patch', (patch) => {
++    { purpose: undefined, label: 'conversation' },
++    { purpose: 'compaction', label: 'compaction' },
++    { purpose: 'session-title', label: 'session-title' },
++  ] as const)('applies the immutable default omission to $label requests', ({ purpose }) => {
 +    const wire = serializeRequest(
 +      request({
 +        messages: history,
-+        purpose: 'session-title',
++        ...purpose === undefined ? {} : { purpose },
 +        reasoningEffort: ReasoningEffortId('max'),
 +      }),
 +      { thinking: 'enabled', reasoningEffort: 'max' },
-+      patch,
++      { thinking: 'omit', reasoningEffort: 'omit' },
 +    )
-+    expect(wire.thinking).toEqual({ type: 'disabled' })
++    expect(wire.thinking).toBeUndefined()
 +    expect(wire.reasoning_effort).toBeUndefined()
++  })
++
++  it.each([
++    { purpose: undefined, label: 'conversation' },
++    { purpose: 'compaction', label: 'compaction' },
++    { purpose: 'session-title', label: 'session-title' },
++  ] as const)('applies the immutable named mapping to $label requests', ({ purpose }) => {
++    const wire = serializeRequest(
++      request({
++        messages: history,
++        ...purpose === undefined ? {} : { purpose },
++        reasoningEffort: ReasoningEffortId('max'),
++      }),
++      { thinking: 'enabled', reasoningEffort: 'max' },
++      { thinking: 'enabled', reasoningEffort: 'low' },
++    )
++    expect(wire.thinking).toEqual({ type: 'enabled' })
++    expect(wire.reasoning_effort).toBe('low')
 +  })
 +
 +  it('callable provider patch replaces both outbound fields exactly', () => {
@@ -260,15 +279,18 @@ index 714cfc5d2..09814a30f 100644
      const wire = serializeRequest(request({ messages: history }), { thinking: 'enabled' })
      expect(wire.thinking).toEqual({ type: 'enabled' })
 diff --git a/packages/sdk/protocol/src/index.ts b/packages/sdk/protocol/src/index.ts
-index 5f0aaca21..25763ff0a 100644
+index 5f0aaca..a172c61 100644
 --- a/packages/sdk/protocol/src/index.ts
 +++ b/packages/sdk/protocol/src/index.ts
-@@ -15,8 +15,15 @@ export type {
+@@ -15,8 +15,18 @@ export type {
    HarnessSdkRequestMap,
    InitializeParams,
    InitializeResult,
++  ProviderProbeParams,
++  ProviderProbeResult,
 +  ProviderRequestNotification,
 +  ProviderRequestOptions,
++  ProviderRequestPurpose,
    SdkRunStatus,
 +  SessionCancelResult,
    SessionEventNotification,
@@ -280,10 +302,10 @@ index 5f0aaca21..25763ff0a 100644
    SessionPromptParams,
    SessionPromptResult,
 diff --git a/packages/sdk/protocol/src/types.ts b/packages/sdk/protocol/src/types.ts
-index 533b5f23c..bb004461e 100644
+index 533b5f2..5736b80 100644
 --- a/packages/sdk/protocol/src/types.ts
 +++ b/packages/sdk/protocol/src/types.ts
-@@ -22,6 +22,20 @@ export interface InitializeParams {
+@@ -22,6 +22,33 @@ export interface InitializeParams {
    model: string
    /** Optional positive output-token cap inherited by SDK-created agents and their in-process descendants. */
    maxTokens?: number
@@ -301,10 +323,23 @@ index 533b5f23c..bb004461e 100644
 +  thinking: 'omit' | 'enabled' | 'disabled'
 +  /** Omit the wire field or force one exact provider reasoning level. */
 +  reasoningEffort: 'omit' | 'low' | 'high' | 'max'
++}
++
++/** Complete set of provider request purposes that can reach an adapter. */
++export type ProviderRequestPurpose = 'conversation' | 'compaction' | 'session-title'
++
++/** Parameters for the loopback-only final-wire admission probe. */
++export interface ProviderProbeParams extends SessionIdentityParams {
++  purpose: ProviderRequestPurpose
++}
++
++/** Receipt that one exact purpose completed through the selected adapter. */
++export interface ProviderProbeResult {
++  purpose: ProviderRequestPurpose
  }
 
  /** Wire-stable server identity returned by initialization. */
-@@ -44,6 +58,40 @@ export interface SessionPromptResult {
+@@ -44,6 +71,40 @@ export interface SessionPromptResult {
    messageId: string
  }
 
@@ -345,7 +380,7 @@ index 533b5f23c..bb004461e 100644
  /** Deployment-mapped SDK outcome: `ok` for an accepted result, `error` otherwise. */
  export type SdkRunStatus = 'ok' | 'error'
 
-@@ -55,6 +103,20 @@ export interface SessionEventNotification {
+@@ -55,6 +116,20 @@ export interface SessionEventNotification {
    event: SessionEvent
  }
 
@@ -360,13 +395,13 @@ index 533b5f23c..bb004461e 100644
 +  /** Resolved native effort, or null when native configuration omits it. */
 +  reasoningEffort: string | null
 +  /** Explicit request purpose; ordinary agent-loop turns are `conversation`. */
-+  purpose: 'conversation' | 'compaction' | 'session-title'
++  purpose: ProviderRequestPurpose
 +}
 +
  /** Whole-agent lifecycle state for one session. */
  export interface SessionStatusNotification {
    /** Session whose live agent changed status. */
-@@ -91,6 +153,7 @@ export interface SubagentFinishedNotification {
+@@ -91,6 +166,7 @@ export interface SubagentFinishedNotification {
 
  /** Server-to-client notifications by JSON-RPC method name. */
  export interface HarnessSdkNotificationMap {
@@ -374,9 +409,11 @@ index 533b5f23c..bb004461e 100644
    'session.event': SessionEventNotification
    'session.status': SessionStatusNotification
    'subagent.started': SubagentStartedNotification
-@@ -101,5 +164,9 @@ export interface HarnessSdkNotificationMap {
+@@ -100,6 +176,11 @@ export interface HarnessSdkNotificationMap {
+ /** Client-to-server request methods with their param and result shapes. */
  export interface HarnessSdkRequestMap {
    'initialize': { params: InitializeParams; result: InitializeResult }
++  'provider/probe': { params: ProviderProbeParams; result: ProviderProbeResult }
    'session/prompt': { params: SessionPromptParams; result: SessionPromptResult }
 +  'session/start': { params: SessionIdentityParams; result: SessionInspectionResult }
 +  'session/cancel': { params: SessionIdentityParams; result: SessionCancelResult }
@@ -385,7 +422,7 @@ index 533b5f23c..bb004461e 100644
    'shutdown': { params: undefined; result: Record<string, never> }
  }
 diff --git a/packages/sdk/server/src/server.ts b/packages/sdk/server/src/server.ts
-index 195caa908..0adf9a442 100644
+index 195caa9..550f956 100644
 --- a/packages/sdk/server/src/server.ts
 +++ b/packages/sdk/server/src/server.ts
 @@ -8,7 +8,7 @@
@@ -397,10 +434,12 @@ index 195caa908..0adf9a442 100644
  import { carrierKeyOf, type Scoped } from '@deepseek-ai/dsh-scope'
  import { SessionId } from '@deepseek-ai/dsh-session'
  import type SubagentRuntime from '@deepseek-ai/dsh-subagent'
-@@ -18,7 +18,13 @@ import type {
+@@ -18,7 +18,15 @@ import type {
    InitializeParams,
    InitializeResult,
    JsonRpcTransportPeer,
++  ProviderProbeParams,
++  ProviderProbeResult,
 +  ProviderRequestNotification,
    SessionEventNotification,
 +  SessionCancelResult,
@@ -411,7 +450,7 @@ index 195caa908..0adf9a442 100644
    SessionPromptParams,
    SessionPromptResult,
    SubagentFinishedNotification,
-@@ -29,6 +35,14 @@ interface SessionRecord {
+@@ -29,6 +37,15 @@ interface SessionRecord {
    handle: AgentHandle
  }
 
@@ -422,11 +461,12 @@ index 195caa908..0adf9a442 100644
 +}
 +
 +const NATIVE_CANCEL_TIMEOUT_MS = 5_000
++const PROVIDER_WIRE_PROBE_ENV = 'SC_DEEPSEEK_PROVIDER_WIRE_PROBE'
 +
  /** Recover the delegating parent from the service-owned scoped carrier. */
  function subagentParentOf(carrier: Scoped<SubagentRuntime>): Agent {
    return carrierKeyOf(carrier) as Agent
-@@ -55,6 +69,7 @@ export class HarnessSdkJsonRpcServer {
+@@ -55,6 +72,7 @@ export class HarnessSdkJsonRpcServer {
    private provider = 'deepseek-official'
    private model = 'deepseek-official'
    private maxTokens: number | undefined
@@ -434,7 +474,7 @@ index 195caa908..0adf9a442 100644
    private llmFiber: { dispose(): Promise<void> } | undefined
    private readonly sessions = new Map<string, SessionRecord>()
    private readonly sessionCreations = new Map<string, Promise<SessionRecord>>()
-@@ -72,6 +87,17 @@ export class HarnessSdkJsonRpcServer {
+@@ -72,6 +90,17 @@ export class HarnessSdkJsonRpcServer {
        const payload: SessionEventNotification = { sessionId: String(session.id), event }
        this.transport.notify('session.event', payload)
      }))
@@ -452,7 +492,7 @@ index 195caa908..0adf9a442 100644
      this.disposers.push(ctx.on('agent/status', ({ agent, status }) => {
        this.transport.notify('session.status', { sessionId: String(agent.session.id), status })
      }))
-@@ -117,9 +143,19 @@ export class HarnessSdkJsonRpcServer {
+@@ -117,9 +146,19 @@ export class HarnessSdkJsonRpcServer {
      this.provider = params.provider
      this.model = params.model
      this.maxTokens = params.maxTokens
@@ -473,10 +513,38 @@ index 195caa908..0adf9a442 100644
      }
      return { serverInfo: { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' } }
    }
-@@ -142,6 +178,52 @@ export class HarnessSdkJsonRpcServer {
+@@ -142,6 +181,80 @@ export class HarnessSdkJsonRpcServer {
      return { messageId: message.id }
    }
 
++  /** Exercise one exact egress purpose through the selected adapter for admission evidence. */
++  async probeProviderRequest(params: ProviderProbeParams): Promise<ProviderProbeResult> {
++    if (process.env[PROVIDER_WIRE_PROBE_ENV] !== '1') {
++      throw new Error('provider wire probing is disabled')
++    }
++    if (!['conversation', 'compaction', 'session-title'].includes(params.purpose)) {
++      throw new TypeError('provider probe purpose is invalid')
++    }
++    const purpose = params.purpose
++    const message = createUserMessage({
++      content: [{ type: 'text', text: 'Reply with OK.' }],
++      source: { kind: 'user' },
++    })
++    const request = {
++      provider: this.provider,
++      model: this.model,
++      messages: [message],
++      sessionId: SessionId(params.sessionId),
++      maxTokens: 8,
++      ...this.reasoningEffort === undefined
++        ? {}
++        : { reasoningEffort: ReasoningEffortId(this.reasoningEffort) },
++      ...purpose === 'conversation' ? {} : { purpose },
++    }
++    for await (const _chunk of this.ctx.llm.stream(request)) { /* drain */ }
++    return { purpose }
++  }
++
 +  /** Materialize or exactly resume one caller-supplied native identity. */
 +  async startSession(params: SessionIdentityParams): Promise<SessionInspectionResult> {
 +    await this.getOrCreateSession(params.sessionId)
@@ -526,8 +594,12 @@ index 195caa908..0adf9a442 100644
    /**
     * Dispose server-owned agents, adapter, and subscriptions to quiescence.
     * The surrounding context remains running.
-@@ -193,6 +275,14 @@ export class HarnessSdkJsonRpcServer {
+@@ -191,8 +304,18 @@ export class HarnessSdkJsonRpcServer {
+     switch (method) {
+       case 'initialize':
          return this.initialize(params as unknown as InitializeParams)
++      case 'provider/probe':
++        return this.probeProviderRequest(params as unknown as ProviderProbeParams)
        case 'session/prompt':
          return this.prompt(params as unknown as SessionPromptParams)
 +      case 'session/start':
@@ -541,7 +613,7 @@ index 195caa908..0adf9a442 100644
        case 'shutdown':
          return this.shutdown()
        default:
-@@ -220,21 +310,89 @@ export class HarnessSdkJsonRpcServer {
+@@ -220,21 +343,89 @@ export class HarnessSdkJsonRpcServer {
      // rows in the host plane, so this agent reads them from the global layer. A
      // deployment that configures a roster has to join one here first
      // (@deepseek-ai/dsh-agent-presets README, "Composing a child agent").
@@ -641,7 +713,7 @@ index 195caa908..0adf9a442 100644
 +  return 'unknown'
 +}
 diff --git a/packages/sdk/server/tests/server.spec.ts b/packages/sdk/server/tests/server.spec.ts
-index 495f1d90f..f137e0676 100644
+index 495f1d9..732d6f3 100644
 --- a/packages/sdk/server/tests/server.spec.ts
 +++ b/packages/sdk/server/tests/server.spec.ts
 @@ -124,6 +124,7 @@ describe('HarnessSdkJsonRpcServer', () => {
@@ -710,7 +782,7 @@ index 495f1d90f..f137e0676 100644
        await vi.waitFor(() => {
          expect(transport.notifications.findLast(n => n.method === 'session.status')).toEqual({
            method: 'session.status',
-@@ -171,6 +214,302 @@ describe('HarnessSdkJsonRpcServer', () => {
+@@ -171,6 +214,355 @@ describe('HarnessSdkJsonRpcServer', () => {
      }
    })
 
@@ -772,6 +844,59 @@ index 495f1d90f..f137e0676 100644
 +          purpose: 'conversation',
 +        },
 +      })
++      await server.handleRequest('shutdown', undefined)
++    } finally {
++      await ctx.fiber.dispose()
++      await rm(storageDir, { recursive: true, force: true })
++    }
++  })
++
++  it('proves default omission across every outbound request purpose', { timeout: 15_000 }, async () => {
++    const storageDir = await mkdtemp(join(tmpdir(), 'dsh-jsonrpc-purpose-proof-'))
++    const llmServer = await mockCompletionServer()
++    vi.stubEnv('DEEPSEEK_API_KEY', 'test-key')
++    vi.stubEnv('DEEPSEEK_BASE_URL', llmServer.url)
++    vi.stubEnv('SC_DEEPSEEK_PROVIDER_WIRE_PROBE', '1')
++    const ctx = await makeHarness(storageDir)
++    try {
++      const transport = new FakeTransport()
++      const server = new HarnessSdkJsonRpcServer(ctx, transport)
++      await server.handleRequest('initialize', {
++        cwd: storageDir,
++        provider: 'deepseek-official',
++        model: 'dsagent-model',
++        providerRequestOptions: { thinking: 'omit', reasoningEffort: 'omit' },
++      })
++      const purposes = ['conversation', 'compaction', 'session-title'] as const
++      for (const purpose of purposes) {
++        await expect(server.handleRequest('provider/probe', {
++          sessionId: `proof-${purpose}`,
++          purpose,
++        })).resolves.toEqual({ purpose })
++      }
++
++      expect(llmServer.requests).toHaveLength(purposes.length)
++      for (const body of llmServer.requests as {
++        model: string
++        thinking?: unknown
++        reasoning_effort?: unknown
++      }[]) {
++        expect(body.model).toBe('dsagent-model')
++        expect(body.thinking).toBeUndefined()
++        expect(body.reasoning_effort).toBeUndefined()
++      }
++      expect(transport.notifications.filter(n => n.method === 'provider.request')).toEqual(
++        purposes.map(purpose => ({
++          method: 'provider.request',
++          params: {
++            sessionId: `proof-${purpose}`,
++            provider: 'deepseek-official',
++            model: 'dsagent-model',
++            reasoningEffort: null,
++            purpose,
++          },
++        })),
++      )
 +      await server.handleRequest('shutdown', undefined)
 +    } finally {
 +      await ctx.fiber.dispose()
@@ -1013,7 +1138,7 @@ index 495f1d90f..f137e0676 100644
    it('queues overlapping prompts for one session without blocking other sessions', async () => {
      const mainFollowup = vi.fn<Agent['followup']>()
      const mainAgent = ({
-@@ -910,20 +1249,36 @@ describe('HarnessSdkJsonRpcServer', () => {
+@@ -910,20 +1302,36 @@ describe('HarnessSdkJsonRpcServer', () => {
      const ctx = {
        on: vi.fn(() => () => undefined),
        agents: { create, get: () => undefined },
@@ -1054,7 +1179,7 @@ index 495f1d90f..f137e0676 100644
      }))
      await server.shutdown()
    })
-@@ -963,6 +1318,6 @@ describe('HarnessSdkJsonRpcServer', () => {
+@@ -963,6 +1371,6 @@ describe('HarnessSdkJsonRpcServer', () => {
      const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
 
      await expect(server.shutdown()).rejects.toBe(listenerFailure)
@@ -1063,7 +1188,7 @@ index 495f1d90f..f137e0676 100644
    })
  })
 diff --git a/python/sdk-runtime/src/deepseek_harness_runtime/deepseek-harness-runtime.json b/python/sdk-runtime/src/deepseek_harness_runtime/deepseek-harness-runtime.json
-index e4d02d8a3..5ff8a564c 100644
+index e4d02d8..5ff8a56 100644
 --- a/python/sdk-runtime/src/deepseek_harness_runtime/deepseek-harness-runtime.json
 +++ b/python/sdk-runtime/src/deepseek_harness_runtime/deepseek-harness-runtime.json
 @@ -1 +1,8 @@
@@ -1077,7 +1202,7 @@ index e4d02d8a3..5ff8a564c 100644
 +  }
 +}
 diff --git a/python/sdk/src/deepseek_harness/__init__.py b/python/sdk/src/deepseek_harness/__init__.py
-index 8c098224f..1f4acb597 100644
+index 8c09822..1f4acb5 100644
 --- a/python/sdk/src/deepseek_harness/__init__.py
 +++ b/python/sdk/src/deepseek_harness/__init__.py
 @@ -1,7 +1,16 @@
@@ -1107,7 +1232,7 @@ index 8c098224f..1f4acb597 100644
 +    "SessionReconciliation",
  ]
 diff --git a/python/sdk/src/deepseek_harness/client.py b/python/sdk/src/deepseek_harness/client.py
-index 5442c7e14..4482f625d 100644
+index 5442c7e..4482f62 100644
 --- a/python/sdk/src/deepseek_harness/client.py
 +++ b/python/sdk/src/deepseek_harness/client.py
 @@ -15,7 +15,16 @@ from typing import Callable, TypeAlias, TypeVar
@@ -1176,7 +1301,7 @@ index 5442c7e14..4482f625d 100644
          self,
          session_id: str,
 diff --git a/python/sdk/src/deepseek_harness/models.py b/python/sdk/src/deepseek_harness/models.py
-index f398bb422..5acbfca44 100644
+index f398bb4..5acbfca 100644
 --- a/python/sdk/src/deepseek_harness/models.py
 +++ b/python/sdk/src/deepseek_harness/models.py
 @@ -30,3 +30,23 @@ class ServerInfo(BaseModel):
@@ -1204,7 +1329,7 @@ index f398bb422..5acbfca44 100644
 +    status: str
 +    outcome: str
 diff --git a/python/sdk/tests/test_client.py b/python/sdk/tests/test_client.py
-index 51c9dacb3..2fac916d8 100644
+index 51c9dac..2fac916 100644
 --- a/python/sdk/tests/test_client.py
 +++ b/python/sdk/tests/test_client.py
 @@ -461,7 +461,17 @@ for line in sys.stdin:
@@ -1249,7 +1374,7 @@ index 51c9dacb3..2fac916d8 100644
          notification = client.next_notification()
          assert notification.method == "llm/request"
 diff --git a/scripts/build-exe-for-python-sdk.ts b/scripts/build-exe-for-python-sdk.ts
-index 801a004fd..694122b8b 100644
+index 801a004..694122b 100644
 --- a/scripts/build-exe-for-python-sdk.ts
 +++ b/scripts/build-exe-for-python-sdk.ts
 @@ -386,6 +386,7 @@ class SingleExeBuild {

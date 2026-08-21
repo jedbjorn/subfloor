@@ -335,11 +335,22 @@ def _deepseek_provider_metadata(
             ),
             "purpose": "conversation",
         }
+        expected_purpose_proofs = {
+            purpose: {
+                "wire_options": expected_wire,
+                "native_request": {
+                    **expected_native,
+                    "purpose": purpose,
+                },
+            }
+            for purpose in deepseek_runtime.PROVIDER_WIRE_PURPOSES
+        }
         digest_payload = {
             key: item.get(key) if isinstance(item, dict) else None
             for key in (
                 "contract", "provider", "model", "effort", "provider_options",
-                "wire_options", "native_request", "runtime_version", "source_commit",
+                "wire_options", "native_request", "purpose_proofs",
+                "runtime_version", "source_commit",
                 "patch_sha256", "composition_sha256", "provider_registry_sha256",
                 "provider_adapter_id", "provider_adapter_digest",
             )
@@ -353,6 +364,7 @@ def _deepseek_provider_metadata(
             or item.get("provider_options") != expected_options
             or item.get("wire_options") != expected_wire
             or item.get("native_request") != expected_native
+            or item.get("purpose_proofs") != expected_purpose_proofs
             or item.get("runtime_version") != expected_runtime
             or item.get("source_commit") != expected_source
             or item.get("patch_sha256") != expected_patch
