@@ -114,6 +114,8 @@ COPY .super-coder/scripts/build_deepseek_carrier.py /opt/super-coder/deepseek-bo
 COPY .super-coder/scripts/deepseek_carrier_worker.py /opt/super-coder/deepseek-bootstrap/scripts/deepseek_carrier_worker.py
 COPY .super-coder/scripts/deepseek_skill_resume_canary.py /opt/super-coder/deepseek-bootstrap/scripts/deepseek_skill_resume_canary.py
 COPY .super-coder/scripts/cli_entry.py /opt/super-coder/deepseek-bootstrap/scripts/cli_entry.py
+COPY .super-coder/scripts/deepseek_carrier_worker.py /opt/super-coder/deepseek-bootstrap/scripts/deepseek_carrier_worker.py
+COPY .super-coder/scripts/deepseek_skill_resume_canary.py /opt/super-coder/deepseek-bootstrap/scripts/deepseek_skill_resume_canary.py
 COPY .super-coder/assets/deepseek /opt/super-coder/deepseek-bootstrap/assets/deepseek
 RUN python /opt/super-coder/deepseek-bootstrap/scripts/deepseek_runtime.py \
       --install-container-carrier /opt/super-coder/deepseek-runtime "$(uname -m)" \

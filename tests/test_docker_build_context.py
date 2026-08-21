@@ -17,6 +17,12 @@ DEEPSEEK_ASSETS = ".super-coder/assets/deepseek"
 REQUIRED_SCRIPTS = {
     ".super-coder/scripts/build_deepseek_carrier.py",
     ".super-coder/scripts/cli_entry.py",
+    ".super-coder/scripts/deepseek_carrier_worker.py",
+    ".super-coder/scripts/deepseek_runtime.py",
+    ".super-coder/scripts/deepseek_skill_resume_canary.py",
+}
+BOOTSTRAP_ENTRYPOINTS = {
+    ".super-coder/scripts/cli_entry.py",
     ".super-coder/scripts/deepseek_runtime.py",
 }
 EXPECTED_RULES = [
@@ -26,6 +32,8 @@ EXPECTED_RULES = [
     "!.super-coder/scripts/deepseek_runtime.py",
     "!.super-coder/scripts/build_deepseek_carrier.py",
     "!.super-coder/scripts/cli_entry.py",
+    "!.super-coder/scripts/deepseek_carrier_worker.py",
+    "!.super-coder/scripts/deepseek_skill_resume_canary.py",
     "!.super-coder/assets",
     f"!{DEEPSEEK_ASSETS}",
     f"!{DEEPSEEK_ASSETS}/**",
@@ -71,6 +79,28 @@ def _tracked_files() -> set[str]:
     }
 
 
+def _manifest_script_paths(value: object) -> set[str]:
+    if isinstance(value, (dict, list)):
+        items = value.values() if isinstance(value, dict) else value
+        paths: set[str] = set()
+        for item in items:
+            paths.update(_manifest_script_paths(item))
+        return paths
+    if isinstance(value, str) and value.startswith("scripts/") and value.endswith(".py"):
+        return {f".super-coder/{value}"}
+    return set()
+
+
+def _materialize_bootstrap(tmp_path: Path) -> Path:
+    bootstrap = tmp_path / "deepseek-bootstrap"
+    scripts = bootstrap / "scripts"
+    scripts.mkdir(parents=True)
+    for source in sorted(REQUIRED_SCRIPTS):
+        shutil.copy2(ROOT / source, scripts / Path(source).name)
+    shutil.copytree(ROOT / DEEPSEEK_ASSETS, bootstrap / "assets" / "deepseek")
+    return scripts
+
+
 def test_sandbox_context_is_exact_default_deny_allowlist() -> None:
     rules = _rules()
     assert rules == EXPECTED_RULES
@@ -107,12 +137,7 @@ def test_sandbox_context_rejects_mutable_and_secret_bearing_neighbors() -> None:
 
 
 def test_isolated_bootstrap_resolves_cli_entry(tmp_path: Path) -> None:
-    bootstrap = tmp_path / "deepseek-bootstrap"
-    scripts = bootstrap / "scripts"
-    scripts.mkdir(parents=True)
-    for source in sorted(REQUIRED_SCRIPTS):
-        shutil.copy2(ROOT / source, scripts / Path(source).name)
-    shutil.copytree(ROOT / DEEPSEEK_ASSETS, bootstrap / "assets" / "deepseek")
+    scripts = _materialize_bootstrap(tmp_path)
 
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)
@@ -157,4 +182,49 @@ print(json.dumps({
     assert json.loads(result.stdout) == {
         "cli_entry": "cli_entry.py",
         "deepseek_runtime": "deepseek_runtime.py",
+    }
+
+
+def test_isolated_bootstrap_validates_complete_manifest_closure(tmp_path: Path) -> None:
+    manifest = json.loads((ROOT / DEEPSEEK_ASSETS / "runtime.json").read_text())
+    assert _manifest_script_paths(manifest) == REQUIRED_SCRIPTS - BOOTSTRAP_ENTRYPOINTS
+    scripts = _materialize_bootstrap(tmp_path)
+
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    probe = """
+import json
+import sys
+from pathlib import Path
+
+scripts = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(scripts))
+import deepseek_runtime
+
+manifest = deepseek_runtime.load_runtime_manifest()
+print(json.dumps({
+    "build": manifest["build"]["path"],
+    "canary": manifest["build"]["canary_path"],
+    "runtime_module": str(
+        Path(deepseek_runtime.__file__).resolve().relative_to(scripts)
+    ),
+    "worker": manifest["carrier"]["worker_path"],
+}, sort_keys=True))
+"""
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", probe, str(scripts)],
+        cwd=tmp_path,
+        env={**environment, "PYTHONNOUSERSITE": "1"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert json.loads(result.stdout) == {
+        "build": "scripts/build_deepseek_carrier.py",
+        "canary": "scripts/deepseek_skill_resume_canary.py",
+        "runtime_module": "deepseek_runtime.py",
+        "worker": "scripts/deepseek_carrier_worker.py",
     }
