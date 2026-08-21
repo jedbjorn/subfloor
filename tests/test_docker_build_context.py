@@ -125,12 +125,12 @@ def test_sandbox_context_rejects_mutable_and_secret_bearing_neighbors() -> None:
         ".git/config",
         ".sc-state/content.sql",
         ".sc-worktrees/dev1/private-state",
-        ".super-coder/assets/skills/sprint_dev/SKILL.md",
+        ".super-coder/assets/skills/memory/SKILL.md",
         ".super-coder/archives/session.json",
         ".super-coder/scripts/conversation_launch.py",
         ".super-coder/shell_db.db",
         "credentials.json",
-        "shared/sprints/sprint-19/receipt.json",
+        "shared/private/receipt.json",
     }
 
     assert {path for path in prohibited if _is_copyable(path, rules)} == set()
